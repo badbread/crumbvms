@@ -1,0 +1,48 @@
+.heroBanner {
+  padding: 4rem 0;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.heroSub {
+  max-width: 640px;
+  margin: 0 auto 1.5rem;
+  opacity: 0.85;
+}
+
+.buttons {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.secondaryButton {
+  border-color: var(--ifm-color-primary);
+  color: var(--ifm-color-primary);
+}
+
+.features {
+  padding: 3rem 0;
+}
+
+.feature {
+  margin-bottom: 1.5rem;
+}
+
+.featureCard {
+  height: 100%;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--ifm-toc-border-color, #33363f);
+  border-radius: 8px;
+}
+
+.ctaSection {
+  padding: 1rem 0 4rem;
+}
+
+.ctaSection ul {
+  line-height: 1.9;
+}

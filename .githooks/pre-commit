@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Crumb — pre-commit secret guard
+#
+# Blocks accidentally committing a .env / secrets file or an obvious inline
+# secret. This is the interim secrets posture.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass for a single commit (use sparingly, you are turning the safety off):
+#   git commit --no-verify
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# Files staged for this commit (added/copied/modified/renamed), NUL-safe.
+mapfile -d '' -t STAGED < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+[[ ${#STAGED[@]} -eq 0 ]] && exit 0
+
+fail=0
+err() { printf '\033[31m[pre-commit] BLOCKED:\033[0m %s\n' "$*" >&2; fail=1; }
+
+# ── 1. Block secret-bearing FILES by path ────────────────────────────────────
+# .env (any variant) and *.env, plus DB backup dumps, must never be committed.
+# The committed template is .env.example — that one is allowed.
+for f in "${STAGED[@]}"; do
+  base="$(basename "${f}")"
+  case "${base}" in
+    .env.example|*.env.example) : ;;                       # allowed template
+    .env|.env.*|*.env)          err "secrets file staged: ${f}  (it must stay gitignored)";;
+  esac
+  case "${f}" in
+    *.sql.gz|backups/*) err "database backup staged: ${f}  (backups must not be committed)";;
+    *id_rsa|*id_ed25519|*.pem|*.pfx|*.p12|*.key) err "private key / cert staged: ${f}";;
+  esac
+done
+
+# ── 2. Block obvious inline secrets in the staged DIFF content ────────────────
+# Only scan added lines (^+), skip the example template, and keep patterns tight
+# to avoid false positives on docs/placeholders.
+DIFF="$(git diff --cached --diff-filter=ACMR -U0 -- . ':(exclude)*.env.example' ':(exclude)*.example.yml' || true)"
+
+scan() { # pattern, message
+  if printf '%s\n' "${DIFF}" | grep -E '^\+' | grep -Eiq "$1"; then
+    err "$2"
+  fi
+}
+
+# A real, filled-in secret assignment (>=20 non-placeholder chars). The negative
+# lookahead-ish guard via grep -v keeps obvious placeholders from tripping it.
+SECRET_LINES="$(printf '%s\n' "${DIFF}" \
+  | grep -E '^\+' \
+  | grep -Ei '(POSTGRES_PASSWORD|JWT_SECRET|SECRET_KEY|API_?KEY|PASSWORD|TOKEN|PRIVATE_KEY)[[:space:]]*[:=]' \
+  | grep -Eiv 'change-?me|example|placeholder|your[-_]|<[^>]+>|\$\{|=[[:space:]]*$|=["'\'']?[[:space:]]*$|generate-with|rand-hex' \
+  | grep -E '[:=][[:space:]]*["'\'']?[A-Za-z0-9+/_-]{20,}' || true)"
+if [[ -n "${SECRET_LINES}" ]]; then
+  err "looks like a real secret value in the diff:"
+  printf '%s\n' "${SECRET_LINES}" | sed 's/^/    /' >&2
+fi
+
+# Private key blocks.
+scan 'BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY' "private key block in staged content"
+
+if [[ "${fail}" -ne 0 ]]; then
+  cat >&2 <<'MSG'
+
+[pre-commit] Commit aborted. Remove the secret(s) above, or:
+  - confirm .env is gitignored (it is, by default)
+  - if this is a deliberate non-secret, bypass once with: git commit --no-verify
+MSG
+  exit 1
+fi
+
+exit 0

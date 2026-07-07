@@ -1,0 +1,15 @@
+# Synthetic RTSP source for the fresh-install smoke test (see
+# docker-compose.smoke.yml `testsrc` + scripts/test/fresh-install-smoke.sh
+# step 4e). A go2rtc exec source lazily spawns an ffmpeg testsrc publisher the
+# first time a consumer (the recorder) connects — one container, no host
+# ports, torn down with the stack.
+log:
+  level: info
+api:
+  listen: ""
+webrtc:
+  listen: ""
+rtsp:
+  listen: ":8554"
+streams:
+  cam: exec:ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=640x360:rate=10 -c:v libx264 -preset ultrafast -tune zerolatency -g 20 -pix_fmt yuv420p -f rtsp {output}

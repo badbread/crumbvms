@@ -1,0 +1,64 @@
+# Contributor License Agreement check.
+#
+# On every pull request, this posts a comment asking first-time contributors to
+# sign the CLA (CLA.md) by replying with a one-line statement. The signature is
+# recorded (keyed to the GitHub account) so it's a one-time action per person.
+#
+# ── One-time setup on the public repo ──────────
+#   1. Create a classic Personal Access Token with `repo` scope and add it as the
+#      repo secret `CLA_SIGNATURES_TOKEN`. The action uses it to write the
+#      signature file back to this repo (`path-to-signatures` below).
+#   2. Replace <OWNER>/<REPO> in `path-to-document` with the real repo slug.
+#   3. Add the maintainer's username to `allowlist`.
+#   4. Set the repo variable `CLA_ENABLED=true` to turn the job on (it is gated
+#      OFF by default via the job `if:` below).
+# Until step 4 the job is a clean skip on every PR (neutral, never red), so it
+# stays inert through the private, read-only tester phase.
+#
+# NOTE: `runs-on` uses the maintainer's self-hosted label to match the other
+# workflows; the publish step swaps it to `ubuntu-latest` for the public repo.
+
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    # Inert until explicitly enabled. During the private, read-only tester phase
+    # there are no external PRs to gate, and the signatures PAT isn't set — so
+    # without this guard the job runs on every PR and FAILS ("Resource not
+    # accessible by integration"). Gate on a repo variable so it's a clean
+    # skip (neutral, not red) until publish. To enable: set repo variable
+    # CLA_ENABLED=true, add the CLA_SIGNATURES_TOKEN secret, and fix the slug
+    # below.
+    if: ${{ vars.CLA_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: CLA Assistant
+        if: >
+          (github.event.comment.body == 'recheck' ||
+           github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') ||
+          github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A classic PAT with `repo` scope — used to store signatures. Required.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          path-to-signatures: 'signatures/version1/cla.json'
+          path-to-document: 'https://github.com/<OWNER>/<REPO>/blob/main/CLA.md'
+          branch: 'main'
+          # People whose PRs don't require a signature (the maintainer + bots).
+          allowlist: 'badbread,dependabot[bot]'
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-allsigned-prcomment: 'All contributors have signed the CLA. ✍️'

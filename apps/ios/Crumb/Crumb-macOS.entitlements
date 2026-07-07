@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Sandbox (M3). Minimal entitlements: -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- Outgoing network client only — talks to the user's own Crumb server
+	     (REST API, WebRTC/go2rtc, fMP4/segment media) plus the LAN-discovery
+	     subnet scan (M6). No listener/server entitlement needed. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- User-selected read-write file access — required by the Export sheet's
+	     NSSavePanel flow (ExportView.saveToUserLocation): the sandbox grants
+	     write access to exactly the file/folder the user picks in the panel,
+	     nothing broader. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>

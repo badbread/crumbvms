@@ -1,0 +1,37 @@
+# Isolation overlay for the fresh-install smoke test (scripts/test/fresh-install-smoke.sh).
+#
+# Lets the stack boot under a unique compose project name alongside anything else
+# on the box with zero port collisions:
+#   - api  -> published to an EPHEMERAL localhost port (127.0.0.1:0:8080), so the
+#     test can curl it directly; `docker compose port api 8080` reveals the port.
+#   - all other host-published services (caddy/mosquitto/recorder — the
+#     recorder publishes the embedded go2rtc's RTSP/WebRTC ports) -> ports removed.
+#
+# `!override` REPLACES the base `ports:` list (a plain value would merge/append and
+# leave the base ports in place). Requires Docker Compose v2.24+.
+#
+# Layer it LAST:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml \
+#     -f docker-compose.smoke.yml -p <unique> up -d --build
+services:
+  api:
+    ports: !override ["127.0.0.1:0:8080"]
+  caddy:
+    ports: !override []
+  mosquitto:
+    ports: !override []
+  recorder:
+    # The embedded go2rtc's published listeners (18554 RTSP, 8556 WebRTC) —
+    # stripped so parallel smoke stacks never collide on host ports.
+    ports: !override []
+
+  # Synthetic RTSP camera for the recorder live-index check (smoke step 4e):
+  # go2rtc holding an exec/ffmpeg-testsrc stream at rtsp://testsrc:8554/cam.
+  # The publisher is spawned on first consumer connect (the recorder), so the
+  # container idles until the test adds the camera. No host ports; lives and
+  # dies with the smoke project.
+  testsrc:
+    image: alexxit/go2rtc:1.9.14
+    volumes:
+      - ./scripts/test/smoke-testsrc-go2rtc.yaml:/config/go2rtc.yaml:ro
+    restart: unless-stopped

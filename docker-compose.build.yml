@@ -1,0 +1,37 @@
+# CrumbVMS — BUILD-FROM-SOURCE override.
+#
+# The base docker-compose.yml PULLS prebuilt api/recorder images from a registry
+# by default (see docs/IMAGES.md) — no Rust toolchain needed for a normal
+# install. Layer THIS file on top to restore local `build:` from source instead:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# When to use this instead of the default:
+#   - You're developing Crumb (editing services/api or services/recorder).
+#   - Air-gapped / no-registry-access environment.
+#   - The owner hasn't published GHCR images yet (private repo, packages not
+#     public) — see docs/IMAGES.md "owner seam". Until publishing is enabled,
+#     the default docker-compose.yml has nothing to pull, so THIS override is
+#     required for anyone running from this repo today.
+#   - You want to pin/test an unreleased local change instead of a tagged image.
+#
+# This override re-adds `build:` and re-tags the image `crumbvms/<service>:local`
+# so it never collides with a pulled registry tag. `docker compose build` (or
+# the `--build` flag above) compiles services/{api,recorder}/Dockerfile from the
+# repo root context — the same multi-stage Rust build CI uses.
+#
+# Copy to docker-compose.build.local.yml (gitignored) if you want to tweak it
+# without touching this committed file.
+
+services:
+  recorder:
+    build:
+      context: .
+      dockerfile: services/recorder/Dockerfile
+    image: crumbvms/recorder:local
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: crumbvms/api:local

@@ -1,0 +1,19 @@
+# Everything runs in Linux containers — normalize to LF in the repo.
+* text=auto eol=lf
+
+# Explicit LF for things that break with CRLF on Linux
+*.sh        text eol=lf
+*.py        text eol=lf
+*.sql       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+Dockerfile  text eol=lf
+
+# Binaries
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.mp4  binary
+*.mkv  binary

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Initial window theme. The real UI theming is done in Compose (CrumbTheme).
+         Uses the framework Material theme so we don't pull in the Material Views library. -->
+    <style name="Theme.Crumb" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/crumb_background</item>
+        <item name="android:statusBarColor">@color/crumb_background</item>
+        <item name="android:navigationBarColor">@color/crumb_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

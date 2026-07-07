@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Pre-Android-12 (API ≤30) backup rules — android:fullBackupContent.
+    Mirrors data_extraction_rules.xml (the API 31+ equivalent): excludes the
+    auth SharedPreferences files so the session token (and the plaintext
+    fallback prefs used when EncryptedSharedPreferences is unavailable — see
+    SecureStore.kt) never rides along in Auto Backup on older OS versions.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="crumb_secure.xml" />
+    <exclude domain="sharedpref" path="crumb_fallback.xml" />
+</full-backup-content>

@@ -1,0 +1,45 @@
+/**
+ * Crumb VMS docs site theme.
+ * Palette from brand/crumb-vms-design-system/project/tokens/colors.css
+ * ("The Trail": dark charcoal base, one warm amber accent). This site is
+ * dark-mode-only by default (see docusaurus.config.js colorMode), so the
+ * light-mode block below exists only as a safety net if a visitor forces
+ * light mode via browser settings.
+ */
+
+:root {
+  --ifm-color-primary: #a66b16;
+  --ifm-color-primary-dark: #96600f;
+  --ifm-color-primary-darker: #8d5a0e;
+  --ifm-color-primary-darkest: #744a0c;
+  --ifm-color-primary-light: #b6760e;
+  --ifm-color-primary-lighter: #c07d14;
+  --ifm-color-primary-lightest: #d08a24;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(232, 163, 61, 0.12);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #e8a33d;
+  --ifm-color-primary-dark: #d08a24;
+  --ifm-color-primary-darker: #c07d14;
+  --ifm-color-primary-darkest: #a66b16;
+  --ifm-color-primary-light: #f0c170;
+  --ifm-color-primary-lighter: #f7e3be;
+  --ifm-color-primary-lightest: #f7e3be;
+
+  --ifm-background-color: #15161a;
+  --ifm-background-surface-color: #1e2026;
+  --ifm-navbar-background-color: #1e2026;
+  --ifm-footer-background-color: #0e0f12;
+  --ifm-toc-border-color: #33363f;
+  --ifm-table-border-color: #33363f;
+  --ifm-hr-border-color: #33363f;
+
+  --docusaurus-highlighted-code-line-bg: rgba(232, 163, 61, 0.16);
+}
+
+.hero--primary {
+  --ifm-hero-background-color: #15161a;
+  --ifm-hero-text-color: #e8e9ed;
+}

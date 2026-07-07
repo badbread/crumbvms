@@ -1,0 +1,33 @@
+# CrumbVMS — GPU overlay (optional NVDEC hardware decode for motion).
+#
+# The base docker-compose.yml boots GPU-FREE: MOTION_HWACCEL=auto probes for
+# NVDEC and falls back to CPU on a host with no NVIDIA GPU. Apply THIS overlay
+# on a host that has an NVIDIA GPU + the nvidia-container-toolkit to give the
+# recorder the GPU and force NVDEC decode:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.example.yml up -d
+#
+# Requirements on the host:
+#   - NVIDIA driver + nvidia-container-toolkit installed.
+#   - `docker info | grep -i runtime` shows the nvidia runtime, OR Compose's
+#     `deploy.resources.reservations.devices` GPU support is available (Compose v2).
+#
+# Copy to docker-compose.gpu.yml (gitignored) if you want to tweak it without
+# touching the committed example.
+
+services:
+  recorder:
+    environment:
+      # Force NVDEC decode now that the GPU is attached (overrides base 'auto').
+      MOTION_HWACCEL: ${MOTION_HWACCEL:-cuda}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      # 'video' capability is REQUIRED for in-container NVDEC (learned in smoke
+      # test); 'compute'/'utility' for NVML stats.
+      NVIDIA_DRIVER_CAPABILITIES: video,compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]   # 'video' = NVDEC/NVENC engines

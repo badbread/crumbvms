@@ -1,0 +1,95 @@
+name: Crumb
+options:
+  bundleIdPrefix: video.crumb
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+  groupSortPosition: top
+  createIntermediateGroups: true
+  defaultConfig: Release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    # Keep in lockstep with the rest of the project (android version.properties,
+    # tauri.conf.json) — the first public tag must mean one version everywhere.
+    MARKETING_VERSION: "0.0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    # Swift-6 readiness for the macOS port. `targeted` checks concurrency-adopting
+    # code for Sendable / actor-isolation violations (warnings, not errors).
+    SWIFT_STRICT_CONCURRENCY: targeted
+
+configs:
+  Debug: debug
+  Release: release
+
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    exactVersion: 149.0.0
+
+targets:
+  Crumb:
+    type: application
+    platform: iOS
+    sources:
+      - path: Crumb
+        excludes:
+          - "**/.DS_Store"
+          - "Info-macOS.plist"
+          - "Crumb-macOS.entitlements"
+    dependencies:
+      - package: WebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: video.crumb.app
+        INFOPLIST_FILE: Crumb/Info.plist
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "DEBUG"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          SWIFT_COMPILATION_MODE: "wholemodule"
+
+  Crumb-mac:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Crumb
+        excludes:
+          - "**/.DS_Store"
+          - "Info.plist"
+    # No WebRTC dependency: stasel/WebRTC's macOS slice is unusable (1 header),
+    # and macOS doesn't need it — the cross-platform fMP4 player drives all live
+    # video here. WebRTC code is #if canImport(WebRTC)-guarded (iOS only).
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: video.crumb.app
+        PRODUCT_NAME: Crumb
+        INFOPLIST_FILE: Crumb/Info-macOS.plist
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Crumb VMS"
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: Crumb/Crumb-macOS.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_HARDENED_RUNTIME: "YES"
+        SWIFT_STRICT_CONCURRENCY: targeted
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "DEBUG"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          SWIFT_COMPILATION_MODE: "wholemodule"

@@ -1,0 +1,17 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Release signing — real keystore + credentials never committed.
+# keystore.properties.example (template, no secrets) IS tracked.
+/keystore.properties
+*.jks
+*.keystore

@@ -1,0 +1,47 @@
+# Fresh-install smoke test — proves a from-scratch `docker compose up` boots a
+# healthy Crumb stack and the first-run flow works (the exact path a new user
+# follows). Kept OUT of ci.yml because it builds both Rust images from source and
+# boots the full 6-service stack (~10 min), which shouldn't tax every push.
+#
+# Runs: nightly, on manual dispatch, and on pushes to main that touch the
+# install surface (compose / migrations / services / setup script).
+name: fresh-install-smoke
+
+on:
+  schedule:
+    - cron: "0 10 * * *" # ~02:00–03:00 America/Los_Angeles (GitHub cron is UTC)
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "docker-compose*.yml"
+      - "db/migrations/**"
+      - "services/**"
+      - "scripts/setup-env.sh"
+      - "scripts/test/fresh-install-smoke.sh"
+      - "scripts/test/smoke-testsrc-go2rtc.yaml"
+      - "caddy/**"
+      - "go2rtc/**"
+      - "mosquitto/**"
+      - "VERSION"
+
+# One smoke run per ref at a time; newer pushes cancel older in-flight builds.
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: fresh-install (docker compose up from scratch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Buildx gives a persistent gha layer cache so the Rust image build is only
+      # cold on the first run.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Fresh-install smoke test
+        run: bash scripts/test/fresh-install-smoke.sh

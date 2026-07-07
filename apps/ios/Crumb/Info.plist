@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Crumb</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<!-- A fixed-grid camera wall isn't designed for iPad split-view / Slide Over;
+	     requiring full screen also clears the partial-orientation build warning. -->
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+	</dict>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<!-- H4 audit (2026-07): considered removing the blanket NSAllowsArbitraryLoads
+	     and relying on NSAllowsLocalNetworking + a scoped NSExceptionDomains list
+	     instead. Rejected: Crumb's server address is user-entered and arbitrary
+	     (self-hosted, any LAN host/IP), and critically many users reach it over
+	     Tailscale (100.64.0.0/10) — a real routed IP range that Apple's "local
+	     networking" classification does NOT cover (it's scoped to mDNS/.local and
+	     RFC1918/link-local, not CGNAT/overlay-network ranges). NSExceptionDomains
+	     requires a fixed domain name known at build time, which doesn't exist here.
+	     Removing NSAllowsArbitraryLoads would silently break every Tailscale user's
+	     plain-http:// connection to their own NVR. Keeping the blanket exception
+	     is a deliberate choice — the app is not gaining any new insecure surface
+	     by keeping it, since it already needed it for Tailscale traffic.
+	     TODO(real fix): ship TLS on the backend (self-signed + pinned, or a
+	     Tailscale-issued cert via `tailscale cert`) so ATS can be tightened for
+	     real instead of blanket-exempted. Track alongside the release plan's TLS
+	     backend work (docs/RELEASE-PLAN.md). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Crumb saves camera snapshots to your photo library.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Crumb connects to your NVR on the local network.</string>
+	<!-- M6: opt-in biometric app-lock (Settings > Account > "Require Face ID").
+	     Face ID requires this usage string even though the actual challenge is
+	     driven by LAContext's deviceOwnerAuthentication policy (BiometricLock.swift),
+	     which also transparently falls back to Touch ID or the device passcode. -->
+	<key>NSFaceIDUsageDescription</key>
+	<string>Crumb can require Face ID to open the app, protecting your camera feeds if your device is unlocked by someone else.</string>
+	<!-- M6: Picture-in-Picture (live + recorded playback, PictureInPicture.swift).
+	     Apple requires the "audio" background mode for AVPlayerLayer/sample-buffer
+	     PiP to keep rendering once the app itself is fully backgrounded (not just
+	     "another app is in front while Crumb's PiP window floats over it"). This
+	     does NOT mean Crumb plays audio in the background outside of an active,
+	     user-initiated PiP session. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+</dict>
+</plist>

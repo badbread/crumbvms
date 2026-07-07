@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Crumb</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Crumb VMS</string>
+	<key>NSMainStoryboardFile</key>
+	<string></string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<!-- H4 audit (2026-07): same reasoning as Info.plist (iOS) — keeping the
+	     blanket NSAllowsArbitraryLoads rather than narrowing to
+	     NSAllowsLocalNetworking + NSExceptionDomains. The server address is
+	     user-entered/arbitrary (self-hosted) and commonly reached over Tailscale
+	     (100.64.0.0/10), which Apple's "local networking" ATS carve-out does NOT
+	     cover and which has no fixed domain to scope via NSExceptionDomains.
+	     TODO(real fix): ship TLS on the backend so ATS can be tightened for real
+	     instead of blanket-exempted; see docs/RELEASE-PLAN.md. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Crumb connects to your NVR on the local network.</string>
+</dict>
+</plist>

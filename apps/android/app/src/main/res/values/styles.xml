@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        (The old CompactSpinnerDatePicker style was removed when the native
+        DatePickerDialog→TimePickerDialog chain was replaced by the Material3
+        Compose JumpToDateTimeDialog — see ui/JumpToDateTimeDialog.kt.)
+    -->
+</resources>

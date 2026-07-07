@@ -1,0 +1,104 @@
+[package]
+name        = "crumb-api"
+version     = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "crumb-api"
+path = "src/main.rs"
+
+# Detection-event plugin (Frigate MQTT ingestion + /events endpoint).
+# Enabled by default; disable with --no-default-features for a pure-Crumb
+# build that has no MQTT dependency at all.
+[features]
+default = ["detection"]
+detection = ["rumqttc", "async-trait"]
+
+[dependencies]
+crumb-common = { path = "../common" }
+
+# Detection (optional, gated by the "detection" feature)
+rumqttc     = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bytes       = { workspace = true }
+
+# Async runtime
+tokio      = { workspace = true }
+
+# HTTP framework
+axum       = { workspace = true }
+tower      = { workspace = true }
+tower-http = { workspace = true }
+
+# Auth
+jsonwebtoken = { workspace = true }
+argon2       = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Domain types
+uuid   = { workspace = true }
+chrono = { workspace = true }
+# IANA timezones for the built-in nightly DB backup schedule (db_backup.rs) —
+# evaluates DB_BACKUP_SCHEDULE in the operator's TZ, DST-correct, with the tz
+# database embedded (no system tzdata needed in the image).
+chrono-tz = { workspace = true }
+
+# DB
+tokio-postgres    = { workspace = true }
+deadpool-postgres = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Async extras (DashMap for export job tracking)
+dashmap    = "6"
+
+# Streaming file bodies — ReaderStream wraps AsyncRead into an axum Body stream.
+tokio-util = { workspace = true }
+
+# Free-space query via statvfs(2) (Linux/Unix only — matches container target)
+libc       = "0.2"
+
+# MIME types — used by playback.rs to set Content-Type: video/mp4 on ServeFile.
+# This is a transitive dep of tower-http but must be declared directly to use
+# the `mime::VIDEO_MP4` constant without depending on tower-http internals.
+mime       = "0.3"
+
+# ONVIF PTZ control.
+# lumeohq/onvif-rs: the `onvif` crate provides the SOAP client builder;
+# `schema` provides the generated WSDL types (devicemgmt, media, ptz, onvif XSD).
+# Pinned to a known-good commit (unpinned git deps float to the branch tip, a
+# supply-chain risk); update deliberately after testing.
+onvif  = { git = "https://github.com/lumeohq/onvif-rs", rev = "8f1490e2ce5e2ddd29dbd3ab2586d7a90da0b6d6", features = [] }
+schema = { git = "https://github.com/lumeohq/onvif-rs", rev = "8f1490e2ce5e2ddd29dbd3ab2586d7a90da0b6d6", features = ["devicemgmt", "media", "ptz", "imaging"] }
+
+# URL parsing — required by the ONVIF client builder (ClientBuilder::new takes &Url).
+url = "2"
+
+# IPv4 CIDR parsing for the network camera-discovery scan (/config/discover).
+# Already present in the lock as a transitive dep; declared directly for Ipv4Net.
+ipnet = "2"
+
+# HTTP client for the heartbeat webhook alerter (alerts.rs) and the live MSE
+# proxy (playback.rs). rustls (no system OpenSSL); minimal features. `stream`
+# is required for `bytes_stream()` (piping go2rtc's open-ended fMP4 body).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+
+# Base64 — ONVIF config is passed base64-encoded (ONVIF_CONFIG_B64) so the JSON
+# survives .env/compose substitution; config.rs decodes it at startup.
+base64 = "0.22"
+
+# ZIP packaging for password-protected evidence export.
+# Only AES-256 encryption + Stored (no compression) are needed; the video data
+# is already compressed so re-compressing wastes CPU and saves nothing.
+zip = { version = "2.2", default-features = false, features = ["aes-crypto"] }

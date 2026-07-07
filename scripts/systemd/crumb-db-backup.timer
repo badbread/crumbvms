@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Crumb Postgres backup (03:15 America/Los_Angeles)
+
+[Timer]
+# System timezone on server-host is America/Los_Angeles, so this fires at 03:15 PT.
+OnCalendar=*-*-* 03:15:00
+# If the machine was off at 03:15, run the backup at next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

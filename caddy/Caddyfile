@@ -1,0 +1,80 @@
+# Crumb — Caddy sidecar Caddyfile (P0-TLS)
+#
+# Purpose: terminate HTTPS in front of the API without changing the API itself.
+# This is ADDITIVE — the api container still publishes plain HTTP on :8080
+# (see docker-compose.yml), so any existing client/bookmark/script hardcoded to
+# http://<host>:8080 keeps working unchanged. Caddy just gives you a second,
+# encrypted door in on :8443 (overridable via CRUMB_HTTPS_PORT in .env).
+#
+# See docs/TLS.md for: the self-signed-cert browser warning you'll see on a
+# LAN install, how to trust Caddy's local CA (so the warning goes away for
+# good), and how to switch to a real domain + automatic Let's Encrypt later.
+
+{
+	# Caddy's local, automatic CA. It mints its own root once (stored in the
+	# crumb_caddy_data volume) and issues a leaf cert for the site below off of
+	# it — no domain, no port 80/443 forwarding, no outbound ACME calls. This is
+	# the right default for a LAN install with no public DNS name.
+	local_certs
+}
+
+# ":8443" (bare port, no host) — Caddy will serve this on any hostname/IP the
+# request came in on (server IP, "localhost", a LAN mDNS name, etc.), so it
+# works out of the box across different LAN setups. The actual container port
+# is templated from CRUMB_HTTPS_PORT so it always matches what's published in
+# docker-compose.yml.
+:{$CRUMB_HTTPS_PORT} {
+	# `on_demand` is required here: with a bare "any host" address (no fixed
+	# hostname in the site block above), Caddy does NOT know ahead of time
+	# which hostname/IP a client will connect with (LAN IP? "localhost"? an
+	# mDNS name?), so it can't pre-issue a leaf cert at startup. `on_demand`
+	# tells it to mint one the first time each identifier is actually seen in
+	# a TLS ClientHello, off of the same local internal CA. Verified: without
+	# this, Caddy returns "no certificate available" and the TLS handshake
+	# fails for every connection. Safe here because this listener is LAN-only
+	# (not internet-facing) — see the on_demand_tls docs if this port is ever
+	# exposed publicly, where you'd want an `ask` endpoint to rate-limit
+	# arbitrary hostnames.
+	tls internal {
+		on_demand
+	}
+
+	# Reverse-proxy everything to the API over the internal compose network.
+	# The API is unaware TLS exists — Caddy is a pure pass-through in front of
+	# it, so no API code changes were needed for this to work.
+	reverse_proxy api:8080
+
+	# Keep response/access logging on stdout so `docker compose logs caddy`
+	# shows the same kind of thing you'd get from any other service here.
+	log {
+		output stdout
+		format console
+	}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GOING HTTPS-ONLY (operator choice, not the default):
+#
+# Once you're comfortable with HTTPS working (see docs/TLS.md), you can stop
+# publishing the api container's plain :8080 port entirely (edit the `ports:`
+# block under the `api` service in docker-compose.yml and remove the
+# "0.0.0.0:8080:8080" line, or bind it to 127.0.0.1 only so it's still reachable
+# for local debugging but not from other LAN hosts). Caddy will keep working
+# unchanged since it talks to `api:8080` over the internal compose network
+# either way.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# REAL DOMAIN + AUTOMATIC LET'S ENCRYPT (later, once you have a domain pointed
+# at this host and can forward :443 from your router/firewall to it):
+#
+# Replace the `:{$CRUMB_HTTPS_PORT} { ... }` block above with something like:
+#
+#   crumb.example.com {
+#       reverse_proxy api:8080
+#   }
+#
+# and swap the compose `ports:` mapping for caddy to publish 443 (and 80, so
+# Caddy can complete the HTTP-01 ACME challenge) instead of CRUMB_HTTPS_PORT.
+# Remove the `local_certs` global option and the `tls internal` directive —
+# Caddy will then automatically request and renew a real trusted certificate
+# from Let's Encrypt for that domain, with no browser warning. See docs/TLS.md.

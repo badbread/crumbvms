@@ -1,0 +1,8 @@
+[Unit]
+Description=CrumbVMS nightly PostgreSQL backup to the archive disk
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/crumb/scripts/db-backup.sh

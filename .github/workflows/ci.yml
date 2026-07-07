@@ -1,0 +1,237 @@
+# Crumb — CI / versioned image build
+#
+# On push/PR to main: lint, build, and test the Rust workspace, then build the
+# recorder + api + web Docker images and tag them with the git short SHA (and,
+# on a git tag like v1.2.3, the version). Pushing to a registry is OPTIONAL and
+# only happens when registry secrets are configured — a missing secret does NOT
+# fail the build. See docs/RELEASE.md for the push + deploy + rollback flow.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Rust workspace: fmt, clippy, build, test ────────────────────────────────
+  rust:
+    name: rust (fmt, clippy, build, test)
+    runs-on: ubuntu-latest
+    # Postgres service for `services/api/tests/auth_rbac.rs` (P0-AUTHTEST): the
+    # auth/JWT/RBAC integration suite runs the REAL auth.rs/auth_mw.rs/handler
+    # code against a real database (self-provisioned via the embedded
+    # `run_migrations`, same as production's first boot) rather than mocking
+    # it — camera-scoping enforcement is exactly the code a mock would paper
+    # over. 16-alpine matches docker-compose.yml's `postgres` service.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: crumb
+          POSTGRES_PASSWORD: crumb_test_only
+          POSTGRES_DB: crumb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crumb -d crumb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Consumed by services/api/tests/support/mod.rs AND (as of 2026-07-05) the
+      # recorder's DB-integration suite in archive.rs / reconcile.rs, which now
+      # falls back to this var — previously they gated only on
+      # CRUMB_TEST_DATABASE_URL, which CI never set, so the footage-critical
+      # eviction/reconcile/quarantine tests silently skipped and the gate was
+      # green *because* they weren't running. The test helpers now assert-fail
+      # under CI if neither var is set, so this can't silently regress again.
+      # The other required secrets (JWT_SECRET, GO2RTC_USER/PASS) have safe
+      # test-only fallbacks baked into the harness, so they don't need setting.
+      TEST_DATABASE_URL: postgresql://crumb:crumb_test_only@localhost:5432/crumb
+    steps:
+      - uses: actions/checkout@v4
+
+      # Guard rail (audit 2026-07-05): `panic = "abort"` would convert every
+      # recorder panic — including a per-camera worker panic that today only
+      # fails that one task's future (panics unwind; the process survives) —
+      # into a whole-process kill, i.e. all cameras dark. It's the kind of thing
+      # someone adds for binary size without realising the footage-loss blast
+      # radius. Forbid it in any Cargo.toml.
+      - name: Guard rails (forbidden release config)
+        run: |
+          if grep -rnE 'panic[[:space:]]*=[[:space:]]*"abort"' --include=Cargo.toml .; then
+            echo "::error::panic=abort is forbidden"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+  # ── Desktop frontend lint (review A2) ───────────────────────────────────────
+  # The desktop UI is a large no-bundler ES module; ESLint no-undef is the
+  # mechanical guard against references to renamed/undefined globals that would
+  # otherwise only fail at runtime. Fails the build on errors; warnings (dead
+  # vars) are advisory.
+  desktop-lint:
+    name: desktop lint (eslint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install + lint
+        working-directory: apps/desktop
+        run: |
+          npm install --no-audit --no-fund eslint@9 globals@15
+          npx eslint src
+
+  # ── Desktop client: Linux build + gate ──────────────────────────────────────
+  # The Tauri desktop crate is its own workspace (NOT part of the root `cargo
+  # --workspace`), so it needs a dedicated job. Builds the cfg(linux) pane backend
+  # (libmpv render API → GtkGLArea) and runs the same fmt + clippy gate. Windows is
+  # not built here (no Windows runner); its path is cfg-gated and unchanged.
+  desktop-linux:
+    name: desktop (linux build + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install GTK / WebKitGTK build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libepoxy-dev libxdo-dev \
+            librsvg2-dev libayatana-appindicator3-dev
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Format check
+        working-directory: apps/desktop/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy (warnings as errors)
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: apps/desktop/src-tauri
+        run: cargo build
+
+  # ── Docker images: build + tag (push only if registry configured) ───────────
+  images:
+    name: build images
+    runs-on: ubuntu-latest
+    needs: rust
+    permissions:
+      contents: read
+      packages: write   # allows pushing to GHCR when enabled below
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: recorder
+            context: .
+            dockerfile: services/recorder/Dockerfile
+          - name: api
+            context: .
+            dockerfile: services/api/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Decide where images go. If REGISTRY + a push token are present we push to
+      # a real registry; otherwise we build locally only (load into the runner's
+      # docker) so the build is still validated. No hard failure on missing creds.
+      - name: Resolve registry + push policy
+        id: cfg
+        env:
+          REGISTRY: ${{ vars.REGISTRY }}            # e.g. ghcr.io/badbread/crumbvms (repo/org variable) —
+                                                     # matches docker-compose.yml's default
+                                                     # CRUMB_IMAGE_PREFIX so a fresh `docker compose
+                                                     # pull` finds these images once packages are
+                                                     # public. See docs/IMAGES.md.
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          if [ -n "${REGISTRY:-}" ]; then
+            echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+            echo "push=true"            >> "$GITHUB_OUTPUT"
+          else
+            # Fall back to a local-only namespace; build but don't push.
+            echo "registry=local/crumb" >> "$GITHUB_OUTPUT"
+            echo "push=false"               >> "$GITHUB_OUTPUT"
+          fi
+
+      # Compute tags: always the short SHA; also 'latest' on main; also the
+      # version on a v* tag push.
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.cfg.outputs.registry }}/${{ matrix.name }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      # Log in to GHCR only when pushing. GITHUB_TOKEN is always present, so this
+      # works out-of-the-box if REGISTRY points at ghcr.io. For another registry,
+      # add REGISTRY_USERNAME / REGISTRY_PASSWORD secrets and swap the values.
+      - name: Log in to registry
+        if: steps.cfg.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.REGISTRY_HOST || 'ghcr.io' }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      - name: Build${{ steps.cfg.outputs.push == 'true' && ' + push' || ' (no push — registry not configured)' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: ${{ steps.cfg.outputs.push }}
+          load: ${{ steps.cfg.outputs.push == 'false' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

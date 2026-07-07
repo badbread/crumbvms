@@ -1,0 +1,28 @@
+# Dependencies
+/node_modules
+
+# Production
+/build
+
+# Generated files
+.docusaurus
+.cache-loader
+
+# Generated Architecture pages (see scripts/sync-arch-docs.mjs). These are
+# copied from docs/ at the start of every build (local, CI, docs.yml) so
+# they can never drift stale in git relative to their sources. Only
+# docs/architecture/index.md (hand-written) is committed.
+/docs/architecture/decisions.md
+/docs/architecture/recorder-correctness.md
+/docs/architecture/motion-recording.md
+
+# Misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

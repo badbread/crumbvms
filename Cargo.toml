@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "services/common",
+    "services/recorder",
+    "services/api",
+]
+
+[workspace.package]
+edition   = "2021"
+authors   = ["Crumb NVR"]
+license   = "AGPL-3.0-or-later"
+
+# ---------------------------------------------------------------------------
+# Workspace-wide dependency versions — members inherit via `workspace = true`.
+# Using major-version floor ranges so `cargo update` pulls latest compatible.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Async runtime
+tokio        = { version = "1", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["rt", "codec", "io"] }
+
+# Byte buffers (used by rumqttc publish payloads and axum body streaming)
+bytes        = "1"
+
+# Database
+tokio-postgres   = { version = "0.7", features = [
+    "with-chrono-0_4",
+    "with-uuid-1",
+    "with-serde_json-1",
+] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+
+# Serialisation
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Domain types
+uuid   = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+# IANA timezones so the archive-schedule cron evaluates in local wall-clock
+# time (DST-correct), not UTC.
+chrono-tz = "0.10"
+
+# Cron scheduling
+croner = "2"
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow    = "1"
+thiserror = "1"
+
+# Async trait support
+async-trait = "0.1"
+
+# MQTT client (Frigate detection ingestion)
+rumqttc = "0.24"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP / API (used by services/api)
+axum          = { version = "0.7", features = ["macros"] }
+tower         = { version = "0.5", features = ["util"] }
+tower-http    = { version = "0.6", features = ["trace", "cors", "fs", "compression-gzip", "timeout"] }
+
+# Auth (used by services/api)
+jsonwebtoken  = "9"
+argon2        = "0.5"
+
+# Async sync primitives (used by services/api for export job map)
+tokio-stream  = "0.1"
+
+# NVIDIA GPU telemetry (recorder per-camera decode%). Reads device telemetry as
+# non-root (unlike `nvidia-smi pmon`), loading libnvidia-ml at runtime via
+# libloading — `Nvml::init()` returns Err on a non-NVIDIA host. Matches the
+# version the desktop crate already uses.
+nvml-wrapper  = "0.10"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"

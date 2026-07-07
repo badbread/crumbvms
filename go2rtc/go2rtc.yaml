@@ -1,0 +1,60 @@
+# CrumbVMS — go2rtc restreamer config (shipped default).
+#
+# go2rtc runs EMBEDDED in the recorder container: the recorder process spawns +
+# supervises the binary (services/recorder/src/go2rtc_embed.rs) with this file
+# mounted read-only at /config/go2rtc.yaml.
+#
+# Camera streams are managed by Crumb at RUNTIME via the go2rtc REST API — see
+# the reconcile loop in services/api/src/go2rtc.rs, driven by the cameras you add
+# in the admin console. Do NOT hand-add cameras or credentials here: anything you
+# add becomes a second, un-managed source of truth that fights the admin (this is
+# exactly the trap that made on-the-fly camera swaps painful).
+#
+# This file only needs the listeners so go2rtc boots cleanly on a fresh
+# install; Crumb fills in `streams` over the API (never persisted here — the
+# mount is read-only, and nothing calls go2rtc's config-write API).
+
+api:
+  listen: ":1984"
+  # P0-GO2RTC lighter lockdown: the REST API has no host publish (it lives
+  # inside the recorder container, reachable over the compose network as
+  # recorder:1984 only), but auth is enabled anyway as defense-in-depth — the
+  # api container reaches this over the Docker bridge network (NOT "localhost"
+  # from go2rtc's point of view), and `local_auth: true` makes sure even
+  # same-host/loopback callers can't skip auth. Credentials come from the
+  # recorder container's env (.env; scripts/setup-env.sh generates strong
+  # defaults).
+  username: "${GO2RTC_USER}"
+  password: "${GO2RTC_PASS}"
+  local_auth: true
+
+rtsp:
+  listen: ":8554"
+  # P0-GO2RTC lighter lockdown: RTSP (:8554, published to the LAN as 18554)
+  # REQUIRES auth so anonymous LAN clients can't open a stream by guessing the
+  # camera name. go2rtc unconditionally exempts true loopback TCP connections
+  # (no local_auth-equivalent toggle exists for RTSP in 1.9.x) — with go2rtc
+  # embedded in the recorder container, the recorder's OWN ffmpeg connects over
+  # loopback and rides that exemption (its embedded credentials are simply
+  # ignored); every off-container caller still authenticates. Clients connect
+  # with rtsp://<user>:<pass>@<host>:18554/<name> — the API embeds these
+  # credentials into the URLs it hands out via GET /cameras/{id}/streams.
+  username: "${GO2RTC_USER}"
+  password: "${GO2RTC_PASS}"
+
+webrtc:
+  # Port 8556 (NOT go2rtc's default 8555): a host-network Frigate/go2rtc may
+  # already own 8555 on the same machine, and two go2rtc instances can't share
+  # the host port. 8556 sidesteps that collision.
+  listen: ":8556"
+  # WebRTC media needs a client-reachable ICE candidate. Inside Docker go2rtc
+  # only sees its container IP (172.x), and otherwise advertises the host's
+  # PUBLIC IP via STUN — neither is reachable for a LAN client, so ICE fails and
+  # clients silently fall back to snapshots. Advertise the server's LAN address
+  # (host:port) so phones/desktops on the LAN can connect. Set via .env:
+  #   WEBRTC_CANDIDATE=192.168.x.y:8556
+  candidates:
+    - ${WEBRTC_CANDIDATE}
+    - stun:8556
+
+streams: {}

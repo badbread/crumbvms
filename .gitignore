@@ -1,0 +1,70 @@
+# secrets / local — never commit a real .env (use .env.example as the template)
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+.claude/settings.local.json
+
+# local compose override (may pin remote DB host / image versions)
+docker-compose.override.yml
+# generated compose secrets overlay + the secret files it references
+docker-compose.secrets.yml
+secrets/
+
+# go2rtc restreamer config: a minimal, creds-free default IS committed
+# (go2rtc/go2rtc.yaml) so a fresh `docker compose up` boots. Camera streams +
+# credentials are managed by Crumb at runtime via the go2rtc API, never written
+# to this file — so it stays safe to track. (If you ever hand-add creds locally,
+# ignore your override instead.)
+
+# database backups (pg_dump output from scripts/backup-db.sh) — never commit
+backups/
+*.sql.gz
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# node / next
+node_modules/
+.next/
+dist/
+build/
+out/
+
+# rust / tauri
+target/
+
+# recorded footage & runtime data — NEVER commit video
+_data/
+recordings/
+*.mp4
+*.mkv
+*.log
+
+# claude code tooling state (session transcripts, memory, agent worktrees) —
+# never commit; .claude/worktrees holds a full nested copy of the repo
+.claude/
+
+# debug screenshots dropped in the repo root during CDP/admin verification
+/_*.png
+
+# internal notes — homelab-specific planning/audit docs kept LOCAL only (they
+# reference internal IPs/paths); never ship in the public/fresh repo
+docs-internal/
+
+# os
+.DS_Store
+Thumbs.db
+# macOS AppleDouble files (created on SMB/NAS shares)
+._*
+# Synology NAS index metadata
+@eaDir/
+
+# crumbvms.com website — lives in its own repo, not the NVR repo
+site/

@@ -1,0 +1,29 @@
+# Docker build context = repo root (docker-compose: build.context=.).
+# Docker reads .dockerignore from the context root, i.e. THIS file.
+.git
+.gitignore
+.gitattributes
+.claude
+
+# Rust build artifacts
+target
+**/target
+
+# recorded footage & runtime data — never ship into an image
+_data
+recordings
+*.mp4
+*.mkv
+*.log
+
+# secrets / local env
+.env
+.env.*
+!.env.example
+
+# not needed to build the recorder binary
+docs
+web
+apps
+node_modules
+**/__pycache__

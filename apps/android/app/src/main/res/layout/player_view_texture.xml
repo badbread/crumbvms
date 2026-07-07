@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PlayerView backed by a TextureView (not the default SurfaceView).
+  A SurfaceView owns a separate hardware layer composited by SurfaceFlinger, so
+  Compose graphicsLayer transforms (pinch-zoom scale / pan translation) are
+  ignored on it. TextureView renders frames as a normal in-hierarchy GPU texture,
+  so zoom/pan transforms apply to the actual video pixels.
+-->
+<androidx.media3.ui.PlayerView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    app:surface_type="texture_view"
+    app:use_controller="false" />

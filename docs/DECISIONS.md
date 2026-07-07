@@ -1,0 +1,374 @@
+# Architecture decisions, and when to revisit them
+
+A log of significant design decisions: what was chosen, what was rejected, and
+the concrete triggers that should reopen the question. Add new entries at the
+top. Keep entries honest about trade-offs, the point of this file is that a
+future session (human or AI) can tell whether the world has changed enough to
+revisit.
+
+---
+
+## 2026-07-06, Docs site: Docusaurus, self-hosted behind cloudflared (docs.crumbvms.com)
+
+**Context.** Crumb needs a public, versioned, searchable documentation site in
+the style of Frigate's. `docs/ROADMAP.md` initiative 4 had leaned MkDocs Material
+as an unratified note. The site is built in `docs-site/`.
+
+**Decision.** Docusaurus v3, classic preset, docs-only mode. Client-side local
+search (`@easyops-cn/docusaurus-search-local`, a build-time lunr index, zero
+external calls), built-in versioning cut at pinned releases (deferred during
+alpha), no third-party trackers/analytics/CDN fonts, static output that is always
+self-hostable. Single-source: user docs authored in `docs-site/docs/`; a
+whitelisted subset of `docs/` engineering docs (`DECISIONS.md`,
+`RECORDER-CORRECTNESS.md`, `MOTION-RECORDING.md`) is copied into an Architecture
+section at build time by `scripts/sync-arch-docs.mjs` (those generated pages are
+gitignored and regenerated on every build, local and CI, so they cannot drift).
+Anti-drift is enforced by `docs/COMPONENT-MAP.md` (the docs site is a propagation
+surface) plus a CI link-check build on every docs PR (`.github/workflows/docs.yml`,
+`onBrokenLinks: 'throw'`).
+
+**Deploy: self-hosted, not Cloudflare Pages.** The site ships as an `nginx:alpine`
+image (`docs-site/Dockerfile` + `nginx.conf` + `docker-compose.yml`) served as a
+static site on port 3000 and reached over a Cloudflare tunnel at
+`docs.crumbvms.com`, the same self-hosted pattern the `crumbvms.com` marketing
+site already uses. This was chosen over a managed static host (Cloudflare Pages)
+because it matches the running marketing-site setup, keeps everything self-hosted
+(consistent with the product's own posture), and adds no new hosting dependency.
+
+**Rejected:** MkDocs Material (second, Python, doc toolchain next to the Node
+marketing site; versioning is a `mike` bolt-on); Astro Starlight (versioning only
+via an immature plugin); VitePress (no built-in versioning); mdBook
+(single-book, no versioning). Algolia DocSearch rejected on privacy grounds
+regardless of generator. Cloudflare Pages rejected for deploy (see above).
+
+**Cost accepted.** Docusaurus is a large npm dev-dependency tree, but it is
+build-time-only tooling in an isolated `docs-site/` workspace: it never ships in a
+product image and adds nothing to the runtime (golden rule 6 reviewed). Builds run
+on dev hosts and CI, never on the clean workstation. The docs-site Docker build
+context is the repo root (not `docs-site/` alone) so the sync script can see
+`docs/` and `docs-site/` as siblings; called out in the Dockerfile/compose.
+
+**Revisit triggers:** Starlight ships first-class versioning and the npm tree
+becomes a maintenance burden; the docs corpus needs capabilities Docusaurus lacks;
+the local-search plugin is abandoned and forces a swap; or the self-hosted static
+path is retired in favor of a managed static host (then revisit Cloudflare Pages).
+
+---
+
+## 2026-07-06, go2rtc stream model: reconcile PATCHes existing streams, only PUTs missing ones
+
+**Context.** Crumb is the sole puller of each camera: the api's reconcile loop
+(`services/api/src/go2rtc.rs`) owns go2rtc's stream table and every consumer
+(recorder record, recorder motion, Frigate, live desktop/Android clients,
+snapshots) is supposed to fan out from **one** producer per stream, so a camera
+sees exactly two RTSP sessions (main + sub) no matter how many viewers. It did
+not. On the session-capped Uniview LPR camera, live and snapshot consumers were
+intermittently refused at RTSP `SETUP`, and `GET /api/streams?src=<cam>` showed
+`consumers: null` on every camera even while recording was live.
+
+Root cause (verified against go2rtc v1.9.14 source + live prod, read-only):
+go2rtc's `PUT /api/streams` handler does `streams[name] = NewStream(...)`, an
+**unconditional replace**. The reconcile loop re-`PUT`s all managed streams every
+`RECONCILE_INTERVAL` (60 s) for drift correction, so every minute each stream's
+in-memory object was swapped for a fresh idle one. The old object kept its live
+camera session and attached consumers running (orphaned, invisible to the API);
+every consumer that attached in a later window landed on a new object and had to
+**dial the camera again**. Steady state converged to one camera RTSP session per
+long-lived consumer, and on a capped camera that exhausts the slots. H.265 was a
+red herring.
+
+**Decision.** Make reconcile **diff-based**. Each pass `GET`s the names go2rtc
+already has; a MISSING name is created with `PUT` (a fresh name orphans nothing —
+this is the cold-start / go2rtc-restart path, unchanged), and an EXISTING name is
+updated in place with `PATCH`, which go2rtc implements as `SetSource` on the
+existing object, a true no-op for an unchanged source on a running producer, and
+no object replacement, so consumers keep sharing the one producer. `reconnect()`
+(DELETE + `PUT`) stays the explicit "source really changed, force a re-dial" path.
+One guard: go2rtc's `Patch()` aliases instead of applying the source when the
+source is `rtsp://` with a single-segment path equal to a managed stream name, so
+Crumb detects that collision and keeps `PUT` for those (no prod camera hits it).
+We do **not** diff sources against the GET body, go2rtc masks credentials in API
+responses, so a compare would be unreliable. Control-plane only: one file plus
+unit tests, no recorder / DB / compose / client / migration changes.
+
+**Rejected / not chosen:**
+
+| Option | Verdict |
+|---|---|
+| **Keep PUT-all, accept the churn** | Rejected. It is the bug: orphaned producers accumulate one camera session per consumer and exhaust session-capped cameras; observability (`consumers`) is blind fleet-wide. |
+| **Client-side applied-state map** (only PUT when desired != applied) | Rejected. Still trusts PUT-replace, re-clobbers once per api restart, and `PATCH` is the in-place primitive go2rtc actually provides. |
+| **Carry a one-hunk patch to go2rtc** making `New()` a no-op for identical sources | Rejected for now. Fixes it for all API consumers but means patching/forking the pinned binary (golden rule 6); the `PATCH`-verb fix needs no binary change. Worth proposing upstream separately. |
+| **Fall back to the sub-stream for capped cameras** | Rejected earlier in-session. Masks a fundamental control-plane defect; three clients would still each take a slot. |
+
+**Cost accepted.** Reconcile now issues an extra `GET` per pass (negligible; passes
+are rare in steady state). During the deploy transition, orphans created by the old
+PUT-all behavior persist until the next go2rtc/recorder restart clears them (a
+one-time artifact). `DELETE` also orphans running producers (documented on
+`reconnect()`): after a camera swap, consumers on the old object keep pulling the
+old source until their own watchdogs (~12 s recorder) reconnect, inherent to
+go2rtc's API, not fixable here without a "drain consumers" primitive it doesn't
+expose.
+
+**Revisit triggers:**
+
+- go2rtc upstream makes `PUT` idempotent for identical sources, then the
+  create/patch split can collapse back to PUT-always.
+- A camera source legitimately needs the single-segment `rtsp://` path form that
+  the alias guard currently steers to `PUT`, then implement a first-class
+  DELETE+PUT fallback for it.
+- A need for immediate source propagation without `reconnect()` (e.g. bulk camera
+  re-IP), consider a "drain consumers" admin action, not resurrecting PUT-all.
+
+---
+
+## 2026-07-06, Storage: Crumb owns recording/storage; do not read Frigate's storage for playback
+
+**Context.** Crumb's headline value is smooth, frame-level timeline scrubbing
+across many cameras. The question came up: for operators who already run Frigate,
+could Crumb keep its own clients and operator UI but let **Frigate own recording
+and archiving**, with Crumb's timeline/playback reading Frigate's stored footage
+directly instead of Crumb's own storage system, as an optional "compose with
+Frigate" mode? A deep dive (2026-07-06, reasoned against Frigate 0.17.x stable,
+verified from docs.frigate.video and the `dev` source) settled it. Note the
+inverse topology already ratified earlier (2026-06-19): Crumb is the streaming
+hub and sole NVR, Frigate pulls from Crumb; this is its storage-side counterpart.
+
+**Decision.** Crumb keeps owning recording and storage. Composition with Frigate
+stays at the **event / clip / live-stream** level (MQTT detection events, proxied
+clips and snapshots, live-stream peer), never at the storage level. The pivotal
+finding: Crumb's smooth scrubbing is a property of its **recorder** (2 to 6 s
+clock-aligned, keyframe-guaranteed fMP4 segments plus the Postgres index plus
+prefetch), not its player. Frigate's stored files are faststart plain MP4 and are
+seekable by libmpv/Media3, so raw file seekability is **not** the blocker one
+might assume; the recorder properties that make scrubbing smooth simply cannot be
+recovered by reading Frigate's storage.
+
+**Rejected / not chosen:**
+
+| Option | Verdict |
+|---|---|
+| **Frigate owns storage, Crumb's operator UI treats those cameras as first-class** | Rejected. Four core guarantees are unimplementable or structurally degraded (see below). A mode that silently downgrades Crumb's sacred guarantees for some cameras is worse than no mode. |
+| **Read-only "Frigate history browser" overlay** (explicitly second-class) | Deferred, not rejected. Buildable as a bounded feature: mirror Frigate's recordings API into a side table (never the `segments` table), RO-mount its recordings dir behind the existing path-guarded file server, badge footage as Frigate-owned, no protect/policy knobs, best-effort export. Real work for a second-class experience; build only on demonstrated user demand. |
+| **Compose at the event/clip/stream level (already shipped)** | Chosen. Gets nearly all the "already runs Frigate" value with zero storage coupling. |
+
+The five decisive limitations of a "Frigate owns storage" mode:
+1. **Segment shape is uncontrolled.** Frigate cuts ~10 s segments at the camera's
+   keyframe (no forced GOP, no clock alignment, audio stripped by default). Seek
+   precision and multi-camera boundary sync degrade to the operator's camera
+   settings, versus Crumb's 2 to 6 s clock-aligned keyframe-guaranteed segments.
+2. **Timeline gaps are the steady state.** Frigate's tiered retention deliberately
+   turns each camera's history into islands of footage as tiers age out; Crumb's
+   contiguous-scrub / prefetch model has no good answer to per-camera gaps.
+3. **Protected bookmarks are unimplementable.** Frigate has no "hold a time range"
+   primitive (only `retain_indefinitely` on detected-object events), and its
+   emergency pruner deletes the oldest hour regardless of retention. The only
+   honest fallback (copy protected footage into Crumb storage) reintroduces
+   Crumb-owned storage into the mode.
+4. **Index and lifecycle races.** Frigate's index is single-writer SQLite, local
+   disk only, schema changing every minor release; any Crumb mirror is always
+   stale against hourly plus 5-minute emergency deletion, so mid-scrub 404s and
+   mid-export file loss are structural, not transient. No equivalent for per-policy
+   size caps, free-space headroom, archive tiers, or the max-retention cap.
+5. **Recorder correctness becomes someone else's cache.** Frigate's cache overflow
+   discards the oldest unprocessed segments (documented silent footage loss), the
+   exact failure the 2026-07-03 motion-recording decision rejected by name. Crumb's
+   UI would present footage it can neither protect nor detect the loss of, which
+   makes golden rule 2 (losing footage is the one unforgivable bug) unenforceable
+   for the footage it displays.
+
+**Cost accepted.** An operator with a large existing Frigate archive cannot browse
+it inside Crumb today; the compose story is detection/clips/live, not "see my old
+Frigate recordings." That is accepted over silently downgrading the storage
+guarantees Crumb treats as sacred.
+
+**Revisit triggers:**
+- **Frigate adds a retention-hold (protect-a-time-range) API and a stable
+  recordings API contract** → reconsider the bounded read-only overlay above.
+- **Real user demand for a read-only "browse my existing Frigate archive inside
+  Crumb" view** → build it as the explicitly second-class overlay, never as a peer
+  storage backend.
+
+---
+
+## 2026-07-05, Retention: a configurable time cap + a neutral over-retention nudge (no hardcoded jurisdictional number)
+
+**Context.** A pass over EU/UK data-minimization considerations flagged two things.
+GDPR Art. 5(1)(e) requires footage be kept "no longer than necessary" for a
+documented purpose, and the ICO explicitly says there is **no fixed statutory
+min/max**. The "30 days / 72 hours"
+figures operators cite are sector custom or an individual DPA's non-binding
+benchmark, **not law**. Liability sits with the **operator** (CrumbVMS holds no
+footage and is neither controller nor processor); the vendor's only exposure is
+if a product feature *misstates the law*.
+
+**Decision.**
+1. **Feature, an opt-in, per-policy absolute time cap** (`max_retention_days`,
+   migration `0042`). It sits alongside the existing size caps
+   (`live_max_bytes`/`archive_max_bytes`) and the per-tier retention windows. It
+   is a *hard ceiling across both live and archive stages*: footage older than
+   the cap is deleted regardless of the other knobs. **Default OFF** (`NULL`) so
+   it can never surprise-delete on an existing install, and when set it only ever
+   removes footage *sooner*, never keeps it longer. Protected bookmarks still win
+   (an explicit human pin is never auto-deleted). The recorder enforces it in
+   `archive::max_retention_sweep` under the same crash-safe file-then-row ordering
+   and `ARCHIVE_GUARD` serialization as the other sweeps.
+2. **UI nudge, general information + disclaimer only.** A neutral note next to
+   the retention controls in the policy editor: *"Keep footage only as long as you
+   need it for your purpose. Some places regulate how long recordings of people
+   may be kept, review your retention against your purpose and local law."* plus
+   an explicit "this is general information, not legal advice, and does not assess
+   your compliance" line.
+
+**Rejected / not chosen:**
+
+| Option | Verdict |
+|---|---|
+| **Hardcode a default number** (e.g. ship "30 days" as *the* retention or as the field's default) | Rejected, there is NO fixed legal number; presenting one as "the GDPR number" is exactly the misstatement that creates vendor liability. The field ships blank (OFF); the operator chooses. |
+| **Assess/assert compliance in-app** ("✓ GDPR-compliant", "you are over the limit") | Rejected, a compliance *judgement* is legal advice and forfeits the liability-free framing. The nudge is deliberately non-committal: general info + disclaimer, never a verdict. |
+| **Make the cap a replacement for the size/tier retention knobs** | Rejected, it's an *additional* constraint. Folding it into the existing knobs would change their meaning and risk deleting footage operators expected the tier settings to keep. |
+| **Delete protected/bookmarked footage to honour the cap strictly** | Rejected, an explicit human "protect from auto-delete" pin must win over an automatic ceiling (golden rule 2: prefer the change that cannot surprise-delete footage). Documented as a known exemption in `docs/RESPONSIBLE-USE.md`. |
+
+**Cost accepted.** The cap is not a strict guarantee (protected bookmarks and,
+by construction, the batch-per-tick drain mean "older than N days" converges
+rather than being instantaneous), and the nudge intentionally gives the operator
+no compliance answer, both are deliberate: correctness/anti-footage-loss and
+liability-framing discipline outrank a stricter or more opinionated design.
+
+**Revisit triggers:**
+- **A DPA (or statute) publishes a *binding numeric* retention limit** for a
+  jurisdiction Crumb operators are in → revisit whether to surface that specific
+  number (still as the operator's choice, clearly scoped to that jurisdiction),
+  never as a global default.
+- Operators report the batch-drain convergence is too slow to satisfy a real
+  retention obligation → revisit the per-tick batch limit / add an immediate
+  purge path.
+- A future counsel review lands on whether an in-app retention/DPIA nudge is safe
+  as framed → adjust wording to match.
+
+---
+
+## 2026-07-05, Contributor licensing: CLA (Apache ICLA v2.0), superseding DCO-only
+
+**Context.** Crumb is AGPL-3.0, "free and open source, forever" for users. The
+maintainer wants to preserve future optionality, specifically the ability to
+**dual-license** (offer a paid commercial license alongside AGPL, the
+MongoDB/Qt model) or otherwise change licensing course, without foreclosing it
+before the project goes public. That ability requires the maintainer to hold, or
+be granted, a sublicensable copyright license over all contributions.
+
+**Prior stance.** CONTRIBUTING said **DCO, not a CLA**, chosen for
+contributor-friendliness. But the DCO only certifies a contributor's *right to
+submit*; it grants **no relicensing rights**. Under DCO-only, once outside
+contributions land, the maintainer could never dual-license or relicense those
+parts without tracking down every contributor. Pre-launch, solo, no outside
+contributors yet → the maintainer owns 100%, so this is the cheapest moment to
+change.
+
+**Decision.** Adopt a **Contributor License Agreement** for outside
+contributions: the **Apache Individual CLA v2.0**, adopted as-is (only the party
+name changed), in `CLA.md`. Section 2's "sublicense" grant is what preserves
+dual-licensing; contributors keep ownership. Enforced by the free
+`contributor-assistant` CLA bot (`.github/workflows/cla.yml`), one comment per
+contributor. The DCO per-commit sign-off is **retained** as a lightweight origin
+certification, not the operative license grant.
+
+**Rejected / not chosen:**
+
+| Option | Verdict |
+|---|---|
+| **DCO only** (prior) | Rejected, no relicensing rights; permanently forecloses dual-licensing once contributions arrive. |
+| **Copyright assignment** | Rejected, heavier, worse optics for a trust-first solo project; a broad license grant achieves the goal without taking ownership. |
+| **Switch to source-available / non-compete** (BSL, PolyForm Shield) to block commercial exploitation outright | Not chosen now, forfeits the "open source" identity and reverses the public AGPL-forever commitment; premature before knowing whether Crumb is a business. The CLA keeps this door open without walking through it. |
+| **Custom-drafted CLA** | Rejected, defeats the "no lawyer needed" goal; adopting a recognized standard as-is is the low-risk path. |
+
+**Cost accepted.** CLAs add contributor friction (some decline to sign) and can
+read as a "trust me" ask. Accepted because the optionality outweighs the
+marginal friction this early, and the bot makes signing one click. **Not a
+lawyer**, the ICLA text is adopted unmodified; a lawyer's review is deferred
+until an actual commercial-license transaction, when it pays for itself.
+
+**Revisit triggers:**
+- Crumb commits permanently to "no commercial licensing, ever" → the CLA's
+  relicensing purpose is moot; drop back to DCO-only to cut friction.
+- A contributor base forms and CLA friction measurably deters contributions →
+  reconsider (e.g. DCO + a narrower inbound license grant).
+- An actual dual-license deal materializes → get the lawyer review then.
+
+---
+
+## 2026-07-03, Motion recording: RAM pre-buffer + persist-on-motion
+
+**Problem.** `RecordingMode::Motion` was cosmetic: ffmpeg recorded 24/7 and
+retention was purely time/size-based, identical to Continuous. Motion mode
+delivered zero disk or storage savings.
+
+**Research summary** (full survey in the session that produced this entry;
+mechanism doc in `docs/MOTION-RECORDING.md`):
+
+- **Enterprise / control-room VMS platforms** generally never gate capture: they
+  ingest continuously into a short RAM pre-buffer and flush to the recording
+  store on a trigger, so pre-event footage is always available.
+- Some **prosumer NVRs** gate capture in motion mode, and their own docs note
+  that true pre-alarm playback then requires continuous mode.
+- The cleanest **hybrid** records a low-res sub-stream continuously and the main
+  stream only on motion.
+- Some consumer NVRs label a mode "motion-only" but actually record continuously
+  and prune afterward, so the saving is retention-side, not ingest-side.
+- **Frigate**: continuous 10 s segments into a tmpfs cache; a mover keeps only
+  segments overlapping motion/events ± pre/post capture. Its worst documented
+  failures are cache-related (tmpfs exhaustion, orphaned handles from crashed
+  ffmpeg → silent footage loss).
+- **ZoneMinder / Blue Iris communities**: recommend continuous recording over
+  motion-gated capture because missed detections lose footage forever.
+
+**Convergent industry finding:** every system that prioritizes not losing
+footage captures first and decides afterward; the disagreement is only *where*
+undecided footage waits (RAM / tmpfs / disk) and *how long* before the
+keep-or-drop call is final.
+
+**Options considered:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Capture-gating (start/stop ffmpeg on motion) | Rejected outright, no pre-roll, misses event starts, a missed detection means footage never existed. No reliability-focused system does this. |
+| 2 | **RAM cache + persist-on-motion (the commercial-VMS model)** | **CHOSEN**, zero idle disk writes, zero idle storage; maps directly onto the existing 2–6 s segment pipeline and the already-built `MotionBuffer` state machine. |
+| 3 | Record to disk → prune non-motion at segment close | Rejected: full continuous disk write load and transient storage "for no reason". |
+| 4 | Record to disk → prune at retention with a grace window (24–72 h full-coverage safety net) | Rejected same grounds as 3. Chief advantage lost: a missed detection could still be recovered within the grace window. |
+| 5 | Dual-stream hybrid (sub-stream continuous + main motion-gated) | Deferred to roadmap, best long-term answer for "never blind, still cheap", but a second recording pipeline + playback source switching is a separate project. Layers cleanly on top of option 2. |
+
+**Safety rails that made option 2 acceptable** (both are invariants, see
+`docs/RECORDER-CORRECTNESS.md`):
+
+1. **Fail-open**: a camera whose motion detector is unhealthy (stalled
+   sub-stream, dead decoder, no frames analyzed yet) persists *everything*
+   until detection recovers, and raises a health alert. Blind-but-recording
+   beats blind-and-empty.
+2. **Spill, never drop**: cache pressure persists the oldest buffered segments
+   to disk instead of deleting them. Footage is never lost to a full cache
+   (Frigate's worst failure mode).
+3. **Shadow mode** (`MOTION_RECORDING_SHADOW=1`) for rollout: record
+   everything as before while stamping `segments.motion_shadow_keep` with the
+   verdict the buffer would have made, so the keep/drop behavior is validated
+   against real footage before any camera goes live.
+
+**Trades knowingly accepted:**
+
+- A genuinely missed detection (below threshold, not a pipeline failure) means
+  that footage **never existed**. There is no safety net by design.
+- A recorder crash loses whatever was in RAM, bounded by pre-roll seconds
+  (commercial VMSes have the same property).
+- Pre/post-roll resolution rounds to segment boundaries (2–6 s).
+
+**Revisit triggers:**
+
+- Missed-event reports from testers/users where the detector simply scored the
+  motion below threshold → revisit option 4 (grace-window prune) as an opt-in
+  per-policy "keep everything for N hours" safety net, or accelerate option 5.
+- Deployments on hardware where RAM is scarcer than disk (SBCs, tiny NAS
+  boxes) → option 3/4 as an alternative cache backend (disk cache dir instead
+  of tmpfs, the commercial-VMS "disk-based pre-buffer" fallback).
+- Demand for full 24/7 timeline coverage alongside motion savings → option 5
+  (dual-stream hybrid, already on `docs/ROADMAP.md`).
+- If shadow-mode validation shows the detector's keep/drop verdicts are not
+  trustworthy on real footage, do **not** ship enforce mode, fix detection
+  first or fall back to option 4.

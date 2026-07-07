@@ -1,0 +1,15 @@
+{
+  "name": "crumb-desktop",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "lint": "eslint src"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "eslint": "^9",
+    "globals": "^15"
+  }
+}

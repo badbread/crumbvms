@@ -1,0 +1,18 @@
+# Xcode — the .xcodeproj is GENERATED from project.yml by xcodegen; do not commit.
+# Run `xcodegen generate` after cloning. project.yml is the source of truth.
+Crumb.xcodeproj/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+build/
+
+# macOS
+.DS_Store
+._*
+
+# CocoaPods (if used later)
+Pods/
+
+# Swift Package Manager
+.build/
+.swiftpm/

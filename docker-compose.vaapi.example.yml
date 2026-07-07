@@ -1,0 +1,41 @@
+# CrumbVMS — VAAPI overlay (optional Intel/AMD iGPU hardware decode for motion).
+#
+# The base docker-compose.yml boots GPU-free (MOTION_HWACCEL=auto → CPU). Apply
+# THIS overlay on a host with an Intel/AMD integrated GPU to decode the motion
+# sub-streams on the iGPU's fixed-function media block (e.g. Intel Quick Sync):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vaapi.example.yml up -d
+#
+# Why VAAPI: on a box with an iGPU this is usually the most power-efficient decode
+# path. The media block lives on the already-powered CPU package, so it has none of
+# a discrete GPU's fixed "wake-up" power cost. (Measured on an Intel Core Ultra 7
+# 265K + 11 low-res cameras: moving motion decode off a discrete NVIDIA card cut
+# the box from ~105 W to ~73 W at the wall — about 30%.)
+#
+# Requirements on the host:
+#   - An Intel/AMD iGPU exposed at /dev/dri (a renderD* node).
+#   - Identify the iGPU render node — `ls -l /dev/dri/by-path`, or check which
+#     /dev/dri/renderD* maps to the i915/xe/amdgpu driver. Intel is commonly
+#     /dev/dri/renderD128. Set MOTION_VAAPI_DEVICE if yours differs.
+#   - The host 'render' group GID: `getent group render | cut -d: -f3`. Put it in
+#     RENDER_GID so the non-root container user (uid 1001) can open the node.
+#
+# NVDEC (discrete NVIDIA) is a SEPARATE overlay (docker-compose.gpu.example.yml).
+# Pick whichever matches your hardware; don't apply both for the same decode mode.
+#
+# Copy to docker-compose.vaapi.yml (gitignored) to tweak without touching this example.
+
+services:
+  recorder:
+    environment:
+      # Force VAAPI decode (overrides the base 'auto').
+      MOTION_HWACCEL: ${MOTION_HWACCEL:-vaapi}
+      # DRI render node for the iGPU. Override if yours isn't renderD128.
+      MOTION_VAAPI_DEVICE: ${MOTION_VAAPI_DEVICE:-/dev/dri/renderD128}
+    devices:
+      # Map the iGPU render node into the container.
+      - ${MOTION_VAAPI_DEVICE:-/dev/dri/renderD128}:${MOTION_VAAPI_DEVICE:-/dev/dri/renderD128}
+    group_add:
+      # Host 'render' group GID — required for the uid-1001 container user to open
+      # the render node. Find it with: getent group render | cut -d: -f3
+      - "${RENDER_GID:-993}"

@@ -1,0 +1,93 @@
+# Crumb — Windows desktop installer (Tauri/NSIS)
+#
+# Builds the desktop client on a GitHub-hosted windows-latest runner and produces
+# an NSIS installer with libmpv-2.dll bundled next to the exe (the client loads
+# libmpv at RUNTIME via libloading, so the build needs no libmpv — only the
+# installer must ship it). libmpv is fetched from the vendored build-dependency
+# release (deps-libmpv-*), the exact ABI verified on the maintainer's workstation.
+#
+# Triggers:
+#   - push to ci/windows-installer  → build + upload as a workflow ARTIFACT (iteration)
+#   - v* tag                        → build + attach the installer to that Release
+#   - workflow_dispatch             → manual build (artifact only)
+#
+# Unsigned for now: Windows SmartScreen shows "unknown publisher" until a code
+# signing cert is wired up. Fine for an alpha; documented in the release notes.
+name: windows-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # attach the installer to the GitHub Release (tag builds)
+
+env:
+  LIBMPV_URL: https://github.com/badbread/crumbvms/releases/download/deps-libmpv-2026-06-14/mpv-dev.7z
+
+jobs:
+  build:
+    name: build Windows installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/src-tauri/target
+          key: win-tauri-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: win-tauri-
+
+      - name: Install Tauri CLI (prebuilt)
+        run: npm install -g @tauri-apps/cli@^2
+
+      - name: Fetch + extract vendored libmpv-2.dll into src-tauri/
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "$env:LIBMPV_URL" -OutFile mpv-dev.7z
+          7z e mpv-dev.7z libmpv-2.dll -osrc-tauri -y | Out-Null
+          if (-not (Test-Path src-tauri/libmpv-2.dll)) { throw "libmpv-2.dll not extracted" }
+          Write-Host "libmpv-2.dll: $((Get-Item src-tauri/libmpv-2.dll).Length) bytes"
+
+      - name: Build NSIS installer (libmpv bundled)
+        run: tauri build --config src-tauri/tauri.windows.conf.json
+
+      - name: Verify the installer actually bundles libmpv-2.dll
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          if (-not $exe) { throw "no NSIS installer produced" }
+          Write-Host "installer: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
+          7z x $exe.FullName -o"unpacked" -y | Out-Null
+          $dll = Get-ChildItem -Recurse "unpacked" -Filter libmpv-2.dll | Select-Object -First 1
+          if (-not $dll) { throw "libmpv-2.dll NOT bundled in the installer" }
+          Write-Host "bundled libmpv at: $($dll.FullName)"
+
+      - name: Upload installer as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crumbvms-windows-nsis-setup
+          path: apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+      - name: Attach installer + sha256 to the Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = Get-ChildItem -Recurse src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$sha  $($exe.Name)" | Out-File "$($exe.FullName).sha256" -Encoding ascii -NoNewline
+          gh release upload ${{ github.ref_name }} $exe.FullName "$($exe.FullName).sha256" --clobber --repo ${{ github.repository }}

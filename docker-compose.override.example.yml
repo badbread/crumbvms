@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Crumb — REMOTE POSTGRES OVERRIDE (example)
+#
+# Run Postgres on a SEPARATE host (a dedicated VM, a managed service, or a NAS
+# Postgres) so the recorder/api host is no longer a single point of failure for
+# the segment index — the sole source of truth for all footage (see
+# docs/OPS-BACKUP-RECOVERY.md). Recorder + API are stateless and just need to
+# reach the DB.
+#
+# ── How to use ───────────────────────────────────────────────────────────────
+#   1. Copy this file:   cp docker-compose.override.example.yml docker-compose.override.yml
+#      (docker compose auto-merges docker-compose.override.yml on top of the base
+#       file — no -f flags needed.)
+#   2. In .env, point DATABASE_URL at the REMOTE host, e.g.:
+#         DATABASE_URL=postgresql://crumb:STRONGPASS@192.0.2.30:5432/crumb
+#      The api + recorder read DATABASE_URL directly (services/*/config.rs), so
+#      no code change is required — only this env var.
+#   3. Apply the schema on the remote DB ONCE (the bundled postgres did this via
+#      docker-entrypoint-initdb.d; a remote DB will not). See the runbook section
+#      "Provisioning a remote Postgres".
+#   4. docker compose up -d   (the local `postgres` service will NOT start)
+#
+# ── How this works ───────────────────────────────────────────────────────────
+#   * `postgres` is pinned to a profile that is never activated by default, so
+#     `docker compose up` skips it entirely. The bundled-DB default in the base
+#     docker-compose.yml is UNCHANGED — delete/rename docker-compose.override.yml
+#     to go back to the embedded Postgres.
+#   * `depends_on` is cleared on api + recorder so they don't wait on the (now
+#     absent) local postgres healthcheck. They connect to the remote DB on boot;
+#     deadpool's create/wait timeouts (services/common/src/db.rs) fail fast and
+#     restart-on-failure (restart: unless-stopped) handles a not-yet-ready DB.
+#
+# Leaving DATABASE_URL pointed at the remote host is the ONLY required change in
+# .env; everything else (storage paths, GO2RTC_*, secrets) is identical.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  postgres:
+    # Park the bundled Postgres behind a profile that is never enabled, so it is
+    # not created/started while this override is active. (To temporarily run it
+    # again for, say, a local→remote migration: `docker compose --profile bundled-db up -d postgres`.)
+    profiles: ["bundled-db"]
+
+  recorder:
+    # Don't wait on the local postgres healthcheck — the DB is remote now.
+    depends_on: !reset []
+    environment:
+      # Redundant if already set in .env, but makes the remote target explicit
+      # and self-documenting in this override. Replace host/creds to match .env.
+      DATABASE_URL: ${DATABASE_URL}
+
+  api:
+    depends_on: !reset []
+    environment:
+      DATABASE_URL: ${DATABASE_URL}

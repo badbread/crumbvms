@@ -1,0 +1,949 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CrumbVMS</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="/app.js" defer></script>
+  </head>
+  <body>
+    <!-- ── Top bar ─────────────────────────────────────────────────────────── -->
+    <header id="topbar" class="topbar hidden">
+      <div class="topbar-left">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <span class="brand-text">
+            <span class="brand-name">Crumb</span>
+            <span class="brand-sub">VMS</span>
+          </span>
+        </div>
+        <nav class="tab-nav">
+          <button class="tab active" data-tab="live">Live</button>
+          <button id="tab-playback-btn" class="tab" data-tab="playback">Playback</button>
+          <button id="tab-clips-btn" class="tab" data-tab="clips">Clips</button>
+          <button id="tab-export-btn" class="tab" data-tab="export">Export</button>
+          <button class="tab" data-tab="server">Settings</button>
+        </nav>
+      </div>
+      <div class="topbar-right">
+        <button id="audio-toggle-btn" class="btn btn-ghost btn-sm" title="Audio, listen to the focused camera (M)">🔇</button>
+        <span id="server-label" class="server-label"></span>
+        <button id="signout-btn" class="btn btn-ghost btn-sm">Sign out</button>
+      </div>
+    </header>
+
+    <!-- ── Recording-at-risk alert: spans the app, visible on EVERY tab, shown
+         only when the recorder is dropping (or about to drop) footage because a
+         disk is filling or a policy is under-provisioned. Click → Settings. ── -->
+    <button id="recording-alert-banner" class="recording-alert-banner hidden" type="button">
+      <span class="recording-alert-icon">&#9888;</span>
+      <span id="recording-alert-text" class="recording-alert-text"></span>
+      <span class="recording-alert-cta">Open Recorder Health &rsaquo;</span>
+    </button>
+
+    <!-- ── Secondary toolbar (Live + Playback only) ────────────────────────── -->
+    <div id="toolbar" class="toolbar hidden">
+      <!-- Layout preset buttons (populated by JS) -->
+      <div id="toolbar-layout-presets" class="toolbar-layout-presets"></div>
+
+      <!-- Spacer pushes the right-side controls right -->
+      <div style="flex:1 1 auto"></div>
+
+      <!-- (Top-bar PTZ toggle removed 2026-06-17, PTZ is now a view item / on-image
+           overlay. The Home + presets buttons below still serve the active PTZ camera.) -->
+      <!-- PTZ Home + presets (shown only while PTZ is active; not over the video, so not occluded by panes) -->
+      <button id="ptz-home-btn" class="toolbar-btn hidden" title="Move camera to its home position">&#8962; Home</button>
+      <select id="ptzo-presets" class="ptzo-select hidden" title="Go to a saved preset"><option value="">Preset&hellip;</option></select>
+      <!-- Focus / iris (ONVIF imaging) for the active PTZ camera, shown with the PTZ row -->
+      <span id="ptz-imaging" class="ptz-imaging hidden">
+        <button id="ptzimg-focus-near" class="toolbar-btn" title="Focus nearer (hold)">Focus&minus;</button>
+        <button id="ptzimg-focus-far" class="toolbar-btn" title="Focus farther (hold)">Focus+</button>
+        <button id="ptzimg-af" class="toolbar-btn" title="Auto-focus">AF</button>
+        <button id="ptzimg-iris-open" class="toolbar-btn" title="Open iris (brighter)">Iris+</button>
+        <button id="ptzimg-iris-close" class="toolbar-btn" title="Close iris (darker)">Iris&minus;</button>
+        <button id="ptzimg-iris-auto" class="toolbar-btn" title="Auto iris">IrisA</button>
+      </span>
+      <!-- Customize on-video PTZ panel, placeable ONVIF buttons (commercial-VMS-style) -->
+      <button id="ptz-edit-panel-btn" class="toolbar-btn hidden" title="Customize the on-video PTZ control panel, drag buttons where you want them">&#9998; Panel</button>
+      <!-- View config, Config View dialog (build/save/delete views). Right-aligned per feedback. -->
+      <button id="toolbar-setup-view-btn" class="toolbar-btn toolbar-btn-setup" title="Configure layouts &amp; saved views">Config View</button>
+      <!-- Snapshot the selected (or maximized) camera's current frame to disk -->
+      <button id="toolbar-snapshot-btn" class="toolbar-btn toolbar-btn-snapshot" title="Snapshot the selected camera's current frame (S)" aria-label="Snapshot">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" style="vertical-align:middle"><path d="M9 2 7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+      </button>
+      <!-- Fullscreen camera wall (hide all chrome; Esc exits) -->
+      <button id="toolbar-fullscreen-btn" class="toolbar-btn toolbar-btn-fullscreen" title="Fullscreen camera wall, show only the cameras, full screen. Press Esc to exit.">&#9974;</button>
+      <!-- Options (gear) -->
+      <button id="toolbar-options-btn" class="toolbar-btn toolbar-btn-options" title="Options">&#9881;</button>
+    </div>
+
+    <!-- PTZ panel editor palette, appears under the toolbar while customizing a
+         camera's on-video control panel. Click an item to add it, then drag it
+         onto the video. (Populated + shown/hidden by JS.) -->
+    <div id="ptz-panel-editor" class="ptz-panel-editor hidden"></div>
+
+    <!-- ── Login screen ───────────────────────────────────────────────────── -->
+    <div id="login-screen" class="login-screen">
+      <div class="login-card">
+        <div class="login-logo">
+          <span class="brand-dot large"></span>
+          <span class="login-product">Crumb</span>
+          <span class="login-edition">VMS</span>
+        </div>
+        <form id="login-form" class="login-form" autocomplete="off">
+          <div class="form-group">
+            <label class="form-label">Management Server</label>
+            <input
+              id="login-server"
+              class="form-input"
+              type="text"
+              value=""
+              placeholder="http://your-server:8080"
+              spellcheck="false"
+            />
+            <div class="login-discover-row" style="display:flex;align-items:center;gap:8px;margin-top:6px;min-height:22px">
+              <button id="login-discover-btn" type="button" class="btn btn-ghost btn-sm">Find my server</button>
+              <span id="login-discover-msg" class="login-hint" style="font-size:12px;opacity:.8"></span>
+            </div>
+            <div id="login-subnet-row" class="login-subnet-row hidden" style="display:flex;gap:8px;margin-top:6px">
+              <input id="login-subnet" class="form-input" type="text" placeholder="192.168.1.0/24" spellcheck="false" style="flex:1 1 auto"/>
+              <button id="login-subnet-btn" type="button" class="btn btn-ghost btn-sm">Scan</button>
+            </div>
+            <div id="login-discover-list" class="login-discover-list" style="margin-top:6px"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input
+              id="login-user"
+              class="form-input"
+              type="text"
+              value=""
+              placeholder="Username"
+              autocomplete="username"
+            />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <input
+              id="login-pass"
+              class="form-input"
+              type="password"
+              autocomplete="current-password"
+            />
+          </div>
+          <label class="login-remember" style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;cursor:pointer;font-size:13px">
+            <input id="login-remember" type="checkbox" checked/>
+            <span>Keep me signed in</span>
+          </label>
+          <div id="login-error" class="login-error hidden"></div>
+          <button id="login-btn" class="btn btn-primary btn-login" type="submit">
+            Connect
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Main shell (shown after login) ────────────────────────────────── -->
+    <div id="app-shell" class="app-shell hidden">
+
+      <!-- ── Stage: views + optional PTZ right panel ──────────────────────── -->
+      <div class="stage">
+
+        <!-- Viewing area: Live tab -->
+        <section id="view-live" class="view-area">
+          <div id="tile-grid" class="tile-grid">
+            <!-- Tiles populated by JS -->
+          </div>
+          <!-- In-view PTZ, a commercial-VMS-style 8-direction joystick WHEEL
+               in the active PTZ tile's lower-left corner. The native video pane
+               eats the mouse + sits above the WebView, so the wheel lives in a
+               small notch carved out of the pane's lower-left (Rust SetWindowRgn)
+               where the DOM is visible + clickable. Hold a wedge → continuous
+               move; release → stop. Center hub = Home. Positioned by JS. -->
+          <div id="ptz-overlay" class="ptz-overlay hidden">
+            <div class="ptz-wheel-row">
+              <svg id="ptz-wheel" class="ptz-wheel" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg"><!-- built by JS --></svg>
+              <div class="ptzo-zoom-col">
+                <button class="ptzo-zoom-btn" data-zoom="in" title="Zoom in">+</button>
+                <button class="ptzo-zoom-btn" data-zoom="out" title="Zoom out">&minus;</button>
+              </div>
+            </div>
+          </div>
+          <!-- Live performance HUD footer (toggle: F8). A flex sibling of
+               #tile-grid so the native panes inset above it (body.hud-on → scheduleSync). -->
+          <div id="hud-footer" class="hud-footer hidden"></div>
+        </section>
+
+        <!-- Viewing area: Playback tab -->
+        <section id="view-playback" class="view-area hidden">
+          <div id="pb-tile-grid" class="tile-grid">
+            <!-- Populated by JS -->
+          </div>
+
+          <!-- Transport bar -->
+          <div id="pb-transport" class="pb-transport">
+            <div class="pb-transport-left">
+              <span id="pb-time-display" class="pb-time-display">--:--:--</span>
+            </div>
+
+            <!-- Transport controls, centered (sit above the timeline center/playhead line). -->
+            <div class="pb-transport-center">
+              <button id="pb-goto-first" class="pb-btn" title="Go to first recording">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <rect x="1" y="2" width="2" height="10" rx="0.5" fill="currentColor"/>
+                  <path d="M13 2L5 7l8 5V2z" fill="currentColor"/>
+                </svg>
+              </button>
+              <button id="pb-frame-back" class="pb-btn" title="Step back one frame">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <path d="M9 3L5 7l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+              <button id="pb-prev-motion" class="pb-btn" title="Previous motion event">
+                <svg width="22" height="14" viewBox="0 0 26 14" fill="none">
+                  <path d="M8 3L4 7l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                  <g transform="translate(11 1.5) scale(0.5)"><path fill="currentColor" d="M13.49 5.48c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm-3.6 13.9l1-4.4 2.1 2v6h2v-7.5l-2.1-2 .6-3c1.3 1.5 3.3 2.5 5.5 2.5v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1l-5.2 2.2v4.7h2v-3.4l1.8-.7-1.6 8.1-4.9-1-.4 2 7 1.4z"/></g>
+                </svg>
+              </button>
+              <button id="pb-play-pause" class="pb-btn pb-btn-primary" title="Play / Pause (Space)">
+                <svg id="pb-play-icon" width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <path d="M3 2l9 5-9 5V2z" fill="currentColor"/>
+                </svg>
+                <svg id="pb-pause-icon" width="14" height="14" viewBox="0 0 14 14" fill="none" class="hidden">
+                  <rect x="2" y="2" width="3.5" height="10" rx="0.5" fill="currentColor"/>
+                  <rect x="8.5" y="2" width="3.5" height="10" rx="0.5" fill="currentColor"/>
+                </svg>
+              </button>
+              <button id="pb-next-motion" class="pb-btn" title="Next motion event">
+                <svg width="22" height="14" viewBox="0 0 26 14" fill="none">
+                  <g transform="translate(3 1.5) scale(0.5)"><path fill="currentColor" d="M13.49 5.48c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm-3.6 13.9l1-4.4 2.1 2v6h2v-7.5l-2.1-2 .6-3c1.3 1.5 3.3 2.5 5.5 2.5v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1l-5.2 2.2v4.7h2v-3.4l1.8-.7-1.6 8.1-4.9-1-.4 2 7 1.4z"/></g>
+                  <path d="M18 3l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+              <button id="pb-frame-fwd" class="pb-btn" title="Step forward one frame">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+              <button id="pb-goto-last" class="pb-btn" title="Go to last recording">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <rect x="11" y="2" width="2" height="10" rx="0.5" fill="currentColor"/>
+                  <path d="M1 2l8 5-8 5V2z" fill="currentColor"/>
+                </svg>
+              </button>
+            </div>
+
+            <div class="pb-transport-right">
+              <button id="pb-speed-btn" class="pb-btn pb-btn-speed" title="Playback speed">1x</button>
+
+              <div class="pb-jump-group">
+                <span class="pb-jump-label">Jump</span>
+                <button class="pb-btn pb-btn-xs" id="pb-jump-minus-hour" title="-1 hour">-1h</button>
+                <button class="pb-btn pb-btn-xs" id="pb-jump-minus-min" title="-10 min">-10m</button>
+                <button class="pb-btn pb-btn-xs" id="pb-jump-plus-min" title="+10 min">+10m</button>
+                <button class="pb-btn pb-btn-xs" id="pb-jump-plus-hour" title="+1 hour">+1h</button>
+              </div>
+
+              <div class="pb-jump-group">
+                <input type="time" id="pb-time-input" class="pb-time-input" step="1" title="Jump to time (HH:MM:SS)" />
+                <button class="pb-btn pb-btn-xs" id="pb-time-goto" title="Go to time">Go</button>
+              </div>
+
+              <div class="pb-jump-group">
+                <button class="pb-btn pb-btn-xs" id="pb-bookmark-add" title="Bookmark this moment (with an optional note)">☆ Bookmark</button>
+                <button class="pb-btn pb-btn-xs" id="pb-bookmarks-open" title="View saved bookmarks">Bookmarks</button>
+              </div>
+
+            </div>
+          </div>
+
+          <!-- Timeline legend, explains the two stacked bands drawn on the
+               canvas below (recording coverage vs. motion). Built by JS
+               (pbInjectTimelineLegend) so its swatch colors are read straight
+               from the TL color table and can never drift from the bars. -->
+          <div id="pb-timeline-legend" class="pb-timeline-legend"></div>
+
+          <!-- Timeline canvas -->
+          <div class="pb-timeline-wrap">
+            <canvas id="pb-timeline" class="pb-timeline-canvas"></canvas>
+          </div>
+        </section>
+
+        <!-- Viewing area: Settings tab, sectioned (This Computer / Performance / Server).
+             Server config (cameras, recording policies, groups, storage, Frigate, users)
+             lives in the admin web console, this tab is client prefs + read-only health. -->
+        <section id="view-server" class="view-area hidden">
+          <div class="srv-shell">
+            <nav class="srv-nav" id="srv-nav">
+              <button class="srv-nav-btn active" data-section="client" type="button">This Computer</button>
+              <button class="srv-nav-btn" data-section="diag" type="button">Performance</button>
+              <button class="srv-nav-btn" data-section="motion" type="button">Motion tuning</button>
+              <button class="srv-nav-btn" data-section="server" type="button">Server</button>
+              <button class="srv-nav-btn" data-section="admin" type="button">Management</button>
+            </nav>
+
+            <div class="srv-sections">
+
+              <!-- ════════ CLIENT ════════ (client-side app preferences; moved off the ⚙ modal) -->
+              <div class="srv-section" data-section="client">
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">Display</span></div>
+                  <div class="srv-panel-body opt-body">
+                    <label class="opt-row">
+                      <input type="checkbox" id="opt-show-infobar" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Camera title bar</span>
+                        <span class="opt-row-desc">Show the per-tile header with camera name, recording &amp; motion indicators.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="checkbox" id="opt-launch-fullscreen" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Launch in fullscreen</span>
+                        <span class="opt-row-desc">Open the app straight into the fullscreen camera wall (Esc exits).</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="checkbox" id="opt-wall-sub" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Wall uses sub-streams</span>
+                        <span class="opt-row-desc">Show the low-bandwidth sub stream on the grid (saves CPU &amp; bandwidth). Per-camera overrides via right-click → Stream.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="checkbox" id="opt-maximize-main" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Full quality when maximized</span>
+                        <span class="opt-row-desc">Maximizing or double-clicking a camera switches it to the main stream for full quality, then back when restored.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="checkbox" id="opt-zoom-motion" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Zoom clips to motion</span>
+                        <span class="opt-row-desc">When a motion clip opens, briefly zoom to where the motion was (when the server has a region for it), then ease back to the full frame.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="checkbox" id="opt-show-allcams" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">"All Cameras" view button</span>
+                        <span class="opt-row-desc">Show the always-available view that tiles every camera in one grid.</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">PTZ, click on video</span></div>
+                  <div class="srv-panel-body opt-body">
+                    <label class="opt-row">
+                      <input type="radio" name="opt-ptz-click" id="opt-ptz-center" value="center" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Click to center</span>
+                        <span class="opt-row-desc">A click recenters the camera on the clicked point.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="radio" name="opt-ptz-click" id="opt-ptz-pan" value="pan" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Click &amp; hold to pan</span>
+                        <span class="opt-row-desc">Press and hold to pan continuously toward the cursor; release to stop.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="radio" name="opt-ptz-click" id="opt-ptz-off" value="off" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Off</span>
+                        <span class="opt-row-desc">Clicking the video doesn't move the camera, steer with the on-screen arrows/wheel only.</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">PTZ, control style</span></div>
+                  <div class="srv-panel-body opt-body">
+                    <label class="opt-row">
+                      <input type="radio" name="opt-ptz-style" id="opt-ptz-edges" value="edges" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Edge arrows</span>
+                        <span class="opt-row-desc">Up/down/left/right pinned to the edges of the camera view.</span>
+                      </span>
+                    </label>
+                    <label class="opt-row">
+                      <input type="radio" name="opt-ptz-style" id="opt-ptz-wheel" value="wheel" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Joystick wheel</span>
+                        <span class="opt-row-desc">A round 8-direction wheel pinned to a corner of the camera view.</span>
+                      </span>
+                    </label>
+                    <div class="opt-suboption">
+                      <span class="opt-row-desc">Corner</span>
+                      <select id="opt-ptz-wheel-corner" class="export-select" style="width:auto;font-size:11px">
+                        <option value="bottom-left">Lower left</option>
+                        <option value="bottom-right">Lower right</option>
+                        <option value="top-left">Top left</option>
+                        <option value="top-right">Top right</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">Export</span></div>
+                  <div class="srv-panel-body">
+                    <div class="srv-kv"><span class="srv-kv-k">Save location</span><span class="srv-kv-v" id="srv-export-path">Downloads folder</span></div>
+                    <div class="export-dest-row" style="margin-top:8px">
+                      <button id="srv-export-browse-btn" type="button" class="pb-btn">Choose folder&hellip;</button>
+                      <button id="srv-export-reset-btn" type="button" class="pb-btn">Use Downloads</button>
+                    </div>
+                    <div class="srv-note">Where exported clips are saved. The Export-to-Disk dialog uses this destination too.</div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">Connection</span></div>
+                  <div class="srv-panel-body">
+                    <div class="srv-kv"><span class="srv-kv-k">Server</span><span class="srv-kv-v" id="srv-conn-server">,</span></div>
+                    <div class="srv-kv"><span class="srv-kv-k">Signed in as</span><span class="srv-kv-v" id="srv-conn-user">,</span></div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">Camera hotkeys</span>
+                    <button id="srv-hotkeys-reset" type="button" class="pb-btn">Reset to auto</button>
+                  </div>
+                  <div class="srv-panel-body">
+                    <label class="opt-row" style="margin:0 0 8px">
+                      <input type="checkbox" id="opt-hotkeys-enabled" />
+                      <span class="opt-row-text">
+                        <span class="opt-row-label">Enable camera number hotkeys</span>
+                        <span class="opt-row-desc">Press a number to jump to that camera; the key shows as a badge in each tile's header. Turn off to hide the badges and disable the number keys.</span>
+                      </span>
+                    </label>
+                    <div id="srv-hotkeys-config">
+                      <div class="srv-note">On the Live wall a number maximizes the camera; on Playback it loads its timeline. Auto-numbered 1,9, 0&nbsp;(=10) in list order; remap any key here, or assign &#8679;1,&#8679;0 to cameras 11,20.</div>
+                      <div id="srv-hotkeys-list" class="srv-hotkeys-list" style="margin-top:8px"></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ════════ SERVER ════════ (console link + read-only health + per-camera storage + motion tuning) -->
+              <div class="srv-section hidden" data-section="server">
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">Configuration console</span></div>
+                  <div class="srv-panel-body">
+                    <div class="srv-kv"><span class="srv-kv-k">Admin web console</span><span class="srv-kv-v" id="srv-admin-url">,</span></div>
+                    <div class="export-dest-row" style="margin-top:8px">
+                      <button id="srv-admin-open" type="button" class="pb-btn">Open configuration console &#8599;</button>
+                    </div>
+                    <div class="srv-note">Cameras, recording policies &amp; groups, storage paths, Frigate connectivity and users are all managed in the server's web console (opens in your browser).</div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">Recorder health</span>
+                    <span id="srv-heartbeat" class="srv-heartbeat-badge"></span>
+                  </div>
+                  <div class="srv-panel-body">
+                    <div id="srv-health-alert" class="srv-health-alert hidden"></div>
+                    <div class="srv-section-label">Disks (free space)</div>
+                    <div id="srv-disk-line" class="srv-disk-line">
+                      <span class="srv-loading">Loading&hellip;</span>
+                    </div>
+                    <div class="srv-section-label" style="margin-top:12px">Frigate detection</div>
+                    <div class="srv-kv"><span class="srv-kv-k">Status</span><span class="srv-kv-v" id="srv-frigate-status">,</span></div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">Policy usage</span>
+                    <span id="srv-policy-total" class="srv-heartbeat-badge"></span>
+                  </div>
+                  <div class="srv-panel-body">
+                    <div id="srv-policy-rows" class="srv-storage-rows">
+                      <div class="srv-loading">Loading&hellip;</div>
+                    </div>
+                    <div class="export-dest-row" style="margin-top:10px;align-items:center">
+                      <button id="srv-policy-verify" type="button" class="pb-btn">Verify sizes on disk</button>
+                      <span id="srv-policy-verify-msg" class="srv-note" style="margin-left:8px"></span>
+                    </div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">Per-camera storage</span>
+                    <span id="srv-stats-total" class="srv-heartbeat-badge"></span>
+                  </div>
+                  <div class="srv-panel-body">
+                    <div id="srv-stats-rows" class="srv-stats-rows">
+                      <div class="srv-loading">Loading&hellip;</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ════════ MOTION TUNING ════════ (own nav entry; camera picker + INLINE live tuner) -->
+              <div class="srv-section hidden" data-section="motion">
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">Motion tuning</span>
+                    <span id="mt-title" class="srv-heartbeat-badge"></span>
+                  </div>
+                  <div class="srv-panel-body">
+                    <div class="export-dest-row" style="margin-bottom:10px">
+                      <label class="srv-kv-k" for="srv-tuner-cam" style="margin-right:2px">Camera</label>
+                      <select id="srv-tuner-cam" class="export-select" style="width:auto;min-width:200px"></select>
+                    </div>
+                    <div class="srv-note" style="margin-bottom:10px"><strong>Drag</strong> to box an area to exclude from motion (tree, road, timestamp); <strong>click</strong> a cell to toggle. Saves the camera's detector, sensitivity, grid &amp; mask.</div>
+                    <!-- Inline tuner (was a modal). Native video panes are cleared on the
+                         Settings tab, so this DOM is never occluded. -->
+                    <div id="mt-inline" style="max-width:780px">
+                      <div id="mt-stage" class="mt-stage">
+                        <!-- LIVE video (MSE fMP4 via the authed /live proxy). The
+                             heatmap canvas overlays it; the <img> is a still fallback
+                             shown only if the live stream fails to start. -->
+                        <video id="mt-video" class="mt-snapshot" muted autoplay playsinline></video>
+                        <img id="mt-snapshot" class="mt-snapshot" alt="" style="display:none" />
+                        <canvas id="mt-canvas" class="mt-canvas"></canvas>
+                      </div>
+                      <div class="mt-meter-row">
+                        <div class="mt-meter-track">
+                          <div id="mt-meter-fill" class="mt-meter-fill"></div>
+                          <div id="mt-meter-mark" class="mt-meter-mark"></div>
+                        </div>
+                        <span id="mt-meter-text" class="mt-meter-text">motion —</span>
+                      </div>
+                      <div class="mt-thresh-row">
+                        <span class="vs-ctl-label" title="Minimum object size to trigger motion, as % of frame">Min size</span>
+                        <input id="mt-thresh-slider" class="mt-thresh-slider" type="range" min="0.05" max="5" step="0.05" value="0.30" />
+                        <span id="mt-thresh-val" class="mt-thresh-val">0.30%</span>
+                        <label class="mt-auto-label"><input id="mt-thresh-auto" type="checkbox" /> Auto</label>
+                      </div>
+                      <div class="mt-controls">
+                        <span class="vs-ctl-label">Detection<span class="mt-info" tabindex="0" title="Pixel analysis runs Crumb's own motion detector on the sub-stream (no extra hardware). Frigate detections record only when Frigate's object detector fires, far fewer false triggers from trees/headlights, but needs Frigate running.">&#9432;</span></span>
+                        <select id="mt-motion-source" class="mt-select" title="Motion source">
+                          <option value="pixel">Pixel analysis</option>
+                          <option value="frigate">Frigate detections</option>
+                        </select>
+                        <select id="mt-motion-algo" class="mt-select" title="Census: illumination-invariant, best all-round (default). Frame diff: fastest, light-sensitive. MOG2: adaptive background. Optical flow: tracks direction, heavier CPU. Ensemble: fuses detectors, highest CPU.">
+                          <option value="census">Census</option>
+                          <option value="framediff">Frame diff</option>
+                          <option value="mog2">MOG2</option>
+                          <option value="opticalflow">Optical flow</option>
+                          <option value="ensemble">Ensemble</option>
+                        </select>
+                        <span id="mt-motion-algo-note" class="mt-grid-hint"></span>
+                      </div>
+                      <div class="mt-controls">
+                        <span id="mt-loaded-detector" class="mt-grid-hint" style="opacity:.9"></span>
+                      </div>
+                      <div class="mt-controls">
+                        <span class="vs-ctl-label">Grid size<span class="mt-info" tabindex="0" title="How finely you can paint motion-exclusion zones. Finer = more precise masks; it does NOT change detection cost (the recorder's analysis grid is fixed). Saved per camera.">&#9432;</span></span>
+                        <select id="mt-grid-size" class="mt-select">
+                          <option value="8,5">8 × 5 (coarse)</option>
+                          <option value="16,9" selected>16 × 9</option>
+                          <option value="24,14">24 × 14</option>
+                          <option value="32,18">32 × 18 (fine)</option>
+                          <option value="48,27">48 × 27 (finest)</option>
+                        </select>
+                        <span class="mt-grid-hint">saved per camera</span>
+                      </div>
+                      <div id="mt-error" class="export-error hidden"></div>
+                      <div class="export-dest-row" style="margin-top:10px">
+                        <button id="mt-clear-btn" class="pb-btn">Clear exclusions</button>
+                        <button id="mt-save-btn" class="pb-btn export-submit-btn">Save mask</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ════════ DIAGNOSTICS ════════ (live performance + benchmark + CSV) -->
+              <div class="srv-section hidden" data-section="diag">
+                <div class="srv-f8-hint">Press <kbd>F8</kbd> on the Live wall to toggle the on-screen <strong>diagnostics overlay</strong> , per-tile decode FPS, frame drops, GPU/CPU/RAM. The same data is summarized below.</div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">Live performance</span>
+                    <span id="srv-diag-agg" class="srv-heartbeat-badge"></span>
+                  </div>
+                  <div class="srv-panel-body">
+                    <div class="srv-note">Per-camera decode on the wall. Press <strong>F8</strong> on the Live view for the on-screen overlay.</div>
+                    <div id="srv-diag-rows" class="srv-stats-rows" style="margin-top:8px"><div class="srv-loading">Open the Live wall to sample.</div></div>
+                  </div>
+                </div>
+                <div class="srv-panel">
+                  <div class="srv-panel-header"><span class="srv-panel-title">Benchmark</span></div>
+                  <div class="srv-panel-body">
+                    <div class="srv-note">Forces every wall tile to its full-resolution main stream for ~12&nbsp;s and measures decode load , the &ldquo;how many 4K can this box take&rdquo; test. Open the Live wall first.</div>
+                    <div class="export-dest-row" style="margin-top:8px">
+                      <button id="srv-bench-run" type="button" class="pb-btn">Run benchmark</button>
+                      <span id="srv-bench-status" class="srv-kv-k"></span>
+                    </div>
+                    <div id="srv-bench-report" class="hidden" style="margin-top:10px"></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ════════ MANAGEMENT ════════ (the full /admin console, embedded via
+                   token SSO so this client is a complete server-management interface) -->
+              <div class="srv-section hidden" data-section="admin">
+                <div class="srv-admin-wrap">
+                  <div class="srv-admin-bar">
+                    <span class="srv-admin-title">Server management</span>
+                    <span id="srv-admin-host" class="srv-kv-k"></span>
+                    <span class="srv-admin-bar-spacer"></span>
+                    <button id="srv-admin-reload" type="button" class="pb-btn" title="Reload the console">Reload</button>
+                    <button id="srv-admin-browser" type="button" class="pb-btn" title="Open the console in your web browser">Open in browser &#8599;</button>
+                  </div>
+                  <div id="srv-admin-frame-host" class="srv-admin-frame-host">
+                    <div id="srv-admin-empty" class="srv-loading">Connect to a server to manage it.</div>
+                    <!-- iframe injected by srvEnterAdmin() so the token isn't baked into static HTML -->
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </section>
+
+        <!-- ── Export, a real dedicated view/tab (not a modal) ─────────────── -->
+        <section id="view-clips" class="view-area hidden">
+          <div class="clips-toolbar">
+            <div class="clips-type-tabs">
+              <button class="clips-type active" data-ctype="all">All</button>
+              <button class="clips-type" data-ctype="detection">Detections</button>
+              <button class="clips-type" data-ctype="motion">Motion</button>
+            </div>
+            <select id="clips-cam" class="clips-select"><option value="">All cameras</option></select>
+            <select id="clips-range" class="clips-select">
+              <option value="6">Last 6 hours</option>
+              <option value="24" selected>Last 24 hours</option>
+              <option value="72">Last 3 days</option>
+              <option value="168">Last 7 days</option>
+              <option value="336">Last 14 days</option>
+              <option value="720">Last 30 days</option>
+            </select>
+            <input type="datetime-local" id="clips-when" class="clips-select" title="Jump to a date/time (the window ends here; empty = live/now)" />
+            <button id="clips-now" class="btn btn-ghost btn-sm" title="Back to live (now)">Now</button>
+            <button id="clips-density-btn" class="btn btn-ghost btn-sm" title="Tile size, click to cycle Compact / Normal / Large">Tiles: Normal</button>
+            <button id="clips-refresh" class="btn btn-ghost btn-sm">Refresh</button>
+            <span id="clips-count" class="clips-count"></span>
+          </div>
+          <div id="clips-grid" class="clips-grid"></div>
+          <div id="clips-pager" class="clips-pager hidden">
+            <button id="clips-newer" class="btn btn-ghost btn-sm">← Newer</button>
+            <span id="clips-page" class="clips-count"></span>
+            <button id="clips-older" class="btn btn-ghost btn-sm">Older →</button>
+          </div>
+          <div id="clips-empty" class="clips-empty hidden">No clips in this window.</div>
+          <div id="clips-player" class="clips-player-overlay hidden">
+            <div class="clips-player-box">
+              <div class="clips-player-head">
+                <span id="clips-player-title"></span>
+                <button id="clips-player-close" class="clips-player-close" title="Close (Esc)">&times;</button>
+              </div>
+              <video id="clips-player-video" class="clips-player-video" controls crossorigin="anonymous"></video>
+              <div class="clips-player-actions">
+                <button id="clips-player-snapshot" class="btn btn-ghost btn-sm clips-iconbtn" title="Save a snapshot of the current frame" aria-label="Snapshot">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M3 4V1h2v3h3v2H5v3H3V6H0V4h3zm3 6V7h3V4h7l1.83 2H21c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H5c-1.1 0-2-.9-2-2V10h3zm7 9c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5zm-3.2-5c0 1.77 1.43 3.2 3.2 3.2s3.2-1.43 3.2-3.2-1.43-3.2-3.2-3.2-3.2 1.43-3.2 3.2z"/></svg>
+                </button>
+                <button id="clips-player-bookmark" class="btn btn-ghost btn-sm clips-iconbtn" title="Bookmark this clip (with optional protect-from-delete)" aria-label="Bookmark">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M17 3H7c-1.1 0-1.99.9-1.99 2L5 21l7-3 7 3V5c0-1.1-.9-2-2-2z"/></svg>
+                </button>
+                <button id="clips-player-quality" class="btn btn-ghost btn-sm clips-iconbtn" title="HD, toggle full-resolution playback (default is a smaller, faster preview)" aria-label="Toggle HD">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.11 0 2-.9 2-2V5c0-1.1-.89-2-2-2zm-9 12H8.5v-2h-2v2H5V9h1.5v2.5h2V9H10v6zm9-1c0 .55-.45 1-1 1h-4V9h4c.55 0 1 .45 1 1v4zm-3.5-1h2v-2h-2v2z"/></svg>
+                </button>
+                <button id="clips-player-playback" class="btn btn-ghost btn-sm" title="Jump to this moment on the playback timeline">View on timeline</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-export" class="view-area hidden">
+          <div class="export-workspace">
+            <div class="export-head">
+              <div class="export-head-icon" aria-hidden="true">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              </div>
+              <div class="export-head-text">
+                <div class="export-head-title">Export</div>
+                <div class="export-head-sub">Build a list of clips , one camera + one time range each , then export the whole batch at once.</div>
+              </div>
+            </div>
+
+            <div class="export-grid">
+              <!-- LEFT, Export list (swaps in-place to the Add-clip builder) -->
+              <section class="export-panel export-left">
+                <!-- LIST MODE (default) -->
+                <div id="export-list-mode" class="export-panel-head export-list-head">
+                  <span>Export list <span id="export-list-count" class="export-list-count"></span></span>
+                  <button id="export-add-btn" type="button" class="export-add-btn">+ Add to list</button>
+                </div>
+                <div id="export-list-items" class="export-list-items"></div>
+
+                <!-- BUILDER MODE (hidden until +Add / edit; same card footprint) -->
+                <div id="export-builder" class="export-builder hidden">
+                  <div class="export-panel-head export-builder-head">
+                    <button id="export-b-back" type="button" class="export-back-btn" title="Back to list" aria-label="Back to list">&larr;</button>
+                    <span id="export-b-title">Add clip</span>
+                  </div>
+                  <div class="export-builder-body">
+                    <div class="export-b-fields">
+                      <div class="export-b-field"><div class="export-field-label">Camera</div><select id="export-b-camera" class="export-select"></select></div>
+                      <div class="export-b-field"><div class="export-field-label">Start</div><input id="export-b-start" class="export-time-input" type="datetime-local" step="1" /></div>
+                      <div class="export-b-field"><div class="export-field-label">End</div><input id="export-b-end" class="export-time-input" type="datetime-local" step="1" /></div>
+                    </div>
+                    <div id="export-quick" class="export-quick">
+                      <button type="button" class="export-quick-chip" data-mins="1">Last 1m</button>
+                      <button type="button" class="export-quick-chip" data-mins="5">Last 5m</button>
+                      <button type="button" class="export-quick-chip" data-mins="10">Last 10m</button>
+                      <button type="button" class="export-quick-chip" data-mins="15">Last 15m</button>
+                      <button id="export-quick-pb" type="button" class="export-quick-chip export-quick-pb">Use playback selection</button>
+                    </div>
+                    <!-- live video preview (native libmpv pane mounts over this box) -->
+                    <div id="export-preview-box" class="export-preview-box">
+                      <div id="export-preview-state" class="export-preview-state">Set a camera and range, then press play to preview</div>
+                    </div>
+                    <div class="export-transport">
+                      <button id="export-pv-play" type="button" class="export-pv-btn" title="Play / pause" aria-label="Play / pause">
+                        <svg id="export-pv-play-icon" width="14" height="14" viewBox="0 0 14 14" fill="none">
+                          <path d="M3 2l9 5-9 5V2z" fill="currentColor"/>
+                        </svg>
+                        <svg id="export-pv-pause-icon" width="14" height="14" viewBox="0 0 14 14" fill="none" class="hidden">
+                          <rect x="2" y="2" width="3.5" height="10" rx="0.5" fill="currentColor"/>
+                          <rect x="8.5" y="2" width="3.5" height="10" rx="0.5" fill="currentColor"/>
+                        </svg>
+                      </button>
+                      <div id="export-pv-track" class="export-pv-track"><div id="export-pv-fill" class="export-pv-fill"></div><div id="export-pv-head" class="export-pv-head"></div></div>
+                      <span id="export-pv-time" class="export-pv-time">,</span>
+                    </div>
+                    <div id="export-b-error" class="export-error hidden"></div>
+                    <div class="export-b-footer">
+                      <button id="export-b-cancel" type="button" class="pb-btn">Cancel</button>
+                      <button id="export-b-add" type="button" class="pb-btn export-submit-btn">+ Add to list</button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <!-- RIGHT, global Output (applies to the whole batch) + Export -->
+              <section class="export-panel export-right">
+                <div class="export-panel-head">Output</div>
+                <div class="export-panel-body">
+                  <div class="export-field-label">Format</div>
+                  <select id="export-format" class="export-select">
+                    <option value="h264-mp4" data-codec="h264" data-container="mp4" selected>MP4 &middot; H.264 , most compatible</option>
+                    <option value="h265-mp4" data-codec="h265" data-container="mp4">MP4 &middot; H.265 (HEVC) , smaller files</option>
+                    <option value="h265-mkv" data-codec="h265" data-container="mkv">MKV &middot; H.265 (HEVC) , smaller files</option>
+                    <option value="copy-mp4" data-codec="copy" data-container="mp4">MP4 &middot; Original quality , fastest, no re-encode</option>
+                    <option value="copy-mkv" data-codec="copy" data-container="mkv">MKV &middot; Original quality , fastest, no re-encode</option>
+                  </select>
+                  <div id="export-codec-hint" class="export-pw-hint hidden">H.265 (HEVC) re-encodes the video , noticeably slower to export.</div>
+                  <div class="export-field-label">Destination</div>
+                  <div class="export-dest-row">
+                    <input id="export-dest-path" class="export-dest-input" type="text" readonly value="Downloads folder" title="Export destination" />
+                    <button id="export-browse-btn" type="button" class="pb-btn export-browse-btn">Browse&hellip;</button>
+                  </div>
+                  <div class="export-field-label">Options</div>
+                  <label class="export-option-label"><input id="export-burn-ts" class="export-checkbox" type="checkbox" checked /> Burn timestamp into video</label>
+                  <label class="export-option-label"><input id="export-include-audio" class="export-checkbox" type="checkbox" checked /> Include audio</label>
+                  <label class="export-option-label export-pw-label">
+                    <span class="export-pw-text">Password-protect&nbsp;(.zip)</span>
+                    <input id="export-password" class="export-pw-input" type="password" autocomplete="new-password" placeholder="optional" spellcheck="false" />
+                  </label>
+                  <div id="export-pw-hint" class="export-pw-hint">Leave blank for plain video files. Set a password and the whole batch is packaged as one <strong>AES-256 encrypted ZIP</strong>.</div>
+
+                  <div class="export-spacer"></div>
+
+                  <!-- live batch summary -->
+                  <div id="export-summary" class="export-summary">
+                    <div class="export-sum-title">Batch</div>
+                    <div class="export-sum-grid">
+                      <div class="export-sum-row"><span class="export-sum-k">Clips</span><span id="export-sum-clips" class="export-sum-v">0</span></div>
+                      <div class="export-sum-row"><span class="export-sum-k">Cameras</span><span id="export-sum-cams" class="export-sum-v">0</span></div>
+                      <div class="export-sum-row"><span class="export-sum-k">Total duration</span><span id="export-sum-dur" class="export-sum-v">,</span></div>
+                      <div class="export-sum-row"><span class="export-sum-k">Est. size</span><span id="export-sum-size" class="export-sum-v">,</span></div>
+                      <div class="export-sum-row"><span class="export-sum-k">Saved to</span><span id="export-sum-dest" class="export-sum-v export-sum-dest">,</span></div>
+                    </div>
+                  </div>
+
+                  <div id="export-progress-wrap" class="export-progress-wrap hidden">
+                    <div class="export-progress-label">
+                      <span id="export-progress-text">Exporting&hellip;</span>
+                      <span id="export-progress-pct">0%</span>
+                    </div>
+                    <div class="export-progress-track">
+                      <div id="export-progress-bar" class="export-progress-bar" style="width:0%"></div>
+                    </div>
+                  </div>
+                  <div id="export-done" class="export-done hidden">
+                    <div class="export-done-msg"><span class="export-done-check">✓</span> <span id="export-done-text">Export saved.</span></div>
+                    <button id="export-open-folder-btn" type="button" class="pb-btn export-open-folder-btn">📁 Open folder</button>
+                  </div>
+                  <div id="export-error" class="export-error hidden"></div>
+
+                  <button id="export-submit-btn" class="pb-btn export-submit-btn export-batch-btn" disabled>Export</button>
+                </div>
+              </section>
+            </div>
+
+            <div class="export-footer">
+              <span class="export-foot-hint">Footage is pulled from recorded segments in each clip&rsquo;s range.</span>
+              <button id="export-cancel-btn" class="pb-btn">Back to Live</button>
+            </div>
+          </div>
+        </section>
+
+      </div><!-- /.stage -->
+
+      <!-- Hidden legacy stubs kept so JS DOM refs don't break on camera-list /
+           saved-views-list / layout-presets lookups that happen before the new
+           toolbar IDs are wired.  These are display:none and never shown. -->
+      <div id="layout-presets"   style="display:none"></div>
+      <div id="saved-views-list" style="display:none"></div>
+      <div id="camera-list"      style="display:none"></div>
+      <!-- #ptz-section stub so activateTab's direct classList.add('hidden') calls don't throw -->
+      <div id="ptz-section"      style="display:none"></div>
+
+    </div><!-- /#app-shell -->
+
+    <!-- ── Status bar (hidden until signed in) ────────────────────────────── -->
+    <footer id="statusbar" class="statusbar hidden">
+      <span id="status-text" class="status-text">Initializing&hellip;</span>
+      <span id="status-alert" class="status-alert"></span>
+    </footer>
+
+    <!-- ── View Setup dialog (custom layout builder) ─────────────────────── -->
+    <div id="vs-backdrop" class="export-backdrop hidden" aria-hidden="true"></div>
+    <div id="vs-dialog" class="vs-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="vs-dialog-title">
+      <div class="export-dialog-header">
+        <span id="vs-dialog-title" class="export-dialog-title">View Setup , design a custom layout</span>
+        <button id="vs-close-btn" class="export-close-btn" title="Close">&times;</button>
+      </div>
+      <div class="vs-dialog-body">
+        <!-- Start from an existing saved view (load its layout + camera assignments
+             into the builder, then tweak + re-save). -->
+        <div class="vs-load-section">
+          <span class="vs-ctl-label">Start from</span>
+          <div id="vs-load-list" class="vs-load-list"><!-- saved views, populated by JS --></div>
+        </div>
+
+        <div class="vs-controls">
+          <div class="vs-control-group">
+            <span class="vs-ctl-label">Columns</span>
+            <button class="vs-step" id="vs-cols-minus" title="Fewer columns">&minus;</button>
+            <span id="vs-cols-val" class="vs-ctl-val">4</span>
+            <button class="vs-step" id="vs-cols-plus" title="More columns">+</button>
+          </div>
+          <div class="vs-control-group">
+            <span class="vs-ctl-label">Rows</span>
+            <button class="vs-step" id="vs-rows-minus" title="Fewer rows">&minus;</button>
+            <span id="vs-rows-val" class="vs-ctl-val">3</span>
+            <button class="vs-step" id="vs-rows-plus" title="More rows">+</button>
+          </div>
+          <div class="vs-control-group">
+            <button class="vs-tmpl-btn" id="vs-edit-layout-btn" title="Toggle layout editing: when on, drag across boxes to merge/reshape them">✎ Edit layout</button>
+          </div>
+          <div class="vs-control-group vs-templates">
+            <span class="vs-ctl-label">Quick</span>
+            <button class="vs-tmpl-btn" data-tmpl="2x2">2&times;2</button>
+            <button class="vs-tmpl-btn" data-tmpl="3x3">3&times;3</button>
+            <button class="vs-tmpl-btn" data-tmpl="1plus5">1+5</button>
+            <button class="vs-tmpl-btn" data-tmpl="1plus7">1+7</button>
+            <button class="vs-tmpl-btn" data-tmpl="hero-bottom">Hero+row</button>
+            <button class="vs-tmpl-btn" data-tmpl="reset" title="Reset to a plain grid">Reset</button>
+          </div>
+          <div class="vs-control-group">
+            <button class="vs-tmpl-btn vs-clear-btn" id="vs-clear-all" title="Remove every camera and reset the layout to a plain grid">Clear all</button>
+          </div>
+          <div class="vs-control-group">
+            <span id="vs-box-count" class="vs-box-count">6 boxes</span>
+          </div>
+        </div>
+
+        <!-- View-item palette: drag a TYPE onto a box (commercial-VMS "view items"). -->
+        <div class="vs-palette">
+          <span class="vs-ctl-label">Add item</span>
+          <div id="vs-palette-list" class="vs-palette-list"><!-- populated by JS --></div>
+        </div>
+
+        <p class="vs-hint" id="vs-hint-arrange">
+          <strong>Drag a camera</strong> from the list onto a box to place it —
+          or drag a placed camera <strong>between boxes</strong> to move/swap it.
+          Turn on <strong>✎ Edit layout</strong> to merge/reshape the boxes.
+        </p>
+        <p class="vs-hint hidden" id="vs-hint-edit">
+          <strong>Edit layout:</strong> drag across boxes to <strong>merge</strong>
+          them into one; use the <span class="vs-hint-split">⊟</span> on a merged box
+          to split it back. Turn off to go back to arranging cameras.
+        </p>
+
+        <div class="vs-layout-row">
+          <div class="vs-camera-panel">
+            <div class="vs-camera-panel-title">Cameras</div>
+            <div id="vs-camera-list" class="vs-camera-list"><!-- populated by JS --></div>
+          </div>
+          <div id="vs-grid" class="vs-grid"><!-- builder cells populated by JS --></div>
+        </div>
+
+        <div class="vs-name-row">
+          <span class="vs-ctl-label">Name</span>
+          <input id="vs-name-input" class="vs-name-input" type="text" placeholder="e.g. Perimeter overview" spellcheck="false" />
+        </div>
+        <!-- Quick-switch icon for this view (shows on the toolbar). Picking the
+             icon lives HERE in Setup now, not via right-click on the toolbar. -->
+        <div class="vs-icon-row">
+          <span class="vs-ctl-label">Icon</span>
+          <div id="vs-icon-grid" class="vs-icon-grid"><!-- populated by JS --></div>
+        </div>
+        <div id="vs-error" class="export-error hidden"></div>
+      </div>
+      <div class="export-dialog-footer">
+        <span class="vs-foot-hint"><strong>Apply</strong> uses this layout on the wall now. <strong>Save view</strong> also keeps it under &ldquo;Start from&rdquo; to switch back to later.</span>
+        <button id="vs-cancel-btn" class="pb-btn">Cancel</button>
+        <button id="vs-apply-btn" class="pb-btn" title="Use this layout on the wall now, without adding it to your saved views">Apply</button>
+        <button id="vs-save-btn" class="pb-btn export-submit-btn" title="Apply this layout AND save it as a named view you can switch back to anytime">Save view</button>
+      </div>
+    </div>
+
+    <!-- Motion Tuner is now INLINE in Settings → Motion tuning (see view-server). -->
+
+    <!-- ── Options dialog ────────────────────────────────────────────────── -->
+    <!-- (The old Options ⚙ modal was relocated into Settings → Client. The gear now
+         navigates there.) -->
+
+    <!-- ── Context menu (shown on right-click; populated by JS) ───────────── -->
+    <div id="ctx-menu" class="ctx-menu" style="display:none"></div>
+
+    <!-- ── Re-auth overlay: a 401 mid-session (expired/revoked token) shows THIS
+         instead of tearing down to the login screen, so an unattended camera wall
+         keeps its native video panes alive underneath while the operator signs
+         back in. Sign out (below) still goes to the full login screen. ────── -->
+    <div id="reauth-backdrop" class="export-backdrop hidden" aria-hidden="true"></div>
+    <div id="reauth-dialog" class="vs-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="reauth-title" style="width:360px">
+      <div class="export-dialog-header">
+        <span id="reauth-title" class="export-dialog-title">Session expired</span>
+      </div>
+      <div class="vs-dialog-body">
+        <p class="vs-hint" style="margin-top:0">Sign back in to keep watching, the camera wall stays live behind this.</p>
+        <form id="reauth-form" autocomplete="off">
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input id="reauth-user" class="form-input" type="text" autocomplete="username" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <input id="reauth-pass" class="form-input" type="password" autocomplete="current-password" />
+          </div>
+          <div id="reauth-error" class="export-error hidden"></div>
+        </form>
+      </div>
+      <div class="export-dialog-footer">
+        <button id="reauth-signout-btn" type="button" class="pb-btn">Sign out instead</button>
+        <button id="reauth-submit-btn" type="button" class="pb-btn export-submit-btn">Sign in</button>
+      </div>
+    </div>
+
+  </body>
+</html>

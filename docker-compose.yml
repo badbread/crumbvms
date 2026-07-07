@@ -1,0 +1,240 @@
+# CrumbVMS — base stack. Boots GPU-free; manually managed (docker compose up -d / down).
+#   ./scripts/setup-env.sh && docker compose pull && docker compose up -d   →  http://<host>:8080/admin
+# Build from source instead of pulling images:  add  -f docker-compose.build.yml   (docs/IMAGES.md)
+# GPU decode:  add  -f docker-compose.gpu.example.yml   (NVDEC)  or  -f docker-compose.vaapi.example.yml
+#
+# This file is deliberately terse. The go2rtc security model, the Postgres migration trap, the
+# motion RAM cache, backups, TLS, Frigate/MQTT, upgrade notes, and every env knob are documented
+# in docs/COMPOSE.md (a section-by-section walkthrough of this exact file).
+name: crumbvms
+
+# json-file logging + rotation so `docker logs` stays reliable regardless of the host daemon's
+# default driver (a syslog default with no listener once silently dropped recorder logs).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      # Schema is owned by the api/recorder embedded migration runner. Do NOT also mount
+      # db/migrations into /docker-entrypoint-initdb.d — it breaks the schema (docs/COMPOSE.md).
+      - crumb_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # ports: ["127.0.0.1:5432:5432"]   # uncomment to inspect locally
+
+  # recorder — also hosts Crumb's OWN embedded go2rtc restreamer (baked into the image, supervised
+  # by the recorder process). Streams are managed at runtime via go2rtc's REST API by the api's
+  # reconcile loop; ./go2rtc/go2rtc.yaml is listener config only. go2rtc's REST API (:1984) is
+  # intentionally NOT published (internal only); RTSP and WebRTC media are LAN-exposed + authed.
+  # Full security model + rationale: docs/COMPOSE.md § go2rtc.
+  recorder:
+    image: ${CRUMB_IMAGE_PREFIX:-ghcr.io/badbread/crumbvms}/recorder:${CRUMB_VERSION:-latest}
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - go2rtc          # back-compat: old installs may still resolve `go2rtc` (now the recorder)
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      # Stream bases are fallbacks; the live values come from admin "Server & streaming" settings.
+      CRUMB_GO2RTC_RTSP_BASE: ${CRUMB_GO2RTC_RTSP_BASE:-rtsp://localhost:8554}
+      CRUMB_GO2RTC_API_BASE: ${CRUMB_GO2RTC_API_BASE:-http://localhost:1984}
+      GO2RTC_USER: ${GO2RTC_USER:?GO2RTC_USER is required (run scripts/setup-env.sh)}
+      GO2RTC_PASS: ${GO2RTC_PASS:?GO2RTC_PASS is required (run scripts/setup-env.sh)}
+      GO2RTC_EMBEDDED: ${GO2RTC_EMBEDDED:-true}          # false only if you run an external restreamer
+      WEBRTC_CANDIDATE: ${WEBRTC_CANDIDATE:-}            # set <server-LAN-ip>:8556 so WebRTC reaches LAN clients
+      TZ: ${TZ:-America/Los_Angeles}
+      GO2RTC_RTSP_BASE: ${GO2RTC_RTSP_BASE:-}            # external BYO-Frigate go2rtc (served_by='frigate' only)
+      GO2RTC_API_BASE: ${GO2RTC_API_BASE:-}
+      MEDIA_ROOT: ${MEDIA_ROOT:-/data}
+      LIVE_STORAGE_PATH: ${LIVE_STORAGE_PATH:-/data/live}
+      LIVE_STORAGE_NAME: "${LIVE_STORAGE_NAME:-Live}"
+      ARCHIVE_STORAGE_PATH: ${ARCHIVE_STORAGE_PATH:-/data/archive}
+      ARCHIVE_STORAGE_NAME: "${ARCHIVE_STORAGE_NAME:-Archive}"
+      SEGMENT_SECONDS: ${SEGMENT_SECONDS:-4}
+      MOTION_HWACCEL: ${MOTION_HWACCEL:-auto}            # 'auto' probes NVDEC, falls back to CPU; overlay forces it
+      MAX_GPU_DECODE_SESSIONS: ${MAX_GPU_DECODE_SESSIONS:-4}
+      CONFIG_POLL_SECONDS: ${CONFIG_POLL_SECONDS:-30}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-900}
+      RECONCILE_PAUSED: ${RECONCILE_PAUSED:-false}       # true = no reconcile passes (set during bulk migrations)
+      MOTION_UNHEALTHY_ALERT_SECS: ${MOTION_UNHEALTHY_ALERT_SECS:-180}
+      MOTION_CACHE_DIR: ${MOTION_CACHE_DIR:-/cache/motion}   # motion-mode RAM buffer (docs/MOTION-RECORDING.md)
+      MOTION_RECORDING_SHADOW: ${MOTION_RECORDING_SHADOW:-0}
+      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
+      SEED_ADMIN_PASSWORD_HASH: ${SEED_ADMIN_PASSWORD_HASH}
+      SEED_DEFAULT_CAMERAS: ${SEED_DEFAULT_CAMERAS:-false}   # dev-only prototype cameras; keep false in real deploys
+      RUST_LOG: ${RUST_LOG:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    volumes:
+      - ${MEDIA_HOST_PATH:-./_data}:/data              # one broad media root, RW (recorder owns all writes)
+      - /proc:/host/proc:ro                            # NSpid translation for per-camera GPU% (optional)
+      - ./go2rtc/go2rtc.yaml:/config/go2rtc.yaml:ro    # listener config only; streams are runtime-managed
+      - type: tmpfs                                    # RAM motion pre/post-roll buffer (docs/MOTION-RECORDING.md)
+        target: /cache
+        tmpfs:
+          size: ${MOTION_CACHE_TMPFS_BYTES:-536870912}
+          mode: 01777                                  # world-writable+sticky: recorder (uid 1001) must mkdir here
+    ports:
+      - "0.0.0.0:18554:8554"      # RTSP — LAN-reachable, authenticated
+      - "0.0.0.0:8556:8556/tcp"   # WebRTC media (ICE/TCP) — 8556 not 8555 to avoid a host-net Frigate/go2rtc
+      - "0.0.0.0:8556:8556/udp"   # WebRTC media (ICE/UDP)
+    deploy:
+      resources:
+        limits:
+          memory: 4g   # includes embedded go2rtc + the tmpfs cache; raise alongside MOTION_CACHE_TMPFS_BYTES
+    healthcheck:
+      # recorder has no HTTP server; verify it's PID 1 (a dead recorder = a dead container).
+      test: ["CMD-SHELL", "grep -q crumb-recorder /proc/1/comm || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    # NVIDIA GPU access is opt-in via docker-compose.gpu.example.yml; the base stack boots GPU-free.
+
+  api:
+    image: ${CRUMB_IMAGE_PREFIX:-ghcr.io/badbread/crumbvms}/api:${CRUMB_VERSION:-latest}
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRY_SECONDS: ${JWT_EXPIRY_SECONDS:-86400}
+      API_BIND: ${API_BIND:-0.0.0.0:8080}
+      CRUMB_GO2RTC_API_BASE: ${CRUMB_GO2RTC_API_BASE:-http://recorder:1984}   # embedded go2rtc REST (internal)
+      CRUMB_GO2RTC_RTSP_BASE: ${CRUMB_GO2RTC_RTSP_BASE:-}
+      GO2RTC_RTSP_BASE: ${GO2RTC_RTSP_BASE:-}
+      GO2RTC_API_BASE: ${GO2RTC_API_BASE:-}
+      GO2RTC_USER: ${GO2RTC_USER:?GO2RTC_USER is required (run scripts/setup-env.sh)}
+      GO2RTC_PASS: ${GO2RTC_PASS:?GO2RTC_PASS is required (run scripts/setup-env.sh)}
+      MEDIA_ROOT: ${MEDIA_ROOT:-/data}
+      LIVE_STORAGE_PATH: ${LIVE_STORAGE_PATH:-/data/live}
+      ARCHIVE_STORAGE_PATH: ${ARCHIVE_STORAGE_PATH:-/data/archive}
+      EXPORT_DIR: ${EXPORT_DIR:-/exports}               # top-level, NOT under /data:ro (can't nest a mount there)
+      EXPORT_TTL_SECONDS: ${EXPORT_TTL_SECONDS:-86400}
+      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}     # optional; the first-run /admin UI can create the admin
+      ONVIF_CONFIG_B64: ${ONVIF_CONFIG_B64:-}           # legacy fallback; per-camera ONVIF creds live in the DB now
+      # Frigate detection (optional, BRING YOUR OWN broker). Empty FRIGATE_MQTT_URL = detection disabled.
+      FRIGATE_MQTT_URL: ${FRIGATE_MQTT_URL:-}
+      FRIGATE_MQTT_USER: ${FRIGATE_MQTT_USER:-}
+      FRIGATE_MQTT_PASSWORD: ${FRIGATE_MQTT_PASSWORD:-}
+      FRIGATE_MQTT_PASSWORD_B64: ${FRIGATE_MQTT_PASSWORD_B64:-}
+      FRIGATE_MQTT_PREFIX: ${FRIGATE_MQTT_PREFIX:-frigate}
+      FRIGATE_API_BASE: ${FRIGATE_API_BASE:-}
+      FRIGATE_MIN_SCORE: ${FRIGATE_MIN_SCORE:-0.3}
+      FRIGATE_CATCHUP_HOURS: ${FRIGATE_CATCHUP_HOURS:-24}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}         # Discord/Slack webhook on recorder-heartbeat stall; empty = silent
+      RUST_LOG: ${RUST_LOG:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      # Built-in nightly pg_dump of the segments index (the mp4→camera/time map). docs/BACKUP.md
+      BACKUP_DIR: ${BACKUP_DIR:-/backups}
+      TZ: ${TZ:-America/Los_Angeles}
+      DB_BACKUP_SCHEDULE: ${DB_BACKUP_SCHEDULE:-03:15}  # local wall-clock "HH:MM" in TZ
+      DB_BACKUP_KEEP_DAYS: ${DB_BACKUP_KEEP_DAYS:-7}
+      DB_BACKUP_KEEP_WEEKS: ${DB_BACKUP_KEEP_WEEKS:-4}
+      DB_BACKUP_KEEP_MONTHS: ${DB_BACKUP_KEEP_MONTHS:-0}
+      DB_BACKUP_ENABLED: ${DB_BACKUP_ENABLED:-true}
+    volumes:
+      - ${MEDIA_HOST_PATH:-./_data}:/data:ro            # same media root as recorder, READ-ONLY (api never writes footage)
+      - crumb_exports:/exports
+      # Nightly dumps (RW). Host path so an off-host sync job can point at it; chown 1001:1001,
+      # ideally a DIFFERENT disk than the footage (docs/BACKUP.md). Unwritable ⇒ api warns + disables backups.
+      - ${DB_BACKUP_HOST_PATH:-./backups}:/backups
+    ports:
+      - "0.0.0.0:8080:8080"   # API + web admin (/admin); JWT-protected except /health + /auth/*
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Caddy — optional HTTPS on :8443 (additive; the api's plain :8080 is unchanged). Internal
+  # self-signed CA by default (no ACME, no domain needed). Remove this service to drop TLS. docs/TLS.md
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - crumb_caddy_data:/data
+      - crumb_caddy_config:/config
+    ports:
+      # Both sides use the same var — the Caddyfile binds {$CRUMB_HTTPS_PORT}, so a hardcoded
+      # container-side port would break HTTPS the moment an operator customized it.
+      - "0.0.0.0:${CRUMB_HTTPS_PORT:-8443}:${CRUMB_HTTPS_PORT:-8443}"
+    environment:
+      - TZ=${TZ:-America/Los_Angeles}
+      - CRUMB_HTTPS_PORT=${CRUMB_HTTPS_PORT:-8443}
+
+  # Mosquitto — bundled MQTT broker for Frigate detection, OPT-IN via the `frigate` profile (a
+  # plain `up -d` never starts it). Only needed if you don't already have a broker. docs/COMPOSE.md
+  #   docker compose --profile frigate up -d
+  mosquitto:
+    profiles: ["frigate"]
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    ports:
+      - "127.0.0.1:1883:1883"   # LAN-local only; not forwarded to WAN
+    environment:
+      - TZ=${TZ:-America/Los_Angeles}
+
+  # Off-host backup sync — OPTIONAL, opt-in via the `offsite` profile. Pushes DB_BACKUP_HOST_PATH to
+  # an rclone remote (SFTP/S3/B2/NAS) so one disk failure can't take out footage AND backups. Simpler
+  # alternative: point DB_BACKUP_HOST_PATH itself at a NAS mount and skip this service. docs/BACKUP.md
+  #   docker compose --profile offsite up -d
+  backup-offsite:
+    image: rclone/rclone:1
+    profiles: ["offsite"]
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-America/Los_Angeles}
+      - BACKUP_OFFSITE_REMOTE=${BACKUP_OFFSITE_REMOTE:-}          # rclone remote:path; empty ⇒ idle no-op
+      - BACKUP_OFFSITE_SCHEDULE=${BACKUP_OFFSITE_SCHEDULE:-15 5 * * *}   # 5-field cron (busybox crond)
+    volumes:
+      - ${DB_BACKUP_HOST_PATH:-./backups}:/backups:ro            # read-only; this container only pushes outward
+      - ${BACKUP_OFFSITE_RCLONE_CONF:-./rclone.conf}:/config/rclone/rclone.conf:ro
+    # busybox crond writes a one-line crontab from the schedule, then each tick runs `rclone sync`.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -z "$$BACKUP_OFFSITE_REMOTE" ]; then
+          echo "[backup-offsite] BACKUP_OFFSITE_REMOTE is not set - nothing to sync (see docs/BACKUP.md)." >&2
+          echo "[backup-offsite] this container is a no-op until configured; it is NOT required for on-host backups." >&2
+          exec sleep infinity
+        fi
+        echo "[backup-offsite] /backups -> $$BACKUP_OFFSITE_REMOTE on schedule '$$BACKUP_OFFSITE_SCHEDULE'"
+        mkdir -p /var/spool/cron/crontabs
+        printf '%s cd / && rclone sync /backups "%s" --config /config/rclone/rclone.conf -v >> /proc/1/fd/1 2>> /proc/1/fd/2\n' \
+          "$$BACKUP_OFFSITE_SCHEDULE" "$$BACKUP_OFFSITE_REMOTE" > /var/spool/cron/crontabs/root
+        exec crond -f -l 2
+
+volumes:
+  crumb_pgdata:
+  crumb_exports:
+  crumb_caddy_data:      # Caddy internal-CA root + issued leaf certs
+  crumb_caddy_config:    # Caddy autosaved running config

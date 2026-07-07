@@ -1,0 +1,32 @@
+# docs.crumbvms.com — served as a static site on the shared front-end Docker
+# network, the same self-hosted pattern the crumbvms.com marketing site uses.
+#
+# Build context is the REPO ROOT, not this directory — see the note at the
+# top of Dockerfile for why (the architecture-docs sync script needs docs/
+# and docs-site/ as siblings). Run `docker compose build`/`up` from the
+# directory that contains docs/, docs-site/, and scripts/ (i.e. one level
+# above this file, or wherever the deploy host's synced copy places them —
+# see docs-site/README.md "Deploying").
+services:
+  crumb-docs:
+    container_name: crumb-docs
+    build:
+      context: ..
+      dockerfile: docs-site/Dockerfile
+    restart: unless-stopped
+    networks:
+      - wordpress_frontend
+    expose:
+      - "3000"
+    healthcheck:
+      # Use 127.0.0.1 (not localhost). BusyBox wget in nginx:alpine tries
+      # IPv6 first when given "localhost" and fails with connection-refused
+      # even though nginx is happily listening on 0.0.0.0:3000.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  wordpress_frontend:
+    external: true

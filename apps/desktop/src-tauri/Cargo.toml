@@ -1,0 +1,66 @@
+[package]
+name = "crumb-desktop"
+version = "0.0.1"
+description = "CrumbVMS — desktop client"
+authors = ["Crumb"]
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin on Windows.
+name = "crumb_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Custom export destination: native folder picker (rfd) + streamed authed
+# download to the chosen path (reqwest, rustls so there's no OpenSSL on Windows).
+rfd = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["fs", "io-util"] }
+# Bounded-concurrency fan-out for the LAN server-discovery scan.
+futures = "0.3"
+
+# Performance HUD: client GPU/NVDEC telemetry. Loads nvml.dll at runtime via
+# libloading (no link-time NVIDIA SDK), so it builds anywhere and gracefully
+# returns None on a non-NVIDIA host (Nvml::init() -> Err).
+nvml-wrapper = "0.10"
+
+# Native video engine (libmpv) loaded at runtime — no link-time dependency.
+libloading = "0.8"
+# Get the parent window HWND from Tauri (rwh 0.6, matching Tauri 2).
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# Win32 child-window compositing. Deliberately `winapi` (not the `windows`
+# crate) to avoid version entanglement with Tauri's transitive `windows` dep.
+winapi = { version = "0.3", features = ["winuser", "windef", "libloaderapi", "errhandlingapi", "minwindef", "wingdi", "processthreadsapi", "psapi", "dpapi", "wincrypt", "winbase"] }
+# DPAPI-encrypted session token is stashed in localStorage as base64 text.
+base64 = "0.22"
+# Disable the WebView2 default browser right-click menu at the CONTROLLER level
+# (AreDefaultContextMenusEnabled=false) — the only way to suppress it over the
+# native libmpv video panes (which never deliver `contextmenu` to the DOM). Pinned
+# to the SAME version Tauri already resolves (0.38.2) so cargo unifies it into the
+# existing graph — this reuses Tauri's transitive webview2-com, adding no new or
+# duplicate `windows`-crate copy.
+webview2-com = "0.38"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Wayland-native pane backend: render libmpv into a GtkGLArea (the `wid`/HWND model
+# has no Wayland equivalent). Pinned to "0.18" to unify with Tauri 2.11's transitive
+# gtk3 (avoid a second gtk-sys). `gl` is used only for the one GetIntegerv FBO read;
+# all real GL drawing is done inside libmpv via the render API.
+gtk = "0.18"
+
+# This desktop crate is intentionally NOT a member of the repo-root services
+# workspace (it's Windows-native, built separately from the Linux service crates).
+# An empty [workspace] table makes it its own workspace root so `cargo build` here
+# doesn't get captured by <repo>\Cargo.toml and error out.
+[workspace]

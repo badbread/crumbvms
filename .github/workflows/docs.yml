@@ -1,0 +1,61 @@
+# Crumb: docs.crumbvms.com build check
+#
+# Builds the public documentation site (docs-site/) on every push to main and
+# every PR that touches docs-site/ or docs/ (path-filtered so unrelated code
+# changes don't trigger a docs build). Runs on GitHub's ubuntu-latest runner.
+#
+# This is a BUILD CHECK only. There is no deploy step here: production
+# deploy is the manual tar-sync + `docker compose build && up -d` pattern
+# documented in docs-site/README.md and the deploy
+# runbook (same as the crumbvms.com marketing site), not a step in this
+# workflow. See docs/DOCS-SITE-PLAN.md section 4.
+
+name: docs-site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs-site/**"
+      - "docs/**"
+      - "scripts/sync-arch-docs.mjs"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs-site/**"
+      - "docs/**"
+      - "scripts/sync-arch-docs.mjs"
+      - ".github/workflows/docs.yml"
+
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (docusaurus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Sync architecture docs whitelist
+        run: node scripts/sync-arch-docs.mjs
+
+      - name: Install dependencies
+        working-directory: docs-site
+        run: npm ci
+
+      - name: "Build (fails on broken links, onBrokenLinks: throw)"
+        working-directory: docs-site
+        run: npm run build
+
+      # No deploy step. Production deploy is manual: tar-sync this repo's
+      # docs/ + docs-site/ + scripts/sync-arch-docs.mjs to the deploy host,
+      # then `docker compose build && docker compose up -d` in the
+      # crumb-docs stack directory. See docs-site/README.md "Deploying".

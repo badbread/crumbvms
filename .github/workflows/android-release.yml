@@ -1,0 +1,131 @@
+# Crumb Android — signed release build on a version tag.
+#
+# Trigger: push a tag matching v* (e.g. `git tag v1.2.0 && git push origin v1.2.0`).
+# Bump apps/android/version.properties (VERSION_CODE + VERSION_NAME) in the same
+# commit you tag — see that file's header comment for the exact steps.
+#
+# Builds `assembleRelease`, signs it with a keystore assembled at build time from
+# repo secrets (never committed), verifies the signature, and uploads the signed
+# APK plus its SHA-256 checksum (`<apk>.sha256`) to the GitHub Release for this
+# tag (creating the release if it doesn't already exist). The checksum lets
+# testers verify their download with `sha256sum -c` even though the APK is not
+# distributed through a paid code-signing / app-store channel.
+#
+# ── Required repository secrets (Settings → Secrets and variables → Actions) ──
+#   ANDROID_RELEASE_KEYSTORE_BASE64   base64 of the .jks/.keystore file
+#                                     (e.g. `base64 -w0 crumb-release.jks`)
+#   ANDROID_RELEASE_KEYSTORE_PASSWORD store password
+#   ANDROID_RELEASE_KEY_ALIAS         key alias inside the keystore
+#   ANDROID_RELEASE_KEY_PASSWORD      key password (often same as store password)
+#
+# See apps/android/keystore.properties.example for how to generate the keystore
+# with `keytool`, and app/build.gradle.kts for how these are consumed (via
+# CRUMB_RELEASE_KEYSTORE_PATH/_PASSWORD/_KEY_ALIAS/_KEY_PASSWORD env vars — this
+# workflow maps the secrets above onto those env vars).
+
+name: android-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # to create/update the GitHub Release and upload the APK
+
+jobs:
+  build-and-sign:
+    name: build + sign release APK
+    # Signing a release APK needs the keystore secrets (see the header). Until
+    # they're configured, gate the job off via the ANDROID_RELEASE_ENABLED repo
+    # variable so a v* tag doesn't fail — it skips cleanly. Set the variable to
+    # 'true' (and add the ANDROID_RELEASE_* secrets) to resume signed releases.
+    if: ${{ vars.ANDROID_RELEASE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/android/**/*.gradle*', 'apps/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::ANDROID_RELEASE_KEYSTORE_BASE64 secret is not set — cannot sign a release build. See apps/android/keystore.properties.example."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/crumb-release.jks"
+
+      - name: Build signed release APK
+        env:
+          CRUMB_RELEASE_KEYSTORE_PATH: ${{ runner.temp }}/crumb-release.jks
+          CRUMB_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          CRUMB_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          CRUMB_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          # gradlew must be executable; the repo tracks it 100755, but chmod here
+          # too so a checkout that drops the bit (e.g. an SMB working copy with
+          # core.fileMode=false) still builds.
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Locate signed APK
+        id: apk
+        run: |
+          apk_path=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
+          if [ -z "$apk_path" ]; then
+            echo "::error::No APK produced under app/build/outputs/apk/release"
+            exit 1
+          fi
+          echo "path=$apk_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK signature
+        run: |
+          build_tools_dir=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n1)
+          apksigner="$build_tools_dir/apksigner"
+          "$apksigner" verify --print-certs "${{ steps.apk.outputs.path }}"
+
+      # Publish a SHA-256 checksum next to the APK so testers can verify their
+      # download without paid code-signing: `sha256sum -c crumb-<ver>.apk.sha256`.
+      # The checksum file records the APK by BASENAME (not the build path) so the
+      # `-c` check works from whatever folder the tester downloads both files into.
+      - name: Generate SHA-256 checksum
+        id: sum
+        run: |
+          apk_dir=$(dirname "${{ steps.apk.outputs.path }}")
+          apk_base=$(basename "${{ steps.apk.outputs.path }}")
+          ( cd "$apk_dir" && sha256sum "$apk_base" > "$apk_base.sha256" )
+          echo "path=$apk_dir/$apk_base.sha256" >> "$GITHUB_OUTPUT"
+          echo "Published checksum:"; cat "$apk_dir/$apk_base.sha256"
+
+      - name: Clean up decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/crumb-release.jks"
+
+      - name: Upload signed APK + checksum to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apps/android/${{ steps.apk.outputs.path }}
+            apps/android/${{ steps.sum.outputs.path }}
+          generate_release_notes: true

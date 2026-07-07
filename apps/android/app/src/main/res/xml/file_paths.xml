@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider path spec for sharing app-downloaded files (currently: Export
+    output, downloaded in-app to app-private cache storage with an authenticated
+    request — see ExportScreen.kt's downloadToCache()/shareUrl() fix for the
+    "Share leaks the session JWT" issue). Only the cache subdirectory we
+    actually write exports into is exposed; nothing else in app storage is
+    reachable through this provider.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="exports" path="exports/" />
+</paths>

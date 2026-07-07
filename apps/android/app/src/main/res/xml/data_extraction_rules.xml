@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 12+ (API 31+) backup/transfer rules — android:dataExtractionRules.
+
+    #6a fix: allowBackup=true (kept — we're not disabling backup wholesale) with
+    NO exclusions let the auth SharedPreferences get swept into Auto Backup
+    (cloud) and device-to-device transfer. SecureStore (data/SecureStore.kt)
+    keeps the session token/role/username/capabilities in:
+      - "crumb_secure"   — EncryptedSharedPreferences (AES-256), the normal path.
+      - "crumb_fallback" — a PLAINTEXT SharedPreferences file used only when
+        EncryptedSharedPreferences/AndroidKeyStore is unavailable (see
+        SecureStore's catch block). That fallback is exactly the "cleartext
+        token backed up to Google" risk this fix closes: it must never leave
+        the device via backup, encrypted store or not (the encrypted one is
+        moot too — Auto Backup would ship the *undecryptable-elsewhere* file,
+        but excluding it is still correct: a restore onto another device HYPOTHETICALLY
+        keyed differently should not resurrect a stale session either).
+
+    Everything else (view cache, UI prefs, etc.) is not sensitive and keeps
+    being backed up as before.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="crumb_secure.xml" />
+        <exclude domain="sharedpref" path="crumb_fallback.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="crumb_secure.xml" />
+        <exclude domain="sharedpref" path="crumb_fallback.xml" />
+    </device-transfer>
+</data-extraction-rules>

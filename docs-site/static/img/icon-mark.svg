@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 42" fill="none" role="img" aria-label="Crumb">
+  
+  <g fill="#E8E9ED">
+    <circle cx="13" cy="38" r="2.5" opacity="0.42"></circle>
+    <circle cx="34" cy="38" r="3.6" opacity="0.58"></circle>
+    <circle cx="58" cy="38" r="4.8" opacity="0.78"></circle>
+    <circle cx="84" cy="38" r="6.2" opacity="0.96"></circle>
+  </g>
+  
+  <g transform="translate(96.4,-1.6) scale(1.8)">
+    <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z" fill="#E8A33D"></path>
+    <circle cx="12" cy="9" r="2.6" fill="#15161A"></circle>
+  </g>
+</svg>

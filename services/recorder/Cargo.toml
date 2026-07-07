@@ -1,0 +1,64 @@
+[package]
+name        = "crumb-recorder"
+version     = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "crumb-recorder"
+path = "src/main.rs"
+
+[[bin]]
+name  = "seed"
+path  = "src/bin/seed.rs"
+
+[dependencies]
+crumb-common  = { path = "../common" }
+
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+
+tokio-postgres    = { workspace = true }
+deadpool-postgres = { workspace = true }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+uuid   = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+croner = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+clap = { workspace = true }
+
+# Per-camera GPU decode% via NVML (non-root device telemetry). Cross-platform:
+# compiles on Windows, but the sampling call site is Linux-gated.
+nvml-wrapper = { workspace = true }
+
+# Fast streaming checksum for the archive copy-verify (audit P1 #8 / P2 #7):
+# hash src during copy, re-hash dst, compare before deleting the source so a
+# same-length corruption (HDD write-back) can't silently propagate. crc32fast is
+# tiny, pure-Rust, and SIMD-accelerated.
+crc32fast = "1"
+
+# free-space floor for eviction (statvfs); Linux/Unix container target. Matches
+# services/api's libc usage.
+libc = "0.2"
+
+# Frigate-as-motion-source (Stage 2): subscribe to the same frigate/events MQTT
+# topic the API ingester consumes and translate object lifecycles → MotionSignal.
+rumqttc = { workspace = true }
+# Decode FRIGATE_MQTT_PASSWORD_B64 (survives compose `$`-escaping); matches the API.
+base64 = "0.22"
+
+[dev-dependencies]
+# Throwaway temp dirs for the size-eviction integration test (opt-in, gated on
+# CRUMB_TEST_DATABASE_URL).
+tempfile = "3"

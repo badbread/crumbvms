@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 42" fill="#E8E9ED" role="img" aria-label="Crumb">
+  
+  <g>
+    <circle cx="13" cy="38" r="2.5" opacity="0.5"></circle>
+    <circle cx="34" cy="38" r="3.6" opacity="0.64"></circle>
+    <circle cx="58" cy="38" r="4.8" opacity="0.82"></circle>
+    <circle cx="84" cy="38" r="6.2" opacity="1"></circle>
+  </g>
+  <path fill-rule="evenodd" clip-rule="evenodd" transform="translate(96.4,-1.6) scale(1.8)" d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zM14.6 9a2.6 2.6 0 1 0-5.2 0 2.6 2.6 0 0 0 5.2 0z"></path>
+</svg>
