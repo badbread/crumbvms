@@ -553,6 +553,54 @@ footage.
   advanced option layered onto Motion mode ("also record sub-stream
   continuously").
 
+### 8. Instant timeline scrub (pre-generated preview proxy)
+
+Make timeline scrubbing feel instant, on every client and across multiple cameras at once, by finishing the already-scaffolded low-res thumbnail preview proxy so the server pre-generates frames instead of decoding one on demand per scrub tick. Decision and rejected alternatives (notably a finer seek index and a custom container) are recorded in `docs/DECISIONS.md` (2026-07-07).
+
+#### Where we are today
+
+The preview-proxy plumbing exists as an explicit "Phase 1" but is server-starved. `services/api/src/filmstrip.rs` serves `/filmstrip/{cam}` (list) + `/frame` (JPEG) from on-demand single-frame ffmpeg extraction cached at `{export_dir}/.thumbs/{cam}/{ts_ms}.jpg`; `crumb_common::db::list_thumbnail_times` is a stub returning empty, and there is no background pre-generation. The client UIs already consume it: iOS single-cam (`PlaybackView`) plus a multi-camera synchronized wall (`PlaybackWallView`), Android single-cam (`PlaybackScreen`), and the desktop export-preview scrubber. Two live defects cripple the cache: filenames are exact-millisecond but clients request arbitrary cursor times (near-zero hit rate, an ffmpeg re-spawn per scrub), and extraction has no concurrency cap (contrast `/play`'s `play_semaphore`) with `.thumbs` never evicted.
+
+Segments are standard fMP4 ~4 s each; the per-segment seek index is sufficient (a finer keyframe index was evaluated and rejected, see the decision entry). The desktop is the only client whose main playback timeline live-seeks the real mpv panes instead of showing thumbnails, so it stalls when a drag crosses segment boundaries (an mpv `loadfile` per 4 s).
+
+#### Where we are going
+
+The server pre-generates the preview frames so a scrub is a static-file fetch (~5-20 ms LAN) instead of a 150-500 ms ffmpeg spawn, N cameras at once, on hardware the operator already owns. iOS and Android get the win with zero client changes; desktop gains a timeline preview it lacks today. All work is API-side / read-side, off the recorder write path (golden rule 2 unaffected), and preserves standard fMP4 (no interop loss).
+
+#### Plan
+
+Phase 0, cache hygiene, API only, standalone (S)
+
+- [ ] Grid-snap the frame timestamp in `serve_frame` and emit grid-aligned slots in `list_filmstrip` (floor to `SEGMENT_SECONDS`) so repeat and multi-cam-wall scrubs hit warm cache (S)
+- [ ] Global extraction semaphore mirroring `playback.rs`'s `play_semaphore` to cap concurrent ffmpeg spawns (S)
+- [ ] Size/age-capped `.thumbs` eviction task, path-guarded to `.thumbs`, `.jpg` only, tested (S)
+
+Phase 1, pre-generation, API + `db.rs` stub, no migration (M)
+
+- [ ] Background per-camera worker reusing `extract_thumbnail`, interval-driven, semaphore-bounded; hour subdirs `.thumbs/{cam}/{YYYYMMDDHH}/` (M)
+- [ ] Implement `list_thumbnail_times` as grid slots intersected with recorded `segments` coverage (kills 404 slots in gaps; no new table) (S)
+- [ ] Thumbnail retention tied to policy retention, a NEW delete path, path-guarded + tested (S)
+- [ ] Config knobs (`THUMB_INTERVAL_SECS`, enable flag) → `.env.example` / `docs/AI-INSTALL.md` (golden rule 5) (S)
+- [ ] Optional `THUMB_CACHE_DIR` to place the scrub cache on fast/separate storage (e.g. an NVMe partition) while footage stays on bulk HDD, matching the random-read-hot thumbnail workload to the right medium. Low-risk: thumbnails are regenerable and the on-demand path self-heals a wiped cache, so the thumb drive can be cheap and non-redundant (a failure only makes scrubbing temporarily slower, never loses footage) (S)
+
+Phase 2, desktop preview UI, `apps/desktop/src/app.js` only (M)
+
+- [ ] Timeline hover/drag thumbnail strip (webview territory, no pane z-order issue) (M)
+- [ ] Optional full drag swap-grid using the existing native-pane hide/show: JPEG grid while dragging, mpv resolves full-res on release (M)
+
+Phase 3, client polish, optional (S)
+
+- [ ] Android playback-wall scrub tiles (iOS parity); client-side grid-snap of requested timestamps; prefetch around the playhead (S)
+
+Phase 4, efficiency, only if measured need (M)
+
+- [ ] Recorder motion-decoder color-split piggyback to remove the per-interval spawn (needs its own DECISIONS entry + motion tests), and/or sprite atlases if `.thumbs` file count hurts (M)
+
+#### Decisions for the maintainer
+
+- Generation interval (preview granularity vs. CPU/storage): 10 s recommended; 4 s equals per-segment, richer but ~6.5 M files over 30 d at 10 cameras.
+- Whether pre-generation backfills history at low priority, or relies on the on-demand fallback to self-heal history as users scrub it.
+
 ### Cross-cutting
 
 Two pairs of initiatives share infrastructure. Building the shared piece once, deliberately, avoids two divergent half-implementations.

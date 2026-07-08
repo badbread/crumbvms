@@ -163,6 +163,53 @@ pub struct ApiConfig {
     /// the cache unbounded within a day. Default: `10 GiB`.
     pub clip_cache_max_bytes: u64,
 
+    /// `THUMB_EXTRACT_MAX_CONCURRENCY` -- max concurrent on-demand thumbnail
+    /// ffmpeg extractions (the filmstrip scrubber). Each cache miss spawns one
+    /// single-frame ffmpeg; a fast multi-camera scrub would otherwise spawn a
+    /// storm. A shared semaphore caps them, mirroring `playback_max_concurrency`
+    /// and `clip_gen_max_concurrency`. Default scales with the host: about half
+    /// the CPU cores, clamped to `[2, 12]`, so a small box keeps CPU headroom for
+    /// the recorder while a big box isn't throttled to a fixed handful. Override
+    /// to taste.
+    pub thumb_extract_max_concurrency: usize,
+
+    /// `THUMB_CACHE_MAX_BYTES` -- soft byte budget for the filmstrip thumbnail
+    /// cache (`{export_dir}/.thumbs`). A periodic sweeper evicts oldest-by-mtime
+    /// past this budget (and past `THUMB_CACHE_TTL_SECONDS` by age), so scrubbing
+    /// can't grow the cache unbounded. Default: `20 GiB`.
+    pub thumb_cache_max_bytes: u64,
+
+    /// `THUMB_CACHE_TTL_SECONDS` -- age past which a cached thumbnail is evicted
+    /// by the sweeper regardless of the byte budget. Default: `30 days`.
+    pub thumb_cache_ttl_seconds: u64,
+
+    /// `THUMB_PREGEN_ENABLED` -- run the background thumbnail pre-generation
+    /// worker. Off by default: scrubbing is already fast on revisit (the grid-snap
+    /// cache) with zero background cost; pre-generation additionally makes COLD
+    /// first-touch fast, at the price of continuous decode CPU + cache storage.
+    /// Default: `false`.
+    pub thumb_pregen_enabled: bool,
+
+    /// `THUMB_PREGEN_LOOKBACK_HOURS` -- on start, and for a newly-seen camera, the
+    /// worker backfills thumbnails this far back before rolling forward. Default: `2`.
+    pub thumb_pregen_lookback_hours: i64,
+
+    /// `THUMB_PREGEN_SCAN_SECS` -- how often the worker wakes to generate
+    /// thumbnails for newly-recorded footage. Default: `60`.
+    pub thumb_pregen_scan_secs: u64,
+
+    /// `THUMB_PREGEN_WIDTH` -- width the worker pre-generates at. Clients requesting
+    /// this width hit the pre-generated cache; other widths fall back to on-demand
+    /// extraction (width is part of the cache key). Default: `160`.
+    pub thumb_pregen_width: u32,
+
+    /// `THUMB_CACHE_DIR` -- optional override for where the thumbnail cache
+    /// (`.thumbs`) lives. Empty (default) means "under `EXPORT_DIR`". Point it at
+    /// a fast/separate volume (e.g. an `NVMe` mount) so scrub-cache reads don't
+    /// compete with footage on a spinning disk. Safe because thumbnails are
+    /// regenerable: a wiped or dead cache self-heals via on-demand extraction.
+    pub thumb_cache_dir: String,
+
     // -- detection (Frigate) -----------------------------------------------
     /// `FRIGATE_API_BASE` -- base URL of Frigate's HTTP API, used by the
     /// snapshot proxy handler to fetch detection JPEGs.
@@ -212,6 +259,17 @@ pub struct ApiConfig {
 }
 
 impl ApiConfig {
+    /// Base directory the thumbnail `.thumbs` cache lives under: `THUMB_CACHE_DIR`
+    /// when set (e.g. a separate `NVMe` mount), otherwise `EXPORT_DIR`.
+    #[must_use]
+    pub fn thumb_cache_base(&self) -> &str {
+        if self.thumb_cache_dir.is_empty() {
+            &self.export_dir
+        } else {
+            &self.thumb_cache_dir
+        }
+    }
+
     /// Read configuration from the process environment.
     ///
     /// # Errors
@@ -264,6 +322,18 @@ impl ApiConfig {
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),
             clip_gen_max_concurrency: parse_env("CLIP_GEN_MAX_CONCURRENCY", 4usize)?.max(1),
             clip_cache_max_bytes: parse_env("CLIP_CACHE_MAX_BYTES", 10_737_418_240_u64)?,
+            thumb_extract_max_concurrency: parse_env(
+                "THUMB_EXTRACT_MAX_CONCURRENCY",
+                default_thumb_concurrency(),
+            )?
+            .max(1),
+            thumb_cache_max_bytes: parse_env("THUMB_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
+            thumb_cache_ttl_seconds: parse_env("THUMB_CACHE_TTL_SECONDS", 2_592_000_u64)?,
+            thumb_pregen_enabled: parse_env("THUMB_PREGEN_ENABLED", false)?,
+            thumb_pregen_lookback_hours: parse_env("THUMB_PREGEN_LOOKBACK_HOURS", 2_i64)?.max(0),
+            thumb_pregen_scan_secs: parse_env("THUMB_PREGEN_SCAN_SECS", 60_u64)?.max(5),
+            thumb_pregen_width: parse_env("THUMB_PREGEN_WIDTH", 160_u32)?,
+            thumb_cache_dir: optional_env("THUMB_CACHE_DIR", ""),
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),
@@ -296,6 +366,14 @@ fn optional_env_opt(key: &str) -> Option<String> {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => None,
     }
+}
+
+/// Default concurrency for on-demand thumbnail extraction, scaled to the host:
+/// about half the CPU cores, clamped to `[2, 12]`. A small box keeps CPU
+/// headroom for the recorder; a big box isn't throttled to a fixed handful.
+fn default_thumb_concurrency() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(2, 12)
 }
 
 fn parse_env<T>(key: &str, default: T) -> Result<T>

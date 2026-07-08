@@ -67,6 +67,18 @@ struct Inner {
     /// `config.clip_gen_max_concurrency`.
     clip_gen_semaphore: Arc<Semaphore>,
 
+    /// Bounds concurrent on-demand thumbnail ffmpeg extractions (the filmstrip
+    /// scrubber). A fast multi-camera scrub can miss the cache on many frames at
+    /// once; without a cap each miss spawns a single-frame ffmpeg, a spawn storm.
+    /// Permit count = `config.thumb_extract_max_concurrency`.
+    thumb_semaphore: Arc<Semaphore>,
+
+    /// Per-key in-flight locks for thumbnail extraction (singleflight). Keyed by
+    /// the final cache path; a request serializes on its key so two concurrent
+    /// misses on the same slot (e.g. the Phase 1 background writer racing an
+    /// on-demand request) extract once instead of both spawning ffmpeg.
+    thumb_inflight: DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -130,6 +142,7 @@ impl AppState {
         let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
         let play_semaphore = Arc::new(Semaphore::new(config.playback_max_concurrency));
         let clip_gen_semaphore = Arc::new(Semaphore::new(config.clip_gen_max_concurrency));
+        let thumb_semaphore = Arc::new(Semaphore::new(config.thumb_extract_max_concurrency));
 
         // Health-alert maintenance window (issue #46). Off by default; an
         // optional `MAINTENANCE_UNTIL` env (unix seconds) lets a deployment
@@ -149,6 +162,8 @@ impl AppState {
             export_cancels: DashMap::new(),
             play_semaphore,
             clip_gen_semaphore,
+            thumb_semaphore,
+            thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
@@ -266,6 +281,33 @@ impl AppState {
     #[inline]
     pub fn clip_gen_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.0.clip_gen_semaphore)
+    }
+
+    /// Clone the thumbnail-extraction concurrency semaphore handle (cheap `Arc`
+    /// clone). Used by the filmstrip handler to cap concurrent single-frame
+    /// ffmpeg extractions during a scrub.
+    #[inline]
+    pub fn thumb_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.0.thumb_semaphore)
+    }
+
+    /// Get (or create) the singleflight lock for a thumbnail cache key. Callers
+    /// lock it around the "check file, else extract" sequence so concurrent
+    /// misses on the same key extract exactly once.
+    ///
+    /// The map holds only transient per-key locks; if it grows large (many
+    /// distinct on-demand thumbnails), it is cleared wholesale. Dropping an entry
+    /// mid-flight at worst permits one redundant extraction (atomic writes keep
+    /// that correct), never corruption.
+    pub fn thumb_inflight_lock(&self, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        if self.0.thumb_inflight.len() > 8192 {
+            self.0.thumb_inflight.clear();
+        }
+        self.0
+            .thumb_inflight
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     // ── health-alert maintenance window (issue #46) ───────────────────────────

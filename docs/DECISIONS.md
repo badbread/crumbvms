@@ -8,6 +8,70 @@ revisit.
 
 ---
 
+## 2026-07-07, Scrub preview: pre-generated JPEG proxy (API-side); keyframe index rejected
+
+**Problem.** Timeline scrubbing does not yet feel like a leading commercial VMS:
+buttery, instant scrub (including synchronized multi-camera) and frame-accurate
+seek. The open question was whether that requires (a) a low-res preview proxy,
+(b) a finer-than-per-segment seek index, or (c) a custom video container. A
+grounded audit (`services/api/src/filmstrip.rs`, `services/recorder/src/recording.rs`,
+`motion.rs`, the segment schema, and all four clients) answered it.
+
+**Findings that shaped the decision:**
+
+- The preview-proxy plumbing already exists as an explicit "Phase 1":
+  `filmstrip.rs` serves `/filmstrip/{cam}` + `/frame` from on-demand single-frame
+  ffmpeg extraction cached under `{export_dir}/.thumbs`. `db::list_thumbnail_times`
+  is a stub returning empty; there is no background pre-generation. iOS (single-cam
+  plus a multi-camera synchronized wall), Android (single-cam), and the desktop
+  export-preview already consume these frames. The UX is built; the server starves it.
+- Two live defects make the existing cache nearly useless: thumbnail filenames are
+  exact millisecond timestamps but clients request arbitrary cursor times, so the
+  hit rate is near zero and every scrub re-spawns ffmpeg; and extraction has no
+  concurrency cap (unlike `/play`'s `play_semaphore`) and `.thumbs` is never evicted.
+- Segments are standard fMP4, ~4 s each (`SEGMENT_SECONDS`, clamped 2-6), written
+  `-movflags +frag_keyframe+empty_moov+default_base_moof` (fragment boundaries are
+  keyframe boundaries). Only the policy-selected stream is recorded (default `main`);
+  the sub stream is NOT recorded for playback.
+
+**Options considered:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | **Pre-generate the JPEG preview proxy, API-side background worker** reusing `extract_thumbnail`, deriving slot times from `segments` coverage (no migration), grid-aligned cache keys, hour subdirs | **CHOSEN.** Zero recorder changes, zero write-path risk (API mount is read-only), covers all cameras and both recording modes, and three client UIs already render it. |
+| 2 | Recorder piggyback on the motion decoder's in-RAM frames | Deferred. The motion frames are grayscale (`format=gray`); color needs a filtergraph split; coverage holes (Frigate-source cameras bypass the frame pipeline); couples a cosmetic feature to the always-must-work recorder. Revisit only if option 1's API-side CPU is measured too high. |
+| 3 | Dedicated long-running ffmpeg-per-camera off go2rtc | Rejected. Duplicates the sub-stream decode the motion task already pays, the exact cost the power-optimization work fought. |
+| 4 | **Finer-grained seek index** (per-keyframe / byte offsets) | **REJECTED.** At 4 s segments over LAN with native fMP4 fragment parsing in every player, nothing inside a ~2 MB segment is worth indexing server-side. Frame accuracy is a decode problem an index cannot solve (an index cannot create keyframes); all three players already expose exact-seek / frame-step. Would matter only if segments were 5-15 minutes. |
+| 5 | Custom video container | Out of scope. A container buys storage packing / inline metadata / evidence integrity, not scrub smoothness, and would cost fMP4 interop + per-client demuxers + write-path risk. |
+| 6 | Dual-stream recording (record sub continuously for cheap multi-cam scrub) | Out of scope here; separate write-path decision, tracked as ROADMAP dual-stream (#7) and option 5 of the 2026-07-03 motion-recording entry. Do not bundle. |
+
+**Chosen approach.** Finish the preview proxy as an API-side, read-side feature.
+Phase 0 (grid-snap cache keys + extraction semaphore + `.thumbs` eviction) fixes
+the two live defects and stands alone. Phase 1 adds the background pre-generation
+worker and a real `list_thumbnail_times` derived from `segments` (no new table, no
+migration). Phase 2 adds the desktop timeline preview UI (the one client lacking
+it). Phasing in `docs/ROADMAP.md` initiative 8.
+
+**Trades knowingly accepted:**
+
+- Preview granularity equals the generation interval (recommended 10 s), so during
+  a drag the preview steps at ~10 s; sub-second precision still comes from the real
+  video on release (desktop already live-seeks in-segment). This matches commercial
+  VMS behavior.
+- Thumbnails are extra small files (~16-39 GB and 2.6-6.5 M files for 10 cams / 30 d
+  at recommended settings, under 1% of video bytes; file count is the real cost,
+  mitigated by hour subdirs; sprite atlases deferred until file count actually hurts).
+- The Phase 1 thumbnail-retention task is a NEW deletion path; it is path-guarded to
+  `.thumbs`, extension-filtered to `.jpg`, and gets a test, per golden rule 2.
+
+**Revisit triggers:**
+
+- API-side extraction CPU measured unacceptably high on real deployments, reopen
+  option 2 (recorder motion-decoder piggyback).
+- Segment length raised beyond ~15 s, or WAN/remote scrubbing becomes a first-class
+  target, reopen option 4 (finer index) and sprite atlases.
+- `.thumbs` file count demonstrably hurts backup/inode performance, build sprite atlases.
+
 ## 2026-07-06, Docs site: Docusaurus, self-hosted behind cloudflared (docs.crumbvms.com)
 
 **Context.** Crumb needs a public, versioned, searchable documentation site in

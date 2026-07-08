@@ -100,6 +100,7 @@ mod state;
 mod stats;
 mod status;
 mod stream_test;
+mod thumb_pregen;
 mod timeline;
 mod views;
 
@@ -595,6 +596,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Phase 1 thumbnail pre-generation (opt-in via THUMB_PREGEN_ENABLED). The
+    // worker logs + returns immediately when disabled, so spawning it here is
+    // always safe.
+    tokio::spawn(thumb_pregen::run(state.clone()));
+
     // ── 7. bind and serve ─────────────────────────────────────────────────────
     // `into_make_service_with_connect_info` exposes the peer SocketAddr to the
     // rate-limit middleware (ConnectInfo extractor).
@@ -784,6 +790,20 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
             state.config().clip_cache_max_bytes,
         )
         .await;
+
+        // Thumbnail cache: filmstrip scrub frames cached under
+        // {thumb_cache_base}/.thumbs/<camera>/ (EXPORT_DIR, or THUMB_CACHE_DIR if
+        // set); evict by age then byte budget so a long scrubbing history can't
+        // grow it unbounded. Only .jpg files inside .thumbs are ever removed
+        // (guarded in the sweeper).
+        sweep_thumbs_cache(
+            state.config().thumb_cache_base(),
+            chrono::Duration::seconds(
+                i64::try_from(state.config().thumb_cache_ttl_seconds).unwrap_or(2_592_000),
+            ),
+            state.config().thumb_cache_max_bytes,
+        )
+        .await;
     }
 }
 
@@ -831,5 +851,109 @@ async fn sweep_clips_cache(export_dir: &str, ttl: chrono::Duration, max_bytes: u
                 total = total.saturating_sub(size);
             }
         }
+    }
+}
+
+/// Evict cached filmstrip thumbnails under `{export_dir}/.thumbs` (walked
+/// recursively: `<camera>/…/<ts>.jpg`, including Phase-1 hour subdirs). First
+/// anything older than `ttl` by mtime, then, if survivors still exceed
+/// `max_bytes`, the oldest until back under budget.
+///
+/// GUARDED: only `.jpg` files inside the canonical `.thumbs` root are ever
+/// removed, so it can never touch a segment, export, or clip even if an odd
+/// entry appears under the tree.
+async fn sweep_thumbs_cache(export_dir: &str, ttl: chrono::Duration, max_bytes: u64) {
+    let root_canon =
+        match tokio::fs::canonicalize(std::path::Path::new(export_dir).join(".thumbs")).await {
+            Ok(p) => p,
+            Err(_) => return, // no thumbs cache yet
+        };
+    let now = std::time::SystemTime::now();
+    let max_age =
+        std::time::Duration::from_secs(u64::try_from(ttl.num_seconds()).unwrap_or(2_592_000));
+
+    // Pass 1: recursive walk + age eviction; collect survivors for pass 2.
+    let mut survivors: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![root_canon.clone()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            // GUARD: only .jpg files, and only within the canonical .thumbs
+            // root. Anything else is left untouched.
+            if !meta.is_file()
+                || path.extension().and_then(|e| e.to_str()) != Some("jpg")
+                || !path.starts_with(&root_canon)
+            {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(now);
+            if now.duration_since(mtime).ok().is_some_and(|a| a > max_age) {
+                let _ = tokio::fs::remove_file(&path).await;
+                continue;
+            }
+            total += meta.len();
+            survivors.push((path, mtime, meta.len()));
+        }
+    }
+
+    // Pass 2: byte-budget LRU eviction (oldest mtime first).
+    if total > max_bytes {
+        survivors.sort_by_key(|(_, mtime, _)| *mtime);
+        for (path, _, size) in survivors {
+            if total <= max_bytes {
+                break;
+            }
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod thumb_sweep_tests {
+    use super::sweep_thumbs_cache;
+
+    /// The sweeper removes `.jpg` thumbnails but NEVER a non-jpg file under
+    /// `.thumbs`, and honours the byte budget. Uses `max_bytes = 0` so the
+    /// byte-eviction pass runs on all surviving jpgs without needing to age
+    /// their mtimes, and a generous ttl so the age pass keeps everything for
+    /// pass 2 to act on.
+    #[tokio::test]
+    async fn sweeps_only_jpgs_within_thumbs() {
+        // Manual unique temp dir (the api test-suite avoids the tempfile crate;
+        // see tests/support). Keyed by pid so parallel test binaries don't clash.
+        let base = std::env::temp_dir().join(format!("crumb-thumbsweep-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let cam_dir = base.join(".thumbs").join("cam-a");
+        tokio::fs::create_dir_all(&cam_dir).await.unwrap();
+
+        let jpg1 = cam_dir.join("0000000001000.jpg");
+        let jpg2 = cam_dir.join("0000000002000.jpg");
+        let keep = cam_dir.join("do-not-touch.mp4"); // a non-jpg the guard must skip
+        tokio::fs::write(&jpg1, b"xxxx").await.unwrap();
+        tokio::fs::write(&jpg2, b"yyyy").await.unwrap();
+        tokio::fs::write(&keep, b"segment-ish").await.unwrap();
+
+        // ttl huge (nothing age-evicted), byte budget 0 (all jpgs LRU-evicted).
+        sweep_thumbs_cache(base.to_str().unwrap(), chrono::Duration::seconds(86_400), 0).await;
+
+        assert!(!jpg1.exists(), "jpg1 should be byte-budget evicted");
+        assert!(!jpg2.exists(), "jpg2 should be byte-budget evicted");
+        assert!(keep.exists(), "non-jpg file must never be removed");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

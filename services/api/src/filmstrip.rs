@@ -71,7 +71,16 @@ use crate::{
 
 /// Spacing between synthetic thumbnail entries when no pre-extracted frames
 /// exist.  4 s matches the default `SEGMENT_SECONDS` in the recorder.
-const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
+pub(crate) const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
+
+/// Bounds on the requested thumbnail width. The width is part of the cache key,
+/// so clamping here keeps the number of distinct cached resolutions finite.
+const THUMB_MIN_WIDTH: u32 = 48;
+const THUMB_MAX_WIDTH: u32 = 640;
+
+/// Monotonic counter for unique temp-file suffixes during atomic thumbnail
+/// writes (ffmpeg renders to `<final>.tmpN`, then we rename into place).
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Subdirectory within `live_storage_path` where thumbnails are stored.
 const THUMBS_SUBDIR: &str = ".thumbs";
@@ -182,27 +191,20 @@ async fn serve_frame(
     // Camera access check.
     user.assert_camera_access(camera_id)?;
 
-    // Derive the file path from the timestamp.
-    //
-    // Filename = milliseconds since epoch, zero-padded to 13 digits.
-    // This is deterministic and contains no user-controlled data beyond the
-    // parsed timestamp.
-    let ts_ms = q.ts.timestamp_millis();
-    // Cache thumbnails under the WRITABLE export volume — the live/archive storage
-    // roots are mounted read-only in the API container, so `.thumbs` can't live there.
-    let thumbs_root = std::path::PathBuf::from(&state.config().export_dir)
-        .join(THUMBS_SUBDIR)
-        .join(camera_id.to_string());
-    let frame_path = thumbs_root.join(format!("{ts_ms:013}.jpg"));
-
-    // On-demand extraction: there is no background thumbnail task, so if this
-    // frame isn't cached yet, pull a single frame from the recorded segment that
-    // covers `ts` and write it to the cache path. This is what makes the filmstrip
-    // scrubber + clip-start thumbnails actually work (and gives a past-frame still,
-    // which the live `frame.jpg` proxy cannot). Subsequent requests hit the cache.
-    if tokio::fs::metadata(&frame_path).await.is_err() {
-        extract_thumbnail(&state, camera_id, q.ts, q.width, &thumbs_root, &frame_path).await?;
-    }
+    // Snap the requested timestamp to a fixed global grid so arbitrary scrub
+    // cursor times settle onto shared cache keys (a mid-scrub jitter no longer
+    // produces a fresh filename + decode per tick), key the cache on the clamped
+    // width, then ensure the frame exists, extracting on demand (singleflight +
+    // atomic write) if the background pre-generation worker hasn't produced it.
+    // The `.thumbs` cache lives under the WRITABLE export volume (the live/archive
+    // roots are read-only in the api container). See `thumb_frame_path`.
+    let grid_ms = DEFAULT_THUMB_INTERVAL_SECS * 1000;
+    let ts_ms = q.ts.timestamp_millis().div_euclid(grid_ms) * grid_ms;
+    let snapped_ts = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or(q.ts);
+    let w = q.width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    let (thumbs_root, frame_path) =
+        thumb_frame_path(state.config().thumb_cache_base(), camera_id, ts_ms, w);
+    ensure_thumbnail(&state, camera_id, snapped_ts, w).await?;
 
     // Path traversal guard: the resolved path must start with the thumbs root.
     // We canonicalize the root first (it must exist for the guard to be
@@ -264,6 +266,54 @@ async fn serve_frame(
     Ok(response)
 }
 
+// ─── shared cache-path + ensure helpers ───────────────────────────────────────
+
+/// On-disk cache path for a thumbnail:
+/// `{export_dir}/.thumbs/{camera}/{ts_ms}_w{width}.jpg`. Returns
+/// `(thumbs_root_dir, frame_file)`. Shared by the request handler and the
+/// background pre-generation worker so both agree on the exact layout.
+pub(crate) fn thumb_frame_path(
+    export_dir: &str,
+    camera_id: Uuid,
+    ts_ms: i64,
+    width: u32,
+) -> (PathBuf, PathBuf) {
+    let root = PathBuf::from(export_dir)
+        .join(THUMBS_SUBDIR)
+        .join(camera_id.to_string());
+    let frame = root.join(format!("{ts_ms:013}_w{width}.jpg"));
+    (root, frame)
+}
+
+/// Ensure a thumbnail exists for the (already grid-snapped) `snapped_ts` at
+/// `width`, extracting it once under the singleflight lock if absent. Reused by
+/// the request path and the Phase 1 background worker. Returns the cache path.
+pub(crate) async fn ensure_thumbnail(
+    state: &AppState,
+    camera_id: Uuid,
+    snapped_ts: DateTime<Utc>,
+    width: u32,
+) -> Result<PathBuf, ApiError> {
+    let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    let (thumbs_root, frame_path) = thumb_frame_path(
+        state.config().thumb_cache_base(),
+        camera_id,
+        snapped_ts.timestamp_millis(),
+        w,
+    );
+    if tokio::fs::metadata(&frame_path).await.is_ok() {
+        return Ok(frame_path);
+    }
+    // Singleflight: serialize concurrent misses on this key so only one caller
+    // extracts (background worker vs on-demand request, or two scrubbers).
+    let lock = state.thumb_inflight_lock(&frame_path);
+    let _flight = lock.lock().await;
+    if tokio::fs::metadata(&frame_path).await.is_err() {
+        extract_thumbnail(state, camera_id, snapped_ts, w, &thumbs_root, &frame_path).await?;
+    }
+    Ok(frame_path)
+}
+
 // ─── on-demand thumbnail extraction ───────────────────────────────────────────
 
 /// Extract a single JPEG frame at `ts` from the recorded segment covering it,
@@ -312,11 +362,31 @@ async fn extract_thumbnail(
     // In-segment offset (clamped non-negative).
     #[allow(clippy::cast_precision_loss)]
     let offset_secs: f64 = (ts - seg.start_ts).num_milliseconds().max(0) as f64 / 1000.0;
-    let w = width.clamp(48, 640);
+    let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
 
     tokio::fs::create_dir_all(thumbs_root)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("create thumbs dir: {e}")))?;
+
+    // Atomic write: ffmpeg renders to a unique temp file, then we rename it into
+    // place. A rename on the same filesystem is atomic, so a concurrent reader
+    // (or the Phase 1 background writer racing an on-demand request) can never
+    // observe a half-written JPEG. The `.tmp*` suffix keeps the `.jpg`-only
+    // sweeper from touching an in-flight temp.
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_os = frame_path.as_os_str().to_owned();
+    tmp_os.push(format!(".tmp{seq}"));
+    let tmp_path = PathBuf::from(tmp_os);
+
+    // Cap concurrent extractions so a fast multi-camera scrub (each miss is one
+    // single-frame ffmpeg) can't spawn a storm, mirroring the `/play` and
+    // clip-gen semaphores. The permit is held only for the decode below and
+    // released on drop when this function returns.
+    let _permit = state
+        .thumb_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("thumb semaphore closed: {e}")))?;
 
     let args: Vec<String> = vec![
         "-y".to_owned(),
@@ -331,7 +401,7 @@ async fn extract_thumbnail(
         format!("scale={w}:-2"),
         "-q:v".to_owned(),
         "4".to_owned(),
-        frame_path.to_string_lossy().into_owned(),
+        tmp_path.to_string_lossy().into_owned(),
     ];
 
     let child = Command::new(FFMPEG_BIN)
@@ -351,23 +421,36 @@ async fn extract_thumbnail(
     .map_err(|_| ApiError::Internal(anyhow::anyhow!("thumbnail extraction timed out")))?
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("ffmpeg wait: {e}")))?;
 
-    if !status.status.success() || tokio::fs::metadata(frame_path).await.is_err() {
+    if !status.status.success() || tokio::fs::metadata(&tmp_path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(ApiError::NotFound(format!(
             "could not extract a thumbnail at {} for camera {camera_id}",
             ts.to_rfc3339()
         )));
     }
 
+    // Publish atomically: rename the completed temp into the final cache path.
+    tokio::fs::rename(&tmp_path, frame_path)
+        .await
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            ApiError::Internal(anyhow::anyhow!("finalize thumbnail: {e}"))
+        })?;
+
     Ok(())
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-/// Generate evenly-spaced timestamp slots across `[start, end)` with
-/// `interval_secs` spacing.
+/// Generate timestamp slots across `[start, end)` anchored to a fixed global
+/// grid of `interval_secs`.
 ///
-/// Always includes a slot at exactly `start`.  The last slot is the largest
-/// multiple of `interval_secs` from `start` that is strictly less than `end`.
+/// Slots are floored to the interval on the wall-clock epoch, NOT anchored to
+/// the arbitrary query `start`. Identical slot timestamps across different scrub
+/// windows are what let the pre-extracted / cached frames be reused instead of
+/// re-extracted per window (the list side of the same snapping `serve_frame`
+/// applies to a single frame). The first slot is `start` floored to the grid;
+/// the last is the largest grid multiple strictly less than `end`.
 fn generate_synthetic_timestamps(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -376,16 +459,19 @@ fn generate_synthetic_timestamps(
     if interval_secs <= 0 {
         return vec![];
     }
-    let total_ms = (end - start).num_milliseconds();
-    if total_ms <= 0 {
+    let step_ms = interval_secs * 1_000;
+    // Floor `start` to the global grid so slot timestamps are stable across
+    // query windows (cache reuse). `div_euclid` floors correctly even for a
+    // pre-epoch input.
+    let start_ms = start.timestamp_millis().div_euclid(step_ms) * step_ms;
+    let end_ms = end.timestamp_millis();
+    if end_ms <= start_ms {
         return vec![];
     }
-    let step_ms = interval_secs * 1_000;
-    // total_ms and step_ms are both positive here; quotient fits usize on all
+    // start_ms < end_ms and step_ms > 0 here; the quotient fits usize on all
     // targets we care about (Linux x86_64 with 48-bit virtual address space).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let count = (total_ms / step_ms) as usize + 1;
-    let start_ms = start.timestamp_millis();
+    let count = ((end_ms - start_ms) / step_ms) as usize + 1;
 
     (0..count)
         .filter_map(|i| {
