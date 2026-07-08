@@ -8125,7 +8125,21 @@ function pbUpdateTimeDisplay() {
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
-  els.pbTimeDisplay.textContent = `${hh}:${mm}:${ss}`;
+  if (!pbIsToday(pbState.playheadMs)) {
+    const mon = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    els.pbTimeDisplay.textContent = `${mon}/${day} ${hh}:${mm}:${ss}`;
+  } else {
+    els.pbTimeDisplay.textContent = `${hh}:${mm}:${ss}`;
+  }
+}
+
+function pbIsToday(epochMs) {
+  const d = new Date(epochMs);
+  const now = new Date();
+  return d.getFullYear() === now.getFullYear() &&
+         d.getMonth() === now.getMonth() &&
+         d.getDate() === now.getDate();
 }
 
 // ── Keyboard shortcuts (playback) ─────────────────────────────────────────────
@@ -8868,15 +8882,24 @@ function pbPickGridInterval(winDurMs) {
   return 6 * HRS;                                   // 6 h
 }
 
-/** Format a label appropriate to the grid interval. */
+/** Format a label appropriate to the grid interval.
+ *  Prefixes a short date (MM/DD) when the gridline falls on a day other than
+ *  today, so scrubbing into the past never loses day context. */
 function pbFmtGridLabel(epochMs, intervalMs) {
   const d  = new Date(epochMs);
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
-  if (intervalMs >= 3600_000) return `${hh}:00`;
-  if (intervalMs >= 60_000)   return `${hh}:${mm}`;
-  return `${hh}:${mm}:${ss}`;
+  let time;
+  if (intervalMs >= 3600_000) time = `${hh}:00`;
+  else if (intervalMs >= 60_000) time = `${hh}:${mm}`;
+  else time = `${hh}:${mm}:${ss}`;
+  if (!pbIsToday(epochMs)) {
+    const mon = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${mon}/${day} ${time}`;
+  }
+  return time;
 }
 
 /** Human-readable window duration label for the span badge. */
@@ -8895,6 +8918,11 @@ function pbFmtTime(epochMs) {
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
+  if (!pbIsToday(epochMs)) {
+    const mon = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${mon}/${day} ${hh}:${mm}:${ss}`;
+  }
   return `${hh}:${mm}:${ss}`;
 }
 
