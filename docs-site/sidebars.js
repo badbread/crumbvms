@@ -59,6 +59,8 @@ const sidebars = {
       link: { type: 'doc', id: 'playback/scrubbing' },
       items: [
         'playback/scrubbing',
+        'playback/clips',
+        'playback/export',
       ],
     },
     {
@@ -92,6 +94,7 @@ const sidebars = {
       link: { type: 'doc', id: 'admin-console/index' },
       items: [
         'admin-console/index',
+        'admin-console/users-and-access',
       ],
     },
     {
