@@ -1476,7 +1476,7 @@ body.vs-reordering, body.vs-reordering * { cursor: grabbing !important; user-sel
   font-weight: 600;
   color: var(--text);
   letter-spacing: 1px;
-  min-width: 84px;
+  min-width: 130px;
   text-align: center;
 }
 
