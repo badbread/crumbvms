@@ -167,7 +167,10 @@ pub struct ApiConfig {
     /// ffmpeg extractions (the filmstrip scrubber). Each cache miss spawns one
     /// single-frame ffmpeg; a fast multi-camera scrub would otherwise spawn a
     /// storm. A shared semaphore caps them, mirroring `playback_max_concurrency`
-    /// and `clip_gen_max_concurrency`. Default: `4`.
+    /// and `clip_gen_max_concurrency`. Default scales with the host: about half
+    /// the CPU cores, clamped to `[2, 12]`, so a small box keeps CPU headroom for
+    /// the recorder while a big box isn't throttled to a fixed handful. Override
+    /// to taste.
     pub thumb_extract_max_concurrency: usize,
 
     /// `THUMB_CACHE_MAX_BYTES` -- soft byte budget for the filmstrip thumbnail
@@ -319,8 +322,11 @@ impl ApiConfig {
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),
             clip_gen_max_concurrency: parse_env("CLIP_GEN_MAX_CONCURRENCY", 4usize)?.max(1),
             clip_cache_max_bytes: parse_env("CLIP_CACHE_MAX_BYTES", 10_737_418_240_u64)?,
-            thumb_extract_max_concurrency: parse_env("THUMB_EXTRACT_MAX_CONCURRENCY", 4usize)?
-                .max(1),
+            thumb_extract_max_concurrency: parse_env(
+                "THUMB_EXTRACT_MAX_CONCURRENCY",
+                default_thumb_concurrency(),
+            )?
+            .max(1),
             thumb_cache_max_bytes: parse_env("THUMB_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
             thumb_cache_ttl_seconds: parse_env("THUMB_CACHE_TTL_SECONDS", 2_592_000_u64)?,
             thumb_pregen_enabled: parse_env("THUMB_PREGEN_ENABLED", false)?,
@@ -360,6 +366,14 @@ fn optional_env_opt(key: &str) -> Option<String> {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => None,
     }
+}
+
+/// Default concurrency for on-demand thumbnail extraction, scaled to the host:
+/// about half the CPU cores, clamped to `[2, 12]`. A small box keeps CPU
+/// headroom for the recorder; a big box isn't throttled to a fixed handful.
+fn default_thumb_concurrency() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(2, 12)
 }
 
 fn parse_env<T>(key: &str, default: T) -> Result<T>
