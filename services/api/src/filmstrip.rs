@@ -388,28 +388,12 @@ async fn extract_thumbnail(
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("thumb semaphore closed: {e}")))?;
 
-    let args: Vec<String> = vec![
-        "-y".to_owned(),
-        "-ss".to_owned(),
-        format!("{offset_secs:.3}"),
-        "-i".to_owned(),
-        seg_abs.to_string_lossy().into_owned(),
-        "-frames:v".to_owned(),
-        "1".to_owned(),
-        "-an".to_owned(),
-        "-vf".to_owned(),
-        format!("scale={w}:-2"),
-        "-q:v".to_owned(),
-        "4".to_owned(),
-        // Force the muxer explicitly. The atomic-write temp path ends in
-        // `.tmp{seq}` (not `.jpg`), so ffmpeg cannot infer the output format from
-        // the extension and fails to open the output — every extraction 404s. A
-        // single-frame mjpeg IS a JPEG, so the served bytes and the `.jpg` cache
-        // file are unchanged.
-        "-f".to_owned(),
-        "mjpeg".to_owned(),
-        tmp_path.to_string_lossy().into_owned(),
-    ];
+    let args = thumb_ffmpeg_args(
+        offset_secs,
+        w,
+        &seg_abs.to_string_lossy(),
+        &tmp_path.to_string_lossy(),
+    );
 
     let child = Command::new(FFMPEG_BIN)
         .args(&args)
@@ -531,5 +515,60 @@ mod urlencoding {
             }
         }
         std::borrow::Cow::Owned(out)
+    }
+}
+
+/// Build the ffmpeg args for a single-frame thumbnail extraction.
+///
+/// Factored out for a regression guard: the output muxer MUST be forced with
+/// `-f mjpeg` because the atomic-write temp path ends in `.tmp{seq}` (not
+/// `.jpg`), so ffmpeg cannot infer the format from the extension. Without it,
+/// every extraction fails to open the output ("Unable to choose an output
+/// format") and `serve_frame` 404s. See `thumb_ffmpeg_args_forces_mjpeg`.
+fn thumb_ffmpeg_args(offset_secs: f64, width: u32, input: &str, output: &str) -> Vec<String> {
+    vec![
+        "-y".to_owned(),
+        "-ss".to_owned(),
+        format!("{offset_secs:.3}"),
+        "-i".to_owned(),
+        input.to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-an".to_owned(),
+        "-vf".to_owned(),
+        format!("scale={width}:-2"),
+        "-q:v".to_owned(),
+        "4".to_owned(),
+        // Force the muxer: the temp output ends in `.tmp{seq}`, not `.jpg`.
+        "-f".to_owned(),
+        "mjpeg".to_owned(),
+        output.to_owned(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thumb_ffmpeg_args;
+
+    #[test]
+    fn thumb_ffmpeg_args_forces_mjpeg() {
+        // The atomic-write output ends in `.tmp{n}`, so ffmpeg can't infer the
+        // muxer from the extension. If `-f mjpeg` ever goes missing, extraction
+        // fails to open the output and every scrub frame 404s (the shipped-broken
+        // regression this guards against).
+        let args = thumb_ffmpeg_args(2.5, 160, "/data/archive/cam/seg.mp4", "/thumbs/x.jpg.tmp7");
+        let f = args
+            .iter()
+            .position(|a| a == "-f")
+            .expect("ffmpeg args must force an output format");
+        assert_eq!(
+            args.get(f + 1).map(String::as_str),
+            Some("mjpeg"),
+            "output muxer must be mjpeg",
+        );
+        // ffmpeg's positional output is last; single frame; no audio.
+        assert_eq!(args.last().map(String::as_str), Some("/thumbs/x.jpg.tmp7"));
+        assert!(args.iter().any(|a| a == "-frames:v"));
+        assert!(args.iter().any(|a| a == "-an"));
     }
 }
