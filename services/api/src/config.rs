@@ -200,6 +200,13 @@ pub struct ApiConfig {
     /// extraction (width is part of the cache key). Default: `160`.
     pub thumb_pregen_width: u32,
 
+    /// `THUMB_CACHE_DIR` -- optional override for where the thumbnail cache
+    /// (`.thumbs`) lives. Empty (default) means "under `EXPORT_DIR`". Point it at
+    /// a fast/separate volume (e.g. an `NVMe` mount) so scrub-cache reads don't
+    /// compete with footage on a spinning disk. Safe because thumbnails are
+    /// regenerable: a wiped or dead cache self-heals via on-demand extraction.
+    pub thumb_cache_dir: String,
+
     // -- detection (Frigate) -----------------------------------------------
     /// `FRIGATE_API_BASE` -- base URL of Frigate's HTTP API, used by the
     /// snapshot proxy handler to fetch detection JPEGs.
@@ -249,6 +256,17 @@ pub struct ApiConfig {
 }
 
 impl ApiConfig {
+    /// Base directory the thumbnail `.thumbs` cache lives under: `THUMB_CACHE_DIR`
+    /// when set (e.g. a separate `NVMe` mount), otherwise `EXPORT_DIR`.
+    #[must_use]
+    pub fn thumb_cache_base(&self) -> &str {
+        if self.thumb_cache_dir.is_empty() {
+            &self.export_dir
+        } else {
+            &self.thumb_cache_dir
+        }
+    }
+
     /// Read configuration from the process environment.
     ///
     /// # Errors
@@ -309,6 +327,7 @@ impl ApiConfig {
             thumb_pregen_lookback_hours: parse_env("THUMB_PREGEN_LOOKBACK_HOURS", 2_i64)?.max(0),
             thumb_pregen_scan_secs: parse_env("THUMB_PREGEN_SCAN_SECS", 60_u64)?.max(5),
             thumb_pregen_width: parse_env("THUMB_PREGEN_WIDTH", 160_u32)?,
+            thumb_cache_dir: optional_env("THUMB_CACHE_DIR", ""),
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),

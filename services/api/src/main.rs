@@ -792,11 +792,12 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
         .await;
 
         // Thumbnail cache: filmstrip scrub frames cached under
-        // {export_dir}/.thumbs/<camera>/; evict by age then byte budget so a
-        // long scrubbing history can't grow it unbounded. Only .jpg files
-        // inside .thumbs are ever removed (guarded in the sweeper).
+        // {thumb_cache_base}/.thumbs/<camera>/ (EXPORT_DIR, or THUMB_CACHE_DIR if
+        // set); evict by age then byte budget so a long scrubbing history can't
+        // grow it unbounded. Only .jpg files inside .thumbs are ever removed
+        // (guarded in the sweeper).
         sweep_thumbs_cache(
-            &state.config().export_dir,
+            state.config().thumb_cache_base(),
             chrono::Duration::seconds(
                 i64::try_from(state.config().thumb_cache_ttl_seconds).unwrap_or(2_592_000),
             ),

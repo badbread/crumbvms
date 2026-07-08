@@ -203,7 +203,7 @@ async fn serve_frame(
     let snapped_ts = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or(q.ts);
     let w = q.width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
     let (thumbs_root, frame_path) =
-        thumb_frame_path(&state.config().export_dir, camera_id, ts_ms, w);
+        thumb_frame_path(state.config().thumb_cache_base(), camera_id, ts_ms, w);
     ensure_thumbnail(&state, camera_id, snapped_ts, w).await?;
 
     // Path traversal guard: the resolved path must start with the thumbs root.
@@ -296,7 +296,7 @@ pub(crate) async fn ensure_thumbnail(
 ) -> Result<PathBuf, ApiError> {
     let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
     let (thumbs_root, frame_path) = thumb_frame_path(
-        &state.config().export_dir,
+        state.config().thumb_cache_base(),
         camera_id,
         snapped_ts.timestamp_millis(),
         w,
