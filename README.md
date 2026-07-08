@@ -231,6 +231,9 @@ That's the whole install. A few options if you want them:
 - **Build from source** instead of pulling images (you're developing Crumb, running air-gapped,
   or using a fork that hasn't published images):
   `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`
+- **Running on Proxmox?** Same stack in a Debian/Ubuntu VM or LXC, though nobody has
+  verified that path yet. See [Running on Proxmox](docs/AI-INSTALL.md#running-on-proxmox-vm-or-lxc)
+  for the VM-vs-LXC tradeoff, GPU passthrough, and where to put recordings.
   ([docs/IMAGES.md](docs/IMAGES.md)).
 
 > Headless/CI: set `SEED_ADMIN_PASSWORD` in `.env` to skip the browser wizard. For a

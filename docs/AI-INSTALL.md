@@ -68,6 +68,45 @@ CrumbVMS records **security cameras**. A misconfiguration is a privacy hazard, s
 **Verify:** `docker compose version` prints v2.x; the target disk has > (estimate
 from camera count × resolution × retention) free.
 
+### Running on Proxmox (VM or LXC)
+
+> **Untested path.** No one has verified a Proxmox install yet. Crumb's
+> maintainer runs it on a plain Docker host, not a Proxmox guest, so the steps
+> below are "same Docker stack on a Linux host" reasoning, sound in principle
+> but not a proven runbook. If you stand it up this way, please report back (an
+> issue or a Discussions note) so it can graduate from "should work" to "tested."
+
+CrumbVMS has no Proxmox-specific requirements, it's the same Docker Compose
+stack, and a Proxmox guest running Debian/Ubuntu is just "a Linux host." The
+guest choice is the user's; provisioning it (and any GPU passthrough) is a
+privileged action on the Proxmox host, so **confirm before creating or
+reconfiguring guests.** Two supported shapes:
+
+- **VM, recommended if unsure.** A Debian/Ubuntu VM, then Docker, then this
+  stack. Fewest surprises. For hardware decode, PCIe-passthrough the GPU to the
+  VM, note this **dedicates** the card to that one guest.
+- **LXC, more efficient and homelab-native.** An **unprivileged** Debian LXC
+  with Docker nesting enabled (`pct set <id> --features nesting=1`, or the
+  "Nesting" checkbox; some setups also need `keyctl=1`). Docker then runs inside
+  the container. For hardware decode, bind the render node (`/dev/dri` for VAAPI,
+  or the NVIDIA device nodes) into the LXC, which keeps the GPU **shareable**
+  across containers instead of dedicating it. Docker-in-LXC + NVIDIA has sharp
+  edges (device cgroups, unprivileged uid mapping), if it fights you, fall back
+  to the VM.
+
+**Storage, do this deliberately.** Footage is large and write-heavy, keep it off
+the guest's root disk. Put `MEDIA_HOST_PATH` (Step 3) on a dedicated disk or
+dataset:
+
+- **LXC:** a mount point to a ZFS dataset, e.g.
+  `pct set <id> --mp0 /tank/crumb-media,mp=/data/media`, then set
+  `MEDIA_HOST_PATH=/data/media` in `.env`.
+- **VM:** a separate virtio disk on the pool, mounted in the guest, then point
+  `MEDIA_HOST_PATH` at that mount.
+
+A thin root disk that silently fills is exactly how a recorder loses footage.
+Everything from Step 2 onward is identical to any other Linux host.
+
 ---
 
 ## 2. Generate config + secrets
