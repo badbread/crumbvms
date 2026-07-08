@@ -140,5 +140,9 @@ focused PRs, tests for changed behavior). Non-negotiables for agent sessions:
   The human owns and must review what an AI session produces before opening a PR.
 - Match the surrounding code's style; don't reformat or "clean up" code you
   aren't changing.
+- Bugs follow the bug workflow: file a GitHub issue (`bug` label + area label),
+  fix on a one-bug-per-branch `fix/<slug>` branch, and put `Fixes #<n>` in the
+  PR. Footage-threatening or won't-boot bugs may hotfix straight to a `fix/`
+  branch. Same flow for every component; details in `CONTRIBUTING.md`.
 - Security vulnerabilities go through GitHub private reporting
   (see `SECURITY.md`), never the public tracker or a PR description.
