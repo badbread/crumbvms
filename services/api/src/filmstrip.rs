@@ -73,6 +73,15 @@ use crate::{
 /// exist.  4 s matches the default `SEGMENT_SECONDS` in the recorder.
 const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
 
+/// Bounds on the requested thumbnail width. The width is part of the cache key,
+/// so clamping here keeps the number of distinct cached resolutions finite.
+const THUMB_MIN_WIDTH: u32 = 48;
+const THUMB_MAX_WIDTH: u32 = 640;
+
+/// Monotonic counter for unique temp-file suffixes during atomic thumbnail
+/// writes (ffmpeg renders to `<final>.tmpN`, then we rename into place).
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Subdirectory within `live_storage_path` where thumbnails are stored.
 const THUMBS_SUBDIR: &str = ".thumbs";
 
@@ -199,12 +208,18 @@ async fn serve_frame(
     let grid_ms = DEFAULT_THUMB_INTERVAL_SECS * 1000;
     let ts_ms = q.ts.timestamp_millis().div_euclid(grid_ms) * grid_ms;
     let snapped_ts = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or(q.ts);
+    // Clamp the requested width to the same range `extract_thumbnail` uses, and
+    // key the cache on it. Different clients ask for different widths (Android
+    // wall 320, iOS single-cam 160); without width in the key the FIRST requester
+    // fixes the stored resolution for everyone. All requests that clamp to the
+    // same width share a file; others get their own.
+    let w = q.width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
     // Cache thumbnails under the WRITABLE export volume — the live/archive storage
     // roots are mounted read-only in the API container, so `.thumbs` can't live there.
     let thumbs_root = std::path::PathBuf::from(&state.config().export_dir)
         .join(THUMBS_SUBDIR)
         .join(camera_id.to_string());
-    let frame_path = thumbs_root.join(format!("{ts_ms:013}.jpg"));
+    let frame_path = thumbs_root.join(format!("{ts_ms:013}_w{w}.jpg"));
 
     // On-demand extraction: there is no background thumbnail task, so if this
     // frame isn't cached yet, pull a single frame from the recorded segment that
@@ -212,15 +227,14 @@ async fn serve_frame(
     // scrubber + clip-start thumbnails actually work (and gives a past-frame still,
     // which the live `frame.jpg` proxy cannot). Subsequent requests hit the cache.
     if tokio::fs::metadata(&frame_path).await.is_err() {
-        extract_thumbnail(
-            &state,
-            camera_id,
-            snapped_ts,
-            q.width,
-            &thumbs_root,
-            &frame_path,
-        )
-        .await?;
+        // Singleflight: serialize concurrent misses on this key so only one
+        // request extracts (the rest wait and hit the freshly-published file).
+        let lock = state.thumb_inflight_lock(&frame_path);
+        let _flight = lock.lock().await;
+        // Re-check under the lock: a prior holder may have just published it.
+        if tokio::fs::metadata(&frame_path).await.is_err() {
+            extract_thumbnail(&state, camera_id, snapped_ts, w, &thumbs_root, &frame_path).await?;
+        }
     }
 
     // Path traversal guard: the resolved path must start with the thumbs root.
@@ -331,11 +345,21 @@ async fn extract_thumbnail(
     // In-segment offset (clamped non-negative).
     #[allow(clippy::cast_precision_loss)]
     let offset_secs: f64 = (ts - seg.start_ts).num_milliseconds().max(0) as f64 / 1000.0;
-    let w = width.clamp(48, 640);
+    let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
 
     tokio::fs::create_dir_all(thumbs_root)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("create thumbs dir: {e}")))?;
+
+    // Atomic write: ffmpeg renders to a unique temp file, then we rename it into
+    // place. A rename on the same filesystem is atomic, so a concurrent reader
+    // (or the Phase 1 background writer racing an on-demand request) can never
+    // observe a half-written JPEG. The `.tmp*` suffix keeps the `.jpg`-only
+    // sweeper from touching an in-flight temp.
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_os = frame_path.as_os_str().to_owned();
+    tmp_os.push(format!(".tmp{seq}"));
+    let tmp_path = PathBuf::from(tmp_os);
 
     // Cap concurrent extractions so a fast multi-camera scrub (each miss is one
     // single-frame ffmpeg) can't spawn a storm, mirroring the `/play` and
@@ -360,7 +384,7 @@ async fn extract_thumbnail(
         format!("scale={w}:-2"),
         "-q:v".to_owned(),
         "4".to_owned(),
-        frame_path.to_string_lossy().into_owned(),
+        tmp_path.to_string_lossy().into_owned(),
     ];
 
     let child = Command::new(FFMPEG_BIN)
@@ -380,12 +404,21 @@ async fn extract_thumbnail(
     .map_err(|_| ApiError::Internal(anyhow::anyhow!("thumbnail extraction timed out")))?
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("ffmpeg wait: {e}")))?;
 
-    if !status.status.success() || tokio::fs::metadata(frame_path).await.is_err() {
+    if !status.status.success() || tokio::fs::metadata(&tmp_path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(ApiError::NotFound(format!(
             "could not extract a thumbnail at {} for camera {camera_id}",
             ts.to_rfc3339()
         )));
     }
+
+    // Publish atomically: rename the completed temp into the final cache path.
+    tokio::fs::rename(&tmp_path, frame_path)
+        .await
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            ApiError::Internal(anyhow::anyhow!("finalize thumbnail: {e}"))
+        })?;
 
     Ok(())
 }

@@ -73,6 +73,12 @@ struct Inner {
     /// Permit count = `config.thumb_extract_max_concurrency`.
     thumb_semaphore: Arc<Semaphore>,
 
+    /// Per-key in-flight locks for thumbnail extraction (singleflight). Keyed by
+    /// the final cache path; a request serializes on its key so two concurrent
+    /// misses on the same slot (e.g. the Phase 1 background writer racing an
+    /// on-demand request) extract once instead of both spawning ffmpeg.
+    thumb_inflight: DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -157,6 +163,7 @@ impl AppState {
             play_semaphore,
             clip_gen_semaphore,
             thumb_semaphore,
+            thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
@@ -282,6 +289,25 @@ impl AppState {
     #[inline]
     pub fn thumb_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.0.thumb_semaphore)
+    }
+
+    /// Get (or create) the singleflight lock for a thumbnail cache key. Callers
+    /// lock it around the "check file, else extract" sequence so concurrent
+    /// misses on the same key extract exactly once.
+    ///
+    /// The map holds only transient per-key locks; if it grows large (many
+    /// distinct on-demand thumbnails), it is cleared wholesale. Dropping an entry
+    /// mid-flight at worst permits one redundant extraction (atomic writes keep
+    /// that correct), never corruption.
+    pub fn thumb_inflight_lock(&self, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        if self.0.thumb_inflight.len() > 8192 {
+            self.0.thumb_inflight.clear();
+        }
+        self.0
+            .thumb_inflight
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     // ── health-alert maintenance window (issue #46) ───────────────────────────
