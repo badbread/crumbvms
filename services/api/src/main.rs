@@ -100,6 +100,7 @@ mod state;
 mod stats;
 mod status;
 mod stream_test;
+mod thumb_pregen;
 mod timeline;
 mod views;
 
@@ -594,6 +595,11 @@ async fn main() -> anyhow::Result<()> {
             db_backup::run_db_backup_job(backup_pool, backup_db_url).await;
         });
     }
+
+    // Phase 1 thumbnail pre-generation (opt-in via THUMB_PREGEN_ENABLED). The
+    // worker logs + returns immediately when disabled, so spawning it here is
+    // always safe.
+    tokio::spawn(thumb_pregen::run(state.clone()));
 
     // ── 7. bind and serve ─────────────────────────────────────────────────────
     // `into_make_service_with_connect_info` exposes the peer SocketAddr to the

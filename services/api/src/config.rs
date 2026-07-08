@@ -180,6 +180,26 @@ pub struct ApiConfig {
     /// by the sweeper regardless of the byte budget. Default: `30 days`.
     pub thumb_cache_ttl_seconds: u64,
 
+    /// `THUMB_PREGEN_ENABLED` -- run the background thumbnail pre-generation
+    /// worker. Off by default: scrubbing is already fast on revisit (the grid-snap
+    /// cache) with zero background cost; pre-generation additionally makes COLD
+    /// first-touch fast, at the price of continuous decode CPU + cache storage.
+    /// Default: `false`.
+    pub thumb_pregen_enabled: bool,
+
+    /// `THUMB_PREGEN_LOOKBACK_HOURS` -- on start, and for a newly-seen camera, the
+    /// worker backfills thumbnails this far back before rolling forward. Default: `2`.
+    pub thumb_pregen_lookback_hours: i64,
+
+    /// `THUMB_PREGEN_SCAN_SECS` -- how often the worker wakes to generate
+    /// thumbnails for newly-recorded footage. Default: `60`.
+    pub thumb_pregen_scan_secs: u64,
+
+    /// `THUMB_PREGEN_WIDTH` -- width the worker pre-generates at. Clients requesting
+    /// this width hit the pre-generated cache; other widths fall back to on-demand
+    /// extraction (width is part of the cache key). Default: `160`.
+    pub thumb_pregen_width: u32,
+
     // -- detection (Frigate) -----------------------------------------------
     /// `FRIGATE_API_BASE` -- base URL of Frigate's HTTP API, used by the
     /// snapshot proxy handler to fetch detection JPEGs.
@@ -285,6 +305,10 @@ impl ApiConfig {
                 .max(1),
             thumb_cache_max_bytes: parse_env("THUMB_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
             thumb_cache_ttl_seconds: parse_env("THUMB_CACHE_TTL_SECONDS", 2_592_000_u64)?,
+            thumb_pregen_enabled: parse_env("THUMB_PREGEN_ENABLED", false)?,
+            thumb_pregen_lookback_hours: parse_env("THUMB_PREGEN_LOOKBACK_HOURS", 2_i64)?.max(0),
+            thumb_pregen_scan_secs: parse_env("THUMB_PREGEN_SCAN_SECS", 60_u64)?.max(5),
+            thumb_pregen_width: parse_env("THUMB_PREGEN_WIDTH", 160_u32)?,
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),

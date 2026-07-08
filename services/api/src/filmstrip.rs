@@ -71,7 +71,7 @@ use crate::{
 
 /// Spacing between synthetic thumbnail entries when no pre-extracted frames
 /// exist.  4 s matches the default `SEGMENT_SECONDS` in the recorder.
-const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
+pub(crate) const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
 
 /// Bounds on the requested thumbnail width. The width is part of the cache key,
 /// so clamping here keeps the number of distinct cached resolutions finite.
@@ -191,51 +191,20 @@ async fn serve_frame(
     // Camera access check.
     user.assert_camera_access(camera_id)?;
 
-    // Derive the file path from the timestamp.
-    //
-    // Filename = milliseconds since epoch, zero-padded to 13 digits.
-    // This is deterministic and contains no user-controlled data beyond the
-    // parsed timestamp.
-    // Snap the requested timestamp to a fixed global grid BEFORE deriving the
-    // cache key. Clients scrub to arbitrary cursor times; without snapping, two
-    // scrubs milliseconds apart produce different filenames and the cache is
-    // never reused, forcing a fresh ffmpeg decode on every scrub tick (and a
-    // multi-camera wall multiplies that per camera). Flooring to the thumbnail
-    // interval on a wall-clock-epoch grid (NOT the query window) means the same
-    // instant always maps to the same file across requests, so a scrub settles
-    // onto cache hits. `snapped_ts` is used for BOTH the filename and the
-    // extraction offset so the file's content matches its name.
+    // Snap the requested timestamp to a fixed global grid so arbitrary scrub
+    // cursor times settle onto shared cache keys (a mid-scrub jitter no longer
+    // produces a fresh filename + decode per tick), key the cache on the clamped
+    // width, then ensure the frame exists, extracting on demand (singleflight +
+    // atomic write) if the background pre-generation worker hasn't produced it.
+    // The `.thumbs` cache lives under the WRITABLE export volume (the live/archive
+    // roots are read-only in the api container). See `thumb_frame_path`.
     let grid_ms = DEFAULT_THUMB_INTERVAL_SECS * 1000;
     let ts_ms = q.ts.timestamp_millis().div_euclid(grid_ms) * grid_ms;
     let snapped_ts = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or(q.ts);
-    // Clamp the requested width to the same range `extract_thumbnail` uses, and
-    // key the cache on it. Different clients ask for different widths (Android
-    // wall 320, iOS single-cam 160); without width in the key the FIRST requester
-    // fixes the stored resolution for everyone. All requests that clamp to the
-    // same width share a file; others get their own.
     let w = q.width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
-    // Cache thumbnails under the WRITABLE export volume — the live/archive storage
-    // roots are mounted read-only in the API container, so `.thumbs` can't live there.
-    let thumbs_root = std::path::PathBuf::from(&state.config().export_dir)
-        .join(THUMBS_SUBDIR)
-        .join(camera_id.to_string());
-    let frame_path = thumbs_root.join(format!("{ts_ms:013}_w{w}.jpg"));
-
-    // On-demand extraction: there is no background thumbnail task, so if this
-    // frame isn't cached yet, pull a single frame from the recorded segment that
-    // covers `ts` and write it to the cache path. This is what makes the filmstrip
-    // scrubber + clip-start thumbnails actually work (and gives a past-frame still,
-    // which the live `frame.jpg` proxy cannot). Subsequent requests hit the cache.
-    if tokio::fs::metadata(&frame_path).await.is_err() {
-        // Singleflight: serialize concurrent misses on this key so only one
-        // request extracts (the rest wait and hit the freshly-published file).
-        let lock = state.thumb_inflight_lock(&frame_path);
-        let _flight = lock.lock().await;
-        // Re-check under the lock: a prior holder may have just published it.
-        if tokio::fs::metadata(&frame_path).await.is_err() {
-            extract_thumbnail(&state, camera_id, snapped_ts, w, &thumbs_root, &frame_path).await?;
-        }
-    }
+    let (thumbs_root, frame_path) =
+        thumb_frame_path(&state.config().export_dir, camera_id, ts_ms, w);
+    ensure_thumbnail(&state, camera_id, snapped_ts, w).await?;
 
     // Path traversal guard: the resolved path must start with the thumbs root.
     // We canonicalize the root first (it must exist for the guard to be
@@ -295,6 +264,54 @@ async fn serve_frame(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build frame response: {e}")))?;
 
     Ok(response)
+}
+
+// ─── shared cache-path + ensure helpers ───────────────────────────────────────
+
+/// On-disk cache path for a thumbnail:
+/// `{export_dir}/.thumbs/{camera}/{ts_ms}_w{width}.jpg`. Returns
+/// `(thumbs_root_dir, frame_file)`. Shared by the request handler and the
+/// background pre-generation worker so both agree on the exact layout.
+pub(crate) fn thumb_frame_path(
+    export_dir: &str,
+    camera_id: Uuid,
+    ts_ms: i64,
+    width: u32,
+) -> (PathBuf, PathBuf) {
+    let root = PathBuf::from(export_dir)
+        .join(THUMBS_SUBDIR)
+        .join(camera_id.to_string());
+    let frame = root.join(format!("{ts_ms:013}_w{width}.jpg"));
+    (root, frame)
+}
+
+/// Ensure a thumbnail exists for the (already grid-snapped) `snapped_ts` at
+/// `width`, extracting it once under the singleflight lock if absent. Reused by
+/// the request path and the Phase 1 background worker. Returns the cache path.
+pub(crate) async fn ensure_thumbnail(
+    state: &AppState,
+    camera_id: Uuid,
+    snapped_ts: DateTime<Utc>,
+    width: u32,
+) -> Result<PathBuf, ApiError> {
+    let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    let (thumbs_root, frame_path) = thumb_frame_path(
+        &state.config().export_dir,
+        camera_id,
+        snapped_ts.timestamp_millis(),
+        w,
+    );
+    if tokio::fs::metadata(&frame_path).await.is_ok() {
+        return Ok(frame_path);
+    }
+    // Singleflight: serialize concurrent misses on this key so only one caller
+    // extracts (background worker vs on-demand request, or two scrubbers).
+    let lock = state.thumb_inflight_lock(&frame_path);
+    let _flight = lock.lock().await;
+    if tokio::fs::metadata(&frame_path).await.is_err() {
+        extract_thumbnail(state, camera_id, snapped_ts, w, &thumbs_root, &frame_path).await?;
+    }
+    Ok(frame_path)
 }
 
 // ─── on-demand thumbnail extraction ───────────────────────────────────────────
