@@ -55,6 +55,14 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Playback',
+      link: { type: 'doc', id: 'playback/scrubbing' },
+      items: [
+        'playback/scrubbing',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Motion & Detection',
       link: { type: 'doc', id: 'motion/index' },
       items: [

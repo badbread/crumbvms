@@ -52,6 +52,21 @@ See [Motion & Detection](/motion/) for the mechanism this configures.
 | `MOTION_CACHE_DIR` | `/cache/motion` | only change alongside the compose tmpfs target |
 | `MOTION_RECORDING_SHADOW` | `0` | `1` records everything as before but stamps each segment with the keep/discard verdict the buffer would have made, for validating before flipping a camera live |
 
+## Timeline previews (scrubbing)
+
+See [Timeline scrubbing](/playback/scrubbing) for what these do. All optional; the defaults work.
+
+| Key | Default | Notes |
+|---|---|---|
+| `THUMB_PREGEN_ENABLED` | `false` | build scrub previews in the background so the *first* drag is instant too; costs some ongoing CPU + disk |
+| `THUMB_PREGEN_LOOKBACK_HOURS` | `2` | how far back to build previews when the worker starts |
+| `THUMB_PREGEN_SCAN_SECS` | `60` | how often to build previews for newly-recorded footage |
+| `THUMB_PREGEN_WIDTH` | `160` | preview width in pixels |
+| `THUMB_CACHE_DIR` | (`EXPORT_DIR`) | where the preview cache lives; point at an SSD/NVMe mount to keep scrubbing fast on a spinning-disk system |
+| `THUMB_EXTRACT_MAX_CONCURRENCY` | scales with cores | how many previews Crumb builds at once; default is roughly half the CPU cores |
+| `THUMB_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | preview cache size budget; oldest previews are dropped past this |
+| `THUMB_CACHE_TTL_SECONDS` | `2592000` (30 days) | preview cache age budget |
+
 ## Storage
 
 | Key | Default | Notes |
