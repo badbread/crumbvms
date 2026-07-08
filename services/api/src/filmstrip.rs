@@ -401,6 +401,13 @@ async fn extract_thumbnail(
         format!("scale={w}:-2"),
         "-q:v".to_owned(),
         "4".to_owned(),
+        // Force the muxer explicitly. The atomic-write temp path ends in
+        // `.tmp{seq}` (not `.jpg`), so ffmpeg cannot infer the output format from
+        // the extension and fails to open the output — every extraction 404s. A
+        // single-frame mjpeg IS a JPEG, so the served bytes and the `.jpg` cache
+        // file are unchanged.
+        "-f".to_owned(),
+        "mjpeg".to_owned(),
         tmp_path.to_string_lossy().into_owned(),
     ];
 
