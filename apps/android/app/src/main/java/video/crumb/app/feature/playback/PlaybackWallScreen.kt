@@ -110,12 +110,12 @@ private const val WALL_MAX_SPAN_MS = WALL_WINDOW_HOURS * 3600_000L
  * pinned at the bottom: a scrubbable coverage timeline, a "Latest" reset, and a
  * jump-to-date/time button.
  *
- * The bottom controls drive a single shared **cursor** time. Tapping a camera tile
- * opens that camera in single-camera [PlaybackScreen] seeded at the cursor — or at
- * its latest footage when the wall is at "Latest". (Per-tile frames don't track the
- * scrubbed time because thumbnail extraction isn't wired yet; the frozen entry frame
- * is just a "which camera is which" reference — the time-accurate footage shows once
- * you tap in.)
+ * The bottom controls drive a single shared **cursor** time. Scrubbing the shared
+ * timeline sets a preview time and every tile swaps to its RECORDED frame nearest
+ * that moment (fetched from the filmstrip), so the whole wall tracks the scrub; a
+ * tile shows "No footage" when no recording covers that instant for that camera.
+ * Tapping a tile opens that camera in single-camera [PlaybackScreen] seeded at the
+ * cursor, or at its latest footage when the wall is at "Latest".
  *
  * @param onOpenLive Switches to the Live tab (anchored so it never lands on
  *   another tab that happens to be under Playback on the back stack).
@@ -564,24 +564,36 @@ private fun WallSnapshotTile(
                 width = 320,
             ).onSuccess { frames ->
                 val nearest = frames.minByOrNull { abs(Time.parseToMillis(it.ts) - previewMs) }
-                if (nearest == null) {
-                    noFootage = true
-                    frame = null
-                } else {
-                    val scoped = runCatching { repo.mediaUrls().scopedUrl(camera.id, nearest.url) }.getOrNull()
-                    if (scoped != null) {
-                        val req = ImageRequest.Builder(context)
-                            .data(scoped)
-                            .allowHardware(false)
-                            .build()
-                        val result = context.imageLoader.execute(req)
-                        if (result is SuccessResult) {
-                            (result.drawable as? BitmapDrawable)?.bitmap?.let {
-                                frame = it.asImageBitmap(); noFootage = false
-                            }
-                        }
-                    }
+                val scoped = nearest?.let {
+                    runCatching { repo.mediaUrls().scopedUrl(camera.id, it.url) }.getOrNull()
                 }
+                val bmp = if (scoped == null) {
+                    null
+                } else {
+                    val req = ImageRequest.Builder(context)
+                        .data(scoped)
+                        .allowHardware(false)
+                        .build()
+                    (context.imageLoader.execute(req) as? SuccessResult)
+                        ?.let { it.drawable as? BitmapDrawable }
+                        ?.bitmap
+                }
+                if (bmp != null) {
+                    frame = bmp.asImageBitmap()
+                    noFootage = false
+                } else {
+                    // No thumbnail available at this instant (the frame request
+                    // 404s when no recorded segment covers previewMs), or the
+                    // image fetch failed. Surface it instead of silently holding
+                    // the stale "Latest" frame — that silent-hold was the bug.
+                    frame = null
+                    noFootage = true
+                }
+            }.onFailure {
+                // The filmstrip LIST request itself failed; don't leave the tile
+                // frozen on its old frame with no feedback.
+                frame = null
+                noFootage = true
             }
         }
     }
