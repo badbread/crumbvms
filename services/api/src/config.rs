@@ -163,6 +163,23 @@ pub struct ApiConfig {
     /// the cache unbounded within a day. Default: `10 GiB`.
     pub clip_cache_max_bytes: u64,
 
+    /// `THUMB_EXTRACT_MAX_CONCURRENCY` -- max concurrent on-demand thumbnail
+    /// ffmpeg extractions (the filmstrip scrubber). Each cache miss spawns one
+    /// single-frame ffmpeg; a fast multi-camera scrub would otherwise spawn a
+    /// storm. A shared semaphore caps them, mirroring `playback_max_concurrency`
+    /// and `clip_gen_max_concurrency`. Default: `4`.
+    pub thumb_extract_max_concurrency: usize,
+
+    /// `THUMB_CACHE_MAX_BYTES` -- soft byte budget for the filmstrip thumbnail
+    /// cache (`{export_dir}/.thumbs`). A periodic sweeper evicts oldest-by-mtime
+    /// past this budget (and past `THUMB_CACHE_TTL_SECONDS` by age), so scrubbing
+    /// can't grow the cache unbounded. Default: `20 GiB`.
+    pub thumb_cache_max_bytes: u64,
+
+    /// `THUMB_CACHE_TTL_SECONDS` -- age past which a cached thumbnail is evicted
+    /// by the sweeper regardless of the byte budget. Default: `30 days`.
+    pub thumb_cache_ttl_seconds: u64,
+
     // -- detection (Frigate) -----------------------------------------------
     /// `FRIGATE_API_BASE` -- base URL of Frigate's HTTP API, used by the
     /// snapshot proxy handler to fetch detection JPEGs.
@@ -264,6 +281,10 @@ impl ApiConfig {
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),
             clip_gen_max_concurrency: parse_env("CLIP_GEN_MAX_CONCURRENCY", 4usize)?.max(1),
             clip_cache_max_bytes: parse_env("CLIP_CACHE_MAX_BYTES", 10_737_418_240_u64)?,
+            thumb_extract_max_concurrency: parse_env("THUMB_EXTRACT_MAX_CONCURRENCY", 4usize)?
+                .max(1),
+            thumb_cache_max_bytes: parse_env("THUMB_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
+            thumb_cache_ttl_seconds: parse_env("THUMB_CACHE_TTL_SECONDS", 2_592_000_u64)?,
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),

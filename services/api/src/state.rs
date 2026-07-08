@@ -67,6 +67,12 @@ struct Inner {
     /// `config.clip_gen_max_concurrency`.
     clip_gen_semaphore: Arc<Semaphore>,
 
+    /// Bounds concurrent on-demand thumbnail ffmpeg extractions (the filmstrip
+    /// scrubber). A fast multi-camera scrub can miss the cache on many frames at
+    /// once; without a cap each miss spawns a single-frame ffmpeg, a spawn storm.
+    /// Permit count = `config.thumb_extract_max_concurrency`.
+    thumb_semaphore: Arc<Semaphore>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -130,6 +136,7 @@ impl AppState {
         let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
         let play_semaphore = Arc::new(Semaphore::new(config.playback_max_concurrency));
         let clip_gen_semaphore = Arc::new(Semaphore::new(config.clip_gen_max_concurrency));
+        let thumb_semaphore = Arc::new(Semaphore::new(config.thumb_extract_max_concurrency));
 
         // Health-alert maintenance window (issue #46). Off by default; an
         // optional `MAINTENANCE_UNTIL` env (unix seconds) lets a deployment
@@ -149,6 +156,7 @@ impl AppState {
             export_cancels: DashMap::new(),
             play_semaphore,
             clip_gen_semaphore,
+            thumb_semaphore,
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
@@ -266,6 +274,14 @@ impl AppState {
     #[inline]
     pub fn clip_gen_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.0.clip_gen_semaphore)
+    }
+
+    /// Clone the thumbnail-extraction concurrency semaphore handle (cheap `Arc`
+    /// clone). Used by the filmstrip handler to cap concurrent single-frame
+    /// ffmpeg extractions during a scrub.
+    #[inline]
+    pub fn thumb_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.0.thumb_semaphore)
     }
 
     // ── health-alert maintenance window (issue #46) ───────────────────────────

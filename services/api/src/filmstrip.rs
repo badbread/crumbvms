@@ -187,7 +187,18 @@ async fn serve_frame(
     // Filename = milliseconds since epoch, zero-padded to 13 digits.
     // This is deterministic and contains no user-controlled data beyond the
     // parsed timestamp.
-    let ts_ms = q.ts.timestamp_millis();
+    // Snap the requested timestamp to a fixed global grid BEFORE deriving the
+    // cache key. Clients scrub to arbitrary cursor times; without snapping, two
+    // scrubs milliseconds apart produce different filenames and the cache is
+    // never reused, forcing a fresh ffmpeg decode on every scrub tick (and a
+    // multi-camera wall multiplies that per camera). Flooring to the thumbnail
+    // interval on a wall-clock-epoch grid (NOT the query window) means the same
+    // instant always maps to the same file across requests, so a scrub settles
+    // onto cache hits. `snapped_ts` is used for BOTH the filename and the
+    // extraction offset so the file's content matches its name.
+    let grid_ms = DEFAULT_THUMB_INTERVAL_SECS * 1000;
+    let ts_ms = q.ts.timestamp_millis().div_euclid(grid_ms) * grid_ms;
+    let snapped_ts = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or(q.ts);
     // Cache thumbnails under the WRITABLE export volume — the live/archive storage
     // roots are mounted read-only in the API container, so `.thumbs` can't live there.
     let thumbs_root = std::path::PathBuf::from(&state.config().export_dir)
@@ -201,7 +212,15 @@ async fn serve_frame(
     // scrubber + clip-start thumbnails actually work (and gives a past-frame still,
     // which the live `frame.jpg` proxy cannot). Subsequent requests hit the cache.
     if tokio::fs::metadata(&frame_path).await.is_err() {
-        extract_thumbnail(&state, camera_id, q.ts, q.width, &thumbs_root, &frame_path).await?;
+        extract_thumbnail(
+            &state,
+            camera_id,
+            snapped_ts,
+            q.width,
+            &thumbs_root,
+            &frame_path,
+        )
+        .await?;
     }
 
     // Path traversal guard: the resolved path must start with the thumbs root.
@@ -318,6 +337,16 @@ async fn extract_thumbnail(
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("create thumbs dir: {e}")))?;
 
+    // Cap concurrent extractions so a fast multi-camera scrub (each miss is one
+    // single-frame ffmpeg) can't spawn a storm, mirroring the `/play` and
+    // clip-gen semaphores. The permit is held only for the decode below and
+    // released on drop when this function returns.
+    let _permit = state
+        .thumb_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("thumb semaphore closed: {e}")))?;
+
     let args: Vec<String> = vec![
         "-y".to_owned(),
         "-ss".to_owned(),
@@ -363,11 +392,15 @@ async fn extract_thumbnail(
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-/// Generate evenly-spaced timestamp slots across `[start, end)` with
-/// `interval_secs` spacing.
+/// Generate timestamp slots across `[start, end)` anchored to a fixed global
+/// grid of `interval_secs`.
 ///
-/// Always includes a slot at exactly `start`.  The last slot is the largest
-/// multiple of `interval_secs` from `start` that is strictly less than `end`.
+/// Slots are floored to the interval on the wall-clock epoch, NOT anchored to
+/// the arbitrary query `start`. Identical slot timestamps across different scrub
+/// windows are what let the pre-extracted / cached frames be reused instead of
+/// re-extracted per window (the list side of the same snapping `serve_frame`
+/// applies to a single frame). The first slot is `start` floored to the grid;
+/// the last is the largest grid multiple strictly less than `end`.
 fn generate_synthetic_timestamps(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -376,16 +409,19 @@ fn generate_synthetic_timestamps(
     if interval_secs <= 0 {
         return vec![];
     }
-    let total_ms = (end - start).num_milliseconds();
-    if total_ms <= 0 {
+    let step_ms = interval_secs * 1_000;
+    // Floor `start` to the global grid so slot timestamps are stable across
+    // query windows (cache reuse). `div_euclid` floors correctly even for a
+    // pre-epoch input.
+    let start_ms = start.timestamp_millis().div_euclid(step_ms) * step_ms;
+    let end_ms = end.timestamp_millis();
+    if end_ms <= start_ms {
         return vec![];
     }
-    let step_ms = interval_secs * 1_000;
-    // total_ms and step_ms are both positive here; quotient fits usize on all
+    // start_ms < end_ms and step_ms > 0 here; the quotient fits usize on all
     // targets we care about (Linux x86_64 with 48-bit virtual address space).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let count = (total_ms / step_ms) as usize + 1;
-    let start_ms = start.timestamp_millis();
+    let count = ((end_ms - start_ms) / step_ms) as usize + 1;
 
     (0..count)
         .filter_map(|i| {
