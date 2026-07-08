@@ -195,6 +195,14 @@ impl Mpv {
         self.command(&["loadfile", url])
     }
 
+    pub fn loadfile_append(&self, url: &str) -> Result<(), String> {
+        self.command(&["loadfile", url, "append"])
+    }
+
+    pub fn playlist_clear(&self) -> Result<(), String> {
+        self.command(&["playlist-clear"])
+    }
+
     /// Create an OpenGL render context for this player (Linux render-API path).
     ///
     /// `get_proc_address` resolves GL symbols against the *current* GL context

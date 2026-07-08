@@ -6966,6 +6966,7 @@ async function pbPrefetchNextSegment(slot) {
         segEndMs:   seg.endMs,
         segDurationMs: seg.duration_ms ?? (seg.endMs - seg.startMs),
       });
+      void invoke('append_pane_next', { id: 'slot' + slot, url: seg.absoluteUrl }).catch(() => {});
     }
   } catch { /* ignore — the boundary resolve will fall back to a live fetch */ }
   finally { pbState._prefetching.delete(slot); }
@@ -7259,7 +7260,7 @@ async function pbResolveAllPanesInner(tMs, forceReload = false) {
     const pre = pbState.slotNextSeg.get(i);
     if (!forceReload && pre && tMs >= pre.segStartMs && tMs < pre.segEndMs) {
       pbState.slotNextSeg.delete(i); // consume it
-      segFetches.push(Promise.resolve({ slot: i, seg: pre }));
+      segFetches.push(Promise.resolve({ slot: i, seg: pre, gapless: true }));
       continue;
     }
 
@@ -7282,8 +7283,10 @@ async function pbResolveAllPanesInner(tMs, forceReload = false) {
 
   const results = await Promise.all(segFetches);
 
-  // Determine which panes need a new URL pushed via sync_panes
+  // Determine which panes need a new URL pushed via sync_panes (gapless
+  // boundary advances are handled by mpv's playlist, not a loadfile).
   const needsSync = results.some(r => {
+    if (r.gapless) return false;
     const existing = pbState.slotSegments.get(r.slot);
     if (!r.seg && !existing) return false;
     if (!r.seg || !existing) return true;
@@ -7292,6 +7295,16 @@ async function pbResolveAllPanesInner(tMs, forceReload = false) {
 
   // Update state
   results.forEach(r => pbState.slotSegments.set(r.slot, r.seg ?? null));
+
+  // Advance gapless panes: mpv's playlist already has the next entry appended
+  // (prefetch-playlist demuxed it), so playlist-next transitions with the
+  // decoder already warm — no re-init stutter.
+  const advanceOps = results.filter(r => r.gapless).map(r =>
+    invoke('advance_pane', { id: `slot${r.slot}`, url: r.seg.segmentUrl }).catch(e => {
+      console.warn(`advance_pane slot${r.slot} failed:`, e);
+    })
+  );
+  if (advanceOps.length) await Promise.all(advanceOps);
 
   // Update tile "no footage" styling
   const grid = els.pbTileGrid;
@@ -7321,6 +7334,7 @@ async function pbResolveAllPanesInner(tMs, forceReload = false) {
     results.forEach(r => {
       if (!r.seg) return;
       if (!forceReload && r.cached) return;
+      if (r.gapless) return;
       const offsetSec = Math.max(0, (tMs - r.seg.segStartMs) / 1000);
       seekOps.push(
         invoke('seek_pane', { id: `slot${r.slot}`, seconds: offsetSec }).catch(e => {
