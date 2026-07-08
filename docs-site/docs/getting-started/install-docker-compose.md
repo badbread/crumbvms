@@ -6,10 +6,7 @@ slug: /getting-started/install-docker-compose
 
 # Install with Docker Compose
 
-This is the manual install path. If you're setting up with an AI coding
-agent instead, see
-[Install with an AI agent](/getting-started/install-with-ai-agent), which
-follows the same steps with an added Verify check after each one.
+This is the full, step-by-step install path. If you just want the fast path, see the [Quickstart](/getting-started/quickstart). If you're setting up with an AI coding agent instead, see [Install with an AI agent](/getting-started/install-with-ai-agent), which follows the same steps with an added Verify check after each one.
 
 ## 1. Get the repository and generate secrets
 

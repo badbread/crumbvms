@@ -91,6 +91,11 @@ const config = {
             label: 'Docs',
           },
           {
+            to: '/getting-started/quickstart',
+            label: 'Install',
+            position: 'left',
+          },
+          {
             to: '/responsible-use',
             label: 'Responsible use',
             position: 'left',

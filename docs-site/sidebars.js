@@ -6,8 +6,9 @@ const sidebars = {
     {
       type: 'category',
       label: 'Getting Started',
-      link: { type: 'doc', id: 'getting-started/what-is-crumb' },
+      link: { type: 'doc', id: 'getting-started/quickstart' },
       items: [
+        'getting-started/quickstart',
         'getting-started/what-is-crumb',
         'getting-started/requirements',
         'getting-started/install-docker-compose',

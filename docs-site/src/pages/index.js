@@ -46,8 +46,8 @@ function HomepageHeader() {
           </Link>
           <Link
             className={clsx('button button--outline button--lg', styles.secondaryButton)}
-            to="/getting-started/install-docker-compose">
-            Install with Docker Compose
+            to="/getting-started/quickstart">
+            Quickstart
           </Link>
         </div>
       </div>
@@ -92,10 +92,10 @@ export default function Home() {
                 <Link to="/getting-started/what-is-crumb">What is Crumb VMS</Link>.
               </li>
               <li>
-                Ready to install?{' '}
+                Ready to install? Follow the{' '}
+                <Link to="/getting-started/quickstart">Quickstart</Link>, or the detailed{' '}
                 <Link to="/getting-started/install-docker-compose">Install with Docker Compose</Link>{' '}
-                or{' '}
-                <Link to="/getting-started/install-with-ai-agent">install with an AI agent</Link>.
+                guide.
               </li>
               <li>
                 Setting up a client?{' '}

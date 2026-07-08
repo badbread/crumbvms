@@ -71,6 +71,15 @@ client, a batch export list, and roles with per-camera access, with Frigate's ob
 detections drawn right on the timeline over MQTT. Run both: **Frigate detects, Crumb is the
 room you sit in.**
 
+**"Why not just read Frigate's recordings?"** Because a smooth, frame-accurate, multi-camera
+scrubbable timeline is a property of how footage is recorded, not how it's played back. Frigate's
+files play fine, but the things that make scrubbing feel instant (short clock-aligned
+keyframe-guaranteed fMP4 segments, a wall-clock index, a pre-generated preview proxy so a drag
+doesn't re-decode 4K H.265 on every tick) have to be baked in at record time, and can't be
+recovered by reading Frigate's storage after the fact. So Crumb owns recording and composes with
+Frigate at the detection and clip level instead. The full, nerdy version is in the
+[Frigate integration guide](https://docs.crumbvms.com/integrations/frigate#why-crumb-records-its-own-footage-and-doesnt-read-frigates).
+
 **It fits whatever Frigate setup you already have.** Both pull RTSP, so the simplest thing is
 to point each at your cameras and run them side by side, no reconfiguration. If you'd rather
 a camera only get pulled once, connect them, and it works either direction: Crumb can ingest
@@ -94,8 +103,8 @@ exclusion zones and pluggable detectors) for recording triggers and timeline eve
 never does object, face, or plate recognition itself. That's Frigate's job, and Frigate is
 better at it than anything I would bolt on.
 
-No Home Assistant integration yet, either. If that's something you'd want, open an issue and
-tell me what it should actually do; that's how it gets built.
+No Home Assistant integration yet but it is planned. If you have any thoughts on what it
+should include please open an issue.
 
 > [!IMPORTANT]
 > ## Looking for testers
@@ -116,7 +125,7 @@ tell me what it should actually do; that's how it gets built.
 ## What it does
 
 **Investigate**
-- Frame-level scrubbable timeline (H.265 native, no server transcode)
+- Frame-level scrubbable timeline (H.265 native, no server transcode), with pre-generated previews so revisiting a spot is a ~1 ms cached read, not a ~250 ms re-decode
 - Jump to the next/previous motion event; digital zoom into a clip
 - Motion dots **and** Frigate object icons on one timeline bar
 - Bookmarks with protected (never-auto-deleted) retention
