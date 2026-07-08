@@ -125,7 +125,7 @@ should include please open an issue.
 ## What it does
 
 **Investigate**
-- Frame-level scrubbable timeline (H.265 native, no server transcode)
+- Frame-level scrubbable timeline (H.265 native, no server transcode), with pre-generated previews so revisiting a spot is a ~1 ms cached read, not a ~250 ms re-decode
 - Jump to the next/previous motion event; digital zoom into a clip
 - Motion dots **and** Frigate object icons on one timeline bar
 - Bookmarks with protected (never-auto-deleted) retention

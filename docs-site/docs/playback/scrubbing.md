@@ -18,6 +18,10 @@ grabs a preview frame from the recording; after that, that spot is remembered,
 so dragging back and forth over a region you've already looked at is instant.
 Scrubbing a whole wall of cameras at the same moment works the same way.
 
+In practice, revisiting a spot you have already scrubbed redraws in about a
+millisecond (a cached image read) rather than the couple hundred milliseconds it
+takes to decode a fresh frame on a 4K camera.
+
 This smoothness is the reason Crumb records its own footage instead of reading a
 detector's recordings; if you run Frigate, see [why Crumb records its own
 footage](/integrations/frigate#why-crumb-records-its-own-footage-and-doesnt-read-frigates).
