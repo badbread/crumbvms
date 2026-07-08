@@ -140,6 +140,35 @@ The full DCO text lives in the [DCO](DCO) file. Forgot it?
 `git commit --amend -s --no-edit`, or `git rebase --signoff <base>` for a whole
 branch.
 
+## Bugs: reporting and fixing
+
+Found a bug in any part of Crumb (recorder, API, a client, docs, the site)? The
+flow is the same regardless of component; only which tests and CI jobs run
+changes.
+
+1. **File an issue first.** Use the
+   [bug report template](.github/ISSUE_TEMPLATE/bug_report.md), even a one-liner.
+   This captures it whether it's fixed now or later. Apply the `bug` label plus
+   the relevant area label (`recorder`, `clients: android`, `clients: desktop`,
+   `clients: web`, `install`, `frigate`, and so on).
+2. **One bug, one branch, one PR.** Fix it on its own `fix/<slug>` branch off
+   `main` (for example `fix/android-wall-scrub-tiles`). One bug per branch keeps
+   the review focused, the revert clean, and the changelog honest; don't batch
+   unrelated fixes together.
+3. **Link the issue.** Put `Fixes #<n>` in the PR body so merging auto-closes the
+   issue and the two stay linked.
+4. **Hotfix lane.** A footage-threatening or won't-boot bug (recorder losing
+   segments, the API refusing to start) can skip issue-first and go straight to a
+   `fix/` branch and an expedited PR; file the issue afterward.
+
+Branch names mirror the rest of the repo: `feat/…`, `fix/…`, `docs/…`,
+`chore/…`. `main` is protected, so every change lands through a PR regardless.
+
+**Releases bundle fixes.** Many merged `fix/` PRs roll up into a single `v*`
+release tag when you cut one, so five bug fixes are five PRs but one release and
+one set of release notes. Versioning and update notifications are
+release-driven, not per-PR.
+
 ## Pull requests
 
 Use the [pull request template](.github/pull_request_template.md). Before you
