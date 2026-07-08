@@ -392,6 +392,8 @@ fn configure_mpv(child_hwnd: isize, url: &str) -> Result<Mpv, String> {
     mpv.set_option("demuxer-max-back-bytes", "1MiB")?;
     mpv.set_option("rtsp-transport", "tcp")?;
     mpv.set_option("keep-open", "yes")?;
+    mpv.set_option("prefetch-playlist", "yes")?;
+    mpv.set_option("gapless-audio", "yes")?;
     // Stream resilience: give up on a dead RTSP feed after ~10 s of no data and
     // let FFmpeg attempt reconnects, so a transient drop recovers instead of
     // freezing on the last frame. A hard stall is also caught by the frontend
@@ -557,6 +559,12 @@ fn sync_panes(app: AppHandle, panes: Vec<PaneSpec>) -> Result<Vec<PaneZoom>, Str
                     }
                     if pane.url != spec.url {
                         pane.mpv.loadfile(&spec.url)?;
+                        // A replacing loadfile is a jump / camera-switch, never a
+                        // gapless boundary advance (those skip sync_panes). Drop any
+                        // segment the playback prefetch appended for the OLD position
+                        // so mpv can't auto-advance to it after this file ends. No-op
+                        // for live panes (single-entry playlists).
+                        let _ = pane.mpv.playlist_clear();
                         pane.url = spec.url.clone();
                         if spec.preserve_zoom {
                             // Same camera, next playback segment — keep the
@@ -1164,6 +1172,36 @@ fn seek_pane(
     } else {
         pane.mpv.set_property("time-pos", &format!("{seconds:.3}"))
     }
+}
+
+/// Append a URL to a pane's mpv playlist (gapless segment prefetch). mpv's
+/// `prefetch-playlist` demuxes the appended file while the current one is still
+/// playing, so the decoder is already warm when the boundary arrives.
+#[tauri::command]
+fn append_pane_next(app: AppHandle, id: String, url: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let map = state.panes.lock().unwrap_or_else(|p| p.into_inner());
+    let pane = map.get(&id).ok_or("no such pane")?;
+    pane.mpv.loadfile_append(&url)
+}
+
+/// Advance a pane to the next playlist entry (the segment appended by
+/// [`append_pane_next`]). `weak` means "do nothing if there is no next entry"
+/// rather than erroring. Also updates the stored URL so a subsequent
+/// `sync_panes` doesn't see a stale mismatch and re-loadfile.
+#[tauri::command]
+fn advance_pane(app: AppHandle, id: String, url: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut map = state.panes.lock().unwrap_or_else(|p| p.into_inner());
+    let pane = map.get_mut(&id).ok_or("no such pane")?;
+    pane.mpv.command(&["playlist-next", "weak"])?;
+    // Drop the now-played entry so the playlist never grows past {current, next}
+    // over a long linear playback (each boundary appends one). `playlist-clear`
+    // keeps the current file, so this can't perturb what's on screen; the next
+    // prefetch re-appends. Best-effort — a hiccup here only leaves a stale entry.
+    let _ = pane.mpv.playlist_clear();
+    pane.url = url;
+    Ok(())
 }
 
 /// Set playback speed for a single pane.
@@ -1942,6 +1980,8 @@ pub fn run() {
             set_pane_paused,
             set_pane_muted,
             seek_pane,
+            append_pane_next,
+            advance_pane,
             set_pane_speed,
             frame_step_pane,
             snapshot_pane,
