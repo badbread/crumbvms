@@ -66,7 +66,7 @@ All paths below are repo-relative and verified to exist as of 2026-07-06.
 |---|---|---|
 | CI gate | `.github/workflows/ci.yml` (jobs: `rust` fmt/clippy/test, `desktop-lint`, `desktop-linux`, `images` recorder+api) | Golden rule 3: fmt, clippy `-D warnings`, workspace tests green before push/PR |
 | Fresh-install smoke | `.github/workflows/smoke.yml` + `docker-compose.smoke.yml` | Boots the stack from scratch; install-surface changes must keep it green |
-| Android release | `.github/workflows/android-release.yml` | `v*` tag, signed APK + sha256 on the GitHub Release. Keystore is a CI secret |
+| Android release | `.github/workflows/android-release.yml` | `v*` tag, signed APK + sha256 on the GitHub Release. Keystore is a CI secret. Also `workflow_dispatch` (input: `release_tag`) to re-ship an Android-only fix onto an existing release without a new tag — bump `apps/android/version.properties` `VERSION_CODE` first |
 | CLA bot | `.github/workflows/cla.yml`, `CLA.md`, `CCLA.md`, `DCO` | |
 | Release orchestration | `scripts/release/` (`release.sh`, `lib.sh`, `backend.sh`, `android.sh`, `ios.sh`, `desktop-windows.sh`, `desktop-linux.sh`, `README.md`), `VERSION`, `docs/RELEASE.md` | Multi-host build fan-out over SSH; versioned-image deploy/rollback contract |
 | GitHub presence | `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`, `.github/FUNDING.yml`, `.github/media/` (README GIFs/screenshots), `LICENSE`, `NOTICE`, `SECURITY.md`, `CONTRIBUTING.md` | README screenshots/GIFs live in `.github/media/` and go stale when the UI changes |
