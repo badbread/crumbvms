@@ -2417,6 +2417,22 @@ body.vs-reordering, body.vs-reordering * { cursor: grabbing !important; user-sel
 .srv-kv-v { color: var(--text); font-family: ui-monospace, "Consolas", monospace; text-align: right; word-break: break-word; }
 .srv-note { font-size: 11px; color: var(--text-muted); margin-top: 8px; line-height: 1.4; }
 .srv-note code { background: var(--surface2); padding: 1px 4px; border-radius: 3px; }
+
+/* Update-available notice (Settings → This Computer → About, issue #7). Amber
+   accent (attention, not danger) — non-intrusive, lives only in this panel. */
+.srv-update-banner {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+  border-left: 3px solid var(--warn, #E8A33D);
+  background: rgba(232, 163, 61, 0.10);
+  font-size: 12px; color: var(--text-dim);
+}
+.srv-update-banner.hidden { display: none; }
+.srv-update-text { flex: 1 1 auto; font-weight: 600; color: var(--text); }
+.srv-update-link { color: var(--accent); text-decoration: none; white-space: nowrap; }
+.srv-update-link:hover { text-decoration: underline; }
+.srv-update-link.hidden { display: none; }
+.srv-update-dismiss-btn { flex: 0 0 auto; padding: 3px 9px; font-size: 11px; }
 .srv-f8-hint {
   font-size: 12px; color: var(--text); line-height: 1.5;
   background: var(--surface2); border: 1px solid var(--border);
