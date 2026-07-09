@@ -178,12 +178,12 @@ should include please open an issue.
 | License | AGPL-3.0 | MIT | Open core | Commercial ($) | GPL |
 | Primary focus | Operator/timeline layer + recording | Object-detection NVR | Integration hub + NVR | All-in-one NVR | Classic NVR |
 | Object detection | **BYO Frigate** (composes) | ✅ built-in | ✅ plugins | ✅ (DeepStack / CodeProject) | Basic / add-ons |
-| Scrubbable timeline | ✅ frame-level, H.265 native | Basic web viewer | Basic | ✅ | Basic |
+| Scrubbable timeline | ✅ frame-level, native (libmpv) | ✅ web-based | ✅ web-based | ✅ native | Basic |
 | Native desktop client | ✅ Tauri/libmpv | ❌ (web) | ❌ (web) | ✅ Windows | ❌ (web) |
-| Mobile app | ✅ Android (iOS built) | via HA / 3rd-party | ✅ | ✅ | 3rd-party |
-| Multi-cam saveable wall | ✅ | limited | limited | ✅ | limited |
+| Mobile app | ✅ Android (iOS in progress) | via HA / 3rd-party | ✅ | ✅ | 3rd-party |
+| Multi-cam saveable wall | ✅ | ✅ camera groups | limited | ✅ | limited |
 | Batch export | ✅ list → MP4 / AES-256 zip | manual | limited | ✅ | limited |
-| RBAC / per-camera roles | ✅ | limited | limited | ✅ | ✅ |
+| RBAC / per-camera roles | ✅ | ✅ roles + per-camera | limited | ✅ | ✅ |
 | Cloud / account required | **Never** | Never | Optional | Never | Never |
 | Runs on | Linux + Docker | Linux + Docker | cross-platform | Windows | Linux |
 
