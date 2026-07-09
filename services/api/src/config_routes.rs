@@ -40,6 +40,15 @@
 //! | `PUT`    | `/config/users/{id}` | Update user (re-hash password if given)  |
 //! | `DELETE` | `/config/users/{id}` | Delete user (refuse last admin)          |
 //!
+//! ## Update-available check (issue #7)
+//! | Method | Path                          | Description                                    |
+//! |--------|-------------------------------|-------------------------------------------------|
+//! | `GET`  | `/config/update-check-enabled` | Resolved effective state (DB, else env default) |
+//! | `PUT`  | `/config/update-check-enabled` | Operator opt-in/out; writes only this field    |
+//!
+//! The public, any-user endpoint clients actually poll is `GET /updates/latest`
+//! (`services/api/src/updates.rs`), not under `/config`.
+//!
 //! # Design notes
 //!
 //! * Every handler requires [`crate::auth_mw::AdminUser`] — viewers never reach
@@ -204,6 +213,13 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/bookmarks-enabled",
             get(get_bookmarks_enabled).put(set_bookmarks_enabled),
+        )
+        // Update-available check opt-in (issue #7, D3: off by default). The
+        // effective GET /updates/latest (any user) lives in updates.rs; this
+        // pair is the admin-only settings toggle.
+        .route(
+            "/update-check-enabled",
+            get(get_update_check_enabled_route).put(set_update_check_enabled_route),
         )
         .route("/setup-complete", put(set_setup_complete_route))
         .route("/beta-terms", put(set_beta_terms_route))
@@ -415,6 +431,45 @@ async fn set_bookmarks_enabled(
     Json(body): Json<BookmarksEnabledRequest>,
 ) -> Result<StatusCode, ApiError> {
     db::set_bookmarks_enabled(state.pool(), body.enabled)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── update-available check opt-in (issue #7, D3: off by default) ──────────────
+
+#[derive(serde::Serialize)]
+struct UpdateCheckEnabledDto {
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateCheckEnabledRequest {
+    enabled: bool,
+}
+
+/// `GET /config/update-check-enabled` — the RESOLVED effective state (an
+/// explicit DB choice, else the `UPDATE_CHECK_ENABLED` env default, itself
+/// `false` per D3). Mirrors the precedence `crate::updates::resolve_enabled`
+/// applies to `GET /updates/latest` itself, so the admin toggle always shows
+/// what the check is actually doing right now, not just the raw DB row.
+async fn get_update_check_enabled_route(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<UpdateCheckEnabledDto>, ApiError> {
+    let enabled = crate::updates::resolve_enabled(state.pool(), state.config()).await?;
+    Ok(Json(UpdateCheckEnabledDto { enabled }))
+}
+
+/// `PUT /config/update-check-enabled` — explicit operator opt-in/out. Writes
+/// ONLY this field (house rule); once set, the DB value wins over the env
+/// default for good (the standard `server_settings` precedence).
+async fn set_update_check_enabled_route(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<UpdateCheckEnabledRequest>,
+) -> Result<StatusCode, ApiError> {
+    db::set_update_check_enabled(state.pool(), body.enabled)
         .await
         .map_err(ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)

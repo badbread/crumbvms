@@ -144,6 +144,7 @@ services:
       FRIGATE_MIN_SCORE: ${FRIGATE_MIN_SCORE:-0.3}
       FRIGATE_CATCHUP_HOURS: ${FRIGATE_CATCHUP_HOURS:-24}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}         # Discord/Slack webhook on recorder-heartbeat stall; empty = silent
+      UPDATE_CHECK_ENABLED: ${UPDATE_CHECK_ENABLED:-false}   # opt-in (issue #7); false = zero github.com requests
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       # Built-in nightly pg_dump of the segments index (the mp4→camera/time map). docs/BACKUP.md

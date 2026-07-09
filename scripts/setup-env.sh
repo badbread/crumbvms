@@ -204,6 +204,13 @@ DB_BACKUP_HOST_PATH=./backups
 # ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/xxxxx/yyyyy
 ALERT_WEBHOOK_URL=
 
+# --- Update-available check (optional, issue #7; OFF by default) ---
+# When enabled, the api periodically asks github.com for the latest CrumbVMS
+# release tag (version number only -- nothing sent) so clients can show an
+# "update available" notice. The admin console toggle (Server settings) wins
+# over this env once set. false = zero github.com requests, ever.
+UPDATE_CHECK_ENABLED=false
+
 # --- Seed (admin bootstrap user) ---
 # Easiest: leave SEED_ADMIN_PASSWORD blank and create the admin in the browser at
 # /admin on first run. For a HEADLESS install, the API hashes SEED_ADMIN_PASSWORD

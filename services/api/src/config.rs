@@ -241,6 +241,21 @@ pub struct ApiConfig {
     /// recovery. Empty/unset disables alerting (no-op watchdog).
     pub alert_webhook_url: Option<String>,
 
+    // -- update-available check (issue #7) -----------------------------------
+    /// `UPDATE_CHECK_ENABLED` -- env fallback for the update-available check
+    /// (`GET /updates/latest`, `services/api/src/updates.rs`). Only consulted
+    /// when the admin-editable `server_settings.update_check_enabled` DB value
+    /// is `NULL` (the operator has never touched the toggle) -- the standard
+    /// house precedence, DB wins, empty/NULL falls back to env.
+    ///
+    /// Default: `false` (D3, opt-in / OFF BY DEFAULT). A fresh install makes
+    /// zero requests to github.com until the operator explicitly enables the
+    /// check via the admin console or this env var -- deliberately the
+    /// opposite of the plan doc's "recommended enabled" default, ratified by
+    /// the maintainer to keep a fresh install at zero external egress
+    /// (Crumb's no-phone-home posture; see `docs/DECISIONS.md`).
+    pub update_check_enabled: bool,
+
     // -- admin bootstrap ----------------------------------------------------
     /// `SEED_ADMIN_USERNAME` -- bootstrap admin username, created at startup if
     /// no admin exists yet.  Default: `admin`.
@@ -343,6 +358,7 @@ impl ApiConfig {
             thumb_cache_dir: optional_env("THUMB_CACHE_DIR", ""),
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
+            update_check_enabled: parse_env("UPDATE_CHECK_ENABLED", false)?,
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),
             // Secret: supports SEED_ADMIN_PASSWORD_FILE (Docker secret) too.
             seed_admin_password: crumb_common::config::secret_env("SEED_ADMIN_PASSWORD")

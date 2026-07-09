@@ -1413,3 +1413,51 @@ pub struct FilmstripResponse {
     pub camera_id: Uuid,
     pub frames: Vec<FilmstripFrame>,
 }
+
+// ─── update-available check (issue #7) ─────────────────────────────────────────
+
+/// Query parameters for `GET /updates/latest`.
+#[derive(Debug, Deserialize)]
+pub struct UpdatesLatestQuery {
+    /// `"1"` forces an immediate re-check ("Check now",
+    /// `docs/UPDATE-SYSTEM-PLAN.md` §2.5), subject to a 60s minimum interval
+    /// between actual forced `GitHub` fetches (a repeat click inside that
+    /// window serves the cached value, `checked_at` unchanged). Anything else,
+    /// including an absent param, is the normal cached path (§2.1).
+    #[serde(default)]
+    pub refresh: Option<String>,
+}
+
+/// `GET /updates/latest` response — see `docs/UPDATE-SYSTEM-PLAN.md` §2.1/§2.5.
+///
+/// `enabled:false` ⇒ every other field is `null` (this, not a 404, is how a
+/// disabled check is told apart from an old server that lacks the route at
+/// all) and `?refresh=1` is silently ignored — disabled means zero `GitHub`
+/// requests, with no exception for a manual "Check now" click.
+///
+/// While enabled, `latest_version` / `notes_url` / `published_at` /
+/// `checked_at` are only `None` in the narrow case where the api has never
+/// completed a `GitHub` fetch yet (no cached value, e.g. right after boot with
+/// `GitHub` unreachable); once a fetch succeeds they stay populated afterwards
+/// even through later outages (stale-while-error — `checked_at` just stops
+/// advancing).
+#[derive(Debug, Serialize)]
+pub struct UpdateCheckResponse {
+    pub enabled: bool,
+    /// Newest stable release tag from `GitHub`, without the leading `v`.
+    pub latest_version: Option<String>,
+    /// `GitHub` release page URL (release notes).
+    pub notes_url: Option<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    /// This server's own build version (the `VERSION` file), so the web
+    /// console's notice needs zero client-side comparison logic.
+    pub server_version: Option<String>,
+    /// `latest_version > server_version`, strict `SemVer` 2.0.0 precedence.
+    /// `None` when either version fails to parse (e.g. a local `-dev` build) —
+    /// "no signal", never a false "you're up to date".
+    pub server_update_available: Option<bool>,
+    /// When the returned release data was last actually refreshed from
+    /// `GitHub` (not merely requested) — an older timestamp during an outage
+    /// is the intentional stale-while-error signal.
+    pub checked_at: Option<DateTime<Utc>>,
+}

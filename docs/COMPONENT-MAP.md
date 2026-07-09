@@ -36,7 +36,7 @@ All paths below are repo-relative and verified to exist as of 2026-07-06.
 | Component | Path(s) | Owns | Built / deployed by |
 |---|---|---|---|
 | Shared crate | `services/common/src/` (`config.rs`, `db.rs`, `types.rs`, `detection.rs`, `logging.rs`, `redact.rs`, `icons.rs`) | Shared types, DB layer, **the `MIGRATIONS` array** (in `db.rs`, search `static MIGRATIONS`), env config, secret redaction | Compiled into both service images |
-| API service | `services/api/src/` (`main.rs` router at the `json_routes` / `media_routes` split; `config_routes.rs`, `dto.rs`, `auth.rs`, `auth_mw.rs`, `roles.rs`, `cameras.rs`, `timeline.rs`, `playback.rs`, `export.rs`, `export_store.rs`, `filmstrip.rs`, `clips.rs`, `events.rs`, `detection_ingester.rs`, `detection/`, `bookmarks.rs`, `views.rs`, `ptz.rs`, `notifications.rs`, `channel_notify.rs`, `status.rs`, `stats.rs`, `stream_test.rs`, `discover.rs`, `go2rtc.rs`, `alerts.rs`, `db_backup.rs`, `metrics.rs`, `rate_limit.rs`) | HTTP API, auth/RBAC, go2rtc reconcile loop, admin console serving, DB backup task | `services/api/Dockerfile`; image `<prefix>/api:<version>` via CI `images` job |
+| API service | `services/api/src/` (`main.rs` router at the `json_routes` / `media_routes` split; `config_routes.rs`, `dto.rs`, `auth.rs`, `auth_mw.rs`, `roles.rs`, `cameras.rs`, `timeline.rs`, `playback.rs`, `export.rs`, `export_store.rs`, `filmstrip.rs`, `clips.rs`, `events.rs`, `detection_ingester.rs`, `detection/`, `bookmarks.rs`, `views.rs`, `ptz.rs`, `notifications.rs`, `channel_notify.rs`, `status.rs`, `stats.rs`, `stream_test.rs`, `discover.rs`, `go2rtc.rs`, `alerts.rs`, `db_backup.rs`, `metrics.rs`, `rate_limit.rs`, `updates.rs`) | HTTP API, auth/RBAC, go2rtc reconcile loop, admin console serving, DB backup task | `services/api/Dockerfile`; image `<prefix>/api:<version>` via CI `images` job |
 | Recorder service | `services/recorder/src/` (`recording.rs`, `motion.rs`, `archive.rs`, `reconcile.rs`, `go2rtc_embed.rs`, `frigate_motion.rs`, `decode_probe.rs`, `resource_stats.rs`) | Recording, motion detection, retention/eviction, segment index, embedded go2rtc supervision. The always-must-work component (golden rule 2) | `services/recorder/Dockerfile`; image `<prefix>/recorder:<version>` |
 | DB schema | `db/migrations/0001..NNNN_*.sql` + the `MIGRATIONS` array in `services/common/src/db.rs` | Schema history. A migration file not listed in the array **silently never runs** (golden rule 4) | Applied on boot by whichever service starts first |
 
@@ -262,6 +262,7 @@ is not. The web admin console doubles as the desktop's management surface
 | Views (saved layouts) | views handling | views + server-backed `/views` | server-backed views | `Platform/`/`Features` |
 | Settings | server settings + users/RBAC | settings + embedded `/admin` | `settings/` | `Settings/` |
 | Notifications | rules + history CRUD | toasts | poll + local notifications | `Settings/` |
+| Update notice (issue #7) | Server settings toggle + status/"Check now" (the console's own update IS the server update) | Phase 2, not yet shipped (`docs/UPDATE-SYSTEM-PLAN.md` §7 C2) | Phase 2, not yet shipped (§7 C3) | Phase 2, not yet shipped, iOS lowest priority per D5 (§7 C4) |
 
 Parity walk for a new feature:
 

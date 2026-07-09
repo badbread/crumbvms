@@ -8,6 +8,85 @@ revisit.
 
 ---
 
+## 2026-07-09, Update-available check: api-mediated, notify-only, opt-in / OFF BY DEFAULT
+
+**Problem.** Issue #7 asks for a non-intrusive "update available → release
+notes" signal across every client (web console, Windows/Linux/macOS desktop,
+Android, iOS), so an install doesn't silently drift for months without the
+operator noticing a new release exists. `docs/UPDATE-SYSTEM-PLAN.md` is the
+full design; this entry records the decisions ratified for Phase 1 (server).
+
+**Chosen.**
+
+- **Notify-only (D1).** Version comparison and a release-notes link only. No
+  download, no install, no update channels, and the recorder is never touched
+  by any part of this feature — footage/metadata are structurally uninvolved.
+- **Api-mediated, not per-client direct polling (D2).** Only `services/api`
+  (`services/api/src/updates.rs`) talks to `GitHub`; every client (including
+  the web console) consumes its own server's `GET /updates/latest`. One
+  implementation, one cache, one operator off-switch that actually turns the
+  whole thing off site-wide, instead of five client codebases each with their
+  own `GitHub` HTTP code and their own switch.
+- **Opt-in, OFF BY DEFAULT (D3).** `UPDATE_CHECK_ENABLED` defaults to `false`;
+  the admin-editable `server_settings.update_check_enabled` (migration
+  `0045_update_check.sql`, nullable — DB wins, `NULL` falls back to env) can
+  turn it on. A fresh install makes **zero** requests to `github.com` until
+  the operator explicitly opts in via the admin console or the env var. This
+  is the plan doc's non-default alternative, deliberately chosen over its
+  "recommended enabled" option to keep Crumb's no-phone-home posture intact
+  out of the box — the checker is a value-add an operator turns on, not a
+  default behavior a privacy-conscious install has to notice and turn off.
+- **Stable releases only, via `releases/latest` (D6).** That `GitHub` endpoint
+  already excludes drafts and pre-releases, so channel selection needs no
+  extra code for Phase 1.
+- **Manual "Check now" (§2.5), added mid-implementation.** `?refresh=1` forces
+  an immediate re-check bypassing the 6h cache TTL, gated to a separate 60s
+  minimum interval between actual forced `GitHub` hits so a burst of manual
+  clicks can't stampede the 60/h/IP unauthenticated rate limit. The disabled
+  state still wins unconditionally: `refresh=1` while disabled makes zero
+  requests, there is no "one-off check while disabled" escape hatch.
+- **No Tauri built-in updater (D4).** Its value is install/relaunch machinery,
+  which #7 explicitly excludes; using it only for version detection would
+  still require its manifest format and a signing keypair at build time for a
+  job a 20-line fetch + hand-rolled `SemVer` compare does against one endpoint.
+
+**Rejected.**
+
+- *Per-client direct `GitHub` polling as the default.* More resilient to a
+  disabled/old server, but five implementations, five off-switches to keep in
+  sync, and every client device (including wall displays) hitting `GitHub`
+  independently instead of one cached point per site. Not ruled out forever —
+  see revisit triggers.
+- *On-by-default (the plan doc's original recommendation).* Would surface the
+  feature to exactly the operators it's meant to help without them hunting for
+  a toggle, but costs a fresh install non-zero external egress before the
+  operator has made any choice at all — a worse trade against the project's
+  "operator's hardware is the whole world, no phone-home" direction than the
+  minor discoverability cost of an opt-in switch.
+- *A server-hosted artifact/manifest system as the #7 vehicle.* Explicitly
+  deferred to the `docs/UPDATE-SYSTEM-PLAN.md` §6 future extension (real
+  install automation, if ever demanded) — out of scope for a notify-only
+  nicety.
+- *Tauri's built-in updater for detection only.* See D4 above.
+
+**Trade-offs accepted.** A client talking to an older server that lacks the
+route gets a 404 and shows nothing — the accepted cost of server-mediation.
+Version-level granularity misses an Android intra-version re-ship
+(`workflow_dispatch` bumping `VERSION_CODE` without a new tag). An unparsable
+own version (a local `-dev` build) shows no banner rather than guessing.
+
+**Revisit triggers.** Real operator demand for in-app download/install
+surfaces (→ design the §6 future extension properly, with signing and scoped
+tokens). `GitHub`'s REST API terms or rate limits change in a way that makes
+server-side caching insufficient. A legitimate need emerges for a client to
+check `GitHub` directly (e.g. a client that is never paired with a Crumb
+server) — revisit D2. Enough operators report never noticing the admin
+console toggle exists that the opt-in default becomes counterproductive —
+revisit D3 (the plan doc's original recommendation is preserved above as the
+alternative to fall back to).
+
+---
+
 ## 2026-07-09, Pin the Rust toolchain (CI + `rust-toolchain.toml`) instead of tracking `stable`
 
 **Problem.** CI installed Rust via `dtolnay/rust-toolchain@stable` (unpinned)
