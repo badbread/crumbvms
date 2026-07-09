@@ -6199,6 +6199,39 @@ pub async fn set_bookmarks_enabled(pool: &Pool, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Operator opt-in toggle for the update-available check (issue #7,
+/// migration 0045). `None` means the operator has never touched this setting
+/// — the caller (`services/api/src/updates.rs::resolve_enabled`) falls back to
+/// the `UPDATE_CHECK_ENABLED` env default (off by default, D3). Unlike
+/// [`get_bookmarks_enabled`], this is deliberately nullable rather than
+/// defaulting in Rust: NULL must be distinguishable from an explicit `false`.
+pub async fn get_update_check_enabled(pool: &Pool) -> Result<Option<bool>> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT update_check_enabled FROM server_settings LIMIT 1",
+            &[],
+        )
+        .await
+        .context("get_update_check_enabled")?;
+    Ok(row
+        .and_then(|r| r.try_get::<_, Option<bool>>("update_check_enabled").ok())
+        .flatten())
+}
+
+/// Set the operator's explicit update-check opt-in/out (issue #7).
+pub async fn set_update_check_enabled(pool: &Pool, enabled: bool) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            "UPDATE server_settings SET update_check_enabled = $1",
+            &[&enabled],
+        )
+        .await
+        .context("set_update_check_enabled")?;
+    Ok(())
+}
+
 /// Set the deployment-wide default clip source (`"crumb"` | `"frigate"`).
 pub async fn set_default_clip_source(pool: &Pool, source: &str) -> Result<()> {
     let client = get_conn(pool).await?;
@@ -7573,6 +7606,10 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
         (
             "0044_beta_terms_acceptance.sql",
             include_str!("../../../db/migrations/0044_beta_terms_acceptance.sql"),
+        ),
+        (
+            "0045_update_check.sql",
+            include_str!("../../../db/migrations/0045_update_check.sql"),
         ),
     ];
 

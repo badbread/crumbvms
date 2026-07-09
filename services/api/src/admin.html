@@ -5767,9 +5767,20 @@ async function renderServerSettings() {
       </label>
       <div id="srv-bk-msg" style="font-size:12px;color:var(--dim);margin-top:4px"></div>
     </div>
+    <div class="policy-section">
+      <div class="policy-section-title">Update checks</div>
+      <div class="card-hint" style="margin-bottom:10px">When enabled, this server periodically asks github.com for the latest CrumbVMS version number so clients can tell you when an update exists. Nothing is sent, and turning this off disables the check for every client. Off by default on a fresh install.</div>
+      <label class="chk" id="srv-upd-wrap" style="cursor:default;opacity:.7">
+        <input type="checkbox" id="srv-upd-enabled" onchange="saveUpdateCheckEnabled(this.checked)" />
+        <span>Enable update checks</span>
+      </label>
+      <div id="srv-upd-msg" style="font-size:12px;color:var(--dim);margin-top:4px"></div>
+      <div id="srv-upd-status" style="font-size:13px;margin-top:8px"></div>
+    </div>
     <div class="card-hint" style="margin-top:4px">Saving applies immediately. Changing the public address may require toggling a camera (or a recorder restart) to take effect on in-flight recordings.</div>
     <div id="srv-msg" class="form-msg"></div>`;
   loadBookmarksEnabled();
+  loadUpdateCheck();
 }
 function onHwaccelChange() {
   const sel = $('srv-hwaccel'); const wrap = $('srv-vaapi-device-wrap');
@@ -5925,6 +5936,75 @@ async function saveBookmarksEnabled(enabled) {
     /* Revert the checkbox to the last-known server state on failure. */
     loadBookmarksEnabled();
   }
+}
+
+/* ── Update-available check (issue #7): opt-in toggle + status/banner ──
+   OFF by default (D3) — this server makes zero github.com requests until the
+   operator flips the switch below. Console writes ONLY this field. */
+async function loadUpdateCheck() {
+  const chk  = $('srv-upd-enabled');
+  const wrap = $('srv-upd-wrap');
+  const msg  = $('srv-upd-msg');
+  if (!chk) return;
+  try {
+    const data = await api('/config/update-check-enabled');
+    chk.checked = !!data.enabled;
+    if (wrap) wrap.style.opacity = '1';
+    if (msg)  msg.textContent = '';
+  } catch (e) {
+    if (msg) msg.textContent = 'Could not load: ' + (e.message || e);
+  }
+  renderUpdateStatus(false);
+}
+async function saveUpdateCheckEnabled(enabled) {
+  const msg = $('srv-upd-msg');
+  try {
+    await api('/config/update-check-enabled', { method: 'PUT', body: JSON.stringify({ enabled: !!enabled }) });
+    if (msg) {
+      msg.style.color = 'var(--ok)';
+      msg.textContent = enabled ? 'Update checks enabled.' : 'Update checks disabled — no more requests to github.com.';
+      setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
+    }
+    renderUpdateStatus(false);
+  } catch (e) {
+    if (msg) { msg.style.color = 'var(--danger)'; msg.textContent = 'Save failed: ' + (e.message || e); }
+    /* Revert the checkbox to the last-known server state on failure. */
+    loadUpdateCheck();
+  }
+}
+/* Renders the status line + "Check now" button. `force` = true bypasses the
+   server's 6h cache (subject to its own 60s "Check now" backoff). Empty when
+   the check is disabled — there is nothing to show, and no request is made. */
+async function renderUpdateStatus(force) {
+  const el = $('srv-upd-status');
+  if (!el) return;
+  const chk = $('srv-upd-enabled');
+  if (!chk || !chk.checked) { el.innerHTML = ''; return; }
+  el.innerHTML = '<span style="color:var(--dim)">Checking…</span>';
+  let data;
+  try {
+    data = await api('/updates/latest' + (force ? '?refresh=1' : ''));
+  } catch (e) {
+    el.innerHTML = `<span class="form-msg err">Couldn't check: ${esc(String(e.message || e))}</span>`;
+    return;
+  }
+  if (!data.enabled) { el.innerHTML = ''; return; }
+  const checkedTxt = data.checked_at ? new Date(data.checked_at).toLocaleString() : null;
+  let statusHtml;
+  if (data.server_update_available) {
+    statusHtml = `<span style="color:var(--warn)">Server v${esc(data.latest_version)} is available</span> — ` +
+      `<a href="${esc(data.notes_url)}" target="_blank" rel="noopener">release notes</a>. ` +
+      `Upgrade: pin <code>CRUMB_VERSION</code>, then <code>docker compose pull &amp;&amp; docker compose up -d</code> (docs/IMAGES.md).`;
+  } else if (data.latest_version) {
+    statusHtml = `<span style="color:var(--ok)">Up to date</span> (v${esc(data.server_version || '?')})` +
+      (checkedTxt ? `, checked ${esc(checkedTxt)}` : '');
+  } else {
+    statusHtml = `<span style="color:var(--dim)">Checked — no data yet (github.com unreachable)</span>`;
+  }
+  el.innerHTML = `<div>${statusHtml}</div><button class="ghost" style="margin-top:6px" onclick="checkForUpdatesNow()">Check now</button>`;
+}
+function checkForUpdatesNow() {
+  renderUpdateStatus(true);
 }
 
 /* ── Camera tab 3: Storage & group ──

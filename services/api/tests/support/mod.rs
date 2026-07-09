@@ -102,6 +102,8 @@ pub mod stats;
 pub mod status;
 #[path = "../../src/timeline.rs"]
 pub mod timeline;
+#[path = "../../src/updates.rs"]
+pub mod updates;
 #[path = "../../src/views.rs"]
 pub mod views;
 

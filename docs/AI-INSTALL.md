@@ -547,6 +547,21 @@ For that, add a small **external uptime check** hitting
 healthchecks.io, or a one-line cron that curls `/health` and alerts on failure.
 Without it, an API outage is silent until someone notices a client won't connect.
 
+**Update notifications (optional, off by default; issue #7).** CrumbVMS can
+tell the operator when a newer release exists, via `GET /updates/latest` and a
+toggle in the admin **Server** settings ("Enable update checks"). This is the
+**one opt-in exception** to the LAN-only/no-egress posture in Step 0: when
+enabled, the api periodically (at most a few times an hour, cached 6h) makes a
+plain HTTPS `GET` to `api.github.com` for the latest `badbread/crumbvms`
+release tag, a version number, nothing else. No telemetry, no client
+identifiers, no counts are sent, and there's no download/auto-install, it is
+strictly a "you're behind, here's the release notes link" notice. **Default is
+OFF** (`UPDATE_CHECK_ENABLED=false`): a fresh install makes zero requests to
+github.com until the operator explicitly flips the switch. Enable it via the
+admin console, or set `UPDATE_CHECK_ENABLED=true` in `.env` before first boot.
+An "enabled" answer includes a manual **"Check now"** button that forces an
+immediate re-check (rate-limited server-side to protect GitHub's API).
+
 ---
 
 ## 10. Remote access (ONLY if the user asks)

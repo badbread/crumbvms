@@ -39,6 +39,7 @@
 //! /filmstrip/*              → filmstrip.rs
 //! /status                   → status.rs
 //! /stats/*                  → stats.rs           (admin only)
+//! /updates/latest           → updates.rs (update-available check, issue #7)
 //! /cameras/:id/ptz          → ptz.rs
 //! /cameras/:id/frame.jpg    → cameras.rs
 //! /health                   → inline (no auth — DB+heartbeat probe, 503 if degraded)
@@ -102,6 +103,7 @@ mod status;
 mod stream_test;
 mod thumb_pregen;
 mod timeline;
+mod updates;
 mod views;
 
 use std::time::Duration;
@@ -454,6 +456,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(clips::json_routes())
         // Notification devices, rules, snooze, presence, and log.
         .merge(notifications::routes())
+        // Update-available check (issue #7): GET /updates/latest, any user.
+        .merge(updates::routes())
         // Layers applied outermost-first: rate-limit (reject early) → timeout →
         // gzip (compress handler output, innermost).
         .layer(CompressionLayer::new())

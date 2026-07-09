@@ -133,6 +133,12 @@ See [Backups](/configuration/backups) for the full picture.
 | `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart |
 | `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot |
 
+## Update-available check (issue #7)
+
+| Key | Default | Notes |
+|---|---|---|
+| `UPDATE_CHECK_ENABLED` | `false` | opt-in; when `true`, the api periodically asks github.com for the latest CrumbVMS release tag (version number only, nothing sent) so clients can show an "update available" notice. `false` means zero github.com requests, ever. The admin console's "Enable update checks" toggle (Server settings) overrides this once set — DB wins over env. |
+
 ## Seed (admin bootstrap)
 
 | Key | Default | Notes |
