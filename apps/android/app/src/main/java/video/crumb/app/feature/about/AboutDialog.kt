@@ -6,8 +6,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -17,6 +19,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import video.crumb.app.BuildConfig
+import video.crumb.app.feature.update.UpdateCheckRow
+import video.crumb.app.feature.update.UpdateUiState
 import video.crumb.app.ui.theme.TextPrimary
 import video.crumb.app.ui.theme.TextSecondary
 
@@ -31,11 +35,17 @@ import video.crumb.app.ui.theme.TextSecondary
  * build is `video.crumb.app` (debug: `video.crumb.app.debug`).
  *
  * @param serverUrl The currently-configured API server, shown for context.
+ * @param updateState Update-available check state (issue #7) — a "you're up
+ *   to date" / "update available → release notes" line plus "Check now",
+ *   shown only while the server has the check enabled.
+ * @param onCheckNow Force an immediate re-check against the server.
  * @param onDismiss Close the dialog.
  */
 @Composable
 fun AboutDialog(
     serverUrl: String,
+    updateState: UpdateUiState,
+    onCheckNow: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -52,6 +62,11 @@ fun AboutDialog(
                 InfoRow("Commit", BuildConfig.GIT_SHA)
                 InfoRow("Build type", BuildConfig.BUILD_TYPE)
                 InfoRow("Server", serverUrl)
+
+                if (updateState.enabled || updateState.updateAvailable) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    UpdateCheckRow(state = updateState, onCheckNow = onCheckNow)
+                }
             }
         },
     )

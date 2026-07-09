@@ -439,6 +439,34 @@ data class CameraStatusEntry(
     @SerialName("recent_motion") val recentMotion: Boolean = false,
 )
 
+// ─── update-available check (issue #7) ──────────────────────────────────────
+
+/**
+ * `GET /updates/latest` response. Mirrors the Rust `UpdateCheckResponse`
+ * (`services/api/src/dto.rs`) exactly — see `docs/UPDATE-SYSTEM-PLAN.md` §2.1/§2.5.
+ *
+ * `enabled == false` means the operator has turned the check off (or this
+ * server predates the feature, in which case the repository layer treats a
+ * 404 the same way): every other field is then null and the client shows
+ * nothing. While enabled, [latestVersion]/[notesUrl]/[publishedAt]/[checkedAt]
+ * are only null in the narrow case where the server has never completed a
+ * GitHub fetch yet.
+ */
+@Serializable
+data class UpdateCheckResponse(
+    val enabled: Boolean = false,
+    /** Newest stable release tag from GitHub, without the leading `v`. */
+    @SerialName("latest_version") val latestVersion: String? = null,
+    /** GitHub release page URL (release notes). */
+    @SerialName("notes_url") val notesUrl: String? = null,
+    @SerialName("published_at") val publishedAt: String? = null,
+    /** The server's own build version — unused by this client, which compares
+     *  [latestVersion] against its OWN `BuildConfig.VERSION_NAME` instead. */
+    @SerialName("server_version") val serverVersion: String? = null,
+    @SerialName("server_update_available") val serverUpdateAvailable: Boolean? = null,
+    @SerialName("checked_at") val checkedAt: String? = null,
+)
+
 // ─── saved views (server-side, per-user; the same /views the desktop/web use) ──
 
 /**

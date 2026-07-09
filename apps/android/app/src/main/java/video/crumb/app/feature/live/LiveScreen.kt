@@ -65,6 +65,8 @@ import video.crumb.app.data.CameraView
 import video.crumb.app.di.appContainer
 import video.crumb.app.feature.about.AboutDialog
 import video.crumb.app.feature.settings.SettingsDialog
+import video.crumb.app.feature.update.UpdateAvailableBanner
+import video.crumb.app.feature.update.UpdateViewModel
 import video.crumb.app.ui.CrumbMode
 import video.crumb.app.ui.CrumbModeTabs
 import video.crumb.app.ui.GridLayoutToggle
@@ -109,6 +111,16 @@ fun LiveScreen(
         },
     )
     val state by vm.uiState.collectAsStateWithLifecycle()
+
+    // Update-available check (issue #7) — lives here because Live is the root
+    // destination (always on the back stack, see MainActivity's popUpTo(LIVE)),
+    // so its 24h re-check timer survives Live/Playback/Clips tab switches.
+    val updateVm: UpdateViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer { UpdateViewModel(container.repository, container.store) }
+        },
+    )
+    val updateState by updateVm.uiState.collectAsStateWithLifecycle()
     val store = container.store
     val caps = store.capabilities
     // Built once (server URL + token are stable for the session). Used to derive the
@@ -351,6 +363,17 @@ fun LiveScreen(
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
+                // ── Update-available banner (issue #7) ────────────────────────────
+                // Non-intrusive, dismissible; dismiss remembers the version so it
+                // stays quiet until a NEWER release appears (see UpdateViewModel).
+                if (updateState.showBanner) {
+                    UpdateAvailableBanner(
+                        state = updateState,
+                        onDismiss = { updateVm.dismiss() },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
                 // ── Auto-fallback badge ───────────────────────────────────────────
                 // Shown when the wall auto-entered low-bw mode due to stalling tiles.
                 // Dismissed by tapping "Restore" (manually exits low-bw mode) or the
@@ -526,7 +549,12 @@ fun LiveScreen(
         )
     }
     if (showAbout) {
-        AboutDialog(serverUrl = store.serverUrl, onDismiss = { showAbout = false })
+        AboutDialog(
+            serverUrl = store.serverUrl,
+            updateState = updateState,
+            onCheckNow = { updateVm.checkNow() },
+            onDismiss = { showAbout = false },
+        )
     }
     editorTarget?.let { target ->
         ViewEditorDialog(
