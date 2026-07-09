@@ -6,6 +6,7 @@ struct SettingsView: View {
 
     let container: AppContainer
     @ObservedObject private var settings: AppSettings
+    @ObservedObject private var updateChecker: UpdateChecker
 
     // Pulled out as a local alias for readability.
     private var store: KeychainStore { container.store }
@@ -19,6 +20,7 @@ struct SettingsView: View {
     init(container: AppContainer) {
         self.container = container
         _settings = ObservedObject(wrappedValue: container.settings)
+        _updateChecker = ObservedObject(wrappedValue: container.updateChecker)
     }
 
     /// Grid-layout pref as a `GridLayout` binding over the Int-backed setting.
@@ -41,6 +43,7 @@ struct SettingsView: View {
                     liveCard
                     ptzCard
                     if store.isAdmin { motionTunerCard }
+                    updateCard
                     aboutButton
                 }
                 .frame(maxWidth: 640)
@@ -53,6 +56,14 @@ struct SettingsView: View {
             .navBarSurfaceBackground(CrumbColors.surface)
             .navigationDestination(isPresented: $navigateToAbout) {
                 AboutView(container: container)
+            }
+            .task {
+                // Redundant with `AppContainer.applyUser`'s login/launch
+                // check, but harmless — `checkIfNeeded()` throttles itself to
+                // once per 24h — and covers sessions that were already logged
+                // in before this feature existed (no fresh login/launch
+                // event to hang the first check off of).
+                await updateChecker.checkIfNeeded()
             }
         }
         .preferredColorScheme(.dark)
@@ -178,6 +189,63 @@ struct SettingsView: View {
                 "Show the motion-detection tuner button in the fullscreen live view.",
                 $settings.motionTunerEnabled
             )
+        }
+    }
+
+    // MARK: - Software update (issue #7 / task C4)
+
+    /// Non-intrusive: nothing renders at all unless the server-side check is
+    /// enabled (`updateChecker.canCheckNow`) or there's a dismissible banner
+    /// to show. Dismissing remembers the version and stays quiet until a
+    /// newer one is reported (`UpdateChecker.dismiss(version:)`).
+    @ViewBuilder
+    private var updateCard: some View {
+        if let banner = updateChecker.bannerVersion {
+            card("Software Update") {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Update available: v\(banner)")
+                            .fontWeight(.semibold)
+                            .foregroundColor(CrumbColors.textPrimary)
+                        if let url = updateChecker.notesURL {
+                            Link("Release notes", destination: url)
+                                .font(.caption)
+                                .foregroundColor(CrumbColors.tealAccent)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        updateChecker.dismiss(version: banner)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(CrumbColors.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss")
+                }
+                if updateChecker.canCheckNow {
+                    rowDivider
+                    checkNowRow
+                }
+            }
+        } else if updateChecker.canCheckNow {
+            card("Software Update") {
+                checkNowRow
+            }
+        }
+    }
+
+    private var checkNowRow: some View {
+        HStack {
+            Text(updateChecker.statusText)
+                .font(.caption)
+                .foregroundColor(CrumbColors.textSecondary)
+            Spacer()
+            Button("Check Now") {
+                Task { await updateChecker.checkNow() }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundColor(CrumbColors.tealAccent)
         }
     }
 

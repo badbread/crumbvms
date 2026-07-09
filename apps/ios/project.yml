@@ -61,6 +61,21 @@ targets:
           SWIFT_OPTIMIZATION_LEVEL: "-O"
           SWIFT_COMPILATION_MODE: "wholemodule"
 
+  # Plain-Swift unit tests (no UI/networking) — currently just the
+  # hand-rolled SemVer comparator behind the update-available checker
+  # (docs/UPDATE-SYSTEM-PLAN.md §2.2, task C4).
+  CrumbTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: CrumbTests
+    dependencies:
+      - target: Crumb
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: video.crumb.app.tests
+
   Crumb-mac:
     type: application
     platform: macOS
