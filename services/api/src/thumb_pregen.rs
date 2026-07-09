@@ -11,6 +11,11 @@
 //! ([`crate::filmstrip::ensure_thumbnail`]), so the worker and live requests
 //! never double-extract or fight over resources.
 //!
+//! Slot selection is coverage-aware: `db::list_thumbnail_times` intersects the
+//! fixed grid with recorded `segments` coverage, so a recording gap never
+//! produces a slot here in the first place (issue #9) — no wasted ffmpeg spawn
+//! that can only 404.
+//!
 //! Cost note: the FIRST pass backfills `THUMB_PREGEN_LOOKBACK_HOURS` of history
 //! sequentially (gentle, one extraction in flight at a time); steady state only
 //! generates the handful of new slots recorded since the previous scan.
@@ -41,7 +46,6 @@ pub async fn run(state: AppState) {
         return;
     }
 
-    let grid_ms = filmstrip::DEFAULT_THUMB_INTERVAL_SECS * 1000;
     let lookback_ms = Duration::hours(lookback_hours).num_milliseconds();
     let scan = std::time::Duration::from_secs(scan_secs);
     tracing::info!(
@@ -57,6 +61,12 @@ pub async fn run(state: AppState) {
 
     loop {
         let now_ms = Utc::now().timestamp_millis();
+        let Some(until) = Utc.timestamp_millis_opt(now_ms).single() else {
+            // Should be unreachable (Utc::now() is always in range); skip this
+            // tick rather than panic a background worker over a clock oddity.
+            tokio::time::sleep(scan).await;
+            continue;
+        };
         let cameras = match db::list_enabled_cameras(state.pool()).await {
             Ok(c) => c,
             Err(e) => {
@@ -71,16 +81,41 @@ pub async fn run(state: AppState) {
                 .get(&cam.id)
                 .copied()
                 .unwrap_or(now_ms - lookback_ms);
-            // Floor the start to the grid; step forward one slot at a time.
-            let mut slot = from_ms.div_euclid(grid_ms) * grid_ms;
-            let mut steps: u64 = 0;
-            while slot < now_ms {
-                if let Some(ts) = Utc.timestamp_millis_opt(slot).single() {
-                    // No-op if already cached; a gap (NotFound) is fine — the
-                    // on-demand path self-heals if the user ever scrubs there.
-                    let _ = filmstrip::ensure_thumbnail(&state, cam.id, ts, width).await;
+            let Some(since) = Utc.timestamp_millis_opt(from_ms).single() else {
+                continue;
+            };
+            if since >= until {
+                watermark.insert(cam.id, now_ms);
+                continue;
+            }
+
+            // Coverage-aware grid slots: gap slots (no recorded footage) are
+            // already excluded, so every extraction below has real footage to
+            // read.
+            let slots = match db::list_thumbnail_times(
+                state.pool(),
+                cam.id,
+                since,
+                until,
+                filmstrip::DEFAULT_THUMB_INTERVAL_SECS,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        camera_id = %cam.id,
+                        error = %e,
+                        "thumb pre-gen: listing thumbnail times failed"
+                    );
+                    continue;
                 }
-                slot += grid_ms;
+            };
+
+            let mut steps: u64 = 0;
+            for ts in slots {
+                // No-op if already cached.
+                let _ = filmstrip::ensure_thumbnail(&state, cam.id, ts, width).await;
                 steps += 1;
                 // Yield periodically so a large initial backfill can't monopolize
                 // the runtime between the semaphore-bounded extractions.

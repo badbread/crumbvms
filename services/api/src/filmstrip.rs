@@ -20,17 +20,20 @@
 //!
 //! The frame timestamp encoded in the filename is the milliseconds-since-epoch
 //! of the frame's wall-clock time.  The API lists frames by scanning the DB
-//! (via `db::list_thumbnail_times`, which is currently stubbed and returns an
-//! empty vec) and builds download URLs pointing at `GET /filmstrip/{id}/frame`.
+//! (via `db::list_thumbnail_times`, which intersects the fixed grid with
+//! recorded `segments` coverage so gap slots are never listed) and builds
+//! download URLs pointing at `GET /filmstrip/{id}/frame`.
 //!
 //! ## On-demand extraction (fallback)
 //!
-//! When `list_thumbnail_times` returns no pre-generated frames (Phase 1 stub),
-//! the list endpoint generates synthetic frame entries spaced every
-//! `DEFAULT_THUMB_INTERVAL_SECS` seconds across the requested range.  Each
-//! synthetic entry points at the same `frame` endpoint which will attempt to
-//! locate the file on disk; if the file is not there (because the background
-//! task has not run yet), the frame endpoint returns 404.
+//! When `list_thumbnail_times` finds NO recorded coverage anywhere in the
+//! requested range (a brand-new camera, or a window entirely before its first
+//! segment), the list endpoint falls back to a synthetic grid spaced every
+//! `DEFAULT_THUMB_INTERVAL_SECS` seconds across the range so the client still
+//! has something to probe as the background task catches up.  Each synthetic
+//! entry points at the same `frame` endpoint which will attempt to locate the
+//! file on disk; if the file is not there (because the background task has
+//! not run yet), the frame endpoint returns 404.
 //!
 //! ## Path traversal guard
 //!
@@ -110,9 +113,12 @@ pub fn routes() -> Router<AppState> {
 /// timestamp and a `GET /filmstrip/{camera_id}/frame?ts=<ts>` URL the client
 /// can fetch for the JPEG.
 ///
-/// When no pre-extracted frames exist in the DB (the current Phase 1 state),
-/// synthetic entries are generated across the range so the client can
-/// conditionally request frames as the background task catches up.
+/// `db::list_thumbnail_times` is coverage-aware: it already excludes grid
+/// slots that fall in a recording gap. The only remaining fallback case is a
+/// range with NO recorded coverage at all (a camera newly added, or a window
+/// entirely before its first segment) — there `db_times` comes back empty and
+/// we synthesise the plain grid so the client still gets slots to probe as
+/// the background task catches up (each will 404 until it does).
 async fn list_filmstrip(
     user: AuthUser,
     State(state): State<AppState>,
@@ -128,11 +134,19 @@ async fn list_filmstrip(
         ));
     }
 
-    // Query pre-extracted thumbnail timestamps from the DB.
-    let db_times = db::list_thumbnail_times(state.pool(), camera_id, q.start, q.end).await?;
+    // Query coverage-filtered thumbnail slot timestamps from the DB.
+    let db_times = db::list_thumbnail_times(
+        state.pool(),
+        camera_id,
+        q.start,
+        q.end,
+        DEFAULT_THUMB_INTERVAL_SECS,
+    )
+    .await?;
 
     let timestamps: Vec<DateTime<Utc>> = if db_times.is_empty() {
-        // Phase 1 fallback: synthesise frame slots across the range.
+        // No recorded coverage anywhere in the range: synthesise the plain
+        // grid (unfiltered) rather than return nothing.
         generate_synthetic_timestamps(q.start, q.end, DEFAULT_THUMB_INTERVAL_SECS)
     } else {
         db_times
@@ -434,49 +448,19 @@ async fn extract_thumbnail(
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 /// Generate timestamp slots across `[start, end)` anchored to a fixed global
-/// grid of `interval_secs`.
+/// grid of `interval_secs`, unfiltered by recorded coverage.
 ///
-/// Slots are floored to the interval on the wall-clock epoch, NOT anchored to
-/// the arbitrary query `start`. Identical slot timestamps across different scrub
-/// windows are what let the pre-extracted / cached frames be reused instead of
-/// re-extracted per window (the list side of the same snapping `serve_frame`
-/// applies to a single frame). The first slot is `start` floored to the grid;
-/// the last is the largest grid multiple strictly less than `end`.
+/// Thin wrapper over `db::thumbnail_grid_slots` — the SAME grid
+/// `list_thumbnail_times` filters by segment coverage, kept here as the
+/// zero-coverage fallback so a brand-new camera (or a window entirely before
+/// its first segment) still gets slots to probe. See that function's doc
+/// comment for the floor/anchor semantics.
 fn generate_synthetic_timestamps(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     interval_secs: i64,
 ) -> Vec<DateTime<Utc>> {
-    if interval_secs <= 0 {
-        return vec![];
-    }
-    let step_ms = interval_secs * 1_000;
-    // Floor `start` to the global grid so slot timestamps are stable across
-    // query windows (cache reuse). `div_euclid` floors correctly even for a
-    // pre-epoch input.
-    let start_ms = start.timestamp_millis().div_euclid(step_ms) * step_ms;
-    let end_ms = end.timestamp_millis();
-    if end_ms <= start_ms {
-        return vec![];
-    }
-    // start_ms < end_ms and step_ms > 0 here; the quotient fits usize on all
-    // targets we care about (Linux x86_64 with 48-bit virtual address space).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let count = ((end_ms - start_ms) / step_ms) as usize + 1;
-
-    (0..count)
-        .filter_map(|i| {
-            #[allow(clippy::cast_possible_wrap)]
-            let ts_ms = start_ms + (i as i64) * step_ms;
-            // Keep slots strictly before `end`.
-            let ts = Utc.timestamp_millis_opt(ts_ms).single()?;
-            if ts < end {
-                Some(ts)
-            } else {
-                None
-            }
-        })
-        .collect()
+    db::thumbnail_grid_slots(start, end, interval_secs)
 }
 
 // ─── urlencoding helper ───────────────────────────────────────────────────────

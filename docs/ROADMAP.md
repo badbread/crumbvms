@@ -569,7 +569,7 @@ The server pre-generates the preview frames so a scrub is a static-file fetch (~
 
 #### Plan
 
-> **Status (2026-07-07):** Phase 0 and the core of Phase 1 (background pre-generation, `THUMB_CACHE_DIR`, config knobs) shipped in #2. Coverage-aware `list_thumbnail_times`, policy-tied thumbnail retention, and the admin-console tunables below remain.
+> **Status (2026-07-09):** Phase 0 and the core of Phase 1 (background pre-generation, `THUMB_CACHE_DIR`, config knobs, coverage-aware `list_thumbnail_times`) shipped in #2 and #9. Policy-tied thumbnail retention and the admin-console tunables below remain.
 
 Phase 0, cache hygiene, API only, standalone (S)
 
@@ -580,7 +580,7 @@ Phase 0, cache hygiene, API only, standalone (S)
 Phase 1, pre-generation, API + `db.rs` stub, no migration (M)
 
 - [x] Background per-camera worker reusing `extract_thumbnail`, interval-driven, semaphore-bounded (shipped in #2 as `thumb_pregen.rs`) (M)
-- [ ] Implement `list_thumbnail_times` as grid slots intersected with recorded `segments` coverage (kills 404 slots in gaps; no new table) (S)
+- [x] Implement `list_thumbnail_times` as grid slots intersected with recorded `segments` coverage (kills 404 slots in gaps; no new table) (S)
 - [ ] Thumbnail retention tied to policy retention, a NEW delete path, path-guarded + tested (S)
 - [x] Config knobs (`THUMB_PREGEN_ENABLED` + lookback/scan/width, cache size/age budget) → `.env.example` / environment reference (golden rule 5) (S)
 - [x] Optional `THUMB_CACHE_DIR` to place the scrub cache on fast/separate storage (e.g. an NVMe partition) while footage stays on bulk HDD, matching the random-read-hot thumbnail workload to the right medium. Low-risk: thumbnails are regenerable and the on-demand path self-heals a wiped cache, so the thumb drive can be cheap and non-redundant (a failure only makes scrubbing temporarily slower, never loses footage) (S)
