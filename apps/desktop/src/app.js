@@ -6475,10 +6475,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   // in-app pane), Dismiss remembers this version only.
   document.getElementById('srv-update-check-btn')?.addEventListener('click', () => void onUpdateCheckNow());
   document.getElementById('srv-update-dismiss-btn')?.addEventListener('click', onUpdateDismiss);
-  document.getElementById('srv-update-link')?.addEventListener('click', (e) => {
-    e.preventDefault();
-    const url = e.currentTarget.dataset.url;
-    if (url) invoke('open_url', { url }).catch(() => setStatus('Could not open the release notes.'));
+  // Both release-notes links (the always-present field + the dismissible banner)
+  // open the notes URL in the OS browser, not the WebView2 in-app pane.
+  document.querySelectorAll('.srv-update-link').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      const url = e.currentTarget.dataset.url;
+      if (url) invoke('open_url', { url }).catch(() => setStatus('Could not open the release notes.'));
+    });
   });
   document.getElementById('srv-admin-open')?.addEventListener('click', () => {
     const url = (state.server || '').replace(/\/$/, '') + '/admin';
@@ -10927,7 +10931,7 @@ function srvSelectSection(name) {
     s.classList.toggle('hidden', s.dataset.section !== name));
   // Leaving Motion: halt the inline tuner's polling so it doesn't run unseen.
   if (name !== 'motion') mtStop();
-  if (name === 'client')      srvReflectClientOptions();
+  if (name === 'client')      { srvReflectClientOptions(); updEnterAbout(); }
   else if (name === 'server') { srvState.lastPolicyUsageMs = 0; void srvLoadHealth(); void srvLoadStats(); void pollRecordingAlerts(); }
   else if (name === 'motion') { void srvEnterMotion(); }
   else if (name === 'admin')  { srvEnterAdmin(); }
@@ -11518,12 +11522,18 @@ function stopRecordingAlertPoll() {
 // server) or enabled:false (operator turned the check off) shows nothing.
 
 const LS_UPDATE_DISMISSED_KEY = 'crumb_update_dismissed_version';
-const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // re-check at most every 24h
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // periodic re-check while the app stays open
+// Light in-session guard: coalesce checks fired close together (a launch check +
+// an About-panel open, or rapid re-renders) into one actual request. The 24h
+// interval governs periodic re-checks; this only debounces bursts.
+const UPDATE_CHECK_MIN_GAP_MS = 15 * 1000;
 
 const updateState = {
   data: null,        // last successful enabled:true /updates/latest body, else null
   ownVersion: null,  // resolved once via the Tauri app API; null = unknown/dev build
   timer: null,
+  checking: false,   // a request is in flight → the About field shows "Checking…"
+  lastCheckMs: 0,    // wall time of the last fired check (for the burst guard)
 };
 
 /** Parse a bare "MAJOR.MINOR.PATCH" string into [maj,min,patch] ints. Anything
@@ -11567,25 +11577,47 @@ function setDismissedUpdateVersion(v) {
 
 /** Fetch GET /updates/latest (optionally forcing a fresh GitHub check server-side
  *  via ?refresh=1, see UPDATE-SYSTEM-PLAN.md §2.5 "Check now"). A 404 (server too
- *  old for the endpoint) or a transient failure just keeps showing the last known
- *  state; a 200 with enabled:false clears it (operator turned the check off). */
+ *  old for the endpoint) or a 200 with enabled:false clears the state (nothing
+ *  shows); other transient failures keep the last known state. Sets the in-flight
+ *  flag so the About field can show "Checking…" while the request runs. */
 async function updCheck(refresh) {
   if (!state.server || !state.token) return;
+  updateState.checking = true;
+  updateState.lastCheckMs = Date.now();
+  updRender();
   try {
     const res = await api(`/updates/latest${refresh ? '?refresh=1' : ''}`);
-    if (res.status === 404) { updateState.data = null; updRender(); return; }
-    if (!res.ok) return; // transient — keep the last known state
-    const body = await res.json();
-    updateState.data = body && body.enabled ? body : null;
+    if (res.status === 404) {
+      updateState.data = null;                    // server too old for the endpoint
+    } else if (res.ok) {
+      const body = await res.json();
+      updateState.data = body && body.enabled ? body : null; // enabled:false → clear
+    }
+    // Any other non-ok status: keep the last known state (transient).
   } catch { /* transient — keep the last known state */ }
-  updRender();
+  finally {
+    updateState.checking = false;
+    updRender();
+  }
 }
 
-/** Begin the post-login poll: check once immediately, then at most every 24h. */
+/** Fire a normal (non-forced) check unless one ran very recently — coalesces a
+ *  launch check with an immediate About-panel open, and absorbs rapid re-renders,
+ *  without spamming the server. `force` (the manual "Check now") bypasses this. */
+function updMaybeCheck() {
+  if (updateState.checking) return;
+  if (Date.now() - updateState.lastCheckMs < UPDATE_CHECK_MIN_GAP_MS) return;
+  void updCheck(false);
+}
+
+/** Begin the update poll on app launch: resolve own version, run one check now
+ *  (every launch — NOT gated behind the 24h interval), then re-check periodically
+ *  while the app stays open. */
 function startUpdateCheckPoll() {
   if (updateState.timer) clearInterval(updateState.timer);
   if (!updateState.ownVersion) void updResolveOwnVersion();
-  void updCheck(false);
+  updateState.lastCheckMs = 0;                    // ensure the launch check always fires
+  updMaybeCheck();
   updateState.timer = setInterval(() => void updCheck(false), UPDATE_CHECK_INTERVAL_MS);
 }
 
@@ -11593,7 +11625,16 @@ function startUpdateCheckPoll() {
 function stopUpdateCheckPoll() {
   if (updateState.timer) { clearInterval(updateState.timer); updateState.timer = null; }
   updateState.data = null;
+  updateState.checking = false;
   updRender();
+}
+
+/** Opening Settings → This Computer (which holds the About panel) triggers a
+ *  fresh check so the always-present Updates field is never stale. This is how a
+ *  client that first checked while the server had the feature OFF can discover it
+ *  was later turned ON. Coalesced by updMaybeCheck so re-entry doesn't spam. */
+function updEnterAbout() {
+  updMaybeCheck();
 }
 
 /** Reflect updateState into the Settings → This Computer → About panel. */
@@ -11601,21 +11642,53 @@ function updRender() {
   const verEl = document.getElementById('srv-app-version');
   if (verEl) verEl.textContent = updateState.ownVersion ? `v${updateState.ownVersion}` : 'unknown (dev build)';
 
+  const d = updateState.data;
+  const enabled = !!d;                            // server reports the check enabled
+  const newer = !!(d && d.latest_version && updIsNewer(d.latest_version, updateState.ownVersion));
+  const ownKnown = !!updParseVersion(updateState.ownVersion);
+
+  // "Check now" is present only while the check is enabled.
   const checkBtn = document.getElementById('srv-update-check-btn');
+  if (checkBtn) checkBtn.classList.toggle('hidden', !enabled);
+
+  // Always-present Updates status field (only while enabled). States:
+  //   "Checking…" / "Update available: vX" (+link) / "You're up to date (vX)".
+  const fieldRow = document.getElementById('srv-update-field-row');
+  const fieldText = document.getElementById('srv-update-field-text');
+  const fieldLink = document.getElementById('srv-update-field-link');
+  if (fieldRow) fieldRow.classList.toggle('hidden', !enabled);
+  if (enabled && fieldText) {
+    let msg;
+    let linkUrl = '';
+    if (updateState.checking) {
+      msg = 'Checking…';
+    } else if (newer) {
+      msg = `Update available: v${d.latest_version}`;
+      linkUrl = d.notes_url || '';
+    } else if (d.latest_version && ownKnown) {
+      msg = `You're up to date (v${d.latest_version})`;
+    } else if (d.latest_version) {
+      // Own version unparsable (dev build): no up-to-date/behind claim, just report latest.
+      msg = `Latest release: v${d.latest_version}`;
+    } else {
+      // Enabled, but the server has no successful GitHub fetch yet.
+      msg = 'Latest version unknown';
+    }
+    fieldText.textContent = msg;
+    if (fieldLink) {
+      fieldLink.classList.toggle('hidden', !linkUrl);
+      fieldLink.dataset.url = linkUrl;
+    }
+  }
+
+  // Dismissible proactive banner: only while an update is available and this
+  // version hasn't been dismissed. Fed by the every-launch check.
   const banner = document.getElementById('srv-update-banner');
   const text = document.getElementById('srv-update-text');
   const link = document.getElementById('srv-update-link');
-  const d = updateState.data;
-
-  // "Check now" only makes sense while the server confirms the check is enabled.
-  if (checkBtn) checkBtn.classList.toggle('hidden', !d);
-
-  const newer = !!(d && d.latest_version && updIsNewer(d.latest_version, updateState.ownVersion));
-  const dismissed = getDismissedUpdateVersion();
-  const show = newer && d.latest_version !== dismissed;
-
-  if (banner) banner.classList.toggle('hidden', !show);
-  if (show) {
+  const showBanner = newer && d.latest_version !== getDismissedUpdateVersion();
+  if (banner) banner.classList.toggle('hidden', !showBanner);
+  if (showBanner) {
     if (text) text.textContent = `Update available: v${d.latest_version}`;
     if (link) {
       link.classList.toggle('hidden', !d.notes_url);
@@ -11624,29 +11697,18 @@ function updRender() {
   }
 }
 
-/** "Check now" click (§2.5): force a fresh check, then report the outcome
- *  inline next to the button, never a popup. */
+/** "Check now" click (§2.5): force a fresh server-side check. The always-present
+ *  field reflects the outcome ("Checking…" → up-to-date / update-available). */
 async function onUpdateCheckNow() {
   const btn = document.getElementById('srv-update-check-btn');
-  const status = document.getElementById('srv-update-status');
   if (btn) btn.disabled = true;
-  if (status) status.textContent = 'Checking…';
   await updCheck(true);
-  if (status) {
-    const d = updateState.data;
-    if (d && d.latest_version && updIsNewer(d.latest_version, updateState.ownVersion)) {
-      status.textContent = `Checked just now, v${d.latest_version} is available.`;
-    } else if (d) {
-      status.textContent = "Checked just now, you're up to date.";
-    } else {
-      status.textContent = '';
-    }
-  }
   if (btn) btn.disabled = false;
 }
 
-/** Dismiss the current notice — remembers this version so it stays quiet until
- *  a newer release appears (per-version, not permanent). */
+/** Dismiss the current banner — remembers this version so the banner stays quiet
+ *  until a newer release appears (per-version, not permanent). The always-present
+ *  Updates field still shows the available update. */
 function onUpdateDismiss() {
   const d = updateState.data;
   if (d && d.latest_version) setDismissedUpdateVersion(d.latest_version);

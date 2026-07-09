@@ -2429,6 +2429,8 @@ body.vs-reordering, body.vs-reordering * { cursor: grabbing !important; user-sel
 }
 .srv-update-banner.hidden { display: none; }
 .srv-update-text { flex: 1 1 auto; font-weight: 600; color: var(--text); }
+/* Always-present status field value (the "Updates" srv-kv row): text + inline link. */
+.srv-update-field { display: inline-flex; align-items: baseline; gap: 8px; justify-content: flex-end; }
 .srv-update-link { color: var(--accent); text-decoration: none; white-space: nowrap; }
 .srv-update-link:hover { text-decoration: underline; }
 .srv-update-link.hidden { display: none; }
