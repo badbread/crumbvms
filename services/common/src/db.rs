@@ -9411,7 +9411,10 @@ mod tests {
         // technique used by the recorder's throwaway-DB tests), URL-encoded.
         let sep = if base_url.contains('?') { '&' } else { '?' };
         let schema_url = format!("{base_url}{sep}options=-c%20search_path%3D{schema}");
-        let pool = build_pool(&schema_url, 2).expect("build_pool (test schema)");
+        // `run_migrations` holds an advisory-lock connection AND a work
+        // connection (via `run_migrations_locked`) concurrently, so a max_size
+        // of 2 deadlocks itself waiting for a slot. Give the fixture headroom.
+        let pool = build_pool(&schema_url, 8).expect("build_pool (test schema)");
 
         SchemaFixture {
             pool,
