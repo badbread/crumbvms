@@ -384,8 +384,8 @@ reference `refs #7`; the PR that completes the last in-scope client carries
 - **S4 Install surface + docs floor.** `.env.example`, `setup-env.sh`
   comment, `docker-compose.yml` api env (+ variant sweep), `docs/AI-INSTALL.md`
   (key + the one-egress disclosure per D3), docs-site environment-reference
-  row. Acceptance: `docker compose config` clean on a real Docker host
-  (dev1/mrUbuntu); smoke workflow green; AI-INSTALL "For maintainers" items
+  row. Acceptance: `docker compose config` clean on a real Docker host (the
+  build/prod host); smoke workflow green; AI-INSTALL "For maintainers" items
   re-verified. Sonnet, small.
 - **S5 Decision log + component map.** The `docs/DECISIONS.md` entry and
   `docs/COMPONENT-MAP.md` "Update notice" parity row per §5 row M, in the
