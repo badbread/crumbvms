@@ -29,6 +29,9 @@ import video.crumb.app.data.SecureStore
  * @param everChecked True once at least one response (success or failure) has
  *   come back, so the About row can distinguish "not checked yet" from
  *   "checked, you're up to date".
+ * @param ownVersion This app's own build version. Defaults to
+ *   `BuildConfig.VERSION_NAME`; a constructor param (not a computed getter) so
+ *   the version-compare gating is unit-testable without `BuildConfig`.
  */
 data class UpdateUiState(
     val enabled: Boolean = false,
@@ -37,10 +40,8 @@ data class UpdateUiState(
     val dismissedVersion: String? = null,
     val checking: Boolean = false,
     val everChecked: Boolean = false,
+    val ownVersion: String = BuildConfig.VERSION_NAME,
 ) {
-    /** Own build version this app was compiled with. */
-    val ownVersion: String get() = BuildConfig.VERSION_NAME
-
     /**
      * True when a strictly newer stable release exists per [SemVer.isNewer].
      * An unparsable own version (e.g. a local `-dev`/debug build) or latest
@@ -59,11 +60,15 @@ data class UpdateUiState(
 }
 
 /**
- * Checks `GET /updates/latest` once shortly after the live wall loads, then at
- * most every 24h while the app keeps running (`docs/UPDATE-SYSTEM-PLAN.md`
- * §3). Also drives the manual "Check now" affordance (§2.5), which forces an
- * immediate re-check via `?refresh=1` — itself rate-limited server-side, so
- * repeated taps are cheap and never hammer GitHub.
+ * Checks `GET /updates/latest` once on every cold app launch, and again
+ * whenever the About dialog is opened (see [refresh]) so its update field is
+ * never stale — a client that first checked while the operator had the feature
+ * OFF must still be able to discover it was turned ON. Periodic re-checks while
+ * the app keeps running are throttled to at most every 24h
+ * (`docs/UPDATE-SYSTEM-PLAN.md` §3). Also drives the manual "Check now"
+ * affordance (§2.5), which forces an immediate re-check via `?refresh=1` —
+ * itself rate-limited server-side, so repeated taps are cheap and never hammer
+ * GitHub.
  *
  * A 404 (older server without the endpoint) or any other failure is treated
  * the same as `enabled:false`: state resets to "nothing to show" rather than
@@ -79,11 +84,31 @@ class UpdateViewModel(
     val uiState: StateFlow<UpdateUiState> = _uiState.asStateFlow()
 
     init {
-        val elapsed = System.currentTimeMillis() - store.lastUpdateCheckAtMs
-        if (elapsed >= RECHECK_INTERVAL_MS) {
+        if (checkedThisLaunch.compareAndSet(false, true)) {
+            // First check of this process launch — ALWAYS, ungated by the 24h
+            // timer, so the proactive live-wall banner appears even right after
+            // the operator flips the server toggle on. The process-static flag
+            // only guards against re-checking on every ViewModel re-creation
+            // within the same running process (config change, back-stack churn).
             performCheck(refresh = false)
+        } else {
+            // A later ViewModel re-creation within the same process: this is the
+            // periodic re-check path — throttled to at most once every 24h (§3).
+            val elapsed = System.currentTimeMillis() - store.lastUpdateCheckAtMs
+            if (elapsed >= RECHECK_INTERVAL_MS) {
+                performCheck(refresh = false)
+            }
         }
     }
+
+    /**
+     * Trigger a fresh NORMAL check (not the forced `?refresh=1` path). Called
+     * when the About dialog opens so its update field reflects current server
+     * state rather than a possibly-stale cached one. Cheap — the server serves
+     * its own 6h cache within the window, so this is at most one GitHub hit
+     * every few hours regardless of how often About is opened.
+     */
+    fun refresh() = performCheck(refresh = false)
 
     /**
      * Force an immediate re-check ("Check now", §2.5). Safe to call
@@ -140,5 +165,13 @@ class UpdateViewModel(
     companion object {
         /** Re-check at most once a day while the app is used (§3). */
         const val RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000L
+
+        /**
+         * Process-static: has the cold-launch check already fired this process?
+         * Ensures the launch check runs exactly once per app launch (ungated by
+         * the 24h timer) regardless of how many times [UpdateViewModel] is
+         * re-created within that process.
+         */
+        private val checkedThisLaunch = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 }

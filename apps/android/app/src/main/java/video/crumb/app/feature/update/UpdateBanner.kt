@@ -100,10 +100,13 @@ fun UpdateAvailableBanner(
 }
 
 /**
- * Settings/About row (issue #7 §3): the current version's update status, plus
- * a "Check now" button offered only while the server has the check enabled
- * ([UpdateUiState.enabled]). Tapping the release-notes line/button opens
- * [UpdateUiState.notesUrl] in the platform browser.
+ * Settings/About row (issue #7 §3). Callers should compose this whenever the
+ * server reports the check enabled ([UpdateUiState.enabled]); it is then always
+ * present, showing one of three statuses — "Checking..." (first check in
+ * flight), "Update available: vX -> release notes" (opens
+ * [UpdateUiState.notesUrl] in the browser), or "You're up to date (vX)" — with
+ * a "Check now" button always reachable. The caller hides it when the server
+ * reports `enabled:false` / 404.
  */
 @Composable
 fun UpdateCheckRow(
@@ -133,22 +136,29 @@ fun UpdateCheckRow(
                     )
                 }
             }
-            state.everChecked && state.enabled -> {
+            // A result is in hand and there is no newer release: up to date.
+            state.everChecked -> {
                 Text(
-                    text = "You're up to date.",
+                    text = "You're up to date (v${state.ownVersion})",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+            }
+            // First check still in flight (nothing resolved yet).
+            else -> {
+                Text(
+                    text = "Checking...",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                 )
             }
         }
-        if (state.enabled) {
-            TextButton(
-                onClick = onCheckNow,
-                enabled = !state.checking,
-                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp),
-            ) {
-                Text(if (state.checking) "Checking..." else "Check now", color = TealAccent)
-            }
+        TextButton(
+            onClick = onCheckNow,
+            enabled = !state.checking,
+            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp),
+        ) {
+            Text(if (state.checking) "Checking..." else "Check now", color = TealAccent)
         }
     }
 }

@@ -552,6 +552,7 @@ fun LiveScreen(
         AboutDialog(
             serverUrl = store.serverUrl,
             updateState = updateState,
+            onOpened = { updateVm.refresh() },
             onCheckNow = { updateVm.checkNow() },
             onDismiss = { showAbout = false },
         )
