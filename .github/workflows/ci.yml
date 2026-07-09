@@ -76,8 +76,11 @@ jobs:
           fi
 
       - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml so a new `stable` release and its
+        # clippy can't turn CI red with no code change. Bump both together.
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.97.0"
           components: rustfmt, clippy
 
       - name: Cache cargo registry + build
@@ -126,8 +129,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml so a new `stable` release and its
+        # clippy can't turn CI red with no code change. Bump both together.
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.97.0"
           components: rustfmt, clippy
 
       - name: Install GTK / WebKitGTK build deps
