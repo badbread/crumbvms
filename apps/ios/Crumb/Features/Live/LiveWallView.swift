@@ -42,6 +42,10 @@ struct LiveWallView: View {
     @State private var macWallFullscreen = false
     @ObservedObject private var container: AppContainer
     @ObservedObject private var settings: AppSettings
+    /// Drives the proactive "update available" banner across the top of the
+    /// wall (issue #7 / task C4) — fed by the every-launch check in
+    /// `AppContainer.applyUser`, so the notice appears without opening Settings.
+    @ObservedObject private var updateChecker: UpdateChecker
     #if os(iOS)
     /// Compact vertical size class == iPhone landscape. In landscape the mode tabs
     /// fold up into the top toolbar (inline with the tile-size button) to reclaim
@@ -52,6 +56,7 @@ struct LiveWallView: View {
     init(container: AppContainer) {
         _container = ObservedObject(wrappedValue: container)
         _settings = ObservedObject(wrappedValue: container.settings)
+        _updateChecker = ObservedObject(wrappedValue: container.updateChecker)
         let vm = LiveViewModel(container: container)
         _vm = StateObject(wrappedValue: vm)
         _selectedCameraId = State(initialValue: container.store.lastLiveCameraId)
@@ -175,6 +180,44 @@ struct LiveWallView: View {
         }
         .onDisappear {
             vm.stopStatusPolling()
+        }
+        // Proactive update-available notice, pinned above the wall content
+        // (pushes content down rather than covering it). Renders nothing —
+        // and reserves no space — unless there's an un-dismissed newer
+        // version, so it stays out of the way the rest of the time.
+        .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
+    }
+
+    // MARK: - Update banner (issue #7 / task C4)
+
+    @ViewBuilder private var updateBanner: some View {
+        if let version = updateChecker.bannerVersion {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .foregroundColor(CrumbColors.teal)
+                Text("Update available: v\(version)")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(CrumbColors.textPrimary)
+                if let url = updateChecker.notesURL {
+                    Link("Release notes", destination: url)
+                        .font(.subheadline)
+                        .foregroundColor(CrumbColors.tealAccent)
+                }
+                Spacer(minLength: 8)
+                Button {
+                    updateChecker.dismiss(version: version)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(CrumbColors.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity)
+            .background(CrumbColors.surface)
         }
     }
 

@@ -73,11 +73,13 @@ final class AppContainer: ObservableObject {
         isAdmin = me.isAdmin
         store.capabilities = caps
         store.role = me.role
-        // `applyUser` runs exactly once per successful login and once per
-        // launch (session validation below), which is precisely "check once
-        // after login/launch" for the update checker (§3) — `checkIfNeeded()`
-        // itself throttles to at most every 24h.
-        Task { await updateChecker.checkIfNeeded() }
+        // `applyUser` runs on every successful login and on every launch-time
+        // session validation. `checkOnLaunch()` fires the update check once per
+        // launch, deliberately bypassing the 24h throttle so a client that last
+        // checked while the server had the feature OFF can discover it was
+        // turned back ON — this drives the proactive banner without the user
+        // ever opening Settings.
+        Task { await updateChecker.checkOnLaunch() }
     }
 
     private func validateSession() async {

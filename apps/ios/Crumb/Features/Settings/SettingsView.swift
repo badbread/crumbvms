@@ -57,13 +57,14 @@ struct SettingsView: View {
             .navigationDestination(isPresented: $navigateToAbout) {
                 AboutView(container: container)
             }
-            .task {
-                // Redundant with `AppContainer.applyUser`'s login/launch
-                // check, but harmless — `checkIfNeeded()` throttles itself to
-                // once per 24h — and covers sessions that were already logged
-                // in before this feature existed (no fresh login/launch
-                // event to hang the first check off of).
-                await updateChecker.checkIfNeeded()
+            .onAppear {
+                // Fresh (non-throttled) check every time Settings opens, so the
+                // card is never stale — and so a client that previously saw the
+                // check DISABLED discovers it was turned back on (the card's own
+                // `.onAppear` can't do that: it only renders once enabled).
+                // `runCheck` coalesces overlapping calls, so this is safe
+                // alongside the launch check.
+                Task { await updateChecker.check() }
             }
         }
         .preferredColorScheme(.dark)
@@ -194,58 +195,80 @@ struct SettingsView: View {
 
     // MARK: - Software update (issue #7 / task C4)
 
-    /// Non-intrusive: nothing renders at all unless the server-side check is
-    /// enabled (`updateChecker.canCheckNow`) or there's a dismissible banner
-    /// to show. Dismissing remembers the version and stays quiet until a
-    /// newer one is reported (`UpdateChecker.dismiss(version:)`).
+    /// Always present whenever the server reports the check enabled; hidden
+    /// entirely when disabled (`enabled:false`) or absent (an older server that
+    /// 404s). A fresh check fires on `.onAppear` (see the card's modifier) so
+    /// the shown state is never stale — a client that previously saw the
+    /// feature OFF discovers it flipped ON just by opening Settings. Three
+    /// states: "Checking…", the up-to-date line, or the dismissible
+    /// update-available row. "Check now" is present in all three.
     @ViewBuilder
     private var updateCard: some View {
-        if let banner = updateChecker.bannerVersion {
+        if updateChecker.isEnabled {
             card("Software Update") {
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Update available: v\(banner)")
-                            .fontWeight(.semibold)
-                            .foregroundColor(CrumbColors.textPrimary)
-                        if let url = updateChecker.notesURL {
-                            Link("Release notes", destination: url)
-                                .font(.caption)
-                                .foregroundColor(CrumbColors.tealAccent)
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    Button {
-                        updateChecker.dismiss(version: banner)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(CrumbColors.textTertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss")
-                }
-                if updateChecker.canCheckNow {
-                    rowDivider
-                    checkNowRow
-                }
-            }
-        } else if updateChecker.canCheckNow {
-            card("Software Update") {
+                updateStatusRow
+                rowDivider
                 checkNowRow
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var updateStatusRow: some View {
+        if let banner = updateChecker.bannerVersion {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Update available: v\(banner)")
+                        .fontWeight(.semibold)
+                        .foregroundColor(CrumbColors.textPrimary)
+                    if let url = updateChecker.notesURL {
+                        Link("Release notes", destination: url)
+                            .font(.caption)
+                            .foregroundColor(CrumbColors.tealAccent)
+                    }
+                }
+                Spacer(minLength: 8)
+                Button {
+                    updateChecker.dismiss(version: banner)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(CrumbColors.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+        } else if updateChecker.isChecking {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(CrumbColors.teal)
+                Text("Checking…")
+                    .foregroundColor(CrumbColors.textSecondary)
+                Spacer()
+            }
+        } else {
+            HStack {
+                Text(updateChecker.upToDateText)
+                    .foregroundColor(CrumbColors.textPrimary)
+                Spacer()
             }
         }
     }
 
     private var checkNowRow: some View {
         HStack {
-            Text(updateChecker.statusText)
-                .font(.caption)
-                .foregroundColor(CrumbColors.textSecondary)
+            if let hint = updateChecker.lastCheckedHint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundColor(CrumbColors.textSecondary)
+            }
             Spacer()
             Button("Check Now") {
                 Task { await updateChecker.checkNow() }
             }
             .font(.caption.weight(.semibold))
             .foregroundColor(CrumbColors.tealAccent)
+            .disabled(updateChecker.isChecking)
         }
     }
 
