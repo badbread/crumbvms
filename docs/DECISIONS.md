@@ -45,9 +45,18 @@ pre-picked.
 
 - **Android** still has the single-shot export flow; porting the batch model
   there is follow-up work under issue #22's umbrella, not silently dropped.
-- **Wall-tile thumbnail crispness** (issue #22 item 5) is server-side
-  (pre-generation width in `filmstrip.rs`) and intentionally not bundled into
-  this client-only change.
+- **Wall-tile thumbnail crispness** (issue #22 item 5) — since addressed:
+  the playback wall + single-camera scrub previews requested ~160px stills
+  that blurred blown up to tile size on a large display. The scrub-still width
+  is now a shared constant (iOS `MediaUrls.scrubThumbWidth` = 480) kept equal
+  to the server's `THUMB_PREGEN_WIDTH` default (raised 160 → 480) so the two
+  agree and requests hit the pre-generated cache when it is enabled (and are
+  cached lazily at that width, grid-snapped, when it is not — the default).
+  480 sits at the top of the maintainer's suggested 320–480 range: notably
+  crisper without paying the full 640 cap on per-tick on-demand extraction for
+  a multi-camera wall. Trade-off: when an operator enables pre-generation the
+  cache is ~3–4× the bytes of the old 160px cache; lowering `THUMB_PREGEN_WIDTH`
+  is safe and just drops those clients back to on-demand at their width.
 - Issue #22 item 6 (format-set parity) was verified a **no-op**: both clients
   already offer exactly MP4/MKV × {H.264 (MP4 only), H.265, copy}.
 

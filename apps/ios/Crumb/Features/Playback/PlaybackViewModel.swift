@@ -333,7 +333,10 @@ final class PlaybackViewModel: ObservableObject {
                 cameraId: cameraId,
                 start: iso(max(centerMs - halfMs, 0)),
                 end: iso(centerMs + halfMs),
-                width: 160
+                // Crisp scrub still (matches the wall + server pre-gen width); the
+                // list only mints frame URLs, so a bigger width costs nothing until
+                // the one nearest frame is actually fetched for the scrub overlay.
+                width: MediaUrls.scrubThumbWidth
             ).frames {
                 guard !Task.isCancelled else { return }
                 filmstrip = frames
