@@ -188,7 +188,9 @@ struct PlaybackView: View {
                 // no custom-URLSession init, and always uses `URLSession.shared`
                 // (disk-cached) — use `TokenedAsyncImage` (MediaSession.swift),
                 // which fetches via the ephemeral `.crumbMedia` session instead.
-                TokenedAsyncImage(url: f) { img in img.resizable().scaledToFit() } placeholder: { EmptyView() }
+                // keepStaleImage: the scrub URL changes per tick; keep the prior
+                // frame up while the next loads instead of blinking to black.
+                TokenedAsyncImage(url: f, keepStaleImage: true) { img in img.resizable().scaledToFit() } placeholder: { EmptyView() }
             }
             if vm.loading && vm.currentSegment == nil {
                 ProgressView().tint(CrumbColors.teal)

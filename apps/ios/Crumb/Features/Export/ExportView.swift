@@ -290,14 +290,17 @@ struct ExportView: View {
                     // persist the tokened URL (and thus the token) to disk.
                     // `TokenedAsyncImage` (MediaSession.swift) fetches via the
                     // ephemeral `.crumbMedia` session instead — in-memory only.
-                    TokenedAsyncImage(url: url) { img in
+                    //
+                    // keepStaleImage: the URL changes on every scrub/play tick;
+                    // the previous frame must stay up while the next one loads
+                    // (blanking per tick = a black flash per frame).
+                    TokenedAsyncImage(url: url, keepStaleImage: true) { img in
                         img.resizable().scaledToFit()
                     } placeholder: {
                         ProgressView().tint(CrumbColors.tealAccent)
                     } failure: {
                         previewPlaceholder("No footage at this moment")
                     }
-                    .id(url)   // reload when camera/position changes
                 } else {
                     previewPlaceholder("Pick a camera to preview")
                 }
