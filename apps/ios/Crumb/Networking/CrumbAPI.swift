@@ -127,6 +127,12 @@ final class CrumbAPI {
         try await post("export", body: body)
     }
 
+    /// Batch export: a list of {camera, range} clips bundled into one job
+    /// (single archive server-side when >1 output or a password is set).
+    func createBatchExport(_ body: CreateBatchExportRequest) async throws -> CreateExportResponse {
+        try await post("export/batch", body: body)
+    }
+
     func exportStatus(jobId: String) async throws -> ExportJob {
         try await get("export/\(jobId)")
     }

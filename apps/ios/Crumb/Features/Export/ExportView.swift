@@ -7,11 +7,14 @@ import AppKit
 
 // MARK: - Sheet entry point
 
-/// Export sheet: operator picks cameras, adjusts the clip window, toggles burn-in,
-/// taps Export, then watches the job progress to completion. On success the iOS
-/// native Share sheet presents the authenticated download URL(s).
+/// Export view, mirroring the desktop client's batch-list flow: the operator
+/// builds a LIST of clips (camera + range each, "+ Add to list"), sets global
+/// output options (format, burn-in, audio, optional AES-256 ZIP password), then
+/// runs the whole batch as one job and watches it to completion. On success each
+/// output file offers a native Share (iOS) / Save (macOS) action.
 ///
-/// Present this as `.sheet(isPresented:)` from a parent view.
+/// Present as `.sheet(isPresented:)` from playback, or embed (the macOS
+/// Exports tab).
 struct ExportView: View {
 
     @StateObject private var vm: ExportViewModel
@@ -20,24 +23,24 @@ struct ExportView: View {
     /// - Parameters:
     ///   - container: App-wide service locator.
     ///   - cameras: Full list of cameras the user may pick from.
-    ///   - cameraIds: Pre-selected camera IDs.
-    ///   - start: Pre-filled clip start.
-    ///   - end: Pre-filled clip end.
-    ///   - onClose: Called when the user taps Cancel / Done.
+    ///   - seedCameraId: Camera to pre-select in the add-clip builder (the
+    ///     camera the user was viewing), nil for no preference.
+    ///   - initialRange: Non-nil (playback "Export selection…" path) opens the
+    ///     builder pre-filled with this range so it's one click to add the
+    ///     first clip. nil (Exports tab) starts in list mode.
+    ///   - onClose: Called when the user taps Close.
     init(
         container: AppContainer,
         cameras: [CameraDto],
-        cameraIds: [String],
-        start: Date,
-        end: Date,
+        seedCameraId: String? = nil,
+        initialRange: (start: Date, end: Date)? = nil,
         onClose: @escaping () -> Void
     ) {
         _vm = StateObject(wrappedValue: ExportViewModel(
             container: container,
             cameras: cameras,
-            cameraIds: cameraIds,
-            start: start,
-            end: end
+            seedCameraId: seedCameraId,
+            initialRange: initialRange
         ))
         self.onClose = onClose
     }
@@ -94,12 +97,14 @@ struct ExportView: View {
 
     // MARK: - Columns
 
-    /// Left builder column: what to export.
+    /// Left builder column: what to export — the clip list, or the add/edit-clip
+    /// builder while it's open (desktop list mode ⇄ builder mode).
+    @ViewBuilder
     private var leftColumn: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            previewSection
-            cameraSection
-            timeRangeSection
+        if vm.state.builder != nil {
+            builderSection
+        } else {
+            listSection
         }
     }
 
@@ -108,16 +113,174 @@ struct ExportView: View {
         VStack(alignment: .leading, spacing: 18) {
             formatSection
             optionsSection
+            summarySection
             exportButton
             jobSection
         }
     }
 
-    // MARK: - Section: Preview
+    // MARK: - Section: Export list
 
-    private var previewSection: some View {
+    private var listSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("Preview")
+            HStack {
+                SectionHeader(vm.clipCount > 0 ? "Export list (\(vm.clipCount))" : "Export list")
+                Spacer()
+                Button {
+                    vm.openBuilder()
+                } label: {
+                    Label("Add clip", systemImage: "plus")
+                        .font(.subheadline.weight(.medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(CrumbColors.tealAccent)
+                .disabled(vm.state.polling)
+            }
+
+            if let err = vm.state.cameraError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundColor(CrumbColors.error)
+            }
+
+            if vm.state.clips.isEmpty {
+                SurfaceCard {
+                    VStack(spacing: 6) {
+                        Text("No clips yet.")
+                            .font(.subheadline)
+                            .foregroundColor(CrumbColors.textSecondary)
+                        Text("Add a camera + time range to build your export.")
+                            .font(.caption)
+                            .foregroundColor(CrumbColors.textTertiary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
+                }
+            } else {
+                ForEach(Array(vm.state.clips.enumerated()), id: \.element.id) { index, clip in
+                    ClipRow(
+                        index: index + 1,
+                        clip: clip,
+                        cameraName: cameraName(for: clip.cameraId),
+                        thumbURL: { [weak vm] in
+                            await vm?.mediaUrls().historicalFrameUrl(
+                                cameraId: clip.cameraId,
+                                tsISO: iso8601String(clip.start),
+                                width: 160
+                            )
+                        },
+                        onEdit: { vm.openBuilder(editing: clip) },
+                        onRemove: { vm.removeClip(clip.id) }
+                    )
+                    .disabled(vm.state.polling)
+                }
+            }
+        }
+        .padding(.bottom, 16)
+    }
+
+    // MARK: - Section: Add/edit-clip builder
+
+    @ViewBuilder
+    private var builderSection: some View {
+        if let b = vm.state.builder {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionHeader(b.editId != nil ? "Edit clip" : "Add clip")
+
+                // Camera
+                SurfaceCard {
+                    HStack {
+                        Text("Camera")
+                            .font(.body)
+                            .foregroundColor(CrumbColors.textPrimary)
+                        Spacer()
+                        Picker("", selection: Binding(
+                            get: { b.cameraId ?? "" },
+                            set: { vm.setBuilderCamera($0) }
+                        )) {
+                            ForEach(vm.state.cameras) { cam in
+                                Text(cam.name).tag(cam.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .tint(CrumbColors.textPrimary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                }
+
+                // Range
+                SurfaceCard {
+                    DatePicker(
+                        "Start",
+                        selection: Binding(get: { b.start }, set: { vm.setBuilderStart($0) }),
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .foregroundColor(CrumbColors.textPrimary)
+                    .tint(CrumbColors.tealAccent)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                }
+                SurfaceCard {
+                    DatePicker(
+                        "End",
+                        selection: Binding(get: { b.end }, set: { vm.setBuilderEnd($0) }),
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .foregroundColor(CrumbColors.textPrimary)
+                    .tint(CrumbColors.tealAccent)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                }
+
+                Text("Duration: \(formatDuration(b.end.timeIntervalSince(b.start)))")
+                    .font(.caption)
+                    .foregroundColor(CrumbColors.textSecondary)
+
+                previewSection(b)
+
+                if let err = b.error {
+                    Text(err)
+                        .font(.subheadline)
+                        .foregroundColor(CrumbColors.error)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        vm.cancelBuilder()
+                    } label: {
+                        Text("Cancel")
+                            .font(.subheadline.weight(.medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(CrumbColors.surfaceVariant, in: RoundedRectangle(cornerRadius: 10))
+                            .foregroundColor(CrumbColors.textPrimary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        vm.commitBuilder()
+                    } label: {
+                        Text(b.editId != nil ? "Save changes" : "+ Add to list")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(CrumbColors.teal, in: RoundedRectangle(cornerRadius: 10))
+                            .foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.bottom, 16)
+        }
+    }
+
+    /// Frame-accurate review before adding: a still at the scrubber position,
+    /// a play toggle (auto-advance, extraction-capped) and a scrub slider —
+    /// the desktop builder's preview scrubber.
+    private func previewSection(_ b: ExportBuilder) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             ZStack {
                 Color.black
                 if let url = vm.previewURL {
@@ -132,30 +295,51 @@ struct ExportView: View {
                     } placeholder: {
                         ProgressView().tint(CrumbColors.tealAccent)
                     } failure: {
-                        previewPlaceholder("Preview unavailable")
+                        previewPlaceholder("No footage at this moment")
                     }
-                    .id(url)   // reload when camera/start changes
+                    .id(url)   // reload when camera/position changes
                 } else {
-                    previewPlaceholder("Select a camera to preview")
+                    previewPlaceholder("Pick a camera to preview")
                 }
             }
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
             // Cap the height so a wide window doesn't blow the preview up to fill
-            // the whole column and push the camera + time-range controls below the
-            // fold. Centered; stays 16:9.
+            // the whole column and push the range controls below the fold.
             .frame(maxWidth: .infinity, maxHeight: 300)
             .clipShape(RoundedRectangle(cornerRadius: 10))
-            // Scoped media token (P0-SESSIONS): the preview URL is now minted
-            // async, so it's refreshed reactively rather than computed inline
-            // in `body`. Keyed on the inputs that change which still to show.
-            .task(id: PreviewKey(cameraIds: vm.state.selectedCameraIds, start: vm.state.start)) {
+            // Scoped media token (P0-SESSIONS): the preview URL is minted async,
+            // so it's refreshed reactively rather than computed inline in `body`.
+            // Keyed on every input that changes which still to show.
+            .task(id: PreviewKey(cameraId: b.cameraId, start: b.start, end: b.end, fraction: b.scrubFraction)) {
                 vm.refreshPreview()
             }
-            Text("Still frame at the clip start.")
-                .font(.caption)
-                .foregroundColor(CrumbColors.textSecondary)
+
+            HStack(spacing: 10) {
+                Button {
+                    vm.togglePlay()
+                } label: {
+                    Image(systemName: b.playing ? "pause.fill" : "play.fill")
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .frame(width: 28, height: 28)
+                        .background(CrumbColors.teal)
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(b.playing ? "Pause preview" : "Play preview")
+
+                Slider(value: Binding(
+                    get: { b.scrubFraction },
+                    set: { vm.setScrubFraction($0) }
+                ), in: 0...1)
+                .tint(CrumbColors.tealAccent)
+
+                Text(scrubReadout(b))
+                    .font(.caption.monospacedDigit())
+                    .foregroundColor(CrumbColors.textSecondary)
+                    .frame(minWidth: 96, alignment: .trailing)
+            }
         }
-        .padding(.bottom, 2)
     }
 
     private func previewPlaceholder(_ text: String) -> some View {
@@ -165,11 +349,19 @@ struct ExportView: View {
         }
     }
 
-    /// `.task(id:)` identity for `vm.refreshPreview()` — the preview still
-    /// depends on the selected camera set and the clip start date.
+    /// "+M:SS / 7m 19s" — offset into the clip at the scrubber, over the total.
+    private func scrubReadout(_ b: ExportBuilder) -> String {
+        let span = max(0, b.end.timeIntervalSince(b.start))
+        let off = Int((span * b.scrubFraction).rounded())
+        return String(format: "+%d:%02d / %@", off / 60, off % 60, formatDuration(span))
+    }
+
+    /// `.task(id:)` identity for `vm.refreshPreview()`.
     private struct PreviewKey: Equatable {
-        let cameraIds: Set<String>
+        let cameraId: String?
         let start: Date
+        let end: Date
+        let fraction: Double
     }
 
     // MARK: - Section: Format
@@ -208,100 +400,18 @@ struct ExportView: View {
                         .font(.caption)
                         .foregroundColor(CrumbColors.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    if vm.state.format.videoCodec == "h265" {
+                        Text("H.265 (HEVC) re-encodes the video — noticeably slower to export.")
+                            .font(.caption)
+                            .foregroundColor(CrumbColors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
         }
-    }
-
-    // MARK: - Section: Camera Selection
-
-    private var cameraSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("Cameras")
-
-            let s = vm.state
-            if s.cameras.isEmpty {
-                Text("No cameras available.")
-                    .font(.subheadline)
-                    .foregroundColor(CrumbColors.textSecondary)
-                    .padding(.vertical, 8)
-            } else {
-                if let err = s.cameraError {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundColor(CrumbColors.error)
-                        .padding(.bottom, 4)
-                }
-                SurfaceCard {
-                    ForEach(Array(s.cameras.enumerated()), id: \.element.id) { index, camera in
-                        CameraCheckRow(
-                            camera: camera,
-                            isSelected: s.selectedCameraIds.contains(camera.id),
-                            onToggle: { vm.toggleCamera(camera.id) }
-                        )
-                        if index < s.cameras.count - 1 {
-                            Divider()
-                                .background(CrumbColors.divider)
-                                .padding(.horizontal, 12)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(.bottom, 16)
-    }
-
-    // MARK: - Section: Time Range
-
-    private var timeRangeSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("Clip Window")
-
-            let s = vm.state
-            let disabled = s.polling
-
-            // Start picker
-            SurfaceCard {
-                DatePicker(
-                    "Start",
-                    selection: Binding(
-                        get: { s.start },
-                        set: { vm.setStart($0) }
-                    ),
-                    displayedComponents: [.date, .hourAndMinute]
-                )
-                .disabled(disabled)
-                .foregroundColor(CrumbColors.textPrimary)
-                .tint(CrumbColors.tealAccent)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-            }
-
-            // End picker
-            SurfaceCard {
-                DatePicker(
-                    "End",
-                    selection: Binding(
-                        get: { s.end },
-                        set: { vm.setEnd($0) }
-                    ),
-                    displayedComponents: [.date, .hourAndMinute]
-                )
-                .disabled(disabled)
-                .foregroundColor(CrumbColors.textPrimary)
-                .tint(CrumbColors.tealAccent)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-            }
-
-            // Duration hint
-            Text("Duration: \(formatDuration(s.end.timeIntervalSince(s.start)))")
-                .font(.caption)
-                .foregroundColor(CrumbColors.textSecondary)
-        }
-        .padding(.bottom, 16)
     }
 
     // MARK: - Section: Options
@@ -325,10 +435,31 @@ struct ExportView: View {
                         get: { vm.state.includeAudio },
                         set: { vm.setIncludeAudio($0) }
                     )
+                    Divider().background(CrumbColors.divider).padding(.horizontal, 16)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Encryption password")
+                            .font(.body)
+                            .foregroundColor(CrumbColors.textPrimary)
+                        SecureField("Optional", text: Binding(
+                            get: { vm.state.password },
+                            set: { vm.setPassword($0) }
+                        ))
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(CrumbColors.surfaceVariant, in: RoundedRectangle(cornerRadius: 8))
+                        .disabled(vm.state.polling)
+                        Text("When set, the outputs are bundled into an AES-256 encrypted ZIP.")
+                            .font(.caption)
+                            .foregroundColor(CrumbColors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
                 }
             }
         }
-        .padding(.bottom, 16)
+        .padding(.bottom, 4)
     }
 
     private func optionToggle(_ title: String, _ description: String,
@@ -354,6 +485,42 @@ struct ExportView: View {
         .padding(.vertical, 12)
     }
 
+    // MARK: - Section: Batch summary
+
+    /// Live batch summary — clip count, distinct cameras, total duration, rough
+    /// size estimate. Mirrors the desktop Output panel's "Batch" block.
+    private var summarySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeader("Batch")
+            SurfaceCard {
+                VStack(spacing: 0) {
+                    summaryRow("Clips", vm.clipCount > 0 ? "\(vm.clipCount)" : "—")
+                    Divider().background(CrumbColors.divider).padding(.horizontal, 16)
+                    summaryRow("Cameras", vm.clipCount > 0 ? "\(vm.distinctCameraCount)" : "—")
+                    Divider().background(CrumbColors.divider).padding(.horizontal, 16)
+                    summaryRow("Duration", vm.clipCount > 0 ? formatDuration(vm.totalDuration) : "—")
+                    Divider().background(CrumbColors.divider).padding(.horizontal, 16)
+                    summaryRow("Est. size", vm.clipCount > 0 ? "~" + formatFileSize(vm.estimatedSizeBytes) : "—")
+                }
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private func summaryRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+                .foregroundColor(CrumbColors.textSecondary)
+            Spacer()
+            Text(value)
+                .font(.subheadline.weight(.medium).monospacedDigit())
+                .foregroundColor(CrumbColors.textPrimary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+    }
+
     // MARK: - Export button
 
     private var exportButton: some View {
@@ -366,7 +533,7 @@ struct ExportView: View {
                         .scaleEffect(0.85)
                         .padding(.trailing, 4)
                 }
-                Text(vm.state.polling ? "Exporting…" : "Create Export")
+                Text(exportButtonLabel)
                     .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
@@ -377,6 +544,12 @@ struct ExportView: View {
         }
         .disabled(!vm.canExport)
         .padding(.bottom, 16)
+    }
+
+    private var exportButtonLabel: String {
+        if vm.state.polling { return "Exporting…" }
+        let n = vm.clipCount
+        return n > 0 ? "Export \(n) clip\(n == 1 ? "" : "s")" : "Export"
     }
 
     // MARK: - Section: Job Status
@@ -427,7 +600,9 @@ struct ExportView: View {
                             .foregroundColor(CrumbColors.error)
                     }
 
-                    ForEach(job.outputFiles, id: \.cameraId) { file in
+                    // Keyed on downloadUrl: a batch job's files aren't guaranteed
+                    // unique per camera (the whole-job archive uses a nil camera).
+                    ForEach(job.outputFiles, id: \.downloadUrl) { file in
                         OutputFileRow(
                             title: cameraName(for: file.cameraId),
                             outputFile: file,
@@ -502,7 +677,7 @@ struct ExportView: View {
 
     /// Friendly name for an output file's camera id (or the archive sentinel).
     private func cameraName(for cameraId: String) -> String {
-        if cameraId == "00000000-0000-0000-0000-000000000000" { return "Archive (all cameras)" }
+        if cameraId == "00000000-0000-0000-0000-000000000000" { return "Archive (all clips)" }
         return vm.state.cameras.first(where: { $0.id == cameraId })?.name ?? cameraId
     }
 
@@ -566,34 +741,88 @@ private struct SurfaceCard<Content: View>: View {
     }
 }
 
-private struct CameraCheckRow: View {
-    let camera: CameraDto
-    let isSelected: Bool
-    let onToggle: () -> Void
+/// One clip card in the export list: index, start-frame thumbnail, camera,
+/// range, duration, edit/remove. The thumbnail URL is minted per-row (a
+/// short-lived per-camera scoped media token, never the full login JWT).
+private struct ClipRow: View {
+    let index: Int
+    let clip: ExportClip
+    let cameraName: String
+    let thumbURL: () async -> URL?
+    let onEdit: () -> Void
+    let onRemove: () -> Void
+
+    @State private var url: URL?
 
     var body: some View {
-        Button(action: onToggle) {
-            HStack(spacing: 12) {
-                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                    .foregroundColor(isSelected ? CrumbColors.tealAccent : CrumbColors.textSecondary)
-                    .font(.system(size: 20))
+        HStack(spacing: 12) {
+            Text("\(index)")
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundColor(CrumbColors.textTertiary)
+                .frame(width: 18)
 
-                Text(camera.name)
-                    .font(.body)
-                    .foregroundColor(CrumbColors.textPrimary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if !camera.enabled {
-                    Text("disabled")
-                        .font(.caption2)
-                        .foregroundColor(CrumbColors.textTertiary)
+            ZStack {
+                Color.black
+                if let url {
+                    TokenedAsyncImage(url: url) { img in
+                        img.resizable().scaledToFill()
+                    } placeholder: {
+                        EmptyView()
+                    } failure: {
+                        EmptyView()
+                    }
+                    .id(url)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .contentShape(Rectangle())
+            .frame(width: 64, height: 36)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(cameraName)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(CrumbColors.textPrimary)
+                    .lineLimit(1)
+                Text("\(clipClock(clip.start)) → \(clipClock(clip.end))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundColor(CrumbColors.textSecondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(formatDuration(clip.duration))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(CrumbColors.textSecondary)
+
+            Button(action: onEdit) {
+                Image(systemName: "pencil")
+                    .font(.system(size: 13))
+                    .foregroundColor(CrumbColors.textSecondary)
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Edit clip")
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(CrumbColors.textSecondary)
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Remove clip")
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(CrumbColors.surface)
+        .cornerRadius(10)
+        .task(id: clip) { url = await thumbURL() }
+    }
+
+    /// Wall-clock "MM/dd HH:mm:ss" for a clip edge (desktop `exportFmtClock`).
+    private func clipClock(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM/dd HH:mm:ss"
+        return f.string(from: d)
     }
 }
 

@@ -126,7 +126,8 @@ struct CenteredTimelineView: View {
                     onZoom: { delta in zoom(by: delta) },
                     playheadMs: playheadMs,
                     spanMs: spanMs,
-                    hasExportSelection: exportSelStartMs != nil && exportSelEndMs != nil,
+                    exportSelStartMs: exportSelStartMs,
+                    exportSelEndMs: exportSelEndMs,
                     onSetExportStart: onSetExportStart,
                     onSetExportEnd: onSetExportEnd,
                     onExportSelection: onExportSelection,
@@ -363,7 +364,8 @@ struct CenteredTimelineView: View {
 import AppKit
 
 /// Transparent AppKit overlay that drives the timeline with a mouse: drag pans,
-/// scroll-wheel zooms. Lives on macOS only; iOS uses SwiftUI drag/pinch gestures.
+/// scroll-wheel zooms, dragging an export handle resizes the export region.
+/// Lives on macOS only; iOS uses SwiftUI drag/pinch gestures.
 private struct TimelineMouseView: NSViewRepresentable {
     let onPanStart: () -> Void
     let onPan: (CGFloat) -> Void
@@ -371,7 +373,8 @@ private struct TimelineMouseView: NSViewRepresentable {
     let onZoom: (CGFloat) -> Void
     let playheadMs: Int64
     let spanMs: Int64
-    let hasExportSelection: Bool
+    let exportSelStartMs: Int64?
+    let exportSelEndMs: Int64?
     let onSetExportStart: ((Int64) -> Void)?
     let onSetExportEnd: ((Int64) -> Void)?
     let onExportSelection: (() -> Void)?
@@ -382,7 +385,8 @@ private struct TimelineMouseView: NSViewRepresentable {
 
     private func configure(_ v: MouseNSView) -> MouseNSView {
         v.onPanStart = onPanStart; v.onPan = onPan; v.onPanEnd = onPanEnd; v.onZoom = onZoom
-        v.playheadMs = playheadMs; v.spanMs = spanMs; v.hasExportSelection = hasExportSelection
+        v.playheadMs = playheadMs; v.spanMs = spanMs
+        v.exportSelStartMs = exportSelStartMs; v.exportSelEndMs = exportSelEndMs
         v.onSetExportStart = onSetExportStart; v.onSetExportEnd = onSetExportEnd
         v.onExportSelection = onExportSelection; v.onClearExportSelection = onClearExportSelection
         return v
@@ -395,30 +399,106 @@ private struct TimelineMouseView: NSViewRepresentable {
         var onZoom: (CGFloat) -> Void = { _ in }
         var playheadMs: Int64 = 0
         var spanMs: Int64 = 0
-        var hasExportSelection = false
+        var exportSelStartMs: Int64?
+        var exportSelEndMs: Int64?
         var onSetExportStart: ((Int64) -> Void)?
         var onSetExportEnd: ((Int64) -> Void)?
         var onExportSelection: (() -> Void)?
         var onClearExportSelection: (() -> Void)?
 
+        private var hasExportSelection: Bool { exportSelStartMs != nil && exportSelEndMs != nil }
+
         private var startX: CGFloat = 0
         private var menuTimeMs: Int64 = 0
+        /// Which export edge a left-drag is resizing: the callback for the edge
+        /// grabbed at mouseDown (start or end), captured so the same edge keeps
+        /// following the mouse even if the handles cross mid-drag. nil = pan.
+        private var resizeEdge: ((Int64) -> Void)?
+
+        /// Pixels of grab slack around an export handle (the drawn handle is 3px).
+        private static let handleTolerance: CGFloat = 6
 
         override func scrollWheel(with event: NSEvent) {
             let d = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
             if d != 0 { onZoom(d) }
         }
+
+        /// Time at an x offset for the CURRENT view window (only valid while not
+        /// panning — the window follows the playhead, which a pan itself moves).
+        private func timeAt(x: CGFloat) -> Int64 {
+            let w = bounds.width
+            guard w > 0 else { return playheadMs }
+            let frac = max(0, min(1, x / w))
+            return (playheadMs - spanMs / 2) + Int64(Double(frac) * Double(spanMs))
+        }
+
+        /// The export-edge setter whose handle sits within grab range of `x`,
+        /// or nil when none does. Nearest wins when the two handles overlap.
+        private func exportEdge(near x: CGFloat) -> ((Int64) -> Void)? {
+            guard let s = exportSelStartMs, let e = exportSelEndMs,
+                  onSetExportStart != nil, onSetExportEnd != nil,
+                  bounds.width > 0, spanMs > 0 else { return nil }
+            let visStart = playheadMs - spanMs / 2
+            func xOf(_ ts: Int64) -> CGFloat {
+                CGFloat(Double(ts - visStart) / Double(spanMs)) * bounds.width
+            }
+            let dS = abs(xOf(s) - x), dE = abs(xOf(e) - x)
+            if min(dS, dE) > Self.handleTolerance { return nil }
+            return dS <= dE ? onSetExportStart : onSetExportEnd
+        }
+
         override func mouseDown(with event: NSEvent) {
-            startX = convert(event.locationInWindow, from: nil).x
+            let x = convert(event.locationInWindow, from: nil).x
+            // Grabbing an export handle resizes the region instead of panning.
+            if let edge = exportEdge(near: x) {
+                resizeEdge = edge
+                edge(clampToNow(timeAt(x: x)))
+                return
+            }
+            startX = x
             onPanStart()
         }
         override func mouseDragged(with event: NSEvent) {
-            onPan(convert(event.locationInWindow, from: nil).x - startX)
+            let x = convert(event.locationInWindow, from: nil).x
+            if let edge = resizeEdge {
+                edge(clampToNow(timeAt(x: x)))
+                return
+            }
+            onPan(x - startX)
         }
         override func mouseUp(with event: NSEvent) {
-            onPanEnd(convert(event.locationInWindow, from: nil).x - startX)
+            let x = convert(event.locationInWindow, from: nil).x
+            if let edge = resizeEdge {
+                edge(clampToNow(timeAt(x: x)))
+                resizeEdge = nil
+                return
+            }
+            onPanEnd(x - startX)
         }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        private func clampToNow(_ ms: Int64) -> Int64 {
+            min(max(ms, 0), Int64(Date().timeIntervalSince1970 * 1000))
+        }
+
+        // Resize cursor while hovering an export handle, so it reads as draggable.
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            for ta in trackingAreas { removeTrackingArea(ta) }
+            addTrackingArea(NSTrackingArea(
+                rect: .zero,
+                options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+                owner: self, userInfo: nil
+            ))
+        }
+        override func mouseMoved(with event: NSEvent) {
+            let x = convert(event.locationInWindow, from: nil).x
+            if resizeEdge != nil || exportEdge(near: x) != nil {
+                NSCursor.resizeLeftRight.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
 
         // Right-click → "mark for export" menu, with the bracket edge placed at the
         // clicked time (matching the desktop client).

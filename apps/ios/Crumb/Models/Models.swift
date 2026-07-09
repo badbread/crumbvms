@@ -335,6 +335,44 @@ struct CreateExportRequest: Encodable {
     }
 }
 
+/// One clip of a `POST /export/batch` list: a camera + a time range. Ranges and
+/// cameras may differ per item; output settings are global to the batch.
+struct BatchExportItem: Encodable {
+    let cameraId: String
+    let start: String
+    let end: String
+
+    enum CodingKeys: String, CodingKey {
+        case cameraId = "camera_id"
+        case start, end
+    }
+}
+
+/// `POST /export/batch` request body — the commercial-VMS-style export list the
+/// desktop client sends. The server bundles the outputs into one archive
+/// (`crumb_export.zip`, AES-256 when `password` is set) whenever more than one
+/// file is produced or a password is given.
+struct CreateBatchExportRequest: Encodable {
+    let items: [BatchExportItem]
+    let burnTimestamp: Bool
+    let includeAudio: Bool
+    /// `"h264"`, `"h265"`, or `"copy"` (stream-copy, no re-encode).
+    let videoCodec: String
+    /// `"mp4"` or `"mkv"`.
+    let container: String
+    /// Non-empty → AES-256-encrypted ZIP archive.
+    let password: String?
+
+    enum CodingKeys: String, CodingKey {
+        case items
+        case burnTimestamp = "burn_timestamp"
+        case includeAudio = "include_audio"
+        case videoCodec = "video_codec"
+        case container
+        case password
+    }
+}
+
 /// User-facing export format = a container + a video codec, matching the desktop
 /// client's options and the backend's accepted (`video_codec`, `container`) pairs.
 enum ExportFormat: String, CaseIterable, Identifiable {
