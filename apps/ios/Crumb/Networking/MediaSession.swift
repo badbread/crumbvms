@@ -79,6 +79,8 @@ struct TokenedAsyncImage<Content: View, Placeholder: View, Failure: View>: View 
               let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let img = PlatformImage(data: data)
         else {
+            // A superseded (cancelled) fetch must NOT flip the view to failed —
+            // a newer URL's task is already resolving. Only a real failure clears.
             if !Task.isCancelled { image = nil; failed = true }
             return
         }

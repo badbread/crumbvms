@@ -481,7 +481,7 @@ struct ExportView: View {
             Toggle("", isOn: Binding(get: get, set: set))
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .tint(CrumbColors.teal)
+                .tint(CrumbColors.positive)
                 .disabled(vm.state.polling)
         }
         .padding(.horizontal, 16)
@@ -755,7 +755,8 @@ private struct ClipRow: View {
     let onEdit: () -> Void
     let onRemove: () -> Void
 
-    @State private var url: URL?
+    @State private var image: PlatformImage?
+    @State private var failed = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -766,15 +767,19 @@ private struct ClipRow: View {
 
             ZStack {
                 Color.black
-                if let url {
-                    TokenedAsyncImage(url: url) { img in
-                        img.resizable().scaledToFill()
-                    } placeholder: {
-                        EmptyView()
-                    } failure: {
-                        EmptyView()
-                    }
-                    .id(url)
+                if let image {
+                    Image(platformImage: image).resizable().scaledToFill()
+                } else if failed {
+                    // Distinguish a genuinely-failed extraction from a dark night
+                    // frame — a silent black tile reads as "broken" either way.
+                    Image(systemName: "camera.metering.unknown")
+                        .font(.system(size: 12))
+                        .foregroundColor(CrumbColors.textTertiary)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(0.5)
+                        .tint(CrumbColors.textTertiary)
                 }
             }
             .frame(width: 64, height: 36)
@@ -818,7 +823,35 @@ private struct ClipRow: View {
         .padding(.vertical, 8)
         .background(CrumbColors.surface)
         .cornerRadius(10)
-        .task(id: clip) { url = await thumbURL() }
+        .task(id: clip) { await loadThumb() }
+    }
+
+    /// Load the clip's start-frame thumbnail, retrying transient failures.
+    /// The clip-start still is an ON-DEMAND server extraction (not a pre-cached
+    /// clip thumbnail), and the frame endpoint drops some requests when several
+    /// rows fetch at once — a single silent fetch left the tile permanently
+    /// black. Mirrors the proven retry loop in `ClipThumbnail` (ClipsView).
+    private func loadThumb() async {
+        failed = false
+        image = nil
+        for attempt in 0..<4 {
+            if Task.isCancelled { return }
+            guard let url = await thumbURL() else {
+                try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 600_000_000)
+                continue
+            }
+            var req = URLRequest(url: url)
+            req.cachePolicy = .returnCacheDataElseLoad
+            req.timeoutInterval = 12
+            if let (data, resp) = try? await URLSession.crumbMedia.data(for: req),
+               let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+               let img = PlatformImage(data: data) {
+                image = img
+                return
+            }
+            try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 600_000_000)
+        }
+        if !Task.isCancelled { failed = true }
     }
 
     /// Wall-clock "MM/dd HH:mm:ss" for a clip edge (desktop `exportFmtClock`).
