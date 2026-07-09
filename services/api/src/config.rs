@@ -177,10 +177,20 @@ pub struct ApiConfig {
     /// cache (`{export_dir}/.thumbs`). A periodic sweeper evicts oldest-by-mtime
     /// past this budget (and past `THUMB_CACHE_TTL_SECONDS` by age), so scrubbing
     /// can't grow the cache unbounded. Default: `20 GiB`.
+    ///
+    /// Admin-console override (issue #10): `server_settings.thumb_cache_max_bytes`
+    /// wins when set (floored at 100 MiB), `NULL` falls back to this env value.
+    /// Both the sweeper and `GET /config/scrub-preview` resolve the effective
+    /// value live via `scrub_settings::resolve` — this field is only the boot
+    /// snapshot / ultimate fallback.
     pub thumb_cache_max_bytes: u64,
 
     /// `THUMB_CACHE_TTL_SECONDS` -- age past which a cached thumbnail is evicted
     /// by the sweeper regardless of the byte budget. Default: `30 days`.
+    ///
+    /// Admin-console override (issue #10): `server_settings.thumb_cache_ttl_seconds`
+    /// wins when set (clamped 1h..=1y), `NULL` falls back to this env value; see
+    /// `thumb_cache_max_bytes`'s note above.
     pub thumb_cache_ttl_seconds: u64,
 
     /// `THUMB_PREGEN_ENABLED` -- run the background thumbnail pre-generation
@@ -188,14 +198,26 @@ pub struct ApiConfig {
     /// cache) with zero background cost; pre-generation additionally makes COLD
     /// first-touch fast, at the price of continuous decode CPU + cache storage.
     /// Default: `false`.
+    ///
+    /// Admin-console override (issue #10): `server_settings.thumb_pregen_enabled`
+    /// wins when set, `NULL` falls back to this env value; see
+    /// `thumb_cache_max_bytes`'s note above (same live-reload precedence).
     pub thumb_pregen_enabled: bool,
 
     /// `THUMB_PREGEN_LOOKBACK_HOURS` -- on start, and for a newly-seen camera, the
     /// worker backfills thumbnails this far back before rolling forward. Default: `2`.
+    ///
+    /// Admin-console override (issue #10): `server_settings.thumb_pregen_lookback_hours`
+    /// wins when set (clamped 0..=168h), `NULL` falls back to this env value; see
+    /// `thumb_cache_max_bytes`'s note above.
     pub thumb_pregen_lookback_hours: i64,
 
     /// `THUMB_PREGEN_SCAN_SECS` -- how often the worker wakes to generate
     /// thumbnails for newly-recorded footage. Default: `60`.
+    ///
+    /// Admin-console override (issue #10): `server_settings.thumb_pregen_scan_secs`
+    /// wins when set (clamped 5..=3600s), `NULL` falls back to this env value; see
+    /// `thumb_cache_max_bytes`'s note above.
     pub thumb_pregen_scan_secs: u64,
 
     /// `THUMB_PREGEN_WIDTH` -- width the worker pre-generates at. Clients requesting
@@ -208,6 +230,13 @@ pub struct ApiConfig {
     /// original 160 because that looked blurry blown up to wall-tile size on a
     /// large display. Lowering it (to shrink pre-gen storage) is safe but means
     /// those clients fall back to on-demand extraction at their requested width.
+    ///
+    /// **Env-only, deliberately NOT an admin-console override** (issue #10,
+    /// ratified decision D1): width is part of the thumbnail cache key, and a
+    /// console value that drifted from the clients' fixed scrub-still width
+    /// would silently waste all pre-generated CPU + storage (every file would
+    /// sit at a cache key nobody ever requests). The console displays this
+    /// value read-only. See `docs/DECISIONS.md`.
     pub thumb_pregen_width: u32,
 
     /// `THUMB_CACHE_DIR` -- optional override for where the thumbnail cache

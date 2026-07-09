@@ -688,6 +688,9 @@ let CAMS = [], STORAGES = [], POLICIES = [], DEFAULT_POLICY = null, GROUPS = [],
    editing only their own subset of columns. */
 let DETECTION_SERVER = null;
 let SERVER_SETTINGS = null;
+/* Scrub-preview tunables (issue #10) last GET response — kept so the input
+   onchange handlers can re-derive bounds without a re-fetch. */
+let SCRUB_PREVIEW = null;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const redact = u => String(u||'').replace(/\/\/[^@/]+@/, '//••••@');
@@ -5777,10 +5780,21 @@ async function renderServerSettings() {
       <div id="srv-upd-msg" style="font-size:12px;color:var(--dim);margin-top:4px"></div>
       <div id="srv-upd-status" style="font-size:13px;margin-top:8px"></div>
     </div>
+    <div class="policy-section">
+      <div class="policy-section-title">Scrub previews (thumbnail pre-generation)</div>
+      <div class="card-hint" style="margin-bottom:10px">Pre-generates timeline scrub-preview thumbnails ahead of time so the FIRST scrub touch is instant, not just on revisit. Trades continuous decode CPU + cache storage for that instant first touch. Off by default. Changes here take effect within one scan interval, no restart needed.</div>
+      <label class="chk" id="srv-pregen-wrap" style="cursor:default;opacity:.7">
+        <input type="checkbox" id="srv-pregen-enabled" onchange="saveScrubPregenEnabled(this.checked)" />
+        <span>Pre-generate scrub previews</span>
+      </label>
+      <div id="srv-pregen-msg" style="font-size:12px;color:var(--dim);margin-top:4px"></div>
+      <div id="srv-pregen-knobs" style="margin-top:10px"></div>
+    </div>
     <div class="card-hint" style="margin-top:4px">Saving applies immediately. Changing the public address may require toggling a camera (or a recorder restart) to take effect on in-flight recordings.</div>
     <div id="srv-msg" class="form-msg"></div>`;
   loadBookmarksEnabled();
   loadUpdateCheck();
+  loadScrubPreview();
 }
 function onHwaccelChange() {
   const sel = $('srv-hwaccel'); const wrap = $('srv-vaapi-device-wrap');
@@ -6005,6 +6019,112 @@ async function renderUpdateStatus(force) {
 }
 function checkForUpdatesNow() {
   renderUpdateStatus(true);
+}
+
+/* ── Scrub-preview pre-generation tunables (issue #10) ──
+   Five THUMB_PREGEN_ and THUMB_CACHE_ knobs, admin-console override with env
+   fallback (server_settings, DB wins, NULL -> env; see scrub_settings.rs).
+   Live-reload: both the pre-gen worker and the thumbnail cache sweeper
+   re-resolve every cycle, so a save here takes effect without a restart.
+   pregen_width stays env-only (D1) -- shown read-only, no PUT for it.
+   Each PUT writes ONLY the one field being edited (house rule). */
+const SCRUB_BYTES_PER_GIB = 1024 * 1024 * 1024;
+const SCRUB_SECS_PER_DAY = 86400;
+
+function scrubSourceNote(source) {
+  return source === 'db' ? '' : ' <span style="color:var(--dim)">(env default)</span>';
+}
+
+async function loadScrubPreview() {
+  const chk = $('srv-pregen-enabled');
+  const wrap = $('srv-pregen-wrap');
+  const msg = $('srv-pregen-msg');
+  const knobs = $('srv-pregen-knobs');
+  if (!chk) return;
+  let data;
+  try {
+    data = await api('/config/scrub-preview');
+  } catch (e) {
+    if (msg) msg.textContent = 'Could not load: ' + (e.message || e);
+    return;
+  }
+  SCRUB_PREVIEW = data;
+  chk.checked = !!data.pregen_enabled.value;
+  if (wrap) wrap.style.opacity = '1';
+  if (msg) msg.textContent = '';
+
+  const gib = (data.cache_max_bytes.value / SCRUB_BYTES_PER_GIB);
+  const minGib = (data.cache_max_bytes.min / SCRUB_BYTES_PER_GIB);
+  const days = (data.cache_ttl_seconds.value / SCRUB_SECS_PER_DAY);
+  const minDays = (data.cache_ttl_seconds.min / SCRUB_SECS_PER_DAY);
+  const maxDays = Math.round(data.cache_ttl_seconds.max / SCRUB_SECS_PER_DAY);
+
+  if (knobs) knobs.innerHTML = `
+    <div class="form-grid">
+      <label class="fg-label" for="srv-pregen-lookback">Backfill lookback${scrubSourceNote(data.pregen_lookback_hours.source)}</label>
+      <div class="fg-ctl"><input id="srv-pregen-lookback" type="number" min="${data.pregen_lookback_hours.min}" max="${data.pregen_lookback_hours.max}" step="1" value="${data.pregen_lookback_hours.value}" class="mono" style="width:80px" onchange="saveScrubPregenField('pregen_lookback_hours', parseInt(this.value,10))"> hours <span style="color:var(--dim2)">(0–${data.pregen_lookback_hours.max}, default 2)</span></div>
+      <label class="fg-label" for="srv-pregen-scan">Scan interval ${infoHint('How often the worker wakes to generate thumbnails for newly-recorded footage. Advanced.')}${scrubSourceNote(data.pregen_scan_secs.source)}</label>
+      <div class="fg-ctl"><input id="srv-pregen-scan" type="number" min="${data.pregen_scan_secs.min}" max="${data.pregen_scan_secs.max}" step="1" value="${data.pregen_scan_secs.value}" class="mono" style="width:80px" onchange="saveScrubPregenField('pregen_scan_secs', parseInt(this.value,10))"> seconds <span style="color:var(--dim2)">(${data.pregen_scan_secs.min}–${data.pregen_scan_secs.max}, default 60)</span></div>
+      <label class="fg-label" for="srv-pregen-cache-gib">Cache budget${scrubSourceNote(data.cache_max_bytes.source)}</label>
+      <div class="fg-ctl"><input id="srv-pregen-cache-gib" type="number" min="${minGib}" step="0.1" value="${gib.toFixed(2)}" class="mono" style="width:90px" onchange="saveScrubPregenBytes(this.value)"> GiB <span style="color:var(--dim2)">(min ${minGib.toFixed(2)} GiB)</span></div>
+      <label class="fg-label" for="srv-pregen-ttl-days">Cache max age${scrubSourceNote(data.cache_ttl_seconds.source)}</label>
+      <div class="fg-ctl"><input id="srv-pregen-ttl-days" type="number" min="${minDays.toFixed(3)}" max="${maxDays}" step="0.1" value="${days.toFixed(2)}" class="mono" style="width:90px" onchange="saveScrubPregenTtl(this.value)"> days <span style="color:var(--dim2)">(min ~1 hour, max ${maxDays}d)</span></div>
+      <label class="fg-label">Pre-gen width</label>
+      <div class="fg-ctl mono">${esc(String(data.pregen_width.value))} px <span style="color:var(--dim2)">(env-only, THUMB_PREGEN_WIDTH -- must match the clients' scrub width or pre-generated previews go unused)</span></div>
+    </div>`;
+}
+
+async function saveScrubPregenEnabled(enabled) {
+  const msg = $('srv-pregen-msg');
+  try {
+    await api('/config/scrub-preview', { method: 'PUT', body: JSON.stringify({ pregen_enabled: !!enabled }) });
+    if (msg) { msg.style.color = 'var(--ok)'; msg.textContent = enabled ? 'Scrub pre-generation enabled.' : 'Scrub pre-generation disabled.'; setTimeout(() => { if (msg) msg.textContent = ''; }, 3000); }
+    loadScrubPreview();
+  } catch (e) {
+    if (msg) { msg.style.color = 'var(--danger)'; msg.textContent = 'Save failed: ' + (e.message || e); }
+    /* Revert the checkbox to the last-known server state on failure. */
+    loadScrubPreview();
+  }
+}
+
+async function saveScrubPregenField(field, value) {
+  if (!Number.isFinite(value)) { loadScrubPreview(); return; }
+  try {
+    await api('/config/scrub-preview', { method: 'PUT', body: JSON.stringify({ [field]: value }) });
+    toast('Saved.');
+    loadScrubPreview();
+  } catch (e) {
+    toast('Save failed: ' + (e.message || e));
+    loadScrubPreview();
+  }
+}
+
+async function saveScrubPregenBytes(gibStr) {
+  const gib = parseFloat(gibStr);
+  if (!Number.isFinite(gib)) { loadScrubPreview(); return; }
+  const bytes = Math.round(gib * SCRUB_BYTES_PER_GIB);
+  try {
+    await api('/config/scrub-preview', { method: 'PUT', body: JSON.stringify({ cache_max_bytes: bytes }) });
+    toast('Cache budget saved.');
+    loadScrubPreview();
+  } catch (e) {
+    toast('Save failed: ' + (e.message || e));
+    loadScrubPreview();
+  }
+}
+
+async function saveScrubPregenTtl(daysStr) {
+  const days = parseFloat(daysStr);
+  if (!Number.isFinite(days)) { loadScrubPreview(); return; }
+  const secs = Math.round(days * SCRUB_SECS_PER_DAY);
+  try {
+    await api('/config/scrub-preview', { method: 'PUT', body: JSON.stringify({ cache_ttl_seconds: secs }) });
+    toast('Cache max age saved.');
+    loadScrubPreview();
+  } catch (e) {
+    toast('Save failed: ' + (e.message || e));
+    loadScrubPreview();
+  }
 }
 
 /* ── Camera tab 3: Storage & group ──

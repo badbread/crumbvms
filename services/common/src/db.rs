@@ -6323,6 +6323,143 @@ pub async fn set_update_check_enabled(pool: &Pool, enabled: bool) -> Result<()> 
     Ok(())
 }
 
+// ─── scrub-preview runtime tunables (issue #10, migration 0046) ────────────────
+//
+// Admin-console overrides for the thumbnail pre-generation worker + cache
+// sweeper. Each field is `None` when the operator has never touched it in the
+// console — the caller (`services/api/src/scrub_settings.rs::resolve`) falls
+// back to the corresponding `THUMB_*` env default, same nullable-column
+// precedence as `update_check_enabled` above. `THUMB_PREGEN_WIDTH` is
+// deliberately NOT here (ratified D1): it stays env-only, see migration
+// 0046's comment and `docs/DECISIONS.md`.
+
+/// Raw `server_settings` overrides for the five scrub-preview knobs. `None` in
+/// any field means "never set in the console" — the resolver falls back to
+/// the matching `ApiConfig` env default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrubPregenOverrides {
+    pub pregen_enabled: Option<bool>,
+    pub pregen_lookback_hours: Option<i64>,
+    pub pregen_scan_secs: Option<i64>,
+    pub cache_max_bytes: Option<i64>,
+    pub cache_ttl_seconds: Option<i64>,
+}
+
+/// Fetch all five scrub-preview overrides in one `server_settings` row read.
+pub async fn get_scrub_pregen_settings(pool: &Pool) -> Result<ScrubPregenOverrides> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT thumb_pregen_enabled, thumb_pregen_lookback_hours, \
+             thumb_pregen_scan_secs, thumb_cache_max_bytes, thumb_cache_ttl_seconds \
+             FROM server_settings LIMIT 1",
+            &[],
+        )
+        .await
+        .context("get_scrub_pregen_settings")?;
+    Ok(match row {
+        Some(r) => ScrubPregenOverrides {
+            pregen_enabled: r
+                .try_get::<_, Option<bool>>("thumb_pregen_enabled")
+                .ok()
+                .flatten(),
+            pregen_lookback_hours: r
+                .try_get::<_, Option<i32>>("thumb_pregen_lookback_hours")
+                .ok()
+                .flatten()
+                .map(i64::from),
+            pregen_scan_secs: r
+                .try_get::<_, Option<i32>>("thumb_pregen_scan_secs")
+                .ok()
+                .flatten()
+                .map(i64::from),
+            cache_max_bytes: r
+                .try_get::<_, Option<i64>>("thumb_cache_max_bytes")
+                .ok()
+                .flatten(),
+            cache_ttl_seconds: r
+                .try_get::<_, Option<i64>>("thumb_cache_ttl_seconds")
+                .ok()
+                .flatten(),
+        },
+        None => ScrubPregenOverrides::default(),
+    })
+}
+
+/// Set the pre-generation worker's enabled override.
+pub async fn set_thumb_pregen_enabled(pool: &Pool, enabled: bool) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            "UPDATE server_settings SET thumb_pregen_enabled = $1",
+            &[&enabled],
+        )
+        .await
+        .context("set_thumb_pregen_enabled")?;
+    Ok(())
+}
+
+/// Set the pre-generation backfill lookback (hours). Clamped to 0..=168 (a
+/// week) before storing — larger backfills belong in the env var, where the
+/// operator has read the cost note in `config.rs`.
+pub async fn set_thumb_pregen_lookback_hours(pool: &Pool, hours: i64) -> Result<()> {
+    let client = get_conn(pool).await?;
+    let clamped = i32::try_from(hours.clamp(0, 168)).unwrap_or(2);
+    client
+        .execute(
+            "UPDATE server_settings SET thumb_pregen_lookback_hours = $1",
+            &[&clamped],
+        )
+        .await
+        .context("set_thumb_pregen_lookback_hours")?;
+    Ok(())
+}
+
+/// Set the pre-generation worker's scan interval (seconds). Clamped to
+/// 5..=3600, matching the existing env floor.
+pub async fn set_thumb_pregen_scan_secs(pool: &Pool, secs: i64) -> Result<()> {
+    let client = get_conn(pool).await?;
+    let clamped = i32::try_from(secs.clamp(5, 3600)).unwrap_or(60);
+    client
+        .execute(
+            "UPDATE server_settings SET thumb_pregen_scan_secs = $1",
+            &[&clamped],
+        )
+        .await
+        .context("set_thumb_pregen_scan_secs")?;
+    Ok(())
+}
+
+/// Set the thumbnail cache byte budget. Floored at 100 MiB (D5) — a
+/// near-zero budget would make the sweeper delete every thumbnail every
+/// minute, silently defeating the feature.
+pub async fn set_thumb_cache_max_bytes(pool: &Pool, bytes: i64) -> Result<()> {
+    let client = get_conn(pool).await?;
+    let clamped = bytes.max(104_857_600);
+    client
+        .execute(
+            "UPDATE server_settings SET thumb_cache_max_bytes = $1",
+            &[&clamped],
+        )
+        .await
+        .context("set_thumb_cache_max_bytes")?;
+    Ok(())
+}
+
+/// Set the thumbnail cache max age (seconds). Clamped to 1 hour..=1 year.
+pub async fn set_thumb_cache_ttl_seconds(pool: &Pool, secs: i64) -> Result<()> {
+    let client = get_conn(pool).await?;
+    let clamped = secs.clamp(3600, 31_536_000);
+    client
+        .execute(
+            "UPDATE server_settings SET thumb_cache_ttl_seconds = $1",
+            &[&clamped],
+        )
+        .await
+        .context("set_thumb_cache_ttl_seconds")?;
+    Ok(())
+}
+
 /// Set the deployment-wide default clip source (`"crumb"` | `"frigate"`).
 pub async fn set_default_clip_source(pool: &Pool, source: &str) -> Result<()> {
     let client = get_conn(pool).await?;
@@ -7701,6 +7838,10 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
         (
             "0045_update_check.sql",
             include_str!("../../../db/migrations/0045_update_check.sql"),
+        ),
+        (
+            "0046_scrub_pregen_settings.sql",
+            include_str!("../../../db/migrations/0046_scrub_pregen_settings.sql"),
         ),
     ];
 
@@ -9724,6 +9865,149 @@ mod tests {
             times, expected,
             "gap slots (10, 15) must be excluded; the segment-end boundary (10) \
              must be excluded and the next segment's start boundary (20) included"
+        );
+    }
+
+    // ── scrub-preview settings (issue #10) — get/set roundtrip + clamps ──────
+    //
+    // `server_settings` is a process-wide singleton row (see the `clip_preroll`/
+    // `update_check_enabled` setters above, and `auth_rbac.rs`'s admin-gate walk
+    // in the api integration suite, which also touches this row from a
+    // different test binary). This test therefore asserts only what IT writes
+    // comes back correctly — never the row's state before/after — so it can't
+    // flake against unrelated concurrent writers to the same shared row.
+
+    #[tokio::test]
+    async fn scrub_pregen_settings_roundtrip_and_clamps() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+
+        // ── enabled: plain bool roundtrip ──
+        set_thumb_pregen_enabled(&pool, true)
+            .await
+            .expect("set enabled=true");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set enabled=true");
+        assert_eq!(s.pregen_enabled, Some(true));
+        set_thumb_pregen_enabled(&pool, false)
+            .await
+            .expect("set enabled=false");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set enabled=false");
+        assert_eq!(s.pregen_enabled, Some(false));
+
+        // ── lookback hours: in-range roundtrip + clamp on both ends ──
+        set_thumb_pregen_lookback_hours(&pool, 10)
+            .await
+            .expect("set lookback=10");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set lookback=10");
+        assert_eq!(s.pregen_lookback_hours, Some(10));
+        set_thumb_pregen_lookback_hours(&pool, -5)
+            .await
+            .expect("set lookback=-5 (below floor)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set lookback=-5");
+        assert_eq!(
+            s.pregen_lookback_hours,
+            Some(0),
+            "must clamp to the 0 floor"
+        );
+        set_thumb_pregen_lookback_hours(&pool, 9999)
+            .await
+            .expect("set lookback=9999 (above ceiling)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set lookback=9999");
+        assert_eq!(
+            s.pregen_lookback_hours,
+            Some(168),
+            "must clamp to the 168h (1 week) ceiling"
+        );
+
+        // ── scan secs: in-range roundtrip + clamp on both ends ──
+        set_thumb_pregen_scan_secs(&pool, 120)
+            .await
+            .expect("set scan=120");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set scan=120");
+        assert_eq!(s.pregen_scan_secs, Some(120));
+        set_thumb_pregen_scan_secs(&pool, 1)
+            .await
+            .expect("set scan=1 (below floor)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set scan=1");
+        assert_eq!(s.pregen_scan_secs, Some(5), "must clamp to the 5s floor");
+        set_thumb_pregen_scan_secs(&pool, 999_999)
+            .await
+            .expect("set scan=999999 (above ceiling)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set scan=999999");
+        assert_eq!(
+            s.pregen_scan_secs,
+            Some(3600),
+            "must clamp to the 3600s ceiling"
+        );
+
+        // ── cache max bytes: in-range roundtrip + floor clamp (no ceiling, D5) ──
+        set_thumb_cache_max_bytes(&pool, 10_000_000_000)
+            .await
+            .expect("set cache_max_bytes=10GB");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set cache_max_bytes=10GB");
+        assert_eq!(s.cache_max_bytes, Some(10_000_000_000));
+        set_thumb_cache_max_bytes(&pool, 0)
+            .await
+            .expect("set cache_max_bytes=0 (below floor)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set cache_max_bytes=0");
+        assert_eq!(
+            s.cache_max_bytes,
+            Some(104_857_600),
+            "must clamp to the 100 MiB floor (D5)"
+        );
+
+        // ── cache ttl seconds: in-range roundtrip + clamp on both ends ──
+        set_thumb_cache_ttl_seconds(&pool, 86_400)
+            .await
+            .expect("set ttl=1 day");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set ttl=1 day");
+        assert_eq!(s.cache_ttl_seconds, Some(86_400));
+        set_thumb_cache_ttl_seconds(&pool, 60)
+            .await
+            .expect("set ttl=60s (below floor)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set ttl=60s");
+        assert_eq!(
+            s.cache_ttl_seconds,
+            Some(3600),
+            "must clamp to the 1h floor"
+        );
+        set_thumb_cache_ttl_seconds(&pool, 999_999_999)
+            .await
+            .expect("set ttl=999999999 (above ceiling)");
+        let s = get_scrub_pregen_settings(&pool)
+            .await
+            .expect("get after set ttl=999999999");
+        assert_eq!(
+            s.cache_ttl_seconds,
+            Some(31_536_000),
+            "must clamp to the 1-year ceiling"
         );
     }
 }

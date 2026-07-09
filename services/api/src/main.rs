@@ -97,6 +97,7 @@ mod playback;
 mod ptz;
 mod rate_limit;
 mod roles;
+mod scrub_settings;
 mod state;
 mod stats;
 mod status;
@@ -600,9 +601,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Phase 1 thumbnail pre-generation (opt-in via THUMB_PREGEN_ENABLED). The
-    // worker logs + returns immediately when disabled, so spawning it here is
-    // always safe.
+    // Thumbnail pre-generation (opt-in via THUMB_PREGEN_ENABLED, or the
+    // admin-console "Scrub previews" toggle, issue #10). The worker always
+    // loops and re-resolves its settings each cycle, idling (one SELECT per
+    // scan interval) while disabled, so spawning it here is always safe and a
+    // console "enable" takes effect without a restart.
     tokio::spawn(thumb_pregen::run(state.clone()));
 
     // ── 7. bind and serve ─────────────────────────────────────────────────────
@@ -800,12 +803,30 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
         // set); evict by age then byte budget so a long scrubbing history can't
         // grow it unbounded. Only .jpg files inside .thumbs are ever removed
         // (guarded in the sweeper).
+        //
+        // Issue #10: resolve the admin-console overrides (else env default)
+        // fresh each tick rather than reading the boot-time `ApiConfig`
+        // snapshot, so a lowered cache budget/TTL takes effect within this
+        // same minute — no restart needed. A resolve failure falls back to
+        // the env-only settings for this one tick and logs a warning; the
+        // sweep itself is still best-effort (same ethos as the pre-gen
+        // worker's keep-last-known-values policy).
+        let scrub_settings = match scrub_settings::resolve(state.pool(), state.config()).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "thumb cache sweep: settings resolve failed; using env-only settings for this tick"
+                );
+                scrub_settings::ScrubSettings::from_env(state.config())
+            }
+        };
         sweep_thumbs_cache(
             state.config().thumb_cache_base(),
             chrono::Duration::seconds(
-                i64::try_from(state.config().thumb_cache_ttl_seconds).unwrap_or(2_592_000),
+                i64::try_from(scrub_settings.cache_ttl_seconds).unwrap_or(2_592_000),
             ),
-            state.config().thumb_cache_max_bytes,
+            scrub_settings.cache_max_bytes,
         )
         .await;
     }
