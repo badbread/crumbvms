@@ -490,11 +490,7 @@ mod linux {
         let translate = std::path::Path::new(HOST_PROC).is_dir();
         // `?` early-returns None if we can't establish our own namespace, i.e.
         // can't safely translate host↔container pids.
-        let my_ns = if translate {
-            Some(my_pid_ns()?)
-        } else {
-            None
-        };
+        let my_ns = if translate { Some(my_pid_ns()?) } else { None };
 
         let mut map: HashMap<i32, f64> = HashMap::new();
         for s in samples {
