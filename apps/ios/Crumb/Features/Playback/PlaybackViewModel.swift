@@ -24,6 +24,11 @@ final class PlaybackViewModel: ObservableObject {
     @Published var speed: Float = 1
     @Published var scrubbing = false
     @Published var scrubFrameURL: URL?
+    /// Set when the next contiguous segment has been resolved ahead of the
+    /// current one's end, so the player can prefetch + queue it for gapless
+    /// boundary playback (issue #23). The view forwards it to
+    /// `SegmentPlayer.enqueueNext`.
+    @Published var prefetchNext: PrefetchSignal?
     @Published var noFootageAtPlayhead = false
     @Published var visibleSpanMs: Int64 = 60 * 60_000
     @Published var motionBuckets: [Float] = []
@@ -39,6 +44,24 @@ final class PlaybackViewModel: ObservableObject {
     private var timelineTask: Task<Void, Never>?
     private var filmstripTask: Task<Void, Never>?
     private var scrubFrameTask: Task<Void, Never>?
+    private var prefetchTask: Task<Void, Never>?
+
+    // ── gapless prefetch (issue #23) ────────────────────────────────────────────
+    /// The next segment resolved ahead of the boundary, promoted to
+    /// `currentSegment` by `commitAdvance()` once the player gaplessly advances.
+    private var prefetchedSegment: ResolvedSegment?
+    /// `segmentId` of the current segment we've already prefetched a next for,
+    /// so `onPlaybackTick` only resolves it once per segment.
+    private var prefetchedForSegmentId: String?
+
+    /// What the player needs to prefetch + queue the next segment. `Equatable`
+    /// so `@Published` republishes only on a genuinely new next segment.
+    struct PrefetchSignal: Equatable {
+        let url: URL
+        let startMs: Int64
+        /// Raw segment path (`ResolvedSegment.url`) for the retag token refresh.
+        let path: String
+    }
 
     // tuning (mirrors Android)
     private let defaultWindowHours: Int64 = 6
@@ -48,6 +71,10 @@ final class PlaybackViewModel: ObservableObject {
     private let motionBucketThreshold: Float = 0.006
     private let speedSteps: [Float] = [0.5, 1, 2, 4, 8]
     private let filmstripDebounceMs: UInt64 = 300
+    /// How far before the current segment's end to resolve + queue the next one.
+    /// Segments are ~4 s (`SEGMENT_SECONDS`), so this leaves the queued item time
+    /// to probe + buffer before the boundary while staying inside the segment.
+    private let prefetchLeadMs: Int64 = 2_500
 
     init(cameraId: String, container: AppContainer, startTime: Date? = nil) {
         self.cameraId = cameraId
@@ -166,6 +193,7 @@ final class PlaybackViewModel: ObservableObject {
 
     func seekTo(_ tsMs: Int64) {
         playheadMs = tsMs
+        resetPrefetch() // any queued next belonged to the old position
         seekTask?.cancel()
         seekTask = Task { [weak self] in
             guard let self else { return }
@@ -217,6 +245,66 @@ final class PlaybackViewModel: ObservableObject {
     func onPlaybackTick(_ tsMs: Int64) {
         guard !scrubbing else { return }
         playheadMs = tsMs
+        maybePrefetchNext(tsMs)
+    }
+
+    // ── gapless prefetch (issue #23) ────────────────────────────────────────────
+
+    /// As the current segment nears its end, resolve the next one and hand it to
+    /// the player to queue — but only when it's immediately CONTIGUOUS (the end
+    /// falls inside a recorded span). A recording gap keeps the old
+    /// resolve-and-seek path, which isn't gapless anyway. Resolves at most once
+    /// per current segment.
+    private func maybePrefetchNext(_ tsMs: Int64) {
+        guard playing, let seg = currentSegment else { return }
+        let endMs = parseMs(seg.end)
+        guard tsMs >= endMs - prefetchLeadMs else { return }
+        guard prefetchedForSegmentId != seg.segmentId else { return }
+        let contiguous = spans.contains { parseMs($0.start) <= endMs && endMs < parseMs($0.end) }
+        guard contiguous else { return }
+        prefetchedForSegmentId = seg.segmentId
+
+        prefetchTask?.cancel()
+        prefetchTask = Task { [weak self] in
+            guard let self else { return }
+            guard let next = try? await container.api.play(cameraId: cameraId, ts: iso(endMs + 1)) else { return }
+            // Bail if we seeked/switched away, or it resolved to the same segment.
+            guard !Task.isCancelled, currentSegment?.segmentId == seg.segmentId,
+                  next.segmentId != seg.segmentId else { return }
+            guard let url = await container.mediaUrls().scopedURL(cameraId: cameraId, next.url) else { return }
+            guard !Task.isCancelled, currentSegment?.segmentId == seg.segmentId else { return }
+            prefetchedSegment = next
+            prefetchNext = PrefetchSignal(url: url, startMs: parseMs(next.start), path: next.url)
+        }
+    }
+
+    /// The player gaplessly advanced to the prefetched next segment — promote it
+    /// to `currentSegment` (updating the playhead base) without a re-resolve.
+    /// Falls back to the normal end-of-segment path if the prefetch is somehow
+    /// gone (shouldn't happen — the player only advances when it queued one).
+    func commitAdvance() {
+        guard let next = prefetchedSegment, let signal = prefetchNext else {
+            onSegmentEnded()
+            return
+        }
+        currentSegment = next
+        let startMs = parseMs(next.start)
+        segmentOffsetMs = 0
+        playheadMs = startMs
+        error = nil
+        noFootageAtPlayhead = false
+        // Setting this re-fires the view's feed(url); the player recognises the
+        // just-advanced URL and no-ops (SegmentPlayer.justAdvanced).
+        currentSegmentURL = signal.url
+        resetPrefetch() // let the NEW current segment queue its own next
+    }
+
+    private func resetPrefetch() {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        prefetchedSegment = nil
+        prefetchedForSegmentId = nil
+        prefetchNext = nil
     }
 
     // ── motion navigation (rising-edge over the histogram) ──────────────────────
