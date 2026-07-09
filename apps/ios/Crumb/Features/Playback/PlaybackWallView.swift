@@ -230,7 +230,9 @@ private struct PlaybackTile: View {
         scrubTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 250_000_000) // debounce continuous scrub
             guard !Task.isCancelled else { return }
-            guard let url = await mediaUrls.historicalFrameUrl(cameraId: camera.id, tsISO: tsISO) else { return }
+            guard let url = await mediaUrls.historicalFrameUrl(
+                cameraId: camera.id, tsISO: tsISO, width: MediaUrls.scrubThumbWidth
+            ) else { return }
             guard !Task.isCancelled else { return }
             var req = URLRequest(url: url)
             req.cachePolicy = .reloadIgnoringLocalCacheData

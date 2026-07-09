@@ -200,7 +200,14 @@ pub struct ApiConfig {
 
     /// `THUMB_PREGEN_WIDTH` -- width the worker pre-generates at. Clients requesting
     /// this width hit the pre-generated cache; other widths fall back to on-demand
-    /// extraction (width is part of the cache key). Default: `160`.
+    /// extraction (width is part of the cache key). Default: `480`.
+    ///
+    /// Kept equal to the playback clients' scrub-still width (iOS
+    /// `MediaUrls.scrubThumbWidth`) so the multi-camera playback wall and the
+    /// single-camera scrub preview hit the pre-generated cache. Raised from the
+    /// original 160 because that looked blurry blown up to wall-tile size on a
+    /// large display. Lowering it (to shrink pre-gen storage) is safe but means
+    /// those clients fall back to on-demand extraction at their requested width.
     pub thumb_pregen_width: u32,
 
     /// `THUMB_CACHE_DIR` -- optional override for where the thumbnail cache
@@ -332,7 +339,7 @@ impl ApiConfig {
             thumb_pregen_enabled: parse_env("THUMB_PREGEN_ENABLED", false)?,
             thumb_pregen_lookback_hours: parse_env("THUMB_PREGEN_LOOKBACK_HOURS", 2_i64)?.max(0),
             thumb_pregen_scan_secs: parse_env("THUMB_PREGEN_SCAN_SECS", 60_u64)?.max(5),
-            thumb_pregen_width: parse_env("THUMB_PREGEN_WIDTH", 160_u32)?,
+            thumb_pregen_width: parse_env("THUMB_PREGEN_WIDTH", 480_u32)?,
             thumb_cache_dir: optional_env("THUMB_CACHE_DIR", ""),
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),

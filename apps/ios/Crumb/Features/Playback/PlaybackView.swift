@@ -18,6 +18,8 @@ struct PlaybackView: View {
     let onBack: () -> Void
 
     @State private var bookmarks: [Int64] = []
+    /// Full bookmark records (macOS "Bookmarks" menu shows description + time).
+    @State private var bookmarkList: [BookmarkDto] = []
     @State private var showAddBookmark = false
     @State private var showJump = false
     @State private var showExport = false
@@ -109,16 +111,18 @@ struct PlaybackView: View {
             }
         }
         .sheet(isPresented: $showExport) {
+            // Seed the batch builder with the viewed camera + the bracketed
+            // selection (or the trailing hour) — one click to add it as the
+            // first clip, mirroring the desktop "Export selection…" flow.
             let range = exportRange()
             ExportView(
                 container: vm.container,
                 cameras: cameras,
-                cameraIds: [vm.cameraId],
-                start: range.start,
-                end: range.end,
+                seedCameraId: vm.cameraId,
+                initialRange: (start: range.start, end: range.end),
                 onClose: { showExport = false }
             )
-            .macModalSize(width: 480, height: 600)
+            .macModalSize(width: 560, height: 700)
         }
         .statusBarHiddenCompat(false)
     }
@@ -184,7 +188,9 @@ struct PlaybackView: View {
                 // no custom-URLSession init, and always uses `URLSession.shared`
                 // (disk-cached) — use `TokenedAsyncImage` (MediaSession.swift),
                 // which fetches via the ephemeral `.crumbMedia` session instead.
-                TokenedAsyncImage(url: f) { img in img.resizable().scaledToFit() } placeholder: { EmptyView() }
+                // keepStaleImage: the scrub URL changes per tick; keep the prior
+                // frame up while the next loads instead of blinking to black.
+                TokenedAsyncImage(url: f, keepStaleImage: true) { img in img.resizable().scaledToFit() } placeholder: { EmptyView() }
             }
             if vm.loading && vm.currentSegment == nil {
                 ProgressView().tint(CrumbColors.teal)
@@ -387,21 +393,30 @@ struct PlaybackView: View {
                     .disabled(bookmarks.isEmpty)
                 iconChip("chevron.forward.to.line", "Next bookmark") { jumpBookmark(forward: true) }
                     .disabled(bookmarks.isEmpty)
+                // "Bookmarks" list — labeled like the desktop client's
+                // "Bookmarks" button (was a bare ≡ icon that read as a mystery
+                // date list). Each item jumps playback to that bookmark.
                 Menu {
-                    if bookmarks.isEmpty {
-                        Text("No bookmarks")
+                    if bookmarkList.isEmpty {
+                        Text("No saved bookmarks")
                     } else {
-                        ForEach(bookmarks, id: \.self) { bm in
-                            Button(formatTime(Date(timeIntervalSince1970: Double(bm) / 1000), style: .clockLong)) {
-                                vm.jumpToTime(bm)
+                        ForEach(bookmarkList) { bm in
+                            Button(bookmarkMenuTitle(bm)) {
+                                if let d = parseISO8601(bm.ts) {
+                                    vm.jumpToTime(Int64(d.timeIntervalSince1970 * 1000))
+                                }
                             }
                         }
                     }
                 } label: {
-                    Image(systemName: "list.bullet").font(.system(size: 15))
-                        .foregroundColor(CrumbColors.textSecondary).frame(width: 32, height: 30)
+                    HStack(spacing: 4) {
+                        Image(systemName: "bookmark").font(.system(size: 12))
+                        Text("Bookmarks").font(.callout)
+                    }
+                    .foregroundColor(CrumbColors.textSecondary)
+                    .frame(height: 30)
                 }
-                .menuStyle(.borderlessButton).fixedSize().help("Bookmarks")
+                .menuStyle(.borderlessButton).fixedSize().help("View saved bookmarks")
 
                 if vm.container.isAdmin || vm.container.capabilities.export {
                     macDivider
@@ -540,8 +555,16 @@ struct PlaybackView: View {
 
     private func loadBookmarks() async {
         if let list = try? await vm.container.api.bookmarks(cameraId: vm.cameraId) {
+            bookmarkList = list.sorted { $0.ts < $1.ts }
             bookmarks = list.compactMap { parseISO8601($0.ts).map { Int64($0.timeIntervalSince1970 * 1000) } }.sorted()
         }
+    }
+
+    /// "Front door — Mon Jun 3, 14:05:30" (or just the time when undescribed).
+    private func bookmarkMenuTitle(_ bm: BookmarkDto) -> String {
+        let time = parseISO8601(bm.ts).map { formatTime($0, style: .clockLong) } ?? bm.ts
+        if let desc = bm.description, !desc.isEmpty { return "\(desc) — \(time)" }
+        return time
     }
 
     /// [both] H1 fix: snapshot the PLAYHEAD frame, not the live camera frame.

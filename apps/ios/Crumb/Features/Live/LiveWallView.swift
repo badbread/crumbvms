@@ -372,12 +372,12 @@ struct LiveWallView: View {
                 }
             }
         case .exports:
+            // List mode; the selected/fullscreen wall camera (if any) seeds the
+            // add-clip builder's camera picker, matching the desktop client.
             ExportView(
                 container: container,
                 cameras: visibleCameras.isEmpty ? vm.cameras : visibleCameras,
-                cameraIds: [],
-                start: Date().addingTimeInterval(-3600),
-                end: Date(),
+                seedCameraId: selectedCameraId,
                 onClose: { mode = .live }
             )
         case .clips:

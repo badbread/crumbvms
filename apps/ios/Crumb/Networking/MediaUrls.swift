@@ -3,6 +3,18 @@
 import Foundation
 
 struct MediaUrls {
+    /// Width requested for playback scrub stills (the multi-camera playback wall
+    /// and the single-camera scrub preview). A crisp value so those stills don't
+    /// look blurry blown up on a large display — the ~160px default did.
+    ///
+    /// IMPORTANT: keep this equal to the server's `THUMB_PREGEN_WIDTH`
+    /// (services/api/src/config.rs). The pre-generated thumbnail cache is keyed
+    /// on width, so a request at a different width MISSES the pre-gen cache and
+    /// falls back to per-tick on-demand extraction (slow on a multi-cam wall).
+    /// When pre-generation is disabled (the default) the frame is still cached
+    /// lazily at this width, grid-snapped — so revisits stay fast either way.
+    static let scrubThumbWidth = 480
+
     let serverUrl: String
     let token: String?
     /// Per-camera scoped media-token cache (P0-SESSIONS), owned by
@@ -78,10 +90,18 @@ struct MediaUrls {
     }
 
     /// Historical still extracted on-demand from recorded footage at `ts`
-    /// (RFC-3339). Used for the playback wall's scrub-to-moment tile previews.
-    func historicalFrameUrl(cameraId: String, tsISO: String) async -> URL? {
+    /// (RFC-3339). Used for the playback wall's scrub-to-moment tile previews and
+    /// the export preview.
+    ///
+    /// `width` (px) is optional: when nil the server picks its default thumbnail
+    /// width (small, cache-shared with the scrub pre-gen — keep it nil for the
+    /// fast wall-scrub path). Callers that render the still LARGE (the export
+    /// preview) pass an explicit width up to the server cap (640) so it isn't a
+    /// tiny thumbnail blown up blurry.
+    func historicalFrameUrl(cameraId: String, tsISO: String, width: Int? = nil) async -> URL? {
         let encoded = tsISO.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? tsISO
-        return await scopedURL(cameraId: cameraId, "/filmstrip/\(cameraId)/frame?ts=\(encoded)")
+        let widthQuery = width.map { "&width=\($0)" } ?? ""
+        return await scopedURL(cameraId: cameraId, "/filmstrip/\(cameraId)/frame?ts=\(encoded)\(widthQuery)")
     }
 
     /// Thumbnail still for a clip. Requires token auth; scoped to `cameraId`.

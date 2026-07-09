@@ -8,6 +8,10 @@ enum CrumbColors {
     static let surfaceVariant = Color(hex: 0x2C2C2C)
     static let teal = Color(hex: 0x009688)
     static let tealAccent = Color(hex: 0x4DB6AC)
+    /// "On / enabled" switch tint. A bright, unmistakably-positive green — the
+    /// dark `teal` reads too close in luminance to the gray off-track to signal
+    /// "on" at switch scale.
+    static let positive = Color(hex: 0x4CAF50)
     static let recDot = Color(hex: 0xFF1744)
     static let motionDot = Color(hex: 0xFFAB00)
     static let timelineGreen = Color(hex: 0x4CAF50)

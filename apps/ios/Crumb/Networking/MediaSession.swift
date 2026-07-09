@@ -26,6 +26,12 @@ extension URLSession {
 /// three.
 struct TokenedAsyncImage<Content: View, Placeholder: View, Failure: View>: View {
     let url: URL?
+    /// When true, a URL change keeps showing the CURRENT image until the new
+    /// fetch resolves, instead of dropping to the placeholder. For scrub-style
+    /// consumers (the export builder's preview) whose URL changes every tick —
+    /// blanking between frames reads as a black flash per frame. A failed fetch
+    /// still clears to the failure view ("no footage here" must stay honest).
+    var keepStaleImage: Bool = false
     @ViewBuilder let content: (Image) -> Content
     @ViewBuilder let placeholder: () -> Placeholder
     @ViewBuilder let failure: () -> Failure
@@ -35,11 +41,13 @@ struct TokenedAsyncImage<Content: View, Placeholder: View, Failure: View>: View 
 
     init(
         url: URL?,
+        keepStaleImage: Bool = false,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder,
         @ViewBuilder failure: @escaping () -> Failure
     ) {
         self.url = url
+        self.keepStaleImage = keepStaleImage
         self.content = content
         self.placeholder = placeholder
         self.failure = failure
@@ -56,14 +64,14 @@ struct TokenedAsyncImage<Content: View, Placeholder: View, Failure: View>: View 
             }
         }
         .task(id: url) {
-            image = nil
+            if !keepStaleImage { image = nil }
             failed = false
             await fetch()
         }
     }
 
     private func fetch() async {
-        guard let url else { failed = true; return }
+        guard let url else { image = nil; failed = true; return }
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = 12
@@ -71,10 +79,13 @@ struct TokenedAsyncImage<Content: View, Placeholder: View, Failure: View>: View 
               let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let img = PlatformImage(data: data)
         else {
-            failed = true
+            // A superseded (cancelled) fetch must NOT flip the view to failed —
+            // a newer URL's task is already resolving. Only a real failure clears.
+            if !Task.isCancelled { image = nil; failed = true }
             return
         }
         image = img
+        failed = false
     }
 }
 
@@ -82,9 +93,11 @@ extension TokenedAsyncImage where Failure == Placeholder {
     /// 2-parameter convenience: failure state renders the same as the placeholder.
     init(
         url: URL?,
+        keepStaleImage: Bool = false,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) {
-        self.init(url: url, content: content, placeholder: placeholder, failure: placeholder)
+        self.init(url: url, keepStaleImage: keepStaleImage,
+                  content: content, placeholder: placeholder, failure: placeholder)
     }
 }

@@ -8,6 +8,63 @@ revisit.
 
 ---
 
+## 2026-07-08, macOS/iOS export: adopt the desktop batch-list model (single-shot export retired)
+
+**Problem.** The SwiftUI (macOS/iOS) export flow had drifted from the
+Windows/Linux desktop client: it exported a single time window across N
+selected cameras (`POST /export`), while the desktop builds a **list** of
+clips (each its own camera + range), with a batch summary, an optional
+AES-256 ZIP password, and one job for the whole list (`POST /export/batch`).
+Issue #22 tracks the parity gap; the maintainer's direction (2026-07-08) is
+"mimic the Windows client as closely as possible".
+
+**Chosen.** Port the desktop batch-list model to the SwiftUI client
+(`ExportViewModel` holds `[ExportClip]` + an add/edit-clip builder with a
+frame-preview scrubber; `ExportView` renders list ⇄ builder on the left and
+the global output panel — format, burn-in, audio, password, batch summary,
+"Export N clips" — on the right). Submission goes through the existing
+server `POST /export/batch`; job polling/cancel is unchanged. Entry points
+seed the builder the way the desktop does: playback passes the viewed camera
+plus the bracketed timeline selection (builder opens pre-filled, one click to
+add); the Exports tab starts in list mode with the selected wall camera
+pre-picked.
+
+**Rejected.**
+
+- *Keeping the single-shot model* (or shipping both flows side by side):
+  re-litigating the ratified "desktop is the reference UX" direction, and two
+  export UIs is worse than one.
+- *A Windows-identical persisted destination-folder picker on macOS/iOS.*
+  Platform-inappropriate: sandboxed macOS/iOS apps get durable folder access
+  only via security-scoped bookmarks, and iOS has no folder workflow at all.
+  Outputs keep the platform-native ends: NSSavePanel per output file (macOS)
+  and the share sheet fed a locally-downloaded file (iOS) — preserving the
+  C1/C2 token-leak fixes. Revisit if operators ask for one-click batch saves.
+
+**Deferred, stated explicitly (component-map §3 parity walk):**
+
+- **Android** still has the single-shot export flow; porting the batch model
+  there is follow-up work under issue #22's umbrella, not silently dropped.
+- **Wall-tile thumbnail crispness** (issue #22 item 5) — since addressed:
+  the playback wall + single-camera scrub previews requested ~160px stills
+  that blurred blown up to tile size on a large display. The scrub-still width
+  is now a shared constant (iOS `MediaUrls.scrubThumbWidth` = 480) kept equal
+  to the server's `THUMB_PREGEN_WIDTH` default (raised 160 → 480) so the two
+  agree and requests hit the pre-generated cache when it is enabled (and are
+  cached lazily at that width, grid-snapped, when it is not — the default).
+  480 sits at the top of the maintainer's suggested 320–480 range: notably
+  crisper without paying the full 640 cap on per-tick on-demand extraction for
+  a multi-camera wall. Trade-off: when an operator enables pre-generation the
+  cache is ~3–4× the bytes of the old 160px cache; lowering `THUMB_PREGEN_WIDTH`
+  is safe and just drops those clients back to on-demand at their width.
+- Issue #22 item 6 (format-set parity) was verified a **no-op**: both clients
+  already offer exactly MP4/MKV × {H.264 (MP4 only), H.265, copy}.
+
+**Revisit triggers:** the desktop export flow changes shape (this port
+follows it); operators request persisted batch-save destinations on macOS.
+
+---
+
 ## 2026-07-07, Scrub preview: pre-generated JPEG proxy (API-side); keyframe index rejected
 
 **Problem.** Timeline scrubbing does not yet feel like a leading commercial VMS:
