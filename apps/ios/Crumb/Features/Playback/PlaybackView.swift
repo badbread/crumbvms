@@ -87,6 +87,14 @@ struct PlaybackView: View {
                         segmentStartMs: vm.currentSegment.map { Int64((parseISO8601($0.start)?.timeIntervalSince1970 ?? 0) * 1000) } ?? 0,
                         segmentPath: vm.currentSegment?.url, cameraId: vm.cameraId, mediaUrls: vm.mediaUrls())
         }
+        // Gapless boundary (issue #23): the VM resolves the next contiguous
+        // segment ~2.5s early; hand it to the player to probe + queue so the
+        // ~4s boundary advances with no black flash.
+        .onChange(of: vm.prefetchNext) { signal in
+            guard let signal else { return }
+            player.enqueueNext(url: signal.url, segmentStartMs: signal.startMs,
+                               segmentPath: signal.path, cameraId: vm.cameraId, mediaUrls: vm.mediaUrls())
+        }
         .onChange(of: vm.playing) { p in player.setPlaying(p && !vm.scrubbing) }
         .onChange(of: vm.speed) { s in player.setSpeed(s) }
         .onChange(of: vm.scrubbing) { s in player.setPlaying(!s && vm.playing) }
@@ -94,6 +102,7 @@ struct PlaybackView: View {
             player.onEnded = { vm.onSegmentEnded() }
             player.onError = { vm.onPlayerError() }
             player.onTick = { ms in vm.onPlaybackTick(ms) }
+            player.onAdvanced = { vm.commitAdvance() }
         }
         .sheet(isPresented: $showAddBookmark) {
             AddBookmarkDialog(atDate: vm.playheadDate) { desc, days, pre, post in
@@ -607,22 +616,47 @@ private struct VideoSizing: ViewModifier {
 
 @MainActor
 final class SegmentPlayer: ObservableObject {
-    let player = AVPlayer()
+    // AVQueuePlayer (an AVPlayer subclass, so `PlayerLayerView` + PiP keep
+    // working unchanged) is what makes playback GAPLESS across the ~4 s segment
+    // boundaries (issue #23): the next segment is prefetched + queued while the
+    // current one still plays, and the queue advances to the already-warm item
+    // with no teardown — instead of the old single-`AVPlayer` `replaceCurrentItem`
+    // at the boundary, which flashed black for a frame or several every segment.
+    let player = AVQueuePlayer()
     var onEnded: () -> Void = {}
     var onError: () -> Void = {}
     var onTick: (Int64) -> Void = { _ in }
+    /// The queue gaplessly advanced to the prefetched next segment. The view
+    /// forwards this to `PlaybackViewModel.commitAdvance()`, which promotes the
+    /// prefetched segment to `currentSegment` and prefetches the one after.
+    var onAdvanced: () -> Void = {}
 
-    private var retagDelegate: HEVCRetagLoaderDelegate?
+    // Retag delegates must stay retained for as long as their item is in the
+    // queue (the resource-loader holds them weakly). One per live item.
+    private var currentDelegate: HEVCRetagLoaderDelegate?
+    private var nextDelegate: HEVCRetagLoaderDelegate?
+
     private var currentURL: URL?
+    /// The prefetched-and-queued next segment's URL (nil = nothing queued).
+    private var nextURL: URL?
     private var segmentStartMs: Int64 = 0
+    private var nextStartMs: Int64 = 0
     private var speed: Float = 1
     private var wantPlaying = false
     private var timeObserver: Any?
     private var statusCancellable: AnyCancellable?
-    private var endObserver: NSObjectProtocol?
+    private var currentItemCancellable: AnyCancellable?
     /// Guards against a stale probe (from a segment we've since moved past)
-    /// installing its player item after a newer `feed` call has already won.
+    /// installing its player item after a newer `feed`/advance has already won.
     private var probeGeneration = 0
+    /// True while we programmatically rebuild the queue (`feed` replace path),
+    /// so the `currentItem` observer doesn't mistake the transient change for a
+    /// real boundary. Starts true so the observer's first emission is ignored.
+    private var isReplacing = true
+    /// Set when the queue auto-advanced to the prefetched next item, so the
+    /// view-model's follow-up `feed(sameURL, offset:0)` is a no-op rather than a
+    /// seek-to-0 hitch on the item that is already playing.
+    private var justAdvanced = false
 
     init() {
         player.automaticallyWaitsToMinimizeStalling = false
@@ -633,9 +667,48 @@ final class SegmentPlayer: ObservableObject {
                 self.onTick(self.segmentStartMs + Int64(time.seconds * 1000))
             }
         }
+        // Drive boundary handling off `currentItem`: the queue removes the
+        // finished item and either advances to the queued next (→ gapless) or,
+        // when nothing is queued, runs dry (→ nil = end-of-segment). `[.new]`
+        // (no `.initial`) + `isReplacing` keep the startup/rebuild churn quiet.
+        currentItemCancellable = player.publisher(for: \.currentItem, options: [.new])
+            .sink { [weak self] item in self?.handleCurrentItemChange(item) }
     }
 
-    /// Feed a new (or the same) recorded segment to the player.
+    private func handleCurrentItemChange(_ item: AVPlayerItem?) {
+        guard !isReplacing else { return }
+        if item == nil {
+            // Queue ran dry with nothing prefetched — a recording gap, a
+            // prefetch that didn't land in time, or the end of footage. Fall
+            // back to the existing resolve-and-seek path (its old ~1-frame
+            // flash, only on these non-contiguous transitions).
+            onEnded()
+        } else if nextURL != nil {
+            // Gapless auto-advance to the prefetched next segment.
+            promoteNext()
+            justAdvanced = true
+            applyRate()
+            attachStatusObserver(item)
+            onAdvanced()
+        }
+    }
+
+    /// Promote the queued next segment's bookkeeping to "current" after the
+    /// queue advanced to it (the item itself is already the queue's currentItem).
+    private func promoteNext() {
+        currentURL = nextURL
+        segmentStartMs = nextStartMs
+        currentDelegate = nextDelegate
+        nextURL = nil
+        nextStartMs = 0
+        nextDelegate = nil
+        probeGeneration += 1 // invalidate any still-in-flight prefetch probe
+    }
+
+    /// Feed a new recorded segment — the REPLACE path (initial load, seek/jump,
+    /// scrub-resume, camera switch). Clears the queue and any prefetched next.
+    /// Linear boundary advances do NOT come through here; they go gaplessly via
+    /// the queue (`enqueueNext` + the `currentItem` observer).
     ///
     /// **M4 seek redesign:** rather than unconditionally routing every segment
     /// through the whole-file-download HEVC retag loader, this first probes
@@ -650,76 +723,98 @@ final class SegmentPlayer: ObservableObject {
     /// - Inconclusive → falls back to the old whole-segment download, so
     ///   correctness is preserved even for an unexpected box layout.
     ///
-    /// The probe itself is a small, fast request (typically a single range
-    /// GET of tens of KB), so this adds negligible latency versus the old
-    /// path while eliminating the full-segment download in the common case.
-    ///
     /// - Parameters:
     ///   - url: the (already scoped-token-bearing) segment URL to play.
     ///   - segmentPath: the RAW path (`segment.url` from `ResolvedSegment`,
     ///     e.g. `/segments/{id}`) `url` was built from — carried through so
     ///     the HEVC-retag range-proxy can re-mint a FRESH scoped token for
     ///     this same segment if playback outlives the ~15 min token that was
-    ///     current when `url` was minted (P0-SESSIONS). `nil` disables
-    ///     refresh (falls back to reusing `url`'s original token for the
-    ///     whole segment — matches pre-migration behavior, just with a
-    ///     shorter-lived token).
+    ///     current when `url` was minted (P0-SESSIONS).
     ///   - cameraId / mediaUrls: together with `segmentPath`, let the retag
-    ///     delegate re-mint via `MediaTokenCache` (a cache hit in the common
-    ///     case where the token is still fresh).
+    ///     delegate re-mint via `MediaTokenCache`.
     func feed(
         url: URL?, offsetMs: Int64, playing: Bool, segmentStartMs: Int64,
         segmentPath: String? = nil, cameraId: String? = nil, mediaUrls: MediaUrls? = nil
     ) {
-        self.segmentStartMs = segmentStartMs
         self.wantPlaying = playing
         guard let url else {
-            player.replaceCurrentItem(with: nil)
-            currentURL = nil
+            rebuild(with: nil, offsetMs: 0, segmentStartMs: 0)
             return
         }
-        guard url != currentURL else {
-            // Same segment — just reseek to the offset.
+        if url == currentURL {
+            // Same segment. A gapless advance already positioned us at offset 0,
+            // so the view-model's follow-up feed is a no-op; otherwise it's a
+            // scrub within the current segment → reseek.
+            if justAdvanced { justAdvanced = false; return }
+            self.segmentStartMs = segmentStartMs
             seek(ms: offsetMs)
             return
         }
-        currentURL = url
         probeGeneration += 1
         let generation = probeGeneration
-
         Task { [weak self] in
             let requirement = await HEVCRetag.probe(url: url)
-            guard let self, self.probeGeneration == generation, self.currentURL == url else { return }
-            self.installPlayerItem(
-                for: url, requirement: requirement, offsetMs: offsetMs,
+            guard let self, self.probeGeneration == generation else { return }
+            let (item, delegate) = self.buildItem(
+                url: url, requirement: requirement,
                 segmentPath: segmentPath, cameraId: cameraId, mediaUrls: mediaUrls
             )
+            self.currentURL = url
+            self.currentDelegate = delegate
+            self.rebuild(with: item, offsetMs: offsetMs, segmentStartMs: segmentStartMs)
         }
     }
 
-    private func installPlayerItem(
-        for url: URL, requirement: HEVCRetag.RemuxRequirement, offsetMs: Int64,
-        segmentPath: String?, cameraId: String?, mediaUrls: MediaUrls?
+    /// Prefetch + queue the next contiguous segment so the boundary is gapless.
+    /// No-op (→ falls back to `onEnded`) if the probe/build races a seek or the
+    /// current item is already gone; a failed queued item recovers via `onError`.
+    func enqueueNext(
+        url: URL, segmentStartMs: Int64,
+        segmentPath: String? = nil, cameraId: String? = nil, mediaUrls: MediaUrls? = nil
     ) {
+        guard url != currentURL, url != nextURL, player.currentItem != nil else { return }
+        let generation = probeGeneration
+        Task { [weak self] in
+            let requirement = await HEVCRetag.probe(url: url)
+            // Bail if a feed/advance happened meanwhile, or a next is already
+            // queued, or the queue emptied out from under us.
+            guard let self, self.probeGeneration == generation,
+                  self.nextURL == nil, url != self.currentURL,
+                  let current = self.player.currentItem else { return }
+            let (item, delegate) = self.buildItem(
+                url: url, requirement: requirement,
+                segmentPath: segmentPath, cameraId: cameraId, mediaUrls: mediaUrls
+            )
+            guard self.player.canInsert(item, after: current) else { return }
+            self.player.insert(item, after: current)
+            self.nextURL = url
+            self.nextStartMs = segmentStartMs
+            self.nextDelegate = delegate
+        }
+    }
+
+    /// Build an `AVPlayerItem` (+ its retag delegate, if any) for a segment URL.
+    /// Shared by the replace path (`feed`) and the prefetch path (`enqueueNext`).
+    private func buildItem(
+        url: URL, requirement: HEVCRetag.RemuxRequirement,
+        segmentPath: String?, cameraId: String?, mediaUrls: MediaUrls?
+    ) -> (AVPlayerItem, HEVCRetagLoaderDelegate?) {
         let asset: AVURLAsset
+        let delegate: HEVCRetagLoaderDelegate?
         switch requirement {
         case .passthrough:
             // No retag needed — native AVURLAsset against the origin URL.
-            // AVFoundation issues its own Range: requests; seeking is exactly
-            // as instant as any ordinary progressive-download HTTP asset.
+            // AVFoundation issues its own Range: requests; seeking is as instant
+            // as any ordinary progressive-download HTTP asset.
             //
-            // NOTE: unlike the retag path below, there is no app-level proxy
-            // sitting in front of these requests to refresh an expiring
-            // scoped token — AVFoundation talks to the origin directly. A
-            // segment played passthrough for longer than the ~15 min token TTL
-            // could see AVFoundation's own range request 401. This matches
-            // the instructed scope (HEVCRetag's proxy is the seam that needs
-            // freshness handling); a passthrough mid-playback 401 surfaces
-            // through the existing `onError` → `PlaybackViewModel.onPlayerError()`
-            // → `seekTo(playheadMs)` retry path, which re-resolves the segment
-            // and mints a fresh token via a new `/play` + scoped-URL round trip.
+            // NOTE: unlike the retag path, there is no app-level proxy in front
+            // of these requests to refresh an expiring scoped token. A passthrough
+            // segment played past the ~15 min token TTL could 401 on AVFoundation's
+            // own range request; that surfaces through `onError` →
+            // `PlaybackViewModel.onPlayerError()` → `seekTo(playheadMs)`, which
+            // re-resolves with a fresh token.
             asset = AVURLAsset(url: url)
-            retagDelegate = nil
+            delegate = nil
         case .retagRequired, .unknown:
             let custom = HEVCRetag.customSchemeURL(url)
             asset = AVURLAsset(url: custom)
@@ -727,22 +822,40 @@ final class SegmentPlayer: ObservableObject {
             if let segmentPath, let cameraId, let mediaUrls {
                 refresh = { await mediaUrls.scopedURL(cameraId: cameraId, segmentPath) }
             }
-            let delegate = HEVCRetagLoaderDelegate(realURL: url, wholeFileFallback: requirement == .unknown, refreshURL: refresh)
-            asset.resourceLoader.setDelegate(delegate, queue: .main)
-            retagDelegate = delegate
+            let d = HEVCRetagLoaderDelegate(realURL: url, wholeFileFallback: requirement == .unknown, refreshURL: refresh)
+            asset.resourceLoader.setDelegate(d, queue: .main)
+            delegate = d
         }
+        return (AVPlayerItem(asset: asset), delegate)
+    }
 
-        let item = AVPlayerItem(asset: asset)
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            self?.onEnded()
+    /// Replace the whole queue with a single item (or clear it when nil).
+    private func rebuild(with item: AVPlayerItem?, offsetMs: Int64, segmentStartMs: Int64) {
+        isReplacing = true
+        justAdvanced = false
+        self.segmentStartMs = segmentStartMs
+        // Drop any prefetched next — it belonged to the old position.
+        nextURL = nil
+        nextStartMs = 0
+        nextDelegate = nil
+        player.removeAllItems()
+        if let item {
+            if player.canInsert(item, after: nil) { player.insert(item, after: nil) }
+            attachStatusObserver(item)
+        } else {
+            currentURL = nil
+            currentDelegate = nil
+            statusCancellable = nil
         }
-        statusCancellable = item.publisher(for: \.status).sink { [weak self] status in
-            if status == .failed { self?.onError() }
-        }
-        player.replaceCurrentItem(with: item)
+        isReplacing = false
         if offsetMs > 0 { seek(ms: offsetMs) }
         applyRate()
+    }
+
+    private func attachStatusObserver(_ item: AVPlayerItem?) {
+        statusCancellable = item?.publisher(for: \.status).sink { [weak self] status in
+            if status == .failed { self?.onError() }
+        }
     }
 
     private func seek(ms: Int64) {
@@ -763,7 +876,6 @@ final class SegmentPlayer: ObservableObject {
 
     deinit {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
     }
 }
 
