@@ -28,6 +28,19 @@ name: android-release
 on:
   push:
     tags: ["v*"]
+  # Manual re-ship: rebuild + re-sign the APK from the selected branch and REPLACE
+  # the asset on an EXISTING release, without cutting a new version tag (and
+  # without firing the macOS/Windows release builds, which only trigger on v*).
+  # Use this when you've fixed something Android-only and just want a fresh signed
+  # APK on the same release. Bump apps/android/version.properties VERSION_CODE
+  # first (Android refuses an update with an equal/lower code), then run this from
+  # the branch that has the fix (default: the default branch).
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the rebuilt APK to (e.g. v0.0.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write   # to create/update the GitHub Release and upload the APK
@@ -125,7 +138,12 @@ jobs:
       - name: Upload signed APK + checksum to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Tag push -> the pushed tag; manual re-ship -> the release_tag input
+          # (the existing release whose APK we're replacing).
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
           files: |
             apps/android/${{ steps.apk.outputs.path }}
             apps/android/${{ steps.sum.outputs.path }}
-          generate_release_notes: true
+          # Only (re)generate notes when creating the release on a tag push; a
+          # manual re-ship must not clobber an existing release's notes.
+          generate_release_notes: ${{ github.event_name == 'push' }}
