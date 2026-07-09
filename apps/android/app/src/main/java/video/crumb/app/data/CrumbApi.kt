@@ -209,4 +209,19 @@ interface CrumbApi {
     /** Delete a view (owner or admin only). */
     @DELETE("views/{id}")
     suspend fun deleteView(@Path("id") id: String): Response<Unit>
+
+    /**
+     * Update-available check (issue #7). Any authenticated user (viewers run
+     * wall displays and phones too). `enabled:false` means the operator has
+     * turned the check off — every other field is then null and the client
+     * shows nothing. An older server that predates this endpoint returns 404,
+     * which the repository layer treats the same way.
+     *
+     * @param refresh Pass `"1"` to force an immediate re-check ("Check now",
+     *   `docs/UPDATE-SYSTEM-PLAN.md` §2.5) bypassing the server's 6h cache —
+     *   itself rate-limited server-side to one actual GitHub hit per 60s.
+     *   Omit for the normal cached lookup.
+     */
+    @GET("updates/latest")
+    suspend fun updatesLatest(@Query("refresh") refresh: String? = null): UpdateCheckResponse
 }

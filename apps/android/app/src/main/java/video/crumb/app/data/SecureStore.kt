@@ -200,6 +200,29 @@ class SecureStore(context: Context) {
     // Playback bookmarks moved server-side (shared across clients) — see
     // CrumbRepository.bookmarks()/addBookmark() and the /bookmarks API.
 
+    // ── update-available check (issue #7) ────────────────────────────────────
+
+    /**
+     * Release version the user last dismissed the update-available banner
+     * for. The banner stays hidden until a NEWER release appears than this
+     * one — dismissing v0.0.2 does not suppress a later v0.0.3. Null when
+     * nothing has ever been dismissed.
+     */
+    var dismissedUpdateVersion: String?
+        get() = prefs.getString(KEY_DISMISSED_UPDATE_VERSION, null)
+        set(value) = prefs.edit().apply {
+            if (value == null) remove(KEY_DISMISSED_UPDATE_VERSION) else putString(KEY_DISMISSED_UPDATE_VERSION, value)
+        }.apply()
+
+    /**
+     * Device-local epoch millis of the last organic (non-"Check now")
+     * update check, so the app re-checks at most once every 24h across app
+     * launches (`docs/UPDATE-SYSTEM-PLAN.md` §3). 0 = never checked.
+     */
+    var lastUpdateCheckAtMs: Long
+        get() = prefs.getLong(KEY_LAST_UPDATE_CHECK, 0L)
+        set(value) = prefs.edit().putLong(KEY_LAST_UPDATE_CHECK, value).apply()
+
     val isLoggedIn: Boolean get() = !token.isNullOrBlank()
 
     val isAdmin: Boolean get() = role.equals("admin", ignoreCase = true)
@@ -232,6 +255,8 @@ class SecureStore(context: Context) {
         private const val KEY_CAPABILITIES = "user_capabilities_json"
         private const val KEY_BIOMETRIC = "biometric_enabled"
         private const val KEY_BIOMETRIC_OFFERED = "biometric_offered"
+        private const val KEY_DISMISSED_UPDATE_VERSION = "dismissed_update_version"
+        private const val KEY_LAST_UPDATE_CHECK = "last_update_check_at_ms"
 
         /** Lenient JSON for the local views blob and capability set (tolerates schema drift). */
         private val jsonCodec = Json { ignoreUnknownKeys = true }

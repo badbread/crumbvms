@@ -189,4 +189,7 @@ dependencies {
     // Biometric / device-credential app lock (BiometricPrompt). Pulls androidx.fragment,
     // which is why MainActivity is a FragmentActivity.
     implementation(libs.androidx.biometric)
+
+    // Local JVM unit tests (src/test) — currently just the update-checker SemVer compare.
+    testImplementation(libs.junit)
 }

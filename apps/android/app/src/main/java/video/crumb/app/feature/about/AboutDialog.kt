@@ -6,17 +6,22 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import video.crumb.app.BuildConfig
+import video.crumb.app.feature.update.UpdateCheckRow
+import video.crumb.app.feature.update.UpdateUiState
 import video.crumb.app.ui.theme.TextPrimary
 import video.crumb.app.ui.theme.TextSecondary
 
@@ -31,13 +36,30 @@ import video.crumb.app.ui.theme.TextSecondary
  * build is `video.crumb.app` (debug: `video.crumb.app.debug`).
  *
  * @param serverUrl The currently-configured API server, shown for context.
+ * @param updateState Update-available check state (issue #7). When the server
+ *   reports the check enabled, an always-present update field is shown
+ *   ("Checking..." / "You're up to date (X)" / "Update available: X → release
+ *   notes") with a "Check now" button; hidden entirely when the server reports
+ *   the check off (or an older server 404s).
+ * @param onOpened Called once when the dialog opens, to trigger a fresh
+ *   (normal, non-forced) check so the update field is never stale — a client
+ *   that first checked while the server had the feature OFF can still discover
+ *   it was turned ON.
+ * @param onCheckNow Force an immediate re-check against the server ("Check now").
  * @param onDismiss Close the dialog.
  */
 @Composable
 fun AboutDialog(
     serverUrl: String,
+    updateState: UpdateUiState,
+    onOpened: () -> Unit,
+    onCheckNow: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // Opening About triggers a fresh check so the field below reflects current
+    // server state rather than a cached (possibly hours-stale) one.
+    LaunchedEffect(Unit) { onOpened() }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
@@ -52,6 +74,13 @@ fun AboutDialog(
                 InfoRow("Commit", BuildConfig.GIT_SHA)
                 InfoRow("Build type", BuildConfig.BUILD_TYPE)
                 InfoRow("Server", serverUrl)
+
+                // Always present while the server has the check enabled; hidden
+                // when it reports enabled:false or an older server 404s.
+                if (updateState.enabled) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    UpdateCheckRow(state = updateState, onCheckNow = onCheckNow)
+                }
             }
         },
     )

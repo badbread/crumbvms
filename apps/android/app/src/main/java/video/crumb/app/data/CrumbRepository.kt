@@ -324,6 +324,17 @@ class CrumbRepository(private val container: AppContainer) {
         }
         byCam.mapValues { it.value.toList() }
     }
+
+    // ── update-available check (issue #7) ───────────────────────────────────
+    /**
+     * `GET /updates/latest`. [refresh] forces an immediate re-check ("Check
+     * now", §2.5); the server itself rate-limits actual GitHub hits, so this
+     * is safe to call repeatedly. A 404 (server predates the endpoint) surfaces
+     * as a [Result.failure] — callers should treat that the same as
+     * `enabled:false` and show nothing.
+     */
+    suspend fun updatesLatest(refresh: Boolean = false): Result<UpdateCheckResponse> =
+        runCatchingCancellable { api.updatesLatest(if (refresh) "1" else null) }
 }
 
 /**
