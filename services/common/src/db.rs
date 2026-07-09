@@ -22,7 +22,7 @@
 //! * Item 13 — [`upsert_storage`] is idempotent on `name` (`ON CONFLICT`).
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use deadpool_postgres::{Config as DeadpoolConfig, Hook, HookError, Pool, Runtime};
 use serde::Serialize;
 use tokio_postgres::NoTls;
@@ -3700,18 +3700,109 @@ pub async fn ensure_segments_camera_start_index(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
-/// Stub: return thumbnail timestamps for a camera in a time range.
+/// Build ascending grid-aligned slot timestamps across `[start, end)`.
 ///
-/// Returns an empty vec until the filmstrip background task is implemented and
-/// a thumbnails index (DB table or directory scan) is available.
+/// Slots are floored to `interval_secs` on the wall-clock epoch (NOT anchored
+/// to `start`), so the same interval requested across different query windows
+/// lands on identical timestamps. That stability is what lets pre-generated
+/// and on-demand frames share cache keys instead of each scrub minting a new
+/// filename. The first slot is `start` floored to the grid; the last is the
+/// largest grid multiple strictly less than `end`.
+///
+/// Shared by [`list_thumbnail_times`] (coverage-filtered below) and
+/// `filmstrip::list_filmstrip`'s synthetic fallback (unfiltered — used only
+/// when a requested range has zero recorded coverage at all), so the two
+/// never drift apart into two different grids.
+pub fn thumbnail_grid_slots(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    interval_secs: i64,
+) -> Vec<DateTime<Utc>> {
+    if interval_secs <= 0 {
+        return vec![];
+    }
+    let step_ms = interval_secs * 1_000;
+    // div_euclid floors correctly even for a pre-epoch input.
+    let start_ms = start.timestamp_millis().div_euclid(step_ms) * step_ms;
+    let end_ms = end.timestamp_millis();
+    if end_ms <= start_ms {
+        return vec![];
+    }
+    // start_ms < end_ms and step_ms > 0 here; the quotient fits usize on all
+    // targets we care about (Linux x86_64 with 48-bit virtual address space).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let count = ((end_ms - start_ms) / step_ms) as usize + 1;
+
+    (0..count)
+        .filter_map(|i| {
+            #[allow(clippy::cast_possible_wrap)]
+            let ts_ms = start_ms + (i as i64) * step_ms;
+            // Keep slots strictly before `end`.
+            let ts = Utc.timestamp_millis_opt(ts_ms).single()?;
+            if ts < end {
+                Some(ts)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Return pre-generation / scrub-preview grid slot timestamps for a camera in
+/// `[start, end)`, filtered to slots that fall within actual recorded `main`-
+/// stream `segments` coverage.
+///
+/// The grid itself is [`thumbnail_grid_slots`] at `interval_secs` — unchanged
+/// cadence from the Phase 1 synthetic fallback. What's new is the filter: a
+/// slot is only returned when some `main`-stream segment's `[start_ts, end_ts)`
+/// span covers it, the same half-open convention [`resolve_segment`] uses (a
+/// slot exactly at a segment's `start_ts` is covered; one exactly at its
+/// `end_ts` is not, unless the next contiguous segment starts exactly there).
+/// This is what keeps recording-gap slots out of both the client-facing
+/// `/filmstrip` list and the background pre-generation worker, so neither ever
+/// requests a frame ffmpeg has no footage to extract (issue #9).
+///
+/// Callers relying on `interval_secs` for cache-key stability (the on-demand
+/// `serve_frame` grid-snap) must pass the same value used elsewhere for this
+/// camera — [`filmstrip::DEFAULT_THUMB_INTERVAL_SECS`] in production.
+///
+/// Implemented by fetching the (already indexed, `camera_id, start_ts`)
+/// segments overlapping the window once via [`list_segments_for_range`], then
+/// sweeping the grid against them in a single linear pass — segments are
+/// non-overlapping and returned ordered by `start_ts`, so a monotonically
+/// advancing cursor is sufficient (no per-slot query).
+///
+/// # Errors
+///
+/// Returns an error if the underlying segments query fails.
 pub async fn list_thumbnail_times(
-    _pool: &Pool,
-    _camera_id: Uuid,
-    _start: DateTime<Utc>,
-    _end: DateTime<Utc>,
+    pool: &Pool,
+    camera_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    interval_secs: i64,
 ) -> Result<Vec<DateTime<Utc>>> {
-    // PHASE 1 stub — implement when the thumb generator lands.
-    Ok(vec![])
+    let grid = thumbnail_grid_slots(start, end, interval_secs);
+    if grid.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let segments = list_segments_for_range(pool, camera_id, "main", start, end).await?;
+
+    let mut covered = Vec::with_capacity(grid.len());
+    let mut idx = 0usize;
+    for ts in grid {
+        // Advance past segments that end at-or-before this slot — such a
+        // segment (and anything earlier) can never cover this or any later
+        // slot, since both the grid and the segments are ascending.
+        while idx < segments.len() && segments[idx].end_ts <= ts {
+            idx += 1;
+        }
+        if idx < segments.len() && segments[idx].start_ts <= ts {
+            covered.push(ts);
+        }
+    }
+    Ok(covered)
 }
 
 // ─── users — CRUD ────────────────────────────────────────────────────────────
@@ -9412,6 +9503,203 @@ mod tests {
         assert!(
             valid_index_survives,
             "reap_invalid_indexes must never touch a VALID index"
+        );
+    }
+
+    // ── thumbnail_grid_slots — pure grid math, no DB needed ───────────────────
+
+    /// The grid must floor to the interval on the wall-clock epoch (not anchor
+    /// to `start`) and must exclude a slot landing exactly on `end` (half-open
+    /// range), matching `filmstrip::generate_synthetic_timestamps`'s original
+    /// contract now that both share this implementation.
+    #[test]
+    fn thumbnail_grid_slots_floors_and_excludes_end() {
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        // start is 2s past a 5s-grid boundary; the first slot must still be
+        // the grid boundary at-or-before start, i.e. `base`, not `start`.
+        let start = base + chrono::Duration::seconds(2);
+        let end = base + chrono::Duration::seconds(15); // exactly a grid multiple
+        let slots = thumbnail_grid_slots(start, end, 5);
+        let expected: Vec<_> = [0, 5, 10]
+            .iter()
+            .map(|s| base + chrono::Duration::seconds(*s))
+            .collect();
+        assert_eq!(
+            slots, expected,
+            "grid floors to the epoch-aligned interval and excludes a slot at exactly `end`"
+        );
+    }
+
+    #[test]
+    fn thumbnail_grid_slots_empty_when_end_not_after_start() {
+        let t = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        assert!(thumbnail_grid_slots(t, t, 5).is_empty());
+        assert!(thumbnail_grid_slots(t + chrono::Duration::seconds(5), t, 5).is_empty());
+    }
+
+    // ── list_thumbnail_times — coverage-aware grid, throwaway-DB integration test ──
+    //
+    // Opt-in: skips (passes) unless `TEST_DATABASE_URL` points at a reachable
+    // Postgres, same convention as `reap_invalid_indexes_drops_invalid_index`
+    // above. Unlike that test, this one needs the REAL schema (segments's FKs
+    // to cameras/storages, cameras' FK to recording_policies), so it runs
+    // `run_migrations` against the freshly created schema rather than hand-
+    // rolling a table.
+
+    /// Seed the single global-default `recording_policies` row
+    /// (`is_default = true`) that `clone_default_policy` requires. Mirrors
+    /// `services/api/tests/support/mod.rs`'s `seed_default_policy_if_absent`
+    /// (same columns/defaults as the recorder's `seed.rs`), duplicated here
+    /// rather than shared because that harness is `services/api`-only
+    /// (`#[path]`-included test source, not a reusable library).
+    async fn seed_default_policy_for_test(pool: &Pool) {
+        let client = get_conn(pool)
+            .await
+            .expect("get_conn (seed_default_policy_for_test)");
+        client
+            .execute(
+                r"
+                INSERT INTO recording_policies (
+                    is_default, mode, live_storage_id, live_retention_hours,
+                    archive_enabled, archive_storage_id, archive_schedule, archive_retention_hours,
+                    motion_pre_seconds, motion_post_seconds, motion_sensitivity,
+                    motion_keyframes_only, record_stream
+                )
+                VALUES (
+                    true, 'continuous', NULL, 48,
+                    false, NULL, NULL, NULL,
+                    5, 10, 'dynamic',
+                    false, 'main'
+                )
+                ",
+                &[],
+            )
+            .await
+            .expect("seed default recording_policies row");
+    }
+
+    /// Seed a minimal camera (own policy cloned from the just-seeded default).
+    async fn seed_camera_for_test(pool: &Pool) -> Uuid {
+        let policy_id = clone_default_policy(pool)
+            .await
+            .expect("clone_default_policy");
+        let suffix = Uuid::new_v4().simple().to_string();
+        let params = CreateCameraParams {
+            name: &format!("cam_{suffix}"),
+            go2rtc_name: &format!("go2rtc_{suffix}"),
+            main_url: "rtsp://127.0.0.1:18554/does-not-matter",
+            sub_url: None,
+            source_url: None,
+            source_sub_url: None,
+            enabled: true,
+            policy_id,
+            motion_mask: None,
+            onvif_motion: false,
+            motion_source: "pixel",
+            motion_algorithm: "census",
+            camera_type: None,
+            icon: None,
+            served_by: "crumb",
+            source_camera_name: None,
+            onvif_host: None,
+            onvif_port: None,
+            onvif_user: None,
+            onvif_password: None,
+        };
+        create_camera(pool, &params)
+            .await
+            .expect("create_camera")
+            .id
+    }
+
+    /// Insert a `main`-stream segment row directly (no real file — this test
+    /// only exercises the coverage query, never opens the path).
+    async fn insert_test_segment(
+        pool: &Pool,
+        camera_id: Uuid,
+        storage_id: Uuid,
+        start_ts: DateTime<Utc>,
+        end_ts: DateTime<Utc>,
+    ) {
+        let client = get_conn(pool)
+            .await
+            .expect("get_conn (insert_test_segment)");
+        let duration_ms = (end_ts - start_ts).num_milliseconds();
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_ms = duration_ms as i32;
+        client
+            .execute(
+                r"
+                INSERT INTO segments
+                    (camera_id, storage_id, stage, path, stream, start_ts, end_ts, duration_ms, has_motion, size_bytes)
+                VALUES ($1, $2, 'live', 'seg.mp4', 'main', $3, $4, $5, false, 64)
+                ",
+                &[&camera_id, &storage_id, &start_ts, &end_ts, &duration_ms],
+            )
+            .await
+            .expect("insert test segment");
+    }
+
+    /// A recording gap in the middle of the requested window must never
+    /// surface a slot, and the two segment BOUNDARIES must resolve per the
+    /// half-open `[start_ts, end_ts)` convention `resolve_segment` already
+    /// uses: a slot exactly at a segment's `end_ts` is NOT covered (that
+    /// instant belongs to whatever comes next, if anything), and a slot
+    /// exactly at the following segment's `start_ts` IS covered.
+    ///
+    /// Layout (grid = 5s, `base` an arbitrary 5s-grid-aligned instant):
+    /// ```text
+    /// offset(s):  0    5    10   15   20   25   30
+    /// segment:    [--- seg1 ---)     [--- seg2 ---)
+    /// grid slot:  ✓    ✓    ✗    ✗    ✓    ✓
+    /// ```
+    /// Slot 10 sits exactly on seg1's `end_ts` (excluded); slot 20 sits
+    /// exactly on seg2's `start_ts` (included); slots 10 and 15 are the pure
+    /// mid-gap case (excluded).
+    #[tokio::test]
+    async fn list_thumbnail_times_excludes_gap_slots() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        run_migrations(&fx.pool)
+            .await
+            .expect("run_migrations (test schema)");
+        seed_default_policy_for_test(&fx.pool).await;
+
+        let camera_id = seed_camera_for_test(&fx.pool).await;
+        let storage_id = create_storage(&fx.pool, "test-storage", "/does/not/matter", None, None)
+            .await
+            .expect("create_storage")
+            .id;
+
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let sec = |n: i64| base + chrono::Duration::seconds(n);
+
+        // seg1 covers [0, 10); a real recording gap sits in [10, 20); seg2
+        // covers [20, 30).
+        insert_test_segment(&fx.pool, camera_id, storage_id, sec(0), sec(10)).await;
+        insert_test_segment(&fx.pool, camera_id, storage_id, sec(20), sec(30)).await;
+
+        let times = list_thumbnail_times(&fx.pool, camera_id, sec(0), sec(30), 5)
+            .await
+            .expect("list_thumbnail_times");
+
+        let expected = vec![sec(0), sec(5), sec(20), sec(25)];
+        assert_eq!(
+            times, expected,
+            "gap slots (10, 15) must be excluded; the segment-end boundary (10) \
+             must be excluded and the next segment's start boundary (20) included"
         );
     }
 }
