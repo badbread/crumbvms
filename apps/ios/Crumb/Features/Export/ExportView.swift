@@ -140,6 +140,10 @@ struct ExportView: View {
                 }
             }
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            // Cap the height so a wide window doesn't blow the preview up to fill
+            // the whole column and push the camera + time-range controls below the
+            // fold. Centered; stays 16:9.
+            .frame(maxWidth: .infinity, maxHeight: 300)
             .clipShape(RoundedRectangle(cornerRadius: 10))
             // Scoped media token (P0-SESSIONS): the preview URL is now minted
             // async, so it's refreshed reactively rather than computed inline
@@ -175,6 +179,10 @@ struct ExportView: View {
             SectionHeader("Format")
             SurfaceCard {
                 VStack(alignment: .leading, spacing: 8) {
+                    // Menu-style picker with an explicit control chrome (filled +
+                    // bordered + chevron) so it reads as a real dropdown. The plain
+                    // picker rendered like a static "MP4 · H.264" caption, so the
+                    // other four formats went unnoticed.
                     Picker("", selection: Binding(
                         get: { vm.state.format },
                         set: { vm.setFormat($0) }
@@ -184,7 +192,16 @@ struct ExportView: View {
                         }
                     }
                     .labelsHidden()
-                    .tint(CrumbColors.tealAccent)
+                    .pickerStyle(.menu)
+                    .tint(CrumbColors.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(CrumbColors.surfaceVariant, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(CrumbColors.divider, lineWidth: 1)
+                    )
                     .disabled(vm.state.polling)
 
                     Text(vm.state.format.detail)

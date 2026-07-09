@@ -125,7 +125,9 @@ final class ExportViewModel: ObservableObject {
         let iso = ISO8601DateFormatter().string(from: state.start)
         previewTask = Task { [weak self] in
             guard let self else { return }
-            let url = await container.mediaUrls().historicalFrameUrl(cameraId: camId, tsISO: iso)
+            // Request the server's max thumbnail width (640): the preview renders
+            // large, so the default ~160px still would look blurry blown up.
+            let url = await container.mediaUrls().historicalFrameUrl(cameraId: camId, tsISO: iso, width: 640)
             guard !Task.isCancelled else { return }
             previewURL = url
         }
