@@ -488,15 +488,9 @@ mod linux {
         // attribute GPU at all (host pids won't match container child pids), so
         // report NULL rather than a misleading 0%.
         let translate = std::path::Path::new(HOST_PROC).is_dir();
-        let my_ns = if translate {
-            match my_pid_ns() {
-                Some(ns) => Some(ns),
-                // Can't establish our own namespace ⇒ can't safely translate.
-                None => return None,
-            }
-        } else {
-            None
-        };
+        // `?` early-returns None if we can't establish our own namespace, i.e.
+        // can't safely translate host↔container pids.
+        let my_ns = if translate { Some(my_pid_ns()?) } else { None };
 
         let mut map: HashMap<i32, f64> = HashMap::new();
         for s in samples {

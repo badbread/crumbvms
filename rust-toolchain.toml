@@ -1,0 +1,9 @@
+# Pin the Rust toolchain so a newly-released `stable` (and its clippy) can't
+# turn CI red with no code change — the gate runs clippy with `-D warnings`.
+# CI (.github/workflows/ci.yml) pins the SAME version via the
+# dtolnay/rust-toolchain `toolchain:` input; bump both together, deliberately.
+# See docs/DECISIONS.md (2026-07-09).
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

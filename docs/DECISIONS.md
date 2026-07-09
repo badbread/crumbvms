@@ -8,6 +8,41 @@ revisit.
 
 ---
 
+## 2026-07-09, Pin the Rust toolchain (CI + `rust-toolchain.toml`) instead of tracking `stable`
+
+**Problem.** CI installed Rust via `dtolnay/rust-toolchain@stable` (unpinned)
+and runs clippy with `-D warnings`. When Rust 1.97 released, its clippy began
+flagging an untouched `match` in `services/recorder/src/resource_stats.rs` as
+`clippy::question_mark`, turning the gate red on a docs-only merge (#29) with
+zero relevant code change. Green-this-morning / red-this-afternoon with no code
+change is exactly the failure mode a floating toolchain + `-D warnings` invites.
+
+**Chosen.** Pin the toolchain to an explicit version in two coordinated,
+cross-referenced places: `rust-toolchain.toml` at the repo root (governs local
+builds, so `cargo clippy` on dev1 matches CI and "run the gate before pushing"
+actually catches what CI catches) and the `toolchain:` input on the CI
+`dtolnay/rust-toolchain` steps (governs CI). Rust is now bumped deliberately by
+editing both, not surprise-upgraded. First pin: `1.97.0`.
+
+**Rejected.**
+
+- *Keep tracking `stable`.* Zero-maintenance until it isn't: any new stable that
+  adds or tightens a lint can break CI with no code change, and it broke on
+  literally the first run after 1.97 shipped.
+- *Drop `-D warnings`.* Removes the fragility but also removes the guard that
+  keeps the tree clippy-clean; trading a real correctness signal for convenience.
+- *`rust-toolchain.toml` alone, CI left on `@stable`.* Works via rustup's
+  auto-switch, but relies on a subtle interaction (CI installs stable, cargo
+  silently switches to the toml version). Explicit pinning in both spots reads
+  clearly to a future maintainer.
+
+**Revisit triggers.** Bumping the pin becomes frequent toil (wanting the newest
+stable often), or the two pin sites drift apart in practice — then consolidate
+to a single source of truth (e.g. an action that reads `rust-toolchain.toml`,
+accepting the extra CI dependency).
+
+---
+
 ## 2026-07-08, macOS/iOS export: adopt the desktop batch-list model (single-shot export retired)
 
 **Problem.** The SwiftUI (macOS/iOS) export flow had drifted from the
