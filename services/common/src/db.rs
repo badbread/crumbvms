@@ -9550,23 +9550,44 @@ mod tests {
     //
     // Opt-in: skips (passes) unless `TEST_DATABASE_URL` points at a reachable
     // Postgres, same convention as `reap_invalid_indexes_drops_invalid_index`
-    // above. Unlike that test, this one needs the REAL schema (segments's FKs
-    // to cameras/storages, cameras' FK to recording_policies), so it runs
-    // `run_migrations` against the freshly created schema rather than hand-
-    // rolling a table.
+    // above.
+    //
+    // Isolation model — deliberately NOT the `setup_schema` search_path trick the
+    // reap test uses: this test needs the REAL schema (segments's FKs to
+    // cameras/storages, cameras' FK to recording_policies), which means running
+    // the full `run_migrations`, and `run_migrations` does not survive the
+    // per-connection `search_path` isolation (it re-acquires pooled connections
+    // and runs `CREATE INDEX CONCURRENTLY` statements as their own sessions,
+    // where the schema-scoping does not hold; migration 0014 then fails looking
+    // up `storage_migrations`). Instead we mirror the PROVEN model in
+    // `services/api/tests/support/mod.rs`: migrate the shared database in its
+    // real `public` schema (idempotent + advisory-locked, so concurrent test
+    // binaries serialize safely), then isolate this test's DATA by a freshly
+    // generated `camera_id`. `list_thumbnail_times` filters solely by
+    // `camera_id`, so a unique camera is complete isolation from any other
+    // rows in the shared throwaway DB — no private schema, no teardown needed.
 
-    /// Seed the single global-default `recording_policies` row
-    /// (`is_default = true`) that `clone_default_policy` requires. Mirrors
-    /// `services/api/tests/support/mod.rs`'s `seed_default_policy_if_absent`
-    /// (same columns/defaults as the recorder's `seed.rs`), duplicated here
-    /// rather than shared because that harness is `services/api`-only
-    /// (`#[path]`-included test source, not a reusable library).
-    async fn seed_default_policy_for_test(pool: &Pool) {
-        let client = get_conn(pool)
+    /// Build a size-8 pool at the raw (public-schema) URL and run migrations.
+    /// The pool needs headroom because `run_migrations` holds an advisory-lock
+    /// connection AND a work connection concurrently (a max_size of 2 would
+    /// deadlock itself).
+    async fn migrated_public_pool(url: &str) -> Pool {
+        let pool = build_pool(url, 8).expect("build_pool (public)");
+        run_migrations(&pool)
             .await
-            .expect("get_conn (seed_default_policy_for_test)");
-        client
-            .execute(
+            .expect("run_migrations (public schema)");
+        pool
+    }
+
+    /// Insert a non-default `recording_policies` row and return its id. Using a
+    /// non-default policy sidesteps the `one_default_policy` partial-unique
+    /// constraint entirely (this test never needs the global default), and the
+    /// explicit column set mirrors `services/api/tests/support/mod.rs`'s seed so
+    /// it stays valid as the schema grows.
+    async fn insert_nondefault_policy(pool: &Pool) -> Uuid {
+        let client = get_conn(pool).await.expect("get_conn (insert_policy)");
+        let row = client
+            .query_one(
                 r"
                 INSERT INTO recording_policies (
                     is_default, mode, live_storage_id, live_retention_hours,
@@ -9575,23 +9596,23 @@ mod tests {
                     motion_keyframes_only, record_stream
                 )
                 VALUES (
-                    true, 'continuous', NULL, 48,
+                    false, 'continuous', NULL, 48,
                     false, NULL, NULL, NULL,
                     5, 10, 'dynamic',
                     false, 'main'
                 )
+                RETURNING id
                 ",
                 &[],
             )
             .await
-            .expect("seed default recording_policies row");
+            .expect("insert non-default recording_policies row");
+        row.get(0)
     }
 
-    /// Seed a minimal camera (own policy cloned from the just-seeded default).
-    async fn seed_camera_for_test(pool: &Pool) -> Uuid {
-        let policy_id = clone_default_policy(pool)
-            .await
-            .expect("clone_default_policy");
+    /// Seed a camera with a UNIQUE name/go2rtc_name on the given policy and
+    /// return its id — the unique id is this test's isolation boundary.
+    async fn seed_camera_for_test(pool: &Pool, policy_id: Uuid) -> Uuid {
         let suffix = Uuid::new_v4().simple().to_string();
         let params = CreateCameraParams {
             name: &format!("cam_{suffix}"),
@@ -9671,14 +9692,14 @@ mod tests {
             eprintln!("skipping: TEST_DATABASE_URL not set");
             return;
         };
-        let fx = setup_schema(&url).await;
-        run_migrations(&fx.pool)
-            .await
-            .expect("run_migrations (test schema)");
-        seed_default_policy_for_test(&fx.pool).await;
+        let pool = migrated_public_pool(&url).await;
 
-        let camera_id = seed_camera_for_test(&fx.pool).await;
-        let storage_id = create_storage(&fx.pool, "test-storage", "/does/not/matter", None, None)
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let camera_id = seed_camera_for_test(&pool, policy_id).await;
+        // Unique storage name — the shared public DB persists rows across runs
+        // and `storages.name` is UNIQUE.
+        let storage_name = format!("test-storage-{}", Uuid::new_v4().simple());
+        let storage_id = create_storage(&pool, &storage_name, "/does/not/matter", None, None)
             .await
             .expect("create_storage")
             .id;
@@ -9691,10 +9712,10 @@ mod tests {
 
         // seg1 covers [0, 10); a real recording gap sits in [10, 20); seg2
         // covers [20, 30).
-        insert_test_segment(&fx.pool, camera_id, storage_id, sec(0), sec(10)).await;
-        insert_test_segment(&fx.pool, camera_id, storage_id, sec(20), sec(30)).await;
+        insert_test_segment(&pool, camera_id, storage_id, sec(0), sec(10)).await;
+        insert_test_segment(&pool, camera_id, storage_id, sec(20), sec(30)).await;
 
-        let times = list_thumbnail_times(&fx.pool, camera_id, sec(0), sec(30), 5)
+        let times = list_thumbnail_times(&pool, camera_id, sec(0), sec(30), 5)
             .await
             .expect("list_thumbnail_times");
 
