@@ -127,7 +127,7 @@ fn db() -> &'static [CompatEntry] {
 /// only (drops spaces, dashes, parens, dots, etc.).
 fn normalize(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
         .collect()
 }
@@ -233,7 +233,7 @@ pub fn contribute_url(make: Option<&str>, model: Option<&str>, firmware: Option<
         for b in s.bytes() {
             match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(b as char)
+                    out.push(b as char);
                 }
                 b' ' => out.push_str("%20"),
                 _ => out.push_str(&format!("%{b:02X}")),
