@@ -95,6 +95,19 @@ final class CrumbAPI {
         try await post("cameras/\(cameraId)/ptz", body: body)
     }
 
+    // MARK: - Updates
+
+    /// `GET /updates/latest` (any authenticated user) — the server-mediated
+    /// GitHub version check (`docs/UPDATE-SYSTEM-PLAN.md` §2.1). `refresh:
+    /// true` forces the server to bypass its TTL cache and re-check
+    /// github.com immediately ("Check now", §2.5); the server itself
+    /// rate-limits this, so callers don't need to. A 404 means an older
+    /// server without the endpoint at all — see `UpdateChecker`, which
+    /// treats that as "show nothing" via `Error.isNotFound`.
+    func updatesLatest(refresh: Bool = false) async throws -> UpdateStatus {
+        try await get("updates/latest", query: refresh ? ["refresh": "1"] : [:])
+    }
+
     // MARK: - Filmstrip
 
     func filmstrip(cameraId: String, start: String, end: String, width: Int = 160) async throws -> FilmstripResponse {

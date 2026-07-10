@@ -14,6 +14,12 @@ final class AppContainer: ObservableObject {
     /// Rebuilt alongside `api` in `rebuildApi()` so a token is never reused
     /// against a different server than the one that minted it.
     private(set) var mediaTokens: MediaTokenCache
+    /// Shared macOS+iOS update-available checker (issue #7, task C4). Unlike
+    /// `mediaTokens`, this object's own identity stays stable for the life of
+    /// the container — `rebuildApi()` only swaps its `api` reference — so a
+    /// view's `@ObservedObject` binding (e.g. `SettingsView`) survives a
+    /// server-URL change.
+    let updateChecker: UpdateChecker
     @Published var isLoggedIn: Bool = false
     /// Effective per-user capabilities, driving feature gating across the app.
     /// Seeded from persistence at launch, refreshed by `GET /auth/me`.
@@ -28,6 +34,7 @@ final class AppContainer: ObservableObject {
         self.settings = AppSettings()
         self.api = CrumbAPI(store: store)
         self.mediaTokens = MediaTokenCache(api: self.api)
+        self.updateChecker = UpdateChecker(api: self.api)
         self.isLoggedIn = store.isLoggedIn
         self.capabilities = store.capabilities
         self.isAdmin = store.isAdmin
@@ -66,6 +73,13 @@ final class AppContainer: ObservableObject {
         isAdmin = me.isAdmin
         store.capabilities = caps
         store.role = me.role
+        // `applyUser` runs on every successful login and on every launch-time
+        // session validation. `checkOnLaunch()` fires the update check once per
+        // launch, deliberately bypassing the 24h throttle so a client that last
+        // checked while the server had the feature OFF can discover it was
+        // turned back ON — this drives the proactive banner without the user
+        // ever opening Settings.
+        Task { await updateChecker.checkOnLaunch() }
     }
 
     private func validateSession() async {
@@ -89,6 +103,10 @@ final class AppContainer: ObservableObject {
         let old = mediaTokens
         Task { await old.invalidateAll() }
         mediaTokens = MediaTokenCache(api: api)
+        // Point the (stable-identity) update checker at the new server
+        // instead of replacing it, so any existing @ObservedObject binding
+        // to it keeps working.
+        updateChecker.api = api
     }
 
     func mediaUrls() -> MediaUrls {
