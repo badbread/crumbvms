@@ -4564,6 +4564,11 @@ function renderCamInfoTab(c) {
       <div id="ce-compat-contrib"></div>
     </div>
 
+    <div class="policy-section">
+      <div class="policy-section-title">Home Assistant</div>
+      <div id="ce-ha"><div class="card-hint" style="margin:0">Loading Home Assistant links&hellip;</div></div>
+    </div>
+
     <details class="detail-section" id="ce-probe-details">
       <summary>
         <span class="ds-chev">&#x25B6;</span>
@@ -4604,6 +4609,7 @@ function renderCamInfoTab(c) {
   autoProbeCamera(c);
   cePreviewIcon();
   loadCameraCompat(c.id);
+  loadCameraHaLinks(c.id);
 }
 
 /* ── Camera compatibility (issue #48) ──
@@ -4695,6 +4701,158 @@ async function contributeCamera(id) {
 
 function openCompatForm() { if (COMPAT_CONTRIB && COMPAT_CONTRIB.url) window.open(COMPAT_CONTRIB.url, '_blank', 'noopener'); }
 function copyCompatDetails() { if (COMPAT_CONTRIB) copyText(COMPAT_CONTRIB.block); }
+
+/* ── Camera <-> Home Assistant entity links (issue #52, Phase 1) ──
+   Link this camera to HA motion/door sensors (role 'motion') and lights/switches
+   /scenes (role 'actuator'). Edited as a set and saved via PUT .../ha/links. */
+let HA_LINKS = [];        // working set for the open camera
+let HA_CAM_ID = null;
+let HA_ENT_CACHE = {};    // domain -> [{entity_id, friendly_name, device_class}], per camera open
+let HA_PICKER = null;         // which picker is open: 'motion' | 'actuator' | null
+let HA_PICKER_SEARCH = '';
+let HA_PICKER_SHOWALL = false;
+// device_classes worth linking to a camera; the rest hide under "Other sensors".
+const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
+
+async function loadCameraHaLinks(camId) {
+  const el = $('ce-ha'); if (!el) return;
+  HA_CAM_ID = camId;
+  HA_ENT_CACHE = {};
+  try {
+    const [links, cfg] = await Promise.all([
+      api('/cameras/' + camId + '/ha/links'),
+      api('/config/ha').catch(() => ({ enabled: false, base_url: '', has_token: false })),
+    ]);
+    HA_LINKS = links.map(l => ({ entity_id: l.entity_id, role: l.role, device_class: l.device_class, label: l.label, sort_order: l.sort_order }));
+    HA_PICKER = null;
+    const configured = !!(cfg && cfg.enabled && cfg.base_url && cfg.has_token);
+    renderHaLinks(configured);
+  } catch (e) {
+    el.innerHTML = '<div class="card-hint" style="margin:0">Could not load Home Assistant links.</div>';
+  }
+}
+
+function haRolePill(l) {
+  if (l.role === 'actuator') return 'control';
+  return l.device_class || 'sensor';   // show the class (door/motion/...) for sensors
+}
+
+function renderHaLinks(configured) {
+  const el = $('ce-ha'); if (!el) return;
+  if (!configured) {
+    el.innerHTML = '<div class="card-hint" style="margin:0">Configure and enable Home Assistant on the <b>Detection &amp; clips</b> page first, then link this camera\'s sensors and controls here.</div>';
+    return;
+  }
+  const rows = HA_LINKS.map((l, i) => `
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <span class="pill">${esc(haRolePill(l))}</span>
+      <span style="flex:1;font-size:13px">${esc(l.label || l.entity_id)}</span>
+      <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
+      <button class="ghost sm" onclick="removeHaLink(${i})">Remove</button>
+    </div>`).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
+  el.innerHTML = `
+    <div>${rows}</div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
+      <button class="ghost sm" onclick="haOpenPicker('motion')">+ Add sensor</button>
+      <button class="ghost sm" onclick="haOpenPicker('actuator')">+ Add control</button>
+      <button class="primary sm" onclick="saveHaLinks()" style="margin-left:auto">Save links</button>
+    </div>
+    <div id="ce-ha-picker"></div>
+    <div id="ce-ha-msg" class="form-msg"></div>`;
+  if (HA_PICKER) renderHaPicker();
+}
+
+/* Reusable search + grouped entity picker (avoids a wall-of-entities select).
+   Sensors: whitelist device_classes grouped first, rest under a collapsed
+   "Other sensors" bucket + a Show-all toggle. Controls: grouped by domain. */
+async function haOpenPicker(role) {
+  HA_PICKER = role; HA_PICKER_SEARCH = ''; HA_PICKER_SHOWALL = false;
+  const domain = role === 'motion' ? 'binary_sensor' : 'controls';
+  if (!HA_ENT_CACHE[domain]) {
+    const box = $('ce-ha-picker'); if (box) box.innerHTML = '<div class="card-hint" style="margin-top:8px">Loading entities from Home Assistant&hellip;</div>';
+    try { HA_ENT_CACHE[domain] = await api('/ha/entities?domain=' + domain); }
+    catch (e) { const b = $('ce-ha-picker'); if (b) b.innerHTML = `<div class="form-msg err" style="margin-top:8px">${esc((e && e.message) || 'Failed to load entities')}</div>`; return; }
+  }
+  renderHaPicker();
+}
+
+function haClosePicker() { HA_PICKER = null; renderHaLinks(true); }
+function haPickerSearch(v) { HA_PICKER_SEARCH = v; renderHaResults(); }
+function haToggleShowAll() { HA_PICKER_SHOWALL = !HA_PICKER_SHOWALL; renderHaResults(); }
+
+function renderHaPicker() {
+  const box = $('ce-ha-picker'); if (!box || !HA_PICKER) return;
+  const kind = HA_PICKER === 'motion' ? 'sensors' : 'controls';
+  box.innerHTML = `
+    <div class="policy-section" style="margin-top:8px">
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="ha-pick-search" placeholder="Search ${kind}&hellip;" value="${esc(HA_PICKER_SEARCH)}" oninput="haPickerSearch(this.value)" style="flex:1" />
+        <button class="ghost sm" onclick="haClosePicker()">Done</button>
+      </div>
+      <div id="ha-pick-extra"></div>
+      <div id="ha-pick-results" style="max-height:240px;overflow:auto;margin-top:6px"></div>
+    </div>`;
+  renderHaResults();
+  const si = $('ha-pick-search'); if (si) si.focus();
+}
+
+function renderHaResults() {
+  const results = $('ha-pick-results'); const extra = $('ha-pick-extra');
+  if (!results || !HA_PICKER) return;
+  const role = HA_PICKER;
+  const domain = role === 'motion' ? 'binary_sensor' : 'controls';
+  const all = HA_ENT_CACHE[domain] || [];
+  const q = HA_PICKER_SEARCH.trim().toLowerCase();
+  const match = e => !q || e.entity_id.toLowerCase().includes(q) || (e.friendly_name || '').toLowerCase().includes(q);
+  const linked = new Set(HA_LINKS.filter(l => l.role === role).map(l => l.entity_id));
+  const groups = [];
+  if (extra) extra.innerHTML = '';
+  if (role === 'motion') {
+    const relevant = [], other = [];
+    all.filter(match).forEach(e => (HA_SENSOR_CLASSES.includes(e.device_class) ? relevant : other).push(e));
+    const byClass = {};
+    relevant.forEach(e => { (byClass[e.device_class] = byClass[e.device_class] || []).push(e); });
+    Object.keys(byClass).sort().forEach(c => groups.push({ title: c, items: byClass[c] }));
+    if (other.length && (HA_PICKER_SHOWALL || q)) groups.push({ title: 'Other sensors', items: other });
+    if (extra && other.length && !q) extra.innerHTML = `<label class="chk" style="font-size:12px;margin-top:6px"><input type="checkbox" ${HA_PICKER_SHOWALL ? 'checked' : ''} onchange="haToggleShowAll()"/> Show all binary sensors (${other.length} more)</label>`;
+  } else {
+    const byDom = {};
+    all.filter(match).forEach(e => { const d = e.entity_id.split('.')[0]; (byDom[d] = byDom[d] || []).push(e); });
+    Object.keys(byDom).sort().forEach(d => groups.push({ title: d, items: byDom[d] }));
+  }
+  results.innerHTML = groups.map(g => `
+    <div style="margin-top:6px"><div style="font-size:11px;color:var(--dim2);text-transform:uppercase;letter-spacing:.04em">${esc(g.title)}</div>
+      ${g.items.map(e => `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;${linked.has(e.entity_id) ? 'opacity:.45' : ''}" onclick="haPick('${esc(e.entity_id)}')">
+        <span style="flex:1;font-size:13px">${esc(e.friendly_name)}${linked.has(e.entity_id) ? ' (linked)' : ''}</span>
+        <span class="mono" style="color:var(--dim2);font-size:11px">${esc(e.entity_id)}</span></div>`).join('')}
+    </div>`).join('') || '<div class="card-hint" style="margin:4px 0">No matching entities.</div>';
+}
+
+function haPick(entity_id) {
+  const role = HA_PICKER; if (!role) return;
+  const domain = role === 'motion' ? 'binary_sensor' : 'controls';
+  const ent = (HA_ENT_CACHE[domain] || []).find(e => e.entity_id === entity_id);
+  if (!ent) return;
+  if (HA_LINKS.some(l => l.entity_id === entity_id && l.role === role)) return;
+  HA_LINKS.push({ entity_id, role, device_class: ent.device_class || null, label: ent.friendly_name || null, sort_order: HA_LINKS.length });
+  renderHaLinks(true);
+}
+
+function removeHaLink(i) {
+  HA_LINKS.splice(i, 1);
+  renderHaLinks(true);
+}
+
+async function saveHaLinks() {
+  const body = { links: HA_LINKS.map((l, i) => ({ entity_id: l.entity_id, role: l.role, device_class: l.device_class, label: l.label, sort_order: i })) };
+  try {
+    const saved = await api('/cameras/' + HA_CAM_ID + '/ha/links', { method: 'PUT', body: JSON.stringify(body) });
+    HA_LINKS = saved.map(l => ({ entity_id: l.entity_id, role: l.role, device_class: l.device_class, label: l.label, sort_order: l.sort_order }));
+    HA_PICKER = null;
+    toast('Home Assistant links saved.');
+    renderHaLinks(true);
+  } catch (e) { setMsg('ce-ha-msg', (e && e.message) || 'Save failed', 'err'); }
+}
 
 /* At-a-glance summary line for the collapsed "Camera info (probed)" section: the
    main stream's resolution / fps / codec if probed, else a hint. */
@@ -5565,8 +5723,8 @@ async function loadMotionCacheGauge() {
 async function renderDetectionClips() {
   selKind = 'detection-root'; selId = null;
   $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('integration',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Detection &amp; clips</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
-  let c, s;
-  try { [c, s] = await Promise.all([api('/config/frigate'), api('/config/server')]); }
+  let c, s, ha;
+  try { [c, s, ha] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha')]); }
   catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
   // Stash the full server settings so saveDetectionServer() can send a COMPLETE
   // /config/server body, that PUT is a whole-row replace with required Crumb
@@ -5620,6 +5778,26 @@ async function renderDetectionClips() {
       </div>
       <div class="card-hint" style="margin-top:4px">Saving Frigate applies immediately, the recorder and API reconnect MQTT within ~15&nbsp;s, no restart.</div>
       <div id="fr-msg" class="form-msg"></div>
+    </div>
+
+    <!-- Home Assistant integration (ha_config): optional, off by default. -->
+    <div class="rp-section-head" style="margin-top:22px">
+      <div class="policy-section-title" style="margin-bottom:0">Home Assistant</div>
+      <button class="primary sm" onclick="saveHa()">Save</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Optional. Links your Home Assistant motion/door sensors and lights to cameras (from the camera editor). Use a token from a <b>non-admin</b> HA user: in Home Assistant add a user under Settings, People, then open that user's profile and create a Long-Lived Access Token.</div>
+      <label class="chk"><input type="checkbox" id="ha-enabled" ${ha.enabled?'checked':''}/> Enable Home Assistant integration</label>
+      <div class="grid2" style="margin-top:10px">
+        <div><label class="field-label" style="margin-top:0">Base URL</label><input id="ha-url" class="mono" value="${esc(ha.base_url)}" placeholder="http://homeassistant.local:8123" /></div>
+        <div><label class="field-label" style="margin-top:0">Long-lived access token</label><input id="ha-token" type="password" autocomplete="new-password" placeholder="${ha.has_token?'•••••••• (unchanged)':'(none set)'}" /></div>
+      </div>
+      <div style="margin-top:10px">
+        <button class="ghost sm" onclick="testHa()">Test connection</button>
+        <span id="ha-test" class="srv-note" style="margin-left:8px"></span>
+      </div>
+      <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection).</div>
+      <div id="ha-msg" class="form-msg"></div>
     </div>
 
     <!-- Frigate stream address bases (external go2rtc), writes server_settings. -->
@@ -5764,6 +5942,30 @@ async function saveDetectionServer() {
     // the decode truth so the operator watches requested → active converge.
     pollDecodeStatus();
   } catch (e) { setMsg('srv-frigate-msg', e.message, 'err'); }
+}
+/* ── Home Assistant integration config (ha_config) ── */
+async function saveHa() {
+  setMsg('ha-msg', '');
+  const body = { enabled: $('ha-enabled').checked, base_url: $('ha-url').value.trim() };
+  const tok = $('ha-token').value;
+  if (tok) body.token = tok;               // write-only: only sent when the user types one
+  if (body.enabled && !body.base_url) { setMsg('ha-msg', 'Base URL is required when enabled.', 'err'); return; }
+  try {
+    const res = await api('/config/ha', { method: 'PUT', body: JSON.stringify(body) });
+    $('ha-token').value = '';
+    $('ha-token').placeholder = res && res.has_token ? '•••••••• (unchanged)' : '(none set)';
+    toast('Home Assistant settings saved.');
+  } catch (e) { setMsg('ha-msg', e.message, 'err'); }
+}
+async function testHa() {
+  const el = $('ha-test');
+  if (el) { el.textContent = 'Testing…'; el.style.color = 'var(--dim2)'; }
+  try {
+    await api('/config/ha/test', { method: 'POST' });
+    if (el) { el.textContent = 'Connected'; el.style.color = 'var(--ok)'; }
+  } catch (e) {
+    if (el) { el.textContent = (e && e.message) || 'Failed'; el.style.color = 'var(--danger)'; }
+  }
 }
 /* ── Frigate URL-base test (POST /config/frigate/test-http) ──────────────────
    Server-side probe of the go2rtc REST base + Frigate HTTP API base (the

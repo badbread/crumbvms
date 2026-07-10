@@ -29,11 +29,11 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 use crate::types::{
-    Bookmark, Camera, CameraDecodeStatus, CameraGroup, CameraMotionCacheStatus, Capabilities,
-    FrigateSettings, MotionCacheStatus, MotionGrid, MotionSensitivity, MotionSignal, RecordStream,
-    RecorderCapabilities, RecorderHeartbeat, RecordingMode, RecordingPolicy, Role, Segment,
-    SegmentStage, SegmentStream, ServerSettings, Session, Storage, StorageMigration, User,
-    UserRole, View,
+    Bookmark, Camera, CameraDecodeStatus, CameraGroup, CameraHaLink, CameraMotionCacheStatus,
+    Capabilities, FrigateSettings, HaSettings, MotionCacheStatus, MotionGrid, MotionSensitivity,
+    MotionSignal, RecordStream, RecorderCapabilities, RecorderHeartbeat, RecordingMode,
+    RecordingPolicy, Role, Segment, SegmentStage, SegmentStream, ServerSettings, Session, Storage,
+    StorageMigration, User, UserRole, View,
 };
 
 // ─── pool creation ───────────────────────────────────────────────────────────
@@ -1382,6 +1382,189 @@ pub async fn update_frigate_settings(
         .await
         .context("update_frigate_settings")?;
     Ok(frigate_settings_from_row(&row))
+}
+
+// ─── Home Assistant: config singleton + per-camera entity links (0048) ────────
+
+fn ha_settings_from_row(row: &tokio_postgres::Row) -> HaSettings {
+    HaSettings {
+        enabled: row.get("enabled"),
+        base_url: row.get("base_url"),
+        token: row.get("token"),
+        version: row.get("version"),
+    }
+}
+
+/// Read-time env fallback for the HA connection: `HA_BASE_URL` and
+/// `HA_TOKEN` / `HA_TOKEN_FILE`. Applied only when the DB fields are empty (DB
+/// wins), mirroring the config-precedence convention.
+fn ha_env() -> (String, Option<String>) {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let base_url = env("HA_BASE_URL").unwrap_or_default();
+    let token = env("HA_TOKEN").or_else(|| {
+        env("HA_TOKEN_FILE").and_then(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+    });
+    (base_url, token)
+}
+
+/// Fetch the singleton HA settings with env fallback applied to empty fields
+/// (DB wins). `None` only if the singleton row is somehow absent.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_ha_settings(pool: &Pool) -> Result<Option<HaSettings>> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt(
+            "SELECT enabled, base_url, token, version FROM ha_config WHERE id = 1",
+            &[],
+        )
+        .await
+        .context("get_ha_settings")?;
+    Ok(opt.as_ref().map(|row| {
+        let mut s = ha_settings_from_row(row);
+        let (env_url, env_token) = ha_env();
+        if s.base_url.trim().is_empty() {
+            s.base_url = env_url;
+        }
+        if s.token.as_deref().is_none_or(|t| t.trim().is_empty()) {
+            s.token = env_token;
+        }
+        s
+    }))
+}
+
+/// Cheap version poll for hot-reload. Returns 0 if the row is missing.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn ha_config_version(pool: &Pool) -> Result<i64> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt("SELECT version FROM ha_config WHERE id = 1", &[])
+        .await
+        .context("ha_config_version")?;
+    Ok(opt.map_or(0, |r| r.get("version")))
+}
+
+/// Update the singleton HA settings and BUMP `version`. `set_token = false`
+/// LEAVES the stored token unchanged (write-only field); `set_token = true` with
+/// `token = Some("")` clears it. The returned settings have env fallback applied.
+///
+/// # Errors
+///
+/// Returns an error if the update fails or the row is missing afterward.
+pub async fn update_ha_settings(
+    pool: &Pool,
+    enabled: bool,
+    base_url: &str,
+    set_token: bool,
+    token: Option<&str>,
+) -> Result<HaSettings> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            UPDATE ha_config SET
+                enabled    = $1,
+                base_url   = $2,
+                token      = CASE WHEN $3::boolean THEN $4 ELSE token END,
+                version    = version + 1,
+                updated_at = now()
+            WHERE id = 1
+            ",
+            &[&enabled, &base_url, &set_token, &token],
+        )
+        .await
+        .context("update_ha_settings")?;
+    get_ha_settings(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ha_config row missing after update"))
+}
+
+fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
+    CameraHaLink {
+        id: row.get("id"),
+        camera_id: row.get("camera_id"),
+        entity_id: row.get("entity_id"),
+        role: row.get("role"),
+        device_class: row.get("device_class"),
+        label: row.get("label"),
+        sort_order: row.get("sort_order"),
+    }
+}
+
+/// All HA entity links for a camera, ordered for display.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<CameraHaLink>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order
+             FROM camera_ha_links WHERE camera_id = $1
+             ORDER BY sort_order, entity_id",
+            &[&camera_id],
+        )
+        .await
+        .context("list_camera_ha_links")?;
+    Ok(rows.iter().map(ha_link_from_row).collect())
+}
+
+/// One camera↔HA link to persist: `(entity_id, role, device_class, label,
+/// sort_order)`. `id` is server-assigned.
+pub type HaLinkInsert = (String, String, Option<String>, Option<String>, i32);
+
+/// Replace the full set of a camera's HA links (delete-then-insert in one
+/// transaction) and bump `ha_config.version` so consumers hot-reload.
+///
+/// # Errors
+///
+/// Returns an error if the transaction fails.
+pub async fn replace_camera_ha_links(
+    pool: &Pool,
+    camera_id: Uuid,
+    links: &[HaLinkInsert],
+) -> Result<Vec<CameraHaLink>> {
+    let mut client = get_conn(pool).await?;
+    let tx = client
+        .transaction()
+        .await
+        .context("replace_camera_ha_links: begin")?;
+    tx.execute(
+        "DELETE FROM camera_ha_links WHERE camera_id = $1",
+        &[&camera_id],
+    )
+    .await
+    .context("replace_camera_ha_links: delete")?;
+    for (entity_id, role, device_class, label, sort_order) in links {
+        tx.execute(
+            "INSERT INTO camera_ha_links (camera_id, entity_id, role, device_class, label, sort_order)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&camera_id, entity_id, role, device_class, label, sort_order],
+        )
+        .await
+        .context("replace_camera_ha_links: insert")?;
+    }
+    tx.execute(
+        "UPDATE ha_config SET version = version + 1 WHERE id = 1",
+        &[],
+    )
+    .await
+    .context("replace_camera_ha_links: bump version")?;
+    tx.commit()
+        .await
+        .context("replace_camera_ha_links: commit")?;
+    list_camera_ha_links(pool, camera_id).await
 }
 
 /// Repair a segment row's `size_bytes` to the actual on-disk byte length.
@@ -7889,6 +8072,10 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
         (
             "0047_camera_device_info.sql",
             include_str!("../../../db/migrations/0047_camera_device_info.sql"),
+        ),
+        (
+            "0048_ha_integration.sql",
+            include_str!("../../../db/migrations/0048_ha_integration.sql"),
         ),
     ];
 
