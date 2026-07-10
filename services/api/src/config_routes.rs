@@ -49,6 +49,22 @@
 //! The public, any-user endpoint clients actually poll is `GET /updates/latest`
 //! (`services/api/src/updates.rs`), not under `/config`.
 //!
+//! ## Scrub-preview runtime tunables (issue #10)
+//! | Method | Path                    | Description                                                |
+//! |--------|-------------------------|-------------------------------------------------------------|
+//! | `GET`  | `/config/scrub-preview` | Effective value + `source` (db/env) + bounds, per knob     |
+//! | `PUT`  | `/config/scrub-preview` | Admin edit; all fields optional, writes only what's sent   |
+//!
+//! Five of the `THUMB_PREGEN_*`/`THUMB_CACHE_*` env knobs move to nullable
+//! `server_settings` overrides (migration 0046), resolved live by
+//! `services/api/src/scrub_settings.rs::resolve` (DB wins, `NULL` falls back
+//! to env) — the pre-generation worker and the thumbnail-cache sweeper both
+//! re-resolve every cycle, so a change here takes effect without a restart.
+//! `THUMB_PREGEN_WIDTH` stays env-only (ratified D1: it is part of the
+//! thumbnail cache key, and a console value that drifted from the clients'
+//! fixed scrub-still width would silently waste all pre-generated output) —
+//! the GET response includes it as a read-only `source: "env-only"` field.
+//!
 //! # Design notes
 //!
 //! * Every handler requires [`crate::auth_mw::AdminUser`] — viewers never reach
@@ -220,6 +236,12 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/update-check-enabled",
             get(get_update_check_enabled_route).put(set_update_check_enabled_route),
+        )
+        // Scrub-preview runtime tunables (issue #10): live-reloaded by the
+        // pre-gen worker + thumbnail cache sweeper via scrub_settings::resolve.
+        .route(
+            "/scrub-preview",
+            get(get_scrub_preview_route).put(set_scrub_preview_route),
         )
         .route("/setup-complete", put(set_setup_complete_route))
         .route("/beta-terms", put(set_beta_terms_route))
@@ -472,6 +494,156 @@ async fn set_update_check_enabled_route(
     db::set_update_check_enabled(state.pool(), body.enabled)
         .await
         .map_err(ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── scrub-preview runtime tunables (issue #10) ────────────────────────────────
+
+/// One knob's effective value + provenance (+ bounds, when the knob is
+/// clamped) — lets the console annotate "(env default)" vs "(set here)" and
+/// clamp its own inputs to the same bounds the server enforces. `source` is
+/// `"db"` (an explicit console value wins), `"env"` (never touched, falling
+/// back to the env default), or `"env-only"` (`pregen_width`: not stored in
+/// `server_settings` at all, D1).
+#[derive(serde::Serialize)]
+struct ScrubKnobDto<T: serde::Serialize> {
+    value: T,
+    source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct ScrubPreviewDto {
+    pregen_enabled: ScrubKnobDto<bool>,
+    pregen_lookback_hours: ScrubKnobDto<i64>,
+    pregen_scan_secs: ScrubKnobDto<i64>,
+    cache_max_bytes: ScrubKnobDto<i64>,
+    cache_ttl_seconds: ScrubKnobDto<i64>,
+    /// Read-only (D1): `THUMB_PREGEN_WIDTH` stays env/compose-only. Included
+    /// here so the console can show the whole picture in one panel.
+    pregen_width: ScrubKnobDto<i64>,
+}
+
+/// All fields optional (house rule: PUT writes only what's present). Byte/
+/// second-count fields accept `u64` from the client (the console converts
+/// GiB/days to bytes/seconds before sending); the per-field db setter does
+/// the authoritative clamping.
+#[derive(serde::Deserialize, Default)]
+struct ScrubPreviewRequest {
+    pregen_enabled: Option<bool>,
+    pregen_lookback_hours: Option<i64>,
+    pregen_scan_secs: Option<i64>,
+    cache_max_bytes: Option<u64>,
+    cache_ttl_seconds: Option<u64>,
+}
+
+fn scrub_source(is_set: bool) -> &'static str {
+    if is_set {
+        "db"
+    } else {
+        "env"
+    }
+}
+
+/// `GET /config/scrub-preview` — the RESOLVED effective value for each of the
+/// five console-editable knobs (DB override, else the matching `THUMB_*` env
+/// default — the same precedence `scrub_settings::resolve` applies to the
+/// pre-gen worker and the cache sweeper), plus `THUMB_PREGEN_WIDTH` read-only
+/// (D1, env-only).
+async fn get_scrub_preview_route(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<ScrubPreviewDto>, ApiError> {
+    let overrides = db::get_scrub_pregen_settings(state.pool())
+        .await
+        .map_err(ApiError::Internal)?;
+    let env = crate::scrub_settings::EnvDefaults::from_config(state.config());
+    let effective = crate::scrub_settings::merge(overrides, env);
+
+    let cache_max_bytes = i64::try_from(effective.cache_max_bytes).unwrap_or(i64::MAX);
+    let cache_ttl_seconds = i64::try_from(effective.cache_ttl_seconds).unwrap_or(i64::MAX);
+    let pregen_scan_secs = i64::try_from(effective.pregen_scan_secs).unwrap_or(i64::MAX);
+
+    Ok(Json(ScrubPreviewDto {
+        pregen_enabled: ScrubKnobDto {
+            value: effective.pregen_enabled,
+            source: scrub_source(overrides.pregen_enabled.is_some()),
+            min: None,
+            max: None,
+        },
+        pregen_lookback_hours: ScrubKnobDto {
+            value: effective.pregen_lookback_hours,
+            source: scrub_source(overrides.pregen_lookback_hours.is_some()),
+            min: Some(0),
+            max: Some(168),
+        },
+        pregen_scan_secs: ScrubKnobDto {
+            value: pregen_scan_secs,
+            source: scrub_source(overrides.pregen_scan_secs.is_some()),
+            min: Some(5),
+            max: Some(3600),
+        },
+        cache_max_bytes: ScrubKnobDto {
+            value: cache_max_bytes,
+            source: scrub_source(overrides.cache_max_bytes.is_some()),
+            min: Some(104_857_600),
+            max: None,
+        },
+        cache_ttl_seconds: ScrubKnobDto {
+            value: cache_ttl_seconds,
+            source: scrub_source(overrides.cache_ttl_seconds.is_some()),
+            min: Some(3600),
+            max: Some(31_536_000),
+        },
+        pregen_width: ScrubKnobDto {
+            value: i64::from(state.config().thumb_pregen_width),
+            source: "env-only",
+            min: None,
+            max: None,
+        },
+    }))
+}
+
+/// `PUT /config/scrub-preview` — admin edit. Writes ONLY the fields present
+/// in the body (house rule), via the clamping per-field db setters; a
+/// hand-crafted out-of-bounds value is clamped server-side, not rejected
+/// (the `clip_preroll` precedent). No "reset to env default" affordance in
+/// v1 (D4) — once set here, the DB value wins for good, matching
+/// `update_check_enabled`.
+async fn set_scrub_preview_route(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<ScrubPreviewRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pool = state.pool();
+    if let Some(v) = body.pregen_enabled {
+        db::set_thumb_pregen_enabled(pool, v)
+            .await
+            .map_err(ApiError::Internal)?;
+    }
+    if let Some(v) = body.pregen_lookback_hours {
+        db::set_thumb_pregen_lookback_hours(pool, v)
+            .await
+            .map_err(ApiError::Internal)?;
+    }
+    if let Some(v) = body.pregen_scan_secs {
+        db::set_thumb_pregen_scan_secs(pool, v)
+            .await
+            .map_err(ApiError::Internal)?;
+    }
+    if let Some(v) = body.cache_max_bytes {
+        db::set_thumb_cache_max_bytes(pool, i64::try_from(v).unwrap_or(i64::MAX))
+            .await
+            .map_err(ApiError::Internal)?;
+    }
+    if let Some(v) = body.cache_ttl_seconds {
+        db::set_thumb_cache_ttl_seconds(pool, i64::try_from(v).unwrap_or(i64::MAX))
+            .await
+            .map_err(ApiError::Internal)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

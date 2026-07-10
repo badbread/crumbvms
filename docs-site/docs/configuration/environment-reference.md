@@ -56,16 +56,23 @@ See [Motion & Detection](/motion/) for the mechanism this configures.
 
 See [Timeline scrubbing](/playback/scrubbing) for what these do. All optional; the defaults work.
 
-| Key | Default | Notes |
-|---|---|---|
-| `THUMB_PREGEN_ENABLED` | `false` | build scrub previews in the background so the *first* drag is instant too; costs some ongoing CPU + disk |
-| `THUMB_PREGEN_LOOKBACK_HOURS` | `2` | how far back to build previews when the worker starts |
-| `THUMB_PREGEN_SCAN_SECS` | `60` | how often to build previews for newly-recorded footage |
-| `THUMB_PREGEN_WIDTH` | `160` | preview width in pixels |
-| `THUMB_CACHE_DIR` | (`EXPORT_DIR`) | where the preview cache lives; point at an SSD/NVMe mount to keep scrubbing fast on a spinning-disk system |
-| `THUMB_EXTRACT_MAX_CONCURRENCY` | scales with cores | how many previews Crumb builds at once; default is roughly half the CPU cores |
-| `THUMB_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | preview cache size budget; oldest previews are dropped past this |
-| `THUMB_CACHE_TTL_SECONDS` | `2592000` (30 days) | preview cache age budget |
+Five of these are also editable live from the admin console (**Server settings
+→ Scrub previews**): the env value below is only the *default* until an
+operator sets it in the console, at which point the console value wins (no
+restart needed, takes effect within one scan interval / cache-sweep tick).
+The other two (`THUMB_CACHE_DIR`, `THUMB_PREGEN_WIDTH`) are env/compose-only,
+see the Notes column.
+
+| Key | Default | Console-editable? | Notes |
+|---|---|---|---|
+| `THUMB_PREGEN_ENABLED` | `false` | yes | build scrub previews in the background so the *first* drag is instant too; costs some ongoing CPU + disk |
+| `THUMB_PREGEN_LOOKBACK_HOURS` | `2` | yes | how far back to build previews when the worker starts (console clamps 0-168h) |
+| `THUMB_PREGEN_SCAN_SECS` | `60` | yes | how often to build previews for newly-recorded footage (console clamps 5-3600s) |
+| `THUMB_PREGEN_WIDTH` | `480` | **no, env-only** | preview width in pixels; must equal the playback clients' scrub-still width or pre-generated previews go unused (silently wasted CPU/storage), which is why this one stays a deployment-time setting, not a console toggle |
+| `THUMB_CACHE_DIR` | (`EXPORT_DIR`) | **no, env-only** | where the preview cache lives; point at an SSD/NVMe mount to keep scrubbing fast on a spinning-disk system (a filesystem mount, not a preference) |
+| `THUMB_EXTRACT_MAX_CONCURRENCY` | scales with cores | no | how many previews Crumb builds at once; default is roughly half the CPU cores |
+| `THUMB_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | yes | preview cache size budget; oldest previews are dropped past this (console floors it at 100 MiB) |
+| `THUMB_CACHE_TTL_SECONDS` | `2592000` (30 days) | yes | preview cache age budget (console clamps 1 hour-1 year) |
 
 ## Storage
 

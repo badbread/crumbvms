@@ -569,7 +569,7 @@ The server pre-generates the preview frames so a scrub is a static-file fetch (~
 
 #### Plan
 
-> **Status (2026-07-09):** Phase 0 and the core of Phase 1 (background pre-generation, `THUMB_CACHE_DIR`, config knobs, coverage-aware `list_thumbnail_times`) shipped in #2 and #9. Policy-tied thumbnail retention and the admin-console tunables below remain.
+> **Status (2026-07-09):** Phase 0 and the core of Phase 1 (background pre-generation, `THUMB_CACHE_DIR`, config knobs, coverage-aware `list_thumbnail_times`, admin-console tunables) shipped in #2, #9, and #10. Policy-tied thumbnail retention remains.
 
 Phase 0, cache hygiene, API only, standalone (S)
 
@@ -584,7 +584,7 @@ Phase 1, pre-generation, API + `db.rs` stub, no migration (M)
 - [ ] Thumbnail retention tied to policy retention, a NEW delete path, path-guarded + tested (S)
 - [x] Config knobs (`THUMB_PREGEN_ENABLED` + lookback/scan/width, cache size/age budget) → `.env.example` / environment reference (golden rule 5) (S)
 - [x] Optional `THUMB_CACHE_DIR` to place the scrub cache on fast/separate storage (e.g. an NVMe partition) while footage stays on bulk HDD, matching the random-read-hot thumbnail workload to the right medium. Low-risk: thumbnails are regenerable and the on-demand path self-heals a wiped cache, so the thumb drive can be cheap and non-redundant (a failure only makes scrubbing temporarily slower, never loses footage) (S)
-- [ ] Follow-up (post-ship): expose the runtime-safe tunables (the pre-generation on/off toggle, lookback/scan/width, and the cache size/age budget) in the admin console via DB `server_settings`, so an operator can turn pre-generation on/off and adjust the cache budget without editing `.env` and restarting. Requires the pre-gen worker and the cache sweeper to read these live from `server_settings` rather than the startup `ApiConfig` snapshot. `THUMB_CACHE_DIR` stays env/compose-only: it is a filesystem mount (like the storage paths), not a preference (M)
+- [x] Follow-up (post-ship): expose the runtime-safe tunables (the pre-generation on/off toggle, lookback/scan, and the cache size/age budget) in the admin console via DB `server_settings` (migration 0046), so an operator can turn pre-generation on/off and adjust the cache budget without editing `.env` and restarting. The pre-gen worker and the cache sweeper read these live from `server_settings` each cycle rather than the startup `ApiConfig` snapshot (shipped in #10). `THUMB_CACHE_DIR` stays env/compose-only: it is a filesystem mount (like the storage paths), not a preference. `THUMB_PREGEN_WIDTH` also stays env-only (ratified D1): it is part of the thumbnail cache key, and a console value that drifted from the clients' fixed scrub-still width would silently waste all pre-generated output (M)
 
 Phase 2, desktop preview UI, `apps/desktop/src/app.js` only (M)
 

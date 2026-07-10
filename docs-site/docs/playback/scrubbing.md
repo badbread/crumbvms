@@ -42,7 +42,15 @@ whether or not you scrub much, which is why it's off by default (a small box
 shouldn't do work nobody asked for). Turn it on if you review footage often and
 want it to feel instant everywhere.
 
-In your `.env`:
+The easiest way to turn it on is the admin console: **Server settings → Scrub
+previews**. Flip "Pre-generate scrub previews" and it starts within a few
+seconds, no restart, no container access needed. The same panel lets you adjust
+how far back it backfills, how often it wakes up, and how much cache space and
+time it's allowed, all of it applies live. Turning it back off also takes
+effect within a few seconds, even in the middle of a large backfill.
+
+Prefer the `.env` file instead (for example, to bake the setting into your
+compose file for a scripted deploy)? It works the same way:
 
 ```bash
 THUMB_PREGEN_ENABLED=true
@@ -54,9 +62,11 @@ Then apply it:
 docker compose up -d api
 ```
 
-The fine-tuning knobs (how far back to build, how often, what size) are in the
-[environment reference](/configuration/environment-reference); the defaults are
-sensible.
+Whichever knob you set last wins: once you change a setting from the admin
+console, that value takes over from the `.env` default for good. The
+[environment reference](/configuration/environment-reference) lists every
+knob (the fine-tuning ones and the console-editable ones) with its default and
+whether it's console-editable.
 
 ## Keep it snappy on a busy hard-drive system (put previews on an SSD)
 

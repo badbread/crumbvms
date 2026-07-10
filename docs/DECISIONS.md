@@ -42,6 +42,100 @@ load concern (they shouldn't: the api caches ≤6h and the client→server hop i
 LAN-local); or a client gains a real background presence where a periodic
 poller becomes worthwhile.
 
+---
+
+## 2026-07-09, Scrub-preview tunables: per-tick `server_settings` re-query; width stays env-only
+
+**Problem.** Issue #10 asks to move the thumbnail pre-generation worker's and
+cache sweeper's runtime tunables from env-only (`ApiConfig`, read once at
+boot) to the admin console, following the `clip_preroll`/`update_check_enabled`
+`server_settings` precedence (DB wins, `NULL` falls back to env). Unlike those
+two, the consumers here are **background loops**, not per-request handlers, so
+a console change also has to reach an already-running worker without a
+restart. `docs/SCRUB-PREGEN-TUNABLES-PLAN.md` is the full design; this entry
+records the ratified decisions (D1-D5).
+
+**Chosen.**
+
+- **Five nullable `server_settings` columns** (migration `0046`):
+  `thumb_pregen_enabled`, `thumb_pregen_lookback_hours`,
+  `thumb_pregen_scan_secs`, `thumb_cache_max_bytes`, `thumb_cache_ttl_seconds`.
+  Same shape as `update_check_enabled`: DB value wins when set, `NULL` (never
+  touched) falls back to the matching `THUMB_*` env default.
+- **Live-reload = per-tick direct re-query (D2), not a cached-settings
+  struct.** `services/api/src/scrub_settings.rs::resolve(pool, cfg)` does one
+  `query_opt` per cycle; both the pre-gen worker (`thumb_pregen.rs`, one query
+  per `scan_secs`) and the cache sweeper (`main.rs::export_ttl_sweeper`, one
+  query per minute) call it fresh. Roughly 2 tiny queries/minute total against
+  a pool that serves every API request, unmeasurable, and mirrors the existing
+  `updates.rs::resolve_enabled` call-per-use pattern exactly. A resolve
+  failure keeps the last-known-good values and logs a `warn!` rather than
+  aborting either background loop.
+- **Mid-backfill kill switch + watermark clear on disable (D3).** The worker
+  never exits when disabled: it idles (one settings SELECT per `scan_secs`)
+  instead. A console "disable" is honored within seconds even mid-backfill,
+  re-checked between cameras and every 256 extracted slots within one camera.
+  An enabled-to-disabled transition clears the per-camera watermark map, so
+  re-enabling always starts a fresh `pregen_lookback_hours` backfill rather
+  than grinding through the entire disabled gap (the operator asked for pregen
+  *now*, not a surprise multi-day catch-up).
+- **`THUMB_PREGEN_WIDTH` stays env-only (D1).** Width is part of the
+  thumbnail cache key (`.../{ts_ms}_w{width}.jpg`); the playback clients pin
+  their requested width (480, matched to the scrub-still tile size). A console
+  width that drifted from that value would make every pre-generated file sit
+  at a cache key nobody ever requests, 100% of the pregen CPU + storage
+  silently wasted while scrubbing quietly degrades to on-demand extraction,
+  with nothing failing loudly. `GET /config/scrub-preview` still surfaces the
+  effective width, read-only (`source: "env-only"`), so the operator sees the
+  whole picture in one panel.
+- **No "reset to env default" affordance (D4).** Matches `update_check_enabled`
+  shipping without one: plain serde can't distinguish an absent field from an
+  explicit JSON `null` without a double-`Option` PATCH helper, and once a knob
+  is touched in the console the DB value wins for good.
+- **100 MiB `thumb_cache_max_bytes` floor (D5).** A near-zero budget would
+  make the sweeper delete every thumbnail every minute, silently defeating the
+  feature; the clamping setter enforces the floor server-side regardless of
+  what the console sends.
+
+**Rejected.**
+
+- *Shared cached-settings struct with TTL/invalidation* (an `AppState` field
+  refreshed periodically, or invalidated by the PUT handler). No hot-path
+  reader exists to justify the machinery: these are 1-2 reads/minute
+  background loops, and an invalidation seam is a new way to silently go
+  stale (PUT handler forgets to invalidate) that per-tick re-query doesn't
+  have. Revisit if a future hot-path consumer of these settings appears, or a
+  multi-replica API deployment makes per-tick staleness (currently bounded to
+  one tick) visible.
+- *Config-file reload / `SIGHUP`.* No precedent anywhere in Crumb; the DB is
+  already the one settings plane (`server_settings`), and adding a second
+  reload mechanism for one feature would be inconsistent with every other
+  console-editable setting.
+- *Exposing `THUMB_PREGEN_WIDTH` as a sixth column with a warning label*
+  (option B in the plan doc). The cache-key-coherence foot-gun above was
+  judged not worth it for v1; revisit if a client ships a different scrub tile
+  size or an operator has a concrete reason to shrink pregen storage via
+  width rather than the cache-budget/TTL knobs that already exist for that.
+- *Forced cache regeneration on a width change.* Not proposed even under
+  option B: old files can't be safely deleted mid-serve, and a mixed-width
+  cache is already structurally coherent (width is part of the key, so
+  nothing is ever served wrong), just potentially wasteful. Stale-width files
+  age out via the existing TTL sweeper on their own.
+
+**Trade-offs accepted.** Up to one `scan_secs` (60s default) of staleness on
+"enable" (an idle tick just costs one SELECT); up to 256 slots / one camera
+of in-flight work before a "disable" is fully honored during a large backfill.
+Both are explicit, bounded costs of the per-tick model, not silent.
+
+**Revisit triggers.** A hot-path consumer of these settings appears (revisit
+D2, add the cached-settings struct). A client ships a scrub tile size other
+than 480px (revisit D1, expose width with per-client negotiation). Operators
+ask for "reset to env default" (revisit D4, double-`Option` clear support).
+Multi-replica API deployments make per-tick staleness visible in practice
+(revisit D2).
+
+---
+
 ## 2026-07-09, Update-available check: api-mediated, notify-only, opt-in / OFF BY DEFAULT
 
 **Problem.** Issue #7 asks for a non-intrusive "update available → release

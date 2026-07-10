@@ -1191,6 +1191,8 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::PUT, "/config/clip-source-default".into()),
         (Method::GET, "/config/clip-preroll".into()),
         (Method::PUT, "/config/clip-preroll".into()),
+        (Method::GET, "/config/scrub-preview".into()),
+        (Method::PUT, "/config/scrub-preview".into()),
         (Method::PUT, "/config/setup-complete".into()),
         (Method::GET, "/config/camera-brands".into()),
         (Method::POST, "/config/discover".into()),
@@ -1341,4 +1343,137 @@ async fn beta_terms_acceptance_requires_admin() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ─── scrub-preview runtime tunables (issue #10) ────────────────────────────
+
+/// Build a `PUT` request with a Bearer token and a raw JSON string body
+/// (mirrors the inline builder `beta_terms_acceptance_*` above; kept local
+/// rather than added to `support/mod.rs` since this is the first PUT test
+/// that needs an arbitrary partial JSON body rather than a fixed shape).
+fn put_auth_json(uri: &str, token: &str, body: &str) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_owned()))
+        .unwrap()
+}
+
+/// `GET`/`PUT /config/scrub-preview` is admin-only, same gate as every other
+/// `/config/*` route: a viewer token is refused 403, no token at all is 401.
+#[tokio::test]
+async fn scrub_preview_requires_admin() {
+    let app = TestApp::new().await;
+    let viewer = seed_viewer(app.pool(), &[]).await;
+    let viewer_token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(get_auth("/config/scrub-preview", &viewer_token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .send(put_auth_json(
+            "/config/scrub-preview",
+            &viewer_token,
+            r#"{"pregen_enabled":true}"#,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app.send(get("/config/scrub-preview")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `GET /config/scrub-preview` reflects the env default (`source: "env"`)
+/// until an admin `PUT`s a value, at which point it reflects the DB override
+/// (`source: "db"`) — the same precedence the pre-gen worker and cache
+/// sweeper resolve live. Also covers: the read-only `pregen_width` field
+/// (`source: "env-only"`, D1); that a `PUT` with only one field leaves every
+/// other field's effective value/source untouched; and that an
+/// out-of-bounds `PUT` value is clamped server-side rather than rejected (the
+/// `clip_preroll` precedent), including the 100 MiB `cache_max_bytes` floor
+/// (D5).
+///
+/// One test function covering the whole GET/PUT round trip rather than
+/// several smaller ones: `server_settings` is a process-wide singleton row
+/// (see the db.rs `scrub_pregen_settings_roundtrip_and_clamps` note), so
+/// asserting "every OTHER field is untouched" only holds if nothing else is
+/// concurrently mutating those same columns — keeping every mutation +
+/// assertion of this row in one sequential test avoids that race entirely.
+#[tokio::test]
+async fn scrub_preview_get_put_roundtrip_and_clamps() {
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+
+    // Fresh DB: every knob falls back to its env default.
+    let resp = app.send(get_auth("/config/scrub-preview", &token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let before = body_json(resp).await;
+    assert_eq!(before["pregen_enabled"]["source"], "env");
+    assert_eq!(before["pregen_lookback_hours"]["source"], "env");
+    assert_eq!(before["pregen_scan_secs"]["source"], "env");
+    assert_eq!(before["cache_max_bytes"]["source"], "env");
+    assert_eq!(before["cache_ttl_seconds"]["source"], "env");
+    // Read-only, never DB-backed.
+    assert_eq!(before["pregen_width"]["source"], "env-only");
+    let default_scan_secs = before["pregen_scan_secs"]["value"].clone();
+    let default_ttl = before["cache_ttl_seconds"]["value"].clone();
+
+    // PUT only `pregen_enabled` — the house rule is "write only the field
+    // that was edited".
+    let resp = app
+        .send(put_auth_json(
+            "/config/scrub-preview",
+            &token,
+            r#"{"pregen_enabled":true}"#,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app.send(get_auth("/config/scrub-preview", &token)).await;
+    let after_enable = body_json(resp).await;
+    assert_eq!(
+        after_enable["pregen_enabled"],
+        serde_json::json!({"value": true, "source": "db"})
+    );
+    // Every OTHER field must be untouched: still env-sourced.
+    assert_eq!(after_enable["pregen_lookback_hours"]["source"], "env");
+    assert_eq!(after_enable["pregen_scan_secs"]["source"], "env");
+    assert_eq!(after_enable["cache_max_bytes"]["source"], "env");
+    assert_eq!(after_enable["cache_ttl_seconds"]["source"], "env");
+
+    // Now PUT out-of-bounds values for two more fields — clamped, not
+    // rejected, and (again) every field not in this PUT stays untouched.
+    let resp = app
+        .send(put_auth_json(
+            "/config/scrub-preview",
+            &token,
+            r#"{"pregen_lookback_hours":9999,"cache_max_bytes":0}"#,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app.send(get_auth("/config/scrub-preview", &token)).await;
+    let after_clamp = body_json(resp).await;
+    assert_eq!(
+        after_clamp["pregen_lookback_hours"],
+        serde_json::json!({"value": 168, "source": "db", "min": 0, "max": 168}),
+        "must clamp to the 168h (1 week) ceiling, not store the raw 9999"
+    );
+    assert_eq!(
+        after_clamp["cache_max_bytes"]["value"],
+        serde_json::json!(104_857_600_i64),
+        "must clamp to the 100 MiB floor (D5), not store 0"
+    );
+    // pregen_enabled (set earlier) and the fields never touched by any PUT
+    // in this test must still reflect their expected state.
+    assert_eq!(after_clamp["pregen_enabled"]["source"], "db");
+    assert_eq!(after_clamp["pregen_scan_secs"]["source"], "env");
+    assert_eq!(after_clamp["pregen_scan_secs"]["value"], default_scan_secs);
+    assert_eq!(after_clamp["cache_ttl_seconds"]["source"], "env");
+    assert_eq!(after_clamp["cache_ttl_seconds"]["value"], default_ttl);
 }

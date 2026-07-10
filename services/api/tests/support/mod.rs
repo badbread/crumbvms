@@ -79,6 +79,8 @@ pub mod playback;
 pub mod ptz;
 #[path = "../../src/roles.rs"]
 pub mod roles;
+#[path = "../../src/scrub_settings.rs"]
+pub mod scrub_settings;
 #[path = "../../src/state.rs"]
 pub mod state;
 #[path = "../../src/stream_test.rs"]
