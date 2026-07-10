@@ -310,7 +310,9 @@ async fn put_links(
             )));
         }
         if l.entity_id.trim().is_empty() {
-            return Err(ApiError::BadRequest("link entity_id must not be empty".to_owned()));
+            return Err(ApiError::BadRequest(
+                "link entity_id must not be empty".to_owned(),
+            ));
         }
     }
     let tuples: Vec<(String, String, Option<String>, i32)> = body

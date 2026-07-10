@@ -31,10 +31,9 @@ use uuid::Uuid;
 use crate::types::{
     Bookmark, Camera, CameraDecodeStatus, CameraGroup, CameraHaLink, CameraMotionCacheStatus,
     Capabilities, FrigateSettings, HaSettings, MotionCacheStatus, MotionGrid, MotionSensitivity,
-    MotionSignal, RecordStream,
-    RecorderCapabilities, RecorderHeartbeat, RecordingMode, RecordingPolicy, Role, Segment,
-    SegmentStage, SegmentStream, ServerSettings, Session, Storage, StorageMigration, User,
-    UserRole, View,
+    MotionSignal, RecordStream, RecorderCapabilities, RecorderHeartbeat, RecordingMode,
+    RecordingPolicy, Role, Segment, SegmentStage, SegmentStream, ServerSettings, Session, Storage,
+    StorageMigration, User, UserRole, View,
 };
 
 // ─── pool creation ───────────────────────────────────────────────────────────
