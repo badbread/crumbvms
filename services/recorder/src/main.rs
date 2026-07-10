@@ -69,6 +69,7 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 10;
 mod archive;
 mod decode_probe;
 mod frigate_motion;
+mod ha_motion;
 mod go2rtc_embed;
 mod motion;
 mod reconcile;

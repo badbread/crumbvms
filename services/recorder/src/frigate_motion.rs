@@ -345,8 +345,9 @@ impl CameraTracker {
     }
 }
 
-/// Map a [`Transition`] to the wire [`MotionSignal`] and `try_send` it.
-fn emit(motion_tx: &MotionTx, camera_id: Uuid, t: Transition) {
+/// Map a [`Transition`] to the wire [`MotionSignal`] and `try_send` it. Shared
+/// with `ha_motion.rs` so there is one Transition→MotionSignal mapping.
+pub(crate) fn emit(motion_tx: &MotionTx, camera_id: Uuid, t: Transition) {
     let signal = match t {
         Transition::Start {
             started_at,

@@ -1410,8 +1410,16 @@ pub async fn run(
     // bump and the supervisor reconnects with the new credentials — no recorder
     // restart. A Frigate-source camera with Frigate disabled falls back to the
     // pixel pipeline (the existing safety net).
-    let camera_wants_frigate = crate::frigate_motion::camera_uses_frigate_motion(&camera);
-    if camera_wants_frigate {
+    let camera_wants_ha = camera.motion_source.eq_ignore_ascii_case("ha");
+    let camera_wants_frigate =
+        !camera_wants_ha && crate::frigate_motion::camera_uses_frigate_motion(&camera);
+    if camera_wants_ha {
+        info!(
+            camera_id = %camera.id,
+            camera_name = %camera.name,
+            "motion source: Home Assistant sensors (when configured)"
+        );
+    } else if camera_wants_frigate {
         info!(
             camera_id = %camera.id,
             camera_name = %camera.name,
@@ -1443,6 +1451,30 @@ pub async fn run(
         // Re-read Frigate settings each iteration so a live admin edit is honored
         // on the next (re)connect. Only cameras that want Frigate touch the DB
         // here — pixel cameras skip it entirely.
+        // HA sensors + this camera's motion links, re-read each iteration so an
+        // admin edit hot-reloads on the next (re)connect. Only HA cameras touch
+        // the DB here; a Motion-mode HA camera with HA disabled or no motion
+        // links falls through to the pixel pipeline (the existing safety net).
+        let ha_settings = if camera_wants_ha {
+            crumb_common::db::get_ha_settings(&pool)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let ha_ver = ha_settings.as_ref().map_or(0, |s| s.version);
+        let ha_client = ha_settings
+            .as_ref()
+            .and_then(crumb_common::ha::HaClient::from_settings);
+        let ha_links = if camera_wants_ha {
+            crumb_common::db::get_camera_ha_links(&pool, camera.id, "motion")
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let frigate = if camera_wants_frigate {
             crumb_common::db::get_frigate_settings(&pool)
                 .await
@@ -1456,7 +1488,47 @@ pub async fn run(
             .as_ref()
             .and_then(crate::frigate_motion::FrigateMotionConfig::from_settings);
 
-        let loop_result = if let Some(ref cfg) = frigate_cfg {
+        let loop_result = if let (Some(client), false) = (ha_client, ha_links.is_empty()) {
+            // HA motion source: linked sensors trigger recording; no local decode.
+            // Same fail-open rail as Frigate — health is healthy for the loop's
+            // whole run and unhealthy the instant it returns (poll error OR a
+            // clean config-version exit), so a Motion-mode camera persists every
+            // segment during any HA outage or reconnect window.
+            report_decode_status(
+                &pool,
+                camera.id,
+                config.motion_hwaccel.as_str(),
+                "none",
+                Some("motion source is Home Assistant (no local decode)"),
+            )
+            .await;
+            report_health(
+                &health_tx,
+                &pool,
+                camera.id,
+                true,
+                "ha motion loop running",
+                &alert_gate,
+                alert_after_secs,
+            )
+            .await;
+            let entity_ids: Vec<String> = ha_links.iter().map(|l| l.entity_id.clone()).collect();
+            let r = crate::ha_motion::run_ha_motion_loop(
+                &camera, client, entity_ids, &motion_tx, &cancel, &pool, ha_ver,
+            )
+            .await;
+            report_health(
+                &health_tx,
+                &pool,
+                camera.id,
+                false,
+                "ha motion loop exited",
+                &alert_gate,
+                alert_after_secs,
+            )
+            .await;
+            r
+        } else if let Some(ref cfg) = frigate_cfg {
             // Truth telemetry: Frigate-sourced motion runs no local ffmpeg
             // decode, so the requested backend is moot for this camera.
             report_decode_status(

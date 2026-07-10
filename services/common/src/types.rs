@@ -450,9 +450,11 @@ pub struct Camera {
     /// `cameras.onvif_motion` — when true, use ONVIF events instead of pixel-diff.
     pub onvif_motion: bool,
     /// `cameras.motion_source` — where this camera's motion comes from:
-    /// `"pixel"` (the local pixel-analysis pipeline, default) or `"frigate"`
-    /// (Frigate's neural object detections via MQTT). See the pluggable-motion
-    /// design (`docs/MOTION-DETECTION-DESIGN.md`).
+    /// `"pixel"` (the local pixel-analysis pipeline, default), `"frigate"`
+    /// (Frigate's neural object detections via MQTT), or `"ha"` (linked Home
+    /// Assistant motion/door sensors, polled). See the pluggable-motion design
+    /// (`docs/MOTION-DETECTION-DESIGN.md`). A `"frigate"`/`"ha"` camera whose
+    /// integration is disabled or unlinked falls back to the pixel pipeline.
     pub motion_source: String,
     /// `cameras.motion_algorithm` — which pixel detector to run when
     /// `motion_source == "pixel"`: `"census"` (default), `"framediff"`, `"mog2"`,
