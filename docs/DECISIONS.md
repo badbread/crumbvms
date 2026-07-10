@@ -56,10 +56,27 @@ path); per-action HA automations; **WS-first** (deferred on the 39s dead-peer
 finding + the new dependency); requiring an admin HA token (spike proved
 non-admin works); extending the views model for links (wrong scope).
 
+**Entity picker + filtering (Phase 1, decided with the review).** The
+`GET /ha/entities` endpoint stays dumb: it returns `device_class` (free from the
+states call) and does **no** server-side class whitelist; the client filters and
+groups. The sensor picker whitelists relevant classes (motion/occupancy/
+presence/moving/door/window/opening/garage_door) and buckets the rest under a
+collapsed "Other sensors" + a show-all toggle, so nothing is unreachable.
+`camera_ha_links.device_class` is captured at link time as a **snapshot of
+intent** (drives the glyph without re-querying HA); if an operator reclasses the
+entity in HA later, the link keeps the old class until re-linked — that is
+correct, do not "fix" it into a live re-query. The `role` CHECK reserves
+`sensor` (status-only overlay widgets, P3) alongside `motion`/`actuator` so P2/P3
+need no migration. Rejected: server-side class whitelist (server owning a policy
+list that needs edits); splitting `motion` vs `door` roles (device_class carries
+that; a door that triggers recording is `role=motion, device_class=door`).
+
 **Revisit triggers.** The real-TCP-partition WS retest passes *and* sub-second
 per-edge fidelity is wanted → promote `HaWsSource` (with keepalive) via #53. HA
 ships scoped tokens → the unscoped-LLAT caveat improves. A shared internal event
 bus lands → the API could relay motion to the recorder over one connection.
+**HA-area filtering** wanted (link a camera to its room's entities) → needs the
+entity/area registry (WS API or a registry helper), lands with the WS phase.
 
 ---
 
