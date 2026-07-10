@@ -106,6 +106,12 @@ function renderCameraDetail(cam) {
   }
   lines.push('');
 
+  // Reported firmware (informational; never affects matching)
+  if (cam.firmware_observed && cam.firmware_observed.length) {
+    lines.push(`_Reported on firmware: ${cam.firmware_observed.map(safe).join(', ')}._`);
+    lines.push('');
+  }
+
   // Quirks
   if (cam.quirks && cam.quirks.length) {
     lines.push('**Quirks & fixes**');

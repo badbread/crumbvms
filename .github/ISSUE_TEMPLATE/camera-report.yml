@@ -1,0 +1,96 @@
+name: Camera compatibility report
+description: Report how a camera works with Crumb, so it can be added to the compatibility database.
+title: "[camera] <Make> <Model>"
+labels: ["camera-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping build the [camera compatibility database](https://docs.crumbvms.com/cameras/compatibility)!
+
+        Crumb's admin console can pre-fill most of this for you (camera detail → "Contribute this camera"). You can also fill it in by hand.
+
+        **Please do not include LAN IPs, credentials, or stream URLs.** Make, model, and settings are all anyone needs.
+  - type: input
+    id: make
+    attributes:
+      label: Manufacturer (make)
+      placeholder: Uniview
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: IPC6322SR-X22P-D
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version (if known)
+      placeholder: HCMN-B2201.6.9.220415
+  - type: input
+    id: streams
+    attributes:
+      label: Stream codecs
+      placeholder: "Main: H265, Sub: H264"
+  - type: dropdown
+    id: recording
+    attributes:
+      label: Recording
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: desktop_live
+    attributes:
+      label: Desktop live view
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: web_live
+    attributes:
+      label: Web (admin console) live view
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: android_live
+    attributes:
+      label: Android live view
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: ios_live
+    attributes:
+      label: iOS / macOS live view
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: playback
+    attributes:
+      label: Recorded playback
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: onvif
+    attributes:
+      label: ONVIF (add / identify / PTZ discovery)
+      options: ["Works", "Works with a caveat", "Not working", "Not tested"]
+      default: 3
+  - type: dropdown
+    id: ptz
+    attributes:
+      label: PTZ
+      options: ["Works", "Works with a caveat", "Not working", "Not tested", "No PTZ on this model"]
+      default: 3
+  - type: textarea
+    id: quirks
+    attributes:
+      label: Quirks and fixes
+      description: Anything that needed a workaround, and the fix that worked.
+      placeholder: "e.g. Android fullscreen live falls back to SD; fix was setting the main stream to H264 in the camera web UI."
+  - type: textarea
+    id: how_tested
+    attributes:
+      label: How did you test this?
+      placeholder: "e.g. ffprobe on the stream, on-device Android playback, Crumb version sha-xxxxx."

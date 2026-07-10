@@ -62,6 +62,37 @@ repo with no maintainer gate. The browser-redirect-to-prefilled-issue pattern
 gives the same one-click ease with zero server egress, no bundled secret, and a
 human PR review, so it is the only sanctioned shape.
 
+**Refinements from a design review (2026-07-10), folded in before implementation:**
+- **The `match` block is a first-class, machine-first schema concept.** Entries
+  carry an explicit normalized `match` (make + make_aliases + models +
+  `*`-globs); an entry without a valid `match` block is documentation-only and
+  never auto-matched. Rejected contributor-supplied **regex** (review burden +
+  ReDoS); normalized exact strings plus `*` globs cover the real cases (lens/
+  region model suffixes). Matching is two-tier: exact make+model = "identified",
+  make/alias-only = "possible match, verify" (never asserts quirks as fact).
+  **Firmware never gates matching** (vendor-arbitrary formats); it is stored and
+  shown as "reported on firmware X" only.
+- **The contribute target is a GitHub issue _form_
+  (`.github/ISSUE_TEMPLATE/camera-report.yml`) plus a copy-button modal**, not a
+  raw prefilled-body URL. This is a narrowing of "pre-filled GitHub issue", not a
+  reversal: rejected the raw-body URL for its ~8 KB ceiling, confusing
+  logged-out UX, and unstructured triage. The admin console shows the full
+  server-built report in a modal (the operator's review step) with a copy
+  button, then opens the issue form prefilled with only short values.
+- **The contribute payload is built server-side from a whitelist**
+  (`GET /cameras/:id/compat-report`, admin-only): make/model/firmware + stream
+  observations + support flags only. Credentials, IP/host, ports, any URL, and
+  the operator's camera name are excluded by construction (camera name is an
+  optional field the user types), because `cameras.onvif_password` /
+  `source_url` are one join away and a client-assembled report would eventually
+  leak one.
+- **Stream fingerprint demoted to data, not a matcher.** Stream observations
+  (codec/profile/pix_fmt/range) are captured and displayed and auto-included in
+  the contribute report, but fingerprint _matching_ stays deferred behind the
+  revisit trigger below (the "PPS id out of range" signal is an ffmpeg log
+  string that shifts across versions, and full-range yuvj420p is common across
+  unrelated models).
+
 **Revisit triggers:**
 - The compatibility corpus grows large enough that a flat JSON file is unwieldy
   (split by vendor, or move to per-entry files with a merge step).

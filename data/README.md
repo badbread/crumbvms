@@ -27,12 +27,29 @@ installed beyond Node.
 
 ## Entry schema
 
+The file is `{ "schema_version": 1, "cameras": [ <entry>, ... ] }`. Each entry:
+
 ```jsonc
 {
-  "make": "Uniview",              // required: manufacturer
-  "model": "IPC2A24SE-ADF40KMC",  // required (use "" if unconfirmed): exact model
+  "make": "Uniview",              // required: manufacturer (display form)
+  "model": "IPC6322SR-X22P-D",    // required (use "" if unconfirmed): exact model
   "aka": ["other names"],         // optional: alternate names/rebrands
-  "category": "LPR / ANPR",       // optional: camera type
+  "category": "PTZ / LPR",        // optional: camera type
+
+  // OPTIONAL but important: the `match` block is what lets the in-app matcher
+  // recognize this camera from its ONVIF make/model. An entry WITHOUT a valid
+  // `match` block is documentation-only (it shows on the page but is never
+  // auto-matched to anyone's camera). All match strings are normalized
+  // (lowercased, non-alphanumerics stripped) before comparison.
+  "match": {
+    "make": "uniview",                  // normalized manufacturer, required in the block
+    "make_aliases": ["unv"],            // other normalized names the camera may report
+    "models": ["ipc6322sr-x22p-d"],     // normalized exact model strings
+    "model_globs": []                   // optional, '*' wildcard only (NO regex)
+  },
+  "firmware_observed": ["HCMN-B2201.6.9.220415"], // optional, informational only;
+                                                  // firmware NEVER gates matching
+
   "streams": {
     "main": { "codec": "H265", "notes": "..." },  // notes optional
     "sub":  { "codec": "H264", "notes": "..." }
@@ -45,7 +62,7 @@ installed beyond Node.
     "ios_live":     "unknown",
     "playback":     "yes",
     "onvif":        "yes",
-    "ptz":          "unknown"
+    "ptz":          "yes"
   },
   "quirks": [                     // optional; omit or [] if none
     {
@@ -65,6 +82,13 @@ installed beyond Node.
 
 - `support` values are exactly `yes`, `partial`, `no`, or `unknown`. `partial`
   means "works with a caveat", and that caveat belongs in `quirks`.
+- `match` strings are normalized (lowercased, non-alphanumerics removed), so
+  write them lowercase. Manufacturers report messy strings (Uniview reports
+  `UNIVIEW` on some lines and `UNV` on others; Dahua OEMs report a storefront
+  brand), so list every form you've seen in `make_aliases` / `models`.
+  `model_globs` supports the `*` wildcard only; regex is not allowed.
+- `firmware_observed` is informational (shown as "reported on firmware X"). It
+  never affects matching, firmware version formats are vendor-arbitrary.
 - Keep prose free of `<` and `{` characters: the page is rendered through MDX,
   which treats them as markup.
 - Do not put LAN IPs, credentials, or stream URLs in entries. Make, model, and
