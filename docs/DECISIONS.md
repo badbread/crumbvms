@@ -8,6 +8,61 @@ revisit.
 
 ---
 
+## 2026-07-10, Home Assistant integration: HA-native transport, REST-polling first (WebSocket deferred), one non-admin token, camera-linked entities
+
+**Context.** Home Assistant is the ideal integration for a self-hosted VMS (it
+IS self-hosted, so it fits "optional integrations must have a self-hosted path,
+footage never leaves your control"). Goal: HA motion/door sensors surface on the
+timeline and can trigger recording; HA lights/switches/scenes become on-video
+controls; and (later) an on-video widget overlay. This entry covers the
+transport and the Phase-1 foundation (epic #52). Two Fable design passes + a
+real-hardware spike informed it.
+
+**Decision — transport: HA-native APIs on ONE long-lived access token (LLAT),
+not MQTT.** Outbound control uses HA's REST service API
+(`POST /api/services/<domain>/<service>`); inbound sensor state will use HA's
+API too. One credential (a non-admin HA user's LLAT) + base URL, stored like
+`frigate_config` (DB singleton `ha_config`, write-only token, env fallback for
+empty fields, monotonic `version` for hot-reload). MQTT is **not** used for this
+integration because HA core has no first-class "call an arbitrary service over
+MQTT" path (control would need a hand-authored per-button automation); MQTT
+remains the right tool for the *separate* Crumb→HA MQTT-Discovery roadmap item.
+
+**Decision — inbound: REST polling first; WebSocket deferred behind a
+transport-agnostic source.** The spike (live HA 2026.7.1) validated REST control
+(~30-40ms, **non-admin token can call services** — no admin rights needed) and
+WS `subscribe_trigger` (~30ms), but found a **silent WS peer drop took ~39s to
+detect** via a blind send loop. That is a recorder-correctness issue: the
+fail-open rail flips health only on loop *exit*, so an undetected-dead WS leaves
+a `motion_source='ha'` camera health=true and motion-gated → **silently missing
+footage** for the dead window. REST polling makes this property free: a poll is a
+bounded GET with a timeout, so a dead HA surfaces as a timed-out poll within one
+interval → the loop errors → fail-open fires in ~1s. Polling also needs **no new
+dependency** (`tokio-tungstenite`, #53, deferred) and no keepalive code; its 1s
+latency is absorbed by the motion RAM pre-buffer for recording and is nothing for
+a status chip. Missed sub-second blips don't affect motion/door sensors (they
+hold state for seconds). So Phase 2's `ha_motion.rs` consumes an internal
+`HaEventSource` trait; `HaPollSource` (REST) ships first, `HaWsSource` drops in
+later, changing no data model, endpoint, or client, gated on a real-TCP-partition
+retest + WS keepalive (ping/pong).
+
+**Decision — model: `camera_ha_links` table** (camera → N entities, role
+`motion`/`actuator`), queried directly (not via `v_camera_effective_policy`).
+Controls (Phase 3) reuse the `actuators` RBAC capability shared with the Reolink
+plan; the client sends a `link_id`, never a raw HA entity id.
+
+**Rejected.** MQTT statestream inbound (YAML-only HA config + broker + no control
+path); per-action HA automations; **WS-first** (deferred on the 39s dead-peer
+finding + the new dependency); requiring an admin HA token (spike proved
+non-admin works); extending the views model for links (wrong scope).
+
+**Revisit triggers.** The real-TCP-partition WS retest passes *and* sub-second
+per-edge fidelity is wanted → promote `HaWsSource` (with keepalive) via #53. HA
+ships scoped tokens → the unscoped-LLAT caveat improves. A shared internal event
+bus lands → the API could relay motion to the recorder over one connection.
+
+---
+
 ## 2026-07-10, Camera compatibility database: JSON source, generated docs, PR-curated (and the ratified in-app identify/contribute direction)
 
 **Context.** Cameras vary in ways Crumb can't fully paper over (codec quirks,
