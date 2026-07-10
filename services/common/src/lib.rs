@@ -23,6 +23,7 @@
 pub mod config;
 pub mod db;
 pub mod detection;
+pub mod ha;
 pub mod icons;
 pub mod logging;
 pub mod redact;

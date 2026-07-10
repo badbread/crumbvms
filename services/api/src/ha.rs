@@ -9,8 +9,6 @@
 //! Config + links edits are admin-only; reading a camera's links needs only
 //! access to that camera.
 
-use std::time::Duration;
-
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
@@ -36,82 +34,16 @@ pub fn routes() -> Router<AppState> {
         .route("/cameras/:id/ha/links", get(get_links).put(put_links))
 }
 
-// ─── REST client ─────────────────────────────────────────────────────────────
+// ─── HTTP: shared client + picker filter ──────────────────────────────────────
 
-struct HaClient {
-    http: reqwest::Client,
-    base_url: String,
-    token: String,
-}
-
-impl HaClient {
-    /// Build a client from the effective settings, or a 400 if HA isn't
-    /// configured (no base URL / token).
-    fn from_settings(s: &HaSettings) -> Result<Self, ApiError> {
-        let token = s.token.clone().unwrap_or_default();
-        if s.base_url.trim().is_empty() || token.trim().is_empty() {
-            return Err(ApiError::BadRequest(
-                "Home Assistant is not configured (set a base URL and token first)".to_owned(),
-            ));
-        }
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("http client build: {e}")))?;
-        Ok(Self {
-            http,
-            base_url: s.base_url.trim_end_matches('/').to_owned(),
-            token,
-        })
-    }
-
-    async fn get(&self, path: &str) -> Result<reqwest::Response, ApiError> {
-        // The token is a header, never in the URL, so a reqwest error string
-        // (URL + kind) can't leak it.
-        self.http
-            .get(format!("{}{path}", self.base_url))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("Home Assistant request failed: {e}")))
-    }
-
-    /// `GET /api/` — a cheap authenticated reachability check.
-    async fn test_connection(&self) -> Result<(), ApiError> {
-        let resp = self.get("/api/").await?;
-        let code = resp.status();
-        if code.is_success() {
-            Ok(())
-        } else {
-            Err(ApiError::BadRequest(format!(
-                "Home Assistant returned HTTP {}{}",
-                code.as_u16(),
-                if code.as_u16() == 401 {
-                    " (token rejected)"
-                } else {
-                    ""
-                }
-            )))
-        }
-    }
-
-    /// `GET /api/states`, filtered to the given entity-id domains, returning
-    /// `(entity_id, friendly_name)` sorted by name.
-    async fn list_entities(&self, domains: &[&str]) -> Result<Vec<HaEntity>, ApiError> {
-        let resp = self.get("/api/states").await?;
-        if !resp.status().is_success() {
-            return Err(ApiError::BadRequest(format!(
-                "Home Assistant returned HTTP {}",
-                resp.status().as_u16()
-            )));
-        }
-        let states: Vec<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("Home Assistant states parse: {e}")))?;
-        Ok(entities_from_states(&states, domains))
-    }
+/// Build the shared `crumb_common::ha` client from stored settings, mapping the
+/// "not configured" case to a 400.
+fn ha_client(s: &HaSettings) -> Result<crumb_common::ha::HaClient, ApiError> {
+    crumb_common::ha::HaClient::from_settings(s).ok_or_else(|| {
+        ApiError::BadRequest(
+            "Home Assistant is not configured (set a base URL and token first)".to_owned(),
+        )
+    })
 }
 
 /// Pure filter/sort of an HA `/api/states` array to the given domains. Split out
@@ -273,7 +205,10 @@ async fn test_config(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let s = effective_settings(&state).await?;
-    HaClient::from_settings(&s)?.test_connection().await?;
+    ha_client(&s)?
+        .test_connection()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -285,13 +220,16 @@ async fn get_entities(
     Query(q): Query<EntitiesQuery>,
 ) -> Result<Json<Vec<HaEntity>>, ApiError> {
     let s = effective_settings(&state).await?;
-    let client = HaClient::from_settings(&s)?;
     let domains: Vec<&str> = match q.domain.as_deref() {
         Some("controls") => vec!["light", "switch", "scene"],
         Some(d) => vec![d],
         None => vec!["binary_sensor", "light", "switch", "scene"],
     };
-    Ok(Json(client.list_entities(&domains).await?))
+    let states = ha_client(&s)?
+        .get_states()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(entities_from_states(&states, &domains)))
 }
 
 /// `GET /cameras/:id/ha/links` — any user with access to the camera.

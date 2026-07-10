@@ -1520,6 +1520,31 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
     Ok(rows.iter().map(ha_link_from_row).collect())
 }
 
+/// HA links for a camera filtered by `role` (`motion` / `sensor` / `actuator`),
+/// ordered for display. Used by the recorder (`role='motion'`) and the surfacing
+/// task without pulling the other roles.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_camera_ha_links(
+    pool: &Pool,
+    camera_id: Uuid,
+    role: &str,
+) -> Result<Vec<CameraHaLink>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order
+             FROM camera_ha_links WHERE camera_id = $1 AND role = $2
+             ORDER BY sort_order, entity_id",
+            &[&camera_id, &role],
+        )
+        .await
+        .context("get_camera_ha_links")?;
+    Ok(rows.iter().map(ha_link_from_row).collect())
+}
+
 /// One camera↔HA link to persist: `(entity_id, role, device_class, label,
 /// sort_order)`. `id` is server-assigned.
 pub type HaLinkInsert = (String, String, Option<String>, Option<String>, i32);
