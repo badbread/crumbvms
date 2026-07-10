@@ -123,6 +123,28 @@ pub fn edge_on(state: &str) -> Option<bool> {
     }
 }
 
+/// Map an HA `device_class` to the Crumb event **label slug** used for a
+/// motion-role sensor's timeline glyph + notification text. The slug is the
+/// per-label `icon_key` (see `crumb_common::detection::icon_key_for_label`), so
+/// clients render the matching glyph and capitalize the slug for display.
+///
+/// `"motion"` deliberately collapses the plain-motion classes: it reuses the
+/// existing motion glyph, which is filtered out of the timeline dot row, so an
+/// HA motion sensor reads as motion (like the pixel/Frigate sources) rather than
+/// a distinct icon. Unknown / absent classes fall back to `"sensor"`.
+#[must_use]
+pub fn label_for_device_class(device_class: Option<&str>) -> &'static str {
+    let normalized = device_class.map(|c| c.trim().to_ascii_lowercase());
+    match normalized.as_deref() {
+        Some("motion" | "moving" | "vibration") => "motion",
+        Some("occupancy" | "presence") => "occupancy",
+        Some("door" | "opening") => "door",
+        Some("window") => "window",
+        Some("garage_door") => "garage",
+        _ => "sensor",
+    }
+}
+
 /// Diff current `(entity_id, state)` readings against the last-known on/off map,
 /// emitting an edge per *changed* entity and updating `last`. Pure + testable.
 ///
@@ -216,6 +238,23 @@ mod tests {
         assert_eq!(edge_on("unavailable"), None);
         assert_eq!(edge_on("unknown"), None);
         assert_eq!(edge_on(""), None);
+    }
+
+    #[test]
+    fn device_class_label_mapping() {
+        assert_eq!(label_for_device_class(Some("door")), "door");
+        assert_eq!(label_for_device_class(Some("opening")), "door");
+        assert_eq!(label_for_device_class(Some("window")), "window");
+        assert_eq!(label_for_device_class(Some("garage_door")), "garage");
+        assert_eq!(label_for_device_class(Some("occupancy")), "occupancy");
+        assert_eq!(label_for_device_class(Some("presence")), "occupancy");
+        // Plain-motion classes collapse to the (dot-row-filtered) motion glyph.
+        assert_eq!(label_for_device_class(Some("motion")), "motion");
+        assert_eq!(label_for_device_class(Some("MOVING")), "motion");
+        // Absent / unknown classes fall back to the generic sensor glyph.
+        assert_eq!(label_for_device_class(None), "sensor");
+        assert_eq!(label_for_device_class(Some("smoke")), "sensor");
+        assert_eq!(label_for_device_class(Some("")), "sensor");
     }
 
     #[test]

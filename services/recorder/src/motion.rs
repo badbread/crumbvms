@@ -1512,9 +1512,12 @@ pub async fn run(
                 alert_after_secs,
             )
             .await;
-            let entity_ids: Vec<String> = ha_links.iter().map(|l| l.entity_id.clone()).collect();
+            let links: Vec<(String, Option<String>)> = ha_links
+                .iter()
+                .map(|l| (l.entity_id.clone(), l.device_class.clone()))
+                .collect();
             let r = crate::ha_motion::run_ha_motion_loop(
-                &camera, client, entity_ids, &motion_tx, &cancel, &pool, ha_ver,
+                &camera, client, links, &motion_tx, &cancel, &pool, ha_ver,
             )
             .await;
             report_health(

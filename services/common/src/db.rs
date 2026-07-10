@@ -7156,6 +7156,60 @@ pub async fn upsert_motion_event(pool: &Pool, sig: &MotionSignal) -> Result<Uuid
     upsert_detection_event(pool, &params).await
 }
 
+/// Persist (or update) a Home-Assistant-sourced motion event in the shared
+/// `events` table, LABELED by the sensor's `device_class` (Door / Window /
+/// Occupancy / …) so it renders a distinct timeline glyph and reads correctly in
+/// notifications — the labeled counterpart of [`upsert_motion_event`] for
+/// `motion_source='ha'` cameras.
+///
+/// This is **surfacing only**: the caller ([`crate::ha`]'s consumer in the
+/// recorder) writes this row *after* it has already emitted the source-agnostic
+/// `MotionSignal` that drives recording, and treats a failure here as
+/// best-effort (log-and-continue), exactly like `upsert_motion_event`. A failed
+/// glyph write can never cost footage.
+///
+/// Idempotent via `(source_id, provider_event_id)` = `('ha', "ha:{entity}:{start_ms}")`:
+/// the START (`stopped_at = None`) inserts (`lifecycle = 'start'`), the STOP with
+/// the same opening entity + `started_at` updates it (`lifecycle = 'end'`,
+/// `end_ts` set). The opening entity (the one that began the event) fixes the
+/// label for the whole event; a different class firing mid-event does not relabel.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn upsert_ha_event(
+    pool: &Pool,
+    camera_id: Uuid,
+    entity_id: &str,
+    device_class: Option<&str>,
+    started_at: DateTime<Utc>,
+    stopped_at: Option<DateTime<Utc>>,
+) -> Result<Uuid> {
+    let provider_event_id = format!("ha:{}:{}", entity_id, started_at.timestamp_millis());
+    let lifecycle = if stopped_at.is_some() { "end" } else { "start" };
+    let label = crate::ha::label_for_device_class(device_class);
+    let params = UpsertDetectionEventParams {
+        camera_id,
+        start_ts: started_at,
+        label: label.to_owned(),
+        score: 1.0, // a binary sensor has no confidence score
+        source_id: "ha".to_owned(),
+        provider_event_id,
+        sub_label: None,
+        top_score: 1.0,
+        end_ts: stopped_at,
+        zones: Vec::new(),
+        snapshot_url: None,
+        raw: serde_json::json!({
+            "source": "ha",
+            "entity_id": entity_id,
+            "device_class": device_class,
+        }),
+        lifecycle: lifecycle.to_owned(),
+    };
+    upsert_detection_event(pool, &params).await
+}
+
 /// Parameters for [`upsert_detection_event`].
 #[derive(Debug)]
 pub struct UpsertDetectionEventParams {

@@ -1136,6 +1136,9 @@ async fn finish_completed_segment(
     // so the buffer isn't fed at all and this call is a pure no-op for it.
     let mut actual = MotionDecision::empty();
     let mut shadow = MotionDecision::empty();
+    // HA-sourced cameras get a labeled 'ha' events row from ha_motion.rs; skip the
+    // generic 'motion' row here to avoid double-surfacing (see fn doc).
+    let write_generic_motion_event = !camera.motion_source.eq_ignore_ascii_case("ha");
     if caching_active && detector_healthy {
         drain_and_persist_motion(
             motion_rx,
@@ -1143,6 +1146,7 @@ async fn finish_completed_segment(
             pool,
             drive_buffer.then_some(&mut *motion_buf),
             &mut actual,
+            write_generic_motion_event,
         )
         .await;
     } else {
@@ -1152,6 +1156,7 @@ async fn finish_completed_segment(
             pool,
             drive_buffer.then_some(&mut *motion_buf),
             &mut shadow,
+            write_generic_motion_event,
         )
         .await;
     }
@@ -1422,18 +1427,30 @@ fn drain_motion_channel(rx: &mut MotionRx, out: &mut Vec<MotionSignal>) {
 /// accumulated list; the buffer's state transitions are edge-triggered on the
 /// channel receive, not on the boundary loop). The resulting [`MotionDecision`]s
 /// are appended into `decision`.
+///
+/// `write_generic_motion_event` gates ONLY the generic `'motion'/'motion'`
+/// surfacing-row write. A `motion_source='ha'` camera passes `false`: its
+/// `ha_motion.rs` loop already wrote a *labeled* `'ha'` events row (Door /
+/// Window / …) for the same transition, so writing the generic row too would
+/// double-surface the event and double-fire notifications. This gate wraps the
+/// event-row upsert loop only — never the `buf.apply_signal` loop below — so the
+/// recording/persist decision is byte-identical regardless of the flag; only
+/// which surfacing row is written changes.
 async fn drain_and_persist_motion(
     rx: &mut MotionRx,
     out: &mut Vec<MotionSignal>,
     pool: &Pool,
     motion_buf: Option<&mut MotionBuffer>,
     decision: &mut MotionDecision,
+    write_generic_motion_event: bool,
 ) {
     let before = out.len();
     drain_motion_channel(rx, out);
-    for sig in &out[before..] {
-        if let Err(e) = db::upsert_motion_event(pool, sig).await {
-            warn!(camera_id = %sig.camera_id, error = %e, "failed to persist motion event");
+    if write_generic_motion_event {
+        for sig in &out[before..] {
+            if let Err(e) = db::upsert_motion_event(pool, sig).await {
+                warn!(camera_id = %sig.camera_id, error = %e, "failed to persist motion event");
+            }
         }
     }
     if let Some(buf) = motion_buf {

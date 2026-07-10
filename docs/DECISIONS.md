@@ -8,6 +8,79 @@ revisit.
 
 ---
 
+## 2026-07-10, HA motion surfacing: the recorder writes the labeled event row; `MotionSignal` stays source-agnostic; generic motion row suppressed for HA cameras
+
+**Context.** Phase 2 makes a `motion_source='ha'` camera trigger recording from
+its linked HA motion/door sensors. The recorder already turns each drained
+`MotionSignal` into a generic `'motion'/'motion'` row in the shared `events`
+table (`db::upsert_motion_event`, called from `drain_and_persist_motion`), which
+is what the notification engine and timeline consume. Slice 3 wants an HA-door
+event to read as **"Door"** with its own timeline glyph, not as anonymous
+motion — the question was *who writes the labeled row and where the label lives*.
+
+**Decision — the recorder writes a LABELED `'ha'` event row itself, at the same
+`HaTracker` Start/Stop transition where it emits the signal (option b).** The
+linchpin: the recorder *already* writes these event rows, so this is not new
+scope in the always-must-work component — it upgrades the existing generic write
+to a labeled one, done in `ha_motion.rs` where the linked entities' `device_class`
+is already in hand. `db::upsert_ha_event` mirrors `upsert_motion_event`
+(`source_id='ha'`, `provider_event_id="ha:{entity}:{start_ms}"`, same
+START-inserts/STOP-updates idempotency) and wraps the same `upsert_detection_event`
+the Frigate ingester uses, so it renders through the existing labeled-glyph
+pipeline with **no new rendering model**. The `device_class → label` map
+(`crumb_common::ha::label_for_device_class`) is one pure, unit-tested fn:
+door/opening→`door`, window→`window`, occupancy/presence→`occupancy`,
+garage_door→`garage`, motion/moving/vibration→`motion` (reuses the existing
+dot-row-filtered motion glyph), null/unknown→`sensor`. The **opening** sensor
+fixes the label for the whole event (decided at Start, never relabeled
+mid-event).
+
+**`MotionSignal` stays byte-for-byte source-agnostic** — no `device_class`, no
+source tag. The label rides a *separate* best-effort DB write, never the signal.
+`recording.rs` and the pixel/Frigate paths are untouched.
+
+**Ordering + best-effort are load-bearing.** `ha_motion.rs` emits the
+footage-driving `MotionSignal` **first and unconditionally**, then writes the
+labeled row best-effort (a DB error is logged and ignored, exactly like the
+generic motion write). A failed glyph write can never cost a segment.
+
+**Generic motion row suppressed for HA cameras.** `drain_and_persist_motion`
+takes `write_generic_motion_event` (`false` iff `motion_source='ha'`) gating only
+the `upsert_motion_event` loop — **never** the `buf.apply_signal` loop — so the
+record/persist decision is byte-identical and only the surfacing row's owner
+changes. Without this an HA door-open would write both a `'motion'` and an `'ha'`
+row and double-fire the 3s-polling notification engine.
+
+**/status live badge: reuse the existing `recent_motion`.** HA motion flows
+through `segments.has_motion` like any motion, so the "motion now" badge already
+lights for HA cameras with zero new code. No `ha_triggered` bool (it would mean
+the same thing and invite skew). A per-tile "Door"/"Occupancy" caption is
+presentation, read from the existing labeled `events` feed; `status.rs` unchanged.
+
+**Rejected.** (a) A second **api-side poller** of the same entities to write
+labels — reintroduces exactly the region/label skew this avoids (two independent
+polls, independent failures) for no benefit, since the recorder already writes
+the row. (c) Carrying `device_class` through a `MotionSignal` side channel into
+`recording.rs` — spreads HA knowledge into the source-agnostic component and is
+more plumbing than (b), which quarantines all HA knowledge in `ha_motion.rs`.
+
+**Deferred (honest).** The client-side Path2D glyphs for the new keys
+(`door`/`window`/`occupancy`/`garage`/`sensor`) across web/desktop/Android/iOS and
+`docs/DETECTION-ICONS.md` are a follow-up presentation slice; until they land an
+HA event renders with the generic/fallback glyph (no breakage). A DB
+round-trip / suppression integration test is deferred: `crumb-common` has no
+integration-test harness (only the api does), and the write path is a thin
+wrapper transitively covered by the api ingester tests + the pure unit tests;
+the runtime fail-open validation covers the recorder path end-to-end.
+
+**Revisit triggers.** A non-recording `role='sensor'` status entity (P3) needs
+surfacing without a recording poll → that is the one case a lightweight api-side
+read returns; decide it then, not now. If a second consumer ever needs the
+per-event source/label off the wire, reopen the source-agnostic-`MotionSignal`
+choice (today nothing does).
+
+---
+
 ## 2026-07-10, Home Assistant integration: HA-native transport, REST-polling first (WebSocket deferred), one non-admin token, camera-linked entities
 
 **Context.** Home Assistant is the ideal integration for a self-hosted VMS (it
