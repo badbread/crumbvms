@@ -292,13 +292,26 @@ fn prepare_layout(root: &Path, keep_weeks: usize, keep_months: usize) -> std::io
 }
 
 /// Point symlink `link` at `target` (remove + recreate).
+///
+/// The `-latest` convenience symlink is created only on unix (production runs
+/// Linux/Docker). On non-unix dev builds (e.g. Windows) recreation is skipped —
+/// creating symlinks there needs elevated privileges and the backups themselves
+/// are unaffected — which keeps `crumb-api` building natively on Windows.
 fn replace_symlink(link: &Path, target: &str) -> std::io::Result<()> {
     match std::fs::remove_file(link) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    std::os::unix::fs::symlink(target, link)
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Ok(())
+    }
 }
 
 /// Refresh a weekly/monthly tier file as a hard link to the newest daily dump
