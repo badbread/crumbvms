@@ -8,6 +8,40 @@ revisit.
 
 ---
 
+## 2026-07-09, Update check: re-check every launch + always-present About field (stale-state fix)
+
+**Problem.** The first client cut of #7 checked once per client and throttled
+even the launch check to 24h, and it hid the update field and "Check now"
+whenever the last response said the feature was disabled. On-device testing
+surfaced a trap: a client that first checked while the operator had the server
+switch OFF cached "disabled" and then had no way to discover it was later turned
+ON — no auto re-check for 24h, and no reachable "Check now" (it was gated behind
+the stale enabled state). The only recovery was wiping app data.
+
+**Chosen.** Across all clients (desktop, Android, iOS/macOS):
+
+- The launch/login check runs on **every cold launch**, ungated by the 24h
+  timer (guarded per-process against re-spam). The 24h throttle now governs
+  only periodic re-checks while the app stays open.
+- The Settings/About screen carries an **always-present update field whenever
+  the server reports the check enabled**, and **opening it triggers a fresh
+  check**, with **"Check now" always reachable there**. The field hides only on
+  `enabled:false`/404.
+
+**Rejected.**
+
+- *Check-once + 24h-throttled launch check* (the original): simplest, but
+  strands a client that checked during a disabled window for a full day with no
+  manual recovery.
+- *A background/periodic poller* to notice enable-flips sooner: heavier than a
+  notify-only nicety warrants; app launch and the About screen are natural,
+  cheap re-check triggers that cover it.
+
+**Revisit triggers.** Every-launch checks become a measurable server/GitHub
+load concern (they shouldn't: the api caches ≤6h and the client→server hop is
+LAN-local); or a client gains a real background presence where a periodic
+poller becomes worthwhile.
+
 ## 2026-07-09, Update-available check: api-mediated, notify-only, opt-in / OFF BY DEFAULT
 
 **Problem.** Issue #7 asks for a non-intrusive "update available → release

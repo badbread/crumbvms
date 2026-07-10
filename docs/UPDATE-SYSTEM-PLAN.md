@@ -225,12 +225,19 @@ egress path:
 
 ## 3. Per-client mechanism
 
-All clients: check once shortly after login/launch and re-check at most
-every 24h while running, against their own server's `GET /updates/latest`.
-404 or `enabled:false` ⇒ show nothing. The notice is non-intrusive: a
-dismissible row/badge in the Settings/About area (dismiss remembers the
-dismissed version and stays quiet until a newer one appears), linking to
-`notes_url` in the platform browser. No download buttons, no install flows.
+All clients check their own server's `GET /updates/latest` on **every cold
+launch/login** (ungated, so a client that first checked during a disabled
+window recovers on the next launch), and again whenever the **Settings/About
+screen opens**; a 24h throttle governs only periodic re-checks while the app
+stays open. 404 or `enabled:false` ⇒ show nothing. Two surfaces: (1) a
+non-intrusive **dismissible banner** for update-available (dismiss remembers
+the version and stays quiet until a newer one appears), and (2) an
+**always-present update field in the Settings/About area whenever the server
+reports the check enabled** (states: "checking" / "up to date" / "update
+available → release notes"), with **"Check now" always reachable there** — the
+escape hatch so a server-side disabled→enabled flip is always discoverable
+without wiping app data. Links open `notes_url` in the platform browser. No
+download buttons, no install flows.
 
 | Client | Own version from | Notice surface | Notes |
 |---|---|---|---|
