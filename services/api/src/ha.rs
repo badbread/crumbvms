@@ -125,15 +125,20 @@ fn entities_from_states(states: &[serde_json::Value], domains: &[&str]) -> Vec<H
             if !domains.contains(&domain) {
                 return None;
             }
-            let friendly_name = s
-                .get("attributes")
+            let attrs = s.get("attributes");
+            let friendly_name = attrs
                 .and_then(|a| a.get("friendly_name"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(eid)
                 .to_owned();
+            let device_class = attrs
+                .and_then(|a| a.get("device_class"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             Some(HaEntity {
                 entity_id: eid.to_owned(),
                 friendly_name,
+                device_class,
             })
         })
         .collect();
@@ -182,6 +187,9 @@ struct HaConfigUpdate {
 struct HaEntity {
     entity_id: String,
     friendly_name: String,
+    /// HA `device_class` (`motion`, `door`, ...), if the entity reports one.
+    /// The client filters/groups on this; the server does not gatekeep it.
+    device_class: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +204,7 @@ struct HaLinkDto {
     id: Uuid,
     entity_id: String,
     role: String,
+    device_class: Option<String>,
     label: Option<String>,
     sort_order: i32,
 }
@@ -206,6 +215,7 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             id: l.id,
             entity_id: l.entity_id,
             role: l.role,
+            device_class: l.device_class,
             label: l.label,
             sort_order: l.sort_order,
         }
@@ -216,6 +226,8 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
 struct HaLinkInput {
     entity_id: String,
     role: String,
+    #[serde(default)]
+    device_class: Option<String>,
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
@@ -303,9 +315,9 @@ async fn put_links(
     Json(body): Json<HaLinksUpdate>,
 ) -> Result<Json<Vec<HaLinkDto>>, ApiError> {
     for l in &body.links {
-        if l.role != "motion" && l.role != "actuator" {
+        if !matches!(l.role.as_str(), "motion" | "sensor" | "actuator") {
             return Err(ApiError::BadRequest(format!(
-                "invalid link role '{}' (expected 'motion' or 'actuator')",
+                "invalid link role '{}' (expected 'motion', 'sensor', or 'actuator')",
                 l.role
             )));
         }
@@ -315,10 +327,10 @@ async fn put_links(
             ));
         }
     }
-    let tuples: Vec<(String, String, Option<String>, i32)> = body
+    let tuples: Vec<(String, String, Option<String>, Option<String>, i32)> = body
         .links
         .into_iter()
-        .map(|l| (l.entity_id, l.role, l.label, l.sort_order))
+        .map(|l| (l.entity_id, l.role, l.device_class, l.label, l.sort_order))
         .collect();
     let links = db::replace_camera_ha_links(state.pool(), camera_id, &tuples)
         .await
@@ -333,7 +345,7 @@ mod tests {
     #[test]
     fn entities_filter_by_domain_with_name_fallback() {
         let states = json!([
-            {"entity_id": "binary_sensor.front_door", "attributes": {"friendly_name": "Front Door"}},
+            {"entity_id": "binary_sensor.front_door", "attributes": {"friendly_name": "Front Door", "device_class": "door"}},
             {"entity_id": "light.kitchen", "attributes": {"friendly_name": "Kitchen"}},
             {"entity_id": "sensor.temperature", "attributes": {"friendly_name": "Temp"}},
             {"entity_id": "binary_sensor.no_name"}
@@ -346,12 +358,19 @@ mod tests {
         assert!(ids.contains(&"binary_sensor.front_door"));
         assert!(ids.contains(&"binary_sensor.no_name"));
         assert!(!ids.contains(&"light.kitchen"));
-        // Missing friendly_name falls back to the entity id.
+        // device_class is surfaced when present, None otherwise.
+        let door = sensors
+            .iter()
+            .find(|e| e.entity_id == "binary_sensor.front_door")
+            .unwrap();
+        assert_eq!(door.device_class.as_deref(), Some("door"));
+        // Missing friendly_name falls back to the entity id; missing class is None.
         let no_name = sensors
             .iter()
             .find(|e| e.entity_id == "binary_sensor.no_name")
             .unwrap();
         assert_eq!(no_name.friendly_name, "binary_sensor.no_name");
+        assert_eq!(no_name.device_class, None);
 
         // 'controls' domain set picks light/switch/scene, not binary_sensor.
         let controls = entities_from_states(arr, &["light", "switch", "scene"]);

@@ -7,9 +7,15 @@
 -- a field is empty (DB wins; see get_ha_settings).
 --
 -- camera_ha_links maps a camera to N HA entities, each with a role:
---   'motion'   -> an HA binary_sensor whose state surfaces on the timeline and
---                 (later) can trigger motion-mode recording for that camera.
+--   'motion'   -> a state-change sensor that FEEDS the record/timeline pipeline
+--                 (PIR/occupancy, or a door you want to trigger recording).
+--   'sensor'   -> a status-only read entity shown on the overlay (temp, humidity,
+--                 display-only door). Never triggers recording. Reserved here,
+--                 wired in a later phase.
 --   'actuator' -> an HA light/switch/scene the camera view can control.
+-- device_class is the entity's HA class captured at link time (motion, door,
+-- window, ...), a denormalized snapshot of the operator's intent so glyphs /
+-- the hotspot card don't have to re-query HA (see docs/DECISIONS.md 2026-07-10).
 -- A table (not columns) because a room legitimately has several sensors and
 -- several controls. Queried directly, NOT via v_camera_effective_policy.
 --
@@ -27,12 +33,13 @@ CREATE TABLE IF NOT EXISTS ha_config (
 INSERT INTO ha_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS camera_ha_links (
-    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    camera_id  uuid NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
-    entity_id  text NOT NULL,
-    role       text NOT NULL CHECK (role IN ('motion', 'actuator')),
-    label      text,
-    sort_order integer NOT NULL DEFAULT 0,
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    camera_id    uuid NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+    entity_id    text NOT NULL,
+    role         text NOT NULL CHECK (role IN ('motion', 'sensor', 'actuator')),
+    device_class text,
+    label        text,
+    sort_order   integer NOT NULL DEFAULT 0,
     UNIQUE (camera_id, entity_id, role)
 );
 

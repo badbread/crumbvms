@@ -124,9 +124,13 @@ pub struct CameraHaLink {
     pub camera_id: uuid::Uuid,
     /// HA entity id, e.g. `binary_sensor.front_door` or `light.living_room`.
     pub entity_id: String,
-    /// `"motion"` (a binary_sensor that surfaces / can trigger recording) or
-    /// `"actuator"` (a light/switch/scene the camera view can control).
+    /// `"motion"` (feeds recording/timeline), `"sensor"` (status-only overlay,
+    /// wired in a later phase), or `"actuator"` (light/switch/scene control).
     pub role: String,
+    /// HA `device_class` captured at link time (`motion`, `door`, `window`, ...),
+    /// a snapshot of intent used to pick the glyph without re-querying HA. May be
+    /// `None` for entities that report no class.
+    pub device_class: Option<String>,
     /// Optional button/label caption (defaults to the HA friendly name in the UI).
     pub label: Option<String>,
     /// Display order within the camera.

@@ -1495,6 +1495,7 @@ fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
         camera_id: row.get("camera_id"),
         entity_id: row.get("entity_id"),
         role: row.get("role"),
+        device_class: row.get("device_class"),
         label: row.get("label"),
         sort_order: row.get("sort_order"),
     }
@@ -1509,7 +1510,7 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
     let client = get_conn(pool).await?;
     let rows = client
         .query(
-            "SELECT id, camera_id, entity_id, role, label, sort_order
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order
              FROM camera_ha_links WHERE camera_id = $1
              ORDER BY sort_order, entity_id",
             &[&camera_id],
@@ -1521,7 +1522,8 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
 
 /// Replace the full set of a camera's HA links (delete-then-insert in one
 /// transaction) and bump `ha_config.version` so consumers hot-reload. Each input
-/// link is `(entity_id, role, label, sort_order)`; `id` is server-assigned.
+/// link is `(entity_id, role, device_class, label, sort_order)`; `id` is
+/// server-assigned.
 ///
 /// # Errors
 ///
@@ -1529,7 +1531,7 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
 pub async fn replace_camera_ha_links(
     pool: &Pool,
     camera_id: Uuid,
-    links: &[(String, String, Option<String>, i32)],
+    links: &[(String, String, Option<String>, Option<String>, i32)],
 ) -> Result<Vec<CameraHaLink>> {
     let mut client = get_conn(pool).await?;
     let tx = client
@@ -1542,11 +1544,11 @@ pub async fn replace_camera_ha_links(
     )
     .await
     .context("replace_camera_ha_links: delete")?;
-    for (entity_id, role, label, sort_order) in links {
+    for (entity_id, role, device_class, label, sort_order) in links {
         tx.execute(
-            "INSERT INTO camera_ha_links (camera_id, entity_id, role, label, sort_order)
-             VALUES ($1, $2, $3, $4, $5)",
-            &[&camera_id, entity_id, role, label, sort_order],
+            "INSERT INTO camera_ha_links (camera_id, entity_id, role, device_class, label, sort_order)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&camera_id, entity_id, role, device_class, label, sort_order],
         )
         .await
         .context("replace_camera_ha_links: insert")?;
