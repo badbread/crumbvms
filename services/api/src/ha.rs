@@ -327,7 +327,7 @@ async fn put_links(
             ));
         }
     }
-    let tuples: Vec<(String, String, Option<String>, Option<String>, i32)> = body
+    let tuples: Vec<db::HaLinkInsert> = body
         .links
         .into_iter()
         .map(|l| (l.entity_id, l.role, l.device_class, l.label, l.sort_order))

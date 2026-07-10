@@ -1520,10 +1520,12 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
     Ok(rows.iter().map(ha_link_from_row).collect())
 }
 
+/// One camera↔HA link to persist: `(entity_id, role, device_class, label,
+/// sort_order)`. `id` is server-assigned.
+pub type HaLinkInsert = (String, String, Option<String>, Option<String>, i32);
+
 /// Replace the full set of a camera's HA links (delete-then-insert in one
-/// transaction) and bump `ha_config.version` so consumers hot-reload. Each input
-/// link is `(entity_id, role, device_class, label, sort_order)`; `id` is
-/// server-assigned.
+/// transaction) and bump `ha_config.version` so consumers hot-reload.
 ///
 /// # Errors
 ///
@@ -1531,7 +1533,7 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
 pub async fn replace_camera_ha_links(
     pool: &Pool,
     camera_id: Uuid,
-    links: &[(String, String, Option<String>, Option<String>, i32)],
+    links: &[HaLinkInsert],
 ) -> Result<Vec<CameraHaLink>> {
     let mut client = get_conn(pool).await?;
     let tx = client
