@@ -5565,8 +5565,8 @@ async function loadMotionCacheGauge() {
 async function renderDetectionClips() {
   selKind = 'detection-root'; selId = null;
   $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('integration',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Detection &amp; clips</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
-  let c, s;
-  try { [c, s] = await Promise.all([api('/config/frigate'), api('/config/server')]); }
+  let c, s, ha;
+  try { [c, s, ha] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha')]); }
   catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
   // Stash the full server settings so saveDetectionServer() can send a COMPLETE
   // /config/server body, that PUT is a whole-row replace with required Crumb
@@ -5620,6 +5620,26 @@ async function renderDetectionClips() {
       </div>
       <div class="card-hint" style="margin-top:4px">Saving Frigate applies immediately, the recorder and API reconnect MQTT within ~15&nbsp;s, no restart.</div>
       <div id="fr-msg" class="form-msg"></div>
+    </div>
+
+    <!-- Home Assistant integration (ha_config): optional, off by default. -->
+    <div class="rp-section-head" style="margin-top:22px">
+      <div class="policy-section-title" style="margin-bottom:0">Home Assistant</div>
+      <button class="primary sm" onclick="saveHa()">Save</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Optional. Links your Home Assistant motion/door sensors and lights to cameras (from the camera editor). Use a token from a <b>non-admin</b> HA user: in Home Assistant add a user under Settings, People, then open that user's profile and create a Long-Lived Access Token.</div>
+      <label class="chk"><input type="checkbox" id="ha-enabled" ${ha.enabled?'checked':''}/> Enable Home Assistant integration</label>
+      <div class="grid2" style="margin-top:10px">
+        <div><label class="field-label" style="margin-top:0">Base URL</label><input id="ha-url" class="mono" value="${esc(ha.base_url)}" placeholder="http://homeassistant.local:8123" /></div>
+        <div><label class="field-label" style="margin-top:0">Long-lived access token</label><input id="ha-token" type="password" autocomplete="new-password" placeholder="${ha.has_token?'•••••••• (unchanged)':'(none set)'}" /></div>
+      </div>
+      <div style="margin-top:10px">
+        <button class="ghost sm" onclick="testHa()">Test connection</button>
+        <span id="ha-test" class="srv-note" style="margin-left:8px"></span>
+      </div>
+      <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection).</div>
+      <div id="ha-msg" class="form-msg"></div>
     </div>
 
     <!-- Frigate stream address bases (external go2rtc), writes server_settings. -->
@@ -5764,6 +5784,30 @@ async function saveDetectionServer() {
     // the decode truth so the operator watches requested → active converge.
     pollDecodeStatus();
   } catch (e) { setMsg('srv-frigate-msg', e.message, 'err'); }
+}
+/* ── Home Assistant integration config (ha_config) ── */
+async function saveHa() {
+  setMsg('ha-msg', '');
+  const body = { enabled: $('ha-enabled').checked, base_url: $('ha-url').value.trim() };
+  const tok = $('ha-token').value;
+  if (tok) body.token = tok;               // write-only: only sent when the user types one
+  if (body.enabled && !body.base_url) { setMsg('ha-msg', 'Base URL is required when enabled.', 'err'); return; }
+  try {
+    const res = await api('/config/ha', { method: 'PUT', body: JSON.stringify(body) });
+    $('ha-token').value = '';
+    $('ha-token').placeholder = res && res.has_token ? '•••••••• (unchanged)' : '(none set)';
+    toast('Home Assistant settings saved.');
+  } catch (e) { setMsg('ha-msg', e.message, 'err'); }
+}
+async function testHa() {
+  const el = $('ha-test');
+  if (el) { el.textContent = 'Testing…'; el.style.color = 'var(--dim2)'; }
+  try {
+    await api('/config/ha/test', { method: 'POST' });
+    if (el) { el.textContent = 'Connected'; el.style.color = 'var(--ok)'; }
+  } catch (e) {
+    if (el) { el.textContent = (e && e.message) || 'Failed'; el.style.color = 'var(--danger)'; }
+  }
 }
 /* ── Frigate URL-base test (POST /config/frigate/test-http) ──────────────────
    Server-side probe of the go2rtc REST base + Frigate HTTP API base (the
