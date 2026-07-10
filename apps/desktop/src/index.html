@@ -426,6 +426,36 @@
                     </div>
                   </div>
                 </div>
+                <!-- Update-available notice (issue #7): the signal comes from THIS
+                     server's GET /updates/latest (server-mediated, never GitHub
+                     directly); version compare against getVersion() is local.
+                     enabled:false or a 404 (old/disabled server) shows nothing. -->
+                <div class="srv-panel">
+                  <div class="srv-panel-header">
+                    <span class="srv-panel-title">About</span>
+                    <button id="srv-update-check-btn" type="button" class="pb-btn hidden">Check now</button>
+                  </div>
+                  <div class="srv-panel-body">
+                    <div class="srv-kv"><span class="srv-kv-k">Version</span><span class="srv-kv-v" id="srv-app-version">,</span></div>
+                    <!-- Always-present update status field: shown whenever the server reports
+                         the check enabled. Opening this panel triggers a fresh (non-forced)
+                         check so the field is never stale. Hidden when disabled/404. -->
+                    <div class="srv-kv hidden" id="srv-update-field-row">
+                      <span class="srv-kv-k">Updates</span>
+                      <span class="srv-kv-v srv-update-field">
+                        <span id="srv-update-field-text"></span>
+                        <a id="srv-update-field-link" class="srv-update-link hidden" href="#">Release notes</a>
+                      </span>
+                    </div>
+                    <!-- Dismissible proactive banner: only while an update is available and
+                         this version hasn't been dismissed. Fed by the every-launch check. -->
+                    <div id="srv-update-banner" class="srv-update-banner hidden">
+                      <span id="srv-update-text" class="srv-update-text"></span>
+                      <a id="srv-update-link" class="srv-update-link hidden" href="#">Release notes</a>
+                      <button id="srv-update-dismiss-btn" type="button" class="pb-btn srv-update-dismiss-btn">Dismiss</button>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <!-- ════════ SERVER ════════ (console link + read-only health + per-camera storage + motion tuning) -->
