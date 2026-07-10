@@ -4958,13 +4958,14 @@ function renderCamMotionTab(c) {
       <!-- col 1: detection source + algorithm + "currently loaded" infobox -->
       <div class="policy-section" style="margin-top:0">
         <div class="policy-section-title">Detection source</div>
-        <div class="card-hint" style="margin:-2px 0 10px 2px">How recording is triggered. <b>Pixel analysis</b> runs Crumb's own detector on the sub-stream; <b>Frigate detections</b> records when Frigate's object detector fires (the algorithm is then managed by Frigate).</div>
+        <div class="card-hint" style="margin:-2px 0 10px 2px">How recording is triggered. <b>Pixel analysis</b> runs Crumb's own detector on the sub-stream; <b>Frigate detections</b> records when Frigate's object detector fires (the algorithm is then managed by Frigate); <b>Home Assistant sensors</b> records when this camera's linked HA motion/door sensors fire (linked below).</div>
         <div class="form-grid narrow">
           <label class="fg-label" for="ce-motion-source">Source ${infoHint(MOTION_SOURCE_HINT)}</label>
           <div class="fg-ctl">
             <select id="ce-motion-source" onchange="ceMotionSourceChanged()" style="font-size:13px">
               <option value="pixel" ${(c.motion_source||'pixel')==='pixel'?'selected':''}>Pixel analysis (Crumb)</option>
               <option value="frigate" ${(c.motion_source||'pixel')==='frigate'?'selected':''}>Frigate detections</option>
+              <option value="ha" ${(c.motion_source||'pixel')==='ha'?'selected':''}>Home Assistant sensors</option>
             </select>
           </div>
         </div>
@@ -5067,6 +5068,8 @@ function ceRenderDetectorBox(c) {
   let loaded;
   if (savedSrc === 'frigate') {
     loaded = 'Frigate object detections';
+  } else if (savedSrc === 'ha') {
+    loaded = 'Home Assistant sensors';
   } else {
     loaded = `Pixel analysis, ${motionAlgoLabel(savedAlgo)}`;
   }
@@ -6565,6 +6568,9 @@ function ceMotionSourceChanged() {
   if (src === 'frigate') {
     if (wrap) wrap.classList.add('hidden');
     if (help) help.innerHTML = 'Recording is triggered by Frigate object detections, the pixel algorithm is managed by Frigate and not used.';
+  } else if (src === 'ha') {
+    if (wrap) wrap.classList.add('hidden');
+    if (help) help.innerHTML = 'Recording is triggered by this camera\'s linked Home Assistant motion/door sensors (set them below under <b>Home Assistant</b>). No local decode runs. Falls back to pixel analysis if Home Assistant is disabled or no motion-role sensors are linked.';
   } else {
     if (wrap) wrap.classList.remove('hidden');
     if (help) help.innerHTML = motionAlgoHelp($('ce-motion-algorithm') ? $('ce-motion-algorithm').value : 'census');
