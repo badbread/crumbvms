@@ -392,7 +392,7 @@ async fn imaging_command(
 
 /// Resolve a camera's ONVIF connection config: DB columns are authoritative, with
 /// the legacy `ONVIF_CONFIG` env map as a fallback for pre-DB-column installs.
-fn resolve_onvif_config(
+pub(crate) fn resolve_onvif_config(
     state: &AppState,
     camera: &crumb_common::types::Camera,
 ) -> Result<OnvifCameraConfig, ApiError> {
@@ -447,6 +447,35 @@ fn resolve_onvif_config(
         user,
         password,
     })
+}
+
+/// Fetch ONVIF device identity (manufacturer / model / firmware) using the same
+/// per-camera config resolution as PTZ. Best-effort: each field degrades to
+/// `None` when the camera doesn't report it. Used by `POST /cameras/:id/identify`.
+pub(crate) async fn onvif_device_info(
+    cfg: &OnvifCameraConfig,
+) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
+    let device_url: Url =
+        format!("http://{}:{}/onvif/device_service", cfg.host, cfg.port).parse()?;
+    let creds = Credentials {
+        username: cfg.user.clone(),
+        password: cfg.password.clone(),
+    };
+    let device_client = ClientBuilder::new(&device_url)
+        .credentials(Some(creds))
+        .auth_type(AuthType::Any)
+        .build();
+    let info =
+        schema::devicemgmt::get_device_information(&device_client, &Default::default()).await?;
+    let ne = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_owned())
+    };
+    Ok((
+        ne(&info.manufacturer),
+        ne(&info.model),
+        ne(&info.firmware_version),
+    ))
 }
 
 /// Build an ONVIF imaging client + resolve the video-source token (required by all

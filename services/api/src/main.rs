@@ -72,6 +72,7 @@ mod alerts;
 mod auth;
 mod auth_mw;
 mod bookmarks;
+mod camera_compat;
 mod cameras;
 mod channel_notify;
 mod clips;
@@ -444,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(auth::media_token_routes())
         .nest("/config", config_routes::routes())
         .merge(cameras::json_routes())
+        .merge(camera_compat::routes())
         .merge(views::routes())
         .merge(bookmarks::routes())
         .merge(timeline::routes())
