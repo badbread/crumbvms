@@ -37,7 +37,11 @@ final class PlaybackViewModel: ObservableObject {
     @Published var detectionEvents: [DetectionEvent] = []
 
     let container: AppContainer
-    private var filmstrip: [FilmstripFrame] = []
+    /// Filmstrip frames with their `ts` PARSED ONCE to epoch-ms. `onScrub` runs a
+    /// nearest-frame lookup on every drag tick; parsing the ISO8601 strings per
+    /// tick over the whole ±1h window (~1800 frames) janked the scrub (issue #28).
+    /// Parsed on load instead — same idea as the timeline's M5 span precompute.
+    private var filmstrip: [(ms: Int64, url: String)] = []
     private var pendingSeedMs: Int64
 
     private var seekTask: Task<Void, Never>?
@@ -370,7 +374,7 @@ final class PlaybackViewModel: ObservableObject {
 
     func onScrub(_ tsMs: Int64) {
         playheadMs = tsMs
-        if let nearest = filmstrip.min(by: { abs(parseMs($0.ts) - tsMs) < abs(parseMs($1.ts) - tsMs) }) {
+        if let nearest = filmstrip.min(by: { abs($0.ms - tsMs) < abs($1.ms - tsMs) }) {
             resolveScrubFrameURL(nearest.url)
         }
         loadFilmstrip(tsMs)
@@ -427,8 +431,8 @@ final class PlaybackViewModel: ObservableObject {
                 width: MediaUrls.scrubThumbWidth
             ).frames {
                 guard !Task.isCancelled else { return }
-                filmstrip = frames
-                if scrubbing, let nearest = frames.min(by: { abs(parseMs($0.ts) - playheadMs) < abs(parseMs($1.ts) - playheadMs) }) {
+                filmstrip = frames.map { (self.parseMs($0.ts), $0.url) }
+                if scrubbing, let nearest = filmstrip.min(by: { abs($0.ms - playheadMs) < abs($1.ms - playheadMs) }) {
                     resolveScrubFrameURL(nearest.url)
                 }
             }
