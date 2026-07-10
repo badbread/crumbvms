@@ -40,6 +40,7 @@ const sidebars = {
         'cameras/adding-a-camera',
         'cameras/go2rtc-model',
         'cameras/onvif-ptz',
+        'cameras/compatibility',
       ],
     },
     {

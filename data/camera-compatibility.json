@@ -1,0 +1,58 @@
+{
+  "_readme": "Source of truth for the Crumb camera compatibility database. Edit this file, then run `node scripts/gen-camera-compat.mjs` to regenerate the published page at docs-site/docs/cameras/compatibility.md. Add a camera by opening a pull request. This data is human-curated and contributed by PR only: Crumb never auto-collects it (no telemetry, no phone-home). See data/README.md for the field schema.",
+  "status_legend": {
+    "yes": "Works",
+    "partial": "Works with a caveat (see the quirk notes)",
+    "no": "Does not work",
+    "unknown": "Not tested"
+  },
+  "cameras": [
+    {
+      "make": "Uniview",
+      "model": "",
+      "aka": ["Uniview LPR / ANPR camera"],
+      "category": "LPR / ANPR",
+      "streams": {
+        "main": {
+          "codec": "H265",
+          "notes": "Full-range (yuvj420p), RTP aggregation-packet packetization, and a 'PPS id out of range' bitstream quirk. Benign to ffmpeg (server ingest, recording, desktop, and web are unaffected); rejected by strict RTSP HEVC readers."
+        },
+        "sub": {
+          "codec": "H264",
+          "notes": "Plays everywhere."
+        }
+      },
+      "support": {
+        "recording": "yes",
+        "desktop_live": "yes",
+        "web_live": "yes",
+        "android_live": "partial",
+        "ios_live": "unknown",
+        "playback": "yes",
+        "onvif": "yes",
+        "ptz": "unknown"
+      },
+      "quirks": [
+        {
+          "summary": "Android fullscreen HD live falls back to SD",
+          "affects": ["android"],
+          "detail": "The H265 main uses RTP aggregation packets plus a 'PPS id out of range' bitstream quirk that Android's RTSP HEVC path (Media3/ExoPlayer) cannot handle, so fullscreen live silently drops to the H264 sub and shows an 'SD' badge. It is specific to this camera's stream, not to H265 in general: clean 4K H265 mains from other cameras play full HD on the same phone. Server ingest, recording, desktop, and web are all unaffected because ffmpeg tolerates the quirk. iOS is untested."
+        }
+      ],
+      "recommended_settings": [
+        "For phone HD live: set the Main stream codec to H264 in the camera web UI (Setup > Video > Encoding).",
+        "Leave the Sub stream on H264 (the default).",
+        "Keep the keyframe (I-frame) interval near 1 second (the default) so the stream starts quickly."
+      ],
+      "tested": {
+        "by": "badbread",
+        "date": "2026-07-10",
+        "method": "ffprobe on the go2rtc restream plus on-device Android playback"
+      },
+      "references": [
+        "https://github.com/androidx/media/issues/1008",
+        "https://github.com/google/ExoPlayer/issues/11089"
+      ]
+    }
+  ]
+}

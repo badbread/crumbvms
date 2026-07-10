@@ -8,6 +8,72 @@ revisit.
 
 ---
 
+## 2026-07-10, Camera compatibility database: JSON source, generated docs, PR-curated (and the ratified in-app identify/contribute direction)
+
+**Context.** Cameras vary in ways Crumb can't fully paper over (codec quirks,
+firmware bitstream oddities, ONVIF gaps). The first concrete case: a Uniview LPR
+whose H265 main uses RTP aggregation packets plus a `PPS id out of range`
+bitstream quirk that Android's Media3 RTSP HEVC path can't decode, so phone
+fullscreen live silently drops to the H264 sub. ffprobe on the go2rtc restream
+confirmed it is specific to that stream (clean 4K H265 mains from other cameras
+play full HD on the same phone). That is exactly the kind of hard-won, per-model
+knowledge a self-hosted VMS community should pool, the way iSpy/Agent DVR and
+Frigate do.
+
+**Decision (built now).** A community-curated **camera compatibility database**:
+- `data/camera-compatibility.json` is the single source of truth (schema in
+  `data/README.md`).
+- `scripts/gen-camera-compat.mjs` (zero-dependency, Node built-ins only, same
+  ethos as `sync-arch-docs.mjs`) renders it into
+  `docs-site/docs/cameras/compatibility.md`, which is **gitignored and
+  regenerated on every build** (local, CI `docs.yml`, and the Docker image
+  build) so it cannot drift from the data.
+- Contributions are **by pull request only**. Crumb never auto-collects camera
+  data: no telemetry, no phone-home (project direction).
+
+**JSON, not YAML.** JSON parses with Node built-ins (keeps the generator
+zero-dependency, honoring the docs-site CI convention) and is directly readable
+by the Rust backend (`serde_json`) for the future in-app hint below, so the same
+one file serves docs and app. Rejected: YAML (would add a parser dependency and
+isn't a native Rust read); a hand-maintained markdown table (drifts, no
+machine-readable form).
+
+**Ratified direction (NOT built yet, tracked as a feature).** Bundle the JSON in
+the server image and, in the admin console:
+1. **Identify** the operator's cameras, primarily via ONVIF
+   `GetDeviceInformation` (Manufacturer/Model/Firmware; the proven approach used
+   by Scrypted and Home Assistant), with an optional **stream fingerprint**
+   (codec/profile/full-range/packetization signature, e.g. the LPR's own
+   full-range + `PPS out of range` signature) as a secondary signal. Crumb does
+   not store make/model today, so capturing it is part of the feature.
+2. If matched, surface **"camera identified" + the known quirks and recommended
+   settings** inline.
+3. If unmatched, offer a **user-initiated "contribute this camera" button that
+   opens a pre-filled GitHub issue in the operator's own browser** (detected
+   make/model/codec/fingerprint + their optional notes), which they review and
+   submit under their own account.
+
+**Rejected (hard line): the server auto-submitting entries to the repo.** It
+would be outbound data to a third party on the server's own initiative (the
+phone-home the project forbids), would require a write credential baked into an
+open-source binary (golden rule 1: no hardcoded secrets, and it would be
+trivially extracted and abused), and would let unvetted content flow into the
+repo with no maintainer gate. The browser-redirect-to-prefilled-issue pattern
+gives the same one-click ease with zero server egress, no bundled secret, and a
+human PR review, so it is the only sanctioned shape.
+
+**Revisit triggers:**
+- The compatibility corpus grows large enough that a flat JSON file is unwieldy
+  (split by vendor, or move to per-entry files with a merge step).
+- A contributor pattern emerges where the pre-filled-issue flow is too much
+  friction and a **self-hosted, opt-in** submission target (never a default,
+  never phone-home) is genuinely wanted, revisit *how*, not *whether*, egress
+  happens.
+- ONVIF identification proves unreliable across enough models that the stream
+  fingerprint has to become the primary matcher.
+
+---
+
 ## 2026-07-09, Update check: re-check every launch + always-present About field (stale-state fix)
 
 **Problem.** The first client cut of #7 checked once per client and throttled
