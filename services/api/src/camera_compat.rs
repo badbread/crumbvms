@@ -172,8 +172,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 
 impl CameraMatch {
     fn make_hit(&self, make_n: &str) -> bool {
-        normalize(&self.make) == make_n
-            || self.make_aliases.iter().any(|a| normalize(a) == make_n)
+        normalize(&self.make) == make_n || self.make_aliases.iter().any(|a| normalize(a) == make_n)
     }
     fn model_hit(&self, model_n: &str) -> bool {
         if model_n.is_empty() {
@@ -242,9 +241,8 @@ pub fn contribute_url(make: Option<&str>, model: Option<&str>, firmware: Option<
         }
         out
     }
-    let mut url = String::from(
-        "https://github.com/badbread/crumbvms/issues/new?template=camera-report.yml",
-    );
+    let mut url =
+        String::from("https://github.com/badbread/crumbvms/issues/new?template=camera-report.yml");
     if let Some(v) = make.filter(|s| !s.is_empty()) {
         url.push_str(&format!("&make={}", enc(v)));
     }
