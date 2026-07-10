@@ -57,7 +57,18 @@ struct PlaybackView: View {
                         .padding(8)
                     }
                 }
+                #if os(iOS)
+                // iOS: the video region fills the space between the header and the
+                // transport bar in BOTH orientations. The transport bar pins to
+                // the bottom of the screen (matching Android), the video sits
+                // CENTERED in the region (AVPlayerLayer `resizeAspect`), and
+                // pinch-zoom grows the video into the letterbox bars — because the
+                // zoomable/clipped area is now the full region, not the fitted
+                // 16:9 box (issue #36).
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                #else
                 .frame(maxWidth: .infinity, maxHeight: landscape ? .infinity : nil)
+                #endif
                 .layoutPriority(1)
                 #if os(macOS)
                 macTransportBar
@@ -604,11 +615,19 @@ struct PlaybackView: View {
 private struct VideoSizing: ViewModifier {
     let landscape: Bool
     func body(content: Content) -> some View {
+        #if os(iOS)
+        // iOS: fill in both orientations so the video sits centered within the
+        // region (resizeAspect) and pinch-zoom can expand into the letterbox
+        // bars, matching Android (issue #36). Was 16:9-boxed in portrait, which
+        // top-anchored the video and bounded zoom to the fitted rect.
+        content.frame(maxWidth: .infinity, maxHeight: .infinity)
+        #else
         if landscape {
             content.frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             content.aspectRatio(16.0 / 9.0, contentMode: .fit)
         }
+        #endif
     }
 }
 
