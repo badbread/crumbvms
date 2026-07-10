@@ -92,6 +92,7 @@ mod export_store;
 mod ffprobe;
 mod filmstrip;
 mod go2rtc;
+mod ha;
 mod metrics;
 mod notifications;
 mod playback;
@@ -446,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/config", config_routes::routes())
         .merge(cameras::json_routes())
         .merge(camera_compat::routes())
+        .merge(ha::routes())
         .merge(views::routes())
         .merge(bookmarks::routes())
         .merge(timeline::routes())

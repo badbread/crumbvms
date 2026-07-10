@@ -97,6 +97,42 @@ pub struct FrigateSettings {
     pub version: i64,
 }
 
+// ─── ha_config / camera_ha_links ─────────────────────────────────────────────
+
+/// Singleton Home Assistant connection settings (`ha_config`, migration 0048).
+/// One base URL + a long-lived access token (write-only — never returned to a
+/// client) + an enable flag + a monotonic `version` (bumped on edit so future
+/// consumers hot-reload). `base_url`/`token` fall back to `HA_BASE_URL`/`HA_TOKEN`
+/// env when the DB fields are empty (DB wins).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaSettings {
+    /// Master switch. When false the integration is dormant regardless of URL.
+    pub enabled: bool,
+    /// HA base URL, e.g. `http://homeassistant.local:8123`. Empty ⇒ disabled.
+    pub base_url: String,
+    /// Long-lived access token (stored as-is; the API never returns it to
+    /// clients — the admin DTO exposes only whether one is set).
+    pub token: Option<String>,
+    /// Monotonic version, bumped on every update.
+    pub version: i64,
+}
+
+/// One camera ↔ HA entity link (`camera_ha_links`, migration 0048).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraHaLink {
+    pub id: uuid::Uuid,
+    pub camera_id: uuid::Uuid,
+    /// HA entity id, e.g. `binary_sensor.front_door` or `light.living_room`.
+    pub entity_id: String,
+    /// `"motion"` (a binary_sensor that surfaces / can trigger recording) or
+    /// `"actuator"` (a light/switch/scene the camera view can control).
+    pub role: String,
+    /// Optional button/label caption (defaults to the HA friendly name in the UI).
+    pub label: Option<String>,
+    /// Display order within the camera.
+    pub sort_order: i32,
+}
+
 // ─── recording_policies ──────────────────────────────────────────────────────
 
 /// Strongly-typed mirror of the `mode` column constraint.
