@@ -4564,6 +4564,11 @@ function renderCamInfoTab(c) {
       <div id="ce-compat-contrib"></div>
     </div>
 
+    <div class="policy-section">
+      <div class="policy-section-title">Home Assistant</div>
+      <div id="ce-ha"><div class="card-hint" style="margin:0">Loading Home Assistant links&hellip;</div></div>
+    </div>
+
     <details class="detail-section" id="ce-probe-details">
       <summary>
         <span class="ds-chev">&#x25B6;</span>
@@ -4604,6 +4609,7 @@ function renderCamInfoTab(c) {
   autoProbeCamera(c);
   cePreviewIcon();
   loadCameraCompat(c.id);
+  loadCameraHaLinks(c.id);
 }
 
 /* ── Camera compatibility (issue #48) ──
@@ -4695,6 +4701,106 @@ async function contributeCamera(id) {
 
 function openCompatForm() { if (COMPAT_CONTRIB && COMPAT_CONTRIB.url) window.open(COMPAT_CONTRIB.url, '_blank', 'noopener'); }
 function copyCompatDetails() { if (COMPAT_CONTRIB) copyText(COMPAT_CONTRIB.block); }
+
+/* ── Camera <-> Home Assistant entity links (issue #52, Phase 1) ──
+   Link this camera to HA motion/door sensors (role 'motion') and lights/switches
+   /scenes (role 'actuator'). Edited as a set and saved via PUT .../ha/links. */
+let HA_LINKS = [];        // working set for the open camera
+let HA_CAM_ID = null;
+let HA_ENT_CACHE = {};    // domain -> [{entity_id, friendly_name}], per camera open
+
+async function loadCameraHaLinks(camId) {
+  const el = $('ce-ha'); if (!el) return;
+  HA_CAM_ID = camId;
+  HA_ENT_CACHE = {};
+  try {
+    const [links, cfg] = await Promise.all([
+      api('/cameras/' + camId + '/ha/links'),
+      api('/config/ha').catch(() => ({ enabled: false, base_url: '', has_token: false })),
+    ]);
+    HA_LINKS = links.map(l => ({ entity_id: l.entity_id, role: l.role, label: l.label, sort_order: l.sort_order }));
+    const configured = !!(cfg && cfg.enabled && cfg.base_url && cfg.has_token);
+    renderHaLinks(configured);
+  } catch (e) {
+    el.innerHTML = '<div class="card-hint" style="margin:0">Could not load Home Assistant links.</div>';
+  }
+}
+
+function renderHaLinks(configured) {
+  const el = $('ce-ha'); if (!el) return;
+  if (!configured) {
+    el.innerHTML = '<div class="card-hint" style="margin:0">Configure and enable Home Assistant on the <b>Detection &amp; clips</b> page first, then link this camera\'s sensors and controls here.</div>';
+    return;
+  }
+  const rows = HA_LINKS.map((l, i) => `
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <span class="pill">${l.role === 'motion' ? 'sensor' : 'control'}</span>
+      <span class="mono" style="flex:1;font-size:12px">${esc(l.entity_id)}</span>
+      <button class="ghost sm" onclick="removeHaLink(${i})">Remove</button>
+    </div>`).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
+  el.innerHTML = `
+    <div>${rows}</div>
+    <div style="display:flex;gap:8px;align-items:flex-end;margin-top:10px;flex-wrap:wrap">
+      <div><label class="field-label" style="margin-top:0">Type</label>
+        <select id="ha-add-role" onchange="haLoadEntities()" style="font-size:13px">
+          <option value="motion">Sensor (motion / door)</option>
+          <option value="actuator">Control (light / switch / scene)</option>
+        </select></div>
+      <div style="flex:1;min-width:200px"><label class="field-label" style="margin-top:0">Entity</label>
+        <select id="ha-add-entity" style="font-size:13px;width:100%"><option value="">Loading&hellip;</option></select></div>
+      <button class="ghost sm" onclick="addHaLink()">Add</button>
+      <button class="primary sm" onclick="saveHaLinks()">Save links</button>
+    </div>
+    <div id="ce-ha-msg" class="form-msg"></div>`;
+  haLoadEntities();
+}
+
+async function haLoadEntities() {
+  const roleSel = $('ha-add-role'); const entSel = $('ha-add-entity');
+  if (!roleSel || !entSel) return;
+  const domain = roleSel.value === 'motion' ? 'binary_sensor' : 'controls';
+  const fill = (entities) => {
+    entSel.innerHTML = entities.length
+      ? entities.map(e => `<option value="${esc(e.entity_id)}" data-label="${esc(e.friendly_name)}">${esc(e.friendly_name)} (${esc(e.entity_id)})</option>`).join('')
+      : '<option value="">(none found in Home Assistant)</option>';
+  };
+  if (HA_ENT_CACHE[domain]) { fill(HA_ENT_CACHE[domain]); return; }
+  entSel.innerHTML = '<option value="">Loading&hellip;</option>';
+  try {
+    const entities = await api('/ha/entities?domain=' + domain);
+    HA_ENT_CACHE[domain] = entities;
+    fill(entities);
+  } catch (e) {
+    entSel.innerHTML = `<option value="">(${esc((e && e.message) || 'failed to load')})</option>`;
+  }
+}
+
+function addHaLink() {
+  const roleSel = $('ha-add-role'); const entSel = $('ha-add-entity');
+  if (!roleSel || !entSel) return;
+  const entity_id = entSel.value;
+  if (!entity_id) return;
+  if (HA_LINKS.some(l => l.entity_id === entity_id && l.role === roleSel.value)) return;
+  const opt = entSel.selectedOptions[0];
+  const label = opt ? opt.getAttribute('data-label') : null;
+  HA_LINKS.push({ entity_id, role: roleSel.value, label, sort_order: HA_LINKS.length });
+  renderHaLinks(true);
+}
+
+function removeHaLink(i) {
+  HA_LINKS.splice(i, 1);
+  renderHaLinks(true);
+}
+
+async function saveHaLinks() {
+  const body = { links: HA_LINKS.map((l, i) => ({ entity_id: l.entity_id, role: l.role, label: l.label, sort_order: i })) };
+  try {
+    const saved = await api('/cameras/' + HA_CAM_ID + '/ha/links', { method: 'PUT', body: JSON.stringify(body) });
+    HA_LINKS = saved.map(l => ({ entity_id: l.entity_id, role: l.role, label: l.label, sort_order: l.sort_order }));
+    toast('Home Assistant links saved.');
+    renderHaLinks(true);
+  } catch (e) { setMsg('ce-ha-msg', (e && e.message) || 'Save failed', 'err'); }
+}
 
 /* At-a-glance summary line for the collapsed "Camera info (probed)" section: the
    main stream's resolution / fps / codec if probed, else a hint. */
