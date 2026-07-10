@@ -7,12 +7,15 @@
 #   ./docs-site/         <- a full copy of the repo's docs-site/ directory
 #   ./docs/              <- a copy of the repo's docs/ directory (source
 #                           for the Architecture section whitelist)
-#   ./scripts/sync-arch-docs.mjs  <- copy of the repo's sync script
+#   ./data/              <- a copy of the repo's data/ directory (source
+#                           for the Camera Compatibility page)
+#   ./scripts/sync-arch-docs.mjs     <- copy of the repo's arch sync script
+#   ./scripts/gen-camera-compat.mjs  <- copy of the repo's compat generator
 #
-# i.e. NOT docs-site/ alone as the context — scripts/sync-arch-docs.mjs
-# resolves docs/ and docs-site/docs/architecture/ as siblings of itself
+# i.e. NOT docs-site/ alone as the context — the generator scripts resolve
+# docs/, data/, and docs-site/docs/ as siblings of themselves
 # (repo-root-relative), so this build stage reproduces that same repo-root
-# layout before running it, exactly like CI and local dev do.
+# layout before running them, exactly like CI and local dev do.
 # See docs-site/README.md and the repo's deploy runbook for the exact
 # tar/rsync command that produces this layout on the deploy host.
 
@@ -20,12 +23,15 @@ FROM node:22-alpine AS build
 WORKDIR /repo
 
 COPY docs/ ./docs/
+COPY data/ ./data/
 COPY scripts/sync-arch-docs.mjs ./scripts/sync-arch-docs.mjs
+COPY scripts/gen-camera-compat.mjs ./scripts/gen-camera-compat.mjs
 COPY docs-site/package.json docs-site/package-lock.json ./docs-site/
 RUN npm --prefix docs-site ci
 
 COPY docs-site/ ./docs-site/
 RUN node scripts/sync-arch-docs.mjs
+RUN node scripts/gen-camera-compat.mjs
 RUN npm --prefix docs-site run build
 
 # stage 2: nginx serves the built output

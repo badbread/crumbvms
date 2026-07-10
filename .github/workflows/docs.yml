@@ -18,13 +18,17 @@ on:
     paths:
       - "docs-site/**"
       - "docs/**"
+      - "data/camera-compatibility.json"
       - "scripts/sync-arch-docs.mjs"
+      - "scripts/gen-camera-compat.mjs"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
       - "docs-site/**"
       - "docs/**"
+      - "data/camera-compatibility.json"
       - "scripts/sync-arch-docs.mjs"
+      - "scripts/gen-camera-compat.mjs"
       - ".github/workflows/docs.yml"
 
 concurrency:
@@ -46,6 +50,9 @@ jobs:
 
       - name: Sync architecture docs whitelist
         run: node scripts/sync-arch-docs.mjs
+
+      - name: Generate camera compatibility page
+        run: node scripts/gen-camera-compat.mjs
 
       - name: Install dependencies
         working-directory: docs-site

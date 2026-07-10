@@ -4555,6 +4555,15 @@ function renderCamInfoTab(c) {
       </div>
     </div>
 
+    <div class="policy-section">
+      <div class="rp-section-head">
+        <div class="policy-section-title">Compatibility</div>
+        <button class="ghost sm" onclick="identifyCamera('${c.id}')" ${(c.onvif_host && c.onvif_host.trim()) ? '' : 'disabled title="Add an ONVIF host above, save, then Identify"'}>Identify (ONVIF)</button>
+      </div>
+      <div id="ce-compat"><div class="card-hint" style="margin:0">Checking the compatibility database&hellip;</div></div>
+      <div id="ce-compat-contrib"></div>
+    </div>
+
     <details class="detail-section" id="ce-probe-details">
       <summary>
         <span class="ds-chev">&#x25B6;</span>
@@ -4594,7 +4603,98 @@ function renderCamInfoTab(c) {
   fillRestreamUrls(c.id);
   autoProbeCamera(c);
   cePreviewIcon();
+  loadCameraCompat(c.id);
 }
+
+/* ── Camera compatibility (issue #48) ──
+   Match this camera's stored ONVIF make/model against the bundled
+   compatibility database and render known quirks / recommended settings, plus
+   an "Identify" (ONVIF probe) action and a "Contribute this camera" flow that
+   opens a pre-filled GitHub issue in the operator's own browser. */
+async function loadCameraCompat(id) {
+  const el = $('ce-compat'); if (!el) return;
+  const cc = $('ce-compat-contrib'); if (cc) cc.innerHTML = '';
+  try {
+    const r = await api('/cameras/' + id + '/compat');
+    el.innerHTML = renderCompat(id, r);
+  } catch (e) {
+    el.innerHTML = '<div class="card-hint" style="margin:0">Could not load compatibility info.</div>';
+  }
+}
+
+function renderCompat(id, r) {
+  const contributeBtn = `<button class="ghost sm" onclick="contributeCamera('${esc(id)}')">Contribute this camera</button>`;
+  // No make read yet: prompt to identify.
+  if (!r.make && !r.model) {
+    return `<div class="card-hint" style="margin:0">Not identified yet. Use <b>Identify (ONVIF)</b> to read this camera's make and model, then Crumb checks the compatibility database. Cameras without ONVIF can't be auto-identified.</div>`;
+  }
+  const idLine = `<div style="margin:0 0 6px 0"><b>${esc(r.make || '(unknown make)')}</b> ${esc(r.model || '')}${r.firmware ? ` <span style="color:var(--dim2)">· firmware ${esc(r.firmware)}</span>` : ''}</div>`;
+
+  if (r.level === 'identified' && r.entry) {
+    const e = r.entry;
+    let out = `${idLine}<div class="pill ok" style="margin-bottom:8px">In the compatibility database</div>`;
+    if (e.quirks && e.quirks.length) {
+      out += '<div class="policy-section-title" style="margin-top:6px">Known quirks &amp; fixes</div>';
+      for (const q of e.quirks) {
+        out += `<div style="margin:4px 0 8px 0"><div><b>${esc(q.summary)}</b>${q.affects && q.affects.length ? ` <span style="color:var(--dim2)">(${q.affects.map(esc).join(', ')})</span>` : ''}</div>`;
+        if (q.detail) out += `<div class="card-hint" style="margin:2px 0 0 0">${esc(q.detail)}</div>`;
+        if (q.fix) out += `<div style="margin:2px 0 0 0"><span style="color:var(--ok)">Fix:</span> ${esc(q.fix)}</div>`;
+        out += '</div>';
+      }
+    }
+    if (e.recommended_settings && e.recommended_settings.length) {
+      out += '<div class="policy-section-title" style="margin-top:6px">Recommended settings</div><ul style="margin:4px 0 0 0;padding-left:18px">';
+      for (const s of e.recommended_settings) out += `<li style="margin:2px 0">${esc(s)}</li>`;
+      out += '</ul>';
+    }
+    out += `<div class="card-hint" style="margin-top:8px">Full list at <a href="https://docs.crumbvms.com/cameras/compatibility" target="_blank" rel="noopener">docs.crumbvms.com</a>. Something off? ${contributeBtn}</div>`;
+    return out;
+  }
+
+  if (r.level === 'possible') {
+    return `${idLine}<div class="pill warn" style="margin-bottom:8px">Manufacturer recognized, model not in the database</div><div class="card-hint" style="margin:0">Crumb knows this maker but not this exact model. If it works well or has a quirk worth noting, help the next person: ${contributeBtn}</div>`;
+  }
+
+  // Detected but not in the DB.
+  return `${idLine}<div class="card-hint" style="margin:0 0 8px 0">This camera isn't in the compatibility database yet. If you've got it working (or hit a quirk), consider adding it: ${contributeBtn}</div>`;
+}
+
+async function identifyCamera(id) {
+  const el = $('ce-compat'); if (el) el.innerHTML = '<div class="card-hint" style="margin:0">Probing ONVIF for make/model&hellip;</div>';
+  try {
+    const r = await api('/cameras/' + id + '/identify', { method: 'POST' });
+    if (el) el.innerHTML = renderCompat(id, r);
+    toast('Camera identified' + (r.make ? `: ${r.make} ${r.model || ''}` : ''));
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="card-hint" style="margin:0;color:var(--danger)">Identify failed: ${esc((e && e.message) || 'ONVIF error')}. Check the ONVIF host and credentials above.</div>`;
+  }
+}
+
+// Stashed so the copy/open buttons don't have to encode the payload into attrs.
+let COMPAT_CONTRIB = null;
+
+async function contributeCamera(id) {
+  const host = $('ce-compat-contrib'); if (!host) return;
+  host.innerHTML = '<div class="card-hint" style="margin:8px 0 0 0">Preparing report&hellip;</div>';
+  try {
+    const r = await api('/cameras/' + id + '/compat-report');
+    const lines = ['Make: ' + (r.make || '(unknown)'), 'Model: ' + (r.model || '(unknown)')];
+    if (r.firmware) lines.push('Firmware: ' + r.firmware);
+    COMPAT_CONTRIB = { block: lines.join('\n'), url: r.contribute_url };
+    host.innerHTML = `
+      <div class="card-hint" style="margin:10px 0 6px 0">This opens a pre-filled GitHub issue in your browser, which you review and submit under your own account. Only this leaves your machine (no IPs, credentials, or stream URLs):</div>
+      <pre class="mono" style="background:var(--panel2,#00000022);padding:8px;border-radius:6px;margin:0 0 8px 0;white-space:pre-wrap">${esc(COMPAT_CONTRIB.block)}</pre>
+      <div style="display:flex;gap:8px">
+        <button class="primary sm" onclick="openCompatForm()">Open contribution form</button>
+        <button class="ghost sm" onclick="copyCompatDetails()">Copy details</button>
+      </div>`;
+  } catch (e) {
+    host.innerHTML = `<div class="card-hint" style="margin:8px 0 0 0;color:var(--danger)">Could not prepare the report: ${esc((e && e.message) || 'error')}.</div>`;
+  }
+}
+
+function openCompatForm() { if (COMPAT_CONTRIB && COMPAT_CONTRIB.url) window.open(COMPAT_CONTRIB.url, '_blank', 'noopener'); }
+function copyCompatDetails() { if (COMPAT_CONTRIB) copyText(COMPAT_CONTRIB.block); }
 
 /* At-a-glance summary line for the collapsed "Camera info (probed)" section: the
    main stream's resolution / fps / codec if probed, else a hint. */

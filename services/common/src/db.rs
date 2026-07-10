@@ -6125,6 +6125,49 @@ pub async fn update_camera_clip_source(
     Ok(())
 }
 
+/// Read a camera's stored ONVIF device identity `(make, model, firmware)`; any
+/// field may be `None` (camera never identified, or added by raw RTSP URL with
+/// no ONVIF). See migration 0047 and `services/api/src/camera_compat.rs`.
+pub async fn get_camera_device_info(
+    pool: &Pool,
+    camera_id: Uuid,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT make, model, firmware FROM cameras WHERE id = $1",
+            &[&camera_id],
+        )
+        .await
+        .context("get_camera_device_info")?;
+    Ok(match row {
+        Some(r) => (r.get(0), r.get(1), r.get(2)),
+        None => (None, None, None),
+    })
+}
+
+/// Persist a camera's ONVIF device identity. A `None` field leaves the existing
+/// column unchanged (`COALESCE`), so a partial ONVIF probe never wipes a
+/// previously-known value.
+pub async fn set_camera_device_info(
+    pool: &Pool,
+    camera_id: Uuid,
+    make: Option<&str>,
+    model: Option<&str>,
+    firmware: Option<&str>,
+) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            "UPDATE cameras SET make = COALESCE($2, make), model = COALESCE($3, model), \
+             firmware = COALESCE($4, firmware) WHERE id = $1",
+            &[&camera_id, &make, &model, &firmware],
+        )
+        .await
+        .context("set_camera_device_info")?;
+    Ok(())
+}
+
 /// Server-configurable clip pre-roll in seconds (footage before the event a clip
 /// starts at). Clamped to 0..=9; defaults to 2 when unset/out of range.
 pub async fn get_clip_pre_roll_seconds(pool: &Pool) -> Result<i64> {
@@ -7842,6 +7885,10 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
         (
             "0046_scrub_pregen_settings.sql",
             include_str!("../../../db/migrations/0046_scrub_pregen_settings.sql"),
+        ),
+        (
+            "0047_camera_device_info.sql",
+            include_str!("../../../db/migrations/0047_camera_device_info.sql"),
         ),
     ];
 

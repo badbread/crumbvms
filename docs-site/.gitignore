@@ -16,6 +16,11 @@
 /docs/architecture/recorder-correctness.md
 /docs/architecture/motion-recording.md
 
+# Generated Camera Compatibility page (see scripts/gen-camera-compat.mjs).
+# Rendered from data/camera-compatibility.json at the start of every build
+# (local, CI, docs.yml, Docker) so it can never drift from the source data.
+/docs/cameras/compatibility.md
+
 # Misc
 .DS_Store
 .env.local

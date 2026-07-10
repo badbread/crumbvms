@@ -63,6 +63,11 @@ COPY VERSION ./
 # (the workspace build below compiles crumb-common).
 COPY db/migrations ./db/migrations
 
+# The API embeds the camera-compatibility database at compile time via
+# include_str!("../../../data/camera-compatibility.json") (services/api/src/
+# camera_compat.rs); the file must exist in the build context.
+COPY data ./data
+
 # Touch source files so cargo detects the change vs the stub build above.
 RUN touch services/common/src/lib.rs \
           services/recorder/src/main.rs \
