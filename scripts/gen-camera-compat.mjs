@@ -70,8 +70,11 @@ function headlineQuirk(cam) {
 }
 
 function renderCameraDetail(cam) {
+  // Rely on Docusaurus's auto-generated heading slug (github-slugger) rather than
+  // an explicit `{#id}`, which MDX v3 tries to parse as a JS expression and
+  // rejects. `anchorId` mirrors that slug so the summary-table links still land.
   const lines = [];
-  lines.push(`## ${safe(title(cam))} {#${anchorId(cam)}}`);
+  lines.push(`## ${safe(title(cam))}`);
   lines.push('');
   const meta = [];
   if (cam.category) meta.push(`**Type:** ${safe(cam.category)}`);
