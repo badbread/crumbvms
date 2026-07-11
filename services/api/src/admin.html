@@ -4630,9 +4630,10 @@ async function loadCameraCompat(id) {
 
 function renderCompat(id, r) {
   const contributeBtn = `<button class="ghost sm" onclick="contributeCamera('${esc(id)}')">Contribute this camera</button>`;
+  const manual = manualDeviceInfoBlock(id, r);
   // No make read yet: prompt to identify.
   if (!r.make && !r.model) {
-    return `<div class="card-hint" style="margin:0">Not identified yet. Use <b>Identify (ONVIF)</b> to read this camera's make and model, then Crumb checks the compatibility database. Cameras without ONVIF can't be auto-identified.</div>`;
+    return `<div class="card-hint" style="margin:0">Not identified yet. Use <b>Identify (ONVIF)</b> to read this camera's make and model, then Crumb checks the compatibility database. Cameras without ONVIF can be set manually below.</div>` + manual;
   }
   const idLine = `<div style="margin:0 0 6px 0"><b>${esc(r.make || '(unknown make)')}</b> ${esc(r.model || '')}${r.firmware ? ` <span style="color:var(--dim2)">· firmware ${esc(r.firmware)}</span>` : ''}</div>`;
 
@@ -4654,15 +4655,15 @@ function renderCompat(id, r) {
       out += '</ul>';
     }
     out += `<div class="card-hint" style="margin-top:8px">Full list at <a href="https://docs.crumbvms.com/cameras/compatibility" target="_blank" rel="noopener">docs.crumbvms.com</a>. Something off? ${contributeBtn}</div>`;
-    return out;
+    return out + manual;
   }
 
   if (r.level === 'possible') {
-    return `${idLine}<div class="pill warn" style="margin-bottom:8px">Manufacturer recognized, model not in the database</div><div class="card-hint" style="margin:0">Crumb knows this maker but not this exact model. If it works well or has a quirk worth noting, help the next person: ${contributeBtn}</div>`;
+    return `${idLine}<div class="pill warn" style="margin-bottom:8px">Manufacturer recognized, model not in the database</div><div class="card-hint" style="margin:0">Crumb knows this maker but not this exact model. If it works well or has a quirk worth noting, help the next person: ${contributeBtn}</div>` + manual;
   }
 
   // Detected but not in the DB.
-  return `${idLine}<div class="card-hint" style="margin:0 0 8px 0">This camera isn't in the compatibility database yet. If you've got it working (or hit a quirk), consider adding it: ${contributeBtn}</div>`;
+  return `${idLine}<div class="card-hint" style="margin:0 0 8px 0">This camera isn't in the compatibility database yet. If you've got it working (or hit a quirk), consider adding it: ${contributeBtn}</div>` + manual;
 }
 
 async function identifyCamera(id) {
@@ -4701,6 +4702,48 @@ async function contributeCamera(id) {
 
 function openCompatForm() { if (COMPAT_CONTRIB && COMPAT_CONTRIB.url) window.open(COMPAT_CONTRIB.url, '_blank', 'noopener'); }
 function copyCompatDetails() { if (COMPAT_CONTRIB) copyText(COMPAT_CONTRIB.block); }
+
+/* Manual make/model/firmware entry (issue #48): for cameras without ONVIF, or to
+   correct a wrong probe. Prefilled from the current values; saving writes through
+   the camera-edit PUT (/config/cameras/:id) and re-checks the compatibility DB. */
+function manualDeviceInfoBlock(id, r) {
+  const open = (!r.make && !r.model) ? ' open' : '';
+  return `
+    <details class="detail-section" style="margin-top:10px"${open}>
+      <summary>
+        <span class="ds-chev">&#x25B6;</span>
+        <span class="ds-title">Set make/model manually</span>
+      </summary>
+      <div class="ds-body">
+        <div class="card-hint" style="margin:0 0 8px 0">For cameras without ONVIF (or to correct a wrong probe), type the make and model so Crumb can still check the compatibility database. Clear a field to blank it.</div>
+        <div class="form-grid">
+          <label class="fg-label" for="ce-dev-make">Make</label>
+          <div class="fg-ctl"><input id="ce-dev-make" value="${esc(r.make || '')}" placeholder="e.g. Uniview" maxlength="200" /></div>
+          <label class="fg-label" for="ce-dev-model">Model</label>
+          <div class="fg-ctl"><input id="ce-dev-model" value="${esc(r.model || '')}" placeholder="e.g. IPC2124SR3-ADPF28M" maxlength="200" /></div>
+          <label class="fg-label" for="ce-dev-fw">Firmware</label>
+          <div class="fg-ctl"><input id="ce-dev-fw" value="${esc(r.firmware || '')}" placeholder="optional" maxlength="200" /></div>
+        </div>
+        <div style="margin-top:8px"><button class="primary sm" onclick="saveCameraDeviceInfo('${esc(id)}')">Save make/model</button></div>
+      </div>
+    </details>`;
+}
+
+async function saveCameraDeviceInfo(id) {
+  const make = ($('ce-dev-make').value || '').trim();
+  const model = ($('ce-dev-model').value || '').trim();
+  const firmware = ($('ce-dev-fw').value || '').trim();
+  try {
+    // null clears the column (double-option), a string sets it.
+    await api('/config/cameras/' + id, { method: 'PUT', body: JSON.stringify({
+      make: make || null, model: model || null, firmware: firmware || null,
+    }) });
+    toast('Make/model saved');
+    loadCameraCompat(id);
+  } catch (e) {
+    toast((e && e.message) || 'Could not save make/model', 'err', 5000);
+  }
+}
 
 /* ── Camera <-> Home Assistant entity links (issue #52, Phase 1) ──
    Link this camera to HA motion/door sensors (role 'motion') and lights/switches
