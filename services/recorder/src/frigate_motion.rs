@@ -380,10 +380,18 @@ pub(crate) fn emit(motion_tx: &MotionTx, camera_id: Uuid, t: Transition) {
 // ── MQTT loop ─────────────────────────────────────────────────────────────────
 
 /// Run the Frigate motion source for one camera until `cancel` fires or the MQTT
-/// connection drops. Returns `Ok(())` on cancellation and `Err` on a connection
-/// error, so `motion::run`'s back-off loop reconnects exactly as it does for the
-/// pixel-diff loop. On any teardown an in-progress event is closed with a STOP so
-/// `recording.rs` never sees a dangling event.
+/// connection drops. Returns `Ok(())` on cancellation / config-reload and `Err` on
+/// a connection error, so `motion::run`'s back-off loop reconnects exactly as it
+/// does for the pixel-diff loop. On any teardown an in-progress event is closed
+/// with a STOP so `recording.rs` never sees a dangling event.
+///
+/// Reports the source HEALTHY (via `health_tx`) only AFTER the broker's `ConnAck`
+/// confirms a live connection — never optimistically before — so a source that
+/// cannot reach the broker stays unhealthy and the supervisor's fail-open grace
+/// accumulates instead of being reset by a premature "healthy" (issue #61, the
+/// `ha_motion.rs` twin). On any exit the supervisor reports unhealthy, so a
+/// Motion-mode camera fails OPEN.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_frigate_motion_loop(
     camera: &Camera,
     cfg: &FrigateMotionConfig,
@@ -391,6 +399,9 @@ pub async fn run_frigate_motion_loop(
     cancel: &CancellationToken,
     pool: &Pool,
     start_version: i64,
+    health_tx: &crate::MotionHealthTx,
+    alert_gate: &std::sync::Arc<crate::motion::UnhealthyAlertGate>,
+    alert_after_secs: u64,
 ) -> Result<()> {
     let frigate_name = camera.go2rtc_name.clone();
     let topic = format!("{}/events", cfg.mqtt_prefix);
@@ -406,8 +417,6 @@ pub async fn run_frigate_motion_loop(
     let (client, mut event_loop) = AsyncClient::new(opts, 256);
 
     let mut tracker = CameraTracker::default();
-    let mut janitor = tokio::time::interval(TICK);
-    janitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     info!(
         camera_id = %camera.id,
@@ -416,12 +425,54 @@ pub async fn run_frigate_motion_loop(
         "frigate motion: connecting"
     );
 
+    // Drive `event_loop.poll()` in a DEDICATED task, forwarding events over a
+    // channel. Two constraints force this shape:
+    //   1. The 1s STOP-grace janitor must run CONCURRENTLY with event delivery —
+    //      an MQTT poll blocks until the next event, which on a quiet camera can
+    //      be tens of seconds, far longer than the grace — so the janitor cannot
+    //      simply run *between* polls the way `ha_motion.rs` does (its `next_edges`
+    //      is a discrete, bounded poll).
+    //   2. rumqttc 0.24's `poll()` is NOT cancellation-safe. Racing it against the
+    //      janitor in one `select!` (the previous shape) cancelled the in-flight
+    //      poll every tick, which can starve rumqttc's keepalive so a wedged /
+    //      half-open broker never surfaces as an `Err` — the source would report
+    //      healthy forever and the camera would stay motion-gated instead of
+    //      failing OPEN (issue #61). Running the poll to completion in its own task
+    //      (racing ONLY cancellation, at shutdown) lets keepalive detect the wedge
+    //      and return `Err`, which closes the channel below.
+    // The main loop then selects the janitor against channel receipt, both
+    // cancel-safe.
+    let cam_id = camera.id;
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(256);
+    let poll_cancel = cancel.clone();
+    let poll_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = poll_cancel.cancelled() => break,
+                res = event_loop.poll() => match res {
+                    Ok(ev) => {
+                        // Sender error = the main loop is gone (teardown); stop.
+                        if ev_tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // Connection lost / keepalive failed: drop the sender so the
+                        // main loop sees the disconnect and fails the camera OPEN.
+                        warn!(camera_id = %cam_id, error = %e, "frigate motion: MQTT connection error");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut janitor = tokio::time::interval(TICK);
+    janitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let result: Result<()> = loop {
         tokio::select! {
-            () = cancel.cancelled() => {
-                let _ = client.disconnect().await;
-                break Ok(());
-            }
+            () = cancel.cancelled() => break Ok(()),
             _ = janitor.tick() => {
                 if let Some(t) = tracker.tick(Utc::now()) {
                     emit(motion_tx, camera.id, t);
@@ -434,19 +485,33 @@ pub async fn run_frigate_motion_loop(
                     != start_version
                 {
                     info!(camera_id = %camera.id, "frigate config changed; reconnecting");
-                    let _ = client.disconnect().await;
                     break Ok(());
                 }
             }
-            notification = event_loop.poll() => {
-                match notification {
-                    Ok(Event::Incoming(Packet::ConnAck(_))) => {
+            maybe_ev = ev_rx.recv() => {
+                match maybe_ev {
+                    Some(Event::Incoming(Packet::ConnAck(_))) => {
                         info!(camera_id = %camera.id, "frigate motion: MQTT connected, subscribing");
+                        // Broker confirmed live → NOW healthy. Reported here, not
+                        // before the loop: a source that never connects never
+                        // reaches this, so its health stays false and the fail-open
+                        // grace accumulates instead of being reset by a premature
+                        // "healthy" (issue #61). `report_health` dedups.
+                        crate::motion::report_health(
+                            health_tx,
+                            pool,
+                            camera.id,
+                            true,
+                            "frigate MQTT connected",
+                            alert_gate,
+                            alert_after_secs,
+                        )
+                        .await;
                         if let Err(e) = client.subscribe(&topic, QoS::AtLeastOnce).await {
                             warn!(camera_id = %camera.id, error = %e, "frigate motion: subscribe failed");
                         }
                     }
-                    Ok(Event::Incoming(Packet::Publish(publish))) => {
+                    Some(Event::Incoming(Packet::Publish(publish))) => {
                         if let Some(ev) = classify(&publish.payload, cfg.min_score) {
                             if ev.camera == frigate_name {
                                 if let Some(t) = tracker.observe(&ev, Utc::now()) {
@@ -455,17 +520,22 @@ pub async fn run_frigate_motion_loop(
                             }
                         }
                     }
-                    Ok(_) => {} // SubAck, Ping, outgoing, etc.
-                    Err(e) => {
-                        break Err(anyhow!("frigate motion MQTT error: {e}"));
+                    Some(_) => {} // SubAck, PingResp, outgoing, etc.
+                    None => {
+                        // Poll task ended: a connection error (or shutdown). Treat as
+                        // a lost connection → `Err` so the supervisor backs off and
+                        // fails the camera OPEN.
+                        break Err(anyhow!("frigate motion MQTT connection lost"));
                     }
                 }
             }
         }
     };
 
-    // Close any in-progress event so recording.rs doesn't keep it open across a
-    // reconnect (the back-off loop will re-START when objects reappear).
+    // Stop the poll task (drops `event_loop`, closing the connection) and close any
+    // in-progress event so recording.rs doesn't keep it open across a reconnect
+    // (the back-off loop will re-START when objects reappear).
+    poll_task.abort();
     if let Some(t) = tracker.force_stop(Utc::now()) {
         emit(motion_tx, camera.id, t);
     }
