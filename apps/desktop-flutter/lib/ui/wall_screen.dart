@@ -17,6 +17,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
@@ -30,6 +31,7 @@ class WallScreen extends StatefulWidget {
     required this.cameras,
     required this.onLogout,
     this.clientOptions,
+    this.streamPrefs,
     this.view,
   });
 
@@ -37,6 +39,10 @@ class WallScreen extends StatefulWidget {
   final Session session;
   final List<Camera> cameras;
   final VoidCallback onLogout;
+
+  /// Per-camera stream (main/sub) + PTZ-disable prefs. Drives the right-click
+  /// menu on a tile and which stream each pane plays.
+  final StreamPrefsStore? streamPrefs;
 
   /// The applied saved view (its custom layout + slot→camera map). Null → the
   /// default auto-grid of every enabled camera (the "All Cameras" wall).
@@ -200,6 +206,7 @@ class _WallScreenState extends State<WallScreen> {
               session: widget.session,
               camera: _maximized!,
               liveStatus: _liveStatus,
+              streamPrefs: widget.streamPrefs,
               onClose: () => setState(() => _maximized = null),
             ),
         ],
@@ -258,6 +265,7 @@ class _WallScreenState extends State<WallScreen> {
                       session: widget.session,
                       camera: cam,
                       liveStatus: _liveStatus,
+                      streamPrefs: widget.streamPrefs,
                       showInfoBar: showInfoBar,
                       // Custom cells can be any aspect — letterbox, don't crop.
                       fit: BoxFit.contain,
@@ -290,6 +298,7 @@ class _WallScreenState extends State<WallScreen> {
             session: widget.session,
             camera: cam,
             liveStatus: _liveStatus,
+            streamPrefs: widget.streamPrefs,
             showInfoBar: showInfoBar,
             onTap: () => setState(() => _maximized = cam),
           ),
@@ -324,6 +333,7 @@ class _WallTile extends StatefulWidget {
     required this.liveStatus,
     required this.showInfoBar,
     required this.onTap,
+    this.streamPrefs,
     this.fit = BoxFit.cover,
   });
 
@@ -333,6 +343,7 @@ class _WallTile extends StatefulWidget {
   final LiveStatusController liveStatus;
   final bool showInfoBar;
   final VoidCallback onTap;
+  final StreamPrefsStore? streamPrefs;
 
   /// How the video fills its tile. The default auto-grid uses `cover` (tiles
   /// are ~16:9, so no visible crop); custom-view cells can be any aspect, so
@@ -385,13 +396,24 @@ class _WallTileState extends State<_WallTile> {
     _load();
   }
 
+  StreamUrls? _streams;
+
   Future<void> _load() async {
     try {
       final streams = await widget.api.cameraStreams(
         widget.session,
         widget.camera.id,
       );
-      final url = streams.preferredForWall;
+      _streams = streams;
+      // Per-camera main/sub override (right-click menu) wins over the wall
+      // default; falls back to the plain wall preference if no prefs store.
+      final url =
+          widget.streamPrefs?.liveStreamUrl(
+            widget.camera.id,
+            streams,
+            isMaximized: false,
+          ) ??
+          streams.preferredForWall;
       if (url == null) {
         setState(() => _error = 'no stream');
         return;
@@ -449,6 +471,87 @@ class _WallTileState extends State<_WallTile> {
   }
 
   String get _paneId => 'wall:${widget.camera.id}';
+
+  /// Re-open the player with the currently-preferred stream (after a main/sub
+  /// override change from the right-click menu). Re-fetches the URLs so a
+  /// server-side change is picked up too.
+  Future<void> _reloadStream() async {
+    final old = _player;
+    SnapshotRegistry.instance.unregister(_paneId);
+    if (mounted) {
+      setState(() {
+        _player = null;
+        _controller = null;
+        _firstFrame = false;
+        _error = null;
+      });
+    }
+    old?.dispose();
+    await _load();
+  }
+
+  /// Right-click menu: per-camera PTZ-controls toggle + stream main/sub
+  /// override (overriding the global "wall uses sub" setting).
+  Future<void> _showTileMenu(Offset globalPos) async {
+    final prefs = widget.streamPrefs;
+    SnapshotRegistry.instance.setActive(_paneId); // select on right-click
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final eff = prefs?.effectiveFor(widget.camera.id);
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPos & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        if (widget.camera.ptz && prefs != null) ...[
+          PopupMenuItem(
+            value: 'ptz',
+            child: Text(
+              prefs.ptzDisabledFor(widget.camera.id)
+                  ? 'Enable PTZ controls'
+                  : 'Disable PTZ controls',
+            ),
+          ),
+          const PopupMenuDivider(),
+        ],
+        CheckedPopupMenuItem(
+          value: 'main',
+          checked: eff == StreamQuality.main,
+          child: const Text('Main stream'),
+        ),
+        CheckedPopupMenuItem(
+          value: 'sub',
+          checked: eff == StreamQuality.sub,
+          child: const Text('Sub stream'),
+        ),
+        if (prefs?.hasOverride(widget.camera.id) ?? false)
+          const PopupMenuItem(
+            value: 'reset',
+            child: Text('Reset to wall default'),
+          ),
+      ],
+    );
+    if (result == null || !mounted) return;
+    switch (result) {
+      case 'ptz':
+        prefs?.setPtzDisabled(
+          widget.camera.id,
+          !prefs.ptzDisabledFor(widget.camera.id),
+        );
+        setState(() {}); // no reload needed — only affects maximized PTZ UI
+      case 'main':
+        prefs?.setOverride(widget.camera.id, StreamQuality.main);
+        await _reloadStream();
+      case 'sub':
+        prefs?.setOverride(widget.camera.id, StreamQuality.sub);
+        await _reloadStream();
+      case 'reset':
+        prefs?.setOverride(widget.camera.id, null);
+        await _reloadStream();
+    }
+  }
 
   @override
   void dispose() {
@@ -535,9 +638,10 @@ class _WallTileState extends State<_WallTile> {
           },
           child: GestureDetector(
             // Single click selects this pane (snapshot target); double-click
-            // maximizes; drag pans when zoomed.
+            // maximizes; right-click opens the per-tile menu; drag pans.
             onTap: () => SnapshotRegistry.instance.setActive(_paneId),
             onDoubleTap: widget.onTap,
+            onSecondaryTapDown: (d) => _showTileMenu(d.globalPosition),
             onPanUpdate: (d) => _panBy(d.delta, pane),
             child: Stack(
               fit: StackFit.expand,
@@ -656,6 +760,7 @@ class _MaximizedPane extends StatefulWidget {
     required this.camera,
     required this.liveStatus,
     required this.onClose,
+    this.streamPrefs,
   });
 
   final CrumbApi api;
@@ -663,6 +768,7 @@ class _MaximizedPane extends StatefulWidget {
   final Camera camera;
   final LiveStatusController liveStatus;
   final VoidCallback onClose;
+  final StreamPrefsStore? streamPrefs;
 
   @override
   State<_MaximizedPane> createState() => _MaximizedPaneState();
@@ -765,6 +871,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     _offset = Offset.zero;
   });
 
+  /// PTZ usable here: camera supports it AND the operator hasn't disabled PTZ
+  /// controls for this camera via the right-click menu.
+  bool get _ptzEnabled =>
+      widget.camera.ptz &&
+      !(widget.streamPrefs?.ptzDisabledFor(widget.camera.id) ?? false);
+
   // ── PTZ optical zoom via the mouse wheel ────────────────────────────────
   // The wheel is discrete but ONVIF zoom is continuous (move → stop), so each
   // notch starts a zoom in the wheel's direction and a debounced timer sends
@@ -821,7 +933,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           },
                           onPointerSignal: (e) {
                             if (e is PointerScrollEvent) {
-                              if (widget.camera.ptz) {
+                              if (_ptzEnabled) {
                                 // PTZ camera → drive OPTICAL zoom, not digital.
                                 _ptzWheelZoom(e.scrollDelta.dy);
                               } else {
@@ -932,8 +1044,8 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                   ),
                 ),
 
-                // PTZ controls (only for PTZ-capable cameras), bottom-right.
-                if (widget.camera.ptz)
+                // PTZ controls (PTZ-capable cameras with PTZ not disabled).
+                if (_ptzEnabled)
                   Positioned(
                     right: 16,
                     bottom: 16,

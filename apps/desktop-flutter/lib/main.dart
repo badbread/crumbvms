@@ -703,6 +703,8 @@ class _MainShellState extends State<MainShell> {
           // The wall listens to client options so the per-tile header bar
           // (showInfoBar) restyles live when toggled in the Settings panel.
           clientOptions: widget.clientOptions,
+          // Per-camera stream (main/sub) + PTZ-disable prefs (right-click menu).
+          streamPrefs: widget.streamPrefs,
           // The applied saved view (null → default auto-grid of all cameras).
           view: _appliedView,
         );

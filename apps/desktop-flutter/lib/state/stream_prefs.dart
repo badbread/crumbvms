@@ -19,6 +19,7 @@ enum StreamQuality { main, sub }
 
 const String _kStreamPrefKey = 'crumb_stream_pref';
 const String _kWallDefaultSubKey = 'crumb_live_wall_sub';
+const String _kPtzDisabledKey = 'crumb_ptz_disabled';
 
 /// Holds per-camera stream-quality overrides and the wall-wide default
 /// (mirrors `options.liveWallSub`). Also tracks, per session, which cameras'
@@ -26,11 +27,20 @@ const String _kWallDefaultSubKey = 'crumb_live_wall_sub';
 /// `mainUnavailable` set) so a maximized tile falls back to SUB instead of
 /// going black.
 class StreamPrefsStore {
-  StreamPrefsStore._(this._prefs, this._wallDefaultSub, this._overrides);
+  StreamPrefsStore._(
+    this._prefs,
+    this._wallDefaultSub,
+    this._overrides,
+    this._ptzDisabled,
+  );
 
   final SharedPreferences? _prefs;
   bool _wallDefaultSub;
   final Map<String, StreamQuality> _overrides;
+
+  /// Camera ids the operator has hidden PTZ controls for (per-camera, client
+  /// side). Some PTZ-capable cameras don't move well / shouldn't be driven.
+  final Set<String> _ptzDisabled;
 
   /// camIds whose MAIN stream failed to produce a frame when maximized this
   /// session. Cleared implicitly on app restart (never persisted) so a fixed
@@ -61,7 +71,10 @@ class StreamPrefsStore {
         /* corrupt/legacy value — start clean */
       }
     }
-    return StreamPrefsStore._(prefs, wallSub, overrides);
+    final ptzDisabled = <String>{};
+    final rawPtz = prefs?.getStringList(_kPtzDisabledKey);
+    if (rawPtz != null) ptzDisabled.addAll(rawPtz);
+    return StreamPrefsStore._(prefs, wallSub, overrides, ptzDisabled);
   }
 
   /// The DEFAULT wall stream when a camera has no explicit override — sub
@@ -81,6 +94,10 @@ class StreamPrefsStore {
   StreamQuality effectiveFor(String cameraId) =>
       _overrides[cameraId] ?? wallDefault;
 
+  /// Whether this camera has an explicit per-camera stream override (vs. just
+  /// following the wall default).
+  bool hasOverride(String cameraId) => _overrides.containsKey(cameraId);
+
   /// Set (or clear, by passing null) an explicit per-camera override.
   /// (app.js `setStreamPref`.)
   void setOverride(String cameraId, StreamQuality? quality) {
@@ -90,6 +107,27 @@ class StreamPrefsStore {
       _overrides[cameraId] = quality;
     }
     unawaited(_persistOverrides());
+  }
+
+  /// Clear ALL per-camera stream overrides — every camera falls back to the
+  /// wall default. Backs the "reset" action next to the substream setting.
+  void clearAllOverrides() {
+    _overrides.clear();
+    unawaited(_persistOverrides());
+  }
+
+  bool get hasAnyOverride => _overrides.isNotEmpty;
+
+  // ── Per-camera PTZ-controls-disabled ──────────────────────────────────────
+  bool ptzDisabledFor(String cameraId) => _ptzDisabled.contains(cameraId);
+
+  void setPtzDisabled(String cameraId, bool disabled) {
+    if (disabled) {
+      _ptzDisabled.add(cameraId);
+    } else {
+      _ptzDisabled.remove(cameraId);
+    }
+    unawaited(_prefs?.setStringList(_kPtzDisabledKey, _ptzDisabled.toList()));
   }
 
   Future<void> _persistOverrides() async {

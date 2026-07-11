@@ -166,6 +166,30 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
                 ? 'Unavailable — no stream preference store wired up for this screen.'
                 : 'Lower-bandwidth stream for the grid; maximizing a tile can still switch to main below.',
           ),
+          if (widget.streamPrefs != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 8, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Right-click a camera to set its stream individually — that '
+                      'overrides this default for that camera.',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: widget.streamPrefs!.hasAnyOverride
+                        ? () => setState(widget.streamPrefs!.clearAllOverrides)
+                        : null,
+                    child: const Text('Reset'),
+                  ),
+                ],
+              ),
+            ),
           _switchRow(
             value: _o.maximizeMain,
             onChanged: _setMaximizeMain,
