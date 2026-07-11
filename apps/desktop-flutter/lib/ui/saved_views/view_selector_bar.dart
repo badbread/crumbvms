@@ -143,8 +143,8 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
                   icon: const Icon(Icons.dashboard_customize_outlined, size: 15),
                   label: const Text('Config View'),
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFFE8A33D),
-                    side: const BorderSide(color: Color(0x66E8A33D)),
+                    foregroundColor: scheme.primary,
+                    side: BorderSide(color: scheme.primary.withValues(alpha: 0.4)),
                     padding: const EdgeInsets.symmetric(horizontal: 10),
                     minimumSize: const Size(0, 26),
                     textStyle: const TextStyle(
@@ -171,9 +171,9 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
     required VoidCallback onTap,
   }) {
     final scheme = Theme.of(context).colorScheme;
-    // Active chip follows the Live tab accent (amber), matching the old client
-    // where the active view chip uses the current tab's --accent.
-    const accent = Color(0xFFE8A33D);
+    // Active chip follows the app-wide accent (the active tab's colour),
+    // matching the old client where the chip uses the current tab's --accent.
+    final accent = scheme.primary;
     return Padding(
       padding: const EdgeInsets.only(right: 4),
       child: Material(

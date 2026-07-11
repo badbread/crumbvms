@@ -462,13 +462,40 @@ class _WallTileState extends State<_WallTile> {
     // Header-bar mode: a title strip on top, video inset below it (the video is
     // not covered by any floating overlay). Otherwise: video fills the tile with
     // floating badge row + name label composited over it.
-    return Container(
+    final content = Container(
       color: Colors.grey.shade900,
       child: widget.showInfoBar
           ? Column(
               children: [_infoBar(), Expanded(child: _videoArea())],
             )
           : _videoArea(),
+    );
+    // Selected (single-tapped / snapshot-target) tile gets an outline in the
+    // app-wide accent (the active tab's colour).
+    return ValueListenableBuilder<String?>(
+      valueListenable: SnapshotRegistry.instance.activePaneId,
+      builder: (context, activeId, _) {
+        final selected = activeId == _paneId;
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            content,
+            if (selected)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: Theme.of(context).colorScheme.primary,
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
     );
   }
 

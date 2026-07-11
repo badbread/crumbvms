@@ -398,11 +398,28 @@ class _MainShellState extends State<MainShell> {
 
   static const Color _settingsColor = Color(0xFF9AA4B2); // neutral slate
 
+  /// The active tab's accent color, used app-wide (selection outlines, active
+  /// chips, highlights) — mirrors the old client swapping `--accent` per tab.
+  Color get _accentColor => _tabs[_index].$4;
+
   @override
   Widget build(BuildContext context) {
     // Fresh session after an in-place re-auth (the app state rebuilds us via
     // its SessionController listener).
     final session = widget.sessionController.session;
+    // Drive an app-wide accent from the active tab: everything that reads
+    // colorScheme.primary (selected-tile outline, view chips, buttons) follows
+    // the current tab's colour.
+    final base = Theme.of(context);
+    return Theme(
+      data: base.copyWith(
+        colorScheme: base.colorScheme.copyWith(primary: _accentColor),
+      ),
+      child: _buildScaffold(session),
+    );
+  }
+
+  Widget _buildScaffold(Session session) {
     return Scaffold(
       body: ListenableBuilder(
         listenable: widget.fullscreen,
