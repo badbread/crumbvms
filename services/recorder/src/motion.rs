@@ -54,6 +54,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::source_health::{FailOpenGate, SourceHealth, SourceKind, DEFAULT_SOURCE_DOWN_GRACE};
 use crate::{MotionHealthTx, MotionTx};
 
 // ─── tuning constants ─────────────────────────────────────────────────────────
@@ -259,6 +260,10 @@ const CENSUS_TIE_BAND: i16 = 2;
 const BACKOFF_BASE_SECS: u64 = 1;
 /// Maximum back-off cap (seconds).
 const BACKOFF_MAX_SECS: u64 = 30;
+/// How long an *enabled-but-not-yet-configured* source idles before re-reading
+/// its settings (so enabling the integration is picked up without a restart,
+/// without hot-spinning the DB).
+const SOURCE_RECHECK_SECS: u64 = 5;
 
 /// Maximum time to wait for `ffprobe` to return stream geometry before giving
 /// up and either using the fallback height or forcing a reconnect.
@@ -1167,12 +1172,12 @@ async fn report_decode_status(
 /// sustained episode instead of once per elapsed timer, and what makes the
 /// RECOVERED transition clear the pending alert instead of leaving a
 /// dangling timer that pages later on an unrelated episode.
-struct UnhealthyAlertGate {
+pub(crate) struct UnhealthyAlertGate {
     generation: std::sync::atomic::AtomicU64,
 }
 
 impl UnhealthyAlertGate {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             generation: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1202,7 +1207,7 @@ impl UnhealthyAlertGate {
 /// 'just went bad', not 'recovered'" design (a flapping detector still can't
 /// spam two events per flap — recovery never alerts at all).
 #[allow(clippy::too_many_arguments)]
-async fn report_health(
+pub(crate) async fn report_health(
     health_tx: &MotionHealthTx,
     pool: &Pool,
     camera_id: uuid::Uuid,
@@ -1385,211 +1390,447 @@ pub async fn run(
         "motion task started"
     );
 
-    // One hysteresis gate for this camera's entire task lifetime — every
-    // `report_health` call below (both branches, and inside
-    // `run_pixel_diff_loop`) shares it so a transition anywhere retires any
-    // stale alert timer from a previous episode. See [`UnhealthyAlertGate`].
-    let alert_gate = UnhealthyAlertGate::new();
+    // Additive motion-source set (migration 0049): run one supervised loop per
+    // ENABLED source and record on the UNION of their triggers (unioned in
+    // recording.rs's MotionUnion). Per-source health is collapsed into the single
+    // camera fail-open signal the recording task reads by `aggregate_health`.
     let alert_after_secs = config.motion_unhealthy_alert_secs;
+    let camera_id = camera.id;
 
-    // Fail-open safety rail: `report_health` logs the transition exactly once in
-    // each direction (not on every tick) and stamps `system_events` on the
-    // UNHEALTHY transition (the alert-worthy direction — mirrors
-    // `frigate_disconnected`/`recorder_offline`). The task marks itself
-    // unhealthy on EVERY exit path (error, cancel, or "camera has no
-    // sub-stream" / Frigate-not-configured — motion detection is effectively
-    // disabled in all of those), so the recording task never trusts a detector
-    // that isn't actually running.
+    let mut enabled: Vec<SourceKind> = Vec::new();
+    if camera.motion_pixel_enabled {
+        enabled.push(SourceKind::Pixel);
+    }
+    if camera.motion_frigate_enabled {
+        enabled.push(SourceKind::Frigate);
+    }
+    if camera.motion_ha_enabled {
+        enabled.push(SourceKind::Ha);
+    }
+    info!(
+        camera_id = %camera_id,
+        sources = ?enabled.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "motion sources (additive)"
+    );
 
-    // Motion-source selection. The pixel-diff pipeline is the default; a camera
-    // can instead be driven by Frigate's neural object detections (Stage 2 of the
-    // pluggable-motion design). Both produce the same MotionSignal stream, so the
-    // back-off/cancel supervision below is shared.
-    // Frigate broker settings are now DB-backed and read INSIDE the loop, so an
-    // admin edit hot-reloads: the Frigate loop exits on a `frigate_config` version
-    // bump and the supervisor reconnects with the new credentials — no recorder
-    // restart. A Frigate-source camera with Frigate disabled falls back to the
-    // pixel pipeline (the existing safety net).
-    let camera_wants_frigate = crate::frigate_motion::camera_uses_frigate_motion(&camera);
-    if camera_wants_frigate {
-        info!(
-            camera_id = %camera.id,
-            camera_name = %camera.name,
-            "motion source: Frigate MQTT object detections (when configured)"
+    // No source enabled on a Motion-mode camera means no detector at all: the
+    // recording task must fail OPEN (record everything) for the task's whole
+    // lifetime. Publish unhealthy once and idle until cancelled.
+    if enabled.is_empty() {
+        warn!(
+            camera_id = %camera_id,
+            "no motion source enabled; recording is fail-open (records everything) \
+             until a source is enabled"
         );
-    } else {
-        info!(
-            camera_id = %camera.id,
-            algorithm = MotionAlgorithm::from_str_lenient(&camera.motion_algorithm).as_str(),
-            "motion source: local pixel analysis"
-        );
-        if camera.onvif_motion {
-            // ONVIF seam — a future implementer short-circuits here before pixel-diff.
-            warn!(
-                camera_id = %camera.id,
-                "ONVIF motion requested but not yet implemented; \
-                 falling back to pixel-diff"
-            );
-        }
+        let gate = UnhealthyAlertGate::new();
+        report_health(
+            &health_tx,
+            &pool,
+            camera_id,
+            false,
+            "no motion source enabled",
+            &gate,
+            alert_after_secs,
+        )
+        .await;
+        cancel.cancelled().await;
+        info!(camera_id = %camera_id, "motion task exiting");
+        return;
     }
 
-    let mut backoff_secs: u64 = BACKOFF_BASE_SECS;
+    // One supervised loop per enabled source. Each publishes to its OWN per-source
+    // health watch (so a per-source alert fires by name) and feeds the shared
+    // motion channel; the aggregator collapses the watches into camera health.
+    let mut supervisors = tokio::task::JoinSet::new();
+    let mut pixel_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+    let mut frigate_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+    let mut ha_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+
+    for kind in enabled.iter().copied() {
+        // Start unhealthy: a source is not trusted until its loop proves healthy.
+        let (src_tx, src_rx) = tokio::sync::watch::channel(false);
+        match kind {
+            SourceKind::Pixel => pixel_rx = Some(src_rx),
+            SourceKind::Frigate => frigate_rx = Some(src_rx),
+            SourceKind::Ha => ha_rx = Some(src_rx),
+        }
+        let camera = camera.clone();
+        let pool = pool.clone();
+        let config = config.clone();
+        let motion_tx = motion_tx.clone();
+        let cancel = cancel.clone();
+        supervisors.spawn(async move {
+            run_one_source(
+                kind,
+                camera,
+                pool,
+                config,
+                motion_tx,
+                src_tx,
+                cancel,
+                alert_after_secs,
+            )
+            .await;
+        });
+    }
+
+    // Health aggregator: collapses the per-source watches into the single camera
+    // fail-open bool via the FailOpenGate rule.
+    let aggregator = {
+        let health_tx = health_tx.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            aggregate_health(
+                enabled, pixel_rx, frigate_rx, ha_rx, health_tx, camera_id, cancel,
+            )
+            .await;
+        })
+    };
+
+    // Wait for cancellation; the source loops observe the same token and exit,
+    // then the aggregator (also watching the token) publishes a final unhealthy.
+    cancel.cancelled().await;
+    while supervisors.join_next().await.is_some() {}
+    let _ = aggregator.await;
+
+    info!(camera_id = %camera_id, "motion task exiting");
+}
+
+/// Supervise ONE motion source for a camera: run its loop, apply back-off on
+/// error, hot-reload on a clean (config-version) exit, and publish this source's
+/// health to `health_tx` — a PER-SOURCE watch the aggregator reads, so a stuck
+/// source's alert fires by name. Feeds the shared `motion_tx`. This is the old
+/// single-source supervisor loop, now one instance per enabled source.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_source(
+    kind: SourceKind,
+    camera: Camera,
+    pool: Pool,
+    config: Config,
+    motion_tx: MotionTx,
+    health_tx: MotionHealthTx,
+    cancel: CancellationToken,
+    alert_after_secs: u64,
+) {
+    // One hysteresis gate for this source's lifetime — every report_health call
+    // below shares it so a transition retires a stale alert timer.
+    let alert_gate = UnhealthyAlertGate::new();
+    let mut backoff_secs = BACKOFF_BASE_SECS;
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        // Re-read Frigate settings each iteration so a live admin edit is honored
-        // on the next (re)connect. Only cameras that want Frigate touch the DB
-        // here — pixel cameras skip it entirely.
-        let frigate = if camera_wants_frigate {
-            crumb_common::db::get_frigate_settings(&pool)
+        let loop_result: Result<()> = match kind {
+            SourceKind::Pixel => {
+                run_pixel_diff_loop(
+                    &camera,
+                    &pool,
+                    &config,
+                    &motion_tx,
+                    &health_tx,
+                    &cancel,
+                    &alert_gate,
+                    alert_after_secs,
+                )
                 .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let frigate_ver = frigate.as_ref().map_or(0, |s| s.version);
-        let frigate_cfg = frigate
-            .as_ref()
-            .and_then(crate::frigate_motion::FrigateMotionConfig::from_settings);
-
-        let loop_result = if let Some(ref cfg) = frigate_cfg {
-            // Truth telemetry: Frigate-sourced motion runs no local ffmpeg
-            // decode, so the requested backend is moot for this camera.
-            report_decode_status(
-                &pool,
-                camera.id,
-                config.motion_hwaccel.as_str(),
-                "none",
-                Some("motion source is Frigate (no local decode)"),
-            )
-            .await;
-            // Fail-open health: the Frigate loop has no per-frame granularity
-            // (there are no frames — it consumes MQTT events), so health here is
-            // coarser than the pixel-diff path: healthy for the loop's entire
-            // run, unhealthy the instant it returns (error OR a clean exit from
-            // a config-version bump, since a reconnect briefly means no
-            // detections can arrive). This is intentionally conservative: a
-            // Motion-mode camera on Frigate fails OPEN (persists every segment)
-            // during every MQTT reconnect window, not just outages.
-            report_health(
-                &health_tx,
-                &pool,
-                camera.id,
-                true,
-                "frigate MQTT loop running",
-                &alert_gate,
-                alert_after_secs,
-            )
-            .await;
-            let r = crate::frigate_motion::run_frigate_motion_loop(
-                &camera,
-                cfg,
-                &motion_tx,
-                &cancel,
-                &pool,
-                frigate_ver,
-            )
-            .await;
-            report_health(
-                &health_tx,
-                &pool,
-                camera.id,
-                false,
-                "frigate MQTT loop exited",
-                &alert_gate,
-                alert_after_secs,
-            )
-            .await;
-            r
-        } else {
-            // Either the camera wants pixel-diff, OR it wants Frigate but Frigate
-            // is not currently configured/enabled — the existing safety net
-            // (falls back to the pixel pipeline either way; `run_pixel_diff_loop`
-            // itself reports health via `health_tx`, including the
-            // "no sub-stream configured" unhealthy case).
-            run_pixel_diff_loop(
-                &camera,
-                &pool,
-                &config,
-                &motion_tx,
-                &health_tx,
-                &cancel,
-                &alert_gate,
-                alert_after_secs,
-            )
-            .await
+            }
+            SourceKind::Frigate => {
+                // Re-read Frigate settings each iteration so a live admin edit is
+                // honored on the next (re)connect.
+                let frigate = crumb_common::db::get_frigate_settings(&pool)
+                    .await
+                    .ok()
+                    .flatten();
+                let frigate_ver = frigate.as_ref().map_or(0, |s| s.version);
+                let frigate_cfg = frigate
+                    .as_ref()
+                    .and_then(crate::frigate_motion::FrigateMotionConfig::from_settings);
+                if let Some(ref cfg) = frigate_cfg {
+                    report_decode_status(
+                        &pool,
+                        camera.id,
+                        config.motion_hwaccel.as_str(),
+                        "none",
+                        Some("motion source is Frigate (no local decode)"),
+                    )
+                    .await;
+                    // Coarse fail-open health: healthy for the loop's whole run,
+                    // unhealthy the instant it returns (error OR a clean
+                    // config-version exit — a reconnect briefly means no
+                    // detections can arrive).
+                    report_health(
+                        &health_tx,
+                        &pool,
+                        camera.id,
+                        true,
+                        "frigate MQTT loop running",
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    let r = crate::frigate_motion::run_frigate_motion_loop(
+                        &camera,
+                        cfg,
+                        &motion_tx,
+                        &cancel,
+                        &pool,
+                        frigate_ver,
+                    )
+                    .await;
+                    report_health(
+                        &health_tx,
+                        &pool,
+                        camera.id,
+                        false,
+                        "frigate MQTT loop exited",
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    r
+                } else {
+                    // Enabled but not configured: this source contributes nothing
+                    // (unhealthy → fail-open weight). Idle, then re-check so
+                    // configuring Frigate later is picked up without a restart.
+                    report_health(
+                        &health_tx,
+                        &pool,
+                        camera.id,
+                        false,
+                        "frigate source enabled but not configured",
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    idle_before_recheck(&cancel).await;
+                    Ok(())
+                }
+            }
+            SourceKind::Ha => {
+                // Re-read HA settings + this camera's motion links each iteration
+                // so an admin edit hot-reloads on the next (re)connect.
+                let ha_settings = crumb_common::db::get_ha_settings(&pool)
+                    .await
+                    .ok()
+                    .flatten();
+                let ha_ver = ha_settings.as_ref().map_or(0, |s| s.version);
+                let ha_client = ha_settings
+                    .as_ref()
+                    .and_then(crumb_common::ha::HaClient::from_settings);
+                let ha_links = crumb_common::db::get_camera_ha_links(&pool, camera.id, "motion")
+                    .await
+                    .unwrap_or_default();
+                if let (Some(client), false) = (ha_client, ha_links.is_empty()) {
+                    report_decode_status(
+                        &pool,
+                        camera.id,
+                        config.motion_hwaccel.as_str(),
+                        "none",
+                        Some("motion source is Home Assistant (no local decode)"),
+                    )
+                    .await;
+                    // Start PESSIMISTIC: the source is not healthy until a poll
+                    // actually succeeds. run_ha_motion_loop flips it healthy on the
+                    // first successful poll. Reporting healthy here (before polling)
+                    // would make a failing source flap healthy on every retry and
+                    // reset the fail-open grace so it never fires.
+                    report_health(
+                        &health_tx,
+                        &pool,
+                        camera.id,
+                        false,
+                        "ha connecting",
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    let links: Vec<(String, Option<String>)> = ha_links
+                        .iter()
+                        .map(|l| (l.entity_id.clone(), l.device_class.clone()))
+                        .collect();
+                    let r = crate::ha_motion::run_ha_motion_loop(
+                        &camera,
+                        client,
+                        links,
+                        &motion_tx,
+                        &cancel,
+                        &pool,
+                        ha_ver,
+                        &health_tx,
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    report_health(
+                        &health_tx,
+                        &pool,
+                        camera.id,
+                        false,
+                        "ha motion loop exited",
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    r
+                } else {
+                    report_health(
+                        &health_tx,
+                        &pool,
+                        camera.id,
+                        false,
+                        "ha source enabled but HA disabled or no motion links",
+                        &alert_gate,
+                        alert_after_secs,
+                    )
+                    .await;
+                    idle_before_recheck(&cancel).await;
+                    Ok(())
+                }
+            }
         };
 
         match loop_result {
             Ok(()) => {
                 if cancel.is_cancelled() {
-                    info!(camera_id = %camera.id, "motion task cancelled cleanly");
                     break;
                 }
-                // Not cancelled → the Frigate loop returned cleanly because the
-                // frigate_config version changed. Reconnect immediately with the
-                // fresh settings (no back-off).
-                info!(camera_id = %camera.id, "frigate config changed; reloading motion source");
+                // Clean exit: a config-version reload (reconnect promptly) or a
+                // not-configured re-check (already idled above). Reset back-off.
                 backoff_secs = BACKOFF_BASE_SECS;
                 continue;
             }
             Err(e) => {
                 if cancel.is_cancelled() {
-                    // Error may be a side-effect of killing the child.
-                    info!(
-                        camera_id = %camera.id,
-                        "motion task cancelled during error recovery"
-                    );
                     break;
                 }
-
                 error!(
                     camera_id = %camera.id,
-                    error     = %e,
+                    source = kind.as_str(),
+                    error = %e,
                     backoff_s = backoff_secs,
-                    "motion loop error; restarting after back-off"
+                    "motion source error; restarting after back-off"
                 );
-
                 tokio::select! {
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)) => {}
-                    () = cancel.cancelled() => { break; }
+                    () = cancel.cancelled() => break,
                 }
-
                 backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
             }
         }
     }
 
-    // Defense in depth: whatever health value was last published, the motion
-    // task is now gone entirely (worker stopped/cancelled), so the recording
-    // task must not keep trusting a stale "healthy" reading. Best-effort: the
-    // receiver may already be dropped if the recording task exited first.
-    // Note on teardown: a normal worker exit reaches this call already
-    // unhealthy in the overwhelming majority of cases (every loop exit path
-    // above reports unhealthy first), so this is a same-value no-op that
-    // neither bumps the alert generation nor spawns a new timer — see the
-    // teardown analysis on [`spawn_unhealthy_alert_timer`]. In the rare case
-    // this fires as a genuine healthy→unhealthy transition (process
-    // shutting down mid-healthy-frame-analysis), it DOES spawn a timer, but
-    // that spawned task is itself dropped the instant the process exits
-    // (nothing survives process teardown to fire it late) — so a normal
-    // shutdown can never emit a spurious alert either way.
+    // The source loop is gone; the recording task must not trust a stale health.
     report_health(
         &health_tx,
         &pool,
         camera.id,
         false,
-        "motion task exiting",
+        "motion source exiting",
         &alert_gate,
         alert_after_secs,
     )
     .await;
+    info!(camera_id = %camera.id, source = kind.as_str(), "motion source task exiting");
+}
 
-    info!(camera_id = %camera.id, "motion task exiting");
+/// Idle a not-yet-configured source before it re-reads settings, so it neither
+/// hot-spins the DB nor waits so long that configuring the integration feels
+/// unresponsive.
+async fn idle_before_recheck(cancel: &CancellationToken) {
+    tokio::select! {
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(SOURCE_RECHECK_SECS)) => {}
+        () = cancel.cancelled() => {}
+    }
+}
+
+/// Collapse the per-source health watches into the single camera fail-open bool
+/// the recording task reads, applying the [`FailOpenGate`] rule. Re-evaluates on
+/// any per-source change AND every second (so the down-past-grace clause fires on
+/// time even with no new event). Publishes a final unhealthy on teardown.
+async fn aggregate_health(
+    enabled: Vec<SourceKind>,
+    mut pixel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    mut frigate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    mut ha_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    health_tx: MotionHealthTx,
+    camera_id: uuid::Uuid,
+    cancel: CancellationToken,
+) {
+    let start = Utc::now();
+    let mut gate = FailOpenGate::new(&enabled, start, DEFAULT_SOURCE_DOWN_GRACE);
+    // Per-source "went down at" — sticky until the source recovers, so the grace
+    // is measured from the FIRST down tick, not reset on every evaluation.
+    let mut down_since: std::collections::HashMap<SourceKind, DateTime<Utc>> =
+        enabled.iter().map(|&k| (k, start)).collect();
+    let mut last_healthy: std::collections::HashMap<SourceKind, bool> =
+        enabled.iter().map(|&k| (k, false)).collect();
+    let mut last_sent: Option<bool> = None;
+
+    let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let now = Utc::now();
+        for (kind, rx) in [
+            (SourceKind::Pixel, &pixel_rx),
+            (SourceKind::Frigate, &frigate_rx),
+            (SourceKind::Ha, &ha_rx),
+        ] {
+            let Some(rx) = rx else { continue };
+            let cur = *rx.borrow();
+            let was = last_healthy.insert(kind, cur).unwrap_or(false);
+            if !cur && was {
+                down_since.insert(kind, now); // just transitioned down
+            }
+            if cur {
+                gate.set(kind, SourceHealth::Healthy);
+            } else {
+                let since = *down_since.get(&kind).unwrap_or(&now);
+                gate.set(kind, SourceHealth::Down { since });
+            }
+        }
+        let camera_healthy = gate.healthy(now);
+        if last_sent != Some(camera_healthy) {
+            if camera_healthy {
+                info!(camera_id = %camera_id, "motion health: RECOVERED (a source is healthy)");
+            } else {
+                warn!(
+                    camera_id = %camera_id,
+                    "motion health: FAIL-OPEN (no source healthy, or one down past grace)"
+                );
+            }
+            let _ = health_tx.send(camera_healthy);
+            last_sent = Some(camera_healthy);
+        }
+
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
+            _ = changed_opt(&mut pixel_rx) => {}
+            _ = changed_opt(&mut frigate_rx) => {}
+            _ = changed_opt(&mut ha_rx) => {}
+        }
+    }
+
+    // Teardown: the recording task must not trust a stale healthy reading.
+    let _ = health_tx.send(false);
+    info!(camera_id = %camera_id, "motion health aggregator exiting");
+}
+
+/// Await the next change on an optional per-source health watch. A `None` slot
+/// never resolves (that source isn't enabled); if the sender is dropped the slot
+/// is cleared so it stops being polled.
+async fn changed_opt(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match rx {
+        Some(r) => {
+            if r.changed().await.is_err() {
+                *rx = None;
+            }
+        }
+        None => std::future::pending().await,
+    }
 }
 
 // ─── one ffmpeg child lifetime ────────────────────────────────────────────────
@@ -2375,9 +2616,11 @@ async fn run_pixel_diff_loop(
                     // from this frame's connected_components are still current).
                     event_bbox = normalized_largest_bbox(&labels, &mut parent, &areas, w, h);
 
-                    // Emit START signal (stopped_at = None means in progress).
-                    send_signal(
+                    // Emit START signal (stopped_at = None means in progress) +
+                    // this source's own labeled 'motion' events row.
+                    emit_pixel_signal(
                         motion_tx,
+                        pool,
                         MotionSignal {
                             camera_id: camera.id,
                             started_at: now,
@@ -2385,8 +2628,8 @@ async fn run_pixel_diff_loop(
                             peak_score: score,
                             bbox: event_bbox,
                         },
-                        camera.id,
-                    );
+                    )
+                    .await;
 
                     debug!(
                         camera_id = %camera.id,
@@ -2416,9 +2659,10 @@ async fn run_pixel_diff_loop(
                     if below_threshold_count >= MOTION_STOP_HYSTERESIS {
                         let started_at = motion_started_at.unwrap_or(now);
 
-                        // Emit STOP signal.
-                        send_signal(
+                        // Emit STOP signal + update this source's 'motion' row.
+                        emit_pixel_signal(
                             motion_tx,
+                            pool,
                             MotionSignal {
                                 camera_id: camera.id,
                                 started_at,
@@ -2426,8 +2670,8 @@ async fn run_pixel_diff_loop(
                                 peak_score,
                                 bbox: event_bbox,
                             },
-                            camera.id,
-                        );
+                        )
+                        .await;
 
                         debug!(
                             camera_id  = %camera.id,
@@ -2478,13 +2722,18 @@ async fn run_pixel_diff_loop(
     // recording.rs can close out the event and write the correct end timestamp.
     if motion_state == MotionState::Active {
         if let Some(started_at) = motion_started_at {
-            let _ = motion_tx.try_send(MotionSignal {
-                camera_id: camera.id,
-                started_at,
-                stopped_at: Some(Utc::now()),
-                peak_score,
-                bbox: event_bbox,
-            });
+            emit_pixel_signal(
+                motion_tx,
+                pool,
+                MotionSignal {
+                    camera_id: camera.id,
+                    started_at,
+                    stopped_at: Some(Utc::now()),
+                    peak_score,
+                    bbox: event_bbox,
+                },
+            )
+            .await;
         }
     }
 
@@ -2662,6 +2911,22 @@ fn send_signal(tx: &MotionTx, signal: MotionSignal, camera_id: uuid::Uuid) {
             error     = %e,
             "motion channel full; signal dropped"
         );
+    }
+}
+
+/// Emit a pixel [`MotionSignal`] AND persist its `'motion'` `events` row.
+///
+/// Under additive motion sources `recording.rs` no longer writes event rows —
+/// each source owns its own surfacing (pixel → `'motion'`, HA → `'ha'`/
+/// device-class, Frigate → its detection rows). The signal is sent FIRST (it
+/// drives footage via the buffer); the labeled row is best-effort — a DB error
+/// is logged and ignored, exactly as the generic write was before, so a failed
+/// surfacing row can never cost a segment.
+async fn emit_pixel_signal(tx: &MotionTx, pool: &Pool, signal: MotionSignal) {
+    let camera_id = signal.camera_id;
+    send_signal(tx, signal.clone(), camera_id);
+    if let Err(e) = crumb_common::db::upsert_motion_event(pool, &signal).await {
+        warn!(camera_id = %camera_id, error = %e, "failed to persist pixel motion event");
     }
 }
 

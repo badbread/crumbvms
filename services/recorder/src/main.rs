@@ -70,10 +70,12 @@ mod archive;
 mod decode_probe;
 mod frigate_motion;
 mod go2rtc_embed;
+mod ha_motion;
 mod motion;
 mod reconcile;
 mod recording;
 mod resource_stats;
+mod source_health;
 
 // ─── channel types (exported for implementers) ────────────────────────────────
 
@@ -128,9 +130,14 @@ struct CameraFingerprint {
     sub_url: Option<String>,
     enabled: bool,
     onvif_motion: bool,
-    // Motion source ("pixel"/"frigate") + pixel algorithm — editing either must
-    // respawn the worker so it picks the new detector / MQTT loop.
+    // Motion sources: the ADDITIVE set (migration 0049) + pixel algorithm.
+    // Toggling which sources are enabled — or the pixel detector — must respawn
+    // the worker so `motion::run` starts/stops the right per-source loops. The
+    // deprecated `motion_source` is kept (harmless, never changes) alongside.
     motion_source: String,
+    motion_pixel_enabled: bool,
+    motion_frigate_enabled: bool,
+    motion_ha_enabled: bool,
     motion_algorithm: String,
     // Effective motion-decode backend (server_settings.motion_hwaccel + vaapi
     // device, admin-editable; empty ⇒ env default). Folded into the per-camera
@@ -185,6 +192,9 @@ impl CameraFingerprint {
             enabled: c.enabled,
             onvif_motion: c.onvif_motion,
             motion_source: c.motion_source.clone(),
+            motion_pixel_enabled: c.motion_pixel_enabled,
+            motion_frigate_enabled: c.motion_frigate_enabled,
+            motion_ha_enabled: c.motion_ha_enabled,
             motion_algorithm: c.motion_algorithm.clone(),
             motion_hwaccel: motion_hwaccel.to_owned(),
             motion_vaapi_device: motion_vaapi_device.to_owned(),
@@ -1173,6 +1183,9 @@ mod tests {
             motion_mask: None,
             onvif_motion: false,
             motion_source: "pixel".to_owned(),
+            motion_pixel_enabled: true,
+            motion_frigate_enabled: false,
+            motion_ha_enabled: false,
             motion_algorithm: "census".to_owned(),
             camera_type: None,
             icon: None,
@@ -1223,6 +1236,29 @@ mod tests {
             CameraFingerprint::from_camera(&cam, "cpu", ""),
             CameraFingerprint::from_camera(&cam, "cpu", ""),
             "fingerprint must be stable when the decode backend is unchanged"
+        );
+    }
+
+    /// Toggling which ADDITIVE motion sources are enabled MUST flip the
+    /// fingerprint. The admin edits these booleans (not the deprecated
+    /// `motion_source`), so without this the supervisor never respawns the worker
+    /// and enabling/disabling a source silently does nothing until a restart.
+    #[test]
+    fn fingerprint_differs_when_motion_source_toggled() {
+        let cam_pixel = mk_camera(mk_policy());
+        let mut cam_ha = mk_camera(mk_policy());
+        cam_ha.motion_ha_enabled = true; // pixel + HA
+        assert_ne!(
+            CameraFingerprint::from_camera(&cam_pixel, "auto", ""),
+            CameraFingerprint::from_camera(&cam_ha, "auto", ""),
+            "fingerprint must differ when the HA source is toggled (else no respawn)"
+        );
+        let mut cam_frigate = mk_camera(mk_policy());
+        cam_frigate.motion_frigate_enabled = true;
+        assert_ne!(
+            CameraFingerprint::from_camera(&cam_pixel, "auto", ""),
+            CameraFingerprint::from_camera(&cam_frigate, "auto", ""),
+            "fingerprint must differ when the Frigate source is toggled"
         );
     }
 

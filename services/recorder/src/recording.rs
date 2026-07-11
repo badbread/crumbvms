@@ -747,6 +747,9 @@ async fn run_ffmpeg_loop(
     let post_secs = camera.policy.motion_post_seconds as i64;
 
     let mut motion_buf = MotionBuffer::new(pre_secs, post_secs);
+    // Unions the additive sources' edges before they reach the buffer (a second
+    // source's STOP must not end recording while another source is still open).
+    let mut motion_union = MotionUnion::default();
 
     // Motion-cache telemetry tick (read-only reporter — see
     // `report_motion_cache_status`). Only meaningful for Motion-mode cameras,
@@ -839,6 +842,7 @@ async fn run_ffmpeg_loop(
                             health_rx,
                             &mut pending_signals,
                             &mut motion_buf,
+                            &mut motion_union,
                             &live_storage.id,
                             &live_storage.path,
                             &camera_dir,
@@ -942,6 +946,7 @@ async fn run_ffmpeg_loop(
                                     health_rx,
                                     &mut pending_signals,
                                     &mut motion_buf,
+                                    &mut motion_union,
                                     &live_storage.id,
                                     &live_storage.path,
                                     &camera_dir,
@@ -1052,6 +1057,7 @@ async fn run_ffmpeg_loop(
             health_rx,
             &mut pending_signals,
             &mut motion_buf,
+            &mut motion_union,
             &live_storage.id,
             &live_storage.path,
             &camera_dir,
@@ -1100,6 +1106,7 @@ async fn finish_completed_segment(
     health_rx: &MotionHealthRx,
     pending_signals: &mut Vec<MotionSignal>,
     motion_buf: &mut MotionBuffer,
+    motion_union: &mut MotionUnion,
     live_storage_id: &uuid::Uuid,
     live_storage_path: &str,
     camera_dir: &Path,
@@ -1140,8 +1147,8 @@ async fn finish_completed_segment(
         drain_and_persist_motion(
             motion_rx,
             pending_signals,
-            pool,
             drive_buffer.then_some(&mut *motion_buf),
+            motion_union,
             &mut actual,
         )
         .await;
@@ -1149,8 +1156,8 @@ async fn finish_completed_segment(
         drain_and_persist_motion(
             motion_rx,
             pending_signals,
-            pool,
             drive_buffer.then_some(&mut *motion_buf),
+            motion_union,
             &mut shadow,
         )
         .await;
@@ -1422,25 +1429,35 @@ fn drain_motion_channel(rx: &mut MotionRx, out: &mut Vec<MotionSignal>) {
 /// accumulated list; the buffer's state transitions are edge-triggered on the
 /// channel receive, not on the boundary loop). The resulting [`MotionDecision`]s
 /// are appended into `decision`.
+///
+/// **Surfacing note (additive sources):** this function no longer writes any
+/// `events` row. Under the additive model each source writes its OWN labeled row
+/// (pixel → `'motion'`, HA → `'ha'`/device-class, Frigate → its detections), so
+/// `recording.rs` — which sees only a source-blind unioned signal — cannot and
+/// must not label events. See `docs/DECISIONS.md` (additive multi-source motion).
+///
+/// The raw drained signals still accumulate into `out` (`pending_signals`) for
+/// the `has_motion`/bbox stamping, which unions across signals itself. The
+/// **buffer** feed is routed through [`MotionUnion`] so a second source's STOP
+/// can't end recording while another source is still open.
 async fn drain_and_persist_motion(
     rx: &mut MotionRx,
     out: &mut Vec<MotionSignal>,
-    pool: &Pool,
     motion_buf: Option<&mut MotionBuffer>,
+    motion_union: &mut MotionUnion,
     decision: &mut MotionDecision,
 ) {
     let before = out.len();
     drain_motion_channel(rx, out);
-    for sig in &out[before..] {
-        if let Err(e) = db::upsert_motion_event(pool, sig).await {
-            warn!(camera_id = %sig.camera_id, error = %e, "failed to persist motion event");
-        }
-    }
     if let Some(buf) = motion_buf {
         for sig in &out[before..] {
-            let d = buf.apply_signal(sig);
-            decision.persist.extend(d.persist);
-            decision.discard.extend(d.discard);
+            // Union the per-source edges before the buffer: only a rising edge on
+            // the FIRST open and a falling edge on the LAST close reach apply_signal.
+            if let Some(union_sig) = motion_union.fold(sig) {
+                let d = buf.apply_signal(&union_sig);
+                decision.persist.extend(d.persist);
+                decision.discard.extend(d.discard);
+            }
         }
     }
 }
@@ -2625,6 +2642,81 @@ impl MotionBuffer {
     }
 }
 
+/// Unions the START/STOP edges from N **additive** motion sources into the single
+/// coherent event stream [`MotionBuffer::apply_signal`] expects.
+///
+/// Why this exists: `apply_signal` tracks ONE event (Idle/Recording/PostBuffer).
+/// With two sources feeding independent START/STOP pairs, one source's STOP would
+/// flip the buffer to PostBuffer while the other source is still open; after the
+/// post-roll it goes Idle → **recording stops while motion is still happening = a
+/// footage gap.** This state machine collapses the per-source edges so the buffer
+/// only ever sees a rising edge when the FIRST source opens and a falling edge
+/// when the LAST source closes. `apply_signal` itself is unchanged (golden rule 2:
+/// don't bet footage on modifying the buffer — feed it a clean stream instead).
+///
+/// It feeds the **buffer only**. Raw per-source signals still flow to
+/// `pending_signals` for `has_motion`/bbox stamping, which already unions across
+/// signals (it scans for ANY overlap), so per-source motion bbox is preserved.
+///
+/// Keyed by `started_at`: a source's START and its matching STOP share it, and
+/// distinct sources have distinct wall-clock start times. A `started_at` collision
+/// across sources is astronomically unlikely and would merely merge two events
+/// (still footage-safe). For a single-source camera this is a pass-through — the
+/// synthetic edges are identical to the raw ones, so behavior is unchanged.
+#[derive(Debug, Default)]
+pub struct MotionUnion {
+    /// Currently-open event keys (each source's in-flight `started_at`).
+    open: std::collections::BTreeSet<DateTime<Utc>>,
+    /// `started_at` of the union event while it is open (the first opener's) —
+    /// used as the synthetic START/STOP `started_at` so pre-buffer flush covers
+    /// from the earliest motion.
+    union_started_at: Option<DateTime<Utc>>,
+}
+
+impl MotionUnion {
+    /// Fold one raw source signal in. Returns the synthetic signal to feed the
+    /// buffer when the union state *changes* (0→1 open = START, 1→0 = STOP), or
+    /// `None` for a re-trigger / an unmatched STOP / an interleaved edge that
+    /// leaves the union state unchanged.
+    pub fn fold(&mut self, sig: &MotionSignal) -> Option<MotionSignal> {
+        match sig.stopped_at {
+            None => {
+                // START: union rises only on the first open.
+                let was_empty = self.open.is_empty();
+                self.open.insert(sig.started_at);
+                if was_empty {
+                    self.union_started_at = Some(sig.started_at);
+                    Some(MotionSignal {
+                        camera_id: sig.camera_id,
+                        started_at: sig.started_at,
+                        stopped_at: None,
+                        peak_score: sig.peak_score,
+                        bbox: None,
+                    })
+                } else {
+                    None
+                }
+            }
+            Some(stopped_at) => {
+                // STOP: union falls only when the LAST open event closes.
+                let removed = self.open.remove(&sig.started_at);
+                if removed && self.open.is_empty() {
+                    let started_at = self.union_started_at.take().unwrap_or(sig.started_at);
+                    Some(MotionSignal {
+                        camera_id: sig.camera_id,
+                        started_at,
+                        stopped_at: Some(stopped_at),
+                        peak_score: sig.peak_score,
+                        bbox: None,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 // ─── watchdog helpers ─────────────────────────────────────────────────────────
 
 /// Pure predicate: returns `true` when `elapsed_secs` meets or exceeds
@@ -2795,6 +2887,76 @@ mod tests {
         let seg_e = utc(2026, 1, 1, 0, 0, 4);
         let sig = make_signal(utc(2026, 1, 1, 0, 0, 2), None);
         assert!(overlaps_motion(seg_s, seg_e, &sig));
+    }
+
+    // ── MotionUnion (additive multi-source edge union) ──────────────────────────
+
+    fn t(s: u32) -> DateTime<Utc> {
+        utc(2026, 1, 1, 0, 0, s)
+    }
+
+    #[test]
+    fn union_single_source_is_passthrough() {
+        // One source: the synthetic edges must equal the raw edges (behavior
+        // unchanged for existing single-source cameras).
+        let mut u = MotionUnion::default();
+        let start = u
+            .fold(&make_signal(t(0), None))
+            .expect("START passes through");
+        assert_eq!(start.started_at, t(0));
+        assert!(start.stopped_at.is_none());
+        let stop = u
+            .fold(&make_signal(t(0), Some(t(5))))
+            .expect("STOP passes through");
+        assert_eq!(stop.stopped_at, Some(t(5)));
+    }
+
+    #[test]
+    fn union_two_sources_no_gap_when_one_stops_while_other_open() {
+        // THE crux: pixel opens, HA opens, PIXEL STOPS while HA still open. The
+        // buffer must NOT see a STOP (which would start the post-roll and end
+        // recording early). Only when the LAST source closes does STOP fire.
+        let mut u = MotionUnion::default();
+        // pixel START @0 → union rises → synthetic START.
+        assert!(u.fold(&make_signal(t(0), None)).is_some());
+        // ha START @2 (different started_at) → union already open → nothing.
+        assert!(u.fold(&make_signal(t(2), None)).is_none());
+        // pixel STOP @5 → ha still open → NO synthetic STOP (no gap!).
+        assert!(u.fold(&make_signal(t(0), Some(t(5)))).is_none());
+        // ha STOP @9 → last source closes → synthetic STOP, from the union start.
+        let stop = u.fold(&make_signal(t(2), Some(t(9)))).expect("union STOP");
+        assert_eq!(stop.started_at, t(0)); // earliest opener fixes the pre-buffer
+        assert_eq!(stop.stopped_at, Some(t(9)));
+    }
+
+    #[test]
+    fn union_retrigger_within_open_emits_no_duplicate_start() {
+        let mut u = MotionUnion::default();
+        assert!(u.fold(&make_signal(t(0), None)).is_some()); // first START
+        assert!(u.fold(&make_signal(t(3), None)).is_none()); // second source, no dup START
+        assert!(u.fold(&make_signal(t(0), Some(t(4)))).is_none()); // one closes, still open
+        assert!(u.fold(&make_signal(t(3), Some(t(6)))).is_some()); // last closes → STOP
+    }
+
+    #[test]
+    fn union_unmatched_stop_is_ignored() {
+        let mut u = MotionUnion::default();
+        // STOP with no prior START (stale / buffer started mid-event): no edge.
+        assert!(u.fold(&make_signal(t(0), Some(t(1)))).is_none());
+        // A real event still works afterwards.
+        assert!(u.fold(&make_signal(t(2), None)).is_some());
+        assert!(u.fold(&make_signal(t(2), Some(t(5)))).is_some());
+    }
+
+    #[test]
+    fn union_reopen_after_close_is_a_fresh_event() {
+        let mut u = MotionUnion::default();
+        assert!(u.fold(&make_signal(t(0), None)).is_some());
+        // First event opens then closes.
+        assert!(u.fold(&make_signal(t(0), Some(t(2)))).is_some());
+        // A later source opens: a brand-new union event (fresh START).
+        let re = u.fold(&make_signal(t(10), None)).expect("fresh START");
+        assert_eq!(re.started_at, t(10));
     }
 
     // ── prune_pending_signals (the "stuck motion" regression) ───────────────────

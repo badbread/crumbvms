@@ -452,6 +452,23 @@ fn camera_from_row(row: &tokio_postgres::Row) -> Result<Camera> {
         motion_mask: row.get("c_motion_mask"),
         onvif_motion: row.get("c_onvif_motion"),
         motion_source: row.get("c_motion_source"),
+        // Additive source set (migration 0049). Fall back to deriving from the
+        // deprecated motion_source if the view predates the re-declaration (belt
+        // and suspenders, mirroring the served_by shim below).
+        motion_pixel_enabled: row.try_get("c_motion_pixel_enabled").unwrap_or_else(|_| {
+            let ms: String = row.try_get("c_motion_source").unwrap_or_default();
+            ms.is_empty() || ms == "pixel"
+        }),
+        motion_frigate_enabled: row.try_get("c_motion_frigate_enabled").unwrap_or_else(|_| {
+            row.try_get::<_, String>("c_motion_source")
+                .map(|s| s == "frigate")
+                .unwrap_or(false)
+        }),
+        motion_ha_enabled: row.try_get("c_motion_ha_enabled").unwrap_or_else(|_| {
+            row.try_get::<_, String>("c_motion_source")
+                .map(|s| s == "ha")
+                .unwrap_or(false)
+        }),
         motion_algorithm: row.get("c_motion_algorithm"),
         camera_type: row.get("c_camera_type"),
         icon: row.get("c_icon"),
@@ -1517,6 +1534,31 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
         )
         .await
         .context("list_camera_ha_links")?;
+    Ok(rows.iter().map(ha_link_from_row).collect())
+}
+
+/// HA links for a camera filtered by `role` (`motion` / `sensor` / `actuator`),
+/// ordered for display. Used by the recorder (`role='motion'`) and the surfacing
+/// task without pulling the other roles.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_camera_ha_links(
+    pool: &Pool,
+    camera_id: Uuid,
+    role: &str,
+) -> Result<Vec<CameraHaLink>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order
+             FROM camera_ha_links WHERE camera_id = $1 AND role = $2
+             ORDER BY sort_order, entity_id",
+            &[&camera_id, &role],
+        )
+        .await
+        .context("get_camera_ha_links")?;
     Ok(rows.iter().map(ha_link_from_row).collect())
 }
 
@@ -2935,9 +2977,15 @@ pub async fn create_camera(pool: &Pool, p: &CreateCameraParams<'_>) -> Result<Ca
                  policy_id, motion_mask, onvif_motion,
                  motion_source, motion_algorithm, camera_type, icon,
                  served_by, source_camera_name,
-                 onvif_host, onvif_port, onvif_user, onvif_password)
+                 onvif_host, onvif_port, onvif_user, onvif_password,
+                 motion_pixel_enabled, motion_frigate_enabled, motion_ha_enabled)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20)
+                    $15, $16, $17, $18, $19, $20,
+                    -- additive source set (migration 0049) derived from the
+                    -- legacy motion_source until callers set the booleans directly
+                    ($11::text = '' OR $11::text = 'pixel'),
+                    ($11::text = 'frigate'),
+                    ($11::text = 'ha'))
             RETURNING id
             ",
             &[
@@ -7131,6 +7179,60 @@ pub async fn upsert_motion_event(pool: &Pool, sig: &MotionSignal) -> Result<Uuid
     upsert_detection_event(pool, &params).await
 }
 
+/// Persist (or update) a Home-Assistant-sourced motion event in the shared
+/// `events` table, LABELED by the sensor's `device_class` (Door / Window /
+/// Occupancy / …) so it renders a distinct timeline glyph and reads correctly in
+/// notifications — the labeled counterpart of [`upsert_motion_event`] for
+/// `motion_source='ha'` cameras.
+///
+/// This is **surfacing only**: the caller ([`crate::ha`]'s consumer in the
+/// recorder) writes this row *after* it has already emitted the source-agnostic
+/// `MotionSignal` that drives recording, and treats a failure here as
+/// best-effort (log-and-continue), exactly like `upsert_motion_event`. A failed
+/// glyph write can never cost footage.
+///
+/// Idempotent via `(source_id, provider_event_id)` = `('ha', "ha:{entity}:{start_ms}")`:
+/// the START (`stopped_at = None`) inserts (`lifecycle = 'start'`), the STOP with
+/// the same opening entity + `started_at` updates it (`lifecycle = 'end'`,
+/// `end_ts` set). The opening entity (the one that began the event) fixes the
+/// label for the whole event; a different class firing mid-event does not relabel.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn upsert_ha_event(
+    pool: &Pool,
+    camera_id: Uuid,
+    entity_id: &str,
+    device_class: Option<&str>,
+    started_at: DateTime<Utc>,
+    stopped_at: Option<DateTime<Utc>>,
+) -> Result<Uuid> {
+    let provider_event_id = format!("ha:{}:{}", entity_id, started_at.timestamp_millis());
+    let lifecycle = if stopped_at.is_some() { "end" } else { "start" };
+    let label = crate::ha::label_for_device_class(device_class);
+    let params = UpsertDetectionEventParams {
+        camera_id,
+        start_ts: started_at,
+        label: label.to_owned(),
+        score: 1.0, // a binary sensor has no confidence score
+        source_id: "ha".to_owned(),
+        provider_event_id,
+        sub_label: None,
+        top_score: 1.0,
+        end_ts: stopped_at,
+        zones: Vec::new(),
+        snapshot_url: None,
+        raw: serde_json::json!({
+            "source": "ha",
+            "entity_id": entity_id,
+            "device_class": device_class,
+        }),
+        lifecycle: lifecycle.to_owned(),
+    };
+    upsert_detection_event(pool, &params).await
+}
+
 /// Parameters for [`upsert_detection_event`].
 #[derive(Debug)]
 pub struct UpsertDetectionEventParams {
@@ -8076,6 +8178,10 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
         (
             "0048_ha_integration.sql",
             include_str!("../../../db/migrations/0048_ha_integration.sql"),
+        ),
+        (
+            "0049_additive_motion_sources.sql",
+            include_str!("../../../db/migrations/0049_additive_motion_sources.sql"),
         ),
     ];
 
