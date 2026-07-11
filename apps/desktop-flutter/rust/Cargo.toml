@@ -21,3 +21,10 @@ winapi = { version = "0.3", features = ["processthreadsapi", "psapi", "minwindef
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# This FRB crate is built by cargokit (from the Flutter build), NOT by the
+# repo-root services workspace. An empty [workspace] table makes it its own
+# workspace root so `cargo` invoked here (e.g. a contributor building the app
+# from a repo checkout) isn't captured by <repo>/Cargo.toml and error out.
+# Same pattern as apps/desktop/src-tauri/Cargo.toml.
+[workspace]
