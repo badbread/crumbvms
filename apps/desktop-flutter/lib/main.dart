@@ -529,6 +529,9 @@ class _MainShellState extends State<MainShell> {
           session: session,
           cameras: widget.cameras,
           onLogout: widget.onLogout,
+          // Per-tile header bar (name + REC/motion/detection) vs floating
+          // overlays. Defaults on, matching the old client's showInfoBar.
+          showInfoBar: widget.clientOptions?.showInfoBar ?? true,
         );
     }
   }

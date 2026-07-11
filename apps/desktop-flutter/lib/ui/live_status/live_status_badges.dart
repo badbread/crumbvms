@@ -61,6 +61,96 @@ class LiveStatusBadgeRow extends StatelessWidget {
   }
 }
 
+/// Commercial-VMS-style per-tile title strip: a thin bar across the TOP of a
+/// camera tile carrying, on the left, a live/offline dot + the camera name and,
+/// on the right, the same REC / motion / detection indicators as
+/// [LiveStatusBadgeRow]. This is the `showInfoBar` (Options -> "Show tile info
+/// bar") presentation: when it is on, the tile insets its video below this
+/// strip and hides its floating name label + floating badge row, consolidating
+/// everything here (mirrors the old Tauri client's `.tile-strip`).
+class TileInfoBar extends StatelessWidget {
+  const TileInfoBar({
+    super.key,
+    required this.name,
+    required this.connected,
+    required this.hasError,
+    required this.recording,
+    required this.recentMotion,
+    required this.detectionKeys,
+    this.height = 24,
+  });
+
+  /// Camera display name.
+  final String name;
+
+  /// First frame decoded and no error — drives the green "live" dot. When
+  /// false (and not [hasError]) the dot is amber ("connecting").
+  final bool connected;
+
+  /// The tile failed to load a stream — dot goes red and " — no stream" is
+  /// appended, matching the old client's `.tile-strip.no-stream`.
+  final bool hasError;
+
+  final bool recording;
+  final bool recentMotion;
+  final Set<String> detectionKeys;
+
+  /// Strip height in logical px. Kept small so it eats minimal video area.
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    final showGenericMotion = recentMotion && detectionKeys.isEmpty;
+    final dotColor = hasError
+        ? Colors.red
+        : (connected ? Colors.greenAccent : Colors.amber);
+    return Container(
+      height: height,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      color: Colors.black.withValues(alpha: 0.62),
+      child: Row(
+        children: [
+          Container(
+            width: 7,
+            height: 7,
+            decoration: BoxDecoration(shape: BoxShape.circle, color: dotColor),
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              hasError ? '$name — no stream' : name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          // Indicators (right-aligned): specific detection glyphs take
+          // precedence over the generic motion runner, then the REC dot —
+          // same precedence as LiveStatusBadgeRow.
+          if (detectionKeys.isNotEmpty)
+            for (final key in detectionKeys)
+              Padding(
+                padding: const EdgeInsets.only(left: 5),
+                child: _DetectionGlyph(iconKey: key),
+              ),
+          if (showGenericMotion) ...[
+            const SizedBox(width: 6),
+            const Icon(Icons.directions_run, color: Colors.amber, size: 15),
+          ],
+          if (recording) ...[
+            const SizedBox(width: 7),
+            const _Dot(color: Colors.redAccent),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _Dot extends StatelessWidget {
   const _Dot({required this.color});
   final Color color;

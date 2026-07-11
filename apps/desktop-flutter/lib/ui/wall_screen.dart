@@ -25,12 +25,18 @@ class WallScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onLogout,
+    this.showInfoBar = true,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
   final VoidCallback onLogout;
+
+  /// Show the per-tile title strip (camera name + REC/motion/detection
+  /// indicators in one header bar). When on, tiles hide their floating name
+  /// label + floating badge row. Mirrors the old client's `showInfoBar` option.
+  final bool showInfoBar;
 
   @override
   State<WallScreen> createState() => _WallScreenState();
@@ -120,6 +126,7 @@ class _WallScreenState extends State<WallScreen> {
                       session: widget.session,
                       camera: cam,
                       liveStatus: _liveStatus,
+                      showInfoBar: widget.showInfoBar,
                       onTap: () => setState(() => _maximized = cam),
                     ),
                 ],
@@ -215,6 +222,7 @@ class _WallTile extends StatefulWidget {
     required this.session,
     required this.camera,
     required this.liveStatus,
+    required this.showInfoBar,
     required this.onTap,
   });
 
@@ -222,6 +230,7 @@ class _WallTile extends StatefulWidget {
   final Session session;
   final Camera camera;
   final LiveStatusController liveStatus;
+  final bool showInfoBar;
   final VoidCallback onTap;
 
   @override
@@ -332,55 +341,92 @@ class _WallTileState extends State<_WallTile> {
 
   @override
   Widget build(BuildContext context) {
+    // Header-bar mode: a title strip on top, video inset below it (the video is
+    // not covered by any floating overlay). Otherwise: video fills the tile with
+    // floating badge row + name label composited over it.
     return Container(
       color: Colors.grey.shade900,
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final pane = Size(constraints.maxWidth, constraints.maxHeight);
-          return Listener(
-            // Hover a tile + mouse wheel → digital zoom IN PLACE (wall stays up).
-            onPointerSignal: (e) {
-              if (e is PointerScrollEvent) {
-                final factor = math.pow(1.0013, -e.scrollDelta.dy) as double;
-                _zoomAt(e.localPosition, factor, pane);
-              }
-            },
-            child: GestureDetector(
-              // Double-click maximizes; single click reserved for selection;
-              // drag pans when zoomed.
-              onDoubleTap: widget.onTap,
-              onPanUpdate: (d) => _panBy(d.delta, pane),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (_controller != null)
-                    ClipRect(
-                      child: Transform(
-                        transform: Matrix4.identity()
-                          ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
-                          ..scaleByDouble(_scale, _scale, 1, 1),
-                        child: Video(
-                          controller: _controller!,
-                          controls: NoVideoControls,
-                          fit: BoxFit.cover,
-                        ),
-                      ),
-                    )
-                  else
-                    Center(
-                      child: _error != null
-                          ? Icon(
-                              Icons.videocam_off,
-                              color: Colors.red.shade300,
-                              size: 28,
-                            )
-                          : const SizedBox(
-                              width: 22,
-                              height: 22,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                    ),
+      child: widget.showInfoBar
+          ? Column(
+              children: [_infoBar(), Expanded(child: _videoArea())],
+            )
+          : _videoArea(),
+    );
+  }
 
+  /// The per-tile title strip (header-bar mode). Listens to the shared
+  /// LiveStatusController so only the strip rebuilds on a poll tick.
+  Widget _infoBar() {
+    return ListenableBuilder(
+      listenable: widget.liveStatus,
+      builder: (context, _) {
+        final status = widget.liveStatus.cameraFor(widget.camera.id);
+        return TileInfoBar(
+          name: widget.camera.name,
+          connected: _firstFrame && _error == null,
+          hasError: _error != null,
+          recording: status?.recording ?? false,
+          recentMotion: status?.recentMotion ?? false,
+          detectionKeys: widget.liveStatus.detectionKeysFor(widget.camera.id),
+        );
+      },
+    );
+  }
+
+  /// The interactive video pane: the player texture with digital zoom/pan, and
+  /// — only when the header strip is OFF — the floating badge row + name label
+  /// composited over the video.
+  Widget _videoArea() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final pane = Size(constraints.maxWidth, constraints.maxHeight);
+        return Listener(
+          // Hover a tile + mouse wheel → digital zoom IN PLACE (wall stays up).
+          onPointerSignal: (e) {
+            if (e is PointerScrollEvent) {
+              final factor = math.pow(1.0013, -e.scrollDelta.dy) as double;
+              _zoomAt(e.localPosition, factor, pane);
+            }
+          },
+          child: GestureDetector(
+            // Double-click maximizes; single click reserved for selection;
+            // drag pans when zoomed.
+            onDoubleTap: widget.onTap,
+            onPanUpdate: (d) => _panBy(d.delta, pane),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (_controller != null)
+                  ClipRect(
+                    child: Transform(
+                      transform: Matrix4.identity()
+                        ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
+                        ..scaleByDouble(_scale, _scale, 1, 1),
+                      child: Video(
+                        controller: _controller!,
+                        controls: NoVideoControls,
+                        fit: BoxFit.cover,
+                      ),
+                    ),
+                  )
+                else
+                  Center(
+                    child: _error != null
+                        ? Icon(
+                            Icons.videocam_off,
+                            color: Colors.red.shade300,
+                            size: 28,
+                          )
+                        : const SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                  ),
+
+                // Floating overlays: only when the header strip is OFF (in
+                // header-bar mode the name + indicators live in the strip).
+                if (!widget.showInfoBar) ...[
                   // REC/motion/detection badges (top-left), driven by the shared
                   // LiveStatusController poll — only this row rebuilds on a tick.
                   Positioned(
@@ -444,11 +490,11 @@ class _WallTileState extends State<_WallTile> {
                     ),
                   ),
                 ],
-              ),
+              ],
             ),
-          );
-        },
-      ),
+          ),
+        );
+      },
     );
   }
 }
