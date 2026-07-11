@@ -22,9 +22,10 @@
 //!   eventually fail open — but a still-working source buys a bounded grace so
 //!   one flaky source doesn't force record-everything on every reconnect.
 //!
-//! A **clean reconnect / config reload** is [`SourceHealth::Reconfiguring`], NOT
-//! `Down` — it never accrues down-time, so normal reconnects never trip clause
-//! (b). This is what stops the flapping.
+//! A **clean reconnect / config reload** is just a brief `Down` — because a
+//! partner keeps the camera healthy and the reload finishes in well under the
+//! grace, it never trips clause (b). This is what stops the flapping without
+//! needing a distinct "reconfiguring" state.
 //!
 //! Reduces exactly to today for a single-source camera: one source, down →
 //! clause (a) "all unhealthy" → immediate fail open, identical to the previous
@@ -60,13 +61,10 @@ impl SourceKind {
 pub enum SourceHealth {
     /// The source loop is running and detecting.
     Healthy,
-    /// The source loop is erroring / in back-off since `since`. Accrues down-time
-    /// toward clause (b).
+    /// The source loop is not detecting (erroring, reconnecting, or briefly
+    /// reloading config) since `since`. A brief reload is absorbed by the grace;
+    /// a genuine outage eventually trips clause (b).
     Down { since: DateTime<Utc> },
-    /// The source loop exited cleanly (config-version bump / cancel) and is about
-    /// to re-run — a transient, does NOT accrue down-time. Counts as "not
-    /// healthy" for clause (a) but never trips clause (b).
-    Reconfiguring,
 }
 
 /// Default grace before a single hard-down source (with others still working)
@@ -164,21 +162,23 @@ mod tests {
     }
 
     #[test]
-    fn brief_reconfigure_does_not_flap() {
-        // A partner reconfiguring (clean reconnect) never trips the grace clause.
+    fn brief_down_with_healthy_partner_does_not_flap() {
+        // A partner briefly down (clean reconnect / reload) never trips the grace
+        // clause, because the reload finishes long before the grace elapses.
         let mut g = FailOpenGate::new(&[SourceKind::Pixel, SourceKind::Ha], at(0), GRACE);
         g.set(SourceKind::Pixel, SourceHealth::Healthy);
-        g.set(SourceKind::Ha, SourceHealth::Reconfiguring);
-        // pixel healthy + ha reconfiguring → still healthy, forever (no down-time).
-        assert!(g.healthy(at(5)));
-        assert!(g.healthy(at(10_000)));
+        g.set(SourceKind::Ha, SourceHealth::Down { since: at(5) });
+        assert!(g.healthy(at(5))); // just went down
+        assert!(g.healthy(at(6))); // reload finished within a second, no flap
+        g.set(SourceKind::Ha, SourceHealth::Healthy);
+        assert!(g.healthy(at(7)));
     }
 
     #[test]
-    fn all_unhealthy_fails_open_immediately_even_if_reconfiguring() {
+    fn all_down_fails_open_immediately() {
         let mut g = FailOpenGate::new(&[SourceKind::Pixel, SourceKind::Ha], at(0), GRACE);
-        g.set(SourceKind::Pixel, SourceHealth::Reconfiguring);
-        g.set(SourceKind::Ha, SourceHealth::Reconfiguring);
+        g.set(SourceKind::Pixel, SourceHealth::Down { since: at(1) });
+        g.set(SourceKind::Ha, SourceHealth::Down { since: at(1) });
         // Nothing detecting → fail open at once (no grace on clause a).
         assert!(!g.healthy(at(1)));
     }
