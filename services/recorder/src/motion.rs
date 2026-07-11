@@ -1556,16 +1556,18 @@ async fn run_one_source(
                         Some("motion source is Frigate (no local decode)"),
                     )
                     .await;
-                    // Coarse fail-open health: healthy for the loop's whole run,
-                    // unhealthy the instant it returns (error OR a clean
-                    // config-version exit — a reconnect briefly means no
-                    // detections can arrive).
+                    // Start PESSIMISTIC: not healthy until the broker's ConnAck
+                    // confirms a live connection — run_frigate_motion_loop flips it
+                    // healthy then. Reporting healthy here (before connecting) would
+                    // make a source that can't reach the broker flap healthy on
+                    // every retry and reset the fail-open grace so it never fires
+                    // (issue #61, the ha_motion twin).
                     report_health(
                         &health_tx,
                         &pool,
                         camera.id,
-                        true,
-                        "frigate MQTT loop running",
+                        false,
+                        "frigate connecting",
                         &alert_gate,
                         alert_after_secs,
                     )
@@ -1577,6 +1579,9 @@ async fn run_one_source(
                         &cancel,
                         &pool,
                         frigate_ver,
+                        &health_tx,
+                        &alert_gate,
+                        alert_after_secs,
                     )
                     .await;
                     report_health(
