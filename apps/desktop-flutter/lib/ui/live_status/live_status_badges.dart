@@ -43,11 +43,10 @@ class LiveStatusBadgeRow extends StatelessWidget {
           // Recording is just a red dot (no "REC" label), matching the old client.
           if (recording) const _Dot(color: Colors.redAccent),
           if (recording && showGenericMotion) const SizedBox(width: 8),
-          if (showGenericMotion) ...[
-            const _Dot(color: Colors.amber),
-            const SizedBox(width: 4),
-            const Text('MOTION', style: _labelStyle),
-          ],
+          // Generic motion = the running-man icon (no "MOTION" text), matching
+          // the old client.
+          if (showGenericMotion)
+            const Icon(Icons.directions_run, color: Colors.amber, size: 15),
           if (detectionKeys.isNotEmpty) ...[
             if (recording || showGenericMotion) const SizedBox(width: 8),
             for (final key in detectionKeys)
@@ -61,13 +60,6 @@ class LiveStatusBadgeRow extends StatelessWidget {
     );
   }
 }
-
-const _labelStyle = TextStyle(
-  color: Colors.white,
-  fontSize: 10,
-  fontWeight: FontWeight.w700,
-  letterSpacing: 0.3,
-);
 
 class _Dot extends StatelessWidget {
   const _Dot({required this.color});
