@@ -1172,12 +1172,12 @@ async fn report_decode_status(
 /// sustained episode instead of once per elapsed timer, and what makes the
 /// RECOVERED transition clear the pending alert instead of leaving a
 /// dangling timer that pages later on an unrelated episode.
-struct UnhealthyAlertGate {
+pub(crate) struct UnhealthyAlertGate {
     generation: std::sync::atomic::AtomicU64,
 }
 
 impl UnhealthyAlertGate {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             generation: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1207,7 +1207,7 @@ impl UnhealthyAlertGate {
 /// 'just went bad', not 'recovered'" design (a flapping detector still can't
 /// spam two events per flap — recovery never alerts at all).
 #[allow(clippy::too_many_arguments)]
-async fn report_health(
+pub(crate) async fn report_health(
     health_tx: &MotionHealthTx,
     pool: &Pool,
     camera_id: uuid::Uuid,
@@ -1631,12 +1631,17 @@ async fn run_one_source(
                         Some("motion source is Home Assistant (no local decode)"),
                     )
                     .await;
+                    // Start PESSIMISTIC: the source is not healthy until a poll
+                    // actually succeeds. run_ha_motion_loop flips it healthy on the
+                    // first successful poll. Reporting healthy here (before polling)
+                    // would make a failing source flap healthy on every retry and
+                    // reset the fail-open grace so it never fires.
                     report_health(
                         &health_tx,
                         &pool,
                         camera.id,
-                        true,
-                        "ha motion loop running",
+                        false,
+                        "ha connecting",
                         &alert_gate,
                         alert_after_secs,
                     )
@@ -1646,7 +1651,16 @@ async fn run_one_source(
                         .map(|l| (l.entity_id.clone(), l.device_class.clone()))
                         .collect();
                     let r = crate::ha_motion::run_ha_motion_loop(
-                        &camera, client, links, &motion_tx, &cancel, &pool, ha_ver,
+                        &camera,
+                        client,
+                        links,
+                        &motion_tx,
+                        &cancel,
+                        &pool,
+                        ha_ver,
+                        &health_tx,
+                        &alert_gate,
+                        alert_after_secs,
                     )
                     .await;
                     report_health(

@@ -231,8 +231,13 @@ async fn publish(motion_tx: &MotionTx, pool: &Pool, camera_id: uuid::Uuid, t: &H
 /// Run the HA motion source for one camera until `cancel` fires, HA settings
 /// change, or a poll fails. `links` is this camera's `role='motion'` entities as
 /// `(entity_id, device_class)`. Returns `Ok(())` on cancel / config-change (a
-/// clean reconnect) and `Err` on a poll failure. Either way the caller
-/// (`motion::run`) reports health false, so a Motion-mode camera fails OPEN.
+/// clean reconnect) and `Err` on a poll failure. It reports the source HEALTHY
+/// (via `health_tx`) only AFTER a poll succeeds — never optimistically before —
+/// so a persistently-failing source stays unhealthy and the supervisor's
+/// fail-open grace accumulates instead of being reset by a premature "healthy".
+/// On any exit the supervisor reports unhealthy, so a Motion-mode camera fails
+/// OPEN.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ha_motion_loop(
     camera: &Camera,
     client: HaClient,
@@ -241,6 +246,9 @@ pub async fn run_ha_motion_loop(
     cancel: &CancellationToken,
     pool: &Pool,
     start_version: i64,
+    health_tx: &crate::MotionHealthTx,
+    alert_gate: &std::sync::Arc<crate::motion::UnhealthyAlertGate>,
+    alert_after_secs: u64,
 ) -> Result<()> {
     let entity_ids: Vec<String> = links.iter().map(|(e, _)| e.clone()).collect();
     let class_by_entity: HashMap<String, Option<String>> = links.into_iter().collect();
@@ -276,6 +284,21 @@ pub async fn run_ha_motion_loop(
         };
         match edges {
             Ok(batch) => {
+                // A successful poll — even an empty one — proves HA is reachable,
+                // so the source is healthy. Reported HERE (not before the poll):
+                // a source that keeps failing never reaches this, so its health
+                // stays false and the fail-open grace accumulates. `report_health`
+                // dedups, so this is a no-op after the first success.
+                crate::motion::report_health(
+                    health_tx,
+                    pool,
+                    camera.id,
+                    true,
+                    "ha reachable",
+                    alert_gate,
+                    alert_after_secs,
+                )
+                .await;
                 let now = Utc::now();
                 for e in &batch {
                     if let Some(t) = tracker.observe(e, now) {
