@@ -284,4 +284,132 @@ mod tests {
         assert!(diff_edges(&[(door.clone(), "unavailable".into())], &mut last, t).is_empty());
         assert_eq!(last.get(&door), Some(&false));
     }
+
+    // ── mock-HA integration: the real reqwest client + poll source against a
+    //    stand-in HA HTTP server. Validates the fail-open TRIGGER end to end —
+    //    a poll failure must surface as `Err` (which exits the loop and arms the
+    //    recorder's fail-open rail). This is the automated proxy for the
+    //    real-hardware "kill HA → records everything" test; it needs no live HA.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Stand-in HA: serves `GET /api/` and `GET /api/states` for one sensor whose
+    /// state the test can flip, and can be switched to fail (HTTP 500) mid-run.
+    struct MockHa {
+        sensor_state: Mutex<String>,
+        fail: AtomicBool,
+    }
+
+    /// Bind a stand-in HA on a loopback port and return its base URL.
+    async fn spawn_mock_ha(mock: Arc<MockHa>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mock = Arc::clone(&mock);
+                tokio::spawn(async move {
+                    // Read the request head (until CRLF CRLF); a GET has no body.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/");
+                    let (status, body) = if mock.fail.load(Ordering::SeqCst) {
+                        ("500 Internal Server Error", String::new())
+                    } else if path == "/api/" {
+                        ("200 OK", r#"{"message":"API running."}"#.to_owned())
+                    } else if path == "/api/states" {
+                        let st = mock.sensor_state.lock().unwrap().clone();
+                        (
+                            "200 OK",
+                            format!(r#"[{{"entity_id":"binary_sensor.test","state":"{st}"}}]"#),
+                        )
+                    } else {
+                        ("404 Not Found", String::new())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    fn settings_for(base: String) -> HaSettings {
+        HaSettings {
+            enabled: true,
+            base_url: base,
+            token: Some("test-token".to_owned()),
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_ha_healthy_reads_then_failure_returns_err() {
+        let mock = Arc::new(MockHa {
+            sensor_state: Mutex::new("off".to_owned()),
+            fail: AtomicBool::new(false),
+        });
+        let base = spawn_mock_ha(Arc::clone(&mock)).await;
+        let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
+
+        // Reachability + a real state read over real HTTP.
+        client.test_connection().await.expect("test_connection ok");
+        let entity = "binary_sensor.test".to_owned();
+        let states = client
+            .get_states_for(std::slice::from_ref(&entity))
+            .await
+            .expect("states");
+        assert_eq!(states, vec![(entity.clone(), "off".to_owned())]);
+
+        // Poll source: first poll seeds silently, then off->on emits a rising edge.
+        let mut src = HaPollSource::new(client.clone(), vec![entity.clone()]);
+        assert!(
+            src.next_edges().await.expect("poll 1").is_empty(),
+            "first observation seeds without a spurious edge"
+        );
+        *mock.sensor_state.lock().unwrap() = "on".to_owned();
+        let edges = src.next_edges().await.expect("poll 2");
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].on);
+        assert_eq!(edges[0].entity_id, entity);
+
+        // THE fail-open trigger: HA starts failing → the poll returns Err. The
+        // caller's loop exits on this, which is what makes the camera fail open.
+        mock.fail.store(true, Ordering::SeqCst);
+        let failed = src.next_edges().await;
+        assert!(
+            failed.is_err(),
+            "a failed poll MUST return Err to arm fail-open, got {failed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_ha_unreachable_returns_err() {
+        // A closed loopback port stands in for an unreachable HA.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
+        assert!(
+            client.get_states().await.is_err(),
+            "an unreachable HA must surface as Err (arms fail-open)"
+        );
+    }
 }
