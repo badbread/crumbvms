@@ -15,13 +15,19 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
+import 'package:crumb_desktop/ui/login_screen.dart';
+import 'package:crumb_desktop/ui/wall_screen.dart';
 
-/// P1 perf gate: with `--dart-define=GRID=<n>` the app renders an n-up media_kit
-/// grid instead of the single-pane spike (see perf_grid.dart). 0 = spike.
+/// Run modes (default = the real client: login then live wall):
+///   `--dart-define=GRID=N`  -> N-up media_kit perf harness (perf_grid.dart)
+///   `--dart-define=SPIKE=1` -> the single-pane P0 spike (LivePane)
 const int kGrid = int.fromEnvironment('GRID', defaultValue: 0);
+const bool kSpike = bool.fromEnvironment('SPIKE', defaultValue: false);
 
 /// The camera/stream to render. Injected at build/run time so no site-specific
 /// address lands in the repo:
@@ -40,8 +46,60 @@ Future<void> main() async {
   // flutter_rust_bridge — loads the cargokit-built rust_lib_crumb_desktop dylib.
   await RustLib.init();
   runApp(
-    kGrid > 0 ? PerfGridApp(count: kGrid, url: kStreamUrl) : const SpikeApp(),
+    kGrid > 0
+        ? PerfGridApp(count: kGrid, url: kStreamUrl)
+        : kSpike
+        ? const SpikeApp()
+        : const CrumbClientApp(),
   );
+}
+
+/// The real desktop client: login → live wall. Holds the authenticated session
+/// in memory (persistence is a later refinement) and swaps between the login and
+/// wall screens.
+class CrumbClientApp extends StatefulWidget {
+  const CrumbClientApp({super.key});
+
+  @override
+  State<CrumbClientApp> createState() => _CrumbClientAppState();
+}
+
+class _CrumbClientAppState extends State<CrumbClientApp> {
+  final CrumbApi _api = CrumbApi();
+  Session? _session;
+  List<Camera> _cameras = const [];
+
+  @override
+  void dispose() {
+    _api.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Crumb',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark(useMaterial3: true),
+      home: _session == null
+          ? LoginScreen(
+              api: _api,
+              onLoggedIn: (session, cameras) => setState(() {
+                _session = session;
+                _cameras = cameras;
+              }),
+            )
+          : WallScreen(
+              api: _api,
+              session: _session!,
+              cameras: _cameras,
+              onLogout: () => setState(() {
+                _session = null;
+                _cameras = const [];
+              }),
+            ),
+    );
+  }
 }
 
 class SpikeApp extends StatelessWidget {
