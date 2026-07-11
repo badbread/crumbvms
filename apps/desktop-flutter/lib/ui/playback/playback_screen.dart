@@ -23,6 +23,8 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
+import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 
 import 'playback_timeline.dart';
 import 'playback_timeline_controller.dart';
@@ -34,6 +36,7 @@ class PlaybackScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onClose,
+    this.hotkeys,
   });
 
   final CrumbApi api;
@@ -45,6 +48,9 @@ class PlaybackScreen extends StatefulWidget {
   final List<Camera> cameras;
 
   final VoidCallback onClose;
+
+  /// Number-key hotkeys load the assigned camera's timeline here.
+  final HotkeyConfigStore? hotkeys;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -482,7 +488,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         : _cameras;
     final cols = shown.isEmpty ? 1 : math.sqrt(shown.length).ceil();
 
-    return Scaffold(
+    final scaffold = Scaffold(
       backgroundColor: Colors.black,
       body: Column(
         children: [
@@ -542,6 +548,17 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
           ),
         ],
       ),
+    );
+
+    // Number-key hotkeys load the assigned camera's timeline here.
+    final hk = widget.hotkeys;
+    if (hk == null) return scaffold;
+    return GlobalHotkeysListener(
+      store: hk,
+      cameras: _cameras,
+      autofocus: true,
+      onGoToCamera: _selectCamera,
+      child: scaffold,
     );
   }
 }

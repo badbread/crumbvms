@@ -718,6 +718,8 @@ class _MainShellState extends State<MainShell> {
           session: session,
           cameras: widget.cameras,
           onClose: () => setState(() => _index = _liveIndex),
+          // Number-key hotkeys load a camera's timeline in playback.
+          hotkeys: widget.hotkeys,
         );
       case _clipsIndex:
         return ClipsScreen(

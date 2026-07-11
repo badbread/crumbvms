@@ -10,6 +10,7 @@
 // from vsMergeRegion so saved geometry round-trips identically either way.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
@@ -83,6 +84,10 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
   String _icon = '🎥';
   final Set<String> _selected = {}; // cell keys selected for merge
   bool _editLayoutMode = false;
+  bool _shiftEdit = false; // transient edit-layout while Shift is held
+
+  /// Effective edit-layout mode: the toggle OR Shift held down.
+  bool get _editing => _editLayoutMode || _shiftEdit;
   String? _error;
   bool _saving = false;
 
@@ -632,6 +637,25 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
     Navigator.of(context).pop();
   }
 
+  /// Hold Shift to temporarily enter "edit layout" mode (merge/split boxes).
+  /// Ignored while typing in a text field so Shift still capitalises.
+  KeyEventResult _onShiftKey(FocusNode node, KeyEvent event) {
+    final isShift = event.logicalKey == LogicalKeyboardKey.shiftLeft ||
+        event.logicalKey == LogicalKeyboardKey.shiftRight;
+    if (!isShift) return KeyEventResult.ignored;
+    final focused = FocusManager.instance.primaryFocus?.context?.widget;
+    if (focused is EditableText) return KeyEventResult.ignored;
+    if (event is KeyDownEvent && !_shiftEdit) {
+      setState(() => _shiftEdit = true);
+    } else if (event is KeyUpEvent && _shiftEdit) {
+      setState(() {
+        _shiftEdit = false;
+        _selected.clear();
+      });
+    }
+    return KeyEventResult.ignored; // don't consume — Shift still works normally
+  }
+
   @override
   Widget build(BuildContext context) {
     final sorted = CustomLayout(
@@ -640,8 +664,11 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       cells: _cells,
     ).sortedByReadingOrder().cells;
 
-    return Scaffold(
-      appBar: AppBar(
+    return Focus(
+      autofocus: true,
+      onKeyEvent: _onShiftKey,
+      child: Scaffold(
+        appBar: AppBar(
         title: Text(
           widget.existingView == null
               ? 'View setup — design a custom layout'
@@ -659,6 +686,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
           ),
           Expanded(child: _gridPane(sorted)),
         ],
+      ),
       ),
     );
   }
@@ -730,7 +758,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
               ),
             ),
           _buildToolbar(),
-          if (!_editLayoutMode) _buildSpecialTilePalette(),
+          if (!_editing) _buildSpecialTilePalette(),
         ],
       ),
     );
@@ -862,17 +890,28 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
           const SizedBox(width: 12),
           FilterChip(
             label: const Text('Edit layout'),
-            selected: _editLayoutMode,
+            selected: _editing,
             onSelected: (v) => setState(() {
               _editLayoutMode = v;
               _selected.clear();
             }),
           ),
-          if (_editLayoutMode)
+          if (_editing)
             ElevatedButton(
               onPressed: _selected.length >= 2 ? _mergeSelected : null,
               child: const Text('Merge selected'),
             ),
+          const SizedBox(width: 8),
+          Text(
+            _editing
+                ? 'Tap boxes to select, then Merge.'
+                : 'Tip: hold Shift to edit the layout (merge/split boxes).',
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: _editing
+                  ? Theme.of(context).colorScheme.primary
+                  : Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
         ],
       ),
     );
@@ -935,14 +974,14 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       child: Padding(
         padding: const EdgeInsets.all(2),
         child: DragTarget<SpecialTileType>(
-          onWillAcceptWithDetails: (details) => !_editLayoutMode,
+          onWillAcceptWithDetails: (details) => !_editing,
           onAcceptWithDetails: (details) =>
               _dropSpecialTile(cell, details.data),
           builder: (context, candidateData, rejectedData) {
             final hovering = candidateData.isNotEmpty;
             return GestureDetector(
               onTap: () {
-                if (_editLayoutMode) {
+                if (_editing) {
                   _toggleSelect(cell);
                 } else if (spec != null && !spec.isCamera) {
                   _handleSpecialTileTap(cell, spec);
