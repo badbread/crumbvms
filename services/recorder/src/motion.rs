@@ -2602,9 +2602,11 @@ async fn run_pixel_diff_loop(
                     // from this frame's connected_components are still current).
                     event_bbox = normalized_largest_bbox(&labels, &mut parent, &areas, w, h);
 
-                    // Emit START signal (stopped_at = None means in progress).
-                    send_signal(
+                    // Emit START signal (stopped_at = None means in progress) +
+                    // this source's own labeled 'motion' events row.
+                    emit_pixel_signal(
                         motion_tx,
+                        pool,
                         MotionSignal {
                             camera_id: camera.id,
                             started_at: now,
@@ -2612,8 +2614,8 @@ async fn run_pixel_diff_loop(
                             peak_score: score,
                             bbox: event_bbox,
                         },
-                        camera.id,
-                    );
+                    )
+                    .await;
 
                     debug!(
                         camera_id = %camera.id,
@@ -2643,9 +2645,10 @@ async fn run_pixel_diff_loop(
                     if below_threshold_count >= MOTION_STOP_HYSTERESIS {
                         let started_at = motion_started_at.unwrap_or(now);
 
-                        // Emit STOP signal.
-                        send_signal(
+                        // Emit STOP signal + update this source's 'motion' row.
+                        emit_pixel_signal(
                             motion_tx,
+                            pool,
                             MotionSignal {
                                 camera_id: camera.id,
                                 started_at,
@@ -2653,8 +2656,8 @@ async fn run_pixel_diff_loop(
                                 peak_score,
                                 bbox: event_bbox,
                             },
-                            camera.id,
-                        );
+                        )
+                        .await;
 
                         debug!(
                             camera_id  = %camera.id,
@@ -2705,13 +2708,18 @@ async fn run_pixel_diff_loop(
     // recording.rs can close out the event and write the correct end timestamp.
     if motion_state == MotionState::Active {
         if let Some(started_at) = motion_started_at {
-            let _ = motion_tx.try_send(MotionSignal {
-                camera_id: camera.id,
-                started_at,
-                stopped_at: Some(Utc::now()),
-                peak_score,
-                bbox: event_bbox,
-            });
+            emit_pixel_signal(
+                motion_tx,
+                pool,
+                MotionSignal {
+                    camera_id: camera.id,
+                    started_at,
+                    stopped_at: Some(Utc::now()),
+                    peak_score,
+                    bbox: event_bbox,
+                },
+            )
+            .await;
         }
     }
 
@@ -2889,6 +2897,22 @@ fn send_signal(tx: &MotionTx, signal: MotionSignal, camera_id: uuid::Uuid) {
             error     = %e,
             "motion channel full; signal dropped"
         );
+    }
+}
+
+/// Emit a pixel [`MotionSignal`] AND persist its `'motion'` `events` row.
+///
+/// Under additive motion sources `recording.rs` no longer writes event rows —
+/// each source owns its own surfacing (pixel → `'motion'`, HA → `'ha'`/
+/// device-class, Frigate → its detection rows). The signal is sent FIRST (it
+/// drives footage via the buffer); the labeled row is best-effort — a DB error
+/// is logged and ignored, exactly as the generic write was before, so a failed
+/// surfacing row can never cost a segment.
+async fn emit_pixel_signal(tx: &MotionTx, pool: &Pool, signal: MotionSignal) {
+    let camera_id = signal.camera_id;
+    send_signal(tx, signal.clone(), camera_id);
+    if let Err(e) = crumb_common::db::upsert_motion_event(pool, &signal).await {
+        warn!(camera_id = %camera_id, error = %e, "failed to persist pixel motion event");
     }
 }
 

@@ -747,6 +747,9 @@ async fn run_ffmpeg_loop(
     let post_secs = camera.policy.motion_post_seconds as i64;
 
     let mut motion_buf = MotionBuffer::new(pre_secs, post_secs);
+    // Unions the additive sources' edges before they reach the buffer (a second
+    // source's STOP must not end recording while another source is still open).
+    let mut motion_union = MotionUnion::default();
 
     // Motion-cache telemetry tick (read-only reporter — see
     // `report_motion_cache_status`). Only meaningful for Motion-mode cameras,
@@ -839,6 +842,7 @@ async fn run_ffmpeg_loop(
                             health_rx,
                             &mut pending_signals,
                             &mut motion_buf,
+                            &mut motion_union,
                             &live_storage.id,
                             &live_storage.path,
                             &camera_dir,
@@ -942,6 +946,7 @@ async fn run_ffmpeg_loop(
                                     health_rx,
                                     &mut pending_signals,
                                     &mut motion_buf,
+                                    &mut motion_union,
                                     &live_storage.id,
                                     &live_storage.path,
                                     &camera_dir,
@@ -1052,6 +1057,7 @@ async fn run_ffmpeg_loop(
             health_rx,
             &mut pending_signals,
             &mut motion_buf,
+            &mut motion_union,
             &live_storage.id,
             &live_storage.path,
             &camera_dir,
@@ -1100,6 +1106,7 @@ async fn finish_completed_segment(
     health_rx: &MotionHealthRx,
     pending_signals: &mut Vec<MotionSignal>,
     motion_buf: &mut MotionBuffer,
+    motion_union: &mut MotionUnion,
     live_storage_id: &uuid::Uuid,
     live_storage_path: &str,
     camera_dir: &Path,
@@ -1136,27 +1143,22 @@ async fn finish_completed_segment(
     // so the buffer isn't fed at all and this call is a pure no-op for it.
     let mut actual = MotionDecision::empty();
     let mut shadow = MotionDecision::empty();
-    // HA-sourced cameras get a labeled 'ha' events row from ha_motion.rs; skip the
-    // generic 'motion' row here to avoid double-surfacing (see fn doc).
-    let write_generic_motion_event = !camera.motion_source.eq_ignore_ascii_case("ha");
     if caching_active && detector_healthy {
         drain_and_persist_motion(
             motion_rx,
             pending_signals,
-            pool,
             drive_buffer.then_some(&mut *motion_buf),
+            motion_union,
             &mut actual,
-            write_generic_motion_event,
         )
         .await;
     } else {
         drain_and_persist_motion(
             motion_rx,
             pending_signals,
-            pool,
             drive_buffer.then_some(&mut *motion_buf),
+            motion_union,
             &mut shadow,
-            write_generic_motion_event,
         )
         .await;
     }
@@ -1428,36 +1430,34 @@ fn drain_motion_channel(rx: &mut MotionRx, out: &mut Vec<MotionSignal>) {
 /// channel receive, not on the boundary loop). The resulting [`MotionDecision`]s
 /// are appended into `decision`.
 ///
-/// `write_generic_motion_event` gates ONLY the generic `'motion'/'motion'`
-/// surfacing-row write. A `motion_source='ha'` camera passes `false`: its
-/// `ha_motion.rs` loop already wrote a *labeled* `'ha'` events row (Door /
-/// Window / …) for the same transition, so writing the generic row too would
-/// double-surface the event and double-fire notifications. This gate wraps the
-/// event-row upsert loop only — never the `buf.apply_signal` loop below — so the
-/// recording/persist decision is byte-identical regardless of the flag; only
-/// which surfacing row is written changes.
+/// **Surfacing note (additive sources):** this function no longer writes any
+/// `events` row. Under the additive model each source writes its OWN labeled row
+/// (pixel → `'motion'`, HA → `'ha'`/device-class, Frigate → its detections), so
+/// `recording.rs` — which sees only a source-blind unioned signal — cannot and
+/// must not label events. See `docs/DECISIONS.md` (additive multi-source motion).
+///
+/// The raw drained signals still accumulate into `out` (`pending_signals`) for
+/// the `has_motion`/bbox stamping, which unions across signals itself. The
+/// **buffer** feed is routed through [`MotionUnion`] so a second source's STOP
+/// can't end recording while another source is still open.
 async fn drain_and_persist_motion(
     rx: &mut MotionRx,
     out: &mut Vec<MotionSignal>,
-    pool: &Pool,
     motion_buf: Option<&mut MotionBuffer>,
+    motion_union: &mut MotionUnion,
     decision: &mut MotionDecision,
-    write_generic_motion_event: bool,
 ) {
     let before = out.len();
     drain_motion_channel(rx, out);
-    if write_generic_motion_event {
-        for sig in &out[before..] {
-            if let Err(e) = db::upsert_motion_event(pool, sig).await {
-                warn!(camera_id = %sig.camera_id, error = %e, "failed to persist motion event");
-            }
-        }
-    }
     if let Some(buf) = motion_buf {
         for sig in &out[before..] {
-            let d = buf.apply_signal(sig);
-            decision.persist.extend(d.persist);
-            decision.discard.extend(d.discard);
+            // Union the per-source edges before the buffer: only a rising edge on
+            // the FIRST open and a falling edge on the LAST close reach apply_signal.
+            if let Some(union_sig) = motion_union.fold(sig) {
+                let d = buf.apply_signal(&union_sig);
+                decision.persist.extend(d.persist);
+                decision.discard.extend(d.discard);
+            }
         }
     }
 }
