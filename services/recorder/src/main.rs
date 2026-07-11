@@ -75,6 +75,7 @@ mod motion;
 mod reconcile;
 mod recording;
 mod resource_stats;
+mod source_health;
 
 // ─── channel types (exported for implementers) ────────────────────────────────
 
