@@ -621,7 +621,12 @@ class _MainShellState extends State<MainShell> {
         child: SizedBox(
           width: 920,
           height: 720,
-          child: LayoutEditorScreen(api: widget.api, session: session),
+          child: LayoutEditorScreen(
+            api: widget.api,
+            session: session,
+            // Apply-without-save: render the layout on the wall immediately.
+            onApply: _applyView,
+          ),
         ),
       ),
     );

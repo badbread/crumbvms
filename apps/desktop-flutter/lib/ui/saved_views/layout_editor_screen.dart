@@ -14,6 +14,8 @@ import 'package:flutter/material.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/views_api.dart';
+import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
+    show AppliedView;
 import 'package:crumb_desktop/ui/special_tiles/config/special_tile_config_sheet.dart';
 import 'package:crumb_desktop/ui/special_tiles/config/special_tile_palette.dart';
 import 'package:crumb_desktop/ui/special_tiles/special_tile_spec.dart';
@@ -52,11 +54,17 @@ class LayoutEditorScreen extends StatefulWidget {
     required this.api,
     required this.session,
     this.existingView,
+    this.onApply,
   });
 
   final CrumbApi api;
   final Session session;
   final SavedView? existingView;
+
+  /// Apply the current layout to the wall NOW without saving it as a named
+  /// view (the old client's "Apply" button). Save still persists + returns a
+  /// [SavedView] via `Navigator.pop`.
+  final void Function(AppliedView view)? onApply;
 
   @override
   State<LayoutEditorScreen> createState() => _LayoutEditorScreenState();
@@ -461,6 +469,86 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
     }
   }
 
+  /// Bottom action bar matching the old client: a hint on the left, then
+  /// Cancel / Apply / Save view. Apply uses the layout on the wall now; Save
+  /// view also keeps it for later.
+  Widget _actionBar() {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHigh,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Apply uses this layout on the wall now. Save view also keeps '
+                'it under the view row to switch back to later.',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: _saving ? null : () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            const SizedBox(width: 4),
+            if (widget.onApply != null)
+              OutlinedButton(
+                onPressed: _saving ? null : _apply,
+                child: const Text('Apply'),
+              ),
+            const SizedBox(width: 8),
+            FilledButton(
+              onPressed: _saving ? null : _save,
+              child: _saving
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Save view'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Apply the current layout to the wall now, without saving it as a named
+  /// view (the old client's "Apply" button).
+  void _apply() {
+    final layout = CustomLayout(
+      cols: _cols,
+      rows: _rows,
+      cells: _cells,
+    ).sortedByReadingOrder();
+    if (layout.cells.isEmpty) {
+      setState(() => _error = 'Layout has no boxes.');
+      return;
+    }
+    final slots = <int, String>{};
+    for (var i = 0; i < layout.cells.length; i++) {
+      final spec = _assign[layout.cells[i].key];
+      if (spec != null && spec.isCamera && spec.cameraId != null) {
+        slots[i] = spec.cameraId!;
+      }
+    }
+    final name = _nameCtrl.text.trim();
+    widget.onApply?.call(
+      AppliedView(
+        id: '__preview__',
+        name: name.isEmpty ? 'Custom layout' : name,
+        layout: layout,
+        slots: slots,
+        rawSlots: const {},
+      ),
+    );
+    Navigator.of(context).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     final sorted = CustomLayout(
@@ -472,21 +560,12 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          widget.existingView == null ? 'New saved view' : 'Edit saved view',
+          widget.existingView == null
+              ? 'View setup — design a custom layout'
+              : 'Edit saved view',
         ),
-        actions: [
-          TextButton(
-            onPressed: _saving ? null : _save,
-            child: _saving
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Text('SAVE'),
-          ),
-        ],
       ),
+      bottomNavigationBar: _actionBar(),
       body: Column(
         children: [
           Padding(
