@@ -15,8 +15,13 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
+
+/// P1 perf gate: with `--dart-define=GRID=<n>` the app renders an n-up media_kit
+/// grid instead of the single-pane spike (see perf_grid.dart). 0 = spike.
+const int kGrid = int.fromEnvironment('GRID', defaultValue: 0);
 
 /// The camera/stream to render. Injected at build/run time so no site-specific
 /// address lands in the repo:
@@ -34,7 +39,9 @@ Future<void> main() async {
   MediaKit.ensureInitialized();
   // flutter_rust_bridge — loads the cargokit-built rust_lib_crumb_desktop dylib.
   await RustLib.init();
-  runApp(const SpikeApp());
+  runApp(
+    kGrid > 0 ? PerfGridApp(count: kGrid, url: kStreamUrl) : const SpikeApp(),
+  );
 }
 
 class SpikeApp extends StatelessWidget {
@@ -113,16 +120,18 @@ class _LivePaneState extends State<LivePane> {
   }
 
   void _resetZoom() => setState(() {
-        _scale = 1.0;
-        _offset = Offset.zero;
-      });
+    _scale = 1.0;
+    _offset = Offset.zero;
+  });
 
   @override
   void initState() {
     super.initState();
     _startVideo();
-    _statsTimer =
-        Timer.periodic(const Duration(seconds: 1), (_) => _pollStats());
+    _statsTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _pollStats(),
+    );
     // Note when the first video frame lands (time-to-first-frame is one of the
     // jank metrics we report).
     _player.stream.width.listen((w) {
@@ -141,7 +150,9 @@ class _LivePaneState extends State<LivePane> {
       if (platform is NativePlayer) {
         await platform.setProperty('rtsp-transport', 'tcp');
       }
-    } catch (_) {/* non-fatal for the spike */}
+    } catch (_) {
+      /* non-fatal for the spike */
+    }
     await _player.open(Media(kStreamUrl));
   }
 
@@ -194,7 +205,8 @@ class _LivePaneState extends State<LivePane> {
                   onPointerSignal: (e) {
                     if (e is PointerScrollEvent) {
                       // ~1.13x per wheel notch; sign selects in/out.
-                      final factor = math.pow(1.0013, -e.scrollDelta.dy) as double;
+                      final factor =
+                          math.pow(1.0013, -e.scrollDelta.dy) as double;
                       _zoomAt(e.localPosition, factor, pane);
                     }
                   },
@@ -281,8 +293,8 @@ class _StatsOverlay extends StatelessWidget {
     final gpu = s?.gpuUtil == null
         ? 'GPU  —  (no NVIDIA)'
         : 'GPU  ${s!.gpuUtil!.toStringAsFixed(0)}%   '
-            'NVDEC ${s.gpuDecUtil?.toStringAsFixed(0) ?? "—"}%   '
-            'VRAM ${s.gpuMemMb?.toStringAsFixed(0) ?? "—"} MB';
+              'NVDEC ${s.gpuDecUtil?.toStringAsFixed(0) ?? "—"}%   '
+              'VRAM ${s.gpuMemMb?.toStringAsFixed(0) ?? "—"} MB';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
@@ -314,25 +326,32 @@ class _StatsOverlay extends StatelessWidget {
                 ),
                 if (zoom > 1.01) ...[
                   const SizedBox(width: 10),
-                  Text('${zoom.toStringAsFixed(1)}×',
-                      style: const TextStyle(
-                          color: Colors.cyanAccent,
-                          fontWeight: FontWeight.w700)),
+                  Text(
+                    '${zoom.toStringAsFixed(1)}×',
+                    style: const TextStyle(
+                      color: Colors.cyanAccent,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
                 ],
               ],
             ),
             const SizedBox(height: 6),
-            Text(s == null
-                ? 'host_stats: (waiting for first FRB poll)'
-                : 'CPU  ${cpuPercent?.toStringAsFixed(0) ?? "—"}%   '
-                    'RSS ${s.memMb.toStringAsFixed(0)} MB   '
-                    '${s.numCpus} cores'),
+            Text(
+              s == null
+                  ? 'host_stats: (waiting for first FRB poll)'
+                  : 'CPU  ${cpuPercent?.toStringAsFixed(0) ?? "—"}%   '
+                        'RSS ${s.memMb.toStringAsFixed(0)} MB   '
+                        '${s.numCpus} cores',
+            ),
             const SizedBox(height: 2),
             Text(gpu),
             if (s?.gpuName != null) ...[
               const SizedBox(height: 2),
-              Text(s!.gpuName!,
-                  style: const TextStyle(color: Colors.white54, fontSize: 11)),
+              Text(
+                s!.gpuName!,
+                style: const TextStyle(color: Colors.white54, fontSize: 11),
+              ),
             ],
           ],
         ),
@@ -363,15 +382,27 @@ class _PtzStub extends StatelessWidget {
           Icon(Icons.keyboard_arrow_up, color: Colors.white, size: 22),
           Align(
             alignment: Alignment.bottomCenter,
-            child: Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 22),
+            child: Icon(
+              Icons.keyboard_arrow_down,
+              color: Colors.white,
+              size: 22,
+            ),
           ),
           Align(
             alignment: Alignment.centerLeft,
-            child: Icon(Icons.keyboard_arrow_left, color: Colors.white, size: 22),
+            child: Icon(
+              Icons.keyboard_arrow_left,
+              color: Colors.white,
+              size: 22,
+            ),
           ),
           Align(
             alignment: Alignment.centerRight,
-            child: Icon(Icons.keyboard_arrow_right, color: Colors.white, size: 22),
+            child: Icon(
+              Icons.keyboard_arrow_right,
+              color: Colors.white,
+              size: 22,
+            ),
           ),
           Icon(Icons.open_with, color: Colors.white54, size: 16),
         ],
