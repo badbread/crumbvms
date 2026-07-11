@@ -19,6 +19,7 @@
 
 import 'dart:async' show unawaited;
 
+import 'package:flutter/gestures.dart' show PointerScrollEvent;
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_windows/webview_windows.dart';
@@ -158,7 +159,31 @@ class _AdminConsoleScreenState extends State<AdminConsoleScreen> {
       case _LoadState.initializing:
         return const Center(child: CircularProgressIndicator());
       case _LoadState.ready:
-        return Webview(_controller);
+        // webview_windows doesn't forward the mouse wheel to the page, so the
+        // console can't be scrolled. Intercept the scroll and drive it into the
+        // page via JS (window + the element under the cursor, to cover inner
+        // scroll containers).
+        return Listener(
+          onPointerSignal: (e) {
+            if (e is PointerScrollEvent) {
+              final dy = e.scrollDelta.dy;
+              unawaited(
+                _controller.executeScript(
+                  '(function(d){'
+                  'var el=document.elementFromPoint('
+                  '${e.localPosition.dx.round()},${e.localPosition.dy.round()});'
+                  'while(el){var s=getComputedStyle(el);'
+                  'if(/(auto|scroll)/.test(s.overflowY)&&'
+                  'el.scrollHeight>el.clientHeight){el.scrollTop+=d;return;}'
+                  'el=el.parentElement;}'
+                  'window.scrollBy(0,d);'
+                  '})($dy);',
+                ),
+              );
+            }
+          },
+          child: Webview(_controller),
+        );
       case _LoadState.unsupported:
       case _LoadState.error:
         return _fallback();
