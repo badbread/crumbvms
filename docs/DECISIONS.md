@@ -8,6 +8,78 @@ revisit.
 
 ---
 
+## 2026-07-10, Desktop client: rewrite native in Flutter (keep the Rust core), retire the Tauri/WebView2 airspace model
+
+**Context.** The desktop client is Tauri 2 + wry/WebView2 with native Win32
+child video panes composited *above* the web chrome (the "airspace" model). Live
+and playback are fast, but the operator kept hitting a class of jank: panes
+return to the wrong camera, the on-video PTZ controls feel crude, and the whole
+thing "feels weird, not native" on Windows, one of the project's golden goals.
+This reopens the 2026-06-15 KEEP-TAURI decision (golden rule 7). A research spike
+confirmed the interim "composition-hosted WebView2" fix (option 2b) is a wall in
+wry 0.55: wry hard-wires HWND-hosted WebView2, and a composition controller you
+create is an orphan webview carrying none of Tauri's IPC, so `sync_panes` /
+pane stats / events all break, getting composition means abandoning Tauri
+anyway. The deciding input came from asking the operator whether "not native" was
+the window/video *behavior* or **also the look of the UI itself** (buttons,
+menus, fonts, scroll feel like a website). Answer: **also the look.** That rules
+out every option that keeps the 13k-line web UI.
+
+**Decision — full native rewrite, toolkit = Flutter**, keeping the existing Rust
+core via `flutter_rust_bridge` and rendering video through `media_kit`/libmpv
+(external-texture). Native compositing makes on-video overlays (PTZ, and the
+planned Home-Assistant status icons) **first-class native widgets**, deleting the
+airspace bug class outright. This is a **UI-only rewrite**: the tested Rust (mpv
+management, the client) is preserved behind the FFI bridge, not reimplemented.
+Flutter *replaces* the Tauri desktop UI, it does not add a codebase, the surface
+count is unchanged (web-admin + SwiftUI iOS/macOS + desktop).
+
+**Decision — hybrid management console.** The settings/users/policies/setup-wizard
+UI (the largest, least-trafficked slice, already shared with the web admin) stays
+an **embedded web view** (system browser on Linux, where Flutter desktop webview
+is weak); only the daily video surfaces (live wall, playback, on-video overlay)
+are native. Saves ~2-3 months and keeps those screens auto-synced with the web
+console. Accepted trade-off: the settings screens keep a web look; the surfaces
+the operator lives in do not.
+
+**Rejected.**
+- *WinUI 3 / WPF* (Windows-only native): permanently forks the on-hold-not-dead
+  Linux desktop against the maintainer's not-over-forking value; its only edges
+  (deepest Windows-Fluent integration, MIT license) don't outweigh a permanent
+  fork. A cross-platform toolkit serves Windows now and Linux later from one
+  codebase.
+- *Qt / QML* (cross-platform native): credible runner-up, retained as the
+  fallback if Flutter desktop maturity disappoints, but heavier (bundled Chromium
+  via QtWebEngine), LGPL dynamic-link/relink obligations inside an AGPL app, a
+  two-hop Rust↔C++↔QML bridge, and no turnkey mpv-texture equal to `media_kit`.
+- *Path B (custom Win32 + composition-WebView2 shell, keep the web UI)* and
+  *tighten-in-place on the current airspace model*: both keep the web UI, which
+  the "also the look" answer rules out; the spike also showed composition means
+  leaving Tauri regardless.
+- *Video into the webview (one web layer)*: reintroduces browser-video
+  latency/fps limits; never on the table for an NVR.
+
+**Consequences.** The reconcile "wrong-camera-on-return" fix (~25 slot-keyed
+sites in `apps/desktop`) is **shelved as throwaway**, a native rewrite gets pane
+identity for free. The SwiftUI iOS/macOS app is **not** absorbed (it works; don't
+destabilize live iOS video chasing one-codebase purity). Linux stays on hold, but
+Flutter makes it near-free when it un-holds. Rough phasing (wide error bars,
+~4-6 months with the hybrid console): P0 de-risk spike (Flutter shell + the Rust
+bridge + `media_kit` rendering one live camera with one native overlay, proving
+mpv-texture + Rust-FFI + native compositing hold together before committing) →
+P1 live wall + HA overlay as first-class native widgets (the headline proof, and
+the surface the operator complained about) → P2 playback → P3 the rest
+(clips/export/tuner/bookmarks/views) → P5 Linux target + packaging when un-held.
+
+**Revisit triggers.** Flutter desktop or `media_kit` maturity regresses or goes
+unmaintained (→ Qt fallback). Linux is declared truly dead **and** deep
+Windows-native integration becomes a priority (→ reconsider WinUI).
+`flutter_rust_bridge` can't keep pace with the Rust core's surface (→ thinner FFI
+or Qt/cxx). The P0 spike shows mpv-texture + Rust-FFI + native compositing don't
+hold together acceptably (→ reconsider the rewrite premise before P1).
+
+---
+
 ## 2026-07-10, Additive multi-source motion: cameras enable N sources at once; fail-open aggregates on residual coverage
 
 **Context.** Motion source was an exclusive single pick (`cameras.motion_source` =
