@@ -427,6 +427,18 @@ pub struct UpdateCameraRequest {
     /// omitted = leave existing password unchanged. Never echo back.
     #[serde(default, deserialize_with = "double_option")]
     pub onvif_password: Option<Option<String>>,
+    /// Camera make (ONVIF `Manufacturer`, or MANUAL entry for a non-ONVIF camera).
+    /// Matched against the bundled compatibility DB (issue #48). `Some(Some(v))`
+    /// sets, `Some(None)` clears, omitted = unchanged.
+    #[serde(default, deserialize_with = "double_option")]
+    pub make: Option<Option<String>>,
+    /// Camera model. Same double-option semantics as [`Self::make`].
+    #[serde(default, deserialize_with = "double_option")]
+    pub model: Option<Option<String>>,
+    /// Camera firmware (informational only, never gates a compat match). Same
+    /// double-option semantics as [`Self::make`].
+    #[serde(default, deserialize_with = "double_option")]
+    pub firmware: Option<Option<String>>,
 }
 
 fn default_true() -> bool {

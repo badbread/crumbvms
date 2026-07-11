@@ -1005,6 +1005,36 @@ async fn update_camera(
         None => existing.onvif_password.clone(),
     };
 
+    // make/model/firmware (camera compatibility, issue #48): ONVIF `identify`
+    // populates these, but a non-ONVIF camera can also set them by hand here.
+    // Same double-option merge as the onvif_* fields. The `Camera` struct does
+    // not carry these columns, so read the current values directly to honor
+    // "omitted = unchanged".
+    let (cur_make, cur_model, cur_firmware) = db::get_camera_device_info(pool, id)
+        .await
+        .context("get_camera_device_info")?;
+    let make: Option<String> = match &body.make {
+        Some(inner) => inner
+            .clone()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
+        None => cur_make,
+    };
+    let model: Option<String> = match &body.model {
+        Some(inner) => inner
+            .clone()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
+        None => cur_model,
+    };
+    let firmware: Option<String> = match &body.firmware {
+        Some(inner) => inner
+            .clone()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
+        None => cur_firmware,
+    };
+
     // motion_mask: same double-option pattern.
     let motion_mask: Option<serde_json::Value> = match body.motion_mask {
         Some(inner) => inner,
@@ -1122,7 +1152,10 @@ async fn update_camera(
                 onvif_password     = $22,
                 motion_pixel_enabled   = $23,
                 motion_frigate_enabled = $24,
-                motion_ha_enabled      = $25
+                motion_ha_enabled      = $25,
+                make                   = $26,
+                model                  = $27,
+                firmware               = $28
             WHERE id = $1
             ",
             &[
@@ -1151,6 +1184,9 @@ async fn update_camera(
                 &motion_pixel_enabled,
                 &motion_frigate_enabled,
                 &motion_ha_enabled,
+                &make,
+                &model,
+                &firmware,
             ],
         )
         .await
@@ -4281,6 +4317,21 @@ fn validate_update_camera(body: &UpdateCameraRequest) -> Result<(), ApiError> {
             return Err(ApiError::BadRequest(
                 "main_url must not be blank".to_owned(),
             ));
+        }
+    }
+    // make/model/firmware are free text (manual entry, issue #48); cap the length
+    // so a bad value can't bloat the row or the contribute-issue URL.
+    for (field, val) in [
+        ("make", &body.make),
+        ("model", &body.model),
+        ("firmware", &body.firmware),
+    ] {
+        if let Some(Some(v)) = val {
+            if v.chars().count() > 200 {
+                return Err(ApiError::BadRequest(format!(
+                    "{field} must be 200 characters or fewer"
+                )));
+            }
         }
     }
     Ok(())
