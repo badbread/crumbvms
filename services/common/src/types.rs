@@ -449,16 +449,25 @@ pub struct Camera {
     pub motion_mask: Option<serde_json::Value>,
     /// `cameras.onvif_motion` — when true, use ONVIF events instead of pixel-diff.
     pub onvif_motion: bool,
-    /// `cameras.motion_source` — where this camera's motion comes from:
-    /// `"pixel"` (the local pixel-analysis pipeline, default), `"frigate"`
-    /// (Frigate's neural object detections via MQTT), or `"ha"` (linked Home
-    /// Assistant motion/door sensors, polled). See the pluggable-motion design
-    /// (`docs/MOTION-DETECTION-DESIGN.md`). A `"frigate"`/`"ha"` camera whose
-    /// integration is disabled or unlinked falls back to the pixel pipeline.
+    /// `cameras.motion_source` — **DEPRECATED (migration 0049)**, superseded by
+    /// the additive `motion_{pixel,frigate,ha}_enabled` set below. Kept only
+    /// because `v_camera_effective_policy` references it; no recorder/API logic
+    /// reads it. Do not add new reads.
     pub motion_source: String,
-    /// `cameras.motion_algorithm` — which pixel detector to run when
-    /// `motion_source == "pixel"`: `"census"` (default), `"framediff"`, `"mog2"`,
-    /// `"opticalflow"`, or `"ensemble"`. Ignored when the source is Frigate.
+    /// The ADDITIVE motion-source set (`cameras.motion_pixel_enabled` /
+    /// `motion_frigate_enabled` / `motion_ha_enabled`, migration 0049). A camera
+    /// records on the UNION of every enabled source; each is toggled
+    /// independently. Sub-config lives elsewhere: [`Self::motion_algorithm`]
+    /// (pixel), `frigate_config` (Frigate), `camera_ha_links` (Home Assistant).
+    /// Zero sources enabled on a Motion-mode camera = no detector = the recorder
+    /// fails OPEN (records everything). See `docs/DECISIONS.md` (additive
+    /// multi-source motion) and `docs/MOTION-DETECTION-DESIGN.md`.
+    pub motion_pixel_enabled: bool,
+    pub motion_frigate_enabled: bool,
+    pub motion_ha_enabled: bool,
+    /// `cameras.motion_algorithm` — which pixel detector to run when the pixel
+    /// source is enabled: `"census"` (default), `"framediff"`, `"mog2"`,
+    /// `"opticalflow"`, or `"ensemble"`. Ignored by the Frigate/HA sources.
     pub motion_algorithm: String,
     /// `cameras.camera_type` — physical camera form-factor, used purely for the
     /// admin-console tree/header glyph: `"ptz"`, `"dome"`, `"bullet"`, `"lpr"`,

@@ -8,6 +8,101 @@ revisit.
 
 ---
 
+## 2026-07-10, Additive multi-source motion: cameras enable N sources at once; fail-open aggregates on residual coverage
+
+**Context.** Motion source was an exclusive single pick (`cameras.motion_source` =
+`pixel`|`frigate`|`ha`). The operator wants it **additive**: a camera can enable
+several sources at once (e.g. pixel + an HA door sensor as a backstop) and record
+on the **union** of their triggers. This reopens the motion-source model
+(golden rule 7). Ratified with a Fable design pass; implemented in increments
+(schema/plumbing first, recorder core next).
+
+**Decision — data model: three boolean columns.** Replace the enum with
+`motion_pixel_enabled` / `motion_frigate_enabled` / `motion_ha_enabled`
+(`NOT NULL DEFAULT false`), backfilled from the old value so **no existing camera
+changes behavior** (migration 0049). Sub-config already lives elsewhere
+(`motion_algorithm` for pixel, `frigate_config`, `camera_ha_links`), so the
+booleans only say *which loops run*. The `motion_source` column is **kept but
+deprecated** (nothing reads it): dropping it would force re-declaring
+`v_camera_effective_policy` (the append-only view trap), so it stays. The view is
+re-declared to *append* the three new `c_*` columns (allowed by CREATE OR REPLACE;
+existing columns keep name+order). **Zero sources enabled on a Motion-mode camera
+= no detector = fail open** (records everything, footage-safe); the admin warns
+before saving that state. Rejected: a `TEXT[]`/set column (array-op querying;
+a typo'd element is a silent no-op) and a join table (over-built for a closed
+3-source set, adds a join to every camera load).
+
+**Decision — orchestration: N supervised loops + a per-camera `SourceMux`.** One
+supervised source loop per enabled source (today's per-camera supervisor cloned
+N ways), but do **not** point them all at the shared `motion_tx` and trust
+`recording.rs` to union. A per-camera `SourceMux` sits between the loops and the
+existing `(motion_tx, health_tx)`: it (1) ORs the per-source open flags into the
+single-open-event `MotionSignal` stream `recording.rs` has always seen
+(preserving `MotionBuffer::apply_signal`'s single-source invariant), and (2)
+aggregates per-source health into the one `health_tx` the buffer reads. Why the
+mux and not "let recording.rs union": `apply_signal` was authored single-source
+(each source's own tracker already unions its events before emitting), so two
+sources feeding independent `started_at` START/STOP pairs could have one source's
+STOP close the buffer while another is still open → **a recording gap = footage
+loss**. The mux removes the risk and keeps the recorder core unchanged. (Revisit
+if a test proves `apply_signal` unions independent interleaved pairs — the mux's
+*union* role could retire, but its *health-aggregation* role stays.)
+
+**Decision — fail-open rule (the crux): aggregate on residual coverage, with an
+asymmetric grace.** The camera fails open (records everything) when **(a) ALL
+enabled sources are unhealthy (immediate, no grace), OR (b) ANY enabled source
+has been hard-DOWN continuously past `motion_source_down_grace` (default 60s)**.
+Otherwise it is healthy and motion-gated on its working sources. Rationale: a
+source is added precisely to catch what the others miss, so its silent death must
+eventually fail open (clause b) — but a still-working source buys a bounded grace
+so one flaky source doesn't force record-everything on every reconnect. "Hard-down"
+(loop erroring / in backoff) accrues down-time; a **clean config-version exit**
+(the loop returns `Ok` and re-runs within a tick) is *reconfiguring*, not down,
+and never trips clause (b) — this is what stops the flapping. Per-source
+`motion_detector_unhealthy` alerts fire **by name** so a dead added-source is
+loud, not silent; the operator's release valve is to **disable** that source
+(untick it → out of the enabled set → can't force fail-open). This reduces
+**exactly to today** for a single-source camera: one source down → clause (a) →
+immediate fail open. Rejected: fail-open-if-ANY-unhealthy (every added source
+becomes a permanent disk-filling liability that flaps on reconnect);
+degrade-to-healthy-only (silently discards exactly the events the operator added
+a source to catch = footage loss of declared-important events).
+
+**Decision — surfacing: each source owns its event row; `recording.rs` writes
+none.** In the additive model the mux feeds `recording.rs` a source-blind unioned
+signal that *cannot* be labeled, so `recording.rs` stops writing `events` rows
+entirely. Each source loop writes its own labeled row at its transitions: pixel →
+`'motion'` (move `upsert_motion_event` out of `recording.rs`'s
+`drain_and_persist_motion` into `run_pixel_diff_loop`), HA → `'ha'`/device-class
+(slice 3, unchanged), Frigate → its detection rows (ingester, unchanged). This
+also **fixes an existing double-surface**: today a Frigate camera gets both a
+generic `'motion'` row (from `recording.rs`) and its `'frigate'` rows; relocating
+the write leaves only the richer `'frigate'` rows. The slice-3
+`motion_source=='ha'` suppression gate is deleted — it existed only because HA
+reused the shared motion signal.
+
+**Sequencing.** PR #55 (exclusive HA) ships as the single-source *mechanics*
+(`ha_motion.rs`/`HaTracker`/labeled events/poll source are reused verbatim);
+additive is this follow-up. Also fixes a #55 gap found in passing: the API's
+`normalize_motion_source` rejects `'ha'`, so the exclusive model was not actually
+settable via the API — additive replaces that validator with the booleans.
+
+**Blocking correctness gate (verify on real hardware before merge):** (1)
+`SourceMux` unit test — interleaved pixel/HA START/STOP with unrelated
+`started_at` produce one continuous window; a STOP from one source while another
+is open does NOT close recording. (2) On a pixel+HA camera: kill HA → after the
+60s grace records EVERYTHING; blip HA (< grace) with pixel healthy → NO fail-open
+flap; disable pixel too (all down) → immediate fail open; a pixel-only camera's
+fail-open timing is unchanged. (3) `cargo test motion::` + full gate.
+
+**Revisit triggers.** A test proves `apply_signal` unions independent interleaved
+pairs → the mux's union role can retire. A 4th+ source arrives → reconsider a set
+column. Operators find the 60s residual-coverage grace too long/short → make
+`motion_source_down_grace` a per-policy knob. A WS `HaEventSource` lands, changing
+HA down-vs-reconfiguring semantics → re-verify the grace classification.
+
+---
+
 ## 2026-07-10, HA motion surfacing: the recorder writes the labeled event row; `MotionSignal` stays source-agnostic; generic motion row suppressed for HA cameras
 
 **Context.** Phase 2 makes a `motion_source='ha'` camera trigger recording from

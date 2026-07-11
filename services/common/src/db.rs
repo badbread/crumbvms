@@ -452,6 +452,23 @@ fn camera_from_row(row: &tokio_postgres::Row) -> Result<Camera> {
         motion_mask: row.get("c_motion_mask"),
         onvif_motion: row.get("c_onvif_motion"),
         motion_source: row.get("c_motion_source"),
+        // Additive source set (migration 0049). Fall back to deriving from the
+        // deprecated motion_source if the view predates the re-declaration (belt
+        // and suspenders, mirroring the served_by shim below).
+        motion_pixel_enabled: row.try_get("c_motion_pixel_enabled").unwrap_or_else(|_| {
+            let ms: String = row.try_get("c_motion_source").unwrap_or_default();
+            ms.is_empty() || ms == "pixel"
+        }),
+        motion_frigate_enabled: row.try_get("c_motion_frigate_enabled").unwrap_or_else(|_| {
+            row.try_get::<_, String>("c_motion_source")
+                .map(|s| s == "frigate")
+                .unwrap_or(false)
+        }),
+        motion_ha_enabled: row.try_get("c_motion_ha_enabled").unwrap_or_else(|_| {
+            row.try_get::<_, String>("c_motion_source")
+                .map(|s| s == "ha")
+                .unwrap_or(false)
+        }),
         motion_algorithm: row.get("c_motion_algorithm"),
         camera_type: row.get("c_camera_type"),
         icon: row.get("c_icon"),
@@ -2960,9 +2977,15 @@ pub async fn create_camera(pool: &Pool, p: &CreateCameraParams<'_>) -> Result<Ca
                  policy_id, motion_mask, onvif_motion,
                  motion_source, motion_algorithm, camera_type, icon,
                  served_by, source_camera_name,
-                 onvif_host, onvif_port, onvif_user, onvif_password)
+                 onvif_host, onvif_port, onvif_user, onvif_password,
+                 motion_pixel_enabled, motion_frigate_enabled, motion_ha_enabled)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20)
+                    $15, $16, $17, $18, $19, $20,
+                    -- additive source set (migration 0049) derived from the
+                    -- legacy motion_source until callers set the booleans directly
+                    ($11::text = '' OR $11::text = 'pixel'),
+                    ($11::text = 'frigate'),
+                    ($11::text = 'ha'))
             RETURNING id
             ",
             &[
@@ -8155,6 +8178,10 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
         (
             "0048_ha_integration.sql",
             include_str!("../../../db/migrations/0048_ha_integration.sql"),
+        ),
+        (
+            "0049_additive_motion_sources.sql",
+            include_str!("../../../db/migrations/0049_additive_motion_sources.sql"),
         ),
     ];
 
