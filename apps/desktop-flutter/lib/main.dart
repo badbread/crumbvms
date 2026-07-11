@@ -343,7 +343,17 @@ class _MainShellState extends State<MainShell> {
 
   static const int _liveIndex = 0;
   static const int _playbackIndex = 1;
-  static const int _layoutsIndex = 5;
+  static const int _clipsIndex = 2;
+  static const int _exportIndex = 3;
+  static const int _settingsIndex = 4;
+
+  static const _tabs = <(int, IconData, String)>[
+    (_liveIndex, Icons.grid_view, 'Live'),
+    (_playbackIndex, Icons.play_circle_outline, 'Playback'),
+    (_clipsIndex, Icons.movie_outlined, 'Clips'),
+    (_exportIndex, Icons.download_outlined, 'Export'),
+    (_settingsIndex, Icons.settings_outlined, 'Settings'),
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -360,18 +370,9 @@ class _MainShellState extends State<MainShell> {
               if (!chromeHidden) ...[
                 RecordingAlertBanner(controller: widget.recordingAlerts),
                 UpdateBanner(controller: widget.updateCheck),
+                _buildTopBar(session),
               ],
-              Expanded(
-                child: Row(
-                  children: [
-                    if (!chromeHidden) ...[
-                      _buildRail(),
-                      const VerticalDivider(width: 1),
-                    ],
-                    Expanded(child: _buildBody(session)),
-                  ],
-                ),
-              ),
+              Expanded(child: _buildBody(session)),
               if (!chromeHidden) StatusBar(controller: widget.statusBar),
             ],
           );
@@ -380,69 +381,97 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
-  Widget _buildRail() {
-    // Scrollable rail: 12 destinations overflow a short window otherwise.
-    return LayoutBuilder(
-      builder: (context, constraints) => SingleChildScrollView(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(minHeight: constraints.maxHeight),
-          child: IntrinsicHeight(
-            child: NavigationRail(
-              selectedIndex: _index,
-              onDestinationSelected: (i) => setState(() => _index = i),
-              labelType: NavigationRailLabelType.all,
-              destinations: const [
-                NavigationRailDestination(
-                  icon: Icon(Icons.grid_view),
-                  label: Text('Live'),
+  /// The top tab bar: the 5 primary tabs (Live · Playback · Clips · Export ·
+  /// Settings) on the left, and the wall toolbar (Layouts · Views · Fullscreen ·
+  /// Logout) on the right — mirroring the old client's topbar.
+  Widget _buildTopBar(Session session) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHigh,
+      child: Container(
+        height: 46,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(bottom: BorderSide(color: scheme.outlineVariant)),
+        ),
+        child: Row(
+          children: [
+            for (final (i, icon, label) in _tabs) _tabButton(i, icon, label),
+            const Spacer(),
+            IconButton(
+              tooltip: 'Layouts',
+              icon: const Icon(Icons.dashboard_customize_outlined, size: 20),
+              onPressed: () => _pushScreen(
+                'Layouts',
+                ManagedWallScreen(
+                  api: widget.api,
+                  session: session,
+                  cameras: widget.cameras,
+                  onLogout: widget.onLogout,
                 ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.play_circle_outline),
-                  label: Text('Playback'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.movie_outlined),
-                  label: Text('Clips'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.bookmark_outline),
-                  label: Text('Bookmarks'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.download_outlined),
-                  label: Text('Export'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.dashboard_customize_outlined),
-                  label: Text('Layouts'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.view_comfy_alt_outlined),
-                  label: Text('Views'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.dns_outlined),
-                  label: Text('Server'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.sensors),
-                  label: Text('Motion'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.admin_panel_settings_outlined),
-                  label: Text('Manage'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.keyboard_outlined),
-                  label: Text('Hotkeys'),
-                ),
-                NavigationRailDestination(
-                  icon: Icon(Icons.settings_outlined),
-                  label: Text('Options'),
-                ),
-              ],
+              ),
             ),
-          ),
+            IconButton(
+              tooltip: 'Saved views',
+              icon: const Icon(Icons.view_comfy_alt_outlined, size: 20),
+              onPressed: () => _pushScreen(
+                'Saved views',
+                SavedViewsScreen(
+                  api: widget.api,
+                  session: session,
+                  cameras: widget.cameras,
+                  onApplyView: (_) {
+                    Navigator.of(context).pop();
+                    setState(() => _index = _liveIndex);
+                  },
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Fullscreen',
+              icon: const Icon(Icons.fullscreen, size: 22),
+              onPressed: widget.fullscreen.toggle,
+            ),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: 'Sign out',
+              icon: const Icon(Icons.logout, size: 18),
+              onPressed: widget.onLogout,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tabButton(int i, IconData icon, String label) {
+    final selected = _index == i;
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: TextButton.icon(
+        onPressed: () => setState(() => _index = i),
+        icon: Icon(icon, size: 18),
+        label: Text(label),
+        style: TextButton.styleFrom(
+          foregroundColor: selected ? scheme.primary : scheme.onSurfaceVariant,
+          backgroundColor: selected
+              ? scheme.primary.withValues(alpha: 0.12)
+              : null,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      ),
+    );
+  }
+
+  /// Push a secondary screen (from the Settings hub or a toolbar button) with a
+  /// back-navigable app bar.
+  void _pushScreen(String title, Widget child) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Scaffold(
+          appBar: AppBar(title: Text(title)),
+          body: child,
         ),
       ),
     );
@@ -450,13 +479,6 @@ class _MainShellState extends State<MainShell> {
 
   Widget _buildBody(Session session) {
     switch (_index) {
-      case _liveIndex:
-        return WallScreen(
-          api: widget.api,
-          session: session,
-          cameras: widget.cameras,
-          onLogout: widget.onLogout,
-        );
       case _playbackIndex:
         return PlaybackScreen(
           api: widget.api,
@@ -464,77 +486,143 @@ class _MainShellState extends State<MainShell> {
           cameras: widget.cameras,
           onClose: () => setState(() => _index = _liveIndex),
         );
-      case 2:
+      case _clipsIndex:
         return ClipsScreen(
           api: widget.api,
           session: session,
           cameras: widget.cameras,
         );
-      case 3:
-        return BookmarksScreen(
-          api: widget.api,
-          session: session,
-          cameras: widget.cameras,
-          // TODO: pass camera/timestamp into PlaybackScreen once it grows an
-          // initial-target seam; for now jumping just switches to Playback.
-          onJumpToPlayback: (cameraId, ts) =>
-              setState(() => _index = _playbackIndex),
-        );
-      case 4:
+      case _exportIndex:
         return ExportScreen(
           api: widget.api,
           session: session,
           cameras: widget.cameras,
         );
-      case _layoutsIndex:
-        return ManagedWallScreen(
+      case _settingsIndex:
+        return _buildSettingsHub(session);
+      case _liveIndex:
+      default:
+        return WallScreen(
           api: widget.api,
           session: session,
           cameras: widget.cameras,
           onLogout: widget.onLogout,
         );
-      case 6:
-        return SavedViewsScreen(
-          api: widget.api,
-          session: session,
-          cameras: widget.cameras,
-          // TODO: apply the view's layout/slots into ManagedWallScreen (needs
-          // a seam on its LayoutController); for now switch to Layouts.
-          onApplyView: (view) => setState(() => _index = _layoutsIndex),
-        );
-      case 7:
-        return ServerDashboardScreen(api: widget.api, session: session);
-      case 8:
-        return MotionTunerScreen(
-          api: widget.api,
-          session: session,
-          mediaTokenCache: widget.mediaTokens,
-          cameras: widget.cameras,
-        );
-      case 9:
-        return AdminConsoleScreen(
-          key: const ValueKey('admin-console'),
-          session: session,
-        );
-      case 10:
-        final hotkeys = widget.hotkeys;
-        return hotkeys == null
-            ? _storesLoading()
-            : HotkeyRemapScreen(store: hotkeys, cameras: widget.cameras);
-      case 11:
-        final options = widget.clientOptions;
-        return options == null
-            ? _storesLoading()
-            : ClientOptionsScreen(
-                options: options,
-                streamPrefs: widget.streamPrefs,
-              );
     }
-    return const SizedBox.shrink();
   }
 
-  Widget _storesLoading() =>
-      const Center(child: CircularProgressIndicator());
+  /// The Settings tab: a hub linking to the server console, native dashboards,
+  /// and client config — everything that was over-promoted into its own rail
+  /// entry now lives here (matching the old client's single "Settings" tab).
+  Widget _buildSettingsHub(Session session) {
+    final tiles = <Widget>[
+      _settingsTile(
+        Icons.admin_panel_settings_outlined,
+        'Server console',
+        'Settings, users, policies (embedded web /admin)',
+        () => _pushScreen(
+          'Server console',
+          AdminConsoleScreen(
+            key: const ValueKey('admin-console'),
+            session: session,
+          ),
+        ),
+      ),
+      _settingsTile(
+        Icons.dns_outlined,
+        'Server dashboard',
+        'Connection, storage, recording health',
+        () => _pushScreen(
+          'Server dashboard',
+          ServerDashboardScreen(api: widget.api, session: session),
+        ),
+      ),
+      _settingsTile(
+        Icons.bookmark_outline,
+        'Bookmarks',
+        'Saved playback moments',
+        () => _pushScreen(
+          'Bookmarks',
+          BookmarksScreen(
+            api: widget.api,
+            session: session,
+            cameras: widget.cameras,
+            onJumpToPlayback: (cameraId, ts) {
+              Navigator.of(context).pop();
+              setState(() => _index = _playbackIndex);
+            },
+          ),
+        ),
+      ),
+      _settingsTile(
+        Icons.sensors,
+        'Motion tuner',
+        'Per-camera motion detection tuning',
+        () => _pushScreen(
+          'Motion tuner',
+          MotionTunerScreen(
+            api: widget.api,
+            session: session,
+            mediaTokenCache: widget.mediaTokens,
+            cameras: widget.cameras,
+          ),
+        ),
+      ),
+      if (widget.hotkeys != null)
+        _settingsTile(
+          Icons.keyboard_outlined,
+          'Hotkeys',
+          'Keyboard shortcut remapping',
+          () => _pushScreen(
+            'Hotkeys',
+            HotkeyRemapScreen(store: widget.hotkeys!, cameras: widget.cameras),
+          ),
+        ),
+      if (widget.clientOptions != null)
+        _settingsTile(
+          Icons.tune,
+          'Options',
+          'Client preferences & stream defaults',
+          () => _pushScreen(
+            'Options',
+            ClientOptionsScreen(
+              options: widget.clientOptions!,
+              streamPrefs: widget.streamPrefs,
+            ),
+          ),
+        ),
+    ];
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Padding(
+          padding: EdgeInsets.only(left: 8, bottom: 8),
+          child: Text(
+            'Settings',
+            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+          ),
+        ),
+        ...tiles,
+      ],
+    );
+  }
+
+  Widget _settingsTile(
+    IconData icon,
+    String title,
+    String subtitle,
+    VoidCallback onTap,
+  ) {
+    return Card(
+      child: ListTile(
+        leading: Icon(icon),
+        title: Text(title),
+        subtitle: Text(subtitle),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: onTap,
+      ),
+    );
+  }
 }
 
 class SpikeApp extends StatelessWidget {
