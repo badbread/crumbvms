@@ -16,13 +16,41 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import 'package:window_manager/window_manager.dart';
+
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/perf_grid.dart';
+import 'package:crumb_desktop/session/session_controller.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/src/rust/api/secret.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
+import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/stream_prefs.dart';
+import 'package:crumb_desktop/ui/admin_console/admin_console_screen.dart';
+import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
+import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
+import 'package:crumb_desktop/ui/clips/clips_screen.dart';
+import 'package:crumb_desktop/ui/export/export_screen.dart';
+import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
+import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
 import 'package:crumb_desktop/ui/login_screen.dart';
+import 'package:crumb_desktop/ui/motion_tuner/motion_tuner_screen.dart';
+import 'package:crumb_desktop/ui/notifications/status_bar.dart';
+import 'package:crumb_desktop/ui/notifications/status_bar_controller.dart';
+import 'package:crumb_desktop/ui/playback/playback_screen.dart';
+import 'package:crumb_desktop/ui/reauth/reauth_overlay.dart';
+import 'package:crumb_desktop/ui/recording_alerts/recording_alert_banner.dart';
+import 'package:crumb_desktop/ui/recording_alerts/recording_alerts_controller.dart';
+import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart';
+import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
+import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
+import 'package:crumb_desktop/ui/updates/update_banner.dart';
+import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
+import 'package:crumb_desktop/ui/wall_layouts/managed_wall_screen.dart';
 import 'package:crumb_desktop/ui/wall_screen.dart';
 
 /// Run modes (default = the real client: login then live wall):
@@ -47,6 +75,9 @@ Future<void> main() async {
   MediaKit.ensureInitialized();
   // flutter_rust_bridge — loads the cargokit-built rust_lib_crumb_desktop dylib.
   await RustLib.init();
+  // window_manager — required before any fullscreen calls (fullscreen wall +
+  // launch-into-fullscreen preference).
+  await windowManager.ensureInitialized();
   runApp(
     kGrid > 0
         ? PerfGridApp(count: kGrid, url: kStreamUrl)
@@ -72,10 +103,41 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   List<Camera> _cameras = const [];
   bool _restoring = true; // trying a saved session on launch
 
+  // ── Session-scoped plumbing (created on login, torn down on logout) ──
+  SessionController? _sessionController;
+  MediaTokenCache? _mediaTokens;
+  RecordingAlertsController? _recordingAlerts;
+  UpdateCheckController? _updateCheck;
+
+  // ── App-scoped controllers/stores ──
+  final FullscreenController _fullscreen = FullscreenController();
+  final StatusBarController _statusBar = StatusBarController();
+  ClientOptionsStore? _clientOptions;
+  StreamPrefsStore? _streamPrefs;
+  HotkeyConfigStore? _hotkeys;
+
   @override
   void initState() {
     super.initState();
+    _fullscreen.attach();
+    _loadStores();
     _restore();
+  }
+
+  /// Load the shared_preferences-backed client stores (options, stream prefs,
+  /// hotkey remaps). Session-independent, loaded once per process; each store
+  /// degrades to in-memory-only if the plugin is unavailable.
+  Future<void> _loadStores() async {
+    final options = await ClientOptionsStore.load();
+    final streamPrefs = await StreamPrefsStore.load();
+    final hotkeys = await HotkeyConfigStore.load();
+    if (mounted) {
+      setState(() {
+        _clientOptions = options;
+        _streamPrefs = streamPrefs;
+        _hotkeys = hotkeys;
+      });
+    }
   }
 
   /// Try to resume a DPAPI-persisted session so the user isn't asked to log in
@@ -91,8 +153,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
         final cameras = await _api.listCameras(session); // validates the token
         if (mounted) {
           setState(() {
-            _session = session;
-            _cameras = cameras;
+            _startSession(session, cameras);
             _restoring = false;
           });
         }
@@ -104,18 +165,69 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     if (mounted) setState(() => _restoring = false);
   }
 
-  Future<void> _onLoggedIn(Session session, List<Camera> cameras) async {
+  /// Stand up all session-scoped plumbing: 401 re-auth controller, scoped
+  /// media-token cache, recording-health + update-check pollers, and the
+  /// launch-into-fullscreen preference. Call inside setState.
+  void _startSession(Session session, List<Camera> cameras) {
+    final controller = SessionController(api: _api, initialSession: session);
+    controller.addListener(_onSessionChanged);
+    _sessionController = controller;
+    _mediaTokens = MediaTokenCache(
+      api: _api,
+      session: session,
+      onUnauthorized: controller.handleUnauthorized,
+    );
+    _recordingAlerts = RecordingAlertsController(api: _api, session: session)
+      ..start();
+    _updateCheck = UpdateCheckController(api: _api, session: session)..start();
+    _session = session;
+    _cameras = cameras;
+    // Apply "launch into fullscreen wall" only after the initial camera load —
+    // same ordering as the old client's applyLaunchPreferences().
+    unawaited(applyLaunchFullscreenPreference(_fullscreen));
+  }
+
+  /// After a successful re-auth the fresh token must reach the media-token
+  /// cache and the DPAPI-persisted session; the shell rebuilds with it.
+  void _onSessionChanged() {
+    final controller = _sessionController;
+    if (controller == null) return;
+    _mediaTokens?.updateSession(controller.session);
+    if (controller.session.token != _session?.token) {
+      _session = controller.session;
+      unawaited(_persistSession(controller.session));
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _persistSession(Session session) async {
     // Persist the session (DPAPI-encrypted, current-user-scoped) for next launch.
     try {
       await saveSession(data: jsonEncode(session.toJson()));
     } catch (_) {
-      /* persistence is best-effort; login still succeeds */
+      /* persistence is best-effort; the session still works */
     }
+  }
+
+  void _teardownSession() {
+    _sessionController?.removeListener(_onSessionChanged);
+    _sessionController = null;
+    // A stale principal's scoped media tokens must never be reused by whoever
+    // signs in next.
+    _mediaTokens?.clear();
+    _mediaTokens = null;
+    _recordingAlerts?.stop();
+    _recordingAlerts?.dispose();
+    _recordingAlerts = null;
+    _updateCheck?.stop();
+    _updateCheck?.dispose();
+    _updateCheck = null;
+  }
+
+  Future<void> _onLoggedIn(Session session, List<Camera> cameras) async {
+    await _persistSession(session);
     if (mounted) {
-      setState(() {
-        _session = session;
-        _cameras = cameras;
-      });
+      setState(() => _startSession(session, cameras));
     }
   }
 
@@ -125,6 +237,9 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     } catch (_) {
       /* ignore */
     }
+    _teardownSession();
+    // Never strand the OS window in fullscreen at the login screen.
+    unawaited(_fullscreen.setFullscreen(false));
     if (mounted) {
       setState(() {
         _session = null;
@@ -135,6 +250,9 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
 
   @override
   void dispose() {
+    _teardownSession();
+    _fullscreen.dispose();
+    _statusBar.dispose();
     _api.close();
     super.dispose();
   }
@@ -142,25 +260,281 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   @override
   Widget build(BuildContext context) {
     final Widget home;
+    final controller = _sessionController;
+    final mediaTokens = _mediaTokens;
     if (_restoring) {
       home = const Scaffold(body: Center(child: CircularProgressIndicator()));
-    } else if (_session == null) {
+    } else if (_session == null || controller == null || mediaTokens == null) {
       home = LoginScreen(api: _api, onLoggedIn: _onLoggedIn);
     } else {
-      home = WallScreen(
-        api: _api,
-        session: _session!,
-        cameras: _cameras,
-        onLogout: _onLogout,
+      // The signed-in shell keeps running underneath the re-auth overlay on a
+      // 401 (panes keep decoding); S-key snapshots work from any tab.
+      home = SnapshotHotkey(
+        child: ReauthOverlay(
+          controller: controller,
+          child: MainShell(
+            api: _api,
+            sessionController: controller,
+            mediaTokens: mediaTokens,
+            cameras: _cameras,
+            onLogout: _onLogout,
+            recordingAlerts: _recordingAlerts!,
+            updateCheck: _updateCheck!,
+            fullscreen: _fullscreen,
+            statusBar: _statusBar,
+            clientOptions: _clientOptions,
+            streamPrefs: _streamPrefs,
+            hotkeys: _hotkeys,
+          ),
+        ),
       );
     }
     return MaterialApp(
       title: 'Crumb',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark(useMaterial3: true),
-      home: home,
+      // Esc exits OS fullscreen before any inner Esc handling (maximize-exit
+      // etc.) — same priority order as the old client.
+      home: FullscreenEscHandler(controller: _fullscreen, child: home),
     );
   }
+}
+
+/// Post-login navigation shell: a desktop NavigationRail switching between the
+/// ported feature surfaces. Only the SELECTED destination is built — the
+/// video-heavy screens (live wall, managed wall, playback) must not all hold
+/// decoding players at once, so switching tabs tears the previous screen down.
+class MainShell extends StatefulWidget {
+  const MainShell({
+    super.key,
+    required this.api,
+    required this.sessionController,
+    required this.mediaTokens,
+    required this.cameras,
+    required this.onLogout,
+    required this.recordingAlerts,
+    required this.updateCheck,
+    required this.fullscreen,
+    required this.statusBar,
+    this.clientOptions,
+    this.streamPrefs,
+    this.hotkeys,
+  });
+
+  final CrumbApi api;
+  final SessionController sessionController;
+  final MediaTokenCache mediaTokens;
+  final List<Camera> cameras;
+  final VoidCallback onLogout;
+  final RecordingAlertsController recordingAlerts;
+  final UpdateCheckController updateCheck;
+  final FullscreenController fullscreen;
+  final StatusBarController statusBar;
+  final ClientOptionsStore? clientOptions;
+  final StreamPrefsStore? streamPrefs;
+  final HotkeyConfigStore? hotkeys;
+
+  @override
+  State<MainShell> createState() => _MainShellState();
+}
+
+class _MainShellState extends State<MainShell> {
+  int _index = _liveIndex;
+
+  static const int _liveIndex = 0;
+  static const int _playbackIndex = 1;
+  static const int _layoutsIndex = 5;
+
+  @override
+  Widget build(BuildContext context) {
+    // Fresh session after an in-place re-auth (the app state rebuilds us via
+    // its SessionController listener).
+    final session = widget.sessionController.session;
+    return Scaffold(
+      body: ListenableBuilder(
+        listenable: widget.fullscreen,
+        builder: (context, _) {
+          final chromeHidden = widget.fullscreen.isFullscreen;
+          return Column(
+            children: [
+              if (!chromeHidden) ...[
+                RecordingAlertBanner(controller: widget.recordingAlerts),
+                UpdateBanner(controller: widget.updateCheck),
+              ],
+              Expanded(
+                child: Row(
+                  children: [
+                    if (!chromeHidden) ...[
+                      _buildRail(),
+                      const VerticalDivider(width: 1),
+                    ],
+                    Expanded(child: _buildBody(session)),
+                  ],
+                ),
+              ),
+              if (!chromeHidden) StatusBar(controller: widget.statusBar),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildRail() {
+    // Scrollable rail: 12 destinations overflow a short window otherwise.
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: IntrinsicHeight(
+            child: NavigationRail(
+              selectedIndex: _index,
+              onDestinationSelected: (i) => setState(() => _index = i),
+              labelType: NavigationRailLabelType.all,
+              destinations: const [
+                NavigationRailDestination(
+                  icon: Icon(Icons.grid_view),
+                  label: Text('Live'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.play_circle_outline),
+                  label: Text('Playback'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.movie_outlined),
+                  label: Text('Clips'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.bookmark_outline),
+                  label: Text('Bookmarks'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.download_outlined),
+                  label: Text('Export'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.dashboard_customize_outlined),
+                  label: Text('Layouts'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.view_comfy_alt_outlined),
+                  label: Text('Views'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.dns_outlined),
+                  label: Text('Server'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.sensors),
+                  label: Text('Motion'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.admin_panel_settings_outlined),
+                  label: Text('Manage'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.keyboard_outlined),
+                  label: Text('Hotkeys'),
+                ),
+                NavigationRailDestination(
+                  icon: Icon(Icons.settings_outlined),
+                  label: Text('Options'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBody(Session session) {
+    switch (_index) {
+      case _liveIndex:
+        return WallScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          onLogout: widget.onLogout,
+        );
+      case _playbackIndex:
+        return PlaybackScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          onClose: () => setState(() => _index = _liveIndex),
+        );
+      case 2:
+        return ClipsScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+        );
+      case 3:
+        return BookmarksScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          // TODO: pass camera/timestamp into PlaybackScreen once it grows an
+          // initial-target seam; for now jumping just switches to Playback.
+          onJumpToPlayback: (cameraId, ts) =>
+              setState(() => _index = _playbackIndex),
+        );
+      case 4:
+        return ExportScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+        );
+      case _layoutsIndex:
+        return ManagedWallScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          onLogout: widget.onLogout,
+        );
+      case 6:
+        return SavedViewsScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          // TODO: apply the view's layout/slots into ManagedWallScreen (needs
+          // a seam on its LayoutController); for now switch to Layouts.
+          onApplyView: (view) => setState(() => _index = _layoutsIndex),
+        );
+      case 7:
+        return ServerDashboardScreen(api: widget.api, session: session);
+      case 8:
+        return MotionTunerScreen(
+          api: widget.api,
+          session: session,
+          mediaTokenCache: widget.mediaTokens,
+          cameras: widget.cameras,
+        );
+      case 9:
+        return AdminConsoleScreen(
+          key: const ValueKey('admin-console'),
+          session: session,
+        );
+      case 10:
+        final hotkeys = widget.hotkeys;
+        return hotkeys == null
+            ? _storesLoading()
+            : HotkeyRemapScreen(store: hotkeys, cameras: widget.cameras);
+      case 11:
+        final options = widget.clientOptions;
+        return options == null
+            ? _storesLoading()
+            : ClientOptionsScreen(
+                options: options,
+                streamPrefs: widget.streamPrefs,
+              );
+    }
+    return const SizedBox.shrink();
+  }
+
+  Widget _storesLoading() =>
+      const Center(child: CircularProgressIndicator());
 }
 
 class SpikeApp extends StatelessWidget {
