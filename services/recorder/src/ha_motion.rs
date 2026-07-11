@@ -29,7 +29,6 @@
 //! state every tick, so a sensor held `on` is real, not stale.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -48,9 +47,6 @@ use crate::MotionTx;
 /// ending and another beginning a moment later don't fragment the recording.
 /// Mirrors the pixel pipeline + the Frigate source.
 const STOP_GRACE: chrono::Duration = chrono::Duration::seconds(5);
-
-/// Janitor tick: STOP-grace check + hot-reload poll.
-const TICK: Duration = Duration::from_secs(1);
 
 /// A tracker transition. Carries the *opening* entity + its `device_class` so the
 /// loop can both emit the source-agnostic [`MotionSignal`] AND write the labeled
@@ -251,42 +247,45 @@ pub async fn run_ha_motion_loop(
     info!(camera_id = %camera.id, entities = entity_ids.len(), "ha motion: polling sensors");
     let mut source = HaPollSource::new(client, entity_ids);
     let mut tracker = HaTracker::new(class_by_entity);
-    let mut janitor = tokio::time::interval(TICK);
-    janitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let result: Result<()> = loop {
-        tokio::select! {
+        if cancel.is_cancelled() {
+            break Ok(());
+        }
+        // STOP-grace tick + hot-reload check, done BETWEEN polls — NOT as a
+        // concurrent `select!` arm racing the poll. A periodic janitor tick racing
+        // `next_edges()` would win the ~1s race and CANCEL the in-flight HTTP poll
+        // before it could complete or hit its 5s timeout, so a hung/unreachable HA
+        // would never surface as `Err` and the camera would never fail OPEN (the
+        // exact silent-drop this transport was chosen to avoid). Checked here, the
+        // poll always runs to completion.
+        if let Some(t) = tracker.tick(Utc::now()) {
+            publish(motion_tx, pool, camera.id, &t).await;
+        }
+        if db::ha_config_version(pool).await.unwrap_or(start_version) != start_version {
+            info!(camera_id = %camera.id, "ha config changed; reconnecting");
+            break Ok(());
+        }
+
+        // Poll, racing ONLY cancellation. `next_edges` bounds itself with the
+        // client's 5s timeout, so a dead HA returns `Err` within ~5s → the loop
+        // exits `Err` → the supervisor fails the camera OPEN.
+        let edges = tokio::select! {
             () = cancel.cancelled() => break Ok(()),
-            _ = janitor.tick() => {
-                if let Some(t) = tracker.tick(Utc::now()) {
-                    publish(motion_tx, pool, camera.id, &t).await;
-                }
-                // Hot-reload: an admin edit to HA settings bumps the version; exit
-                // cleanly so the supervisor reconnects with the fresh config.
-                if db::ha_config_version(pool)
-                    .await
-                    .unwrap_or(start_version)
-                    != start_version
-                {
-                    info!(camera_id = %camera.id, "ha config changed; reconnecting");
-                    break Ok(());
-                }
-            }
-            edges = source.next_edges() => {
-                match edges {
-                    Ok(batch) => {
-                        let now = Utc::now();
-                        for e in &batch {
-                            if let Some(t) = tracker.observe(e, now) {
-                                publish(motion_tx, pool, camera.id, &t).await;
-                            }
-                        }
+            r = source.next_edges() => r,
+        };
+        match edges {
+            Ok(batch) => {
+                let now = Utc::now();
+                for e in &batch {
+                    if let Some(t) = tracker.observe(e, now) {
+                        publish(motion_tx, pool, camera.id, &t).await;
                     }
-                    // A failed poll exits the loop → the supervisor fails the
-                    // camera OPEN. NEVER swallow this into a retry (see module doc).
-                    Err(e) => break Err(anyhow!("ha motion poll error: {e}")),
                 }
             }
+            // A failed poll exits the loop → the supervisor fails the camera OPEN.
+            // NEVER swallow this into a retry (see module doc).
+            Err(e) => break Err(anyhow!("ha motion poll error: {e}")),
         }
     };
 
