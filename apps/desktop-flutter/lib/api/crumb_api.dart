@@ -103,5 +103,53 @@ class CrumbApi {
     return StreamUrls.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  // ─── PTZ (ONVIF, continuous velocity model) ────────────────────────────────
+  // POST /cameras/{id}/ptz with {action, pan, tilt, zoom, preset}. `move` starts
+  // continuous motion at the given velocities (-1..1); `stop` halts it. Requires
+  // the PTZ capability + camera access server-side.
+
+  Future<void> _ptz(
+    Session s,
+    String cameraId,
+    Map<String, dynamic> body,
+  ) async {
+    final resp = await _http.post(
+      Uri.parse('${s.base}/cameras/$cameraId/ptz'),
+      headers: {
+        'authorization': 'Bearer ${s.token}',
+        'content-type': 'application/json',
+      },
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw CrumbApiException(
+        'PTZ ${body['action']} failed (HTTP ${resp.statusCode}).',
+        statusCode: resp.statusCode,
+      );
+    }
+  }
+
+  /// Start continuous PTZ motion at the given velocities (each -1.0..1.0).
+  Future<void> ptzMove(
+    Session s,
+    String cameraId, {
+    double pan = 0,
+    double tilt = 0,
+    double zoom = 0,
+  }) => _ptz(s, cameraId, {
+    'action': 'move',
+    'pan': pan,
+    'tilt': tilt,
+    'zoom': zoom,
+  });
+
+  /// Stop all ongoing PTZ motion.
+  Future<void> ptzStop(Session s, String cameraId) =>
+      _ptz(s, cameraId, {'action': 'stop'});
+
+  /// Recall the camera's configured home position.
+  Future<void> ptzHome(Session s, String cameraId) =>
+      _ptz(s, cameraId, {'action': 'home'});
+
   void close() => _http.close();
 }

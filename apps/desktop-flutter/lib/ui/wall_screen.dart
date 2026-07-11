@@ -564,10 +564,172 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     ],
                   ),
                 ),
+
+                // PTZ controls (only for PTZ-capable cameras), bottom-right.
+                if (widget.camera.ptz)
+                  Positioned(
+                    right: 16,
+                    bottom: 16,
+                    child: _PtzControls(
+                      api: widget.api,
+                      session: widget.session,
+                      camera: widget.camera,
+                    ),
+                  ),
               ],
             );
           },
         ),
+      ),
+    );
+  }
+}
+
+/// On-video PTZ controls for a PTZ-capable camera in the maximized view.
+/// Continuous-velocity model: press-and-hold a direction to move, release to
+/// stop (matching the ONVIF continuous-move API). Home recenters. Errors (e.g.
+/// ONVIF not reachable) surface as a brief caption rather than a crash.
+class _PtzControls extends StatefulWidget {
+  const _PtzControls({
+    required this.api,
+    required this.session,
+    required this.camera,
+  });
+
+  final CrumbApi api;
+  final Session session;
+  final Camera camera;
+
+  @override
+  State<_PtzControls> createState() => _PtzControlsState();
+}
+
+class _PtzControlsState extends State<_PtzControls> {
+  static const double _v = 0.6; // pan/tilt/zoom velocity
+  String? _error;
+
+  Future<void> _move({double pan = 0, double tilt = 0, double zoom = 0}) async {
+    try {
+      await widget.api.ptzMove(
+        widget.session,
+        widget.camera.id,
+        pan: pan,
+        tilt: tilt,
+        zoom: zoom,
+      );
+      if (mounted && _error != null) setState(() => _error = null);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'PTZ unavailable');
+    }
+  }
+
+  Future<void> _stop() async {
+    try {
+      await widget.api.ptzStop(widget.session, widget.camera.id);
+    } catch (_) {
+      /* ignore stop errors */
+    }
+  }
+
+  Future<void> _home() async {
+    try {
+      await widget.api.ptzHome(widget.session, widget.camera.id);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'PTZ unavailable');
+    }
+  }
+
+  /// A press-and-hold button: down → start motion, up/cancel → stop.
+  Widget _hold(
+    IconData icon, {
+    double pan = 0,
+    double tilt = 0,
+    double zoom = 0,
+  }) {
+    return Listener(
+      onPointerDown: (_) => _move(pan: pan, tilt: tilt, zoom: zoom),
+      onPointerUp: (_) => _stop(),
+      onPointerCancel: (_) => _stop(),
+      child: Container(
+        margin: const EdgeInsets.all(2),
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Icon(icon, color: Colors.white, size: 22),
+      ),
+    );
+  }
+
+  Widget _tap(IconData icon, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.all(2),
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Icon(icon, color: Colors.white, size: 20),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6, right: 2),
+              child: Text(
+                _error!,
+                style: TextStyle(color: Colors.red.shade300, fontSize: 11),
+              ),
+            ),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              // Zoom column
+              Column(
+                children: [
+                  _hold(Icons.zoom_in, zoom: _v),
+                  _hold(Icons.zoom_out, zoom: -_v),
+                ],
+              ),
+              const SizedBox(width: 8),
+              // Pan/tilt D-pad
+              Column(
+                children: [
+                  _hold(Icons.keyboard_arrow_up, tilt: _v),
+                  Row(
+                    children: [
+                      _hold(Icons.keyboard_arrow_left, pan: -_v),
+                      _tap(Icons.home, _home),
+                      _hold(Icons.keyboard_arrow_right, pan: _v),
+                    ],
+                  ),
+                  _hold(Icons.keyboard_arrow_down, tilt: -_v),
+                ],
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
