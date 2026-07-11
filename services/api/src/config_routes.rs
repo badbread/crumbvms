@@ -1033,6 +1033,16 @@ async fn update_camera(
         None => existing.motion_algorithm.clone(),
     };
 
+    // Additive motion sources (migration 0049): each provided value sets that
+    // source; omitted keeps the existing value. The recorder records on the UNION.
+    let motion_pixel_enabled = body
+        .motion_pixel_enabled
+        .unwrap_or(existing.motion_pixel_enabled);
+    let motion_frigate_enabled = body
+        .motion_frigate_enabled
+        .unwrap_or(existing.motion_frigate_enabled);
+    let motion_ha_enabled = body.motion_ha_enabled.unwrap_or(existing.motion_ha_enabled);
+
     // camera_type: Option<Option<String>>. Omitted = keep existing; Some(None) or
     // Some(Some("")) = clear to NULL (generic icon); Some(Some(v)) = validated set.
     let camera_type: Option<String> = match &body.camera_type {
@@ -1109,7 +1119,10 @@ async fn update_camera(
                 onvif_host         = $19,
                 onvif_port         = $20,
                 onvif_user         = $21,
-                onvif_password     = $22
+                onvif_password     = $22,
+                motion_pixel_enabled   = $23,
+                motion_frigate_enabled = $24,
+                motion_ha_enabled      = $25
             WHERE id = $1
             ",
             &[
@@ -1135,6 +1148,9 @@ async fn update_camera(
                 &onvif_port,
                 &onvif_user,
                 &onvif_password,
+                &motion_pixel_enabled,
+                &motion_frigate_enabled,
+                &motion_ha_enabled,
             ],
         )
         .await
@@ -4015,6 +4031,9 @@ fn camera_to_dto(c: Camera) -> CameraDto {
         motion_mask: c.motion_mask,
         onvif_motion: c.onvif_motion,
         motion_source: c.motion_source,
+        motion_pixel_enabled: c.motion_pixel_enabled,
+        motion_frigate_enabled: c.motion_frigate_enabled,
+        motion_ha_enabled: c.motion_ha_enabled,
         motion_algorithm: c.motion_algorithm,
         camera_type: c.camera_type,
         icon: c.icon,
@@ -4189,10 +4208,14 @@ fn slugify_go2rtc_name(name: &str) -> String {
 
 /// Normalise + validate a motion-source string to its canonical lowercase form
 /// (`"pixel"` / `"frigate"`). `None` ⇒ unrecognised (caller returns 400).
+/// DEPRECATED (migration 0049): `motion_source` is superseded by the
+/// `motion_*_enabled` booleans; this only normalizes the vestigial column so an
+/// older client that still sends it doesn't 400. `'ha'` is accepted now too.
 fn normalize_motion_source(s: &str) -> Option<&'static str> {
     match s.trim().to_ascii_lowercase().as_str() {
         "pixel" | "local" | "" => Some("pixel"),
         "frigate" => Some("frigate"),
+        "ha" => Some("ha"),
         _ => None,
     }
 }

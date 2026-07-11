@@ -254,9 +254,15 @@ pub struct CameraDto {
     pub policy: RecordingPolicyDto,
     pub motion_mask: Option<serde_json::Value>,
     pub onvif_motion: bool,
-    /// Motion source: `"pixel"` (local analysis) or `"frigate"` (neural detections).
+    /// DEPRECATED (migration 0049): superseded by the `motion_*_enabled` set
+    /// below. Still emitted for older clients; new clients use the booleans.
     pub motion_source: String,
-    /// Pixel detector when `motion_source == "pixel"`: census / framediff / mog2 /
+    /// Additive motion sources: a camera records on the UNION of every enabled
+    /// source. Each is toggled independently.
+    pub motion_pixel_enabled: bool,
+    pub motion_frigate_enabled: bool,
+    pub motion_ha_enabled: bool,
+    /// Pixel detector when the pixel source is enabled: census / framediff / mog2 /
     /// opticalflow / ensemble.
     pub motion_algorithm: String,
     /// Physical camera form-factor for the console glyph: `"ptz"`, `"dome"`,
@@ -366,8 +372,15 @@ pub struct UpdateCameraRequest {
     #[serde(default, deserialize_with = "double_option")]
     pub motion_mask: Option<Option<serde_json::Value>>,
     pub onvif_motion: Option<bool>,
-    /// Change the motion source (`"pixel"`/`"frigate"`); omitted = unchanged.
+    /// DEPRECATED (migration 0049): superseded by the `motion_*_enabled` set.
+    /// Omitted = unchanged.
     pub motion_source: Option<String>,
+    /// Change the additive motion sources (migration 0049). Each `Some(v)` toggles
+    /// that source; omitted = unchanged. A camera records on the UNION of the
+    /// enabled sources; zero enabled records everything (fail-open).
+    pub motion_pixel_enabled: Option<bool>,
+    pub motion_frigate_enabled: Option<bool>,
+    pub motion_ha_enabled: Option<bool>,
     /// Change the pixel detector; omitted = unchanged.
     pub motion_algorithm: Option<String>,
     /// Change the camera form-factor glyph: `Some(Some("dome"))` sets it,

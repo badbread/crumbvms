@@ -4958,15 +4958,13 @@ function renderCamMotionTab(c) {
       <!-- col 1: detection source + algorithm + "currently loaded" infobox -->
       <div class="policy-section" style="margin-top:0">
         <div class="policy-section-title">Detection source</div>
-        <div class="card-hint" style="margin:-2px 0 10px 2px">How recording is triggered. <b>Pixel analysis</b> runs Crumb's own detector on the sub-stream; <b>Frigate detections</b> records when Frigate's object detector fires (the algorithm is then managed by Frigate); <b>Home Assistant sensors</b> records when this camera's linked HA motion/door sensors fire (linked below).</div>
-        <div class="form-grid narrow">
-          <label class="fg-label" for="ce-motion-source">Source ${infoHint(MOTION_SOURCE_HINT)}</label>
+        <div class="card-hint" style="margin:-2px 0 10px 2px">How recording is triggered. Enable one or more; the camera records on the <b>union</b> of every enabled source. <b>Pixel analysis</b> runs Crumb's own detector on the sub-stream; <b>Frigate detections</b> records when Frigate's object detector fires; <b>Home Assistant sensors</b> records when this camera's linked HA motion/door sensors fire (linked below). With none enabled a Motion-mode camera records everything (fail-open).</div>
+        <div class="form-grid narrow" style="align-items:start">
+          <label class="fg-label">Sources ${infoHint(MOTION_SOURCE_HINT)}</label>
           <div class="fg-ctl">
-            <select id="ce-motion-source" onchange="ceMotionSourceChanged()" style="font-size:13px">
-              <option value="pixel" ${(c.motion_source||'pixel')==='pixel'?'selected':''}>Pixel analysis (Crumb)</option>
-              <option value="frigate" ${(c.motion_source||'pixel')==='frigate'?'selected':''}>Frigate detections</option>
-              <option value="ha" ${(c.motion_source||'pixel')==='ha'?'selected':''}>Home Assistant sensors</option>
-            </select>
+            <label class="chk"><input type="checkbox" id="ce-motion-pixel" ${(c.motion_pixel_enabled ?? ((c.motion_source||'pixel')==='pixel'))?'checked':''} onchange="ceMotionSourceChanged()"/> Pixel analysis (Crumb)</label>
+            <label class="chk"><input type="checkbox" id="ce-motion-frigate" ${(c.motion_frigate_enabled ?? (c.motion_source==='frigate'))?'checked':''} onchange="ceMotionSourceChanged()"/> Frigate detections</label>
+            <label class="chk"><input type="checkbox" id="ce-motion-ha" ${(c.motion_ha_enabled ?? (c.motion_source==='ha'))?'checked':''} onchange="ceMotionSourceChanged()"/> Home Assistant sensors</label>
           </div>
         </div>
         <div id="ce-motion-algo-wrap" style="margin-top:8px">
@@ -5062,23 +5060,24 @@ function cmApplyManualFloorToMeter() {
    a picker, before the save round-trips. */
 function ceRenderDetectorBox(c) {
   const box = $('ce-detector-box'); if (!box) return;
-  const src = $('ce-motion-source') ? $('ce-motion-source').value : (c.motion_source || 'pixel');
-  const savedSrc = c.motion_source || 'pixel';
+  const px = $('ce-motion-pixel') ? $('ce-motion-pixel').checked : !!c.motion_pixel_enabled;
+  const fr = $('ce-motion-frigate') ? $('ce-motion-frigate').checked : !!c.motion_frigate_enabled;
+  const ha = $('ce-motion-ha') ? $('ce-motion-ha').checked : !!c.motion_ha_enabled;
   const savedAlgo = c.motion_algorithm || 'census';
-  let loaded;
-  if (savedSrc === 'frigate') {
-    loaded = 'Frigate object detections';
-  } else if (savedSrc === 'ha') {
-    loaded = 'Home Assistant sensors';
-  } else {
-    loaded = `Pixel analysis, ${motionAlgoLabel(savedAlgo)}`;
-  }
-  // Pending = the picker differs from the saved value (a change not yet saved).
   const pickedAlgo = $('ce-motion-algorithm') ? $('ce-motion-algorithm').value : savedAlgo;
-  const changed = (src !== savedSrc) || (src === 'pixel' && pickedAlgo !== savedAlgo);
+  const names = [];
+  if (px) names.push(`Pixel analysis, ${motionAlgoLabel(px ? pickedAlgo : savedAlgo)}`);
+  if (fr) names.push('Frigate detections');
+  if (ha) names.push('Home Assistant sensors');
+  const loaded = names.length ? names.join(' + ') : 'NONE — records everything (fail-open)';
+  // Pending = the pickers differ from the saved values (a change not yet saved).
+  const changed = (px !== !!c.motion_pixel_enabled)
+    || (fr !== !!c.motion_frigate_enabled)
+    || (ha !== !!c.motion_ha_enabled)
+    || (px && pickedAlgo !== savedAlgo);
   const note = changed
-    ? 'Save to apply, the recorder reloads the detector and the live heatmap above will follow within a few seconds.'
-    : 'The live heatmap above reflects this detector. After a change the recorder reloads within a few seconds.';
+    ? 'Save to apply, the recorder reloads its sources and the live heatmap above will follow within a few seconds.'
+    : 'The live heatmap above reflects the pixel detector. After a change the recorder reloads within a few seconds.';
   box.innerHTML = `<span class="db-ico">${icon('reload', 14)}</span><span>Recorder currently loaded: <b>${esc(loaded)}</b><br><span class="db-note">${esc(note)}</span></span>`;
 }
 /* Toggle the manual-floor controls on the sensitivity mode. In Dynamic mode the
@@ -6562,18 +6561,15 @@ function motionAlgoHelp(a) {
 /* Toggle the algorithm picker: hidden + "managed by Frigate" when the source is
    Frigate; otherwise show the picker and its per-algorithm help text. */
 function ceMotionSourceChanged() {
-  const src = $('ce-motion-source') ? $('ce-motion-source').value : 'pixel';
+  // The pixel ALGORITHM block is only relevant when the pixel source is enabled.
+  const pixel = $('ce-motion-pixel') ? $('ce-motion-pixel').checked : true;
   const wrap = $('ce-motion-algo-wrap');
   const help = $('ce-motion-algo-help');
-  if (src === 'frigate') {
-    if (wrap) wrap.classList.add('hidden');
-    if (help) help.innerHTML = 'Recording is triggered by Frigate object detections, the pixel algorithm is managed by Frigate and not used.';
-  } else if (src === 'ha') {
-    if (wrap) wrap.classList.add('hidden');
-    if (help) help.innerHTML = 'Recording is triggered by this camera\'s linked Home Assistant motion/door sensors (set them below under <b>Home Assistant</b>). No local decode runs. Falls back to pixel analysis if Home Assistant is disabled or no motion-role sensors are linked.';
-  } else {
-    if (wrap) wrap.classList.remove('hidden');
-    if (help) help.innerHTML = motionAlgoHelp($('ce-motion-algorithm') ? $('ce-motion-algorithm').value : 'census');
+  if (wrap) wrap.classList.toggle('hidden', !pixel);
+  if (help) {
+    help.innerHTML = pixel
+      ? motionAlgoHelp($('ce-motion-algorithm') ? $('ce-motion-algorithm').value : 'census')
+      : 'Pixel analysis is off; enable it above to choose a detector. Frigate and Home Assistant sources need no local algorithm.';
   }
   // Reflect the (possibly just-changed) picker in the "currently loaded" infobox.
   const c = CAMS.find(x => x.id === selId);
@@ -6766,8 +6762,10 @@ async function saveCamEdit() {
       if (managed) { camBody.source_url = src; camBody.source_sub_url = sub; }
       else         { camBody.main_url   = src; camBody.sub_url        = sub; }
     }
-    // Motion source + (pixel) algorithm (Motion tab).
-    if ($('ce-motion-source')) camBody.motion_source = $('ce-motion-source').value;
+    // Additive motion sources + (pixel) algorithm (Motion tab).
+    if ($('ce-motion-pixel')) camBody.motion_pixel_enabled = $('ce-motion-pixel').checked;
+    if ($('ce-motion-frigate')) camBody.motion_frigate_enabled = $('ce-motion-frigate').checked;
+    if ($('ce-motion-ha')) camBody.motion_ha_enabled = $('ce-motion-ha').checked;
     if ($('ce-motion-algorithm')) camBody.motion_algorithm = $('ce-motion-algorithm').value;
 
     // Phase 3: a grouped camera is AUTHORITATIVELY governed by its group's
