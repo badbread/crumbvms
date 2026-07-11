@@ -14,6 +14,7 @@ import 'package:flutter/gestures.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
@@ -419,6 +420,15 @@ class _WallTileState extends State<_WallTile> {
         player.dispose();
         return;
       }
+      // Register this pane so the snapshot hotkey/button can grab its frame.
+      // The first pane to come up becomes the default capture target.
+      SnapshotRegistry.instance.register(
+        _paneId,
+        SnapshotTarget(player: player, cameraName: widget.camera.name),
+      );
+      if (SnapshotRegistry.instance.activePaneId.value == null) {
+        SnapshotRegistry.instance.setActive(_paneId);
+      }
       setState(() {
         _player = player;
         _controller = controller;
@@ -430,8 +440,11 @@ class _WallTileState extends State<_WallTile> {
     }
   }
 
+  String get _paneId => 'wall:${widget.camera.id}';
+
   @override
   void dispose() {
+    SnapshotRegistry.instance.unregister(_paneId);
     _player?.dispose();
     super.dispose();
   }
@@ -486,8 +499,9 @@ class _WallTileState extends State<_WallTile> {
             }
           },
           child: GestureDetector(
-            // Double-click maximizes; single click reserved for selection;
-            // drag pans when zoomed.
+            // Single click selects this pane (snapshot target); double-click
+            // maximizes; drag pans when zoomed.
+            onTap: () => SnapshotRegistry.instance.setActive(_paneId),
             onDoubleTap: widget.onTap,
             onPanUpdate: (d) => _panBy(d.delta, pane),
             child: Stack(
@@ -672,6 +686,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         player.dispose();
         return;
       }
+      // While maximized, this pane is the snapshot target.
+      SnapshotRegistry.instance.register(
+        'maximized',
+        SnapshotTarget(player: player, cameraName: widget.camera.name),
+      );
+      SnapshotRegistry.instance.setActive('maximized');
       setState(() {
         _player = player;
         _controller = controller;
@@ -730,6 +750,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   @override
   void dispose() {
+    SnapshotRegistry.instance.unregister('maximized');
     _ptzZoomStop?.cancel();
     _player?.dispose();
     super.dispose();

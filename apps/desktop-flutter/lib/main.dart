@@ -21,6 +21,8 @@ import 'package:window_manager/window_manager.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/api/views_api.dart' show SavedView;
+import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/session/session_controller.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
@@ -43,6 +45,7 @@ import 'package:crumb_desktop/ui/playback/playback_screen.dart';
 import 'package:crumb_desktop/ui/reauth/reauth_overlay.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alert_banner.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alerts_controller.dart';
+import 'package:crumb_desktop/ui/saved_views/layout_editor_screen.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart';
 import 'package:crumb_desktop/ui/saved_views/view_prefs.dart';
 import 'package:crumb_desktop/ui/saved_views/view_selector_bar.dart';
@@ -373,6 +376,10 @@ class _MainShellState extends State<MainShell> {
   AppliedView? _appliedView;
   String? _activeViewId = ViewPrefs.allCamerasId;
 
+  /// Bumped to force the view-selector row to reload views (e.g. after the
+  /// Config View editor creates one).
+  int _viewsRefreshToken = 0;
+
   static const int _liveIndex = 0;
   static const int _playbackIndex = 1;
   static const int _clipsIndex = 2;
@@ -410,11 +417,15 @@ class _MainShellState extends State<MainShell> {
                 // Saved-views quick-switch row — Live tab only.
                 if (_index == _liveIndex)
                   ViewSelectorBar(
+                    key: ValueKey('viewbar-$_viewsRefreshToken'),
                     api: widget.api,
                     session: session,
                     cameras: widget.cameras,
                     activeViewId: _activeViewId,
                     onApply: _applyView,
+                    onSnapshot: () =>
+                        SnapshotService.captureActivePane(context),
+                    onConfigView: () => _openConfigView(session),
                   ),
               ],
               Expanded(
@@ -580,6 +591,26 @@ class _MainShellState extends State<MainShell> {
         ),
       ),
     );
+  }
+
+  /// Open the view/layout editor ("Config View") as a floating window (dialog),
+  /// like the old client's VIEW SETUP modal. Reloads the view row if a view was
+  /// created so it appears immediately.
+  Future<void> _openConfigView(Session session) async {
+    final created = await showDialog<SavedView>(
+      context: context,
+      builder: (ctx) => Dialog(
+        clipBehavior: Clip.antiAlias,
+        child: SizedBox(
+          width: 920,
+          height: 720,
+          child: LayoutEditorScreen(api: widget.api, session: session),
+        ),
+      ),
+    );
+    if (created != null && mounted) {
+      setState(() => _viewsRefreshToken++);
+    }
   }
 
   /// Open Bookmarks — a top-level quick action (not buried in Settings), since

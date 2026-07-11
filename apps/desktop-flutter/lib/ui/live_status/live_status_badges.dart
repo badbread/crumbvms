@@ -77,7 +77,7 @@ class TileInfoBar extends StatelessWidget {
     required this.recording,
     required this.recentMotion,
     required this.detectionKeys,
-    this.height = 24,
+    this.height = 18,
   });
 
   /// Camera display name.
@@ -106,18 +106,18 @@ class TileInfoBar extends StatelessWidget {
         : (connected ? Colors.greenAccent : Colors.amber);
     return Container(
       height: height,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 6),
       // Navy blue, matching the old client's camera tile-strip header
       // (rgba(20,36,66)) rather than a plain black bar.
       color: const Color.fromRGBO(20, 38, 72, 0.94),
       child: Row(
         children: [
           Container(
-            width: 7,
-            height: 7,
+            width: 6,
+            height: 6,
             decoration: BoxDecoration(shape: BoxShape.circle, color: dotColor),
           ),
-          const SizedBox(width: 7),
+          const SizedBox(width: 5),
           Expanded(
             child: Text(
               hasError ? '$name — no stream' : name,
@@ -125,8 +125,9 @@ class TileInfoBar extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                 color: Colors.white,
-                fontSize: 12,
+                fontSize: 10.5,
                 fontWeight: FontWeight.w500,
+                height: 1.0,
               ),
             ),
           ),
@@ -136,15 +137,15 @@ class TileInfoBar extends StatelessWidget {
           if (detectionKeys.isNotEmpty)
             for (final key in detectionKeys)
               Padding(
-                padding: const EdgeInsets.only(left: 5),
-                child: _DetectionGlyph(iconKey: key),
+                padding: const EdgeInsets.only(left: 4),
+                child: _DetectionGlyph(iconKey: key, size: 12),
               ),
           if (showGenericMotion) ...[
-            const SizedBox(width: 6),
-            const Icon(Icons.directions_run, color: Colors.amber, size: 15),
+            const SizedBox(width: 5),
+            const Icon(Icons.directions_run, color: Colors.amber, size: 13),
           ],
           if (recording) ...[
-            const SizedBox(width: 7),
+            const SizedBox(width: 6),
             const _Dot(color: Colors.redAccent),
           ],
         ],
@@ -166,15 +167,16 @@ class _Dot extends StatelessWidget {
 }
 
 class _DetectionGlyph extends StatelessWidget {
-  const _DetectionGlyph({required this.iconKey});
+  const _DetectionGlyph({required this.iconKey, this.size = 14});
   final String iconKey;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
     final spec = detectionIconFor(iconKey);
     return Tooltip(
       message: iconKey,
-      child: Icon(spec.icon, size: 14, color: spec.color),
+      child: Icon(spec.icon, size: size, color: spec.color),
     );
   }
 }

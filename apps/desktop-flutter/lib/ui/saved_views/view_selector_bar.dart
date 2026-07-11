@@ -20,12 +20,19 @@ class ViewSelectorBar extends StatefulWidget {
     required this.cameras,
     required this.activeViewId,
     required this.onApply,
+    this.onSnapshot,
+    this.onConfigView,
     this.showAllCameras = true,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
+
+  /// Right-cluster controls (old client's 2nd-toolbar right side): snapshot the
+  /// active pane, and open the view/layout editor ("Config View").
+  final VoidCallback? onSnapshot;
+  final VoidCallback? onConfigView;
 
   /// The currently-applied view's id. Null or [ViewPrefs.allCamerasId] means
   /// the "All Cameras" chip is active.
@@ -78,34 +85,75 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
         decoration: BoxDecoration(
           border: Border(bottom: BorderSide(color: scheme.outlineVariant)),
         ),
-        child: ListView(
-          scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
           children: [
-            if (widget.showAllCameras)
-              _chip(
-                icon: Icons.grid_view,
-                label: 'All Cameras',
-                active: activeAll,
-                onTap: () =>
-                    widget.onApply(AppliedView.allCameras(widget.cameras)),
+            Expanded(
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                children: [
+                  if (widget.showAllCameras)
+                    _chip(
+                      icon: Icons.grid_view,
+                      label: 'All Cameras',
+                      active: activeAll,
+                      onTap: () => widget
+                          .onApply(AppliedView.allCameras(widget.cameras)),
+                    ),
+                  for (final v in _views)
+                    _chip(
+                      emoji: v.icon,
+                      label: v.name.isEmpty ? '(unnamed)' : v.name,
+                      active: widget.activeViewId == v.id,
+                      onTap: () => widget.onApply(
+                        AppliedView.fromSavedView(v, widget.cameras),
+                      ),
+                    ),
+                  if (_loaded && _views.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 7,
+                      ),
+                      child: Text(
+                        'No saved views yet',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                ],
               ),
-            for (final v in _views)
-              _chip(
-                emoji: v.icon,
-                label: v.name.isEmpty ? '(unnamed)' : v.name,
-                active: widget.activeViewId == v.id,
-                onTap: () =>
-                    widget.onApply(AppliedView.fromSavedView(v, widget.cameras)),
+            ),
+            // Right controls (snapshot + Config View), matching the old client.
+            if (widget.onSnapshot != null)
+              IconButton(
+                tooltip: 'Snapshot (S)',
+                iconSize: 17,
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.photo_camera_outlined),
+                onPressed: widget.onSnapshot,
               ),
-            if (_loaded && _views.isEmpty)
+            if (widget.onConfigView != null)
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
-                child: Text(
-                  'No saved views yet',
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: scheme.onSurfaceVariant,
+                padding: const EdgeInsets.only(right: 6, left: 2),
+                child: OutlinedButton.icon(
+                  onPressed: widget.onConfigView,
+                  icon: const Icon(Icons.dashboard_customize_outlined, size: 15),
+                  label: const Text('Config View'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFE8A33D),
+                    side: const BorderSide(color: Color(0x66E8A33D)),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    minimumSize: const Size(0, 26),
+                    textStyle: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(4),
+                    ),
                   ),
                 ),
               ),
