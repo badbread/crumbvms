@@ -10,6 +10,8 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import 'package:flutter/gestures.dart';
+
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
@@ -38,6 +40,8 @@ class _WallScreenState extends State<WallScreen> {
   double? _cpuPercent;
   double? _lastCpuTime;
   DateTime? _lastSample;
+
+  Camera? _maximized;
 
   List<Camera> get _shown =>
       widget.cameras.where((c) => c.enabled).toList(growable: false);
@@ -107,6 +111,7 @@ class _WallScreenState extends State<WallScreen> {
                       api: widget.api,
                       session: widget.session,
                       camera: cam,
+                      onTap: () => setState(() => _maximized = cam),
                     ),
                 ],
               ),
@@ -160,6 +165,16 @@ class _WallScreenState extends State<WallScreen> {
               ),
             ),
           ),
+
+          // Maximized single-camera view (main stream + zoom/pan), on top.
+          if (_maximized != null)
+            _MaximizedPane(
+              key: ValueKey('max-${_maximized!.id}'),
+              api: widget.api,
+              session: widget.session,
+              camera: _maximized!,
+              onClose: () => setState(() => _maximized = null),
+            ),
         ],
       ),
     );
@@ -174,11 +189,13 @@ class _WallTile extends StatefulWidget {
     required this.api,
     required this.session,
     required this.camera,
+    required this.onTap,
   });
 
   final CrumbApi api;
   final Session session;
   final Camera camera;
+  final VoidCallback onTap;
 
   @override
   State<_WallTile> createState() => _WallTileState();
@@ -258,65 +275,299 @@ class _WallTileState extends State<_WallTile> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: Colors.grey.shade900,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (_controller != null)
-            Video(
-              controller: _controller!,
-              controls: NoVideoControls,
-              fit: BoxFit.cover,
-            )
-          else
-            Center(
-              child: _error != null
-                  ? Icon(
-                      Icons.videocam_off,
-                      color: Colors.red.shade300,
-                      size: 28,
-                    )
-                  : const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-            ),
+    return GestureDetector(
+      onTap: widget.onTap,
+      child: Container(
+        color: Colors.grey.shade900,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (_controller != null)
+              Video(
+                controller: _controller!,
+                controls: NoVideoControls,
+                fit: BoxFit.cover,
+              )
+            else
+              Center(
+                child: _error != null
+                    ? Icon(
+                        Icons.videocam_off,
+                        color: Colors.red.shade300,
+                        size: 28,
+                      )
+                    : const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+              ),
 
-          // Camera-name label (bottom-left), with a live/offline dot.
-          Positioned(
-            left: 6,
-            bottom: 6,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.55),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 7,
-                    height: 7,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: _error != null
-                          ? Colors.red
-                          : (_firstFrame ? Colors.greenAccent : Colors.amber),
+            // Camera-name label (bottom-left), with a live/offline dot.
+            Positioned(
+              left: 6,
+              bottom: 6,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 7,
+                      height: 7,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _error != null
+                            ? Colors.red
+                            : (_firstFrame ? Colors.greenAccent : Colors.amber),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    widget.camera.name,
-                    style: const TextStyle(color: Colors.white, fontSize: 12),
-                  ),
-                ],
+                    const SizedBox(width: 6),
+                    Text(
+                      widget.camera.name,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Maximized single-camera view: plays the MAIN stream (higher res than the wall
+/// sub) with Flutter-native digital zoom/pan (wheel = zoom-to-cursor, drag = pan,
+/// double-tap = reset) — the same model proven in the P0 spike. Fills the wall.
+class _MaximizedPane extends StatefulWidget {
+  const _MaximizedPane({
+    super.key,
+    required this.api,
+    required this.session,
+    required this.camera,
+    required this.onClose,
+  });
+
+  final CrumbApi api;
+  final Session session;
+  final Camera camera;
+  final VoidCallback onClose;
+
+  @override
+  State<_MaximizedPane> createState() => _MaximizedPaneState();
+}
+
+class _MaximizedPaneState extends State<_MaximizedPane> {
+  Player? _player;
+  VideoController? _controller;
+  String? _error;
+
+  double _scale = 1.0;
+  Offset _offset = Offset.zero;
+  static const double _maxZoom = 8.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final streams = await widget.api.cameraStreams(
+        widget.session,
+        widget.camera.id,
+      );
+      // Prefer MAIN for the maximized view; fall back to sub.
+      final url = streams.rtspMain ?? streams.preferredForWall;
+      if (url == null) {
+        setState(() => _error = 'no stream');
+        return;
+      }
+      final player = Player();
+      final controller = VideoController(player);
+      final p = player.platform;
+      if (p is NativePlayer) {
+        for (final kv in const [
+          ['rtsp-transport', 'tcp'],
+          ['hwdec', 'auto'],
+          ['cache', 'yes'],
+          ['demuxer-readahead-secs', '2.0'],
+          ['demuxer-max-bytes', '32MiB'],
+          ['demuxer-max-back-bytes', '1MiB'],
+          ['network-timeout', '10'],
+          ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+        ]) {
+          try {
+            await p.setProperty(kv[0], kv[1]);
+          } catch (_) {
+            /* non-fatal */
+          }
+        }
+      }
+      await player.open(Media(url));
+      if (!mounted) {
+        player.dispose();
+        return;
+      }
+      setState(() {
+        _player = player;
+        _controller = controller;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _error = 'load failed');
+    }
+  }
+
+  void _zoomAt(Offset cursor, double factor, Size pane) {
+    final newScale = (_scale * factor).clamp(1.0, _maxZoom);
+    if (newScale == _scale) return;
+    final newOffset = cursor - (cursor - _offset) * (newScale / _scale);
+    setState(() {
+      _scale = newScale;
+      _offset = _clampOffset(newOffset, pane);
+    });
+  }
+
+  Offset _clampOffset(Offset o, Size pane) {
+    final minX = pane.width * (1 - _scale);
+    final minY = pane.height * (1 - _scale);
+    return Offset(
+      o.dx.clamp(minX <= 0 ? minX : 0.0, 0.0),
+      o.dy.clamp(minY <= 0 ? minY : 0.0, 0.0),
+    );
+  }
+
+  void _panBy(Offset delta, Size pane) {
+    if (_scale <= 1.0) return;
+    setState(() => _offset = _clampOffset(_offset + delta, pane));
+  }
+
+  void _resetZoom() => setState(() {
+    _scale = 1.0;
+    _offset = Offset.zero;
+  });
+
+  @override
+  void dispose() {
+    _player?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final pane = Size(constraints.maxWidth, constraints.maxHeight);
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: _controller == null
+                      ? Center(
+                          child: _error != null
+                              ? Icon(
+                                  Icons.videocam_off,
+                                  color: Colors.red.shade300,
+                                  size: 40,
+                                )
+                              : const CircularProgressIndicator(),
+                        )
+                      : Listener(
+                          onPointerSignal: (e) {
+                            if (e is PointerScrollEvent) {
+                              final factor =
+                                  math.pow(1.0013, -e.scrollDelta.dy) as double;
+                              _zoomAt(e.localPosition, factor, pane);
+                            }
+                          },
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onDoubleTap: _resetZoom,
+                            onPanUpdate: (d) => _panBy(d.delta, pane),
+                            child: ClipRect(
+                              child: Transform(
+                                transform: Matrix4.identity()
+                                  ..translateByDouble(
+                                    _offset.dx,
+                                    _offset.dy,
+                                    0,
+                                    1,
+                                  )
+                                  ..scaleByDouble(_scale, _scale, 1, 1),
+                                child: Video(
+                                  controller: _controller!,
+                                  controls: NoVideoControls,
+                                  fit: BoxFit.contain,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                ),
+
+                // Close (back to wall) + camera name + zoom level.
+                Positioned(
+                  top: 12,
+                  left: 12,
+                  child: Row(
+                    children: [
+                      Material(
+                        color: Colors.black.withValues(alpha: 0.55),
+                        shape: const CircleBorder(),
+                        child: IconButton(
+                          icon: const Icon(Icons.arrow_back),
+                          color: Colors.white,
+                          onPressed: widget.onClose,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          children: [
+                            Text(
+                              widget.camera.name,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            if (_scale > 1.01) ...[
+                              const SizedBox(width: 10),
+                              Text(
+                                '${_scale.toStringAsFixed(1)}×',
+                                style: const TextStyle(
+                                  color: Colors.cyanAccent,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
       ),
     );
   }
