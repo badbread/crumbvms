@@ -123,15 +123,16 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
     required VoidCallback onTap,
   }) {
     final scheme = Theme.of(context).colorScheme;
+    // Active chip follows the Live tab accent (amber), matching the old client
+    // where the active view chip uses the current tab's --accent.
+    const accent = Color(0xFFE8A33D);
     return Padding(
       padding: const EdgeInsets.only(right: 4),
       child: Material(
-        color: active ? scheme.primary.withValues(alpha: 0.16) : scheme.surface,
+        color: active ? accent.withValues(alpha: 0.16) : scheme.surface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(6),
-          side: BorderSide(
-            color: active ? scheme.primary : scheme.outlineVariant,
-          ),
+          borderRadius: BorderRadius.circular(4),
+          side: BorderSide(color: active ? accent : scheme.outlineVariant),
         ),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
@@ -152,7 +153,7 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
                     child: Icon(
                       icon,
                       size: 13,
-                      color: active ? scheme.primary : scheme.onSurfaceVariant,
+                      color: active ? accent : scheme.onSurfaceVariant,
                     ),
                   ),
                 ConstrainedBox(

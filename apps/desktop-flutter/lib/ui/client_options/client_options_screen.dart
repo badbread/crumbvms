@@ -84,6 +84,60 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setPtzWheelCorner(PtzWheelCorner v) =>
       setState(() => _o.ptzWheelCorner = v);
 
+  /// A compact preference row with a small (non-blobby) switch — a desktop
+  /// alternative to the touch-sized [SwitchListTile]. Disabled when
+  /// [onChanged] is null.
+  Widget _switchRow({
+    required bool value,
+    required ValueChanged<bool>? onChanged,
+    required String title,
+    String? subtitle,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final enabled = onChanged != null;
+    return InkWell(
+      onTap: enabled ? () => onChanged(!value) : null,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 7, 12, 7),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: enabled ? null : scheme.onSurfaceVariant,
+                    ),
+                  ),
+                  if (subtitle != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            Transform.scale(
+              scale: 0.72,
+              child: Switch(value: value, onChanged: onChanged),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -92,39 +146,32 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
         padding: const EdgeInsets.symmetric(vertical: 8),
         children: [
           _SectionHeader('Camera wall'),
-          SwitchListTile(
+          _switchRow(
             value: _o.showInfoBar,
             onChanged: _setShowInfoBar,
-            title: const Text('Show tile info bar'),
-            subtitle: const Text(
-              'Camera name and REC/motion indicators on each tile.',
-            ),
+            title: 'Show tile info bar',
+            subtitle: 'Camera name and REC/motion indicators on each tile.',
           ),
-          SwitchListTile(
+          _switchRow(
             value: _o.showAllCamerasView,
             onChanged: _setShowAllCamerasView,
-            title: const Text('Show "All Cameras" quick view'),
-            subtitle: const Text(
-              'Auto-build a grid of every camera as a selectable view.',
-            ),
+            title: 'Show "All Cameras" quick view',
+            subtitle: 'Auto-build a grid of every camera as a selectable view.',
           ),
-          SwitchListTile(
+          _switchRow(
             value: _wallUsesSub,
             onChanged: widget.streamPrefs == null ? null : _setWallUsesSub,
-            title: const Text('Wall tiles use sub streams'),
-            subtitle: Text(
-              widget.streamPrefs == null
-                  ? 'Unavailable — no stream preference store wired up for this screen.'
-                  : 'Lower-bandwidth stream for the grid; maximizing a tile can still switch to main below.',
-            ),
+            title: 'Wall tiles use sub streams',
+            subtitle: widget.streamPrefs == null
+                ? 'Unavailable — no stream preference store wired up for this screen.'
+                : 'Lower-bandwidth stream for the grid; maximizing a tile can still switch to main below.',
           ),
-          SwitchListTile(
+          _switchRow(
             value: _o.maximizeMain,
             onChanged: _setMaximizeMain,
-            title: const Text('Maximize plays main stream'),
-            subtitle: const Text(
-              'Full-quality stream when a tile is maximized, instead of staying on the wall\'s stream.',
-            ),
+            title: 'Maximize plays main stream',
+            subtitle:
+                'Full-quality stream when a tile is maximized, instead of staying on the wall\'s stream.',
           ),
 
           const Divider(height: 24),
@@ -207,10 +254,10 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
 
           const Divider(height: 24),
           _SectionHeader('Hotkeys'),
-          SwitchListTile(
+          _switchRow(
             value: _o.hotkeysEnabled,
             onChanged: _setHotkeysEnabled,
-            title: const Text('Enable keyboard shortcuts'),
+            title: 'Enable keyboard shortcuts',
           ),
 
           const Divider(height: 24),

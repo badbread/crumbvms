@@ -198,6 +198,7 @@ class _WallScreenState extends State<WallScreen> {
               api: widget.api,
               session: widget.session,
               camera: _maximized!,
+              liveStatus: _liveStatus,
               onClose: () => setState(() => _maximized = null),
             ),
         ],
@@ -604,12 +605,14 @@ class _MaximizedPane extends StatefulWidget {
     required this.api,
     required this.session,
     required this.camera,
+    required this.liveStatus,
     required this.onClose,
   });
 
   final CrumbApi api;
   final Session session;
   final Camera camera;
+  final LiveStatusController liveStatus;
   final VoidCallback onClose;
 
   @override
@@ -848,6 +851,28 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                         ),
                       ),
                     ],
+                  ),
+                ),
+
+                // Live status badges (REC / motion / detection), top-right —
+                // the maximized view must show the same indicators as the wall.
+                Positioned(
+                  top: 14,
+                  right: 14,
+                  child: ListenableBuilder(
+                    listenable: widget.liveStatus,
+                    builder: (context, _) {
+                      final status = widget.liveStatus.cameraFor(
+                        widget.camera.id,
+                      );
+                      return LiveStatusBadgeRow(
+                        recording: status?.recording ?? false,
+                        recentMotion: status?.recentMotion ?? false,
+                        detectionKeys: widget.liveStatus.detectionKeysFor(
+                          widget.camera.id,
+                        ),
+                      );
+                    },
                   ),
                 ),
 

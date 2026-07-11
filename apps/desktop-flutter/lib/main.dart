@@ -30,6 +30,7 @@ import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/admin_console/admin_console_screen.dart';
+import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
 import 'package:crumb_desktop/ui/clips/clips_screen.dart';
 import 'package:crumb_desktop/ui/export/export_screen.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
@@ -379,14 +380,16 @@ class _MainShellState extends State<MainShell> {
 
   // The body tabs (Settings is a panel toggle, not a body tab — see below).
   // Each carries its own accent color used for the active underline + label.
+  // Live amber + Playback cyan match the old client (its --accent / mode-
+  // playback swap); Clips/Export/Settings get distinct, function-fitting hues.
   static const _tabs = <(int, IconData, String, Color)>[
-    (_liveIndex, Icons.grid_view, 'Live', Color(0xFF4FB477)),
-    (_playbackIndex, Icons.play_circle_outline, 'Playback', Color(0xFF4F9BEF)),
-    (_clipsIndex, Icons.movie_outlined, 'Clips', Color(0xFFB57BEF)),
-    (_exportIndex, Icons.download_outlined, 'Export', Color(0xFFE8A33D)),
+    (_liveIndex, Icons.grid_view, 'Live', Color(0xFFE8A33D)), // amber
+    (_playbackIndex, Icons.play_circle_outline, 'Playback', Color(0xFF38BDD6)), // cyan
+    (_clipsIndex, Icons.movie_outlined, 'Clips', Color(0xFFB57BEF)), // violet
+    (_exportIndex, Icons.download_outlined, 'Export', Color(0xFF57C888)), // green
   ];
 
-  static const Color _settingsColor = Color(0xFF3FB8C8);
+  static const Color _settingsColor = Color(0xFF9AA4B2); // neutral slate
 
   @override
   Widget build(BuildContext context) {
@@ -474,6 +477,11 @@ class _MainShellState extends State<MainShell> {
                   ),
                 ],
               ),
+            ),
+            IconButton(
+              tooltip: 'Bookmarks',
+              icon: const Icon(Icons.bookmark_outline, size: 20),
+              onPressed: () => _openBookmarks(session),
             ),
             IconButton(
               tooltip: 'Layouts',
@@ -571,10 +579,23 @@ class _MainShellState extends State<MainShell> {
           cameras: widget.cameras,
         ),
       ),
-      onJumpToPlayback: (cameraId, ts) => setState(() {
-        _settingsOpen = false;
-        _index = _playbackIndex;
-      }),
+    );
+  }
+
+  /// Open Bookmarks — a top-level quick action (not buried in Settings), since
+  /// bookmarks are meant for fast access.
+  void _openBookmarks(Session session) {
+    _pushScreen(
+      'Bookmarks',
+      BookmarksScreen(
+        api: widget.api,
+        session: session,
+        cameras: widget.cameras,
+        onJumpToPlayback: (cameraId, ts) {
+          Navigator.of(context).pop();
+          setState(() => _index = _playbackIndex);
+        },
+      ),
     );
   }
 

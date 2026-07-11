@@ -107,7 +107,9 @@ class TileInfoBar extends StatelessWidget {
     return Container(
       height: height,
       padding: const EdgeInsets.symmetric(horizontal: 8),
-      color: Colors.black.withValues(alpha: 0.62),
+      // Navy blue, matching the old client's camera tile-strip header
+      // (rgba(20,36,66)) rather than a plain black bar.
+      color: const Color.fromRGBO(20, 38, 72, 0.94),
       child: Row(
         children: [
           Container(

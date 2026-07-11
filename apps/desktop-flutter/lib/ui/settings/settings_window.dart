@@ -22,7 +22,6 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
-import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
 import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
 import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
@@ -33,7 +32,6 @@ enum SettingsSection {
   options(Icons.tune, 'Options', pane: true),
   hotkeys(Icons.keyboard_outlined, 'Hotkeys', pane: true),
   serverDashboard(Icons.dns_outlined, 'Server dashboard', pane: true),
-  bookmarks(Icons.bookmark_outline, 'Bookmarks', pane: true),
   serverConsole(Icons.admin_panel_settings_outlined, 'Server console',
       pane: false),
   motionTuner(Icons.sensors, 'Motion tuner', pane: false);
@@ -57,7 +55,6 @@ class SettingsWindow extends StatefulWidget {
     required this.onClose,
     required this.onOpenServerConsole,
     required this.onOpenMotionTuner,
-    required this.onJumpToPlayback,
     this.clientOptions,
     this.streamPrefs,
     this.hotkeys,
@@ -73,10 +70,6 @@ class SettingsWindow extends StatefulWidget {
   /// Open the WebView2 surfaces as their own full screen (panel closes first).
   final VoidCallback onOpenServerConsole;
   final VoidCallback onOpenMotionTuner;
-
-  /// Jump from a bookmark to the Playback tab (panel closes first). Signature
-  /// matches BookmarksScreen.onJumpToPlayback.
-  final void Function(String cameraId, DateTime ts) onJumpToPlayback;
 
   final ClientOptionsStore? clientOptions;
   final StreamPrefsStore? streamPrefs;
@@ -156,7 +149,7 @@ class _SettingsWindowState extends State<SettingsWindow> {
     return Material(
       elevation: 16,
       color: scheme.surface,
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: BorderRadius.circular(6),
       clipBehavior: Clip.antiAlias,
       child: Stack(
         children: [
@@ -298,13 +291,6 @@ class _SettingsWindowState extends State<SettingsWindow> {
         return HotkeyRemapScreen(store: hk, cameras: widget.cameras);
       case SettingsSection.serverDashboard:
         return ServerDashboardScreen(api: widget.api, session: widget.session);
-      case SettingsSection.bookmarks:
-        return BookmarksScreen(
-          api: widget.api,
-          session: widget.session,
-          cameras: widget.cameras,
-          onJumpToPlayback: widget.onJumpToPlayback,
-        );
       case SettingsSection.serverConsole:
       case SettingsSection.motionTuner:
         // Never rendered in-pane (see _select), but keep the switch exhaustive.
