@@ -5,7 +5,6 @@ package video.crumb.app.feature.live
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -43,6 +42,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -55,6 +55,7 @@ import video.crumb.app.data.CameraView
 import video.crumb.app.ui.HintTooltip
 import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.NavySurface
+import video.crumb.app.ui.theme.NavySurfaceVariant
 import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
 import java.util.UUID
@@ -163,108 +164,122 @@ fun ViewEditorDialog(
                         modifier = Modifier.fillMaxWidth(),
                     )
 
-                    // ── available cameras (tap to add) — TOP ──────────────────
+                    // ── selected cameras (reorderable) — TOP, in a shaded card ─
                     Spacer(Modifier.height(16.dp))
-                    Text("Add cameras", style = MaterialTheme.typography.labelLarge, color = TextSecondary)
-                    Spacer(Modifier.height(4.dp))
-                    if (available.isEmpty()) {
-                        Text(
-                            "All cameras are in this view.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            modifier = Modifier.padding(vertical = 8.dp),
-                        )
-                    } else {
-                        available.forEach { (id, nm) ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(ROW_HEIGHT)
-                                    .clickable { selected.add(id) }
-                                    .padding(horizontal = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = "Add", tint = TealAccent)
-                                Spacer(Modifier.width(12.dp))
-                                Text(nm, style = MaterialTheme.typography.bodyMedium)
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = NavySurface,
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(
+                                "In this view — long-press the handle to reorder (${selected.size})",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = TextSecondary,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            if (selected.isEmpty()) {
+                                Text(
+                                    "Tap cameras below to add them.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary,
+                                    modifier = Modifier.padding(vertical = 8.dp),
+                                )
+                            } else {
+                                // key(camId) keeps each row's composable (and its drag gesture)
+                                // alive across reorders, so an in-progress drag isn't restarted.
+                                selected.forEach { camId ->
+                                    key(camId) {
+                                        val dragging = dragId == camId
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(ROW_HEIGHT)
+                                                .zIndex(if (dragging) 1f else 0f)
+                                                .graphicsLayer { translationY = if (dragging) dragAccum else 0f }
+                                                .background(
+                                                    if (dragging) NavySurfaceVariant else Color.Transparent,
+                                                    RoundedCornerShape(6.dp),
+                                                )
+                                                .padding(horizontal = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.DragHandle,
+                                                contentDescription = "Reorder",
+                                                tint = TextSecondary,
+                                                modifier = Modifier.pointerInput(camId) {
+                                                    // Long-press to start: a deliberate press on the
+                                                    // handle claims the pointer so the parent
+                                                    // verticalScroll can't steal the (vertical) drag.
+                                                    detectDragGesturesAfterLongPress(
+                                                        onDragStart = { dragId = camId; dragAccum = 0f },
+                                                        onDragEnd = { dragId = null; dragAccum = 0f },
+                                                        onDragCancel = { dragId = null; dragAccum = 0f },
+                                                        onDrag = { change, amount ->
+                                                            change.consume()
+                                                            dragAccum += amount.y
+                                                            var idx = selected.indexOf(camId)
+                                                            if (idx >= 0) {
+                                                                while (dragAccum > rowPx / 2 && idx < selected.lastIndex) {
+                                                                    swap(idx, idx + 1); idx++; dragAccum -= rowPx
+                                                                }
+                                                                while (dragAccum < -rowPx / 2 && idx > 0) {
+                                                                    swap(idx, idx - 1); idx--; dragAccum += rowPx
+                                                                }
+                                                            }
+                                                        },
+                                                    )
+                                                },
+                                            )
+                                            Spacer(Modifier.width(12.dp))
+                                            Text(
+                                                text = nameById[camId] ?: "(removed camera)",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            HintTooltip("Remove from view") {
+                                                IconButton(onClick = { selected.remove(camId) }) {
+                                                    Icon(Icons.Default.Close, contentDescription = "Remove", tint = TextSecondary)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // ── selected cameras (reorderable) — BOTTOM ───────────────
+                    // ── available cameras (tap to add) — BOTTOM, shaded card ────
                     Spacer(Modifier.height(16.dp))
-                    Box1pxDivider()
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "In this view — long-press the handle to reorder (${selected.size})",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = TextSecondary,
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    if (selected.isEmpty()) {
-                        Text(
-                            "Tap cameras above to add them.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            modifier = Modifier.padding(vertical = 8.dp),
-                        )
-                    } else {
-                        // key(camId) keeps each row's composable (and its drag gesture)
-                        // alive across reorders, so an in-progress drag isn't restarted.
-                        selected.forEach { camId ->
-                            key(camId) {
-                                val dragging = dragId == camId
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(ROW_HEIGHT)
-                                        .zIndex(if (dragging) 1f else 0f)
-                                        .graphicsLayer { translationY = if (dragging) dragAccum else 0f }
-                                        .background(
-                                            if (dragging) NavySurface else NavyDeep,
-                                            RoundedCornerShape(6.dp),
-                                        )
-                                        .padding(horizontal = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.DragHandle,
-                                        contentDescription = "Reorder",
-                                        tint = TextSecondary,
-                                        modifier = Modifier.pointerInput(camId) {
-                                            // Long-press to start: a deliberate press on the
-                                            // handle claims the pointer so the parent
-                                            // verticalScroll can't steal the (vertical) drag.
-                                            detectDragGesturesAfterLongPress(
-                                                onDragStart = { dragId = camId; dragAccum = 0f },
-                                                onDragEnd = { dragId = null; dragAccum = 0f },
-                                                onDragCancel = { dragId = null; dragAccum = 0f },
-                                                onDrag = { change, amount ->
-                                                    change.consume()
-                                                    dragAccum += amount.y
-                                                    var idx = selected.indexOf(camId)
-                                                    if (idx >= 0) {
-                                                        while (dragAccum > rowPx / 2 && idx < selected.lastIndex) {
-                                                            swap(idx, idx + 1); idx++; dragAccum -= rowPx
-                                                        }
-                                                        while (dragAccum < -rowPx / 2 && idx > 0) {
-                                                            swap(idx, idx - 1); idx--; dragAccum += rowPx
-                                                        }
-                                                    }
-                                                },
-                                            )
-                                        },
-                                    )
-                                    Spacer(Modifier.width(12.dp))
-                                    Text(
-                                        text = nameById[camId] ?: "(removed camera)",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    HintTooltip("Remove from view") {
-                                        IconButton(onClick = { selected.remove(camId) }) {
-                                            Icon(Icons.Default.Close, contentDescription = "Remove", tint = TextSecondary)
-                                        }
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = NavySurface,
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("Add cameras", style = MaterialTheme.typography.labelLarge, color = TextSecondary)
+                            Spacer(Modifier.height(4.dp))
+                            if (available.isEmpty()) {
+                                Text(
+                                    "All cameras are in this view.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary,
+                                    modifier = Modifier.padding(vertical = 8.dp),
+                                )
+                            } else {
+                                available.forEach { (id, nm) ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(ROW_HEIGHT)
+                                            .clickable { selected.add(id) }
+                                            .padding(horizontal = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Icon(Icons.Default.Add, contentDescription = "Add", tint = TealAccent)
+                                        Spacer(Modifier.width(12.dp))
+                                        Text(nm, style = MaterialTheme.typography.bodyMedium)
                                     }
                                 }
                             }
@@ -284,18 +299,6 @@ fun ViewEditorDialog(
             }
         }
     }
-}
-
-/** A thin horizontal rule (avoids Divider/HorizontalDivider API-name churn). */
-@Composable
-private fun Box1pxDivider() {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .height(1.dp)
-            .background(NavySurface),
-        horizontalArrangement = Arrangement.Center,
-    ) {}
 }
 
 /**
