@@ -14,6 +14,7 @@ import 'package:flutter/gestures.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
@@ -33,12 +34,17 @@ class WallScreen extends StatefulWidget {
     this.clientOptions,
     this.streamPrefs,
     this.view,
+    this.audio,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
   final VoidCallback onLogout;
+
+  /// Play-on-focus audio controller (single audible pane). Tiles register
+  /// their Player; selection/maximize pick the active pane.
+  final AudioFollowController? audio;
 
   /// Per-camera stream (main/sub) + PTZ-disable prefs. Drives the right-click
   /// menu on a tile and which stream each pane plays.
@@ -109,6 +115,12 @@ class _WallScreenState extends State<WallScreen> {
     _statsTimer?.cancel();
     _liveStatus.dispose();
     super.dispose();
+  }
+
+  /// Maximize a camera + make it the audio-active pane.
+  void _maximize(Camera cam) {
+    widget.audio?.setMaximized('max:${cam.id}');
+    setState(() => _maximized = cam);
   }
 
   @override
@@ -207,9 +219,13 @@ class _WallScreenState extends State<WallScreen> {
               camera: _maximized!,
               liveStatus: _liveStatus,
               streamPrefs: widget.streamPrefs,
+              audio: widget.audio,
               ptzClickMode:
                   widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
-              onClose: () => setState(() => _maximized = null),
+              onClose: () {
+                widget.audio?.setMaximized(null);
+                setState(() => _maximized = null);
+              },
             ),
         ],
       ),
@@ -268,10 +284,11 @@ class _WallScreenState extends State<WallScreen> {
                       camera: cam,
                       liveStatus: _liveStatus,
                       streamPrefs: widget.streamPrefs,
+                      audio: widget.audio,
                       showInfoBar: showInfoBar,
                       // Custom cells can be any aspect — letterbox, don't crop.
                       fit: BoxFit.contain,
-                      onTap: () => setState(() => _maximized = cam),
+                      onTap: () => _maximize(cam),
                     ),
             ),
           );
@@ -301,8 +318,9 @@ class _WallScreenState extends State<WallScreen> {
             camera: cam,
             liveStatus: _liveStatus,
             streamPrefs: widget.streamPrefs,
+            audio: widget.audio,
             showInfoBar: showInfoBar,
-            onTap: () => setState(() => _maximized = cam),
+            onTap: () => _maximize(cam),
           ),
       ],
     );
@@ -336,6 +354,7 @@ class _WallTile extends StatefulWidget {
     required this.showInfoBar,
     required this.onTap,
     this.streamPrefs,
+    this.audio,
     this.fit = BoxFit.cover,
   });
 
@@ -346,6 +365,7 @@ class _WallTile extends StatefulWidget {
   final bool showInfoBar;
   final VoidCallback onTap;
   final StreamPrefsStore? streamPrefs;
+  final AudioFollowController? audio;
 
   /// How the video fills its tile. The default auto-grid uses `cover` (tiles
   /// are ~16:9, so no visible crop); custom-view cells can be any aspect, so
@@ -398,15 +418,12 @@ class _WallTileState extends State<_WallTile> {
     _load();
   }
 
-  StreamUrls? _streams;
-
   Future<void> _load() async {
     try {
       final streams = await widget.api.cameraStreams(
         widget.session,
         widget.camera.id,
       );
-      _streams = streams;
       // Per-camera main/sub override (right-click menu) wins over the wall
       // default; falls back to the plain wall preference if no prefs store.
       final url =
@@ -461,6 +478,11 @@ class _WallTileState extends State<_WallTile> {
       if (SnapshotRegistry.instance.activePaneId.value == null) {
         SnapshotRegistry.instance.setActive(_paneId);
       }
+      // Register as an audio pane (muted until it becomes the audible pane).
+      widget.audio?.registerPane(
+        _paneId,
+        AudioPane.forPlayer(player, hasAudio: () => mounted),
+      );
       setState(() {
         _player = player;
         _controller = controller;
@@ -558,6 +580,7 @@ class _WallTileState extends State<_WallTile> {
   @override
   void dispose() {
     SnapshotRegistry.instance.unregister(_paneId);
+    widget.audio?.unregisterPane(_paneId);
     _player?.dispose();
     super.dispose();
   }
@@ -639,9 +662,12 @@ class _WallTileState extends State<_WallTile> {
             }
           },
           child: GestureDetector(
-            // Single click selects this pane (snapshot target); double-click
-            // maximizes; right-click opens the per-tile menu; drag pans.
-            onTap: () => SnapshotRegistry.instance.setActive(_paneId),
+            // Single click selects this pane (snapshot + audio target);
+            // double-click maximizes; right-click opens the per-tile menu.
+            onTap: () {
+              SnapshotRegistry.instance.setActive(_paneId);
+              widget.audio?.setSelected(_paneId);
+            },
             onDoubleTap: widget.onTap,
             onSecondaryTapDown: (d) => _showTileMenu(d.globalPosition),
             onPanUpdate: (d) => _panBy(d.delta, pane),
@@ -763,6 +789,7 @@ class _MaximizedPane extends StatefulWidget {
     required this.liveStatus,
     required this.onClose,
     this.streamPrefs,
+    this.audio,
     this.ptzClickMode = PtzClickMode.center,
   });
 
@@ -772,6 +799,7 @@ class _MaximizedPane extends StatefulWidget {
   final LiveStatusController liveStatus;
   final VoidCallback onClose;
   final StreamPrefsStore? streamPrefs;
+  final AudioFollowController? audio;
 
   /// What a click on a PTZ-capable video does (center / pan / off).
   final PtzClickMode ptzClickMode;
@@ -820,6 +848,8 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
           ['demuxer-max-back-bytes', '1MiB'],
           ['network-timeout', '10'],
           ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+          // Muted by default — the global audio button unmutes the active pane.
+          ['mute', 'yes'],
         ]) {
           try {
             await p.setProperty(kv[0], kv[1]);
@@ -833,12 +863,16 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         player.dispose();
         return;
       }
-      // While maximized, this pane is the snapshot target.
+      // While maximized, this pane is the snapshot + audio target.
       SnapshotRegistry.instance.register(
         'maximized',
         SnapshotTarget(player: player, cameraName: widget.camera.name),
       );
       SnapshotRegistry.instance.setActive('maximized');
+      widget.audio?.registerPane(
+        'max:${widget.camera.id}',
+        AudioPane.forPlayer(player, hasAudio: () => mounted),
+      );
       setState(() {
         _player = player;
         _controller = controller;
@@ -871,11 +905,6 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     if (_scale <= 1.0) return;
     setState(() => _offset = _clampOffset(_offset + delta, pane));
   }
-
-  void _resetZoom() => setState(() {
-    _scale = 1.0;
-    _offset = Offset.zero;
-  });
 
   /// PTZ usable here: camera supports it AND the operator hasn't disabled PTZ
   /// controls for this camera via the right-click menu.
@@ -958,6 +987,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   @override
   void dispose() {
     SnapshotRegistry.instance.unregister('maximized');
+    widget.audio?.unregisterPane('max:${widget.camera.id}');
     _ptzZoomStop?.cancel();
     _ptzPulseStop?.cancel();
     _player?.dispose();

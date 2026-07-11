@@ -22,6 +22,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/views_api.dart' show SavedView;
+import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/session/session_controller.dart';
@@ -53,7 +54,6 @@ import 'package:crumb_desktop/ui/settings/settings_window.dart';
 import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
 import 'package:crumb_desktop/ui/updates/update_banner.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
-import 'package:crumb_desktop/ui/wall_layouts/managed_wall_screen.dart';
 import 'package:crumb_desktop/ui/wall_screen.dart';
 
 /// Run modes (default = the real client: login then live wall):
@@ -380,6 +380,17 @@ class _MainShellState extends State<MainShell> {
   /// Config View editor creates one).
   int _viewsRefreshToken = 0;
 
+  /// Play-on-focus audio: exactly one pane (maximized else selected) is
+  /// audible when audio is on. Owned here, driven by the global audio button
+  /// and the wall's tile selection/maximize.
+  final AudioFollowController _audio = AudioFollowController();
+
+  @override
+  void dispose() {
+    _audio.dispose();
+    super.dispose();
+  }
+
   static const int _liveIndex = 0;
   static const int _playbackIndex = 1;
   static const int _clipsIndex = 2;
@@ -443,6 +454,9 @@ class _MainShellState extends State<MainShell> {
                     onSnapshot: () =>
                         SnapshotService.captureActivePane(context),
                     onConfigView: () => _openConfigView(session),
+                    // Hide the "All Cameras" chip when the option is off.
+                    showAllCameras:
+                        widget.clientOptions?.showAllCamerasView ?? true,
                   ),
               ],
               Expanded(
@@ -506,39 +520,34 @@ class _MainShellState extends State<MainShell> {
                 ],
               ),
             ),
+            // Global audio on/off — the active (maximized else selected) pane
+            // is the one audible pane; this toggles it.
+            ListenableBuilder(
+              listenable: _audio,
+              builder: (context, _) => IconButton(
+                tooltip: _audio.audioOn ? 'Mute audio' : 'Audio off',
+                icon: Icon(
+                  _audio.audioOn ? Icons.volume_up : Icons.volume_off,
+                  size: 20,
+                  color: _audio.audioOn ? scheme.primary : null,
+                ),
+                onPressed: () async {
+                  final ok = await _audio.toggleAudio();
+                  if (!ok && mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Select a camera to hear its audio.'),
+                        duration: Duration(seconds: 2),
+                      ),
+                    );
+                  }
+                },
+              ),
+            ),
             IconButton(
               tooltip: 'Bookmarks',
               icon: const Icon(Icons.bookmark_outline, size: 20),
               onPressed: () => _openBookmarks(session),
-            ),
-            IconButton(
-              tooltip: 'Layouts',
-              icon: const Icon(Icons.dashboard_customize_outlined, size: 20),
-              onPressed: () => _pushScreen(
-                'Layouts',
-                ManagedWallScreen(
-                  api: widget.api,
-                  session: session,
-                  cameras: widget.cameras,
-                  onLogout: widget.onLogout,
-                ),
-              ),
-            ),
-            IconButton(
-              tooltip: 'Saved views',
-              icon: const Icon(Icons.view_comfy_alt_outlined, size: 20),
-              onPressed: () => _pushScreen(
-                'Saved views',
-                SavedViewsScreen(
-                  api: widget.api,
-                  session: session,
-                  cameras: widget.cameras,
-                  onApplyView: (view) {
-                    Navigator.of(context).pop();
-                    _applyView(view);
-                  },
-                ),
-              ),
             ),
             IconButton(
               tooltip: 'Fullscreen',
@@ -720,6 +729,8 @@ class _MainShellState extends State<MainShell> {
           streamPrefs: widget.streamPrefs,
           // The applied saved view (null → default auto-grid of all cameras).
           view: _appliedView,
+          // Play-on-focus audio (global audio button governs it).
+          audio: _audio,
         );
     }
   }
