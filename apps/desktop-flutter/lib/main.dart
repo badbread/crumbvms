@@ -43,6 +43,8 @@ import 'package:crumb_desktop/ui/reauth/reauth_overlay.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alert_banner.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alerts_controller.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart';
+import 'package:crumb_desktop/ui/saved_views/view_prefs.dart';
+import 'package:crumb_desktop/ui/saved_views/view_selector_bar.dart';
 import 'package:crumb_desktop/ui/settings/settings_window.dart';
 import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
 import 'package:crumb_desktop/ui/updates/update_banner.dart';
@@ -365,6 +367,11 @@ class _MainShellState extends State<MainShell> {
   /// (not its own tab) so the live wall keeps running and updates behind it.
   bool _settingsOpen = false;
 
+  /// The applied saved view (null → the default "All Cameras" auto-grid wall),
+  /// and the id used to highlight the active chip in the view-selector row.
+  AppliedView? _appliedView;
+  String? _activeViewId = ViewPrefs.allCamerasId;
+
   static const int _liveIndex = 0;
   static const int _playbackIndex = 1;
   static const int _clipsIndex = 2;
@@ -397,6 +404,15 @@ class _MainShellState extends State<MainShell> {
                 RecordingAlertBanner(controller: widget.recordingAlerts),
                 UpdateBanner(controller: widget.updateCheck),
                 _buildTopBar(session),
+                // Saved-views quick-switch row — Live tab only.
+                if (_index == _liveIndex)
+                  ViewSelectorBar(
+                    api: widget.api,
+                    session: session,
+                    cameras: widget.cameras,
+                    activeViewId: _activeViewId,
+                    onApply: _applyView,
+                  ),
               ],
               Expanded(
                 child: Stack(
@@ -481,9 +497,9 @@ class _MainShellState extends State<MainShell> {
                   api: widget.api,
                   session: session,
                   cameras: widget.cameras,
-                  onApplyView: (_) {
+                  onApplyView: (view) {
                     Navigator.of(context).pop();
-                    setState(() => _index = _liveIndex);
+                    _applyView(view);
                   },
                 ),
               ),
@@ -562,6 +578,18 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
+  /// Apply a saved view to the live wall. "All Cameras" (id ==
+  /// [ViewPrefs.allCamerasId]) resets to the default auto-grid; any other view
+  /// renders its custom layout. Always lands on the Live tab.
+  void _applyView(AppliedView view) {
+    setState(() {
+      _activeViewId = view.id;
+      _appliedView = view.id == ViewPrefs.allCamerasId ? null : view;
+      _index = _liveIndex;
+      _settingsOpen = false;
+    });
+  }
+
   /// Push a secondary screen (from the Settings panel or a toolbar button) with
   /// a back-navigable app bar.
   void _pushScreen(String title, Widget child) {
@@ -606,6 +634,8 @@ class _MainShellState extends State<MainShell> {
           // The wall listens to client options so the per-tile header bar
           // (showInfoBar) restyles live when toggled in the Settings panel.
           clientOptions: widget.clientOptions,
+          // The applied saved view (null → default auto-grid of all cameras).
+          view: _appliedView,
         );
     }
   }

@@ -18,6 +18,8 @@ import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
+import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
+    show AppliedView;
 
 class WallScreen extends StatefulWidget {
   const WallScreen({
@@ -27,12 +29,17 @@ class WallScreen extends StatefulWidget {
     required this.cameras,
     required this.onLogout,
     this.clientOptions,
+    this.view,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
   final VoidCallback onLogout;
+
+  /// The applied saved view (its custom layout + slot→camera map). Null → the
+  /// default auto-grid of every enabled camera (the "All Cameras" wall).
+  final AppliedView? view;
 
   /// Client options store. The wall LISTENS to it, so a preference change made
   /// while the wall is visible — e.g. toggling "Show tile info bar" in the
@@ -106,26 +113,18 @@ class _WallScreenState extends State<WallScreen> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          if (cams.isEmpty)
-            const Center(
-              child: Text(
-                'No enabled cameras visible to this account.',
-                style: TextStyle(color: Colors.white70),
-              ),
-            )
-          else
-            Positioned.fill(
-              // Listen to client options so toggling "Show tile info bar" in the
-              // floating Settings panel restyles the tiles live (tile States
-              // persist by ValueKey(cam.id), so no player teardown/restart).
-              child: widget.clientOptions == null
-                  ? _grid(cams, cols, true)
-                  : ListenableBuilder(
-                      listenable: widget.clientOptions!,
-                      builder: (context, _) =>
-                          _grid(cams, cols, widget.clientOptions!.showInfoBar),
-                    ),
-            ),
+          Positioned.fill(
+            // Listen to client options so toggling "Show tile info bar" in the
+            // floating Settings panel restyles the tiles live (tile States
+            // persist by key, so no player teardown/restart).
+            child: widget.clientOptions == null
+                ? _wallBody(cams, cols, true)
+                : ListenableBuilder(
+                    listenable: widget.clientOptions!,
+                    builder: (context, _) =>
+                        _wallBody(cams, cols, widget.clientOptions!.showInfoBar),
+                  ),
+          ),
 
           // Top bar: camera count + host stats (FRB) + logout.
           Positioned(
@@ -206,6 +205,68 @@ class _WallScreenState extends State<WallScreen> {
     );
   }
 
+  /// Pick what fills the wall: an applied view's custom layout, the empty-state
+  /// message, or the default auto-grid of every enabled camera.
+  Widget _wallBody(List<Camera> cams, int cols, bool showInfoBar) {
+    final view = widget.view;
+    if (view != null) return _viewGrid(view, showInfoBar);
+    if (cams.isEmpty) {
+      return const Center(
+        child: Text(
+          'No enabled cameras visible to this account.',
+          style: TextStyle(color: Colors.white70),
+        ),
+      );
+    }
+    return _grid(cams, cols, showInfoBar);
+  }
+
+  /// Render an applied saved view: place one tile per layout cell (in reading
+  /// order = slot index) at its fractional rect, mapping the slot to its camera
+  /// (empty slots show a placeholder). Custom geometry fills the pane exactly
+  /// like the old client's CSS-grid `gridColumn/gridRow` spans.
+  Widget _viewGrid(AppliedView view, bool showInfoBar) {
+    final layout = view.layout;
+    final camById = {for (final c in widget.cameras) c.id: c};
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final h = constraints.maxHeight;
+        const g = 1.0; // half-gap between tiles
+        final children = <Widget>[];
+        for (var i = 0; i < layout.cells.length; i++) {
+          final cell = layout.cells[i];
+          final left = cell.x / layout.cols * w;
+          final top = cell.y / layout.rows * h;
+          final width = cell.w / layout.cols * w;
+          final height = cell.h / layout.rows * h;
+          final camId = view.slots[i];
+          final cam = camId == null ? null : camById[camId];
+          children.add(
+            Positioned(
+              left: left + g,
+              top: top + g,
+              width: (width - 2 * g).clamp(0.0, w),
+              height: (height - 2 * g).clamp(0.0, h),
+              child: cam == null
+                  ? const _EmptySlot()
+                  : _WallTile(
+                      key: ValueKey('${view.id}:$i:${cam.id}'),
+                      api: widget.api,
+                      session: widget.session,
+                      camera: cam,
+                      liveStatus: _liveStatus,
+                      showInfoBar: showInfoBar,
+                      onTap: () => setState(() => _maximized = cam),
+                    ),
+            ),
+          );
+        }
+        return Stack(children: children);
+      },
+    );
+  }
+
   /// The tile grid. Pulled out of [build] so it can be rebuilt on a client-
   /// option change (via the ListenableBuilder above) without disturbing the
   /// rest of the wall. `showInfoBar` chooses the per-tile header strip vs the
@@ -229,6 +290,21 @@ class _WallScreenState extends State<WallScreen> {
             onTap: () => setState(() => _maximized = cam),
           ),
       ],
+    );
+  }
+}
+
+/// Placeholder for a view slot with no camera assigned.
+class _EmptySlot extends StatelessWidget {
+  const _EmptySlot();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: Colors.grey.shade900,
+      child: const Center(
+        child: Icon(Icons.videocam_off_outlined, color: Colors.white24, size: 26),
+      ),
     );
   }
 }
