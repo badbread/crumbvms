@@ -15,6 +15,8 @@ import 'package:flutter/gestures.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
+import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
+import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 
 class WallScreen extends StatefulWidget {
   const WallScreen({
@@ -43,6 +45,8 @@ class _WallScreenState extends State<WallScreen> {
 
   Camera? _maximized;
 
+  late final LiveStatusController _liveStatus;
+
   List<Camera> get _shown =>
       widget.cameras.where((c) => c.enabled).toList(growable: false);
 
@@ -53,6 +57,9 @@ class _WallScreenState extends State<WallScreen> {
       const Duration(seconds: 2),
       (_) => _pollStats(),
     );
+    _liveStatus = LiveStatusController(api: widget.api, session: widget.session)
+      ..cameraIds = _shown.map((c) => c.id).toList()
+      ..start();
   }
 
   Future<void> _pollStats() async {
@@ -77,6 +84,7 @@ class _WallScreenState extends State<WallScreen> {
   @override
   void dispose() {
     _statsTimer?.cancel();
+    _liveStatus.dispose();
     super.dispose();
   }
 
@@ -111,6 +119,7 @@ class _WallScreenState extends State<WallScreen> {
                       api: widget.api,
                       session: widget.session,
                       camera: cam,
+                      liveStatus: _liveStatus,
                       onTap: () => setState(() => _maximized = cam),
                     ),
                 ],
@@ -166,6 +175,14 @@ class _WallScreenState extends State<WallScreen> {
             ),
           ),
 
+          // Connection-lost banner: status polling has failed 3x in a row, so
+          // the REC/motion/detection badges below may be stale.
+          ListenableBuilder(
+            listenable: _liveStatus,
+            builder: (context, _) =>
+                ConnLostBanner(show: _liveStatus.connectionLost),
+          ),
+
           // Maximized single-camera view (main stream + zoom/pan), on top.
           if (_maximized != null)
             _MaximizedPane(
@@ -189,12 +206,14 @@ class _WallTile extends StatefulWidget {
     required this.api,
     required this.session,
     required this.camera,
+    required this.liveStatus,
     required this.onTap,
   });
 
   final CrumbApi api;
   final Session session;
   final Camera camera;
+  final LiveStatusController liveStatus;
   final VoidCallback onTap;
 
   @override
@@ -302,6 +321,26 @@ class _WallTileState extends State<_WallTile> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       ),
               ),
+
+            // REC/motion/detection badges (top-left), driven by the shared
+            // LiveStatusController poll — only this row rebuilds on a tick.
+            Positioned(
+              left: 6,
+              top: 6,
+              child: ListenableBuilder(
+                listenable: widget.liveStatus,
+                builder: (context, _) {
+                  final status = widget.liveStatus.cameraFor(widget.camera.id);
+                  return LiveStatusBadgeRow(
+                    recording: status?.recording ?? false,
+                    recentMotion: status?.recentMotion ?? false,
+                    detectionKeys: widget.liveStatus.detectionKeysFor(
+                      widget.camera.id,
+                    ),
+                  );
+                },
+              ),
+            ),
 
             // Camera-name label (bottom-left), with a live/offline dot.
             Positioned(
