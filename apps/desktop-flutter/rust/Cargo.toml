@@ -17,7 +17,7 @@ nvml-wrapper = "0.10"
 [target.'cfg(windows)'.dependencies]
 # CPU-time + working-set memory of the client process (GetProcessTimes /
 # GetProcessMemoryInfo). Same crate + feature set the Tauri desktop already uses.
-winapi = { version = "0.3", features = ["processthreadsapi", "psapi", "minwindef", "handleapi"] }
+winapi = { version = "0.3", features = ["processthreadsapi", "psapi", "minwindef", "handleapi", "dpapi", "wincrypt", "winbase"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
