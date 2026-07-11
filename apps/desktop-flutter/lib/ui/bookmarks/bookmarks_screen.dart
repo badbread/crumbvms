@@ -8,10 +8,13 @@
 // this ships as its own full nav destination. [onJumpToPlayback] is the seam
 // a future playback screen wires up — see integration notes.
 
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import 'package:crumb_desktop/api/bookmarks_api.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 
 import 'add_bookmark_dialog.dart';
@@ -176,6 +179,8 @@ class _BookmarksScreenState extends State<BookmarksScreen> {
         itemCount: rows.length,
         separatorBuilder: (_, __) => const Divider(height: 1),
         itemBuilder: (context, i) => _BookmarkRow(
+          api: widget.api,
+          session: widget.session,
           bookmark: rows[i],
           cameraFallbackName: _cameraById(rows[i].cameraId)?.name,
           onJump: widget.onJumpToPlayback == null
@@ -190,12 +195,16 @@ class _BookmarksScreenState extends State<BookmarksScreen> {
 
 class _BookmarkRow extends StatelessWidget {
   const _BookmarkRow({
+    required this.api,
+    required this.session,
     required this.bookmark,
     required this.cameraFallbackName,
     required this.onJump,
     required this.onDelete,
   });
 
+  final CrumbApi api;
+  final Session session;
   final Bookmark bookmark;
   final String? cameraFallbackName;
   final VoidCallback? onJump;
@@ -210,11 +219,10 @@ class _BookmarkRow extends StatelessWidget {
 
     return ListTile(
       onTap: onJump,
-      leading: Icon(
-        bookmark.isProtected
-            ? Icons.lock_outline
-            : Icons.bookmark_border,
-        color: bookmark.isProtected ? theme.colorScheme.primary : null,
+      leading: _BookmarkThumb(
+        api: api,
+        session: session,
+        bookmark: bookmark,
       ),
       title: Row(
         children: [
@@ -254,6 +262,100 @@ class _BookmarkRow extends StatelessWidget {
             onPressed: onDelete,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// A small preview snapshot of the moment a bookmark marks — one filmstrip
+/// JPEG frame at the bookmark's timestamp — falling back to a bookmark icon
+/// while loading or if no frame is available.
+class _BookmarkThumb extends StatefulWidget {
+  const _BookmarkThumb({
+    required this.api,
+    required this.session,
+    required this.bookmark,
+  });
+
+  final CrumbApi api;
+  final Session session;
+  final Bookmark bookmark;
+
+  @override
+  State<_BookmarkThumb> createState() => _BookmarkThumbState();
+}
+
+class _BookmarkThumbState extends State<_BookmarkThumb> {
+  Uint8List? _bytes;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    Uint8List? bytes;
+    try {
+      bytes = await widget.api.fetchFilmstripFrame(
+        widget.session,
+        widget.bookmark.cameraId,
+        widget.bookmark.ts,
+        width: 160,
+      );
+    } catch (_) {
+      bytes = null;
+    }
+    if (mounted) {
+      setState(() {
+        _bytes = bytes;
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(4),
+      child: SizedBox(
+        width: 64,
+        height: 40,
+        child: _bytes != null
+            ? Stack(
+                fit: StackFit.expand,
+                children: [
+                  Image.memory(_bytes!, fit: BoxFit.cover, gaplessPlayback: true),
+                  if (widget.bookmark.isProtected)
+                    const Positioned(
+                      right: 2,
+                      top: 2,
+                      child: Icon(Icons.lock, size: 12, color: Colors.white),
+                    ),
+                ],
+              )
+            : Container(
+                color: scheme.surfaceContainerHighest,
+                child: Center(
+                  child: _loading
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          widget.bookmark.isProtected
+                              ? Icons.lock_outline
+                              : Icons.bookmark_border,
+                          size: 18,
+                          color: widget.bookmark.isProtected
+                              ? scheme.primary
+                              : scheme.onSurfaceVariant,
+                        ),
+                ),
+              ),
       ),
     );
   }

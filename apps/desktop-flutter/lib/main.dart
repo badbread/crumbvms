@@ -636,18 +636,26 @@ class _MainShellState extends State<MainShell> {
   }
 
   /// Open Bookmarks — a top-level quick action (not buried in Settings), since
-  /// bookmarks are meant for fast access.
+  /// bookmarks are meant for fast access. Shown as a floating window (dialog),
+  /// not a full-screen takeover.
   void _openBookmarks(Session session) {
-    _pushScreen(
-      'Bookmarks',
-      BookmarksScreen(
-        api: widget.api,
-        session: session,
-        cameras: widget.cameras,
-        onJumpToPlayback: (cameraId, ts) {
-          Navigator.of(context).pop();
-          setState(() => _index = _playbackIndex);
-        },
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        clipBehavior: Clip.antiAlias,
+        child: SizedBox(
+          width: 760,
+          height: 620,
+          child: BookmarksScreen(
+            api: widget.api,
+            session: session,
+            cameras: widget.cameras,
+            onJumpToPlayback: (cameraId, ts) {
+              Navigator.of(ctx).pop();
+              setState(() => _index = _playbackIndex);
+            },
+          ),
+        ),
       ),
     );
   }
