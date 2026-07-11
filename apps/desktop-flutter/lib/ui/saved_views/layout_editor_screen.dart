@@ -14,6 +14,9 @@ import 'package:flutter/material.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/views_api.dart';
+import 'package:crumb_desktop/ui/special_tiles/config/special_tile_config_sheet.dart';
+import 'package:crumb_desktop/ui/special_tiles/config/special_tile_palette.dart';
+import 'package:crumb_desktop/ui/special_tiles/special_tile_spec.dart';
 
 /// Curated quick-switch glyphs (VIEW_ICON_CHOICES in app.js).
 const kViewIconChoices = [
@@ -180,7 +183,8 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       changed = false;
       for (final c in _cells) {
         final cx2 = c.x + c.w - 1, cy2 = c.y + c.h - 1;
-        final intersects = !(c.x > maxX || cx2 < minX || c.y > maxY || cy2 < minY);
+        final intersects =
+            !(c.x > maxX || cx2 < minX || c.y > maxY || cy2 < minY);
         if (!intersects) continue;
         if (c.x < minX) {
           minX = c.x;
@@ -214,7 +218,9 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
         }
       }
       final kept = _cells.where((c) => !inBox(c)).toList()
-        ..add(LayoutCell(x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1));
+        ..add(
+          LayoutCell(x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1),
+        );
       _cells = CustomLayout(
         cols: _cols,
         rows: _rows,
@@ -264,6 +270,136 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
         _assign[cell.key] = TileSpec.camera(chosen.cameraId!);
       }
     });
+  }
+
+  // ── Special-tile palette (arrange mode) ─────────────────────────────────
+  // Port of vsDragSpec's drop handler + vsOpenItemConfig (app.js): dropping a
+  // palette chip assigns a fresh default spec immediately, then — for the
+  // configurable types — opens the config sheet right away. Cancelling the
+  // config sheet leaves the default spec in place, matching vsCfgCancel
+  // (which just closes the panel; the assignment made on drop already stuck).
+
+  List<String> get _allCameraIds =>
+      _cameras.map((c) => c.id).toList(growable: false);
+
+  Future<void> _dropSpecialTile(LayoutCell cell, SpecialTileType type) async {
+    final defaultSpec = SpecialTileSpec.defaultFor(
+      type,
+      allCameraIds: _allCameraIds,
+    );
+    setState(() {
+      _assign[cell.key] = TileSpec.fromSlotValue(defaultSpec.toJson())!;
+      _error = null;
+    });
+    if (!kSpecialTileConfigurable.contains(type)) return;
+    final edited = await showSpecialTileConfigSheet(
+      context,
+      spec: defaultSpec,
+      cameras: _cameras,
+    );
+    if (edited != null && mounted) {
+      setState(
+        () => _assign[cell.key] = TileSpec.fromSlotValue(edited.toJson())!,
+      );
+    }
+  }
+
+  /// Tap on a box that already holds a non-camera spec: offer Configure (if
+  /// applicable) / Replace with a camera / Clear — a single-tap-friendly
+  /// stand-in for app.js's ⚙ button + dblclick/right-click-to-edit + × button.
+  Future<void> _handleSpecialTileTap(LayoutCell cell, TileSpec spec) async {
+    final type = SpecialTileType.fromWire(spec.type);
+    // Reconstruct the typed spec from the round-tripped raw JSON (fromRaw
+    // returns null for `camera`/`ptz` or a type this build doesn't know —
+    // e.g. a tile placed by another client — in which case we still let the
+    // operator clear the box, just not configure it.
+    final parsed = SpecialTileSpec.fromRaw(spec.raw);
+    final configurable =
+        type != null &&
+        parsed != null &&
+        kSpecialTileConfigurable.contains(type);
+
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: Text(parsed?.kind.wireType ?? spec.type),
+              enabled: false,
+            ),
+            if (configurable)
+              ListTile(
+                leading: const Icon(Icons.tune),
+                title: const Text('Configure'),
+                onTap: () => Navigator.of(ctx).pop('configure'),
+              ),
+            ListTile(
+              leading: const Icon(Icons.videocam_outlined),
+              title: const Text('Replace with a camera'),
+              onTap: () => Navigator.of(ctx).pop('camera'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.clear),
+              title: const Text('Clear this box'),
+              onTap: () => Navigator.of(ctx).pop('clear'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case 'configure':
+        final edited = await showSpecialTileConfigSheet(
+          context,
+          spec: parsed!,
+          cameras: _cameras,
+        );
+        if (edited != null && mounted) {
+          setState(
+            () => _assign[cell.key] = TileSpec.fromSlotValue(edited.toJson())!,
+          );
+        }
+        break;
+      case 'camera':
+        await _assignCell(cell);
+        break;
+      case 'clear':
+        setState(() => _assign.remove(cell.key));
+        break;
+    }
+  }
+
+  /// Short icon + detail label for an assigned special-tile box (vsCellLabelText
+  /// in app.js). Falls back to the bare wire type for a spec this build can't
+  /// fully decode (still round-tripped, just not editable/labelable in detail).
+  String _specialTileLabel(TileSpec spec) {
+    final type = SpecialTileType.fromWire(spec.type);
+    final parsed = SpecialTileSpec.fromRaw(spec.raw);
+    SpecialTilePaletteItem? palette;
+    if (type != null) {
+      for (final p in SpecialTilePaletteItem.all) {
+        if (p.type == type) {
+          palette = p;
+          break;
+        }
+      }
+    }
+    final icon = palette?.icon ?? '❔';
+    final label = palette?.label ?? spec.type;
+    final detail = switch (parsed) {
+      CarouselSpec s =>
+        '${s.cameras.length} cam${s.cameras.length == 1 ? '' : 's'} · ${s.mode.wire}',
+      HotspotSpec s => s.isAutoFollow ? 'auto-follow' : 'classic',
+      TextSpec s => s.text.isEmpty ? 'tap to edit' : s.text,
+      WebSpec s => s.url.isEmpty ? 'set URL' : s.url,
+      ImageSpec s => s.dataUrl.isEmpty ? 'pick a file' : 'set',
+      ClockSpec() || EventsSpec() || null => null,
+    };
+    return detail == null ? '$icon $label' : '$icon $label · $detail';
   }
 
   // ── Save ─────────────────────────────────────────────────────────────────
@@ -385,6 +521,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
               ),
             ),
           _buildToolbar(),
+          if (!_editLayoutMode) _buildSpecialTilePalette(),
           const Divider(height: 1),
           Expanded(
             child: Padding(
@@ -455,6 +592,27 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
     );
   }
 
+  /// Draggable special-tile palette (VS_PALETTE in app.js): drag a chip onto a
+  /// box below to drop a carousel/hotspot/clock/text/image/events/web tile
+  /// into it (see `_dropSpecialTile`). Hidden in "Edit layout" mode, where a
+  /// tap on a box selects it for merging instead.
+  Widget _buildSpecialTilePalette() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Drag onto a box to add a special tile (tap a camera-less box for a plain camera):',
+            style: Theme.of(context).textTheme.labelSmall,
+          ),
+          const SizedBox(height: 6),
+          const SpecialTilePalette(),
+        ],
+      ),
+    );
+  }
+
   Widget _dimStepper(String label, int value, ValueChanged<int> onChanged) {
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -490,65 +648,84 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       height: cell.h * cellH,
       child: Padding(
         padding: const EdgeInsets.all(2),
-        child: GestureDetector(
-          onTap: () {
-            if (_editLayoutMode) {
-              _toggleSelect(cell);
-            } else {
-              _assignCell(cell);
-            }
-          },
-          child: Container(
-            decoration: BoxDecoration(
-              color: selected
-                  ? scheme.primary.withValues(alpha: 0.25)
-                  : (spec != null
-                        ? scheme.primaryContainer.withValues(alpha: 0.5)
-                        : scheme.surfaceContainerHighest),
-              border: Border.all(
-                color: selected ? scheme.primary : scheme.outlineVariant,
-                width: selected ? 2 : 1,
+        child: DragTarget<SpecialTileType>(
+          onWillAcceptWithDetails: (details) => !_editLayoutMode,
+          onAcceptWithDetails: (details) =>
+              _dropSpecialTile(cell, details.data),
+          builder: (context, candidateData, rejectedData) {
+            final hovering = candidateData.isNotEmpty;
+            return GestureDetector(
+              onTap: () {
+                if (_editLayoutMode) {
+                  _toggleSelect(cell);
+                } else if (spec != null && !spec.isCamera) {
+                  _handleSpecialTileTap(cell, spec);
+                } else {
+                  _assignCell(cell);
+                }
+              },
+              child: Container(
+                decoration: BoxDecoration(
+                  color: hovering
+                      ? scheme.primary.withValues(alpha: 0.35)
+                      : (selected
+                            ? scheme.primary.withValues(alpha: 0.25)
+                            : (spec != null
+                                  ? scheme.primaryContainer.withValues(
+                                      alpha: 0.5,
+                                    )
+                                  : scheme.surfaceContainerHighest)),
+                  border: Border.all(
+                    color: hovering
+                        ? scheme.primary
+                        : (selected ? scheme.primary : scheme.outlineVariant),
+                    width: hovering || selected ? 2 : 1,
+                  ),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Stack(
+                  children: [
+                    Positioned(
+                      left: 4,
+                      top: 2,
+                      child: Text(
+                        '${index + 1}',
+                        style: TextStyle(fontSize: 10, color: scheme.outline),
+                      ),
+                    ),
+                    if (merged)
+                      Positioned(
+                        right: 2,
+                        top: 0,
+                        child: IconButton(
+                          tooltip: 'Split this box',
+                          icon: const Icon(Icons.call_split, size: 16),
+                          onPressed: () => _splitCell(cell),
+                        ),
+                      ),
+                    Center(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: Text(
+                          spec == null
+                              ? 'drop or tap to assign'
+                              : (spec.isCamera
+                                    ? (_cameraById(spec.cameraId!)?.name ??
+                                          'camera')
+                                    : _specialTileLabel(spec)),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: spec == null ? scheme.outline : null,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Stack(
-              children: [
-                Positioned(
-                  left: 4,
-                  top: 2,
-                  child: Text(
-                    '${index + 1}',
-                    style: TextStyle(fontSize: 10, color: scheme.outline),
-                  ),
-                ),
-                if (merged)
-                  Positioned(
-                    right: 2,
-                    top: 0,
-                    child: IconButton(
-                      tooltip: 'Split this box',
-                      icon: const Icon(Icons.call_split, size: 16),
-                      onPressed: () => _splitCell(cell),
-                    ),
-                  ),
-                Center(
-                  child: Text(
-                    spec == null
-                        ? 'tap to assign'
-                        : (spec.isCamera
-                              ? (_cameraById(spec.cameraId!)?.name ??
-                                    'camera')
-                              : spec.type),
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: spec == null ? scheme.outline : null,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+            );
+          },
         ),
       ),
     );
