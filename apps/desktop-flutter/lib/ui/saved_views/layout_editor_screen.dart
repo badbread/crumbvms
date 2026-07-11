@@ -16,6 +16,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/views_api.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
     show AppliedView;
+import 'package:crumb_desktop/ui/saved_views/view_prefs.dart';
 import 'package:crumb_desktop/ui/special_tiles/config/special_tile_config_sheet.dart';
 import 'package:crumb_desktop/ui/special_tiles/config/special_tile_palette.dart';
 import 'package:crumb_desktop/ui/special_tiles/special_tile_spec.dart';
@@ -88,27 +89,103 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
   List<Camera> _cameras = [];
   bool _loadingCameras = true;
 
+  // The saved views listed on the left (edit / reorder / delete / star) and
+  // the client-side order + launch-default prefs backing them.
+  List<SavedView> _views = const [];
+  ViewPrefs? _prefs;
+  String? _editingId; // id of the view currently loaded for editing, if any
+  String? _defaultViewId; // starred launch view
+
   @override
   void initState() {
     super.initState();
     _loadCameras();
+    _loadViews();
     final existing = widget.existingView;
-    if (existing != null) {
-      _nameCtrl.text = existing.name;
-      _icon = existing.icon ?? '🎥';
-      final cl = existing.customLayout;
-      if (cl != null) {
-        _cols = cl.cols;
-        _rows = cl.rows;
-        _cells = cl.cells;
-      }
-      existing.slots.forEach((idxStr, raw) {
+    if (existing != null) _loadIntoEditor(existing);
+  }
+
+  Future<void> _loadViews() async {
+    final prefs = ViewPrefs();
+    List<SavedView> views;
+    try {
+      views = await widget.api.listViews(widget.session);
+    } catch (_) {
+      views = const [];
+    }
+    final orderedIds = await prefs.reconciledOrder(
+      views.map((v) => v.id).toList(),
+    );
+    final byId = {for (final v in views) v.id: v};
+    final ordered = [
+      for (final id in orderedIds)
+        if (byId[id] != null) byId[id]!,
+    ];
+    final defaultId = await prefs.getDefaultViewId();
+    if (!mounted) return;
+    setState(() {
+      _prefs = prefs;
+      _views = ordered;
+      _defaultViewId = defaultId;
+    });
+  }
+
+  Future<void> _moveView(SavedView v, int dir) async {
+    await _prefs?.move(v.id, dir, _views.map((e) => e.id).toList());
+    await _loadViews();
+  }
+
+  Future<void> _toggleStar(SavedView v) async {
+    await _prefs?.toggleDefault(v.id);
+    final def = await _prefs?.getDefaultViewId();
+    if (mounted) setState(() => _defaultViewId = def);
+  }
+
+  /// Load an existing view's name/icon/geometry/assignments into the editor.
+  void _loadIntoEditor(SavedView v) {
+    setState(() {
+      _editingId = v.id;
+      _nameCtrl.text = v.name;
+      _icon = v.icon ?? '🎥';
+      _assign.clear();
+      _selected.clear();
+      final cl = v.customLayout ?? CustomLayout.unitGrid(4, 3);
+      _cols = cl.cols;
+      _rows = cl.rows;
+      _cells = cl.cells;
+      v.slots.forEach((idxStr, raw) {
         final idx = int.tryParse(idxStr);
         if (idx == null || idx < 0 || idx >= _cells.length) return;
         final spec = TileSpec.fromSlotValue(raw);
         if (spec != null) _assign[_cells[idx].key] = spec;
       });
+      _error = null;
+    });
+  }
+
+  /// Start a fresh, unsaved layout.
+  void _newView() {
+    setState(() {
+      _editingId = null;
+      _nameCtrl.clear();
+      _icon = '🎥';
+      _assign.clear();
+      _selected.clear();
+      _cols = 4;
+      _rows = 3;
+      _cells = CustomLayout.unitGrid(4, 3).cells;
+      _error = null;
+    });
+  }
+
+  Future<void> _deleteView(SavedView v) async {
+    try {
+      await widget.api.deleteView(widget.session, v.id);
+    } catch (_) {
+      /* ignore — reload reflects reality */
     }
+    if (_editingId == v.id) _newView();
+    await _loadViews();
   }
 
   Future<void> _loadCameras() async {
@@ -450,15 +527,21 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       // The API has no update for name/layout/slots — saving an edit creates
       // the new row then deletes the old one, so "Save" on a loaded view
       // replaces it in place rather than leaving a duplicate.
-      final existing = widget.existingView;
-      if (existing != null && existing.id != created.id) {
+      final editingId = _editingId;
+      if (editingId != null && editingId != created.id) {
         try {
-          await widget.api.deleteView(widget.session, existing.id);
+          await widget.api.deleteView(widget.session, editingId);
         } catch (_) {
           // Non-fatal: the new view was created successfully either way.
         }
       }
-      if (mounted) Navigator.of(context).pop(created);
+      if (!mounted) return;
+      // Stay in the editor now editing the saved row; refresh the left list.
+      setState(() {
+        _saving = false;
+        _editingId = created.id;
+      });
+      await _loadViews();
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -566,66 +649,190 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
         ),
       ),
       bottomNavigationBar: _actionBar(),
-      body: Column(
+      body: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _nameCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'View name',
-                      isDense: true,
-                    ),
+          SizedBox(width: 320, child: _leftPane()),
+          VerticalDivider(
+            width: 1,
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
+          Expanded(child: _gridPane(sorted)),
+        ],
+      ),
+    );
+  }
+
+  /// Left column: the saved-views list (edit / reorder / star / delete) above
+  /// the layout options (name, icon, templates, grid size, tile palette).
+  Widget _leftPane() {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      color: scheme.surfaceContainerLow,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(10, 10, 10, 16),
+        children: [
+          Row(
+            children: [
+              Text(
+                'Saved views',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: _newView,
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('New'),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+              ),
+            ],
+          ),
+          if (_views.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+              child: Text(
+                'No saved views yet.',
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+              ),
+            )
+          else
+            for (var i = 0; i < _views.length; i++) _viewRow(_views[i], i),
+          const Divider(height: 20),
+          // ── Layout options ──
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _nameCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'View name',
+                    isDense: true,
                   ),
                 ),
-                const SizedBox(width: 16),
-                Text(_icon, style: const TextStyle(fontSize: 26)),
-                IconButton(
-                  tooltip: 'Choose icon',
-                  icon: const Icon(Icons.emoji_emotions_outlined),
-                  onPressed: _pickIcon,
-                ),
-              ],
-            ),
+              ),
+              const SizedBox(width: 8),
+              Text(_icon, style: const TextStyle(fontSize: 22)),
+              IconButton(
+                tooltip: 'Choose icon',
+                icon: const Icon(Icons.emoji_emotions_outlined),
+                onPressed: _pickIcon,
+              ),
+            ],
           ),
           if (_error != null)
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.only(top: 4),
               child: Text(
                 _error!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
+                style: TextStyle(color: scheme.error, fontSize: 12),
               ),
             ),
           _buildToolbar(),
           if (!_editLayoutMode) _buildSpecialTilePalette(),
-          const Divider(height: 1),
+        ],
+      ),
+    );
+  }
+
+  /// One row in the saved-views list.
+  Widget _viewRow(SavedView v, int i) {
+    final scheme = Theme.of(context).colorScheme;
+    final editing = _editingId == v.id;
+    final isDefault = _defaultViewId == v.id;
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 1),
+      decoration: BoxDecoration(
+        color: editing ? scheme.primary.withValues(alpha: 0.14) : null,
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Row(
+        children: [
           Expanded(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: _cols / _rows,
-                  child: LayoutBuilder(
-                    builder: (context, constraints) => Stack(
-                      children: [
-                        for (final cell in sorted)
-                          _buildCell(
-                            cell,
-                            sorted.indexOf(cell),
-                            constraints.maxWidth,
-                            constraints.maxHeight,
-                          ),
-                      ],
+            child: InkWell(
+              onTap: () => _loadIntoEditor(v),
+              borderRadius: BorderRadius.circular(5),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                child: Row(
+                  children: [
+                    Text(v.icon ?? '🎥', style: const TextStyle(fontSize: 14)),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        v.name.isEmpty ? '(unnamed)' : v.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: editing
+                              ? FontWeight.w600
+                              : FontWeight.w400,
+                        ),
+                      ),
                     ),
-                  ),
+                  ],
                 ),
               ),
             ),
           ),
+          IconButton(
+            tooltip: isDefault ? 'Launch view' : 'Set as launch view',
+            visualDensity: VisualDensity.compact,
+            iconSize: 15,
+            icon: Icon(isDefault ? Icons.star : Icons.star_border),
+            color: isDefault ? scheme.primary : scheme.onSurfaceVariant,
+            onPressed: () => _toggleStar(v),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'More',
+            iconSize: 15,
+            padding: EdgeInsets.zero,
+            onSelected: (a) {
+              switch (a) {
+                case 'up':
+                  _moveView(v, -1);
+                case 'down':
+                  _moveView(v, 1);
+                case 'delete':
+                  _deleteView(v);
+              }
+            },
+            itemBuilder: (_) => [
+              if (i > 0)
+                const PopupMenuItem(value: 'up', child: Text('Move up')),
+              if (i < _views.length - 1)
+                const PopupMenuItem(value: 'down', child: Text('Move down')),
+              const PopupMenuItem(value: 'delete', child: Text('Delete')),
+            ],
+          ),
         ],
+      ),
+    );
+  }
+
+  /// Right pane: the layout builder grid.
+  Widget _gridPane(List<LayoutCell> sorted) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Center(
+        child: AspectRatio(
+          aspectRatio: _cols / _rows,
+          child: LayoutBuilder(
+            builder: (context, constraints) => Stack(
+              children: [
+                for (final cell in sorted)
+                  _buildCell(
+                    cell,
+                    sorted.indexOf(cell),
+                    constraints.maxWidth,
+                    constraints.maxHeight,
+                  ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }

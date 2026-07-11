@@ -21,7 +21,6 @@ import 'package:window_manager/window_manager.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
-import 'package:crumb_desktop/api/views_api.dart' show SavedView;
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/perf_grid.dart';
@@ -623,25 +622,20 @@ class _MainShellState extends State<MainShell> {
   /// like the old client's VIEW SETUP modal. Reloads the view row if a view was
   /// created so it appears immediately.
   Future<void> _openConfigView(Session session) async {
-    final created = await showDialog<SavedView>(
-      context: context,
-      builder: (ctx) => Dialog(
-        clipBehavior: Clip.antiAlias,
-        child: SizedBox(
-          width: 920,
-          height: 720,
-          child: LayoutEditorScreen(
-            api: widget.api,
-            session: session,
-            // Apply-without-save: render the layout on the wall immediately.
-            onApply: _applyView,
-          ),
+    // Full-screen editor/manager: views list + options on the left, layout
+    // builder on the right.
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => LayoutEditorScreen(
+          api: widget.api,
+          session: session,
+          // Apply-without-save: render the layout on the wall immediately.
+          onApply: _applyView,
         ),
       ),
     );
-    if (created != null && mounted) {
-      setState(() => _viewsRefreshToken++);
-    }
+    // Views may have been created/edited/deleted/reordered — refresh the row.
+    if (mounted) setState(() => _viewsRefreshToken++);
   }
 
   /// Open Bookmarks — a top-level quick action (not buried in Settings), since
