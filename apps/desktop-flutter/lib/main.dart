@@ -30,13 +30,10 @@ import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/admin_console/admin_console_screen.dart';
-import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
-import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
 import 'package:crumb_desktop/ui/clips/clips_screen.dart';
 import 'package:crumb_desktop/ui/export/export_screen.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
-import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
 import 'package:crumb_desktop/ui/login_screen.dart';
 import 'package:crumb_desktop/ui/motion_tuner/motion_tuner_screen.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar.dart';
@@ -46,7 +43,7 @@ import 'package:crumb_desktop/ui/reauth/reauth_overlay.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alert_banner.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alerts_controller.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart';
-import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
+import 'package:crumb_desktop/ui/settings/settings_window.dart';
 import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
 import 'package:crumb_desktop/ui/updates/update_banner.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
@@ -341,18 +338,21 @@ class MainShell extends StatefulWidget {
 class _MainShellState extends State<MainShell> {
   int _index = _liveIndex;
 
+  /// Whether the floating Settings panel is open. It overlays the current tab
+  /// (not its own tab) so the live wall keeps running and updates behind it.
+  bool _settingsOpen = false;
+
   static const int _liveIndex = 0;
   static const int _playbackIndex = 1;
   static const int _clipsIndex = 2;
   static const int _exportIndex = 3;
-  static const int _settingsIndex = 4;
 
+  // The body tabs (Settings is a panel toggle, not a body tab — see below).
   static const _tabs = <(int, IconData, String)>[
     (_liveIndex, Icons.grid_view, 'Live'),
     (_playbackIndex, Icons.play_circle_outline, 'Playback'),
     (_clipsIndex, Icons.movie_outlined, 'Clips'),
     (_exportIndex, Icons.download_outlined, 'Export'),
-    (_settingsIndex, Icons.settings_outlined, 'Settings'),
   ];
 
   @override
@@ -372,7 +372,17 @@ class _MainShellState extends State<MainShell> {
                 UpdateBanner(controller: widget.updateCheck),
                 _buildTopBar(session),
               ],
-              Expanded(child: _buildBody(session)),
+              Expanded(
+                child: Stack(
+                  children: [
+                    _buildBody(session),
+                    // The floating Settings panel overlays the current tab with
+                    // no scrim, so the wall behind stays live + interactive.
+                    if (_settingsOpen)
+                      Positioned.fill(child: _settingsPanel(session)),
+                  ],
+                ),
+              ),
               if (!chromeHidden) StatusBar(controller: widget.statusBar),
             ],
           );
@@ -397,6 +407,8 @@ class _MainShellState extends State<MainShell> {
         child: Row(
           children: [
             for (final (i, icon, label) in _tabs) _tabButton(i, icon, label),
+            // Settings is a floating-panel toggle, not a body tab.
+            _settingsToggle(),
             const Spacer(),
             // Connected server address.
             Padding(
@@ -486,8 +498,65 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
-  /// Push a secondary screen (from the Settings hub or a toolbar button) with a
-  /// back-navigable app bar.
+  /// The Settings button: toggles the floating Settings panel rather than
+  /// switching to a body tab. Highlighted while the panel is open.
+  Widget _settingsToggle() {
+    final scheme = Theme.of(context).colorScheme;
+    final selected = _settingsOpen;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: TextButton.icon(
+        onPressed: () => setState(() => _settingsOpen = !_settingsOpen),
+        icon: const Icon(Icons.settings_outlined, size: 18),
+        label: const Text('Settings'),
+        style: TextButton.styleFrom(
+          foregroundColor: selected ? scheme.primary : scheme.onSurfaceVariant,
+          backgroundColor: selected
+              ? scheme.primary.withValues(alpha: 0.12)
+              : null,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      ),
+    );
+  }
+
+  /// The floating Settings panel. Native settings render in its right pane;
+  /// the WebView2 surfaces (server console, motion tuner) close the panel and
+  /// launch full-screen so a web pane never composites over the live wall.
+  Widget _settingsPanel(Session session) {
+    return SettingsWindow(
+      api: widget.api,
+      session: session,
+      cameras: widget.cameras,
+      clientOptions: widget.clientOptions,
+      streamPrefs: widget.streamPrefs,
+      hotkeys: widget.hotkeys,
+      onClose: () => setState(() => _settingsOpen = false),
+      onOpenServerConsole: () => _pushScreen(
+        'Server console',
+        AdminConsoleScreen(
+          key: const ValueKey('admin-console'),
+          session: session,
+        ),
+      ),
+      onOpenMotionTuner: () => _pushScreen(
+        'Motion tuner',
+        MotionTunerScreen(
+          api: widget.api,
+          session: session,
+          mediaTokenCache: widget.mediaTokens,
+          cameras: widget.cameras,
+        ),
+      ),
+      onJumpToPlayback: (cameraId, ts) => setState(() {
+        _settingsOpen = false;
+        _index = _playbackIndex;
+      }),
+    );
+  }
+
+  /// Push a secondary screen (from the Settings panel or a toolbar button) with
+  /// a back-navigable app bar.
   void _pushScreen(String title, Widget child) {
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -520,8 +589,6 @@ class _MainShellState extends State<MainShell> {
           session: session,
           cameras: widget.cameras,
         );
-      case _settingsIndex:
-        return _buildSettingsHub(session);
       case _liveIndex:
       default:
         return WallScreen(
@@ -529,125 +596,13 @@ class _MainShellState extends State<MainShell> {
           session: session,
           cameras: widget.cameras,
           onLogout: widget.onLogout,
-          // Per-tile header bar (name + REC/motion/detection) vs floating
-          // overlays. Defaults on, matching the old client's showInfoBar.
-          showInfoBar: widget.clientOptions?.showInfoBar ?? true,
+          // The wall listens to client options so the per-tile header bar
+          // (showInfoBar) restyles live when toggled in the Settings panel.
+          clientOptions: widget.clientOptions,
         );
     }
   }
 
-  /// The Settings tab: a hub linking to the server console, native dashboards,
-  /// and client config — everything that was over-promoted into its own rail
-  /// entry now lives here (matching the old client's single "Settings" tab).
-  Widget _buildSettingsHub(Session session) {
-    final tiles = <Widget>[
-      _settingsTile(
-        Icons.admin_panel_settings_outlined,
-        'Server console',
-        'Settings, users, policies (embedded web /admin)',
-        () => _pushScreen(
-          'Server console',
-          AdminConsoleScreen(
-            key: const ValueKey('admin-console'),
-            session: session,
-          ),
-        ),
-      ),
-      _settingsTile(
-        Icons.dns_outlined,
-        'Server dashboard',
-        'Connection, storage, recording health',
-        () => _pushScreen(
-          'Server dashboard',
-          ServerDashboardScreen(api: widget.api, session: session),
-        ),
-      ),
-      _settingsTile(
-        Icons.bookmark_outline,
-        'Bookmarks',
-        'Saved playback moments',
-        () => _pushScreen(
-          'Bookmarks',
-          BookmarksScreen(
-            api: widget.api,
-            session: session,
-            cameras: widget.cameras,
-            onJumpToPlayback: (cameraId, ts) {
-              Navigator.of(context).pop();
-              setState(() => _index = _playbackIndex);
-            },
-          ),
-        ),
-      ),
-      _settingsTile(
-        Icons.sensors,
-        'Motion tuner',
-        'Per-camera motion detection tuning',
-        () => _pushScreen(
-          'Motion tuner',
-          MotionTunerScreen(
-            api: widget.api,
-            session: session,
-            mediaTokenCache: widget.mediaTokens,
-            cameras: widget.cameras,
-          ),
-        ),
-      ),
-      if (widget.hotkeys != null)
-        _settingsTile(
-          Icons.keyboard_outlined,
-          'Hotkeys',
-          'Keyboard shortcut remapping',
-          () => _pushScreen(
-            'Hotkeys',
-            HotkeyRemapScreen(store: widget.hotkeys!, cameras: widget.cameras),
-          ),
-        ),
-      if (widget.clientOptions != null)
-        _settingsTile(
-          Icons.tune,
-          'Options',
-          'Client preferences & stream defaults',
-          () => _pushScreen(
-            'Options',
-            ClientOptionsScreen(
-              options: widget.clientOptions!,
-              streamPrefs: widget.streamPrefs,
-            ),
-          ),
-        ),
-    ];
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        const Padding(
-          padding: EdgeInsets.only(left: 8, bottom: 8),
-          child: Text(
-            'Settings',
-            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
-          ),
-        ),
-        ...tiles,
-      ],
-    );
-  }
-
-  Widget _settingsTile(
-    IconData icon,
-    String title,
-    String subtitle,
-    VoidCallback onTap,
-  ) {
-    return Card(
-      child: ListTile(
-        leading: Icon(icon),
-        title: Text(title),
-        subtitle: Text(subtitle),
-        trailing: const Icon(Icons.chevron_right),
-        onTap: onTap,
-      ),
-    );
-  }
 }
 
 class SpikeApp extends StatelessWidget {

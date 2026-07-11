@@ -26,6 +26,7 @@
 
 import 'dart:async' show unawaited;
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// What a click on a live/maximized PTZ-capable tile does.
@@ -108,7 +109,11 @@ const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
 /// the instance down; callers mutate through the setters, which persist
 /// best-effort and update the in-memory value synchronously so widgets can
 /// read the new value immediately after calling a setter.
-class ClientOptionsStore {
+///
+/// It is a [ChangeNotifier]: every setter notifies listeners so a surface that
+/// is visible while the option changes (e.g. the live wall behind the floating
+/// Settings panel) can rebuild immediately — no tab switch / app restart.
+class ClientOptionsStore extends ChangeNotifier {
   ClientOptionsStore._(
     this._prefs, {
     required bool showInfoBar,
@@ -160,47 +165,61 @@ class ClientOptionsStore {
   // ── show the per-tile title strip (name + REC/motion indicators) ──
   bool get showInfoBar => _showInfoBar;
   set showInfoBar(bool v) {
+    if (v == _showInfoBar) return;
     _showInfoBar = v;
     unawaited(_prefs?.setBool(_kShowInfoBar, v));
+    notifyListeners();
   }
 
   // ── auto-build the "All Cameras" quick-grid view on login/wall-empty ──
   bool get showAllCamerasView => _showAllCamerasView;
   set showAllCamerasView(bool v) {
+    if (v == _showAllCamerasView) return;
     _showAllCamerasView = v;
     unawaited(_prefs?.setBool(_kShowAllCamerasView, v));
+    notifyListeners();
   }
 
   // ── global keyboard-shortcut handling on/off ──
   bool get hotkeysEnabled => _hotkeysEnabled;
   set hotkeysEnabled(bool v) {
+    if (v == _hotkeysEnabled) return;
     _hotkeysEnabled = v;
     unawaited(_prefs?.setBool(_kHotkeysEnabled, v));
+    notifyListeners();
   }
 
   // ── maximizing a tile plays its MAIN stream instead of the wall's
   //    current quality (app.js `liveStreamUrl` / `options.maximizeMain`) ──
   bool get maximizeMain => _maximizeMain;
   set maximizeMain(bool v) {
+    if (v == _maximizeMain) return;
     _maximizeMain = v;
     unawaited(_prefs?.setBool(_kMaximizeMain, v));
+    notifyListeners();
   }
 
   PtzClickMode get ptzClickMode => _ptzClickMode;
   set ptzClickMode(PtzClickMode v) {
+    if (v == _ptzClickMode) return;
     _ptzClickMode = v;
     unawaited(_prefs?.setString(_kPtzClickMode, v.wire));
+    notifyListeners();
   }
 
   PtzStyle get ptzStyle => _ptzStyle;
   set ptzStyle(PtzStyle v) {
+    if (v == _ptzStyle) return;
     _ptzStyle = v;
     unawaited(_prefs?.setString(_kPtzStyle, v.wire));
+    notifyListeners();
   }
 
   PtzWheelCorner get ptzWheelCorner => _ptzWheelCorner;
   set ptzWheelCorner(PtzWheelCorner v) {
+    if (v == _ptzWheelCorner) return;
     _ptzWheelCorner = v;
     unawaited(_prefs?.setString(_kPtzWheelCorner, v.wire));
+    notifyListeners();
   }
 }

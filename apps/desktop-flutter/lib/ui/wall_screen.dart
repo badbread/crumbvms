@@ -15,6 +15,7 @@ import 'package:flutter/gestures.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
+import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 
@@ -25,7 +26,7 @@ class WallScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onLogout,
-    this.showInfoBar = true,
+    this.clientOptions,
   });
 
   final CrumbApi api;
@@ -33,10 +34,12 @@ class WallScreen extends StatefulWidget {
   final List<Camera> cameras;
   final VoidCallback onLogout;
 
-  /// Show the per-tile title strip (camera name + REC/motion/detection
-  /// indicators in one header bar). When on, tiles hide their floating name
-  /// label + floating badge row. Mirrors the old client's `showInfoBar` option.
-  final bool showInfoBar;
+  /// Client options store. The wall LISTENS to it, so a preference change made
+  /// while the wall is visible — e.g. toggling "Show tile info bar" in the
+  /// floating Settings panel — is reflected live on the wall behind the panel.
+  /// The relevant option here is `showInfoBar` (per-tile header strip vs
+  /// floating overlays). Null → defaults (header bar on).
+  final ClientOptionsStore? clientOptions;
 
   @override
   State<WallScreen> createState() => _WallScreenState();
@@ -112,25 +115,16 @@ class _WallScreenState extends State<WallScreen> {
             )
           else
             Positioned.fill(
-              child: GridView.count(
-                crossAxisCount: cols,
-                mainAxisSpacing: 2,
-                crossAxisSpacing: 2,
-                childAspectRatio: 16 / 9,
-                physics: const NeverScrollableScrollPhysics(),
-                children: [
-                  for (final cam in cams)
-                    _WallTile(
-                      key: ValueKey(cam.id),
-                      api: widget.api,
-                      session: widget.session,
-                      camera: cam,
-                      liveStatus: _liveStatus,
-                      showInfoBar: widget.showInfoBar,
-                      onTap: () => setState(() => _maximized = cam),
+              // Listen to client options so toggling "Show tile info bar" in the
+              // floating Settings panel restyles the tiles live (tile States
+              // persist by ValueKey(cam.id), so no player teardown/restart).
+              child: widget.clientOptions == null
+                  ? _grid(cams, cols, true)
+                  : ListenableBuilder(
+                      listenable: widget.clientOptions!,
+                      builder: (context, _) =>
+                          _grid(cams, cols, widget.clientOptions!.showInfoBar),
                     ),
-                ],
-              ),
             ),
 
           // Top bar: camera count + host stats (FRB) + logout.
@@ -209,6 +203,32 @@ class _WallScreenState extends State<WallScreen> {
             ),
         ],
       ),
+    );
+  }
+
+  /// The tile grid. Pulled out of [build] so it can be rebuilt on a client-
+  /// option change (via the ListenableBuilder above) without disturbing the
+  /// rest of the wall. `showInfoBar` chooses the per-tile header strip vs the
+  /// floating name/badge overlays.
+  Widget _grid(List<Camera> cams, int cols, bool showInfoBar) {
+    return GridView.count(
+      crossAxisCount: cols,
+      mainAxisSpacing: 2,
+      crossAxisSpacing: 2,
+      childAspectRatio: 16 / 9,
+      physics: const NeverScrollableScrollPhysics(),
+      children: [
+        for (final cam in cams)
+          _WallTile(
+            key: ValueKey(cam.id),
+            api: widget.api,
+            session: widget.session,
+            camera: cam,
+            liveStatus: _liveStatus,
+            showInfoBar: showInfoBar,
+            onTap: () => setState(() => _maximized = cam),
+          ),
+      ],
     );
   }
 }
