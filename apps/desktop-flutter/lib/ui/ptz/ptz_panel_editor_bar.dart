@@ -135,16 +135,16 @@ class _PtzPanelEditorBarState extends State<PtzPanelEditorBar> {
                   ),
                   _EdButton(
                     label: 'To front',
-                    onTap: () => c.bringToFront(selected.id),
+                    onTap: () => c.bringToFront(selected!.id),
                   ),
                   _EdButton(
                     label: 'To back',
-                    onTap: () => c.sendToBack(selected.id),
+                    onTap: () => c.sendToBack(selected!.id),
                   ),
                   _EdButton(
                     label: 'Delete',
                     danger: true,
-                    onTap: () => c.deleteButton(selected.id),
+                    onTap: () => c.deleteButton(selected!.id),
                   ),
                 ],
               ],

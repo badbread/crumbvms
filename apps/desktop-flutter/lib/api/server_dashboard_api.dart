@@ -12,6 +12,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'models.dart';
 import 'server_dashboard_models.dart';
 
 extension ServerDashboardApi on CrumbApi {

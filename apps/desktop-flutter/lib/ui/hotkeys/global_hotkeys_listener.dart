@@ -39,7 +39,7 @@ String? _hotkeyTokenFromEvent(KeyEvent event) {
   if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
     return null;
   }
-  const digitKeys = {
+  final digitKeys = {
     PhysicalKeyboardKey.digit1: '1',
     PhysicalKeyboardKey.digit2: '2',
     PhysicalKeyboardKey.digit3: '3',

@@ -49,6 +49,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../api/crumb_api.dart';
 import '../../api/models.dart';

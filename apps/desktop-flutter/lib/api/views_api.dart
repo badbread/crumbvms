@@ -22,6 +22,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'models.dart';
 
 /// A saved wall arrangement (`GET /views` row / `POST /views` response).
 class SavedView {
