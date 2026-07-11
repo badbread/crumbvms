@@ -207,6 +207,8 @@ class _WallScreenState extends State<WallScreen> {
               camera: _maximized!,
               liveStatus: _liveStatus,
               streamPrefs: widget.streamPrefs,
+              ptzClickMode:
+                  widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
               onClose: () => setState(() => _maximized = null),
             ),
         ],
@@ -761,6 +763,7 @@ class _MaximizedPane extends StatefulWidget {
     required this.liveStatus,
     required this.onClose,
     this.streamPrefs,
+    this.ptzClickMode = PtzClickMode.center,
   });
 
   final CrumbApi api;
@@ -769,6 +772,9 @@ class _MaximizedPane extends StatefulWidget {
   final LiveStatusController liveStatus;
   final VoidCallback onClose;
   final StreamPrefsStore? streamPrefs;
+
+  /// What a click on a PTZ-capable video does (center / pan / off).
+  final PtzClickMode ptzClickMode;
 
   @override
   State<_MaximizedPane> createState() => _MaximizedPaneState();
@@ -877,6 +883,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       widget.camera.ptz &&
       !(widget.streamPrefs?.ptzDisabledFor(widget.camera.id) ?? false);
 
+  bool get _ptzCenter =>
+      _ptzEnabled && widget.ptzClickMode == PtzClickMode.center;
+  bool get _ptzPan => _ptzEnabled && widget.ptzClickMode == PtzClickMode.pan;
+
   // ── PTZ optical zoom via the mouse wheel ────────────────────────────────
   // The wheel is discrete but ONVIF zoom is continuous (move → stop), so each
   // notch starts a zoom in the wheel's direction and a debounced timer sends
@@ -895,10 +905,61 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     });
   }
 
+  // ── PTZ click-to-center / click-hold-to-pan (ported from app.js
+  //    ptzVideoClick / ptzVideoSteer). Offset from tile centre, normalised to
+  //    [-1,1], drives an ONVIF velocity move.
+  Timer? _ptzPulseStop;
+  bool _ptzSteering = false;
+
+  ({double nx, double ny}) _normOffset(Offset local, Size pane) {
+    final nx = (local.dx / pane.width * 2 - 1).clamp(-1.0, 1.0);
+    final ny = (local.dy / pane.height * 2 - 1).clamp(-1.0, 1.0);
+    return (nx: nx, ny: ny);
+  }
+
+  /// Center mode: a proportional recenter pulse — click near the centre is a
+  /// no-op, edges pan harder/longer — then auto-stop.
+  void _ptzCenterPulse(Offset local, Size pane) {
+    final o = _normOffset(local, pane);
+    final mag = math.max(o.nx.abs(), o.ny.abs());
+    if (mag < 0.06) return; // dead-centre click
+    widget.api
+        .ptzMove(
+          widget.session,
+          widget.camera.id,
+          pan: (o.nx * 0.7).clamp(-1.0, 1.0),
+          tilt: (-o.ny * 0.7).clamp(-1.0, 1.0),
+        )
+        .catchError((_) {});
+    _ptzPulseStop?.cancel();
+    _ptzPulseStop = Timer(
+      Duration(milliseconds: (80 + 320 * mag).round()),
+      () => widget.api.ptzStop(widget.session, widget.camera.id).catchError(
+        (_) {},
+      ),
+    );
+  }
+
+  /// Pan mode: continuous velocity toward the cursor, held until release.
+  void _ptzSteer(Offset local, Size pane) {
+    final o = _normOffset(local, pane);
+    _ptzSteering = true;
+    widget.api
+        .ptzMove(widget.session, widget.camera.id, pan: o.nx, tilt: -o.ny)
+        .catchError((_) {});
+  }
+
+  void _ptzStopSteer() {
+    if (!_ptzSteering) return;
+    _ptzSteering = false;
+    widget.api.ptzStop(widget.session, widget.camera.id).catchError((_) {});
+  }
+
   @override
   void dispose() {
     SnapshotRegistry.instance.unregister('maximized');
     _ptzZoomStop?.cancel();
+    _ptzPulseStop?.cancel();
     _player?.dispose();
     super.dispose();
   }
@@ -949,7 +1010,21 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                             // Double-click in the maximized view returns to the
                             // wall (matches the old client).
                             onDoubleTap: widget.onClose,
-                            onPanUpdate: (d) => _panBy(d.delta, pane),
+                            // PTZ center mode: single click recenters on the
+                            // clicked point. PTZ pan mode: press-hold steers
+                            // toward the cursor (drag re-steers), release stops.
+                            // Otherwise the drag digitally pans a zoomed frame.
+                            onTapUp: _ptzCenter
+                                ? (d) => _ptzCenterPulse(d.localPosition, pane)
+                                : null,
+                            onPanStart: _ptzPan
+                                ? (d) => _ptzSteer(d.localPosition, pane)
+                                : null,
+                            onPanUpdate: _ptzPan
+                                ? (d) => _ptzSteer(d.localPosition, pane)
+                                : (d) => _panBy(d.delta, pane),
+                            onPanEnd: _ptzPan ? (_) => _ptzStopSteer() : null,
+                            onPanCancel: _ptzPan ? _ptzStopSteer : null,
                             child: ClipRect(
                               child: Transform(
                                 transform: Matrix4.identity()
