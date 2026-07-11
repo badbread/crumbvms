@@ -40,11 +40,8 @@ class LiveStatusBadgeRow extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (recording) ...[
-            const _Dot(color: Colors.redAccent),
-            const SizedBox(width: 4),
-            const Text('REC', style: _labelStyle),
-          ],
+          // Recording is just a red dot (no "REC" label), matching the old client.
+          if (recording) const _Dot(color: Colors.redAccent),
           if (recording && showGenericMotion) const SizedBox(width: 8),
           if (showGenericMotion) ...[
             const _Dot(color: Colors.amber),

@@ -303,7 +303,9 @@ class _WallTileState extends State<_WallTile> {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: widget.onTap,
+      // Double-click a tile to maximize (matches the old client); single click
+      // is reserved for selection.
+      onDoubleTap: widget.onTap,
       child: Container(
         color: Colors.grey.shade900,
         child: Stack(
@@ -548,6 +550,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                               : const CircularProgressIndicator(),
                         )
                       : Listener(
+                          onPointerDown: (e) {
+                            // Mouse "back" button returns to the wall.
+                            if (e.buttons & kBackMouseButton != 0) {
+                              widget.onClose();
+                            }
+                          },
                           onPointerSignal: (e) {
                             if (e is PointerScrollEvent) {
                               if (widget.camera.ptz) {
@@ -563,7 +571,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           },
                           child: GestureDetector(
                             behavior: HitTestBehavior.opaque,
-                            onDoubleTap: _resetZoom,
+                            // Double-click in the maximized view returns to the
+                            // wall (matches the old client).
+                            onDoubleTap: widget.onClose,
                             onPanUpdate: (d) => _panBy(d.delta, pane),
                             child: ClipRect(
                               child: Transform(

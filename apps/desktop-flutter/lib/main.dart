@@ -398,6 +398,28 @@ class _MainShellState extends State<MainShell> {
           children: [
             for (final (i, icon, label) in _tabs) _tabButton(i, icon, label),
             const Spacer(),
+            // Connected server address.
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.dns_outlined,
+                    size: 14,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    Uri.tryParse(session.base)?.authority ?? session.base,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
             IconButton(
               tooltip: 'Layouts',
               icon: const Icon(Icons.dashboard_customize_outlined, size: 20),
