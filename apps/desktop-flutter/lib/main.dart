@@ -66,6 +66,29 @@ const String kStreamUrl = String.fromEnvironment(
   defaultValue: 'av://lavfi:testsrc=size=1280x720:rate=30',
 );
 
+/// A denser, desktop-grade dark theme. Material's defaults are tuned for touch
+/// (large tap targets, big type, chunky switches) which read as "mobile" on a
+/// desktop VMS; this compacts control density and type for a professional look.
+ThemeData _desktopTheme() {
+  final base = ThemeData.dark(useMaterial3: true);
+  return base.copyWith(
+    visualDensity: VisualDensity.compact,
+    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    textTheme: base.textTheme.apply(fontSizeFactor: 0.9),
+    listTileTheme: base.listTileTheme.copyWith(
+      dense: true,
+      minVerticalPadding: 4,
+    ),
+    // Slimmer switches — the M3 default reads as a phone toggle on desktop.
+    switchTheme: SwitchThemeData(
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      thumbColor: WidgetStateProperty.resolveWith(
+        (s) => s.contains(WidgetState.selected) ? base.colorScheme.primary : null,
+      ),
+    ),
+  );
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // media_kit native surface + libmpv init.
@@ -289,7 +312,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     return MaterialApp(
       title: 'Crumb',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true),
+      theme: _desktopTheme(),
       // Esc exits OS fullscreen before any inner Esc handling (maximize-exit
       // etc.) — same priority order as the old client.
       home: FullscreenEscHandler(controller: _fullscreen, child: home),
@@ -348,12 +371,15 @@ class _MainShellState extends State<MainShell> {
   static const int _exportIndex = 3;
 
   // The body tabs (Settings is a panel toggle, not a body tab — see below).
-  static const _tabs = <(int, IconData, String)>[
-    (_liveIndex, Icons.grid_view, 'Live'),
-    (_playbackIndex, Icons.play_circle_outline, 'Playback'),
-    (_clipsIndex, Icons.movie_outlined, 'Clips'),
-    (_exportIndex, Icons.download_outlined, 'Export'),
+  // Each carries its own accent color used for the active underline + label.
+  static const _tabs = <(int, IconData, String, Color)>[
+    (_liveIndex, Icons.grid_view, 'Live', Color(0xFF4FB477)),
+    (_playbackIndex, Icons.play_circle_outline, 'Playback', Color(0xFF4F9BEF)),
+    (_clipsIndex, Icons.movie_outlined, 'Clips', Color(0xFFB57BEF)),
+    (_exportIndex, Icons.download_outlined, 'Export', Color(0xFFE8A33D)),
   ];
+
+  static const Color _settingsColor = Color(0xFF3FB8C8);
 
   @override
   Widget build(BuildContext context) {
@@ -399,14 +425,15 @@ class _MainShellState extends State<MainShell> {
     return Material(
       color: scheme.surfaceContainerHigh,
       child: Container(
-        height: 46,
-        padding: const EdgeInsets.symmetric(horizontal: 8),
+        height: 42,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
         decoration: BoxDecoration(
           border: Border(bottom: BorderSide(color: scheme.outlineVariant)),
         ),
         child: Row(
           children: [
-            for (final (i, icon, label) in _tabs) _tabButton(i, icon, label),
+            for (final (i, icon, label, color) in _tabs)
+              _tabButton(i, icon, label, color),
             // Settings is a floating-panel toggle, not a body tab.
             _settingsToggle(),
             const Spacer(),
@@ -478,45 +505,25 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
-  Widget _tabButton(int i, IconData icon, String label) {
-    final selected = _index == i;
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: TextButton.icon(
-        onPressed: () => setState(() => _index = i),
-        icon: Icon(icon, size: 18),
-        label: Text(label),
-        style: TextButton.styleFrom(
-          foregroundColor: selected ? scheme.primary : scheme.onSurfaceVariant,
-          backgroundColor: selected
-              ? scheme.primary.withValues(alpha: 0.12)
-              : null,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        ),
-      ),
+  Widget _tabButton(int i, IconData icon, String label, Color color) {
+    return _TopTab(
+      icon: icon,
+      label: label,
+      color: color,
+      selected: _index == i,
+      onTap: () => setState(() => _index = i),
     );
   }
 
   /// The Settings button: toggles the floating Settings panel rather than
-  /// switching to a body tab. Highlighted while the panel is open.
+  /// switching to a body tab. Highlighted (underline) while the panel is open.
   Widget _settingsToggle() {
-    final scheme = Theme.of(context).colorScheme;
-    final selected = _settingsOpen;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: TextButton.icon(
-        onPressed: () => setState(() => _settingsOpen = !_settingsOpen),
-        icon: const Icon(Icons.settings_outlined, size: 18),
-        label: const Text('Settings'),
-        style: TextButton.styleFrom(
-          foregroundColor: selected ? scheme.primary : scheme.onSurfaceVariant,
-          backgroundColor: selected
-              ? scheme.primary.withValues(alpha: 0.12)
-              : null,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        ),
-      ),
+    return _TopTab(
+      icon: Icons.settings_outlined,
+      label: 'Settings',
+      color: _settingsColor,
+      selected: _settingsOpen,
+      onTap: () => setState(() => _settingsOpen = !_settingsOpen),
     );
   }
 
@@ -603,6 +610,66 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+}
+
+/// A top-bar tab: label (+ small icon) with a 2px accent underline when active,
+/// in the tab's own color. Underline style (not a filled pill) and compact
+/// sizing — a professional desktop look rather than a mobile segmented control.
+class _TopTab extends StatelessWidget {
+  const _TopTab({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      hoverColor: Colors.white.withValues(alpha: 0.04),
+      child: Container(
+        height: 42,
+        padding: const EdgeInsets.symmetric(horizontal: 13),
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(
+              color: selected ? color : Colors.transparent,
+              width: 2,
+            ),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 15,
+              color: selected ? color : scheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12.5,
+                letterSpacing: 0.2,
+                fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                color: selected ? scheme.onSurface : scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class SpikeApp extends StatelessWidget {
