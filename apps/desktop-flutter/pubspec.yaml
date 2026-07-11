@@ -46,6 +46,11 @@ dependencies:
   media_kit_video: ^1.2.5
   media_kit_libs_windows_video: ^1.0.10
 
+  # Crumb server API (login, camera list, per-camera stream URLs). Plain Dart
+  # HTTP — the server API is JSON/Bearer; only the platform-native bits
+  # (host stats, later DPAPI secrets + discovery) go through flutter_rust_bridge.
+  http: ^1.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
