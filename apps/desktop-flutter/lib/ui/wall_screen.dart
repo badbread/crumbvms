@@ -18,7 +18,9 @@ import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
+import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
@@ -35,6 +37,7 @@ class WallScreen extends StatefulWidget {
     this.streamPrefs,
     this.view,
     this.audio,
+    this.hotkeys,
   });
 
   final CrumbApi api;
@@ -45,6 +48,9 @@ class WallScreen extends StatefulWidget {
   /// Play-on-focus audio controller (single audible pane). Tiles register
   /// their Player; selection/maximize pick the active pane.
   final AudioFollowController? audio;
+
+  /// Hotkey config — number keys maximize the assigned camera on the wall.
+  final HotkeyConfigStore? hotkeys;
 
   /// Per-camera stream (main/sub) + PTZ-disable prefs. Drives the right-click
   /// menu on a tile and which stream each pane plays.
@@ -128,7 +134,7 @@ class _WallScreenState extends State<WallScreen> {
     final cams = _shown;
     final cols = cams.isEmpty ? 1 : math.sqrt(cams.length).ceil();
     final s = _stats;
-    return Scaffold(
+    final scaffold = Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
@@ -229,6 +235,34 @@ class _WallScreenState extends State<WallScreen> {
             ),
         ],
       ),
+    );
+
+    // Number-key hotkeys maximize the assigned camera; Esc restores; M toggles
+    // audio. (S snapshot is handled by the app-level SnapshotHotkey.)
+    final hk = widget.hotkeys;
+    if (hk == null) return scaffold;
+    return GlobalHotkeysListener(
+      store: hk,
+      cameras: cams,
+      autofocus: true,
+      onGoToCamera: (id) {
+        for (final c in cams) {
+          if (c.id == id) {
+            _maximize(c);
+            break;
+          }
+        }
+      },
+      onEscape: _maximized == null
+          ? null
+          : () {
+              widget.audio?.setMaximized(null);
+              setState(() => _maximized = null);
+            },
+      onToggleAudio: widget.audio == null
+          ? null
+          : () => widget.audio!.toggleAudio(),
+      child: scaffold,
     );
   }
 

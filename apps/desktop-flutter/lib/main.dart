@@ -557,7 +557,7 @@ class _MainShellState extends State<MainShell> {
             IconButton(
               tooltip: 'Sign out',
               icon: const Icon(Icons.logout, size: 18),
-              onPressed: widget.onLogout,
+              onPressed: _confirmLogout,
             ),
           ],
         ),
@@ -663,6 +663,28 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
+  /// Confirm before signing out — the button is easy to hit by accident.
+  Future<void> _confirmLogout() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Sign out?'),
+        content: const Text('You\'ll need to log in again to view cameras.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Sign out'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) widget.onLogout();
+  }
+
   /// Apply a saved view to the live wall. "All Cameras" (id ==
   /// [ViewPrefs.allCamerasId]) resets to the default auto-grid; any other view
   /// renders its custom layout. Always lands on the Live tab.
@@ -725,6 +747,8 @@ class _MainShellState extends State<MainShell> {
           view: _appliedView,
           // Play-on-focus audio (global audio button governs it).
           audio: _audio,
+          // Number-key hotkeys maximize the assigned camera on the wall.
+          hotkeys: widget.hotkeys,
         );
     }
   }
