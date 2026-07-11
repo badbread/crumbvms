@@ -259,6 +259,8 @@ class _WallScreenState extends State<WallScreen> {
                       camera: cam,
                       liveStatus: _liveStatus,
                       showInfoBar: showInfoBar,
+                      // Custom cells can be any aspect — letterbox, don't crop.
+                      fit: BoxFit.contain,
                       onTap: () => setState(() => _maximized = cam),
                     ),
             ),
@@ -322,6 +324,7 @@ class _WallTile extends StatefulWidget {
     required this.liveStatus,
     required this.showInfoBar,
     required this.onTap,
+    this.fit = BoxFit.cover,
   });
 
   final CrumbApi api;
@@ -330,6 +333,11 @@ class _WallTile extends StatefulWidget {
   final LiveStatusController liveStatus;
   final bool showInfoBar;
   final VoidCallback onTap;
+
+  /// How the video fills its tile. The default auto-grid uses `cover` (tiles
+  /// are ~16:9, so no visible crop); custom-view cells can be any aspect, so
+  /// they use `contain` to letterbox (black bars) instead of cropping tight.
+  final BoxFit fit;
 
   @override
   State<_WallTile> createState() => _WallTileState();
@@ -516,7 +524,7 @@ class _WallTileState extends State<_WallTile> {
                       child: Video(
                         controller: _controller!,
                         controls: NoVideoControls,
-                        fit: BoxFit.cover,
+                        fit: widget.fit,
                       ),
                     ),
                   )
