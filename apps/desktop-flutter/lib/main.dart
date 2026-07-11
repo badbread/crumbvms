@@ -13,6 +13,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
@@ -37,6 +38,7 @@ import 'package:crumb_desktop/ui/clips/clips_screen.dart';
 import 'package:crumb_desktop/ui/export/export_screen.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
+import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/login_screen.dart';
 import 'package:crumb_desktop/ui/motion_tuner/motion_tuner_screen.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar.dart';
@@ -145,8 +147,23 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   void initState() {
     super.initState();
     _fullscreen.attach();
+    HardwareKeyboard.instance.addHandler(_hintsKeyHandler);
     _loadStores();
     _restore();
+  }
+
+  /// Drive the app-wide "hold Shift to see what buttons do" hint layer. Never
+  /// consumes the event (returns false) so Shift still works everywhere; skips
+  /// while typing so capitals don't flash the hints.
+  bool _hintsKeyHandler(KeyEvent event) {
+    if (event.logicalKey == LogicalKeyboardKey.shiftLeft ||
+        event.logicalKey == LogicalKeyboardKey.shiftRight) {
+      final down = event is KeyDownEvent || event is KeyRepeatEvent;
+      final typing =
+          FocusManager.instance.primaryFocus?.context?.widget is EditableText;
+      HintsController.instance.active.value = down && !typing;
+    }
+    return false;
   }
 
   /// Load the shared_preferences-backed client stores (options, stream prefs,
@@ -275,6 +292,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_hintsKeyHandler);
     _teardownSession();
     _fullscreen.dispose();
     _statusBar.dispose();
@@ -521,43 +539,59 @@ class _MainShellState extends State<MainShell> {
             ),
             // Global audio on/off — the active (maximized else selected) pane
             // is the one audible pane; this toggles it.
-            ListenableBuilder(
-              listenable: _audio,
-              builder: (context, _) => IconButton(
-                tooltip: _audio.audioOn ? 'Mute audio' : 'Audio off',
-                icon: Icon(
-                  _audio.audioOn ? Icons.volume_up : Icons.volume_off,
-                  size: 20,
-                  color: _audio.audioOn ? scheme.primary : null,
+            ShiftHint(
+              hint: 'Toggle audio (M)',
+              above: false,
+              child: ListenableBuilder(
+                listenable: _audio,
+                builder: (context, _) => IconButton(
+                  tooltip: _audio.audioOn ? 'Mute audio' : 'Audio off',
+                  icon: Icon(
+                    _audio.audioOn ? Icons.volume_up : Icons.volume_off,
+                    size: 20,
+                    color: _audio.audioOn ? scheme.primary : null,
+                  ),
+                  onPressed: () async {
+                    final ok = await _audio.toggleAudio();
+                    if (!ok && mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Select a camera to hear its audio.'),
+                          duration: Duration(seconds: 2),
+                        ),
+                      );
+                    }
+                  },
                 ),
-                onPressed: () async {
-                  final ok = await _audio.toggleAudio();
-                  if (!ok && mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Select a camera to hear its audio.'),
-                        duration: Duration(seconds: 2),
-                      ),
-                    );
-                  }
-                },
               ),
             ),
-            IconButton(
-              tooltip: 'Bookmarks',
-              icon: const Icon(Icons.bookmark_outline, size: 20),
-              onPressed: () => _openBookmarks(session),
+            ShiftHint(
+              hint: 'Bookmarks',
+              above: false,
+              child: IconButton(
+                tooltip: 'Bookmarks',
+                icon: const Icon(Icons.bookmark_outline, size: 20),
+                onPressed: () => _openBookmarks(session),
+              ),
             ),
-            IconButton(
-              tooltip: 'Fullscreen',
-              icon: const Icon(Icons.fullscreen, size: 22),
-              onPressed: widget.fullscreen.toggle,
+            ShiftHint(
+              hint: 'Fullscreen',
+              above: false,
+              child: IconButton(
+                tooltip: 'Fullscreen',
+                icon: const Icon(Icons.fullscreen, size: 22),
+                onPressed: widget.fullscreen.toggle,
+              ),
             ),
             const SizedBox(width: 4),
-            IconButton(
-              tooltip: 'Sign out',
-              icon: const Icon(Icons.logout, size: 18),
-              onPressed: _confirmLogout,
+            ShiftHint(
+              hint: 'Sign out',
+              above: false,
+              child: IconButton(
+                tooltip: 'Sign out',
+                icon: const Icon(Icons.logout, size: 18),
+                onPressed: _confirmLogout,
+              ),
             ),
           ],
         ),
