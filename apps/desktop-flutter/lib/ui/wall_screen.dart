@@ -234,6 +234,36 @@ class _WallTileState extends State<_WallTile> {
   String? _error;
   bool _firstFrame = false;
 
+  // Per-tile digital zoom: hovering the tile + mouse wheel zooms IN PLACE
+  // (the wall stays up); drag pans when zoomed. Double-click still maximizes.
+  double _scale = 1.0;
+  Offset _offset = Offset.zero;
+  static const double _maxZoom = 8.0;
+
+  void _zoomAt(Offset cursor, double factor, Size pane) {
+    final newScale = (_scale * factor).clamp(1.0, _maxZoom);
+    if (newScale == _scale) return;
+    final newOffset = cursor - (cursor - _offset) * (newScale / _scale);
+    setState(() {
+      _scale = newScale;
+      _offset = _clampOffset(newOffset, pane);
+    });
+  }
+
+  Offset _clampOffset(Offset o, Size pane) {
+    final minX = pane.width * (1 - _scale);
+    final minY = pane.height * (1 - _scale);
+    return Offset(
+      o.dx.clamp(minX <= 0 ? minX : 0.0, 0.0),
+      o.dy.clamp(minY <= 0 ? minY : 0.0, 0.0),
+    );
+  }
+
+  void _panBy(Offset delta, Size pane) {
+    if (_scale <= 1.0) return;
+    setState(() => _offset = _clampOffset(_offset + delta, pane));
+  }
+
   @override
   void initState() {
     super.initState();
@@ -302,90 +332,122 @@ class _WallTileState extends State<_WallTile> {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      // Double-click a tile to maximize (matches the old client); single click
-      // is reserved for selection.
-      onDoubleTap: widget.onTap,
-      child: Container(
-        color: Colors.grey.shade900,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            if (_controller != null)
-              Video(
-                controller: _controller!,
-                controls: NoVideoControls,
-                fit: BoxFit.cover,
-              )
-            else
-              Center(
-                child: _error != null
-                    ? Icon(
-                        Icons.videocam_off,
-                        color: Colors.red.shade300,
-                        size: 28,
-                      )
-                    : const SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+    return Container(
+      color: Colors.grey.shade900,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final pane = Size(constraints.maxWidth, constraints.maxHeight);
+          return Listener(
+            // Hover a tile + mouse wheel → digital zoom IN PLACE (wall stays up).
+            onPointerSignal: (e) {
+              if (e is PointerScrollEvent) {
+                final factor = math.pow(1.0013, -e.scrollDelta.dy) as double;
+                _zoomAt(e.localPosition, factor, pane);
+              }
+            },
+            child: GestureDetector(
+              // Double-click maximizes; single click reserved for selection;
+              // drag pans when zoomed.
+              onDoubleTap: widget.onTap,
+              onPanUpdate: (d) => _panBy(d.delta, pane),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (_controller != null)
+                    ClipRect(
+                      child: Transform(
+                        transform: Matrix4.identity()
+                          ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
+                          ..scaleByDouble(_scale, _scale, 1, 1),
+                        child: Video(
+                          controller: _controller!,
+                          controls: NoVideoControls,
+                          fit: BoxFit.cover,
+                        ),
                       ),
-              ),
-
-            // REC/motion/detection badges (top-left), driven by the shared
-            // LiveStatusController poll — only this row rebuilds on a tick.
-            Positioned(
-              left: 6,
-              top: 6,
-              child: ListenableBuilder(
-                listenable: widget.liveStatus,
-                builder: (context, _) {
-                  final status = widget.liveStatus.cameraFor(widget.camera.id);
-                  return LiveStatusBadgeRow(
-                    recording: status?.recording ?? false,
-                    recentMotion: status?.recentMotion ?? false,
-                    detectionKeys: widget.liveStatus.detectionKeysFor(
-                      widget.camera.id,
+                    )
+                  else
+                    Center(
+                      child: _error != null
+                          ? Icon(
+                              Icons.videocam_off,
+                              color: Colors.red.shade300,
+                              size: 28,
+                            )
+                          : const SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
                     ),
-                  );
-                },
-              ),
-            ),
 
-            // Camera-name label (bottom-left), with a live/offline dot.
-            Positioned(
-              left: 6,
-              bottom: 6,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.55),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 7,
-                      height: 7,
+                  // REC/motion/detection badges (top-left), driven by the shared
+                  // LiveStatusController poll — only this row rebuilds on a tick.
+                  Positioned(
+                    left: 6,
+                    top: 6,
+                    child: ListenableBuilder(
+                      listenable: widget.liveStatus,
+                      builder: (context, _) {
+                        final status = widget.liveStatus.cameraFor(
+                          widget.camera.id,
+                        );
+                        return LiveStatusBadgeRow(
+                          recording: status?.recording ?? false,
+                          recentMotion: status?.recentMotion ?? false,
+                          detectionKeys: widget.liveStatus.detectionKeysFor(
+                            widget.camera.id,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+
+                  // Camera-name label (bottom-left), with a live/offline dot.
+                  Positioned(
+                    left: 6,
+                    bottom: 6,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
                       decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: _error != null
-                            ? Colors.red
-                            : (_firstFrame ? Colors.greenAccent : Colors.amber),
+                        color: Colors.black.withValues(alpha: 0.55),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 7,
+                            height: 7,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _error != null
+                                  ? Colors.red
+                                  : (_firstFrame
+                                        ? Colors.greenAccent
+                                        : Colors.amber),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            widget.camera.name,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      widget.camera.name,
-                      style: const TextStyle(color: Colors.white, fontSize: 12),
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
