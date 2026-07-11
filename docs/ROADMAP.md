@@ -604,6 +604,18 @@ Phase 4, efficiency, only if measured need (M)
 - Generation interval (preview granularity vs. CPU/storage): 10 s recommended; 4 s equals per-segment, richer but ~6.5 M files over 30 d at 10 cameras.
 - Whether pre-generation backfills history at low priority, or relies on the on-demand fallback to self-heal history as users scrub it.
 
+### 9. Desktop client rewrite — native Flutter (XL)
+
+Rewrite the Windows/Linux desktop client from Tauri/WebView2 to native Flutter, keeping the existing Rust core via `flutter_rust_bridge` and rendering video through `media_kit`/libmpv, to retire the native-video-over-WebView2 "airspace" model that made the client feel non-native. Ratified in [`DECISIONS.md`](DECISIONS.md) (2026-07-10).
+
+#### Where we are today
+
+**P0 (de-risk spike) is done.** `apps/desktop-flutter/` proves media_kit live video + FRB → the real Windows-native Rust core + native overlay compositing (incl. Flutter-native digital zoom/pan) hold together on real hardware. Two things it settled: FRB bridges the *client/util* core (not the mpv engine, which media_kit replaces), and digital zoom/pan belongs in Flutter, not mpv. The Tauri `apps/desktop` is untouched and still ships.
+
+#### What's next
+
+Full plan in [`desktop-flutter-P1.md`](desktop-flutter-P1.md). **P1** = authenticated live wall + HA on-video overlays as first-class native widgets, gated on an up-front **16-pane media_kit perf check** (each tile is its own libmpv instance — validate 9/16-up vs the Tauri baseline before building the wall). Then P2 playback, P3 the rest; Linux stays on hold (Flutter makes it near-free later).
+
 ### Cross-cutting
 
 Two pairs of initiatives share infrastructure. Building the shared piece once, deliberately, avoids two divergent half-implementations.
