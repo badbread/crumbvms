@@ -56,4 +56,16 @@ class Session {
   final String base; // e.g. http://host:port (no trailing slash)
   final String token; // bearer JWT
   final DateTime? expiresAt;
+
+  Map<String, dynamic> toJson() => {
+    'base': base,
+    'token': token,
+    'expires_at': expiresAt?.toIso8601String(),
+  };
+
+  factory Session.fromJson(Map<String, dynamic> j) => Session(
+    base: j['base'] as String,
+    token: j['token'] as String,
+    expiresAt: DateTime.tryParse((j['expires_at'] as String?) ?? ''),
+  );
 }

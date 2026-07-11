@@ -8,6 +8,7 @@
 // spike's whole job (revisit trigger in the rewrite decision).
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -19,6 +20,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
+import 'package:crumb_desktop/src/rust/api/secret.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
 import 'package:crumb_desktop/ui/login_screen.dart';
 import 'package:crumb_desktop/ui/wall_screen.dart';
@@ -54,9 +56,9 @@ Future<void> main() async {
   );
 }
 
-/// The real desktop client: login → live wall. Holds the authenticated session
-/// in memory (persistence is a later refinement) and swaps between the login and
-/// wall screens.
+/// The real desktop client: login → live wall. Restores a DPAPI-persisted
+/// session on launch (so the user isn't asked to log in every time) and swaps
+/// between the login and wall screens.
 class CrumbClientApp extends StatefulWidget {
   const CrumbClientApp({super.key});
 
@@ -68,6 +70,68 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   final CrumbApi _api = CrumbApi();
   Session? _session;
   List<Camera> _cameras = const [];
+  bool _restoring = true; // trying a saved session on launch
+
+  @override
+  void initState() {
+    super.initState();
+    _restore();
+  }
+
+  /// Try to resume a DPAPI-persisted session so the user isn't asked to log in
+  /// every launch. A stored token that no longer works (expired/revoked) is
+  /// discarded and we fall back to the login screen.
+  Future<void> _restore() async {
+    try {
+      final saved = await loadSession();
+      if (saved != null) {
+        final session = Session.fromJson(
+          jsonDecode(saved) as Map<String, dynamic>,
+        );
+        final cameras = await _api.listCameras(session); // validates the token
+        if (mounted) {
+          setState(() {
+            _session = session;
+            _cameras = cameras;
+            _restoring = false;
+          });
+        }
+        return;
+      }
+    } catch (_) {
+      await clearSession(); // stale/invalid — start clean
+    }
+    if (mounted) setState(() => _restoring = false);
+  }
+
+  Future<void> _onLoggedIn(Session session, List<Camera> cameras) async {
+    // Persist the session (DPAPI-encrypted, current-user-scoped) for next launch.
+    try {
+      await saveSession(data: jsonEncode(session.toJson()));
+    } catch (_) {
+      /* persistence is best-effort; login still succeeds */
+    }
+    if (mounted) {
+      setState(() {
+        _session = session;
+        _cameras = cameras;
+      });
+    }
+  }
+
+  Future<void> _onLogout() async {
+    try {
+      await clearSession();
+    } catch (_) {
+      /* ignore */
+    }
+    if (mounted) {
+      setState(() {
+        _session = null;
+        _cameras = const [];
+      });
+    }
+  }
 
   @override
   void dispose() {
@@ -77,27 +141,24 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
 
   @override
   Widget build(BuildContext context) {
+    final Widget home;
+    if (_restoring) {
+      home = const Scaffold(body: Center(child: CircularProgressIndicator()));
+    } else if (_session == null) {
+      home = LoginScreen(api: _api, onLoggedIn: _onLoggedIn);
+    } else {
+      home = WallScreen(
+        api: _api,
+        session: _session!,
+        cameras: _cameras,
+        onLogout: _onLogout,
+      );
+    }
     return MaterialApp(
       title: 'Crumb',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark(useMaterial3: true),
-      home: _session == null
-          ? LoginScreen(
-              api: _api,
-              onLoggedIn: (session, cameras) => setState(() {
-                _session = session;
-                _cameras = cameras;
-              }),
-            )
-          : WallScreen(
-              api: _api,
-              session: _session!,
-              cameras: _cameras,
-              onLogout: () => setState(() {
-                _session = null;
-                _cameras = const [];
-              }),
-            ),
+      home: home,
     );
   }
 }
