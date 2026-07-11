@@ -1,0 +1,51 @@
+# gitleaks config for the crumbvms public repo — homelab-identifier + secret scan.
+#
+# This file is PUBLIC on purpose: it holds only GENERIC structural rules (private
+# IP ranges, NAS mount paths, internal domain suffixes) that reveal nothing
+# specific. The maintainer's exact hostnames / camera labels / VM ids are NOT
+# here — they are injected at CI time from the `HOMELAB_DENYLIST_B64` Actions
+# secret (see .github/workflows/leak-scan.yml), so the specific list never lives
+# in the repo.
+#
+# Run locally:  gitleaks detect --no-git --source . --config .gitleaks.toml
+
+title = "crumbvms leak-scan"
+
+# Deliberately NOT extending gitleaks' default secret rules yet — this gate's job
+# is homelab identifiers, and default rules can false-positive on a Rust codebase
+# and train people to bypass. Flip `useDefault = true` in a follow-up once a
+# baseline scan is triaged.
+# [extend]
+# useDefault = true
+
+[[rules]]
+id = "homelab-rfc1918"
+description = "Private RFC1918 LAN address (four octets — so semver never matches)"
+regex = '''\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b'''
+tags = ["homelab", "network"]
+
+[[rules]]
+id = "homelab-mount-path"
+description = "Internal NAS / array mount path (Synology / Unraid conventions)"
+regex = '''(/volume1|/mnt/user)(/|\b)'''
+tags = ["homelab", "path"]
+
+[[rules]]
+id = "homelab-internal-domain"
+description = "Internal DNS suffix (private ARPA zone or mDNS)"
+regex = '''\b[a-z0-9][a-z0-9-]*\.(home\.arpa|local)\b'''
+tags = ["homelab", "network"]
+
+[allowlist]
+description = "Known-safe: RFC5737/RFC3849 documentation example ranges, app version, env example"
+regexes = [
+  '''\b192\.0\.2\.\d{1,3}\b''',
+  '''\b198\.51\.100\.\d{1,3}\b''',
+  '''\b203\.0\.113\.\d{1,3}\b''',
+  '''\b2001:db8:''',
+]
+paths = [
+  '''(^|/)VERSION$''',
+  '''\.env\.example$''',
+  '''(^|/)\.gitleaks\.toml$''',
+]

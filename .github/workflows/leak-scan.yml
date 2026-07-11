@@ -1,0 +1,77 @@
+# Leak scan — blocks homelab identifiers (and, later, secrets) from reaching main.
+#
+# This is the un-bypassable layer: unlike a local hook, a required status check
+# under branch protection can't be skipped with --no-verify or a stale config.
+# Make `leak-scan / scan` a REQUIRED check on main (Settings → Branches).
+#
+# Rules: generic structural patterns ship in .gitleaks.toml (public, reveal
+# nothing); the maintainer's exact hostnames/labels/ids are injected here from the
+# HOMELAB_DENYLIST_B64 secret so the specific list never lives in the repo.
+#   Set it:  gh secret set HOMELAB_DENYLIST_B64 -b "$(base64 -w0 ~/.claude/homelab-identifiers.txt)"
+#
+# PRs scan only their OWN commit range, so the pre-existing identifiers still on
+# main don't fail every PR — a leak is blocked only when a PR ADDS one. The
+# nightly job scans the whole tree to surface the backlog.
+
+name: leak-scan
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 9 * * *" # ~02:17 America/Los_Angeles; full-tree backlog sweep
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          VER=8.18.4
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" -o gl.tgz
+          tar -xzf gl.tgz gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Assemble config (public generic rules + private denylist secret)
+        env:
+          DENY_B64: ${{ secrets.HOMELAB_DENYLIST_B64 }}
+        run: |
+          cp .gitleaks.toml /tmp/leaks.toml
+          if [ -n "$DENY_B64" ]; then
+            PATS="$(printf '%s' "$DENY_B64" | base64 -d | grep -vE '^[[:space:]]*#|^[[:space:]]*$' | paste -sd '|' -)"
+            {
+              printf '\n[[rules]]\n'
+              printf 'id = "homelab-private-identifiers"\n'
+              printf 'description = "Private homelab identifiers (injected from HOMELAB_DENYLIST_B64)"\n'
+              printf "regex = '''(%s)'''\n" "$PATS"
+            } >> /tmp/leaks.toml
+          else
+            echo "::warning title=leak-scan::HOMELAB_DENYLIST_B64 not set — scanning with public generic rules only. Set the secret to enforce the full identifier list."
+          fi
+
+      - name: Scan PR commit range
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}" || git fetch --no-tags origin "${{ github.base_ref }}"
+          gitleaks detect \
+            --config /tmp/leaks.toml \
+            --redact --no-banner \
+            --log-opts="origin/${{ github.base_ref }}..HEAD" \
+            --exit-code 1
+
+      - name: Scan full tree (scheduled / manual)
+        if: github.event_name != 'pull_request'
+        run: |
+          gitleaks detect \
+            --config /tmp/leaks.toml \
+            --redact --no-banner \
+            --no-git --source . \
+            --exit-code 1
