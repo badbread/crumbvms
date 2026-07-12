@@ -147,3 +147,49 @@ recorder, and later the API) must satisfy these *by construction*.
     reliable detector is a packet count: the segmenter's audio args are unit-
     tested to keep `-copyinkf:a`, and any integration check must assert
     `nb_read_packets > 0` on the audio stream, not merely that the stream exists.
+
+## free-space floor (ENOSPC safety valve)
+24. **The floor keys off free space AVAILABLE to the recorder, and its response
+    must actually FREE bytes.** Read `statvfs` `f_bavail`/`f_frsize`, NOT `f_bfree`
+    (which includes the ext4 root reserve the non-root recorder cannot use, so the
+    valve would never fire). When the floor is in deficit, an archive-move that
+    lands on the SAME filesystem as the deficit disk frees nothing — on the default
+    compose layout that let the disk fill to 100% and ENOSPC-halt recording. So the
+    deficit path DELETES the oldest live segment (a narrow, loud exception to item
+    7, in the spirit of item 22) when — and only when — the segment's storage
+    shares the archive filesystem AND the deficit filesystem (`st_dev` identity); a
+    segment on any other disk falls through to the normal footage-preserving move.
+    Oldest-first, protected bookmarks excluded, file-then-row (10), serialized on
+    `ARCHIVE_GUARD` (8), and a `premature_rollover` event fires so the loss is
+    visible. See `docs/DECISIONS.md` (2026-07-12).
+
+## fail-open across every seam (extends item 19)
+25. **Fail-open state survives reconnect and stays consistent through an unhealthy
+    window.** `MotionBuffer`/`MotionUnion`/`pending_signals` are worker-lifetime
+    (carried across an ffmpeg reconnect; the R1 cache sweep spares carried pre-roll
+    via a keep-set; a flip-guard blocks a cache/storage-flavour self-copy-truncate),
+    so a reconnect mid-event never drops the tail. Through a frozen window the union
+    is kept in sync — edges fold, the newest is stashed and replayed on thaw, and a
+    replayed STOP onto an Idle buffer enters `PostBuffer` so a full event inside the
+    window keeps its post-roll. Do NOT add a blind time-based `MotionUnion` expiry:
+    it cannot tell a lost STOP from a genuinely-long event and on a multi-source
+    camera would discard footage a healthy source is still asserting (the wedge is
+    covered footage-safe by the loss-debt fail-open + source supervision instead).
+26. **A detector is HEALTHY only when it can produce a keep/discard verdict.** The
+    Frigate source reports healthy on a GRANTED MQTT SubAck, never on ConnAck (a
+    denied subscription is "healthy forever, zero events"); the pixel detector only
+    after warm-up; a panicked source task is supervised and immediately reads
+    unhealthy → fail-open; a `MotionSignal` dropped on a full channel flips the
+    source to fail-open via an interposed health watch (never silently lost).
+
+## stall watchdog & boot reap
+27. **The segment-receipt stall watchdog is anchored to the last received segment,
+    not a per-`select!`-iteration timeout.** A co-scheduled telemetry tick shorter
+    than the timeout must not be able to rebuild/reset the deadline every loop — that
+    left a half-open stream recording nothing indefinitely. It is a dedicated select
+    arm on `sleep_until(last_segment_at + timeout)`.
+28. **Boot index-reap skips only a GENUINE in-progress build.** An INVALID index is
+    dropped so a later `CREATE INDEX IF NOT EXISTS` rebuilds it; on a lock timeout,
+    re-check `pg_stat_progress_create_index` for that index — skip a real manual
+    `CREATE INDEX CONCURRENTLY`, but RETRY transient/foreign contention rather than
+    permanently skipping (which would silently leave a broken catalog entry).

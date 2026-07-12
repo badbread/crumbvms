@@ -8,6 +8,71 @@ revisit.
 
 ---
 
+## 2026-07-12, Recorder audit hardening: the free-space floor frees real bytes, fail-open survives every seam, boot-reap tolerates contention
+
+**Context.** A two-round adversarial audit of the recorder (issues #70–#84, PR
+#85) found a class of footage-safety bugs. Fixing them forced several decisions
+where a plausible alternative was rejected, and the audit iterated
+(fix → re-audit → fix): a few round-1/round-2 fixes were themselves reverted or
+reshaped once a later pass proved them unsafe — those reversals are decisions too.
+
+**Decision — the free-space (ENOSPC) floor must FREE bytes, not relocate them.**
+When the floor is in deficit and a segment's archive move would land on the SAME
+filesystem as the live storage (the default compose layout: `/data/archive` on
+the live disk) AND that filesystem is the one actually in deficit, the sweep
+DELETES the oldest live segment instead of archive-moving it in place. This is a
+deliberate, narrow exception to correctness item #7 (the live sweep normally
+skips archive-enabled cameras, the archiver owns their deletion), in the exact
+spirit of item #22 (the `max_retention_days` ceiling also overrides #7): losing
+the OLDEST footage beats losing ALL FUTURE footage to a 100%-full disk that
+ENOSPC-halts recording on every camera. It stays bound by every other safety
+rule, oldest-first, protected bookmarks excluded, file-then-row (#10), serialized
+on `ARCHIVE_GUARD` (#8), and only triggers when a move genuinely cannot free the
+deficit disk (`st_dev` identity of segment-fs == archive-fs == floor-fs); a
+segment on a different disk falls through to the normal lossless move. A loud
+`premature_rollover` system event fires so the loss is visible, never silent.
+
+**Decision — fail-open is an invariant across EVERY seam, not just steady state
+(item #19 extended).** Concretely: (a) worker-lifetime motion state, the
+`MotionBuffer` / `MotionUnion` / `pending_signals` are carried across an ffmpeg
+reconnect (the R1 cache sweep gets a keep-set so it won't delete carried pre-roll,
+and a flip-guard prevents a cache/storage-flavour mismatch from self-copy-
+truncating an indexed segment), so a reconnect mid-event no longer drops the event
+tail; (b) the `MotionUnion` is kept consistent through an unhealthy (frozen)
+window, edges are folded and the newest is stashed and replayed on thaw, and a
+STOP replayed onto an Idle buffer enters `PostBuffer` (`apply_replayed_edge`) so
+an event that ran entirely inside the window still keeps its post-roll; (c) a
+detector reports HEALTHY only when it can actually produce a verdict, the Frigate
+source on a granted MQTT SubAck (not ConnAck), the pixel detector after warm-up;
+(d) a panicked motion-source task is supervised (a `JoinSet`, the motion-side twin
+of the service-task watchdog) and immediately reads unhealthy → fail-open; (e) a
+`MotionSignal` dropped on a full channel flips the source to fail-open via an
+interposed health watch rather than being silently lost.
+
+**Rejected / not chosen:**
+
+| Option | Verdict |
+|---|---|
+| Free-space floor **archive-moves** oldest live footage even when the move frees nothing (pre-fix behaviour) | Rejected, on the default shared-fs layout it freed 0 bytes every tick, the disk filled to 100%, and ffmpeg ENOSPC-halted recording on every camera. A no-op that reads as success is worse than a bounded, loud deletion. |
+| Free-space floor deletes any same-archive-fs segment **without checking it is on the deficit disk** (a round-2 fix, reverted in round-3) | Rejected, on a repointed-storage config it deleted footage on a disk that frees nothing on the full disk: unbounded loss, zero benefit. The delete now also requires segment-fs == floor(deficit)-fs. |
+| A **time-based `MotionUnion` stale-key expiry** to un-wedge a lost STOP (a round-2 fix, reverted in round-3) | Rejected, it can't tell a lost STOP from a genuinely-long event (an HA occupancy/contact sensor held on for hours; a pixel event through a storm). On a MULTI-source camera, expiring the long event's key let a second source's STOP close the union and DISCARD footage while a healthy source still asserted motion (golden rule 2). The wedge is covered the footage-safe way (over-record) by the #81 loss-debt fail-open + the motion-source supervision. |
+| Signal a dropped-`MotionSignal` fail-open by writing `false` into `motion.rs`'s `aggregate_health` watch | Rejected, that watch dedups on `last_sent`, so a foreign `false` would never be re-published `true`: permanent fail-open with no recovery. An interposed second watch (`forward_motion_health`) folds signal-loss into health and recovers when the channel drains. |
+| Boot index-reap **permanently skips** any `DROP INDEX` that hits a lock timeout | Rejected, it conflates a real in-progress manual `CREATE INDEX CONCURRENTLY` (must skip) with transient contention (a busy boot, autovacuum), leaving a droppable INVALID index un-dropped so a later `CREATE INDEX IF NOT EXISTS` silently no-ops. The reap now re-checks `pg_stat_progress_create_index` on a timeout: skip only a genuine build, retry transient contention. |
+| Keep the stall watchdog as a per-`select!`-iteration `timeout(read)` | Rejected, a co-scheduled telemetry tick (45s < 90s) returned from the select and rebuilt the timeout every iteration, so it never fired → silent dead recording on a half-open stream. The watchdog is now a dedicated arm anchored to the last segment receipt. |
+
+**Cost accepted.** The shared-fs floor deletes un-archived live footage of
+archive-enabled cameras when the disk would otherwise fill, an explicit, loud
+exception (not silent). Several fail-open paths deliberately OVER-record (a lost
+STOP over-records until the next event; a warm-up window persists idle footage),
+disk-waste bounded by retention, never loss, the correct direction per item #19.
+
+**Revisit triggers.** A source-identity-keyed `MotionUnion` (each open key tagged
+by source) lands → the lost-STOP wedge can be closed without over-record, and the
+"no time-based expiry" rejection can be revisited. Per-GPU decode accounting lands
+→ the floor's single-fs assumption could generalize to multi-disk deficit
+tracking. A hermetic api-integration-test harness lands (issue #88) → the
+`server_settings`-sharing test flakiness surfaced during this work is resolved.
+
 ## 2026-07-10, Desktop client: rewrite native in Flutter (keep the Rust core), retire the Tauri/WebView2 airspace model
 
 **Context.** The desktop client is Tauri 2 + wry/WebView2 with native Win32
