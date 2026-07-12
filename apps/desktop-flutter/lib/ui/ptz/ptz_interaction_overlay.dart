@@ -84,8 +84,20 @@ class _PtzInteractionOverlayState extends State<PtzInteractionOverlay> {
 
   @override
   void dispose() {
+    // Guaranteed stop: if any motion could still be in flight (an active
+    // hold-to-pan, or a pulse/wheel move whose auto-stop timer hasn't fired
+    // yet), send Stop — cancelling the timers alone would leave the camera
+    // moving forever after an unmount mid-interaction.
+    final motionPending =
+        _panActive ||
+        (_pulseStopTimer?.isActive ?? false) ||
+        (_wheelStopTimer?.isActive ?? false);
     _pulseStopTimer?.cancel();
     _wheelStopTimer?.cancel();
+    if (motionPending) {
+      _panActive = false;
+      _stopMotion();
+    }
     super.dispose();
   }
 

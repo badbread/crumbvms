@@ -272,27 +272,9 @@ class _WallScreenState extends State<WallScreen> {
                   ),
           ),
 
-          // Small logout affordance top-left. The perf/debug stats that used to
-          // sit here (camera count + CPU/GPU/NVDEC/RSS) now live in the bottom
-          // status bar (via statsSink) instead of a floating overlay.
-          Positioned(
-            top: 10,
-            left: 10,
-            child: Material(
-              color: Colors.black.withValues(alpha: 0.6),
-              shape: const CircleBorder(
-                side: BorderSide(color: Colors.white24),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: IconButton(
-                tooltip: 'Sign out',
-                iconSize: 16,
-                visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.logout, color: Colors.white70),
-                onPressed: widget.onLogout,
-              ),
-            ),
-          ),
+          // (Sign-out lives in the top bar — no redundant floating button here.
+          // The perf/debug stats that used to sit top-left now live in the
+          // bottom status bar via statsSink.)
 
           // Connection-lost banner: status polling has failed 3x in a row, so
           // the REC/motion/detection badges below may be stale. Positioned is
@@ -323,6 +305,10 @@ class _WallScreenState extends State<WallScreen> {
               warmController: _maximizeWarmCtrl,
               ptzClickMode:
                   widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
+              ptzStyle: widget.clientOptions?.ptzStyle ?? PtzStyle.edges,
+              ptzWheelCorner:
+                  widget.clientOptions?.ptzWheelCorner ??
+                  PtzWheelCorner.bottomLeft,
               onClose: _restore,
             ),
         ],
@@ -1047,6 +1033,8 @@ class _MaximizedPane extends StatefulWidget {
     this.audio,
     this.warmController,
     this.ptzClickMode = PtzClickMode.center,
+    this.ptzStyle = PtzStyle.edges,
+    this.ptzWheelCorner = PtzWheelCorner.bottomLeft,
   });
 
   final CrumbApi api;
@@ -1068,6 +1056,11 @@ class _MaximizedPane extends StatefulWidget {
   /// What a click on a PTZ-capable video does (center / pan / off).
   final PtzClickMode ptzClickMode;
 
+  /// On-video PTZ control affordance: edge-pinned arrows or the corner wheel
+  /// box (Options → "PTZ style"), plus which corner the wheel box pins to.
+  final PtzStyle ptzStyle;
+  final PtzWheelCorner ptzWheelCorner;
+
   @override
   State<_MaximizedPane> createState() => _MaximizedPaneState();
 }
@@ -1080,6 +1073,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// True once this pane's own (main-stream) player has decoded a frame —
   /// until then the warm-start controller (if any) covers the wait.
   bool _firstFrame = false;
+
+  /// Decoded video dimensions — needed to undo the BoxFit.contain letterbox
+  /// when mapping a click on the pane to a point ON THE VIDEO for PTZ.
+  int? _videoW;
+  int? _videoH;
 
   double _scale = 1.0;
   Offset _offset = Offset.zero;
@@ -1131,11 +1129,15 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         }
       }
       player.stream.width.listen((w) {
+        if (w != null && w > 0) _videoW = w;
         if (w != null && w > 0 && !_firstFrame && mounted) {
           // First decoded frame from the main stream — drop the warm-start
           // stand-in and hand the pane to this player.
           setState(() => _firstFrame = true);
         }
+      });
+      player.stream.height.listen((h) {
+        if (h != null && h > 0) _videoH = h;
       });
       await player.open(Media(url));
       if (!mounted) {
@@ -1204,44 +1206,70 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   void _ptzWheelZoom(double scrollDy) {
     const v = 0.5;
     final zoom = scrollDy < 0 ? v : -v; // wheel up = zoom in
+    // Single motion channel: a pending recenter-pulse stop must not cut this
+    // zoom short (and vice versa) — clear BOTH timers, like the old client.
+    _ptzPulseStop?.cancel();
+    _ptzZoomStop?.cancel();
     widget.api
         .ptzMove(widget.session, widget.camera.id, zoom: zoom)
         .catchError((_) {});
-    _ptzZoomStop?.cancel();
     _ptzZoomStop = Timer(const Duration(milliseconds: 220), () {
       widget.api.ptzStop(widget.session, widget.camera.id).catchError((_) {});
     });
   }
 
   // ── PTZ click-to-center / click-hold-to-pan (ported from app.js
-  //    ptzVideoClick / ptzVideoSteer). Offset from tile centre, normalised to
-  //    [-1,1], drives an ONVIF velocity move.
+  //    ptzVideoClick / ptzVideoSteer). Offset from the VIDEO centre, normalised
+  //    to [-1,1], drives an ONVIF velocity move.
   Timer? _ptzPulseStop;
   bool _ptzSteering = false;
+  ({double nx, double ny})? _ptzLastSteer;
 
+  /// Normalized offset (-1..1 each axis) of a pane-local point from the centre
+  /// of the DISPLAYED video. The video sits in the pane via BoxFit.contain, so
+  /// when aspect ratios differ the click must be mapped against the letterboxed
+  /// video rect, not the pane (same trap the clips zoom hit). Clicks in the
+  /// letterbox bars clamp to the nearest video edge.
   ({double nx, double ny}) _normOffset(Offset local, Size pane) {
-    final nx = (local.dx / pane.width * 2 - 1).clamp(-1.0, 1.0);
-    final ny = (local.dy / pane.height * 2 - 1).clamp(-1.0, 1.0);
+    double vx = 0, vy = 0, vw = pane.width, vh = pane.height;
+    final w = _videoW, h = _videoH;
+    if (w != null && h != null && w > 0 && h > 0) {
+      final s = math.min(pane.width / w, pane.height / h);
+      vw = w * s;
+      vh = h * s;
+      vx = (pane.width - vw) / 2;
+      vy = (pane.height - vh) / 2;
+    }
+    final nx = ((local.dx - vx) / vw * 2 - 1).clamp(-1.0, 1.0);
+    final ny = ((local.dy - vy) / vh * 2 - 1).clamp(-1.0, 1.0);
     return (nx: nx, ny: ny);
   }
 
-  /// Center mode: a proportional recenter pulse — click near the centre is a
-  /// no-op, edges pan harder/longer — then auto-stop.
+  /// Center mode: an open-loop recenter pulse aimed at the clicked point. The
+  /// backend only exposes ONVIF ContinuousMove/Stop (no absolute or relative
+  /// move, no position read-back), so "make the clicked point the centre" is a
+  /// timed velocity pulse: a fixed above-deadband speed pointed straight at the
+  /// click, held for a duration proportional to how far off-centre it is.
+  /// (Scaling the VELOCITY by the offset instead — the old behaviour — falls
+  /// under many cameras' minimum ONVIF velocity for mid-frame clicks, which is
+  /// why small corrections did nothing at all.)
   void _ptzCenterPulse(Offset local, Size pane) {
     final o = _normOffset(local, pane);
-    final mag = math.max(o.nx.abs(), o.ny.abs());
-    if (mag < 0.06) return; // dead-centre click
+    final len = math.sqrt(o.nx * o.nx + o.ny * o.ny);
+    if (len < 0.06) return; // dead-centre click
+    const speed = 0.7;
+    _ptzPulseStop?.cancel();
+    _ptzZoomStop?.cancel();
     widget.api
         .ptzMove(
           widget.session,
           widget.camera.id,
-          pan: (o.nx * 0.7).clamp(-1.0, 1.0),
-          tilt: (-o.ny * 0.7).clamp(-1.0, 1.0),
+          pan: (o.nx / len * speed).clamp(-1.0, 1.0),
+          tilt: (-o.ny / len * speed).clamp(-1.0, 1.0),
         )
         .catchError((_) {});
-    _ptzPulseStop?.cancel();
     _ptzPulseStop = Timer(
-      Duration(milliseconds: (80 + 320 * mag).round()),
+      Duration(milliseconds: (90 + 420 * len).round()),
       () => widget.api.ptzStop(widget.session, widget.camera.id).catchError(
         (_) {},
       ),
@@ -1249,9 +1277,23 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   }
 
   /// Pan mode: continuous velocity toward the cursor, held until release.
+  /// Driven from raw pointer events (not a drag gesture), so the move starts
+  /// the instant the button goes down — no drag-slop movement required — and
+  /// keeps going until [_ptzStopSteer]. Re-sends only when the direction
+  /// meaningfully changes, so dragging doesn't flood the API.
   void _ptzSteer(Offset local, Size pane) {
     final o = _normOffset(local, pane);
+    final last = _ptzLastSteer;
+    if (_ptzSteering &&
+        last != null &&
+        (o.nx - last.nx).abs() < 0.04 &&
+        (o.ny - last.ny).abs() < 0.04) {
+      return;
+    }
+    _ptzPulseStop?.cancel();
+    _ptzZoomStop?.cancel();
     _ptzSteering = true;
+    _ptzLastSteer = o;
     widget.api
         .ptzMove(widget.session, widget.camera.id, pan: o.nx, tilt: -o.ny)
         .catchError((_) {});
@@ -1260,15 +1302,35 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   void _ptzStopSteer() {
     if (!_ptzSteering) return;
     _ptzSteering = false;
+    _ptzLastSteer = null;
     widget.api.ptzStop(widget.session, widget.camera.id).catchError((_) {});
+  }
+
+  @override
+  void didUpdateWidget(covariant _MaximizedPane old) {
+    super.didUpdateWidget(old);
+    // A mode switch mid-hold must not leave the camera panning.
+    if (old.ptzClickMode != widget.ptzClickMode) _ptzStopSteer();
   }
 
   @override
   void dispose() {
     SnapshotRegistry.instance.unregister('maximized');
     widget.audio?.unregisterPane('max:${widget.camera.id}');
+    // Guaranteed stop: if any PTZ motion could still be in flight (an active
+    // hold-to-pan, or a pulse/zoom move whose auto-stop timer hasn't fired),
+    // send Stop — cancelling the timers alone would leave the camera moving
+    // forever. This also covers unmount mid-drag (e.g. double-click restore).
+    final ptzMotionPending =
+        _ptzSteering ||
+        (_ptzZoomStop?.isActive ?? false) ||
+        (_ptzPulseStop?.isActive ?? false);
     _ptzZoomStop?.cancel();
     _ptzPulseStop?.cancel();
+    if (ptzMotionPending) {
+      _ptzSteering = false;
+      widget.api.ptzStop(widget.session, widget.camera.id).catchError((_) {});
+    }
     _player?.dispose();
     super.dispose();
   }
@@ -1309,8 +1371,25 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                             // Mouse "back" button returns to the wall.
                             if (e.buttons & kBackMouseButton != 0) {
                               widget.onClose();
+                              return;
+                            }
+                            // PTZ pan mode: press-and-hold starts a continuous
+                            // move IMMEDIATELY (raw pointer event, no drag-slop
+                            // wait); released/cancelled below.
+                            if (_ptzPan &&
+                                e.buttons & kPrimaryMouseButton != 0) {
+                              _ptzSteer(e.localPosition, pane);
                             }
                           },
+                          // While held, dragging re-steers toward the cursor.
+                          // Move/up/cancel are delivered to this Listener for
+                          // the whole interaction even if the pointer leaves
+                          // the pane, so release always stops the motion.
+                          onPointerMove: (e) {
+                            if (_ptzSteering) _ptzSteer(e.localPosition, pane);
+                          },
+                          onPointerUp: (_) => _ptzStopSteer(),
+                          onPointerCancel: (_) => _ptzStopSteer(),
                           onPointerSignal: (e) {
                             if (e is PointerScrollEvent) {
                               if (_ptzEnabled) {
@@ -1330,20 +1409,15 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                             // wall (matches the old client).
                             onDoubleTap: widget.onClose,
                             // PTZ center mode: single click recenters on the
-                            // clicked point. PTZ pan mode: press-hold steers
-                            // toward the cursor (drag re-steers), release stops.
-                            // Otherwise the drag digitally pans a zoomed frame.
+                            // clicked point. (PTZ pan mode is driven by the
+                            // raw-pointer Listener above, so a stationary hold
+                            // works.) Otherwise the drag digitally pans a
+                            // zoomed frame — a no-op for PTZ cameras, whose
+                            // wheel drives optical zoom and never scales.
                             onTapUp: _ptzCenter
                                 ? (d) => _ptzCenterPulse(d.localPosition, pane)
                                 : null,
-                            onPanStart: _ptzPan
-                                ? (d) => _ptzSteer(d.localPosition, pane)
-                                : null,
-                            onPanUpdate: _ptzPan
-                                ? (d) => _ptzSteer(d.localPosition, pane)
-                                : (d) => _panBy(d.delta, pane),
-                            onPanEnd: _ptzPan ? (_) => _ptzStopSteer() : null,
-                            onPanCancel: _ptzPan ? _ptzStopSteer : null,
+                            onPanUpdate: (d) => _panBy(d.delta, pane),
                             child: ClipRect(
                               child: Transform(
                                 transform: Matrix4.identity()
@@ -1438,15 +1512,17 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                   ),
                 ),
 
-                // PTZ controls (PTZ-capable cameras with PTZ not disabled).
+                // PTZ controls (PTZ-capable cameras with PTZ not disabled):
+                // Options "PTZ style" picks edge-pinned arrows or the compact
+                // corner wheel box (pinned per "Wheel corner").
                 if (_ptzEnabled)
-                  Positioned(
-                    right: 16,
-                    bottom: 16,
+                  Positioned.fill(
                     child: _PtzControls(
                       api: widget.api,
                       session: widget.session,
                       camera: widget.camera,
+                      style: widget.ptzStyle,
+                      wheelCorner: widget.ptzWheelCorner,
                     ),
                   ),
               ],
@@ -1462,16 +1538,29 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 /// Continuous-velocity model: press-and-hold a direction to move, release to
 /// stop (matching the ONVIF continuous-move API). Home recenters. Errors (e.g.
 /// ONVIF not reachable) surface as a brief caption rather than a crash.
+///
+/// Renders one of the two Options "PTZ style" affordances (fills the pane;
+/// only the buttons themselves are hit-testable, everything else falls
+/// through to the video):
+/// - [PtzStyle.edges] — directional arrow tabs pinned mid-edge on all four
+///   sides, zoom −/+ in the bottom corners and Home beside zoom + (the old
+///   client's `ptzBuildEdgeAss`/`ptzCtrlGeom` layout).
+/// - [PtzStyle.wheel] — the compact zoom-column + D-pad box pinned to the
+///   corner picked by [wheelCorner].
 class _PtzControls extends StatefulWidget {
   const _PtzControls({
     required this.api,
     required this.session,
     required this.camera,
+    required this.style,
+    required this.wheelCorner,
   });
 
   final CrumbApi api;
   final Session session;
   final Camera camera;
+  final PtzStyle style;
+  final PtzWheelCorner wheelCorner;
 
   @override
   State<_PtzControls> createState() => _PtzControlsState();
@@ -1480,6 +1569,26 @@ class _PtzControls extends StatefulWidget {
 class _PtzControlsState extends State<_PtzControls> {
   static const double _v = 0.6; // pan/tilt/zoom velocity
   String? _error;
+
+  /// A hold-button's move is in flight (down received, stop not yet sent) —
+  /// so unmounting mid-hold can send the guaranteed stop.
+  bool _holdActive = false;
+
+  @override
+  void didUpdateWidget(covariant _PtzControls old) {
+    super.didUpdateWidget(old);
+    // A style switch mid-hold unmounts the held button (its pointer-up would
+    // be lost) — stop any in-flight motion rather than leave it running.
+    if (old.style != widget.style && _holdActive) _stop();
+  }
+
+  @override
+  void dispose() {
+    if (_holdActive) {
+      widget.api.ptzStop(widget.session, widget.camera.id).catchError((_) {});
+    }
+    super.dispose();
+  }
 
   Future<void> _move({double pan = 0, double tilt = 0, double zoom = 0}) async {
     try {
@@ -1497,6 +1606,7 @@ class _PtzControlsState extends State<_PtzControls> {
   }
 
   Future<void> _stop() async {
+    _holdActive = false;
     try {
       await widget.api.ptzStop(widget.session, widget.camera.id);
     } catch (_) {
@@ -1518,15 +1628,20 @@ class _PtzControlsState extends State<_PtzControls> {
     double pan = 0,
     double tilt = 0,
     double zoom = 0,
+    double w = 40,
+    double h = 40,
   }) {
     return Listener(
-      onPointerDown: (_) => _move(pan: pan, tilt: tilt, zoom: zoom),
+      onPointerDown: (_) {
+        _holdActive = true;
+        _move(pan: pan, tilt: tilt, zoom: zoom);
+      },
       onPointerUp: (_) => _stop(),
       onPointerCancel: (_) => _stop(),
       child: Container(
         margin: const EdgeInsets.all(2),
-        width: 40,
-        height: 40,
+        width: w,
+        height: h,
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(8),
@@ -1537,13 +1652,18 @@ class _PtzControlsState extends State<_PtzControls> {
     );
   }
 
-  Widget _tap(IconData icon, VoidCallback onTap) {
+  Widget _tap(
+    IconData icon,
+    VoidCallback onTap, {
+    double w = 40,
+    double h = 40,
+  }) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
         margin: const EdgeInsets.all(2),
-        width: 40,
-        height: 40,
+        width: w,
+        height: h,
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(8),
@@ -1556,53 +1676,177 @@ class _PtzControlsState extends State<_PtzControls> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          if (_error != null)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 6, right: 2),
-              child: Text(
-                _error!,
-                style: TextStyle(color: Colors.red.shade300, fontSize: 11),
+    return widget.style == PtzStyle.edges
+        ? _buildEdges(context)
+        : _buildWheelBox(context);
+  }
+
+  /// Edge-arrows style: hold-to-move arrow tabs pinned mid-edge on all four
+  /// sides of the video, zoom − / zoom + in the bottom corners and Home just
+  /// left of zoom + — the same layout as the old client's `ptzCtrlGeom`.
+  /// The enclosing Stack claims hits only on the buttons; the rest of the
+  /// pane still receives click-to-center / hold-to-pan / wheel-zoom.
+  Widget _buildEdges(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final h = constraints.maxHeight;
+        const m = 10.0;
+        final aLong = (w * 0.13).clamp(46.0, 78.0); // arrow long dimension
+        final aShort = (h * 0.10).clamp(30.0, 46.0); // arrow short dimension
+        final zs = aShort; // zoom/home button side
+        return Stack(
+          children: [
+            Positioned(
+              left: (w - aLong) / 2,
+              top: m,
+              child: _hold(
+                Icons.keyboard_arrow_up,
+                tilt: _v,
+                w: aLong,
+                h: aShort,
               ),
             ),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              // Zoom column
-              Column(
-                children: [
-                  _hold(Icons.zoom_in, zoom: _v),
-                  _hold(Icons.zoom_out, zoom: -_v),
-                ],
+            Positioned(
+              left: (w - aLong) / 2,
+              bottom: m,
+              child: _hold(
+                Icons.keyboard_arrow_down,
+                tilt: -_v,
+                w: aLong,
+                h: aShort,
               ),
-              const SizedBox(width: 8),
-              // Pan/tilt D-pad
-              Column(
+            ),
+            Positioned(
+              left: m,
+              top: (h - aLong) / 2,
+              child: _hold(
+                Icons.keyboard_arrow_left,
+                pan: -_v,
+                w: aShort,
+                h: aLong,
+              ),
+            ),
+            Positioned(
+              right: m,
+              top: (h - aLong) / 2,
+              child: _hold(
+                Icons.keyboard_arrow_right,
+                pan: _v,
+                w: aShort,
+                h: aLong,
+              ),
+            ),
+            Positioned(
+              left: m,
+              bottom: m,
+              child: _hold(Icons.zoom_out, zoom: -_v, w: zs, h: zs),
+            ),
+            Positioned(
+              right: m,
+              bottom: m,
+              child: _hold(Icons.zoom_in, zoom: _v, w: zs, h: zs),
+            ),
+            Positioned(
+              right: m + zs + 6,
+              bottom: m,
+              child: _tap(Icons.home, _home, w: zs, h: zs),
+            ),
+            if (_error != null)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: m + aShort + 10,
+                child: IgnorePointer(
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.55),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        _error!,
+                        style: TextStyle(
+                          color: Colors.red.shade300,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// Corner-wheel style: the compact zoom-column + D-pad box, pinned to the
+  /// Options-picked corner (extra top inset clears the name/badge rows).
+  Widget _buildWheelBox(BuildContext context) {
+    final corner = widget.wheelCorner;
+    return Align(
+      alignment: switch (corner) {
+        PtzWheelCorner.bottomLeft => Alignment.bottomLeft,
+        PtzWheelCorner.bottomRight => Alignment.bottomRight,
+        PtzWheelCorner.topLeft => Alignment.topLeft,
+        PtzWheelCorner.topRight => Alignment.topRight,
+      },
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(16, corner.isTop ? 64 : 16, 16, 16),
+        child: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white24),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6, right: 2),
+                  child: Text(
+                    _error!,
+                    style: TextStyle(color: Colors.red.shade300, fontSize: 11),
+                  ),
+                ),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
-                  _hold(Icons.keyboard_arrow_up, tilt: _v),
-                  Row(
+                  // Zoom column
+                  Column(
                     children: [
-                      _hold(Icons.keyboard_arrow_left, pan: -_v),
-                      _tap(Icons.home, _home),
-                      _hold(Icons.keyboard_arrow_right, pan: _v),
+                      _hold(Icons.zoom_in, zoom: _v),
+                      _hold(Icons.zoom_out, zoom: -_v),
                     ],
                   ),
-                  _hold(Icons.keyboard_arrow_down, tilt: -_v),
+                  const SizedBox(width: 8),
+                  // Pan/tilt D-pad
+                  Column(
+                    children: [
+                      _hold(Icons.keyboard_arrow_up, tilt: _v),
+                      Row(
+                        children: [
+                          _hold(Icons.keyboard_arrow_left, pan: -_v),
+                          _tap(Icons.home, _home),
+                          _hold(Icons.keyboard_arrow_right, pan: _v),
+                        ],
+                      ),
+                      _hold(Icons.keyboard_arrow_down, tilt: -_v),
+                    ],
+                  ),
                 ],
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
