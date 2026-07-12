@@ -204,16 +204,37 @@ class _ExportScreenState extends State<ExportScreen> {
 
   int get _distinctCameras => _list.map((it) => it.cameraId).toSet().length;
 
+  /// Relative output size per codec: copy passes the source bitrate through;
+  /// H.264/H.265 re-encode to a lower target, H.265 the smallest.
+  double get _codecSizeFactor => switch (_videoCodec) {
+    'h265' => 0.4,
+    'h264' => 0.6,
+    _ => 1.0, // copy
+  };
+
+  /// Rough processing-time multiplier per codec, relative to footage length:
+  /// copy just remuxes (near-instant, IO-bound); H.264 re-encodes; H.265 is the
+  /// slowest. Very approximate — hardware-dependent — hence the "~".
+  double get _codecTimeFactor => switch (_videoCodec) {
+    'h265' => 0.9,
+    'h264' => 0.4,
+    _ => 0.05, // copy / remux
+  };
+
   /// Rough size estimate (heuristic ~4 Mbps main stream), scaled by codec.
-  /// H.265 re-encodes to roughly half the bitrate; copy/H.264 keep the source
-  /// rate. Mirrors exportEstSize in app.js. Always prefixed with "~".
+  /// Always prefixed with "~".
   String _estSize() {
     final ms = _totalDuration.inMilliseconds;
-    final factor = _videoCodec == 'h265' ? 0.5 : 1.0;
-    final bytes = (ms / 1000) * 500000 * factor; // 4 Mbps ~= 500 KB/s
+    final bytes = (ms / 1000) * 500000 * _codecSizeFactor; // 4 Mbps ~= 500 KB/s
     if (bytes >= 1e9) return '~${(bytes / 1e9).toStringAsFixed(1)} GB';
     if (bytes >= 1e6) return '~${(bytes / 1e6).round()} MB';
     return '~${(bytes / 1e3).clamp(1, double.infinity).round()} KB';
+  }
+
+  /// Rough processing-time estimate, scaled by codec (copy is fastest). "~".
+  String _estTime() {
+    final secs = (_totalDuration.inSeconds * _codecTimeFactor).round();
+    return '~${_fmtDuration(Duration(seconds: secs.clamp(1, 1 << 30)))}';
   }
 
   String _fmtDuration(Duration d) {
@@ -526,6 +547,10 @@ class _ExportScreenState extends State<ExportScreen> {
                     _list.isEmpty ? '-' : _fmtDuration(_totalDuration),
                   ),
                   _summaryRow('Est. size', _list.isEmpty ? '-' : _estSize()),
+                  _summaryRow(
+                    'Est. process time',
+                    _list.isEmpty ? '-' : _estTime(),
+                  ),
                   const SizedBox(height: 16),
                   const Divider(),
                   const SizedBox(height: 8),
