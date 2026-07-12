@@ -319,6 +319,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
       // The signed-in shell keeps running underneath the re-auth overlay on a
       // 401 (panes keep decoding); S-key snapshots work from any tab.
       home = SnapshotHotkey(
+        options: _clientOptions,
         child: ReauthOverlay(
           controller: controller,
           child: MainShell(

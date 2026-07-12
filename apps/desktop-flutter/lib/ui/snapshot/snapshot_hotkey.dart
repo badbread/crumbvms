@@ -18,33 +18,50 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../services/snapshot_service.dart';
+import '../../state/client_options.dart';
 
-class _SnapshotIntent extends Intent {
-  const _SnapshotIntent();
-}
-
+/// Wires the "S" hotkey to a snapshot of the active pane.
+///
+/// This is a BUBBLE-PHASE handler (a plain `Focus.onKeyEvent`, not a
+/// `Shortcuts`/`SingleActivator`): the focused widget sees the key FIRST, so
+/// - typing an "s" into a text field (a password, a search box, …) is consumed
+///   by that field and never reaches here — the old `Shortcuts` binding fired
+///   on bare "s" even while typing, which stole keystrokes from the password
+///   field; and
+/// - a per-screen S handler (the live wall / playback) that already acted on
+///   the key isn't double-fired.
+///
+/// It also respects the "keyboard shortcuts" toggle ([ClientOptionsStore.
+/// hotkeysEnabled]) — with shortcuts off, S does nothing — and re-checks that no
+/// text field holds focus, belt-and-suspenders.
 class SnapshotHotkey extends StatelessWidget {
-  const SnapshotHotkey({super.key, required this.child});
+  const SnapshotHotkey({super.key, required this.child, this.options});
 
   final Widget child;
 
+  /// Read live at key-press time so toggling the setting takes effect
+  /// immediately (no rebuild needed).
+  final ClientOptionsStore? options;
+
   @override
   Widget build(BuildContext context) {
-    return Shortcuts(
-      shortcuts: const <ShortcutActivator, Intent>{
-        SingleActivator(LogicalKeyboardKey.keyS): _SnapshotIntent(),
+    return Focus(
+      canRequestFocus: false, // never steal focus; just observe bubbled keys
+      skipTraversal: true,
+      onKeyEvent: (node, event) {
+        if (event is! KeyDownEvent) return KeyEventResult.ignored;
+        if (event.logicalKey != LogicalKeyboardKey.keyS) {
+          return KeyEventResult.ignored;
+        }
+        if (!(options?.hotkeysEnabled ?? true)) return KeyEventResult.ignored;
+        final focused = FocusManager.instance.primaryFocus;
+        if (focused?.context?.widget is EditableText) {
+          return KeyEventResult.ignored;
+        }
+        SnapshotService.captureActivePane(context);
+        return KeyEventResult.handled;
       },
-      child: Actions(
-        actions: <Type, Action<Intent>>{
-          _SnapshotIntent: CallbackAction<_SnapshotIntent>(
-            onInvoke: (_) {
-              SnapshotService.captureActivePane(context);
-              return null;
-            },
-          ),
-        },
-        child: Focus(autofocus: true, child: child),
-      ),
+      child: child,
     );
   }
 }

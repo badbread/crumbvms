@@ -577,10 +577,29 @@ class _ExportScreenState extends State<ExportScreen> {
                 ),
                 Expanded(
                   child: _list.isEmpty
-                      ? const Center(
-                          child: Text(
-                            'No clips yet.\nAdd a camera + time range to build your export.',
-                            textAlign: TextAlign.center,
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text(
+                                'No clips yet.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(fontWeight: FontWeight.w600),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Add clips two ways:\n'
+                                '• "Add clip" above — pick a camera + time range.\n'
+                                '• On the Playback timeline — right-click-drag to '
+                                'select a range, drag the edges to fine-tune, then '
+                                'right-click the selection → "Add to export list".',
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.textTheme.bodySmall?.color
+                                      ?.withValues(alpha: 0.75),
+                                ),
+                              ),
+                            ],
                           ),
                         )
                       : ListView.separated(
