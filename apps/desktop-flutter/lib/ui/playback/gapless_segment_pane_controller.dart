@@ -33,12 +33,11 @@
 //
 // Scope: this controller owns ONE camera's [Player] + its segment/prefetch
 // bookkeeping ONLY. It deliberately does NOT own play/pause/speed or the
-// shared playhead clock — those are cross-pane concerns already covered by
-// this app's `PlaybackTransportController` (registerPane/onPlayheadAdvance)
-// and `PlaybackTimelineController`. Wire this controller's [player] into
-// `PlaybackTransportController.registerPane`, and call [onTick] from
-// `PlaybackTransportController.onPlayheadAdvance` for every active camera —
-// see this file's integration note in the porting task output.
+// shared playhead clock — those are cross-pane concerns owned by the playback
+// screen (its transport bar + `PlaybackTimelineController`). The screen drives
+// [player] directly for play/pause/speed (keeping [rate] in sync), calls
+// [onTick] once per playhead tick for every active camera, and [resolveAt]
+// with `forceReload` for explicit jumps/seeks.
 //
 // Segment-resolve and scoped-media-token logic is NOT duplicated here — it
 // calls the existing `PlaybackApi` extension (lib/api/playback_api.dart),
@@ -97,6 +96,12 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   bool _resolving = false;
   bool _advancing = false;
 
+  /// Playback rate to reassert after a fresh `open()`. mpv keeps `speed`
+  /// across a playlist advance (the gapless path), but a fallback `loadfile`
+  /// would reset an operator-chosen 4x back to 1x without this. Kept in sync
+  /// by whoever owns the speed control (alongside its `player.setRate`).
+  double rate = 1.0;
+
   /// True once a resolve for the current playhead came back with no covering
   /// segment (a normal "no footage here" outcome, not an error).
   bool noFootage = false;
@@ -118,6 +123,11 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       ['demuxer-max-back-bytes', '1MiB'],
       ['network-timeout', '10'],
       ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+      // Same as the wall tiles: never emit decoder output from before the
+      // first keyframe. The gapless advance never decodes mid-GOP, but the
+      // jump/seek fallback `loadfile` can — this masks the grey/blocky
+      // partial frames it would otherwise flash.
+      ['vd-lavc-show-all', 'no'],
       // THE feature this file ports: demux the appended next-segment file
       // while the current one is still playing, so `Player.next()` at the
       // boundary lands on an already-warm decoder. Verbatim equivalent of
@@ -138,12 +148,26 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   /// Call once per tick with the shared playhead. Triggers the next-segment
   /// prefetch shortly before the current segment's boundary, and swaps
   /// across the boundary (gapless if a prefetch made it in time) once
-  /// reached. No-ops if nothing is currently loaded (e.g. this camera has no
-  /// footage at the playhead — [resolveAt] owns getting a segment loaded in
-  /// the first place).
-  Future<void> onTick(DateTime playhead) async {
+  /// reached. If nothing is currently loaded (this camera had no footage at
+  /// the last resolve, or the pane just became active) it keeps resolving so
+  /// footage under the advancing playhead loads as soon as it exists —
+  /// mirrors `pbTick` re-resolving empty slots every tick. `playing` is the
+  /// transport's play/pause state, applied to any fallback `loadfile`.
+  Future<void> onTick(DateTime playhead, {bool playing = false}) async {
     final cur = _current;
-    if (cur == null) return;
+    if (cur == null) {
+      if (!_resolving) await resolveAt(playhead, playing: playing);
+      return;
+    }
+
+    if (playhead.isBefore(cur.start)) {
+      // The playhead is BEHIND the loaded segment (a backwards nudge, or a
+      // pane re-activated after the operator scrubbed back while it was
+      // hidden) — the linear boundary logic below can never get there, so do
+      // a real resolve.
+      if (!_resolving) await resolveAt(playhead, playing: playing);
+      return;
+    }
 
     final untilEnd = cur.end.difference(playhead);
     if (untilEnd <= kPrefetchLeadTime && _prefetched == null && !_prefetching) {
@@ -153,7 +177,7 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     if (!playhead.isBefore(cur.end.subtract(kBoundaryTolerance)) &&
         !_advancing &&
         !_resolving) {
-      unawaited(_advanceOrResolve(playhead));
+      unawaited(_advanceOrResolve(playhead, playing: playing));
     }
   }
 
@@ -170,12 +194,16 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         DateTime.fromMillisecondsSinceEpoch(cur.endMs + 1, isUtc: true),
         stream: stream,
       );
+      // A jump/seek may have swapped the current segment while the resolve
+      // was in flight — this prefetch was for the OLD linear path, drop it
+      // (a forced resolve invalidates the look-ahead, as in app.js).
+      if (!identical(_current, cur)) return;
       // Keep only if it's genuinely a LATER segment (guard against the API
       // returning the same/overlapping one near the boundary) — mirrors
       // app.js's `seg.startMs >= cur.segEndMs - 250` guard.
       if (seg == null || seg.startMs < cur.endMs - 250) return;
       final url = await api.mediaUrlForSegment(_session, seg);
-      if (url == null) return;
+      if (url == null || !identical(_current, cur)) return;
       try {
         await _player.add(Media(url));
         _prefetched = seg;
@@ -191,7 +219,10 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   // ── boundary crossing (port of the gapless branch in
   //    pbResolveAllPanesInner) ────────────────────────────────────────────
 
-  Future<void> _advanceOrResolve(DateTime playhead) async {
+  Future<void> _advanceOrResolve(
+    DateTime playhead, {
+    bool playing = false,
+  }) async {
     final pre = _prefetched;
     if (pre != null && pre.covers(playhead)) {
       _advancing = true;
@@ -220,7 +251,26 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         _advancing = false;
       }
     }
-    await resolveAt(playhead, forceReload: false);
+    await resolveAt(playhead, forceReload: false, playing: playing);
+  }
+
+  /// Invalidate a prefetched-but-not-yet-played next segment: forget it AND
+  /// best-effort remove its appended playlist entry (always the LAST entry —
+  /// the playlist never grows past {current, next}). Without the removal,
+  /// mpv's EOF auto-advance could wander into wrong-time footage when the
+  /// current file runs out with the playhead sitting in a coverage gap.
+  /// Paths that go on to `open()` don't strictly need it (open replaces the
+  /// whole playlist), but the paths that DON'T open (a jump landing in a
+  /// gap) do.
+  Future<void> _dropPrefetch() async {
+    if (_prefetched == null) return;
+    _prefetched = null;
+    try {
+      final n = _player.state.playlist.medias.length;
+      if (n > 1) await _player.remove(n - 1);
+    } catch (_) {
+      /* best-effort */
+    }
   }
 
   // ── full resolve (port of the non-gapless branch of
@@ -245,15 +295,15 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     try {
       final cur = _current;
       if (forceReload) {
-        _prefetched = null;
+        await _dropPrefetch();
       } else if (cur != null && cur.covers(ts)) {
         return; // still covered — nothing to do (matches the cached-skip in app.js)
       }
 
       final seg = await api.resolveSegment(_session, cameraId, ts, stream: stream);
       if (seg == null) {
+        await _dropPrefetch();
         _current = null;
-        _prefetched = null;
         noFootage = true;
         error = null;
         notifyListeners();
@@ -273,9 +323,9 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       if (!sameFile) {
         await _player.open(Playlist([Media(url)]), play: playing);
         try {
-          await _player.setRate(1.0);
+          await _player.setRate(rate);
         } catch (_) {
-          /* caller/transport controller reasserts the real speed */
+          /* non-fatal — the transport owner reasserts speed on its next change */
         }
       }
       final offsetMs = (ts.millisecondsSinceEpoch - seg.startMs)

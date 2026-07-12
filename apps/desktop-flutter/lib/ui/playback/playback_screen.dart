@@ -33,6 +33,7 @@ import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
+import 'gapless_segment_pane_controller.dart';
 import 'playback_timeline_controller.dart';
 
 class PlaybackScreen extends StatefulWidget {
@@ -84,20 +85,6 @@ class PlaybackScreen extends StatefulWidget {
   State<PlaybackScreen> createState() => _PlaybackScreenState();
 }
 
-/// Mutable per-camera pane state: the media_kit player (created lazily, on
-/// first resolved segment) plus which segment it currently has loaded.
-class _PbPane {
-  Player? player;
-  VideoController? controller;
-  ResolvedSegment? segment;
-  bool loading = false;
-  String? error;
-
-  void dispose() {
-    player?.dispose();
-  }
-}
-
 /// Cached full-range recording coverage for one camera: merged spans over
 /// `[start, freshAt]`. `freshAt` is the live edge the cache is known fresh
 /// to — the periodic top-up fetches only `[freshAt − 1 min, now]` and unions
@@ -123,7 +110,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   late final List<String> _cameraIds = _cameras
       .map((c) => c.id)
       .toList(growable: false);
-  final Map<String, _PbPane> _panes = {};
+  // Per-camera playback engine: media_kit player + segment bookkeeping +
+  // next-segment prefetch, so segment boundaries cross via an mpv playlist
+  // advance (warm decoder) instead of a fresh `loadfile` that flashed black.
+  final Map<String, GaplessSegmentPaneController> _panes = {};
 
   late final PlaybackTimelineController _timeline =
       PlaybackTimelineController();
@@ -174,7 +164,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   void initState() {
     super.initState();
     for (final c in _cameras) {
-      _panes[c.id] = _PbPane();
+      _panes[c.id] = GaplessSegmentPaneController(
+        api: widget.api,
+        session: widget.session,
+        cameraId: c.id,
+      );
     }
     _selectedCameraId = _cameras.isNotEmpty ? _cameras.first.id : null;
     // Carry a maximized live pane into playback (if it's one of our cameras).
@@ -423,97 +417,23 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     return _cameras;
   }
 
+  /// Per-pane resolve/advance fan-out. `force` (an explicit jump/seek/zoom
+  /// commit) invalidates each pane's prefetch and reloads; otherwise this is
+  /// the 10 Hz tick body — each pane prefetches its next segment ~1 s before
+  /// the boundary and crosses it via an mpv playlist advance with a warm
+  /// decoder (no black flash), falling back to a fresh load only for a real
+  /// coverage gap or a lost prefetch race. See [GaplessSegmentPaneController].
   Future<void> _resolveAll(DateTime t, {bool force = false}) async {
     final futures = <Future<void>>[];
     for (final cam in _activeCameras()) {
       final pane = _panes[cam.id]!;
-      final existing = pane.segment;
-      if (!force && existing != null && existing.covers(t)) {
-        continue; // still-valid segment — no network call needed
-      }
-      futures.add(_resolveOne(cam.id, pane, t, force));
+      futures.add(
+        force
+            ? pane.resolveAt(t, forceReload: true, playing: _playing)
+            : pane.onTick(t, playing: _playing),
+      );
     }
     await Future.wait(futures);
-  }
-
-  Future<void> _resolveOne(
-    String cameraId,
-    _PbPane pane,
-    DateTime t,
-    bool force,
-  ) async {
-    final seg = await widget.api.resolveSegment(widget.session, cameraId, t);
-    if (!mounted) return;
-    if (seg == null) {
-      pane.segment = null;
-      pane.error = null; // "no footage right now" is not an error state
-      setState(() {});
-      return;
-    }
-    final sameFile = pane.segment?.segmentId == seg.segmentId;
-    if (sameFile && !force) {
-      pane.segment = seg;
-      return;
-    }
-    final url = await widget.api.mediaUrlForSegment(widget.session, seg);
-    if (!mounted) return;
-    if (url == null) {
-      pane.error = 'media token failed';
-      setState(() {});
-      return;
-    }
-    await _openSegment(pane, seg, url, t, reuseFile: sameFile);
-  }
-
-  Future<void> _openSegment(
-    _PbPane pane,
-    ResolvedSegment seg,
-    String url,
-    DateTime t, {
-    required bool reuseFile,
-  }) async {
-    pane.loading = true;
-    if (mounted) setState(() {});
-    try {
-      pane.player ??= Player();
-      pane.controller ??= VideoController(pane.player!);
-      final p = pane.player!.platform;
-      if (p is NativePlayer) {
-        for (final kv in const [
-          ['rtsp-transport', 'tcp'],
-          ['hwdec', 'auto'],
-          ['cache', 'yes'],
-          ['demuxer-readahead-secs', '2.0'],
-          ['demuxer-max-bytes', '32MiB'],
-          ['demuxer-max-back-bytes', '1MiB'],
-          ['network-timeout', '10'],
-          ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
-        ]) {
-          try {
-            await p.setProperty(kv[0], kv[1]);
-          } catch (_) {
-            /* non-fatal */
-          }
-        }
-      }
-      pane.segment = seg;
-      if (!reuseFile) {
-        await pane.player!.open(Media(url), play: _playing);
-        await pane.player!.setRate(_speeds[_speedIdx]);
-      }
-      final offsetMs = t
-          .difference(seg.start)
-          .inMilliseconds
-          .clamp(0, seg.durationMs)
-          .toInt();
-      await pane.player!.seek(Duration(milliseconds: offsetMs));
-      if (!_playing) await pane.player!.pause();
-      pane.loading = false;
-      pane.error = null;
-    } catch (_) {
-      pane.loading = false;
-      pane.error = 'load failed';
-    }
     if (mounted) setState(() {});
   }
 
@@ -528,16 +448,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       setState(() => _scrubbing = true);
     }
     for (final cam in _activeCameras()) {
-      final pane = _panes[cam.id];
-      final seg = pane?.segment;
-      if (pane?.player != null && seg != null && seg.covers(t)) {
-        final offsetMs = t
-            .difference(seg.start)
-            .inMilliseconds
-            .clamp(0, seg.durationMs)
-            .toInt();
-        pane!.player!.seek(Duration(milliseconds: offsetMs));
-      }
+      // Cheap in-segment seek; no-op if `t` left the loaded segment (the
+      // cross-segment resolve happens once on release, in _commitSeek).
+      unawaited(_panes[cam.id]?.seekWithinSegment(t) ?? Future.value());
     }
     // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
     // server-side extract load, superseded-request-safe via a token.
@@ -708,11 +621,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   void _togglePlay() {
     setState(() => _playing = !_playing);
     for (final pane in _panes.values) {
-      if (pane.player == null) continue;
       if (_playing) {
-        pane.player!.play();
+        pane.player.play();
       } else {
-        pane.player!.pause();
+        pane.player.pause();
       }
     }
     if (_playing) {
@@ -726,7 +638,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   void _setSpeed(int idx) {
     setState(() => _speedIdx = idx);
     for (final pane in _panes.values) {
-      pane.player?.setRate(_speeds[_speedIdx]);
+      // `rate` is reasserted by the pane after any fallback fresh open (mpv
+      // keeps `speed` across the gapless playlist advance, but not loadfile).
+      pane.rate = _speeds[_speedIdx];
+      pane.player.setRate(_speeds[_speedIdx]);
     }
   }
 
@@ -759,7 +674,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _tickTimer?.cancel();
       _tickTimer = null;
       for (final pane in _panes.values) {
-        pane.player?.pause();
+        pane.player.pause();
       }
       if (mounted) setState(() {});
     }
@@ -1385,7 +1300,7 @@ class _PbTile extends StatelessWidget {
   });
 
   final Camera camera;
-  final _PbPane pane;
+  final GaplessSegmentPaneController pane;
   final bool selected;
   final bool maximized;
   final VoidCallback onSelect;
@@ -1396,7 +1311,7 @@ class _PbTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final hasFootage = pane.segment != null;
+    final hasFootage = pane.currentSegment != null;
     // Selected-tile outline follows the active tab accent (cyan on Playback).
     final accent = Theme.of(context).colorScheme.primary;
     return GestureDetector(
@@ -1413,13 +1328,13 @@ class _PbTile extends StatelessWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            if (pane.controller != null)
-              Video(
-                controller: pane.controller!,
-                controls: NoVideoControls,
-                fit: BoxFit.contain,
-              )
-            else
+            Video(
+              controller: pane.videoController,
+              controls: NoVideoControls,
+              fit: BoxFit.contain,
+            ),
+            if (!hasFootage) Container(color: Colors.black54),
+            if (!hasFootage)
               Center(
                 child: pane.error != null
                     ? Icon(
@@ -1427,7 +1342,7 @@ class _PbTile extends StatelessWidget {
                         color: Colors.red.shade300,
                         size: 24,
                       )
-                    : (pane.loading
+                    : (!pane.noFootage
                           ? const SizedBox(
                               width: 18,
                               height: 18,
@@ -1437,8 +1352,6 @@ class _PbTile extends StatelessWidget {
                             )
                           : const SizedBox.shrink()),
               ),
-            if (!hasFootage && pane.controller != null)
-              Container(color: Colors.black54),
             // Filmstrip scrub frame: covers the (frozen) video while dragging so
             // scrubbing is smooth and never flashes black.
             if (scrubFrame != null)
