@@ -403,6 +403,10 @@ class _MainShellState extends State<MainShell> {
   /// tab on entry. Cleared when the user navigates to a tab manually.
   ExportClipDraft? _pendingExportClip;
 
+  /// A moment handed off from Clips' "View on timeline" — opens Playback at
+  /// that time. Cleared on manual tab nav.
+  DateTime? _playbackSeekTo;
+
   /// Play-on-focus audio: exactly one pane (maximized else selected) is
   /// audible when audio is on. Owned here, driven by the global audio button
   /// and the wall's tile selection/maximize.
@@ -611,9 +615,10 @@ class _MainShellState extends State<MainShell> {
       label: label,
       color: color,
       selected: _index == i,
-      // Manual tab navigation clears a one-shot pending export clip.
+      // Manual tab navigation clears one-shot hand-offs.
       onTap: () => setState(() {
         _pendingExportClip = null;
+        _playbackSeekTo = null;
         _index = i;
       }),
     );
@@ -774,10 +779,18 @@ class _MainShellState extends State<MainShell> {
     switch (_index) {
       case _playbackIndex:
         return PlaybackScreen(
+          // Remount when a "View on timeline" hand-off arrives so _enter opens
+          // at that moment.
+          key: ValueKey(
+            _playbackSeekTo == null
+                ? 'pb'
+                : 'pb-${_playbackSeekTo!.millisecondsSinceEpoch}',
+          ),
           api: widget.api,
           session: session,
           // Mirror the current Live view's cameras (or all if none applied).
           cameras: _playbackCameras(),
+          initialTime: _playbackSeekTo,
           onClose: () => setState(() => _index = _liveIndex),
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
@@ -797,6 +810,13 @@ class _MainShellState extends State<MainShell> {
           api: widget.api,
           session: session,
           cameras: widget.cameras,
+          // Number-key hotkeys filter the list to that camera.
+          hotkeys: widget.hotkeys,
+          // "View on timeline" → open Playback at the clip's moment.
+          onViewOnTimeline: (camId, at) => setState(() {
+            _playbackSeekTo = at;
+            _index = _playbackIndex;
+          }),
         );
       case _exportIndex:
         return ExportScreen(

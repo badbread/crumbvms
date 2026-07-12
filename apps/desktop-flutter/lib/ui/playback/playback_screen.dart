@@ -43,6 +43,7 @@ class PlaybackScreen extends StatefulWidget {
     required this.onClose,
     this.hotkeys,
     this.onExportRange,
+    this.initialTime,
   });
 
   final CrumbApi api;
@@ -62,6 +63,10 @@ class PlaybackScreen extends StatefulWidget {
   /// the Export tab pre-filled with this clip.
   final void Function(String cameraId, DateTime start, DateTime end)?
   onExportRange;
+
+  /// Open the playhead at this moment on entry (e.g. Clips "View on timeline")
+  /// instead of jumping to the latest footage.
+  final DateTime? initialTime;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -207,7 +212,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _allSpans = spans;
 
     DateTime target = now;
-    if (spans.isNotEmpty) {
+    final initial = widget.initialTime?.toUtc();
+    if (initial != null) {
+      target = initial.isAfter(now) ? now : initial;
+    } else if (spans.isNotEmpty) {
       final latestEnd = spans
           .map((s) => s.end)
           .reduce((a, b) => a.isAfter(b) ? a : b);

@@ -20,13 +20,18 @@ import 'dart:typed_data';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import 'package:shared_preferences/shared_preferences.dart';
+
 import 'package:crumb_desktop/api/clips_api.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 
 enum ClipsDensity { compact, normal, large }
 
@@ -43,7 +48,12 @@ const _rangeOptions = <int, String>{
   24: '24 hours',
   72: '3 days',
   168: '7 days',
+  336: '14 days',
+  720: '30 days',
 };
+
+const _kClipsHoursKey = 'crumb.clips.hours';
+const _kClipsDensityKey = 'crumb.clips.density';
 
 class ClipsScreen extends StatefulWidget {
   const ClipsScreen({
@@ -51,11 +61,23 @@ class ClipsScreen extends StatefulWidget {
     required this.api,
     required this.session,
     required this.cameras,
+    this.initialCameraId,
+    this.hotkeys,
+    this.onViewOnTimeline,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
+
+  /// Start the list filtered to this camera (e.g. a number-key hotkey).
+  final String? initialCameraId;
+
+  /// Number-key hotkeys filter the list to the assigned camera.
+  final HotkeyConfigStore? hotkeys;
+
+  /// "View on timeline" from the clip player → open Playback at this moment.
+  final void Function(String cameraId, DateTime at)? onViewOnTimeline;
 
   @override
   State<ClipsScreen> createState() => _ClipsScreenState();
@@ -86,7 +108,40 @@ class _ClipsScreenState extends State<ClipsScreen> {
   @override
   void initState() {
     super.initState();
+    _cameraId = widget.initialCameraId;
+    _restorePrefs();
     _load();
+  }
+
+  Future<void> _restorePrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final h = prefs.getInt(_kClipsHoursKey);
+      final d = prefs.getString(_kClipsDensityKey);
+      if (!mounted) return;
+      setState(() {
+        if (h != null && _rangeOptions.containsKey(h)) _hours = h;
+        if (d != null) {
+          _density = ClipsDensity.values.firstWhere(
+            (e) => e.name == d,
+            orElse: () => _density,
+          );
+        }
+      });
+      _load();
+    } catch (_) {
+      /* prefs unavailable — in-memory only */
+    }
+  }
+
+  Future<void> _persistPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_kClipsHoursKey, _hours);
+      await prefs.setString(_kClipsDensityKey, _density.name);
+    } catch (_) {
+      /* best-effort */
+    }
   }
 
   List<String> get _cameraIds =>
@@ -182,6 +237,7 @@ class _ClipsScreenState extends State<ClipsScreen> {
     const order = [ClipsDensity.compact, ClipsDensity.normal, ClipsDensity.large];
     final next = order[(order.indexOf(_density) + 1) % order.length];
     setState(() => _density = next);
+    _persistPrefs();
   }
 
   double _tileExtent() {
@@ -195,9 +251,15 @@ class _ClipsScreenState extends State<ClipsScreen> {
     }
   }
 
+  void _filterToCamera(String cameraId) {
+    if (cameraId == _cameraId) return;
+    setState(() => _cameraId = cameraId);
+    _load();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    final scaffold = Scaffold(
       backgroundColor: const Color(0xFF17181C),
       body: Stack(
         children: [
@@ -220,9 +282,27 @@ class _ClipsScreenState extends State<ClipsScreen> {
               clip: _playing!,
               motionHighlightSeconds: _motionHighlightSeconds,
               onClose: () => setState(() => _playing = null),
+              onViewOnTimeline: widget.onViewOnTimeline == null
+                  ? null
+                  : () {
+                      final c = _playing!;
+                      setState(() => _playing = null);
+                      widget.onViewOnTimeline!(c.cameraId, c.startTs);
+                    },
             ),
         ],
       ),
+    );
+
+    // Number-key hotkeys filter the clips list to the assigned camera.
+    final hk = widget.hotkeys;
+    if (hk == null) return scaffold;
+    return GlobalHotkeysListener(
+      store: hk,
+      cameras: widget.cameras,
+      autofocus: true,
+      onGoToCamera: _filterToCamera,
+      child: scaffold,
     );
   }
 
@@ -272,6 +352,7 @@ class _ClipsScreenState extends State<ClipsScreen> {
             onChanged: (v) {
               if (v == null) return;
               setState(() => _hours = v);
+              _persistPrefs();
               _load();
             },
           ),
@@ -635,6 +716,7 @@ class _ClipPlayer extends StatefulWidget {
     required this.clip,
     required this.motionHighlightSeconds,
     required this.onClose,
+    this.onViewOnTimeline,
   });
 
   final CrumbApi api;
@@ -642,6 +724,7 @@ class _ClipPlayer extends StatefulWidget {
   final ClipDescriptor clip;
   final int motionHighlightSeconds;
   final VoidCallback onClose;
+  final VoidCallback? onViewOnTimeline;
 
   @override
   State<_ClipPlayer> createState() => _ClipPlayerState();
@@ -925,8 +1008,18 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     final c = widget.clip;
     final label = c.kind == 'motion' ? 'Motion' : (c.label.isEmpty ? 'Detection' : c.label);
     return Positioned.fill(
-      child: Material(
-        color: Colors.black.withValues(alpha: 0.92),
+      child: Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent &&
+              event.logicalKey == LogicalKeyboardKey.escape) {
+            widget.onClose();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Material(
+          color: Colors.black.withValues(alpha: 0.92),
         child: LayoutBuilder(
           builder: (context, constraints) {
             _paneSize = Size(constraints.maxWidth, constraints.maxHeight * 0.82);
@@ -956,6 +1049,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
             );
           },
         ),
+      ),
       ),
     );
   }
@@ -1004,8 +1098,18 @@ class _ClipPlayerState extends State<_ClipPlayer> {
                         onPressed: _bookmark,
                         icon: const Icon(Icons.bookmark_add_outlined, color: Colors.white70, size: 20),
                       ),
+                      if (widget.onViewOnTimeline != null)
+                        IconButton(
+                          tooltip: 'View on timeline',
+                          onPressed: widget.onViewOnTimeline,
+                          icon: const Icon(
+                            Icons.timeline,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                        ),
                       IconButton(
-                        tooltip: 'Close',
+                        tooltip: 'Close (Esc)',
                         onPressed: widget.onClose,
                         icon: const Icon(Icons.close, color: Colors.white70, size: 22),
                       ),
