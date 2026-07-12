@@ -424,6 +424,30 @@ pub async fn run(
 /// open-source set, and the accumulated signals all carry across an
 /// error/stall restart of the ffmpeg child instead of being silently reset
 /// (which used to discard the remainder of the event).
+/// The audio ffmpeg args for the `-c copy` segmenter, given the camera's
+/// `record_audio` policy.
+///
+/// When `record_audio` is false → `-an` (drop the audio output stream).
+///
+/// When true → `-copyinkf:a` ("copy initial non-keyframes", audio streams
+/// only), which is **LOAD-BEARING, not a nicety**. Under `-c copy` ffmpeg's CLI
+/// silently discards every packet on a stream until it sees the first packet
+/// flagged as a keyframe. Video packets get that flag at each IDR, so video
+/// records; but the RTSP/RTP AAC (MPEG4-GENERIC) depacketizer never sets the
+/// key flag on ANY audio packet, so without this flag 100% of audio packets are
+/// dropped before the muxer. The moov still declares the aac track (from the
+/// stream's SDP), so the result is a declared-but-EMPTY audio track — silent
+/// footage, with no warning at any normal log level. See
+/// `docs/RECORDER-CORRECTNESS.md`: a declared track must carry decodable
+/// packets. Zero-transcode is preserved (this only ungates copying).
+fn audio_segmenter_args(record_audio: bool) -> &'static [&'static str] {
+    if record_audio {
+        &["-copyinkf:a"]
+    } else {
+        &["-an"]
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_loop(
     camera: &Camera,
@@ -765,14 +789,10 @@ async fn run_ffmpeg_loop(
         // pure container-level retag (no transcode); harmless for H.264 streams.
         .args(["-tag:v", "hvc1"]);
 
-    // Drop audio when the policy says so.  `-an` must come after `-c copy` so
-    // ffmpeg interprets it as "disable audio output stream" rather than
-    // overriding a stream-specifier codec.  When `record_audio` is true the
-    // `-c copy` codec selection already carries the audio track through without
-    // transcoding — no extra flag needed.
-    if !camera.policy.record_audio {
-        ffmpeg_cmd.arg("-an");
-    }
+    // Audio handling (see [`audio_segmenter_args`]).  These must come after
+    // `-c copy` so ffmpeg reads `-an` as "disable audio output" rather than
+    // overriding a stream-specifier codec.
+    ffmpeg_cmd.args(audio_segmenter_args(camera.policy.record_audio));
 
     ffmpeg_cmd
         // Segmenter muxer
@@ -3061,6 +3081,41 @@ mod tests {
     // Helper to build a UTC DateTime quickly.
     fn utc(y: i32, mo: u32, d: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, m, s).unwrap()
+    }
+
+    // ── audio segmenter args (declared-track-must-carry-packets invariant) ──────
+
+    #[test]
+    fn audio_args_copy_initial_non_keyframes_when_recording_audio() {
+        // The load-bearing case: with `-c copy`, ffmpeg drops every packet
+        // until the first keyframe-flagged one, and RTP-AAC audio is NEVER
+        // key-flagged — so without `-copyinkf:a` the recorded segment declares
+        // an aac track (from the SDP) but contains ZERO audio packets. This
+        // guards against a future cleanup silently dropping the flag and
+        // reintroducing the empty-audio-track footage bug.
+        let args = audio_segmenter_args(true);
+        assert!(
+            args.contains(&"-copyinkf:a"),
+            "record_audio=true must pass -copyinkf:a so audio packets aren't \
+             gated out of the copy; got {args:?}"
+        );
+        assert!(
+            !args.contains(&"-an"),
+            "record_audio=true must NOT disable audio; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn audio_args_disable_audio_when_not_recording_audio() {
+        let args = audio_segmenter_args(false);
+        assert!(
+            args.contains(&"-an"),
+            "record_audio=false must pass -an; got {args:?}"
+        );
+        assert!(
+            !args.contains(&"-copyinkf:a"),
+            "record_audio=false has no audio to copy; got {args:?}"
+        );
     }
 
     // ── classify_failure (cold-start fast retry) ────────────────────────────────

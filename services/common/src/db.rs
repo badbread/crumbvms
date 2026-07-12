@@ -10259,6 +10259,21 @@ mod tests {
             .await
             .expect("create table + index");
 
+        // De-flake under `cargo test --workspace` parallelism (CI): the reap's
+        // `DROP INDEX` needs ACCESS EXCLUSIVE on `widgets`, and the only session
+        // that can otherwise contend for it on this test's private-schema table
+        // is autovacuum (SHARE UPDATE EXCLUSIVE, which conflicts). Under heavy
+        // parallel load a freshly created + catalog-UPDATE'd table can draw an
+        // autovacuum that holds that lock past the connection's `lock_timeout`,
+        // so the reap exhausts its retries and (correctly, safe-direction) SKIPS
+        // the drop — making this assertion flaky. Turning autovacuum off for the
+        // table removes the sole external lock contender so the drop is
+        // deterministic; it does not weaken what the test checks.
+        client
+            .batch_execute("ALTER TABLE widgets SET (autovacuum_enabled = false)")
+            .await
+            .expect("disable autovacuum on the fixture table");
+
         // Simulate the catalog state a killed CREATE INDEX CONCURRENTLY
         // leaves behind: the index exists but is marked NOT VALID.
         client
@@ -10281,22 +10296,42 @@ mod tests {
             .get(0);
         assert!(still_present_before, "fixture setup: index should exist");
 
-        reap_invalid_indexes(&client)
+        // De-flake under `cargo test --workspace`: this test races ~16 parallel
+        // DDL-heavy tests on a single Postgres, so a reap pass can hit transient
+        // contention and (correctly, safe-direction) SKIP the drop that pass.
+        // The production reaper runs on EVERY boot, so the real contract is
+        // "drops within a few passes", not "drops on the very first". Use a short
+        // per-attempt lock_timeout so a contended pass fails fast instead of
+        // stalling, and retry the idempotent reap until the index is gone.
+        // (Disabling autovacuum on the fixture table above was not enough on its
+        // own — the remaining contention is catalog-wide from the parallel DDL.)
+        client
+            .batch_execute("SET lock_timeout = '1s'")
             .await
-            .expect("reap_invalid_indexes");
+            .expect("shorten lock_timeout for the reap retries");
 
-        let still_present_after: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
-                &[],
-            )
-            .await
-            .expect("check index exists after reap")
-            .get(0);
+        let mut still_present_after = true;
+        for _ in 0..40 {
+            reap_invalid_indexes(&client)
+                .await
+                .expect("reap_invalid_indexes");
+            still_present_after = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                    &[],
+                )
+                .await
+                .expect("check index exists after reap")
+                .get(0);
+            if !still_present_after {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         assert!(
             !still_present_after,
-            "reap_invalid_indexes must DROP an INVALID index so a later \
-             CREATE INDEX IF NOT EXISTS rebuilds it"
+            "reap_invalid_indexes must DROP an INVALID index (within a few \
+             passes) so a later CREATE INDEX IF NOT EXISTS rebuilds it"
         );
 
         // A VALID index must be left completely alone.

@@ -121,3 +121,29 @@ recorder, and later the API) must satisfy these *by construction*.
     (a human pin outranks the automatic cap); and batch-limited so first enabling a
     short cap converges over ticks instead of one mass delete. When set it can only
     remove footage *sooner* than the other knobs would, never keep it longer.
+
+## declared tracks must carry decodable packets (audio-integrity)
+23. **A recorded segment MUST contain decodable media PACKETS for every track it
+    declares — a declared-but-empty track is a silent footage-integrity failure,
+    and `-copyinkf:a` on the `-c copy` audio path is load-bearing against it.**
+    Under stream-copy, ffmpeg's CLI silently discards every packet on a stream
+    until it sees the first packet flagged as a keyframe. Video packets are
+    key-flagged at each IDR (so video records), but the RTSP/RTP AAC
+    (MPEG4-GENERIC) depacketizer never sets the key flag on ANY audio packet, so
+    without `-copyinkf:a` ("copy initial non-keyframes", audio streams only) 100%
+    of audio packets are dropped before the muxer — while the moov still declares
+    the aac track from the stream's SDP. The result probes as a healthy segment
+    (ffprobe lists an aac stream) but has ZERO audio samples: silent playback,
+    silent export, no warning at any normal log level. So `-copyinkf:a` is emitted
+    on **both** `-c copy` audio sites (recorder `audio_segmenter_args`, and the
+    export's `-f concat … -c:a copy` in `services/api/src/export.rs` — mandatory
+    there too because the recorded fMP4's `trun` sample flags faithfully preserve
+    the missing key flag, so even a correctly-recorded segment reads back with its
+    audio unflagged and a plain concat-copy re-drops it). Decode paths (re-encode
+    exports, clip playback/preview/thumbnails) are unaffected — the keyframe gate
+    is a stream-copy behavior only. This is zero-transcode; it only ungates the
+    copy. It does NOT touch the fMP4 crash-safety flags (item 1). Because a
+    declared-but-empty track looks healthy to ffprobe's stream listing, the only
+    reliable detector is a packet count: the segmenter's audio args are unit-
+    tested to keep `-copyinkf:a`, and any integration check must assert
+    `nb_read_packets > 0` on the audio stream, not merely that the stream exists.
