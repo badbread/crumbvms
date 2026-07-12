@@ -1455,25 +1455,39 @@ pub async fn run(
     // One supervised loop per enabled source. Each publishes to its OWN per-source
     // health watch (so a per-source alert fires by name) and feeds the shared
     // motion channel; the aggregator collapses the watches into camera health.
-    let mut supervisors = tokio::task::JoinSet::new();
+    //
+    // We keep a CLONE of every per-source health sender here (`src_txs`). A
+    // panicked source task drops ITS sender clone without ever running its
+    // "motion source exiting" unhealthy report — without our retained clone the
+    // aggregator's watch would close on the source's last-known value (often
+    // healthy) and a Motion-mode camera would stay motion-gated on a dead
+    // detector, silently missing footage (correctness item 19). The retained
+    // clone (a) keeps the watch channel open, (b) lets the supervision loop
+    // below force the dead source unhealthy the instant its task ends, and
+    // (c) lets the respawned task publish onto the SAME watch the aggregator
+    // already reads.
+    let mut supervisors: tokio::task::JoinSet<SourceKind> = tokio::task::JoinSet::new();
     let mut pixel_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
     let mut frigate_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
     let mut ha_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+    let mut src_txs: std::collections::HashMap<SourceKind, MotionHealthTx> =
+        std::collections::HashMap::new();
+    let mut task_kinds: std::collections::HashMap<tokio::task::Id, SourceKind> =
+        std::collections::HashMap::new();
 
-    for kind in enabled.iter().copied() {
-        // Start unhealthy: a source is not trusted until its loop proves healthy.
-        let (src_tx, src_rx) = tokio::sync::watch::channel(false);
-        match kind {
-            SourceKind::Pixel => pixel_rx = Some(src_rx),
-            SourceKind::Frigate => frigate_rx = Some(src_rx),
-            SourceKind::Ha => ha_rx = Some(src_rx),
-        }
+    // Spawn (or respawn) ONE source task; the returned SourceKind lets the
+    // supervision loop identify a cleanly-returned task, and `task_kinds` maps
+    // a panicked task's id back to its source.
+    let spawn_source = |supervisors: &mut tokio::task::JoinSet<SourceKind>,
+                        task_kinds: &mut std::collections::HashMap<tokio::task::Id, SourceKind>,
+                        kind: SourceKind,
+                        src_tx: MotionHealthTx| {
         let camera = camera.clone();
         let pool = pool.clone();
         let config = config.clone();
         let motion_tx = motion_tx.clone();
         let cancel = cancel.clone();
-        supervisors.spawn(async move {
+        let handle = supervisors.spawn(async move {
             run_one_source(
                 kind,
                 camera,
@@ -1485,7 +1499,21 @@ pub async fn run(
                 alert_after_secs,
             )
             .await;
+            kind
         });
+        task_kinds.insert(handle.id(), kind);
+    };
+
+    for kind in enabled.iter().copied() {
+        // Start unhealthy: a source is not trusted until its loop proves healthy.
+        let (src_tx, src_rx) = tokio::sync::watch::channel(false);
+        match kind {
+            SourceKind::Pixel => pixel_rx = Some(src_rx),
+            SourceKind::Frigate => frigate_rx = Some(src_rx),
+            SourceKind::Ha => ha_rx = Some(src_rx),
+        }
+        src_txs.insert(kind, src_tx.clone());
+        spawn_source(&mut supervisors, &mut task_kinds, kind, src_tx);
     }
 
     // Health aggregator: collapses the per-source watches into the single camera
@@ -1501,9 +1529,72 @@ pub async fn run(
         })
     };
 
-    // Wait for cancellation; the source loops observe the same token and exit,
-    // then the aggregator (also watching the token) publishes a final unhealthy.
-    cancel.cancelled().await;
+    // Supervise the source tasks until cancellation (the motion-task twin of
+    // main.rs's `respawn_dead_services`, audit #75). `run_one_source` loops
+    // until the token fires, so a task that ends OUTSIDE shutdown died
+    // unexpectedly — in practice a panic (panics unwind and kill just that
+    // task's future). Without this, a panicked source never runs its exit
+    // report, and a Motion-mode camera would sit motion-gated on a dead
+    // detector forever (correctness item 19). On a dead source we (1) force
+    // its health watch to unhealthy IMMEDIATELY — the aggregator drives the
+    // camera to fail-open (record everything) while the source is down — and
+    // (2) respawn it after a short delay onto the same watch.
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            joined = supervisors.join_next_with_id() => {
+                let Some(joined) = joined else {
+                    // No source task left to supervise (unreachable while every
+                    // dead source is respawned below); just await shutdown.
+                    cancel.cancelled().await;
+                    break;
+                };
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let kind = match joined {
+                    Ok((id, kind)) => {
+                        task_kinds.remove(&id);
+                        warn!(
+                            camera_id = %camera_id,
+                            source = kind.as_str(),
+                            "motion source task ended unexpectedly; failing open and respawning"
+                        );
+                        Some(kind)
+                    }
+                    Err(e) => {
+                        let kind = task_kinds.remove(&e.id());
+                        error!(
+                            camera_id = %camera_id,
+                            source = kind.map_or("unknown", SourceKind::as_str),
+                            error = %e,
+                            "motion source task PANICKED; failing open and respawning"
+                        );
+                        kind
+                    }
+                };
+                let Some(kind) = kind else { continue };
+                // Force the dead source unhealthy NOW (its panic skipped the
+                // "motion source exiting" report): the aggregator must never
+                // keep trusting the last-known health of a dead detector.
+                if let Some(src_tx) = src_txs.get(&kind) {
+                    let _ = src_tx.send(false);
+                }
+                // Brief pause so a source that panics on entry cannot hot-spin;
+                // the source reads unhealthy (fail-open) for the whole gap.
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(tokio::time::Duration::from_secs(BACKOFF_BASE_SECS)) => {}
+                }
+                if let Some(src_tx) = src_txs.get(&kind) {
+                    spawn_source(&mut supervisors, &mut task_kinds, kind, src_tx.clone());
+                }
+            }
+        }
+    }
+
+    // Shutdown: the source loops observe the same token and exit, then the
+    // aggregator (also watching the token) publishes a final unhealthy.
     while supervisors.join_next().await.is_some() {}
     let _ = aggregator.await;
 
@@ -1799,8 +1890,21 @@ async fn aggregate_health(
             (SourceKind::Frigate, &frigate_rx),
             (SourceKind::Ha, &ha_rx),
         ] {
-            let Some(rx) = rx else { continue };
-            let cur = *rx.borrow();
+            if !enabled.contains(&kind) {
+                continue;
+            }
+            // An enabled source whose slot is `None` had its sender DROPPED
+            // (the source task panicked/ended and `changed_opt` cleared the
+            // slot). Its last-known health — often healthy — must never be
+            // trusted: read it as down so the gate fails open (record
+            // everything, correctness item 19) instead of leaving a
+            // Motion-mode camera gated on a dead detector. Belt-and-braces:
+            // `run` retains a sender clone and respawns dead sources, so this
+            // path only fires if the motion task itself is dying.
+            let cur = match rx {
+                Some(rx) => *rx.borrow(),
+                None => false,
+            };
             let was = last_healthy.insert(kind, cur).unwrap_or(false);
             if !cur && was {
                 down_since.insert(kind, now); // just transitioned down
@@ -1842,7 +1946,10 @@ async fn aggregate_health(
 
 /// Await the next change on an optional per-source health watch. A `None` slot
 /// never resolves (that source isn't enabled); if the sender is dropped the slot
-/// is cleared so it stops being polled.
+/// is cleared so it stops being polled — and the aggregator's scan reads a
+/// cleared ENABLED slot as down (never its stale last value), so a dead source
+/// task drives the gate to fail-open rather than freezing its last-known
+/// health (correctness item 19).
 async fn changed_opt(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
     match rx {
         Some(r) => {
@@ -5564,5 +5671,52 @@ mod tests {
             }
             println!();
         }
+    }
+
+    // ── health aggregator: dropped source sender ⇒ fail-open ────────────────────
+
+    /// Await the camera health watch reaching `want`, with a hard timeout so a
+    /// broken aggregator fails the test instead of hanging it.
+    async fn wait_for_camera_health(rx: &mut tokio::sync::watch::Receiver<bool>, want: bool) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx.wait_for(|&v| v == want),
+        )
+        .await
+        .expect("timed out waiting for the aggregated camera health value")
+        .expect("camera health watch sender dropped");
+    }
+
+    /// A source task that panics drops its health sender without ever running
+    /// its "motion source exiting" unhealthy report. The aggregator must NOT
+    /// keep the source's last-known (healthy) reading — the gate has to fail
+    /// open (record everything, correctness item 19), never leave a
+    /// Motion-mode camera gated on a dead detector.
+    #[tokio::test]
+    async fn dropped_source_sender_drives_fail_open() {
+        let (src_tx, src_rx) = tokio::sync::watch::channel(false);
+        let (cam_tx, mut cam_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
+        let aggregator = tokio::spawn(aggregate_health(
+            vec![SourceKind::Pixel],
+            Some(src_rx),
+            None,
+            None,
+            cam_tx,
+            uuid::Uuid::nil(),
+            cancel.clone(),
+        ));
+
+        // The source proves healthy → the camera is healthy (motion-gated).
+        src_tx.send(true).expect("aggregator holds the receiver");
+        wait_for_camera_health(&mut cam_rx, true).await;
+
+        // The source task "panics": its sender is dropped mid-healthy. The
+        // camera must flip to fail-open, not freeze on the stale healthy.
+        drop(src_tx);
+        wait_for_camera_health(&mut cam_rx, false).await;
+
+        cancel.cancel();
+        let _ = aggregator.await;
     }
 }

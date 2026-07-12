@@ -99,9 +99,17 @@ const MOTION_CHANNEL_CAPACITY: usize = 256;
 /// motion. The wrapper therefore books the loss per HANDLE in shared state
 /// that [`forward_motion_health`] folds into the recording task's fail-open
 /// signal: a lost verdict degrades to record-everything (correctness item 19),
-/// never to silence. The debt clears on this handle's next ACCEPTED signal —
-/// the edge at which the source's transition tracker and the recording task's
-/// union agree again — so recovery is automatic once the channel drains.
+/// never to silence. The debt clears on this handle's next ACCEPTED signal
+/// **after which the source is genuinely idle** — a completed event
+/// (`stopped_at` set) — so recovery is automatic once the channel drains.
+/// Clearing on just *any* next accepted signal would be too early: when the
+/// LOST edge was a START, the very next accepted signal is that same event's
+/// STOP, and ending fail-open at the stop instant would leave the
+/// boundary-spanning tail segment and the `motion_post_seconds` post-roll
+/// exposed (the recording task's union never saw the event). Coordination
+/// boundary (#2/#5): recording.rs treats an unmatched STOP received while
+/// healthy as a synthetic post-buffer trigger, which is what makes clearing
+/// at the accepted STOP footage-safe.
 pub struct MotionTx {
     tx: tokio::sync::mpsc::Sender<crumb_common::MotionSignal>,
     camera_id: Uuid,
@@ -147,18 +155,29 @@ impl MotionTx {
     /// On failure (channel full — or closed, i.e. the recording task is gone,
     /// which is an even less trustworthy state) the signal is lost: mark this
     /// handle's debt so the camera fails OPEN until the same handle delivers a
-    /// fresh edge. The error is still returned so callers keep their existing
-    /// per-drop warning logs.
+    /// fresh accepted signal AFTER WHICH it is genuinely idle (a completed
+    /// event, `stopped_at` set). An accepted START edge does NOT clear the
+    /// debt: if the lost edge was itself a START, the union missed the whole
+    /// event, and ending fail-open before the event has fully closed (and its
+    /// unmatched STOP has reached the recording task, which converts it into a
+    /// synthetic post-buffer trigger — the recording.rs half of this fix)
+    /// could ring-discard the boundary tail + post-roll. The error is still
+    /// returned so callers keep their existing per-drop warning logs.
     pub fn try_send(
         &self,
         signal: crumb_common::MotionSignal,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<crumb_common::MotionSignal>> {
+        // Whether, after this signal, the source has no open event. Captured
+        // before the send moves the signal into the channel.
+        let source_idle = signal.stopped_at.is_some();
         match self.tx.try_send(signal) {
             Ok(()) => {
-                if self.lost.swap(false, Ordering::SeqCst) {
-                    // The channel accepted a fresh edge from this handle: the
-                    // recording task's view of this source re-syncs at this
-                    // edge, so the debt (and with it fail-open) can end.
+                if source_idle && self.lost.swap(false, Ordering::SeqCst) {
+                    // The channel accepted a completed event from this handle:
+                    // the source is idle and the recording task's view of it
+                    // re-syncs at this edge (an unmatched STOP is a synthetic
+                    // post-buffer trigger on the recording side), so the debt
+                    // (and with it fail-open) can end.
                     self.shared.lost_handles.fetch_sub(1, Ordering::SeqCst);
                     self.shared.changed.notify_one();
                 }
@@ -884,6 +903,10 @@ impl RecorderSupervisor {
         }
         if service_task_died(&self.migration_handle) {
             error!("migration worker task ended unexpectedly (likely a panic); respawning");
+            // The dead incarnation's claimed migration (if any) is left with
+            // status='running'; the respawned worker's idle poll re-runs the
+            // boot path's guaranteed-stale reset (see `run_migration_worker`)
+            // so the drain resumes instead of freezing at N%.
             self.spawn_migration_worker();
         }
         if service_task_died(&self.reaper_handle) {
@@ -1128,7 +1151,13 @@ const POLICY_REAP_SECONDS: u64 = 3600;
 /// `ARCHIVE_GUARD` (per batch) so footage moves never race archiving/eviction.
 /// A failed run is recorded as `failed` with the error; the loop continues so a
 /// later migration isn't blocked. Cheap when idle (a single indexed query per
-/// poll).
+/// poll, plus the stale-`running` self-heal below — one no-op UPDATE against a
+/// tiny table).
+///
+/// Self-heals a migration orphaned by a PANICKED predecessor: the #75 watchdog
+/// respawns this worker, and the idle poll re-runs the boot path's
+/// guaranteed-stale reset (`reset_stale_migrations`) so the drain the dead
+/// incarnation had claimed resumes instead of freezing at `running` forever.
 async fn run_migration_worker(pool: Pool, cancel: CancellationToken) {
     loop {
         // Claim before sleeping so a freshly-enqueued migration starts promptly on
@@ -1167,6 +1196,37 @@ async fn run_migration_worker(pool: Pool, cancel: CancellationToken) {
                 // Loop straight back to pick up any other pending migration.
             }
             Ok(None) => {
+                // Nothing 'pending' — but a row stuck in 'running' can still
+                // exist: the #75 watchdog respawns this worker after a panic,
+                // and the migration the dead incarnation had claimed stays
+                // 'running' forever (this loop only claims 'pending'), freezing
+                // the operator's storage repoint at N%. This worker is the ONLY
+                // claimer (we hold the recorder singleton advisory lock, R7)
+                // and it is idle right now, so any 'running' row here is
+                // guaranteed stale. Reuse the boot path's reset verbatim — its
+                // 2-minute freshness guard only bounds how quickly a
+                // freshly-orphaned row is recovered (a later idle poll gets it).
+                match db::reset_stale_migrations(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        info!(
+                            reset = n,
+                            "migration worker: reset stale 'running' migration rows to \
+                             'pending' (previous worker incarnation died mid-drain); resuming"
+                        );
+                        // Claim the reset row promptly instead of idling —
+                        // unless shutdown fired meanwhile (never start a fresh
+                        // drain into a teardown).
+                        if cancel.is_cancelled() {
+                            info!("migration worker shutting down");
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "migration worker: reset_stale_migrations failed; will retry next poll");
+                    }
+                }
                 tokio::select! {
                     () = tokio::time::sleep(tokio::time::Duration::from_secs(MIGRATION_POLL_SECONDS)) => {}
                     () = cancel.cancelled() => { info!("migration worker shutting down"); break; }
@@ -1572,7 +1632,7 @@ mod tests {
 
     // ── motion-signal loss → fail-open (audit #81) ────────────────────────────
 
-    /// Minimal signal for the loss-tracking tests.
+    /// Minimal START-edge signal (event still open) for the loss-tracking tests.
     fn mk_signal() -> crumb_common::MotionSignal {
         crumb_common::MotionSignal {
             camera_id: Uuid::nil(),
@@ -1583,8 +1643,23 @@ mod tests {
         }
     }
 
+    /// Minimal STOP-edge signal (completed event — the source is idle after it).
+    fn mk_stop_signal() -> crumb_common::MotionSignal {
+        crumb_common::MotionSignal {
+            camera_id: Uuid::nil(),
+            started_at: Utc::now(),
+            stopped_at: Some(Utc::now()),
+            peak_score: 0.5,
+            bbox: None,
+        }
+    }
+
     /// A signal dropped on a full channel must mark the loss (the camera owes
-    /// a fail-open), and the SAME handle's next accepted signal must clear it.
+    /// a fail-open). The debt must NOT clear on the next accepted signal if
+    /// that signal leaves an event open (a START edge — the lost edge may have
+    /// been the START of an event the union never saw, audit #81); it clears
+    /// only on an accepted signal after which the source is genuinely idle
+    /// (a completed event, `stopped_at` set).
     #[tokio::test]
     async fn motion_tx_overflow_marks_loss_until_resync() {
         let (raw, mut rx) = tokio::sync::mpsc::channel(1);
@@ -1601,9 +1676,18 @@ mod tests {
         assert!(tx.try_send(mk_signal()).is_err());
         assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
 
-        // Drain, then a fresh accepted edge re-syncs the source: debt cleared.
+        // Drain, then an accepted START edge: the source now has an OPEN
+        // event, so the debt (and fail-open) must be HELD, not cleared —
+        // clearing here could end fail-open at the lost event's own STOP and
+        // expose the boundary tail + post-roll.
         assert!(rx.recv().await.is_some());
         assert!(tx.try_send(mk_signal()).is_ok());
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
+
+        // Drain, then an accepted COMPLETED event (stop edge): the source is
+        // genuinely idle — debt cleared, fail-open may end.
+        assert!(rx.recv().await.is_some());
+        assert!(tx.try_send(mk_stop_signal()).is_ok());
         assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 0);
     }
 
@@ -1621,9 +1705,10 @@ mod tests {
         assert!(b.try_send(mk_signal()).is_err()); // b loses a signal
         assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
 
-        // a's accepted send (after a drain) must not clear b's debt.
+        // a's accepted send (after a drain) must not clear b's debt — not even
+        // a stop edge, which WOULD clear a's own debt if a had one.
         assert!(rx.recv().await.is_some());
-        assert!(a.try_send(mk_signal()).is_ok());
+        assert!(a.try_send(mk_stop_signal()).is_ok());
         assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
 
         // Dropping the indebted handle hands the debt back.
@@ -1670,9 +1755,11 @@ mod tests {
         assert!(tx.try_send(mk_signal()).is_err());
         wait_for_health(&mut recording_rx, false).await;
 
-        // Drain + a fresh accepted edge → re-synced → healthy again.
+        // Drain + an accepted COMPLETED event (source idle after it) →
+        // re-synced → healthy again. (An accepted START edge would hold the
+        // debt — see motion_tx_overflow_marks_loss_until_resync.)
         assert!(rx.recv().await.is_some());
-        assert!(tx.try_send(mk_signal()).is_ok());
+        assert!(tx.try_send(mk_stop_signal()).is_ok());
         wait_for_health(&mut recording_rx, true).await;
 
         cancel.cancel();
