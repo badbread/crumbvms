@@ -51,8 +51,20 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
     return AnimatedBuilder(
       animation: widget.motion,
       builder: (context, _) {
+        // Only cameras with ACTUAL activity in the current timeline window earn
+        // a legend swatch: real motion (a bucket at/above the motion floor) or a
+        // detection. `buckets.isNotEmpty` alone let idle cameras (all-zero
+        // buckets) clutter the row — the operator asked to see only the cameras
+        // that actually did something in view.
+        final detectionCams = widget.motion.detections
+            .map((d) => d.cameraId)
+            .toSet();
         final entries = widget.motion.intensityByCam.entries
-            .where((e) => e.value.buckets.isNotEmpty)
+            .where(
+              (e) =>
+                  e.value.buckets.any((b) => b >= kMotionAbsFloor) ||
+                  detectionCams.contains(e.key),
+            )
             .map((e) => e.key)
             .toList()
           ..sort((a, b) => _nameFor(a).compareTo(_nameFor(b)));
