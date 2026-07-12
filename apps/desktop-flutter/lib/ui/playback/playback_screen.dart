@@ -98,6 +98,22 @@ class _PbPane {
   }
 }
 
+/// Cached full-range recording coverage for one camera: merged spans over
+/// `[start, freshAt]`. `freshAt` is the live edge the cache is known fresh
+/// to — the periodic top-up fetches only `[freshAt − 1 min, now]` and unions
+/// it in, so scrubbing/panning never triggers another wide query.
+class _CoverageCache {
+  _CoverageCache({
+    required this.start,
+    required this.freshAt,
+    required this.spans,
+  });
+
+  DateTime start;
+  DateTime freshAt;
+  List<RecordedSpan> spans;
+}
+
 const List<double> _speeds = [0.5, 1, 2, 4, 8];
 
 class _PlaybackScreenState extends State<PlaybackScreen> {
@@ -138,10 +154,13 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   bool _entering = true;
   String? _statusMessage;
 
-  List<RecordedSpan> _allSpans = const [];
-  DateTime? _spansLoadedStart;
-  DateTime? _spansLoadedEnd;
-  bool _spanReloadPending = false;
+  // Per-camera preloaded recording coverage for the timeline's thin bottom
+  // line. Fetched ONCE per camera across the whole navigable range (not a
+  // window around the playhead, which made the line visibly "draw itself"
+  // behind the scrubber) — see _syncCoverage.
+  final Map<String, _CoverageCache> _coverage = {};
+  final Set<String> _coverageLoading = {};
+  int _idleTicks = 0;
   bool _resolvePending = false;
 
   Timer? _tickTimer;
@@ -170,7 +189,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _enter();
     _idleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (!mounted) return;
-      _reloadSpans();
+      _idleTicks++;
+      // Live-edge top-up most ticks; a full re-fetch every ~5 min so coverage
+      // evicted by retention eventually drops off the line.
+      unawaited(_syncCoverage(force: _idleTicks % 60 == 0));
       _scheduleMotionRefresh();
     });
   }
@@ -219,10 +241,6 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   // ── entry / spans ─────────────────────────────────────────────────────────
 
-  List<RecordedSpan> _spansForSelected() => _allSpans
-      .where((s) => s.cameraId == _selectedCameraId)
-      .toList(growable: false);
-
   Future<void> _enter() async {
     final now = DateTime.now().toUtc();
     setState(() => _statusMessage = 'Loading timeline…');
@@ -234,7 +252,6 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       now.add(const Duration(minutes: 1)),
     );
     if (!mounted) return;
-    _allSpans = spans;
 
     DateTime target = now;
     final initial = widget.initialTime?.toUtc();
@@ -248,9 +265,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       target = candidate.isAfter(now) ? now : candidate;
     }
     _timeline.setPlayhead(target, now: now);
-    _timeline.setSpans(_spansForSelected());
 
-    await _reloadSpans();
+    await _syncCoverage();
     await _resolveAll(_timeline.playhead, force: true);
     if (!mounted) return;
     setState(() {
@@ -259,24 +275,120 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     });
   }
 
-  Future<void> _reloadSpans() async {
-    final spanMs = _timeline.span.inMilliseconds;
-    final marginMs = (spanMs * 0.5).round();
-    final start = _timeline.windowStart.subtract(
-      Duration(milliseconds: marginMs),
-    );
-    final end = _timeline.windowEnd.add(Duration(milliseconds: marginMs));
-    final spans = await widget.api.fetchTimeline(
-      widget.session,
-      _cameraIds,
-      start,
-      end,
-    );
-    if (!mounted) return;
-    _allSpans = spans;
-    _spansLoadedStart = start;
-    _spansLoadedEnd = end;
-    _timeline.setSpans(_spansForSelected());
+  // ── recording coverage (the timeline's thin bottom line) ──────────────────
+
+  /// Coverage preload horizon behind "now" (or behind the visible window when
+  /// the operator navigates deeper) — matches [_jumpToFirst]'s 30-day search.
+  static const Duration _coverageHorizon = Duration(days: 30);
+
+  /// Server hard cap per /timeline response (MAX_SPAN_LIMIT in timeline.rs);
+  /// pages of this size are fetched until a short page arrives.
+  static const int _coveragePageLimit = 10000;
+  static const int _coverageMaxPages = 5;
+
+  /// Bring the selected camera's coverage cache up to date and push it to the
+  /// timeline. Not cached yet, `force`, or the window navigated past the
+  /// cached start → ONE wide fetch (30 days behind min(now, window start));
+  /// already cached → top up just the live edge since `freshAt`. Pan / zoom /
+  /// scrub therefore never trigger wide queries — the coverage line is static.
+  Future<void> _syncCoverage({bool force = false}) async {
+    final camId = _selectedCameraId;
+    if (camId == null || _coverageLoading.contains(camId)) return;
+    final now = DateTime.now().toUtc();
+    final end = now.add(const Duration(minutes: 1));
+    final cached = _coverage[camId];
+
+    _coverageLoading.add(camId);
+    try {
+      if (force ||
+          cached == null ||
+          _timeline.windowStart.isBefore(cached.start)) {
+        final navStart = _timeline.windowStart.isBefore(now)
+            ? _timeline.windowStart
+            : now;
+        final start = navStart.subtract(_coverageHorizon);
+        final spans = await _fetchCoverage(camId, start, end);
+        if (!mounted) return;
+        _coverage[camId] = _CoverageCache(
+          start: start,
+          freshAt: now,
+          spans: spans,
+        );
+      } else {
+        // Debounce back-to-back top-ups (commit-seek right after an idle tick).
+        if (now.difference(cached.freshAt) < const Duration(seconds: 2)) {
+          return;
+        }
+        final fresh = await _fetchCoverage(
+          camId,
+          cached.freshAt.subtract(const Duration(minutes: 1)),
+          end,
+        );
+        if (!mounted) return;
+        cached.spans = _unionSpans(cached.spans, fresh);
+        cached.freshAt = now;
+      }
+    } finally {
+      _coverageLoading.remove(camId);
+    }
+    if (camId == _selectedCameraId) {
+      _timeline.setSpans(_coverage[camId]!.spans);
+    }
+  }
+
+  /// Fetch every merged recorded span for [cameraId] over `[start, end)`,
+  /// paging past the server's per-response span cap.
+  Future<List<RecordedSpan>> _fetchCoverage(
+    String cameraId,
+    DateTime start,
+    DateTime end,
+  ) async {
+    final all = <RecordedSpan>[];
+    var offset = 0;
+    for (var page = 0; page < _coverageMaxPages; page++) {
+      final spans = await widget.api.fetchTimeline(
+        widget.session,
+        [cameraId],
+        start,
+        end,
+        limit: _coveragePageLimit,
+        offset: offset,
+      );
+      all.addAll(spans);
+      if (spans.length < _coveragePageLimit) break;
+      offset += spans.length;
+    }
+    return all;
+  }
+
+  /// Union two span lists into one sorted, merged list (single camera).
+  /// Overlaps and sub-second seams are merged with the same 1 s tolerance as
+  /// the server's GAP_TOLERANCE_MS so a live-edge top-up extends the current
+  /// span instead of stacking a duplicate next to it.
+  List<RecordedSpan> _unionSpans(
+    List<RecordedSpan> a,
+    List<RecordedSpan> b,
+  ) {
+    const gapMs = 1000;
+    final all = [...a, ...b]..sort((x, y) => x.startMs.compareTo(y.startMs));
+    final out = <RecordedSpan>[];
+    for (final s in all) {
+      final last = out.isEmpty ? null : out.last;
+      if (last != null && s.startMs <= last.endMs + gapMs) {
+        if (s.endMs > last.endMs) {
+          out[out.length - 1] = RecordedSpan(
+            cameraId: last.cameraId,
+            start: last.start,
+            end: s.end,
+            hasMotion: last.hasMotion || s.hasMotion,
+            stage: last.stage,
+          );
+        }
+      } else {
+        out.add(s);
+      }
+    }
+    return out;
   }
 
   // ── segment resolve ─────────────────────────────────────────────────────────
@@ -441,12 +553,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         _scrubFrames.clear();
       });
     }
-    await _reloadSpans();
+    // Coverage is preloaded (static) — this only extends the cache if the
+    // operator navigated past its horizon, so don't hold up the video resolve.
+    unawaited(_syncCoverage());
     await _resolveAll(t, force: true);
   }
 
   Future<void> _onZoomChanged() async {
-    await _reloadSpans();
+    unawaited(_syncCoverage());
     await _resolveAll(_timeline.playhead, force: true);
   }
 
@@ -614,15 +728,6 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (next.isAfter(nowUtc)) next = nowUtc;
     _timeline.setPlayhead(next, now: nowUtc);
 
-    if (_spansLoadedStart == null ||
-        _timeline.windowStart.isBefore(_spansLoadedStart!) ||
-        _timeline.windowEnd.isAfter(_spansLoadedEnd!)) {
-      if (!_spanReloadPending) {
-        _spanReloadPending = true;
-        _reloadSpans().whenComplete(() => _spanReloadPending = false);
-      }
-    }
-
     if (!_resolvePending) {
       _resolvePending = true;
       _resolveAll(next).whenComplete(() => _resolvePending = false);
@@ -736,7 +841,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   void _selectCamera(String cameraId) {
     if (cameraId == _selectedCameraId) return;
     setState(() => _selectedCameraId = cameraId);
-    _timeline.setSpans(_spansForSelected());
+    // Instant repaint from the cache (empty on first select of this camera),
+    // then preload / live-edge top-up in the background.
+    _timeline.setSpans(_coverage[cameraId]?.spans ?? const []);
+    unawaited(_syncCoverage());
     _scheduleMotionRefresh(); // redraw the selected motion track prominent
   }
 

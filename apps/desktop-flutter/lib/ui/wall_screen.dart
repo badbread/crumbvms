@@ -100,6 +100,23 @@ class _WallScreenState extends State<WallScreen> {
   /// in here are plain cameras (or empty).
   Map<int, SpecialTileSpec> _specsBySlot = const {};
 
+  /// Stable per-camera GlobalKeys for the wall tiles. Keying a plain camera
+  /// tile by CAMERA (not by view+slot) lets Flutter move the tile's element —
+  /// and the live, already-decoding Player inside it — to its new position
+  /// when the wall relayouts (view switch, default grid ↔ view), instead of
+  /// tearing every pane down and making each fresh mpv player wait ~a GOP
+  /// (1–2 s of black) for its first keyframe from the go2rtc restream.
+  final Map<String, GlobalKey<_WallTileState>> _tileKeys = {};
+
+  GlobalKey<_WallTileState> _tileKeyFor(String cameraId) =>
+      _tileKeys.putIfAbsent(cameraId, () => GlobalKey<_WallTileState>());
+
+  /// The maximized pane's warm-start surface: the wall tile's live controller,
+  /// captured at maximize time. The tile stays mounted (and decoding) under
+  /// the maximized overlay, so the pane can paint this at full size while its
+  /// own main-stream player waits for a keyframe — no black flash.
+  VideoController? _maximizeWarmCtrl;
+
   List<Camera> get _shown =>
       widget.cameras.where((c) => c.enabled).toList(growable: false);
 
@@ -126,6 +143,10 @@ class _WallScreenState extends State<WallScreen> {
     super.didUpdateWidget(old);
     // A different applied view (or none) → re-parse its special-tile specs.
     if (!identical(old.view, widget.view) || old.view?.id != widget.view?.id) {
+      // The new view may drop the maximized camera's tile — whose player the
+      // maximized pane could still be painting as its warm-start surface —
+      // so release the handoff before that tile is unmounted this frame.
+      _maximizeWarmCtrl = null;
       _applyViewSpecs();
     }
   }
@@ -204,14 +225,23 @@ class _WallScreenState extends State<WallScreen> {
   void _maximize(Camera cam) {
     widget.audio?.setMaximized('max:${cam.id}');
     widget.onMaximizedCameraChanged?.call(cam.id);
-    setState(() => _maximized = cam);
+    setState(() {
+      // Hand the tile's already-decoding controller to the maximized pane so
+      // it shows live video (upscaled sub stream) instead of black while its
+      // own main-stream player waits ~a GOP for its first keyframe.
+      _maximizeWarmCtrl = _tileKeys[cam.id]?.currentState?.warmController;
+      _maximized = cam;
+    });
   }
 
   /// Restore from the maximized pane back to the grid.
   void _restore() {
     widget.audio?.setMaximized(null);
     widget.onMaximizedCameraChanged?.call(null);
-    setState(() => _maximized = null);
+    setState(() {
+      _maximizeWarmCtrl = null;
+      _maximized = null;
+    });
   }
 
   @override
@@ -311,6 +341,7 @@ class _WallScreenState extends State<WallScreen> {
               liveStatus: _liveStatus,
               streamPrefs: widget.streamPrefs,
               audio: widget.audio,
+              warmController: _maximizeWarmCtrl,
               ptzClickMode:
                   widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
               onClose: _restore,
@@ -372,6 +403,10 @@ class _WallScreenState extends State<WallScreen> {
         final h = constraints.maxHeight;
         const g = 1.0; // half-gap between tiles
         final children = <Widget>[];
+        // Camera ids that already claimed their per-camera GlobalKey this
+        // build — a GlobalKey may appear at most once per frame, so a second
+        // slot showing the same camera falls back to a slot-scoped key.
+        final usedCamKeys = <String>{};
         for (var i = 0; i < layout.cells.length; i++) {
           final cell = layout.cells[i];
           final left = cell.x / layout.cols * w;
@@ -401,10 +436,20 @@ class _WallScreenState extends State<WallScreen> {
                 ? _special.resolvedCamera(i)
                 : view.slots[i];
             final cam = camId == null ? null : camById[camId];
+            // Plain camera slots key by camera (per-camera GlobalKey) so a
+            // camera shared between the outgoing and incoming view keeps its
+            // decoding player across the switch. Carousel/hotspot slots keep
+            // the old slot-scoped key — their camera changes over time, and
+            // stealing a static slot's key would just move the teardown.
+            final Key? tileKey = cam == null
+                ? null
+                : (spec == null && usedCamKeys.add(cam.id))
+                ? _tileKeyFor(cam.id)
+                : ValueKey('${view.id}:$i:${cam.id}');
             child = cam == null
                 ? const _EmptySlot()
                 : _WallTile(
-                    key: ValueKey('${view.id}:$i:${cam.id}'),
+                    key: tileKey,
                     api: widget.api,
                     session: widget.session,
                     camera: cam,
@@ -468,7 +513,10 @@ class _WallScreenState extends State<WallScreen> {
               width: (cellW - 2 * g).clamp(0.0, w),
               height: (cellH - 2 * g).clamp(0.0, h),
               child: _WallTile(
-                key: ValueKey(cam.id),
+                // Per-camera GlobalKey: the tile (and its already-decoding
+                // player) survives a switch between this default grid and a
+                // saved view, instead of tearing down and re-waiting a keyframe.
+                key: _tileKeyFor(cam.id),
                 api: widget.api,
                 session: widget.session,
                 camera: cam,
@@ -549,8 +597,22 @@ class _WallTile extends StatefulWidget {
 class _WallTileState extends State<_WallTile> {
   Player? _player;
   VideoController? _controller;
+
+  /// A replacement player mid stream-swap (main/sub change): it decodes in
+  /// the background while the old player keeps rendering, and [_onFirstFrame]
+  /// promotes it once it has a real frame — so a stream switch never blanks
+  /// the pane while the fresh player waits ~a GOP for its first keyframe.
+  Player? _pending;
+
   String? _error;
   bool _firstFrame = false;
+
+  /// The tile's live controller, offered to the maximized pane as a warm-start
+  /// surface. Null until a frame has decoded, and null while a stream swap is
+  /// pending — the pending swap will dispose the current player, which must
+  /// never happen while the maximized pane is still painting it.
+  VideoController? get warmController =>
+      _firstFrame && _pending == null ? _controller : null;
 
   // Per-tile digital zoom: hovering the tile + mouse wheel zooms IN PLACE
   // (the wall stays up); drag pans when zoomed. Double-click still maximizes.
@@ -632,6 +694,10 @@ class _WallTileState extends State<_WallTile> {
           ['demuxer-max-back-bytes', '1MiB'],
           ['network-timeout', '10'],
           ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+          // Never emit decoder output from before the first keyframe — masks
+          // the grey/blocky "difference map" partial frames a mid-GOP RTSP
+          // join can otherwise flash before the first clean frame.
+          ['vd-lavc-show-all', 'no'],
           ['mute', 'yes'],
         ]) {
           try {
@@ -642,8 +708,8 @@ class _WallTileState extends State<_WallTile> {
         }
       }
       player.stream.width.listen((w) {
-        if (w != null && w > 0 && !_firstFrame && mounted) {
-          setState(() => _firstFrame = true);
+        if (w != null && w > 0 && mounted) {
+          _onFirstFrame(player, controller);
         }
       });
       await player.open(Media(url));
@@ -651,28 +717,14 @@ class _WallTileState extends State<_WallTile> {
         player.dispose();
         return;
       }
-      // Register this pane so the snapshot hotkey/button can grab its frame.
-      // The first pane to come up becomes the default capture target.
-      SnapshotRegistry.instance.register(
-        _paneId,
-        SnapshotTarget(player: player, cameraName: widget.camera.name),
-      );
-      // Register as an audio pane (muted until it becomes the audible pane).
-      widget.audio?.registerPane(
-        _paneId,
-        AudioPane.forPlayer(player, hasAudio: () => mounted),
-      );
-      if (SnapshotRegistry.instance.activePaneId.value == null) {
-        SnapshotRegistry.instance.setActive(_paneId);
-        // Mirror the default selection into audio-follow too, so the global
-        // audio button has a target from the start — without this, the tile
-        // looks selected but the audio toggle reports "select a camera".
-        widget.audio?.setSelected(_paneId);
+      if (_player == null) {
+        _adopt(player, controller);
+      } else {
+        // A stream swap: keep the old player rendering while this one decodes
+        // toward its first keyframe; _onFirstFrame does the visible swap.
+        _pending?.dispose(); // superseded by an even newer swap
+        _pending = player;
       }
-      setState(() {
-        _player = player;
-        _controller = controller;
-      });
     } catch (e) {
       if (mounted) {
         setState(() => _error = 'load failed');
@@ -680,25 +732,61 @@ class _WallTileState extends State<_WallTile> {
     }
   }
 
+  /// Wire [player] into this pane: register it as the snapshot/audio target
+  /// (re-registering the same pane id overwrites the retired player) and make
+  /// its controller the one the tile renders.
+  void _adopt(Player player, VideoController controller) {
+    // Register this pane so the snapshot hotkey/button can grab its frame.
+    // The first pane to come up becomes the default capture target.
+    SnapshotRegistry.instance.register(
+      _paneId,
+      SnapshotTarget(player: player, cameraName: widget.camera.name),
+    );
+    // Register as an audio pane (muted until it becomes the audible pane).
+    widget.audio?.registerPane(
+      _paneId,
+      AudioPane.forPlayer(player, hasAudio: () => mounted),
+    );
+    if (SnapshotRegistry.instance.activePaneId.value == null) {
+      SnapshotRegistry.instance.setActive(_paneId);
+      // Mirror the default selection into audio-follow too, so the global
+      // audio button has a target from the start — without this, the tile
+      // looks selected but the audio toggle reports "select a camera".
+      widget.audio?.setSelected(_paneId);
+    }
+    setState(() {
+      _player = player;
+      _controller = controller;
+      _error = null;
+    });
+  }
+
+  /// First decoded frame from [player]. For the pane's active player this
+  /// just flips the live dot; for a pending stream swap it is the moment the
+  /// swap becomes invisible — promote the replacement and retire the old
+  /// player, so the pane never blanks while the new stream waits for a
+  /// keyframe.
+  void _onFirstFrame(Player player, VideoController controller) {
+    if (identical(player, _player)) {
+      if (!_firstFrame) setState(() => _firstFrame = true);
+      return;
+    }
+    if (!identical(player, _pending)) return; // superseded swap — ignore
+    final old = _player;
+    _pending = null;
+    _firstFrame = true;
+    _adopt(player, controller);
+    old?.dispose();
+  }
+
   String get _paneId => 'wall:${widget.camera.id}';
 
-  /// Re-open the player with the currently-preferred stream (after a main/sub
-  /// override change from the right-click menu). Re-fetches the URLs so a
-  /// server-side change is picked up too.
-  Future<void> _reloadStream() async {
-    final old = _player;
-    SnapshotRegistry.instance.unregister(_paneId);
-    if (mounted) {
-      setState(() {
-        _player = null;
-        _controller = null;
-        _firstFrame = false;
-        _error = null;
-      });
-    }
-    old?.dispose();
-    await _load();
-  }
+  /// Swap to the currently-preferred stream (after a main/sub override change
+  /// from the right-click menu, or a zoom-to-main toggle). Re-fetches the URLs
+  /// so a server-side change is picked up too. The old player keeps rendering
+  /// until the replacement decodes its first frame (see [_onFirstFrame]) —
+  /// blanking the pane for that wait was the 1–2 s black flash.
+  Future<void> _reloadStream() => _load();
 
   /// Right-click menu: per-camera PTZ-controls toggle + stream main/sub
   /// override (overriding the global "wall uses sub" setting).
@@ -768,6 +856,7 @@ class _WallTileState extends State<_WallTile> {
   void dispose() {
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
+    _pending?.dispose();
     _player?.dispose();
     super.dispose();
   }
@@ -977,6 +1066,7 @@ class _MaximizedPane extends StatefulWidget {
     required this.onClose,
     this.streamPrefs,
     this.audio,
+    this.warmController,
     this.ptzClickMode = PtzClickMode.center,
   });
 
@@ -987,6 +1077,14 @@ class _MaximizedPane extends StatefulWidget {
   final VoidCallback onClose;
   final StreamPrefsStore? streamPrefs;
   final AudioFollowController? audio;
+
+  /// The wall tile's live controller for this camera, if it was already
+  /// decoding when we maximized. Painted full-pane (sub stream, upscaled) as
+  /// a stand-in until this pane's own main-stream player decodes its first
+  /// frame — so maximizing never flashes black while mpv waits for a
+  /// keyframe. The tile stays mounted (and decoding) under this overlay, so
+  /// the controller stays valid for the handoff window.
+  final VideoController? warmController;
 
   /// What a click on a PTZ-capable video does (center / pan / off).
   final PtzClickMode ptzClickMode;
@@ -999,6 +1097,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   Player? _player;
   VideoController? _controller;
   String? _error;
+
+  /// True once this pane's own (main-stream) player has decoded a frame —
+  /// until then the warm-start controller (if any) covers the wait.
+  bool _firstFrame = false;
 
   double _scale = 1.0;
   Offset _offset = Offset.zero;
@@ -1035,6 +1137,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
           ['demuxer-max-back-bytes', '1MiB'],
           ['network-timeout', '10'],
           ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+          // Never emit decoder output from before the first keyframe — masks
+          // the grey/blocky "difference map" partial frames a mid-GOP RTSP
+          // join can otherwise flash before the first clean frame.
+          ['vd-lavc-show-all', 'no'],
           // Muted by default — the global audio button unmutes the active pane.
           ['mute', 'yes'],
         ]) {
@@ -1045,6 +1151,13 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
           }
         }
       }
+      player.stream.width.listen((w) {
+        if (w != null && w > 0 && !_firstFrame && mounted) {
+          // First decoded frame from the main stream — drop the warm-start
+          // stand-in and hand the pane to this player.
+          setState(() => _firstFrame = true);
+        }
+      });
       await player.open(Media(url));
       if (!mounted) {
         player.dispose();
@@ -1192,16 +1305,26 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
             return Stack(
               children: [
                 Positioned.fill(
-                  child: _controller == null
-                      ? Center(
-                          child: _error != null
-                              ? Icon(
+                  // Until the main-stream player decodes its first frame,
+                  // paint the wall tile's still-live video (if we got one) in
+                  // its place — never a black pane while mpv waits for a
+                  // keyframe. Errors still show the camera-off icon.
+                  child: _controller == null || !_firstFrame
+                      ? (_error != null
+                            ? Center(
+                                child: Icon(
                                   Icons.videocam_off,
                                   color: Colors.red.shade300,
                                   size: 40,
-                                )
-                              : const CircularProgressIndicator(),
-                        )
+                                ),
+                              )
+                            : widget.warmController != null
+                            ? Video(
+                                controller: widget.warmController!,
+                                controls: NoVideoControls,
+                                fit: BoxFit.contain,
+                              )
+                            : const Center(child: CircularProgressIndicator()))
                       : Listener(
                           onPointerDown: (e) {
                             // Mouse "back" button returns to the wall.

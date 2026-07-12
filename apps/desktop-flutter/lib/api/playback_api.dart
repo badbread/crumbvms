@@ -120,18 +120,26 @@ extension PlaybackApi on CrumbApi {
   /// `[start, end)`. Returns `[]` on error rather than throwing, matching
   /// app.js's `pbFetchTimeline` (the timeline is best-effort, redrawn on the
   /// next reload/pan/zoom rather than surfacing a hard error to the operator).
+  ///
+  /// `limit`/`offset` page through the server's merged-span list (server
+  /// default 2 000, hard cap 10 000 — see timeline.rs). A page shorter than
+  /// `limit` means there are no more spans.
   Future<List<RecordedSpan>> fetchTimeline(
     Session s,
     List<String> cameraIds,
     DateTime start,
-    DateTime end,
-  ) async {
+    DateTime end, {
+    int? limit,
+    int? offset,
+  }) async {
     if (cameraIds.isEmpty) return const [];
     final uri = Uri.parse('${s.base}/timeline').replace(
       queryParameters: {
         'camera_ids': cameraIds.join(','),
         'start': start.toUtc().toIso8601String(),
         'end': end.toUtc().toIso8601String(),
+        if (limit != null) 'limit': '$limit',
+        if (offset != null) 'offset': '$offset',
       },
     );
     try {
