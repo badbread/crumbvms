@@ -42,6 +42,7 @@ class PlaybackScreen extends StatefulWidget {
     required this.cameras,
     required this.onClose,
     this.hotkeys,
+    this.onExportRange,
   });
 
   final CrumbApi api;
@@ -56,6 +57,11 @@ class PlaybackScreen extends StatefulWidget {
 
   /// Number-key hotkeys load the assigned camera's timeline here.
   final HotkeyConfigStore? hotkeys;
+
+  /// Export a Shift+drag-selected range (camera + start/end) — the host opens
+  /// the Export tab pre-filled with this clip.
+  final void Function(String cameraId, DateTime start, DateTime end)?
+  onExportRange;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -392,6 +398,61 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     );
   }
 
+  /// Hand the Shift+drag selection off to the Export tab as a pre-filled clip.
+  void _exportSelection() {
+    final ss = _timeline.selStartMs;
+    final se = _timeline.selEndMs;
+    final camId = _maximizedCameraId ?? _selectedCameraId;
+    if (ss == null || se == null || camId == null) return;
+    widget.onExportRange?.call(
+      camId,
+      DateTime.fromMillisecondsSinceEpoch(ss, isUtc: true),
+      DateTime.fromMillisecondsSinceEpoch(se, isUtc: true),
+    );
+    _timeline.clearSelection();
+  }
+
+  Widget _buildExportSelectionBar() {
+    final ss = _timeline.selStartMs!;
+    final se = _timeline.selEndMs!;
+    final s = ((se - ss) / 1000).round();
+    final h = s ~/ 3600;
+    final m = (s % 3600) ~/ 60;
+    final sec = s % 60;
+    final durLabel = h > 0
+        ? '${h}h ${m}m'
+        : (m > 0 ? '${m}m ${sec}s' : '${sec}s');
+    return Container(
+      color: const Color(0xFF2A2410),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.content_cut, size: 16, color: Color(0xFFE8A33D)),
+          const SizedBox(width: 8),
+          Text(
+            'Selection: $durLabel',
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+          ),
+          const Spacer(),
+          TextButton(
+            onPressed: _timeline.clearSelection,
+            child: const Text('Clear'),
+          ),
+          const SizedBox(width: 6),
+          FilledButton.icon(
+            onPressed: widget.onExportRange == null ? null : _exportSelection,
+            icon: const Icon(Icons.download, size: 16),
+            label: const Text('Export selection'),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFE8A33D),
+              foregroundColor: Colors.black,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// Shift the playhead by a signed duration (arrow keys / nudge buttons).
   Future<void> _shiftWindow(Duration by) async {
     final t = _timeline.playhead.add(by);
@@ -667,6 +728,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onZoomOut: () => _zoomBy(1),
             onZoomIn: () => _zoomBy(-1),
           ),
+          if (_timeline.hasSelection) _buildExportSelectionBar(),
           // Motion-intensity histogram + detection glyphs + legend +
           // prev/next-motion transport, synced to the scrubber window.
           MotionTimelineView(

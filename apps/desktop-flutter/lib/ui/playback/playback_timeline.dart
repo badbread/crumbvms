@@ -23,6 +23,7 @@ import 'dart:async';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'playback_timeline_controller.dart';
 import 'playback_timeline_painter.dart';
@@ -78,6 +79,10 @@ class _PlaybackTimelineState extends State<PlaybackTimeline> {
   double _width = 1;
   Timer? _liveSeekTimer;
 
+  // Shift+drag = export range selection (instead of pan).
+  bool _selecting = false;
+  int? _selAnchorMs;
+
   @override
   void dispose() {
     _liveSeekTimer?.cancel();
@@ -95,6 +100,14 @@ class _PlaybackTimelineState extends State<PlaybackTimeline> {
   void _onPointerDown(PointerDownEvent e) {
     _dragging = true;
     _isPan = false;
+    // Shift+drag starts an export-range selection rather than a pan/seek.
+    if (HardwareKeyboard.instance.isShiftPressed) {
+      _selecting = true;
+      _selAnchorMs = _xToTime(e.localPosition.dx).millisecondsSinceEpoch;
+      widget.controller.setSelection(_selAnchorMs, _selAnchorMs);
+      return;
+    }
+    _selecting = false;
     _panStartX = e.localPosition.dx;
     _panStartPlayhead = widget.controller.playhead;
     _panStartSpanMs = widget.controller.span.inMilliseconds;
@@ -102,6 +115,13 @@ class _PlaybackTimelineState extends State<PlaybackTimeline> {
 
   void _onPointerMove(PointerMoveEvent e) {
     if (!_dragging) return;
+    if (_selecting) {
+      widget.controller.setSelection(
+        _selAnchorMs,
+        _xToTime(e.localPosition.dx).millisecondsSinceEpoch,
+      );
+      return;
+    }
     final dx = e.localPosition.dx - _panStartX;
     if (!_isPan && dx.abs() > _panThresholdPx) {
       _isPan = true;
@@ -126,6 +146,12 @@ class _PlaybackTimelineState extends State<PlaybackTimeline> {
   void _onPointerUp(PointerUpEvent e) {
     if (!_dragging) return;
     _dragging = false;
+    if (_selecting) {
+      _selecting = false;
+      // A zero-width selection (plain shift-click) is not usable — clear it.
+      if (!widget.controller.hasSelection) widget.controller.clearSelection();
+      return;
+    }
     _liveSeekTimer?.cancel();
     _liveSeekTimer = null;
 
@@ -175,6 +201,8 @@ class _PlaybackTimelineState extends State<PlaybackTimeline> {
                       playhead: widget.controller.playhead,
                       spans: widget.controller.spans,
                       selectedCameraName: widget.selectedCameraName,
+                      selStartMs: widget.controller.selStartMs,
+                      selEndMs: widget.controller.selEndMs,
                     ),
                   ),
                 ),

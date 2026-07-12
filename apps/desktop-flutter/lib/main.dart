@@ -35,6 +35,8 @@ import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/admin_console/admin_console_screen.dart';
 import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
 import 'package:crumb_desktop/ui/clips/clips_screen.dart';
+import 'package:crumb_desktop/ui/export/export_builder_dialog.dart'
+    show ExportClipDraft;
 import 'package:crumb_desktop/ui/export/export_screen.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
@@ -397,6 +399,10 @@ class _MainShellState extends State<MainShell> {
   /// Config View editor creates one).
   int _viewsRefreshToken = 0;
 
+  /// A clip handed off from Playback's "Export selection" — seeds the Export
+  /// tab on entry. Cleared when the user navigates to a tab manually.
+  ExportClipDraft? _pendingExportClip;
+
   /// Play-on-focus audio: exactly one pane (maximized else selected) is
   /// audible when audio is on. Owned here, driven by the global audio button
   /// and the wall's tile selection/maximize.
@@ -605,7 +611,11 @@ class _MainShellState extends State<MainShell> {
       label: label,
       color: color,
       selected: _index == i,
-      onTap: () => setState(() => _index = i),
+      // Manual tab navigation clears a one-shot pending export clip.
+      onTap: () => setState(() {
+        _pendingExportClip = null;
+        _index = i;
+      }),
     );
   }
 
@@ -754,6 +764,16 @@ class _MainShellState extends State<MainShell> {
           onClose: () => setState(() => _index = _liveIndex),
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
+          // "Export selection" → seed the Export tab with this clip.
+          onExportRange: (camId, start, end) => setState(() {
+            _pendingExportClip = ExportClipDraft(
+              id: 1,
+              cameraId: camId,
+              start: start,
+              end: end,
+            );
+            _index = _exportIndex;
+          }),
         );
       case _clipsIndex:
         return ClipsScreen(
@@ -763,9 +783,17 @@ class _MainShellState extends State<MainShell> {
         );
       case _exportIndex:
         return ExportScreen(
+          // A fresh key when a pending clip arrives remounts ExportScreen so
+          // its initState seeds the new clip.
+          key: ValueKey(
+            _pendingExportClip == null
+                ? 'export'
+                : 'export-${_pendingExportClip!.start.millisecondsSinceEpoch}',
+          ),
           api: widget.api,
           session: session,
           cameras: widget.cameras,
+          initialClip: _pendingExportClip,
         );
       case _liveIndex:
       default:

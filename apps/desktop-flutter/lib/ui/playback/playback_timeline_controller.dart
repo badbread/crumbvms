@@ -103,4 +103,34 @@ class PlaybackTimelineController extends ChangeNotifier {
     notifyListeners();
     return true;
   }
+
+  // ── Export range selection (Shift+drag on the timeline) ──────────────────
+  int? _selStartMs;
+  int? _selEndMs;
+
+  int? get selStartMs => _selStartMs;
+  int? get selEndMs => _selEndMs;
+
+  /// True when a usable (start < end) export range is selected.
+  bool get hasSelection =>
+      _selStartMs != null && _selEndMs != null && _selEndMs! > _selStartMs!;
+
+  /// Set (or update) the selection; values are normalized so start <= end.
+  void setSelection(int? aMs, int? bMs) {
+    if (aMs == null || bMs == null) {
+      _selStartMs = aMs;
+      _selEndMs = bMs;
+    } else {
+      _selStartMs = aMs < bMs ? aMs : bMs;
+      _selEndMs = aMs < bMs ? bMs : aMs;
+    }
+    notifyListeners();
+  }
+
+  void clearSelection() {
+    if (_selStartMs == null && _selEndMs == null) return;
+    _selStartMs = null;
+    _selEndMs = null;
+    notifyListeners();
+  }
 }

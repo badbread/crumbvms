@@ -24,6 +24,8 @@ class PlaybackTimelinePainter extends CustomPainter {
     required this.playhead,
     required this.spans,
     required this.selectedCameraName,
+    this.selStartMs,
+    this.selEndMs,
     DateTime? now,
   }) : now = now ?? DateTime.now().toUtc();
 
@@ -32,7 +34,11 @@ class PlaybackTimelinePainter extends CustomPainter {
   final DateTime playhead;
   final List<RecordedSpan> spans;
   final String? selectedCameraName;
+  final int? selStartMs; // export range selection (Shift+drag), or null
+  final int? selEndMs;
   final DateTime now;
+
+  static const Color selColor = Color(0xFFE8A33D); // amber brackets/band
 
   // ── layout bands (px) ───────────────────────────────────────────────────
   static const double labelH = 16; // top ruler / grid-label strip
@@ -189,6 +195,45 @@ class PlaybackTimelinePainter extends CustomPainter {
       Paint()..color = const Color(0xD9080C14),
     );
     tp.paint(canvas, Offset(lx - tp.width / 2, 1));
+
+    // ── export range selection (Shift+drag): band + brackets + duration ──
+    final ss = selStartMs;
+    final se = selEndMs;
+    if (ss != null && se != null && se > ss) {
+      final x1 = _msToX(ss, cw).clamp(0.0, cw);
+      final x2 = _msToX(se, cw).clamp(0.0, cw);
+      final top = labelH;
+      final bot = ch - bottomH;
+      canvas.drawRect(
+        Rect.fromLTRB(x1, top, x2, bot),
+        Paint()..color = selColor.withValues(alpha: 0.18),
+      );
+      final bp = Paint()
+        ..color = selColor
+        ..strokeWidth = 2;
+      canvas.drawLine(Offset(x1, top), Offset(x1, bot), bp);
+      canvas.drawLine(Offset(x2, top), Offset(x2, bot), bp);
+      final dtp = _textPainter(_fmtDur(se - ss), Colors.white, 10, bold: true);
+      final mid = ((x1 + x2) / 2).clamp(
+        dtp.width / 2 + 3,
+        cw - dtp.width / 2 - 3,
+      );
+      canvas.drawRect(
+        Rect.fromLTWH(mid - dtp.width / 2 - 4, top + 2, dtp.width + 8, 14),
+        Paint()..color = const Color(0xCC000000),
+      );
+      dtp.paint(canvas, Offset(mid - dtp.width / 2, top + 3));
+    }
+  }
+
+  String _fmtDur(int ms) {
+    final s = (ms / 1000).round();
+    final h = s ~/ 3600;
+    final m = (s % 3600) ~/ 60;
+    final sec = s % 60;
+    if (h > 0) return '${h}h ${m}m';
+    if (m > 0) return '${m}m ${sec}s';
+    return '${sec}s';
   }
 
   @override
@@ -198,6 +243,8 @@ class PlaybackTimelinePainter extends CustomPainter {
         oldDelegate.playhead != playhead ||
         oldDelegate.spans != spans ||
         oldDelegate.selectedCameraName != selectedCameraName ||
+        oldDelegate.selStartMs != selStartMs ||
+        oldDelegate.selEndMs != selEndMs ||
         oldDelegate.now != now;
   }
 
