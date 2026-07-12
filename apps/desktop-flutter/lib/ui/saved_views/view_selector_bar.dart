@@ -61,9 +61,21 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
   Future<void> _load() async {
     try {
       final views = await widget.api.listViews(widget.session);
+      // Apply the user's drag-reorder order (client-only ViewPrefs, the same
+      // order the view builder persists) so the chips here match the builder —
+      // the server list has no ordering column. Any views missing from the
+      // stored order fall to the end in their natural order.
+      final order = await ViewPrefs().reconciledOrder(
+        views.map((v) => v.id).toList(),
+      );
+      final byId = {for (final v in views) v.id: v};
+      final ordered = [
+        for (final id in order)
+          if (byId[id] != null) byId[id]!,
+      ];
       if (mounted) {
         setState(() {
-          _views = views;
+          _views = ordered;
           _loaded = true;
         });
       }
