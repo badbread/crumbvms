@@ -2138,12 +2138,25 @@ pub async fn policy_size_eviction_sweep(
                 );
                 let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
                     std::collections::HashMap::new();
-                // Memoized per-source-storage answer to "does an archive move
-                // free real bytes?" for the ENOSPC-rescue exception (see the
-                // SAFETY INVARIANT above). Keyed by the segment's own storage
-                // id; the archive root is fixed for the whole sweep.
+                // Memoized per-source-storage answers for the ENOSPC-rescue
+                // exception (see the SAFETY INVARIANT above), keyed by the
+                // segment's own storage id (the archive root and the floor root
+                // are both fixed for the whole sweep):
+                //   same_fs_cache       — does the segment share the ARCHIVE fs
+                //                          (so a move would free nothing)?
+                //   same_fs_floor_cache — does the segment share the FLOOR fs
+                //                          (the disk actually in deficit)?
+                // The delete rescue requires BOTH: deleting a segment that is
+                // NOT on the deficit disk frees zero bytes there yet destroys it
+                // permanently (a repointed-storage config), so those fall
+                // through to the normal footage-preserving MOVE instead.
                 let mut same_fs_cache: std::collections::HashMap<Uuid, bool> =
                     std::collections::HashMap::new();
+                let mut same_fs_floor_cache: std::collections::HashMap<Uuid, bool> =
+                    std::collections::HashMap::new();
+                let floor_root: Option<&Path> = live_storage_for_floor
+                    .as_ref()
+                    .map(|s| Path::new(s.path.as_str()));
                 for seg in &live {
                     // Stop once BOTH conditions are satisfied: under the live TARGET
                     // (cap - spill, if a cap exists) AND the free-space deficit
@@ -2194,14 +2207,36 @@ pub async fn policy_size_eviction_sweep(
                         // exactly like the archive-off arm (file-then-row, item
                         // 10; protected bookmarks already excluded by the query).
                         let move_frees_nothing = if still_below_floor {
-                            match same_fs_cache.get(&src_storage.id).copied() {
+                            // (a) segment shares the ARCHIVE fs → a move frees
+                            //     nothing on it.
+                            let shares_archive = match same_fs_cache.get(&src_storage.id).copied() {
                                 Some(v) => v,
                                 None => {
                                     let v = same_filesystem(src_root, archive_root).await;
                                     same_fs_cache.insert(src_storage.id, v);
                                     v
                                 }
-                            }
+                            };
+                            // (b) AND the segment lives on the FLOOR fs (the disk
+                            //     actually in deficit) — otherwise deleting it
+                            //     frees zero bytes on the deficit disk while
+                            //     destroying footage permanently. Only checked
+                            //     when (a) already holds and the floor storage is
+                            //     known (it is, whenever still_below_floor).
+                            let shares_floor = match (shares_archive, floor_root) {
+                                (true, Some(fr)) => {
+                                    match same_fs_floor_cache.get(&src_storage.id).copied() {
+                                        Some(v) => v,
+                                        None => {
+                                            let v = same_filesystem(src_root, fr).await;
+                                            same_fs_floor_cache.insert(src_storage.id, v);
+                                            v
+                                        }
+                                    }
+                                }
+                                _ => false,
+                            };
+                            shares_archive && shares_floor
                         } else {
                             false
                         };

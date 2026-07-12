@@ -1664,6 +1664,14 @@ async fn drain_and_persist_motion(
             for sig in &out[before..] {
                 if let Some(union_sig) = motion_union.fold(sig) {
                     motion_union.stash_replay(union_sig);
+                } else if sig.stopped_at.is_some() && motion_union.open.is_empty() {
+                    // Unmatched STOP (its START was lost to channel overflow, so
+                    // the union never opened) drained while the buffer is frozen.
+                    // Stash it so the thaw replay turns it into a PostBuffer
+                    // trigger (apply_replayed_edge keeps the post-roll) — the
+                    // frozen-window twin of the healthy-arm #5 coordination
+                    // above. Newest-edge-wins: a later real START supersedes it.
+                    motion_union.stash_replay(sig.clone());
                 }
             }
         }
@@ -2971,30 +2979,24 @@ impl MotionUnion {
     /// `None` for a re-trigger / an unmatched STOP / an interleaved edge that
     /// leaves the union state unchanged.
     pub fn fold(&mut self, sig: &MotionSignal) -> Option<MotionSignal> {
-        // Wedge net (#7): before processing, expire any open source key older
-        // than MAX_OPEN_SIGNAL_SECS relative to this signal's time. A source
-        // whose STOP was lost (channel overflow at the STOP edge, or a source
-        // dropped mid-event) would otherwise keep its `started_at` in `open`
-        // forever, so the union never falls to zero and the MotionBuffer stays
-        // pinned in Recording 24/7 on a "healthy" Motion-mode camera. Expiring
-        // here re-syncs the union whenever any later signal arrives; the buffer
-        // then leaves Recording on the next real STOP. (A camera that goes
-        // permanently silent immediately after a lost STOP keeps over-recording
-        // until the next signal — disk waste bounded by retention, never footage
-        // loss, the fail-open-safe direction.)
-        let now = sig.stopped_at.unwrap_or(sig.started_at);
-        let cutoff = now - chrono::Duration::seconds(MAX_OPEN_SIGNAL_SECS);
-        let before_len = self.open.len();
-        self.open.retain(|k| *k >= cutoff);
-        if self.open.len() != before_len {
-            warn!(
-                expired = before_len - self.open.len(),
-                "MotionUnion: expired stale open key(s) with no STOP within MAX_OPEN_SIGNAL_SECS"
-            );
-            if self.open.is_empty() {
-                self.union_started_at = None;
-            }
-        }
+        // NOTE (#7, deliberately NOT a time-based expiry): a blind expiry of
+        // open keys older than MAX_OPEN_SIGNAL_SECS is NOT footage-safe on a
+        // MULTI-source camera. Genuinely-long open events are real — an HA
+        // occupancy/contact sensor held "on" for hours (ha_motion.rs: "real,
+        // not a dropped end"), or a pixel event through a sustained storm. If
+        // such a long event's key were expired, a SECOND source's short event
+        // closing would empty the union, drive the buffer Recording→PostBuffer→
+        // Idle, and DISCARD segments while a healthy source is still asserting
+        // motion (golden rule 2 / invariant #19 — never bet footage on a buffer
+        // change; "unknown" resolves to keep). The wedge a blind expiry targets
+        // (a lost STOP pinning Recording) is already covered the footage-safe
+        // way: a STOP lost to channel overflow trips the #81 loss debt →
+        // fail-open (over-record); a panicked source is respawned by the
+        // motion-source supervision and its health goes false for the gap. What
+        // remains is only over-record (disk waste, bounded by retention), never
+        // loss — the correct direction. Do NOT reintroduce a time-based expiry
+        // here; a proper fix keys `open` by source identity and expires a key
+        // only when the SAME source re-opens (definitive lost-STOP evidence).
         match sig.stopped_at {
             None => {
                 // START: union rises only on the first open.
@@ -3440,35 +3442,43 @@ mod tests {
     }
 
     #[test]
-    fn motion_union_expires_stale_open_key_on_later_signal() {
-        // #7 wedge net: source A opens, its STOP is lost, then much later another
-        // signal arrives. The stale A key must be expired so the union is not
-        // pinned open forever (which would hold the buffer Recording 24/7).
+    fn motion_union_keeps_long_event_open_across_a_second_sources_event() {
+        // #7 regression guard: a genuinely-long open event on one source must
+        // NOT be closed by a second source's short event — recording continues
+        // as long as ANY source asserts motion. (This is why the blind
+        // time-based expiry was reverted: it discarded footage here.)
         let mut union = MotionUnion::default();
         let t0 = utc(2026, 1, 1, 0, 0, 0);
-        let a_start = make_signal(t0, None);
+        // Source A opens a long event (e.g. an HA occupancy sensor held on).
         assert!(
-            union.fold(&a_start).is_some(),
-            "first open emits a union START"
+            union.fold(&make_signal(t0, None)).is_some(),
+            "A opens the union"
         );
-        assert_eq!(union.open.len(), 1);
-
-        // A's STOP is lost; > MAX_OPEN_SIGNAL_SECS later, source B opens.
+        // Much later (> MAX_OPEN_SIGNAL_SECS) source B has a short event while A
+        // is still open. B's START is a re-trigger (union already open → None);
+        // B's STOP must NOT fall the union, because A is still open.
         let late = t0 + chrono::Duration::seconds(MAX_OPEN_SIGNAL_SECS + 60);
-        let b_start = make_signal(late, None);
         assert!(
-            union.fold(&b_start).is_some(),
-            "B is a fresh first-open once the stale A key is expired"
+            union.fold(&make_signal(late, None)).is_none(),
+            "B is a re-trigger"
         );
-        assert_eq!(
-            union.open.len(),
-            1,
-            "only B remains; the stale A key was expired, not left pinning the union"
+        assert!(
+            union
+                .fold(&make_signal(
+                    late,
+                    Some(late + chrono::Duration::seconds(4))
+                ))
+                .is_none(),
+            "B's STOP must NOT close the union while A is still open (no footage loss)"
         );
-
-        // B closes cleanly → union falls to empty (no stuck-open key).
-        let b_stop = make_signal(late, Some(late + chrono::Duration::seconds(4)));
-        assert!(union.fold(&b_stop).is_some(), "B's STOP closes the union");
+        assert_eq!(union.open.len(), 1, "A's long event stays open");
+        // Only A's own STOP closes the union.
+        assert!(
+            union
+                .fold(&make_signal(t0, Some(late + chrono::Duration::seconds(30))))
+                .is_some(),
+            "A's real STOP finally closes the union"
+        );
         assert!(union.open.is_empty());
     }
 
