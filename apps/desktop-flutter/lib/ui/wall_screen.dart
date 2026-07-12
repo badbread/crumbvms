@@ -41,6 +41,7 @@ class WallScreen extends StatefulWidget {
     this.view,
     this.audio,
     this.hotkeys,
+    this.onMaximizedCameraChanged,
   });
 
   final CrumbApi api;
@@ -62,6 +63,10 @@ class WallScreen extends StatefulWidget {
   /// The applied saved view (its custom layout + slot→camera map). Null → the
   /// default auto-grid of every enabled camera (the "All Cameras" wall).
   final AppliedView? view;
+
+  /// Reports which camera is currently maximized (full-pane) on the wall, or
+  /// null when restored — so the host can carry that maximize into Playback.
+  final ValueChanged<String?>? onMaximizedCameraChanged;
 
   /// Client options store. The wall LISTENS to it, so a preference change made
   /// while the wall is visible — e.g. toggling "Show tile info bar" in the
@@ -198,7 +203,15 @@ class _WallScreenState extends State<WallScreen> {
   /// Maximize a camera + make it the audio-active pane.
   void _maximize(Camera cam) {
     widget.audio?.setMaximized('max:${cam.id}');
+    widget.onMaximizedCameraChanged?.call(cam.id);
     setState(() => _maximized = cam);
+  }
+
+  /// Restore from the maximized pane back to the grid.
+  void _restore() {
+    widget.audio?.setMaximized(null);
+    widget.onMaximizedCameraChanged?.call(null);
+    setState(() => _maximized = null);
   }
 
   @override
@@ -300,10 +313,7 @@ class _WallScreenState extends State<WallScreen> {
               audio: widget.audio,
               ptzClickMode:
                   widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
-              onClose: () {
-                widget.audio?.setMaximized(null);
-                setState(() => _maximized = null);
-              },
+              onClose: _restore,
             ),
         ],
       ),
@@ -325,12 +335,7 @@ class _WallScreenState extends State<WallScreen> {
           }
         }
       },
-      onEscape: _maximized == null
-          ? null
-          : () {
-              widget.audio?.setMaximized(null);
-              setState(() => _maximized = null);
-            },
+      onEscape: _maximized == null ? null : _restore,
       onToggleAudio: widget.audio == null
           ? null
           : () => widget.audio!.toggleAudio(),

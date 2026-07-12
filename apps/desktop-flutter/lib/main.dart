@@ -407,6 +407,10 @@ class _MainShellState extends State<MainShell> {
   /// that time. Cleared on manual tab nav.
   DateTime? _playbackSeekTo;
 
+  /// Which camera is maximized on the live wall (or null) — carried into
+  /// Playback so switching tabs keeps the same full-pane camera.
+  String? _liveMaximizedId;
+
   /// Play-on-focus audio: exactly one pane (maximized else selected) is
   /// audible when audio is on. Owned here, driven by the global audio button
   /// and the wall's tile selection/maximize.
@@ -791,7 +795,11 @@ class _MainShellState extends State<MainShell> {
           session: session,
           // Mirror the current Live view's cameras (or all if none applied).
           cameras: _playbackCameras(),
+          // Reproduce the same custom layout (cell spans) as the live wall.
+          view: _appliedView,
           initialTime: _playbackSeekTo,
+          // Carry a maximized live pane straight into Playback.
+          initialMaximizedCameraId: _liveMaximizedId,
           onClose: () => setState(() => _index = _liveIndex),
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
@@ -851,6 +859,8 @@ class _MainShellState extends State<MainShell> {
           audio: _audio,
           // Number-key hotkeys maximize the assigned camera on the wall.
           hotkeys: widget.hotkeys,
+          // Remember which pane is maximized so Playback can open on it.
+          onMaximizedCameraChanged: (id) => _liveMaximizedId = id,
         );
     }
   }

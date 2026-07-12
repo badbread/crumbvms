@@ -12,7 +12,6 @@
 // bar was folded into it.)
 
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
@@ -21,7 +20,10 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
+import 'package:crumb_desktop/api/views_api.dart' show CustomLayout;
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
+    show AppliedView;
 import 'package:crumb_desktop/ui/bookmarks/add_bookmark_dialog.dart';
 import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
@@ -38,9 +40,11 @@ class PlaybackScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onClose,
+    this.view,
     this.hotkeys,
     this.onExportRange,
     this.initialTime,
+    this.initialMaximizedCameraId,
   });
 
   final CrumbApi api;
@@ -50,6 +54,15 @@ class PlaybackScreen extends StatefulWidget {
   /// wall so slot/camera identity matches when the operator switches tabs
   /// (mirrors `pbGetWallCameraIds` reading the shared `state.slotMap`).
   final List<Camera> cameras;
+
+  /// The applied saved view — playback reproduces its exact custom layout
+  /// (cell spans), scaled to fit, matching the live wall. Null → an auto-grid
+  /// of [cameras].
+  final AppliedView? view;
+
+  /// Open with this camera already maximized (carried over from a maximized
+  /// live pane when the operator switches to Playback).
+  final String? initialMaximizedCameraId;
 
   final VoidCallback onClose;
 
@@ -133,6 +146,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _panes[c.id] = _PbPane();
     }
     _selectedCameraId = _cameras.isNotEmpty ? _cameras.first.id : null;
+    // Carry a maximized live pane into playback (if it's one of our cameras).
+    final maxId = widget.initialMaximizedCameraId;
+    if (maxId != null && _cameras.any((c) => c.id == maxId)) {
+      _maximizedCameraId = maxId;
+      _selectedCameraId = maxId;
+    }
     // Rebuild (fresh playhead for the motion strip) + debounced motion refetch
     // whenever the scrubber window/playhead changes.
     _timeline.addListener(_onTimelineChanged);
@@ -705,13 +724,85 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     return null;
   }
 
+  /// Fractional-cell grid that scales to fit the available area (never crops /
+  /// overflows), reproducing the applied view's exact layout — the same model
+  /// as the live wall's `_viewGrid`. Maximized → the one camera fills the area;
+  /// no view → an auto-grid of all cameras.
+  Widget _buildGrid() {
+    if (_maximizedCameraId != null) {
+      Camera? cam;
+      for (final c in _cameras) {
+        if (c.id == _maximizedCameraId) {
+          cam = c;
+          break;
+        }
+      }
+      if (cam == null) return const SizedBox.shrink();
+      final maxCam = cam;
+      return _PbTile(
+        camera: maxCam,
+        pane: _panes[maxCam.id]!,
+        selected: true,
+        maximized: true,
+        onSelect: () => _selectCamera(maxCam.id),
+        onMaximizeToggle: () => _toggleMaximize(maxCam.id),
+      );
+    }
+
+    final CustomLayout layout;
+    final String? Function(int) camForCell;
+    final view = widget.view;
+    if (view != null) {
+      layout = view.layout;
+      camForCell = (i) => view.slots[i];
+    } else {
+      final n = _cameras.isEmpty ? 1 : _cameras.length;
+      var cols = 1;
+      while (cols * cols < n) {
+        cols++;
+      }
+      final rows = (n + cols - 1) ~/ cols;
+      layout = CustomLayout.unitGrid(cols, rows);
+      camForCell = (i) => i < _cameras.length ? _cameras[i].id : null;
+    }
+
+    final byId = {for (final c in _cameras) c.id: c};
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final h = constraints.maxHeight;
+        const g = 1.0;
+        final children = <Widget>[];
+        for (var i = 0; i < layout.cells.length; i++) {
+          final cell = layout.cells[i];
+          final camId = camForCell(i);
+          final cam = camId == null ? null : byId[camId];
+          children.add(
+            Positioned(
+              left: cell.x / layout.cols * w + g,
+              top: cell.y / layout.rows * h + g,
+              width: (cell.w / layout.cols * w - 2 * g).clamp(0.0, w),
+              height: (cell.h / layout.rows * h - 2 * g).clamp(0.0, h),
+              child: cam == null
+                  ? const ColoredBox(color: Colors.black)
+                  : _PbTile(
+                      camera: cam,
+                      pane: _panes[cam.id]!,
+                      selected: cam.id == _selectedCameraId,
+                      maximized: false,
+                      onSelect: () => _selectCamera(cam.id),
+                      onMaximizeToggle: () => _toggleMaximize(cam.id),
+                    ),
+            ),
+          );
+        }
+        return Stack(children: children);
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final shown = _maximizedCameraId != null
-        ? _cameras.where((c) => c.id == _maximizedCameraId).toList()
-        : _cameras;
-    final cols = shown.isEmpty ? 1 : math.sqrt(shown.length).ceil();
-
     final scaffold = Scaffold(
       backgroundColor: Colors.black,
       body: Column(
@@ -727,7 +818,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                   const Center(
                     child: CircularProgressIndicator(color: Colors.white54),
                   )
-                else if (shown.isEmpty)
+                else if (_cameras.isEmpty)
                   const Center(
                     child: Text(
                       'No cameras to review.',
@@ -735,24 +826,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                     ),
                   )
                 else
-                  Padding(
-                    padding: const EdgeInsets.all(2),
-                    child: GridView.count(
-                      crossAxisCount: cols,
-                      mainAxisSpacing: 2,
-                      crossAxisSpacing: 2,
-                      childAspectRatio: 16 / 9,
-                      children: [
-                        for (final cam in shown)
-                          _PbTile(
-                            camera: cam,
-                            pane: _panes[cam.id]!,
-                            selected: cam.id == _selectedCameraId,
-                            maximized: cam.id == _maximizedCameraId,
-                            onSelect: () => _selectCamera(cam.id),
-                            onMaximizeToggle: () => _toggleMaximize(cam.id),
-                          ),
-                      ],
+                  Positioned.fill(
+                    child: Padding(
+                      padding: const EdgeInsets.all(2),
+                      child: _buildGrid(),
                     ),
                   ),
                 if (!_entering && _statusMessage != null)
