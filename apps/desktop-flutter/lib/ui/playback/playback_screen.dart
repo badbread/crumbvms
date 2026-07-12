@@ -1227,6 +1227,8 @@ class _PbTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hasFootage = pane.segment != null;
+    // Selected-tile outline follows the active tab accent (cyan on Playback).
+    final accent = Theme.of(context).colorScheme.primary;
     return GestureDetector(
       onTap: onSelect,
       onDoubleTap: onMaximizeToggle,
@@ -1234,7 +1236,7 @@ class _PbTile extends StatelessWidget {
         decoration: BoxDecoration(
           color: Colors.grey.shade900,
           border: Border.all(
-            color: selected ? Colors.amberAccent : Colors.white12,
+            color: selected ? accent : Colors.white12,
             width: selected ? 2 : 1,
           ),
         ),

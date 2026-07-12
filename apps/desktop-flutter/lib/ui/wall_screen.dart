@@ -412,6 +412,7 @@ class _WallScreenState extends State<WallScreen> {
                     streamPrefs: widget.streamPrefs,
                     audio: widget.audio,
                     showInfoBar: showInfoBar,
+                    zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
                     // Custom cells can be any aspect — letterbox, don't crop.
                     fit: BoxFit.contain,
                     onTap: () {
@@ -458,6 +459,7 @@ class _WallScreenState extends State<WallScreen> {
             streamPrefs: widget.streamPrefs,
             audio: widget.audio,
             showInfoBar: showInfoBar,
+            zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
             onTap: () => _maximize(cam),
           ),
       ],
@@ -494,6 +496,7 @@ class _WallTile extends StatefulWidget {
     this.streamPrefs,
     this.audio,
     this.fit = BoxFit.cover,
+    this.zoomToMain = false,
   });
 
   final CrumbApi api;
@@ -504,6 +507,11 @@ class _WallTile extends StatefulWidget {
   final VoidCallback onTap;
   final StreamPrefsStore? streamPrefs;
   final AudioFollowController? audio;
+
+  /// When true, digitally zooming this tile past 100% temporarily loads its
+  /// main stream (reverting to sub at 100%). From the "Zoom switches to main
+  /// stream" client option.
+  final bool zoomToMain;
 
   /// How the video fills its tile. The default auto-grid uses `cover` (tiles
   /// are ~16:9, so no visible crop); custom-view cells can be any aspect, so
@@ -526,6 +534,10 @@ class _WallTileState extends State<_WallTile> {
   Offset _offset = Offset.zero;
   static const double _maxZoom = 8.0;
 
+  /// True while a zoom-in has temporarily switched this tile to the main
+  /// stream (see [WallScreen.onMaximizedCameraChanged]/zoomSwitchesToMain).
+  bool _zoomedToMain = false;
+
   void _zoomAt(Offset cursor, double factor, Size pane) {
     final newScale = (_scale * factor).clamp(1.0, _maxZoom);
     if (newScale == _scale) return;
@@ -534,6 +546,13 @@ class _WallTileState extends State<_WallTile> {
       _scale = newScale;
       _offset = _clampOffset(newOffset, pane);
     });
+    // Optionally swap to the full-res main stream while zoomed in, reverting to
+    // sub back at 100% (the zoom transform persists across the reload).
+    final wantMain = widget.zoomToMain && newScale > 1.01;
+    if (wantMain != _zoomedToMain) {
+      _zoomedToMain = wantMain;
+      unawaited(_reloadStream());
+    }
   }
 
   Offset _clampOffset(Offset o, Size pane) {
@@ -568,7 +587,8 @@ class _WallTileState extends State<_WallTile> {
           widget.streamPrefs?.liveStreamUrl(
             widget.camera.id,
             streams,
-            isMaximized: false,
+            // Zoomed-in tiles temporarily play main (full-res); otherwise sub.
+            isMaximized: _zoomedToMain,
           ) ??
           streams.preferredForWall;
       if (url == null) {

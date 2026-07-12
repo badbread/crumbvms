@@ -71,6 +71,8 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setShowAllCamerasView(bool v) => setState(() => _o.showAllCamerasView = v);
   void _setHotkeysEnabled(bool v) => setState(() => _o.hotkeysEnabled = v);
   void _setMaximizeMain(bool v) => setState(() => _o.maximizeMain = v);
+  void _setZoomSwitchesToMain(bool v) =>
+      setState(() => _o.zoomSwitchesToMain = v);
 
   bool get _wallUsesSub => widget.streamPrefs?.wallUsesSub ?? true;
   void _setWallUsesSub(bool v) {
@@ -196,6 +198,13 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Maximize plays main stream',
             subtitle:
                 'Full-quality stream when a tile is maximized, instead of staying on the wall\'s stream.',
+          ),
+          _switchRow(
+            value: _o.zoomSwitchesToMain,
+            onChanged: _setZoomSwitchesToMain,
+            title: 'Zoom switches to main stream',
+            subtitle:
+                'Digitally zooming a wall tile past 100% temporarily loads its full-res main stream; back at 100% it reverts to sub.',
           ),
 
           const Divider(height: 24),

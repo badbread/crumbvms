@@ -103,6 +103,7 @@ const String _kMaximizeMain = 'crumb.maximizeMain';
 const String _kPtzClickMode = 'crumb.ptzClickMode';
 const String _kPtzStyle = 'crumb.ptzStyle';
 const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
+const String _kZoomSwitchesToMain = 'crumb.zoomSwitchesToMain';
 
 /// Loads/holds/persists the client options this file owns. Construct once
 /// (e.g. in `CrumbClientApp` state) via [ClientOptionsStore.load] and pass
@@ -123,13 +124,15 @@ class ClientOptionsStore extends ChangeNotifier {
     required PtzClickMode ptzClickMode,
     required PtzStyle ptzStyle,
     required PtzWheelCorner ptzWheelCorner,
+    required bool zoomSwitchesToMain,
   }) : _showInfoBar = showInfoBar,
        _showAllCamerasView = showAllCamerasView,
        _hotkeysEnabled = hotkeysEnabled,
        _maximizeMain = maximizeMain,
        _ptzClickMode = ptzClickMode,
        _ptzStyle = ptzStyle,
-       _ptzWheelCorner = ptzWheelCorner;
+       _ptzWheelCorner = ptzWheelCorner,
+       _zoomSwitchesToMain = zoomSwitchesToMain;
 
   final SharedPreferences? _prefs;
 
@@ -140,6 +143,7 @@ class ClientOptionsStore extends ChangeNotifier {
   PtzClickMode _ptzClickMode;
   PtzStyle _ptzStyle;
   PtzWheelCorner _ptzWheelCorner;
+  bool _zoomSwitchesToMain;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -159,6 +163,7 @@ class ClientOptionsStore extends ChangeNotifier {
       ptzWheelCorner: PtzWheelCorner.fromWire(
         prefs?.getString(_kPtzWheelCorner),
       ),
+      zoomSwitchesToMain: prefs?.getBool(_kZoomSwitchesToMain) ?? false,
     );
   }
 
@@ -220,6 +225,16 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _ptzWheelCorner) return;
     _ptzWheelCorner = v;
     unawaited(_prefs?.setString(_kPtzWheelCorner, v.wire));
+    notifyListeners();
+  }
+
+  // ── digitally zooming a wall tile past 1× temporarily switches it to the
+  //    MAIN (full-res) stream; zooming back to 100% reverts to sub ──
+  bool get zoomSwitchesToMain => _zoomSwitchesToMain;
+  set zoomSwitchesToMain(bool v) {
+    if (v == _zoomSwitchesToMain) return;
+    _zoomSwitchesToMain = v;
+    unawaited(_prefs?.setBool(_kZoomSwitchesToMain, v));
     notifyListeners();
   }
 }

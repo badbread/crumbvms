@@ -469,6 +469,7 @@ class _TypeToggle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
     Widget seg(String v, String label) {
       final active = value == v;
       return Padding(
@@ -481,7 +482,9 @@ class _TypeToggle extends StatelessWidget {
             fontSize: 12,
             color: active ? Colors.black : Colors.white70,
           ),
-          selectedColor: Colors.cyanAccent,
+          // Follow the active tab's accent; keep the check visible on it.
+          selectedColor: accent,
+          checkmarkColor: Colors.black,
           backgroundColor: const Color(0xFF2A2D35),
         ),
       );
@@ -1104,16 +1107,21 @@ class _ClipPlayerState extends State<_ClipPlayer> {
                         icon: Icon(
                           Icons.high_quality,
                           size: 16,
-                          color: _quality == 'full' ? Colors.cyanAccent : Colors.white70,
+                          color: _quality == 'full'
+                              ? Theme.of(context).colorScheme.primary
+                              : Colors.white70,
                         ),
                         label: Text(
                           _quality == 'full' ? 'Full' : 'Preview',
                           style: TextStyle(
                             fontSize: 12,
-                            color: _quality == 'full' ? Colors.cyanAccent : Colors.white70,
+                            color: _quality == 'full'
+                                ? Theme.of(context).colorScheme.primary
+                                : Colors.white70,
                           ),
                         ),
                       ),
+                      // (accent follows the active tab colour)
                       IconButton(
                         tooltip: 'Snapshot',
                         onPressed: _snapshot,
