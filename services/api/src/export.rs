@@ -599,7 +599,20 @@ fn build_codec_args(
             "128k".to_owned(),
         ]);
     } else {
-        args.extend(["-c:a".to_owned(), "copy".to_owned()]);
+        // `-copyinkf:a` is MANDATORY on the audio copy path, same reason as the
+        // recorder (see recording.rs / docs/RECORDER-CORRECTNESS.md): under
+        // `-c copy` ffmpeg drops every packet until the first keyframe-flagged
+        // one, and RTP-AAC audio is never key-flagged. The recorded fMP4's trun
+        // sample flags faithfully preserve that missing key flag, so even a
+        // correctly-recorded segment reads back with its audio unflagged — a
+        // plain `-f concat … -c:a copy` would silently drop the audio all over
+        // again. (The export output is non-fragmented mp4, so it re-writes
+        // proper key flags and stays remux-safe in third-party tools.)
+        args.extend([
+            "-c:a".to_owned(),
+            "copy".to_owned(),
+            "-copyinkf:a".to_owned(),
+        ]);
     }
 
     // MP4-specific: move the moov atom to the front for fast web streaming.
@@ -1594,5 +1607,50 @@ mod tests {
         let token = CancellationToken::new(); // not cancelled
         let outcome = wait_or_cancel(&mut child, &token).await;
         assert!(matches!(outcome, WaitOutcome::Finished(Ok(s)) if s.success()));
+    }
+
+    // ── build_codec_args audio handling ─────────────────────────────────────────
+
+    /// The audio-copy path MUST carry `-copyinkf:a`. The recorder writes fMP4
+    /// whose trun sample flags faithfully record that RTP-AAC audio was never
+    /// key-flagged, so a plain `-f concat … -c:a copy` re-drops the audio (every
+    /// packet before the first "keyframe" is discarded, and none is flagged) —
+    /// producing a silent export even from correctly-recorded footage. Guards
+    /// the fix from being cleaned away.
+    #[test]
+    fn copy_audio_export_keeps_initial_non_keyframes() {
+        let a = build_codec_args(false, true, "copy", "mp4").args;
+        // -c:a copy present, immediately followed/accompanied by -copyinkf:a.
+        assert!(
+            a.windows(2).any(|w| w == ["-c:a", "copy"]),
+            "expected -c:a copy; got {a:?}"
+        );
+        assert!(
+            a.iter().any(|s| s == "-copyinkf:a"),
+            "copy-audio export MUST include -copyinkf:a; got {a:?}"
+        );
+    }
+
+    /// Dropping audio (`include_audio=false`) still emits `-an` and never the
+    /// copy flag; the re-encode path transcodes (`-c:a aac`) so the keyframe
+    /// gate doesn't apply and the flag is neither needed nor emitted.
+    #[test]
+    fn no_audio_and_reencode_paths_omit_copyinkf() {
+        let dropped = build_codec_args(false, false, "copy", "mp4").args;
+        assert!(dropped.iter().any(|s| s == "-an"), "got {dropped:?}");
+        assert!(
+            !dropped.iter().any(|s| s == "-copyinkf:a"),
+            "no audio → no copy flag; got {dropped:?}"
+        );
+
+        let reencoded = build_codec_args(true, true, "copy", "mp4").args;
+        assert!(
+            reencoded.windows(2).any(|w| w == ["-c:a", "aac"]),
+            "burn_timestamp forces a re-encode → -c:a aac; got {reencoded:?}"
+        );
+        assert!(
+            !reencoded.iter().any(|s| s == "-copyinkf:a"),
+            "re-encode path decodes audio, no keyframe gate; got {reencoded:?}"
+        );
     }
 }
