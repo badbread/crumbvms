@@ -44,7 +44,7 @@
 //! actually changed, preventing needless ring-buffer destruction.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -88,8 +88,173 @@ const MOTION_CHANNEL_CAPACITY: usize = 256;
 
 /// Sender half of the per-camera motion signal channel.
 ///
-/// Produced by `CameraWorker::spawn`; owned by the motion task.
-pub type MotionTx = tokio::sync::mpsc::Sender<crumb_common::MotionSignal>;
+/// Produced by `CameraWorker::spawn`; owned by the motion task (one clone per
+/// enabled source loop).
+///
+/// Wraps the raw mpsc sender so a full channel can never *silently* corrupt
+/// the keep/discard verdict (audit #81). The send must stay non-blocking (a
+/// blocking send would stall the frame-diff loop and deadlock ffmpeg —
+/// correctness item 5), so on overflow the signal really is lost — but a lost
+/// START edge would let a Motion-mode camera discard footage during real
+/// motion. The wrapper therefore books the loss per HANDLE in shared state
+/// that [`forward_motion_health`] folds into the recording task's fail-open
+/// signal: a lost verdict degrades to record-everything (correctness item 19),
+/// never to silence. The debt clears on this handle's next ACCEPTED signal —
+/// the edge at which the source's transition tracker and the recording task's
+/// union agree again — so recovery is automatic once the channel drains.
+pub struct MotionTx {
+    tx: tokio::sync::mpsc::Sender<crumb_common::MotionSignal>,
+    camera_id: Uuid,
+    /// This handle's un-resynced-loss flag. Per handle (not shared): each
+    /// source loop holds its own clone, and only a signal from the SAME source
+    /// re-syncs that source's verdict stream.
+    lost: AtomicBool,
+    /// Camera-wide loss bookkeeping, shared by every clone.
+    shared: Arc<MotionLossShared>,
+}
+
+/// Camera-wide bookkeeping for lost motion signals, shared by every clone of
+/// one camera's [`MotionTx`] and read by [`forward_motion_health`].
+#[derive(Default)]
+struct MotionLossShared {
+    /// Number of sender handles whose most recent `try_send` failed and which
+    /// have not delivered a signal since — each such source's verdict stream
+    /// is missing an edge until its next accepted signal re-syncs it.
+    lost_handles: AtomicUsize,
+    /// Wakes the health forwarder whenever `lost_handles` moves. `notify_one`
+    /// stores a permit, so a wake between the forwarder's recompute and its
+    /// re-arm is never missed.
+    changed: tokio::sync::Notify,
+}
+
+impl MotionTx {
+    fn new(tx: tokio::sync::mpsc::Sender<crumb_common::MotionSignal>, camera_id: Uuid) -> Self {
+        Self {
+            tx,
+            camera_id,
+            lost: AtomicBool::new(false),
+            shared: Arc::new(MotionLossShared::default()),
+        }
+    }
+
+    /// The shared loss state, handed to this camera's [`forward_motion_health`].
+    fn loss_state(&self) -> Arc<MotionLossShared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// Non-blocking send of a motion signal to the recording task.
+    ///
+    /// On failure (channel full — or closed, i.e. the recording task is gone,
+    /// which is an even less trustworthy state) the signal is lost: mark this
+    /// handle's debt so the camera fails OPEN until the same handle delivers a
+    /// fresh edge. The error is still returned so callers keep their existing
+    /// per-drop warning logs.
+    pub fn try_send(
+        &self,
+        signal: crumb_common::MotionSignal,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<crumb_common::MotionSignal>> {
+        match self.tx.try_send(signal) {
+            Ok(()) => {
+                if self.lost.swap(false, Ordering::SeqCst) {
+                    // The channel accepted a fresh edge from this handle: the
+                    // recording task's view of this source re-syncs at this
+                    // edge, so the debt (and with it fail-open) can end.
+                    self.shared.lost_handles.fetch_sub(1, Ordering::SeqCst);
+                    self.shared.changed.notify_one();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if !self.lost.swap(true, Ordering::SeqCst) {
+                    // Once per loss episode, not per dropped signal — the
+                    // caller already warns on every drop.
+                    error!(
+                        camera_id = %self.camera_id,
+                        "motion signal LOST (channel full/closed); failing open \
+                         (recording everything) until this source re-syncs"
+                    );
+                    self.shared.lost_handles.fetch_add(1, Ordering::SeqCst);
+                    self.shared.changed.notify_one();
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Clone for MotionTx {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            camera_id: self.camera_id,
+            // Loss is per handle: a fresh clone has lost nothing yet.
+            lost: AtomicBool::new(false),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl Drop for MotionTx {
+    fn drop(&mut self) {
+        // A handle dropped mid-debt can never re-sync, so return its debt —
+        // otherwise the camera would fail open forever on a vanished handle.
+        // A dying source has its own fail-open path (the per-source health
+        // watch in motion.rs), which is the correct one from here on.
+        if self.lost.load(Ordering::SeqCst) {
+            self.shared.lost_handles.fetch_sub(1, Ordering::SeqCst);
+            self.shared.changed.notify_one();
+        }
+    }
+}
+
+/// Fold the motion task's health watch AND the motion-channel loss state into
+/// the single fail-open bool the recording task reads (audit #81).
+///
+/// `recording_tx` has exactly ONE writer — this task — so a detector-health
+/// flip and a loss flip can never interleave into a stale healthy reading.
+/// The recording task fails open (`healthy == false`) whenever the detector
+/// itself is unhealthy (motion.rs's aggregator, forwarded from `detector_rx`)
+/// OR any sender handle has an un-resynced lost signal. Mirrors the
+/// aggregator's teardown rule: publish a final unhealthy so the recording task
+/// never trusts a stale healthy reading.
+async fn forward_motion_health(
+    mut detector_rx: MotionHealthRx,
+    recording_tx: MotionHealthTx,
+    loss: Arc<MotionLossShared>,
+    camera_id: Uuid,
+    cancel: CancellationToken,
+) {
+    loop {
+        let lossy = loss.lost_handles.load(Ordering::SeqCst) > 0;
+        let healthy = *detector_rx.borrow() && !lossy;
+        if *recording_tx.borrow() != healthy {
+            if !healthy && lossy {
+                // Detector-driven transitions are already logged by motion.rs
+                // (RECOVERED / FAIL-OPEN); only the loss-driven one is ours.
+                warn!(
+                    camera_id = %camera_id,
+                    "motion health: FAIL-OPEN (motion signal lost on a full channel; \
+                     recording everything until the source re-syncs)"
+                );
+            }
+            // Only errors when the recording task dropped its receiver
+            // (worker teardown) — nothing left to protect.
+            let _ = recording_tx.send(healthy);
+        }
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            res = detector_rx.changed() => {
+                if res.is_err() {
+                    break; // motion task gone — teardown
+                }
+            }
+            () = loss.changed.notified() => {}
+        }
+    }
+    // Teardown: the recording task must not trust a stale healthy reading
+    // (same rule as motion.rs's aggregator).
+    let _ = recording_tx.send(false);
+}
 
 /// Receiver half of the per-camera motion signal channel.
 ///
@@ -237,8 +402,8 @@ impl CameraWorker {
             &config.motion_vaapi_device,
         );
 
-        let (motion_tx, motion_rx): (MotionTx, MotionRx) =
-            tokio::sync::mpsc::channel(MOTION_CHANNEL_CAPACITY);
+        let (raw_motion_tx, motion_rx) = tokio::sync::mpsc::channel(MOTION_CHANNEL_CAPACITY);
+        let motion_tx = MotionTx::new(raw_motion_tx, camera.id);
 
         // Health channel: starts `false` (unhealthy / unconfirmed) until the
         // motion task's first successful frame analysis flips it `true`. This
@@ -247,6 +412,20 @@ impl CameraWorker {
         // trusting an unproven detector from the first segment.
         let (health_tx, health_rx): (MotionHealthTx, MotionHealthRx) =
             tokio::sync::watch::channel(false);
+
+        // Interposed fail-open rail (audit #81): the recording task reads a
+        // SECOND watch that folds the detector health above together with the
+        // motion channel's loss state, written only by `forward_motion_health`.
+        // Same initial `false` — the worker starts fail-open either way.
+        let (rec_health_tx, rec_health_rx): (MotionHealthTx, MotionHealthRx) =
+            tokio::sync::watch::channel(false);
+        tokio::spawn(forward_motion_health(
+            health_rx,
+            rec_health_tx,
+            motion_tx.loss_state(),
+            camera.id,
+            cancel.clone(),
+        ));
 
         // Clone the cancellation token for each child task.
         let rec_cancel = cancel.clone();
@@ -257,7 +436,12 @@ impl CameraWorker {
         let rec_config = config.clone();
         let recording_handle = tokio::spawn(async move {
             recording::run(
-                rec_camera, rec_pool, rec_config, motion_rx, health_rx, rec_cancel,
+                rec_camera,
+                rec_pool,
+                rec_config,
+                motion_rx,
+                rec_health_rx,
+                rec_cancel,
             )
             .await;
         });
@@ -515,56 +699,15 @@ impl RecorderSupervisor {
         //     decode-status panel. Telemetry only, best-effort, once per boot.
         decode_probe::publish(&self.pool).await;
 
-        // 3. Spawn the archive scheduler.
-        {
-            let sched_pool = self.pool.clone();
-            let sched_config = self.config.clone();
-            let sched_cancel = self.shutdown.clone();
-            let handle = tokio::spawn(async move {
-                archive::run_scheduler(sched_pool, sched_config, sched_cancel).await;
-            });
-            self.archive_handle = Some(handle);
-        }
-
-        // 3b. Spawn the liveness heartbeat task.
-        {
-            let hb_pool = self.pool.clone();
-            let hb_cancel = self.shutdown.clone();
-            let hb_active = Arc::clone(&self.active_cameras);
-            let handle = tokio::spawn(async move {
-                run_heartbeat(hb_pool, hb_active, hb_cancel).await;
-            });
-            self.heartbeat_handle = Some(handle);
-        }
-
-        // 3c. Spawn the per-camera resource sampler (CPU / mem / GPU). Reads /proc
-        //     + nvidia-smi out-of-band; never touches the recording/motion path.
-        self.resource_handle = Some(resource_stats::spawn(
-            self.pool.clone(),
-            self.shutdown.clone(),
-        ));
-
-        // 3d. Spawn the "Change storage" drain worker — claims pending
-        //     storage_migrations and relocates footage under ARCHIVE_GUARD so it
-        //     never races archiving/eviction. Idle-polls; cheap when no migration.
-        {
-            let mig_pool = self.pool.clone();
-            let mig_cancel = self.shutdown.clone();
-            self.migration_handle = Some(tokio::spawn(async move {
-                run_migration_worker(mig_pool, mig_cancel).await;
-            }));
-        }
-
-        // 3e. Spawn the policy-fork reaper — periodically deletes orphaned anonymous
-        //     per-camera COW policy rows no camera/group references (the "separate
-        //     vacuum" the config-routes COW design refers to). Cheap; hourly.
-        {
-            let reap_pool = self.pool.clone();
-            let reap_cancel = self.shutdown.clone();
-            self.reaper_handle = Some(tokio::spawn(async move {
-                run_policy_reaper(reap_pool, reap_cancel).await;
-            }));
-        }
+        // 3. Spawn the long-lived service tasks (archive scheduler, heartbeat,
+        //    resource sampler, migration worker, policy reaper). Each spawn is a
+        //    method so the poll-loop watchdog (`respawn_dead_services`, audit
+        //    #75) can respawn one that panicked, exactly like camera workers.
+        self.spawn_archive_scheduler();
+        self.spawn_heartbeat();
+        self.spawn_resource_sampler();
+        self.spawn_migration_worker();
+        self.spawn_policy_reaper();
 
         // 4. Initial camera sync.
         self.sync_cameras().await;
@@ -577,6 +720,7 @@ impl RecorderSupervisor {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    self.respawn_dead_services();
                     self.sync_cameras().await;
                 }
                 () = self.shutdown.cancelled() => {
@@ -659,6 +803,93 @@ impl RecorderSupervisor {
         }
 
         Ok(())
+    }
+
+    /// Spawn the archive scheduler task.
+    fn spawn_archive_scheduler(&mut self) {
+        let sched_pool = self.pool.clone();
+        let sched_config = self.config.clone();
+        let sched_cancel = self.shutdown.clone();
+        self.archive_handle = Some(tokio::spawn(async move {
+            archive::run_scheduler(sched_pool, sched_config, sched_cancel).await;
+        }));
+    }
+
+    /// Spawn the liveness heartbeat task.
+    fn spawn_heartbeat(&mut self) {
+        let hb_pool = self.pool.clone();
+        let hb_cancel = self.shutdown.clone();
+        let hb_active = Arc::clone(&self.active_cameras);
+        self.heartbeat_handle = Some(tokio::spawn(async move {
+            run_heartbeat(hb_pool, hb_active, hb_cancel).await;
+        }));
+    }
+
+    /// Spawn the per-camera resource sampler (CPU / mem / GPU). Reads /proc
+    /// + nvidia-smi out-of-band; never touches the recording/motion path.
+    fn spawn_resource_sampler(&mut self) {
+        self.resource_handle = Some(resource_stats::spawn(
+            self.pool.clone(),
+            self.shutdown.clone(),
+        ));
+    }
+
+    /// Spawn the "Change storage" drain worker — claims pending
+    /// storage_migrations and relocates footage under ARCHIVE_GUARD so it
+    /// never races archiving/eviction. Idle-polls; cheap when no migration.
+    fn spawn_migration_worker(&mut self) {
+        let mig_pool = self.pool.clone();
+        let mig_cancel = self.shutdown.clone();
+        self.migration_handle = Some(tokio::spawn(async move {
+            run_migration_worker(mig_pool, mig_cancel).await;
+        }));
+    }
+
+    /// Spawn the policy-fork reaper — periodically deletes orphaned anonymous
+    /// per-camera COW policy rows no camera/group references (the "separate
+    /// vacuum" the config-routes COW design refers to). Cheap; hourly.
+    fn spawn_policy_reaper(&mut self) {
+        let reap_pool = self.pool.clone();
+        let reap_cancel = self.shutdown.clone();
+        self.reaper_handle = Some(tokio::spawn(async move {
+            run_policy_reaper(reap_pool, reap_cancel).await;
+        }));
+    }
+
+    /// Watchdog for the long-lived service tasks (audit #75). Each of them
+    /// loops until `shutdown` fires, so a finished handle outside shutdown
+    /// means the task died unexpectedly — in practice a panic (panics unwind
+    /// and fail just that task's future; the process survives because
+    /// `panic = "abort"` is forbidden). Without this check a panicked archive
+    /// scheduler silently stops retention/eviction until the whole recorder
+    /// restarts. Mirrors the camera-worker resurrection in `sync_cameras`
+    /// (audit 2026-07-05); called from the same poll loop.
+    fn respawn_dead_services(&mut self) {
+        if self.shutdown.is_cancelled() {
+            // Shutting down — finished service tasks are expected, and the
+            // shutdown path below joins them; never respawn into a teardown.
+            return;
+        }
+        if service_task_died(&self.archive_handle) {
+            error!("archive scheduler task ended unexpectedly (likely a panic); respawning");
+            self.spawn_archive_scheduler();
+        }
+        if service_task_died(&self.heartbeat_handle) {
+            error!("heartbeat task ended unexpectedly (likely a panic); respawning");
+            self.spawn_heartbeat();
+        }
+        if service_task_died(&self.resource_handle) {
+            error!("resource sampler task ended unexpectedly (likely a panic); respawning");
+            self.spawn_resource_sampler();
+        }
+        if service_task_died(&self.migration_handle) {
+            error!("migration worker task ended unexpectedly (likely a panic); respawning");
+            self.spawn_migration_worker();
+        }
+        if service_task_died(&self.reaper_handle) {
+            error!("policy reaper task ended unexpectedly (likely a panic); respawning");
+            self.spawn_policy_reaper();
+        }
     }
 
     /// Diff enabled DB cameras vs running workers; start new ones, stop
@@ -793,14 +1024,19 @@ impl RecorderSupervisor {
         }
     }
 
-    /// Cancel and join all running workers.
+    /// Cancel and join all running workers, concurrently.
+    ///
+    /// Each `CameraWorker::stop` is individually bounded (8 s join + abort),
+    /// so stopping concurrently bounds the WHOLE fleet's shutdown at ~one
+    /// worker's budget instead of N × 8 s of sequential joins — the total
+    /// shutdown must fit inside compose's `stop_grace_period` or Docker
+    /// SIGKILLs the recorder mid-teardown (audit #84).
     async fn stop_all_workers(&mut self) {
-        let ids: Vec<Uuid> = self.workers.keys().copied().collect();
-        for id in ids {
-            if let Some(worker) = self.workers.remove(&id) {
-                worker.stop().await;
-            }
+        let mut stops = tokio::task::JoinSet::new();
+        for (_, worker) in self.workers.drain() {
+            stops.spawn(worker.stop());
         }
+        while stops.join_next().await.is_some() {}
     }
 
     /// Ensure the two named storage rows exist (idempotent via `ON CONFLICT`).
@@ -832,6 +1068,14 @@ impl RecorderSupervisor {
         );
         Ok(())
     }
+}
+
+/// True when a stored long-lived service handle has ended and must be
+/// respawned (see [`RecorderSupervisor::respawn_dead_services`]). `None`
+/// (never spawned / already taken for shutdown) is NOT "died" — there is
+/// nothing to resurrect.
+fn service_task_died(handle: &Option<tokio::task::JoinHandle<()>>) -> bool {
+    handle.as_ref().is_some_and(|h| h.is_finished())
 }
 
 // ─── heartbeat task ───────────────────────────────────────────────────────────
@@ -1124,11 +1368,13 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::CameraFingerprint;
+    use super::{forward_motion_health, service_task_died, CameraFingerprint, MotionTx};
     use chrono::Utc;
     use crumb_common::types::{
         Camera, MotionSensitivity, RecordStream, RecordingMode, RecordingPolicy,
     };
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     /// Build a minimal default policy for fingerprint tests.
@@ -1292,5 +1538,143 @@ mod tests {
             CameraFingerprint::from_camera(&cam_b, "auto", ""),
             "fingerprint must be stable when no fingerprinted field changes"
         );
+    }
+
+    // ── service-task watchdog (audit #75) ─────────────────────────────────────
+
+    /// The watchdog's liveness predicate: a panicked service task must read as
+    /// died (so `respawn_dead_services` resurrects it); a live task and a
+    /// never-spawned/taken-for-shutdown slot must not.
+    #[tokio::test]
+    async fn service_watchdog_detects_dead_task() {
+        // A task that panics: its JoinHandle finishes with a JoinError.
+        let mut dead = tokio::spawn(async { panic!("service task panicked (test)") });
+        let joined = (&mut dead).await;
+        assert!(joined.is_err(), "panicked task must join with an error");
+        assert!(
+            service_task_died(&Some(dead)),
+            "a panicked service task must be detected as died"
+        );
+
+        // A live task must NOT read as died.
+        let alive = Some(tokio::spawn(std::future::pending::<()>()));
+        assert!(
+            !service_task_died(&alive),
+            "a running service task must not be respawned"
+        );
+        if let Some(h) = alive {
+            h.abort();
+        }
+
+        // Never spawned / already taken for shutdown: nothing to resurrect.
+        assert!(!service_task_died(&None));
+    }
+
+    // ── motion-signal loss → fail-open (audit #81) ────────────────────────────
+
+    /// Minimal signal for the loss-tracking tests.
+    fn mk_signal() -> crumb_common::MotionSignal {
+        crumb_common::MotionSignal {
+            camera_id: Uuid::nil(),
+            started_at: Utc::now(),
+            stopped_at: None,
+            peak_score: 0.5,
+            bbox: None,
+        }
+    }
+
+    /// A signal dropped on a full channel must mark the loss (the camera owes
+    /// a fail-open), and the SAME handle's next accepted signal must clear it.
+    #[tokio::test]
+    async fn motion_tx_overflow_marks_loss_until_resync() {
+        let (raw, mut rx) = tokio::sync::mpsc::channel(1);
+        let tx = MotionTx::new(raw, Uuid::nil());
+        let loss = tx.loss_state();
+
+        assert!(tx.try_send(mk_signal()).is_ok());
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 0);
+
+        // Channel full → the signal is lost → the handle owes a re-sync.
+        assert!(tx.try_send(mk_signal()).is_err());
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
+        // Repeated drops in the same episode must not double-count.
+        assert!(tx.try_send(mk_signal()).is_err());
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
+
+        // Drain, then a fresh accepted edge re-syncs the source: debt cleared.
+        assert!(rx.recv().await.is_some());
+        assert!(tx.try_send(mk_signal()).is_ok());
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 0);
+    }
+
+    /// Loss is tracked per handle — another source's accepted signal must NOT
+    /// clear a debt it didn't incur — and a handle dropped mid-debt returns it
+    /// (a dead source's fail-open is motion.rs's per-source health watch).
+    #[tokio::test]
+    async fn motion_tx_loss_is_per_handle_and_returned_on_drop() {
+        let (raw, mut rx) = tokio::sync::mpsc::channel(1);
+        let a = MotionTx::new(raw, Uuid::nil());
+        let b = a.clone();
+        let loss = a.loss_state();
+
+        assert!(a.try_send(mk_signal()).is_ok()); // fill the only slot
+        assert!(b.try_send(mk_signal()).is_err()); // b loses a signal
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
+
+        // a's accepted send (after a drain) must not clear b's debt.
+        assert!(rx.recv().await.is_some());
+        assert!(a.try_send(mk_signal()).is_ok());
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 1);
+
+        // Dropping the indebted handle hands the debt back.
+        drop(b);
+        assert_eq!(loss.lost_handles.load(Ordering::SeqCst), 0);
+    }
+
+    /// Await the forwarded health watch reaching `want`, with a hard timeout so
+    /// a broken forwarder fails the test instead of hanging it.
+    async fn wait_for_health(rx: &mut super::MotionHealthRx, want: bool) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx.wait_for(|&v| v == want),
+        )
+        .await
+        .expect("timed out waiting for the forwarded health value")
+        .expect("health watch sender dropped");
+    }
+
+    /// End-to-end: the recording-side health watch must go false while a lost
+    /// signal is un-resynced, and recover once the same handle delivers a fresh
+    /// edge — even though the detector stayed healthy throughout.
+    #[tokio::test]
+    async fn health_forwarder_folds_signal_loss_into_fail_open() {
+        let (detector_tx, detector_rx) = tokio::sync::watch::channel(false);
+        let (recording_tx, mut recording_rx) = tokio::sync::watch::channel(false);
+        let (raw, mut rx) = tokio::sync::mpsc::channel(1);
+        let tx = MotionTx::new(raw, Uuid::nil());
+        let cancel = CancellationToken::new();
+        tokio::spawn(forward_motion_health(
+            detector_rx,
+            recording_tx,
+            tx.loss_state(),
+            Uuid::nil(),
+            cancel.clone(),
+        ));
+
+        // Detector healthy, nothing lost → forwarded healthy.
+        detector_tx.send(true).unwrap();
+        wait_for_health(&mut recording_rx, true).await;
+
+        // Overflow: fill the one slot, then lose a signal → fail-open.
+        assert!(tx.try_send(mk_signal()).is_ok());
+        assert!(tx.try_send(mk_signal()).is_err());
+        wait_for_health(&mut recording_rx, false).await;
+
+        // Drain + a fresh accepted edge → re-synced → healthy again.
+        assert!(rx.recv().await.is_some());
+        assert!(tx.try_send(mk_signal()).is_ok());
+        wait_for_health(&mut recording_rx, true).await;
+
+        cancel.cancel();
     }
 }
