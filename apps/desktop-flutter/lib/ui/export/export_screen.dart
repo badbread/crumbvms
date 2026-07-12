@@ -10,12 +10,10 @@
 // /export/{job_id} (+GET .../files/{camera_id} | .../archive) — see
 // services/api/src/export.rs and lib/api/export_api.dart.
 //
-// NOT ported: the Playback-timeline right-click "Export selection…" entry
-// point (pbTimelineContextMenu/pbSetExportEdge/exportInjectButton in
-// app.js) — there is no timeline/playback view in the new app yet (see
-// docs/COMPONENT-MAP.md). [ExportScreen.initialClip] is the seam a future
-// playback view can use to pre-fill the builder with a bracketed selection,
-// mirroring exportOpenBuilder(null, cam, startMs, endMs).
+// Playback hand-off: the Playback timeline's Shift+drag "Export selection"
+// routes a bracketed range here via [ExportScreen.initialClip] (see
+// PlaybackScreen.onExportRange + main.dart), mirroring the old client's
+// exportOpenBuilder(null, cam, startMs, endMs).
 
 import 'dart:async';
 import 'dart:io';
@@ -23,6 +21,8 @@ import 'dart:typed_data';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/export_api.dart';
@@ -79,12 +79,37 @@ class _ExportScreenState extends State<ExportScreen> {
   Timer? _pollTimer;
   DateTime? _earliestStart;
 
+  static const _kExportDirKey = 'crumb.export.dir';
+
   @override
   void initState() {
     super.initState();
     if (widget.initialClip != null) {
       _seq = widget.initialClip!.id;
       _list.add(widget.initialClip!);
+    }
+    _restoreDestDir();
+  }
+
+  Future<void> _restoreDestDir() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final dir = prefs.getString(_kExportDirKey);
+      if (dir != null && dir.isNotEmpty && mounted) {
+        setState(() => _destDir = dir);
+      }
+    } catch (_) {
+      /* prefs unavailable */
+    }
+  }
+
+  Future<void> _openDestFolder() async {
+    final dir = _destDir;
+    if (dir == null) return;
+    try {
+      await launchUrl(Uri.file(dir));
+    } catch (_) {
+      /* best-effort */
     }
   }
 
@@ -203,7 +228,15 @@ class _ExportScreenState extends State<ExportScreen> {
     final dir = await getDirectoryPath(
       confirmButtonText: 'Select export folder',
     );
-    if (dir != null && mounted) setState(() => _destDir = dir);
+    if (dir != null && mounted) {
+      setState(() => _destDir = dir);
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_kExportDirKey, dir);
+      } catch (_) {
+        /* best-effort */
+      }
+    }
   }
 
   // ── submit / poll / download ──────────────────────────────────────────────
@@ -599,6 +632,38 @@ class _ExportScreenState extends State<ExportScreen> {
                           ? 'Submitting…'
                           : _statusLabel(_status) + ' $_progressPct%',
                       style: theme.textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  if (_completed) ...[
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.check_circle,
+                            color: Colors.green,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Saved to ${_destDir ?? "the export folder"}',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          ),
+                          if (_destDir != null)
+                            TextButton.icon(
+                              onPressed: _openDestFolder,
+                              icon: const Icon(Icons.folder_open, size: 16),
+                              label: const Text('Open'),
+                            ),
+                        ],
+                      ),
                     ),
                     const SizedBox(height: 8),
                   ],

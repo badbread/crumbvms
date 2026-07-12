@@ -316,6 +316,27 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
                 'Duration: ${_fmtDuration(_span)}',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
+              const SizedBox(height: 8),
+              // Quick ranges ending "now" (old client's Last 1m/5m/10m/15m).
+              Wrap(
+                spacing: 6,
+                children: [
+                  for (final n in const [1, 5, 10, 15])
+                    ActionChip(
+                      label: Text('Last ${n}m'),
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () {
+                        final now = DateTime.now();
+                        setState(() {
+                          _end = now;
+                          _start = now.subtract(Duration(minutes: n));
+                        });
+                        _stopPlay();
+                        _seekTo(0);
+                      },
+                    ),
+                ],
+              ),
               const SizedBox(height: 12),
               // ── preview scrubber ─────────────────────────────────────────
               AspectRatio(
