@@ -296,15 +296,25 @@ pub async fn run(
         )
         .await;
 
-        if indexed_ok && backoff != BACKOFF_INIT {
+        // "Stream healthy again" is determined by `saw_segment` (ffmpeg produced
+        // at least one segment-list line this run), NOT `indexed_ok` (a segment
+        // was KEPT). A Motion-mode camera on a healthy stream with no motion
+        // rings/discards every segment and never indexes one, so keying the
+        // reset on `indexed_ok` left its backoff ratcheting toward BACKOFF_MAX
+        // (30s) across idle-night blips forever — and a real event starting
+        // during one of those 30s windows lost its opening seconds with an empty
+        // pre-roll ring. A stream that demonstrably produced and processed
+        // segments is healthy regardless of the keep/discard verdict.
+        let stream_healthy = saw_segment;
+        if stream_healthy && backoff != BACKOFF_INIT {
             debug!(
                 camera_id   = %camera.id,
                 camera_name = %camera.name,
-                "stream healthy again (segment indexed); resetting reconnect backoff"
+                "stream healthy again (segments produced); resetting reconnect backoff"
             );
             backoff = BACKOFF_INIT;
         }
-        if indexed_ok {
+        if stream_healthy {
             // A confirmed-healthy stream is by definition not in the cold-start
             // window anymore; a later failure starts the fast-retry count fresh.
             cold_start_retries = 0;
@@ -803,14 +813,28 @@ async fn run_ffmpeg_loop(
     // unconditionally and log at debug level.
     let camera_id_for_stderr = camera.id;
     let stderr_drain = tokio::spawn(async move {
+        // Drain BYTES, not UTF-8 lines. ffmpeg warning lines can contain
+        // non-UTF-8 bytes (camera-supplied stream metadata); `read_line`
+        // returns InvalidData on those and the old `break` closed the pipe
+        // under the LIVE recording child — the ~64 KB stderr buffer then fills,
+        // ffmpeg blocks writing video, and the stdout segment reader blocks →
+        // deadlock (correctness item 5). The task's contract is "keep the pipe
+        // empty until EOF", not "log every line", so we read raw bytes, lossy-
+        // decode only for the debug log, and CONTINUE (bounded) on an IO error
+        // instead of breaking. (#76 fixed the go2rtc and motion drains the same
+        // way; this recording-child drain was missed in the first pass.)
+        const MAX_CONSECUTIVE_ERRORS: u32 = 100;
         let mut reader = BufReader::new(ffmpeg_stderr);
-        let mut line = String::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let mut consecutive_errors: u32 = 0;
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break, // EOF — child's stderr closed
                 Ok(_) => {
-                    let trimmed = line.trim_end();
+                    consecutive_errors = 0;
+                    let text = String::from_utf8_lossy(&buf);
+                    let trimmed = text.trim_end();
                     if !trimmed.is_empty() {
                         debug!(
                             camera_id = %camera_id_for_stderr,
@@ -820,12 +844,18 @@ async fn run_ffmpeg_loop(
                     }
                 }
                 Err(e) => {
-                    debug!(
-                        camera_id = %camera_id_for_stderr,
-                        error = %e,
-                        "error reading ffmpeg recording stderr"
-                    );
-                    break;
+                    // A pathologically erroring fd is bounded so teardown
+                    // (`stderr_drain.await`) can never hang.
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        debug!(
+                            camera_id = %camera_id_for_stderr,
+                            error = %e,
+                            "ffmpeg recording stderr drain giving up after repeated errors"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -1531,9 +1561,6 @@ pub(crate) fn redact_rtsp_credentials(url: &str) -> String {
     }
 }
 
-/// Read one line from the segment-list stdout reader.
-///
-/// Returns `Ok(None)` on EOF, `Ok(Some(line))` on a line, `Err` on IO error.
 /// Drain all currently-available items from `motion_rx` into `out`.
 ///
 /// This is non-blocking: it empties the channel without yielding or sleeping.
@@ -1589,7 +1616,10 @@ async fn drain_and_persist_motion(
             // Recording is a re-trigger; a STOP on Idle is stale-ignored), so
             // this can only make the buffer persist MORE, never less.
             if let Some(replay) = motion_union.take_pending_replay() {
-                let d = buf.apply_signal(&replay);
+                // apply_replayed_edge (not apply_signal): a replayed STOP onto an
+                // Idle buffer means a full event ran inside the frozen window and
+                // we owe its post-roll → PostBuffer, not stale-ignore (#74).
+                let d = buf.apply_replayed_edge(&replay);
                 decision.persist.extend(d.persist);
                 decision.discard.extend(d.discard);
             }
@@ -1598,6 +1628,21 @@ async fn drain_and_persist_motion(
                 // the FIRST open and a falling edge on the LAST close reach apply_signal.
                 if let Some(union_sig) = motion_union.fold(sig) {
                     let d = buf.apply_signal(&union_sig);
+                    decision.persist.extend(d.persist);
+                    decision.discard.extend(d.discard);
+                } else if sig.stopped_at.is_some()
+                    && motion_union.open.is_empty()
+                    && matches!(buf.state, MotionBufferState::Idle)
+                {
+                    // Unmatched STOP while the union AND the buffer are idle: its
+                    // matching START was lost to channel overflow, so fail-open
+                    // (the #81 loss debt) held health false and persisted the
+                    // event body directly, the union never opened, and fold()
+                    // returned None. The debt clears at exactly this accepted STOP
+                    // (main.rs #5), so without this the post-roll would drop —
+                    // treat it as a synthetic PostBuffer trigger (persist-more).
+                    // This is the recording.rs half of the #5 coordination.
+                    let d = buf.apply_replayed_edge(sig);
                     decision.persist.extend(d.persist);
                     decision.discard.extend(d.discard);
                 }
@@ -2810,6 +2855,30 @@ impl MotionBuffer {
         }
     }
 
+    /// Apply a union edge REPLAYED after a fail-open freeze thaws (#74). Differs
+    /// from [`apply_signal`](Self::apply_signal) in exactly one cell: a STOP
+    /// replayed while the buffer is Idle. A *fresh* STOP while Idle is a spurious
+    /// stop with no matching START and is correctly ignored — but a *replayed*
+    /// STOP while Idle means a full motion event opened AND closed inside the
+    /// unhealthy window (fail-open already persisted its body directly) and we
+    /// are now in its post-roll, so the buffer must enter `PostBuffer` to keep
+    /// segments within `motion_post_seconds` after the stop (MOTION-RECORDING.md
+    /// §4's post-roll keep verdict; invariant #19). The ring is empty at thaw
+    /// (#77 drains it on the transition), so this can only persist MORE, never
+    /// discard. Every other case (a START replay, or a STOP replay while already
+    /// Recording/PostBuffer) is identical to `apply_signal`.
+    pub fn apply_replayed_edge(&mut self, signal: &MotionSignal) -> MotionDecision {
+        if let Some(stopped_at) = signal.stopped_at {
+            if matches!(self.state, MotionBufferState::Idle) {
+                self.state = MotionBufferState::PostBuffer {
+                    motion_stopped: stopped_at,
+                };
+                return MotionDecision::empty();
+            }
+        }
+        self.apply_signal(signal)
+    }
+
     /// Evict pre-buffer segments older than `pre_seconds + RING_SLACK_SECS` to
     /// bound memory, returning the evicted segments as discards (RAM
     /// pre-buffer mode: an aged-out cache segment is deleted, never written to
@@ -2902,6 +2971,30 @@ impl MotionUnion {
     /// `None` for a re-trigger / an unmatched STOP / an interleaved edge that
     /// leaves the union state unchanged.
     pub fn fold(&mut self, sig: &MotionSignal) -> Option<MotionSignal> {
+        // Wedge net (#7): before processing, expire any open source key older
+        // than MAX_OPEN_SIGNAL_SECS relative to this signal's time. A source
+        // whose STOP was lost (channel overflow at the STOP edge, or a source
+        // dropped mid-event) would otherwise keep its `started_at` in `open`
+        // forever, so the union never falls to zero and the MotionBuffer stays
+        // pinned in Recording 24/7 on a "healthy" Motion-mode camera. Expiring
+        // here re-syncs the union whenever any later signal arrives; the buffer
+        // then leaves Recording on the next real STOP. (A camera that goes
+        // permanently silent immediately after a lost STOP keeps over-recording
+        // until the next signal — disk waste bounded by retention, never footage
+        // loss, the fail-open-safe direction.)
+        let now = sig.stopped_at.unwrap_or(sig.started_at);
+        let cutoff = now - chrono::Duration::seconds(MAX_OPEN_SIGNAL_SECS);
+        let before_len = self.open.len();
+        self.open.retain(|k| *k >= cutoff);
+        if self.open.len() != before_len {
+            warn!(
+                expired = before_len - self.open.len(),
+                "MotionUnion: expired stale open key(s) with no STOP within MAX_OPEN_SIGNAL_SECS"
+            );
+            if self.open.is_empty() {
+                self.union_started_at = None;
+            }
+        }
         match sig.stopped_at {
             None => {
                 // START: union rises only on the first open.
@@ -3316,12 +3409,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_event_inside_unhealthy_window_is_a_noop_replay_on_thaw() {
+    async fn full_event_inside_unhealthy_window_replays_stop_into_post_buffer() {
         // #74 boundary: an event opens AND closes entirely inside the frozen
-        // window (its footage was persisted directly by fail-open). Only the
-        // newest edge (the STOP) is stashed; replaying it onto an Idle buffer
-        // is stale-ignored — no state change, no discard, and the union ends
-        // consistent (empty).
+        // window (its body was persisted directly by fail-open). Only the newest
+        // edge (the STOP) is stashed. On thaw, replaying that STOP onto the Idle
+        // buffer must enter PostBuffer — NOT stale-ignore it — so the event's
+        // post-roll (segments within motion_post_seconds after the stop) is kept
+        // (MOTION-RECORDING.md §4). The union ends consistent (empty).
         let (tx, mut rx) = motion_channel();
         let mut buf = MotionBuffer::new(5, 10);
         let mut union = MotionUnion::default();
@@ -3336,10 +3430,46 @@ mod tests {
         let mut d2 = MotionDecision::empty();
         drain_and_persist_motion(&mut rx, &mut out, Some(&mut buf), &mut union, &mut d2).await;
         assert!(
-            matches!(buf.state, MotionBufferState::Idle),
-            "a stale replayed STOP on an Idle buffer must be ignored"
+            matches!(buf.state, MotionBufferState::PostBuffer { .. }),
+            "a replayed STOP after a full in-window event must enter PostBuffer to keep the post-roll"
         );
+        // The ring was empty at thaw (fail-open persisted the body directly), so
+        // entering PostBuffer produces no immediate persist/discard here — the
+        // post-roll is kept by subsequent push_segment calls within the window.
         assert!(d2.persist.is_empty() && d2.discard.is_empty());
+    }
+
+    #[test]
+    fn motion_union_expires_stale_open_key_on_later_signal() {
+        // #7 wedge net: source A opens, its STOP is lost, then much later another
+        // signal arrives. The stale A key must be expired so the union is not
+        // pinned open forever (which would hold the buffer Recording 24/7).
+        let mut union = MotionUnion::default();
+        let t0 = utc(2026, 1, 1, 0, 0, 0);
+        let a_start = make_signal(t0, None);
+        assert!(
+            union.fold(&a_start).is_some(),
+            "first open emits a union START"
+        );
+        assert_eq!(union.open.len(), 1);
+
+        // A's STOP is lost; > MAX_OPEN_SIGNAL_SECS later, source B opens.
+        let late = t0 + chrono::Duration::seconds(MAX_OPEN_SIGNAL_SECS + 60);
+        let b_start = make_signal(late, None);
+        assert!(
+            union.fold(&b_start).is_some(),
+            "B is a fresh first-open once the stale A key is expired"
+        );
+        assert_eq!(
+            union.open.len(),
+            1,
+            "only B remains; the stale A key was expired, not left pinning the union"
+        );
+
+        // B closes cleanly → union falls to empty (no stuck-open key).
+        let b_stop = make_signal(late, Some(late + chrono::Duration::seconds(4)));
+        assert!(union.fold(&b_stop).is_some(), "B's STOP closes the union");
+        assert!(union.open.is_empty());
     }
 
     // ── prune_pending_signals (the "stuck motion" regression) ───────────────────
