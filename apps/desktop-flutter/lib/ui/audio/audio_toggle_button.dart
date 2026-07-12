@@ -31,8 +31,9 @@ class AudioToggleButton extends StatelessWidget {
   final VoidCallback? onNoActiveCamera;
 
   Future<void> _toggle() async {
-    final ok = await controller.toggleAudio();
-    if (!ok) onNoActiveCamera?.call();
+    // Audio is a plain on/off toggle now — it never rejects, so
+    // onNoActiveCamera is retained only for API compatibility.
+    await controller.toggleAudio();
   }
 
   @override
@@ -111,8 +112,9 @@ class AudioHotkeyListener extends StatelessWidget {
   }
 
   Future<void> _toggle() async {
-    final ok = await controller.toggleAudio();
-    if (!ok) onNoActiveCamera?.call();
+    // Audio is a plain on/off toggle now — it never rejects, so
+    // onNoActiveCamera is retained only for API compatibility.
+    await controller.toggleAudio();
   }
 
   @override

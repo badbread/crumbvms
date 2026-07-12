@@ -5,6 +5,12 @@
 //
 // The global Shift signal is owned by [HintsController]; the app root toggles
 // it from a HardwareKeyboard handler (see main.dart). Buttons just opt in.
+//
+// Rendering: the caption is a sibling in a Clip.none Stack, floated just
+// above/below the child with a FractionalTranslation, and given its natural
+// width via an OverflowBox. This is deliberately NOT an OverlayPortal /
+// CompositedTransformFollower — that approach rendered oversized black boxes in
+// practice. Here the caption is a tight text chip in the normal widget tree.
 
 import 'package:flutter/material.dart';
 
@@ -18,8 +24,8 @@ class HintsController {
 }
 
 /// Wrap a button (or any widget) to show [hint] above/below it while the
-/// Shift-hint layer is active. Non-intrusive: the caption is an overlay, never
-/// affects layout, and ignores pointer events.
+/// Shift-hint layer is active. Non-intrusive: the caption never affects layout
+/// and ignores pointer events.
 class ShiftHint extends StatefulWidget {
   const ShiftHint({
     super.key,
@@ -40,25 +46,20 @@ class ShiftHint extends StatefulWidget {
 }
 
 class _ShiftHintState extends State<ShiftHint> {
-  final LayerLink _link = LayerLink();
-  final OverlayPortalController _portal = OverlayPortalController();
+  bool _show = false;
 
   @override
   void initState() {
     super.initState();
     HintsController.instance.active.addListener(_sync);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _sync());
+    _sync();
   }
 
   void _sync() {
     if (!mounted) return;
     final show =
         HintsController.instance.active.value && widget.hint.isNotEmpty;
-    if (show && !_portal.isShowing) {
-      _portal.show();
-    } else if (!show && _portal.isShowing) {
-      _portal.hide();
-    }
+    if (show != _show) setState(() => _show = show);
   }
 
   @override
@@ -69,53 +70,51 @@ class _ShiftHintState extends State<ShiftHint> {
 
   @override
   Widget build(BuildContext context) {
-    return CompositedTransformTarget(
-      link: _link,
-      child: OverlayPortal(
-        controller: _portal,
-        overlayChildBuilder: (context) => CompositedTransformFollower(
-          link: _link,
-          showWhenUnlinked: false,
-          targetAnchor: widget.above
-              ? Alignment.topCenter
-              : Alignment.bottomCenter,
-          followerAnchor: widget.above
-              ? Alignment.bottomCenter
-              : Alignment.topCenter,
-          offset: Offset(0, widget.above ? -4 : 4),
-          child: IgnorePointer(
-            // Size to the caption text on a single line. Without an explicit
-            // width bound the overlay child can be handed a near-zero max-width
-            // and wrap one glyph per line — the caption then renders as a thin
-            // vertical sliver. ConstrainedBox + softWrap:false keeps it a normal
-            // horizontal chip.
-            child: Material(
-              color: Colors.transparent,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 260),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 6,
-                    vertical: 3,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.88),
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: Colors.white24),
-                  ),
-                  child: Text(
-                    widget.hint,
-                    maxLines: 1,
-                    softWrap: false,
-                    overflow: TextOverflow.visible,
-                    style: const TextStyle(color: Colors.white, fontSize: 10.5),
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        widget.child,
+        if (_show)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Align(
+                alignment:
+                    widget.above ? Alignment.topCenter : Alignment.bottomCenter,
+                child: FractionalTranslation(
+                  // Move the caption fully out of the child's box (100% of its
+                  // own height) plus a hair, so it sits just above/below it.
+                  translation: Offset(0, widget.above ? -1.15 : 1.15),
+                  child: OverflowBox(
+                    minWidth: 0,
+                    maxWidth: 260,
+                    alignment: Alignment.center,
+                    child: _caption(),
                   ),
                 ),
               ),
             ),
           ),
+      ],
+    );
+  }
+
+  Widget _caption() {
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.88),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: Colors.white24),
         ),
-        child: widget.child,
+        child: Text(
+          widget.hint,
+          maxLines: 1,
+          softWrap: false,
+          overflow: TextOverflow.visible,
+          style: const TextStyle(color: Colors.white, fontSize: 10.5),
+        ),
       ),
     );
   }

@@ -567,17 +567,7 @@ class _MainShellState extends State<MainShell> {
                     size: 20,
                     color: _audio.audioOn ? scheme.primary : null,
                   ),
-                  onPressed: () async {
-                    final ok = await _audio.toggleAudio();
-                    if (!ok && mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('Select a camera to hear its audio.'),
-                          duration: Duration(seconds: 2),
-                        ),
-                      );
-                    }
-                  },
+                  onPressed: () => _audio.toggleAudio(),
                 ),
               ),
             ),

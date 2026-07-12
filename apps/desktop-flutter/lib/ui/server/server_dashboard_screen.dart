@@ -691,7 +691,7 @@ class _RetentionSectionState extends State<_RetentionSection> {
               '${p.liveMaxBytes != null ? ' / ${fmtBytes(p.liveMaxBytes)} cap' : ' (no size cap)'}'
               ' · ${p.gbPerHour.toStringAsFixed(2)} GB/h'
               ' · on disk now ${fmtRetentionHours(p.liveRetentionHoursNow)}'
-              ' · configured ${p.liveRetentionHoursCap}h',
+              ' · configured ${fmtRetentionHours(p.liveRetentionHoursCap.toDouble())}',
             ),
             if (p.archiveUsedBytes > 0 || p.archiveMaxBytes != null)
               Text(
@@ -724,7 +724,7 @@ class _RetentionSectionState extends State<_RetentionSection> {
             ? 'Size cap binds; not enough recent footage to project.'
             : 'Size cap binds — full in ~${fmtRetentionHours(ttf)} at current rate.';
       case 'time':
-        return 'Time retention binds (${p.liveRetentionHoursCap}h) — eviction holds the store flat.';
+        return 'Time retention binds (${fmtRetentionHours(p.liveRetentionHoursCap.toDouble())}) — eviction holds the store flat.';
       default:
         return 'Not enough recent footage to project.';
     }

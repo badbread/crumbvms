@@ -631,11 +631,13 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       initialDate: base.isAfter(now) ? now : base,
       firstDate: now.subtract(const Duration(days: 3650)),
       lastDate: now,
+      initialEntryMode: DatePickerEntryMode.input,
     );
     if (date == null || !mounted) return;
     final time = await showTimePicker(
       context: context,
       initialTime: TimeOfDay.fromDateTime(base),
+      initialEntryMode: TimePickerEntryMode.input,
     );
     if (time == null || !mounted) return;
     final target = DateTime(

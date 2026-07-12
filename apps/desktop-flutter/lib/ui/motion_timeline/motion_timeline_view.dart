@@ -23,7 +23,6 @@ import 'package:flutter/services.dart';
 
 import '../../api/models.dart';
 import '../../api/motion_timeline_api.dart';
-import '../../api/playback_api.dart';
 import '../live_status/detection_icons.dart';
 import '../playback/playback_timeline_controller.dart';
 import 'camera_colors.dart';
@@ -208,8 +207,6 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          _buildLegend(),
-          const SizedBox(height: 2),
           LayoutBuilder(
             builder: (context, constraints) {
               final width = constraints.maxWidth;
@@ -256,6 +253,9 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
               );
             },
           ),
+          // Legend under the scrubber (in the dead space below it), not above.
+          const SizedBox(height: 2),
+          _buildLegend(),
           if (widget.motion.error != null) _buildError(),
         ],
       ),

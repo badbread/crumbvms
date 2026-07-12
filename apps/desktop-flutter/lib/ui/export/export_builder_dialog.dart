@@ -203,11 +203,14 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
       initialDate: initial,
       firstDate: DateTime.now().subtract(const Duration(days: 3650)),
       lastDate: DateTime.now().add(const Duration(days: 1)),
+      // Compact text-entry rather than the oversized full calendar.
+      initialEntryMode: DatePickerEntryMode.input,
     );
     if (date == null || !mounted) return;
     final time = await showTimePicker(
       context: context,
       initialTime: TimeOfDay.fromDateTime(initial),
+      initialEntryMode: TimePickerEntryMode.input,
     );
     if (time == null || !mounted) return;
     final combined = DateTime(

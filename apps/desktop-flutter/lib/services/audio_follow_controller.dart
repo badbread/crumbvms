@@ -139,18 +139,14 @@ class AudioFollowController extends ChangeNotifier {
     }
   }
 
-  /// Toggle master audio on/off for the active (maximized else selected)
-  /// pane. Returns false, leaving state unchanged, if the active pane has no
-  /// playable stream — mirrors `toggleActiveAudio`'s "No camera in the
-  /// selected tile" guard (app.js:3473); the caller can use the return value
-  /// to surface that same status message.
-  Future<bool> toggleAudio() async {
-    final active = activePaneId;
-    final pane = active == null ? null : _panes[active];
-    if (pane == null || !pane.hasAudio()) return false;
+  /// Toggle master audio on/off. This is a plain on/off switch that reflects
+  /// the operator's INTENT for whichever camera is active (maximized else
+  /// selected): it always flips, even if that camera happens to carry no audio
+  /// track — reconcile simply won't find anything to unmute in that case, but
+  /// the button state stays truthful (on is on). No "select a camera" gating.
+  Future<void> toggleAudio() async {
     _audioOn = !_audioOn;
     await reconcile();
-    return true;
   }
 
   /// Re-run reconcile a couple of times after panes are torn down and
