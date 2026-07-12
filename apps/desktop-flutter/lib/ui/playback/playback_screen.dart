@@ -1385,11 +1385,6 @@ class _TransportBar extends StatelessWidget {
                   onShuttle: onShuttle,
                   onShuttleEnd: onShuttleEnd,
                 ),
-                const SizedBox(width: 10),
-                // Speed sits right beside the play cluster (its natural home)
-                // as a clearly-labelled pill with a direct-pick dropdown, not a
-                // cryptic tap-to-cycle text button off in the corner.
-                _speedPill(accent),
                 const SizedBox(width: 8),
               ],
             ),
@@ -1459,11 +1454,14 @@ class _TransportBar extends StatelessWidget {
               ),
             ],
           ),
-          // ── right cluster: go-to date/time + bookmark + zoom ─────────────
+          // ── right cluster: speed + go-to date/time + bookmark + zoom ─────
           Expanded(
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                // Playback speed pill, just right of the center play cluster.
+                _speedPill(accent),
+                const SizedBox(width: 10),
                 ShiftHint(
                   hint: 'Jump to a date & time',
                   child: OutlinedButton.icon(

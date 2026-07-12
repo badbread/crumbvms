@@ -724,8 +724,16 @@ class _TimelinePainter extends CustomPainter {
     final recPaint = Paint()..color = recColor;
     final covY = size.height - covH;
     for (final s in timeline.spans) {
-      final x1 = msToX(s.startMs);
-      final x2 = msToX(s.endMs);
+      final rawX1 = msToX(s.startMs);
+      final rawX2 = msToX(s.endMs);
+      // Skip spans entirely outside the window, and CLAMP the endpoints to the
+      // viewport (not the width) — an always-recording camera's span is far
+      // wider than the window and starts off-screen left, so clamping only the
+      // width drew the whole line off-screen (motion clips are short, so they
+      // happened to land in view — hence "works on motion cameras only").
+      if (rawX2 < 0 || rawX1 > size.width) continue;
+      final x1 = rawX1.clamp(0.0, size.width);
+      final x2 = rawX2.clamp(0.0, size.width);
       canvas.drawRect(
         Rect.fromLTWH(x1, covY, (x2 - x1).clamp(1.5, size.width), covH),
         recPaint,

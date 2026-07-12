@@ -647,10 +647,17 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
 
           // ── Live stage: video/snapshot backdrop + heatmap/exclusion overlay ──
           Center(
-            child: AspectRatio(
-              aspectRatio: _stageAspect ?? (16 / 9),
-              child: Container(
-                key: _stageKey,
+            child: ConstrainedBox(
+              // Cap the stage to ~half the window height so the whole tuner
+              // (stage + the controls below) fits the popup instead of the
+              // full-width 16:9 stage eating the screen and forcing a scroll.
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * 0.5,
+              ),
+              child: AspectRatio(
+                aspectRatio: _stageAspect ?? (16 / 9),
+                child: Container(
+                  key: _stageKey,
                 color: Colors.black,
                 child: Listener(
                   onPointerDown: _onPointerDown,
@@ -689,6 +696,7 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
                     ],
                   ),
                 ),
+              ),
               ),
             ),
           ),
