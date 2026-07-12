@@ -25,6 +25,8 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
+import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'playback_timeline.dart';
 import 'playback_timeline_controller.dart';
@@ -84,6 +86,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   late final PlaybackTimelineController _timeline =
       PlaybackTimelineController();
 
+  // Motion-intensity + detection-glyph strip above the scrubber. Its window is
+  // kept in sync with the scrubber; data (re)fetch is debounced.
+  late final MotionTimelineController _motion = MotionTimelineController(
+    api: widget.api,
+    session: widget.session,
+  );
+  Timer? _motionDebounce;
+
   String? _selectedCameraId;
   String? _maximizedCameraId;
 
@@ -110,17 +120,51 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _panes[c.id] = _PbPane();
     }
     _selectedCameraId = _cameras.isNotEmpty ? _cameras.first.id : null;
+    // Rebuild (fresh playhead for the motion strip) + debounced motion refetch
+    // whenever the scrubber window/playhead changes.
+    _timeline.addListener(_onTimelineChanged);
     _enter();
+  }
+
+  void _onTimelineChanged() {
+    if (mounted) setState(() {});
+    _scheduleMotionRefresh();
+  }
+
+  /// Keep the motion controller's window/selection in step with the scrubber,
+  /// then (debounced) refetch intensity + detections.
+  void _scheduleMotionRefresh() {
+    _motion.configure(
+      windowStartMs: _timeline.windowStart.millisecondsSinceEpoch,
+      windowEndMs: _timeline.windowEnd.millisecondsSinceEpoch,
+      wallCameraIds: _cameraIds,
+      selectedCameraId: _maximizedCameraId ?? _selectedCameraId,
+    );
+    _motionDebounce?.cancel();
+    _motionDebounce = Timer(
+      const Duration(milliseconds: 350),
+      () => _motion.refresh(),
+    );
+  }
+
+  /// Seek the playhead to `ms` epoch (from a motion-strip click / prev-next).
+  Future<void> _seekToMs(int ms) async {
+    final t = DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+    _timeline.setPlayhead(t, now: DateTime.now().toUtc());
+    await _commitSeek(t);
   }
 
   @override
   void dispose() {
     _tickTimer?.cancel();
+    _motionDebounce?.cancel();
+    _timeline.removeListener(_onTimelineChanged);
     for (final p in _panes.values) {
       p.dispose();
     }
     _timeGotoController.dispose();
     _timeline.dispose();
+    _motion.dispose();
     super.dispose();
   }
 
@@ -458,6 +502,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (cameraId == _selectedCameraId) return;
     setState(() => _selectedCameraId = cameraId);
     _timeline.setSpans(_spansForSelected());
+    _scheduleMotionRefresh(); // redraw the selected motion track prominent
   }
 
   void _toggleMaximize(String cameraId) {
@@ -538,6 +583,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onJumpFirst: _jumpToFirst,
             onJumpLatest: _jumpToLatest,
             onTimeGoto: _handleTimeGoto,
+          ),
+          // Motion-intensity histogram + detection glyphs + legend +
+          // prev/next-motion transport, synced to the scrubber window.
+          MotionTimelineView(
+            controller: _motion,
+            cameras: _cameras,
+            playheadMs: _timeline.playhead.millisecondsSinceEpoch,
+            onSeek: _seekToMs,
           ),
           PlaybackTimeline(
             controller: _timeline,
