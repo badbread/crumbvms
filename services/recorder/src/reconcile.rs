@@ -50,7 +50,7 @@ use chrono::{DateTime, Duration, Utc};
 use crumb_common::{
     config::Config,
     db,
-    types::{SegmentStage, SegmentStream},
+    types::{RecordStream, SegmentStage, SegmentStream},
 };
 use deadpool_postgres::Pool;
 use tokio_util::sync::CancellationToken;
@@ -214,7 +214,9 @@ async fn run_periodic(pool: Pool, config: Config, shutdown: CancellationToken) {
 async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken) {
     info!("reconcile phase 2: starting background pass (dangling rows + orphan indexing)");
 
-    // ── 2× segment-length, used to bound in-flight skips + duration clamps ────
+    // ── segment lengths: 1× for end_ts fallbacks + future-mtime slop, 2× to
+    //    bound in-flight skips + duration plausibility ─────────────────────────
+    let segment_len = Duration::seconds(i64::from(config.segment_seconds));
     let twice_segment = Duration::seconds(i64::from(config.segment_seconds) * 2);
 
     // ── dangling-row pass (paginated) ─────────────────────────────────────────
@@ -529,25 +531,66 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     };
 
     // `stage` is a RETENTION label, not a location selector — but a newly-adopted
-    // truly-orphan row still needs one. Label files found under the configured
-    // ARCHIVE-default disk as Archive; everything else (the live default and any
-    // per-policy disk) as Live (the conservative recording stage). The archive
-    // scheduler re-stages footage by policy regardless of this initial guess.
-    let archive_default_id = match db::get_storage_by_name(&pool, &config.archive_storage_name)
-        .await
-    {
-        Ok(opt) => opt.map(|s| s.id),
-        Err(e) => {
-            // Non-fatal: without it we just label everything Live (safe default).
-            warn!(error = %e, "reconcile phase 2: cannot resolve archive-default storage; labelling all orphans Live");
-            None
+    // truly-orphan row still needs one. An orphan found on an ARCHIVE destination
+    // disk must be adopted as stage=archive: labelling it Live mis-scoped its
+    // retention (archive tiers often keep footage far longer than live) and
+    // pointed the next cron archive run at a "live" segment already sitting at
+    // its archive destination (the issue-#70 family — archive.rs now also guards
+    // that self-copy, but the label should simply be right at adoption).
+    //
+    // Archive destinations are the configured ARCHIVE-default disk PLUS every
+    // policy's `archive_storage_id` (previously only the config-name default was
+    // labelled Archive, so orphans on a per-policy archive disk were adopted as
+    // Live). A storage that is ALSO a live destination (some policy's
+    // `live_storage_id`, or the configured live default — e.g. a shared
+    // live==archive directory expressed as one row) stays labelled Live, the
+    // conservative recording stage, exactly as before.
+    let mut archive_storage_ids: HashSet<Uuid> = HashSet::new();
+    let mut live_storage_ids: HashSet<Uuid> = HashSet::new();
+    match db::get_storage_by_name(&pool, &config.archive_storage_name).await {
+        Ok(opt) => {
+            if let Some(s) = opt {
+                archive_storage_ids.insert(s.id);
+            }
         }
-    };
+        Err(e) => {
+            // Non-fatal: without it we just label fewer disks Archive (safe).
+            warn!(error = %e, "reconcile phase 2: cannot resolve archive-default storage");
+        }
+    }
+    match db::get_storage_by_name(&pool, &config.live_storage_name).await {
+        Ok(opt) => {
+            if let Some(s) = opt {
+                live_storage_ids.insert(s.id);
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "reconcile phase 2: cannot resolve live-default storage");
+        }
+    }
+    match db::list_policies(&pool).await {
+        Ok(policies) => {
+            for p in &policies {
+                if let Some(id) = p.archive_storage_id {
+                    archive_storage_ids.insert(id);
+                }
+                if let Some(id) = p.live_storage_id {
+                    live_storage_ids.insert(id);
+                }
+            }
+        }
+        Err(e) => {
+            // Non-fatal: fall back to the storage-name defaults resolved above.
+            warn!(error = %e, "reconcile phase 2: cannot list policies for archive-stage labelling; using storage-name defaults only");
+        }
+    }
 
     let storages_to_scan: Vec<(Uuid, PathBuf, SegmentStage)> = all_storages
         .into_iter()
         .map(|s| {
-            let stage = if Some(s.id) == archive_default_id {
+            let is_archive_dest =
+                archive_storage_ids.contains(&s.id) && !live_storage_ids.contains(&s.id);
+            let stage = if is_archive_dest {
                 SegmentStage::Archive
             } else {
                 SegmentStage::Live
@@ -618,12 +661,14 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             // 2×segment_seconds of NOW is almost certainly one ffmpeg is STILL
             // writing — indexing it produced the prod 28-byte ftyp-only rows.
             // Skip it; the recorder's own boundary insert (or a later reconcile)
-            // will index it once it is complete.
+            // will index it once it is complete. A FUTURE mtime beyond one
+            // segment length of clock slop is implausible, not "recent" — see
+            // [`mtime_in_flight`] — and must not gate the file forever.
             match tokio::fs::metadata(&abs_path).await {
                 Ok(meta) => {
                     if let Ok(mtime) = meta.modified() {
                         let mtime_utc: DateTime<Utc> = mtime.into();
-                        if Utc::now() - mtime_utc < twice_segment {
+                        if mtime_in_flight(Utc::now(), mtime_utc, segment_len, twice_segment) {
                             debug!(
                                 path = %rel_path,
                                 "orphan file modified too recently (in-flight); skipping this boot"
@@ -691,6 +736,7 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             entry.storage_id,
             &entry.rel_path,
             &entry.stage,
+            segment_len,
             twice_segment,
         )
         .await
@@ -796,6 +842,33 @@ enum OrphanOutcome {
     NotIndexable,
 }
 
+/// In-flight gate for the ORPHAN pass: `true` when `mtime` says the file may
+/// still be actively written, so adoption must wait for a later pass.
+///
+/// A file modified within `twice_segment` of `now` is almost certainly one
+/// ffmpeg is still writing (indexing those produced the prod 28-byte ftyp-only
+/// rows). But an mtime more than one segment length in the FUTURE is not
+/// "recent" — it is implausible (a clock step, a copied/restored file) — and
+/// the pre-fix arithmetic (`now - mtime < twice_segment`, which is trivially
+/// true when the difference is negative) kept such files "in flight" FOREVER:
+/// never adopted, never counted toward any budget, silently eating disk
+/// (issue #84). Treat them as settled and adoptable; [`try_index_orphan`]
+/// already ignores an implausible mtime and derives timestamps from the
+/// filename. Up to one segment length of future skew is still tolerated as
+/// ordinary clock slop (a segment being written right now legitimately carries
+/// an mtime a moment ahead of a slightly-behind reader clock).
+fn mtime_in_flight(
+    now: DateTime<Utc>,
+    mtime: DateTime<Utc>,
+    segment_len: Duration,
+    twice_segment: Duration,
+) -> bool {
+    if mtime > now + segment_len {
+        return false; // implausible future mtime — settled, adoptable
+    }
+    now - mtime < twice_segment
+}
+
 /// Attempt to index an orphan file.
 ///
 /// Returns [`OrphanOutcome::Indexed`] if a new row was inserted,
@@ -804,8 +877,12 @@ enum OrphanOutcome {
 /// is genuine junk (caller should quarantine), or `Err` on a database /
 /// filesystem error.
 ///
+/// `segment_len` is the nominal segment length (the `end_ts` fallback);
+/// `max_segment_len` (2×) is the mtime plausibility window only.
+///
 /// The path structure is expected to be:
 /// `{storage_root}/{camera_id}/{YYYY}/{MM}/{DD}/{timestamp}.mp4`
+#[allow(clippy::too_many_arguments)]
 async fn try_index_orphan(
     pool: &Pool,
     abs_path: &Path,
@@ -813,6 +890,7 @@ async fn try_index_orphan(
     storage_id: Uuid,
     rel_path: &str,
     stage: &SegmentStage,
+    segment_len: Duration,
     max_segment_len: Duration,
 ) -> Result<OrphanOutcome> {
     // Parse the segment start timestamp from the filename.
@@ -853,8 +931,9 @@ async fn try_index_orphan(
         }
     };
 
-    // Verify the camera exists in the DB.
-    match db::get_camera(pool, camera_id).await {
+    // Verify the camera exists in the DB (and keep it: its effective policy
+    // tells us which stream this camera records — issue #84 below).
+    let camera = match db::get_camera(pool, camera_id).await {
         Ok(None) => {
             warn!(
                 camera_id = %camera_id,
@@ -866,8 +945,8 @@ async fn try_index_orphan(
         Err(e) => {
             return Err(e.context("looking up camera for orphan indexing"));
         }
-        Ok(Some(_)) => {}
-    }
+        Ok(Some(cam)) => cam,
+    };
 
     // Get file size.
     let metadata = tokio::fs::metadata(abs_path)
@@ -890,8 +969,11 @@ async fn try_index_orphan(
     // For end_ts: use the file's modification time as a best-effort estimate,
     // CLAMPED so a reset/copied mtime can't manufacture a multi-hour duration
     // (audit GAP / P1 #6 — prod had 806 rows up to 49h). Falls back to
-    // start_ts + segment length when mtime is unavailable or implausible.
-    let fallback_end = start_ts + max_segment_len;
+    // start_ts + ONE nominal segment length when mtime is unavailable or
+    // implausible — NOT the 2× plausibility window, which would manufacture a
+    // double-length segment (issue #84); 2× is only how far an mtime may
+    // legitimately land past start_ts (a real segment can run somewhat long).
+    let fallback_end = start_ts + segment_len;
     let end_ts = match metadata.modified() {
         Ok(mtime) => {
             let mtime_utc: DateTime<Utc> = mtime.into();
@@ -908,12 +990,23 @@ async fn try_index_orphan(
 
     let duration_ms = (end_ts - start_ts).num_milliseconds().max(0) as i32;
 
+    // Adopt with the STREAM the camera's effective policy actually records
+    // (issue #84): hardcoding Main mislabelled sub-stream cameras' footage and
+    // weakened the (camera_id, stream, start_ts) AlreadyIndexed guard — a
+    // sub-stream camera's real row never collided with a Main-labelled adopt.
+    // The RecordStream→SegmentStream mapping is total, so Main remains the
+    // value only for cameras that record main (the previous default).
+    let stream = match camera.policy.record_stream {
+        RecordStream::Main => SegmentStream::Main,
+        RecordStream::Sub => SegmentStream::Sub,
+    };
+
     let params = db::InsertSegmentParams {
         camera_id,
         storage_id,
         stage: *stage,
         path: rel_path.to_owned(),
-        stream: SegmentStream::Main, // conservative default — main stream is recorded
+        stream,
         start_ts,
         end_ts,
         duration_ms,
@@ -1161,13 +1254,16 @@ mod tests {
 
     /// Pure-logic test of the mtime-derived-duration clamp the orphan reindexer
     /// applies (audit P1 #6). Mirrors `try_index_orphan`'s clamp arithmetic so the
-    /// boundary is verifiable without a DB/filesystem.
+    /// boundary is verifiable without a DB/filesystem: the fallback is ONE
+    /// nominal segment length; `max_segment_len` (2×) is only the plausibility
+    /// window an observed mtime may land in (issue #84).
     fn clamp_end_ts(
         start_ts: DateTime<Utc>,
         mtime: DateTime<Utc>,
+        segment_len: Duration,
         max_segment_len: Duration,
     ) -> DateTime<Utc> {
-        let fallback = start_ts + max_segment_len;
+        let fallback = start_ts + segment_len;
         if mtime <= start_ts || (mtime - start_ts) > max_segment_len {
             fallback
         } else {
@@ -1178,18 +1274,80 @@ mod tests {
     #[test]
     fn orphan_clamps_absurd_mtime_duration() {
         let start = Utc::now() - Duration::hours(50);
-        let seg_len = Duration::seconds(8); // 2× a 4s segment
-                                            // A 49h mtime (copied/recovered file) must clamp to start+seg_len.
+        let seg_len = Duration::seconds(4); // nominal segment
+        let window = Duration::seconds(8); // 2× plausibility window
+
+        // A 49h mtime (copied/recovered file) must clamp to the fallback.
         let bad_mtime = start + Duration::hours(49);
-        assert_eq!(clamp_end_ts(start, bad_mtime, seg_len), start + seg_len);
-        // mtime before start → also fallback.
         assert_eq!(
-            clamp_end_ts(start, start - Duration::seconds(1), seg_len),
+            clamp_end_ts(start, bad_mtime, seg_len, window),
             start + seg_len
         );
-        // A plausible mtime (within seg_len) is kept verbatim.
-        let good = start + Duration::seconds(4);
-        assert_eq!(clamp_end_ts(start, good, seg_len), good);
+        // mtime before start → also fallback.
+        assert_eq!(
+            clamp_end_ts(start, start - Duration::seconds(1), seg_len, window),
+            start + seg_len
+        );
+        // A plausible mtime (within the 2× window) is kept verbatim — even one
+        // somewhat past the nominal length (a real segment can run long).
+        let good = start + Duration::seconds(6);
+        assert_eq!(clamp_end_ts(start, good, seg_len, window), good);
+    }
+
+    /// Issue #84: the end_ts FALLBACK is one NOMINAL segment, not the 2×
+    /// plausibility window — the old code manufactured a double-length
+    /// duration for every adopted orphan whose mtime was implausible.
+    #[test]
+    fn orphan_end_ts_fallback_is_one_segment_not_double() {
+        let start = Utc::now() - Duration::hours(50);
+        let seg_len = Duration::seconds(4);
+        let window = Duration::seconds(8);
+        let implausible = start + Duration::hours(49);
+        let end = clamp_end_ts(start, implausible, seg_len, window);
+        assert_eq!(
+            end,
+            start + seg_len,
+            "fallback must be start + segment_seconds"
+        );
+        assert_ne!(
+            end,
+            start + window,
+            "fallback must NOT be the 2× window (the manufactured 2×-duration bug)"
+        );
+    }
+
+    /// Issue #84: the orphan in-flight gate must not skip FUTURE-mtime files
+    /// forever. Pre-fix, `now - mtime` was negative for any future mtime and
+    /// therefore always `< twice_segment`, so the file was gated on EVERY
+    /// pass — never adopted, never counted, silently eating disk.
+    #[test]
+    fn inflight_gate_treats_far_future_mtime_as_adoptable() {
+        let now = Utc::now();
+        let seg = Duration::seconds(4);
+        let twice = Duration::seconds(8);
+
+        // Just written → genuinely in flight.
+        assert!(mtime_in_flight(now, now, seg, twice));
+        // Written 1s ago → still in flight.
+        assert!(mtime_in_flight(now, now - Duration::seconds(1), seg, twice));
+        // Settled (older than the 2× window) → adoptable.
+        assert!(!mtime_in_flight(
+            now,
+            now - Duration::seconds(9),
+            seg,
+            twice
+        ));
+        // Slight future skew (within one segment of clock slop) → still gated.
+        assert!(mtime_in_flight(now, now + Duration::seconds(3), seg, twice));
+        // FAR-future mtime (beyond one segment ahead): implausible, must be
+        // treated as settled/adoptable instead of gated forever.
+        assert!(!mtime_in_flight(now, now + Duration::hours(5), seg, twice));
+        assert!(!mtime_in_flight(
+            now,
+            now + Duration::seconds(5),
+            seg,
+            twice
+        ));
     }
 
     /// Prefers `CRUMB_TEST_DATABASE_URL`, falling back to the workspace-wide
@@ -1806,6 +1964,7 @@ mod tests {
             disk_b.id,
             &rel_path,
             &SegmentStage::Live,
+            Duration::seconds(15),
             Duration::seconds(30),
         )
         .await
@@ -2013,6 +2172,157 @@ mod tests {
             .expect("row must still exist — dangling re-verify must not delete a row whose file is present");
         assert!(row.path.ends_with(filename));
         assert!(abs_path.exists(), "file itself must be untouched");
+    }
+
+    /// Issue #84: orphan adoption must index with the STREAM the camera's
+    /// effective policy actually records — hardcoding Main mislabelled
+    /// sub-stream cameras' footage and weakened the (camera_id, stream,
+    /// start_ts) AlreadyIndexed guard.
+    #[tokio::test]
+    async fn orphan_adoption_uses_policy_record_stream() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+
+        // Flip the camera's effective policy to record the SUB stream.
+        {
+            let client = fx.pool.get().await.expect("conn");
+            client
+                .execute("UPDATE recording_policies SET record_stream = 'sub'", &[])
+                .await
+                .expect("set record_stream = sub");
+        }
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        let cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+        let filename = "20260101T000100Z.mp4";
+        let abs_path = cam_dir.join(filename);
+        tokio::fs::write(&abs_path, vec![0u8; 4096])
+            .await
+            .expect("write orphan");
+        backdate(&abs_path, 3600).await;
+
+        let rel_path = format!("{}/{filename}", fx.camera_id);
+        let outcome = try_index_orphan(
+            &fx.pool,
+            &abs_path,
+            &fx.live_path,
+            live.id,
+            &rel_path,
+            &SegmentStage::Live,
+            Duration::seconds(15),
+            Duration::seconds(30),
+        )
+        .await
+        .expect("try_index_orphan must not error");
+        assert_eq!(outcome, OrphanOutcome::Indexed, "truly-orphan key adopted");
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments");
+        assert_eq!(rows.len(), 1, "one adopted row: {rows:?}");
+        assert_eq!(
+            rows[0].stream,
+            SegmentStream::Sub,
+            "adopted orphan must carry the policy's record_stream (sub), not a hardcoded Main"
+        );
+    }
+
+    /// Issue #70 family: an orphan found on an ARCHIVE destination disk (a
+    /// policy's `archive_storage_id`, not just the config-name default) must be
+    /// adopted as stage=archive — pre-fix it was labelled Live, which
+    /// mis-scoped its retention and pointed the next cron archive run at a
+    /// "live" segment already sitting at its archive destination. A control
+    /// orphan on the live disk stays stage=live.
+    #[tokio::test]
+    async fn orphan_on_policy_archive_storage_adopts_as_archive_stage() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+
+        // A per-policy archive disk that is NOT the config-name default
+        // ("Bulk-Archive") — the case the old labelling missed.
+        let policy_arch_dir = tempfile::Builder::new()
+            .prefix("crumb-recon-policy-arch")
+            .tempdir()
+            .expect("policy archive tmp");
+        let policy_arch = crumb_common::db::upsert_storage(
+            &fx.pool,
+            "Policy-Archive",
+            policy_arch_dir.path().to_str().expect("utf8"),
+        )
+        .await
+        .expect("policy archive storage");
+        {
+            let client = fx.pool.get().await.expect("conn");
+            client
+                .execute(
+                    "UPDATE recording_policies SET archive_storage_id = $1",
+                    &[&policy_arch.id],
+                )
+                .await
+                .expect("point policy at the archive storage");
+        }
+
+        // Orphan on the POLICY ARCHIVE disk → must adopt as stage=archive.
+        let arch_cam_dir = policy_arch_dir.path().join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&arch_cam_dir)
+            .await
+            .expect("mkdir arch cam");
+        let arch_file = arch_cam_dir.join("20260101T000200Z.mp4");
+        tokio::fs::write(&arch_file, vec![0u8; 4096])
+            .await
+            .expect("write archive orphan");
+        backdate(&arch_file, 3600).await;
+
+        // Control orphan on the LIVE disk → must adopt as stage=live.
+        let live_cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&live_cam_dir)
+            .await
+            .expect("mkdir live cam");
+        let live_file = live_cam_dir.join("20260101T000210Z.mp4");
+        tokio::fs::write(&live_file, vec![0u8; 4096])
+            .await
+            .expect("write live orphan");
+        backdate(&live_file, 3600).await;
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments");
+        let by_suffix = |suffix: &str| {
+            rows.iter()
+                .find(|r| r.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("adopted row for {suffix} missing: {rows:?}"))
+        };
+
+        let arch_row = by_suffix("20260101T000200Z.mp4");
+        assert_eq!(
+            arch_row.stage,
+            SegmentStage::Archive,
+            "orphan on a policy archive disk must be adopted as stage=archive"
+        );
+        assert_eq!(arch_row.storage_id, policy_arch.id);
+
+        let live_row = by_suffix("20260101T000210Z.mp4");
+        assert_eq!(
+            live_row.stage,
+            SegmentStage::Live,
+            "orphan on the live disk must stay stage=live"
+        );
     }
 
     /// Set a file's mtime `secs_ago` seconds into the past so it falls OUTSIDE
