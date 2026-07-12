@@ -40,6 +40,12 @@ const double _panThresholdPx = 4;
 /// tracks the drag in real time instead of only updating once it settles.
 const Duration _liveSeekThrottle = Duration(milliseconds: 80);
 
+/// Grab radius (px) around an export-range selection edge for drag-to-adjust.
+const double _selEdgeGrabPx = 7;
+
+/// Which edge of the export-range selection a drag is adjusting.
+enum _SelEdge { start, end }
+
 class MotionTimelineView extends StatefulWidget {
   const MotionTimelineView({
     super.key,
@@ -112,6 +118,11 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
   // on release it pops the export context menu.
   bool _secondaryPress = false;
 
+  // While adjusting/creating a selection, the last time the moving edge was
+  // dragged to — the video live-seeks here so playback follows the drag, and
+  // it's committed (exact frame) on release. Null when not editing a selection.
+  DateTime? _selSeekTarget;
+
   @override
   void initState() {
     super.initState();
@@ -151,17 +162,77 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     return winStart + ((x / _width) * winDur).round();
   }
 
+  double? _xAtMs(int ms) {
+    final c = widget.timeline;
+    final winStart = c.windowStart.millisecondsSinceEpoch;
+    final winDur = c.windowEnd.millisecondsSinceEpoch - winStart;
+    if (winDur <= 0 || _width <= 0) return null;
+    return (ms - winStart) / winDur * _width;
+  }
+
+  /// Which selection edge (if any) the cursor at [dx] is close enough to grab
+  /// for a drag-to-adjust. Prefers the nearer edge when both are in range.
+  _SelEdge? _selectionEdgeAt(double dx) {
+    final t = widget.timeline;
+    if (!t.hasSelection || t.selStartMs == null || t.selEndMs == null) {
+      return null;
+    }
+    final xs = _xAtMs(t.selStartMs!);
+    final xe = _xAtMs(t.selEndMs!);
+    final ds = xs == null ? double.infinity : (dx - xs).abs();
+    final de = xe == null ? double.infinity : (dx - xe).abs();
+    if (ds <= _selEdgeGrabPx && ds <= de) return _SelEdge.start;
+    if (de <= _selEdgeGrabPx) return _SelEdge.end;
+    return null;
+  }
+
+  /// Push a throttled live-seek (leading + trailing edge) to [target] so the
+  /// video tracks a drag in real time. Shared by pan-scrub and selection-edge
+  /// drag.
+  void _liveSeekThrottled(DateTime target) {
+    final now = DateTime.now();
+    final since = now.difference(_lastLiveSeek);
+    _liveSeekTimer?.cancel();
+    if (since >= _liveSeekThrottle) {
+      _lastLiveSeek = now;
+      widget.onLiveSeek?.call(target);
+    } else {
+      _liveSeekTimer = Timer(_liveSeekThrottle - since, () {
+        _lastLiveSeek = DateTime.now();
+        widget.onLiveSeek?.call(target);
+      });
+    }
+  }
+
   // ── pointer handlers ──────────────────────────────────────────────────────
 
   void _onPointerDown(PointerDownEvent e) {
     _dragging = true;
     _isPan = false;
     _secondaryPress = e.buttons == kSecondaryButton;
-    // Right-drag (like Shift+drag) selects an export range instead of panning.
+
+    // Grab an existing selection edge to drag-adjust it (either button). The
+    // OPPOSITE edge becomes the fixed anchor; the video live-seeks to the edge
+    // under the cursor so playback follows the drag.
+    final edge = _selectionEdgeAt(e.localPosition.dx);
+    if (edge != null) {
+      _selecting = true;
+      _selAnchorMs =
+          edge == _SelEdge.start ? widget.timeline.selEndMs : widget.timeline.selStartMs;
+      final t = _xToTime(e.localPosition.dx);
+      widget.timeline.setSelection(_selAnchorMs, t.millisecondsSinceEpoch);
+      _selSeekTarget = t;
+      _liveSeekThrottled(t);
+      return;
+    }
+
+    // Right-drag (like Shift+drag) selects a new export range instead of panning.
     if (_secondaryPress || HardwareKeyboard.instance.isShiftPressed) {
       _selecting = true;
-      _selAnchorMs = _xToTime(e.localPosition.dx).millisecondsSinceEpoch;
+      final t = _xToTime(e.localPosition.dx);
+      _selAnchorMs = t.millisecondsSinceEpoch;
       widget.timeline.setSelection(_selAnchorMs, _selAnchorMs);
+      _selSeekTarget = t;
       return;
     }
     _selecting = false;
@@ -173,10 +244,11 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
   void _onPointerMove(PointerMoveEvent e) {
     if (!_dragging) return;
     if (_selecting) {
-      widget.timeline.setSelection(
-        _selAnchorMs,
-        _xToTime(e.localPosition.dx).millisecondsSinceEpoch,
-      );
+      final t = _xToTime(e.localPosition.dx);
+      widget.timeline.setSelection(_selAnchorMs, t.millisecondsSinceEpoch);
+      // Playback follows the moving edge so start/end can be picked precisely.
+      _selSeekTarget = t;
+      _liveSeekThrottled(t);
       return;
     }
     final dx = e.localPosition.dx - _panStartX;
@@ -192,20 +264,8 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     widget.timeline.setPlayhead(_panStartPlayhead!.add(Duration(milliseconds: deltaMs)));
 
     // Live scrub: push the seek to the panes AS the drag moves (throttled),
-    // not just after it settles — leading edge fires now if enough time has
-    // passed, otherwise a trailing timer catches the latest position.
-    final now = DateTime.now();
-    final since = now.difference(_lastLiveSeek);
-    _liveSeekTimer?.cancel();
-    if (since >= _liveSeekThrottle) {
-      _lastLiveSeek = now;
-      widget.onLiveSeek?.call(widget.timeline.playhead);
-    } else {
-      _liveSeekTimer = Timer(_liveSeekThrottle - since, () {
-        _lastLiveSeek = DateTime.now();
-        widget.onLiveSeek?.call(widget.timeline.playhead);
-      });
-    }
+    // not just after it settles.
+    _liveSeekThrottled(widget.timeline.playhead);
   }
 
   void _onPointerUp(PointerUpEvent e) {
@@ -215,7 +275,17 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
       _selecting = false;
       final wasSecondary = _secondaryPress;
       _secondaryPress = false;
-      if (!widget.timeline.hasSelection) widget.timeline.clearSelection();
+      final seekTarget = _selSeekTarget;
+      _selSeekTarget = null;
+      _liveSeekTimer?.cancel();
+      _liveSeekTimer = null;
+      if (!widget.timeline.hasSelection) {
+        widget.timeline.clearSelection();
+      } else if (seekTarget != null) {
+        // Lock the exact frame at the edge just placed so the operator sees the
+        // precise start/end they're selecting (release = commit resolve).
+        widget.onCommitSeek?.call(seekTarget);
+      }
       // A right-click (with or without a drag) pops the export context menu.
       if (wasSecondary) _showTimelineMenu(e.position);
       return;
@@ -316,7 +386,10 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
               return MouseRegion(
                 cursor: _dragging && _isPan
                     ? SystemMouseCursors.grabbing
-                    : SystemMouseCursors.grab,
+                    : (_hoverLocal != null &&
+                            _selectionEdgeAt(_hoverLocal!.dx) != null)
+                        ? SystemMouseCursors.resizeLeftRight
+                        : SystemMouseCursors.grab,
                 onHover: (e) => setState(() => _hoverLocal = e.localPosition),
                 onExit: (_) => setState(() => _hoverLocal = null),
                 child: Listener(
@@ -809,6 +882,17 @@ class _TimelinePainter extends CustomPainter {
       final bp = Paint()..color = selColor..strokeWidth = 2;
       canvas.drawLine(Offset(x1, rulerH), Offset(x1, motionBottom), bp);
       canvas.drawLine(Offset(x2, rulerH), Offset(x2, motionBottom), bp);
+      // Draggable grab handles at each edge (adjust start/end).
+      final hp = Paint()..color = selColor;
+      for (final hx in [x1, x2]) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(center: Offset(hx, rulerH + 6), width: 7, height: 13),
+            const Radius.circular(2),
+          ),
+          hp,
+        );
+      }
     }
 
     // ── playhead line + timestamp chip ──────────────────────────────────────
