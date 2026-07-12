@@ -23,6 +23,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/export_api.dart';
@@ -73,6 +74,8 @@ class _ExportScreenState extends State<ExportScreen> {
 
   // ── destination folder (persisted across launches via [_kExportDirKey]) ──
   String? _destDir;
+  final _destDirCtrl = TextEditingController();
+  bool _pickingFolder = false; // never stack two native modal pickers
 
   // ── run state ──────────────────────────────────────────────────────────
   bool _submitting = false;
@@ -106,10 +109,22 @@ class _ExportScreenState extends State<ExportScreen> {
       final prefs = await SharedPreferences.getInstance();
       final dir = prefs.getString(_kExportDirKey);
       if (dir != null && dir.isNotEmpty && mounted) {
-        setState(() => _destDir = dir);
+        setState(() {
+          _destDir = dir;
+          _destDirCtrl.text = dir;
+        });
       }
     } catch (_) {
       /* prefs unavailable */
+    }
+  }
+
+  Future<void> _persistDestDir(String dir) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kExportDirKey, dir);
+    } catch (_) {
+      /* best-effort */
     }
   }
 
@@ -127,6 +142,7 @@ class _ExportScreenState extends State<ExportScreen> {
   void dispose() {
     _pollTimer?.cancel();
     _passwordCtrl.dispose();
+    _destDirCtrl.dispose();
     super.dispose();
   }
 
@@ -259,18 +275,65 @@ class _ExportScreenState extends State<ExportScreen> {
   // ── destination folder ──────────────────────────────────────────────────
 
   Future<void> _pickFolder() async {
-    final dir = await getDirectoryPath(
-      confirmButtonText: 'Select export folder',
-    );
-    if (dir != null && mounted) {
-      setState(() => _destDir = dir);
+    // Re-entry guard: the native picker is modal to the app window; opening a
+    // second one from a double-click (or a click landing while the first is
+    // still tearing down) wedges the whole app.
+    if (_pickingFolder) return;
+    _pickingFolder = true;
+
+    // The Win32 folder dialog (IFileDialog) is owned by — and disables — the
+    // app window. Under the borderless fullscreen wall (window_manager
+    // setFullScreen) the dialog can open BEHIND the fullscreen surface, so the
+    // user sees a disabled, apparently frozen app with no visible dialog.
+    // Drop to windowed + foreground for the pick, then restore fullscreen.
+    bool wasFullscreen = false;
+    try {
+      wasFullscreen = await windowManager.isFullScreen();
+    } catch (_) {
+      /* window_manager unavailable — proceed as-is */
+    }
+    try {
+      if (wasFullscreen) {
+        // FullscreenController hears this via onWindowLeaveFullScreen and
+        // re-shows the chrome — it is built for externally-driven changes.
+        await windowManager.setFullScreen(false);
+        // Let the window transition settle before the modal message loop
+        // takes over, so the dialog z-orders against the windowed state.
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
       try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(_kExportDirKey, dir);
+        await windowManager.focus(); // dialog opens above a foreground owner
       } catch (_) {
         /* best-effort */
       }
+      final dir = await getDirectoryPath(
+        confirmButtonText: 'Select export folder',
+      );
+      if (dir != null && mounted) {
+        setState(() {
+          _destDir = dir;
+          _destDirCtrl.text = dir;
+        });
+        await _persistDestDir(dir);
+      }
+    } finally {
+      _pickingFolder = false;
+      if (wasFullscreen) {
+        try {
+          await windowManager.setFullScreen(true);
+        } catch (_) {
+          /* best-effort */
+        }
+      }
     }
+  }
+
+  /// Manual fallback for the native picker: a typed/pasted path in the
+  /// Destination field always works, even if the OS dialog misbehaves.
+  /// Persisted on submit (once validated), not per keystroke.
+  void _setDestDirFromText(String value) {
+    final dir = value.trim();
+    setState(() => _destDir = dir.isEmpty ? null : dir);
   }
 
   // ── submit / poll / download ──────────────────────────────────────────────
@@ -301,6 +364,15 @@ class _ExportScreenState extends State<ExportScreen> {
       await _pickFolder();
       if (_destDir == null) return; // user cancelled the folder picker
     }
+
+    // A typed/pasted destination may not exist — fail here with a clear
+    // message instead of at download time.
+    final destDir = _destDir!;
+    if (!Directory(destDir).existsSync()) {
+      setState(() => _error = 'Destination folder does not exist: $destDir');
+      return;
+    }
+    unawaited(_persistDestDir(destDir)); // typed paths persist once used
 
     setState(() {
       _error = null;
@@ -638,10 +710,17 @@ class _ExportScreenState extends State<ExportScreen> {
                   Row(
                     children: [
                       Expanded(
-                        child: Text(
-                          _destDir ?? '(choose a folder)',
-                          overflow: TextOverflow.ellipsis,
+                        // Editable so a path can be typed/pasted directly —
+                        // the reliable fallback if the native Browse… dialog
+                        // ever fails to appear.
+                        child: TextField(
+                          controller: _destDirCtrl,
                           style: theme.textTheme.bodySmall,
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            hintText: '(choose a folder or type a path)',
+                          ),
+                          onChanged: _setDestDirFromText,
                         ),
                       ),
                       TextButton(
