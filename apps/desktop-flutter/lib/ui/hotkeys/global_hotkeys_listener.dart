@@ -29,16 +29,35 @@ import 'package:flutter/services.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 
-/// A keydown -> hotkey token ("3", "s3"), or null. Plain digit or
-/// Shift+digit only, using the PHYSICAL key (independent of layout/shift
-/// symbol) — the Flutter equivalent of app.js's `e.code`-based
-/// `hotkeyTokenFromEvent` (app.js:4031), so Shift+1 (which types "!" on a US
-/// keyboard) still resolves to digit 1.
+/// A keydown -> hotkey token ("3", "s3", "n3"), or null. Uses the PHYSICAL key
+/// (independent of layout/shift symbol) — the Flutter equivalent of app.js's
+/// `e.code`-based `hotkeyTokenFromEvent` (app.js:4031), so Shift+1 (which types
+/// "!" on a US keyboard) still resolves to digit 1. The numeric keypad is its
+/// own bank ("n1".."n0"), distinct from the number row, so numpad 1 and row 1
+/// can drive different cameras.
 String? _hotkeyTokenFromEvent(KeyEvent event) {
   final keys = HardwareKeyboard.instance;
   if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
     return null;
   }
+  // Numpad bank first — its physical keys are distinct from the digit row.
+  // (final, not const: PhysicalKeyboardKey overrides ==, disallowed as a
+  // const map key.)
+  final numpadKeys = {
+    PhysicalKeyboardKey.numpad1: 'n1',
+    PhysicalKeyboardKey.numpad2: 'n2',
+    PhysicalKeyboardKey.numpad3: 'n3',
+    PhysicalKeyboardKey.numpad4: 'n4',
+    PhysicalKeyboardKey.numpad5: 'n5',
+    PhysicalKeyboardKey.numpad6: 'n6',
+    PhysicalKeyboardKey.numpad7: 'n7',
+    PhysicalKeyboardKey.numpad8: 'n8',
+    PhysicalKeyboardKey.numpad9: 'n9',
+    PhysicalKeyboardKey.numpad0: 'n0',
+  };
+  final numpad = numpadKeys[event.physicalKey];
+  if (numpad != null) return numpad;
+
   final digitKeys = {
     PhysicalKeyboardKey.digit1: '1',
     PhysicalKeyboardKey.digit2: '2',
