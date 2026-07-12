@@ -24,6 +24,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/ui/bookmarks/add_bookmark_dialog.dart';
 import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
@@ -113,6 +114,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   Timer? _tickTimer;
   DateTime _lastTickWall = DateTime.now();
 
+  /// Periodic (5s) reload so newly-recorded footage + fresh motion appear on
+  /// the scrubber/strip even while sitting still. Ported from pbStartTick.
+  Timer? _idleTimer;
+
   final TextEditingController _timeGotoController = TextEditingController();
 
   @override
@@ -126,6 +131,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // whenever the scrubber window/playhead changes.
     _timeline.addListener(_onTimelineChanged);
     _enter();
+    _idleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted) return;
+      _reloadSpans();
+      _scheduleMotionRefresh();
+    });
   }
 
   void _onTimelineChanged() {
@@ -159,6 +169,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   @override
   void dispose() {
     _tickTimer?.cancel();
+    _idleTimer?.cancel();
     _motionDebounce?.cancel();
     _timeline.removeListener(_onTimelineChanged);
     for (final p in _panes.values) {
@@ -362,6 +373,23 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   Future<void> _onZoomChanged() async {
     await _reloadSpans();
     await _resolveAll(_timeline.playhead, force: true);
+  }
+
+  /// Step the timeline zoom (−/＋ buttons). +1 = zoom out (longer window).
+  void _zoomBy(int dir) {
+    if (_timeline.zoomStep(dir)) unawaited(_onZoomChanged());
+  }
+
+  /// Bookmark the current moment on the selected camera (opens the dialog).
+  Future<void> _addBookmark() async {
+    await showAddBookmarkDialog(
+      context,
+      api: widget.api,
+      session: widget.session,
+      camera: _selectedCamera,
+      cameras: _cameras,
+      at: _timeline.playhead,
+    );
   }
 
   /// Shift the playhead by a signed duration (arrow keys / nudge buttons).
@@ -635,6 +663,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onFrameBack: () => _frameStep(false),
             onFrameFwd: () => _frameStep(true),
             onNudge: _shiftWindow,
+            onBookmark: _addBookmark,
+            onZoomOut: () => _zoomBy(1),
+            onZoomIn: () => _zoomBy(-1),
           ),
           // Motion-intensity histogram + detection glyphs + legend +
           // prev/next-motion transport, synced to the scrubber window.
@@ -742,6 +773,9 @@ class _TransportBar extends StatelessWidget {
     required this.onFrameBack,
     required this.onFrameFwd,
     required this.onNudge,
+    required this.onBookmark,
+    required this.onZoomOut,
+    required this.onZoomIn,
   });
 
   final bool playing;
@@ -755,6 +789,9 @@ class _TransportBar extends StatelessWidget {
   final VoidCallback onFrameBack;
   final VoidCallback onFrameFwd;
   final void Function(Duration by) onNudge;
+  final VoidCallback onBookmark;
+  final VoidCallback onZoomOut;
+  final VoidCallback onZoomIn;
 
   @override
   Widget build(BuildContext context) {
@@ -860,6 +897,34 @@ class _TransportBar extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           TextButton(onPressed: onTimeGoto, child: const Text('Go')),
+          const Spacer(),
+          ShiftHint(
+            hint: 'Bookmark this moment',
+            child: IconButton(
+              tooltip: 'Bookmark',
+              icon: const Icon(
+                Icons.bookmark_add_outlined,
+                color: Colors.white70,
+              ),
+              onPressed: onBookmark,
+            ),
+          ),
+          ShiftHint(
+            hint: 'Zoom out (longer span)',
+            child: IconButton(
+              tooltip: 'Zoom out',
+              icon: const Icon(Icons.zoom_out, color: Colors.white70),
+              onPressed: onZoomOut,
+            ),
+          ),
+          ShiftHint(
+            hint: 'Zoom in (shorter span)',
+            child: IconButton(
+              tooltip: 'Zoom in',
+              icon: const Icon(Icons.zoom_in, color: Colors.white70),
+              onPressed: onZoomIn,
+            ),
+          ),
         ],
       ),
     );
