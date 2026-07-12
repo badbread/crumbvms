@@ -44,46 +44,46 @@ class _ClockTileState extends State<ClockTile> {
     final d = _now;
     final time = '${_two(d.hour)}:${_two(d.minute)}:${_two(d.second)}';
     final date = '${_weekdays[d.weekday - 1]}, ${_months[d.month - 1]} ${d.day}, ${d.year}';
+    // Lay the time + date out at a fixed natural size, then let a FittedBox
+    // scale the WHOLE block uniformly to fit the cell — both lines always fit
+    // and stay proportional, whatever the cell's width/height/aspect. (The old
+    // hand-rolled font-size formula sized from the time string only, so the
+    // longer date line overflowed and clipped in short/narrow cells.)
     return ColoredBox(
       color: Colors.black,
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final w = constraints.maxWidth;
-          final h = constraints.maxHeight;
-          if (w <= 0 || h <= 0) return const SizedBox.shrink();
-          // Mirrors fitClock's deterministic formula: 8 monospace glyphs at
-          // ~0.6em advance + 7px letter-spacing filling ~90% of the width,
-          // capped so time + date fit the height (time ~= 60% of h).
-          final fsW = (w * 0.90 - 7) / (8 * 0.60);
-          final fsH = h * 0.60;
-          final fs = fsW.clamp(0.0, fsH).clamp(12.0, 140.0);
-          return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Center(
+          child: FittedBox(
+            fit: BoxFit.contain,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
                   time,
-                  style: TextStyle(
+                  maxLines: 1,
+                  style: const TextStyle(
                     color: Colors.white,
-                    fontSize: fs,
-                    fontFeatures: const [FontFeature.tabularFigures()],
+                    fontSize: 64,
+                    fontFeatures: [FontFeature.tabularFigures()],
                     fontWeight: FontWeight.w600,
-                    letterSpacing: 7,
+                    letterSpacing: 6,
                     fontFamily: 'monospace',
                   ),
                 ),
-                SizedBox(height: fs * 0.06),
+                const SizedBox(height: 6),
                 Text(
                   date,
-                  style: TextStyle(
+                  maxLines: 1,
+                  style: const TextStyle(
                     color: Colors.white70,
-                    fontSize: (fs * 0.34).clamp(10.0, 48.0),
+                    fontSize: 22,
                   ),
                 ),
               ],
             ),
-          );
-        },
+          ),
+        ),
       ),
     );
   }
