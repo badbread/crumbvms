@@ -354,9 +354,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (mounted) setState(() {});
   }
 
-  /// Cheap in-segment seek only — no /play/ resolve. Fired by the timeline's
-  /// debounced live-seek while dragging.
+  /// Live-scrub seek fired continuously while dragging the scrubber. For panes
+  /// whose loaded segment already covers `t` this is a cheap in-segment seek
+  /// (instant, no network). If the drag crosses into a segment we don't have
+  /// loaded, pull it in via a resolve — guarded by [_resolvePending] so a fast
+  /// drag across many segments doesn't fire overlapping resolves — so the video
+  /// keeps tracking the scrubber across segment boundaries.
   void _liveSeek(DateTime t) {
+    var needsResolve = false;
     for (final cam in _activeCameras()) {
       final pane = _panes[cam.id];
       final seg = pane?.segment;
@@ -367,7 +372,13 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             .clamp(0, seg.durationMs)
             .toInt();
         pane!.player!.seek(Duration(milliseconds: offsetMs));
+      } else {
+        needsResolve = true;
       }
+    }
+    if (needsResolve && !_resolvePending) {
+      _resolvePending = true;
+      _resolveAll(t).whenComplete(() => _resolvePending = false);
     }
   }
 

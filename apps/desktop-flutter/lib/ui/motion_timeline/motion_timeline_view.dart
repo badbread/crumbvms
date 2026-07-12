@@ -35,8 +35,10 @@ const int kLegendCameraMax = 8;
 /// Horizontal drag distance (px) beyond which a press is a pan, not a click.
 const double _panThresholdPx = 4;
 
-/// Debounce for the cheap in-drag live-seek callback (matches app.js 120ms).
-const Duration _liveSeekDebounce = Duration(milliseconds: 120);
+/// Throttle for the in-drag live-seek callback: the seek fires continuously
+/// AS the scrubber moves (leading + trailing edge), ~12/sec, so the video
+/// tracks the drag in real time instead of only updating once it settles.
+const Duration _liveSeekThrottle = Duration(milliseconds: 80);
 
 class MotionTimelineView extends StatefulWidget {
   const MotionTimelineView({
@@ -94,6 +96,7 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
   DateTime? _panStartPlayhead;
   int? _panStartSpanMs;
   Timer? _liveSeekTimer;
+  DateTime _lastLiveSeek = DateTime.fromMillisecondsSinceEpoch(0);
 
   // Shift+drag = export range selection (instead of pan).
   bool _selecting = false;
@@ -166,10 +169,21 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     final deltaMs = (-dx * msPerPx).round();
     widget.timeline.setPlayhead(_panStartPlayhead!.add(Duration(milliseconds: deltaMs)));
 
+    // Live scrub: push the seek to the panes AS the drag moves (throttled),
+    // not just after it settles — leading edge fires now if enough time has
+    // passed, otherwise a trailing timer catches the latest position.
+    final now = DateTime.now();
+    final since = now.difference(_lastLiveSeek);
     _liveSeekTimer?.cancel();
-    _liveSeekTimer = Timer(_liveSeekDebounce, () {
+    if (since >= _liveSeekThrottle) {
+      _lastLiveSeek = now;
       widget.onLiveSeek?.call(widget.timeline.playhead);
-    });
+    } else {
+      _liveSeekTimer = Timer(_liveSeekThrottle - since, () {
+        _lastLiveSeek = DateTime.now();
+        widget.onLiveSeek?.call(widget.timeline.playhead);
+      });
+    }
   }
 
   void _onPointerUp(PointerUpEvent e) {
