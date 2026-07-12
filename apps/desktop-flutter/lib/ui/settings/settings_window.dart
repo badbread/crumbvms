@@ -21,9 +21,11 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
+import 'package:crumb_desktop/ui/hotkeys/keyboard_shortcuts_screen.dart';
 import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
 import 'package:crumb_desktop/ui/updates/about_panel.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
@@ -32,7 +34,9 @@ import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
 /// LAUNCH sections open as their own full screen (see file header).
 enum SettingsSection {
   options(Icons.tune, 'Options', pane: true),
-  hotkeys(Icons.keyboard_outlined, 'Hotkeys', pane: true),
+  keyboardShortcuts(Icons.keyboard_alt_outlined, 'Keyboard Shortcuts',
+      pane: true),
+  hotkeys(Icons.keyboard_outlined, 'Camera Hotkeys', pane: true),
   serverDashboard(Icons.dns_outlined, 'Server dashboard', pane: true),
   about(Icons.info_outline, 'About', pane: true),
   serverConsole(Icons.admin_panel_settings_outlined, 'Server console',
@@ -62,6 +66,7 @@ class SettingsWindow extends StatefulWidget {
     this.clientOptions,
     this.streamPrefs,
     this.hotkeys,
+    this.keyboardShortcuts,
   });
 
   final CrumbApi api;
@@ -81,6 +86,7 @@ class SettingsWindow extends StatefulWidget {
   final ClientOptionsStore? clientOptions;
   final StreamPrefsStore? streamPrefs;
   final HotkeyConfigStore? hotkeys;
+  final KeyboardShortcutsStore? keyboardShortcuts;
 
   @override
   State<SettingsWindow> createState() => _SettingsWindowState();
@@ -292,9 +298,18 @@ class _SettingsWindowState extends State<SettingsWindow> {
           options: opts,
           streamPrefs: widget.streamPrefs,
         );
+      case SettingsSection.keyboardShortcuts:
+        final ks = widget.keyboardShortcuts;
+        if (ks == null) return const _Unavailable('Keyboard shortcuts');
+        return KeyboardShortcutsScreen(
+          store: ks,
+          options: widget.clientOptions,
+          cameraHotkeys: widget.hotkeys,
+          cameras: widget.cameras,
+        );
       case SettingsSection.hotkeys:
         final hk = widget.hotkeys;
-        if (hk == null) return const _Unavailable('Hotkeys');
+        if (hk == null) return const _Unavailable('Camera hotkeys');
         return HotkeyRemapScreen(store: hk, cameras: widget.cameras);
       case SettingsSection.serverDashboard:
         return ServerDashboardScreen(api: widget.api, session: widget.session);

@@ -33,6 +33,7 @@ import 'package:crumb_desktop/src/rust/api/secret.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/admin_console/admin_console_screen.dart';
 import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
@@ -148,6 +149,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   ClientOptionsStore? _clientOptions;
   StreamPrefsStore? _streamPrefs;
   HotkeyConfigStore? _hotkeys;
+  KeyboardShortcutsStore? _shortcuts;
 
   @override
   void initState() {
@@ -179,11 +181,13 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     final options = await ClientOptionsStore.load();
     final streamPrefs = await StreamPrefsStore.load();
     final hotkeys = await HotkeyConfigStore.load();
+    final shortcuts = await KeyboardShortcutsStore.load();
     if (mounted) {
       setState(() {
         _clientOptions = options;
         _streamPrefs = streamPrefs;
         _hotkeys = hotkeys;
+        _shortcuts = shortcuts;
       });
     }
   }
@@ -320,6 +324,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
       // 401 (panes keep decoding); S-key snapshots work from any tab.
       home = SnapshotHotkey(
         options: _clientOptions,
+        shortcuts: _shortcuts,
         child: ReauthOverlay(
           controller: controller,
           child: MainShell(
@@ -335,6 +340,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
             clientOptions: _clientOptions,
             streamPrefs: _streamPrefs,
             hotkeys: _hotkeys,
+            shortcuts: _shortcuts,
           ),
         ),
       );
@@ -369,6 +375,7 @@ class MainShell extends StatefulWidget {
     this.clientOptions,
     this.streamPrefs,
     this.hotkeys,
+    this.shortcuts,
   });
 
   final CrumbApi api;
@@ -383,6 +390,7 @@ class MainShell extends StatefulWidget {
   final ClientOptionsStore? clientOptions;
   final StreamPrefsStore? streamPrefs;
   final HotkeyConfigStore? hotkeys;
+  final KeyboardShortcutsStore? shortcuts;
 
   @override
   State<MainShell> createState() => _MainShellState();
@@ -809,6 +817,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
       clientOptions: widget.clientOptions,
       streamPrefs: widget.streamPrefs,
       hotkeys: widget.hotkeys,
+      keyboardShortcuts: widget.shortcuts,
       onClose: () => setState(() => _settingsOpen = false),
       onOpenServerConsole: () => _pushScreen(
         'Server console',
@@ -1051,6 +1060,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
           audio: _audio,
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
+          // Remapped action shortcuts + the master enable toggle.
+          shortcuts: widget.shortcuts,
+          clientOptions: widget.clientOptions,
           // "Add clip to export list" → APPEND to the batch (don't replace) and
           // jump to the Export tab.
           onExportRange: (camId, start, end) => setState(() {
@@ -1070,6 +1082,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
           cameras: widget.cameras,
           // Number-key hotkeys filter the list to that camera.
           hotkeys: widget.hotkeys,
+          // Remapped action shortcuts + the master enable toggle, and the
+          // "Always open clips in HD" option for the clip player.
+          shortcuts: widget.shortcuts,
+          clientOptions: widget.clientOptions,
           // Esc priority: leave OS fullscreen before closing an open clip.
           fullscreen: widget.fullscreen,
           // Returning from a clip-originated Playback → reopen that clip.
@@ -1114,6 +1130,8 @@ class _MainShellState extends State<MainShell> with WindowListener {
           audio: _audio,
           // Number-key hotkeys maximize the assigned camera on the wall.
           hotkeys: widget.hotkeys,
+          // Remapped action shortcuts for the wall's key listener.
+          shortcuts: widget.shortcuts,
           // Remember which pane is maximized so Playback can open on it.
           onMaximizedCameraChanged: (id) => _liveMaximizedId = id,
           // Perf/debug line → bottom status bar (not a floating wall overlay).

@@ -73,6 +73,7 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setMaximizeMain(bool v) => setState(() => _o.maximizeMain = v);
   void _setZoomSwitchesToMain(bool v) =>
       setState(() => _o.zoomSwitchesToMain = v);
+  void _setOpenClipsInHd(bool v) => setState(() => _o.openClipsInHd = v);
 
   bool get _wallUsesSub => widget.streamPrefs?.wallUsesSub ?? true;
   void _setWallUsesSub(bool v) {
@@ -208,6 +209,16 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
           ),
 
           const Divider(height: 24),
+          _SectionHeader('Clips'),
+          _switchRow(
+            value: _o.openClipsInHd,
+            onChanged: _setOpenClipsInHd,
+            title: 'Always open clips in HD',
+            subtitle:
+                'Open clips on the main (HD) stream instead of the sub-stream.',
+          ),
+
+          const Divider(height: 24),
           _SectionHeader('PTZ controls'),
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 0, 16, 4),
@@ -291,6 +302,8 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             value: _o.hotkeysEnabled,
             onChanged: _setHotkeysEnabled,
             title: 'Enable keyboard shortcuts',
+            subtitle:
+                'Master switch — remap the individual keys in the Keyboard Shortcuts section.',
           ),
 
           const Divider(height: 24),

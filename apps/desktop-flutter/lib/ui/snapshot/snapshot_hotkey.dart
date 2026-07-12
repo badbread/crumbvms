@@ -19,6 +19,7 @@ import 'package:flutter/services.dart';
 
 import '../../services/snapshot_service.dart';
 import '../../state/client_options.dart';
+import '../../state/keyboard_shortcuts.dart';
 
 /// Wires the "S" hotkey to a snapshot of the active pane.
 ///
@@ -35,13 +36,22 @@ import '../../state/client_options.dart';
 /// hotkeysEnabled]) — with shortcuts off, S does nothing — and re-checks that no
 /// text field holds focus, belt-and-suspenders.
 class SnapshotHotkey extends StatelessWidget {
-  const SnapshotHotkey({super.key, required this.child, this.options});
+  const SnapshotHotkey({
+    super.key,
+    required this.child,
+    this.options,
+    this.shortcuts,
+  });
 
   final Widget child;
 
   /// Read live at key-press time so toggling the setting takes effect
   /// immediately (no rebuild needed).
   final ClientOptionsStore? options;
+
+  /// Remapped snapshot binding (Keyboard Shortcuts settings). Read live at
+  /// key-press time like [options]; null → the default S.
+  final KeyboardShortcutsStore? shortcuts;
 
   @override
   Widget build(BuildContext context) {
@@ -50,7 +60,9 @@ class SnapshotHotkey extends StatelessWidget {
       skipTraversal: true,
       onKeyEvent: (node, event) {
         if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        if (event.logicalKey != LogicalKeyboardKey.keyS) {
+        if (event.logicalKey !=
+            (shortcuts?.keyFor(ShortcutAction.snapshot) ??
+                LogicalKeyboardKey.keyS)) {
           return KeyEventResult.ignored;
         }
         if (!(options?.hotkeysEnabled ?? true)) return KeyEventResult.ignored;
@@ -70,12 +82,17 @@ class SnapshotHotkey extends StatelessWidget {
 /// (apps/desktop/src/app.js:6448). Drop next to the existing toolbar
 /// buttons (mute, fullscreen, etc.).
 class SnapshotToolbarButton extends StatelessWidget {
-  const SnapshotToolbarButton({super.key});
+  const SnapshotToolbarButton({super.key, this.shortcuts});
+
+  /// Names the current snapshot key in the tooltip; null → the default S.
+  final KeyboardShortcutsStore? shortcuts;
 
   @override
   Widget build(BuildContext context) {
+    final key = shortcuts?.keyFor(ShortcutAction.snapshot) ??
+        LogicalKeyboardKey.keyS;
     return IconButton(
-      tooltip: 'Snapshot active pane (S)',
+      tooltip: 'Snapshot active pane (${shortcutKeyLabel(key)})',
       icon: const Icon(Icons.camera_alt_outlined),
       onPressed: () => SnapshotService.captureActivePane(context),
     );

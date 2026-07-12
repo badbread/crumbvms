@@ -1,5 +1,9 @@
 // Global keyboard shortcuts: F8 (perf HUD), S (snapshot), M (toggle audio),
 // Esc (restore maximize), and the 1-9/0 + Shift+1-9/0 "go to camera" keys.
+// The three action keys (F8/S/M) are the DEFAULTS — a wired-up
+// [KeyboardShortcutsStore] (Keyboard Shortcuts settings section) rebinds
+// them, and [ClientOptionsStore.hotkeysEnabled] is the master off switch for
+// everything except Esc.
 //
 // Port of app.js `handleKeyDown` (app.js:4106-4151). Follows the same
 // Focus/onKeyEvent shape already established by
@@ -27,7 +31,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 
 /// A keydown -> hotkey token ("3", "s3", "n3"), or null. Uses the PHYSICAL key
 /// (independent of layout/shift symbol) — the Flutter equivalent of app.js's
@@ -96,11 +102,23 @@ class GlobalHotkeysListener extends StatelessWidget {
     this.onToggleAudio,
     this.onEscape,
     this.autofocus = false,
+    this.shortcuts,
+    this.options,
   });
 
   final HotkeyConfigStore store;
   final List<Camera> cameras;
   final Widget child;
+
+  /// Remapped action-shortcut bindings (Keyboard Shortcuts settings). Read at
+  /// key-press time; null → the hardcoded defaults (S / M / F8).
+  final KeyboardShortcutsStore? shortcuts;
+
+  /// The master "Enable keyboard shortcuts" toggle
+  /// ([ClientOptionsStore.hotkeysEnabled]). When off, every shortcut here is
+  /// inert EXCEPT Esc (leaving a maximized pane isn't a "shortcut" — trapping
+  /// the user in a maximize would be worse). Null → shortcuts on.
+  final ClientOptionsStore? options;
 
   /// Context-aware "go to camera N": on the Live wall this should maximize
   /// the camera (see [goToCameraOnLiveWall]); on Playback it should load
@@ -140,16 +158,8 @@ class GlobalHotkeysListener extends StatelessWidget {
         if (event is! KeyDownEvent) return KeyEventResult.ignored;
         if (_focusedIsTextField()) return KeyEventResult.ignored;
 
-        // F8: toggle the live performance HUD footer.
-        if (event.logicalKey == LogicalKeyboardKey.f8) {
-          if (onHudToggle != null) {
-            onHudToggle!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Esc: restore from maximize.
+        // Esc: restore from maximize. Checked BEFORE the master toggle —
+        // Esc must always work or a maximized pane becomes a trap.
         if (event.logicalKey == LogicalKeyboardKey.escape) {
           if (onEscape != null) {
             onEscape!();
@@ -158,8 +168,25 @@ class GlobalHotkeysListener extends StatelessWidget {
           return KeyEventResult.ignored;
         }
 
-        // S: snapshot the active pane.
-        if (event.logicalKey == LogicalKeyboardKey.keyS) {
+        // Master "Enable keyboard shortcuts" toggle: everything below —
+        // actions AND camera number keys — is inert while it's off.
+        if (!(options?.hotkeysEnabled ?? true)) return KeyEventResult.ignored;
+
+        // Perf HUD toggle (default F8) — remappable via KeyboardShortcutsStore.
+        if (event.logicalKey ==
+            (shortcuts?.keyFor(ShortcutAction.hudToggle) ??
+                LogicalKeyboardKey.f8)) {
+          if (onHudToggle != null) {
+            onHudToggle!();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        }
+
+        // Snapshot the active pane (default S) — remappable.
+        if (event.logicalKey ==
+            (shortcuts?.keyFor(ShortcutAction.snapshot) ??
+                LogicalKeyboardKey.keyS)) {
           if (onSnapshot != null) {
             onSnapshot!();
             return KeyEventResult.handled;
@@ -167,8 +194,10 @@ class GlobalHotkeysListener extends StatelessWidget {
           return KeyEventResult.ignored;
         }
 
-        // M: toggle audio for the active camera.
-        if (event.logicalKey == LogicalKeyboardKey.keyM) {
+        // Toggle audio for the active camera (default M) — remappable.
+        if (event.logicalKey ==
+            (shortcuts?.keyFor(ShortcutAction.toggleAudio) ??
+                LogicalKeyboardKey.keyM)) {
           if (onToggleAudio != null) {
             onToggleAudio!();
             return KeyEventResult.handled;

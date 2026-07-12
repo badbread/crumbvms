@@ -17,6 +17,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
+
 bool _focusedIsTextField() {
   final focused = FocusManager.instance.primaryFocus;
   return focused?.context?.widget is EditableText;
@@ -37,9 +40,20 @@ class PlaybackHotkeysListener extends StatelessWidget {
     this.onSnapshot,
     this.onExitMaximize,
     this.autofocus = false,
+    this.shortcuts,
+    this.options,
   });
 
   final Widget child;
+
+  /// Remapped action-shortcut bindings — only the snapshot key applies here
+  /// (the transport keys are inherent, not remappable). Null → default S.
+  final KeyboardShortcutsStore? shortcuts;
+
+  /// Master "Enable keyboard shortcuts" toggle: gates the snapshot ACTION
+  /// key. The transport keys (Space/arrows/,/. and Esc) are inherent playback
+  /// controls, not shortcuts, and stay live. Null → shortcuts on.
+  final ClientOptionsStore? options;
 
   /// Whether a playback tile is currently maximized — controls what Esc
   /// does (app.js:8173-8178: only handled while a tile is maximized).
@@ -146,8 +160,12 @@ class PlaybackHotkeysListener extends StatelessWidget {
           return KeyEventResult.ignored;
         }
 
-        if (event.logicalKey == LogicalKeyboardKey.keyS) {
-          if (onSnapshot != null) {
+        // Snapshot (default S) — remappable; inert while the master
+        // "Enable keyboard shortcuts" toggle is off.
+        if (event.logicalKey ==
+            (shortcuts?.keyFor(ShortcutAction.snapshot) ??
+                LogicalKeyboardKey.keyS)) {
+          if (onSnapshot != null && (options?.hotkeysEnabled ?? true)) {
             onSnapshot!();
             return KeyEventResult.handled;
           }

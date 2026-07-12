@@ -25,7 +25,9 @@ import 'package:crumb_desktop/api/export_api.dart' show ExportApi;
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
 import 'package:crumb_desktop/api/views_api.dart' show CustomLayout;
+import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
     show AppliedView;
 import 'package:crumb_desktop/ui/bookmarks/add_bookmark_dialog.dart';
@@ -48,6 +50,8 @@ class PlaybackScreen extends StatefulWidget {
     required this.onClose,
     this.view,
     this.hotkeys,
+    this.shortcuts,
+    this.clientOptions,
     this.onExportRange,
     this.initialTime,
     this.initialMaximizedCameraId,
@@ -77,6 +81,14 @@ class PlaybackScreen extends StatefulWidget {
 
   /// Number-key hotkeys load the assigned camera's timeline here.
   final HotkeyConfigStore? hotkeys;
+
+  /// Remapped action-shortcut bindings (Keyboard Shortcuts settings) for the
+  /// key listeners. Null → the hardcoded defaults.
+  final KeyboardShortcutsStore? shortcuts;
+
+  /// Client options — `hotkeysEnabled` is the master shortcut off switch for
+  /// the listeners here. Null → shortcuts on.
+  final ClientOptionsStore? clientOptions;
 
   /// Export a Shift+drag-selected range (camera + start/end) — the host opens
   /// the Export tab pre-filled with this clip.
@@ -1287,12 +1299,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         store: hk,
         cameras: _cameras,
         autofocus: true,
+        shortcuts: widget.shortcuts,
+        options: widget.clientOptions,
         onGoToCamera: _selectCamera,
         child: tree,
       );
     }
     return PlaybackHotkeysListener(
       autofocus: !hasGlobal,
+      shortcuts: widget.shortcuts,
+      options: widget.clientOptions,
       isMaximized: _maximizedCameraId != null,
       onTogglePlay: _togglePlay,
       onShiftWindow: _shiftWindow,

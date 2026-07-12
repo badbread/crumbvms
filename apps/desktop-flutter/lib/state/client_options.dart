@@ -104,6 +104,7 @@ const String _kPtzClickMode = 'crumb.ptzClickMode';
 const String _kPtzStyle = 'crumb.ptzStyle';
 const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
 const String _kZoomSwitchesToMain = 'crumb.zoomSwitchesToMain';
+const String _kOpenClipsInHd = 'crumb.openClipsInHd';
 
 /// Loads/holds/persists the client options this file owns. Construct once
 /// (e.g. in `CrumbClientApp` state) via [ClientOptionsStore.load] and pass
@@ -125,6 +126,7 @@ class ClientOptionsStore extends ChangeNotifier {
     required PtzStyle ptzStyle,
     required PtzWheelCorner ptzWheelCorner,
     required bool zoomSwitchesToMain,
+    required bool openClipsInHd,
   }) : _showInfoBar = showInfoBar,
        _showAllCamerasView = showAllCamerasView,
        _hotkeysEnabled = hotkeysEnabled,
@@ -132,7 +134,8 @@ class ClientOptionsStore extends ChangeNotifier {
        _ptzClickMode = ptzClickMode,
        _ptzStyle = ptzStyle,
        _ptzWheelCorner = ptzWheelCorner,
-       _zoomSwitchesToMain = zoomSwitchesToMain;
+       _zoomSwitchesToMain = zoomSwitchesToMain,
+       _openClipsInHd = openClipsInHd;
 
   final SharedPreferences? _prefs;
 
@@ -144,6 +147,7 @@ class ClientOptionsStore extends ChangeNotifier {
   PtzStyle _ptzStyle;
   PtzWheelCorner _ptzWheelCorner;
   bool _zoomSwitchesToMain;
+  bool _openClipsInHd;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -164,6 +168,7 @@ class ClientOptionsStore extends ChangeNotifier {
         prefs?.getString(_kPtzWheelCorner),
       ),
       zoomSwitchesToMain: prefs?.getBool(_kZoomSwitchesToMain) ?? false,
+      openClipsInHd: prefs?.getBool(_kOpenClipsInHd) ?? false,
     );
   }
 
@@ -235,6 +240,16 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _zoomSwitchesToMain) return;
     _zoomSwitchesToMain = v;
     unawaited(_prefs?.setBool(_kZoomSwitchesToMain, v));
+    notifyListeners();
+  }
+
+  // ── opening a clip starts on the full-quality (HD) rendition instead of
+  //    the preview; the player's quality toggle still switches either way ──
+  bool get openClipsInHd => _openClipsInHd;
+  set openClipsInHd(bool v) {
+    if (v == _openClipsInHd) return;
+    _openClipsInHd = v;
+    unawaited(_prefs?.setBool(_kOpenClipsInHd, v));
     notifyListeners();
   }
 }

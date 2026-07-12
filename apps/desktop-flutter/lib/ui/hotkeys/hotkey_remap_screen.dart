@@ -53,7 +53,7 @@ class _HotkeyRemapScreenState extends State<HotkeyRemapScreen> {
     final numMap = widget.store.numpadConfigured(cams);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Camera hotkeys'),
+        title: const Text('Camera Hotkeys'),
         actions: [
           TextButton(
             onPressed: () {

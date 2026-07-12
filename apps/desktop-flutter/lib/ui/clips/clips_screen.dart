@@ -30,7 +30,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:crumb_desktop/api/clips_api.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart'
     show FullscreenController;
 import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
@@ -67,6 +69,8 @@ class ClipsScreen extends StatefulWidget {
     this.initialCameraId,
     this.initialClip,
     this.hotkeys,
+    this.clientOptions,
+    this.shortcuts,
     this.onViewOnTimeline,
     this.fullscreen,
   });
@@ -85,6 +89,15 @@ class ClipsScreen extends StatefulWidget {
 
   /// Number-key hotkeys filter the list to the assigned camera.
   final HotkeyConfigStore? hotkeys;
+
+  /// Client options — `openClipsInHd` opens the clip player on the full (HD)
+  /// rendition instead of the preview; `hotkeysEnabled` gates the number-key
+  /// filter. Null → defaults (preview quality, hotkeys on).
+  final ClientOptionsStore? clientOptions;
+
+  /// Remapped action-shortcut bindings for the hotkeys listener. Null → the
+  /// hardcoded defaults.
+  final KeyboardShortcutsStore? shortcuts;
 
   /// "View on timeline" from the clip player → open Playback at this clip's
   /// moment, scoped to its camera.
@@ -300,6 +313,7 @@ class _ClipsScreenState extends State<ClipsScreen> {
               session: widget.session,
               clip: _playing!,
               motionHighlightSeconds: _motionHighlightSeconds,
+              openInHd: widget.clientOptions?.openClipsInHd ?? false,
               fullscreen: widget.fullscreen,
               onClose: () => setState(() => _playing = null),
               onViewOnTimeline: widget.onViewOnTimeline == null
@@ -321,6 +335,8 @@ class _ClipsScreenState extends State<ClipsScreen> {
       store: hk,
       cameras: widget.cameras,
       autofocus: true,
+      options: widget.clientOptions,
+      shortcuts: widget.shortcuts,
       onGoToCamera: _filterToCamera,
       // Esc closes an open clip player — defence in depth ONLY. The
       // authoritative close-on-Esc is _ClipPlayerState's HardwareKeyboard
@@ -751,6 +767,7 @@ class _ClipPlayer extends StatefulWidget {
     required this.clip,
     required this.motionHighlightSeconds,
     required this.onClose,
+    this.openInHd = false,
     this.onViewOnTimeline,
     this.fullscreen,
   });
@@ -762,6 +779,11 @@ class _ClipPlayer extends StatefulWidget {
   final VoidCallback onClose;
   final VoidCallback? onViewOnTimeline;
 
+  /// Start on the full-quality (HD) rendition instead of the preview — the
+  /// "Always open clips in HD" client option. The in-player quality toggle
+  /// still switches freely afterwards.
+  final bool openInHd;
+
   /// Esc leaves OS fullscreen before closing the clip (old-client priority).
   final FullscreenController? fullscreen;
 
@@ -772,7 +794,7 @@ class _ClipPlayer extends StatefulWidget {
 class _ClipPlayerState extends State<_ClipPlayer> {
   Player? _player;
   VideoController? _controller;
-  String _quality = 'preview';
+  late String _quality = widget.openInHd ? 'full' : 'preview';
   int _loadAttempt = 0;
   Timer? _watchdog;
   StreamSubscription<bool>? _playingSub;
@@ -813,7 +835,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     // mechanism the app's Shift-hints handler relies on (main.dart).
     // Registered for exactly the lifetime of the open clip.
     HardwareKeyboard.instance.addHandler(_onKeyEvent);
-    _open('preview', resetAttempt: true);
+    _open(_quality, resetAttempt: true);
   }
 
   /// Lifetime-of-the-open-clip Esc handler; consumes only the Esc it acts on.

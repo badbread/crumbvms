@@ -20,6 +20,7 @@ import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
@@ -47,6 +48,7 @@ class WallScreen extends StatefulWidget {
     this.view,
     this.audio,
     this.hotkeys,
+    this.shortcuts,
     this.onMaximizedCameraChanged,
     this.statsSink,
   });
@@ -62,6 +64,10 @@ class WallScreen extends StatefulWidget {
 
   /// Hotkey config — number keys maximize the assigned camera on the wall.
   final HotkeyConfigStore? hotkeys;
+
+  /// Remapped action-shortcut bindings (Keyboard Shortcuts settings) for the
+  /// wall's key listener. Null → the hardcoded defaults.
+  final KeyboardShortcutsStore? shortcuts;
 
   /// Per-camera stream (main/sub) + PTZ-disable prefs. Drives the right-click
   /// menu on a tile and which stream each pane plays.
@@ -379,6 +385,8 @@ class _WallScreenState extends State<WallScreen> {
       store: hk,
       cameras: cams,
       autofocus: true,
+      shortcuts: widget.shortcuts,
+      options: widget.clientOptions,
       onGoToCamera: (id) {
         for (final c in cams) {
           if (c.id == id) {
