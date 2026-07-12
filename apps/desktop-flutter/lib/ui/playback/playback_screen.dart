@@ -12,6 +12,7 @@
 // bar was folded into it.)
 
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -156,6 +157,18 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   Timer? _tickTimer;
   DateTime _lastTickWall = DateTime.now();
 
+  // ── jog/shuttle (spring-return velocity review) ───────────────────────────
+  // While the shuttle thumb is deflected, the shuttle ticker owns the playhead
+  // (the normal play tick is stopped so the two never fight): forward runs
+  // REAL decode at the mapped rate through the gapless engine; reverse — which
+  // mpv cannot decode — walks the playhead backward down the filmstrip scrub
+  // path (_liveSeek). Release stops playback and commits the exact frame.
+  bool _shuttling = false;
+  double _shuttleVelocity = 0; // signed playback rate; 0 = dead zone (hold)
+  double _shuttleAppliedRate = 0; // last forward rate pushed to the players
+  Timer? _shuttleTimer;
+  DateTime _lastShuttleWall = DateTime.now();
+
   /// Periodic (5s) reload so newly-recorded footage + fresh motion appear on
   /// the scrubber/strip even while sitting still. Ported from pbStartTick.
   Timer? _idleTimer;
@@ -222,6 +235,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   @override
   void dispose() {
     _tickTimer?.cancel();
+    _shuttleTimer?.cancel();
     _idleTimer?.cancel();
     _motionDebounce?.cancel();
     _timeline.removeListener(_onTimelineChanged);
@@ -423,14 +437,21 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   /// the boundary and crosses it via an mpv playlist advance with a warm
   /// decoder (no black flash), falling back to a fresh load only for a real
   /// coverage gap or a lost prefetch race. See [GaplessSegmentPaneController].
-  Future<void> _resolveAll(DateTime t, {bool force = false}) async {
+  /// `playing` overrides the transport's play/pause state for freshly opened
+  /// files (the forward shuttle decodes while `_playing` stays false).
+  Future<void> _resolveAll(
+    DateTime t, {
+    bool force = false,
+    bool? playing,
+  }) async {
+    final play = playing ?? _playing;
     final futures = <Future<void>>[];
     for (final cam in _activeCameras()) {
       final pane = _panes[cam.id]!;
       futures.add(
         force
-            ? pane.resolveAt(t, forceReload: true, playing: _playing)
-            : pane.onTick(t, playing: _playing),
+            ? pane.resolveAt(t, forceReload: true, playing: play)
+            : pane.onTick(t, playing: play),
       );
     }
     await Future.wait(futures);
@@ -639,6 +660,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   // ── transport ─────────────────────────────────────────────────────────────
 
   void _togglePlay() {
+    if (_shuttling) return; // the shuttle owns the transport until release
     setState(() => _playing = !_playing);
     for (final pane in _panes.values) {
       if (_playing) {
@@ -697,6 +719,144 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         pane.player.pause();
       }
       if (mounted) setState(() {});
+    }
+  }
+
+  // ── jog/shuttle ───────────────────────────────────────────────────────────
+
+  /// Drag update from the shuttle control. `velocity` is a signed playback
+  /// rate (+2.0 = 2× forward, −0.5 = 0.5× backward, 0 = dead zone / hold).
+  /// The first update takes the transport over: the normal play tick stops
+  /// (so the two tickers never fight over the playhead) and the shuttle
+  /// ticker starts. Actual rate/decode changes are applied on the 100 ms
+  /// shuttle tick, which throttles mpv `setRate` spam from pointer-rate
+  /// drag updates.
+  void _onShuttleUpdate(double velocity) {
+    if (!_shuttling) {
+      _shuttling = true;
+      _tickTimer?.cancel();
+      _tickTimer = null;
+      if (_playing) setState(() => _playing = false);
+      _shuttleAppliedRate = 0;
+      for (final pane in _panes.values) {
+        pane.player.pause();
+      }
+      _lastShuttleWall = DateTime.now();
+      _shuttleTimer = Timer.periodic(
+        const Duration(milliseconds: 100),
+        _onShuttleTick,
+      );
+    }
+    _shuttleVelocity = velocity;
+  }
+
+  /// Shuttle released — spring-return: stop (pause), restore the steady
+  /// speed-pill rate so Play behaves normally afterwards, and resolve the
+  /// exact frame under the playhead (also drops any reverse-scrub filmstrip).
+  Future<void> _onShuttleEnd() async {
+    if (!_shuttling) return;
+    _shuttling = false;
+    _shuttleVelocity = 0;
+    _shuttleAppliedRate = 0;
+    _shuttleTimer?.cancel();
+    _shuttleTimer = null;
+    for (final pane in _panes.values) {
+      pane.player.pause();
+      pane.rate = _speeds[_speedIdx];
+      unawaited(pane.player.setRate(_speeds[_speedIdx]));
+    }
+    if (mounted) setState(() {});
+    await _commitSeek(_timeline.playhead);
+  }
+
+  void _onShuttleTick(Timer _) {
+    if (!_shuttling) return;
+    final wallNow = DateTime.now();
+    final elapsedMs = wallNow.difference(_lastShuttleWall).inMilliseconds;
+    _lastShuttleWall = wallNow;
+    if (elapsedMs <= 0) return;
+    final v = _shuttleVelocity;
+
+    final nowUtc = DateTime.now().toUtc();
+    var next = _timeline.playhead;
+    if (v != 0) {
+      next = next.add(Duration(milliseconds: (elapsedMs * v).round()));
+      // Never shuttle into the future…
+      if (next.isAfter(nowUtc)) next = nowUtc;
+      // …and never reverse past the start of known footage (mirrors
+      // _jumpToFirst's earliest-span floor). No coverage loaded → leave
+      // unclamped; the panes just show "no footage".
+      if (v < 0 && _timeline.spans.isNotEmpty) {
+        var earliestMs = _timeline.spans.first.startMs;
+        for (final s in _timeline.spans) {
+          if (s.startMs < earliestMs) earliestMs = s.startMs;
+        }
+        final earliest = DateTime.fromMillisecondsSinceEpoch(
+          earliestMs,
+          isUtc: true,
+        );
+        if (next.isBefore(earliest)) next = earliest;
+      }
+    }
+
+    // Pinned at "now" while shuttling forward: hold with decoders paused
+    // (same live-edge posture as _onTick) until the operator eases back.
+    final atLiveEdge =
+        v > 0 &&
+        !next.isBefore(nowUtc.subtract(const Duration(milliseconds: 200)));
+
+    if (v > 0 && !atLiveEdge) {
+      _applyShuttleForwardRate(v);
+    } else if (_shuttleAppliedRate > 0) {
+      // Left the forward zone (dead zone, reverse, or live edge) — freeze
+      // the real decode; reverse review is filmstrip-driven below.
+      _shuttleAppliedRate = 0;
+      for (final pane in _panes.values) {
+        pane.player.pause();
+      }
+    }
+
+    if (v == 0) return; // dead zone — hold position
+    _timeline.setPlayhead(next, now: nowUtc);
+
+    if (v > 0) {
+      // Forward: same fan-out as the normal play tick — panes prefetch and
+      // cross segment boundaries gaplessly at the shuttled rate.
+      if (!atLiveEdge && !_resolvePending) {
+        _resolvePending = true;
+        _resolveAll(
+          next,
+          playing: true,
+        ).whenComplete(() => _resolvePending = false);
+      }
+    } else {
+      // Reverse: mpv can't decode backward — ride the filmstrip scrub path
+      // (cheap in-segment keyframe seeks + server-extracted frames), which is
+      // rock-solid in any direction. The real video resolves on release.
+      _liveSeek(next);
+    }
+  }
+
+  /// Push the forward shuttle rate to the players (throttled to real
+  /// changes). On the first forward tick after reverse/hold, drop any
+  /// filmstrip overlay and start the decoders.
+  void _applyShuttleForwardRate(double v) {
+    if ((v - _shuttleAppliedRate).abs() <= 0.01) return;
+    final starting = _shuttleAppliedRate <= 0;
+    _shuttleAppliedRate = v;
+    if (starting && (_scrubbing || _scrubFrames.isNotEmpty)) {
+      _scrubToken++; // invalidate in-flight filmstrip fetches
+      setState(() {
+        _scrubbing = false;
+        _scrubFrames.clear();
+      });
+    }
+    for (final pane in _panes.values) {
+      // Keep pane.rate in sync so a fallback fresh open reasserts the
+      // shuttled rate (same contract as _setSpeed); restored on release.
+      pane.rate = v;
+      unawaited(pane.player.setRate(v));
+      if (starting) unawaited(pane.player.play());
     }
   }
 
@@ -970,6 +1130,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             gotoLabel: _fmtPlayheadLabel(),
             onTogglePlay: _togglePlay,
             onSetSpeed: _setSpeed,
+            onShuttle: _onShuttleUpdate,
+            onShuttleEnd: _onShuttleEnd,
             onJumpFirst: _jumpToFirst,
             onJumpLatest: _jumpToLatest,
             onPrevMotion: () => _jumpMotion(false),
@@ -1046,6 +1208,8 @@ class _TransportBar extends StatelessWidget {
     required this.gotoLabel,
     required this.onTogglePlay,
     required this.onSetSpeed,
+    required this.onShuttle,
+    required this.onShuttleEnd,
     required this.onJumpFirst,
     required this.onJumpLatest,
     required this.onPrevMotion,
@@ -1065,6 +1229,11 @@ class _TransportBar extends StatelessWidget {
   final String gotoLabel;
   final VoidCallback onTogglePlay;
   final ValueChanged<int> onSetSpeed;
+
+  /// Jog/shuttle drag: signed playback rate (0 = dead zone), then release.
+  final ValueChanged<double> onShuttle;
+  final VoidCallback onShuttleEnd;
+
   final VoidCallback onJumpFirst;
   final VoidCallback onJumpLatest;
   final VoidCallback onPrevMotion;
@@ -1179,6 +1348,15 @@ class _TransportBar extends StatelessWidget {
                     ),
                   ),
                 const Spacer(),
+                // Jog/shuttle (Milestone-style): spring-return velocity
+                // review — a transient tool, distinct from the speed pill's
+                // steady rate — sitting just left of the play cluster.
+                _ShuttleControl(
+                  accent: accent,
+                  onShuttle: onShuttle,
+                  onShuttleEnd: onShuttleEnd,
+                ),
+                const SizedBox(width: 10),
                 // Speed sits right beside the play cluster (its natural home)
                 // as a clearly-labelled pill with a direct-pick dropdown, not a
                 // cryptic tap-to-cycle text button off in the corner.
@@ -1303,6 +1481,177 @@ class _TransportBar extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Milestone-XProtect-style jog/shuttle: a horizontal track with a
+/// spring-return center thumb. Drag the thumb right to play forward, left to
+/// review backward; the further from center, the faster (0.25×–8×ᵉˣᵖ). A
+/// small dead zone around center reads as "hold", and releasing springs the
+/// thumb home and stops playback (the parent pauses + commits the frame).
+///
+/// Self-contained: owns only the thumb position; playback behavior lives in
+/// the parent via [onShuttle] (signed rate on every drag update, 0 = dead
+/// zone) and [onShuttleEnd] (release).
+class _ShuttleControl extends StatefulWidget {
+  const _ShuttleControl({
+    required this.accent,
+    required this.onShuttle,
+    required this.onShuttleEnd,
+  });
+
+  final Color accent;
+
+  /// Signed velocity in playback-rate units (+2.0 = 2× forward, −0.5 = 0.5×
+  /// backward, 0 = dead zone / hold). Fired on every drag update.
+  final ValueChanged<double> onShuttle;
+  final VoidCallback onShuttleEnd;
+
+  @override
+  State<_ShuttleControl> createState() => _ShuttleControlState();
+}
+
+class _ShuttleControlState extends State<_ShuttleControl> {
+  static const double _width = 148;
+  static const double _height = 28;
+  static const double _knob = 16;
+
+  /// |deflection| below this fraction of full throw = dead zone (hold).
+  static const double _deadZone = 0.12;
+  static const double _minSpeed = 0.25;
+  static const double _maxSpeed = 8;
+
+  double _frac = 0; // thumb deflection, −1 (full left) .. 1 (full right)
+  bool _dragging = false;
+
+  /// Exponential drag→speed mapping: just past the dead zone = [_minSpeed],
+  /// full deflection = [_maxSpeed]:
+  ///   speed = 0.25 × 32^u,  u = (|frac| − 0.12) / (1 − 0.12)
+  /// so speed doubles every fifth of the remaining throw (half throw ≈ 1.4×)
+  /// and the low, precise speeds get most of the travel. Sign = direction.
+  static double _velocityFor(double frac) {
+    final a = frac.abs();
+    if (a <= _deadZone) return 0;
+    final u = (a - _deadZone) / (1 - _deadZone);
+    final speed = _minSpeed * math.pow(_maxSpeed / _minSpeed, u).toDouble();
+    return frac < 0 ? -speed : speed;
+  }
+
+  static String _fmtVelocity(double v) {
+    final a = v.abs();
+    final s = a >= 1 ? a.toStringAsFixed(1) : a.toStringAsFixed(2);
+    return '${v < 0 ? '−' : ''}${s.endsWith('.0') ? a.toStringAsFixed(0) : s}×';
+  }
+
+  void _applyFromDx(double dx) {
+    const half = (_width - _knob) / 2; // px of thumb travel each way
+    final frac = ((dx - _width / 2) / half).clamp(-1.0, 1.0);
+    setState(() => _frac = frac);
+    widget.onShuttle(_velocityFor(frac));
+  }
+
+  void _onDragStart(DragStartDetails d) {
+    _dragging = true;
+    _applyFromDx(d.localPosition.dx);
+  }
+
+  void _onDragUpdate(DragUpdateDetails d) {
+    if (_dragging) _applyFromDx(d.localPosition.dx);
+  }
+
+  void _onDragStop() {
+    if (!_dragging) return;
+    _dragging = false;
+    setState(() => _frac = 0); // AnimatedAlign springs the thumb home
+    widget.onShuttleEnd();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = widget.accent;
+    final v = _velocityFor(_frac);
+    final active = _dragging && v != 0;
+    return ShiftHint(
+      hint: 'Shuttle — drag to review, release to stop',
+      child: Tooltip(
+        message:
+            'Shuttle: drag right to play forward, left to review backward.\n'
+            'Further = faster (0.25×–8×); release to stop.',
+        waitDuration: const Duration(milliseconds: 600),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragStart: _onDragStart,
+          onHorizontalDragUpdate: _onDragUpdate,
+          onHorizontalDragEnd: (_) => _onDragStop(),
+          onHorizontalDragCancel: _onDragStop,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.resizeLeftRight,
+            child: SizedBox(
+              width: _width,
+              height: _height,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  // Track groove.
+                  Container(
+                    height: 6,
+                    margin: const EdgeInsets.symmetric(horizontal: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.white10,
+                      borderRadius: BorderRadius.circular(3),
+                      border: Border.all(color: Colors.white24, width: 0.5),
+                    ),
+                  ),
+                  // Speed ticks at half throw each way + the center notch.
+                  for (final x in const [-0.5, 0.5])
+                    Align(
+                      alignment: Alignment(x, 0),
+                      child: Container(
+                        width: 1,
+                        height: 8,
+                        color: Colors.white24,
+                      ),
+                    ),
+                  Container(width: 2, height: 12, color: Colors.white38),
+                  // Transient speed readout, on the side away from the thumb.
+                  if (active)
+                    Align(
+                      alignment: Alignment(_frac > 0 ? -0.7 : 0.7, 0),
+                      child: Text(
+                        _fmtVelocity(v),
+                        style: TextStyle(
+                          color: accent,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  // The spring-return thumb.
+                  AnimatedAlign(
+                    alignment: Alignment(_frac, 0),
+                    duration: _dragging
+                        ? Duration.zero
+                        : const Duration(milliseconds: 160),
+                    curve: Curves.easeOutBack,
+                    child: Container(
+                      width: _knob,
+                      height: _knob,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: active ? accent : const Color(0xFF3A414B),
+                        border: Border.all(
+                          color: active ? accent : Colors.white38,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
