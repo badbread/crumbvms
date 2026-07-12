@@ -1459,7 +1459,7 @@ class _TransportBar extends StatelessWidget {
                     ),
                   ),
                 const Spacer(),
-                // Jog/shuttle (Milestone-style): spring-return velocity
+                // Jog/shuttle (broadcast-style): spring-return velocity
                 // review — a transient tool, distinct from the speed pill's
                 // steady rate — sitting just left of the play cluster.
                 _ShuttleControl(
@@ -1606,7 +1606,7 @@ class _TransportBar extends StatelessWidget {
   }
 }
 
-/// Milestone-XProtect-style jog/shuttle: a horizontal track with a
+/// Broadcast-style jog/shuttle: a horizontal track with a
 /// spring-return center thumb. Drag the thumb right to play forward, left to
 /// review backward; the further from center, the faster (0.25×–8×ᵉˣᵖ). A
 /// small dead zone around center reads as "hold", and releasing springs the
