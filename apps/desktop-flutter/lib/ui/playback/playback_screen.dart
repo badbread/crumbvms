@@ -2,16 +2,14 @@
 // slice of apps/desktop/src/app.js's `pb*` functions: segment resolve
 // (`pbFetchSegment`/`pbResolveAllPanes`/`pbSeekAllPanes`), the tile grid
 // mirroring the live wall (`pbBuildTileGrid`, tile maximize on double-click),
-// the canvas timeline (`PlaybackTimeline`, see playback_timeline.dart) with
-// drag-to-scrub/pan/wheel-zoom, the play/pause/speed transport, the
-// time-goto field (`pbHandleTimeGoto`), and jump-to-latest/first
+// the play/pause/speed transport, the date/time goto, and jump-to-latest/first
 // (`pbJumpToLatest`/`pbJumpToFirst`).
 //
-// OUT of scope for this port (separate features, not part of
-// playback-timeline-core): per-camera motion-intensity tracks, Frigate
-// detection glyphs, export-range selection, bookmarks, prev/next-motion nav.
-// The canvas still has room for those to be layered on later — see
-// playback_timeline_painter.dart's header comment.
+// The scrub surface is a SINGLE unified strip (`MotionTimelineView`): motion
+// intensity + Frigate detection glyphs + a thin recording-coverage line, and
+// the drag-to-scrub/pan/wheel-zoom/Shift-select interaction itself, all driven
+// by the shared [PlaybackTimelineController]. (The old separate bottom scrubber
+// bar was folded into it.)
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -31,7 +29,6 @@ import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
-import 'playback_timeline.dart';
 import 'playback_timeline_controller.dart';
 
 class PlaybackScreen extends StatefulWidget {
@@ -793,22 +790,18 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onZoomIn: () => _zoomBy(-1),
           ),
           if (_timeline.hasSelection) _buildExportSelectionBar(),
-          // Motion-intensity histogram + detection glyphs + legend, synced to
-          // the scrubber window (prev/next-motion now lives in the transport
-          // bar above). Compact so it doesn't crowd the video.
+          // The single playback timeline: motion intensity + detection glyphs +
+          // a thin recording-coverage line at the bottom, and the scrub surface
+          // itself — drag = pan, click = seek, wheel = zoom, Shift+drag =
+          // export range. (Replaces the old separate bottom scrubber bar.)
           MotionTimelineView(
-            controller: _motion,
+            motion: _motion,
+            timeline: _timeline,
             cameras: _cameras,
-            playheadMs: _timeline.playhead.millisecondsSinceEpoch,
-            onSeek: _seekToMs,
-          ),
-          PlaybackTimeline(
-            controller: _timeline,
             selectedCameraName: _selectedCamera?.name,
             onLiveSeek: _liveSeek,
             onCommitSeek: _commitSeek,
             onZoomChanged: _onZoomChanged,
-            height: 58,
           ),
         ],
       ),
