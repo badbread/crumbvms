@@ -1,12 +1,14 @@
-// App-wide "hold Shift to see what a button does" hints. A button wraps itself
-// in a [ShiftHint] with a short caption; while Shift is held down (globally),
-// hovering a wrapped button floats its caption just above/below it.
+// App-wide "hold Shift to see what every button does" hints. A button wraps
+// itself in a [ShiftHint] with a short caption; while Shift is held down
+// (globally), a caption floats over EVERY wrapped button at once — the whole
+// keyboard/action map at a glance, which the per-button hover tooltip can't
+// give you.
 //
-// Hover-scoped ON PURPOSE: an earlier version showed EVERY wrapped button's
-// caption at once, but on dense rows (the playback transport) the ~200px-wide
-// captions, each centred on a small button, overlapped into an unreadable mess.
-// Showing only the hovered button's hint eliminates the overlap and is more
-// targeted — hold Shift, sweep the mouse over the controls to learn them.
+// Overlap: on dense rows (the playback transport) many ~200px captions centred
+// on ~35px-spaced buttons would pile on top of each other. To keep them
+// readable while still showing all at once, each caption is nudged to one of a
+// few VERTICAL levels chosen from its horizontal position — neighbouring
+// buttons land on different levels, so their captions clear each other.
 //
 // The global Shift signal is owned by [HintsController]; the app root toggles
 // it from a HardwareKeyboard handler (see main.dart). Buttons just opt in.
@@ -51,8 +53,12 @@ class ShiftHint extends StatefulWidget {
 }
 
 class _ShiftHintState extends State<ShiftHint> {
-  bool _shiftHeld = false;
-  bool _hovering = false;
+  bool _show = false;
+
+  /// Extra vertical offset (in caption-heights) so neighbouring captions land
+  /// on different levels instead of overlapping. Derived from this widget's
+  /// horizontal position, measured after layout.
+  int _level = 0;
 
   @override
   void initState() {
@@ -63,9 +69,26 @@ class _ShiftHintState extends State<ShiftHint> {
 
   void _sync() {
     if (!mounted) return;
-    final held =
+    final show =
         HintsController.instance.active.value && widget.hint.isNotEmpty;
-    if (held != _shiftHeld) setState(() => _shiftHeld = held);
+    if (show != _show) {
+      setState(() => _show = show);
+      if (show) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => _measureLevel());
+      }
+    }
+  }
+
+  void _measureLevel() {
+    if (!mounted || !_show) return;
+    final box = context.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    final gx = box.localToGlobal(Offset.zero).dx;
+    // 5 staggered levels across the screen width so densely-packed captions
+    // (transport buttons ~35px apart, captions ~200px wide) clear each other.
+    const levels = 5;
+    final level = (((gx / 46).floor() % levels) + levels) % levels;
+    if (level != _level) setState(() => _level = level);
   }
 
   @override
@@ -76,30 +99,21 @@ class _ShiftHintState extends State<ShiftHint> {
 
   @override
   Widget build(BuildContext context) {
-    // Only the hovered button's caption shows, so adjacent captions can't
-    // overlap. MouseRegion is opaque so hovering the child counts.
-    final show = _shiftHeld && _hovering;
-    return MouseRegion(
-      onEnter: (_) {
-        if (!_hovering) setState(() => _hovering = true);
-      },
-      onExit: (_) {
-        if (_hovering) setState(() => _hovering = false);
-      },
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          widget.child,
-          if (show)
-            Positioned.fill(
+    // Base nudge fully clears the child (1.15 caption-heights); each stagger
+    // level adds one more so neighbours don't collide.
+    final offset = 1.15 + _level * 1.12;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        widget.child,
+        if (_show)
+          Positioned.fill(
             child: IgnorePointer(
               child: Align(
                 alignment:
                     widget.above ? Alignment.topCenter : Alignment.bottomCenter,
                 child: FractionalTranslation(
-                  // Move the caption fully out of the child's box (100% of its
-                  // own height) plus a hair, so it sits just above/below it.
-                  translation: Offset(0, widget.above ? -1.15 : 1.15),
+                  translation: Offset(0, widget.above ? -offset : offset),
                   child: OverflowBox(
                     minWidth: 0,
                     maxWidth: 260,
@@ -110,8 +124,7 @@ class _ShiftHintState extends State<ShiftHint> {
               ),
             ),
           ),
-        ],
-      ),
+      ],
     );
   }
 
