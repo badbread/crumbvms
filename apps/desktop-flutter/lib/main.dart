@@ -387,8 +387,20 @@ class MainShell extends StatefulWidget {
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WindowListener {
   int _index = _liveIndex;
+
+  /// True while the OS window is minimized. The video-heavy tabs (Live /
+  /// Playback) are torn down for the duration so N libmpv panes aren't
+  /// decoding invisibly, and — more importantly — so they come back with
+  /// FRESH players on restore. Left running across a long minimize the mpv
+  /// panes wedge (no visible surface → the demuxer stalls), and on restore
+  /// all of them fight to catch up at once, starving Flutter's raster thread
+  /// for 10–15s: clicks don't repaint the selection highlight and a
+  /// double-click's maximize only lands once the pipeline unclogs. A
+  /// tab-switch already recovers by disposing + rebuilding the wall; this
+  /// gives restore-from-minimize the same recovery. See issue #91.
+  bool _minimized = false;
 
   /// Whether the floating Settings panel is open. It overlays the current tab
   /// (not its own tab) so the live wall keeps running and updates behind it.
@@ -453,6 +465,9 @@ class _MainShellState extends State<MainShell> {
     // focus-chain Esc handling there never fires — see the same pattern on
     // the clip player (_ClipPlayerState._onKeyEvent, clips_screen.dart).
     HardwareKeyboard.instance.addHandler(_playbackFocusEscHandler);
+    // Recover the live wall from the long-minimize wedge (#91): tear the
+    // video tabs down on minimize, rebuild them fresh on restore.
+    windowManager.addListener(this);
     _loadDefaultView();
   }
 
@@ -491,9 +506,29 @@ class _MainShellState extends State<MainShell> {
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_playbackFocusEscHandler);
+    windowManager.removeListener(this);
     _audio.dispose();
     _wallStats.dispose();
     super.dispose();
+  }
+
+  // ── window minimize/restore recovery (#91) ────────────────────────────────
+  // window_manager delivers these on the platform thread; both the
+  // FullscreenController and this shell are registered listeners (the manager
+  // fans out to all of them). onWindowRestore fires on un-minimize AND
+  // un-maximize, so gate the rebuild on having actually been minimized.
+  @override
+  void onWindowMinimize() {
+    if (!mounted || _minimized) return;
+    setState(() => _minimized = true);
+  }
+
+  @override
+  void onWindowRestore() {
+    if (!mounted || !_minimized) return;
+    // Leaving _minimized swaps the placeholder back for the real screen; the
+    // fresh WallScreen/PlaybackScreen State opens brand-new players.
+    setState(() => _minimized = false);
   }
 
   /// Esc while Playback is showing a clip-originated single-camera focus:
@@ -955,6 +990,13 @@ class _MainShellState extends State<MainShell> {
   }
 
   Widget _buildBody(Session session) {
+    // While minimized, render nothing for the video-heavy tabs so their State
+    // disposes the mpv players; restore rebuilds them fresh (#91). The window
+    // is invisible while this shows, so a plain fill is all that's needed.
+    // Non-video tabs (Clips/Export/Settings) are unaffected.
+    if (_minimized && (_index == _liveIndex || _index == _playbackIndex)) {
+      return const ColoredBox(color: Color(0xFF14171C));
+    }
     switch (_index) {
       case _playbackIndex:
         return PlaybackScreen(
