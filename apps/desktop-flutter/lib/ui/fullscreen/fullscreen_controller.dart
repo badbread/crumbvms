@@ -60,28 +60,12 @@ class FullscreenController extends ChangeNotifier with WindowListener {
     } catch (_) {
       // Best-effort, same as the old client's `.catch(() => {})` around the
       // `invoke('set_window_fullscreen', ...)` call — never let a window-
-      // manager failure crash the wall.
-    }
-    if (!on) {
-      // Robust exit (#86). On Windows, `setFullScreen(false)` can leave the
-      // window OFF the taskbar and without focus — an uninteractable "ghost"
-      // the user can't recover without Win+D or killing the process
-      // (reported after launch-into-fullscreen + Esc). Force the window back
-      // to a normal, visible, focused, taskbar-present state. Each step is
-      // independently best-effort so one failing plugin call can't re-strand
-      // the window: getting even one of show/focus/taskbar through is enough
-      // to avoid the ghost.
-      for (final step in <Future<void> Function()>[
-        () => windowManager.setSkipTaskbar(false),
-        () => windowManager.show(),
-        () => windowManager.focus(),
-      ]) {
-        try {
-          await step();
-        } catch (_) {
-          /* best-effort — keep trying the remaining steps */
-        }
-      }
+      // manager failure crash the wall. (Do NOT chain extra window_manager
+      // calls like setSkipTaskbar/show/focus right after setFullScreen(false):
+      // an earlier attempt to do that closed the app on Esc-exit from a
+      // launch-fullscreen wall — a native crash during the exit transition
+      // that a Dart try/catch can't stop. The real launch white-box fix lives
+      // in applyLaunchFullscreenPreference, not here.)
     }
   }
 
