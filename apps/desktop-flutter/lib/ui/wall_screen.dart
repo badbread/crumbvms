@@ -14,6 +14,7 @@ import 'package:flutter/gestures.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/api/ptz_panel_store.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
@@ -23,6 +24,11 @@ import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
+import 'package:crumb_desktop/ui/ptz/ptz_imaging_controls.dart';
+import 'package:crumb_desktop/ui/ptz/ptz_panel_controller.dart';
+import 'package:crumb_desktop/ui/ptz/ptz_panel_editor_bar.dart';
+import 'package:crumb_desktop/ui/ptz/ptz_panel_overlay.dart';
+import 'package:crumb_desktop/ui/ptz/ptz_presets_panel.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
     show AppliedView;
 import 'package:crumb_desktop/ui/special_tiles/special_tile_controller.dart';
@@ -121,6 +127,18 @@ class _WallScreenState extends State<WallScreen> {
   /// own main-stream player waits for a keyframe — no black flash.
   VideoController? _maximizeWarmCtrl;
 
+  /// Custom per-camera PTZ control panels (the drag-laid-out button clusters
+  /// ported from the old client's `ptzPanels`). One store + one controller
+  /// shared by every maximized pane: the store serializes writes to the single
+  /// shared_preferences key, and the controller carries edit state across the
+  /// tile right-click menu ("Edit PTZ panel…") → maximized-pane handoff.
+  final PtzPanelStore _ptzPanelStore = PtzPanelStore();
+  late final PtzPanelController _ptzPanel = PtzPanelController(
+    api: widget.api,
+    session: widget.session,
+    store: _ptzPanelStore,
+  );
+
   List<Camera> get _shown =>
       widget.cameras.where((c) => c.enabled).toList(growable: false);
 
@@ -145,6 +163,11 @@ class _WallScreenState extends State<WallScreen> {
   @override
   void didUpdateWidget(WallScreen old) {
     super.didUpdateWidget(old);
+    // Fresh session after an in-place re-auth — keep PTZ panel calls authed.
+    if (old.session.token != widget.session.token ||
+        old.session.base != widget.session.base) {
+      _ptzPanel.updateSession(widget.session);
+    }
     // A different applied view (or none) → re-parse its special-tile specs.
     if (!identical(old.view, widget.view) || old.view?.id != widget.view?.id) {
       // The new view may drop the maximized camera's tile — whose player the
@@ -225,11 +248,33 @@ class _WallScreenState extends State<WallScreen> {
     _liveStatus.removeListener(_onLiveStatusTick);
     _special.dispose();
     _liveStatus.dispose();
+    // Persist any in-flight panel edit straight to the store — the async
+    // endEdit() would notifyListeners on the controller after dispose().
+    // (Every discrete edit already persisted itself; this only covers a
+    // mid-drag move.)
+    final editCam = _ptzPanel.editMode ? _ptzPanel.editCameraId : null;
+    if (editCam != null) {
+      unawaited(
+        _ptzPanelStore.save(
+          editCam,
+          _ptzPanelStore.panelForEditSync(editCam) ?? const [],
+        ),
+      );
+    }
+    _ptzPanel.dispose();
     super.dispose();
   }
 
   /// Maximize a camera + make it the audio-active pane.
   void _maximize(Camera cam) {
+    // Maximizing a different camera mid panel-edit ends (and persists) the
+    // edit — the editor chrome must not follow the wrong camera.
+    if (_ptzPanel.editMode && _ptzPanel.editCameraId != cam.id) {
+      unawaited(_ptzPanel.endEdit());
+    }
+    // Load the camera's saved custom PTZ panel (if any) so the maximized
+    // pane can render it in view mode.
+    if (cam.ptz) unawaited(_ptzPanel.loadForView(cam.id));
     widget.audio?.setMaximized('max:${cam.id}');
     widget.onMaximizedCameraChanged?.call(cam.id);
     setState(() {
@@ -243,12 +288,22 @@ class _WallScreenState extends State<WallScreen> {
 
   /// Restore from the maximized pane back to the grid.
   void _restore() {
+    // Leaving the maximized view mid panel-edit ends (and persists) the edit.
+    if (_ptzPanel.editMode) unawaited(_ptzPanel.endEdit());
     widget.audio?.setMaximized(null);
     widget.onMaximizedCameraChanged?.call(null);
     setState(() {
       _maximizeWarmCtrl = null;
       _maximized = null;
     });
+  }
+
+  /// "Edit PTZ panel…" from a tile's right-click menu: maximize the camera
+  /// (the panel is composed over the full-pane video, WYSIWYG) and enter the
+  /// panel editor.
+  void _editPtzPanel(Camera cam) {
+    if (_maximized?.id != cam.id) _maximize(cam);
+    unawaited(_ptzPanel.beginEdit(cam.id));
   }
 
   @override
@@ -303,6 +358,7 @@ class _WallScreenState extends State<WallScreen> {
               streamPrefs: widget.streamPrefs,
               audio: widget.audio,
               warmController: _maximizeWarmCtrl,
+              ptzPanel: _ptzPanel,
               ptzClickMode:
                   widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
               ptzStyle: widget.clientOptions?.ptzStyle ?? PtzStyle.edges,
@@ -331,7 +387,17 @@ class _WallScreenState extends State<WallScreen> {
           }
         }
       },
-      onEscape: _maximized == null ? null : _restore,
+      // Esc leaves panel-edit mode first (persisting the layout); the next
+      // Esc restores the wall — same layered-Esc model as fullscreen.
+      onEscape: _maximized == null
+          ? null
+          : () {
+              if (_ptzPanel.editMode) {
+                unawaited(_ptzPanel.endEdit());
+              } else {
+                _restore();
+              }
+            },
       onToggleAudio: widget.audio == null
           ? null
           : () => widget.audio!.toggleAudio(),
@@ -430,6 +496,7 @@ class _WallScreenState extends State<WallScreen> {
                       _special.routeHotspotClick(i, cam.id);
                       _maximize(cam);
                     },
+                    onEditPtzPanel: () => _editPtzPanel(cam),
                   );
           }
           children.add(
@@ -494,6 +561,7 @@ class _WallScreenState extends State<WallScreen> {
                 // rather than crop, matching _viewGrid and the old client.
                 fit: BoxFit.contain,
                 onTap: () => _maximize(cam),
+                onEditPtzPanel: () => _editPtzPanel(cam),
               ),
             ),
           );
@@ -534,6 +602,7 @@ class _WallTile extends StatefulWidget {
     this.audio,
     this.fit = BoxFit.cover,
     this.zoomToMain = false,
+    this.onEditPtzPanel,
   });
 
   final CrumbApi api;
@@ -544,6 +613,10 @@ class _WallTile extends StatefulWidget {
   final VoidCallback onTap;
   final StreamPrefsStore? streamPrefs;
   final AudioFollowController? audio;
+
+  /// "Edit PTZ panel…" from the right-click menu (PTZ cameras only): the wall
+  /// maximizes this camera and opens the custom-panel editor over it.
+  final VoidCallback? onEditPtzPanel;
 
   /// When true, digitally zooming this tile past 100% temporarily loads its
   /// main stream (reverting to sub at 100%). From the "Zoom switches to main
@@ -778,6 +851,14 @@ class _WallTileState extends State<_WallTile> {
                   : 'Disable PTZ controls',
             ),
           ),
+          // Custom panel builder — pointless while PTZ controls are disabled
+          // (the maximized pane hides the panel behind the same gate).
+          if (widget.onEditPtzPanel != null &&
+              !prefs.ptzDisabledFor(widget.camera.id))
+            const PopupMenuItem(
+              value: 'ptz-panel',
+              child: Text('Edit PTZ panel…'),
+            ),
           const PopupMenuDivider(),
         ],
         CheckedPopupMenuItem(
@@ -805,6 +886,8 @@ class _WallTileState extends State<_WallTile> {
           !prefs.ptzDisabledFor(widget.camera.id),
         );
         setState(() {}); // no reload needed — only affects maximized PTZ UI
+      case 'ptz-panel':
+        widget.onEditPtzPanel?.call();
       case 'main':
         prefs?.setOverride(widget.camera.id, StreamQuality.main);
         await _reloadStream();
@@ -1032,6 +1115,7 @@ class _MaximizedPane extends StatefulWidget {
     this.streamPrefs,
     this.audio,
     this.warmController,
+    this.ptzPanel,
     this.ptzClickMode = PtzClickMode.center,
     this.ptzStyle = PtzStyle.edges,
     this.ptzWheelCorner = PtzWheelCorner.bottomLeft,
@@ -1052,6 +1136,13 @@ class _MaximizedPane extends StatefulWidget {
   /// keyframe. The tile stays mounted (and decoding) under this overlay, so
   /// the controller stays valid for the handoff window.
   final VideoController? warmController;
+
+  /// Custom per-camera PTZ panel controller (shared, owned by the wall).
+  /// When this camera has a saved custom panel (or is being edited) the
+  /// panel overlay REPLACES the stock edge-arrows/wheel controls; with no
+  /// panel the stock controls and click/wheel interaction are untouched —
+  /// the old client's `ptzActivePanel` fallback rule.
+  final PtzPanelController? ptzPanel;
 
   /// What a click on a PTZ-capable video does (center / pan / off).
   final PtzClickMode ptzClickMode;
@@ -1083,9 +1174,35 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   Offset _offset = Offset.zero;
   static const double _maxZoom = 8.0;
 
+  /// Mirror of the custom-panel controller state for THIS camera: whether a
+  /// custom panel is active (saved layout or edit session) and whether it's
+  /// in edit mode. Kept as fields updated by a change-comparing listener so
+  /// the pane only rebuilds on panel-mode transitions — the controller also
+  /// notifies on every drag tick, which only [PtzPanelOverlay] (with its own
+  /// AnimatedBuilder) needs to repaint for.
+  bool _panelActive = false;
+  bool _panelEditing = false;
+
+  void _onPtzPanelChanged() {
+    if (!mounted) return;
+    final rec = widget.ptzPanel?.activePanelFor(widget.camera.id);
+    final active = rec != null;
+    final editing = rec?.$2 ?? false;
+    if (active != _panelActive || editing != _panelEditing) {
+      setState(() {
+        _panelActive = active;
+        _panelEditing = editing;
+      });
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    widget.ptzPanel?.addListener(_onPtzPanelChanged);
+    final rec = widget.ptzPanel?.activePanelFor(widget.camera.id);
+    _panelActive = rec != null;
+    _panelEditing = rec?.$2 ?? false;
     _load();
   }
 
@@ -1193,9 +1310,16 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       widget.camera.ptz &&
       !(widget.streamPrefs?.ptzDisabledFor(widget.camera.id) ?? false);
 
+  // While the custom-panel EDITOR is open, clicks/drags on the video arrange
+  // buttons — they must not also steer the camera, so the click-to-center /
+  // hold-to-pan interactions pause for the edit session (view mode keeps
+  // them: panel buttons are opaque hit targets, empty video falls through).
   bool get _ptzCenter =>
-      _ptzEnabled && widget.ptzClickMode == PtzClickMode.center;
-  bool get _ptzPan => _ptzEnabled && widget.ptzClickMode == PtzClickMode.pan;
+      _ptzEnabled &&
+      !_panelEditing &&
+      widget.ptzClickMode == PtzClickMode.center;
+  bool get _ptzPan =>
+      _ptzEnabled && !_panelEditing && widget.ptzClickMode == PtzClickMode.pan;
 
   // ── PTZ optical zoom via the mouse wheel ────────────────────────────────
   // The wheel is discrete but ONVIF zoom is continuous (move → stop), so each
@@ -1315,6 +1439,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   @override
   void dispose() {
+    widget.ptzPanel?.removeListener(_onPtzPanelChanged);
     SnapshotRegistry.instance.unregister('maximized');
     widget.audio?.unregisterPane('max:${widget.camera.id}');
     // Guaranteed stop: if any PTZ motion could still be in flight (an active
@@ -1392,6 +1517,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           onPointerCancel: (_) => _ptzStopSteer(),
                           onPointerSignal: (e) {
                             if (e is PointerScrollEvent) {
+                              // Panel editor open: the wheel must not move
+                              // the camera (or scale the video under the
+                              // fixed-position editor overlay).
+                              if (_panelEditing) return;
                               if (_ptzEnabled) {
                                 // PTZ camera → drive OPTICAL zoom, not digital.
                                 _ptzWheelZoom(e.scrollDelta.dy);
@@ -1438,6 +1567,18 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           ),
                         ),
                 ),
+
+                // Custom PTZ panel: the operator-composed button cluster,
+                // drawn over the video but under the HUD chrome below (view
+                // mode drives PTZ/imaging via press-hold/tap; edit mode
+                // drags/resizes). Renders nothing when inactive.
+                if (_ptzEnabled && widget.ptzPanel != null && _panelActive)
+                  Positioned.fill(
+                    child: PtzPanelOverlay(
+                      controller: widget.ptzPanel!,
+                      cameraId: widget.camera.id,
+                    ),
+                  ),
 
                 // Close (back to wall) + camera name + zoom level.
                 Positioned(
@@ -1514,8 +1655,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
                 // PTZ controls (PTZ-capable cameras with PTZ not disabled):
                 // Options "PTZ style" picks edge-pinned arrows or the compact
-                // corner wheel box (pinned per "Wheel corner").
-                if (_ptzEnabled)
+                // corner wheel box (pinned per "Wheel corner"). A custom
+                // panel (saved layout or open editor) replaces these stock
+                // controls — the `ptzActivePanel` rule from the old client.
+                if (_ptzEnabled && !_panelActive)
                   Positioned.fill(
                     child: _PtzControls(
                       api: widget.api,
@@ -1525,6 +1668,42 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                       wheelCorner: widget.ptzWheelCorner,
                     ),
                   ),
+
+                // Panel-editor chrome: live presets/imaging on the right (so
+                // the operator can exercise the camera while arranging) and
+                // the palette/properties toolbar along the bottom (its Done
+                // button ends the edit; Esc does too, via the wall hotkeys).
+                if (_ptzEnabled &&
+                    widget.ptzPanel != null &&
+                    _panelEditing) ...[
+                  Positioned(
+                    right: 14,
+                    top: 64,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        PtzPresetsPanel(
+                          api: widget.api,
+                          session: widget.session,
+                          cameraId: widget.camera.id,
+                        ),
+                        const SizedBox(height: 6),
+                        PtzImagingControls(
+                          api: widget.api,
+                          session: widget.session,
+                          cameraId: widget.camera.id,
+                        ),
+                      ],
+                    ),
+                  ),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: PtzPanelEditorBar(controller: widget.ptzPanel!),
+                  ),
+                ],
               ],
             );
           },
