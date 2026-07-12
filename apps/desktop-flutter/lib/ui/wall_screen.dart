@@ -25,6 +25,9 @@ import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
     show AppliedView;
+import 'package:crumb_desktop/ui/special_tiles/special_tile_controller.dart';
+import 'package:crumb_desktop/ui/special_tiles/special_tile_spec.dart';
+import 'package:crumb_desktop/ui/special_tiles/special_tile_widgets.dart';
 
 class WallScreen extends StatefulWidget {
   const WallScreen({
@@ -82,6 +85,16 @@ class _WallScreenState extends State<WallScreen> {
 
   late final LiveStatusController _liveStatus;
 
+  /// Runtime engine for the two VIDEO special tiles (carousel/hotspot) — it
+  /// resolves each to a live camera id the normal tile widget renders. The
+  /// DOM-only special tiles (clock/text/image/web/events) render standalone via
+  /// [specialTileWidget] and don't go through this controller.
+  late final SpecialTileController _special;
+
+  /// Parsed special-tile specs for the applied view, by slot index. Cells not
+  /// in here are plain cameras (or empty).
+  Map<int, SpecialTileSpec> _specsBySlot = const {};
+
   List<Camera> get _shown =>
       widget.cameras.where((c) => c.enabled).toList(growable: false);
 
@@ -95,6 +108,63 @@ class _WallScreenState extends State<WallScreen> {
     _liveStatus = LiveStatusController(api: widget.api, session: widget.session)
       ..cameraIds = _shown.map((c) => c.id).toList()
       ..start();
+    _special = SpecialTileController(
+      allCameraIds: () => _shown.map((c) => c.id).toList(),
+    )..addListener(_onSpecialChanged);
+    // Feed carousel/hotspot resolution from the live-status motion signal.
+    _liveStatus.addListener(_onLiveStatusTick);
+    _applyViewSpecs();
+  }
+
+  @override
+  void didUpdateWidget(WallScreen old) {
+    super.didUpdateWidget(old);
+    // A different applied view (or none) → re-parse its special-tile specs.
+    if (!identical(old.view, widget.view) || old.view?.id != widget.view?.id) {
+      _applyViewSpecs();
+    }
+  }
+
+  void _onSpecialChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _onLiveStatusTick() {
+    _special.onMotionTick(
+      recentMotionCameraIds: _liveStatus.byCameraId.values
+          .where((c) => c.recentMotion)
+          .map((c) => c.id)
+          .toSet(),
+    );
+  }
+
+  /// Parse the applied view's raw slots into special-tile specs and hand them
+  /// to the controller (starts/stops carousel timers, seeds hotspots).
+  void _applyViewSpecs() {
+    final view = widget.view;
+    final specs = <int, SpecialTileSpec>{};
+    if (view != null) {
+      view.rawSlots.forEach((idxStr, raw) {
+        final idx = int.tryParse(idxStr);
+        if (idx == null || raw is! Map) return;
+        final spec = SpecialTileSpec.fromRaw(Map<String, dynamic>.from(raw));
+        if (spec != null) specs[idx] = spec;
+      });
+    }
+    _specsBySlot = specs;
+    _special.applySpecs(specs);
+    // Seed the classic (click) hotspot from the view's first camera slot.
+    if (view != null) {
+      String? firstCam;
+      for (var i = 0; i < view.layout.cells.length; i++) {
+        final c = view.slots[i];
+        if (c != null) {
+          firstCam = c;
+          break;
+        }
+      }
+      _special.seedClickHotspot(firstCam);
+    }
   }
 
   Future<void> _pollStats() async {
@@ -119,6 +189,8 @@ class _WallScreenState extends State<WallScreen> {
   @override
   void dispose() {
     _statsTimer?.cancel();
+    _liveStatus.removeListener(_onLiveStatusTick);
+    _special.dispose();
     _liveStatus.dispose();
     super.dispose();
   }
@@ -301,29 +373,56 @@ class _WallScreenState extends State<WallScreen> {
           final top = cell.y / layout.rows * h;
           final width = cell.w / layout.cols * w;
           final height = cell.h / layout.rows * h;
-          final camId = view.slots[i];
-          final cam = camId == null ? null : camById[camId];
+          final spec = _specsBySlot[i];
+          Widget child;
+          if (spec != null && !spec.isVideoTile) {
+            // DOM-only special tile (clock/text/image/web/events): render
+            // standalone, no camera pane underneath.
+            child = KeyedSubtree(
+              key: ValueKey('${view.id}:$i:${spec.kind.wireType}'),
+              child: ColoredBox(
+                color: Colors.black,
+                child: specialTileWidget(
+                  spec,
+                  api: widget.api,
+                  session: widget.session,
+                  cameras: widget.cameras,
+                ),
+              ),
+            );
+          } else {
+            // Plain camera slot, or a carousel/hotspot resolved to a camera.
+            final camId = (spec != null && spec.isVideoTile)
+                ? _special.resolvedCamera(i)
+                : view.slots[i];
+            final cam = camId == null ? null : camById[camId];
+            child = cam == null
+                ? const _EmptySlot()
+                : _WallTile(
+                    key: ValueKey('${view.id}:$i:${cam.id}'),
+                    api: widget.api,
+                    session: widget.session,
+                    camera: cam,
+                    liveStatus: _liveStatus,
+                    streamPrefs: widget.streamPrefs,
+                    audio: widget.audio,
+                    showInfoBar: showInfoBar,
+                    // Custom cells can be any aspect — letterbox, don't crop.
+                    fit: BoxFit.contain,
+                    onTap: () {
+                      // Clicking a camera retargets classic (click) hotspots.
+                      _special.routeHotspotClick(i, cam.id);
+                      _maximize(cam);
+                    },
+                  );
+          }
           children.add(
             Positioned(
               left: left + g,
               top: top + g,
               width: (width - 2 * g).clamp(0.0, w),
               height: (height - 2 * g).clamp(0.0, h),
-              child: cam == null
-                  ? const _EmptySlot()
-                  : _WallTile(
-                      key: ValueKey('${view.id}:$i:${cam.id}'),
-                      api: widget.api,
-                      session: widget.session,
-                      camera: cam,
-                      liveStatus: _liveStatus,
-                      streamPrefs: widget.streamPrefs,
-                      audio: widget.audio,
-                      showInfoBar: showInfoBar,
-                      // Custom cells can be any aspect — letterbox, don't crop.
-                      fit: BoxFit.contain,
-                      onTap: () => _maximize(cam),
-                    ),
+              child: child,
             ),
           );
         }
