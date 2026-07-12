@@ -729,6 +729,22 @@ class _MainShellState extends State<MainShell> {
     if (ok == true) widget.onLogout();
   }
 
+  /// The cameras Playback should review: the currently-applied view's cameras
+  /// (so Playback mirrors what you were watching on Live), or all cameras when
+  /// no specific view is applied.
+  List<Camera> _playbackCameras() {
+    final view = _appliedView;
+    if (view == null) return widget.cameras;
+    final byId = {for (final c in widget.cameras) c.id: c};
+    final seen = <String>{};
+    final out = <Camera>[];
+    for (final i in view.slots.keys.toList()..sort()) {
+      final id = view.slots[i];
+      if (id != null && byId[id] != null && seen.add(id)) out.add(byId[id]!);
+    }
+    return out.isEmpty ? widget.cameras : out;
+  }
+
   /// Apply a saved view to the live wall. "All Cameras" (id ==
   /// [ViewPrefs.allCamerasId]) resets to the default auto-grid; any other view
   /// renders its custom layout. Always lands on the Live tab.
@@ -760,7 +776,8 @@ class _MainShellState extends State<MainShell> {
         return PlaybackScreen(
           api: widget.api,
           session: session,
-          cameras: widget.cameras,
+          // Mirror the current Live view's cameras (or all if none applied).
+          cameras: _playbackCameras(),
           onClose: () => setState(() => _index = _liveIndex),
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
