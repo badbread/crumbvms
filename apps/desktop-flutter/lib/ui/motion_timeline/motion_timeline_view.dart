@@ -259,7 +259,7 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
                           ),
                         ),
                         if (_hoverLocal != null)
-                          _buildHoverOverlay(_hoverLocal!, width),
+                          _buildHover(_hoverLocal!, width),
                       ],
                     ),
                   ),
@@ -321,6 +321,130 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
             child: Text('+$extra', style: Theme.of(context).textTheme.labelSmall),
           ),
       ],
+    );
+  }
+
+  /// Hover feedback inside the strip: when the cursor is over a detection
+  /// glyph, a detail chip (what + WHERE it was detected); otherwise the
+  /// "which cameras had motion here" chip.
+  Widget _buildHover(Offset local, double width) {
+    final det = _detectionNear(local);
+    if (det != null) return _buildDetectionOverlay(local, width, det);
+    return _buildHoverOverlay(local, width);
+  }
+
+  /// The detection event whose glyph sits under [local], or null. Mirrors the
+  /// painter's glyph placement (a row near the bottom of the motion area, at
+  /// `y = motionBottom - 8`, `motionBottom = height - covH - 1`) so the
+  /// hit-test lines up with what's actually drawn.
+  DetectionEvent? _detectionNear(Offset local) {
+    final t = widget.timeline;
+    final winStart = t.windowStart.millisecondsSinceEpoch;
+    final winEnd = t.windowEnd.millisecondsSinceEpoch;
+    final winDur = winEnd - winStart;
+    if (winDur <= 0 || _width <= 0) return null;
+    final glyphY = widget.height - _TimelinePainter.covH - 1 - 8;
+    if ((local.dy - glyphY).abs() > 9) return null; // not on the glyph row
+    DetectionEvent? best;
+    double bestDx = 9; // px hit radius (glyphs are ~8px)
+    for (final ev in widget.motion.detections) {
+      final ms = ev.ts.millisecondsSinceEpoch;
+      if (ms < winStart || ms > winEnd) continue;
+      final x = ((ms - winStart) / winDur) * _width;
+      final dx = (x - local.dx).abs();
+      if (dx <= bestDx) {
+        bestDx = dx;
+        best = ev;
+      }
+    }
+    return best;
+  }
+
+  static String _titleCase(String s) =>
+      s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
+
+  /// Detail chip for a hovered detection glyph: icon + label, the zone(s) where
+  /// it was detected (Frigate zones) plus the camera, confidence, and time.
+  /// Answers the operator's "where was the person detected?" at a glance.
+  Widget _buildDetectionOverlay(Offset local, double width, DetectionEvent det) {
+    final spec = detectionIconFor(det.iconKey);
+    final label = det.label.isEmpty ? det.iconKey : det.label;
+    final where = det.zones.isEmpty
+        ? _nameFor(det.cameraId)
+        : '${det.zones.join(', ')} · ${_nameFor(det.cameraId)}';
+    final score = det.topScore > 0 ? det.topScore : det.score;
+    final ts = det.ts.toLocal();
+    String p2(int v) => v.toString().padLeft(2, '0');
+    final time = '${p2(ts.hour)}:${p2(ts.minute)}:${p2(ts.second)}';
+    const chipW = 220.0;
+    final left = (local.dx - chipW / 2).clamp(
+      0.0,
+      (width - chipW).clamp(0.0, double.infinity),
+    );
+    return Positioned(
+      left: left,
+      top: 0,
+      child: IgnorePointer(
+        child: Container(
+          width: chipW,
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.9),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: spec.color.withValues(alpha: 0.7)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(spec.icon, size: 13, color: spec.color),
+                  const SizedBox(width: 5),
+                  Flexible(
+                    child: Text(
+                      _titleCase(label),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  if (score > 0) ...[
+                    const SizedBox(width: 6),
+                    Text(
+                      '${(score * 100).round()}%',
+                      style: TextStyle(fontSize: 11, color: spec.color),
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 1),
+              Text(
+                where,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 10.5, color: Colors.white70),
+              ),
+              if (det.subLabel != null && det.subLabel!.isNotEmpty)
+                Text(
+                  det.subLabel!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white54),
+                ),
+              Text(
+                time,
+                style: const TextStyle(fontSize: 9.5, color: Colors.white38),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 

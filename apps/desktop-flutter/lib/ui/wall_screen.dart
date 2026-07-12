@@ -437,32 +437,56 @@ class _WallScreenState extends State<WallScreen> {
     );
   }
 
-  /// The tile grid. Pulled out of [build] so it can be rebuilt on a client-
-  /// option change (via the ListenableBuilder above) without disturbing the
-  /// rest of the wall. `showInfoBar` chooses the per-tile header strip vs the
-  /// floating name/badge overlays.
+  /// The default auto-grid of every enabled camera. Pulled out of [build] so it
+  /// can be rebuilt on a client-option change (via the ListenableBuilder above)
+  /// without disturbing the rest of the wall. `showInfoBar` chooses the per-tile
+  /// header strip vs the floating name/badge overlays.
+  ///
+  /// Fills the whole pane with fractional [Positioned] cells (like [_viewGrid]
+  /// and the old client's CSS grid) rather than [GridView.count], whose forced
+  /// `childAspectRatio` left dead space at the bottom whenever the grid's aspect
+  /// didn't match the pane. Video is letterboxed (contain) inside each cell, so
+  /// no footage is cropped.
   Widget _grid(List<Camera> cams, int cols, bool showInfoBar) {
-    return GridView.count(
-      crossAxisCount: cols,
-      mainAxisSpacing: 2,
-      crossAxisSpacing: 2,
-      childAspectRatio: 16 / 9,
-      physics: const NeverScrollableScrollPhysics(),
-      children: [
-        for (final cam in cams)
-          _WallTile(
-            key: ValueKey(cam.id),
-            api: widget.api,
-            session: widget.session,
-            camera: cam,
-            liveStatus: _liveStatus,
-            streamPrefs: widget.streamPrefs,
-            audio: widget.audio,
-            showInfoBar: showInfoBar,
-            zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
-            onTap: () => _maximize(cam),
-          ),
-      ],
+    final rows = cols <= 0 ? 1 : (cams.length / cols).ceil().clamp(1, cams.length);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final h = constraints.maxHeight;
+        const g = 1.0; // half-gap between tiles (matches _viewGrid)
+        final cellW = w / cols;
+        final cellH = h / rows;
+        final children = <Widget>[];
+        for (var i = 0; i < cams.length; i++) {
+          final cam = cams[i];
+          final col = i % cols;
+          final row = i ~/ cols;
+          children.add(
+            Positioned(
+              left: col * cellW + g,
+              top: row * cellH + g,
+              width: (cellW - 2 * g).clamp(0.0, w),
+              height: (cellH - 2 * g).clamp(0.0, h),
+              child: _WallTile(
+                key: ValueKey(cam.id),
+                api: widget.api,
+                session: widget.session,
+                camera: cam,
+                liveStatus: _liveStatus,
+                streamPrefs: widget.streamPrefs,
+                audio: widget.audio,
+                showInfoBar: showInfoBar,
+                zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
+                // Cells rarely land on 16:9 once they fill the pane — letterbox
+                // rather than crop, matching _viewGrid and the old client.
+                fit: BoxFit.contain,
+                onTap: () => _maximize(cam),
+              ),
+            ),
+          );
+        }
+        return Stack(children: children);
+      },
     );
   }
 }

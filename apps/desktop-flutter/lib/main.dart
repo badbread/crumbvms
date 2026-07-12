@@ -22,6 +22,7 @@ import 'package:window_manager/window_manager.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/api/views_api.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/perf_grid.dart';
@@ -419,6 +420,44 @@ class _MainShellState extends State<MainShell> {
   /// audible when audio is on. Owned here, driven by the global audio button
   /// and the wall's tile selection/maximize.
   final AudioFollowController _audio = AudioFollowController();
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDefaultView();
+  }
+
+  /// Honor the client-side "launch view" star on startup: if the user pinned a
+  /// saved view as their default (ViewPrefs, the old Tauri client's
+  /// LS_DEFAULT_VIEW), apply it instead of the built-in "All Cameras" auto-grid
+  /// the field initializer starts on. Fails quiet — All Cameras stays the
+  /// fallback if the default is unset, points at the sentinel, is stale
+  /// (deleted view), or the fetch fails.
+  Future<void> _loadDefaultView() async {
+    try {
+      final prefs = ViewPrefs();
+      final defaultId = await prefs.getDefaultViewId();
+      if (defaultId == null || defaultId == ViewPrefs.allCamerasId) return;
+      final views = await widget.api.listViews(widget.sessionController.session);
+      SavedView? match;
+      for (final v in views) {
+        if (v.id == defaultId) {
+          match = v;
+          break;
+        }
+      }
+      if (match == null) {
+        // Star points at a view that no longer exists — clear it so the app
+        // doesn't keep trying to open a ghost on every launch.
+        await prefs.clearDefaultIfStale(defaultId);
+        return;
+      }
+      if (!mounted) return;
+      _applyView(AppliedView.fromSavedView(match, widget.cameras));
+    } catch (_) {
+      // Fall back to the default All Cameras wall.
+    }
+  }
 
   @override
   void dispose() {
