@@ -36,17 +36,23 @@ class ExportScreen extends StatefulWidget {
     required this.api,
     required this.session,
     required this.cameras,
-    this.initialClip,
+    this.initialClips = const [],
+    this.onListChanged,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
 
-  /// Pre-fill the list with one clip on entry (e.g. a future playback view's
-  /// "Export selection…" action). Mirrors app.js's `pbState.exportSel`
-  /// hand-off into `exportOpenBuilder`.
-  final ExportClipDraft? initialClip;
+  /// Pre-fill the batch on entry. The host (MainShell) owns this list so it
+  /// ACCUMULATES across Playback "Add clip to export list" actions and survives
+  /// leaving/returning to the Export tab (the tab body is rebuilt on switch).
+  final List<ExportClipDraft> initialClips;
+
+  /// Called whenever the batch changes (add/edit/remove) so the host can keep
+  /// its persistent copy in sync — without this, edits made here would be lost
+  /// the next time a clip is added from Playback and the tab is rebuilt.
+  final ValueChanged<List<ExportClipDraft>>? onListChanged;
 
   @override
   State<ExportScreen> createState() => _ExportScreenState();
@@ -84,12 +90,16 @@ class _ExportScreenState extends State<ExportScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.initialClip != null) {
-      _seq = widget.initialClip!.id;
-      _list.add(widget.initialClip!);
+    if (widget.initialClips.isNotEmpty) {
+      _list.addAll(widget.initialClips);
+      // Keep new ids above every seeded one so add/edit never collide.
+      _seq = widget.initialClips.map((c) => c.id).reduce((a, b) => a > b ? a : b);
     }
     _restoreDestDir();
   }
+
+  /// Push the current batch up to the host so it survives a tab rebuild.
+  void _notifyChanged() => widget.onListChanged?.call(List.of(_list));
 
   Future<void> _restoreDestDir() async {
     try {
@@ -146,6 +156,7 @@ class _ExportScreenState extends State<ExportScreen> {
       _thumbCache.remove(result.id);
       _clearCompletedState();
     });
+    _notifyChanged();
   }
 
   Future<void> _editClip(ExportClipDraft draft) async {
@@ -164,6 +175,7 @@ class _ExportScreenState extends State<ExportScreen> {
       _thumbCache.remove(draft.id);
       _clearCompletedState();
     });
+    _notifyChanged();
   }
 
   void _removeClip(ExportClipDraft draft) {
@@ -172,6 +184,7 @@ class _ExportScreenState extends State<ExportScreen> {
       _thumbCache.remove(draft.id);
       _clearCompletedState();
     });
+    _notifyChanged();
   }
 
   /// Any list/settings edit after a completed export reverts the button back

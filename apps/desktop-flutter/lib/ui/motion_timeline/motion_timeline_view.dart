@@ -422,11 +422,23 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
               );
             },
           ),
-          // Legend under the scrubber (in the dead space below it), not above.
-          const SizedBox(height: 2),
-          _buildLegend(),
-          _buildHints(),
-          if (widget.motion.error != null) _buildError(),
+          // Legend + hints under the scrubber sit on the SAME gray as the
+          // timeline canvas (not the black scaffold behind), so the whole strip
+          // reads as one box rather than the captions floating on black.
+          Container(
+            width: double.infinity,
+            color: _TimelinePainter.bg,
+            padding: const EdgeInsets.fromLTRB(8, 3, 8, 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildLegend(),
+                _buildHints(),
+                if (widget.motion.error != null) _buildError(),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -459,38 +471,32 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
 
   /// Palette color picker for a camera's motion color (right-click a legend
   /// swatch). Persists the choice via the camera-color override store and
-  /// repaints so the ribbons + swatch update immediately.
+  /// repaints so the ribbons + swatch update immediately. Colors already in use
+  /// by OTHER cameras aren't blocked, just flagged (a check badge + tooltip
+  /// listing who uses them) so duplicates are a deliberate choice.
   Future<void> _pickCameraColor(String cameraId) async {
     final current = cameraMotionColor(cameraId);
     final overridden = hasCameraColorOverride(cameraId);
+    // Map each in-use color (by any OTHER camera) to the camera names using it.
+    final usedBy = <int, List<String>>{};
+    for (final c in widget.cameras) {
+      if (c.id == cameraId) continue;
+      (usedBy[cameraMotionColor(c.id).toARGB32()] ??= []).add(c.name);
+    }
     final chosen = await showDialog<Object?>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text('Color for ${_nameFor(cameraId)}'),
-        content: Wrap(
-          spacing: 10,
-          runSpacing: 10,
-          children: [
-            for (final color in kCameraColorPalette)
-              InkWell(
-                onTap: () => Navigator.pop(ctx, color),
-                customBorder: const CircleBorder(),
-                child: Container(
-                  width: 30,
-                  height: 30,
-                  decoration: BoxDecoration(
-                    color: color,
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: color == current
-                          ? Colors.white
-                          : Colors.transparent,
-                      width: 2,
-                    ),
-                  ),
-                ),
-              ),
-          ],
+        content: SizedBox(
+          width: 300,
+          child: Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              for (final color in kCameraPickerPalette)
+                _colorSwatch(ctx, color, current, usedBy[color.toARGB32()]),
+            ],
+          ),
         ),
         actions: [
           if (overridden)
@@ -512,6 +518,54 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
       await setCameraColorOverride(cameraId, chosen);
     }
     if (mounted) setState(() {});
+  }
+
+  /// One selectable color swatch in the picker. [usedByNames] is non-null when
+  /// another camera already uses this color — shown with a small check badge
+  /// and a tooltip, but still pickable.
+  Widget _colorSwatch(
+    BuildContext ctx,
+    Color color,
+    Color current,
+    List<String>? usedByNames,
+  ) {
+    final isCurrent = color == current;
+    final used = usedByNames != null && usedByNames.isNotEmpty;
+    final swatch = InkWell(
+      onTap: () => Navigator.pop(ctx, color),
+      customBorder: const CircleBorder(),
+      child: Container(
+        width: 30,
+        height: 30,
+        decoration: BoxDecoration(
+          color: color,
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: isCurrent ? Colors.white : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: used
+            ? Align(
+                alignment: Alignment.bottomRight,
+                child: Container(
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.6),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.check, size: 9, color: Colors.white),
+                ),
+              )
+            : null,
+      ),
+    );
+    if (!used) return swatch;
+    return Tooltip(
+      message: 'In use by ${usedByNames.join(', ')}',
+      child: swatch,
+    );
   }
 
   /// Legend: the color→camera key for every camera with a loaded motion series,
@@ -893,6 +947,10 @@ class _TimelinePainter extends CustomPainter {
           hp,
         );
       }
+      // Absolute start/end times at the edges so exact export times are visible
+      // while selecting/dragging (not just the duration).
+      _drawSelEdgeTime(canvas, _fmtTime(ss), x1, size.width, atStart: true);
+      _drawSelEdgeTime(canvas, _fmtTime(se), x2, size.width, atStart: false);
     }
 
     // ── playhead line + timestamp chip ──────────────────────────────────────
@@ -911,6 +969,27 @@ class _TimelinePainter extends CustomPainter {
       canvas.drawLine(Offset(hoverX!, rulerH), Offset(hoverX!, size.height),
           Paint()..color = Colors.white.withValues(alpha: 0.25)..strokeWidth = 1);
     }
+  }
+
+  /// A small dark time chip beside a selection edge (drawn to the OUTER side of
+  /// the edge so the two edge times don't collide on a narrow range), clamped
+  /// to stay on-canvas.
+  void _drawSelEdgeTime(
+    Canvas canvas,
+    String text,
+    double edgeX,
+    double width, {
+    required bool atStart,
+  }) {
+    final tp = _textPainter(text, selColor, 9, bold: true);
+    double x = atStart ? edgeX - tp.width - 5 : edgeX + 5;
+    x = x.clamp(2.0, (width - tp.width - 2).clamp(2.0, width));
+    const y = rulerH + 15.0;
+    canvas.drawRect(
+      Rect.fromLTWH(x - 3, y - 1, tp.width + 6, tp.height + 2),
+      Paint()..color = const Color(0xE6080C14),
+    );
+    tp.paint(canvas, Offset(x, y));
   }
 
   /// One camera's intensity buckets as a bar histogram between [top]..[bottom].

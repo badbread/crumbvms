@@ -400,9 +400,12 @@ class _MainShellState extends State<MainShell> {
   /// Config View editor creates one).
   int _viewsRefreshToken = 0;
 
-  /// A clip handed off from Playback's "Export selection" — seeds the Export
-  /// tab on entry. Cleared when the user navigates to a tab manually.
-  ExportClipDraft? _pendingExportClip;
+  /// The export batch, owned HERE (the persistent shell) so it accumulates
+  /// across Playback "Add clip to export list" actions and survives the Export
+  /// tab being rebuilt on every tab switch. The Export tab edits it and syncs
+  /// changes back via its onListChanged callback.
+  final List<ExportClipDraft> _exportClips = [];
+  int _exportSeq = 0;
 
   /// A moment handed off from Clips' "View on timeline" — opens Playback at
   /// that time. Cleared on manual tab nav.
@@ -658,9 +661,10 @@ class _MainShellState extends State<MainShell> {
       label: label,
       color: color,
       selected: _index == i,
-      // Manual tab navigation clears one-shot hand-offs.
+      // Manual tab navigation clears one-shot hand-offs. The export batch is
+      // NOT cleared here — it persists until exported or removed, so clips
+      // added from Playback accumulate.
       onTap: () => setState(() {
-        _pendingExportClip = null;
         _playbackSeekTo = null;
         _playbackFocusCameraId = null;
         _index = i;
@@ -857,14 +861,15 @@ class _MainShellState extends State<MainShell> {
           onClose: () => setState(() => _index = _liveIndex),
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
-          // "Export selection" → seed the Export tab with this clip.
+          // "Add clip to export list" → APPEND to the batch (don't replace) and
+          // jump to the Export tab.
           onExportRange: (camId, start, end) => setState(() {
-            _pendingExportClip = ExportClipDraft(
-              id: 1,
+            _exportClips.add(ExportClipDraft(
+              id: ++_exportSeq,
               cameraId: camId,
               start: start,
               end: end,
-            );
+            ));
             _index = _exportIndex;
           }),
         );
@@ -884,17 +889,17 @@ class _MainShellState extends State<MainShell> {
         );
       case _exportIndex:
         return ExportScreen(
-          // A fresh key when a pending clip arrives remounts ExportScreen so
-          // its initState seeds the new clip.
-          key: ValueKey(
-            _pendingExportClip == null
-                ? 'export'
-                : 'export-${_pendingExportClip!.start.millisecondsSinceEpoch}',
-          ),
           api: widget.api,
           session: session,
           cameras: widget.cameras,
-          initialClip: _pendingExportClip,
+          // The batch is owned by the shell so it accumulates across adds; the
+          // Export tab seeds from it and syncs edits back.
+          initialClips: _exportClips,
+          onListChanged: (list) {
+            _exportClips
+              ..clear()
+              ..addAll(list);
+          },
         );
       case _liveIndex:
       default:

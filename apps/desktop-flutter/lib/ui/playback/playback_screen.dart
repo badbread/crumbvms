@@ -528,6 +528,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _timeline.clearSelection();
   }
 
+  static String _hms(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:'
+      '${d.minute.toString().padLeft(2, '0')}:'
+      '${d.second.toString().padLeft(2, '0')}';
+
+  static String _mmdd(DateTime d) =>
+      '${d.month.toString().padLeft(2, '0')}/${d.day.toString().padLeft(2, '0')} ';
+
   Widget _buildExportSelectionBar() {
     final ss = _timeline.selStartMs!;
     final se = _timeline.selEndMs!;
@@ -538,6 +546,15 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     final durLabel = h > 0
         ? '${h}h ${m}m'
         : (m > 0 ? '${m}m ${sec}s' : '${sec}s');
+    // Show the ACTUAL start/end times (local), not just the length — so a
+    // precise export window can be read straight off the bar.
+    final startT = DateTime.fromMillisecondsSinceEpoch(ss, isUtc: true).toLocal();
+    final endT = DateTime.fromMillisecondsSinceEpoch(se, isUtc: true).toLocal();
+    final sameDay = startT.year == endT.year &&
+        startT.month == endT.month &&
+        startT.day == endT.day;
+    final startLabel = '${_mmdd(startT)}${_hms(startT)}';
+    final endLabel = sameDay ? _hms(endT) : '${_mmdd(endT)}${_hms(endT)}';
     return Container(
       color: const Color(0xFF2A2410),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -545,9 +562,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         children: [
           const Icon(Icons.content_cut, size: 16, color: Color(0xFFE8A33D)),
           const SizedBox(width: 8),
-          Text(
-            'Selection: $durLabel',
-            style: const TextStyle(color: Colors.white, fontSize: 12),
+          Flexible(
+            child: Text(
+              '$startLabel  →  $endLabel   ($durLabel)',
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
           ),
           const Spacer(),
           TextButton(

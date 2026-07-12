@@ -29,6 +29,32 @@ const List<Color> kCameraColorPalette = [
   Color(0xFF7AA2F7), // periwinkle
 ];
 
+/// Extra colors offered ONLY in the manual color picker — kept SEPARATE from
+/// [kCameraColorPalette] so adding them never changes the modulo that derives a
+/// camera's default color (existing cameras keep their color). Still red-free
+/// (red reads as alarm/record on the timeline).
+const List<Color> kExtraCameraColors = [
+  Color(0xFF2D9CDB), // strong blue
+  Color(0xFF27AE60), // emerald
+  Color(0xFFE2B93B), // gold
+  Color(0xFFEB7BC0), // rose
+  Color(0xFF8E7CFF), // violet
+  Color(0xFF4ECDC4), // turquoise
+  Color(0xFFB2D235), // chartreuse
+  Color(0xFFFF9F43), // tangerine
+  Color(0xFF9B59B6), // amethyst
+  Color(0xFF00B8A9), // jade
+  Color(0xFF6C8EAD), // slate blue
+  Color(0xFFD6A2E8), // orchid
+];
+
+/// The full swatch set shown in the manual picker: the derived palette plus the
+/// extras.
+final List<Color> kCameraPickerPalette = [
+  ...kCameraColorPalette,
+  ...kExtraCameraColors,
+];
+
 /// FNV-1a 32-bit string hash — matches the old client's `fnv1a()` exactly so
 /// a given camera id maps to the same palette index across clients.
 int fnv1a32(String str) {
