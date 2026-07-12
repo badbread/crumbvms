@@ -87,7 +87,33 @@ class _ExportScreenState extends State<ExportScreen> {
   Timer? _pollTimer;
   DateTime? _earliestStart;
 
+  /// Wall-clock export timing: started when a job is submitted, ticked once a
+  /// second while running so the UI shows LIVE elapsed time, and frozen when the
+  /// job reaches a terminal state so the final "took Ns" is held on screen.
+  DateTime? _startedAt;
+  Duration _elapsed = Duration.zero;
+  Timer? _elapsedTicker;
+
   static const _kExportDirKey = 'crumb.export.dir';
+
+  void _startElapsedTicker() {
+    _startedAt = DateTime.now();
+    _elapsed = Duration.zero;
+    _elapsedTicker?.cancel();
+    _elapsedTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      final started = _startedAt;
+      if (!mounted || started == null) return;
+      setState(() => _elapsed = DateTime.now().difference(started));
+    });
+  }
+
+  /// Stop ticking and freeze the final elapsed time (held on the completed card).
+  void _stopElapsedTicker() {
+    _elapsedTicker?.cancel();
+    _elapsedTicker = null;
+    final started = _startedAt;
+    if (started != null) _elapsed = DateTime.now().difference(started);
+  }
 
   @override
   void initState() {
@@ -140,6 +166,7 @@ class _ExportScreenState extends State<ExportScreen> {
   @override
   void dispose() {
     _pollTimer?.cancel();
+    _elapsedTicker?.cancel();
     _passwordCtrl.dispose();
     _destDirCtrl.dispose();
     super.dispose();
@@ -236,11 +263,13 @@ class _ExportScreenState extends State<ExportScreen> {
     _ => 0.05, // copy / remux
   };
 
-  /// Rough size estimate (heuristic ~4 Mbps main stream), scaled by codec.
-  /// Always prefixed with "~".
+  /// Rough size estimate, scaled by codec. Heuristic ~10 Mbps main stream —
+  /// modern IP cameras (esp. the 4K/2K ones here) record far above the old
+  /// 4 Mbps assumption, which under-estimated a copy export by ~3x. Still only a
+  /// ballpark (real bitrate varies by camera/scene), hence the "~".
   String _estSize() {
     final ms = _totalDuration.inMilliseconds;
-    final bytes = (ms / 1000) * 500000 * _codecSizeFactor; // 4 Mbps ~= 500 KB/s
+    final bytes = (ms / 1000) * 1250000 * _codecSizeFactor; // ~10 Mbps ≈ 1.25 MB/s
     if (bytes >= 1e9) return '~${(bytes / 1e9).toStringAsFixed(1)} GB';
     if (bytes >= 1e6) return '~${(bytes / 1e6).round()} MB';
     return '~${(bytes / 1e3).clamp(1, double.infinity).round()} KB';
@@ -351,6 +380,7 @@ class _ExportScreenState extends State<ExportScreen> {
       _progressPct = 0;
       _status = null;
     });
+    _startElapsedTicker();
 
     _earliestStart = items
         .map((it) => it.start)
@@ -382,12 +412,14 @@ class _ExportScreenState extends State<ExportScreen> {
       _poll();
     } on CrumbApiException catch (e) {
       if (!mounted) return;
+      _stopElapsedTicker();
       setState(() {
         _submitting = false;
         _error = e.message;
       });
     } catch (e) {
       if (!mounted) return;
+      _stopElapsedTicker();
       setState(() {
         _submitting = false;
         _error = 'Export request failed: $e';
@@ -404,6 +436,7 @@ class _ExportScreenState extends State<ExportScreen> {
         job = await widget.api.getExportStatus(widget.session, _jobId!);
       } catch (e) {
         if (!mounted || !_running) return;
+        _stopElapsedTicker();
         setState(() {
           _running = false;
           _error = 'Poll failed: $e';
@@ -418,16 +451,19 @@ class _ExportScreenState extends State<ExportScreen> {
 
       switch (job.status) {
         case ExportJobStatus.done:
+          _stopElapsedTicker();
           setState(() => _running = false);
           await _downloadAll(job.outputFiles);
           return;
         case ExportJobStatus.failed:
+          _stopElapsedTicker();
           setState(() {
             _running = false;
             _error = job.error ?? 'Export job failed (no details provided).';
           });
           return;
         case ExportJobStatus.cancelled:
+          _stopElapsedTicker();
           setState(() {
             _running = false;
             _error = 'Export cancelled.';
@@ -444,6 +480,7 @@ class _ExportScreenState extends State<ExportScreen> {
     final jobId = _jobId;
     if (jobId == null) return;
     _pollTimer?.cancel();
+    _stopElapsedTicker();
     setState(() => _running = false);
     try {
       await widget.api.cancelExport(widget.session, jobId);
@@ -510,7 +547,8 @@ class _ExportScreenState extends State<ExportScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Export')),
+      // No AppBar: the top tab bar already labels this "Export" — a second
+      // page header just wastes vertical space.
       body: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -708,17 +746,24 @@ class _ExportScreenState extends State<ExportScreen> {
                     ),
                     const SizedBox(height: 8),
                   ],
-                  if (_submitting || _running || _status != null) ...[
+                  // Progress shows ONLY while the job is submitting/running.
+                  // Once it reaches a terminal state the green "saved" card below
+                  // takes over — the old code kept this block alive on `_status`
+                  // and its bar fell back to INDETERMINATE (endless animation)
+                  // even though the export was done.
+                  if (_submitting || _running) ...[
                     LinearProgressIndicator(
-                      value: (_running || _submitting)
-                          ? _progressPct / 100
-                          : null,
+                      // Determinate while running so the bar tracks real progress;
+                      // only the brief submit handshake is indeterminate.
+                      value: _running ? _progressPct / 100 : null,
+                      minHeight: 4,
                     ),
                     const SizedBox(height: 4),
                     Text(
                       _submitting
                           ? 'Submitting…'
-                          : _statusLabel(_status) + ' $_progressPct%',
+                          : '${_statusLabel(_status)} $_progressPct%'
+                                '  ·  ${_fmtDuration(_elapsed)} elapsed',
                       style: theme.textTheme.bodySmall,
                     ),
                     const SizedBox(height: 8),
@@ -739,9 +784,23 @@ class _ExportScreenState extends State<ExportScreen> {
                           ),
                           const SizedBox(width: 8),
                           Expanded(
-                            child: Text(
-                              'Saved to ${_destDir ?? "the export folder"}',
-                              style: theme.textTheme.bodySmall,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Saved to ${_destDir ?? "the export folder"}',
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                                // Hold the final elapsed time on the card.
+                                if (_elapsed > Duration.zero)
+                                  Text(
+                                    'Took ${_fmtDuration(_elapsed)}',
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: theme.textTheme.bodySmall?.color
+                                          ?.withValues(alpha: 0.7),
+                                    ),
+                                  ),
+                              ],
                             ),
                           ),
                           if (_destDir != null)
@@ -755,24 +814,43 @@ class _ExportScreenState extends State<ExportScreen> {
                     ),
                     const SizedBox(height: 8),
                   ],
-                  Row(
-                    children: [
-                      Expanded(
-                        child: FilledButton(
-                          onPressed: (_submitting || _running)
-                              ? null
-                              : _submit,
+                  // Compact, right-aligned action buttons (not full-width bars).
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (_running) ...[
+                          OutlinedButton(
+                            onPressed: _cancel,
+                            style: OutlinedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 10,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                            ),
+                            child: const Text('Cancel'),
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        FilledButton(
+                          onPressed: (_submitting || _running) ? null : _submit,
+                          style: FilledButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 20,
+                              vertical: 10,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                          ),
                           child: Text(_submitButtonLabel()),
                         ),
-                      ),
-                      if (_running) ...[
-                        const SizedBox(width: 8),
-                        OutlinedButton(
-                          onPressed: _cancel,
-                          child: const Text('Cancel'),
-                        ),
                       ],
-                    ],
+                    ),
                   ),
                 ],
               ),
