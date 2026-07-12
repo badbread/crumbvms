@@ -12,12 +12,14 @@
 // bar was folded into it.)
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/export_api.dart' show ExportApi;
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
 import 'package:crumb_desktop/api/views_api.dart' show CustomLayout;
@@ -120,6 +122,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   String? _selectedCameraId;
   String? _maximizedCameraId;
+
+  // ── filmstrip scrubbing ──────────────────────────────────────────────────
+  // While dragging the scrubber we DON'T reopen the video players (that caused
+  // black flashing crossing segment boundaries). Instead the focused pane shows
+  // a server-extracted filmstrip frame at the drag position — "rock solid"
+  // scrubbing — and the real video resolve happens once on release.
+  bool _scrubbing = false;
+  final Map<String, Uint8List?> _scrubFrames = {};
+  int _scrubToken = 0;
+  DateTime _lastScrubFetch = DateTime.fromMillisecondsSinceEpoch(0);
 
   bool _playing = false;
   int _speedIdx = 1; // 1x
@@ -373,14 +385,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (mounted) setState(() {});
   }
 
-  /// Live-scrub seek fired continuously while dragging the scrubber. For panes
-  /// whose loaded segment already covers `t` this is a cheap in-segment seek
-  /// (instant, no network). If the drag crosses into a segment we don't have
-  /// loaded, pull it in via a resolve — guarded by [_resolvePending] so a fast
-  /// drag across many segments doesn't fire overlapping resolves — so the video
-  /// keeps tracking the scrubber across segment boundaries.
+  /// Live-scrub, fired continuously while dragging the scrubber. Panes are NOT
+  /// reopened here (that flashes black across segment boundaries): panes whose
+  /// loaded segment covers `t` do a cheap in-segment keyframe seek, and the
+  /// focused pane additionally shows a server-extracted filmstrip frame so it
+  /// tracks the scrubber rock-solid even across segments. The real cross-segment
+  /// resolve happens once on release ([_commitSeek]).
   void _liveSeek(DateTime t) {
-    var needsResolve = false;
+    if (!_scrubbing) {
+      setState(() => _scrubbing = true);
+    }
     for (final cam in _activeCameras()) {
       final pane = _panes[cam.id];
       final seg = pane?.segment;
@@ -391,19 +405,42 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             .clamp(0, seg.durationMs)
             .toInt();
         pane!.player!.seek(Duration(milliseconds: offsetMs));
-      } else {
-        needsResolve = true;
       }
     }
-    if (needsResolve && !_resolvePending) {
-      _resolvePending = true;
-      _resolveAll(t).whenComplete(() => _resolvePending = false);
+    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
+    // server-side extract load, superseded-request-safe via a token.
+    final focusId = _maximizedCameraId ?? _selectedCameraId;
+    if (focusId == null) return;
+    final now = DateTime.now();
+    if (now.difference(_lastScrubFetch) < const Duration(milliseconds: 120)) {
+      return;
     }
+    _lastScrubFetch = now;
+    _fetchScrubFrame(focusId, t, ++_scrubToken);
+  }
+
+  Future<void> _fetchScrubFrame(String camId, DateTime t, int token) async {
+    final bytes = await widget.api.fetchFilmstripFrame(
+      widget.session,
+      camId,
+      t,
+      width: 480,
+    );
+    if (!mounted || token != _scrubToken || !_scrubbing) return;
+    setState(() => _scrubFrames[camId] = bytes);
   }
 
   /// Playhead position is final (drag released, or a click-seek) — full
   /// cross-segment resolve + timeline reload, mirroring `pbJumpTo`.
   Future<void> _commitSeek(DateTime t) async {
+    // Drag released: drop the filmstrip overlay and load the real video.
+    if (_scrubbing || _scrubFrames.isNotEmpty) {
+      _scrubToken++; // invalidate any in-flight filmstrip fetches
+      setState(() {
+        _scrubbing = false;
+        _scrubFrames.clear();
+      });
+    }
     await _reloadSpans();
     await _resolveAll(t, force: true);
   }
@@ -746,6 +783,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         maximized: true,
         onSelect: () => _selectCamera(maxCam.id),
         onMaximizeToggle: () => _toggleMaximize(maxCam.id),
+        scrubFrame: _scrubbing ? _scrubFrames[maxCam.id] : null,
       );
     }
 
@@ -792,6 +830,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       maximized: false,
                       onSelect: () => _selectCamera(cam.id),
                       onMaximizeToggle: () => _toggleMaximize(cam.id),
+                      scrubFrame: _scrubbing ? _scrubFrames[cam.id] : null,
                     ),
             ),
           );
@@ -992,6 +1031,8 @@ class _TransportBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Transport controls follow the active tab's accent (cyan on Playback).
+    final accent = Theme.of(context).colorScheme.primary;
     return Container(
       color: const Color(0xFF15181D),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -1012,8 +1053,8 @@ class _TransportBar extends StatelessWidget {
                     ),
                     child: Text(
                       speedLabel,
-                      style: const TextStyle(
-                        color: Colors.cyanAccent,
+                      style: TextStyle(
+                        color: accent,
                         fontWeight: FontWeight.w700,
                       ),
                     ),
@@ -1051,12 +1092,20 @@ class _TransportBar extends StatelessWidget {
                 'Oldest footage',
                 onJumpFirst,
               ),
-              _iconBtn(
-                Icons.fast_rewind,
-                'Previous motion',
-                'Previous motion (↑)',
-                onPrevMotion,
-                color: Colors.amberAccent,
+              // Previous motion — the old client's "run to the mover" glyph,
+              // mirrored to face back, tinted with the tab accent.
+              ShiftHint(
+                hint: 'Previous motion (↑)',
+                child: IconButton(
+                  tooltip: 'Previous motion',
+                  iconSize: 22,
+                  visualDensity: VisualDensity.compact,
+                  icon: Transform.flip(
+                    flipX: true,
+                    child: Icon(Icons.directions_run, color: accent),
+                  ),
+                  onPressed: onPrevMotion,
+                ),
               ),
               _iconBtn(
                 Icons.navigate_before,
@@ -1072,7 +1121,7 @@ class _TransportBar extends StatelessWidget {
                   visualDensity: VisualDensity.compact,
                   icon: Icon(
                     playing ? Icons.pause_circle : Icons.play_circle,
-                    color: Colors.white,
+                    color: accent,
                   ),
                   onPressed: onTogglePlay,
                 ),
@@ -1084,11 +1133,11 @@ class _TransportBar extends StatelessWidget {
                 onFrameFwd,
               ),
               _iconBtn(
-                Icons.fast_forward,
+                Icons.directions_run,
                 'Next motion',
                 'Next motion (↓)',
                 onNextMotion,
-                color: Colors.amberAccent,
+                color: accent,
               ),
               _iconBtn(
                 Icons.last_page,
@@ -1162,6 +1211,7 @@ class _PbTile extends StatelessWidget {
     required this.maximized,
     required this.onSelect,
     required this.onMaximizeToggle,
+    this.scrubFrame,
   });
 
   final Camera camera;
@@ -1170,6 +1220,9 @@ class _PbTile extends StatelessWidget {
   final bool maximized;
   final VoidCallback onSelect;
   final VoidCallback onMaximizeToggle;
+
+  /// Filmstrip frame shown over the video while the scrubber is being dragged.
+  final Uint8List? scrubFrame;
 
   @override
   Widget build(BuildContext context) {
@@ -1214,6 +1267,16 @@ class _PbTile extends StatelessWidget {
               ),
             if (!hasFootage && pane.controller != null)
               Container(color: Colors.black54),
+            // Filmstrip scrub frame: covers the (frozen) video while dragging so
+            // scrubbing is smooth and never flashes black.
+            if (scrubFrame != null)
+              Positioned.fill(
+                child: Image.memory(
+                  scrubFrame!,
+                  fit: BoxFit.contain,
+                  gaplessPlayback: true,
+                ),
+              ),
             Positioned(
               left: 6,
               bottom: 6,

@@ -895,7 +895,30 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     if (!(region > 0) || region > 0.7) return false;
     final s = math.min(4.0, math.max(1.4, 0.9 / region));
     final cx = bx + bw / 2, cy = by + bh / 2;
-    _applyZoom(s, Offset(-s * (cx - 0.5) * _paneSize.width, -s * (cy - 0.5) * _paneSize.height));
+    // The bbox is in VIDEO-frame fractions, but the video is drawn
+    // BoxFit.contain inside the pane — so it's letterboxed when the video's
+    // aspect differs from the pane's. Map the bbox centre through the actual
+    // fitted display rect, otherwise the zoom lands off to the side.
+    final pw = _paneSize.width, ph = _paneSize.height;
+    final vw = (_player?.state.width ?? 0).toDouble();
+    final vh = (_player?.state.height ?? 0).toDouble();
+    var dispW = pw, dispH = ph, ox = 0.0, oy = 0.0;
+    if (vw > 0 && vh > 0 && pw > 0 && ph > 0) {
+      final videoAspect = vw / vh, paneAspect = pw / ph;
+      if (videoAspect > paneAspect) {
+        dispW = pw;
+        dispH = pw / videoAspect;
+      } else {
+        dispH = ph;
+        dispW = ph * videoAspect;
+      }
+      ox = (pw - dispW) / 2;
+      oy = (ph - dispH) / 2;
+    }
+    final pointX = ox + cx * dispW;
+    final pointY = oy + cy * dispH;
+    // Center-scaled transform: offset moves the target point to the pane centre.
+    _applyZoom(s, Offset(-s * (pointX - pw / 2), -s * (pointY - ph / 2)));
     return true;
   }
 
@@ -1008,7 +1031,10 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     final c = widget.clip;
     final label = c.kind == 'motion' ? 'Motion' : (c.label.isEmpty ? 'Detection' : c.label);
     return Positioned.fill(
-      child: Focus(
+      // FocusScope (not plain Focus) so this overlay traps keyboard focus over
+      // the clips screen's own autofocused hotkey listener — otherwise Esc can
+      // be swallowed by the ancestor and never close the player.
+      child: FocusScope(
         autofocus: true,
         onKeyEvent: (node, event) {
           if (event is KeyDownEvent &&

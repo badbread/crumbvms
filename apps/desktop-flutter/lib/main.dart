@@ -411,6 +411,10 @@ class _MainShellState extends State<MainShell> {
   /// Playback so switching tabs keeps the same full-pane camera.
   String? _liveMaximizedId;
 
+  /// Set from Clips' "View on timeline": open Playback scoped to this single
+  /// camera (maximized), not the multi-window view. Cleared on manual tab nav.
+  String? _playbackFocusCameraId;
+
   /// Play-on-focus audio: exactly one pane (maximized else selected) is
   /// audible when audio is on. Owned here, driven by the global audio button
   /// and the wall's tile selection/maximize.
@@ -619,6 +623,7 @@ class _MainShellState extends State<MainShell> {
       onTap: () => setState(() {
         _pendingExportClip = null;
         _playbackSeekTo = null;
+        _playbackFocusCameraId = null;
         _index = i;
       }),
     );
@@ -740,6 +745,12 @@ class _MainShellState extends State<MainShell> {
   /// (so Playback mirrors what you were watching on Live), or all cameras when
   /// no specific view is applied.
   List<Camera> _playbackCameras() {
+    // Clips "View on timeline" scopes Playback to a single camera.
+    final focus = _playbackFocusCameraId;
+    if (focus != null) {
+      final cam = widget.cameras.where((c) => c.id == focus);
+      if (cam.isNotEmpty) return [cam.first];
+    }
     final view = _appliedView;
     if (view == null) return widget.cameras;
     final byId = {for (final c in widget.cameras) c.id: c};
@@ -789,17 +800,21 @@ class _MainShellState extends State<MainShell> {
           // to the newly-picked view's cameras).
           key: ValueKey(
             'pb-${_activeViewId ?? "all"}-'
+            '${_playbackFocusCameraId ?? ""}-'
             '${_playbackSeekTo?.millisecondsSinceEpoch ?? 0}',
           ),
           api: widget.api,
           session: session,
-          // Mirror the current Live view's cameras (or all if none applied).
+          // Mirror the current Live view's cameras (or all if none applied);
+          // a Clips focus scopes it to that single camera.
           cameras: _playbackCameras(),
-          // Reproduce the same custom layout (cell spans) as the live wall.
-          view: _appliedView,
+          // Reproduce the wall's custom layout — but a single-camera focus
+          // (from Clips) has no layout, it just maximizes that camera.
+          view: _playbackFocusCameraId != null ? null : _appliedView,
           initialTime: _playbackSeekTo,
-          // Carry a maximized live pane straight into Playback.
-          initialMaximizedCameraId: _liveMaximizedId,
+          // Carry a maximized live pane (or the Clips focus) into Playback.
+          initialMaximizedCameraId:
+              _playbackFocusCameraId ?? _liveMaximizedId,
           onClose: () => setState(() => _index = _liveIndex),
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
@@ -821,9 +836,10 @@ class _MainShellState extends State<MainShell> {
           cameras: widget.cameras,
           // Number-key hotkeys filter the list to that camera.
           hotkeys: widget.hotkeys,
-          // "View on timeline" → open Playback at the clip's moment.
+          // "View on timeline" → open Playback single-window on that camera.
           onViewOnTimeline: (camId, at) => setState(() {
             _playbackSeekTo = at;
+            _playbackFocusCameraId = camId;
             _index = _playbackIndex;
           }),
         );
