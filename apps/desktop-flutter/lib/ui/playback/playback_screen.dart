@@ -1033,6 +1033,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         pane: _panes[maxCam.id]!,
         selected: true,
         maximized: true,
+        recordsElsewhere: _recordsElsewhere(maxCam.id),
         onSelect: () => _selectCamera(maxCam.id),
         onMaximizeToggle: () => _toggleMaximize(maxCam.id),
         scrubFrame: _scrubbing ? _scrubFrames[maxCam.id] : null,
@@ -1080,6 +1081,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       pane: _panes[cam.id]!,
                       selected: cam.id == _selectedCameraId,
                       maximized: false,
+                      recordsElsewhere: _recordsElsewhere(cam.id),
                       onSelect: () => _selectCamera(cam.id),
                       onMaximizeToggle: () => _toggleMaximize(cam.id),
                       scrubFrame: _scrubbing ? _scrubFrames[cam.id] : null,
@@ -1090,6 +1092,17 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         return Stack(children: children);
       },
     );
+  }
+
+  /// Whether [camId] has any recording coverage loaded — i.e. it records at
+  /// SOME time in the navigable range. Lets a no-footage pane distinguish a
+  /// motion camera's normal gap ("records elsewhere") from a camera with no
+  /// footage at all (worth flagging). Null when coverage isn't loaded for this
+  /// camera (only the selected camera is fetched) → the tile stays neutral.
+  bool? _recordsElsewhere(String camId) {
+    final cov = _coverage[camId];
+    if (cov == null) return null;
+    return cov.spans.isNotEmpty;
   }
 
   @override
@@ -1692,6 +1705,7 @@ class _PbTile extends StatelessWidget {
     required this.maximized,
     required this.onSelect,
     required this.onMaximizeToggle,
+    this.recordsElsewhere,
     this.scrubFrame,
   });
 
@@ -1702,8 +1716,118 @@ class _PbTile extends StatelessWidget {
   final VoidCallback onSelect;
   final VoidCallback onMaximizeToggle;
 
+  /// Whether this camera has recording coverage at OTHER times (records
+  /// elsewhere in range). Distinguishes a normal motion-camera gap (`true`) from
+  /// a camera with no footage at all (`false`, worth flagging). Null = unknown
+  /// (coverage not loaded for this camera) → a neutral message.
+  final bool? recordsElsewhere;
+
   /// Filmstrip frame shown over the video while the scrubber is being dragged.
   final Uint8List? scrubFrame;
+
+  /// The overlay shown when a pane has no live segment: a load error, a spinner
+  /// while resolving, or — once resolved with nothing here — a styled "no
+  /// footage" placeholder that reads calmly for a motion gap but flags a camera
+  /// with no footage at all.
+  Widget _noFootageOverlay() {
+    if (pane.error != null) {
+      return _placeholder(
+        icon: Icons.videocam_off_rounded,
+        iconColor: Colors.red.shade300,
+        title: 'Playback error',
+        subtitle: 'Could not load this segment',
+        tint: Colors.red,
+      );
+    }
+    if (!pane.noFootage) {
+      // Still resolving / opening a segment.
+      return const ColoredBox(
+        color: Colors.black54,
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    // Resolved: genuinely no footage at this instant.
+    if (recordsElsewhere == false) {
+      // No coverage anywhere in range — a live/always-record camera with no
+      // footage is worth flagging (amber).
+      return _placeholder(
+        icon: Icons.warning_amber_rounded,
+        iconColor: Colors.amber.shade400,
+        title: 'No footage for this camera',
+        subtitle: 'No recordings found in this time range',
+        tint: Colors.amber,
+      );
+    }
+    // Records at other times (motion-gated gap) or unknown → calm.
+    return _placeholder(
+      icon: Icons.motion_photos_off_rounded,
+      iconColor: Colors.white38,
+      title: recordsElsewhere == true
+          ? 'No motion during this time'
+          : 'No footage at this time',
+      subtitle:
+          recordsElsewhere == true ? 'This camera records on motion' : null,
+      tint: Colors.blueGrey,
+    );
+  }
+
+  Widget _placeholder({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    String? subtitle,
+    required Color tint,
+  }) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: RadialGradient(
+          radius: 1.1,
+          colors: [
+            tint.withValues(alpha: 0.16),
+            Colors.black.withValues(alpha: 0.82),
+          ],
+        ),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, color: iconColor, size: 38),
+                const SizedBox(height: 8),
+                Text(
+                  title,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1729,25 +1853,7 @@ class _PbTile extends StatelessWidget {
               controls: NoVideoControls,
               fit: BoxFit.contain,
             ),
-            if (!hasFootage) Container(color: Colors.black54),
-            if (!hasFootage)
-              Center(
-                child: pane.error != null
-                    ? Icon(
-                        Icons.videocam_off,
-                        color: Colors.red.shade300,
-                        size: 24,
-                      )
-                    : (!pane.noFootage
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                              ),
-                            )
-                          : const SizedBox.shrink()),
-              ),
+            if (!hasFootage) Positioned.fill(child: _noFootageOverlay()),
             // Filmstrip scrub frame: covers the (frozen) video while dragging so
             // scrubbing is smooth and never flashes black.
             if (scrubFrame != null)
