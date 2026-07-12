@@ -687,7 +687,11 @@ class _MainShellState extends State<MainShell> {
                   icon: Icon(
                     _audio.audioOn ? Icons.volume_up : Icons.volume_off,
                     size: 20,
-                    color: _audio.audioOn ? scheme.primary : null,
+                    // Use the active tab's accent directly — the top bar is
+                    // built with the State's context, which is ABOVE the
+                    // per-tab Theme override, so scheme.primary here is the base
+                    // theme, not the tab colour.
+                    color: _audio.audioOn ? _accentColor : null,
                   ),
                   onPressed: () => _audio.toggleAudio(),
                 ),
@@ -990,6 +994,9 @@ class _MainShellState extends State<MainShell> {
               _playbackMotion = null;
             }
           },
+          // Shared audio-follow controller → the selected/maximized playback
+          // camera is audible when audio is on (same button as Live).
+          audio: _audio,
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
           // "Add clip to export list" → APPEND to the batch (don't replace) and

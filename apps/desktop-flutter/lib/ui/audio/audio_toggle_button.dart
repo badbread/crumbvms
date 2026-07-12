@@ -42,19 +42,22 @@ class AudioToggleButton extends StatelessWidget {
       animation: controller,
       builder: (context, _) {
         final on = controller.audioOn;
+        // Follow the active tab's accent (app-wide colorScheme.primary swap),
+        // like the other header controls, instead of a hardcoded cyan.
+        final accent = Theme.of(context).colorScheme.primary;
         return Tooltip(
           message: on
               ? 'Audio on (M to mute) — follows selected camera'
               : 'Audio off (M to unmute selected camera)',
           child: Material(
             color: on
-                ? Colors.cyanAccent.withValues(alpha: 0.18)
+                ? accent.withValues(alpha: 0.18)
                 : Colors.black.withValues(alpha: 0.55),
             shape: const CircleBorder(),
             child: IconButton(
               icon: Icon(
                 on ? Icons.volume_up : Icons.volume_off,
-                color: on ? Colors.cyanAccent : Colors.white70,
+                color: on ? accent : Colors.white70,
               ),
               iconSize: 20,
               tooltip: null, // Tooltip widget above already provides this

@@ -31,6 +31,7 @@ import 'package:crumb_desktop/ui/bookmarks/add_bookmark_dialog.dart';
 import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
+import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
@@ -51,6 +52,7 @@ class PlaybackScreen extends StatefulWidget {
     this.initialMaximizedCameraId,
     this.onExitFocus,
     this.onMotionController,
+    this.audio,
   });
 
   final CrumbApi api;
@@ -98,6 +100,11 @@ class PlaybackScreen extends StatefulWidget {
   /// the new controller before the old one disposes).
   final void Function(MotionTimelineController controller, bool active)?
   onMotionController;
+
+  /// Shared play-on-focus audio controller (the same one the live wall and the
+  /// global audio button use). Playback registers its panes here so the
+  /// selected/maximized camera is audible when audio is on.
+  final AudioFollowController? audio;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -210,6 +217,29 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _maximizedCameraId = maxId;
       _selectedCameraId = maxId;
     }
+    // Register panes with the shared audio-follow controller so the active
+    // (maximized else selected) camera is audible when audio is on — and reset
+    // the controller's target off any stale wall pane onto ours.
+    final audio = widget.audio;
+    if (audio != null) {
+      for (final c in _cameras) {
+        final pane = _panes[c.id]!;
+        audio.registerPane(
+          _audioPaneId(c.id),
+          AudioPane.forPlayer(
+            pane.player,
+            hasAudio: () => pane.currentSegment != null,
+          ),
+        );
+      }
+      audio.setMaximized(
+        _maximizedCameraId != null ? _audioPaneId(_maximizedCameraId!) : null,
+        paneRecreated: false,
+      );
+      audio.setSelected(
+        _selectedCameraId != null ? _audioPaneId(_selectedCameraId!) : null,
+      );
+    }
     // Rebuild (fresh playhead for the motion strip) + debounced motion refetch
     // whenever the scrubber window/playhead changes.
     _timeline.addListener(_onTimelineChanged);
@@ -262,6 +292,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // Drop the host's reference to our motion controller before disposing it,
     // so the status-bar legend never reads a disposed controller.
     widget.onMotionController?.call(_motion, false);
+    // Unregister our panes from the shared audio controller and clear the
+    // target so the live wall re-establishes its own audio on the way back.
+    final audio = widget.audio;
+    if (audio != null) {
+      audio.setMaximized(null, paneRecreated: false);
+      audio.setSelected(null);
+      for (final c in _cameras) {
+        audio.unregisterPane(_audioPaneId(c.id));
+      }
+    }
     for (final p in _panes.values) {
       p.dispose();
     }
@@ -976,9 +1016,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     return '${_monthAbbr[d.month - 1]} ${d.day}, $h12:$mm:$ss $ampm';
   }
 
+  /// Audio-follow pane id for a playback camera (distinct from the wall's
+  /// `wall:<id>` so the two screens don't clash in the shared controller).
+  String _audioPaneId(String camId) => 'pb:$camId';
+
   void _selectCamera(String cameraId) {
     if (cameraId == _selectedCameraId) return;
     setState(() => _selectedCameraId = cameraId);
+    widget.audio?.setSelected(_audioPaneId(cameraId));
     // Instant repaint from the cache (empty on first select of this camera),
     // then preload / live-edge top-up in the background.
     _timeline.setSpans(_coverage[cameraId]?.spans ?? const []);
@@ -996,6 +1041,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     setState(() {
       _maximizedCameraId = _maximizedCameraId == cameraId ? null : cameraId;
     });
+    // Audio follows the maximized pane (or falls back to the selected one when
+    // restored). The pane's Player persists across maximize, so not recreated.
+    widget.audio?.setMaximized(
+      _maximizedCameraId != null ? _audioPaneId(_maximizedCameraId!) : null,
+      paneRecreated: false,
+    );
     // Newly-active panes (e.g. the whole grid again after un-maximizing)
     // may not hold the right segment yet — force a resolve at the current
     // playhead for whichever set is now active.
