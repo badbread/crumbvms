@@ -31,6 +31,8 @@ import 'package:crumb_desktop/api/clips_api.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart'
+    show FullscreenController;
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 
 enum ClipsDensity { compact, normal, large }
@@ -62,8 +64,10 @@ class ClipsScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     this.initialCameraId,
+    this.initialClip,
     this.hotkeys,
     this.onViewOnTimeline,
+    this.fullscreen,
   });
 
   final CrumbApi api;
@@ -73,11 +77,22 @@ class ClipsScreen extends StatefulWidget {
   /// Start the list filtered to this camera (e.g. a number-key hotkey).
   final String? initialCameraId;
 
+  /// Open with this clip's player already up — set when returning from a
+  /// clip-originated Playback review, so the user lands back in the clip box
+  /// that launched it rather than on the bare grid.
+  final ClipDescriptor? initialClip;
+
   /// Number-key hotkeys filter the list to the assigned camera.
   final HotkeyConfigStore? hotkeys;
 
-  /// "View on timeline" from the clip player → open Playback at this moment.
-  final void Function(String cameraId, DateTime at)? onViewOnTimeline;
+  /// "View on timeline" from the clip player → open Playback at this clip's
+  /// moment, scoped to its camera.
+  final void Function(ClipDescriptor clip)? onViewOnTimeline;
+
+  /// OS-window fullscreen state, so the clip player's Esc handler can keep
+  /// the old client's priority order: Esc leaves fullscreen first, then
+  /// closes the clip on the next press.
+  final FullscreenController? fullscreen;
 
   @override
   State<ClipsScreen> createState() => _ClipsScreenState();
@@ -109,6 +124,9 @@ class _ClipsScreenState extends State<ClipsScreen> {
   void initState() {
     super.initState();
     _cameraId = widget.initialCameraId;
+    // Returning from a clip-originated Playback review: reopen the clip box
+    // that launched it (already marked viewed on the first open).
+    _playing = widget.initialClip;
     _restorePrefs();
     _load();
   }
@@ -281,13 +299,14 @@ class _ClipsScreenState extends State<ClipsScreen> {
               session: widget.session,
               clip: _playing!,
               motionHighlightSeconds: _motionHighlightSeconds,
+              fullscreen: widget.fullscreen,
               onClose: () => setState(() => _playing = null),
               onViewOnTimeline: widget.onViewOnTimeline == null
                   ? null
                   : () {
                       final c = _playing!;
                       setState(() => _playing = null);
-                      widget.onViewOnTimeline!(c.cameraId, c.startTs);
+                      widget.onViewOnTimeline!(c);
                     },
             ),
         ],
@@ -302,14 +321,17 @@ class _ClipsScreenState extends State<ClipsScreen> {
       cameras: widget.cameras,
       autofocus: true,
       onGoToCamera: _filterToCamera,
-      // Esc closes an open clip player. This must live HERE, on the screen's
-      // autofocused listener, not (only) on the player overlay: this node is
-      // what actually holds keyboard focus on the Clips tab, so key events
-      // dispatch through it. The overlay's own `autofocus` is silently
-      // discarded (Flutter only honors autofocus when the enclosing scope has
-      // no focused child — and this listener already does), so the overlay's
-      // key handler never sees the Esc. Same shape as the wall's
-      // Esc-restores-maximize (wall_screen.dart).
+      // Esc closes an open clip player — defence in depth ONLY. The
+      // authoritative close-on-Esc is _ClipPlayerState's HardwareKeyboard
+      // handler, which fires no matter where keyboard focus sits. This
+      // focus-chain path (like the overlay's own FocusScope) only ever fires
+      // when this node happens to hold primary focus, which on real hardware
+      // it usually does NOT: this listener's `autofocus` is discarded because
+      // an app-root node (FullscreenEscHandler / SnapshotHotkey, both
+      // autofocus and built first) already holds focus in the same scope, and
+      // key events dispatch only through the focused node's ancestor chain —
+      // which does not include this sibling branch. Closing twice in the same
+      // event is idempotent.
       onEscape: _playing == null ? null : () => setState(() => _playing = null),
       child: scaffold,
     );
@@ -729,6 +751,7 @@ class _ClipPlayer extends StatefulWidget {
     required this.motionHighlightSeconds,
     required this.onClose,
     this.onViewOnTimeline,
+    this.fullscreen,
   });
 
   final CrumbApi api;
@@ -737,6 +760,9 @@ class _ClipPlayer extends StatefulWidget {
   final int motionHighlightSeconds;
   final VoidCallback onClose;
   final VoidCallback? onViewOnTimeline;
+
+  /// Esc leaves OS fullscreen before closing the clip (old-client priority).
+  final FullscreenController? fullscreen;
 
   @override
   State<_ClipPlayer> createState() => _ClipPlayerState();
@@ -773,7 +799,45 @@ class _ClipPlayerState extends State<_ClipPlayer> {
   @override
   void initState() {
     super.initState();
+    // Esc must close the player no matter which node holds keyboard focus.
+    // Focus-chain listeners (`Focus.onKeyEvent`) only see keys dispatched
+    // from the currently-focused node's ancestor chain, and on the Clips tab
+    // primary focus routinely sits OUTSIDE both this overlay and the screen's
+    // GlobalHotkeysListener (their `autofocus` is discarded because an
+    // app-root autofocus node — FullscreenEscHandler / SnapshotHotkey —
+    // already holds focus in the scope), which is why two prior focus-based
+    // Esc attempts never fired. HardwareKeyboard handlers are different:
+    // KeyEventManager invokes EVERY registered handler for every key event,
+    // before and independent of the focus dispatch — the same always-fires
+    // mechanism the app's Shift-hints handler relies on (main.dart).
+    // Registered for exactly the lifetime of the open clip.
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
     _open('preview', resetAttempt: true);
+  }
+
+  /// Lifetime-of-the-open-clip Esc handler; consumes only the Esc it acts on.
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.escape) return false;
+    if (!mounted) return false;
+    // A focused text field (bookmark dialog) owns its own Esc.
+    if (FocusManager.instance.primaryFocus?.context?.widget is EditableText) {
+      return false;
+    }
+    // A pushed route on top (dialog, picker, dropdown menu) owns Esc — don't
+    // close the player out from under it.
+    if (Navigator.of(context).canPop()) return false;
+    // Old-client priority order: Esc leaves the fullscreen camera wall first;
+    // the next Esc closes the clip. (isFullscreen flips synchronously, so the
+    // focus-chain FullscreenEscHandler — dispatched after hardware handlers
+    // in the same event — sees false and won't double-handle.)
+    final fs = widget.fullscreen;
+    if (fs != null && fs.isFullscreen) {
+      fs.setFullscreen(false);
+      return true;
+    }
+    widget.onClose();
+    return true;
   }
 
   String _clipRelUrl(String quality, {int? retry}) {
@@ -1029,6 +1093,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
     _watchdog?.cancel();
     _autoZoomTimer?.cancel();
     _toastTimer?.cancel();
@@ -1045,12 +1110,12 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     return Positioned.fill(
       // Best-effort only: this handler fires just when the overlay itself
       // holds focus, which it normally never does — `autofocus` is discarded
-      // because the clips screen's GlobalHotkeysListener already has focus
-      // (Flutter applies autofocus only when the enclosing scope has no
-      // focused child), and key events dispatch from the focused node UP
-      // through its ancestors, never down into this sibling branch. The Esc
-      // that actually closes the player is the screen-level listener's
-      // onEscape (see this screen's build). Kept as defence in depth for the
+      // because another node in the scope already has focus (Flutter applies
+      // autofocus only when the enclosing scope has no focused child), and
+      // key events dispatch from the focused node UP through its ancestors,
+      // never down into this sibling branch. The Esc that actually closes
+      // the player is this state's HardwareKeyboard handler (_onKeyEvent),
+      // which fires regardless of focus. Kept as defence in depth for the
       // rare case where focus does land inside the overlay.
       child: FocusScope(
         autofocus: true,

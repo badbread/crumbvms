@@ -49,6 +49,7 @@ class PlaybackScreen extends StatefulWidget {
     this.onExportRange,
     this.initialTime,
     this.initialMaximizedCameraId,
+    this.onExitFocus,
   });
 
   final CrumbApi api;
@@ -81,6 +82,12 @@ class PlaybackScreen extends StatefulWidget {
   /// Open the playhead at this moment on entry (e.g. Clips "View on timeline")
   /// instead of jumping to the latest footage.
   final DateTime? initialTime;
+
+  /// Set when this Playback is a clip-originated single-camera focus
+  /// (Clips "View on timeline"): there is no grid behind the maximized pane,
+  /// so the maximize-toggle (double-click / Esc) calls this to hand control
+  /// back to the opener instead of un-maximizing into a 1-up grid.
+  final VoidCallback? onExitFocus;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -964,6 +971,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   void _toggleMaximize(String cameraId) {
+    // Clip-originated single-camera focus: "restore" leaves the focus view
+    // entirely (back to the Clips box that opened it) — there's no grid here.
+    if (widget.onExitFocus != null) {
+      widget.onExitFocus!();
+      return;
+    }
     setState(() {
       _maximizedCameraId = _maximizedCameraId == cameraId ? null : cameraId;
     });

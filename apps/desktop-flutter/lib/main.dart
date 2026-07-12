@@ -19,6 +19,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:window_manager/window_manager.dart';
 
+import 'package:crumb_desktop/api/clips_api.dart' show ClipDescriptor;
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
@@ -419,6 +420,13 @@ class _MainShellState extends State<MainShell> {
   /// camera (maximized), not the multi-window view. Cleared on manual tab nav.
   String? _playbackFocusCameraId;
 
+  /// The clip whose "View on timeline" opened the current Playback focus.
+  /// Leaving that focus view (double-click / Esc) returns to the Clips tab
+  /// with this clip's player reopened — back to the box that opened it, since
+  /// the clip's camera may not even be in the current live view. Cleared on
+  /// manual tab nav like the other one-shot hand-offs.
+  ClipDescriptor? _originClip;
+
   /// Play-on-focus audio: exactly one pane (maximized else selected) is
   /// audible when audio is on. Owned here, driven by the global audio button
   /// and the wall's tile selection/maximize.
@@ -427,6 +435,13 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
+    // Esc in a clip-originated Playback focus returns to the Clips tab.
+    // Registered on HardwareKeyboard (every handler fires for every key
+    // event, independent of focus) rather than a Focus.onKeyEvent listener,
+    // because primary focus routinely sits outside the Playback subtree and
+    // focus-chain Esc handling there never fires — see the same pattern on
+    // the clip player (_ClipPlayerState._onKeyEvent, clips_screen.dart).
+    HardwareKeyboard.instance.addHandler(_playbackFocusEscHandler);
     _loadDefaultView();
   }
 
@@ -464,8 +479,48 @@ class _MainShellState extends State<MainShell> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_playbackFocusEscHandler);
     _audio.dispose();
     super.dispose();
+  }
+
+  /// Esc while Playback is showing a clip-originated single-camera focus:
+  /// go back to the clip box that opened it. Consumes only the Esc it acts
+  /// on; everything else falls through untouched.
+  bool _playbackFocusEscHandler(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.escape) return false;
+    if (!mounted) return false;
+    if (_index != _playbackIndex || _playbackFocusCameraId == null) {
+      return false;
+    }
+    if (_settingsOpen) return false; // panel on top — don't yank the tab
+    if (FocusManager.instance.primaryFocus?.context?.widget is EditableText) {
+      return false;
+    }
+    // A pushed route on top (dialog, goto picker, dropdown) owns its own Esc.
+    if (Navigator.of(context).canPop()) return false;
+    // Old-client priority: Esc leaves OS fullscreen first; the next Esc
+    // returns to Clips. (isFullscreen flips synchronously, so the focus-chain
+    // FullscreenEscHandler sees false and won't double-handle this press.)
+    if (widget.fullscreen.isFullscreen) {
+      widget.fullscreen.setFullscreen(false);
+      return true;
+    }
+    _returnToClips();
+    return true;
+  }
+
+  /// Leave a clip-originated Playback focus: back to the Clips tab, with the
+  /// originating clip's player reopened. Clears the one-shot focus/seek state
+  /// so a later manual Playback entry starts clean (keeps [_originClip] so
+  /// the remounted Clips screen can reopen the box that launched the review).
+  void _returnToClips() {
+    setState(() {
+      _playbackFocusCameraId = null;
+      _playbackSeekTo = null;
+      _index = _clipsIndex;
+    });
   }
 
   static const int _liveIndex = 0;
@@ -667,6 +722,7 @@ class _MainShellState extends State<MainShell> {
       onTap: () => setState(() {
         _playbackSeekTo = null;
         _playbackFocusCameraId = null;
+        _originClip = null;
         _index = i;
       }),
     );
@@ -859,6 +915,10 @@ class _MainShellState extends State<MainShell> {
           initialMaximizedCameraId:
               _playbackFocusCameraId ?? _liveMaximizedId,
           onClose: () => setState(() => _index = _liveIndex),
+          // A clip-originated focus has no grid to restore to — double-click
+          // (and Esc, via the handler above) goes back to the Clips box that
+          // opened it, not to a live view the camera may not even be in.
+          onExitFocus: _playbackFocusCameraId == null ? null : _returnToClips,
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
           // "Add clip to export list" → APPEND to the batch (don't replace) and
@@ -880,10 +940,15 @@ class _MainShellState extends State<MainShell> {
           cameras: widget.cameras,
           // Number-key hotkeys filter the list to that camera.
           hotkeys: widget.hotkeys,
+          // Esc priority: leave OS fullscreen before closing an open clip.
+          fullscreen: widget.fullscreen,
+          // Returning from a clip-originated Playback → reopen that clip.
+          initialClip: _originClip,
           // "View on timeline" → open Playback single-window on that camera.
-          onViewOnTimeline: (camId, at) => setState(() {
-            _playbackSeekTo = at;
-            _playbackFocusCameraId = camId;
+          onViewOnTimeline: (clip) => setState(() {
+            _originClip = clip;
+            _playbackSeekTo = clip.startTs;
+            _playbackFocusCameraId = clip.cameraId;
             _index = _playbackIndex;
           }),
         );
