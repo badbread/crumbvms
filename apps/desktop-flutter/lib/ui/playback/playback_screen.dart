@@ -204,11 +204,18 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // hints in the app's bottom status bar (set here, cleared in dispose).
     widget.onMotionController?.call(_motion, true);
     for (final c in _cameras) {
-      _panes[c.id] = GaplessSegmentPaneController(
+      final pane = GaplessSegmentPaneController(
         api: widget.api,
         session: widget.session,
         cameraId: c.id,
       );
+      // A pane's audio eligibility (hasAudio == currentSegment != null) is
+      // false at register time because no segment has loaded yet, so the
+      // controller's first reconcile mutes it and never revisits. Re-run
+      // reconcile whenever a pane's segment (hence hasAudio) changes so the
+      // active pane becomes audible once its footage actually loads.
+      pane.addListener(_syncAudioReconcile);
+      _panes[c.id] = pane;
     }
     _selectedCameraId = _cameras.isNotEmpty ? _cameras.first.id : null;
     // Carry a maximized live pane into playback (if it's one of our cameras).
@@ -303,11 +310,22 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       }
     }
     for (final p in _panes.values) {
+      p.removeListener(_syncAudioReconcile);
       p.dispose();
     }
     _timeline.dispose();
     _motion.dispose();
     super.dispose();
+  }
+
+  /// Nudge the shared audio controller to re-evaluate which pane is audible.
+  /// Called when any pane's segment (and thus its `hasAudio`) changes:
+  /// reconcile is idempotent and cheap, and only ever acts on the active
+  /// pane, so calling it from every pane's listener is safe. This closes the
+  /// gap where the active pane was muted at register time (no segment yet)
+  /// and never revisited once its footage loaded.
+  void _syncAudioReconcile() {
+    unawaited(widget.audio?.reconcile() ?? Future<void>.value());
   }
 
   // ── entry / spans ─────────────────────────────────────────────────────────

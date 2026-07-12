@@ -993,6 +993,15 @@ class _MainShellState extends State<MainShell> {
             } else if (identical(_playbackMotion, c)) {
               _playbackMotion = null;
             }
+            // This fires from PlaybackScreen's initState/dispose (during our
+            // own build/teardown), so a synchronous setState would throw.
+            // Defer a rebuild to the next frame so the bottom status bar
+            // re-evaluates its `leading` and actually shows/hides the legend —
+            // without this, the field changes but the StatusBar never repaints
+            // and the motion legend silently never appears.
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) setState(() {});
+            });
           },
           // Shared audio-follow controller → the selected/maximized playback
           // camera is audible when audio is on (same button as Live).

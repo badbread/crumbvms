@@ -122,6 +122,13 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       ['demuxer-max-bytes', '32MiB'],
       ['demuxer-max-back-bytes', '1MiB'],
       ['network-timeout', '10'],
+      // Start muted, exactly like the live wall tiles (wall_screen.dart's
+      // _WallTile sets mute=yes at creation). The shared AudioFollowController
+      // is the sole owner of unmuting: it unmutes only the active (maximized
+      // else selected) pane when audio is on. Without this, every playback
+      // pane would start unmuted and several cameras' audio would blare at
+      // once; with it, the controller's reconcile decides who is audible.
+      ['mute', 'yes'],
       ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
       // Same as the wall tiles: never emit decoder output from before the
       // first keyframe. The gapless advance never decodes mid-GOP, but the
