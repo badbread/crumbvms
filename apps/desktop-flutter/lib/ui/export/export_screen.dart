@@ -19,7 +19,6 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -27,7 +26,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
-import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
+import 'package:crumb_desktop/ui/folder_picker_dialog.dart';
 
 import 'export_builder_dialog.dart';
 
@@ -275,21 +274,19 @@ class _ExportScreenState extends State<ExportScreen> {
   // ── destination folder ──────────────────────────────────────────────────
 
   Future<void> _pickFolder() async {
-    // Re-entry guard: the native picker is modal to the app window; opening a
-    // second one from a double-click (or a click landing while the first is
-    // still tearing down) wedges the whole app.
+    // Re-entry guard: don't stack two pickers from a double-click.
     if (_pickingFolder) return;
     _pickingFolder = true;
 
-    // Route the native folder dialog through the SHARED runNativePicker guard
-    // (the same one clip-save and image-tile pickers use) instead of a bespoke
-    // copy of the fullscreen dance — so the folder picker also gets the
-    // show()+focus() foreground fix that a bare focus() lacked (#87). The
-    // guard drops fullscreen for the pick and restores it after.
+    // Use the IN-APP folder picker, not the native OS dialog. On Windows the
+    // Win32 folder dialog (file_selector getDirectoryPath) runs its modal
+    // message loop on the Flutter platform thread and hard-hangs the whole app
+    // ("Not Responding") with no dialog ever shown — a platform-thread
+    // deadlock, not a z-order/fullscreen issue, so dropping fullscreen +
+    // foregrounding didn't help (#87). The in-app picker browses directories
+    // with dart:io from the Dart isolate and cannot block the platform thread.
     try {
-      final dir = await runNativePicker(
-        () => getDirectoryPath(confirmButtonText: 'Select export folder'),
-      );
+      final dir = await pickFolderInApp(context, initialPath: _destDir);
       if (dir != null && mounted) {
         setState(() {
           _destDir = dir;
