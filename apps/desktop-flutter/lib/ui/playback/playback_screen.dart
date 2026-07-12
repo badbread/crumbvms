@@ -24,7 +24,9 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
+import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
@@ -362,6 +364,53 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     await _resolveAll(_timeline.playhead, force: true);
   }
 
+  /// Shift the playhead by a signed duration (arrow keys / nudge buttons).
+  Future<void> _shiftWindow(Duration by) async {
+    final t = _timeline.playhead.add(by);
+    _timeline.setPlayhead(t, now: DateTime.now().toUtc());
+    await _commitSeek(_timeline.playhead);
+  }
+
+  /// Jump to the previous/next motion event on the selected camera.
+  Future<void> _jumpMotion(bool next) async {
+    final camId = _maximizedCameraId ?? _selectedCameraId;
+    if (camId == null) return;
+    final target = await _motion.jumpToMotion(
+      cameraId: camId,
+      fromMs: _timeline.playhead.millisecondsSinceEpoch,
+      next: next,
+    );
+    if (target != null) await _seekToMs(target);
+  }
+
+  /// Nudge every active pane's player by ±1 frame (pauses first). Approximate
+  /// (uses estimated-vf-fps), good enough for frame-by-frame review.
+  Future<void> _frameStep(bool forward) async {
+    if (_playing) _togglePlay();
+    for (final cam in _activeCameras()) {
+      final player = _panes[cam.id]?.player;
+      if (player == null) continue;
+      try {
+        double fps = 30;
+        final p = player.platform;
+        if (p is NativePlayer) {
+          final raw = await p.getProperty('estimated-vf-fps');
+          final parsed = double.tryParse(raw);
+          if (parsed != null && parsed > 0) fps = parsed;
+        }
+        final frameMs = (1000 / fps).round().clamp(1, 1000);
+        final cur = player.state.position;
+        var target = forward
+            ? cur + Duration(milliseconds: frameMs)
+            : cur - Duration(milliseconds: frameMs);
+        if (target < Duration.zero) target = Duration.zero;
+        await player.seek(target);
+      } catch (_) {
+        /* non-fatal per-pane */
+      }
+    }
+  }
+
   // ── transport ─────────────────────────────────────────────────────────────
 
   void _togglePlay() {
@@ -583,6 +632,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onJumpFirst: _jumpToFirst,
             onJumpLatest: _jumpToLatest,
             onTimeGoto: _handleTimeGoto,
+            onFrameBack: () => _frameStep(false),
+            onFrameFwd: () => _frameStep(true),
+            onNudge: _shiftWindow,
           ),
           // Motion-intensity histogram + detection glyphs + legend +
           // prev/next-motion transport, synced to the scrubber window.
@@ -603,15 +655,33 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       ),
     );
 
-    // Number-key hotkeys load the assigned camera's timeline here.
+    // Keyboard: number keys load a camera (GlobalHotkeysListener, autofocus so
+    // it's the focused node); Space/arrows/,/./frame-step bubble up to the
+    // PlaybackHotkeysListener wrapping it.
+    Widget tree = scaffold;
     final hk = widget.hotkeys;
-    if (hk == null) return scaffold;
-    return GlobalHotkeysListener(
-      store: hk,
-      cameras: _cameras,
-      autofocus: true,
-      onGoToCamera: _selectCamera,
-      child: scaffold,
+    final hasGlobal = hk != null;
+    if (hasGlobal) {
+      tree = GlobalHotkeysListener(
+        store: hk,
+        cameras: _cameras,
+        autofocus: true,
+        onGoToCamera: _selectCamera,
+        child: tree,
+      );
+    }
+    return PlaybackHotkeysListener(
+      autofocus: !hasGlobal,
+      isMaximized: _maximizedCameraId != null,
+      onTogglePlay: _togglePlay,
+      onShiftWindow: _shiftWindow,
+      onPrevMotion: () => _jumpMotion(false),
+      onNextMotion: () => _jumpMotion(true),
+      onFrameStep: _frameStep,
+      onExitMaximize: _maximizedCameraId != null
+          ? () => _toggleMaximize(_maximizedCameraId!)
+          : null,
+      child: tree,
     );
   }
 }
@@ -669,6 +739,9 @@ class _TransportBar extends StatelessWidget {
     required this.onJumpFirst,
     required this.onJumpLatest,
     required this.onTimeGoto,
+    required this.onFrameBack,
+    required this.onFrameFwd,
+    required this.onNudge,
   });
 
   final bool playing;
@@ -679,6 +752,9 @@ class _TransportBar extends StatelessWidget {
   final VoidCallback onJumpFirst;
   final VoidCallback onJumpLatest;
   final VoidCallback onTimeGoto;
+  final VoidCallback onFrameBack;
+  final VoidCallback onFrameFwd;
+  final void Function(Duration by) onNudge;
 
   @override
   Widget build(BuildContext context) {
@@ -687,34 +763,81 @@ class _TransportBar extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       child: Row(
         children: [
-          IconButton(
-            tooltip: 'Oldest footage',
-            icon: const Icon(Icons.first_page, color: Colors.white70),
-            onPressed: onJumpFirst,
-          ),
-          IconButton(
-            tooltip: playing ? 'Pause' : 'Play',
-            icon: Icon(
-              playing ? Icons.pause : Icons.play_arrow,
-              color: Colors.white,
+          ShiftHint(
+            hint: 'Oldest footage',
+            child: IconButton(
+              tooltip: 'Oldest footage',
+              icon: const Icon(Icons.first_page, color: Colors.white70),
+              onPressed: onJumpFirst,
             ),
-            onPressed: onTogglePlay,
           ),
-          IconButton(
-            tooltip: 'Latest footage',
-            icon: const Icon(Icons.last_page, color: Colors.white70),
-            onPressed: onJumpLatest,
+          ShiftHint(
+            hint: 'Step back one frame (Shift+,)',
+            child: IconButton(
+              tooltip: 'Frame back',
+              icon: const Icon(Icons.skip_previous, color: Colors.white70),
+              onPressed: onFrameBack,
+            ),
           ),
-          TextButton(
-            onPressed: onCycleSpeed,
-            child: Text(
-              speedLabel,
-              style: const TextStyle(
-                color: Colors.cyanAccent,
-                fontWeight: FontWeight.w700,
+          ShiftHint(
+            hint: playing ? 'Pause (Space)' : 'Play (Space)',
+            child: IconButton(
+              tooltip: playing ? 'Pause' : 'Play',
+              icon: Icon(
+                playing ? Icons.pause : Icons.play_arrow,
+                color: Colors.white,
+              ),
+              onPressed: onTogglePlay,
+            ),
+          ),
+          ShiftHint(
+            hint: 'Step forward one frame (Shift+.)',
+            child: IconButton(
+              tooltip: 'Frame forward',
+              icon: const Icon(Icons.skip_next, color: Colors.white70),
+              onPressed: onFrameFwd,
+            ),
+          ),
+          ShiftHint(
+            hint: 'Latest footage',
+            child: IconButton(
+              tooltip: 'Latest footage',
+              icon: const Icon(Icons.last_page, color: Colors.white70),
+              onPressed: onJumpLatest,
+            ),
+          ),
+          ShiftHint(
+            hint: 'Playback speed',
+            child: TextButton(
+              onPressed: onCycleSpeed,
+              child: Text(
+                speedLabel,
+                style: const TextStyle(
+                  color: Colors.cyanAccent,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
           ),
+          const SizedBox(width: 8),
+          for (final n in const [
+            (-3600, '−1h'),
+            (-600, '−10m'),
+            (600, '+10m'),
+            (3600, '+1h'),
+          ])
+            ShiftHint(
+              hint: 'Jump ${n.$2}',
+              child: TextButton(
+                onPressed: () => onNudge(Duration(seconds: n.$1)),
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(0, 30),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  foregroundColor: Colors.white70,
+                ),
+                child: Text(n.$2, style: const TextStyle(fontSize: 11)),
+              ),
+            ),
           const SizedBox(width: 12),
           SizedBox(
             width: 110,
