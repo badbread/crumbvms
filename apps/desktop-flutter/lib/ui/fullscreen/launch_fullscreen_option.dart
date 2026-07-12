@@ -6,6 +6,7 @@
 // fullscreen camera wall if that option is on".
 
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_prefs.dart';
@@ -19,9 +20,24 @@ Future<void> applyLaunchFullscreenPreference(
   FullscreenController controller,
 ) async {
   final wantsFullscreen = await LaunchFullscreenPrefs.get();
-  if (wantsFullscreen) {
-    await controller.setFullscreen(true);
+  if (!wantsFullscreen) return;
+  // Entering fullscreen too early — before the Flutter view has actually
+  // RASTERIZED its first frame — leaves a blank WHITE window on Windows that
+  // never paints and is uninteractable (#86: launch-into-fullscreen ghost).
+  // The toolbar toggle works fine because by then the view has rendered, so
+  // this is purely a launch-timing problem: wait until the first frame is on
+  // screen, make sure the window is shown/focused, then enter fullscreen.
+  await WidgetsBinding.instance.waitUntilFirstFrameRasterized;
+  try {
+    await windowManager.show();
+    await windowManager.focus();
+  } catch (_) {
+    /* best-effort — never let a window-manager hiccup block the wall */
   }
+  // A brief settle after first paint so the swapchain is live before the
+  // fullscreen (borderless) window recreation.
+  await Future<void>.delayed(const Duration(milliseconds: 250));
+  await controller.setFullscreen(true);
 }
 
 /// A settings-panel checkbox for the "Launch into fullscreen camera wall"
