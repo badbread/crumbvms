@@ -4398,6 +4398,7 @@ function renderAddCamera() {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('cam_other',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('cameras-root')" title="Back to all cameras">‹ Cameras</button>
           <div class="rp-head-title">Add cameras</div>
           <div class="rp-head-sub">Scan the network, pick what you want, add them in one go</div>
         </div>
@@ -7549,6 +7550,7 @@ function renderGroup(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('group',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('cameras-root')" title="Back to all cameras">‹ Cameras</button>
           <div class="rp-head-title">${esc(g.name)}</div>
           <div class="rp-head-sub">${members.length} camera${members.length!==1?'s':''}</div>
         </div>
@@ -7799,6 +7801,7 @@ function renderProfile(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(isDefault?'star':'profiles',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('profiles-root')" title="Back to recording profiles">‹ Recording</button>
           <div class="rp-head-title">${esc(p.name || 'Default')}</div>
           <div class="rp-head-sub">${isDefault?'Default profile · ':''}${direct.length} camera${direct.length!==1?'s':''} direct${viaGroups.length?` · ${viaGroups.length} group${viaGroups.length!==1?'s':''}`:''}</div>
         </div>
@@ -8158,6 +8161,7 @@ function renderStorage(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(storageIcon(s.name, s.icon),22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('storage-root')" title="Back to storage">‹ Storage</button>
           <div class="rp-head-title">${esc(s.name)}</div>
           <div class="rp-head-sub mono">${esc(s.path)}</div>
         </div>
@@ -8377,6 +8381,7 @@ function renderUser(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(u.role==='admin'?'shield':'user',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('security-root')" title="Back to users &amp; security">‹ Users</button>
           <div class="rp-head-title">${esc(u.username)}</div>
           <div class="rp-head-sub">${roleSub}</div>
         </div>
@@ -8561,6 +8566,7 @@ function renderRole(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(isBuiltinAdmin?'shield':'roles',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('security-root')" title="Back to users &amp; security">‹ Users</button>
           <div class="rp-head-title">${esc(r.name)}</div>
           <div class="rp-head-sub">${isBuiltinAdmin ? 'Built-in administrator role, full access, cannot be modified' : 'Custom role'}</div>
         </div>
