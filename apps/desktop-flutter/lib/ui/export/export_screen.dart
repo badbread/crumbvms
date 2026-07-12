@@ -65,7 +65,7 @@ class _ExportScreenState extends State<ExportScreen> {
   final _passwordCtrl = TextEditingController();
   bool _obscurePassword = true;
 
-  // ── destination folder (session-scoped; no localStorage-equivalent yet) ──
+  // ── destination folder (persisted across launches via [_kExportDirKey]) ──
   String? _destDir;
 
   // ── run state ──────────────────────────────────────────────────────────

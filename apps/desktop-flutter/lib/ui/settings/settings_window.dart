@@ -25,6 +25,8 @@ import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
 import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
+import 'package:crumb_desktop/ui/updates/about_panel.dart';
+import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
 
 /// Identifies a settings section. PANE sections render in the right pane;
 /// LAUNCH sections open as their own full screen (see file header).
@@ -32,6 +34,7 @@ enum SettingsSection {
   options(Icons.tune, 'Options', pane: true),
   hotkeys(Icons.keyboard_outlined, 'Hotkeys', pane: true),
   serverDashboard(Icons.dns_outlined, 'Server dashboard', pane: true),
+  about(Icons.info_outline, 'About', pane: true),
   serverConsole(Icons.admin_panel_settings_outlined, 'Server console',
       pane: false),
   motionTuner(Icons.sensors, 'Motion tuner', pane: false);
@@ -55,6 +58,7 @@ class SettingsWindow extends StatefulWidget {
     required this.onClose,
     required this.onOpenServerConsole,
     required this.onOpenMotionTuner,
+    required this.updateCheck,
     this.clientOptions,
     this.streamPrefs,
     this.hotkeys,
@@ -70,6 +74,9 @@ class SettingsWindow extends StatefulWidget {
   /// Open the WebView2 surfaces as their own full screen (panel closes first).
   final VoidCallback onOpenServerConsole;
   final VoidCallback onOpenMotionTuner;
+
+  /// Drives the About pane's version + update-check status.
+  final UpdateCheckController updateCheck;
 
   final ClientOptionsStore? clientOptions;
   final StreamPrefsStore? streamPrefs;
@@ -291,6 +298,8 @@ class _SettingsWindowState extends State<SettingsWindow> {
         return HotkeyRemapScreen(store: hk, cameras: widget.cameras);
       case SettingsSection.serverDashboard:
         return ServerDashboardScreen(api: widget.api, session: widget.session);
+      case SettingsSection.about:
+        return AboutPanel(controller: widget.updateCheck);
       case SettingsSection.serverConsole:
       case SettingsSection.motionTuner:
         // Never rendered in-pane (see _select), but keep the switch exhaustive.

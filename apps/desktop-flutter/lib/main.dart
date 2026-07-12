@@ -650,6 +650,7 @@ class _MainShellState extends State<MainShell> {
       api: widget.api,
       session: session,
       cameras: widget.cameras,
+      updateCheck: widget.updateCheck,
       clientOptions: widget.clientOptions,
       streamPrefs: widget.streamPrefs,
       hotkeys: widget.hotkeys,
