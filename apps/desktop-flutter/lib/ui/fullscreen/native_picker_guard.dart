@@ -33,6 +33,17 @@ Future<T> runNativePicker<T>(Future<T> Function() pick) async {
       // over, so the dialog z-orders against the windowed state.
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
+    // The Win32 dialog parents to whatever window is foreground; if ours is
+    // hidden or not foreground (e.g. just restored from minimize, issue #91)
+    // the dialog can open BEHIND it and the app looks frozen. show() before
+    // focus() makes the window a proper visible, foreground owner — the extra
+    // step over a bare focus() that the folder picker needs (#87). Both
+    // best-effort; show() does not un-maximize, so it's safe on any state.
+    try {
+      await windowManager.show();
+    } catch (_) {
+      /* best-effort */
+    }
     try {
       await windowManager.focus(); // dialog opens above a foreground owner
     } catch (_) {

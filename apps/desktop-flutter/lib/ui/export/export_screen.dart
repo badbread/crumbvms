@@ -23,11 +23,11 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:window_manager/window_manager.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
 
 import 'export_builder_dialog.dart';
 
@@ -281,33 +281,14 @@ class _ExportScreenState extends State<ExportScreen> {
     if (_pickingFolder) return;
     _pickingFolder = true;
 
-    // The Win32 folder dialog (IFileDialog) is owned by — and disables — the
-    // app window. Under the borderless fullscreen wall (window_manager
-    // setFullScreen) the dialog can open BEHIND the fullscreen surface, so the
-    // user sees a disabled, apparently frozen app with no visible dialog.
-    // Drop to windowed + foreground for the pick, then restore fullscreen.
-    bool wasFullscreen = false;
+    // Route the native folder dialog through the SHARED runNativePicker guard
+    // (the same one clip-save and image-tile pickers use) instead of a bespoke
+    // copy of the fullscreen dance — so the folder picker also gets the
+    // show()+focus() foreground fix that a bare focus() lacked (#87). The
+    // guard drops fullscreen for the pick and restores it after.
     try {
-      wasFullscreen = await windowManager.isFullScreen();
-    } catch (_) {
-      /* window_manager unavailable — proceed as-is */
-    }
-    try {
-      if (wasFullscreen) {
-        // FullscreenController hears this via onWindowLeaveFullScreen and
-        // re-shows the chrome — it is built for externally-driven changes.
-        await windowManager.setFullScreen(false);
-        // Let the window transition settle before the modal message loop
-        // takes over, so the dialog z-orders against the windowed state.
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-      }
-      try {
-        await windowManager.focus(); // dialog opens above a foreground owner
-      } catch (_) {
-        /* best-effort */
-      }
-      final dir = await getDirectoryPath(
-        confirmButtonText: 'Select export folder',
+      final dir = await runNativePicker(
+        () => getDirectoryPath(confirmButtonText: 'Select export folder'),
       );
       if (dir != null && mounted) {
         setState(() {
@@ -318,13 +299,6 @@ class _ExportScreenState extends State<ExportScreen> {
       }
     } finally {
       _pickingFolder = false;
-      if (wasFullscreen) {
-        try {
-          await windowManager.setFullScreen(true);
-        } catch (_) {
-          /* best-effort */
-        }
-      }
     }
   }
 
