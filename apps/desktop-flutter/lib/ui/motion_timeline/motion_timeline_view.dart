@@ -50,6 +50,7 @@ class MotionTimelineView extends StatefulWidget {
     this.onLiveSeek,
     this.onCommitSeek,
     this.onZoomChanged,
+    this.onExportSelection,
     this.height = 66,
   });
 
@@ -78,6 +79,11 @@ class MotionTimelineView extends StatefulWidget {
   /// Fired after a wheel-zoom changes the window span.
   final VoidCallback? onZoomChanged;
 
+  /// Fired when the user picks "Add clip to export list" from the timeline's
+  /// right-click menu (a range is selected). The host hands the current
+  /// [timeline] selection off to the Export tab.
+  final VoidCallback? onExportSelection;
+
   final double height;
 
   @override
@@ -98,9 +104,23 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
   Timer? _liveSeekTimer;
   DateTime _lastLiveSeek = DateTime.fromMillisecondsSinceEpoch(0);
 
-  // Shift+drag = export range selection (instead of pan).
+  // Shift+drag OR right-drag = export range selection (instead of pan).
   bool _selecting = false;
   int? _selAnchorMs;
+
+  // The press that started the current drag used the secondary (right) button —
+  // on release it pops the export context menu.
+  bool _secondaryPress = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Pick up any persisted per-camera color overrides so the legend swatches
+    // and motion ribbons show the operator's chosen colors.
+    loadCameraColorOverrides().then((_) {
+      if (mounted) setState(() {});
+    });
+  }
 
   @override
   void dispose() {
@@ -136,7 +156,9 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
   void _onPointerDown(PointerDownEvent e) {
     _dragging = true;
     _isPan = false;
-    if (HardwareKeyboard.instance.isShiftPressed) {
+    _secondaryPress = e.buttons == kSecondaryButton;
+    // Right-drag (like Shift+drag) selects an export range instead of panning.
+    if (_secondaryPress || HardwareKeyboard.instance.isShiftPressed) {
       _selecting = true;
       _selAnchorMs = _xToTime(e.localPosition.dx).millisecondsSinceEpoch;
       widget.timeline.setSelection(_selAnchorMs, _selAnchorMs);
@@ -191,9 +213,14 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     _dragging = false;
     if (_selecting) {
       _selecting = false;
+      final wasSecondary = _secondaryPress;
+      _secondaryPress = false;
       if (!widget.timeline.hasSelection) widget.timeline.clearSelection();
+      // A right-click (with or without a drag) pops the export context menu.
+      if (wasSecondary) _showTimelineMenu(e.position);
       return;
     }
+    _secondaryPress = false;
     _liveSeekTimer?.cancel();
     _liveSeekTimer = null;
     if (_isPan) {
@@ -210,6 +237,61 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     if (e is PointerScrollEvent) {
       final direction = e.scrollDelta.dy > 0 ? 1 : -1;
       if (widget.timeline.zoomStep(direction)) widget.onZoomChanged?.call();
+    }
+  }
+
+  /// Right-click menu on the scrubber: turn the just-drawn selection into an
+  /// export clip, or clear it. When nothing is selected it shows the how-to
+  /// hint (right-drag to select) so the affordance is discoverable.
+  Future<void> _showTimelineMenu(Offset globalPos) async {
+    if (!mounted) return;
+    final hasSel = widget.timeline.hasSelection;
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        globalPos.dx,
+        globalPos.dy,
+        globalPos.dx,
+        globalPos.dy,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'export',
+          enabled: hasSel && widget.onExportSelection != null,
+          child: const Row(
+            children: [
+              Icon(Icons.playlist_add, size: 16),
+              SizedBox(width: 8),
+              Text('Add clip to export list'),
+            ],
+          ),
+        ),
+        PopupMenuItem<String>(
+          value: 'clear',
+          enabled: hasSel,
+          child: const Row(
+            children: [
+              Icon(Icons.clear, size: 16),
+              SizedBox(width: 8),
+              Text('Clear selection'),
+            ],
+          ),
+        ),
+        if (!hasSel)
+          const PopupMenuItem<String>(
+            enabled: false,
+            child: Text(
+              'Right-drag to select an export range',
+              style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic),
+            ),
+          ),
+      ],
+    );
+    if (!mounted) return;
+    if (choice == 'export') {
+      widget.onExportSelection?.call();
+    } else if (choice == 'clear') {
+      widget.timeline.clearSelection();
     }
   }
 
@@ -270,10 +352,93 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
           // Legend under the scrubber (in the dead space below it), not above.
           const SizedBox(height: 2),
           _buildLegend(),
+          _buildHints(),
           if (widget.motion.error != null) _buildError(),
         ],
       ),
     );
+  }
+
+  /// Faint usage hints in the strip's bottom dead space (mirrors the Android
+  /// client's affordance captions) — advertises the non-obvious right-click
+  /// gestures so the operator can discover export-select and per-camera color.
+  Widget _buildHints() {
+    final c = Theme.of(context)
+        .colorScheme
+        .onSurfaceVariant
+        .withValues(alpha: 0.6);
+    return Padding(
+      padding: const EdgeInsets.only(top: 2),
+      child: DefaultTextStyle(
+        style: TextStyle(fontSize: 10, color: c),
+        child: const Wrap(
+          spacing: 14,
+          runSpacing: 1,
+          children: [
+            Text('Right-drag: select export range'),
+            Text('Scroll: zoom'),
+            Text('Right-click a camera dot: change color'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Palette color picker for a camera's motion color (right-click a legend
+  /// swatch). Persists the choice via the camera-color override store and
+  /// repaints so the ribbons + swatch update immediately.
+  Future<void> _pickCameraColor(String cameraId) async {
+    final current = cameraMotionColor(cameraId);
+    final overridden = hasCameraColorOverride(cameraId);
+    final chosen = await showDialog<Object?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Color for ${_nameFor(cameraId)}'),
+        content: Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            for (final color in kCameraColorPalette)
+              InkWell(
+                onTap: () => Navigator.pop(ctx, color),
+                customBorder: const CircleBorder(),
+                child: Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: color,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: color == current
+                          ? Colors.white
+                          : Colors.transparent,
+                      width: 2,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+        actions: [
+          if (overridden)
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'reset'),
+              child: const Text('Reset to default'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (chosen == null) return;
+    if (chosen == 'reset') {
+      await setCameraColorOverride(cameraId, null);
+    } else if (chosen is Color) {
+      await setCameraColorOverride(cameraId, chosen);
+    }
+    if (mounted) setState(() {});
   }
 
   /// Legend: the color→camera key for every camera with a loaded motion series,
@@ -298,21 +463,28 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
       children: [
         for (final e in shown)
           Tooltip(
-            message: 'Motion band color for ${e.value}',
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  margin: const EdgeInsets.only(right: 4),
-                  decoration: BoxDecoration(
-                    color: cameraMotionColor(e.key),
-                    shape: BoxShape.circle,
-                  ),
+            message: 'Motion color for ${e.value} — right-click to change',
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                // Right-click a legend swatch to recolor that camera.
+                onSecondaryTap: () => _pickCameraColor(e.key),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      margin: const EdgeInsets.only(right: 4),
+                      decoration: BoxDecoration(
+                        color: cameraMotionColor(e.key),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    Text(e.value, style: Theme.of(context).textTheme.labelSmall),
+                  ],
                 ),
-                Text(e.value, style: Theme.of(context).textTheme.labelSmall),
-              ],
+              ),
             ),
           ),
         if (extra > 0)

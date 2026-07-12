@@ -5,7 +5,10 @@
 // order. Shared by the motion ribbons, the legend, and the hover hint so the
 // three can never drift apart.
 
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// A hand-picked, well-separated 12-color palette (not a raw hash->hue) so
 /// adjacent indices never land on muddy/near-identical hues on a dark
@@ -39,12 +42,64 @@ int fnv1a32(String str) {
 
 final Map<String, Color> _cache = {};
 
-/// Stable color for a camera id. Cached (the hash is deterministic anyway;
-/// caching just avoids recomputing on every paint).
+// ── user color overrides ────────────────────────────────────────────────────
+// The operator can right-click a camera in the timeline legend to pick its
+// motion color. Overrides win over the deterministic palette color and are
+// persisted per-camera (client-only, like the old client's per-device prefs).
+
+const String _kOverridesKey = 'crumb_cam_colors';
+final Map<String, Color> _overrides = {};
+bool _overridesLoaded = false;
+
+/// Load persisted per-camera color overrides once. Safe to call repeatedly.
+/// Degrades to in-memory-only if `shared_preferences` isn't available.
+Future<void> loadCameraColorOverrides() async {
+  if (_overridesLoaded) return;
+  _overridesLoaded = true;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kOverridesKey);
+    if (raw == null || raw.isEmpty) return;
+    final map = jsonDecode(raw) as Map<String, dynamic>;
+    map.forEach((k, v) {
+      if (v is int) _overrides[k] = Color(v);
+    });
+  } catch (_) {
+    // in-memory only for this session
+  }
+}
+
+/// Set (or clear, when [color] is null) a camera's motion-color override and
+/// persist the full map. The next [cameraMotionColor] call reflects it.
+Future<void> setCameraColorOverride(String cameraId, Color? color) async {
+  if (color == null) {
+    _overrides.remove(cameraId);
+  } else {
+    _overrides[cameraId] = color;
+  }
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final map = {
+      for (final e in _overrides.entries) e.key: e.value.toARGB32(),
+    };
+    await prefs.setString(_kOverridesKey, jsonEncode(map));
+  } catch (_) {
+    // persistence best-effort; the override still applies in-memory
+  }
+}
+
+/// True if [cameraId] has a user color override (vs the derived palette color).
+bool hasCameraColorOverride(String cameraId) => _overrides.containsKey(cameraId);
+
+/// Stable color for a camera id: a user override if set, else the deterministic
+/// palette color (cached — the hash is deterministic anyway; caching just
+/// avoids recomputing on every paint).
 Color cameraMotionColor(String? cameraId) {
   if (cameraId == null || cameraId.isEmpty) {
     return const Color(0x804C9AFF); // faded fallback, matches TL.MOTION_FADED intent
   }
+  final override = _overrides[cameraId];
+  if (override != null) return override;
   return _cache.putIfAbsent(
     cameraId,
     () => kCameraColorPalette[fnv1a32(cameraId) % kCameraColorPalette.length],

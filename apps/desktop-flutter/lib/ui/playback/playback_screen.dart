@@ -1029,8 +1029,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
           if (_timeline.hasSelection) _buildExportSelectionBar(),
           // The single playback timeline: motion intensity + detection glyphs +
           // a thin recording-coverage line at the bottom, and the scrub surface
-          // itself — drag = pan, click = seek, wheel = zoom, Shift+drag =
-          // export range. (Replaces the old separate bottom scrubber bar.)
+          // itself — drag = pan, click = seek, wheel = zoom, right-drag or
+          // Shift+drag = export range (right-click menu → add clip to export
+          // list). (Replaces the old separate bottom scrubber bar.)
           MotionTimelineView(
             motion: _motion,
             timeline: _timeline,
@@ -1039,6 +1040,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onLiveSeek: _liveSeek,
             onCommitSeek: _commitSeek,
             onZoomChanged: _onZoomChanged,
+            onExportSelection: _exportSelection,
           ),
         ],
       ),
