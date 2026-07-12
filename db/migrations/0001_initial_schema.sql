@@ -2,11 +2,16 @@
 -- Source of truth: docs/00-architecture.md ("Data model"). PostgreSQL 14+.
 -- gen_random_uuid() is in core since PG13. Applied automatically by the postgres
 -- container on first init (mounted at /docker-entrypoint-initdb.d).
+--
+-- Every CREATE here is IF NOT EXISTS: the migration runner's crash-recovery
+-- contract is that a file may be re-applied if the process died after applying
+-- it but before recording it in schema_migrations, so it must be idempotent
+-- (exactly like 0002+).
 
 BEGIN;
 
 -- Dumb named locations. All policy lives on the camera, NOT here.
-CREATE TABLE storages (
+CREATE TABLE IF NOT EXISTS storages (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name        text NOT NULL UNIQUE,          -- human label, e.g. "NVMe-Live", "NAS-Archive"
                                                -- UNIQUE required: seed is idempotent via ON CONFLICT(name)
@@ -17,7 +22,7 @@ CREATE TABLE storages (
 
 -- The GLOBAL DEFAULT lives here as a single row (is_default=true). Each camera
 -- gets its own policy row cloned from the default, with individual fields overridden.
-CREATE TABLE recording_policies (
+CREATE TABLE IF NOT EXISTS recording_policies (
     id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     is_default              boolean NOT NULL DEFAULT false,
     mode                    text    NOT NULL DEFAULT 'continuous'
@@ -39,9 +44,9 @@ CREATE TABLE recording_policies (
 );
 
 -- Enforce exactly one default policy row.
-CREATE UNIQUE INDEX one_default_policy ON recording_policies (is_default) WHERE is_default;
+CREATE UNIQUE INDEX IF NOT EXISTS one_default_policy ON recording_policies (is_default) WHERE is_default;
 
-CREATE TABLE cameras (
+CREATE TABLE IF NOT EXISTS cameras (
     id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name         text NOT NULL,
     enabled      boolean NOT NULL DEFAULT true,
@@ -57,7 +62,7 @@ CREATE TABLE cameras (
 
 -- THE INDEX. One row per recorded fMP4 segment. Single source of truth for
 -- playback/timeline/export/archive. Moving a file = updating storage_id + path here.
-CREATE TABLE segments (
+CREATE TABLE IF NOT EXISTS segments (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     camera_id   uuid NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
     storage_id  uuid NOT NULL REFERENCES storages(id),   -- current location; updated on archive move
@@ -72,10 +77,10 @@ CREATE TABLE segments (
 );
 
 -- (camera_id, start_ts) is critical for fast seek.
-CREATE INDEX segments_camera_start       ON segments (camera_id, start_ts);
-CREATE INDEX segments_camera_stage_start ON segments (camera_id, stage, start_ts);
+CREATE INDEX IF NOT EXISTS segments_camera_start       ON segments (camera_id, start_ts);
+CREATE INDEX IF NOT EXISTS segments_camera_stage_start ON segments (camera_id, stage, start_ts);
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     username      text NOT NULL UNIQUE,
     password_hash text NOT NULL,
@@ -86,7 +91,7 @@ CREATE TABLE users (
 -- ---------------------------------------------------------------------------
 -- PHASE 2 stubs — seams only, no logic in v1 (see docs/00-architecture.md).
 -- ---------------------------------------------------------------------------
-CREATE TABLE events (                          -- Frigate event markers
+CREATE TABLE IF NOT EXISTS events (            -- Frigate event markers
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     camera_id  uuid REFERENCES cameras(id) ON DELETE CASCADE,
     ts         timestamptz NOT NULL,
@@ -94,21 +99,21 @@ CREATE TABLE events (                          -- Frigate event markers
     score      real,
     thumb_path text
 );
-CREATE TABLE bookmarks (
+CREATE TABLE IF NOT EXISTS bookmarks (
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     camera_id  uuid REFERENCES cameras(id) ON DELETE CASCADE,
     ts         timestamptz NOT NULL,
     note       text,
     created_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE TABLE evidence_locks (
+CREATE TABLE IF NOT EXISTS evidence_locks (
     id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     camera_id uuid REFERENCES cameras(id) ON DELETE CASCADE,
     start_ts  timestamptz NOT NULL,
     end_ts    timestamptz NOT NULL,
     reason    text
 );
-CREATE TABLE smart_search_results (
+CREATE TABLE IF NOT EXISTS smart_search_results (
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     camera_id  uuid REFERENCES cameras(id) ON DELETE CASCADE,
     ts         timestamptz NOT NULL,

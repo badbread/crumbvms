@@ -61,7 +61,9 @@ BEGIN
     SELECT c.conname INTO v_conname
     FROM pg_constraint c
     JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_namespace nsp ON nsp.oid = t.relnamespace
     WHERE t.relname = 'storage_migrations'
+      AND nsp.nspname = current_schema()
       AND c.contype = 'c'
       AND pg_get_constraintdef(c.oid) LIKE '%pending%'
       AND pg_get_constraintdef(c.oid) LIKE '%running%'
