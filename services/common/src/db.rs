@@ -10296,22 +10296,42 @@ mod tests {
             .get(0);
         assert!(still_present_before, "fixture setup: index should exist");
 
-        reap_invalid_indexes(&client)
+        // De-flake under `cargo test --workspace`: this test races ~16 parallel
+        // DDL-heavy tests on a single Postgres, so a reap pass can hit transient
+        // contention and (correctly, safe-direction) SKIP the drop that pass.
+        // The production reaper runs on EVERY boot, so the real contract is
+        // "drops within a few passes", not "drops on the very first". Use a short
+        // per-attempt lock_timeout so a contended pass fails fast instead of
+        // stalling, and retry the idempotent reap until the index is gone.
+        // (Disabling autovacuum on the fixture table above was not enough on its
+        // own — the remaining contention is catalog-wide from the parallel DDL.)
+        client
+            .batch_execute("SET lock_timeout = '1s'")
             .await
-            .expect("reap_invalid_indexes");
+            .expect("shorten lock_timeout for the reap retries");
 
-        let still_present_after: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
-                &[],
-            )
-            .await
-            .expect("check index exists after reap")
-            .get(0);
+        let mut still_present_after = true;
+        for _ in 0..40 {
+            reap_invalid_indexes(&client)
+                .await
+                .expect("reap_invalid_indexes");
+            still_present_after = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                    &[],
+                )
+                .await
+                .expect("check index exists after reap")
+                .get(0);
+            if !still_present_after {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         assert!(
             !still_present_after,
-            "reap_invalid_indexes must DROP an INVALID index so a later \
-             CREATE INDEX IF NOT EXISTS rebuilds it"
+            "reap_invalid_indexes must DROP an INVALID index (within a few \
+             passes) so a later CREATE INDEX IF NOT EXISTS rebuilds it"
         );
 
         // A VALID index must be left completely alone.
