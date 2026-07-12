@@ -50,6 +50,7 @@ class PlaybackScreen extends StatefulWidget {
     this.initialTime,
     this.initialMaximizedCameraId,
     this.onExitFocus,
+    this.onMotionController,
   });
 
   final CrumbApi api;
@@ -88,6 +89,15 @@ class PlaybackScreen extends StatefulWidget {
   /// so the maximize-toggle (double-click / Esc) calls this to hand control
   /// back to the opener instead of un-maximizing into a 1-up grid.
   final VoidCallback? onExitFocus;
+
+  /// Reports this screen's motion timeline controller to the host so it can
+  /// render the camera-color legend + timeline hints inside the app's bottom
+  /// status bar (rather than an extra strip here). Called `(controller, true)`
+  /// on entry and `(controller, false)` on dispose; the host stores it on
+  /// register and clears only on a matching unregister (a keyed remount inits
+  /// the new controller before the old one disposes).
+  final void Function(MotionTimelineController controller, bool active)?
+  onMotionController;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -183,6 +193,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   @override
   void initState() {
     super.initState();
+    // Hand our motion controller to the host so it can render the legend +
+    // hints in the app's bottom status bar (set here, cleared in dispose).
+    widget.onMotionController?.call(_motion, true);
     for (final c in _cameras) {
       _panes[c.id] = GaplessSegmentPaneController(
         api: widget.api,
@@ -246,6 +259,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _idleTimer?.cancel();
     _motionDebounce?.cancel();
     _timeline.removeListener(_onTimelineChanged);
+    // Drop the host's reference to our motion controller before disposing it,
+    // so the status-bar legend never reads a disposed controller.
+    widget.onMotionController?.call(_motion, false);
     for (final p in _panes.values) {
       p.dispose();
     }

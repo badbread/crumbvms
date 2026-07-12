@@ -13,9 +13,15 @@ import 'package:flutter/material.dart';
 import 'status_bar_controller.dart';
 
 class StatusBar extends StatelessWidget {
-  const StatusBar({super.key, required this.controller});
+  const StatusBar({super.key, required this.controller, this.leading});
 
   final StatusBarController controller;
+
+  /// Optional widget that takes the left side of the bar in place of the plain
+  /// [StatusBarController.message] text — e.g. the Playback tab's camera-color
+  /// legend + timeline hints, so those live in this one gray bar rather than an
+  /// extra strip. Null → show the message text as usual.
+  final Widget? leading;
 
   @override
   Widget build(BuildContext context) {
@@ -29,15 +35,19 @@ class StatusBar extends StatelessWidget {
           color: theme.colorScheme.surfaceContainerHighest,
           child: Row(
             children: [
+              // A screen-provided widget (e.g. the Playback legend + hints)
+              // takes the left side in place of the plain message text, so it
+              // lives in this one gray bar rather than an extra strip above.
               Expanded(
-                child: Text(
-                  controller.message,
-                  overflow: TextOverflow.ellipsis,
-                  maxLines: 1,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
+                child: leading ??
+                    Text(
+                      controller.message,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
               ),
               if (controller.viewLabel.isNotEmpty) ...[
                 const SizedBox(width: 12),

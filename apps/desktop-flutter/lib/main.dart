@@ -45,6 +45,8 @@ import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
 import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/login_screen.dart';
 import 'package:crumb_desktop/ui/motion_tuner/motion_tuner_screen.dart';
+import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
+import 'package:crumb_desktop/ui/motion_timeline/playback_legend_bar.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar_controller.dart';
 import 'package:crumb_desktop/ui/playback/playback_screen.dart';
@@ -420,6 +422,11 @@ class _MainShellState extends State<MainShell> {
   /// camera (maximized), not the multi-window view. Cleared on manual tab nav.
   String? _playbackFocusCameraId;
 
+  /// The active Playback screen's motion controller, reported up so the bottom
+  /// status bar can render that tab's camera-color legend + timeline hints
+  /// (see [PlaybackLegendBar]). Registered on Playback entry, cleared on exit.
+  MotionTimelineController? _playbackMotion;
+
   /// The clip whose "View on timeline" opened the current Playback focus.
   /// Leaving that focus view (double-click / Esc) returns to the Clips tab
   /// with this clip's player reopened — back to the box that opened it, since
@@ -608,7 +615,18 @@ class _MainShellState extends State<MainShell> {
                   ],
                 ),
               ),
-              if (!chromeHidden) StatusBar(controller: widget.statusBar),
+              if (!chromeHidden)
+                StatusBar(
+                  controller: widget.statusBar,
+                  // On Playback, the camera-color legend + timeline hints live
+                  // in this gray bar (no extra strip under the timeline).
+                  leading: (_index == _playbackIndex && _playbackMotion != null)
+                      ? PlaybackLegendBar(
+                          motion: _playbackMotion!,
+                          cameras: widget.cameras,
+                        )
+                      : null,
+                ),
             ],
           );
         },
@@ -919,6 +937,16 @@ class _MainShellState extends State<MainShell> {
           // (and Esc, via the handler above) goes back to the Clips box that
           // opened it, not to a live view the camera may not even be in.
           onExitFocus: _playbackFocusCameraId == null ? null : _returnToClips,
+          // Report the motion controller so the bottom status bar can host the
+          // legend + hints. Store on register; clear only on a matching
+          // unregister (a keyed remount inits the new one before old disposes).
+          onMotionController: (c, active) {
+            if (active) {
+              _playbackMotion = c;
+            } else if (identical(_playbackMotion, c)) {
+              _playbackMotion = null;
+            }
+          },
           // Number-key hotkeys load a camera's timeline in playback.
           hotkeys: widget.hotkeys,
           // "Add clip to export list" → APPEND to the batch (don't replace) and
