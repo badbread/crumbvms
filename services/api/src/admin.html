@@ -140,6 +140,28 @@ body.embedded .topbar{display:none;}
 .tree-group-cams.collapsed{display:none;}
 .tree-group-cams .tree-row{padding-left:30px;}
 .tree-empty{padding:6px 14px;font-size:12px;color:var(--dim2);font-style:italic;}
+/* ── Rail: grouped section nav (Frigate-style). Sections only — the content
+   pane shows each section's list/detail, so the rail carries no nested items. */
+.rail-eyebrow{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim2);font-weight:600;padding:14px 12px 5px;}
+.rail-eyebrow:first-child{padding-top:4px;}
+.tree-root-head .tw-count{margin-left:auto;font:600 11px/1 ui-monospace,monospace;color:var(--dim2);background:var(--surface2);padding:3px 7px;border-radius:999px;font-variant-numeric:tabular-nums;}
+.tree-root-head.selected .tw-count{color:var(--accent);background:rgba(232,163,61,.14);}
+/* ── Content-list views (section = header + stat tiles + list table → detail) ── */
+.stat-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:12px;margin-bottom:18px;}
+.stat-tile{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:13px 15px;}
+.stat-tile .st-k{font-size:11.5px;color:var(--dim);display:flex;align-items:center;gap:7px;font-weight:500;}
+.stat-tile .st-k svg{width:14px;height:14px;color:var(--dim2);flex:none;}
+.stat-tile .st-v{font:650 23px/1.1 "Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums;margin-top:8px;letter-spacing:-.02em;}
+.stat-tile .st-v small{font-size:13px;color:var(--dim);font-weight:500;letter-spacing:0;}
+.stat-tile .st-t{font-size:11.5px;margin-top:5px;color:var(--dim2);}
+.stat-tile .st-t.ok{color:var(--ok);} .stat-tile .st-t.warn{color:var(--warn);}
+.rp-back{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--dim);background:none;border:none;min-height:0;padding:2px 0;margin-bottom:4px;cursor:pointer;font-weight:500;}
+.rp-back:hover{color:var(--accent);background:none;border:none;}
+table.list-tbl tbody tr{cursor:pointer;}
+.lt-name{display:flex;align-items:center;gap:11px;min-width:0;}
+.lt-name .lt-ico{width:20px;color:var(--dim2);display:flex;flex-shrink:0;justify-content:center;}
+.lt-name .lt-main{font-weight:600;overflow:hidden;text-overflow:ellipsis;}
+.lt-name .lt-sub{font-size:11.5px;color:var(--dim2);margin-top:1px;}
 /* ── Right-pane header → slim sticky toolbar strip ──
    Title (small) on the left, the pane's action buttons on the right. When the
    header is a DIRECT child of the scrolling right-pane it pins to the top
@@ -3704,6 +3726,8 @@ function routeFor() {
   if (selKind === 'role' && selId)    return '/security/roles/' + selId;
   if (selKind === 'cameras-root')     return '/cameras';
   if (selKind === 'add-camera')       return '/cameras/add';
+  if (selKind === 'profiles-root')    return '/recording';
+  if (selKind === 'security-root')    return '/security';
   if (selKind === 'storage-root')     return '/storage';
   if (selKind === 'detection-root')   return '/detection';
   if (selKind === 'notifications-root') return '/notifications';
@@ -3747,8 +3771,7 @@ function routeApply(r) {
     if (sec === 'recording') {
       const p = parts[1] ? profileById(parts[1]) : null;
       if (p) return select('profile', p.id);
-      const first = allProfiles()[0];
-      return first ? select('profile', first.id) : selectNone();
+      return select('profiles-root');
     }
     if (sec === 'storage') {
       if (parts[1] && STORAGES.find(s => s.id === parts[1])) return select('storage', parts[1]);
@@ -3757,7 +3780,7 @@ function routeApply(r) {
     if (sec === 'security') {
       if (parts[1] === 'users' && USERS.find(u => u.id === parts[2])) return select('user', parts[2]);
       if (parts[1] === 'roles' && ROLES.find(x => x.id === parts[2])) return select('role', parts[2]);
-      return selectNone();
+      return select('security-root');
     }
     if (sec === 'detection')     return select('detection-root');
     if (sec === 'notifications') return select('notifications-root');
@@ -3797,11 +3820,8 @@ function restoreSelection() {
   } else if (selKind === 'add-camera') {
     renderAddCamera(); renderBottom(); routeWrite(); return;
   }
-  // Nothing valid selected.
-  selKind = null; selId = null;
-  renderWelcome();
-  renderBottom();
-  routeWrite();
+  // Nothing valid selected → land on the Cameras list (the default section).
+  return select('cameras-root');
 }
 
 /* Valid camera tabs for the current context, Motion is dropped when embedded in
@@ -3855,61 +3875,35 @@ function treeKey(ev, el) {
   }
 }
 
+/* Sections-only rail (Frigate model): the rail carries just the seven sections,
+   grouped under three eyebrows. Selecting a section renders its list/detail in
+   the content pane — cameras, profiles, storages, users are NO LONGER nested in
+   the rail; they live in each section's content view. Active state highlights
+   the section whose family (root OR any item under it) is currently open. */
 function renderTree() {
-  const camRows = renderCameraTreeRows();
-  const profRows = allProfiles().map(p => {
-    const isDef = !!p.is_default;
-    return `<div class="tree-row ${selKind==='profile'&&selId===p.id?'selected':''}" role="button" tabindex="0" onclick="select('profile','${p.id}')" onkeydown="treeKey(event,this)" title="${esc(p.name || 'Default')}">
-      <span class="tr-icon">${icon(isDef?'star':'profiles',14)}</span>
-      <span class="tr-label">${esc(p.name || 'Default')}</span>
-    </div>`;
-  }).join('') || `<div class="tree-empty">No profiles</div>`;
-
-  const stRows = (STORAGES.length
-    ? STORAGES.map(s => `<div class="tree-row ${selKind==='storage'&&selId===s.id?'selected':''}" role="button" tabindex="0" onclick="select('storage','${s.id}')" onkeydown="treeKey(event,this)" title="${esc(s.name)}">
-        <span class="tr-icon">${icon(storageIcon(s.name, s.icon),14)}</span>
-        <span class="tr-label">${esc(s.name)}</span>
-      </div>`).join('')
-    : `<div class="tree-empty" onclick="select('storage-root')" style="cursor:pointer">No locations, click to add</div>`);
-
-  // Users & security: one section, ROLES listed first (the reusable thing), then
-  // USERS (the instances), each under a small labelled sub-heading (§5e). No
-  // separate top-level Roles/Users roots any more (S5/S9).
-  const roleRows = (ROLES.length
-    ? ROLES.map(r => `<div class="tree-row ${selKind==='role'&&selId===r.id?'selected':''}" role="button" tabindex="0" onclick="select('role','${r.id}')" onkeydown="treeKey(event,this)" title="${esc(r.name)}">
-        <span class="tr-icon">${icon(r.is_admin?'shield':'roles',14)}</span>
-        <span class="tr-label">${esc(r.name)}</span>
-      </div>`).join('')
-    : `<div class="tree-empty">No roles</div>`);
-
-  const userRows = (USERS.length
-    ? USERS.map(u => {
-        const roleObj = ROLES.find(r => r.id === u.role_id);
-        const sublabel = u.role === 'admin' ? 'Administrator' : (roleObj ? esc(roleObj.name) : 'No role');
-        return `<div class="tree-row ${selKind==='user'&&selId===u.id?'selected':''}" role="button" tabindex="0" onclick="select('user','${u.id}')" onkeydown="treeKey(event,this)" title="${esc(u.username)}, ${sublabel}">
-        <span class="tr-icon">${icon(u.role==='admin'?'shield':'user',14)}</span>
-        <span class="tr-label">${esc(u.username)}</span>
-      </div>`;
-      }).join('')
-    : `<div class="tree-empty">No users</div>`);
-
-  // Combined "Users & security" children: a Roles sub-group (with its own + add)
-  // above a Users sub-group (with its own + add), so the two concepts stay
-  // distinct inside one section.
-  const securityRows =
-    subHead('Roles', `newRole()`) + roleRows +
-    subHead('Users', `newUser()`) + userRows;
-
-  // Six workflow-ordered sections + a Server leaf last (§4.1):
-  //  Cameras · Recording · Storage · Detection & clips · Notifications · Users & security  (· Server)
+  const camActive = ['cameras-root','camera','group','add-camera'].includes(selKind);
+  const recActive = ['profiles-root','profile'].includes(selKind);
+  const stoActive = ['storage-root','storage'].includes(selKind);
+  const detActive = selKind === 'detection-root';
+  const notActive = selKind === 'notifications-root';
+  const secActive = ['security-root','user','role'].includes(selKind);
+  const srvActive = selKind === 'server-root';
+  const item = (onclick, ic, label, active, count) => {
+    const badge = (count != null) ? `<span class="tw-count">${count}</span>` : '';
+    return `<div class="tree-root"><div class="tree-root-head leaf ${active?'selected':''}" role="button" tabindex="0" onclick="${onclick}" onkeydown="treeKey(event,this)">
+      <span class="tw-icon">${ic}</span><span class="tw-label">${label}</span>${badge}</div></div>`;
+  };
   $('tree-pane').innerHTML =
-    root('cameras', icon('cameras',15), 'Cameras', camRows, "select('cameras-root')", `newCamera()`, selKind==='cameras-root') +
-    root('profiles', icon('profiles',15), 'Recording', profRows, null, `newProfile()`, false) +
-    root('storages', icon('storage',15), 'Storage', stRows, "select('storage-root')", `select('storage-root')`, selKind==='storage-root') +
-    leafRoot('detection-root', icon('integration',15), 'Detection &amp; clips', selKind==='detection-root') +
-    leafRoot('notifications-root', icon('bell',15), 'Notifications', selKind==='notifications-root') +
-    root('security', icon('shield',15), 'Users &amp; security', securityRows, null, null, false) +
-    leafRoot('server-root', icon('storage',15), 'Server', selKind==='server-root');
+    `<div class="rail-eyebrow">Configure</div>` +
+    item("select('cameras-root')",  icon('cameras',17),     'Cameras',            camActive, CAMS.length) +
+    item("select('profiles-root')", icon('profiles',17),    'Recording',          recActive, allProfiles().length) +
+    item("select('storage-root')",  icon('storage',17),     'Storage',            stoActive, STORAGES.length) +
+    `<div class="rail-eyebrow">Intelligence</div>` +
+    item("select('detection-root')",     icon('integration',17), 'Detection &amp; clips', detActive, null) +
+    item("select('notifications-root')",  icon('bell',17),        'Notifications',        notActive, null) +
+    `<div class="rail-eyebrow">Administer</div>` +
+    item("select('security-root')", icon('shield',17),      'Users &amp; security', secActive, USERS.length) +
+    item("select('server-root')",   icon('storage',17),     'Server',               srvActive, null);
 }
 
 /* A small labelled divider inside a section's children (e.g. "Roles" / "Users"
@@ -3993,9 +3987,11 @@ function camRow(c) {
 function renderWelcome() {
   if (selKind === 'cameras-root') return renderCamerasRoot();
   if (selKind === 'storage-root') return renderStorageRoot();
+  if (selKind === 'profiles-root') return renderRecordingRoot();
+  if (selKind === 'security-root') return renderSecurityRoot();
   $('right-pane').innerHTML = `<div class="empty-state" style="padding-top:80px">
     <div class="empty-icon">${icon('cameras',40)}</div>
-    <p>Select an item from the tree on the left to view and edit it.</p>
+    <p>Select a section on the left to get started.</p>
     <p style="margin-top:12px">
       <button class="primary sm" onclick="newCamera()">+ Add camera</button>
       <button class="ghost sm" onclick="newCamera()" title="Discover cameras from the Add-camera pane">Scan network</button>
@@ -4003,37 +3999,120 @@ function renderWelcome() {
   </div>`;
 }
 function renderCamerasRoot() {
+  const byName = (a,b)=>(a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
   const total = CAMS.length, rec = CAMS.filter(c => c.enabled).length;
+  const groupCount = (GROUPS||[]).length;
+  const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).length;
+  const camBody = CAMS.slice().sort(byName).map(c => {
+    const g = groupOfCamera(c.id);
+    const model = (c.model || c.make) ? esc(c.model || c.make) : '<span style="color:var(--dim2)">—</span>';
+    const type = esc(c.camera_type || 'other');
+    const status = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
+    return `<tr onclick="select('camera','${c.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div></td>
+      <td>${g ? esc(g.name) : '<span style="color:var(--dim2)">Ungrouped</span>'}</td>
+      <td>${model}</td>
+      <td>${status}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="4" style="color:var(--dim2);padding:20px;text-align:center">No cameras yet — click “Add camera” to get started.</td></tr>`;
+
+  const groupBody = (GROUPS||[]).slice().sort(byName).map(g => {
+    const gp = g.policy_id ? profileById(g.policy_id) : null;
+    const n = (g.camera_ids||[]).length;
+    return `<tr onclick="select('group','${g.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon('group',18)}</span><div class="lt-main">${esc(g.name)}</div></div></td>
+      <td>${gp ? esc(gp.name) : 'Default'}</td>
+      <td>${n} camera${n!==1?'s':''}</td>
+    </tr>`;
+  }).join('');
+
+  const tile = (ic, k, v) => `<div class="stat-tile"><div class="st-k">${icon(ic,14)} ${k}</div><div class="st-v">${v}</div></div>`;
+
   $('right-pane').innerHTML = `
     <div class="rp-head">
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('cameras',22)}</span>
         <div class="rp-head-titles">
           <div class="rp-head-title">Cameras</div>
-          <div class="rp-head-sub">${total} total · ${rec} recording</div>
+          <div class="rp-head-sub">Add, tune, and monitor every camera Crumb records</div>
         </div>
       </div>
       <div class="rp-head-actions">
-        <button class="primary sm" onclick="newCamera()">+ Add camera</button>
-        <button class="ghost sm" onclick="newGroup()">+ New group</button>
         <button class="ghost sm" onclick="newCamera()" title="Discover cameras from the Add-camera pane">Scan network</button>
+        <button class="primary sm" onclick="newCamera()">+ Add camera</button>
       </div>
     </div>
-    <div class="card-hint">Pick a camera in the tree to edit it, or add a new one. Cameras can be organized into groups; a group inherits a recording profile that its cameras use unless individually overridden.</div>
-
-    <div class="policy-section">
-      <div class="policy-section-title">Camera groups</div>
-      ${(GROUPS||[]).length ? `<div style="display:flex;flex-direction:column;gap:4px">` + (GROUPS||[]).slice().sort((a,b)=>(a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase())).map(g => {
-        const gp = g.policy_id ? profileById(g.policy_id) : null;
-        const n = (g.camera_ids||[]).length;
-        return `<div class="tree-row" role="button" tabindex="0" onclick="select('group','${g.id}')" onkeydown="treeKey(event,this)">
-          <span class="tr-icon">${icon('group',14)}</span>
-          <span class="tr-label">${esc(g.name)}</span>
-          <span class="tr-meta" style="margin-left:auto;color:var(--dim2)">${gp?esc(gp.name):'Default'}</span>
-          <span class="tr-meta" style="margin-left:8px">${n} cam${n!==1?'s':''}</span>
-        </div>`;
-      }).join('') + `</div>` : '<div style="color:var(--dim2);font-size:12px">No groups yet. Create one to assign a shared recording profile to several cameras at once.</div>'}
-      <div style="margin-top:10px"><button class="ghost sm" onclick="newGroup()">+ New group</button></div>
+    <div class="stat-tiles">
+      ${tile('cameras','Cameras',total)}
+      ${tile('profiles','Recording',`${rec}<small> / ${total}</small>`)}
+      ${tile('group','Groups',groupCount)}
+      ${tile('cameras','Ungrouped',ungrouped)}
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)">
+        <div class="card-title">All cameras</div>
+      </div>
+      <div class="table-wrap">
+        <table class="list-tbl"><thead><tr><th>Camera</th><th>Group</th><th>Model</th><th>Recording</th></tr></thead>
+        <tbody>${camBody}</tbody></table>
+      </div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title">Camera groups</div>
+        <button class="ghost sm" onclick="newGroup()">+ New group</button>
+      </div>
+      ${groupCount ? `<div class="table-wrap"><table class="list-tbl"><thead><tr><th>Group</th><th>Recording profile</th><th>Cameras</th></tr></thead><tbody>${groupBody}</tbody></table></div>`
+        : `<div class="card-hint" style="padding:14px 16px">No groups yet. Create one to assign a shared recording profile to several cameras at once.</div>`}
+    </div>`;
+}
+/* Recording section list: the reusable profiles cameras/groups inherit. */
+function renderRecordingRoot() {
+  const profs = allProfiles();
+  const body = profs.map(p => {
+    const def = p.is_default ? '<span style="margin-left:auto"><span class="pill accent">Default</span></span>' : '';
+    return `<tr onclick="select('profile','${p.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(p.is_default?'star':'profiles',18)}</span><div class="lt-main">${esc(p.name||'Default')}</div>${def}</div></td>
+    </tr>`;
+  }).join('') || `<tr><td style="color:var(--dim2);padding:20px;text-align:center">No recording profiles.</td></tr>`;
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left"><span class="rp-head-icon">${icon('profiles',22)}</span>
+        <div class="rp-head-titles"><div class="rp-head-title">Recording</div><div class="rp-head-sub">Reusable recording profiles that cameras and groups inherit</div></div></div>
+      <div class="rp-head-actions"><button class="primary sm" onclick="newProfile()">+ New profile</button></div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)"><div class="card-title">Recording profiles</div></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Profile</th></tr></thead><tbody>${body}</tbody></table></div>
+    </div>`;
+}
+/* Users & security section list: roles (capabilities) + users (sign-in accounts). */
+function renderSecurityRoot() {
+  const roleBody = ROLES.map(r => `<tr onclick="select('role','${r.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(r.is_admin?'shield':'roles',18)}</span><div class="lt-main">${esc(r.name)}</div>${r.is_admin?'<span style="margin-left:auto"><span class="pill accent">Admin</span></span>':''}</div></td>
+    </tr>`).join('') || `<tr><td style="color:var(--dim2);padding:20px;text-align:center">No roles.</td></tr>`;
+  const userBody = USERS.map(u => {
+    const roleObj = ROLES.find(r => r.id === u.role_id);
+    const sub = u.role === 'admin' ? 'Administrator' : (roleObj ? esc(roleObj.name) : '<span style="color:var(--dim2)">No role</span>');
+    return `<tr onclick="select('user','${u.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(u.role==='admin'?'shield':'user',18)}</span><div class="lt-main">${esc(u.username)}</div></div></td>
+      <td>${sub}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="2" style="color:var(--dim2);padding:20px;text-align:center">No users.</td></tr>`;
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left"><span class="rp-head-icon">${icon('shield',22)}</span>
+        <div class="rp-head-titles"><div class="rp-head-title">Users &amp; security</div><div class="rp-head-sub">Roles define capabilities; each user signs in with a role</div></div></div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title">Roles</div><button class="ghost sm" onclick="newRole()">+ New role</button></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Role</th></tr></thead><tbody>${roleBody}</tbody></table></div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title">Users</div><button class="primary sm" onclick="newUser()">+ New user</button></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>User</th><th>Role</th></tr></thead><tbody>${userBody}</tbody></table></div>
     </div>`;
 }
 function renderStorageRoot() {
@@ -4451,6 +4530,7 @@ function renderCamera(id) {
         <div class="rp-head-left">
           <span class="rp-head-icon">${icon(camIcon(c),22)}</span>
           <div class="rp-head-titles">
+            <button class="rp-back" onclick="select('cameras-root')" title="Back to all cameras">‹ Cameras</button>
             <div class="rp-head-title">${esc(c.name)} ${statusBadge}</div>
             <div class="rp-head-sub">${sub}</div>
           </div>
