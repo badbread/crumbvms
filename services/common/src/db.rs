@@ -7978,7 +7978,8 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
     let rows = client
         .query(
             r"
-            SELECT ci.relname AS index_name, ct.relname AS table_name
+            SELECT ci.relname AS index_name, ct.relname AS table_name,
+                   pi.indexrelid AS index_oid
             FROM pg_index pi
             JOIN pg_class ci ON ci.oid = pi.indexrelid
             JOIN pg_class ct ON ct.oid = pi.indrelid
@@ -8008,6 +8009,7 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
     for row in rows {
         let index_name: String = row.get("index_name");
         let table_name: String = row.get("table_name");
+        let index_oid: u32 = row.get("index_oid");
         tracing::warn!(
             index_name,
             table_name,
@@ -8023,33 +8025,74 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
         // quote them defensively since `format!` can't bind a DDL identifier
         // as a parameter.
         //
-        // Guard 2 (see the doc comment): this DROP runs under the pool's
-        // per-connection `lock_timeout` (set by build_pool's post-create
-        // hook). If a manual CONCURRENTLY build slipped in between the
-        // catalog snapshot above and this DROP, the build's locks make the
-        // DROP time out with 55P03 — treat that as skip-and-warn, never as a
-        // boot-failing error and never as an unbounded queued ACCESS
-        // EXCLUSIVE request stalling the table.
-        let drop_result = client
-            .batch_execute(&format!(
-                r#"DROP INDEX IF EXISTS "{index_name}""#,
-                index_name = index_name.replace('"', "\"\"")
-            ))
-            .await;
-        if let Err(e) = drop_result {
-            if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) {
-                tracing::warn!(
-                    index_name,
-                    table_name,
-                    "run_migrations: DROP of INVALID index timed out waiting \
-                     for a lock — something (likely an in-progress manual \
-                     CREATE INDEX CONCURRENTLY) holds locks on it; leaving it \
-                     alone. It will be re-examined on the next startup"
-                );
-                continue;
+        // Guard 2 (see the doc comment): this DROP runs under the connection's
+        // `lock_timeout` (set by build_pool's post-create hook). A lock timeout
+        // (55P03) has TWO very different causes that must be handled
+        // differently, or the reap is non-deterministic under load:
+        //   (a) a live manual CREATE INDEX CONCURRENTLY holds the index's locks
+        //       — leave it alone (skip-and-warn); or
+        //   (b) transient/foreign contention (a busy boot, autovacuum, a
+        //       concurrent DDL elsewhere) — which must NOT permanently skip a
+        //       droppable INVALID index (that would leave it un-dropped so a
+        //       later CREATE INDEX IF NOT EXISTS silently no-ops against the
+        //       broken catalog entry).
+        // Distinguish them by RE-CHECKING pg_stat_progress_create_index for THIS
+        // index on a timeout: a genuine build → skip; otherwise retry a few
+        // times so momentary contention clears, and only skip (never boot-fail)
+        // if a foreign lock persists.
+        let drop_sql = format!(
+            r#"DROP INDEX IF EXISTS "{index_name}""#,
+            index_name = index_name.replace('"', "\"\"")
+        );
+        const DROP_MAX_ATTEMPTS: u32 = 4;
+        for attempt in 1..=DROP_MAX_ATTEMPTS {
+            match client.batch_execute(&drop_sql).await {
+                Ok(()) => break,
+                Err(e)
+                    if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) =>
+                {
+                    let build_in_progress: bool = client
+                        .query_one(
+                            "SELECT EXISTS (
+                                 SELECT 1 FROM pg_stat_progress_create_index
+                                 WHERE index_relid = $1
+                                   AND datid = (SELECT oid FROM pg_database
+                                                WHERE datname = current_database())
+                             )",
+                            &[&index_oid],
+                        )
+                        .await
+                        .map(|r| r.get(0))
+                        .unwrap_or(false);
+                    if build_in_progress {
+                        tracing::warn!(
+                            index_name,
+                            table_name,
+                            "run_migrations: DROP of INVALID index skipped — a manual \
+                             CREATE INDEX CONCURRENTLY build holds its locks; leaving it \
+                             alone, it will be re-examined on the next startup"
+                        );
+                        break;
+                    }
+                    if attempt == DROP_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            index_name,
+                            table_name,
+                            attempts = DROP_MAX_ATTEMPTS,
+                            "run_migrations: DROP of INVALID index kept timing out on a \
+                             lock with no build in progress; leaving it for the next \
+                             startup rather than boot-failing"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("reap_invalid_indexes: drop invalid index {index_name}")
+                    });
+                }
             }
-            return Err(e)
-                .with_context(|| format!("reap_invalid_indexes: drop invalid index {index_name}"));
         }
     }
 
