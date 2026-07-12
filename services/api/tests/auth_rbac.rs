@@ -1477,3 +1477,92 @@ async fn scrub_preview_get_put_roundtrip_and_clamps() {
     assert_eq!(after_clamp["cache_ttl_seconds"]["source"], "env");
     assert_eq!(after_clamp["cache_ttl_seconds"]["value"], default_ttl);
 }
+
+// ─── bookmark scope: the read-all / manage-own tier (BookmarkScope::ViewAll) ──
+
+/// A `ViewAll` viewer SEES every bookmark on cameras it can access (like `All`)
+/// but may edit/delete only its OWN — the "view all, manage own" tier. Proven
+/// end-to-end: it lists another user's bookmark, is refused 403 on PATCH/DELETE
+/// of that bookmark, and can PATCH/DELETE one it created itself.
+#[tokio::test]
+async fn bookmark_viewall_sees_all_but_manages_only_own() {
+    use crumb_common::types::BookmarkScope;
+
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    // Owner (any bookmark-capable scope) + the ViewAll viewer, both scoped to
+    // the same camera so cross-visibility is about bookmark scope, not camera
+    // scope.
+    let owner = seed_viewer_with_bookmark_scope(app.pool(), &[cam], BookmarkScope::Own).await;
+    let viewer = seed_viewer_with_bookmark_scope(app.pool(), &[cam], BookmarkScope::ViewAll).await;
+    let owner_token = login(&app, &owner.username, &owner.password).await;
+    let viewer_token = login(&app, &viewer.username, &viewer.password).await;
+
+    // Each user creates a bookmark on the shared camera.
+    let mk = |token: &str| {
+        post_auth_json(
+            "/bookmarks",
+            token,
+            &serde_json::json!({ "camera_id": cam, "ts": "2026-06-21T17:03:52Z" }),
+        )
+    };
+    let resp = app.send(mk(&owner_token)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let owners_bookmark = body_json(resp).await["id"].as_str().unwrap().to_owned();
+
+    let resp = app.send(mk(&viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let viewers_bookmark = body_json(resp).await["id"].as_str().unwrap().to_owned();
+
+    // ViewAll SEES both (the owner's and its own).
+    let resp = app
+        .send(get_auth(
+            &format!("/bookmarks?camera_id={cam}"),
+            &viewer_token,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids: Vec<String> = body_json(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        ids.contains(&owners_bookmark) && ids.contains(&viewers_bookmark),
+        "ViewAll must see every bookmark on the camera, got {ids:?}"
+    );
+
+    let patch = |id: &str, token: &str| {
+        axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/bookmarks/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"description":"edited"}"#))
+            .unwrap()
+    };
+    let delete = |id: &str, token: &str| {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/bookmarks/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+
+    // Managing the OWNER's bookmark is refused — ViewAll is read-all, not
+    // manage-all.
+    let resp = app.send(patch(&owners_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app.send(delete(&owners_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Managing its OWN bookmark works.
+    let resp = app.send(patch(&viewers_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.send(delete(&viewers_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}

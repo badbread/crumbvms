@@ -918,7 +918,10 @@ pub enum BookmarkScope {
     None,
     /// See/manage only bookmarks the user created (on the role's cameras).
     Own,
-    /// See all bookmarks on the role's cameras (and create).
+    /// See ALL bookmarks on the role's cameras (and create), but edit/delete
+    /// only one's OWN — a read-all, manage-own tier. Serialized as `"viewall"`.
+    ViewAll,
+    /// See and manage (edit/delete) ALL bookmarks on the role's cameras.
     All,
 }
 
