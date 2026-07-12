@@ -18,6 +18,7 @@ import 'package:flutter/scheduler.dart';
 
 import '../../api/models.dart';
 import '../../api/motion_timeline_api.dart';
+import '../live_status/detection_icons.dart';
 import 'camera_colors.dart';
 import 'motion_timeline_controller.dart';
 
@@ -386,9 +387,10 @@ class _MotionTimelinePainter extends CustomPainter {
     }
   }
 
-  /// Object-detection glyphs (person/vehicle/etc.) as small dots at the
-  /// bottom of the track, colored by their camera. Ported from the
-  /// icon_key-filtered `pbState.detections` drawing.
+  /// Object-detection markers: the actual Frigate type icon (person/car/
+  /// package/…) on a dark backing disc at the bottom of the track, colored by
+  /// detection type. Matches the old client drawing the label glyph rather
+  /// than a plain dot. Collision-thinned so a burst doesn't overdraw.
   void _drawDetectionGlyphs(
     Canvas canvas,
     Size size,
@@ -396,14 +398,46 @@ class _MotionTimelinePainter extends CustomPainter {
     String? selCamId,
   ) {
     if (controller.detections.isEmpty) return;
+    final y = size.height - 8;
+    double? lastX;
     for (final ev in controller.detections) {
       final ms = ev.ts.millisecondsSinceEpoch;
-      if (ms < controller.windowStartMs || ms > controller.windowEndMs) continue;
+      if (ms < controller.windowStartMs || ms > controller.windowEndMs) {
+        continue;
+      }
       final x = msToX(ms);
-      final color = cameraMotionColor(ev.cameraId);
+      if (x < -12 || x > size.width + 12) continue;
+      if (lastX != null && (x - lastX).abs() < 11) continue; // thin bursts
+      lastX = x;
+
+      final spec = detectionIconFor(ev.iconKey);
       final prominent = ev.cameraId == selCamId;
-      final paint = Paint()..color = color.withValues(alpha: prominent ? 1 : 0.55);
-      canvas.drawCircle(Offset(x, size.height - 3), prominent ? 3 : 2, paint);
+      final r = prominent ? 8.0 : 6.5;
+      // Dark backing disc + a thin type-colored ring.
+      canvas.drawCircle(Offset(x, y), r, Paint()..color = const Color(0xE60A0E16));
+      canvas.drawCircle(
+        Offset(x, y),
+        r,
+        Paint()
+          ..color = spec.color.withValues(alpha: prominent ? 0.95 : 0.55)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1,
+      );
+      // The label icon itself, painted from the Material icon font.
+      final icon = spec.icon;
+      final tp = TextPainter(
+        text: TextSpan(
+          text: String.fromCharCode(icon.codePoint),
+          style: TextStyle(
+            fontFamily: icon.fontFamily,
+            package: icon.fontPackage,
+            fontSize: prominent ? 11 : 9,
+            color: spec.color.withValues(alpha: prominent ? 1 : 0.75),
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(x - tp.width / 2, y - tp.height / 2));
     }
   }
 
