@@ -62,6 +62,27 @@ class FullscreenController extends ChangeNotifier with WindowListener {
       // `invoke('set_window_fullscreen', ...)` call — never let a window-
       // manager failure crash the wall.
     }
+    if (!on) {
+      // Robust exit (#86). On Windows, `setFullScreen(false)` can leave the
+      // window OFF the taskbar and without focus — an uninteractable "ghost"
+      // the user can't recover without Win+D or killing the process
+      // (reported after launch-into-fullscreen + Esc). Force the window back
+      // to a normal, visible, focused, taskbar-present state. Each step is
+      // independently best-effort so one failing plugin call can't re-strand
+      // the window: getting even one of show/focus/taskbar through is enough
+      // to avoid the ghost.
+      for (final step in <Future<void> Function()>[
+        () => windowManager.setSkipTaskbar(false),
+        () => windowManager.show(),
+        () => windowManager.focus(),
+      ]) {
+        try {
+          await step();
+        } catch (_) {
+          /* best-effort — keep trying the remaining steps */
+        }
+      }
+    }
   }
 
   Future<void> toggle() => setFullscreen(!_isFullscreen);
