@@ -266,7 +266,17 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     }
     _timeline.setPlayhead(target, now: now);
 
-    await _syncCoverage();
+    // Seed the coverage line immediately from the fast initial fetch (the
+    // selected camera's spans) so the bottom recording line shows right away.
+    // The wider static preload below then extends it across the whole
+    // navigable range — but if that wide query is slow or fails it must never
+    // blank this seed (guarded in _syncCoverage). Don't block tab entry on it.
+    final seed = spans
+        .where((s) => s.cameraId == _selectedCameraId)
+        .toList(growable: false);
+    if (seed.isNotEmpty) _timeline.setSpans(seed);
+
+    unawaited(_syncCoverage());
     await _resolveAll(_timeline.playhead, force: true);
     if (!mounted) return;
     setState(() {
@@ -309,6 +319,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         final start = navStart.subtract(_coverageHorizon);
         final spans = await _fetchCoverage(camId, start, end);
         if (!mounted) return;
+        // A slow or failed wide query returns []. Never blank a coverage line
+        // that's already showing (e.g. the initial seed) — keep it and retry on
+        // a later tick (we don't cache the empty, so the wide branch runs
+        // again). A camera that genuinely has no footage has an empty seed too,
+        // so this correctly still shows no line for it.
+        if (spans.isEmpty &&
+            camId == _selectedCameraId &&
+            _timeline.spans.isNotEmpty) {
+          return;
+        }
         _coverage[camId] = _CoverageCache(
           start: start,
           freshAt: now,
