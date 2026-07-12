@@ -129,8 +129,6 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   /// the scrubber/strip even while sitting still. Ported from pbStartTick.
   Timer? _idleTimer;
 
-  final TextEditingController _timeGotoController = TextEditingController();
-
   @override
   void initState() {
     super.initState();
@@ -186,7 +184,6 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     for (final p in _panes.values) {
       p.dispose();
     }
-    _timeGotoController.dispose();
     _timeline.dispose();
     _motion.dispose();
     super.dispose();
@@ -626,22 +623,48 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     await _jumpTo(earliestStart.add(const Duration(milliseconds: 1000)));
   }
 
-  void _handleTimeGoto() {
-    final val = _timeGotoController.text.trim(); // "HH:MM" or "HH:MM:SS"
-    if (val.isEmpty) return;
-    final parts = val.split(':');
-    if (parts.length < 2) return;
-    final hh = int.tryParse(parts[0]);
-    final mm = int.tryParse(parts[1]);
-    if (hh == null || mm == null) return;
-    final ss = parts.length > 2 ? (int.tryParse(parts[2]) ?? 0) : 0;
-    // Apply the time-of-day to the day currently under the playhead (not
-    // "today") so refining the time while reviewing a past day doesn't jump
-    // back to today and get clamped to "now" (mirrors `pbHandleTimeGoto`).
+  /// Pick an exact date + time to jump to (replaces the old free-text
+  /// HH:MM:SS field). Seeds both pickers from the current playhead so refining
+  /// while reviewing a past day stays on that day.
+  Future<void> _pickGotoDateTime() async {
     final base = _timeline.playhead.toLocal();
-    final target = DateTime(base.year, base.month, base.day, hh, mm, ss)
-        .toUtc();
-    _jumpTo(target);
+    final now = DateTime.now();
+    final date = await showDatePicker(
+      context: context,
+      initialDate: base.isAfter(now) ? now : base,
+      firstDate: now.subtract(const Duration(days: 3650)),
+      lastDate: now,
+    );
+    if (date == null || !mounted) return;
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(base),
+    );
+    if (time == null || !mounted) return;
+    final target = DateTime(
+      date.year,
+      date.month,
+      date.day,
+      time.hour,
+      time.minute,
+    ).toUtc();
+    await _jumpTo(target);
+  }
+
+  static const List<String> _monthAbbr = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+
+  /// Compact local label for the goto button, e.g. "Jul 11, 6:26:41 PM".
+  String _fmtPlayheadLabel() {
+    final d = _timeline.playhead.toLocal();
+    final h24 = d.hour;
+    final ampm = h24 >= 12 ? 'PM' : 'AM';
+    final h12 = h24 % 12 == 0 ? 12 : h24 % 12;
+    final mm = d.minute.toString().padLeft(2, '0');
+    final ss = d.second.toString().padLeft(2, '0');
+    return '${_monthAbbr[d.month - 1]} ${d.day}, $h12:$mm:$ss $ampm';
   }
 
   void _selectCamera(String cameraId) {
@@ -683,23 +706,26 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       backgroundColor: Colors.black,
       body: Column(
         children: [
-          _TopBar(
-            statusMessage: _statusMessage,
-            onClose: widget.onClose,
-          ),
+          // No subheader here: Playback lives under the shared app header
+          // (tabs + view row) owned by MainShell. Status ("Loading timeline…",
+          // "No recorded footage found") floats as an unobtrusive overlay chip
+          // instead of a whole bar.
           Expanded(
-            child: _entering
-                ? const Center(
+            child: Stack(
+              children: [
+                if (_entering)
+                  const Center(
                     child: CircularProgressIndicator(color: Colors.white54),
                   )
-                : shown.isEmpty
-                ? const Center(
+                else if (shown.isEmpty)
+                  const Center(
                     child: Text(
                       'No cameras to review.',
                       style: TextStyle(color: Colors.white70),
                     ),
                   )
-                : Padding(
+                else
+                  Padding(
                     padding: const EdgeInsets.all(2),
                     child: GridView.count(
                       crossAxisCount: cols,
@@ -719,16 +745,46 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       ],
                     ),
                   ),
+                if (!_entering && _statusMessage != null)
+                  Positioned(
+                    top: 8,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.7),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.white24),
+                        ),
+                        child: Text(
+                          _statusMessage!,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
           _TransportBar(
             playing: _playing,
             speedLabel: '${_speeds[_speedIdx]}x',
-            timeGotoController: _timeGotoController,
+            gotoLabel: _fmtPlayheadLabel(),
             onTogglePlay: _togglePlay,
             onCycleSpeed: _cycleSpeed,
             onJumpFirst: _jumpToFirst,
             onJumpLatest: _jumpToLatest,
-            onTimeGoto: _handleTimeGoto,
+            onPrevMotion: () => _jumpMotion(false),
+            onNextMotion: () => _jumpMotion(true),
+            onPickGoto: _pickGotoDateTime,
             onFrameBack: () => _frameStep(false),
             onFrameFwd: () => _frameStep(true),
             onNudge: _shiftWindow,
@@ -737,8 +793,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onZoomIn: () => _zoomBy(-1),
           ),
           if (_timeline.hasSelection) _buildExportSelectionBar(),
-          // Motion-intensity histogram + detection glyphs + legend +
-          // prev/next-motion transport, synced to the scrubber window.
+          // Motion-intensity histogram + detection glyphs + legend, synced to
+          // the scrubber window (prev/next-motion now lives in the transport
+          // bar above). Compact so it doesn't crowd the video.
           MotionTimelineView(
             controller: _motion,
             cameras: _cameras,
@@ -751,6 +808,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onLiveSeek: _liveSeek,
             onCommitSeek: _commitSeek,
             onZoomChanged: _onZoomChanged,
+            height: 58,
           ),
         ],
       ),
@@ -787,59 +845,23 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 }
 
-class _TopBar extends StatelessWidget {
-  const _TopBar({required this.statusMessage, required this.onClose});
-
-  final String? statusMessage;
-  final VoidCallback onClose;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: const Color(0xFF15181D),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Row(
-        children: [
-          const Icon(Icons.history, color: Colors.amberAccent, size: 18),
-          const SizedBox(width: 8),
-          const Text(
-            'Playback',
-            style: TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          if (statusMessage != null) ...[
-            const SizedBox(width: 16),
-            Text(
-              statusMessage!,
-              style: const TextStyle(color: Colors.white54, fontSize: 12),
-            ),
-          ],
-          const Spacer(),
-          InkWell(
-            onTap: onClose,
-            child: const Padding(
-              padding: EdgeInsets.all(4),
-              child: Icon(Icons.close, color: Colors.white70, size: 18),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
+/// The transport bar. Layout: a left cluster (speed + coarse nudges), a
+/// CENTERED playback cluster over the scrubber's midpoint (oldest · prev-motion
+/// · frame-back · play · frame-fwd · next-motion · latest), and a right cluster
+/// (go-to date/time · bookmark · zoom). The centering is achieved with equal
+/// Expanded spacers flanking the fixed-width middle.
 class _TransportBar extends StatelessWidget {
   const _TransportBar({
     required this.playing,
     required this.speedLabel,
-    required this.timeGotoController,
+    required this.gotoLabel,
     required this.onTogglePlay,
     required this.onCycleSpeed,
     required this.onJumpFirst,
     required this.onJumpLatest,
-    required this.onTimeGoto,
+    required this.onPrevMotion,
+    required this.onNextMotion,
+    required this.onPickGoto,
     required this.onFrameBack,
     required this.onFrameFwd,
     required this.onNudge,
@@ -850,12 +872,14 @@ class _TransportBar extends StatelessWidget {
 
   final bool playing;
   final String speedLabel;
-  final TextEditingController timeGotoController;
+  final String gotoLabel;
   final VoidCallback onTogglePlay;
   final VoidCallback onCycleSpeed;
   final VoidCallback onJumpFirst;
   final VoidCallback onJumpLatest;
-  final VoidCallback onTimeGoto;
+  final VoidCallback onPrevMotion;
+  final VoidCallback onNextMotion;
+  final VoidCallback onPickGoto;
   final VoidCallback onFrameBack;
   final VoidCallback onFrameFwd;
   final void Function(Duration by) onNudge;
@@ -863,136 +887,182 @@ class _TransportBar extends StatelessWidget {
   final VoidCallback onZoomOut;
   final VoidCallback onZoomIn;
 
+  Widget _iconBtn(
+    IconData icon,
+    String tip,
+    String hint,
+    VoidCallback onPressed, {
+    Color color = Colors.white70,
+    double size = 22,
+  }) {
+    return ShiftHint(
+      hint: hint,
+      child: IconButton(
+        tooltip: tip,
+        iconSize: size,
+        visualDensity: VisualDensity.compact,
+        icon: Icon(icon, color: color),
+        onPressed: onPressed,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Container(
       color: const Color(0xFF15181D),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       child: Row(
         children: [
-          ShiftHint(
-            hint: 'Oldest footage',
-            child: IconButton(
-              tooltip: 'Oldest footage',
-              icon: const Icon(Icons.first_page, color: Colors.white70),
-              onPressed: onJumpFirst,
+          // ── left cluster: speed + coarse nudges ──────────────────────────
+          Expanded(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.start,
+              children: [
+                ShiftHint(
+                  hint: 'Playback speed',
+                  child: TextButton(
+                    onPressed: onCycleSpeed,
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(0, 30),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                    child: Text(
+                      speedLabel,
+                      style: const TextStyle(
+                        color: Colors.cyanAccent,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                for (final n in const [
+                  (-3600, '−1h'),
+                  (-600, '−10m'),
+                  (600, '+10m'),
+                  (3600, '+1h'),
+                ])
+                  ShiftHint(
+                    hint: 'Jump ${n.$2}',
+                    child: TextButton(
+                      onPressed: () => onNudge(Duration(seconds: n.$1)),
+                      style: TextButton.styleFrom(
+                        minimumSize: const Size(0, 30),
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        foregroundColor: Colors.white70,
+                      ),
+                      child: Text(n.$2, style: const TextStyle(fontSize: 11)),
+                    ),
+                  ),
+              ],
             ),
           ),
-          ShiftHint(
-            hint: 'Step back one frame (Shift+,)',
-            child: IconButton(
-              tooltip: 'Frame back',
-              icon: const Icon(Icons.skip_previous, color: Colors.white70),
-              onPressed: onFrameBack,
-            ),
-          ),
-          ShiftHint(
-            hint: playing ? 'Pause (Space)' : 'Play (Space)',
-            child: IconButton(
-              tooltip: playing ? 'Pause' : 'Play',
-              icon: Icon(
-                playing ? Icons.pause : Icons.play_arrow,
-                color: Colors.white,
+          // ── centered playback cluster (over the scrubber midpoint) ────────
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _iconBtn(
+                Icons.first_page,
+                'Oldest footage',
+                'Oldest footage',
+                onJumpFirst,
               ),
-              onPressed: onTogglePlay,
-            ),
-          ),
-          ShiftHint(
-            hint: 'Step forward one frame (Shift+.)',
-            child: IconButton(
-              tooltip: 'Frame forward',
-              icon: const Icon(Icons.skip_next, color: Colors.white70),
-              onPressed: onFrameFwd,
-            ),
-          ),
-          ShiftHint(
-            hint: 'Latest footage',
-            child: IconButton(
-              tooltip: 'Latest footage',
-              icon: const Icon(Icons.last_page, color: Colors.white70),
-              onPressed: onJumpLatest,
-            ),
-          ),
-          ShiftHint(
-            hint: 'Playback speed',
-            child: TextButton(
-              onPressed: onCycleSpeed,
-              child: Text(
-                speedLabel,
-                style: const TextStyle(
-                  color: Colors.cyanAccent,
-                  fontWeight: FontWeight.w700,
+              _iconBtn(
+                Icons.fast_rewind,
+                'Previous motion',
+                'Previous motion (↑)',
+                onPrevMotion,
+                color: Colors.amberAccent,
+              ),
+              _iconBtn(
+                Icons.navigate_before,
+                'Frame back',
+                'Step back one frame (Shift+,)',
+                onFrameBack,
+              ),
+              ShiftHint(
+                hint: playing ? 'Pause (Space)' : 'Play (Space)',
+                child: IconButton(
+                  tooltip: playing ? 'Pause' : 'Play',
+                  iconSize: 30,
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(
+                    playing ? Icons.pause_circle : Icons.play_circle,
+                    color: Colors.white,
+                  ),
+                  onPressed: onTogglePlay,
                 ),
               ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          for (final n in const [
-            (-3600, '−1h'),
-            (-600, '−10m'),
-            (600, '+10m'),
-            (3600, '+1h'),
-          ])
-            ShiftHint(
-              hint: 'Jump ${n.$2}',
-              child: TextButton(
-                onPressed: () => onNudge(Duration(seconds: n.$1)),
-                style: TextButton.styleFrom(
-                  minimumSize: const Size(0, 30),
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  foregroundColor: Colors.white70,
-                ),
-                child: Text(n.$2, style: const TextStyle(fontSize: 11)),
+              _iconBtn(
+                Icons.navigate_next,
+                'Frame forward',
+                'Step forward one frame (Shift+.)',
+                onFrameFwd,
               ),
-            ),
-          const SizedBox(width: 12),
-          SizedBox(
-            width: 110,
-            child: TextField(
-              controller: timeGotoController,
-              style: const TextStyle(color: Colors.white, fontSize: 12),
-              decoration: const InputDecoration(
-                isDense: true,
-                hintText: 'HH:MM:SS',
-                hintStyle: TextStyle(color: Colors.white38),
-                enabledBorder: OutlineInputBorder(
-                  borderSide: BorderSide(color: Colors.white24),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderSide: BorderSide(color: Colors.cyanAccent),
-                ),
+              _iconBtn(
+                Icons.fast_forward,
+                'Next motion',
+                'Next motion (↓)',
+                onNextMotion,
+                color: Colors.amberAccent,
               ),
-              onSubmitted: (_) => onTimeGoto(),
-            ),
-          ),
-          const SizedBox(width: 6),
-          TextButton(onPressed: onTimeGoto, child: const Text('Go')),
-          const Spacer(),
-          ShiftHint(
-            hint: 'Bookmark this moment',
-            child: IconButton(
-              tooltip: 'Bookmark',
-              icon: const Icon(
-                Icons.bookmark_add_outlined,
-                color: Colors.white70,
+              _iconBtn(
+                Icons.last_page,
+                'Latest footage',
+                'Latest footage',
+                onJumpLatest,
               ),
-              onPressed: onBookmark,
-            ),
+            ],
           ),
-          ShiftHint(
-            hint: 'Zoom out (longer span)',
-            child: IconButton(
-              tooltip: 'Zoom out',
-              icon: const Icon(Icons.zoom_out, color: Colors.white70),
-              onPressed: onZoomOut,
-            ),
-          ),
-          ShiftHint(
-            hint: 'Zoom in (shorter span)',
-            child: IconButton(
-              tooltip: 'Zoom in',
-              icon: const Icon(Icons.zoom_in, color: Colors.white70),
-              onPressed: onZoomIn,
+          // ── right cluster: go-to date/time + bookmark + zoom ─────────────
+          Expanded(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                ShiftHint(
+                  hint: 'Jump to a date & time',
+                  child: OutlinedButton.icon(
+                    onPressed: onPickGoto,
+                    icon: const Icon(Icons.event, size: 15),
+                    label: Text(
+                      gotoLabel,
+                      style: const TextStyle(fontSize: 11.5),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white24),
+                      minimumSize: const Size(0, 28),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                _iconBtn(
+                  Icons.bookmark_add_outlined,
+                  'Bookmark',
+                  'Bookmark this moment',
+                  onBookmark,
+                  size: 20,
+                ),
+                _iconBtn(
+                  Icons.zoom_out,
+                  'Zoom out',
+                  'Zoom out (longer span)',
+                  onZoomOut,
+                  size: 20,
+                ),
+                _iconBtn(
+                  Icons.zoom_in,
+                  'Zoom in',
+                  'Zoom in (shorter span)',
+                  onZoomIn,
+                  size: 20,
+                ),
+              ],
             ),
           ),
         ],

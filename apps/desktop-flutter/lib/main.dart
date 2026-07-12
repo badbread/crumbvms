@@ -469,8 +469,11 @@ class _MainShellState extends State<MainShell> {
                 RecordingAlertBanner(controller: widget.recordingAlerts),
                 UpdateBanner(controller: widget.updateCheck),
                 _buildTopBar(session),
-                // Saved-views quick-switch row — Live tab only.
-                if (_index == _liveIndex)
+                // Saved-views quick-switch row — shared by Live and Playback so
+                // the header stays the same across the two. Playback only needs
+                // to pick which cameras to review, so it hides the Live-only
+                // Snapshot + Config View controls.
+                if (_index == _liveIndex || _index == _playbackIndex)
                   ViewSelectorBar(
                     key: ValueKey('viewbar-$_viewsRefreshToken'),
                     api: widget.api,
@@ -478,9 +481,12 @@ class _MainShellState extends State<MainShell> {
                     cameras: widget.cameras,
                     activeViewId: _activeViewId,
                     onApply: _applyView,
-                    onSnapshot: () =>
-                        SnapshotService.captureActivePane(context),
-                    onConfigView: () => _openConfigView(session),
+                    onSnapshot: _index == _liveIndex
+                        ? () => SnapshotService.captureActivePane(context)
+                        : null,
+                    onConfigView: _index == _liveIndex
+                        ? () => _openConfigView(session)
+                        : null,
                     // Hide the "All Cameras" chip when the option is off.
                     showAllCameras:
                         widget.clientOptions?.showAllCamerasView ?? true,
@@ -678,8 +684,9 @@ class _MainShellState extends State<MainShell> {
         builder: (_) => LayoutEditorScreen(
           api: widget.api,
           session: session,
-          // Apply-without-save: render the layout on the wall immediately.
-          onApply: _applyView,
+          // Apply-without-save: render the layout on the wall immediately
+          // (and jump to Live, since the editor is a Live-tab action).
+          onApply: (v) => _applyView(v, toLive: true),
         ),
       ),
     );
@@ -750,14 +757,17 @@ class _MainShellState extends State<MainShell> {
     return out.isEmpty ? widget.cameras : out;
   }
 
-  /// Apply a saved view to the live wall. "All Cameras" (id ==
-  /// [ViewPrefs.allCamerasId]) resets to the default auto-grid; any other view
-  /// renders its custom layout. Always lands on the Live tab.
-  void _applyView(AppliedView view) {
+  /// Apply a saved view. "All Cameras" (id == [ViewPrefs.allCamerasId]) resets
+  /// to the default auto-grid; any other view renders its custom layout.
+  ///
+  /// Applied from the Live/Playback view row it keeps the current tab (so
+  /// picking a view on Playback re-scopes the review set without bouncing to
+  /// Live); applied from the Config View editor it lands on Live ([toLive]).
+  void _applyView(AppliedView view, {bool toLive = false}) {
     setState(() {
       _activeViewId = view.id;
       _appliedView = view.id == ViewPrefs.allCamerasId ? null : view;
-      _index = _liveIndex;
+      if (toLive) _index = _liveIndex;
       _settingsOpen = false;
     });
   }
@@ -779,12 +789,12 @@ class _MainShellState extends State<MainShell> {
     switch (_index) {
       case _playbackIndex:
         return PlaybackScreen(
-          // Remount when a "View on timeline" hand-off arrives so _enter opens
-          // at that moment.
+          // Remount when a "View on timeline" hand-off arrives (open at that
+          // moment) or when the applied view changes (re-scope the review set
+          // to the newly-picked view's cameras).
           key: ValueKey(
-            _playbackSeekTo == null
-                ? 'pb'
-                : 'pb-${_playbackSeekTo!.millisecondsSinceEpoch}',
+            'pb-${_activeViewId ?? "all"}-'
+            '${_playbackSeekTo?.millisecondsSinceEpoch ?? 0}',
           ),
           api: widget.api,
           session: session,

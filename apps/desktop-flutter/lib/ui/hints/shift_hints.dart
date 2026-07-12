@@ -84,19 +84,32 @@ class _ShiftHintState extends State<ShiftHint> {
               : Alignment.topCenter,
           offset: Offset(0, widget.above ? -4 : 4),
           child: IgnorePointer(
+            // Size to the caption text on a single line. Without an explicit
+            // width bound the overlay child can be handed a near-zero max-width
+            // and wrap one glyph per line — the caption then renders as a thin
+            // vertical sliver. ConstrainedBox + softWrap:false keeps it a normal
+            // horizontal chip.
             child: Material(
               color: Colors.transparent,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.88),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: Colors.white24),
-                ),
-                child: Text(
-                  widget.hint,
-                  maxLines: 1,
-                  style: const TextStyle(color: Colors.white, fontSize: 10.5),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 260),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.88),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: Text(
+                    widget.hint,
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.visible,
+                    style: const TextStyle(color: Colors.white, fontSize: 10.5),
+                  ),
                 ),
               ),
             ),

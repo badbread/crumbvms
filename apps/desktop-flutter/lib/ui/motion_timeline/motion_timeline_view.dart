@@ -11,8 +11,6 @@
 // [onSeek]/[onCameraSelected] for anything that affects shared playback
 // state (the playhead, which camera is "selected" for playback).
 
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
@@ -33,7 +31,7 @@ class MotionTimelineView extends StatefulWidget {
     required this.cameras,
     required this.playheadMs,
     required this.onSeek,
-    this.height = 96,
+    this.height = 40,
   });
 
   final MotionTimelineController controller;
@@ -73,18 +71,6 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     return c.windowStartMs + ((x / width) * winDur).round();
   }
 
-  Future<void> _prevNext(bool next) async {
-    final c = widget.controller;
-    final camId = c.selectedCameraId;
-    if (camId == null) return;
-    final target = await c.jumpToMotion(
-      cameraId: camId,
-      fromMs: widget.playheadMs,
-      next: next,
-    );
-    if (target != null) widget.onSeek(target);
-  }
-
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
@@ -93,8 +79,6 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          _buildTransportRow(),
-          const SizedBox(height: 4),
           _buildLegend(),
           const SizedBox(height: 2),
           LayoutBuilder(
@@ -120,56 +104,33 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
                   child: SizedBox(
                     width: width,
                     height: widget.height,
-                    child: CustomPaint(
-                      painter: _MotionTimelinePainter(
-                        controller: widget.controller,
-                        playheadMs: widget.playheadMs,
-                        hoverX: _hoverLocal?.dx,
-                      ),
+                    // The hover legend floats INSIDE this fixed-height box (a
+                    // Stack overlay), so revealing it never grows the column /
+                    // shoves the scrubber below it.
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Positioned.fill(
+                          child: CustomPaint(
+                            painter: _MotionTimelinePainter(
+                              controller: widget.controller,
+                              playheadMs: widget.playheadMs,
+                              hoverX: _hoverLocal?.dx,
+                            ),
+                          ),
+                        ),
+                        if (_hoverLocal != null)
+                          _buildHoverOverlay(_hoverLocal!, width),
+                      ],
                     ),
                   ),
                 ),
               );
             },
           ),
-          if (_hoverLocal != null) _buildHoverHint(_hoverLocal!, _lastWidth),
           if (widget.controller.error != null) _buildError(),
         ],
       ),
-    );
-  }
-
-  Widget _buildTransportRow() {
-    final selected = widget.controller.selectedCameraId;
-    return Row(
-      children: [
-        Text(
-          'Motion',
-          style: Theme.of(context).textTheme.labelMedium,
-        ),
-        const SizedBox(width: 8),
-        IconButton(
-          tooltip: 'Previous motion',
-          icon: const Icon(Icons.skip_previous, size: 18),
-          onPressed: selected == null ? null : () => _prevNext(false),
-          visualDensity: VisualDensity.compact,
-        ),
-        IconButton(
-          tooltip: 'Next motion',
-          icon: const Icon(Icons.skip_next, size: 18),
-          onPressed: selected == null ? null : () => _prevNext(true),
-          visualDensity: VisualDensity.compact,
-        ),
-        if (widget.controller.loading)
-          const Padding(
-            padding: EdgeInsets.only(left: 8),
-            child: SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          ),
-      ],
     );
   }
 
@@ -222,33 +183,56 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     );
   }
 
-  Widget _buildHoverHint(Offset local, double width) {
+  /// Floating "which cameras had motion here" chip, positioned near the cursor
+  /// x INSIDE the fixed-height strip (a Stack child) so it never changes the
+  /// layout / pushes the scrubber. Horizontally clamped to stay on-screen.
+  Widget _buildHoverOverlay(Offset local, double width) {
     final ms = _msAtX(local.dx, width);
     if (ms == null) return const SizedBox.shrink();
     final camIds = widget.controller.camerasWithMotionAt(ms);
     if (camIds.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(top: 2),
-      child: Wrap(
-        spacing: 8,
-        children: [
-          for (final id in camIds)
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 7,
-                  height: 7,
-                  margin: const EdgeInsets.only(right: 4),
-                  decoration: BoxDecoration(
-                    color: cameraMotionColor(id),
-                    shape: BoxShape.circle,
-                  ),
+    const chipW = 150.0;
+    final left = (local.dx - chipW / 2).clamp(
+      0.0,
+      (width - chipW).clamp(0.0, double.infinity),
+    );
+    return Positioned(
+      left: left,
+      top: 0,
+      child: IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.82),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: Colors.white24),
+          ),
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 2,
+            children: [
+              for (final id in camIds)
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 7,
+                      height: 7,
+                      margin: const EdgeInsets.only(right: 4),
+                      decoration: BoxDecoration(
+                        color: cameraMotionColor(id),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    Text(
+                      _nameFor(id),
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
+                  ],
                 ),
-                Text(_nameFor(id), style: Theme.of(context).textTheme.labelSmall),
-              ],
-            ),
-        ],
+            ],
+          ),
+        ),
       ),
     );
   }
