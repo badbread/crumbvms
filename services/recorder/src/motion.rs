@@ -1357,6 +1357,20 @@ fn should_emit_unhealthy_alert(
     !already_alerted && unhealthy_elapsed_secs >= threshold_secs
 }
 
+/// Pure gate for the pixel detector's healthy report: a real keep/discard
+/// verdict is only possible once the warm-up window has elapsed (section g's
+/// `warming_up = !pixel_verdict_capable(..)` forces `motion_detected = false`
+/// through frame `WARMUP_FRAMES`), so health must not flip `true` before then.
+/// Reporting healthy on the first post-seed frame (the old behaviour) ended
+/// fail-open while the detector was still verdict-blind — a Motion-mode camera
+/// gating footage on a detector that cannot yet say KEEP, after every
+/// (re)connect (correctness item 19: "detector state unknown" must resolve to
+/// keep-everything, never keep-nothing).
+#[must_use]
+fn pixel_verdict_capable(frames_seen: u64) -> bool {
+    frames_seen > WARMUP_FRAMES
+}
+
 // ─── public entry point ───────────────────────────────────────────────────────
 
 /// Run the motion detection task for `camera` until `cancel` is triggered.
@@ -1556,12 +1570,14 @@ async fn run_one_source(
                         Some("motion source is Frigate (no local decode)"),
                     )
                     .await;
-                    // Start PESSIMISTIC: not healthy until the broker's ConnAck
-                    // confirms a live connection — run_frigate_motion_loop flips it
-                    // healthy then. Reporting healthy here (before connecting) would
-                    // make a source that can't reach the broker flap healthy on
-                    // every retry and reset the fail-open grace so it never fires
-                    // (issue #61, the ha_motion twin).
+                    // Start PESSIMISTIC: not healthy until the broker GRANTS the
+                    // events subscription (SubAck) — run_frigate_motion_loop flips
+                    // it healthy then. Reporting healthy here (before connecting)
+                    // would make a source that can't reach the broker flap healthy
+                    // on every retry and reset the fail-open grace so it never
+                    // fires (issue #61, the ha_motion twin); reporting on ConnAck
+                    // would trust a connection whose subscription the broker may
+                    // still deny (issue #78).
                     report_health(
                         &health_tx,
                         &pool,
@@ -2224,32 +2240,7 @@ async fn run_pixel_diff_loop(
     // a background task, logging at DEBUG level.
     let camera_id_log = camera.id;
     let stderr_handle = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF — ffmpeg has exited.
-                Ok(_) => {
-                    let trimmed = line.trim_end();
-                    if !trimmed.is_empty() {
-                        debug!(
-                            camera_id     = %camera_id_log,
-                            ffmpeg_stderr = trimmed,
-                            "motion ffmpeg"
-                        );
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        camera_id = %camera_id_log,
-                        error     = %e,
-                        "motion ffmpeg stderr drain error"
-                    );
-                    break;
-                }
-            }
-        }
+        drain_motion_stderr(stderr, camera_id_log).await;
     });
 
     // ── 7. Initialise per-loop state ──────────────────────────────────────────
@@ -2440,21 +2431,27 @@ async fn run_pixel_diff_loop(
             continue; // seed frame — nothing to compare yet
         }
 
-        // Fail-open recovery: the FIRST post-seed frame proves the detector is
-        // genuinely analysing content again (not just that ffmpeg connected —
-        // seeding only copies raw bytes, it does not run the detection
-        // pipeline). Cheap to call every frame; `report_health` no-ops after
+        // Fail-open recovery: report healthy only once the warm-up window has
+        // elapsed — the first frame where a keep/discard verdict is actually
+        // possible. Analysing frames is not enough: through `WARMUP_FRAMES`
+        // section g forces `motion_detected = false`, so a healthy report on
+        // the first post-seed frame (the old behaviour) opened a "healthy but
+        // verdict-blind" window after every (re)connect in which Motion mode
+        // gated footage on a detector that could not yet say KEEP (correctness
+        // item 19). Cheap to call every frame; `report_health` no-ops after
         // the first transition since the value no longer changes.
-        report_health(
-            health_tx,
-            pool,
-            camera.id,
-            true,
-            "analysing frames",
-            alert_gate,
-            alert_after_secs,
-        )
-        .await;
+        if pixel_verdict_capable(frames_seen) {
+            report_health(
+                health_tx,
+                pool,
+                camera.id,
+                true,
+                "analysing frames (warm-up complete)",
+                alert_gate,
+                alert_after_secs,
+            )
+            .await;
+        }
 
         // ── a2. Adaptive-rate skip (Part B) ────────────────────────────────────
         // When the scene has been quiet for QUIET_SECS, we skip analysis on every
@@ -2508,7 +2505,9 @@ async fn run_pixel_diff_loop(
         let score = largest_blob as f32 / total_pixels;
 
         // ── g. Decision: largest-blob fraction vs the effective floor ─────────
-        let warming_up = frames_seen <= WARMUP_FRAMES;
+        // Kept in lockstep with the healthy report above: verdict-capable and
+        // "no longer warming up" are the same predicate by construction.
+        let warming_up = !pixel_verdict_capable(frames_seen);
 
         // Adaptive threshold: drive recompute on a ~15 s wall-clock schedule.
         // `now` here is the Utc timestamp used by the state machine below — the
@@ -2891,6 +2890,77 @@ async fn read_exact_frame(
     Ok(true)
 }
 
+/// Consecutive read errors after which [`drain_motion_stderr`] gives up. An
+/// `Err` from a pipe read is transient by nature (EOF is delivered as `Ok(0)`,
+/// not `Err`), so this bound only exists to keep a pathological fd from
+/// spinning the drain task forever — which would also hang the worker's
+/// teardown `stderr_handle.await`.
+const STDERR_DRAIN_MAX_CONSECUTIVE_ERRORS: u32 = 100;
+
+/// Drain the motion ffmpeg child's stderr to DEBUG logs until EOF, returning
+/// the number of lines drained (exercised by tests).
+///
+/// Drains BYTES (`read_until`), NOT UTF-8 lines: ffmpeg's stderr is not
+/// guaranteed to be valid UTF-8 (stream metadata, dumped packet bytes), and
+/// the previous `read_line` failed the whole read on the first invalid byte,
+/// ending the drain early — the pipe closed while ffmpeg kept writing, ffmpeg
+/// blocked on the full ~64 KB pipe buffer, and the stdout frame reader stalled:
+/// the exact deadlock this task exists to prevent (correctness item 5). Lines
+/// are rendered lossily for logging; a read error is logged and skipped (with
+/// a short pause, bounded by [`STDERR_DRAIN_MAX_CONSECUTIVE_ERRORS`]) rather
+/// than ending the drain, because only EOF (`Ok(0)` — the child exited) means
+/// there is nothing left to drain.
+async fn drain_motion_stderr(
+    stderr: impl tokio::io::AsyncRead + Unpin,
+    camera_id: uuid::Uuid,
+) -> u64 {
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut line: Vec<u8> = Vec::new();
+    let mut drained: u64 = 0;
+    let mut consecutive_errors: u32 = 0;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) => break, // EOF — ffmpeg has exited.
+            Ok(_) => {
+                consecutive_errors = 0;
+                drained += 1;
+                let text = String::from_utf8_lossy(&line);
+                let trimmed = text.trim_end();
+                if !trimmed.is_empty() {
+                    debug!(
+                        camera_id     = %camera_id,
+                        ffmpeg_stderr = trimmed,
+                        "motion ffmpeg"
+                    );
+                }
+            }
+            Err(e) => {
+                // Do NOT break while the child may still be alive — an
+                // abandoned stderr pipe recreates the fill-and-deadlock this
+                // task prevents. Pause briefly so a persistently erroring fd
+                // cannot busy-spin, and give up only past the error bound.
+                consecutive_errors += 1;
+                debug!(
+                    camera_id = %camera_id,
+                    error     = %e,
+                    consecutive_errors,
+                    "motion ffmpeg stderr drain error (continuing)"
+                );
+                if consecutive_errors >= STDERR_DRAIN_MAX_CONSECUTIVE_ERRORS {
+                    warn!(
+                        camera_id = %camera_id,
+                        "motion ffmpeg stderr drain giving up after repeated errors"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    drained
+}
+
 // ─── motion state ─────────────────────────────────────────────────────────────
 
 /// Internal state of the per-frame motion detector.
@@ -2905,7 +2975,7 @@ enum MotionState {
 /// Try to send a [`MotionSignal`] on `tx`; log a warning if the channel is full.
 ///
 /// The channel is bounded at [`MOTION_CHANNEL_CAPACITY`](crate::MOTION_CHANNEL_CAPACITY)
-/// (64).  Using `try_send` prevents the frame-diff loop from blocking, which
+/// (256).  Using `try_send` prevents the frame-diff loop from blocking, which
 /// would stall the stdout pipe and eventually deadlock ffmpeg (correctness
 /// item 5).
 #[inline]
@@ -3954,6 +4024,42 @@ mod tests {
             + 1;
         assert_ne!(g1, g2);
         assert_ne!(g0, g2);
+    }
+
+    // ── pixel healthy report deferred past warm-up (pixel_verdict_capable) ──────
+
+    #[test]
+    fn pixel_health_waits_out_warmup() {
+        // Warm-up frames are verdict-blind (section g forces
+        // `motion_detected = false`), so reporting healthy there would end
+        // fail-open on a detector that cannot yet say KEEP (correctness
+        // item 19) — a "healthy but blind" window after every (re)connect.
+        assert!(!pixel_verdict_capable(1)); // first post-seed frame
+        assert!(!pixel_verdict_capable(WARMUP_FRAMES)); // last warm-up frame
+                                                        // The first frame past warm-up can produce a real keep/discard
+                                                        // verdict — healthy may be reported from here on.
+        assert!(pixel_verdict_capable(WARMUP_FRAMES + 1));
+    }
+
+    // ── stderr drain (byte-based, UTF-8 tolerant) ────────────────────────────────
+
+    #[tokio::test]
+    async fn stderr_drain_survives_invalid_utf8() {
+        // ffmpeg stderr with invalid UTF-8 mid-stream. The old `read_line`
+        // drain errored on line 2 and STOPPED draining — the pipe closed while
+        // ffmpeg kept writing, ffmpeg blocked on the full pipe buffer, and the
+        // stdout frame reader stalled (correctness item 5). The byte drain
+        // must reach EOF having seen all three lines.
+        let stderr: &[u8] = b"frame=1 fps=5\n\xff\xfe bad bytes\nframe=2 fps=5\n";
+        assert_eq!(drain_motion_stderr(stderr, uuid::Uuid::nil()).await, 3);
+    }
+
+    #[tokio::test]
+    async fn stderr_drain_counts_final_unterminated_line() {
+        // A child that dies mid-line leaves a final chunk without '\n' — it is
+        // still drained (read_until returns Ok(n>0) for it) before the Ok(0) EOF.
+        let stderr: &[u8] = b"line one\ntruncated";
+        assert_eq!(drain_motion_stderr(stderr, uuid::Uuid::nil()).await, 2);
     }
 
     // ── frame_absdiff ─────────────────────────────────────────────────────────
