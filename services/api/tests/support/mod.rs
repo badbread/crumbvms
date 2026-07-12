@@ -196,6 +196,17 @@ fn ensure_env() {
 // waits and reuses the result.
 static MIGRATE_ONCE: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
 
+/// Serializes the tests that assert on / mutate the process-wide
+/// `server_settings` singleton row (beta-terms acceptance, scrub-preview
+/// tunables). That row is ONE global row shared by every test against the
+/// single shared test database, so a "fresh install ⇒ default" assertion in one
+/// test can otherwise observe a value written by a concurrent test — or one left
+/// behind by a prior `cargo test` run against a reused throwaway Postgres. Tests
+/// that touch it take this lock and call [`reset_server_settings`] first, giving
+/// each an exclusive, pristine view. (Same cross-runtime `const_new` Mutex idiom
+/// as `MIGRATE_ONCE`; a `Mutex<()>` used purely as a critical-section guard.)
+pub static SERVER_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Build a fresh [`AppState`] wired to the shared test Postgres, running
 /// migrations exactly once per process (idempotent + tracked via
 /// `schema_migrations`, so this is also safe if called from multiple test
@@ -292,6 +303,29 @@ async fn seed_default_policy_if_absent(pool: &Pool) {
         )
         .await
         .expect("seed default recording_policies row");
+}
+
+/// Reset the `server_settings` singleton back to its pristine, first-boot state
+/// for the columns the settings tests assert on: no beta-terms acceptance, and
+/// no scrub-preview overrides (so every knob falls back to its env default,
+/// `source: "env"`). Call while holding [`SERVER_SETTINGS_LOCK`]. The `UPDATE`
+/// is no-op-safe — the singleton row is seeded by migration 0012, but even zero
+/// matched rows simply does nothing.
+pub async fn reset_server_settings(pool: &Pool) {
+    let client = pool.get().await.expect("pool.get (reset_server_settings)");
+    client
+        .execute(
+            "UPDATE server_settings SET \
+                 beta_terms_accepted_at      = NULL, \
+                 thumb_pregen_enabled        = NULL, \
+                 thumb_pregen_lookback_hours = NULL, \
+                 thumb_pregen_scan_secs      = NULL, \
+                 thumb_cache_max_bytes       = NULL, \
+                 thumb_cache_ttl_seconds     = NULL",
+            &[],
+        )
+        .await
+        .expect("reset server_settings to pristine");
 }
 
 /// Build the subset router this suite exercises: `/auth`, `/config` (admin
