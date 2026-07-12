@@ -302,6 +302,15 @@ class _ClipsScreenState extends State<ClipsScreen> {
       cameras: widget.cameras,
       autofocus: true,
       onGoToCamera: _filterToCamera,
+      // Esc closes an open clip player. This must live HERE, on the screen's
+      // autofocused listener, not (only) on the player overlay: this node is
+      // what actually holds keyboard focus on the Clips tab, so key events
+      // dispatch through it. The overlay's own `autofocus` is silently
+      // discarded (Flutter only honors autofocus when the enclosing scope has
+      // no focused child — and this listener already does), so the overlay's
+      // key handler never sees the Esc. Same shape as the wall's
+      // Esc-restores-maximize (wall_screen.dart).
+      onEscape: _playing == null ? null : () => setState(() => _playing = null),
       child: scaffold,
     );
   }
@@ -1034,9 +1043,15 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     final c = widget.clip;
     final label = c.kind == 'motion' ? 'Motion' : (c.label.isEmpty ? 'Detection' : c.label);
     return Positioned.fill(
-      // FocusScope (not plain Focus) so this overlay traps keyboard focus over
-      // the clips screen's own autofocused hotkey listener — otherwise Esc can
-      // be swallowed by the ancestor and never close the player.
+      // Best-effort only: this handler fires just when the overlay itself
+      // holds focus, which it normally never does — `autofocus` is discarded
+      // because the clips screen's GlobalHotkeysListener already has focus
+      // (Flutter applies autofocus only when the enclosing scope has no
+      // focused child), and key events dispatch from the focused node UP
+      // through its ancestors, never down into this sibling branch. The Esc
+      // that actually closes the player is the screen-level listener's
+      // onEscape (see this screen's build). Kept as defence in depth for the
+      // rare case where focus does land inside the overlay.
       child: FocusScope(
         autofocus: true,
         onKeyEvent: (node, event) {
