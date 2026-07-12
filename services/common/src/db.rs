@@ -60,6 +60,16 @@ fn timeout_ms_env(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The pool's configured `statement_timeout`, in milliseconds — the single
+/// source of truth shared by [`build_pool`]'s post-create hook (which sets it
+/// on every fresh connection) and the migration runner's restore path (which
+/// must re-issue the SAME value after a CONCURRENTLY migration ran with the
+/// timeout disabled; see the "restore" comment in `run_migrations_locked`).
+/// Keeping both call sites on this one function means they cannot drift.
+fn pool_statement_timeout_ms() -> u64 {
+    timeout_ms_env("DB_STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS)
+}
+
 /// Build and return a `deadpool-postgres` connection pool.
 ///
 /// The `database_url` must be a valid `libpq`-style connection string, e.g.:
@@ -104,11 +114,11 @@ pub fn build_pool(database_url: &str, pool_size: usize) -> Result<Pool> {
     // Migrations exemption: `run_migrations_locked` uses this SAME pool to run
     // DDL, including `CREATE INDEX CONCURRENTLY` builds that can legitimately
     // take far longer than 30s on a large table. That function explicitly
-    // raises/clears `statement_timeout` around its own DDL (see the "migration
+    // disables `statement_timeout` around its own DDL and then re-issues this
+    // pool value via [`pool_statement_timeout_ms`] (see the "migration
     // timeout exemption" comments there) rather than us weakening the default
     // here — every other caller keeps the safety net.
-    let statement_timeout_ms =
-        timeout_ms_env("DB_STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS);
+    let statement_timeout_ms = pool_statement_timeout_ms();
     let lock_timeout_ms = timeout_ms_env("DB_LOCK_TIMEOUT_MS", DEFAULT_LOCK_TIMEOUT_MS);
     cfg.builder(NoTls)
         .context("failed to create deadpool-postgres pool builder")?
@@ -7923,8 +7933,25 @@ const RUN_MIGRATIONS_LOCK_KEY: i64 = 917_342_002;
 /// Dropping is safe here: an INVALID index provided no guarantees anyway (the
 /// planner never uses it, and an invalid UNIQUE index enforces nothing), and
 /// [`run_migrations`] (the sole caller, via [`run_migrations_locked`]) holds
-/// [`RUN_MIGRATIONS_LOCK_KEY`] for the whole call, so no other process can be
-/// concurrently building the same index name.
+/// [`RUN_MIGRATIONS_LOCK_KEY`] for the whole call, so no other *Crumb* process
+/// can be concurrently building the same index name.
+///
+/// The advisory lock does NOT cover an **operator's manual**
+/// `CREATE INDEX CONCURRENTLY` running in a plain psql session, though — and a
+/// concurrent build IN PROGRESS is also marked `indisvalid = false` until it
+/// finishes, so a naive reap during an api/recorder restart mid-build would
+/// destroy the operator's hours-long build. Two guards prevent that:
+///
+/// 1. The catalog query excludes any index with a live row in
+///    `pg_stat_progress_create_index` (the build backend's progress entry for
+///    this database) — a healthy in-flight build is skipped, not dropped.
+/// 2. Belt-and-braces for the race where a build starts between that snapshot
+///    and the `DROP`: the pool's per-connection `lock_timeout` (set in
+///    [`build_pool`], default 10s) bounds how long `DROP INDEX` queues behind
+///    the build's locks, and a `55P03 lock_not_available` error is treated as
+///    skip-and-WARN rather than a hard failure — the index is re-examined on
+///    the next boot, when the build has either finished (now VALID, untouched)
+///    or died (truly orphaned, reaped).
 ///
 /// Dropping is NOT always self-healing, though. The dropped index is rebuilt
 /// automatically only when the migration that creates it has **not yet been
@@ -7958,6 +7985,20 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
             JOIN pg_namespace ns ON ns.oid = ci.relnamespace
             WHERE NOT pi.indisvalid
               AND ns.nspname = current_schema()
+              -- Guard 1 (see the doc comment): an in-progress CREATE INDEX
+              -- CONCURRENTLY is ALSO indisvalid=false until it completes.
+              -- Skip any index whose build is live right now — it has a row
+              -- in pg_stat_progress_create_index (scoped to this database;
+              -- the view is cluster-wide and OIDs are only unique per-DB).
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_stat_progress_create_index prog
+                  WHERE prog.index_relid = pi.indexrelid
+                    AND prog.datid = (
+                        SELECT oid FROM pg_database
+                        WHERE datname = current_database()
+                    )
+              )
             ",
             &[],
         )
@@ -7971,22 +8012,45 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
             index_name,
             table_name,
             "run_migrations: found INVALID index (left by an interrupted \
-             CREATE INDEX CONCURRENTLY) — dropping it; it provided NO \
-             guarantees while invalid. It is rebuilt automatically only if \
-             the migration that creates it is still pending; if that \
-             migration is already recorded in schema_migrations, recreate \
-             the index manually from its db/migrations/ file"
+             CREATE INDEX CONCURRENTLY) — dropping it unless its locks are \
+             held; it provided NO guarantees while invalid. It is rebuilt \
+             automatically only if the migration that creates it is still \
+             pending; if that migration is already recorded in \
+             schema_migrations, recreate the index manually from its \
+             db/migrations/ file"
         );
         // Index names are catalog-sourced identifiers (not user input), but
         // quote them defensively since `format!` can't bind a DDL identifier
         // as a parameter.
-        client
+        //
+        // Guard 2 (see the doc comment): this DROP runs under the pool's
+        // per-connection `lock_timeout` (set by build_pool's post-create
+        // hook). If a manual CONCURRENTLY build slipped in between the
+        // catalog snapshot above and this DROP, the build's locks make the
+        // DROP time out with 55P03 — treat that as skip-and-warn, never as a
+        // boot-failing error and never as an unbounded queued ACCESS
+        // EXCLUSIVE request stalling the table.
+        let drop_result = client
             .batch_execute(&format!(
                 r#"DROP INDEX IF EXISTS "{index_name}""#,
                 index_name = index_name.replace('"', "\"\"")
             ))
-            .await
-            .with_context(|| format!("reap_invalid_indexes: drop invalid index {index_name}"))?;
+            .await;
+        if let Err(e) = drop_result {
+            if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) {
+                tracing::warn!(
+                    index_name,
+                    table_name,
+                    "run_migrations: DROP of INVALID index timed out waiting \
+                     for a lock — something (likely an in-progress manual \
+                     CREATE INDEX CONCURRENTLY) holds locks on it; leaving it \
+                     alone. It will be re-examined on the next startup"
+                );
+                continue;
+            }
+            return Err(e)
+                .with_context(|| format!("reap_invalid_indexes: drop invalid index {index_name}"));
+        }
     }
 
     Ok(())
@@ -8397,11 +8461,20 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
                     format!("run_migrations: apply (concurrently stmt) {filename}")
                 })?;
             }
-            // Restore the pool default for the rest of this connection's life
-            // (it is about to be re-acquired fresh below anyway, but this
-            // keeps the invariant explicit rather than relying on that).
+            // Restore the POOL'S configured timeout for the rest of this
+            // connection's life. NOT `RESET`: `RESET statement_timeout`
+            // restores the Postgres SERVER default (typically 0 = disabled),
+            // not the 30s runaway-query backstop [`build_pool`]'s post-create
+            // hook set — the hook runs once per PHYSICAL connection at
+            // creation, not on every checkout, so this connection would
+            // return to the pool with NO statement timeout and a later
+            // hot-path query on it could hang indefinitely (exactly the
+            // pool-starvation hole the backstop exists to close). Re-issue
+            // the same value the hook set, via the shared
+            // [`pool_statement_timeout_ms`] source of truth.
+            let restore_ms = pool_statement_timeout_ms();
             client
-                .batch_execute("RESET statement_timeout")
+                .batch_execute(&format!("SET statement_timeout = '{restore_ms}ms'"))
                 .await
                 .context("run_migrations: restore statement_timeout after CONCURRENTLY")?;
         } else {
@@ -10202,6 +10275,107 @@ mod tests {
         assert!(
             valid_index_survives,
             "reap_invalid_indexes must never touch a VALID index"
+        );
+    }
+
+    /// An INVALID index whose locks are HELD by another session must be
+    /// skipped (with a WARN), not dropped and not turned into a boot-failing
+    /// error — this is the "operator's manual CREATE INDEX CONCURRENTLY is
+    /// running right now" protection (guard 2 in [`reap_invalid_indexes`]'s
+    /// docs).
+    ///
+    /// A real in-progress CONCURRENTLY build can't be reproduced
+    /// deterministically in a test (and guard 1's
+    /// `pg_stat_progress_create_index` row can't be faked — it is a stat
+    /// view, not a table), so this simulates the lock footprint instead: a
+    /// second session holds `SHARE UPDATE EXCLUSIVE` on the table, which is
+    /// exactly the table lock a live `CREATE INDEX CONCURRENTLY` holds, and
+    /// which conflicts with the `ACCESS EXCLUSIVE` that `DROP INDEX` needs.
+    /// The reaper must hit its `lock_timeout`, map the `55P03` to
+    /// skip-and-warn, and reap successfully on the next pass once the lock
+    /// is released.
+    #[tokio::test]
+    async fn reap_invalid_indexes_skips_lock_held_index() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        let client = get_conn(&fx.pool).await.expect("get_conn");
+
+        client
+            .batch_execute(
+                r"
+                CREATE TABLE widgets (id int PRIMARY KEY, name text);
+                CREATE INDEX widgets_name_idx ON widgets (name);
+                UPDATE pg_index SET indisvalid = false
+                WHERE indexrelid = 'widgets_name_idx'::regclass;
+                ",
+            )
+            .await
+            .expect("create table + invalid index");
+
+        // Second session: hold the table lock a live CREATE INDEX
+        // CONCURRENTLY would hold, in an open transaction.
+        let (holder, holder_conn) = tokio_postgres::connect(&fx.base_url, NoTls)
+            .await
+            .expect("connect lock-holder session");
+        tokio::spawn(holder_conn);
+        holder
+            .batch_execute(&format!(
+                "BEGIN; LOCK TABLE {}.widgets IN SHARE UPDATE EXCLUSIVE MODE",
+                fx.schema
+            ))
+            .await
+            .expect("hold SHARE UPDATE EXCLUSIVE on widgets");
+
+        // Shorten the reaper connection's lock_timeout (pool default is 10s)
+        // so the blocked DROP fails fast and the test stays quick. Session-
+        // level SET, same mechanism the pool's post-create hook uses.
+        client
+            .batch_execute("SET lock_timeout = '500ms'")
+            .await
+            .expect("shorten lock_timeout for test");
+
+        // Must return Ok (skip-and-warn), and must NOT have dropped the
+        // lock-held index.
+        reap_invalid_indexes(&client)
+            .await
+            .expect("reap_invalid_indexes must skip a lock-held index, not error");
+        let survives_while_locked: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                &[],
+            )
+            .await
+            .expect("check index survives while locked")
+            .get(0);
+        assert!(
+            survives_while_locked,
+            "reap_invalid_indexes must NOT drop an INVALID index whose locks \
+             are held by another session (a live manual CONCURRENTLY build)"
+        );
+
+        // Release the lock; the next boot's reap pass now truly reaps it.
+        holder
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("release lock");
+        reap_invalid_indexes(&client)
+            .await
+            .expect("reap_invalid_indexes (lock released)");
+        let still_present_after_release: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                &[],
+            )
+            .await
+            .expect("check index reaped after lock release")
+            .get(0);
+        assert!(
+            !still_present_after_release,
+            "once the blocking session is gone, the orphaned INVALID index \
+             must be reaped on the next pass"
         );
     }
 
