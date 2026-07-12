@@ -15,6 +15,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -1777,7 +1778,7 @@ class _ShuttleControlState extends State<_ShuttleControl> {
   }
 }
 
-class _PbTile extends StatelessWidget {
+class _PbTile extends StatefulWidget {
   const _PbTile({
     required this.camera,
     required this.pane,
@@ -1805,12 +1806,49 @@ class _PbTile extends StatelessWidget {
   /// Filmstrip frame shown over the video while the scrubber is being dragged.
   final Uint8List? scrubFrame;
 
+  @override
+  State<_PbTile> createState() => _PbTileState();
+}
+
+class _PbTileState extends State<_PbTile> {
+  // Per-pane digital zoom, ported from the live wall's _WallTile (see
+  // wall_screen.dart): hover the pane + mouse wheel zooms IN PLACE, drag pans
+  // when zoomed. Double-click still maximizes. Playback plays a single segment
+  // stream, so there is no sub→main swap like the live wall's zoomToMain.
+  double _scale = 1.0;
+  Offset _offset = Offset.zero;
+  static const double _maxZoom = 8.0;
+
+  void _zoomAt(Offset cursor, double factor, Size pane) {
+    final newScale = (_scale * factor).clamp(1.0, _maxZoom);
+    if (newScale == _scale) return;
+    final newOffset = cursor - (cursor - _offset) * (newScale / _scale);
+    setState(() {
+      _scale = newScale;
+      _offset = _clampOffset(newOffset, pane);
+    });
+  }
+
+  Offset _clampOffset(Offset o, Size pane) {
+    final minX = pane.width * (1 - _scale);
+    final minY = pane.height * (1 - _scale);
+    return Offset(
+      o.dx.clamp(minX <= 0 ? minX : 0.0, 0.0),
+      o.dy.clamp(minY <= 0 ? minY : 0.0, 0.0),
+    );
+  }
+
+  void _panBy(Offset delta, Size pane) {
+    if (_scale <= 1.0) return;
+    setState(() => _offset = _clampOffset(_offset + delta, pane));
+  }
+
   /// The overlay shown when a pane has no live segment: a load error, a spinner
   /// while resolving, or — once resolved with nothing here — a styled "no
   /// footage" placeholder that reads calmly for a motion gap but flags a camera
   /// with no footage at all.
   Widget _noFootageOverlay() {
-    if (pane.error != null) {
+    if (widget.pane.error != null) {
       return _placeholder(
         icon: Icons.videocam_off_rounded,
         iconColor: Colors.red.shade300,
@@ -1819,7 +1857,7 @@ class _PbTile extends StatelessWidget {
         tint: Colors.red,
       );
     }
-    if (!pane.noFootage) {
+    if (!widget.pane.noFootage) {
       // Still resolving / opening a segment.
       return const ColoredBox(
         color: Colors.black54,
@@ -1833,7 +1871,7 @@ class _PbTile extends StatelessWidget {
       );
     }
     // Resolved: genuinely no footage at this instant.
-    if (recordsElsewhere == false) {
+    if (widget.recordsElsewhere == false) {
       // No coverage anywhere in range — a live/always-record camera with no
       // footage is worth flagging (amber).
       return _placeholder(
@@ -1848,11 +1886,12 @@ class _PbTile extends StatelessWidget {
     return _placeholder(
       icon: Icons.motion_photos_off_rounded,
       iconColor: Colors.white38,
-      title: recordsElsewhere == true
+      title: widget.recordsElsewhere == true
           ? 'No motion during this time'
           : 'No footage at this time',
-      subtitle:
-          recordsElsewhere == true ? 'This camera records on motion' : null,
+      subtitle: widget.recordsElsewhere == true
+          ? 'This camera records on motion'
+          : null,
       tint: Colors.blueGrey,
     );
   }
@@ -1927,85 +1966,126 @@ class _PbTile extends StatelessWidget {
     );
   }
 
+  /// The digital-zoom transform applied to the video (and the scrub frame so
+  /// they stay aligned while zoomed).
+  Matrix4 get _zoomTransform => Matrix4.identity()
+    ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
+    ..scaleByDouble(_scale, _scale, 1, 1);
+
   @override
   Widget build(BuildContext context) {
-    final hasFootage = pane.currentSegment != null;
+    final hasFootage = widget.pane.currentSegment != null;
     // Selected-tile outline follows the active tab accent (cyan on Playback).
     final accent = Theme.of(context).colorScheme.primary;
-    return GestureDetector(
-      onTap: onSelect,
-      onDoubleTap: onMaximizeToggle,
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.grey.shade900,
-          border: Border.all(
-            color: selected ? accent : Colors.white12,
-            width: selected ? 2 : 1,
-          ),
-        ),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            Video(
-              controller: pane.videoController,
-              controls: NoVideoControls,
-              fit: BoxFit.contain,
-            ),
-            if (!hasFootage) Positioned.fill(child: _noFootageOverlay()),
-            // Filmstrip scrub frame: covers the (frozen) video while dragging so
-            // scrubbing is smooth and never flashes black.
-            if (scrubFrame != null)
-              Positioned.fill(
-                child: Image.memory(
-                  scrubFrame!,
-                  fit: BoxFit.contain,
-                  gaplessPlayback: true,
-                ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final paneSize = Size(constraints.maxWidth, constraints.maxHeight);
+        return GestureDetector(
+          onTap: widget.onSelect,
+          onDoubleTap: widget.onMaximizeToggle,
+          // Drag pans the image only while zoomed in (no-op at 1×).
+          onPanUpdate: (d) => _panBy(d.delta, paneSize),
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade900,
+              border: Border.all(
+                color: widget.selected ? accent : Colors.white12,
+                width: widget.selected ? 2 : 1,
               ),
-            Positioned(
-              left: 6,
-              bottom: 6,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 3,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.55),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 7,
-                      height: 7,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: hasFootage ? Colors.amberAccent : Colors.white24,
+            ),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                // Hover the pane + mouse wheel → digital zoom IN PLACE, exactly
+                // like the live wall tiles (#87-adjacent: playback panes had no
+                // wheel-zoom, so hovering the video and scrolling did nothing).
+                Listener(
+                  onPointerSignal: (e) {
+                    if (e is PointerScrollEvent) {
+                      final factor =
+                          math.pow(1.0013, -e.scrollDelta.dy) as double;
+                      _zoomAt(e.localPosition, factor, paneSize);
+                    }
+                  },
+                  child: ClipRect(
+                    child: Transform(
+                      transform: _zoomTransform,
+                      child: Video(
+                        controller: widget.pane.videoController,
+                        controls: NoVideoControls,
+                        fit: BoxFit.contain,
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      camera.name,
-                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                ),
+                if (!hasFootage) Positioned.fill(child: _noFootageOverlay()),
+                // Filmstrip scrub frame: covers the (frozen) video while
+                // dragging so scrubbing is smooth and never flashes black.
+                // Zoomed with the same transform so it stays aligned.
+                if (widget.scrubFrame != null)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: Transform(
+                        transform: _zoomTransform,
+                        child: Image.memory(
+                          widget.scrubFrame!,
+                          fit: BoxFit.contain,
+                          gaplessPlayback: true,
+                        ),
+                      ),
                     ),
-                  ],
+                  ),
+                Positioned(
+                  left: 6,
+                  bottom: 6,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.55),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: hasFootage
+                                ? Colors.amberAccent
+                                : Colors.white24,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          widget.camera.name,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
+                if (!hasFootage)
+                  const Positioned(
+                    right: 6,
+                    top: 6,
+                    child: Text(
+                      'no footage',
+                      style: TextStyle(color: Colors.white38, fontSize: 10),
+                    ),
+                  ),
+              ],
             ),
-            if (!hasFootage)
-              const Positioned(
-                right: 6,
-                top: 6,
-                child: Text(
-                  'no footage',
-                  style: TextStyle(color: Colors.white38, fontSize: 10),
-                ),
-              ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
