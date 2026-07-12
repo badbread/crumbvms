@@ -703,8 +703,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     }
   }
 
-  void _cycleSpeed() {
-    setState(() => _speedIdx = (_speedIdx + 1) % _speeds.length);
+  void _setSpeed(int idx) {
+    setState(() => _speedIdx = idx);
     for (final pane in _panes.values) {
       pane.player?.setRate(_speeds[_speedIdx]);
     }
@@ -1010,10 +1010,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
           ),
           _TransportBar(
             playing: _playing,
-            speedLabel: '${_speeds[_speedIdx]}x',
+            speeds: _speeds,
+            speedIdx: _speedIdx,
             gotoLabel: _fmtPlayheadLabel(),
             onTogglePlay: _togglePlay,
-            onCycleSpeed: _cycleSpeed,
+            onSetSpeed: _setSpeed,
             onJumpFirst: _jumpToFirst,
             onJumpLatest: _jumpToLatest,
             onPrevMotion: () => _jumpMotion(false),
@@ -1085,10 +1086,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 class _TransportBar extends StatelessWidget {
   const _TransportBar({
     required this.playing,
-    required this.speedLabel,
+    required this.speeds,
+    required this.speedIdx,
     required this.gotoLabel,
     required this.onTogglePlay,
-    required this.onCycleSpeed,
+    required this.onSetSpeed,
     required this.onJumpFirst,
     required this.onJumpLatest,
     required this.onPrevMotion,
@@ -1103,10 +1105,11 @@ class _TransportBar extends StatelessWidget {
   });
 
   final bool playing;
-  final String speedLabel;
+  final List<double> speeds;
+  final int speedIdx;
   final String gotoLabel;
   final VoidCallback onTogglePlay;
-  final VoidCallback onCycleSpeed;
+  final ValueChanged<int> onSetSpeed;
   final VoidCallback onJumpFirst;
   final VoidCallback onJumpLatest;
   final VoidCallback onPrevMotion;
@@ -1118,6 +1121,55 @@ class _TransportBar extends StatelessWidget {
   final VoidCallback onBookmark;
   final VoidCallback onZoomOut;
   final VoidCallback onZoomIn;
+
+  static String _fmtSpeed(double s) =>
+      s == s.truncateToDouble() ? '${s.toInt()}×' : '$s×';
+
+  /// The playback-speed control: a bordered accent pill showing the current
+  /// rate with a speedometer icon, opening a menu to pick a rate directly.
+  Widget _speedPill(Color accent) {
+    return ShiftHint(
+      hint: 'Playback speed',
+      child: PopupMenuButton<int>(
+        tooltip: 'Playback speed',
+        initialValue: speedIdx,
+        onSelected: onSetSpeed,
+        position: PopupMenuPosition.under,
+        itemBuilder: (context) => [
+          for (var i = 0; i < speeds.length; i++)
+            CheckedPopupMenuItem<int>(
+              value: i,
+              checked: i == speedIdx,
+              child: Text(_fmtSpeed(speeds[i])),
+            ),
+        ],
+        child: Container(
+          height: 28,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            border: Border.all(color: accent.withValues(alpha: 0.6)),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.speed, size: 15, color: accent),
+              const SizedBox(width: 5),
+              Text(
+                _fmtSpeed(speeds[speedIdx]),
+                style: TextStyle(
+                  color: accent,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 13,
+                ),
+              ),
+              Icon(Icons.arrow_drop_down, size: 16, color: accent),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _iconBtn(
     IconData icon,
@@ -1148,29 +1200,11 @@ class _TransportBar extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       child: Row(
         children: [
-          // ── left cluster: speed + coarse nudges ──────────────────────────
+          // ── left cluster: coarse nudges (far left) + speed (next to play) ──
           Expanded(
             child: Row(
               mainAxisAlignment: MainAxisAlignment.start,
               children: [
-                ShiftHint(
-                  hint: 'Playback speed',
-                  child: TextButton(
-                    onPressed: onCycleSpeed,
-                    style: TextButton.styleFrom(
-                      minimumSize: const Size(0, 30),
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
-                    child: Text(
-                      speedLabel,
-                      style: TextStyle(
-                        color: accent,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 4),
                 for (final n in const [
                   (-3600, '−1h'),
                   (-600, '−10m'),
@@ -1189,6 +1223,12 @@ class _TransportBar extends StatelessWidget {
                       child: Text(n.$2, style: const TextStyle(fontSize: 11)),
                     ),
                   ),
+                const Spacer(),
+                // Speed sits right beside the play cluster (its natural home)
+                // as a clearly-labelled pill with a direct-pick dropdown, not a
+                // cryptic tap-to-cycle text button off in the corner.
+                _speedPill(accent),
+                const SizedBox(width: 8),
               ],
             ),
           ),
