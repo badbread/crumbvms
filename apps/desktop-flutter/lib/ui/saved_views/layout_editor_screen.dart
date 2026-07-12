@@ -9,6 +9,8 @@
 // rectangle expansion so the result always tiles cleanly) is ported exactly
 // from vsMergeRegion so saved geometry round-trips identically either way.
 
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -101,6 +103,10 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
   String? _editingId; // id of the view currently loaded for editing, if any
   String? _defaultViewId; // starred launch view
 
+  /// Signature of the editor state at the last load/save; the Save button is
+  /// shown only while the current state differs from it (unsaved changes).
+  String? _baseline;
+
   @override
   void initState() {
     super.initState();
@@ -108,6 +114,40 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
     _loadViews();
     final existing = widget.existingView;
     if (existing != null) _loadIntoEditor(existing);
+    // Re-evaluate the dirty state (and thus Save visibility) as the name types.
+    _nameCtrl.addListener(() {
+      if (mounted) setState(() {});
+    });
+    _captureBaseline();
+  }
+
+  /// A stable string capturing everything a save persists: name, icon, layout
+  /// geometry, and per-cell assignments (via TileSpec.toJson).
+  String _signature() {
+    final layout = CustomLayout(
+      cols: _cols,
+      rows: _rows,
+      cells: _cells,
+    ).sortedByReadingOrder();
+    final slots = <String>[];
+    for (var i = 0; i < layout.cells.length; i++) {
+      final spec = _assign[layout.cells[i].key];
+      if (spec != null) slots.add('$i:${jsonEncode(spec.toSlotValue())}');
+    }
+    return '${_nameCtrl.text.trim()}$_icon'
+        '${layout.encodeLayoutField()}${slots.join("|")}';
+  }
+
+  void _captureBaseline() => _baseline = _signature();
+
+  /// True when the editor has changes not yet saved.
+  bool get _dirty => _baseline != null && _signature() != _baseline;
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
+    );
   }
 
   Future<void> _loadViews() async {
@@ -166,6 +206,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       });
       _error = null;
     });
+    _captureBaseline(); // freshly loaded → no unsaved changes
   }
 
   /// Start a fresh, unsaved layout.
@@ -181,6 +222,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       _cells = CustomLayout.unitGrid(4, 3).cells;
       _error = null;
     });
+    _captureBaseline();
   }
 
   Future<void> _deleteView(SavedView v) async {
@@ -497,7 +539,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
   Future<void> _save() async {
     final name = _nameCtrl.text.trim();
     if (name.isEmpty) {
-      setState(() => _error = 'Enter a name to save this view.');
+      _snack('Enter a name to save this view.');
       return;
     }
     final layout = CustomLayout(
@@ -506,7 +548,7 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
       cells: _cells,
     ).sortedByReadingOrder();
     if (layout.cells.isEmpty) {
-      setState(() => _error = 'Layout has no boxes.');
+      _snack('Add at least one box to the layout before saving.');
       return;
     }
 
@@ -546,95 +588,61 @@ class _LayoutEditorScreenState extends State<LayoutEditorScreen> {
         _saving = false;
         _editingId = created.id;
       });
+      _captureBaseline(); // saved → no unsaved changes → Save button hides
       await _loadViews();
+      if (!mounted) return;
+      _snack('Saved "$name".');
+      // Make the just-saved view the active wall view, so it shows up when the
+      // editor is closed (the old "Apply" is now folded into Save).
+      widget.onApply?.call(AppliedView.fromSavedView(created, _cameras));
     } catch (e) {
       if (mounted) {
-        setState(() {
-          _error = 'Save failed: $e';
-          _saving = false;
-        });
+        setState(() => _saving = false);
+        _snack('Save failed: $e');
       }
     }
   }
 
-  /// Bottom action bar matching the old client: a hint on the left, then
-  /// Cancel / Apply / Save view. Apply uses the layout on the wall now; Save
-  /// view also keeps it for later.
+  /// Bottom action bar: Cancel (always) + Save (only while there are unsaved
+  /// changes). Saving persists the view AND makes it the active wall view, so
+  /// the separate "Apply" button is gone. When there's nothing to save the
+  /// Save button disappears — its absence is the "you're saved" signal.
   Widget _actionBar() {
     final scheme = Theme.of(context).colorScheme;
+    final dirty = _dirty;
     return Material(
       color: scheme.surfaceContainerHigh,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
         child: Row(
           children: [
-            Expanded(
-              child: Text(
-                'Apply uses this layout on the wall now. Save view also keeps '
-                'it under the view row to switch back to later.',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: scheme.onSurfaceVariant,
-                ),
+            if (dirty)
+              Text(
+                'Unsaved changes',
+                style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
               ),
-            ),
+            const Spacer(),
             TextButton(
               onPressed: _saving ? null : () => Navigator.of(context).pop(),
               child: const Text('Cancel'),
             ),
-            const SizedBox(width: 4),
-            if (widget.onApply != null)
-              OutlinedButton(
-                onPressed: _saving ? null : _apply,
-                child: const Text('Apply'),
+            if (dirty) ...[
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: _saving ? null : _save,
+                child: _saving
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Save'),
               ),
-            const SizedBox(width: 8),
-            FilledButton(
-              onPressed: _saving ? null : _save,
-              child: _saving
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Save view'),
-            ),
+            ],
           ],
         ),
       ),
     );
-  }
-
-  /// Apply the current layout to the wall now, without saving it as a named
-  /// view (the old client's "Apply" button).
-  void _apply() {
-    final layout = CustomLayout(
-      cols: _cols,
-      rows: _rows,
-      cells: _cells,
-    ).sortedByReadingOrder();
-    if (layout.cells.isEmpty) {
-      setState(() => _error = 'Layout has no boxes.');
-      return;
-    }
-    final slots = <int, String>{};
-    for (var i = 0; i < layout.cells.length; i++) {
-      final spec = _assign[layout.cells[i].key];
-      if (spec != null && spec.isCamera && spec.cameraId != null) {
-        slots[i] = spec.cameraId!;
-      }
-    }
-    final name = _nameCtrl.text.trim();
-    widget.onApply?.call(
-      AppliedView(
-        id: '__preview__',
-        name: name.isEmpty ? 'Custom layout' : name,
-        layout: layout,
-        slots: slots,
-        rawSlots: const {},
-      ),
-    );
-    Navigator.of(context).pop();
   }
 
   /// Hold Shift to temporarily enter "edit layout" mode (merge/split boxes).
