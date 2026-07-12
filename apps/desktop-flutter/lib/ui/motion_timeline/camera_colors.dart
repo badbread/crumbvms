@@ -10,42 +10,43 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// A hand-picked, well-separated 12-color palette (not a raw hash->hue) so
-/// adjacent indices never land on muddy/near-identical hues on a dark
-/// timeline background. Deliberately red-free: red reads as alarm/record on
-/// this timeline, not routine per-camera motion.
+/// A hand-picked, MAXIMALLY-separated 12-color palette (not a raw hash->hue) so
+/// adjacent cameras on the dark timeline are easy to tell apart — hues span the
+/// wheel with big gaps and lightness alternates so even same-family hues
+/// (blue/cyan/indigo, green/lime/teal) still read distinct. Deliberately
+/// red-free: red reads as alarm/record on this timeline, not routine motion.
 const List<Color> kCameraColorPalette = [
-  Color(0xFF4C9AFF), // azure
-  Color(0xFFF2994A), // orange
-  Color(0xFF6FCF97), // green
-  Color(0xFFF2C94C), // yellow
-  Color(0xFFBB6BD9), // purple
-  Color(0xFF56CCF2), // cyan
-  Color(0xFFF783AC), // pink
-  Color(0xFFA9DC76), // lime
-  Color(0xFF9B8AFB), // indigo
-  Color(0xFFFFB86B), // amber
-  Color(0xFF5FE3C0), // teal
-  Color(0xFF7AA2F7), // periwinkle
+  Color(0xFF4C9AFF), // blue
+  Color(0xFFFF8A3D), // orange
+  Color(0xFF2FCF6F), // green
+  Color(0xFFFFD23F), // yellow
+  Color(0xFFB57BEF), // purple
+  Color(0xFF17D5E6), // cyan (brighter/greener than the blue)
+  Color(0xFFFF7FB2), // pink
+  Color(0xFF9CD323), // lime
+  Color(0xFF7C6CFF), // indigo
+  Color(0xFF12B58A), // teal (darker, green-leaning)
+  Color(0xFFE08A5A), // coral
+  Color(0xFFD65DB1), // magenta
 ];
 
 /// Extra colors offered ONLY in the manual color picker — kept SEPARATE from
 /// [kCameraColorPalette] so adding them never changes the modulo that derives a
-/// camera's default color (existing cameras keep their color). Still red-free
-/// (red reads as alarm/record on the timeline).
+/// camera's default color. Chosen to fill the GAPS in the base palette (paler /
+/// darker variants + off-hues) for more manual choice. Still red-free.
 const List<Color> kExtraCameraColors = [
-  Color(0xFF2D9CDB), // strong blue
-  Color(0xFF27AE60), // emerald
-  Color(0xFFE2B93B), // gold
-  Color(0xFFEB7BC0), // rose
-  Color(0xFF8E7CFF), // violet
-  Color(0xFF4ECDC4), // turquoise
-  Color(0xFFB2D235), // chartreuse
-  Color(0xFFFF9F43), // tangerine
-  Color(0xFF9B59B6), // amethyst
-  Color(0xFF00B8A9), // jade
-  Color(0xFF6C8EAD), // slate blue
-  Color(0xFFD6A2E8), // orchid
+  Color(0xFF8FB3FF), // pale blue
+  Color(0xFFC08A00), // dark gold
+  Color(0xFF00A3A3), // dark teal
+  Color(0xFFF06292), // rose
+  Color(0xFFA5D6A7), // pale green
+  Color(0xFFCE93D8), // pale purple
+  Color(0xFFFFAB40), // amber
+  Color(0xFF64B5F6), // sky
+  Color(0xFF9575CD), // lavender
+  Color(0xFF4DB6AC), // aqua
+  Color(0xFFC6D64B), // olive-lime
+  Color(0xFFBA68C8), // orchid
 ];
 
 /// The full swatch set shown in the manual picker: the derived palette plus the

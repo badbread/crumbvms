@@ -519,19 +519,20 @@ class _MainShellState extends State<MainShell> {
       widget.fullscreen.setFullscreen(false);
       return true;
     }
-    _returnToClips();
+    _exitPlaybackFocus();
     return true;
   }
 
-  /// Leave a clip-originated Playback focus: back to the Clips tab, with the
-  /// originating clip's player reopened. Clears the one-shot focus/seek state
-  /// so a later manual Playback entry starts clean (keeps [_originClip] so
-  /// the remounted Clips screen can reopen the box that launched the review).
-  void _returnToClips() {
+  /// Leave a single-camera Playback focus. If it was clip-originated
+  /// ([_originClip] set) return to the Clips tab and reopen that clip's box;
+  /// otherwise (e.g. a bookmark jump) return to the live wall. Clears the
+  /// one-shot focus/seek state so a later manual Playback entry starts clean
+  /// (keeps [_originClip] so the remounted Clips screen can reopen the box).
+  void _exitPlaybackFocus() {
     setState(() {
       _playbackFocusCameraId = null;
       _playbackSeekTo = null;
-      _index = _clipsIndex;
+      _index = _originClip != null ? _clipsIndex : _liveIndex;
     });
   }
 
@@ -830,7 +831,15 @@ class _MainShellState extends State<MainShell> {
             cameras: widget.cameras,
             onJumpToPlayback: (cameraId, ts) {
               Navigator.of(ctx).pop();
-              setState(() => _index = _playbackIndex);
+              // Open Playback focused on the bookmarked camera AT the bookmark
+              // moment (was just switching tabs at the default time). No clip
+              // origin → Esc/double-click returns to the live wall.
+              setState(() {
+                _originClip = null;
+                _playbackFocusCameraId = cameraId;
+                _playbackSeekTo = ts;
+                _index = _playbackIndex;
+              });
             },
           ),
         ),
@@ -969,7 +978,8 @@ class _MainShellState extends State<MainShell> {
           // A clip-originated focus has no grid to restore to — double-click
           // (and Esc, via the handler above) goes back to the Clips box that
           // opened it, not to a live view the camera may not even be in.
-          onExitFocus: _playbackFocusCameraId == null ? null : _returnToClips,
+          onExitFocus:
+              _playbackFocusCameraId == null ? null : _exitPlaybackFocus,
           // Report the motion controller so the bottom status bar can host the
           // legend + hints. Store on register; clear only on a matching
           // unregister (a keyed remount inits the new one before old disposes).
