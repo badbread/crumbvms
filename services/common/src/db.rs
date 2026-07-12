@@ -10259,6 +10259,21 @@ mod tests {
             .await
             .expect("create table + index");
 
+        // De-flake under `cargo test --workspace` parallelism (CI): the reap's
+        // `DROP INDEX` needs ACCESS EXCLUSIVE on `widgets`, and the only session
+        // that can otherwise contend for it on this test's private-schema table
+        // is autovacuum (SHARE UPDATE EXCLUSIVE, which conflicts). Under heavy
+        // parallel load a freshly created + catalog-UPDATE'd table can draw an
+        // autovacuum that holds that lock past the connection's `lock_timeout`,
+        // so the reap exhausts its retries and (correctly, safe-direction) SKIPS
+        // the drop — making this assertion flaky. Turning autovacuum off for the
+        // table removes the sole external lock contender so the drop is
+        // deterministic; it does not weaken what the test checks.
+        client
+            .batch_execute("ALTER TABLE widgets SET (autovacuum_enabled = false)")
+            .await
+            .expect("disable autovacuum on the fixture table");
+
         // Simulate the catalog state a killed CREATE INDEX CONCURRENTLY
         // leaves behind: the index exists but is marked NOT VALID.
         client
