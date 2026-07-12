@@ -17,6 +17,8 @@ import 'dart:ui' as ui;
 
 import 'package:file_selector/file_selector.dart';
 
+import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
+
 /// Open a native "choose image" dialog, downscale the result so the longest
 /// side is at most [maxDim] px (matches vsDownscaleImage's `maxDim=1280`
 /// default used by the view-item config panel), and return a PNG `data:` URI
@@ -27,7 +29,11 @@ Future<String?> pickAndDownscaleImage({int maxDim = 1280}) async {
     label: 'images',
     extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'],
   );
-  final file = await openFile(acceptedTypeGroups: const [typeGroup]);
+  // Fullscreen-safe: the native open dialog can otherwise freeze the app
+  // behind a borderless fullscreen window (see runNativePicker).
+  final file = await runNativePicker(
+    () => openFile(acceptedTypeGroups: const [typeGroup]),
+  );
   if (file == null) return null;
   final bytes = await file.readAsBytes();
   return downscaleImageBytes(bytes, maxDim: maxDim);

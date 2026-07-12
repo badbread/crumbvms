@@ -33,6 +33,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart'
     show FullscreenController;
+import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 
 enum ClipsDensity { compact, normal, large }
@@ -1048,8 +1049,12 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     final cam = widget.clip.cameraName.replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '_');
     final stamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
     try {
-      final loc = await getSaveLocation(
-        suggestedName: 'crumb_${cam.isEmpty ? "clip" : cam}_$stamp.png',
+      // Fullscreen-safe: the native save dialog can open behind a borderless
+      // fullscreen window and freeze the app (see runNativePicker).
+      final loc = await runNativePicker(
+        () => getSaveLocation(
+          suggestedName: 'crumb_${cam.isEmpty ? "clip" : cam}_$stamp.png',
+        ),
       );
       if (loc == null) return; // user cancelled
       final file = XFile.fromData(bytes, mimeType: 'image/png', name: 'snapshot.png');
