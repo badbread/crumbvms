@@ -509,14 +509,18 @@ class _WallTileState extends State<_WallTile> {
         _paneId,
         SnapshotTarget(player: player, cameraName: widget.camera.name),
       );
-      if (SnapshotRegistry.instance.activePaneId.value == null) {
-        SnapshotRegistry.instance.setActive(_paneId);
-      }
       // Register as an audio pane (muted until it becomes the audible pane).
       widget.audio?.registerPane(
         _paneId,
         AudioPane.forPlayer(player, hasAudio: () => mounted),
       );
+      if (SnapshotRegistry.instance.activePaneId.value == null) {
+        SnapshotRegistry.instance.setActive(_paneId);
+        // Mirror the default selection into audio-follow too, so the global
+        // audio button has a target from the start — without this, the tile
+        // looks selected but the audio toggle reports "select a camera".
+        widget.audio?.setSelected(_paneId);
+      }
       setState(() {
         _player = player;
         _controller = controller;
@@ -553,6 +557,7 @@ class _WallTileState extends State<_WallTile> {
   Future<void> _showTileMenu(Offset globalPos) async {
     final prefs = widget.streamPrefs;
     SnapshotRegistry.instance.setActive(_paneId); // select on right-click
+    widget.audio?.setSelected(_paneId); // keep audio-follow in step
     final overlay =
         Overlay.of(context).context.findRenderObject() as RenderBox;
     final eff = prefs?.effectiveFor(widget.camera.id);
