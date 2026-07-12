@@ -35,7 +35,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, SubscribeReasonCode};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -385,12 +385,14 @@ pub(crate) fn emit(motion_tx: &MotionTx, camera_id: Uuid, t: Transition) {
 /// does for the pixel-diff loop. On any teardown an in-progress event is closed
 /// with a STOP so `recording.rs` never sees a dangling event.
 ///
-/// Reports the source HEALTHY (via `health_tx`) only AFTER the broker's `ConnAck`
-/// confirms a live connection — never optimistically before — so a source that
-/// cannot reach the broker stays unhealthy and the supervisor's fail-open grace
-/// accumulates instead of being reset by a premature "healthy" (issue #61, the
-/// `ha_motion.rs` twin). On any exit the supervisor reports unhealthy, so a
-/// Motion-mode camera fails OPEN.
+/// Reports the source HEALTHY (via `health_tx`) only AFTER the broker GRANTS the
+/// events subscription (a `SubAck` whose return codes are all granted-QoS) —
+/// never optimistically before — so a source that cannot reach the broker
+/// (issue #61, the `ha_motion.rs` twin) or that connects but is denied the
+/// subscription (issue #78: ACL deny ⇒ "healthy forever with zero events")
+/// stays unhealthy and the supervisor's fail-open grace accumulates instead of
+/// being reset by a premature "healthy". On any exit the supervisor reports
+/// unhealthy, so a Motion-mode camera fails OPEN.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_frigate_motion_loop(
     camera: &Camera,
@@ -492,24 +494,43 @@ pub async fn run_frigate_motion_loop(
                 match maybe_ev {
                     Some(Event::Incoming(Packet::ConnAck(_))) => {
                         info!(camera_id = %camera.id, "frigate motion: MQTT connected, subscribing");
-                        // Broker confirmed live → NOW healthy. Reported here, not
-                        // before the loop: a source that never connects never
-                        // reaches this, so its health stays false and the fail-open
-                        // grace accumulates instead of being reset by a premature
-                        // "healthy" (issue #61). `report_health` dedups.
+                        // Connected is NOT healthy yet: the broker can still refuse
+                        // the subscription (ACL deny), which would leave the source
+                        // "connected forever with zero events" — health is reported
+                        // only on a granted SubAck below (issue #78). If the
+                        // subscribe request itself cannot be issued, no SubAck will
+                        // ever arrive: bail so the supervisor backs off and the
+                        // camera fails OPEN instead of idling unsubscribed.
+                        if let Err(e) = client.subscribe(&topic, QoS::AtLeastOnce).await {
+                            warn!(camera_id = %camera.id, error = %e, "frigate motion: subscribe failed");
+                            break Err(anyhow!("frigate motion MQTT subscribe request failed: {e}"));
+                        }
+                    }
+                    Some(Event::Incoming(Packet::SubAck(ack))) => {
+                        if !suback_granted(&ack.return_codes) {
+                            warn!(
+                                camera_id = %camera.id,
+                                return_codes = ?ack.return_codes,
+                                "frigate motion: broker denied the events subscription"
+                            );
+                            break Err(anyhow!("frigate motion MQTT subscription denied by broker"));
+                        }
+                        // Broker granted the subscription → NOW healthy. Reported
+                        // here, not on ConnAck: events are only guaranteed to flow
+                        // once the subscribe is acknowledged as granted, so anything
+                        // earlier is a premature "healthy" that resets the fail-open
+                        // grace (issue #78; same shape as the pre-connect healthy of
+                        // issue #61). `report_health` dedups.
                         crate::motion::report_health(
                             health_tx,
                             pool,
                             camera.id,
                             true,
-                            "frigate MQTT connected",
+                            "frigate MQTT subscription granted",
                             alert_gate,
                             alert_after_secs,
                         )
                         .await;
-                        if let Err(e) = client.subscribe(&topic, QoS::AtLeastOnce).await {
-                            warn!(camera_id = %camera.id, error = %e, "frigate motion: subscribe failed");
-                        }
                     }
                     Some(Event::Incoming(Packet::Publish(publish))) => {
                         if let Some(ev) = classify(&publish.payload, cfg.min_score) {
@@ -520,7 +541,7 @@ pub async fn run_frigate_motion_loop(
                             }
                         }
                     }
-                    Some(_) => {} // SubAck, PingResp, outgoing, etc.
+                    Some(_) => {} // PingResp, outgoing, etc.
                     None => {
                         // Poll task ended: a connection error (or shutdown). Treat as
                         // a lost connection → `Err` so the supervisor backs off and
@@ -540,6 +561,20 @@ pub async fn run_frigate_motion_loop(
         emit(motion_tx, camera.id, t);
     }
     result
+}
+
+/// Whether a broker `SubAck` actually GRANTED the subscription. Any `Failure`
+/// return code (0x80 — e.g. an ACL deny) — or an empty grant list — means the
+/// events topic will never be delivered to us no matter how live the
+/// connection is, so the source must not be reported healthy on it (issue #78).
+/// We subscribe to exactly one filter, so all-granted and any-granted coincide;
+/// `all` is the conservative choice.
+#[must_use]
+fn suback_granted(return_codes: &[SubscribeReasonCode]) -> bool {
+    !return_codes.is_empty()
+        && return_codes
+            .iter()
+            .all(|rc| matches!(rc, SubscribeReasonCode::Success(_)))
 }
 
 /// Parse `host` and `port` from an `mqtt://host:port` (or `mqtts://`, or bare
@@ -677,6 +712,28 @@ mod tests {
         t.observe(&ev("a", false), t0);
         assert!(matches!(t.force_stop(t0), Some(Transition::Stop { .. })));
         assert!(t.force_stop(t0).is_none(), "already stopped");
+    }
+
+    #[test]
+    fn suback_granted_requires_all_success() {
+        // Granted QoS (any level) → the subscription is live, healthy allowed.
+        assert!(suback_granted(&[SubscribeReasonCode::Success(
+            QoS::AtLeastOnce
+        )]));
+        assert!(suback_granted(&[SubscribeReasonCode::Success(
+            QoS::AtMostOnce
+        )]));
+        // Broker refusal (0x80, e.g. an ACL deny) → must NOT report healthy:
+        // "connected but unsubscribed" is a zero-event source and the camera
+        // must fail OPEN instead (issue #78).
+        assert!(!suback_granted(&[SubscribeReasonCode::Failure]));
+        // Mixed (defensive — we only subscribe to one filter) → still denied.
+        assert!(!suback_granted(&[
+            SubscribeReasonCode::Success(QoS::AtLeastOnce),
+            SubscribeReasonCode::Failure,
+        ]));
+        // An empty grant list confirms nothing.
+        assert!(!suback_granted(&[]));
     }
 
     #[test]

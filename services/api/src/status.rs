@@ -249,15 +249,17 @@ fn statvfs_bytes(path: &str) -> Option<(i64, i64)> {
             return None;
         }
         // Blocks are `f_bsize` bytes each. `f_blocks` = total data blocks,
-        // `f_bfree` = free blocks. All unsigned; products fit i64 for any
-        // realistic disk size.
+        // `f_bavail` = blocks available to a NON-root writer (we use this, not
+        // `f_bfree`, which includes the ext4 root reserve the non-root services
+        // can't use → over-reported free space; issue #72). All unsigned;
+        // products fit i64 for any realistic disk size.
         // cast_lossless: c_ulong = u64 on x86_64 Linux — alias, not identical type.
         #[allow(clippy::cast_lossless)]
         let bsize = buf.f_bsize as u64;
         #[allow(clippy::cast_lossless)]
         let total = (buf.f_blocks as u64).saturating_mul(bsize);
         #[allow(clippy::cast_lossless)]
-        let free = (buf.f_bfree as u64).saturating_mul(bsize);
+        let free = (buf.f_bavail as u64).saturating_mul(bsize);
         Some((i64::try_from(total).ok()?, i64::try_from(free).ok()?))
     }
 

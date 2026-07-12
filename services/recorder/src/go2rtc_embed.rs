@@ -171,20 +171,10 @@ async fn run_once(bin: &str, config: &str, shutdown: &CancellationToken) -> RunE
     // go2rtc writes its own level/timestamp per line, so both pipes log at the
     // same tracing level.
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                info!("go2rtc: {line}");
-            }
-        });
+        tokio::spawn(drain_pipe(stdout, false));
     }
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                warn!("go2rtc: {line}");
-            }
-        });
+        tokio::spawn(drain_pipe(stderr, true));
     }
 
     tokio::select! {
@@ -195,6 +185,49 @@ async fn run_once(bin: &str, config: &str, shutdown: &CancellationToken) -> RunE
         () = shutdown.cancelled() => {
             terminate(&mut child).await;
             RunEnd::Shutdown
+        }
+    }
+}
+
+/// Forward one child pipe into tracing, line by line, until EOF.
+///
+/// The task's contract is "keep the pipe empty for as long as the child
+/// lives" — a full ~64 KB pipe blocks the child's writes and a closed one
+/// SIGPIPEs it into a restart loop (correctness item 5). So reads are
+/// BYTE-oriented: `read_until(b'\n')` + lossy UTF-8 conversion. A UTF-8-strict
+/// `read_line`/`next_line` returns `InvalidData` on the first non-UTF-8 byte
+/// go2rtc emits, silently ending the drain while the child still runs — the
+/// exact failure this replaces. On a genuine (non-`Interrupted`) IO error the
+/// task falls back to a raw copy-to-null so the pipe stays drained even when
+/// line reads are broken; only EOF (child closed its end) ends the task.
+async fn drain_pipe<R>(pipe: R, is_stderr: bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(pipe);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => return, // EOF — the child closed its end.
+            Ok(_) => {
+                let raw = String::from_utf8_lossy(&buf);
+                let line = raw.trim_end_matches(['\r', '\n']);
+                if is_stderr {
+                    warn!("go2rtc: {line}");
+                } else {
+                    info!("go2rtc: {line}");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // Retry; worst case the partial line in `buf` is dropped at
+                // the top of the loop (cosmetic — the pipe stays drained).
+            }
+            Err(e) => {
+                warn!(error = %e, "go2rtc: log pipe read failed; draining raw to null until EOF");
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                return;
+            }
         }
     }
 }
@@ -219,4 +252,28 @@ async fn terminate(child: &mut Child) {
     }
     // Non-unix, no pid (already reaped), or SIGTERM grace expired: hard kill.
     let _ = child.kill().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_pipe;
+
+    /// Audit #76 regression: the old UTF-8-strict `next_line()` drain returned
+    /// `InvalidData` on the first non-UTF-8 byte and silently exited, closing
+    /// the pipe under a live child (SIGPIPE → restart loop). The byte drain
+    /// must consume ALL lines — valid and invalid alike — and return only at
+    /// EOF. Completion of this future (rather than a hang or panic) is the
+    /// assertion.
+    #[tokio::test]
+    async fn drain_pipe_survives_invalid_utf8_to_eof() {
+        let input: &[u8] = b"ok line\n\xff\xfe\xfd binary junk\nlast line without newline";
+        drain_pipe(input, false).await;
+        drain_pipe(input, true).await; // stderr path shares the same loop
+    }
+
+    /// An empty pipe (child produced nothing before exiting) is immediate EOF.
+    #[tokio::test]
+    async fn drain_pipe_handles_immediate_eof() {
+        drain_pipe(&b""[..], false).await;
+    }
 }

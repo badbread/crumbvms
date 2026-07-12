@@ -44,6 +44,9 @@ services:
     image: ${CRUMB_IMAGE_PREFIX:-ghcr.io/badbread/crumbvms}/recorder:${CRUMB_VERSION:-latest}
     restart: unless-stopped
     logging: *default-logging
+    # Clean shutdown finalizes in-flight segments and lets an in-progress storage-migration
+    # batch complete (up to ~60s); Docker's default 10s grace would SIGKILL mid-teardown.
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
