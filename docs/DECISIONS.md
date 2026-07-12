@@ -8,6 +8,46 @@ revisit.
 
 ---
 
+## 2026-07-11, Admin console: rebuild to a Frigate-style rail + list→detail model (not a reskin)
+
+**Context.** The web admin console (`services/api/src/admin.html`, also embedded
+by the desktop client per the hybrid-console decision below) used a Milestone
+Management-Client layout: a left tree with every camera / profile / storage / user
+nested under collapsible section roots, plus a right-hand editor pane. The
+operator's repeated complaint was the **format/layout itself** ("looks like a
+toy", "make it like Frigate"), not just the styling. Two prior attempts restyled
+the same tree and were rejected for exactly that reason.
+
+**Decision — change the information architecture, not just the CSS.**
+- The left rail is **sections-only**, grouped under three eyebrows
+  (Configure / Intelligence / Administer). No items nest in the rail.
+- Each section renders its **list in the content pane** (Cameras → stat tiles +
+  camera table; Recording → profiles; Users & security → roles + users), and
+  selecting a row opens that item's **detail/editor** (list→detail) with a
+  "‹ Section" breadcrumb back; the rail keeps the active section highlighted.
+- A visual reskin rode along: cool near-black ground, a **single amber accent**
+  (the old amber+cyan dual-accent retired), rounder geometry, one consistent
+  card / pill / form component kit, and label-over-input forms.
+
+**Rejected.**
+- *Reskin the existing tree-nested layout* (the first two attempts): a
+  "format/layout" complaint is about the IA, not the colors — repainting the
+  same bones does not address it.
+- *Keep the Milestone tree-with-children model*: familiar to VMS operators, but
+  it was the thing being rejected; the Frigate rail + list→detail model is what
+  the operator asked for and approved via a mockup.
+
+**Consequences / trade-offs.** Cameras/profiles/users sit one extra click away
+than when nested in the rail (rail → list → item) — accepted; it matches the
+Frigate flow and declutters the rail. Because the desktop client embeds `/admin`
+(hybrid-console decision below), it inherits this redesign for free.
+
+**Revisit triggers.** Operators report list→detail is slower for their workflow
+than direct tree access; or the desktop client stops embedding `/admin` (which
+would change the shared-surface calculus behind investing here).
+
+---
+
 ## 2026-07-10, Desktop client: rewrite native in Flutter (keep the Rust core), retire the Tauri/WebView2 airspace model
 
 **Context.** The desktop client is Tauri 2 + wry/WebView2 with native Win32

@@ -3906,80 +3906,10 @@ function renderTree() {
     item("select('server-root')",   icon('storage',17),     'Server',               srvActive, null);
 }
 
-/* A small labelled divider inside a section's children (e.g. "Roles" / "Users"
-   under Users & security), with an optional + add affordance. Typography-only,
-   no bordered box, matches the visual-hierarchy rule (§4.1). */
-function subHead(label, addFn) {
-  const add = addFn ? `<span class="tw-add" title="Add" onclick="event.stopPropagation();${addFn}">+</span>` : '';
-  return `<div class="tree-subhead">${esc(label)}${add}</div>`;
-}
-
-/* A standalone top-level entry that selects a whole-pane view (no children, no
-   +add), e.g. Integrations. Styled like a root head but acts as a row. */
-function leafRoot(kind, icon, label, selected) {
-  return `<div class="tree-root">
-    <div class="tree-root-head leaf ${selected?'selected':''}" role="button" tabindex="0"
-         onclick="select('${kind}')" onkeydown="treeKey(event,this)">
-      <span class="tw-icon">${icon}</span>
-      <span class="tw-label">${label}</span>
-    </div>
-  </div>`;
-}
-
-/* One top-level root section with a + add affordance. headClick fires when the
-   root label itself is clicked (used for Cameras/Storage "add when empty"). */
-function root(key, icon, label, childrenHTML, headClickFn, addFn, selected) {
-  const collapsed = isCollapsed(key);
-  const headClick = headClickFn ? `onclick="event.stopPropagation();${headClickFn}"` : '';
-  // A section may have no top-level + add (e.g. Users & security adds per sub-group).
-  const add = addFn ? `<span class="tw-add" title="Add" onclick="event.stopPropagation();${addFn}">+</span>` : '';
-  return `<div class="tree-root">
-    <div class="tree-root-head ${collapsed?'collapsed':''} ${selected?'selected':''}">
-      <span class="tw-chev" onclick="event.stopPropagation();toggleCollapse('${key}')">&#x25BC;</span>
-      <span class="tw-icon" onclick="event.stopPropagation();toggleCollapse('${key}')">${icon}</span>
-      <span class="tw-label" ${headClick}>${label}</span>
-      ${add}
-    </div>
-    <div class="tree-children ${collapsed?'collapsed':''}">${childrenHTML}</div>
-  </div>`;
-}
-
-/* Cameras root contents: ungrouped cameras first (by name), then each group as a
-   collapsible folder node (chevron + folder + member count) expanding to its
-   cameras (indented). */
-function renderCameraTreeRows() {
-  const byName = (a, b) => (a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
-  const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).slice().sort(byName);
-  let html = '';
-  // Add-camera ghost row when in add mode (keeps the tree's selection coherent).
-  if (selKind === 'add-camera') {
-    html += `<div class="tree-row selected"><span class="tr-icon">${icon('add',14)}</span><span class="tr-label">Add camera…</span></div>`;
-  }
-  html += ungrouped.map(camRow).join('');
-  // Groups (sorted by name), each a collapsible folder.
-  (GROUPS || []).slice().sort(byName).forEach(g => {
-    const key = 'grp:' + g.id;
-    const collapsed = isCollapsed(key);
-    const members = (g.camera_ids || [])
-      .map(cid => CAMS.find(c => c.id === cid)).filter(Boolean).sort(byName);
-    html += `<div class="tree-group-head ${collapsed?'collapsed':''} ${selKind==='group'&&selId===g.id?'selected':''}" role="button" tabindex="0" onclick="select('group','${g.id}')" onkeydown="treeKey(event,this)" title="${esc(g.name)}">
-      <span class="tg-chev" onclick="event.stopPropagation();toggleCollapse('${key}')" title="Expand / collapse">&#x25BC;</span>
-      <span class="tg-icon" onclick="event.stopPropagation();toggleCollapse('${key}')">${icon('group',13)}</span>
-      <span class="tg-label">${esc(g.name)}</span>
-      <span class="tg-count">${members.length}</span>
-    </div>
-    <div class="tree-group-cams ${collapsed?'collapsed':''}">${members.map(camRow).join('') || `<div class="tree-empty" style="padding-left:30px">Empty</div>`}</div>`;
-  });
-  if (!html) html = `<div class="tree-empty" onclick="newCamera()" style="cursor:pointer">No cameras, click to add</div>`;
-  return html;
-}
-function camRow(c) {
-  return `<div class="tree-row ${selKind==='camera'&&selId===c.id?'selected':''}" role="button" tabindex="0" onclick="select('camera','${c.id}')" onkeydown="treeKey(event,this)" title="${esc(c.name)} (${esc(c.camera_type||'other')})">
-    <span class="tr-icon">${icon(camIcon(c),14)}</span>
-    <span class="tr-label">${esc(c.name)}</span>
-    <span class="tr-status ${c.enabled?'on':''}" title="${c.enabled?'Recording':'Disabled'}"></span>
-  </div>`;
-}
+/* (Removed with the Frigate-model rebuild: subHead / leafRoot / root /
+   renderCameraTreeRows / camRow — the old nested-tree builders. The rail is now
+   sections-only (see renderTree above) and cameras/groups live in the Cameras
+   content view (renderCamerasRoot), not the rail.) */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    RIGHT PANE, welcome / cameras-root / storage-root
