@@ -427,6 +427,10 @@ class _MainShellState extends State<MainShell> {
   /// (see [PlaybackLegendBar]). Registered on Playback entry, cleared on exit.
   MotionTimelineController? _playbackMotion;
 
+  /// The live wall's perf/debug line (camera count + CPU/GPU/NVDEC/RSS), shown
+  /// in the bottom status bar on the Live tab instead of a floating overlay.
+  final ValueNotifier<String?> _wallStats = ValueNotifier<String?>(null);
+
   /// The clip whose "View on timeline" opened the current Playback focus.
   /// Leaving that focus view (double-click / Esc) returns to the Clips tab
   /// with this clip's player reopened — back to the box that opened it, since
@@ -488,6 +492,7 @@ class _MainShellState extends State<MainShell> {
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_playbackFocusEscHandler);
     _audio.dispose();
+    _wallStats.dispose();
     super.dispose();
   }
 
@@ -618,14 +623,7 @@ class _MainShellState extends State<MainShell> {
               if (!chromeHidden)
                 StatusBar(
                   controller: widget.statusBar,
-                  // On Playback, the camera-color legend + timeline hints live
-                  // in this gray bar (no extra strip under the timeline).
-                  leading: (_index == _playbackIndex && _playbackMotion != null)
-                      ? PlaybackLegendBar(
-                          motion: _playbackMotion!,
-                          cameras: widget.cameras,
-                        )
-                      : null,
+                  leading: _statusBarLeading(),
                 ),
             ],
           );
@@ -778,13 +776,17 @@ class _MainShellState extends State<MainShell> {
           session: session,
         ),
       ),
-      onOpenMotionTuner: () => _pushScreen(
-        'Motion tuner',
-        MotionTunerScreen(
-          api: widget.api,
-          session: session,
-          mediaTokenCache: widget.mediaTokens,
-          cameras: widget.cameras,
+      // Pushed directly (not via _pushScreen) so its own "Motion tuning" app
+      // bar — which carries the camera picker — is the ONLY header, instead of
+      // stacking under a second "Motion tuner" bar.
+      onOpenMotionTuner: () => Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => MotionTunerScreen(
+            api: widget.api,
+            session: session,
+            mediaTokenCache: widget.mediaTokens,
+            cameras: widget.cameras,
+          ),
         ),
       ),
     );
@@ -908,6 +910,37 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
+  /// What occupies the left of the bottom status bar per tab: the Playback
+  /// camera legend + hints, the Live wall's perf/debug line, else nothing
+  /// (falls back to the status message).
+  Widget? _statusBarLeading() {
+    if (_index == _playbackIndex && _playbackMotion != null) {
+      return PlaybackLegendBar(
+        motion: _playbackMotion!,
+        cameras: widget.cameras,
+      );
+    }
+    if (_index == _liveIndex) {
+      return ValueListenableBuilder<String?>(
+        valueListenable: _wallStats,
+        builder: (context, v, _) {
+          if (v == null || v.isEmpty) return const SizedBox.shrink();
+          return Text(
+            v,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 11,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          );
+        },
+      );
+    }
+    return null;
+  }
+
   Widget _buildBody(Session session) {
     switch (_index) {
       case _playbackIndex:
@@ -1014,6 +1047,8 @@ class _MainShellState extends State<MainShell> {
           hotkeys: widget.hotkeys,
           // Remember which pane is maximized so Playback can open on it.
           onMaximizedCameraChanged: (id) => _liveMaximizedId = id,
+          // Perf/debug line → bottom status bar (not a floating wall overlay).
+          statsSink: _wallStats,
         );
     }
   }

@@ -799,49 +799,73 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
             'A camera records on the union of every enabled source.',
             style: TextStyle(fontSize: 12, color: Colors.white54),
           ),
-          CheckboxListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Pixel analysis'),
-            subtitle: Text(kMotionAlgoNotes[_algorithm] ?? ''),
-            value: _pixelEnabled,
-            onChanged: (v) {
-              setState(() => _pixelEnabled = v ?? true);
-              unawaited(_applyMotionConfig());
-            },
-          ),
-          if (_pixelEnabled)
-            Padding(
-              padding: const EdgeInsets.only(left: 32, bottom: 8),
-              child: DropdownButton<String>(
-                value: _algorithm,
-                items: [
-                  for (final a in kMotionAlgorithms)
-                    DropdownMenuItem(value: a, child: Text(a)),
-                ],
-                onChanged: (v) {
-                  if (v == null) return;
-                  setState(() => _algorithm = v);
-                  unawaited(_applyMotionConfig());
-                },
+          const SizedBox(height: 4),
+          // Two columns so the sources fit without scrolling: pixel analysis
+          // (+ its algorithm dropdown) on the left, the two integration
+          // toggles on the right.
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Pixel analysis'),
+                      subtitle: Text(kMotionAlgoNotes[_algorithm] ?? ''),
+                      value: _pixelEnabled,
+                      onChanged: (v) {
+                        setState(() => _pixelEnabled = v ?? true);
+                        unawaited(_applyMotionConfig());
+                      },
+                    ),
+                    if (_pixelEnabled)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 32, bottom: 8),
+                        child: DropdownButton<String>(
+                          value: _algorithm,
+                          items: [
+                            for (final a in kMotionAlgorithms)
+                              DropdownMenuItem(value: a, child: Text(a)),
+                          ],
+                          onChanged: (v) {
+                            if (v == null) return;
+                            setState(() => _algorithm = v);
+                            unawaited(_applyMotionConfig());
+                          },
+                        ),
+                      ),
+                  ],
+                ),
               ),
-            ),
-          CheckboxListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Frigate detections'),
-            value: _frigateEnabled,
-            onChanged: (v) {
-              setState(() => _frigateEnabled = v ?? false);
-              unawaited(_applyMotionConfig());
-            },
-          ),
-          CheckboxListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Home Assistant'),
-            value: _haEnabled,
-            onChanged: (v) {
-              setState(() => _haEnabled = v ?? false);
-              unawaited(_applyMotionConfig());
-            },
+              const SizedBox(width: 24),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Frigate detections'),
+                      value: _frigateEnabled,
+                      onChanged: (v) {
+                        setState(() => _frigateEnabled = v ?? false);
+                        unawaited(_applyMotionConfig());
+                      },
+                    ),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Home Assistant'),
+                      value: _haEnabled,
+                      onChanged: (v) {
+                        setState(() => _haEnabled = v ?? false);
+                        unawaited(_applyMotionConfig());
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 24),
         ],

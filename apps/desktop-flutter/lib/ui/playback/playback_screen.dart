@@ -1475,22 +1475,33 @@ class _TransportBar extends StatelessWidget {
                 // Playback speed pill, just right of the center play cluster.
                 _speedPill(accent),
                 const SizedBox(width: 10),
-                ShiftHint(
-                  hint: 'Jump to a date & time',
-                  child: OutlinedButton.icon(
-                    onPressed: onPickGoto,
-                    icon: const Icon(Icons.event, size: 15),
-                    label: Text(
-                      gotoLabel,
-                      style: const TextStyle(fontSize: 11.5),
-                    ),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: const BorderSide(color: Colors.white24),
-                      minimumSize: const Size(0, 28),
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(4),
+                // Fixed width + left-aligned + tabular figures so the ticking
+                // clock never resizes the button and jitters the speed pill.
+                SizedBox(
+                  width: 172,
+                  child: ShiftHint(
+                    hint: 'Jump to a date & time',
+                    child: OutlinedButton.icon(
+                      onPressed: onPickGoto,
+                      icon: const Icon(Icons.event, size: 15),
+                      label: Text(
+                        gotoLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontFeatures: [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        alignment: Alignment.centerLeft,
+                        foregroundColor: Colors.white,
+                        side: const BorderSide(color: Colors.white24),
+                        minimumSize: const Size(0, 28),
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(4),
+                        ),
                       ),
                     ),
                   ),

@@ -42,6 +42,7 @@ class WallScreen extends StatefulWidget {
     this.audio,
     this.hotkeys,
     this.onMaximizedCameraChanged,
+    this.statsSink,
   });
 
   final CrumbApi api;
@@ -68,6 +69,11 @@ class WallScreen extends StatefulWidget {
   /// null when restored — so the host can carry that maximize into Playback.
   final ValueChanged<String?>? onMaximizedCameraChanged;
 
+  /// Sink for the perf/debug line (camera count + CPU/GPU/NVDEC/RSS). The host
+  /// renders it in the bottom status bar on the Live tab instead of a floating
+  /// overlay on the wall. Updated on each ~2s stats poll.
+  final ValueNotifier<String?>? statsSink;
+
   /// Client options store. The wall LISTENS to it, so a preference change made
   /// while the wall is visible — e.g. toggling "Show tile info bar" in the
   /// floating Settings panel — is reflected live on the wall behind the panel.
@@ -81,8 +87,6 @@ class WallScreen extends StatefulWidget {
 
 class _WallScreenState extends State<WallScreen> {
   Timer? _statsTimer;
-  HostStats? _stats;
-  double? _cpuPercent;
   double? _lastCpuTime;
   DateTime? _lastSample;
 
@@ -204,12 +208,15 @@ class _WallScreenState extends State<WallScreen> {
         cpuPct = ((s.cpuTimeSecs - _lastCpuTime!) / dt) / s.numCpus * 100.0;
       }
     }
-    setState(() {
-      _stats = s;
-      _cpuPercent = cpuPct;
-      _lastCpuTime = s.cpuTimeSecs;
-      _lastSample = now;
-    });
+    _lastCpuTime = s.cpuTimeSecs;
+    _lastSample = now;
+    // Perf/debug line for the bottom status bar (no wall rebuild needed).
+    widget.statsSink?.value =
+        '${_shown.length} cameras     '
+        'CPU ${cpuPct?.toStringAsFixed(0) ?? "—"}%   '
+        'GPU ${s.gpuUtil?.toStringAsFixed(0) ?? "—"}%   '
+        'NVDEC ${s.gpuDecUtil?.toStringAsFixed(0) ?? "—"}%   '
+        'RSS ${s.memMb.toStringAsFixed(0)}MB';
   }
 
   @override
@@ -248,7 +255,6 @@ class _WallScreenState extends State<WallScreen> {
   Widget build(BuildContext context) {
     final cams = _shown;
     final cols = cams.isEmpty ? 1 : math.sqrt(cams.length).ceil();
-    final s = _stats;
     final scaffold = Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
@@ -266,51 +272,24 @@ class _WallScreenState extends State<WallScreen> {
                   ),
           ),
 
-          // Top bar: camera count + host stats (FRB) + logout.
+          // Small logout affordance top-left. The perf/debug stats that used to
+          // sit here (camera count + CPU/GPU/NVDEC/RSS) now live in the bottom
+          // status bar (via statsSink) instead of a floating overlay.
           Positioned(
             top: 10,
             left: 10,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.6),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: Colors.white24),
+            child: Material(
+              color: Colors.black.withValues(alpha: 0.6),
+              shape: const CircleBorder(
+                side: BorderSide(color: Colors.white24),
               ),
-              child: DefaultTextStyle(
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontFeatures: [FontFeature.tabularFigures()],
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      '${cams.length} cameras',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        color: Colors.cyanAccent,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Text(
-                      'CPU ${_cpuPercent?.toStringAsFixed(0) ?? "—"}%  '
-                      'GPU ${s?.gpuUtil?.toStringAsFixed(0) ?? "—"}%  '
-                      'NVDEC ${s?.gpuDecUtil?.toStringAsFixed(0) ?? "—"}%  '
-                      'RSS ${s?.memMb.toStringAsFixed(0) ?? "—"}MB',
-                    ),
-                    const SizedBox(width: 12),
-                    InkWell(
-                      onTap: widget.onLogout,
-                      child: const Icon(
-                        Icons.logout,
-                        size: 16,
-                        color: Colors.white70,
-                      ),
-                    ),
-                  ],
-                ),
+              clipBehavior: Clip.antiAlias,
+              child: IconButton(
+                tooltip: 'Sign out',
+                iconSize: 16,
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.logout, color: Colors.white70),
+                onPressed: widget.onLogout,
               ),
             ),
           ),
