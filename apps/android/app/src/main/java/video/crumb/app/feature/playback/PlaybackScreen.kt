@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.NavigateNext
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -103,6 +105,7 @@ import video.crumb.app.ui.player.ViewTransform
 import video.crumb.app.ui.player.ZoomableVideoSurface
 import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.NavySurface
+import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
 import java.time.Instant
 
@@ -234,6 +237,20 @@ fun PlaybackScreen(
         MediaFactory.newPlayer(context).apply {
             setSeekParameters(SeekParameters.EXACT) // frame-accurate stepping
         }
+    }
+
+    // Recorded-playback audio on/off (mirrors the fullscreen live view's toggle).
+    // Seeded from SecureStore (default OFF — reviewing footage is silent until the
+    // operator asks for sound) and persisted on every change. A segment recorded
+    // without an audio track just plays silent when this is on — no crash.
+    val store = container.store
+    var audioOn by remember { mutableStateOf(store.playbackAudioOn) }
+    // Drive the single ExoPlayer's volume from the toggle. ExoPlayer keeps this
+    // volume across setMediaSource / the gapless addMediaSource path, so applying it
+    // to the one player here covers every segment (initial, scrub, motion-jump,
+    // auto-advance) without re-asserting it per segment.
+    LaunchedEffect(player, audioOn) {
+        player.volume = if (audioOn) 1f else 0f
     }
 
     // Frame step (paused): nudge the player by ~one frame within the current
@@ -730,6 +747,28 @@ fun PlaybackScreen(
                                 Icons.AutoMirrored.Filled.ArrowBack,
                                 contentDescription = "Back",
                                 tint = Color.White,
+                            )
+                        }
+                    }
+                }
+
+                // Audio on/off toggle — floats top-end over the video in BOTH
+                // orientations (same affordance as the fullscreen live view). Only
+                // shown once there's a resolved segment to hear; hidden on the
+                // loading / error / no-footage states where there's nothing playing.
+                if (state.currentSegment != null) {
+                    HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
+                        IconButton(
+                            onClick = {
+                                audioOn = !audioOn
+                                store.playbackAudioOn = audioOn
+                            },
+                            modifier = Modifier.align(Alignment.TopEnd).padding(2.dp),
+                        ) {
+                            Icon(
+                                imageVector = if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                contentDescription = if (audioOn) "Mute audio" else "Play audio",
+                                tint = if (audioOn) TealAccent else Color.White,
                             )
                         }
                     }
