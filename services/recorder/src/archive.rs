@@ -98,6 +98,17 @@ const EVICTION_BATCH_LIMIT: i64 = 2_000;
 /// huge backlog in one pass. Same rationale as [`EVICTION_BATCH_LIMIT`].
 const MAX_RETENTION_BATCH_LIMIT: i64 = 2_000;
 
+/// Upper bound on rows ONE archive run's eligibility query pulls (the oldest
+/// prefix). The #80 backlog continuation re-runs [`archive_camera`] every tick
+/// until the catch-up drains — but an UNBOUNDED listing re-fetched the entire
+/// eligible set (a 300k-row / ~70MB `Vec` on a large catch-up) once per 60s
+/// tick even though the wall-time budget only processes ~1-2k of them. Sized
+/// to a generous multiple of one tick's realistic throughput (same rationale
+/// as [`EVICTION_BATCH_LIMIT`]); a listing that FILLS the limit is treated as
+/// pending backlog even when fully processed, so the next tick re-queries and
+/// the continuation semantics are unchanged.
+const ARCHIVE_LIST_LIMIT: i64 = 5_000;
+
 /// Process-wide guard ensuring archive operations NEVER run concurrently.
 ///
 /// Today they already can't: the scheduler runs ONE tick at a time and processes
@@ -469,8 +480,11 @@ async fn run_cron_archive(
     );
 
     match archive_camera(pool, config, camera, deadline).await {
-        Ok(deferred) => {
-            tracker.backlog_pending = deferred > 0;
+        Ok(outcome) => {
+            // Deferred segments OR a truncated listing (#80 follow-up: a
+            // fully-processed but LIMIT-filled batch may hide more eligible
+            // rows) both mean "continue next tick without a cron fire".
+            tracker.backlog_pending = outcome.backlog_pending();
         }
         Err(e) => {
             // Setup failures (missing storage / bad policy) won't self-heal
@@ -572,8 +586,10 @@ fn ensure_cron_tracker<'a>(
 ///
 /// # Returns
 ///
-/// The number of eligible segments DEFERRED past the deadline (0 = backlog
-/// fully drained this run).
+/// An [`ArchiveRunOutcome`]: how many LISTED segments were deferred past the
+/// deadline, and whether the listing itself was truncated at
+/// [`ARCHIVE_LIST_LIMIT`] (more eligible rows may exist that were never
+/// listed). Either condition means the backlog is pending.
 ///
 /// # Errors
 ///
@@ -581,10 +597,43 @@ fn ensure_cron_tracker<'a>(
 /// Per-segment errors are logged and not propagated.
 pub async fn archive_camera(
     pool: &Pool,
+    config: &Config,
+    camera: &Camera,
+    deadline: std::time::Instant,
+) -> Result<ArchiveRunOutcome> {
+    archive_camera_bounded(pool, config, camera, deadline, ARCHIVE_LIST_LIMIT).await
+}
+
+/// Outcome of one bounded [`archive_camera`] run (issue #80 + its follow-up).
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveRunOutcome {
+    /// Eligible segments that were LISTED this run but deferred past the
+    /// wall-time deadline (0 = every listed segment was processed).
+    pub deferred: usize,
+    /// The eligibility listing FILLED [`ARCHIVE_LIST_LIMIT`] — more eligible
+    /// rows may exist behind the truncation that were never listed at all, so
+    /// even a fully-processed run must re-query on the next tick.
+    pub listing_truncated: bool,
+}
+
+impl ArchiveRunOutcome {
+    /// More work may remain: the scheduler continues on the NEXT tick without
+    /// waiting for the next cron fire (#80 continuation).
+    pub fn backlog_pending(self) -> bool {
+        self.deferred > 0 || self.listing_truncated
+    }
+}
+
+/// [`archive_camera`] with an explicit listing bound, so tests can exercise
+/// the truncated-listing continuation without inserting `ARCHIVE_LIST_LIMIT`
+/// rows.
+async fn archive_camera_bounded(
+    pool: &Pool,
     _config: &Config,
     camera: &Camera,
     deadline: std::time::Instant,
-) -> Result<usize> {
+    list_limit: i64,
+) -> Result<ArchiveRunOutcome> {
     info!(
         camera_id   = %camera.id,
         camera_name = %camera.name,
@@ -611,16 +660,25 @@ pub async fn archive_camera(
 
     let cutoff = Utc::now() - Duration::hours(i64::from(camera.policy.live_retention_hours));
 
-    let segments = db::list_live_segments_for_archive(pool, camera.id, cutoff)
+    let segments = list_live_segments_for_archive_limited(pool, camera.id, cutoff, list_limit)
         .await
         .context("listing live segments for archive")?;
+    // A listing that fills the limit may hide more eligible rows behind the
+    // truncation; the caller must treat this run as pending backlog even when
+    // every listed segment is processed within budget.
+    let listing_truncated = usize::try_from(list_limit)
+        .map(|l| segments.len() >= l)
+        .unwrap_or(false);
 
     if segments.is_empty() {
         debug!(
             camera_id = %camera.id,
             "no segments eligible for archiving"
         );
-        return Ok(0);
+        return Ok(ArchiveRunOutcome {
+            deferred: 0,
+            listing_truncated: false,
+        });
     }
 
     info!(
@@ -681,16 +739,87 @@ pub async fn archive_camera(
             "archive tick budget exhausted; deferring remaining segments to the next tick"
         );
     }
+    if listing_truncated {
+        info!(
+            camera_id = %camera.id,
+            list_limit = list_limit,
+            "eligible-segment listing truncated at the per-run limit; \
+             remaining backlog will be re-queried next tick"
+        );
+    }
 
     info!(
         camera_id = %camera.id,
         archived  = archived,
         failed    = failed,
         deferred  = deferred,
+        listing_truncated = listing_truncated,
         "archive job complete"
     );
 
-    Ok(deferred)
+    Ok(ArchiveRunOutcome {
+        deferred,
+        listing_truncated,
+    })
+}
+
+/// Bounded variant of `db::list_live_segments_for_archive` (issue #80
+/// follow-up): the same oldest-first eligibility SELECT with a `LIMIT`, so the
+/// per-tick backlog continuation re-fetches at most [`ARCHIVE_LIST_LIMIT`]
+/// rows instead of the entire eligible set (300k rows / ~70MB per 60s tick on
+/// a large catch-up). Lives here rather than in `common/db.rs` because the
+/// recorder's archive job is its only consumer and this audit fix is scoped to
+/// this file; the projection mirrors the db.rs segment reads (no
+/// `motion_score` / `motion_bbox_*` columns — neither is needed to move a
+/// file, exactly as the unbounded query it replaces).
+async fn list_live_segments_for_archive_limited(
+    pool: &Pool,
+    camera_id: Uuid,
+    older_than: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<Segment>> {
+    let client = db::get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT id, camera_id, storage_id, stage, path,
+                   stream, start_ts, end_ts, duration_ms,
+                   has_motion, size_bytes
+            FROM segments
+            WHERE camera_id = $1
+              AND stage = 'live'
+              AND start_ts < $2
+            ORDER BY start_ts
+            LIMIT $3
+            ",
+            &[&camera_id, &older_than, &limit],
+        )
+        .await
+        .context("list_live_segments_for_archive_limited")?;
+    rows.iter()
+        .map(|row| {
+            let stage_str: String = row.get("stage");
+            let stage = SegmentStage::from_str(&stage_str)
+                .with_context(|| format!("unknown segment stage '{stage_str}'"))?;
+            let stream_str: String = row.get("stream");
+            let stream = crumb_common::types::SegmentStream::from_str(&stream_str)
+                .with_context(|| format!("unknown segment stream '{stream_str}'"))?;
+            Ok(Segment {
+                id: row.get("id"),
+                camera_id: row.get("camera_id"),
+                storage_id: row.get("storage_id"),
+                stage,
+                path: row.get("path"),
+                stream,
+                start_ts: row.get("start_ts"),
+                end_ts: row.get("end_ts"),
+                duration_ms: row.get("duration_ms"),
+                has_motion: row.get("has_motion"),
+                size_bytes: row.get("size_bytes"),
+                motion_bbox: None,
+            })
+        })
+        .collect()
 }
 
 /// Archive ONE segment for [`archive_camera`]: resolve its OWN source storage
@@ -1260,6 +1389,37 @@ async fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// True when `a` and `b` live on the SAME filesystem (identical `st_dev`), so a
+/// live→archive "move" between them cannot free a single byte of physical disk
+/// space. This is the default compose layout: `/data/archive` on the same
+/// filesystem as the live `/data` tree, expressed as two storage rows.
+///
+/// Used by the free-space-floor rescue in [`policy_size_eviction_sweep`]: when
+/// the floor is in deficit, freeing space must actually reduce used bytes, and
+/// a same-filesystem archive move does not.
+///
+/// Conservative on failure: if either side cannot be stat'd (unmounted
+/// storage, archive root not yet created) this returns `false`, keeping the
+/// normal footage-preserving archive-move behaviour — the floor deficit then
+/// persists into the next tick, by which time the move will have created the
+/// archive root and the detection works. Also `false` on non-Unix (no
+/// `st_dev`; CI cross-checks only).
+async fn same_filesystem(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (tokio::fs::metadata(a).await, tokio::fs::metadata(b).await) {
+            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
 async fn copy_with_crc32(src: &Path, dst: &Path) -> Result<(u64, u32)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1805,6 +1965,21 @@ pub async fn archive_retention_sweep(pool: &Pool, _config: &Config, camera: &Cam
 /// missing/unresolved, this logs an error and SKIPS live eviction entirely —
 /// leaving footage in place rather than deleting un-archived footage.
 ///
+/// **One deliberate, narrow exception — the ENOSPC rescue.** When the
+/// free-space FLOOR is in DEFICIT *and* the archive destination is on the SAME
+/// filesystem as the segment's own storage ([`same_filesystem`]; the default
+/// compose layout puts `/data/archive` beside live `/data`), an archive move
+/// frees ZERO bytes: pre-fix the sweep "moved" the oldest live footage in
+/// place every tick, the deficit read as satisfied, and the disk filled to
+/// 100% until ffmpeg hit ENOSPC and recording halted on EVERY camera — losing
+/// all future footage. In exactly that state the deficit-driven portion of
+/// the sweep DELETES the oldest segments instead (file-then-row, item 10, via
+/// the shared helper; protected bookmarks are still excluded by the candidate
+/// query; the whole sweep still holds [`ARCHIVE_GUARD`]), and emits
+/// `premature_rollover` so the loss is loud. Cap-only pressure (no floor
+/// deficit) still MOVES as before — the exception applies only while real
+/// bytes must be freed and a move cannot free them.
+///
 /// `used` is computed once via `SUM` at entry, then decremented by
 /// `seg.size_bytes` after each disposal so the loop stops exactly at the cap
 /// without re-SUMming every iteration.
@@ -1963,6 +2138,12 @@ pub async fn policy_size_eviction_sweep(
                 );
                 let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
                     std::collections::HashMap::new();
+                // Memoized per-source-storage answer to "does an archive move
+                // free real bytes?" for the ENOSPC-rescue exception (see the
+                // SAFETY INVARIANT above). Keyed by the segment's own storage
+                // id; the archive root is fixed for the whole sweep.
+                let mut same_fs_cache: std::collections::HashMap<Uuid, bool> =
+                    std::collections::HashMap::new();
                 for seg in &live {
                     // Stop once BOTH conditions are satisfied: under the live TARGET
                     // (cap - spill, if a cap exists) AND the free-space deficit
@@ -2001,6 +2182,63 @@ pub async fn policy_size_eviction_sweep(
                         };
                         let src_root = Path::new(&src_storage.path);
                         let archive_root = Path::new(&archive_storage.path);
+
+                        // ── ENOSPC RESCUE (SAFETY INVARIANT exception above) ──
+                        // While the free-space floor is in DEFICIT, the disposal
+                        // must reduce USED bytes on the physical disk. An archive
+                        // move onto the SAME filesystem frees nothing (default
+                        // compose layout: /data/archive on the live disk) — the
+                        // pre-fix sweep "moved" oldest live footage in place every
+                        // tick until the disk hit 100% and ffmpeg ENOSPC-halted
+                        // recording on every camera. Delete oldest-first instead,
+                        // exactly like the archive-off arm (file-then-row, item
+                        // 10; protected bookmarks already excluded by the query).
+                        let move_frees_nothing = if still_below_floor {
+                            match same_fs_cache.get(&src_storage.id).copied() {
+                                Some(v) => v,
+                                None => {
+                                    let v = same_filesystem(src_root, archive_root).await;
+                                    same_fs_cache.insert(src_storage.id, v);
+                                    v
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if move_frees_nothing {
+                            match delete_segment_file_then_row(pool, seg, &mut storage_cache).await
+                            {
+                                Ok(()) => {
+                                    used -= seg.size_bytes;
+                                    deficit = (deficit - seg.size_bytes).max(0);
+                                    warn!(
+                                        policy_id  = %policy.id,
+                                        segment_id = %seg.id,
+                                        "free-space floor: archive shares the live \
+                                         filesystem, so a move would free nothing; \
+                                         deleted oldest live segment to free real bytes"
+                                    );
+                                    emit_premature_rollover_if_early(
+                                        pool,
+                                        seg,
+                                        policy.live_retention_hours,
+                                        "free-space floor eviction (archive on same filesystem)",
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        policy_id  = %policy.id,
+                                        segment_id = %seg.id,
+                                        error      = %e,
+                                        "free-space floor: failed to delete over-floor \
+                                         live segment"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
                         match move_segment_to_archive(
                             pool,
                             seg,
@@ -2012,10 +2250,11 @@ pub async fn policy_size_eviction_sweep(
                         {
                             Ok(()) => {
                                 used -= seg.size_bytes;
-                                // Moving frees the source bytes from the live FS
-                                // (when archive is a separate device — the normal
-                                // case; if same-device, next tick's statvfs re-reads
-                                // the true free space and self-corrects).
+                                // Moving frees the source bytes from the live FS.
+                                // A floor-deficit move only reaches here when the
+                                // archive is a DIFFERENT filesystem (the same-fs
+                                // case is deleted by the ENOSPC rescue above), so
+                                // decrementing the deficit is accurate.
                                 deficit = (deficit - seg.size_bytes).max(0);
                                 debug!(
                                     policy_id  = %policy.id,
@@ -3699,10 +3938,17 @@ mod tests {
             let camera = load_camera(&fx).await;
 
             // (1) Deadline already expired → everything deferred, untouched.
-            let deferred = archive_camera(&fx.pool, &config, &camera, std::time::Instant::now())
+            let outcome = archive_camera(&fx.pool, &config, &camera, std::time::Instant::now())
                 .await
                 .expect("bounded run ok");
-            assert_eq!(deferred, 3, "an exhausted budget defers the whole backlog");
+            assert_eq!(
+                outcome.deferred, 3,
+                "an exhausted budget defers the whole backlog"
+            );
+            assert!(
+                outcome.backlog_pending(),
+                "a deferred backlog must flag the continuation"
+            );
             let all = db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
                 .await
                 .unwrap();
@@ -3720,10 +3966,17 @@ mod tests {
 
             // (2) A later run with headroom drains the same backlog fully.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-            let deferred = archive_camera(&fx.pool, &config, &camera, deadline)
+            let outcome = archive_camera(&fx.pool, &config, &camera, deadline)
                 .await
                 .expect("full run ok");
-            assert_eq!(deferred, 0, "with budget headroom the backlog fully drains");
+            assert_eq!(
+                outcome.deferred, 0,
+                "with budget headroom the backlog fully drains"
+            );
+            assert!(
+                !outcome.backlog_pending(),
+                "a drained, non-truncated run must clear the continuation"
+            );
             let all = db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
                 .await
                 .unwrap();
@@ -3738,6 +3991,90 @@ mod tests {
                     "source bud{i} removed after the verified move"
                 );
             }
+        }
+
+        /// Issue #80 follow-up: the eligibility LISTING itself is bounded. A
+        /// run whose listing FILLED the limit must report the backlog as
+        /// pending even when every listed segment was processed within budget
+        /// (a fully-processed but truncated batch may hide more eligible rows
+        /// behind the LIMIT), so the next tick re-queries; successive bounded
+        /// runs drain the whole backlog with nothing lost.
+        #[tokio::test]
+        async fn archive_camera_truncated_listing_flags_backlog_and_drains() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup(&url, None, None, true).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+
+            let live_path = fx._live_dir.path().to_path_buf();
+            // Well past the fixture's default live_retention_hours (48) so all
+            // three segments are archive-eligible.
+            let t0 = Utc::now() - Duration::hours(100);
+            for i in 0..3 {
+                add_segment(
+                    &fx,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("lim{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+            let camera = load_camera(&fx).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+            // Run 1 with list_limit=2: lists exactly 2 (== limit), processes
+            // BOTH within budget → deferred == 0, but the truncated listing
+            // must still flag pending backlog (pre-fix semantics would have
+            // cleared backlog_pending here and stranded lim2 until the next
+            // cron fire).
+            let outcome = archive_camera_bounded(&fx.pool, &config, &camera, deadline, 2)
+                .await
+                .expect("run 1 ok");
+            assert_eq!(outcome.deferred, 0, "both listed segments processed");
+            assert!(
+                outcome.listing_truncated,
+                "a listing that fills the limit must be flagged truncated"
+            );
+            assert!(
+                outcome.backlog_pending(),
+                "a truncated listing IS pending backlog even when fully processed"
+            );
+            let archived_now =
+                db::camera_stage_bytes(&fx.pool, fx.camera_id, SegmentStage::Archive)
+                    .await
+                    .unwrap();
+            assert_eq!(archived_now, 200, "the two oldest were archived in run 1");
+
+            // Run 2: only lim2 remains eligible → lists 1 (< limit), drains it,
+            // and the continuation stops.
+            let outcome = archive_camera_bounded(&fx.pool, &config, &camera, deadline, 2)
+                .await
+                .expect("run 2 ok");
+            assert_eq!(outcome.deferred, 0);
+            assert!(
+                !outcome.listing_truncated,
+                "a short listing means the backlog is fully drained"
+            );
+            assert!(
+                !outcome.backlog_pending(),
+                "the continuation must stop once the backlog drains"
+            );
+
+            // Nothing lost across the bounded runs: all three rows archived.
+            let all = db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 3, "no rows lost across bounded runs");
+            assert!(
+                all.iter().all(|s| s.stage == SegmentStage::Archive),
+                "all segments archived after the continuation drains: {all:?}"
+            );
         }
 
         /// LIVE over-cap with archiving ON ⇒ oldest live segments MOVE to archive
@@ -4577,6 +4914,141 @@ mod tests {
             assert_eq!(
                 used2, 300,
                 "between target and cap, eviction must stay quiet (trigger is the cap), got {used2}"
+            );
+        }
+
+        /// ENOSPC rescue (free-space floor × shared filesystem): when the floor
+        /// is in DEFICIT and the archive destination is on the SAME filesystem
+        /// as the live storage (the default compose layout — both fixture
+        /// tempdirs share one fs, same `st_dev`), the sweep must DELETE the
+        /// oldest live segments — actually freeing bytes — instead of
+        /// archive-moving them in place. Pre-fix, the move freed 0 bytes, the
+        /// deficit read as satisfied, and the loop repeated every tick until
+        /// the disk hit 100% and ffmpeg ENOSPC-halted recording on every
+        /// camera. Protected bookmarks still survive, nothing lands on
+        /// stage=archive, and rows go file-then-row.
+        #[tokio::test]
+        async fn floor_deficit_on_shared_fs_deletes_oldest_instead_of_moving() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            // Archive ON, NO byte caps — only the free-space floor drives this
+            // sweep, so the delete can only be the floor-deficit path.
+            let fx = setup_policy(&url, None, None, true).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+
+            // Force the floor into deficit DETERMINISTICALLY: read the live
+            // tempdir filesystem's real free/total and set the per-policy
+            // fractional floor strictly between the current free fraction and
+            // 1.0 — guaranteed below-floor regardless of how full the host
+            // disk is. (`None` ⇒ statvfs unavailable, e.g. non-Unix — skip,
+            // mirroring the floor itself.)
+            let live_path = fx._live_dir.path().to_path_buf();
+            let Some((free, total)) = fs_free_and_total(live_path.to_str().expect("utf8")) else {
+                eprintln!("skipping: statvfs unavailable on this platform");
+                return;
+            };
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let frac = (((free as f64 / total as f64) + 1.0) / 2.0) as f32;
+            if !(0.0..1.0).contains(&frac) {
+                eprintln!("skipping: cannot construct a firing floor (free={free}, total={total})");
+                return;
+            }
+            {
+                let client = fx.pool.get().await.expect("conn");
+                client
+                    .execute(
+                        "UPDATE recording_policies SET live_min_free_pct = $2 WHERE id = $1",
+                        &[&fx.policy_id, &frac],
+                    )
+                    .await
+                    .expect("set per-policy floor");
+            }
+
+            // Three old live segments; the OLDEST is pinned by a protected
+            // bookmark (a human pin outranks the automatic rescue).
+            let t0 = Utc::now() - Duration::hours(10);
+            for (rel, offset) in [("pinned.mp4", 0i64), ("old1.mp4", 1), ("old2.mp4", 2)] {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_a_id,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    rel,
+                    t0 + Duration::minutes(offset),
+                    100,
+                )
+                .await;
+            }
+            {
+                let client = fx.pool.get().await.expect("conn");
+                client
+                    .execute(
+                        "INSERT INTO bookmarks \
+                             (camera_id, ts, protect_until, protect_start_ts, protect_end_ts) \
+                         VALUES ($1, $2, now() + interval '1 day', $3, $4)",
+                        &[
+                            &fx.camera_a_id,
+                            &t0,
+                            &(t0 - Duration::seconds(5)),
+                            &(t0 + Duration::seconds(5)),
+                        ],
+                    )
+                    .await
+                    .expect("insert protected bookmark");
+            }
+
+            let policy = load_policy(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &policy)
+                .await
+                .expect("sweep ok");
+
+            // The deficit (GB-scale) dwarfs the 300B of footage, so every
+            // UNPROTECTED candidate must be DELETED — real bytes freed — never
+            // archive-moved in place.
+            assert!(
+                !live_path.join("old1.mp4").exists(),
+                "old1 must be deleted (bytes actually freed), not moved in place"
+            );
+            assert!(
+                !live_path.join("old2.mp4").exists(),
+                "old2 must be deleted (bytes actually freed), not moved in place"
+            );
+            assert!(
+                live_path.join("pinned.mp4").exists(),
+                "the protected segment must survive the ENOSPC rescue"
+            );
+
+            // Rows follow the files (file-then-row): only the protected row
+            // remains, still live — nothing was flipped to stage=archive.
+            let rows = db::list_all_segments_for_camera(&fx.pool, fx.camera_a_id)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "only the protected row remains: {rows:?}");
+            assert!(rows[0].path.ends_with("pinned.mp4"));
+            assert_eq!(
+                rows[0].stage,
+                SegmentStage::Live,
+                "the protected segment must not be archive-moved either"
+            );
+            let archive_bytes =
+                db::policy_stage_bytes(&fx.pool, fx.policy_id, SegmentStage::Archive)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                archive_bytes, 0,
+                "a shared-fs floor deficit must never archive-move (0 bytes freed)"
+            );
+            // And the archive directory really received nothing.
+            let mut entries = tokio::fs::read_dir(fx._archive_dir.path())
+                .await
+                .expect("read archive dir");
+            assert!(
+                entries.next_entry().await.expect("read entry").is_none(),
+                "no files may land on the archive dir during a shared-fs floor rescue"
             );
         }
 

@@ -319,9 +319,19 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
                     // The recorder's own boundary insert keeps the row accurate
                     // meanwhile. This matters now that reconcile runs periodically,
                     // not just at a quiescent startup.
+                    //
+                    // #84 follow-up: this gate must use the SAME future-mtime-aware
+                    // helper as the orphan pass ([`mtime_in_flight`]). The raw
+                    // `now - mtime < twice_segment` check it previously used is
+                    // trivially true for ANY future mtime (the difference is
+                    // negative), so after a backwards clock step the file was
+                    // "in flight" on every pass FOREVER — a torn 28-byte skeleton
+                    // row+file was never reconciled. An mtime more than one segment
+                    // length in the future is implausible, not "recent": treat it
+                    // as settled and reconcile it normally.
                     if let Ok(mtime) = meta.modified() {
                         let mtime_utc: DateTime<Utc> = mtime.into();
-                        if Utc::now() - mtime_utc < twice_segment {
+                        if mtime_in_flight(Utc::now(), mtime_utc, segment_len, twice_segment) {
                             debug!(
                                 segment_id = %seg.id,
                                 path = %abs_path.display(),
@@ -842,8 +852,9 @@ enum OrphanOutcome {
     NotIndexable,
 }
 
-/// In-flight gate for the ORPHAN pass: `true` when `mtime` says the file may
-/// still be actively written, so adoption must wait for a later pass.
+/// In-flight gate shared by the ORPHAN pass and the DANGLING-ROW pass: `true`
+/// when `mtime` says the file may still be actively written, so adoption (or a
+/// row mutation / sub-floor delete) must wait for a later pass.
 ///
 /// A file modified within `twice_segment` of `now` is almost certainly one
 /// ffmpeg is still writing (indexing those produced the prod 28-byte ftyp-only
@@ -1811,6 +1822,79 @@ mod tests {
         );
     }
 
+    /// #84 follow-up: the DANGLING-ROW pass's in-flight gate must be
+    /// future-mtime-aware, exactly like the orphan pass. Pre-fix it used the
+    /// raw `now - mtime < twice_segment` arithmetic, which is trivially true
+    /// for ANY future mtime (negative difference) — so after a backwards clock
+    /// step a torn 28-byte skeleton whose row claimed a full segment was
+    /// "in flight" on EVERY pass, forever: never size-repaired, never removed.
+    /// With [`mtime_in_flight`] a far-future mtime is implausible → settled →
+    /// the sub-floor branch reconciles it (file + row deleted).
+    #[tokio::test]
+    async fn dangling_pass_reconciles_future_mtime_file_instead_of_gating_forever() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config(); // segment_seconds = 4 → slop allowance = 4s
+
+        let cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        // A 28-byte torn skeleton whose row claims a full 800KB segment, with
+        // an mtime 5 HOURS in the future — far beyond the one-segment clock
+        // slop mtime_in_flight tolerates.
+        let torn = cam_dir.join("20260101T000000Z.mp4");
+        tokio::fs::write(&torn, vec![0u8; 28])
+            .await
+            .expect("write torn skeleton");
+        futuredate(&torn, 5 * 3600).await;
+        crumb_common::db::insert_segment(
+            &fx.pool,
+            &crumb_common::db::InsertSegmentParams {
+                camera_id: fx.camera_id,
+                storage_id: live.id,
+                stage: SegmentStage::Live,
+                path: format!("{}/20260101T000000Z.mp4", fx.camera_id),
+                stream: SegmentStream::Main,
+                start_ts: "2026-01-01T00:00:00Z".parse().expect("start ts"),
+                end_ts: "2026-01-01T00:00:04Z".parse().expect("end ts"),
+                duration_ms: 4000,
+                has_motion: false,
+                motion_score: 0.0,
+                size_bytes: 800_000, // the row's claim; on disk it is 28 bytes
+                motion_bbox: None,
+            },
+        )
+        .await
+        .expect("insert torn row");
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        // Post-fix: the future mtime does NOT gate the file; the sub-floor
+        // branch removes the unusable file + its row in one pass. Pre-fix both
+        // survived every pass indefinitely.
+        assert!(
+            !torn.exists(),
+            "a far-future-mtime torn file must be reconciled (deleted), not gated forever"
+        );
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "the torn row must be deleted, not kept alive by the in-flight gate: {rows:?}"
+        );
+    }
+
     /// R3b regression: a PERSISTENTLY sub-floor file — one whose row was ALSO
     /// indexed at the sub-floor size (`on_disk == seg.size_bytes`, both 28
     /// bytes) — must still be deleted. Before the fix, the sub-floor check
@@ -2328,7 +2412,26 @@ mod tests {
     /// Set a file's mtime `secs_ago` seconds into the past so it falls OUTSIDE
     /// the in-flight window. Uses `filetime`-free approach via std on Unix.
     async fn backdate(path: &Path, secs_ago: u64) {
-        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        set_mtime(
+            path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago),
+        )
+        .await;
+    }
+
+    /// Set a file's mtime `secs_ahead` seconds into the FUTURE — models a
+    /// backwards clock step / restored file whose mtime is ahead of the
+    /// recorder's clock (issue #84).
+    async fn futuredate(path: &Path, secs_ahead: u64) {
+        set_mtime(
+            path,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(secs_ahead),
+        )
+        .await;
+    }
+
+    /// Shared mtime setter for [`backdate`] / [`futuredate`].
+    async fn set_mtime(path: &Path, when: std::time::SystemTime) {
         let path = path.to_path_buf();
         let ft = when;
         tokio::task::spawn_blocking(move || {
@@ -2362,6 +2465,6 @@ mod tests {
             }
         })
         .await
-        .expect("backdate join");
+        .expect("set_mtime join");
     }
 }
