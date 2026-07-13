@@ -30,17 +30,25 @@ object MediaFactory {
     fun newPlayer(context: Context): ExoPlayer =
         ExoPlayer.Builder(context).build()
 
+    /** `USAGE_MEDIA` / movie audio attributes for recorded playback. Exposed so
+     *  the screen can (re-)apply them with audio-focus handling tied to the
+     *  mute/unmute toggle — see [newPlaybackPlayer]. */
+    val playbackAudioAttributes: AudioAttributes = AudioAttributes.Builder()
+        .setUsage(C.USAGE_MEDIA)
+        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+        .build()
+
     /**
      * ExoPlayer for RECORDED PLAYBACK (the timeline scrubber). Differs from the
      * bare [newPlayer] in two ways that matter for footage review over a WAN:
      *
-     * 1. **Audio focus + media attributes (#106).** Unlike the deliberately-muted
-     *    live-wall tiles, recorded playback is watched WITH sound on purpose. We
-     *    declare `USAGE_MEDIA` / `CONTENT_TYPE_MOVIE` audio attributes and let
-     *    ExoPlayer manage audio focus (`handleAudioFocus = true`), so the player
-     *    properly acquires the media output path instead of a silent AudioTrack,
-     *    and pauses on headphones-unplug (`handleAudioBecomingNoisy`). The
-     *    per-segment volume the UI sets (mute/unmute toggle) rides on top of this.
+     * 1. **Media audio attributes (#106).** Unlike the deliberately-muted live-wall
+     *    tiles, recorded playback is watched WITH sound on purpose, so it declares
+     *    `USAGE_MEDIA` / `CONTENT_TYPE_MOVIE` attributes to route to the media
+     *    output path. Audio-**focus** handling is deliberately OFF at build time and
+     *    (re)enabled by the screen only while the audio toggle is ON (see the volume
+     *    effect in `PlaybackScreen`) — otherwise a silent scrub-through (the default,
+     *    `playbackAudioOn = false`) would grab focus and pause the user's music.
      * 2. **WAN-tuned buffering.** A larger `DefaultLoadControl` window than the
      *    ExoPlayer default plus a retained back-buffer, so small backward scrubs
      *    replay from RAM instead of re-fetching, and a jittery cellular link has
@@ -61,14 +69,12 @@ object MediaFactory {
             // replays from memory rather than re-downloading over the slow link.
             .setBackBuffer(/* backBufferDurationMs */ 30_000, /* retainBackBufferFromKeyframe */ true)
             .build()
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(C.USAGE_MEDIA)
-            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-            .build()
         return ExoPlayer.Builder(context)
             .setLoadControl(loadControl)
-            .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ true)
-            .setHandleAudioBecomingNoisy(true)
+            // Focus handling starts OFF (default playback is muted review); the
+            // screen re-applies these attributes with focus = audioOn when the
+            // user toggles sound on.
+            .setAudioAttributes(playbackAudioAttributes, /* handleAudioFocus = */ false)
             .build()
     }
 

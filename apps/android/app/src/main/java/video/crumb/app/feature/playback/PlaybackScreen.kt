@@ -81,6 +81,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.SeekParameters
 import android.view.TextureView
@@ -275,8 +276,9 @@ fun PlaybackScreen(
     var bookmarkAtMs by remember { mutableLongStateOf(0L) }
 
     // ── ExoPlayer setup ─────────────────────────────────────────────────────────
-    // newPlaybackPlayer declares media audio attributes + audio-focus handling
-    // (#106) and a WAN-tuned buffer, unlike the muted live-wall tiles.
+    // newPlaybackPlayer declares media audio attributes (#106) and a WAN-tuned
+    // buffer, unlike the muted live-wall tiles. Audio focus is applied below only
+    // while sound is ON.
     val player = remember {
         MediaFactory.newPlaybackPlayer(context).apply {
             setSeekParameters(SeekParameters.EXACT) // frame-accurate stepping
@@ -289,28 +291,31 @@ fun PlaybackScreen(
     // without an audio track just plays silent when this is on — no crash.
     val store = container.store
     var audioOn by remember { mutableStateOf(store.playbackAudioOn) }
-    // Drive the single ExoPlayer's volume from the toggle whenever it changes.
+    // Drive volume from the toggle, and request audio focus ONLY while sound is on
+    // (so a silent scrub-through doesn't pause the user's music — Fable MED#3).
     LaunchedEffect(player, audioOn) {
+        player.setAudioAttributes(MediaFactory.playbackAudioAttributes, /* handleAudioFocus = */ audioOn)
         player.volume = if (audioOn) 1f else 0f
     }
-    // Re-assert the intended volume across media transitions (#106). ExoPlayer is
-    // *supposed* to keep player.volume across setMediaSource / gapless
-    // addMediaSource, but on a segment-boundary AudioTrack reconfigure the
-    // framework AudioTrack could be re-created and end up muted independent of the
-    // player-level volume. Re-applying it on every transition / when the renderer
-    // reaches READY / on an audio-session change makes the intended state
-    // authoritative no matter what the sink did underneath.
+    // Re-assert the intended volume across media transitions AND whenever the
+    // player-level volume changes out from under us (#106). The reported symptom is
+    // the AudioTrack going to volume 0 mid-playback while the toggle is on; whatever
+    // drives that, onVolumeChanged catches it and restores the intended level. The
+    // write converges (setting volume to the intended value re-fires onVolumeChanged
+    // with a matching value, which is then a no-op), so there is no feedback loop.
     val currentAudioOn by rememberUpdatedState(audioOn)
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             private fun reassert() {
-                player.volume = if (currentAudioOn) 1f else 0f
+                val intended = if (currentAudioOn) 1f else 0f
+                if (player.volume != intended) player.volume = intended
             }
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = reassert()
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) reassert()
             }
             override fun onAudioSessionIdChanged(audioSessionId: Int) = reassert()
+            override fun onVolumeChanged(volume: Float) = reassert()
         }
         player.addListener(listener)
         onDispose { player.removeListener(listener) }
@@ -523,10 +528,21 @@ fun PlaybackScreen(
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
-                // If the low-bitrate variant failed (server has no `/low.mp4`, or a
-                // transcode errored), fall back to full BEFORE re-resolving — else
-                // onPlayerError would just refetch the same failing low URL forever.
-                vm.noteLowQualityFailed()
+                // Fall back off the low variant ONLY when the `/low.mp4` URL itself
+                // HTTP-errored (server has no such endpoint, or a transcode 5xx'd).
+                // A generic error — expired media token, a transient network blip —
+                // must NOT permanently disable Data saver for the session (Fable
+                // HIGH#1); the normal re-resolve below already refreshes the token.
+                var c: Throwable? = error
+                var badLowUrl = false
+                while (c != null) {
+                    if (c is HttpDataSource.InvalidResponseCodeException) {
+                        badLowUrl = c.dataSpec.uri.toString().contains("/low.mp4")
+                        break
+                    }
+                    c = c.cause
+                }
+                if (badLowUrl) vm.noteLowQualityFailed()
                 vm.onPlayerError()
             }
         }

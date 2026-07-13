@@ -141,9 +141,6 @@ fun LiveFullscreenScreen(
     var rtspUrl by remember { mutableStateOf<String?>(null) }
     var mainUrl by remember(currentCameraId) { mutableStateOf<String?>(null) }
     var subUrl by remember(currentCameraId) { mutableStateOf<String?>(null) }
-    // On-demand mobile transcode URL (server may omit it); used as the metered
-    // "data saver" start stream for cameras that have no sub of their own.
-    var mobileUrl by remember(currentCameraId) { mutableStateOf<String?>(null) }
     // True once we've downgraded to the sub stream because the main never played.
     var usingSub by remember(currentCameraId) { mutableStateOf(false) }
     // Drives the subtle "SD" badge: the main (HD) stream was unplayable, on sub now.
@@ -243,7 +240,6 @@ fun LiveFullscreenScreen(
                 onSuccess = { streams ->
                     mainUrl = streams.rtspMainUrl
                     subUrl = streams.rtspSubUrl
-                    mobileUrl = streams.rtspMobileUrl
                     // On a metered link, start on a data-saver stream: the camera's
                     // sub when it has one, else the server's on-demand mobile
                     // transcode. Off metered (Wi-Fi/LAN), start on the main (HD)
