@@ -941,9 +941,23 @@ pub struct Capabilities {
     /// Bookmark visibility/creation level.
     #[serde(default)]
     pub bookmarks: BookmarkScope,
-    /// Create + share saved views.
-    #[serde(default)]
+    /// Create + share saved views. Defaults to `true` when absent from the
+    /// stored jsonb (#69): unlike the footage-access caps above, saving a layout
+    /// view is the lowest-sensitivity capability, and the no-resolvable-role
+    /// fallback (`auth_mw::fallback_caps`) already grants Viewers `manage_views:
+    /// true`. A role row persisted before this capability existed would
+    /// otherwise deserialize to `false` and be wrongly denied `POST /views`
+    /// (403) — inconsistent with that fallback. Seeded/admin roles are
+    /// unaffected (0028 sets it explicitly; admin bypasses caps entirely).
+    #[serde(default = "default_true")]
     pub manage_views: bool,
+}
+
+/// Serde default for capability fields that should read as granted (not the
+/// bool `Default::default()` of `false`) when a legacy jsonb row omits them.
+/// See [`Capabilities::manage_views`].
+fn default_true() -> bool {
+    true
 }
 
 impl Capabilities {
@@ -1014,4 +1028,40 @@ pub struct Session {
     pub expires_at: DateTime<Utc>,
     /// `None` ⇒ active; `Some(_)` ⇒ revoked at this instant (extractor rejects it).
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #69: a legacy role row whose stored `capabilities` jsonb predates the
+    /// `manage_views` capability (key absent) must deserialize with
+    /// `manage_views = true` — matching `auth_mw::fallback_caps` — so it isn't
+    /// wrongly denied `POST /views`. The footage-access caps stay deny-by-default.
+    #[test]
+    fn legacy_caps_without_manage_views_default_to_granted() {
+        let caps: Capabilities = serde_json::from_str("{}").expect("empty caps parse");
+        assert!(
+            caps.manage_views,
+            "absent manage_views must heal to true (#69)"
+        );
+        // Everything sensitive stays off.
+        assert!(!caps.export);
+        assert!(!caps.playback);
+        assert!(!caps.clips);
+        assert!(!caps.ptz);
+        assert_eq!(caps.bookmarks, BookmarkScope::None);
+    }
+
+    /// An explicit `manage_views: false` in the stored jsonb is still honoured —
+    /// the default only fills an ABSENT key, it never overrides a real value.
+    #[test]
+    fn explicit_manage_views_false_is_respected() {
+        let caps: Capabilities =
+            serde_json::from_str(r#"{"manage_views": false}"#).expect("caps parse");
+        assert!(
+            !caps.manage_views,
+            "an explicit false must not be overridden by the default"
+        );
+    }
 }
