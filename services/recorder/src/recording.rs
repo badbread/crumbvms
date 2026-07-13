@@ -424,25 +424,36 @@ pub async fn run(
 /// open-source set, and the accumulated signals all carry across an
 /// error/stall restart of the ffmpeg child instead of being silently reset
 /// (which used to discard the remainder of the event).
-/// The audio ffmpeg args for the `-c copy` segmenter, given the camera's
+/// The audio ffmpeg args for the `-c copy` (video) segmenter, given the camera's
 /// `record_audio` policy.
 ///
 /// When `record_audio` is false → `-an` (drop the audio output stream).
 ///
-/// When true → `-copyinkf:a` ("copy initial non-keyframes", audio streams
-/// only), which is **LOAD-BEARING, not a nicety**. Under `-c copy` ffmpeg's CLI
-/// silently discards every packet on a stream until it sees the first packet
-/// flagged as a keyframe. Video packets get that flag at each IDR, so video
-/// records; but the RTSP/RTP AAC (MPEG4-GENERIC) depacketizer never sets the
-/// key flag on ANY audio packet, so without this flag 100% of audio packets are
-/// dropped before the muxer. The moov still declares the aac track (from the
-/// stream's SDP), so the result is a declared-but-EMPTY audio track — silent
-/// footage, with no warning at any normal log level. See
-/// `docs/RECORDER-CORRECTNESS.md`: a declared track must carry decodable
-/// packets. Zero-transcode is preserved (this only ungates copying).
+/// When true → **transcode audio to 48 kHz AAC** (`-c:a aac -ar 48000`) rather
+/// than bit-exact copy. Two reasons this must transcode (docs/DECISIONS.md
+/// 2026-07-12):
+///
+/// 1. **Cross-client playability.** Some cameras stream AAC at sample rates that
+///    Android's hardware/`c2` AAC decoders reject outright — a real device logs
+///    `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac
+///    .decoder]` and plays the footage silent. Desktop's software ffmpeg decoder
+///    handles those rates, so copy "worked" there but not on Android/web.
+///    Normalizing to 48 kHz (universally supported) makes recorded audio play on
+///    EVERY client.
+/// 2. **Correctness, for free.** Copying RTP-AAC under `-c copy` also silently
+///    drops every audio packet until a keyframe-flagged one, and MPEG4-GENERIC
+///    audio is never key-flagged — the old `-copyinkf:a` copy path existed only
+///    to work around that. Transcoding re-encodes from decoded PCM, so there is
+///    no keyframe gate and no declared-but-EMPTY-track risk at all.
+///
+/// These args come AFTER `-c copy`, so `-c:a aac` overrides ONLY the audio codec
+/// (video stays a bit-exact copy) and `-ar 48000` inserts the resampler. Audio
+/// re-encode is negligible CPU next to the copied video. See
+/// `docs/RECORDER-CORRECTNESS.md`: a declared track must carry decodable packets
+/// — now satisfied by re-encoding rather than by ungating a copy.
 fn audio_segmenter_args(record_audio: bool) -> &'static [&'static str] {
     if record_audio {
-        &["-copyinkf:a"]
+        &["-c:a", "aac", "-ar", "48000"]
     } else {
         &["-an"]
     }
@@ -779,7 +790,8 @@ async fn run_ffmpeg_loop(
         // RTSP input options
         .args(["-rtsp_transport", "tcp"])
         .args(["-i", &rtsp_url])
-        // Encoding: zero-transcode copy
+        // Encoding: bit-exact video copy (audio is normalized below — see
+        // audio_segmenter_args; the `-c:a aac` there overrides only the audio).
         .args(["-c", "copy"])
         // Force the HEVC sample entry to `hvc1` (not ffmpeg's default `hev1`).
         // Apple's AVFoundation (iOS/macOS AVPlayer) will NOT decode HEVC in MP4
@@ -789,9 +801,10 @@ async fn run_ffmpeg_loop(
         // pure container-level retag (no transcode); harmless for H.264 streams.
         .args(["-tag:v", "hvc1"]);
 
-    // Audio handling (see [`audio_segmenter_args`]).  These must come after
-    // `-c copy` so ffmpeg reads `-an` as "disable audio output" rather than
-    // overriding a stream-specifier codec.
+    // Audio handling (see [`audio_segmenter_args`]).  These must come AFTER
+    // `-c copy` so ffmpeg applies them as an override on top of it: `-an`
+    // disables the audio output, and `-c:a aac -ar 48000` re-encodes ONLY the
+    // audio (video stays a bit-exact copy) to a 48 kHz AAC every client decodes.
     ffmpeg_cmd.args(audio_segmenter_args(camera.policy.record_audio));
 
     ffmpeg_cmd
@@ -3086,18 +3099,24 @@ mod tests {
     // ── audio segmenter args (declared-track-must-carry-packets invariant) ──────
 
     #[test]
-    fn audio_args_copy_initial_non_keyframes_when_recording_audio() {
-        // The load-bearing case: with `-c copy`, ffmpeg drops every packet
-        // until the first keyframe-flagged one, and RTP-AAC audio is NEVER
-        // key-flagged — so without `-copyinkf:a` the recorded segment declares
-        // an aac track (from the SDP) but contains ZERO audio packets. This
-        // guards against a future cleanup silently dropping the flag and
-        // reintroducing the empty-audio-track footage bug.
+    fn audio_args_transcode_to_48k_aac_when_recording_audio() {
+        // Recorded audio is NORMALIZED to 48 kHz AAC, not copied: some cameras
+        // stream sample rates (e.g. 64 kHz) that Android/web AAC decoders reject
+        // outright, and transcoding also sidesteps the RTP-AAC keyframe gate that
+        // the old `-copyinkf:a` copy path had to work around. Guards a future
+        // "optimize back to copy" from silently breaking cross-client playback.
         let args = audio_segmenter_args(true);
         assert!(
-            args.contains(&"-copyinkf:a"),
-            "record_audio=true must pass -copyinkf:a so audio packets aren't \
-             gated out of the copy; got {args:?}"
+            args.contains(&"-c:a") && args.contains(&"aac"),
+            "record_audio=true must encode AAC; got {args:?}"
+        );
+        assert!(
+            args.contains(&"-ar") && args.contains(&"48000"),
+            "record_audio=true must resample to 48 kHz; got {args:?}"
+        );
+        assert!(
+            !args.contains(&"-copyinkf:a"),
+            "the transcode path must not copy audio; got {args:?}"
         );
         assert!(
             !args.contains(&"-an"),
@@ -3113,8 +3132,8 @@ mod tests {
             "record_audio=false must pass -an; got {args:?}"
         );
         assert!(
-            !args.contains(&"-copyinkf:a"),
-            "record_audio=false has no audio to copy; got {args:?}"
+            !args.contains(&"aac"),
+            "record_audio=false has no audio to encode; got {args:?}"
         );
     }
 

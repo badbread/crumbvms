@@ -122,30 +122,35 @@ recorder, and later the API) must satisfy these *by construction*.
     short cap converges over ticks instead of one mass delete. When set it can only
     remove footage *sooner* than the other knobs would, never keep it longer.
 
-## declared tracks must carry decodable packets (audio-integrity)
+## declared tracks must carry decodable packets, on every client (audio-integrity)
 23. **A recorded segment MUST contain decodable media PACKETS for every track it
-    declares — a declared-but-empty track is a silent footage-integrity failure,
-    and `-copyinkf:a` on the `-c copy` audio path is load-bearing against it.**
-    Under stream-copy, ffmpeg's CLI silently discards every packet on a stream
-    until it sees the first packet flagged as a keyframe. Video packets are
-    key-flagged at each IDR (so video records), but the RTSP/RTP AAC
-    (MPEG4-GENERIC) depacketizer never sets the key flag on ANY audio packet, so
-    without `-copyinkf:a` ("copy initial non-keyframes", audio streams only) 100%
-    of audio packets are dropped before the muxer — while the moov still declares
-    the aac track from the stream's SDP. The result probes as a healthy segment
-    (ffprobe lists an aac stream) but has ZERO audio samples: silent playback,
-    silent export, no warning at any normal log level. So `-copyinkf:a` is emitted
-    on **both** `-c copy` audio sites (recorder `audio_segmenter_args`, and the
-    export's `-f concat … -c:a copy` in `services/api/src/export.rs` — mandatory
-    there too because the recorded fMP4's `trun` sample flags faithfully preserve
-    the missing key flag, so even a correctly-recorded segment reads back with its
-    audio unflagged and a plain concat-copy re-drops it). Decode paths (re-encode
-    exports, clip playback/preview/thumbnails) are unaffected — the keyframe gate
-    is a stream-copy behavior only. This is zero-transcode; it only ungates the
-    copy. It does NOT touch the fMP4 crash-safety flags (item 1). Because a
-    declared-but-empty track looks healthy to ffprobe's stream listing, the only
-    reliable detector is a packet count: the segmenter's audio args are unit-
-    tested to keep `-copyinkf:a`, and any integration check must assert
+    declares — and those packets must be decodable by EVERY client, not just
+    desktop.** The recorder satisfies this for audio by **transcoding to 48 kHz
+    AAC** (`audio_segmenter_args` → `-c:a aac -ar 48000`), NOT by stream-copy
+    (docs/DECISIONS.md 2026-07-12). Two failure modes a copy hit, both fixed by
+    transcoding:
+    - **Cross-client playability.** Some cameras stream AAC at sample rates that
+      Android's hardware/`c2` AAC decoders reject outright (a real device logs
+      `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac
+      .decoder]` and plays the footage SILENT). A bit-exact copy plays on
+      desktop's software ffmpeg decoder but not on Android/web; 48 kHz is
+      universally decodable.
+    - **Empty-track copy gate.** Under `-c copy`, ffmpeg's CLI silently discards
+      every packet on a stream until the first keyframe-flagged one, and the
+      RTP-AAC (MPEG4-GENERIC) depacketizer never key-flags audio — so a plain
+      copy yields a declared-but-EMPTY aac track (the moov lists it from the SDP;
+      zero samples), silent with no warning at any normal log level. The old
+      `-copyinkf:a` ("copy initial non-keyframes") existed only to ungate this.
+
+    Transcoding re-encodes from decoded PCM, so neither applies. Video stays a
+    bit-exact copy (`-c:a aac` overrides only audio; it does NOT touch the fMP4
+    crash-safety flags, item 1). **The export path is separate:**
+    `services/api/src/export.rs`'s `-c:a copy` still emits `-copyinkf:a` against
+    the keyframe gate (the recorded fMP4's `trun` faithfully preserves the missing
+    key flag), and it does **not yet** normalize the sample rate — an exported
+    clip can still carry a rate a phone won't decode until export is normalized
+    too (a known follow-up). Detector: the recorder's audio args are unit-tested
+    to encode AAC @ 48 kHz (not copy); any integration check should assert
     `nb_read_packets > 0` on the audio stream, not merely that the stream exists.
 
 ## free-space floor (ENOSPC safety valve)

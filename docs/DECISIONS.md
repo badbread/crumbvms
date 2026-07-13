@@ -8,6 +8,49 @@ revisit.
 
 ---
 
+## 2026-07-12, Recorded audio is transcoded to 48 kHz AAC, not stream-copied
+
+**Context.** The Android client played recorded footage silent while desktop
+played the same footage with sound. Device logs showed the segment's audio track
+present but rejected by the hardware decoder: `MediaCodecInfo: NoSupport
+[sampleRate.support, 64000] [c2.android.aac.decoder]`. The camera streams AAC at
+64 kHz; Android's AAC decoders cap below that, while desktop's software ffmpeg
+decoder handles it — so a bit-exact copy was decodable on desktop only.
+
+**Decision — normalize recorded audio to 48 kHz AAC on record.** The recorder's
+`audio_segmenter_args` emits `-c:a aac -ar 48000` (after `-c copy`, overriding
+only the audio codec; video stays a bit-exact copy) instead of the prior
+`-copyinkf:a` copy. 48 kHz is universally decodable (Android/web/iOS/desktop).
+Transcoding also makes RECORDER-CORRECTNESS #23 automatic — re-encoding from
+decoded PCM has no RTP-AAC keyframe gate, so `-copyinkf:a` is no longer needed on
+the recorder path.
+
+**Rejected — keep bit-exact copy (`-copyinkf:a`).** Preserves source fidelity and
+zero audio CPU, but leaves any camera whose audio rate a client's decoder rejects
+(64 kHz here) silent on that client. Low-bitrate camera audio re-encoded to 48 kHz
+AAC is perceptually lossless for this use; the CPU is negligible next to the
+copied video.
+
+**Rejected — a per-client software decoder (Media3 FFmpeg extension on Android).**
+Would decode any AAC on-device, but is a heavyweight new dependency that must be
+built from source and only fixes Android, not web/other clients. Normalizing once
+at the source fixes every client.
+
+**Rejected — conditional transcode (copy unless the source rate is non-standard).**
+More surgical (bit-exact for the common case) but adds a probe + branch on the hot
+record path; deferred as a possible optimization if audio CPU ever matters.
+
+**Trade-offs accepted.** Tiny audio-quality loss from re-encode; per-segment AAC
+encoder priming (a few ms) at segment boundaries; negligible extra CPU. The EXPORT
+path (`services/api/src/export.rs`) still copies audio with `-copyinkf:a` and is
+NOT yet sample-rate-normalized — a known follow-up so shared clips play on phones.
+
+**Revisit if.** Audio CPU becomes material at scale (→ conditional transcode); a
+lossless-audio requirement emerges (→ copy + document the Android caveat); or
+Android's decoders gain the missing sample-rate support.
+
+---
+
 ## 2026-07-12, Recorder audit hardening: the free-space floor frees real bytes, fail-open survives every seam, boot-reap tolerates contention
 
 **Context.** A two-round adversarial audit of the recorder (issues #70–#84, PR
