@@ -8,6 +8,54 @@ revisit.
 
 ---
 
+## 2026-07-13, Recorded audio: ALWAYS re-encode to gap-filled 48 kHz AAC (supersedes the 2026-07-12 copy-when-safe split)
+
+**Context.** The 2026-07-12 decision recorded audio with a per-camera split:
+copy bit-exact when the source rate is "client-safe" (≤ 48 kHz), transcode only
+the rates Android/web reject (> 48 kHz). Its premise was that a ≤ 48 kHz rate is
+safe to copy. On-device diagnostics (Media3 1.4.1, SM-S921U) proved that **false**:
+recorded playback was silent on Android for a **48 kHz** camera on the copy path.
+
+**Root cause (measured).** A bit-exact `-c:a copy` preserves the camera's audio
+*timeline* verbatim, and cheap camera audio clocks drift ~1 %: the container
+timestamps promise more time than the AAC frames deliver (measured ~32 ms
+phantom gap per 4 s segment; 61 of 62 frames non-uniform). ExoPlayer's
+`DefaultAudioSink` enforces sample-continuous audio — once accumulated drift
+crosses ~200 ms it throws `UnexpectedDiscontinuityException` and, because the
+audio renderer is the player's master clock, the position lurches, segments
+"end" early, and the whole player wedges (silent audio, stalled video). libmpv
+(desktop) and the RTSP live path don't slave to strict sample continuity, which
+is why only Android fMP4 playback broke.
+
+**Decision.** The recorder ALWAYS re-encodes audio (when `record_audio`):
+`-af aresample=async=1:first_pts=0 -c:a aac -ar 48000`. Video stays a bit-exact
+`-c copy`.
+
+**Alternatives considered.**
+
+| Option | Verdict |
+|---|---|
+| **Always re-encode + `aresample=async`** | **Chosen.** `aresample=async=1` resamples onto a strictly continuous lattice, filling genuine gaps with silence (preserving A/V alignment). Measured 0/192 discontinuous frames after (vs 61/62 before). |
+| Keep the copy-when-safe split | Rejected: its premise is empirically false; timeline continuity — not sample rate — is what matters, and only re-encode guarantees it. |
+| Plain re-encode (`-c:a aac` without `aresample`) | Rejected: still inherits the input's jittery frame PTS (measured 75/187 discontinuous) — this is why SD/low.mp4 still threw the occasional discontinuity. `aresample=async` is the load-bearing part. |
+| Client-side (tolerate the discontinuity in a custom `AudioSink`) | Rejected/tested: making the sink swallow the discontinuity turned it into a silent continuous clock lurch that dragged **video** down too. No correct client-only fix exists (the audio renderer is the master clock). |
+| Per-client serve variant (video-copy + audio-reencode on demand) | Rejected: ships a workaround for defective recorded *data*; bad cache economics (full-segment-sized entries); export/iOS/web still inherit the broken timeline. Fix the data at the source instead. |
+
+**Trades accepted.** A mono/stereo AAC encode is < 1 % of a core per camera
+(negligible; the CPU-saving that motivated the copy path is not worth silent
+audio). `-copyinkf:a` is dropped (it only mattered for the `-c copy` keyframe
+gate — RECORDER-CORRECTNESS #23). Existing footage recorded on the copy path
+(only ~1–2 days, since #103) is **not** retroactively fixed, but it already
+plays with audio via Data-saver's on-demand re-encode (`/segments/{id}/low.mp4`).
+
+**Revisit triggers.** If the `aac` encoder ever becomes a measurable CPU problem
+on a large deployment, revisit selective copy — but only for sources *proven*
+sample-continuous, not merely ≤ 48 kHz. If a future ExoPlayer/Media3 gains a
+"trust sample count over container PTS" mode for progressive sources, the copy
+path could return.
+
+---
+
 ## 2026-07-13, Mobile performance: on-demand per-segment low-bitrate transcode (not continuous stream / ABR), Auto default
 
 **Context.** Recorded playback and fullscreen live were unusable over poor
