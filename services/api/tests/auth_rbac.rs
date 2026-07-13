@@ -790,6 +790,45 @@ async fn query_param_media_token_is_scope_checked_and_full_jwt_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn low_mp4_variant_enforces_camera_scope_like_segments() {
+    // The on-demand low-bitrate variant `/segments/{id}/low.mp4` is a NEW
+    // authenticated media endpoint (golden rule 1) and must enforce exactly the
+    // same camera scoping as its byte-transparent sibling `/segments/{id}`. We
+    // assert the auth FENCE only (403 cross-camera, 401 full-JWT) — both are
+    // decided before any transcode, so this test needs no ffmpeg.
+    let fx = build_rbac_fixture().await;
+    let pool = fx.app.pool().clone();
+    let storage_id = seed_storage(&pool, fx.storage_root.path().to_str().unwrap()).await;
+    let seg_b = seed_segment_with_file(&pool, fx.cam_b, storage_id, fx.storage_root.path()).await;
+
+    // A media token scoped to cam_a must NOT unlock cam_b's low variant.
+    let media_a = mint_media_token(&fx.app, &fx.viewer_token, fx.cam_a).await;
+    let other = fx
+        .app
+        .send(get(&format!("/segments/{seg_b}/low.mp4?token={media_a}")))
+        .await;
+    assert_eq!(
+        other.status(),
+        StatusCode::FORBIDDEN,
+        "low.mp4 must enforce the same per-camera scoping as /segments/{{id}}"
+    );
+
+    // A full login JWT via ?token= must be rejected on this fail-closed media route.
+    let full_jwt = fx
+        .app
+        .send(get(&format!(
+            "/segments/{seg_b}/low.mp4?token={}",
+            fx.viewer_token
+        )))
+        .await;
+    assert_eq!(
+        full_jwt.status(),
+        StatusCode::UNAUTHORIZED,
+        "a full login JWT via ?token= must be rejected on the low.mp4 media route"
+    );
+}
+
 // The camera snapshot route is now FAIL-CLOSED (audit 2026-07-05 #2): the web
 // console (admin.html) mints a scoped media token like every other client, so a
 // full login JWT via ?token= is rejected here — while a scoped media token still
@@ -1234,6 +1273,7 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::GET, "/play/aligned".into()),
         (Method::GET, format!("/play/{u}")),
         (Method::GET, format!("/segments/{u}")),
+        (Method::GET, format!("/segments/{u}/low.mp4")),
         (Method::GET, format!("/cameras/{u}/streams")),
         (Method::GET, format!("/cameras/{u}/motion-grid")),
         (Method::GET, format!("/live/{u}/stream.mp4")),

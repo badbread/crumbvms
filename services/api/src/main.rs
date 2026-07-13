@@ -100,6 +100,7 @@ mod ptz;
 mod rate_limit;
 mod roles;
 mod scrub_settings;
+mod segment_low;
 mod state;
 mod stats;
 mod status;
@@ -493,6 +494,7 @@ async fn main() -> anyhow::Result<()> {
 
     let media_routes = Router::new()
         .merge(playback::routes())
+        .merge(segment_low::routes())
         .merge(export::routes())
         .merge(filmstrip::routes())
         // On-demand DB-vs-disk size verification: a filesystem walk that can run

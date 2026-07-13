@@ -1216,6 +1216,13 @@ pub struct LiveStreamsResponse {
     pub rtsp_main_url: String,
     /// RTSP URL for the sub stream (same credential note as `rtsp_main_url`).
     pub rtsp_sub_url: Option<String>,
+    /// RTSP URL for the on-demand mobile transcode (`<name>_mobile`) — a low-res
+    /// H.264 variant produced by go2rtc only while a consumer is connected, for a
+    /// cellular "Data saver" fullscreen-live mode. `None` when the feature is
+    /// disabled (`MOBILE_STREAM_ENABLED=false`) or the camera is Frigate-served
+    /// (its go2rtc is a separate BYO instance Crumb does not manage). Same
+    /// embedded-credential + sensitivity note as `rtsp_main_url`.
+    pub rtsp_mobile_url: Option<String>,
 }
 
 // ─── export ───────────────────────────────────────────────────────────────────

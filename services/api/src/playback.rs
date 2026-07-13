@@ -671,12 +671,38 @@ async fn live_streams(
         None
     };
 
+    // On-demand mobile transcode (`<name>_mobile`) — a relative go2rtc stream
+    // name Crumb registers in the reconcile loop, so it resolves off the CRUMB
+    // RTSP base (with embedded creds), never Frigate's. Exposed only when reconcile
+    // would ACTUALLY register the stream: the feature is on, the camera is
+    // Crumb-owned, AND it has a `source_url` (the exact predicate
+    // `db::list_camera_streams` filters on). A legacy `served_by='crumb'` row with
+    // an absolute `main_url` but empty `source_url` gets no `_mobile` stream, so we
+    // must not advertise a URL that resolves to nothing (else fullscreen live would
+    // burn its reconnect budget on a dead stream). go2rtc spawns the transcode
+    // ffmpeg lazily on first consumer connect (idle cost zero).
+    let has_source = cam
+        .source_url
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let rtsp_mobile_url = (state.config().mobile_stream_enabled
+        && cam.served_by != "frigate"
+        && has_source)
+        .then(|| {
+            format!(
+                "{}/{}_mobile",
+                crumb_rtsp_authed.trim_end_matches('/'),
+                cam.go2rtc_name
+            )
+        });
+
     Ok(Json(LiveStreamsResponse {
         camera_id,
         webrtc_main_url,
         webrtc_sub_url,
         rtsp_main_url,
         rtsp_sub_url,
+        rtsp_mobile_url,
     }))
 }
 
@@ -730,6 +756,9 @@ fn parse_uuid_csv(csv: &str) -> Result<Vec<Uuid>, ApiError> {
 ///
 /// Returns the canonicalised path on success.
 ///
+/// `pub(crate)` so the low-bitrate segment transcoder (`segment_low`) reuses the
+/// exact same guard rather than duplicating this security-critical check.
+///
 /// # Errors
 ///
 /// * `ApiError::Internal` — if the storage root path cannot be canonicalised
@@ -737,7 +766,7 @@ fn parse_uuid_csv(csv: &str) -> Result<Vec<Uuid>, ApiError> {
 /// * `ApiError::NotFound` — if the file does not exist on disk.
 /// * `ApiError::BadRequest` (400) — if the resolved path escapes the root; also
 ///   emits a `tracing::warn!` so the attempt is visible in the operator logs.
-fn guard_path_traversal(
+pub(crate) fn guard_path_traversal(
     storage_root: &Path,
     absolute: &Path,
     segment_id: Uuid,

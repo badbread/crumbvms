@@ -75,7 +75,7 @@ All paths below are repo-relative and verified to exist as of 2026-07-06.
 
 | Surface | Path(s) | Notes |
 |---|---|---|
-| Engineering docs | `docs/` (notably `DECISIONS.md`, `RECORDER-CORRECTNESS.md`, `ROADMAP.md`, `MOTION-RECORDING.md`, `MOTION-DETECTION-DESIGN.md`, `MOTION-ADAPTIVE-THRESHOLD.md`, plus design docs) | `DECISIONS.md` is governed by golden rule 7 |
+| Engineering docs | `docs/` (notably `DECISIONS.md`, `RECORDER-CORRECTNESS.md`, `ROADMAP.md`, `MOTION-RECORDING.md`, `MOTION-DETECTION-DESIGN.md`, `MOTION-ADAPTIVE-THRESHOLD.md`, `MOBILE-PERFORMANCE.md`, plus design docs) | `DECISIONS.md` is governed by golden rule 7 |
 | User docs | `docs/AI-INSTALL.md`, `docs/CLIENTS.md` (client install and connect), `docs/RESPONSIBLE-USE.md`, `docs/ALPHA-TESTER-TERMS.md`, `docs/BACKUP.md`, `docs/TLS.md`, `docs/OPS-BACKUP-RECOVERY.md` | These are the seed content for the public docs site |
 | Public docs site | `docs-site/` (Docusaurus), published at `docs.crumbvms.com`; the docs-site build model is recorded in `docs/DECISIONS.md` | Live. It is a propagation surface in every user-facing change below: update the matching `docs-site/docs/` page in the same change |
 | Camera compatibility DB | `data/camera-compatibility.json` (source of truth, schema in `data/README.md`) → `scripts/gen-camera-compat.mjs` (zero-dep) → `docs-site/docs/cameras/compatibility.md` (generated, gitignored). Wired into `docs.yml` and `docs-site/Dockerfile` | PR-curated, no telemetry. Same JSON is the intended input to the future in-app "identify camera + known quirks" hint (`serde_json`); see `docs/DECISIONS.md` 2026-07-10 |
