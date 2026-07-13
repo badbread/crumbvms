@@ -30,10 +30,10 @@ use uuid::Uuid;
 
 use crate::types::{
     Bookmark, Camera, CameraDecodeStatus, CameraGroup, CameraHaLink, CameraMotionCacheStatus,
-    Capabilities, FrigateSettings, HaSettings, MotionCacheStatus, MotionGrid, MotionSensitivity,
-    MotionSignal, RecordStream, RecorderCapabilities, RecorderHeartbeat, RecordingMode,
-    RecordingPolicy, Role, Segment, SegmentStage, SegmentStream, ServerSettings, Session, Storage,
-    StorageMigration, User, UserRole, View,
+    Capabilities, FrigateSettings, HaSettings, LprSettings, MotionCacheStatus, MotionGrid,
+    MotionSensitivity, MotionSignal, RecordStream, RecorderCapabilities, RecorderHeartbeat,
+    RecordingMode, RecordingPolicy, Role, Segment, SegmentStage, SegmentStream, ServerSettings,
+    Session, Storage, StorageMigration, User, UserRole, View,
 };
 
 // ─── pool creation ───────────────────────────────────────────────────────────
@@ -1514,6 +1514,85 @@ pub async fn update_ha_settings(
     get_ha_settings(pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("ha_config row missing after update"))
+}
+
+// ─── LPR config singleton (lpr_config, migration 0051) ──────────────────────
+
+fn lpr_settings_from_row(row: &tokio_postgres::Row) -> LprSettings {
+    LprSettings {
+        enabled: row.get("enabled"),
+        ingest_token: row.get("ingest_token"),
+        retention_days: row.get("retention_days"),
+        version: row.get("version"),
+    }
+}
+
+/// Read the LPR config singleton. `None` only if the row is somehow missing
+/// (the migration seeds it). Admin-toggled; no env fallback (unlike HA), so the
+/// DB is the single source of truth for a privacy-sensitive default-off feature.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_lpr_settings(pool: &Pool) -> Result<Option<LprSettings>> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt(
+            "SELECT enabled, ingest_token, retention_days, version FROM lpr_config WHERE id = 1",
+            &[],
+        )
+        .await
+        .context("get_lpr_settings")?;
+    Ok(opt.as_ref().map(lpr_settings_from_row))
+}
+
+/// Cheap version poll for hot-reload. Returns 0 if the row is missing.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn lpr_config_version(pool: &Pool) -> Result<i64> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt("SELECT version FROM lpr_config WHERE id = 1", &[])
+        .await
+        .context("lpr_config_version")?;
+    Ok(opt.map_or(0, |r| r.get("version")))
+}
+
+/// Update the singleton LPR settings and BUMP `version`. `set_token = false`
+/// LEAVES the stored ingest token unchanged (write-only field); `set_token =
+/// true` with `ingest_token = Some("")` clears it.
+///
+/// # Errors
+///
+/// Returns an error if the update fails or the row is missing afterward.
+pub async fn update_lpr_settings(
+    pool: &Pool,
+    enabled: bool,
+    retention_days: i32,
+    set_token: bool,
+    ingest_token: Option<&str>,
+) -> Result<LprSettings> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            UPDATE lpr_config SET
+                enabled        = $1,
+                retention_days = $2,
+                ingest_token   = CASE WHEN $3::boolean THEN $4 ELSE ingest_token END,
+                version        = version + 1,
+                updated_at     = now()
+            WHERE id = 1
+            ",
+            &[&enabled, &retention_days, &set_token, &ingest_token],
+        )
+        .await
+        .context("update_lpr_settings")?;
+    get_lpr_settings(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("lpr_config row missing after update"))
 }
 
 fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
@@ -8476,6 +8555,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0050_camera_audio_status.sql",
         include_str!("../../../db/migrations/0050_camera_audio_status.sql"),
+    ),
+    (
+        "0051_lpr.sql",
+        include_str!("../../../db/migrations/0051_lpr.sql"),
     ),
 ];
 

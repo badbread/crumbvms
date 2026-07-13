@@ -117,6 +117,26 @@ pub struct HaSettings {
     pub version: i64,
 }
 
+/// LPR (license-plate recognition) config singleton (`lpr_config`, migration
+/// 0051). Same shape as [`HaSettings`]: an enable flag, a write-only ingest
+/// token for the external-engine POST path (the API exposes only whether one is
+/// set, never the value), a `plate_reads` retention window, and a monotonic
+/// version consumers poll to hot-reload. Default-off: a plate database is
+/// privacy-sensitive and opt-in, toggled in the admin console.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LprSettings {
+    /// Master switch. When false, plate reads are NOT captured even if Frigate
+    /// emits plates on the event stream.
+    pub enabled: bool,
+    /// Write-only ingest token for `POST /lpr/reads` (external engines). Stored
+    /// as-is; never returned to clients.
+    pub ingest_token: Option<String>,
+    /// Days to keep `plate_reads` before the daily prune deletes them.
+    pub retention_days: i32,
+    /// Monotonic version, bumped on every update.
+    pub version: i64,
+}
+
 /// One camera ↔ HA entity link (`camera_ha_links`, migration 0048).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraHaLink {
