@@ -1,6 +1,6 @@
 -- License-plate recognition (LPR): plate-reads store + config singleton.
 --
--- Phase 0 of the LPR feature (see docs/DECISIONS.md, 2026-07-XX). Crumb does
+-- Phase 0 of the LPR feature (see docs/DECISIONS.md, 2026-07-13). Crumb does
 -- NOT run an OCR engine: plate strings arrive from Frigate 0.16's native LPR on
 -- the `frigate/events` stream Crumb already ingests (as `recognized_license_plate`
 -- / a matched-known-plate `sub_label`), or later from an external engine POSTing
@@ -66,10 +66,10 @@ CREATE INDEX IF NOT EXISTS plate_reads_ts
     ON plate_reads (ts DESC);
 
 -- Config singleton, same shape as ha_config / frigate_config: an enable flag, a
--- generated write-only ingest token (for the external-engine POST path; never
--- returned by the API), a retention window, and a monotonic version consumers
--- poll to hot-reload. Env (LPR_ENABLED) seeds `enabled` as a read-time fallback
--- when unset; DB wins (see get_lpr_settings).
+-- write-only ingest token (Phase 3 external-engine POST path; never returned by
+-- the API), a retention window, and a monotonic version column. Unlike HA there
+-- is NO env fallback — LPR is admin-toggled only (a privacy-sensitive plate
+-- database should be enabled deliberately in the console, see get_lpr_settings).
 CREATE TABLE IF NOT EXISTS lpr_config (
     id             smallint    PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     enabled        boolean     NOT NULL DEFAULT false,

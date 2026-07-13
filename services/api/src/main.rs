@@ -557,6 +557,39 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── 6a3. plate-reads retention prune (LPR) ────────────────────────────────
+    // Enforce `lpr_config.retention_days`: delete `plate_reads` older than the
+    // window so the (privacy-sensitive) plate database self-bounds, matching the
+    // retention the admin console promises. Best-effort, daily; a no-op when LPR
+    // is disabled or the config can't be read. Correctness never depends on it.
+    {
+        let prune_pool = state.pool().clone();
+        tokio::spawn(async move {
+            let tick = Duration::from_hours(24);
+            loop {
+                tokio::time::sleep(tick).await;
+                match crumb_common::db::get_lpr_settings(&prune_pool).await {
+                    Ok(Some(c)) if c.enabled && c.retention_days > 0 => {
+                        let cutoff = chrono::Utc::now()
+                            - chrono::Duration::days(i64::from(c.retention_days));
+                        match crumb_common::db::prune_plate_reads(&prune_pool, cutoff).await {
+                            Ok(n) if n > 0 => {
+                                info!(
+                                    "pruned {n} plate read(s) older than {} days",
+                                    c.retention_days
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("plate-reads prune failed: {e}"),
+                        }
+                    }
+                    Ok(_) => {} // LPR disabled — nothing to prune
+                    Err(e) => tracing::warn!("plate-reads prune: get_lpr_settings failed: {e}"),
+                }
+            }
+        });
+    }
+
     // ── 6b. heartbeat webhook alerter (opt-in via ALERT_WEBHOOK_URL) ───────────
     if let Some(url) = cfg.alert_webhook_url.clone() {
         let alert_pool = state.pool().clone();

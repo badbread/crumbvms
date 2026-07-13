@@ -108,8 +108,13 @@ async fn maybe_record_plate(
                 ts: ev.start_ts,
                 plate: normalized,
                 plate_raw: Some(plate_raw.to_owned()),
-                // Prefer a plate-specific score; else the object's top score.
-                confidence: ev.plate_confidence.or(Some(ev.top_score)),
+                // ONLY the plate-specific OCR score. NOT the object's top_score:
+                // that's the *vehicle* detection confidence (often 0.9+), and
+                // storing it as plate confidence would green-light a mediocre OCR
+                // read (and the upsert's GREATEST would keep the inflated value
+                // forever). NULL when the engine gives no plate score — clients
+                // render that as "—".
+                confidence: ev.plate_confidence,
                 source_id: ev.source_id.clone(),
                 provider_event_id: Some(ev.provider_event_id.clone()),
                 event_id: Some(event_id),

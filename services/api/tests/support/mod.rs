@@ -73,6 +73,8 @@ pub mod ffprobe;
 pub mod filmstrip;
 #[path = "../../src/go2rtc.rs"]
 pub mod go2rtc;
+#[path = "../../src/plates.rs"]
+pub mod plates;
 #[path = "../../src/playback.rs"]
 pub mod playback;
 #[path = "../../src/ptz.rs"]
@@ -358,6 +360,7 @@ pub fn test_router() -> Router<AppState> {
         .merge(filmstrip::routes())
         .merge(events::json_routes())
         .merge(events::media_routes())
+        .merge(plates::json_routes())
         .merge(clips::json_routes())
         .merge(clips::media_routes())
         // -- full-surface: the remaining viewer-facing JSON + media route groups

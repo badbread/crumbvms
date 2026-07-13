@@ -7585,6 +7585,21 @@ pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result
     Ok(row.get("id"))
 }
 
+/// Delete plate reads older than `cutoff` (the retention prune). Returns the
+/// number of rows deleted. The `plate_reads_ts` index serves the scan.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub async fn prune_plate_reads(pool: &Pool, cutoff: DateTime<Utc>) -> Result<u64> {
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute("DELETE FROM plate_reads WHERE ts < $1", &[&cutoff])
+        .await
+        .context("prune_plate_reads")?;
+    Ok(n)
+}
+
 /// Plate-search mode for [`list_plate_reads`].
 #[derive(Debug, Clone, Copy)]
 pub enum PlateMatch {

@@ -290,23 +290,27 @@ via `PUT /config/beta-terms`). Then:
    backend whose device isn't mapped into the recorder container shows the exact
    compose-overlay commands to fix it (see "Hardware-accelerated motion decode"
    below). CPU/Auto are fine defaults, skipping is normal.
-9. **License-plate recognition (optional)**, OFF by default. If the user runs
-   their cameras through Frigate with Frigate's native LPR enabled, plate reads
-   arrive on the event stream Crumb already ingests — turn on **Detection &
-   clips → License-plate recognition** in the console to start capturing them
-   into the searchable **Plates** tab. No new services or env keys; it reuses
-   the Frigate integration. A plate database is privacy-sensitive, so it stays
-   opt-in, and viewing it needs the **View license plates** role capability.
-10. **Notifications (optional)**, add one destination (ntfy / Pushover / webhook)
+9. **Notifications (optional)**, add one destination (ntfy / Pushover / webhook)
    with a **Save & send test** button. Full options (per-camera rules, quiet
    hours, Discord/Slack/Telegram, system alerts) live in Settings → Notifications.
-11. **Additional users (optional)**, list existing accounts and add users
+10. **Additional users (optional)**, list existing accounts and add users
     inline (username, password ≥ 8 chars, role). Roles control cameras +
     capabilities; fine-grained control is Settings → Users & Security.
-12. **Done.**
+11. **Done.**
 
 You're finished; they take it from here. (Skipping the camera steps adds nothing —
-secure by default; steps 7–11 are all optional and skippable.)
+secure by default; steps 7–10 are all optional and skippable.)
+
+**After the wizard — License-plate recognition (optional).** Not a wizard step;
+it lives in the console under **Settings → Detection & clips**. OFF by default.
+If the user runs their cameras through Frigate with Frigate's native LPR enabled,
+plate reads arrive on the event stream Crumb already ingests — flip
+**License-plate recognition** on there (and set a **retention** window; older
+plate reads are pruned automatically) to start capturing them into the
+searchable **Plates** tab. No new services or env keys; it reuses the Frigate
+integration. A plate database is privacy-sensitive, so it stays opt-in, and
+viewing it needs the **View license plates** role capability (Settings → Users &
+Security). REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
 ### 6b. Drive it yourself via the REST API (full hands-off)
 All wizard steps have API equivalents. Do them in order:
