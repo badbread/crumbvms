@@ -8,6 +8,61 @@ revisit.
 
 ---
 
+## 2026-07-13, Mobile performance: on-demand per-segment low-bitrate transcode (not continuous stream / ABR), Auto default
+
+**Context.** Recorded playback and fullscreen live were unusable over poor
+cellular: `GET /segments/{id}` served the full main-stream bytes (multi-Mbps
+H.265) with no downscale option anywhere, and fullscreen live started on HD main.
+The 2026-07-07 scrub-preview decision listed "WAN/remote scrubbing becomes a
+first-class target" as an explicit revisit trigger — that trigger fired.
+
+**Decision.** Add an on-demand, cached, operator-side low-bitrate variant, and an
+Auto/Full/Data-saver client selector defaulting to **Auto**:
+
+- **Playback:** `GET /segments/{id}/low.mp4` transcodes one segment to
+  640p/15fps/CRF28 H.264 (+ AAC mono), produced on first request and cached
+  (`{export_dir}/segcache`, LRU, ETag'd). A near-copy of the `clips.rs`
+  preview machinery — same semaphore, same read-only media mount, same
+  path-traversal guard, same auth (`?token=`). The recorder is never touched.
+- **Live:** the reconcile loop registers a per-camera `<name>_mobile` go2rtc
+  ffmpeg transcode of the sub (or main) stream; go2rtc pulls it only while a
+  consumer is attached (zero idle cost). Gated by `MOBILE_STREAM_ENABLED`.
+- **Client (Android):** Auto = Full on unmetered, Low on metered; the on-demand
+  transcode therefore runs ONLY when a client actually asks for Low.
+
+Full write-up: `docs/MOBILE-PERFORMANCE.md`.
+
+**Alternatives considered.**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | **Per-segment `q=low` variant** | **Chosen.** One-line client URL change; cacheable/idempotent per segment (repeat scrubs hit cache); reuses clip machinery wholesale; failure isolation per 4 s unit. |
+| 2 | Continuous time-range transcode (`/play/.../low.mp4?start=`) | Rejected for v1: replaces the whole segment/prefetch/seek client model with a long-lived stream a seek must restart, holds a semaphore permit for the whole session, output not reusable across scrubs. Kept as the v2 shape (it also removes any residual segment-boundary audio seam). |
+| 3 | HLS/DASH ABR ladder | Rejected: ≥2 encode ladders (double CPU) + playlist generation + a client player-mode change, overkill for a single-operator VMS; a manual/auto two-level selector matches the commercial-app UX at a fraction of the complexity. |
+| 4 | Pre-transcode everything at record time | Rejected outright: permanent CPU+storage for footage mostly never watched, and it touches the sacred write path. On-demand + cache is strictly better. |
+| 5 | Cloud/third-party transcode or relay | Out of scope — violates the ratified direction (footage never leaves operator hardware). |
+
+**Trades knowingly accepted.**
+
+- One ffmpeg spawn per 4 s segment on a cache miss (mitigated by cache + the
+  N-deep prefetch; `-preset ultrafast` at 640p is many-× realtime).
+- The `<name>_mobile` live transcode runs beside the recorder (go2rtc is embedded
+  in the recorder container). On-demand and bounded to one process per active
+  mobile viewer, disable-able via `MOBILE_STREAM_ENABLED=false`.
+- Default-on mobile stream doubles the go2rtc stream table; inert until consumed.
+
+**Revisit triggers.**
+
+- Measured per-segment spawn overhead dominates on real hosts → switch playback
+  to option 2 (continuous-range transcode), which also subsumes any audio seam.
+- Multi-user remote viewing becomes common → reconsider option 3 (real ABR).
+- ROADMAP dual-stream recording ships → "Low" should prefer a *recorded* sub
+  segment over an on-the-fly transcode; design the selector so they compose.
+- Recorder-host CPU contention reports → make the live mobile transcode default
+  off, or move go2rtc to a separate restreamer host.
+
+---
+
 ## 2026-07-12, Recorded audio: copy when client-safe, transcode only the rates Android rejects
 
 **Context.** The Android client played recorded footage silent while desktop
