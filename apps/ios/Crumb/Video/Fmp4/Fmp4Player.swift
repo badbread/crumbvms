@@ -20,6 +20,11 @@ struct Fmp4VideoView: View {
     /// Builds a fresh, authenticated (scoped-token) stream URL for each connect.
     let streamProvider: () async -> URL?
     let snapshotURL: URL?
+    /// When false, the stream's AAC audio track (if any) is decoded and played;
+    /// when true (the default — wall tiles, and single views before the operator
+    /// taps "listen") the audio path is skipped entirely. Only the fullscreen
+    /// single-camera view ever passes `false`.
+    var muted: Bool = true
     /// M6 (iOS only — see `PictureInPicture.swift`): when supplied, this
     /// view attaches `controller.displayLayer` to it on appear so the caller
     /// can drive Picture-in-Picture for the live stream. `nil` (the default)
@@ -52,11 +57,13 @@ struct Fmp4VideoView: View {
             }
         }
         .onAppear {
+            controller.setMuted(muted)
             controller.start(provider: streamProvider)
             #if os(iOS)
             pip?.attach(to: controller.displayLayer)
             #endif
         }
+        .onChange(of: muted) { controller.setMuted($0) }
         #if os(iOS)
         .onDisappear {
             // Don't tear down PiP itself here — `LiveFullscreenView.onBack`
@@ -72,6 +79,7 @@ struct Fmp4VideoView: View {
         #endif
         .onChange(of: streamKey) { _ in
             controller.stop()
+            controller.setMuted(muted)
             controller.start(provider: streamProvider)
         }
         #if os(iOS)
@@ -98,6 +106,7 @@ struct Fmp4VideoView: View {
                     controller.stop()
                 }
             case .active:
+                controller.setMuted(muted)
                 controller.start(provider: streamProvider)
             default:
                 break
@@ -119,6 +128,21 @@ final class Fmp4StreamController: NSObject, ObservableObject {
 
     let displayLayer = AVSampleBufferDisplayLayer()
 
+    // ── Audio (opt-in; only the fullscreen single-camera view unmutes) ────────
+    /// Renders decoded AAC access units. Paced by `audioSynchronizer` so it plays
+    /// at real-time regardless of how fast the demuxer hands us fragments.
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+    private let audioSynchronizer = AVSampleBufferRenderSynchronizer()
+    /// False = play audio when the stream carries it. Default muted: wall tiles
+    /// and a freshly-opened single view stay silent until the operator opts in.
+    private var muted = true
+    /// True once the synchronizer's clock has been anchored to the first audio
+    /// sample after (un)muting; reset on mute/stop so the next unmute re-anchors.
+    private var audioAnchored = false
+    /// Balances `CrumbAudioSession.acquire()`/`release()` so the shared session
+    /// refcount can't leak across mute toggles / teardown.
+    private var audioSessionHeld = false
+
     private var session: URLSession?
     private var task: URLSessionDataTask?
     /// Builds a fresh, authenticated (scoped-token) stream URL for each connect.
@@ -133,10 +157,61 @@ final class Fmp4StreamController: NSObject, ObservableObject {
     override init() {
         super.init()
         displayLayer.videoGravity = .resizeAspect
+        audioSynchronizer.addRenderer(audioRenderer)
         demuxer.onSample = { [weak self] sample in
             // Demux runs on the demux queue; UI + layer touch the main actor.
             DispatchQueue.main.async { self?.enqueue(sample) }
         }
+        // `onAudioSample` is wired only while unmuted (see `setMuted`), so a muted
+        // feed pays nothing for audio beyond the near-free moov scan.
+    }
+
+    // MARK: - Audio
+
+    /// Turn the stream's audio on/off. Idempotent, and safe to call before
+    /// `start()` — deliberately NOT guarded on an unchanged value: the view
+    /// re-asserts the current mute state after every `stop()`/`start()` cycle
+    /// (camera switch, foreground resume), which must re-wire the demuxer
+    /// callback that `stop()` cleared.
+    func setMuted(_ newValue: Bool) {
+        muted = newValue
+        if newValue {
+            teardownAudio()
+        } else {
+            // Acquire the shared `.playback` session and start feeding the renderer
+            // audio access units as the demuxer produces them.
+            if !audioSessionHeld { CrumbAudioSession.acquire(); audioSessionHeld = true }
+            audioAnchored = false
+            demuxer.onAudioSample = { [weak self] sample in
+                DispatchQueue.main.async { self?.enqueueAudio(sample) }
+            }
+        }
+    }
+
+    /// Feed one timed AAC sample to the renderer, anchoring the synchronizer clock
+    /// to the first sample so playback starts immediately and stays real-time.
+    private func enqueueAudio(_ sample: CMSampleBuffer) {
+        guard !stopped, !muted else { return }
+        if !audioAnchored {
+            audioAnchored = true
+            audioSynchronizer.setRate(1.0, time: sample.presentationTimeStamp)
+        }
+        if audioRenderer.isReadyForMoreMediaData {
+            audioRenderer.enqueue(sample)
+        }
+        // If the renderer isn't ready (rare — audio is naturally real-time paced),
+        // drop the sample rather than let latency grow unbounded.
+    }
+
+    /// Stop audio: unhook the demuxer callback, halt + flush the renderer, and
+    /// release the shared audio session. Leaves `muted` untouched (callers set it).
+    private func teardownAudio() {
+        demuxer.onAudioSample = nil
+        audioSynchronizer.setRate(0, time: .zero)
+        audioRenderer.flush()
+        audioRenderer.stopRequestingMediaData()
+        audioAnchored = false
+        if audioSessionHeld { CrumbAudioSession.release(); audioSessionHeld = false }
     }
 
     func start(provider: @escaping () async -> URL?) {
@@ -161,6 +236,10 @@ final class Fmp4StreamController: NSObject, ObservableObject {
         session?.invalidateAndCancel(); session = nil
         demuxQueue.async { [demuxer] in demuxer.reset() }
         displayLayer.flushAndRemoveImage()
+        // Release the audio session + flush the renderer whenever the stream
+        // stops (disappear, background, camera switch). `muted` is preserved, so
+        // the view's post-start `setMuted(muted)` re-arms audio if still unmuted.
+        teardownAudio()
         displaying = false
         failed = false
     }
@@ -171,6 +250,13 @@ final class Fmp4StreamController: NSObject, ObservableObject {
         session?.finishTasksAndInvalidate()
         demuxQueue.async { [demuxer] in demuxer.reset() }
         displaying = false
+        // Drop any audio buffered from the prior connection and re-anchor the
+        // synchronizer clock to the reconnected stream's first sample (its PTS
+        // timeline restarts), so audio isn't stuck waiting on a stale clock.
+        if !muted {
+            audioAnchored = false
+            audioRenderer.flush()
+        }
         let gen = generation
         // Mint a FRESH scoped-token stream URL for this connect (tokens are
         // short-lived; a persistent stream may reconnect after the last expired).

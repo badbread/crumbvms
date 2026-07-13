@@ -27,6 +27,8 @@ struct PlaybackView: View {
     @State private var showSpeedMenu = false
     @State private var savedToast: String?
     @State private var audioOn = false
+    /// Balances `CrumbAudioSession` acquire/release for recorded-playback audio.
+    @State private var audioSessionHeld = false
     // Export-range selection (macOS right-click "mark for export").
     @State private var exportSelStart: Int64?
     @State private var exportSelEnd: Int64?
@@ -88,7 +90,7 @@ struct PlaybackView: View {
             }
         }
         .task { await loadBookmarks() }
-        .onChange(of: vm.cameraId) { _ in Task { await loadBookmarks() } }
+        .onChange(of: vm.cameraId) { _ in Task { await loadBookmarks() }; restoreAudio() }
         // Feed the player whenever the resolved segment changes. `segmentPath`/
         // `cameraId`/`mediaUrls` let the HEVC-retag range-proxy re-mint a fresh
         // scoped media token if this segment plays longer than the token's
@@ -114,7 +116,9 @@ struct PlaybackView: View {
             player.onError = { vm.onPlayerError() }
             player.onTick = { ms in vm.onPlaybackTick(ms) }
             player.onAdvanced = { vm.commitAdvance() }
+            restoreAudio()
         }
+        .onDisappear { releaseAudioSession() }
         .sheet(isPresented: $showAddBookmark) {
             AddBookmarkDialog(atDate: vm.playheadDate) { desc, days, pre, post in
                 Task {
@@ -196,10 +200,13 @@ struct PlaybackView: View {
             PlayerLayerView(player: player.player, onLayer: { pip.attach(to: $0) })
                 .zoomable()
 
-            // M6: Picture-in-Picture toggle — only rendered once PiP is
-            // actually possible for the current player (system convention).
-            PictureInPictureButton(pip: pip)
-                .padding(8)
+            // Top-right controls: audio toggle (always shown) + PiP (shown once
+            // PiP is actually possible for the current player).
+            HStack(spacing: 6) {
+                audioToggleButton
+                PictureInPictureButton(pip: pip)
+            }
+            .padding(8)
 
             if vm.scrubbing, let f = vm.scrubFrameURL {
                 Color.black.opacity(0.55)
@@ -248,14 +255,6 @@ struct PlaybackView: View {
                 motionJump(forward: true, size: ctlSize, icon: ctlIcon) { vm.jumpToNextMotion() }
                 ctl("forward.frame.fill", "Step forward one frame", ctlSize, ctlIcon) { player.stepFrame(forward: true); vm.setPlaying(false) }
                 ctl("forward.to.line", "Jump to latest", ctlSize, ctlIcon) { vm.gotoLast() }
-                Button {
-                    audioOn.toggle(); player.setMuted(!audioOn)
-                } label: {
-                    Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                        .font(.system(size: ctlIcon)).foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
-                        .frame(width: ctlSize, height: ctlSize)
-                }
-                .accessibilityLabel(audioOn ? "Mute audio" : "Unmute audio")
                 Menu {
                     ForEach([8.0, 4.0, 2.0, 1.0, 0.5], id: \.self) { s in
                         Button { vm.setSpeed(Float(s)) } label: {
@@ -326,6 +325,53 @@ struct PlaybackView: View {
         s == 0.5 ? "0.5×" : "\(Int(s))×"
     }
 
+    // MARK: - audio
+
+    /// The top-right audio toggle, pinned over the video so it's reachable in
+    /// both orientations (the header is hidden in landscape). Enables/disables
+    /// sound for the recorded footage of the current camera; remembered per
+    /// camera. Audio only exists in segments the recorder captured with the
+    /// camera's `record_audio` policy on.
+    private var audioToggleButton: some View {
+        Button { setAudio(!audioOn) } label: {
+            Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                .font(.title3)
+                .foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
+                .padding(8)
+                .background(.black.opacity(0.45))
+                .clipShape(Circle())
+        }
+        .accessibilityLabel(audioOn ? "Mute audio" : "Unmute audio")
+        #if os(macOS)
+        .buttonStyle(.plain)
+        #endif
+    }
+
+    /// Apply an audio on/off choice: mute the player, persist it for this camera,
+    /// and acquire/release the shared `.playback` session so unmuted sound
+    /// actually plays (through the speaker, ignoring the ring switch).
+    private func setAudio(_ on: Bool) {
+        audioOn = on
+        player.setMuted(!on)
+        vm.container.settings.setAudioEnabled(on, for: vm.cameraId)
+        if on {
+            if !audioSessionHeld { CrumbAudioSession.acquire(); audioSessionHeld = true }
+        } else if audioSessionHeld {
+            CrumbAudioSession.release(); audioSessionHeld = false
+        }
+    }
+
+    /// Restore the remembered audio choice for the current camera (called on
+    /// appear and camera switch).
+    private func restoreAudio() {
+        setAudio(vm.container.settings.audioEnabled(for: vm.cameraId))
+    }
+
+    /// Drop the audio session if we hold it (leaving the view).
+    private func releaseAudioSession() {
+        if audioSessionHeld { CrumbAudioSession.release(); audioSessionHeld = false }
+    }
+
     // MARK: - macOS desktop transport
 
     #if os(macOS)
@@ -379,12 +425,6 @@ struct PlaybackView: View {
                             .foregroundColor(CrumbColors.tealAccent).frame(minWidth: 38)
                     }
                     .menuStyle(.borderlessButton).fixedSize()
-                    Button { audioOn.toggle(); player.setMuted(!audioOn) } label: {
-                        Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                            .font(.system(size: 17)).foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
-                            .frame(width: 34, height: 34)
-                    }
-                    .buttonStyle(.plain)
                 }
                 .frame(minWidth: 150, alignment: .trailing)
             }

@@ -43,8 +43,26 @@ final class AppSettings: ObservableObject {
         biometricLockEnabled = defaults.object(forKey: Keys.biometricLockEnabled) as? Bool ?? false
     }
 
+    // MARK: - Per-camera audio preference
+
+    /// Whether the operator last chose to hear audio for `cameraId`. Persisted
+    /// per camera (default off) so a security viewer never surprises a room with
+    /// sound, but a camera you deliberately listen to comes back unmuted. Shared
+    /// by both live (`Fmp4VideoView`) and recorded playback so the choice is
+    /// consistent across the two surfaces for the same camera.
+    func audioEnabled(for cameraId: String) -> Bool {
+        defaults.object(forKey: Keys.audioEnabledPrefix + cameraId) as? Bool ?? false
+    }
+
+    /// Persist the audio on/off choice for `cameraId`.
+    func setAudioEnabled(_ enabled: Bool, for cameraId: String) {
+        defaults.set(enabled, forKey: Keys.audioEnabledPrefix + cameraId)
+    }
+
     private enum Keys {
         static let liveGridLayout = "live_grid_layout"
+        /// Prefix for the per-camera audio-enabled flag (`audio_enabled_<cameraId>`).
+        static let audioEnabledPrefix = "audio_enabled_"
         static let ptzStyle = "ptz_style"
         static let lowBandwidthMode = "low_bandwidth_mode"
         static let motionTunerEnabled = "motion_tuner_enabled"

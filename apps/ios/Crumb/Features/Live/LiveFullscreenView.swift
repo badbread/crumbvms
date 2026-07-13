@@ -15,6 +15,9 @@ struct LiveFullscreenView: View {
 
     @State private var isPtz = false
     @State private var ptzPresets: [PtzPresetDto] = []
+    /// Live audio on/off for the current camera, restored from the per-camera
+    /// preference and threaded into `Fmp4VideoView` as `muted: !audioOn`.
+    @State private var audioOn = false
     /// Scoped (~15 min-token) snapshot-backdrop URL, resolved async — see
     /// `.task(id: camera.id)` below. `cameraFrameUrl` used to be a synchronous
     /// full-JWT URL built inline in `body`; minting the scoped token requires
@@ -99,6 +102,8 @@ struct LiveFullscreenView: View {
         }
         .statusBarHiddenCompat(true)
         .task(id: camera.id) {
+            // Restore this camera's remembered audio choice (default off).
+            audioOn = vm.container.settings.audioEnabled(for: camera.id)
             frameUrl = nil
             frameUrl = await vm.mediaUrls().cameraFrameUrl(camera.id)
         }
@@ -139,13 +144,15 @@ struct LiveFullscreenView: View {
             streamKey: cameraId,
             streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: false) },
             snapshotURL: frameUrl,
+            muted: !audioOn,
             pip: pip
         )
         #else
         Fmp4VideoView(
             streamKey: cameraId,
             streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: false) },
-            snapshotURL: frameUrl
+            snapshotURL: frameUrl,
+            muted: !audioOn
         )
         #endif
     }
@@ -262,6 +269,19 @@ struct LiveFullscreenView: View {
                             .foregroundColor(.white)
                     }
                 }
+
+                // Audio toggle (top-right): enable/disable live sound for THIS
+                // camera. Remembered per camera; plays only if the stream carries
+                // an audio track (see `Fmp4Demuxer`/go2rtc transcode).
+                Button {
+                    audioOn.toggle()
+                    vm.container.settings.setAudioEnabled(audioOn, for: camera.id)
+                } label: {
+                    Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                        .font(.title3)
+                        .foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
+                }
+                .accessibilityLabel(audioOn ? "Mute audio" : "Unmute audio")
 
                 // Secondary actions in a menu — keeps the bar uncluttered
                 Menu {
