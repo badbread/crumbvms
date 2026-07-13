@@ -823,6 +823,15 @@ pub struct CameraDecodeStatus {
     /// backend is expected to fail); `None` when all is well.
     pub fallback_reason: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// Recorded-audio status (migration 0050, LEFT JOINed from
+    /// `camera_audio_status`): source audio sample rate in Hz as probed at
+    /// record start. `None` when the probe failed, the camera has no audio, or
+    /// no audio-status row exists yet.
+    pub audio_sample_rate: Option<i32>,
+    /// `Some(true)` when the recorder is re-encoding this camera's audio to
+    /// 48 kHz AAC (source rate > 48 kHz), `Some(false)` when bit-exact copied,
+    /// `None` when unknown / no audio-status row.
+    pub audio_transcoding: Option<bool>,
 }
 
 // ─── motion RAM-cache telemetry (migration 0039) ──────────────────────────────

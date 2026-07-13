@@ -4560,6 +4560,7 @@ function renderCamInfoTab(c) {
         <div class="policy-section-title">Compatibility</div>
         <button class="ghost sm" onclick="identifyCamera('${c.id}')" ${(c.onvif_host && c.onvif_host.trim()) ? '' : 'disabled title="No ONVIF configured for this camera (it was added by a direct RTSP URL), so make and model cannot be read automatically. Add an ONVIF host and credentials in the ONVIF / PTZ section above, or set make/model by hand below."'}>Identify (ONVIF)</button>
       </div>
+      <div id="ce-audio-status"></div>
       <div id="ce-compat"><div class="card-hint" style="margin:0">Checking the compatibility database&hellip;</div></div>
       <div id="ce-compat-contrib"></div>
     </div>
@@ -4609,6 +4610,7 @@ function renderCamInfoTab(c) {
   autoProbeCamera(c);
   cePreviewIcon();
   loadCameraCompat(c.id);
+  loadCameraAudioStatus(c.id);
   loadCameraHaLinks(c.id);
 }
 
@@ -4617,6 +4619,28 @@ function renderCamInfoTab(c) {
    compatibility database and render known quirks / recommended settings, plus
    an "Identify" (ONVIF probe) action and a "Contribute this camera" flow that
    opens a pre-filled GitHub issue in the operator's own browser. */
+/* ── Audio-transcoding notice (per camera) ──
+   Shows a warning when the recorder is re-encoding this camera's audio to 48 kHz
+   because its source rate is one Android/web decoders can't play (> 48 kHz), with
+   a hint to set the camera's own audio to <=48 kHz to record bit-exact. Reads the
+   recorder-published per-camera audio status from GET /config/decode-status. */
+async function loadCameraAudioStatus(id) {
+  const el = $('ce-audio-status'); if (!el) return;
+  el.innerHTML = '';
+  try {
+    const r = await api('/config/decode-status');
+    const cam = (r.cameras || []).find(c => c.camera_id === id);
+    if (!cam || !cam.audio_transcoding) return; // copied (or unknown) — nothing to warn about
+    const khz = cam.audio_sample_rate ? Math.round(cam.audio_sample_rate / 1000) : null;
+    el.innerHTML = `<div class="card-hint" style="margin:0 0 10px 0;border-left:3px solid var(--warn);padding:6px 0 6px 10px">
+      <b style="color:var(--warn)">Audio is being re-encoded to 48&nbsp;kHz.</b>
+      This camera streams ${khz ? esc(khz + ' kHz') : 'a sample rate'} audio, which phones and browsers
+      can't decode, so Crumb transcodes it so recorded audio plays on every client (desktop copies it fine).
+      To record it <b>bit-exact</b> (no re-encode, no CPU), set this camera's own audio sample rate to
+      <b>&le;&nbsp;48&nbsp;kHz</b> (48&nbsp;kHz is ideal) in its web UI, then it will be copied automatically.</div>`;
+  } catch (e) { /* status unavailable (recorder not reporting yet) — no notice */ }
+}
+
 async function loadCameraCompat(id) {
   const el = $('ce-compat'); if (!el) return;
   const cc = $('ce-compat-contrib'); if (cc) cc.innerHTML = '';

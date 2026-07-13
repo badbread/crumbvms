@@ -5294,6 +5294,36 @@ pub async fn upsert_camera_decode_status(
     Ok(())
 }
 
+/// Upsert one camera's recorded-audio status (source sample rate + whether the
+/// recorder is transcoding it to 48 kHz). Written by the record loop at each
+/// (re)connect so the admin console can show which cameras are being re-encoded.
+///
+/// # Errors
+/// Returns an error if the database query fails.
+pub async fn upsert_camera_audio_status(
+    pool: &Pool,
+    camera_id: Uuid,
+    sample_rate: Option<i32>,
+    transcoding: bool,
+) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            INSERT INTO camera_audio_status (camera_id, sample_rate, transcoding, updated_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (camera_id) DO UPDATE
+                SET sample_rate = EXCLUDED.sample_rate,
+                    transcoding = EXCLUDED.transcoding,
+                    updated_at  = now()
+            ",
+            &[&camera_id, &sample_rate, &transcoding],
+        )
+        .await
+        .context("upsert_camera_audio_status")?;
+    Ok(())
+}
+
 /// Delete one camera's decode-status row.
 ///
 /// Called by the supervisor when it stops the worker of a disabled/removed
@@ -5313,6 +5343,16 @@ pub async fn delete_camera_decode_status(pool: &Pool, camera_id: Uuid) -> Result
         )
         .await
         .context("delete_camera_decode_status")?;
+    // Clear the companion audio-status row too so the admin never shows a stale
+    // "transcoding" badge for a camera that stopped recording (camera deletion
+    // also cascades via the FK; this covers the disable case).
+    client
+        .execute(
+            "DELETE FROM camera_audio_status WHERE camera_id = $1",
+            &[&camera_id],
+        )
+        .await
+        .context("delete_camera_audio_status")?;
     Ok(())
 }
 
@@ -5328,9 +5368,12 @@ pub async fn list_camera_decode_status(pool: &Pool) -> Result<Vec<CameraDecodeSt
         .query(
             r"
             SELECT s.camera_id, c.name AS camera_name,
-                   s.requested, s.active, s.fallback_reason, s.updated_at
+                   s.requested, s.active, s.fallback_reason, s.updated_at,
+                   a.sample_rate AS audio_sample_rate,
+                   a.transcoding AS audio_transcoding
             FROM camera_decode_status s
             JOIN cameras c ON c.id = s.camera_id
+            LEFT JOIN camera_audio_status a ON a.camera_id = s.camera_id
             ORDER BY c.name, s.camera_id
             ",
             &[],
@@ -5346,6 +5389,8 @@ pub async fn list_camera_decode_status(pool: &Pool) -> Result<Vec<CameraDecodeSt
             active: row.get("active"),
             fallback_reason: row.get("fallback_reason"),
             updated_at: row.get("updated_at"),
+            audio_sample_rate: row.get("audio_sample_rate"),
+            audio_transcoding: row.get("audio_transcoding"),
         })
         .collect())
 }
@@ -8427,6 +8472,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0049_additive_motion_sources.sql",
         include_str!("../../../db/migrations/0049_additive_motion_sources.sql"),
+    ),
+    (
+        "0050_camera_audio_status.sql",
+        include_str!("../../../db/migrations/0050_camera_audio_status.sql"),
     ),
 ];
 

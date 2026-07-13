@@ -146,6 +146,17 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Decision log | `docs/DECISIONS.md` | Retention/recording design choices are exactly what it exists for |
 | Migration | rows C above if schema changes | |
 
+### D2. Audio/video encoding change (recorder segments, export, any transcode)
+
+| Surface | Path | Why |
+|---|---|---|
+| **Best practice (audio)** | **Recorded/exported audio MUST be decodable on every client: copy it when the source rate is already client-safe (≤ 48 kHz), transcode to 48 kHz AAC only when it isn't (> 48 kHz).** | Android/web hardware AAC decoders reject rates above 48 kHz: a camera streaming 64 kHz logs `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac.decoder]` and plays SILENT, even though desktop's software ffmpeg decoder handles it. Don't blanket-transcode (wastes CPU on the already-safe majority); don't blanket-copy (silences > 48 kHz cameras). See `docs/DECISIONS.md` 2026-07-12 and `docs/RECORDER-CORRECTNESS.md` #23 |
+| Recorder | `services/recorder/src/recording.rs` — `probe_audio_sample_rate` + `audio_needs_transcode` + `audio_segmenter_args` (after `-c copy`, overriding only audio): `≤48k → -c:a copy -copyinkf:a`, else `-c:a aac -ar 48000` | The record path picks per camera from the probed rate; a failed probe → transcode (safe) |
+| Export | `services/api/src/export.rs` codec args | **Known follow-up:** still `-c:a copy` (+ `-copyinkf:a`) and NOT yet sample-rate-normalized, so an exported clip can still carry a rate a phone won't play — normalize to 48 kHz here too |
+| Video | keep video a **bit-exact copy** (`-c copy`); retag containers, don't transcode (`-tag:v hvc1` for HEVC so Apple decodes it) | Transcoding video is expensive + lossy; audio re-encode is negligible next to copied video |
+| Tests | assert the audio args encode AAC @ 48 kHz (not copy); any integration check asserts `nb_read_packets > 0` on the audio stream | A declared-but-empty OR wrong-sample-rate track still probes as a healthy stream |
+| Decision log | `docs/DECISIONS.md` | Encoding choices with rejected alternatives (copy / per-client software decoder / conditional transcode) |
+
 ### E. New camera capability (PTZ, imaging, ONVIF, stream handling)
 
 | Surface | Path | Why |
