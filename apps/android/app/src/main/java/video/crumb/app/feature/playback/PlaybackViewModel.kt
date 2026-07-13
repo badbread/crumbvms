@@ -430,17 +430,43 @@ class PlaybackViewModel(
      */
     private var lowQuality = false
 
+    /**
+     * Set once a low-bitrate fetch fails (the server doesn't offer `/low.mp4` —
+     * e.g. it predates that endpoint — or a transcode errored). While set, we stop
+     * appending `/low.mp4` and serve the full recorded bytes, so playback never
+     * hard-stalls on a missing/broken low variant. Cleared when the user
+     * explicitly (re-)selects a low quality mode, to give it another chance.
+     */
+    private var lowUnavailable = false
+
     /** Map a resolved segment URL to the active quality variant. */
     private fun qualityUrl(segmentUrl: String): String =
-        if (lowQuality) "$segmentUrl/low.mp4" else segmentUrl
+        if (lowQuality && !lowUnavailable) "$segmentUrl/low.mp4" else segmentUrl
+
+    /**
+     * Note that the low-bitrate variant failed to load, and fall back to full for
+     * the rest of the session. Returns true if this actually changed anything (we
+     * were using low and hadn't already fallen back), so the caller can re-resolve
+     * the current playhead with the full URL instead of refetching the failing one.
+     */
+    fun noteLowQualityFailed(): Boolean {
+        if (lowQuality && !lowUnavailable) {
+            lowUnavailable = true
+            _state.update { it.copy(nextSegment = null, nextSegmentUrl = null) }
+            return true
+        }
+        return false
+    }
 
     /**
      * Switch the playback quality (full vs. low-bitrate transcode). If it actually
      * changes, re-resolve the current playhead so the newly-built segment URL
      * (with/without the `low.mp4` suffix) takes effect immediately, and drop any
-     * prefetched next segment (it was resolved for the old quality).
+     * prefetched next segment (it was resolved for the old quality). Explicitly
+     * asking for low clears a prior "low unavailable" fallback so it's retried.
      */
     fun setLowQuality(low: Boolean) {
+        if (low) lowUnavailable = false
         if (low == lowQuality) return
         lowQuality = low
         _state.update { it.copy(nextSegment = null, nextSegmentUrl = null) }
