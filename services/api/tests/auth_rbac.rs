@@ -1289,7 +1289,14 @@ async fn no_protected_route_is_reachable_without_credentials() {
 /// not merely the client-side checkbox.
 #[tokio::test]
 async fn beta_terms_acceptance_recorded_and_surfaced() {
+    // This test asserts the fresh-install state of the process-wide
+    // `server_settings` singleton (beta_terms_accepted=false) and then mutates
+    // it. Serialize + reset so a concurrent settings test — or residue from a
+    // prior `cargo test` run against a reused Postgres — can't flip that shared
+    // row mid-assert (#88).
+    let _settings_guard = SERVER_SETTINGS_LOCK.lock().await;
     let app = TestApp::new().await;
+    reset_server_settings(app.pool()).await;
     let admin = seed_admin(app.pool()).await;
     let token = login(&app, &admin.username, &admin.password).await;
 
@@ -1405,7 +1412,14 @@ async fn scrub_preview_requires_admin() {
 /// assertion of this row in one sequential test avoids that race entirely.
 #[tokio::test]
 async fn scrub_preview_get_put_roundtrip_and_clamps() {
+    // Asserts every scrub knob falls back to its env default (`source: "env"`)
+    // on a fresh DB, then mutates them. Serialize + reset the shared
+    // `server_settings` singleton so a concurrent settings test — or leftover
+    // state from a prior `cargo test` run against a reused Postgres — can't make
+    // a knob read `source: "db"` before this test writes it (#88).
+    let _settings_guard = SERVER_SETTINGS_LOCK.lock().await;
     let app = TestApp::new().await;
+    reset_server_settings(app.pool()).await;
     let admin = seed_admin(app.pool()).await;
     let token = login(&app, &admin.username, &admin.password).await;
 
