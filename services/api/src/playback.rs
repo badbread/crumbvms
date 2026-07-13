@@ -671,12 +671,27 @@ async fn live_streams(
         None
     };
 
+    // On-demand mobile transcode (`<name>_mobile`) — a relative go2rtc stream
+    // name Crumb registers in the reconcile loop, so it resolves off the CRUMB
+    // RTSP base (with embedded creds), never Frigate's. Exposed only for
+    // Crumb-owned cameras when the feature is enabled; go2rtc spawns the
+    // transcode ffmpeg lazily on first consumer connect (idle cost zero).
+    let rtsp_mobile_url = (state.config().mobile_stream_enabled && cam.served_by != "frigate")
+        .then(|| {
+            format!(
+                "{}/{}_mobile",
+                crumb_rtsp_authed.trim_end_matches('/'),
+                cam.go2rtc_name
+            )
+        });
+
     Ok(Json(LiveStreamsResponse {
         camera_id,
         webrtc_main_url,
         webrtc_sub_url,
         rtsp_main_url,
         rtsp_sub_url,
+        rtsp_mobile_url,
     }))
 }
 
@@ -730,6 +745,9 @@ fn parse_uuid_csv(csv: &str) -> Result<Vec<Uuid>, ApiError> {
 ///
 /// Returns the canonicalised path on success.
 ///
+/// `pub(crate)` so the low-bitrate segment transcoder (`segment_low`) reuses the
+/// exact same guard rather than duplicating this security-critical check.
+///
 /// # Errors
 ///
 /// * `ApiError::Internal` — if the storage root path cannot be canonicalised
@@ -737,7 +755,7 @@ fn parse_uuid_csv(csv: &str) -> Result<Vec<Uuid>, ApiError> {
 /// * `ApiError::NotFound` — if the file does not exist on disk.
 /// * `ApiError::BadRequest` (400) — if the resolved path escapes the root; also
 ///   emits a `tracing::warn!` so the attempt is visible in the operator logs.
-fn guard_path_traversal(
+pub(crate) fn guard_path_traversal(
     storage_root: &Path,
     absolute: &Path,
     segment_id: Uuid,

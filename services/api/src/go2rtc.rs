@@ -76,6 +76,23 @@ fn sub_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_sub")
 }
 
+/// The go2rtc stream name for a camera's on-demand MOBILE transcode.
+fn mobile_name(go2rtc_name: &str) -> String {
+    format!("{go2rtc_name}_mobile")
+}
+
+/// Build the go2rtc source for a camera's `<name>_mobile` transcode. It reads
+/// `input_stream` (an EXISTING go2rtc stream — the camera's sub when present,
+/// else main) and re-encodes to H.264 capped at `width` px (height derived to
+/// preserve aspect). Referencing the stream by NAME (go2rtc's documented
+/// restream-and-transcode form, `ffmpeg:<stream>#video=h264`) shares that
+/// stream's single producer, so the transcode adds no extra camera session — and
+/// go2rtc only launches the ffmpeg process while a consumer is attached, so an
+/// idle mobile stream costs nothing. Pure + unit-tested.
+fn mobile_src(input_stream: &str, width: u32) -> String {
+    format!("ffmpeg:{input_stream}#video=h264#width={width}")
+}
+
 /// PUT a stream into go2rtc (idempotent — sets/replaces the stream by name).
 ///
 /// NOTE: go2rtc REGISTERS the stream even when it answers `400` (its immediate
@@ -311,16 +328,25 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
         .await
         .unwrap_or_default();
 
-    // Every name WE manage (main + sub) — for the PATCH alias-collision guard.
+    let mobile_enabled = state.config().mobile_stream_enabled;
+    let mobile_width = state.config().mobile_stream_width;
+
+    // Every name WE manage (main + sub + mobile) — for the PATCH alias-collision
+    // guard. (The mobile source is `ffmpeg:…`, never `rtsp://`, so it can't
+    // itself alias-collide, but keeping the full managed set is correct.)
     let managed: HashSet<String> = streams
         .iter()
         .flat_map(|s| {
-            let mut names = vec![s.go2rtc_name.clone()];
-            if s.source_sub_url
+            let has_sub = s
+                .source_sub_url
                 .as_deref()
-                .is_some_and(|u| !u.trim().is_empty())
-            {
+                .is_some_and(|u| !u.trim().is_empty());
+            let mut names = vec![s.go2rtc_name.clone()];
+            if has_sub {
                 names.push(sub_name(&s.go2rtc_name));
+            }
+            if mobile_enabled {
+                names.push(mobile_name(&s.go2rtc_name));
             }
             names
         })
@@ -337,12 +363,35 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             auth,
         )
         .await;
-        if let Some(sub) = s.source_sub_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        let has_sub = s
+            .source_sub_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+        if has_sub {
             apply_stream(
                 &c,
                 api_base,
                 &sub_name(&s.go2rtc_name),
-                sub,
+                s.source_sub_url.as_deref().unwrap_or_default(),
+                &existing,
+                &managed,
+                auth,
+            )
+            .await;
+        }
+        // On-demand mobile transcode: source the SUB stream when the camera has
+        // one (already low-res), else the MAIN stream. go2rtc pulls it lazily.
+        if mobile_enabled {
+            let input = if has_sub {
+                sub_name(&s.go2rtc_name)
+            } else {
+                s.go2rtc_name.clone()
+            };
+            apply_stream(
+                &c,
+                api_base,
+                &mobile_name(&s.go2rtc_name),
+                &mobile_src(&input, mobile_width),
                 &existing,
                 &managed,
                 auth,
@@ -393,6 +442,9 @@ pub async fn remove(state: &AppState, go2rtc_name: &str) -> Result<()> {
     let c = client()?;
     delete_stream(&c, api_base, go2rtc_name, auth).await?;
     delete_stream(&c, api_base, &sub_name(go2rtc_name), auth).await?;
+    // Best-effort: drop the mobile transcode too (a no-op if it was never
+    // registered — go2rtc DELETE tolerates a missing name).
+    let _ = delete_stream(&c, api_base, &mobile_name(go2rtc_name), auth).await;
     Ok(())
 }
 
@@ -651,6 +703,38 @@ mod tests {
 
     fn names(list: &[&str]) -> HashSet<String> {
         list.iter().copied().map(String::from).collect()
+    }
+
+    // ── mobile transcode stream (Phase 2) ───────────────────────────────────
+
+    #[test]
+    fn mobile_name_and_src_shapes() {
+        assert_eq!(mobile_name("driveway"), "driveway_mobile");
+        // References an existing stream by name (shares its producer) and caps width.
+        assert_eq!(
+            mobile_src("driveway_sub", 640),
+            "ffmpeg:driveway_sub#video=h264#width=640"
+        );
+        assert_eq!(
+            mobile_src("driveway", 480),
+            "ffmpeg:driveway#video=h264#width=480"
+        );
+    }
+
+    #[test]
+    fn mobile_src_is_never_an_rtsp_alias_collision() {
+        // The mobile source is an `ffmpeg:` string, not `rtsp://`, so the PATCH
+        // alias-collision guard never fires for it — it PATCHes in place like any
+        // other existing managed stream.
+        let managed = names(&["driveway", "driveway_sub", "driveway_mobile"]);
+        assert!(!is_patch_alias_collision(
+            &mobile_src("driveway_sub", 640),
+            &managed
+        ));
+        assert_eq!(
+            choose_verb(true, &mobile_src("driveway_sub", 640), &managed),
+            StreamVerb::Patch
+        );
     }
 
     // ── choose_verb (create-vs-patch fan-out fix) ───────────────────────────
