@@ -252,6 +252,22 @@ pub fn contribute_url(make: Option<&str>, model: Option<&str>, firmware: Option<
     if let Some(v) = firmware.filter(|s| !s.is_empty()) {
         url.push_str(&format!("&firmware={}", enc(v)));
     }
+    // Prefill the issue TITLE too (#60). The camera-report form's template sets a
+    // placeholder `title:`, so without an explicit &title the opened issue keeps
+    // "[camera] <Make> <Model>" verbatim. Build it from whatever identity we have,
+    // matching that template's title shape.
+    let title = match (
+        make.filter(|s| !s.is_empty()),
+        model.filter(|s| !s.is_empty()),
+    ) {
+        (Some(mk), Some(md)) => Some(format!("[camera] {mk} {md}")),
+        (Some(mk), None) => Some(format!("[camera] {mk}")),
+        (None, Some(md)) => Some(format!("[camera] {md}")),
+        (None, None) => None,
+    };
+    if let Some(t) = title {
+        url.push_str(&format!("&title={}", enc(&t)));
+    }
     url
 }
 
@@ -484,5 +500,20 @@ mod tests {
         assert!(u.contains("make=Uniview"));
         assert!(u.contains("model=IPC6322SR-X22P-D"));
         assert!(!u.contains("firmware="));
+        // #60: the title is prefilled (URL-encoded) from make + model, so the
+        // opened issue isn't left on the template placeholder.
+        assert!(
+            u.contains("&title=%5Bcamera%5D%20Uniview%20IPC6322SR-X22P-D"),
+            "expected an encoded [camera] make model title, got: {u}"
+        );
+    }
+
+    /// With no make/model there's nothing to build a meaningful title from, so
+    /// no `&title=` is appended (the form falls back to its own placeholder).
+    #[test]
+    fn contribute_url_omits_title_when_unidentified() {
+        let u = contribute_url(None, None, Some("1.2.3"));
+        assert!(!u.contains("&title="));
+        assert!(u.contains("firmware=1.2.3"));
     }
 }
