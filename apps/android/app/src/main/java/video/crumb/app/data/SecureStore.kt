@@ -115,6 +115,18 @@ class SecureStore(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_LIVE_AUDIO, value).apply()
 
     /**
+     * Whether the recorded-playback screen plays segment audio. Persisted across
+     * sessions so the user's choice is remembered. Defaults to FALSE — reviewing
+     * footage should stay silent unless the operator explicitly turns audio on,
+     * so scrubbing through recordings never blares unexpected sound. (Older
+     * footage recorded before audio capture landed simply plays silent when the
+     * toggle is on — no crash.)
+     */
+    var playbackAudioOn: Boolean
+        get() = prefs.getBoolean(KEY_PLAYBACK_AUDIO, false)
+        set(value) = prefs.edit().putBoolean(KEY_PLAYBACK_AUDIO, value).apply()
+
+    /**
      * Live wall grid-layout ordinal (GridLayout: 0=single, 1=2x2, 2=list).
      * Persisted so the chosen layout survives navigating in/out of a camera AND
      * app restarts (a plain `remember` was resetting it to 2x2 on every return).
@@ -244,6 +256,7 @@ class SecureStore(context: Context) {
         private const val KEY_USERNAME = "username"
         private const val KEY_LAST_LIVE_CAM = "last_live_cam"
         private const val KEY_LIVE_AUDIO = "live_audio_on"
+        private const val KEY_PLAYBACK_AUDIO = "playback_audio_on"
         private const val KEY_LIVE_LAYOUT = "live_grid_layout"
         private const val KEY_LOW_BW_AUTOFIX = "low_bw_autofix_applied"
         private const val KEY_PTZ_STYLE = "ptz_style"
