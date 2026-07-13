@@ -19,6 +19,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:window_manager/window_manager.dart';
 
+import 'package:crumb_desktop/api/boot_api.dart';
 import 'package:crumb_desktop/api/clips_api.dart' show ClipDescriptor;
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
@@ -51,6 +52,7 @@ import 'package:crumb_desktop/ui/motion_timeline/playback_legend_bar.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar_controller.dart';
 import 'package:crumb_desktop/ui/playback/playback_screen.dart';
+import 'package:crumb_desktop/ui/plates/plates_screen.dart';
 import 'package:crumb_desktop/ui/reauth/reauth_overlay.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alert_banner.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alerts_controller.dart';
@@ -415,6 +417,12 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// (not its own tab) so the live wall keeps running and updates behind it.
   bool _settingsOpen = false;
 
+  /// Server-side truth (from `GET /auth/me`) for whether this account may use
+  /// the license-plate (LPR) surface. The ONLY gate for the Plates tab: false
+  /// hides the tab button and falls its body back to Live. Fetched once on
+  /// shell init; stays false if `/auth/me` is unreachable (fail-closed).
+  bool _platesEnabled = false;
+
   /// The applied saved view (null → the default "All Cameras" auto-grid wall),
   /// and the id used to highlight the active chip in the view-selector row.
   AppliedView? _appliedView;
@@ -478,6 +486,21 @@ class _MainShellState extends State<MainShell> with WindowListener {
     // video tabs down on minimize, rebuild them fresh on restore.
     windowManager.addListener(this);
     _loadDefaultView();
+    _loadCapabilities();
+  }
+
+  /// Resolve the capability gate for the Plates tab. The app otherwise gates
+  /// nothing on capabilities, so this is the one `/auth/me` call the shell
+  /// makes; it stores only [MeResponse.platesEnabled]. Best-effort — a failure
+  /// leaves the tab hidden rather than surfacing an error.
+  Future<void> _loadCapabilities() async {
+    try {
+      final me = await widget.api.fetchMe(widget.sessionController.session);
+      if (!mounted || me.platesEnabled == _platesEnabled) return;
+      setState(() => _platesEnabled = me.platesEnabled);
+    } catch (_) {
+      // Leave _platesEnabled false — the Plates tab simply stays hidden.
+    }
   }
 
   /// Honor the client-side "launch view" star on startup: if the user pinned a
@@ -584,16 +607,20 @@ class _MainShellState extends State<MainShell> with WindowListener {
   static const int _playbackIndex = 1;
   static const int _clipsIndex = 2;
   static const int _exportIndex = 3;
+  // Appended LAST so indices 0-3 don't shift (the _buildBody switch stays
+  // correct). Capability-gated — only rendered when [_platesEnabled].
+  static const int _platesIndex = 4;
 
   // The body tabs (Settings is a panel toggle, not a body tab — see below).
   // Each carries its own accent color used for the active underline + label.
   // Live amber + Playback cyan match the old client (its --accent / mode-
-  // playback swap); Clips/Export/Settings get distinct, function-fitting hues.
+  // playback swap); Clips/Export/Plates get distinct, function-fitting hues.
   static const _tabs = <(int, IconData, String, Color)>[
     (_liveIndex, Icons.grid_view, 'Live', Color(0xFFE8A33D)), // amber
     (_playbackIndex, Icons.play_circle_outline, 'Playback', Color(0xFF38BDD6)), // cyan
     (_clipsIndex, Icons.movie_outlined, 'Clips', Color(0xFFB57BEF)), // violet
     (_exportIndex, Icons.download_outlined, 'Export', Color(0xFF57C888)), // green
+    (_platesIndex, Icons.directions_car_outlined, 'Plates', Color(0xFFE05A8A)), // pink
   ];
 
   static const Color _settingsColor = Color(0xFF9AA4B2); // neutral slate
@@ -693,7 +720,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
         child: Row(
           children: [
             for (final (i, icon, label, color) in _tabs)
-              _tabButton(i, icon, label, color),
+              // The Plates tab is capability-gated; every other tab always shows.
+              if (i != _platesIndex || _platesEnabled)
+                _tabButton(i, icon, label, color),
             // Settings is a floating-panel toggle, not a body tab.
             _settingsToggle(),
             const Spacer(),
@@ -1007,7 +1036,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
     if (_minimized && (_index == _liveIndex || _index == _playbackIndex)) {
       return const ColoredBox(color: Color(0xFF14171C));
     }
-    switch (_index) {
+    // The Plates tab is capability-gated (its tab button is hidden when
+    // disabled); if _index still points at it while disabled, fall back to Live.
+    final index = (_index == _platesIndex && !_platesEnabled) ? _liveIndex : _index;
+    switch (index) {
       case _playbackIndex:
         return PlaybackScreen(
           // Remount when a "View on timeline" hand-off arrives (open at that
@@ -1111,6 +1143,22 @@ class _MainShellState extends State<MainShell> with WindowListener {
               ..clear()
               ..addAll(list);
           },
+        );
+      case _platesIndex:
+        return PlatesScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          // Row click → jump to Playback at that read's moment on that camera.
+          // Same one-shot seek/focus hand-off the Clips "View on timeline" uses
+          // (no origin clip → Esc/double-click returns to the live wall, since
+          // the plate's camera may not be in the current view).
+          onViewFootage: (cameraId, ts) => setState(() {
+            _originClip = null;
+            _playbackSeekTo = ts;
+            _playbackFocusCameraId = cameraId;
+            _index = _playbackIndex;
+          }),
         );
       case _liveIndex:
       default:

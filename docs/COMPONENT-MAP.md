@@ -276,6 +276,7 @@ is not. The web admin console doubles as the desktop's management surface
 | Settings | server settings + users/RBAC | settings + embedded `/admin` | `settings/` | `Settings/` |
 | Notifications | rules + history CRUD | toasts | poll + local notifications | `Settings/` |
 | Update notice (issue #7) | Server settings toggle + status/"Check now" (the console's own update IS the server update) | Phase 2, not yet shipped (`docs/UPDATE-SYSTEM-PLAN.md` §7 C2) | Phase 2, not yet shipped (§7 C3) | Phase 2, not yet shipped, iOS lowest priority per D5 (§7 C4) |
+| License plates (LPR, `docs/DECISIONS.md` 2026-07-13) | **Phase 0**: enable/retention toggle in Detection & clips + `view_plates` role checkbox (+ optional Plates list) | **Phase 0**: "Plates" tab (gated on `MeResponse.plates_enabled`), list → click-to-playback (this is the modern Flutter client, `apps/desktop-flutter/`) | Deferred (Phase 3+) | Deferred (Phase 3+) | Backend: `plates.rs` (`GET /plates`), `plate_reads`/`lpr_config` (migration `0051`), Frigate ingestion in `detection/frigate.rs`, `view_plates` capability. Engine = Frigate native LPR; external engines (incl. OpenALPR) via a future `POST /lpr/reads` |
 
 Parity walk for a new feature:
 

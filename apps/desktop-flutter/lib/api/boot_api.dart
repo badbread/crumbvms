@@ -28,6 +28,7 @@ class MeResponse {
     required this.capabilities,
     required this.cameraIds,
     this.roleId,
+    this.platesEnabled = false,
   });
 
   final String id; // UUID
@@ -38,6 +39,12 @@ class MeResponse {
   final List<String> cameraIds;
   final String? roleId; // UUID, null for legacy binary-role users
 
+  /// Server-side truth for whether the caller may use the license-plate (LPR)
+  /// surface: true only when LPR is enabled server-side AND this account holds
+  /// the `view_plates` capability. The single flag the Plates tab gates on —
+  /// clients must NOT re-derive it from [capabilities]. Absent → false.
+  final bool platesEnabled;
+
   factory MeResponse.fromJson(Map<String, dynamic> j) => MeResponse(
     id: j['id'] as String,
     username: j['username'] as String,
@@ -47,6 +54,7 @@ class MeResponse {
     cameraIds:
         (j['camera_ids'] as List<dynamic>?)?.cast<String>() ?? const [],
     roleId: j['role_id'] as String?,
+    platesEnabled: (j['plates_enabled'] as bool?) ?? false,
   );
 }
 

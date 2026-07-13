@@ -8,6 +8,68 @@ revisit.
 
 ---
 
+## 2026-07-13, License-plate recognition: Frigate native LPR as the engine, engine-agnostic `plate_reads` + gated "Plates" surface; replaces the paid OpenALPR/Rekor cloud plan
+
+**Context.** The operator paid for the Rekor (OpenALPR) cloud plan solely for a
+searchable plate-reads dashboard. Crumb already ingests Frigate events, and the
+pipeline is plate-aware at the type level (`DetectionLabel::LicensePlate`,
+`sub_label`, `raw` JSONB); Frigate's native LPR emits plate strings on the
+already-consumed `frigate/events` stream (`recognized_license_plate`, and a
+matched-known-plate `sub_label`). The operator's requirement is **moving plates
+only** (they don't want static/parked plates) — which is exactly what Frigate's
+motion-gated LPR does, and what its "does not run on stationary vehicles"
+limitation makes it good at.
+
+**Decision — engine: Frigate native LPR; Crumb stays engine-agnostic.** The api
+parses the plate from the existing Frigate ingestion (`detection/frigate.rs`,
+MQTT + HTTP paths → `NormalizedEvent.recognized_plate`) and never embeds an OCR
+engine. A dedicated **`plate_reads`** table (normalized `plate` + `plate_raw`,
+confidence, region, vehicle jsonb, bbox, crop bytea, `source_id`, `event_id`
+FK, dedup on `(source_id, provider_event_id)`, `gin_trgm_ops` index; migration
+`0051`, registered) sits BESIDE the shared `events` row (each source keeps
+writing its labeled row, per the additive-motion-sources rule), so plate
+search / history / hotlists don't contort the shared `events` schema. Capture is
+gated on an **`lpr_config`** DB singleton (`enabled` DEFAULT false — a plate
+database is opt-in), same shape as `ha_config`. A new **`view_plates`**
+capability gates `GET /plates` (Crumb's FIRST capability-gated read endpoint;
+`/events` is deliberately left camera-scope-only). Clients gate the "Plates" tab
+on `MeResponse.plates_enabled` (LPR on AND `view_plates`); the desktop tab is
+appended last so existing tab indices don't shift. An **engine escape hatch**
+is designed-in (built later only if needed): an authed `POST /lpr/reads`
+(generated ingest token) lets an external engine — the operator's existing
+continuous-scan OpenALPR box, or a MIT `fast-alpr` sidecar reading a go2rtc
+`_sub` stream — write the same `plate_reads` via `source_id='openalpr'` etc.,
+with zero Crumb code change.
+
+**Rejected.** (a) Plate-in-`sub_label`-only / zero-migration: every UI query
+(fuzzy search, per-plate history, hotlist join, vehicle attrs) fights the
+shared `events` schema and mixed `sub_label` semantics. (b) OpenALPR OSS as the
+in-Crumb engine: AGPL-compatible but dormant since 2016, accuracy below the
+cloud plan — instead the operator's existing OpenALPR *box* stays an optional
+external source via the ingest endpoint. (c) CodeProject.AI ALPR: SSPL,
+(A)GPL-incompatible — never linked, bundled, or documented as an option.
+(d) Building a sidecar first: pays an engine + service cost for reads Frigate
+already produces on the existing stream. (e) Crops on the media volume: the api
+mount is read-only (seam) — crops are bytea in Postgres, retention-pruned api-side.
+
+**Trade-offs accepted.** Frigate LPR is prosumer (tuning required; no
+state/region or make/model — the one durable cloud-plan advantage) and reads
+plates off the lower-res/low-fps `detect` stream, so fast/distant plates trail
+a continuous-mainstream scanner — acceptable for the moving-plate use case, and
+the ingest endpoint keeps OpenALPR available if not. Plate data is
+privacy-sensitive: default-off, `view_plates`-gated, retention-pruned. Desktop
+gains its first feature-gated tab. `pg_trgm` enters the schema (trusted, in-image).
+
+**Revisit triggers.** A validation month shows Frigate LPR materially under the
+canceled cloud plan's hit rate on moving plates → wire the operator's OpenALPR
+box (or a `fast-alpr` sidecar) through `POST /lpr/reads`. A second
+capability-gated read surface appears → extract a shared client tab-gating
+helper (the desktop const-tab-list refactor deferred here). Frigate renames the
+LPR fields → re-verify the ingester parsing. Operator wants vehicle
+make/model/color search → reopen engine choice (paid add-on vs OSS classifiers).
+
+---
+
 ## 2026-07-13, Recorded audio: ALWAYS re-encode to gap-filled 48 kHz AAC (supersedes the 2026-07-12 copy-when-safe split)
 
 **Context.** The 2026-07-12 decision recorded audio with a per-camera split:
