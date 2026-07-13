@@ -4558,7 +4558,7 @@ function renderCamInfoTab(c) {
     <div class="policy-section">
       <div class="rp-section-head">
         <div class="policy-section-title">Compatibility</div>
-        <button class="ghost sm" onclick="identifyCamera('${c.id}')" ${(c.onvif_host && c.onvif_host.trim()) ? '' : 'disabled title="Add an ONVIF host above, save, then Identify"'}>Identify (ONVIF)</button>
+        <button class="ghost sm" onclick="identifyCamera('${c.id}')" ${(c.onvif_host && c.onvif_host.trim()) ? '' : 'disabled title="No ONVIF configured for this camera (it was added by a direct RTSP URL), so make and model cannot be read automatically. Add an ONVIF host and credentials in the ONVIF / PTZ section above, or set make/model by hand below."'}>Identify (ONVIF)</button>
       </div>
       <div id="ce-compat"><div class="card-hint" style="margin:0">Checking the compatibility database&hellip;</div></div>
       <div id="ce-compat-contrib"></div>
@@ -4633,7 +4633,7 @@ function renderCompat(id, r) {
   const manual = manualDeviceInfoBlock(id, r);
   // No make read yet: prompt to identify.
   if (!r.make && !r.model) {
-    return `<div class="card-hint" style="margin:0">Not identified yet. Use <b>Identify (ONVIF)</b> to read this camera's make and model, then Crumb checks the compatibility database. Cameras without ONVIF can be set manually below.</div>` + manual;
+    return `<div class="card-hint" style="margin:0">Not identified yet. If this camera supports ONVIF, use <b>Identify (ONVIF)</b> above to read its make and model automatically (Crumb then checks the compatibility database). Cameras with no ONVIF — e.g. added by a direct RTSP URL — have that button disabled; set make and model by hand below.</div>` + manual;
   }
   const idLine = `<div style="margin:0 0 6px 0"><b>${esc(r.make || '(unknown make)')}</b> ${esc(r.model || '')}${r.firmware ? ` <span style="color:var(--dim2)">· firmware ${esc(r.firmware)}</span>` : ''}</div>`;
 
