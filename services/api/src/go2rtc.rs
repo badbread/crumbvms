@@ -90,7 +90,11 @@ fn mobile_name(go2rtc_name: &str) -> String {
 /// go2rtc only launches the ffmpeg process while a consumer is attached, so an
 /// idle mobile stream costs nothing. Pure + unit-tested.
 fn mobile_src(input_stream: &str, width: u32) -> String {
-    format!("ffmpeg:{input_stream}#video=h264#width={width}")
+    // `#audio=aac` transcodes audio too (go2rtc drops audio with `-an` when no
+    // `#audio` is given). This matters for the no-sub case, where the mobile
+    // stream sources the MAIN stream whose audio the viewer expects; AAC is safer
+    // than a copy (which could pass through G.711 an RTSP client can't decode).
+    format!("ffmpeg:{input_stream}#video=h264#width={width}#audio=aac")
 }
 
 /// PUT a stream into go2rtc (idempotent — sets/replaces the stream by name).
@@ -478,6 +482,12 @@ pub async fn reconnect(state: &AppState, go2rtc_name: &str) -> Result<()> {
     if let Err(e) = delete_stream(&c, api_base, &sub_name(go2rtc_name), auth).await {
         tracing::warn!(go2rtc_name, error = %format!("{e:#}"), "reconnect: DELETE sub stream failed (ignoring)");
     }
+    // Drop the mobile transcode too, so a source-URL change re-derives it fresh
+    // (its input stream name is unchanged, but symmetry with reconcile's PUT-all
+    // keeps the managed set consistent). Best-effort.
+    if let Err(e) = delete_stream(&c, api_base, &mobile_name(go2rtc_name), auth).await {
+        tracing::warn!(go2rtc_name, error = %format!("{e:#}"), "reconnect: DELETE mobile stream failed (ignoring)");
+    }
     // Brief pause so go2rtc drops the producer before we re-PUT.
     tokio::time::sleep(Duration::from_millis(200)).await;
     // Re-PUT all managed streams (the updated source_url is now in the DB).
@@ -713,11 +723,11 @@ mod tests {
         // References an existing stream by name (shares its producer) and caps width.
         assert_eq!(
             mobile_src("driveway_sub", 640),
-            "ffmpeg:driveway_sub#video=h264#width=640"
+            "ffmpeg:driveway_sub#video=h264#width=640#audio=aac"
         );
         assert_eq!(
             mobile_src("driveway", 480),
-            "ffmpeg:driveway#video=h264#width=480"
+            "ffmpeg:driveway#video=h264#width=480#audio=aac"
         );
     }
 

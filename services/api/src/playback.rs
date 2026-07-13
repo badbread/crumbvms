@@ -673,10 +673,21 @@ async fn live_streams(
 
     // On-demand mobile transcode (`<name>_mobile`) — a relative go2rtc stream
     // name Crumb registers in the reconcile loop, so it resolves off the CRUMB
-    // RTSP base (with embedded creds), never Frigate's. Exposed only for
-    // Crumb-owned cameras when the feature is enabled; go2rtc spawns the
-    // transcode ffmpeg lazily on first consumer connect (idle cost zero).
-    let rtsp_mobile_url = (state.config().mobile_stream_enabled && cam.served_by != "frigate")
+    // RTSP base (with embedded creds), never Frigate's. Exposed only when reconcile
+    // would ACTUALLY register the stream: the feature is on, the camera is
+    // Crumb-owned, AND it has a `source_url` (the exact predicate
+    // `db::list_camera_streams` filters on). A legacy `served_by='crumb'` row with
+    // an absolute `main_url` but empty `source_url` gets no `_mobile` stream, so we
+    // must not advertise a URL that resolves to nothing (else fullscreen live would
+    // burn its reconnect budget on a dead stream). go2rtc spawns the transcode
+    // ffmpeg lazily on first consumer connect (idle cost zero).
+    let has_source = cam
+        .source_url
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let rtsp_mobile_url = (state.config().mobile_stream_enabled
+        && cam.served_by != "frigate"
+        && has_source)
         .then(|| {
             format!(
                 "{}/{}_mobile",

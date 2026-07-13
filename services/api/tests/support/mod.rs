@@ -81,6 +81,8 @@ pub mod ptz;
 pub mod roles;
 #[path = "../../src/scrub_settings.rs"]
 pub mod scrub_settings;
+#[path = "../../src/segment_low.rs"]
+pub mod segment_low;
 #[path = "../../src/state.rs"]
 pub mod state;
 #[path = "../../src/stream_test.rs"]
@@ -351,6 +353,7 @@ pub fn test_router() -> Router<AppState> {
         .merge(auth::media_token_routes())
         .nest("/config", config_routes::routes())
         .merge(playback::routes())
+        .merge(segment_low::routes())
         .merge(export::routes())
         .merge(filmstrip::routes())
         .merge(events::json_routes())
