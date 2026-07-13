@@ -248,6 +248,16 @@ pub async fn test_state() -> AppState {
             db::ensure_named_policies_and_groups(&pool)
                 .await
                 .expect("ensure_named_policies_and_groups");
+            // Mirror the api's startup: `run_migrations` alone leaves the
+            // bookmarks table at its 0001 shape (`note`, no
+            // description/created_by/protect_*) because 0010's CREATE-IF-NOT-
+            // EXISTS is a no-op over the already-created table. Production
+            // reconciles this at boot via ensure_bookmarks_table() (main.rs);
+            // without it here, bookmark inserts fail (missing columns), which is
+            // why the bookmark endpoints previously had no test coverage.
+            db::ensure_bookmarks_table(&pool)
+                .await
+                .expect("ensure_bookmarks_table");
             seed_default_policy_if_absent(&pool).await;
             *done = true;
         }
@@ -474,6 +484,29 @@ pub async fn seed_viewer_user(pool: &Pool, role_id: Uuid) -> SeededUser {
 pub async fn seed_viewer(pool: &Pool, camera_ids: &[Uuid]) -> SeededUser {
     let role_id = seed_viewer_role(pool, camera_ids).await;
     seed_viewer_user(pool, role_id).await
+}
+
+/// Seed a viewer role with a specific [`BookmarkScope`] (camera-scoped to
+/// `camera_ids`, every other capability on) plus a user assigned to it. Backs
+/// the bookmark-scope enforcement tests.
+pub async fn seed_viewer_with_bookmark_scope(
+    pool: &Pool,
+    camera_ids: &[Uuid],
+    scope: crumb_common::types::BookmarkScope,
+) -> SeededUser {
+    let name = unique("role");
+    let caps = Capabilities {
+        export: true,
+        playback: true,
+        clips: true,
+        ptz: true,
+        bookmarks: scope,
+        manage_views: true,
+    };
+    let role = db::create_role(pool, &name, &caps, camera_ids)
+        .await
+        .expect("create_role (viewer bookmark-scope)");
+    seed_viewer_user(pool, role.id).await
 }
 
 /// Hash a password the same way `auth.rs::hash_password` does (Argon2id,

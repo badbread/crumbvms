@@ -8407,9 +8407,10 @@ function roleCapUI(pfx, caps) {
     <div style="margin-top:10px">
       <label class="field-label" style="margin-top:0">Bookmarks</label>
       <select id="${pfx}-cap-bookmarks" style="max-width:280px">
-        <option value="none"  ${bk==='none' ?'selected':''}>None, no bookmark access</option>
-        <option value="own"   ${bk==='own'  ?'selected':''}>Own, create &amp; view their own bookmarks</option>
-        <option value="all"   ${bk==='all'  ?'selected':''}>All, view and manage all users' bookmarks</option>
+        <option value="none"    ${bk==='none'    ?'selected':''}>None, no bookmark access</option>
+        <option value="own"     ${bk==='own'     ?'selected':''}>Own, create &amp; view their own bookmarks</option>
+        <option value="viewall" ${bk==='viewall' ?'selected':''}>View all, manage own, see everyone's, edit/delete only their own</option>
+        <option value="all"     ${bk==='all'     ?'selected':''}>All, view and manage everyone's bookmarks</option>
       </select>
     </div>
   </div>`;

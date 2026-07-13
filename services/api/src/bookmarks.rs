@@ -20,8 +20,11 @@
 //! * [`BookmarkScope::None`] — viewer has no bookmark access; all routes return 403.
 //! * [`BookmarkScope::Own`]  — viewer sees / modifies only their OWN bookmarks, and
 //!   only for cameras they can access.
-//! * [`BookmarkScope::All`]  — viewer (or admin) may see all bookmarks for cameras
-//!   they can access.
+//! * [`BookmarkScope::ViewAll`] — viewer SEES all bookmarks for cameras they can
+//!   access and may create, but may edit/delete only their OWN (read-all,
+//!   manage-own).
+//! * [`BookmarkScope::All`]  — viewer (or admin) may see AND manage (edit/delete)
+//!   all bookmarks for cameras they can access.
 //!
 //! Admins always resolve to `All` (via [`AuthUser::bookmarks_scope`]).
 
@@ -93,9 +96,11 @@ pub struct UpdateBookmarkRequest {
 /// * `BookmarkScope::Own`   → bookmarks created by this user for cameras they
 ///   can access (newest first). When `?camera_id=` is given, asserts camera
 ///   access and returns that camera's bookmarks owned by this user (newest first).
-/// * `BookmarkScope::All`   → all bookmarks for cameras the user can access
-///   (newest first). When `?camera_id=` is given, asserts camera access and
-///   returns that camera's bookmarks (oldest first, for timeline marker order).
+/// * `BookmarkScope::ViewAll` / `BookmarkScope::All` → all bookmarks for cameras
+///   the user can access (newest first). When `?camera_id=` is given, asserts
+///   camera access and returns that camera's bookmarks (oldest first, for
+///   timeline marker order). `ViewAll` differs from `All` only at edit/delete
+///   time (see [`check_bookmark_access`]), not in what it can see.
 async fn list_bookmarks(
     user: AuthUser,
     State(state): State<AppState>,
@@ -133,7 +138,7 @@ async fn list_bookmarks(
             }
         }
 
-        BookmarkScope::All => {
+        BookmarkScope::ViewAll | BookmarkScope::All => {
             if let Some(cam) = q.camera_id {
                 user.assert_camera_access(cam)?;
                 let list = db::list_bookmarks_for_camera(state.pool(), cam)
@@ -215,8 +220,8 @@ async fn create_bookmark(
 
 /// `PATCH /bookmarks/:id` — edit a bookmark's note.
 ///
-/// Enforces bookmark scope: `None` → 403; `Own` → must be creator; `All` →
-/// any accessible camera.
+/// Enforces bookmark scope: `None` → 403; `Own`/`ViewAll` → must be creator;
+/// `All` → any accessible camera.
 async fn update_bookmark(
     user: AuthUser,
     State(state): State<AppState>,
@@ -239,8 +244,8 @@ async fn update_bookmark(
 
 /// `DELETE /bookmarks/:id` — remove a bookmark.
 ///
-/// Enforces bookmark scope: `None` → 403; `Own` → must be creator; `All` →
-/// any accessible camera.
+/// Enforces bookmark scope: `None` → 403; `Own`/`ViewAll` → must be creator;
+/// `All` → any accessible camera.
 async fn delete_bookmark(
     user: AuthUser,
     State(state): State<AppState>,
@@ -265,7 +270,10 @@ async fn delete_bookmark(
 /// 1. `BookmarkScope::None` → 403 immediately.
 /// 2. Loads `(camera_id, created_by)` from the DB — 404 if the row is missing.
 /// 3. Asserts camera access (viewer can only touch bookmarks for their cameras).
-/// 4. For `BookmarkScope::Own`: additionally requires the caller is the creator.
+/// 4. For `BookmarkScope::Own` and `BookmarkScope::ViewAll`: additionally
+///    requires the caller is the creator (both are manage-own tiers — `ViewAll`
+///    can *see* everyone's but only *modify* its own). Only `All` may edit/delete
+///    another user's bookmark.
 async fn check_bookmark_access(user: &AuthUser, pool: &Pool, id: Uuid) -> Result<(), ApiError> {
     if matches!(user.bookmarks_scope(), BookmarkScope::None) {
         return Err(ApiError::Forbidden(
@@ -280,7 +288,10 @@ async fn check_bookmark_access(user: &AuthUser, pool: &Pool, id: Uuid) -> Result
 
     user.assert_camera_access(camera_id)?;
 
-    if matches!(user.bookmarks_scope(), BookmarkScope::Own) {
+    if matches!(
+        user.bookmarks_scope(),
+        BookmarkScope::Own | BookmarkScope::ViewAll
+    ) {
         let is_owner = created_by.is_some_and(|u| u == user.user_id);
         if !is_owner {
             return Err(ApiError::Forbidden(
