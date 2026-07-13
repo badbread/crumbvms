@@ -164,6 +164,11 @@ fun LiveFullscreenScreen(
     // against a link that can't reach the server at all.
     val isOnline by rememberIsOnline()
 
+    // Metered/cellular signal: on a metered link, fullscreen live starts on a
+    // data-saver stream (sub, or the on-demand mobile transcode when there is no
+    // sub) instead of the HD main — the SD badge lets the user tap for HD.
+    val isMetered by rememberIsMetered()
+
     // Bumped to force a fresh `remember(rtspUrl, playerGeneration)` player without
     // touching rtspUrl — tap-to-retry (#2) rebuilds from scratch (fresh backoff
     // `attempt`) instead of waiting out the rest of the slow retry cadence.
@@ -235,11 +240,21 @@ fun LiveFullscreenScreen(
                 onSuccess = { streams ->
                     mainUrl = streams.rtspMainUrl
                     subUrl = streams.rtspSubUrl
-                    usingSub = false
-                    hdUnavailable = false
-                    // Start on the main (HD) stream; the reconnect logic below falls
-                    // back to the sub stream if the main never reaches a playable frame.
-                    rtspUrl = streams.rtspMainUrl
+                    // On a metered link, start on a data-saver stream: the camera's
+                    // sub when it has one, else the server's on-demand mobile
+                    // transcode. Off metered (Wi-Fi/LAN), start on the main (HD)
+                    // stream. Either way the codec-failure fallback + "tap for HD"
+                    // badge below still apply.
+                    val lowFirst = if (isMetered) (streams.rtspSubUrl ?: streams.rtspMobileUrl) else null
+                    if (lowFirst != null) {
+                        usingSub = true
+                        hdUnavailable = true
+                        rtspUrl = lowFirst
+                    } else {
+                        usingSub = false
+                        hdUnavailable = false
+                        rtspUrl = streams.rtspMainUrl
+                    }
                     isResolving = false
                 },
                 onFailure = { cause ->
@@ -565,12 +580,13 @@ fun LiveFullscreenScreen(
             }
         }
 
-        // "SD" badge — the main (HD) stream couldn't play on this device (e.g. an
-        // H265 main the RTSP path can't decode), so we downgraded to the sub stream.
-        // Distinct from the reconnecting/error states. Hidden in PiP (video only).
+        // "SD" badge — running the sub (or mobile) stream rather than HD main,
+        // either because the main couldn't decode on this device (H265-over-RTSP)
+        // or because we're on a metered link (data-saver start). TAPPABLE: forces
+        // the HD (main) stream — the manual HD/SD override. Hidden in PiP.
         if (!inPip && hdUnavailable && !isResolving && !playerError) {
             Text(
-                text = "SD",
+                text = "SD · tap for HD",
                 style = MaterialTheme.typography.labelMedium,
                 color = Color.White,
                 modifier = Modifier
@@ -581,6 +597,14 @@ fun LiveFullscreenScreen(
                         color = Color.Black.copy(alpha = 0.55f),
                         shape = androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
                     )
+                    .clickable {
+                        mainUrl?.let {
+                            usingSub = false
+                            hdUnavailable = false
+                            rtspUrl = it
+                            playerGeneration += 1
+                        }
+                    }
                     .padding(horizontal = 8.dp, vertical = 4.dp),
             )
         }
