@@ -146,6 +146,17 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Decision log | `docs/DECISIONS.md` | Retention/recording design choices are exactly what it exists for |
 | Migration | rows C above if schema changes | |
 
+### D2. Audio/video encoding change (recorder segments, export, any transcode)
+
+| Surface | Path | Why |
+|---|---|---|
+| **Best practice (audio)** | **Recorded and exported audio MUST be normalized to 48 kHz AAC — never stream-copied at the camera's own sample rate.** | Android/web hardware AAC decoders reject non-standard rates: a camera streaming 64 kHz logs `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac.decoder]` and plays SILENT, even though desktop's software ffmpeg decoder handles it. 48 kHz is universally decodable on every client. See `docs/DECISIONS.md` 2026-07-12 and `docs/RECORDER-CORRECTNESS.md` #23 |
+| Recorder | `services/recorder/src/recording.rs` — `audio_segmenter_args` → `-c:a aac -ar 48000` (after `-c copy`, overriding only audio) | The record path: every segment carries 48 kHz AAC |
+| Export | `services/api/src/export.rs` codec args | **Known follow-up:** still `-c:a copy` (+ `-copyinkf:a`) and NOT yet sample-rate-normalized, so an exported clip can still carry a rate a phone won't play — normalize to 48 kHz here too |
+| Video | keep video a **bit-exact copy** (`-c copy`); retag containers, don't transcode (`-tag:v hvc1` for HEVC so Apple decodes it) | Transcoding video is expensive + lossy; audio re-encode is negligible next to copied video |
+| Tests | assert the audio args encode AAC @ 48 kHz (not copy); any integration check asserts `nb_read_packets > 0` on the audio stream | A declared-but-empty OR wrong-sample-rate track still probes as a healthy stream |
+| Decision log | `docs/DECISIONS.md` | Encoding choices with rejected alternatives (copy / per-client software decoder / conditional transcode) |
+
 ### E. New camera capability (PTZ, imaging, ONVIF, stream handling)
 
 | Surface | Path | Why |
