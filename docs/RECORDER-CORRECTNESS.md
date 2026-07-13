@@ -125,33 +125,35 @@ recorder, and later the API) must satisfy these *by construction*.
 ## declared tracks must carry decodable packets, on every client (audio-integrity)
 23. **A recorded segment MUST contain decodable media PACKETS for every track it
     declares — and those packets must be decodable by EVERY client, not just
-    desktop.** The recorder satisfies this for audio by **transcoding to 48 kHz
-    AAC** (`audio_segmenter_args` → `-c:a aac -ar 48000`), NOT by stream-copy
-    (docs/DECISIONS.md 2026-07-12). Two failure modes a copy hit, both fixed by
-    transcoding:
-    - **Cross-client playability.** Some cameras stream AAC at sample rates that
-      Android's hardware/`c2` AAC decoders reject outright (a real device logs
-      `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac
-      .decoder]` and plays the footage SILENT). A bit-exact copy plays on
-      desktop's software ffmpeg decoder but not on Android/web; 48 kHz is
-      universally decodable.
-    - **Empty-track copy gate.** Under `-c copy`, ffmpeg's CLI silently discards
-      every packet on a stream until the first keyframe-flagged one, and the
-      RTP-AAC (MPEG4-GENERIC) depacketizer never key-flags audio — so a plain
-      copy yields a declared-but-EMPTY aac track (the moov lists it from the SDP;
-      zero samples), silent with no warning at any normal log level. The old
-      `-copyinkf:a` ("copy initial non-keyframes") existed only to ungate this.
+    desktop.** The recorder picks the audio args per camera from the probed source
+    sample rate (`audio_segmenter_args` / `audio_needs_transcode` /
+    `probe_audio_sample_rate`; docs/DECISIONS.md 2026-07-12): **≤ 48 kHz → bit-exact
+    copy** (`-c:a copy -copyinkf:a`); **> 48 kHz, or an unknown/failed probe →
+    transcode to 48 kHz AAC** (`-c:a aac -ar 48000`). This guards two failure modes:
+    - **Cross-client playability (the transcode case).** Some cameras stream AAC at
+      rates that Android's hardware/`c2` decoders reject outright (a real device
+      logs `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac
+      .decoder]` and plays SILENT). A bit-exact copy plays on desktop's software
+      ffmpeg decoder but not on Android/web, so any rate > 48 kHz is transcoded down
+      to a universally-decodable 48 kHz.
+    - **Empty-track copy gate (the copy case still needs `-copyinkf:a`).** Under
+      `-c copy`, ffmpeg's CLI silently discards every packet on a stream until the
+      first keyframe-flagged one, and the RTP-AAC (MPEG4-GENERIC) depacketizer never
+      key-flags audio — so a plain copy yields a declared-but-EMPTY aac track (the
+      moov lists it from the SDP; zero samples), silent with no warning at any
+      normal log level. The copy path therefore keeps `-copyinkf:a`; the transcode
+      path re-encodes from decoded PCM and has no keyframe gate.
 
-    Transcoding re-encodes from decoded PCM, so neither applies. Video stays a
-    bit-exact copy (`-c:a aac` overrides only audio; it does NOT touch the fMP4
-    crash-safety flags, item 1). **The export path is separate:**
+    Video always stays a bit-exact copy (the audio args override only audio; they do
+    NOT touch the fMP4 crash-safety flags, item 1). **The export path is separate:**
     `services/api/src/export.rs`'s `-c:a copy` still emits `-copyinkf:a` against
     the keyframe gate (the recorded fMP4's `trun` faithfully preserves the missing
     key flag), and it does **not yet** normalize the sample rate — an exported
     clip can still carry a rate a phone won't decode until export is normalized
-    too (a known follow-up). Detector: the recorder's audio args are unit-tested
-    to encode AAC @ 48 kHz (not copy); any integration check should assert
-    `nb_read_packets > 0` on the audio stream, not merely that the stream exists.
+    too (a known follow-up). Detector: `audio_needs_transcode` is unit-tested (≤ 48 kHz
+    → copy, > 48 kHz / unknown → transcode) and `audio_segmenter_args` for both
+    branches; any integration check should assert `nb_read_packets > 0` on the audio
+    stream, not merely that the stream exists.
 
 ## free-space floor (ENOSPC safety valve)
 24. **The floor keys off free space AVAILABLE to the recorder, and its response

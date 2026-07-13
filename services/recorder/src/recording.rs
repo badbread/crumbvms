@@ -425,38 +425,82 @@ pub async fn run(
 /// error/stall restart of the ffmpeg child instead of being silently reset
 /// (which used to discard the remainder of the event).
 /// The audio ffmpeg args for the `-c copy` (video) segmenter, given the camera's
-/// `record_audio` policy.
+/// `record_audio` policy and whether the source audio needs transcoding.
 ///
-/// When `record_audio` is false → `-an` (drop the audio output stream).
+/// - `record_audio == false` → `-an` (drop the audio output stream).
+/// - `transcode == true` → **re-encode to 48 kHz AAC** (`-c:a aac -ar 48000`).
+/// - otherwise → **bit-exact copy** (`-c:a copy -copyinkf:a`), zero re-encode.
 ///
-/// When true → **transcode audio to 48 kHz AAC** (`-c:a aac -ar 48000`) rather
-/// than bit-exact copy. Two reasons this must transcode (docs/DECISIONS.md
-/// 2026-07-12):
+/// The copy-vs-transcode split (docs/DECISIONS.md 2026-07-12): most cameras
+/// already stream a client-safe rate (≤ 48 kHz standard AAC), and those are
+/// copied — zero CPU, bit-exact. Only cameras whose audio is a rate Android's
+/// hardware/`c2` AAC decoders reject (64/88.2/96 kHz — a real device logs
+/// `MediaCodecInfo: NoSupport [sampleRate.support, 64000]` and plays silent) are
+/// transcoded down to 48 kHz so recorded audio plays on EVERY client, not just
+/// desktop's software decoder. See [`audio_needs_transcode`] /
+/// [`probe_audio_sample_rate`].
 ///
-/// 1. **Cross-client playability.** Some cameras stream AAC at sample rates that
-///    Android's hardware/`c2` AAC decoders reject outright — a real device logs
-///    `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac
-///    .decoder]` and plays the footage silent. Desktop's software ffmpeg decoder
-///    handles those rates, so copy "worked" there but not on Android/web.
-///    Normalizing to 48 kHz (universally supported) makes recorded audio play on
-///    EVERY client.
-/// 2. **Correctness, for free.** Copying RTP-AAC under `-c copy` also silently
-///    drops every audio packet until a keyframe-flagged one, and MPEG4-GENERIC
-///    audio is never key-flagged — the old `-copyinkf:a` copy path existed only
-///    to work around that. Transcoding re-encodes from decoded PCM, so there is
-///    no keyframe gate and no declared-but-EMPTY-track risk at all.
+/// The copy path keeps `-copyinkf:a` ("copy initial non-keyframes"): under
+/// `-c copy` ffmpeg drops every packet until a keyframe-flagged one, and RTP-AAC
+/// (MPEG4-GENERIC) audio is never key-flagged, so without it the segment would
+/// declare an aac track (from the SDP) with ZERO packets — silent footage, no
+/// warning (RECORDER-CORRECTNESS #23). The transcode path re-encodes from decoded
+/// PCM, so it has no keyframe gate and needs no such flag.
 ///
-/// These args come AFTER `-c copy`, so `-c:a aac` overrides ONLY the audio codec
-/// (video stays a bit-exact copy) and `-ar 48000` inserts the resampler. Audio
-/// re-encode is negligible CPU next to the copied video. See
-/// `docs/RECORDER-CORRECTNESS.md`: a declared track must carry decodable packets
-/// — now satisfied by re-encoding rather than by ungating a copy.
-fn audio_segmenter_args(record_audio: bool) -> &'static [&'static str] {
-    if record_audio {
+/// All of these come AFTER `-c copy`, so they override ONLY the audio (video
+/// stays a bit-exact copy).
+fn audio_segmenter_args(record_audio: bool, transcode: bool) -> &'static [&'static str] {
+    if !record_audio {
+        &["-an"]
+    } else if transcode {
         &["-c:a", "aac", "-ar", "48000"]
     } else {
-        &["-an"]
+        &["-c:a", "copy", "-copyinkf:a"]
     }
+}
+
+/// AAC sample rates above 48 kHz (64 / 88.2 / 96 kHz) are the ones Android/web
+/// hardware decoders reject; every standard rate at or below 48 kHz is decodable
+/// on every client and can be bit-exact copied. An UNKNOWN rate (probe failed,
+/// go2rtc not ready yet) ⇒ transcode — the always-safe default.
+fn audio_needs_transcode(sample_rate: Option<u32>) -> bool {
+    sample_rate.is_none_or(|hz| hz > 48_000)
+}
+
+/// Best-effort probe of the first audio stream's sample rate (Hz) at `url`, for
+/// the copy-vs-transcode decision. Returns `None` on ANY failure — no audio
+/// stream, `ffprobe` missing, a timeout, or go2rtc not serving yet — so the
+/// caller safely falls back to transcode. Bounded timeout so a slow/unready
+/// source never stalls the start of recording (the recorder records from the
+/// go2rtc restream, so this is a local consumer, not a camera connection).
+async fn probe_audio_sample_rate(url: &str) -> Option<u32> {
+    let fut = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            "-i",
+            url,
+        ])
+        .output();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(4), fut)
+        .await
+        .ok()? // timed out
+        .ok()?; // failed to spawn (e.g. ffprobe absent)
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,8 +834,9 @@ async fn run_ffmpeg_loop(
         // RTSP input options
         .args(["-rtsp_transport", "tcp"])
         .args(["-i", &rtsp_url])
-        // Encoding: bit-exact video copy (audio is normalized below — see
-        // audio_segmenter_args; the `-c:a aac` there overrides only the audio).
+        // Encoding: bit-exact video copy. Audio is handled below (copied when the
+        // source rate is already client-safe, else transcoded to 48 kHz) — see
+        // audio_segmenter_args; those args override ONLY the audio.
         .args(["-c", "copy"])
         // Force the HEVC sample entry to `hvc1` (not ffmpeg's default `hev1`).
         // Apple's AVFoundation (iOS/macOS AVPlayer) will NOT decode HEVC in MP4
@@ -801,11 +846,36 @@ async fn run_ffmpeg_loop(
         // pure container-level retag (no transcode); harmless for H.264 streams.
         .args(["-tag:v", "hvc1"]);
 
-    // Audio handling (see [`audio_segmenter_args`]).  These must come AFTER
-    // `-c copy` so ffmpeg applies them as an override on top of it: `-an`
-    // disables the audio output, and `-c:a aac -ar 48000` re-encodes ONLY the
-    // audio (video stays a bit-exact copy) to a 48 kHz AAC every client decodes.
-    ffmpeg_cmd.args(audio_segmenter_args(camera.policy.record_audio));
+    // Audio handling (see [`audio_segmenter_args`]).  These come AFTER `-c copy`
+    // so they override ONLY the audio (video stays a bit-exact copy). When
+    // recording audio, probe the source sample rate first: already-client-safe
+    // rates (≤ 48 kHz) are bit-exact COPIED (zero re-encode); only the rates
+    // Android/web decoders reject (> 48 kHz) are transcoded down to 48 kHz. A
+    // failed/timed-out probe (e.g. go2rtc not serving yet) falls back to the
+    // safe transcode. The recorder records from the go2rtc restream, so this
+    // probe is a local consumer, not an extra camera connection.
+    let audio_transcode = if camera.policy.record_audio {
+        let sample_rate = probe_audio_sample_rate(&rtsp_url).await;
+        let transcode = audio_needs_transcode(sample_rate);
+        info!(
+            camera_id = %camera.id,
+            audio_sample_rate = ?sample_rate,
+            transcode,
+            "audio: {}",
+            if transcode {
+                "transcoding to 48 kHz AAC (source rate not client-safe or unknown)"
+            } else {
+                "bit-exact copy (source rate already client-safe)"
+            }
+        );
+        transcode
+    } else {
+        false
+    };
+    ffmpeg_cmd.args(audio_segmenter_args(
+        camera.policy.record_audio,
+        audio_transcode,
+    ));
 
     ffmpeg_cmd
         // Segmenter muxer
@@ -3099,42 +3169,75 @@ mod tests {
     // ── audio segmenter args (declared-track-must-carry-packets invariant) ──────
 
     #[test]
-    fn audio_args_transcode_to_48k_aac_when_recording_audio() {
-        // Recorded audio is NORMALIZED to 48 kHz AAC, not copied: some cameras
-        // stream sample rates (e.g. 64 kHz) that Android/web AAC decoders reject
-        // outright, and transcoding also sidesteps the RTP-AAC keyframe gate that
-        // the old `-copyinkf:a` copy path had to work around. Guards a future
-        // "optimize back to copy" from silently breaking cross-client playback.
-        let args = audio_segmenter_args(true);
+    fn audio_needs_transcode_only_above_48k() {
+        // Already-client-safe rates (≤ 48 kHz) are copied; only the rates Android
+        // /web decoders reject (64/88.2/96 kHz) are transcoded. An unknown rate
+        // (probe failed / go2rtc not ready) defaults to transcode — always safe.
+        assert!(!audio_needs_transcode(Some(48_000)));
+        assert!(!audio_needs_transcode(Some(44_100)));
+        assert!(!audio_needs_transcode(Some(16_000)));
+        assert!(!audio_needs_transcode(Some(8_000)));
+        assert!(audio_needs_transcode(Some(64_000)));
+        assert!(audio_needs_transcode(Some(88_200)));
+        assert!(audio_needs_transcode(Some(96_000)));
+        assert!(
+            audio_needs_transcode(None),
+            "an unknown source rate must default to transcode (safe)"
+        );
+    }
+
+    #[test]
+    fn audio_args_copy_when_source_rate_is_client_safe() {
+        // transcode=false ⇒ bit-exact copy, and it MUST keep -copyinkf:a so the
+        // RTP-AAC keyframe gate doesn't drop the whole (declared) audio track.
+        let args = audio_segmenter_args(true, false);
+        assert!(
+            args.contains(&"-c:a") && args.contains(&"copy"),
+            "client-safe audio must be copied; got {args:?}"
+        );
+        assert!(
+            args.contains(&"-copyinkf:a"),
+            "the copy path must keep -copyinkf:a (empty-track guard); got {args:?}"
+        );
+        assert!(
+            !args.contains(&"aac"),
+            "the copy path must not re-encode; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn audio_args_transcode_to_48k_when_unsafe_or_unknown() {
+        // transcode=true ⇒ re-encode to 48 kHz AAC (no keyframe gate to work
+        // around, so no -copyinkf:a).
+        let args = audio_segmenter_args(true, true);
         assert!(
             args.contains(&"-c:a") && args.contains(&"aac"),
-            "record_audio=true must encode AAC; got {args:?}"
+            "must encode AAC; got {args:?}"
         );
         assert!(
             args.contains(&"-ar") && args.contains(&"48000"),
-            "record_audio=true must resample to 48 kHz; got {args:?}"
+            "must resample to 48 kHz; got {args:?}"
         );
         assert!(
-            !args.contains(&"-copyinkf:a"),
-            "the transcode path must not copy audio; got {args:?}"
-        );
-        assert!(
-            !args.contains(&"-an"),
-            "record_audio=true must NOT disable audio; got {args:?}"
+            !args.contains(&"copy") && !args.contains(&"-copyinkf:a"),
+            "the transcode path must not copy; got {args:?}"
         );
     }
 
     #[test]
     fn audio_args_disable_audio_when_not_recording_audio() {
-        let args = audio_segmenter_args(false);
-        assert!(
-            args.contains(&"-an"),
-            "record_audio=false must pass -an; got {args:?}"
-        );
-        assert!(
-            !args.contains(&"aac"),
-            "record_audio=false has no audio to encode; got {args:?}"
-        );
+        // record_audio=false ⇒ -an regardless of the transcode flag.
+        for transcode in [false, true] {
+            let args = audio_segmenter_args(false, transcode);
+            assert!(
+                args.contains(&"-an"),
+                "record_audio=false must pass -an (transcode={transcode}); got {args:?}"
+            );
+            assert!(
+                !args.contains(&"aac") && !args.contains(&"copy"),
+                "record_audio=false has no audio (transcode={transcode}); got {args:?}"
+            );
+        }
     }
 
     // ── classify_failure (cold-start fast retry) ────────────────────────────────

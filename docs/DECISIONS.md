@@ -8,46 +8,57 @@ revisit.
 
 ---
 
-## 2026-07-12, Recorded audio is transcoded to 48 kHz AAC, not stream-copied
+## 2026-07-12, Recorded audio: copy when client-safe, transcode only the rates Android rejects
 
 **Context.** The Android client played recorded footage silent while desktop
 played the same footage with sound. Device logs showed the segment's audio track
 present but rejected by the hardware decoder: `MediaCodecInfo: NoSupport
 [sampleRate.support, 64000] [c2.android.aac.decoder]`. The camera streams AAC at
-64 kHz; Android's AAC decoders cap below that, while desktop's software ffmpeg
-decoder handles it — so a bit-exact copy was decodable on desktop only.
+64 kHz; Android's/web hardware AAC decoders cap at 48 kHz, while desktop's
+software ffmpeg decoder handles higher rates — so a bit-exact copy was decodable
+on desktop only. AAC rates above 48 kHz (64/88.2/96 kHz) are the entire problem
+set; every standard rate ≤ 48 kHz plays on every client.
 
-**Decision — normalize recorded audio to 48 kHz AAC on record.** The recorder's
-`audio_segmenter_args` emits `-c:a aac -ar 48000` (after `-c copy`, overriding
-only the audio codec; video stays a bit-exact copy) instead of the prior
-`-copyinkf:a` copy. 48 kHz is universally decodable (Android/web/iOS/desktop).
-Transcoding also makes RECORDER-CORRECTNESS #23 automatic — re-encoding from
-decoded PCM has no RTP-AAC keyframe gate, so `-copyinkf:a` is no longer needed on
-the recorder path.
+**Decision — conditional: copy when already client-safe, transcode only the
+oddballs.** At record start the recorder probes the source audio sample rate
+(`probe_audio_sample_rate`, a bounded best-effort ffprobe of the go2rtc restream —
+a local consumer, not a camera connection) and `audio_segmenter_args` picks per
+camera:
+- source **≤ 48 kHz** → **bit-exact copy** (`-c:a copy -copyinkf:a`): zero
+  re-encode, zero added CPU, source fidelity preserved.
+- source **> 48 kHz** → **transcode to 48 kHz AAC** (`-c:a aac -ar 48000`) so it
+  plays on every client.
+- **probe failed / go2rtc not ready** → transcode (the always-safe default).
 
-**Rejected — keep bit-exact copy (`-copyinkf:a`).** Preserves source fidelity and
-zero audio CPU, but leaves any camera whose audio rate a client's decoder rejects
-(64 kHz here) silent on that client. Low-bitrate camera audio re-encoded to 48 kHz
-AAC is perceptually lossless for this use; the CPU is negligible next to the
-copied video.
+The copy path keeps `-copyinkf:a` (RECORDER-CORRECTNESS #23: RTP-AAC audio is
+never key-flagged, so a plain `-c copy` would drop the whole declared audio
+track). The transcode path re-encodes from decoded PCM, so it has no keyframe
+gate.
+
+**Rejected — always transcode to 48 kHz (blanket).** Simplest (no probe), and it
+was the first cut — but it re-encodes EVERY camera's audio including the majority
+already at a safe rate: wasted CPU + a tiny generational quality loss for no
+benefit. The probe is cheap and the copy path is strictly better when the source
+is already fine.
+
+**Rejected — always keep bit-exact copy.** Leaves any > 48 kHz camera silent on
+Android/web.
 
 **Rejected — a per-client software decoder (Media3 FFmpeg extension on Android).**
-Would decode any AAC on-device, but is a heavyweight new dependency that must be
-built from source and only fixes Android, not web/other clients. Normalizing once
-at the source fixes every client.
+Heavyweight new dependency, build-from-source, Android-only; normalizing at the
+source fixes every client.
 
-**Rejected — conditional transcode (copy unless the source rate is non-standard).**
-More surgical (bit-exact for the common case) but adds a probe + branch on the hot
-record path; deferred as a possible optimization if audio CPU ever matters.
+**Trade-offs accepted.** A bounded best-effort ffprobe at each (re)connect (falls
+back to transcode on failure, so it never blocks or breaks recording); for the
+transcoded oddballs only, tiny quality loss + per-segment AAC encoder priming.
+Operators see which cameras are transcoding in the admin camera menu, with a hint
+to set the camera's audio ≤ 48 kHz to avoid it. The EXPORT path
+(`services/api/src/export.rs`) still copies audio unconditionally and is NOT yet
+rate-aware — a known follow-up so shared clips of > 48 kHz cameras play on phones.
 
-**Trade-offs accepted.** Tiny audio-quality loss from re-encode; per-segment AAC
-encoder priming (a few ms) at segment boundaries; negligible extra CPU. The EXPORT
-path (`services/api/src/export.rs`) still copies audio with `-copyinkf:a` and is
-NOT yet sample-rate-normalized — a known follow-up so shared clips play on phones.
-
-**Revisit if.** Audio CPU becomes material at scale (→ conditional transcode); a
-lossless-audio requirement emerges (→ copy + document the Android caveat); or
-Android's decoders gain the missing sample-rate support.
+**Revisit if.** The per-connect probe cost matters (→ cache the rate per session);
+or a lossless requirement emerges for the > 48 kHz cameras (→ copy + document the
+Android caveat).
 
 ---
 
