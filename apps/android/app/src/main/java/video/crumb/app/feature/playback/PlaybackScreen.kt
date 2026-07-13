@@ -523,6 +523,10 @@ fun PlaybackScreen(
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
+                // If the low-bitrate variant failed (server has no `/low.mp4`, or a
+                // transcode errored), fall back to full BEFORE re-resolving — else
+                // onPlayerError would just refetch the same failing low URL forever.
+                vm.noteLowQualityFailed()
                 vm.onPlayerError()
             }
         }
