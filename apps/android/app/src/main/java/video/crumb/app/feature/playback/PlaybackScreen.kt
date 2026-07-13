@@ -623,6 +623,28 @@ fun PlaybackScreen(
                         }
                     }
                 },
+                // Audio on/off toggle lives here (portrait): a primary, always-
+                // visible control docked in the app bar, out of the video — NOT a
+                // floating overlay that lands over the footage on a letterboxed
+                // pane. Only meaningful once a segment is resolved to hear.
+                actions = {
+                    if (state.currentSegment != null) {
+                        HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
+                            IconButton(
+                                onClick = {
+                                    audioOn = !audioOn
+                                    store.playbackAudioOn = audioOn
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                    contentDescription = if (audioOn) "Mute audio" else "Play audio",
+                                    tint = if (audioOn) TealAccent else Color.White,
+                                )
+                            }
+                        }
+                    }
+                },
                 // Snapshot + Bookmark moved OUT of the app bar into the transport's
                 // 3-dot overflow menu (portrait), keeping the bar uncluttered and the
                 // secondary actions grouped where the user controls playback.
@@ -752,11 +774,10 @@ fun PlaybackScreen(
                     }
                 }
 
-                // Audio on/off toggle — floats top-end over the video in BOTH
-                // orientations (same affordance as the fullscreen live view). Only
-                // shown once there's a resolved segment to hear; hidden on the
-                // loading / error / no-footage states where there's nothing playing.
-                if (state.currentSegment != null) {
+                // Audio on/off toggle — LANDSCAPE ONLY: the top app bar is hidden
+                // then, so float it in the corner. In portrait it lives in the app
+                // bar's actions (above) instead of floating over the footage.
+                if (isLandscape && state.currentSegment != null) {
                     HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
                         IconButton(
                             onClick = {
