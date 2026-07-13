@@ -4769,6 +4769,130 @@ pub async fn ensure_bookmarks_table(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+/// ONVIF connection parts parsed out of an `onvif://` go2rtc source URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnvifSourceParts {
+    pub host: String,
+    /// `None` ⇒ caller uses the ONVIF default (80).
+    pub port: Option<i32>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Minimal percent-decode for URL userinfo (ONVIF creds embedded in a source
+/// URL may be `%`-encoded). Leaves malformed escapes as-is.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse an `onvif://[user[:pass]@]host[:port][/path][?query]` source URL into
+/// its connection parts. Returns `None` unless the scheme is `onvif://` and a
+/// host is present. Path/query are ignored. Splits userinfo at the LAST `@`
+/// (a host can't contain `@`) and the port at the LAST `:` only when the tail
+/// is a valid port number, so an IPv4 host with no port is handled correctly.
+#[must_use]
+pub fn parse_onvif_source(source_url: &str) -> Option<OnvifSourceParts> {
+    let rest = source_url.strip_prefix("onvif://")?;
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((ui, hp)) => (Some(ui), hp),
+        None => (None, authority),
+    };
+    if hostport.is_empty() {
+        return None;
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(n) if !h.is_empty() => (h.to_owned(), Some(i32::from(n))),
+            _ => (hostport.to_owned(), None),
+        },
+        None => (hostport.to_owned(), None),
+    };
+    let (user, password) = match userinfo.filter(|ui| !ui.is_empty()) {
+        Some(ui) => match ui.split_once(':') {
+            Some((u, p)) => (
+                Some(pct_decode(u)).filter(|s| !s.is_empty()),
+                Some(pct_decode(p)),
+            ),
+            None => (Some(pct_decode(ui)), None),
+        },
+        None => (None, None),
+    };
+    Some(OnvifSourceParts {
+        host,
+        port,
+        user,
+        password,
+    })
+}
+
+/// Backfill the dedicated `onvif_host`/`onvif_port`/`onvif_user`/`onvif_password`
+/// columns from a camera's `onvif://` `source_url` when the host column is empty
+/// (#ONVIF-Identify). Cameras added via ONVIF discovery stored their ONVIF
+/// endpoint + credentials in the go2rtc source URL but not in these columns, so
+/// Identify, Re-detect, and PTZ detection — all of which read the columns — were
+/// disabled even though full working ONVIF creds existed in the source. This
+/// mirrors that connection info into the columns (idempotent: only fills empty
+/// hosts, never overwrites an explicitly-set one). Streaming is unaffected —
+/// go2rtc keeps using `source_url`. Returns the number of rows repaired.
+pub async fn backfill_onvif_from_source(pool: &Pool) -> Result<u64> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, source_url FROM cameras \
+             WHERE source_url LIKE 'onvif://%' \
+               AND (onvif_host IS NULL OR onvif_host = '')",
+            &[],
+        )
+        .await
+        .context("backfill_onvif_from_source: select candidates")?;
+    let mut repaired = 0u64;
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let source_url: Option<String> = row.get("source_url");
+        let Some(parts) = source_url.as_deref().and_then(parse_onvif_source) else {
+            continue;
+        };
+        let n = client
+            .execute(
+                "UPDATE cameras SET \
+                     onvif_host = $2, \
+                     onvif_port = COALESCE($3, onvif_port), \
+                     onvif_user = COALESCE($4, onvif_user), \
+                     onvif_password = COALESCE($5, onvif_password) \
+                 WHERE id = $1 AND (onvif_host IS NULL OR onvif_host = '')",
+                &[&id, &parts.host, &parts.port, &parts.user, &parts.password],
+            )
+            .await
+            .context("backfill_onvif_from_source: update")?;
+        repaired += n;
+    }
+    if repaired > 0 {
+        tracing::info!(
+            repaired,
+            "backfilled ONVIF host/credentials from onvif:// source URLs"
+        );
+    }
+    Ok(repaired)
+}
+
 /// Columns selected for a [`Bookmark`], with the joined camera name.
 const BOOKMARK_SELECT: &str = r"
     SELECT b.id, b.camera_id, c.name AS camera_name, b.ts, b.description,
@@ -10815,6 +10939,130 @@ mod tests {
             s.cache_ttl_seconds,
             Some(31_536_000),
             "must clamp to the 1-year ceiling"
+        );
+    }
+
+    // ── ONVIF source_url parsing + backfill (#ONVIF-Identify) ────────────────
+
+    #[test]
+    fn parse_onvif_source_full() {
+        let p = parse_onvif_source("onvif://admin:s3cr3t@192.0.2.5:8000").expect("parse");
+        assert_eq!(p.host, "192.0.2.5");
+        assert_eq!(p.port, Some(8000));
+        assert_eq!(p.user.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn parse_onvif_source_no_port_defaults_to_none() {
+        // No port ⇒ None (the caller applies the ONVIF default of 80).
+        let p = parse_onvif_source("onvif://admin:pw@192.0.2.6").expect("parse");
+        assert_eq!(p.host, "192.0.2.6");
+        assert_eq!(p.port, None);
+        assert_eq!(p.user.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn parse_onvif_source_percent_decodes_userinfo() {
+        // A `%40` in the password decodes to `@`; the LAST `@` still splits
+        // userinfo from host, so the encoded one stays inside the password.
+        let p = parse_onvif_source("onvif://user:p%40ss@cam.example.com:80/path?subtype=1")
+            .expect("parse");
+        assert_eq!(p.host, "cam.example.com");
+        assert_eq!(p.port, Some(80));
+        assert_eq!(p.user.as_deref(), Some("user"));
+        assert_eq!(p.password.as_deref(), Some("p@ss"));
+    }
+
+    #[test]
+    fn parse_onvif_source_ignores_path_and_query() {
+        let p = parse_onvif_source("onvif://192.0.2.9?subtype=MediaProfile00000").expect("parse");
+        assert_eq!(p.host, "192.0.2.9");
+        assert_eq!(p.port, None);
+        assert_eq!(p.user, None);
+        assert_eq!(p.password, None);
+    }
+
+    #[test]
+    fn parse_onvif_source_rejects_non_onvif_and_empty() {
+        assert!(parse_onvif_source("rtsp://admin:pw@192.0.2.2:554/cam").is_none());
+        assert!(parse_onvif_source("onvif://").is_none());
+        assert!(parse_onvif_source("onvif://user@").is_none());
+    }
+
+    #[tokio::test]
+    async fn backfill_onvif_from_source_fills_empty_columns() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        let client = get_conn(&fx.pool).await.expect("get_conn");
+
+        // A minimal `cameras` table with only the columns the backfill reads and
+        // writes. The isolated per-test schema can't run the full `run_migrations`
+        // (its catalog-scoped ensure queries clash across concurrent test schemas
+        // — the same reason `reap_invalid_indexes_*` builds its own table), so we
+        // stand up just what this behaviour needs. `gen_random_uuid()` is built in
+        // on the Postgres 16 test server.
+        client
+            .batch_execute(
+                "CREATE TABLE cameras (\
+                     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), \
+                     source_url text, \
+                     onvif_host text, onvif_port int, \
+                     onvif_user text, onvif_password text)",
+            )
+            .await
+            .expect("create minimal cameras table");
+        // The shape of an ONVIF-discovered camera predating the column split: its
+        // ONVIF endpoint lives ONLY in the onvif:// source_url, columns empty.
+        let cam_id: Uuid = client
+            .query_one(
+                "INSERT INTO cameras (source_url) \
+                 VALUES ('onvif://admin:s3cr3t%40x@192.0.2.9:8000') RETURNING id",
+                &[],
+            )
+            .await
+            .expect("insert onvif-sourced camera")
+            .get(0);
+
+        assert_eq!(
+            backfill_onvif_from_source(&fx.pool)
+                .await
+                .expect("backfill"),
+            1,
+            "the one onvif-sourced camera with an empty host must be repaired"
+        );
+        let row = client
+            .query_one(
+                "SELECT onvif_host, onvif_port, onvif_user, onvif_password FROM cameras WHERE id = $1",
+                &[&cam_id],
+            )
+            .await
+            .expect("re-read camera");
+        assert_eq!(
+            row.get::<_, Option<String>>("onvif_host").as_deref(),
+            Some("192.0.2.9")
+        );
+        assert_eq!(row.get::<_, Option<i32>>("onvif_port"), Some(8000));
+        assert_eq!(
+            row.get::<_, Option<String>>("onvif_user").as_deref(),
+            Some("admin")
+        );
+        // %40 in the source decoded to '@' in the stored password.
+        assert_eq!(
+            row.get::<_, Option<String>>("onvif_password").as_deref(),
+            Some("s3cr3t@x")
+        );
+
+        // Idempotent: a second run finds nothing left to repair.
+        assert_eq!(
+            backfill_onvif_from_source(&fx.pool)
+                .await
+                .expect("backfill again"),
+            0,
+            "backfill must not touch already-populated hosts"
         );
     }
 }
