@@ -461,6 +461,13 @@ struct FrigateEventState {
     label: String,
     #[serde(default, deserialize_with = "de_sub_label")]
     sub_label: Option<String>,
+    // Frigate's native LPR fills these on a tracked car/motorcycle: the raw OCR
+    // plate string (present known-or-not) and, when it reports one, a
+    // plate-specific score. `de_sub_label` tolerates both the bare-string and
+    // the `[value, score]` array wire shapes.
+    #[serde(default, deserialize_with = "de_sub_label")]
+    recognized_license_plate: Option<String>,
+    recognized_license_plate_score: Option<f32>,
     score: Option<f32>,
     top_score: Option<f32>,
     start_time: f64,
@@ -584,6 +591,8 @@ fn process_mqtt_payload(
         bounding_box: None, // Phase 2
         zones: after.current_zones.clone(),
         snapshot_url,
+        recognized_plate: after.recognized_license_plate.clone(),
+        plate_confidence: after.recognized_license_plate_score,
         raw: raw_value,
     }))
 }
@@ -623,6 +632,10 @@ struct FrigateApiEvent {
 struct FrigateApiEventData {
     score: Option<f32>,
     top_score: Option<f32>,
+    // Frigate's HTTP API nests the LPR result under `data` (like the scores).
+    #[serde(default, deserialize_with = "de_sub_label")]
+    recognized_license_plate: Option<String>,
+    recognized_license_plate_score: Option<f32>,
 }
 
 /// Fetch recent events from Frigate's HTTP API and forward them to `tx`.
@@ -702,6 +715,14 @@ async fn http_backfill(
         } else {
             EventLifecycle::Update
         };
+        let recognized_plate = ev
+            .data
+            .as_ref()
+            .and_then(|d| d.recognized_license_plate.clone());
+        let plate_confidence = ev
+            .data
+            .as_ref()
+            .and_then(|d| d.recognized_license_plate_score);
 
         let event = NormalizedEvent {
             source_id: "frigate".to_owned(),
@@ -717,6 +738,8 @@ async fn http_backfill(
             bounding_box: None,
             zones: ev.zones,
             snapshot_url,
+            recognized_plate,
+            plate_confidence,
             raw: serde_json::json!({
                 "id": ev.id,
                 "camera": ev.camera,

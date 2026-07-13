@@ -154,6 +154,10 @@ pub struct MeResponse {
     /// Effective accessible camera ids (from the role; empty for admins = all).
     pub camera_ids: Vec<Uuid>,
     pub role_id: Option<Uuid>,
+    /// Whether the "Plates" surface should be shown to this caller: LPR capture
+    /// is enabled server-side AND the caller has the `view_plates` capability.
+    /// Clients gate the Plates tab on this (no server round-trip per tab).
+    pub plates_enabled: bool,
 }
 
 // ─── sessions (revocable auth) ─────────────────────────────────────────────────

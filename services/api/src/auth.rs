@@ -754,6 +754,15 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> Result<Json<MeResp
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("user {} not found", user.user_id)))?;
 
+    // Plates surface: shown only when LPR capture is enabled server-side AND the
+    // caller holds the view_plates capability. Read the singleton (cheap) so the
+    // client can gate the tab without a separate round-trip.
+    let plates_enabled = user.can_view_plates()
+        && db::get_lpr_settings(state.pool())
+            .await
+            .map_err(ApiError::Internal)?
+            .is_some_and(|s| s.enabled);
+
     // Effective role/capabilities/cameras come from the AuthUser extractor (resolved
     // from the assigned role); username comes from the fresh DB row.
     Ok(Json(MeResponse {
@@ -764,6 +773,7 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> Result<Json<MeResp
         capabilities: user.capabilities.clone(),
         camera_ids: user.camera_ids.clone(),
         role_id: user.role_id,
+        plates_enabled,
     }))
 }
 

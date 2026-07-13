@@ -459,6 +459,7 @@ pub async fn seed_viewer_role(pool: &Pool, camera_ids: &[Uuid]) -> Uuid {
         ptz: true,
         bookmarks: crumb_common::types::BookmarkScope::All,
         manage_views: true,
+        view_plates: true,
     };
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await
@@ -505,6 +506,7 @@ pub async fn seed_viewer_with_bookmark_scope(
         ptz: true,
         bookmarks: scope,
         manage_views: true,
+        view_plates: true,
     };
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await

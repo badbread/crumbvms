@@ -22,7 +22,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crumb_common::{
-    db::{upsert_detection_event, UpsertDetectionEventParams},
+    db::{
+        get_lpr_settings, normalize_plate, upsert_detection_event, upsert_plate_read,
+        UpsertDetectionEventParams, UpsertPlateReadParams,
+    },
     detection::NormalizedEvent,
 };
 
@@ -63,6 +66,11 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedEvent>, pool: Pool) {
                     lifecycle = %ev.lifecycle.as_str(),
                     "detection ingester: upserted event"
                 );
+                // LPR: if this event carries a plate and capture is enabled,
+                // record it in the plate-domain store beside the events row.
+                if let Some(plate) = ev.plate_string() {
+                    maybe_record_plate(&pool, &ev, id, &plate).await;
+                }
             }
             Err(e) => {
                 warn!(
@@ -76,4 +84,53 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedEvent>, pool: Pool) {
     }
 
     info!("detection ingester: channel closed, exiting");
+}
+
+/// Record a plate read for an event that carried one, but only when LPR capture
+/// is enabled (`lpr_config.enabled`). Off by default, so enabling Frigate
+/// detections alone never silently builds a plate database. The read is deduped
+/// on `(source_id, provider_event_id)` and linked to its sibling `events` row
+/// via `event_id`. Best-effort: failures are logged, never fatal to ingestion.
+async fn maybe_record_plate(
+    pool: &Pool,
+    ev: &NormalizedEvent,
+    event_id: uuid::Uuid,
+    plate_raw: &str,
+) {
+    let normalized = normalize_plate(plate_raw);
+    if normalized.is_empty() {
+        return; // OCR noise / non-alphanumeric — nothing worth storing
+    }
+    match get_lpr_settings(pool).await {
+        Ok(Some(cfg)) if cfg.enabled => {
+            let params = UpsertPlateReadParams {
+                camera_id: ev.camera_id,
+                ts: ev.start_ts,
+                plate: normalized,
+                plate_raw: Some(plate_raw.to_owned()),
+                // Prefer a plate-specific score; else the object's top score.
+                confidence: ev.plate_confidence.or(Some(ev.top_score)),
+                source_id: ev.source_id.clone(),
+                provider_event_id: Some(ev.provider_event_id.clone()),
+                event_id: Some(event_id),
+                snapshot_url: ev.snapshot_url.clone(),
+                raw: ev.raw.clone(),
+            };
+            match upsert_plate_read(pool, &params).await {
+                Ok(id) => tracing::debug!(
+                    plate_read_id = %id,
+                    plate = %plate_raw,
+                    camera = %ev.camera_id,
+                    "detection ingester: recorded plate read"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    source = %ev.source_id,
+                    "detection ingester: plate_read upsert failed"
+                ),
+            }
+        }
+        Ok(_) => { /* LPR disabled — capture nothing */ }
+        Err(e) => warn!(error = %e, "detection ingester: get_lpr_settings failed"),
+    }
 }

@@ -95,6 +95,7 @@ mod go2rtc;
 mod ha;
 mod metrics;
 mod notifications;
+mod plates;
 mod playback;
 mod ptz;
 mod rate_limit;
@@ -470,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
         // Detection events list (authenticated, subject to rate-limit + gzip).
         // Snapshot proxy is in media_routes below (authenticated via ?token=, no timeout).
         .merge(events::json_routes())
+        .merge(plates::json_routes())
         // Clips feed (detections + derived motion), source-abstracted.
         .merge(clips::json_routes())
         // Notification devices, rules, snooze, presence, and log.

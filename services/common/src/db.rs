@@ -31,9 +31,9 @@ use uuid::Uuid;
 use crate::types::{
     Bookmark, Camera, CameraDecodeStatus, CameraGroup, CameraHaLink, CameraMotionCacheStatus,
     Capabilities, FrigateSettings, HaSettings, LprSettings, MotionCacheStatus, MotionGrid,
-    MotionSensitivity, MotionSignal, RecordStream, RecorderCapabilities, RecorderHeartbeat,
-    RecordingMode, RecordingPolicy, Role, Segment, SegmentStage, SegmentStream, ServerSettings,
-    Session, Storage, StorageMigration, User, UserRole, View,
+    MotionSensitivity, MotionSignal, PlateRead, RecordStream, RecorderCapabilities,
+    RecorderHeartbeat, RecordingMode, RecordingPolicy, Role, Segment, SegmentStage, SegmentStream,
+    ServerSettings, Session, Storage, StorageMigration, User, UserRole, View,
 };
 
 // ─── pool creation ───────────────────────────────────────────────────────────
@@ -7507,6 +7507,189 @@ pub struct UpsertDetectionEventParams {
     pub snapshot_url: Option<String>,
     pub raw: serde_json::Value,
     pub lifecycle: String,
+}
+
+// ─── plate reads (plate_reads, migration 0051) ──────────────────────────────
+
+/// Normalize a plate for storage + search: uppercase ASCII alphanumerics only
+/// (drop spaces, dashes, punctuation). Keeps exact and trigram matching sane;
+/// the engine's original string is preserved separately in `plate_raw`.
+#[must_use]
+pub fn normalize_plate(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Parameters for [`upsert_plate_read`]. `plate` must already be normalized
+/// (see [`normalize_plate`]).
+pub struct UpsertPlateReadParams {
+    pub camera_id: Uuid,
+    pub ts: DateTime<Utc>,
+    pub plate: String,
+    pub plate_raw: Option<String>,
+    pub confidence: Option<f32>,
+    pub source_id: String,
+    pub provider_event_id: Option<String>,
+    pub event_id: Option<Uuid>,
+    pub snapshot_url: Option<String>,
+    pub raw: serde_json::Value,
+}
+
+/// Upsert one plate read into `plate_reads`, deduped on `(source_id,
+/// provider_event_id)` exactly like the events table — so a Frigate event that
+/// updates over its lifecycle refines the same row (keeping the highest
+/// confidence). Returns the row id.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result<Uuid> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            INSERT INTO plate_reads (
+                camera_id, ts, plate, plate_raw, confidence,
+                source_id, provider_event_id, event_id, snapshot_url, raw
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (source_id, provider_event_id)
+            WHERE source_id IS NOT NULL AND provider_event_id IS NOT NULL
+            DO UPDATE SET
+                ts           = EXCLUDED.ts,
+                plate        = EXCLUDED.plate,
+                plate_raw    = EXCLUDED.plate_raw,
+                confidence   = GREATEST(EXCLUDED.confidence, plate_reads.confidence),
+                event_id     = COALESCE(EXCLUDED.event_id, plate_reads.event_id),
+                snapshot_url = COALESCE(EXCLUDED.snapshot_url, plate_reads.snapshot_url),
+                raw          = EXCLUDED.raw
+            RETURNING id
+            ",
+            &[
+                &p.camera_id,
+                &p.ts,
+                &p.plate,
+                &p.plate_raw,
+                &p.confidence,
+                &p.source_id,
+                &p.provider_event_id,
+                &p.event_id,
+                &p.snapshot_url,
+                &p.raw,
+            ],
+        )
+        .await
+        .context("upsert_plate_read")?;
+    Ok(row.get("id"))
+}
+
+/// Plate-search mode for [`list_plate_reads`].
+#[derive(Debug, Clone, Copy)]
+pub enum PlateMatch {
+    /// `plate = q` — exact.
+    Exact,
+    /// `plate LIKE q%` — starts-with.
+    Prefix,
+    /// `plate LIKE %q%` — contains (default when a query is present).
+    Contains,
+    /// `plate % q` — trigram similarity (Rekor's "missing character" search),
+    /// ordered by closeness.
+    Fuzzy,
+}
+
+/// Filters for [`list_plate_reads`]. `camera_ids` is the caller's accessible
+/// scope (the route intersects the requested cameras with the user's grants);
+/// an empty scope yields no rows. `plate` must already be normalized.
+pub struct PlateReadQuery {
+    pub camera_ids: Vec<Uuid>,
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
+    pub plate: Option<String>,
+    pub match_mode: PlateMatch,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+fn plate_read_from_row(row: &tokio_postgres::Row) -> PlateRead {
+    PlateRead {
+        id: row.get("id"),
+        camera_id: row.get("camera_id"),
+        ts: row.get("ts"),
+        plate: row.get("plate"),
+        plate_raw: row.get("plate_raw"),
+        confidence: row.get("confidence"),
+        region: row.get("region"),
+        source_id: row.get("source_id"),
+        event_id: row.get("event_id"),
+        snapshot_url: row.get("snapshot_url"),
+    }
+}
+
+/// List plate reads for the scoped cameras, newest first (or by fuzzy closeness
+/// when searching), with a total count for pagination. Camera-scoped exactly
+/// like `/events`: a caller sees reads only from cameras it can access.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<PlateRead>, i64)> {
+    if q.camera_ids.is_empty() {
+        return Ok((vec![], 0));
+    }
+    let client = get_conn(pool).await?;
+
+    let mut conds: Vec<String> = vec!["camera_id = ANY($1)".to_owned()];
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&q.camera_ids];
+    let mut n = 1;
+    if let Some(ref s) = q.start {
+        n += 1;
+        conds.push(format!("ts >= ${n}"));
+        params.push(s);
+    }
+    if let Some(ref e) = q.end {
+        n += 1;
+        conds.push(format!("ts < ${n}"));
+        params.push(e);
+    }
+    let mut order = "ts DESC".to_owned();
+    if let Some(ref plate) = q.plate {
+        n += 1;
+        match q.match_mode {
+            PlateMatch::Exact => conds.push(format!("plate = ${n}")),
+            PlateMatch::Prefix => conds.push(format!("plate LIKE ${n} || '%'")),
+            PlateMatch::Contains => conds.push(format!("plate LIKE '%' || ${n} || '%'")),
+            PlateMatch::Fuzzy => {
+                conds.push(format!("plate % ${n}"));
+                order = format!("similarity(plate, ${n}) DESC, ts DESC");
+            }
+        }
+        params.push(plate);
+    }
+    let where_clause = conds.join(" AND ");
+
+    let count_sql = format!("SELECT COUNT(*)::bigint AS cnt FROM plate_reads WHERE {where_clause}");
+    let total: i64 = client
+        .query_one(&count_sql, &params)
+        .await
+        .context("list_plate_reads: count")?
+        .get("cnt");
+
+    let limit_idx = n + 1;
+    let offset_idx = n + 2;
+    let list_sql = format!(
+        "SELECT id, camera_id, ts, plate, plate_raw, confidence, region, source_id, event_id, \
+         snapshot_url FROM plate_reads WHERE {where_clause} ORDER BY {order} \
+         LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+    params.push(&q.limit);
+    params.push(&q.offset);
+    let rows = client
+        .query(&list_sql, &params)
+        .await
+        .context("list_plate_reads")?;
+    Ok((rows.iter().map(plate_read_from_row).collect(), total))
 }
 
 /// Ensure the `UNIQUE(name)` constraint exists on `storages`.

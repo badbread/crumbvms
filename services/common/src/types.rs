@@ -137,6 +137,26 @@ pub struct LprSettings {
     pub version: i64,
 }
 
+/// One license-plate read (`plate_reads`, migration 0051), as served to clients
+/// by `GET /plates`. Omits the heavy `crop`/`raw`/`vehicle`/`bbox` columns from
+/// the list shape; a crop is fetched separately.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlateRead {
+    pub id: uuid::Uuid,
+    pub camera_id: uuid::Uuid,
+    pub ts: DateTime<Utc>,
+    /// Normalized plate (uppercase alphanumerics).
+    pub plate: String,
+    /// The engine's original string, if it differed from the normalized form.
+    pub plate_raw: Option<String>,
+    pub confidence: Option<f32>,
+    pub region: Option<String>,
+    pub source_id: String,
+    /// The sibling `events` row, if any (for "view footage" jump).
+    pub event_id: Option<uuid::Uuid>,
+    pub snapshot_url: Option<String>,
+}
+
 /// One camera ↔ HA entity link (`camera_ha_links`, migration 0048).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraHaLink {
@@ -983,6 +1003,11 @@ pub struct Capabilities {
     /// unaffected (0028 sets it explicitly; admin bypasses caps entirely).
     #[serde(default = "default_true")]
     pub manage_views: bool,
+    /// View the license-plate reads ("Plates" tab / `GET /plates`). A searchable
+    /// plate database is the most privacy-sensitive surface, so this defaults to
+    /// `false` (absent ⇒ denied) — a role must be granted it explicitly.
+    #[serde(default)]
+    pub view_plates: bool,
 }
 
 /// Serde default for capability fields that should read as granted (not the
@@ -1003,6 +1028,7 @@ impl Capabilities {
             ptz: true,
             bookmarks: BookmarkScope::All,
             manage_views: true,
+            view_plates: true,
         }
     }
 }

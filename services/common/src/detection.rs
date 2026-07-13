@@ -130,11 +130,37 @@ pub struct NormalizedEvent {
     /// `GET /events/{id}/snapshot` which proxies this URL.
     pub snapshot_url: Option<String>,
 
+    /// Recognized license plate (raw OCR string) if the provider read one on
+    /// this object — Frigate's native LPR `recognized_license_plate` field.
+    /// Drives the LPR `plate_reads` store; `None` for non-plate events.
+    pub recognized_plate: Option<String>,
+
+    /// Confidence of [`Self::recognized_plate`] (`0.0..=1.0`) if the provider
+    /// reports a plate-specific score, else `None` (the ingester falls back to
+    /// `top_score`).
+    pub plate_confidence: Option<f32>,
+
     /// Full vendor payload preserved verbatim as JSONB.
     ///
     /// Used for debugging and future provider-specific feature extraction
     /// without requiring a schema migration.
     pub raw: serde_json::Value,
+}
+
+impl NormalizedEvent {
+    /// The license-plate string this event carries, if any: the raw OCR result
+    /// preferred, else a plate-typed `sub_label` (dedicated-LPR-mode, where the
+    /// tracked object itself is a `license_plate`). `None` for everything else.
+    #[must_use]
+    pub fn plate_string(&self) -> Option<String> {
+        self.recognized_plate.clone().or_else(|| {
+            if self.label == DetectionLabel::LicensePlate {
+                self.sub_label.clone()
+            } else {
+                None
+            }
+        })
+    }
 }
 
 // ── EventLifecycle ────────────────────────────────────────────────────────────
