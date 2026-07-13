@@ -968,6 +968,12 @@ pub struct CameraDecodeStatusDto {
     pub fallback_reason: Option<String>,
     /// When the recorder last (re)started this camera's decode child.
     pub updated_at: DateTime<Utc>,
+    /// Source audio sample rate (Hz) probed at record start; `null` if unknown /
+    /// no audio / no status row yet.
+    pub audio_sample_rate: Option<i32>,
+    /// `true` when the recorder is re-encoding this camera's audio to 48 kHz AAC
+    /// (source rate > 48 kHz), `false` when bit-exact copied, `null` when unknown.
+    pub audio_transcoding: Option<bool>,
 }
 
 /// `GET /config/decode-status` response — what the recorder is ACTUALLY using

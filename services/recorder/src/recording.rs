@@ -854,7 +854,7 @@ async fn run_ffmpeg_loop(
     // failed/timed-out probe (e.g. go2rtc not serving yet) falls back to the
     // safe transcode. The recorder records from the go2rtc restream, so this
     // probe is a local consumer, not an extra camera connection.
-    let audio_transcode = if camera.policy.record_audio {
+    let (audio_sample_rate, audio_transcode) = if camera.policy.record_audio {
         let sample_rate = probe_audio_sample_rate(&rtsp_url).await;
         let transcode = audio_needs_transcode(sample_rate);
         info!(
@@ -868,10 +868,23 @@ async fn run_ffmpeg_loop(
                 "bit-exact copy (source rate already client-safe)"
             }
         );
-        transcode
+        (sample_rate, transcode)
     } else {
-        false
+        (None, false)
     };
+    // Publish the per-camera audio status so the admin console can flag which
+    // cameras are being re-encoded (and hint the operator to set the camera to
+    // ≤ 48 kHz). Best-effort — a DB hiccup must never stop recording.
+    if let Err(e) = crumb_common::db::upsert_camera_audio_status(
+        pool,
+        camera.id,
+        audio_sample_rate.and_then(|r| i32::try_from(r).ok()),
+        audio_transcode,
+    )
+    .await
+    {
+        warn!(camera_id = %camera.id, error = %e, "upsert_camera_audio_status failed (audio badge may be stale)");
+    }
     ffmpeg_cmd.args(audio_segmenter_args(
         camera.policy.record_audio,
         audio_transcode,
