@@ -81,6 +81,8 @@ pub mod ptz;
 pub mod roles;
 #[path = "../../src/scrub_settings.rs"]
 pub mod scrub_settings;
+#[path = "../../src/segment_low.rs"]
+pub mod segment_low;
 #[path = "../../src/state.rs"]
 pub mod state;
 #[path = "../../src/stream_test.rs"]
@@ -196,6 +198,17 @@ fn ensure_env() {
 // waits and reuses the result.
 static MIGRATE_ONCE: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
 
+/// Serializes the tests that assert on / mutate the process-wide
+/// `server_settings` singleton row (beta-terms acceptance, scrub-preview
+/// tunables). That row is ONE global row shared by every test against the
+/// single shared test database, so a "fresh install ⇒ default" assertion in one
+/// test can otherwise observe a value written by a concurrent test — or one left
+/// behind by a prior `cargo test` run against a reused throwaway Postgres. Tests
+/// that touch it take this lock and call [`reset_server_settings`] first, giving
+/// each an exclusive, pristine view. (Same cross-runtime `const_new` Mutex idiom
+/// as `MIGRATE_ONCE`; a `Mutex<()>` used purely as a critical-section guard.)
+pub static SERVER_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Build a fresh [`AppState`] wired to the shared test Postgres, running
 /// migrations exactly once per process (idempotent + tracked via
 /// `schema_migrations`, so this is also safe if called from multiple test
@@ -237,6 +250,16 @@ pub async fn test_state() -> AppState {
             db::ensure_named_policies_and_groups(&pool)
                 .await
                 .expect("ensure_named_policies_and_groups");
+            // Mirror the api's startup: `run_migrations` alone leaves the
+            // bookmarks table at its 0001 shape (`note`, no
+            // description/created_by/protect_*) because 0010's CREATE-IF-NOT-
+            // EXISTS is a no-op over the already-created table. Production
+            // reconciles this at boot via ensure_bookmarks_table() (main.rs);
+            // without it here, bookmark inserts fail (missing columns), which is
+            // why the bookmark endpoints previously had no test coverage.
+            db::ensure_bookmarks_table(&pool)
+                .await
+                .expect("ensure_bookmarks_table");
             seed_default_policy_if_absent(&pool).await;
             *done = true;
         }
@@ -294,6 +317,29 @@ async fn seed_default_policy_if_absent(pool: &Pool) {
         .expect("seed default recording_policies row");
 }
 
+/// Reset the `server_settings` singleton back to its pristine, first-boot state
+/// for the columns the settings tests assert on: no beta-terms acceptance, and
+/// no scrub-preview overrides (so every knob falls back to its env default,
+/// `source: "env"`). Call while holding [`SERVER_SETTINGS_LOCK`]. The `UPDATE`
+/// is no-op-safe — the singleton row is seeded by migration 0012, but even zero
+/// matched rows simply does nothing.
+pub async fn reset_server_settings(pool: &Pool) {
+    let client = pool.get().await.expect("pool.get (reset_server_settings)");
+    client
+        .execute(
+            "UPDATE server_settings SET \
+                 beta_terms_accepted_at      = NULL, \
+                 thumb_pregen_enabled        = NULL, \
+                 thumb_pregen_lookback_hours = NULL, \
+                 thumb_pregen_scan_secs      = NULL, \
+                 thumb_cache_max_bytes       = NULL, \
+                 thumb_cache_ttl_seconds     = NULL",
+            &[],
+        )
+        .await
+        .expect("reset server_settings to pristine");
+}
+
 /// Build the subset router this suite exercises: `/auth`, `/config` (admin
 /// gate), and the media/playback/clips/export/events routes that enforce
 /// per-camera RBAC. Mirrors the mounting in `main.rs` closely enough to be a
@@ -307,6 +353,7 @@ pub fn test_router() -> Router<AppState> {
         .merge(auth::media_token_routes())
         .nest("/config", config_routes::routes())
         .merge(playback::routes())
+        .merge(segment_low::routes())
         .merge(export::routes())
         .merge(filmstrip::routes())
         .merge(events::json_routes())
@@ -440,6 +487,29 @@ pub async fn seed_viewer_user(pool: &Pool, role_id: Uuid) -> SeededUser {
 pub async fn seed_viewer(pool: &Pool, camera_ids: &[Uuid]) -> SeededUser {
     let role_id = seed_viewer_role(pool, camera_ids).await;
     seed_viewer_user(pool, role_id).await
+}
+
+/// Seed a viewer role with a specific [`BookmarkScope`] (camera-scoped to
+/// `camera_ids`, every other capability on) plus a user assigned to it. Backs
+/// the bookmark-scope enforcement tests.
+pub async fn seed_viewer_with_bookmark_scope(
+    pool: &Pool,
+    camera_ids: &[Uuid],
+    scope: crumb_common::types::BookmarkScope,
+) -> SeededUser {
+    let name = unique("role");
+    let caps = Capabilities {
+        export: true,
+        playback: true,
+        clips: true,
+        ptz: true,
+        bookmarks: scope,
+        manage_views: true,
+    };
+    let role = db::create_role(pool, &name, &caps, camera_ids)
+        .await
+        .expect("create_role (viewer bookmark-scope)");
+    seed_viewer_user(pool, role.id).await
 }
 
 /// Hash a password the same way `auth.rs::hash_password` does (Argon2id,

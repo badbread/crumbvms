@@ -163,6 +163,28 @@ pub struct ApiConfig {
     /// the cache unbounded within a day. Default: `10 GiB`.
     pub clip_cache_max_bytes: u64,
 
+    /// `SEGMENT_LOW_CACHE_MAX_BYTES` -- soft byte budget for the on-demand
+    /// low-bitrate playback cache (`{export_dir}/segcache`), the transcoded
+    /// 640p/15fps variants served by `GET /segments/{id}/low.mp4` for mobile /
+    /// poor-connection playback. Oldest-by-mtime files are pruned past this after
+    /// each generation. Scrubbing produces many more artifacts than clip
+    /// browsing, so this gets its own knob (separate from `CLIP_CACHE_MAX_BYTES`).
+    /// Default: `2 GiB`.
+    pub segment_low_cache_max_bytes: u64,
+
+    /// `MOBILE_STREAM_ENABLED` -- register a per-camera `<name>_mobile` go2rtc
+    /// stream: an on-demand H.264 transcode of the camera's sub stream (or main,
+    /// when there is no sub), capped to [`Self::mobile_stream_width`]. Exposed to
+    /// clients as `rtsp_mobile_url` for a fullscreen-live "Data saver" mode on
+    /// cellular. go2rtc pulls the source only while a consumer is connected, so
+    /// the idle cost is zero; when a viewer connects, the transcode ffmpeg runs
+    /// inside the recorder container (where go2rtc is embedded). Default: `true`.
+    pub mobile_stream_enabled: bool,
+
+    /// `MOBILE_STREAM_WIDTH` -- target width (px) of the `<name>_mobile`
+    /// transcode; height is derived to preserve aspect. Default: `640`.
+    pub mobile_stream_width: u32,
+
     /// `THUMB_EXTRACT_MAX_CONCURRENCY` -- max concurrent on-demand thumbnail
     /// ffmpeg extractions (the filmstrip scrubber). Each cache miss spawns one
     /// single-frame ffmpeg; a fast multi-camera scrub would otherwise spawn a
@@ -373,6 +395,12 @@ impl ApiConfig {
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),
             clip_gen_max_concurrency: parse_env("CLIP_GEN_MAX_CONCURRENCY", 4usize)?.max(1),
             clip_cache_max_bytes: parse_env("CLIP_CACHE_MAX_BYTES", 10_737_418_240_u64)?,
+            segment_low_cache_max_bytes: parse_env(
+                "SEGMENT_LOW_CACHE_MAX_BYTES",
+                2_147_483_648_u64,
+            )?,
+            mobile_stream_enabled: parse_env("MOBILE_STREAM_ENABLED", true)?,
+            mobile_stream_width: parse_env("MOBILE_STREAM_WIDTH", 640_u32)?.max(160),
             thumb_extract_max_concurrency: parse_env(
                 "THUMB_EXTRACT_MAX_CONCURRENCY",
                 default_thumb_concurrency(),

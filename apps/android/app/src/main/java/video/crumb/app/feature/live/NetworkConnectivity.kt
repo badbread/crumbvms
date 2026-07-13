@@ -47,6 +47,78 @@ object NetworkConnectivityObserver {
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
+
+    /**
+     * Best-effort synchronous "is the active network metered" check — cellular,
+     * a metered Wi-Fi hotspot, or a network the user manually flagged as metered.
+     * Uses [ConnectivityManager.isActiveNetworkMetered], which honours the user's
+     * per-network metered override, and falls back to `false` (assume unmetered,
+     * i.e. never force the low-bitrate path) when connectivity can't be read.
+     * Drives the playback quality selector's **Auto** mode (Auto → Low on metered).
+     */
+    fun isMeteredNow(context: Context): Boolean {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return false
+        return cm.isActiveNetworkMetered
+    }
+}
+
+/**
+ * Remembers a live [State]<Boolean> tracking whether the active network is
+ * metered (see [NetworkConnectivityObserver.isMeteredNow]). Re-samples on every
+ * connectivity change over the same lifecycle-gated callback pattern as
+ * [rememberIsOnline]. Drives the playback quality selector's Auto mode.
+ */
+@Composable
+fun rememberIsMetered(): State<Boolean> {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var metered by remember { mutableStateOf(NetworkConnectivityObserver.isMeteredNow(context)) }
+
+    DisposableEffect(lifecycleOwner) {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        var callback: ConnectivityManager.NetworkCallback? = null
+
+        fun resync() {
+            metered = NetworkConnectivityObserver.isMeteredNow(context)
+        }
+
+        fun register() {
+            if (cm == null || callback != null) return
+            resync()
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = resync()
+                override fun onLost(network: Network) = resync()
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = resync()
+            }
+            callback = cb
+            cm.registerNetworkCallback(request, cb)
+        }
+
+        fun unregister() {
+            callback?.let { cm?.unregisterNetworkCallback(it) }
+            callback = null
+        }
+
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> register()
+                Lifecycle.Event.ON_STOP -> unregister()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        register()
+
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            unregister()
+        }
+    }
+
+    return remember { DerivedOnlineState { metered } }
 }
 
 /**

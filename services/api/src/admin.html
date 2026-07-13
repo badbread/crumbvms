@@ -4583,8 +4583,9 @@ function renderCamInfoTab(c) {
     <div class="policy-section">
       <div class="rp-section-head">
         <div class="policy-section-title">Compatibility</div>
-        <button class="ghost sm" onclick="identifyCamera('${c.id}')" ${(c.onvif_host && c.onvif_host.trim()) ? '' : 'disabled title="Add an ONVIF host above, save, then Identify"'}>Identify (ONVIF)</button>
+        <button class="ghost sm" onclick="identifyCamera('${c.id}')" ${(c.onvif_host && c.onvif_host.trim()) ? '' : 'disabled title="No ONVIF configured for this camera (it was added by a direct RTSP URL), so make and model cannot be read automatically. Add an ONVIF host and credentials in the ONVIF / PTZ section above, or set make/model by hand below."'}>Identify (ONVIF)</button>
       </div>
+      <div id="ce-audio-status"></div>
       <div id="ce-compat"><div class="card-hint" style="margin:0">Checking the compatibility database&hellip;</div></div>
       <div id="ce-compat-contrib"></div>
     </div>
@@ -4634,6 +4635,7 @@ function renderCamInfoTab(c) {
   autoProbeCamera(c);
   cePreviewIcon();
   loadCameraCompat(c.id);
+  loadCameraAudioStatus(c.id);
   loadCameraHaLinks(c.id);
 }
 
@@ -4642,6 +4644,17 @@ function renderCamInfoTab(c) {
    compatibility database and render known quirks / recommended settings, plus
    an "Identify" (ONVIF probe) action and a "Contribute this camera" flow that
    opens a pre-filled GitHub issue in the operator's own browser. */
+/* ── Audio-transcoding notice (per camera) ──
+   Obsolete: recorded audio is now ALWAYS normalized to gap-filled 48 kHz AAC at
+   record time (docs/DECISIONS.md 2026-07-13), because a bit-exact copy of the
+   camera's drifting audio clock plays silent on Android. There is no longer a
+   per-camera copy-vs-transcode decision for the operator to act on, so this shows
+   nothing. Kept as a no-op so the #ce-audio-status slot + call site stay stable
+   (the /config/decode-status audio fields remain available for future use). */
+async function loadCameraAudioStatus(id) {
+  const el = $('ce-audio-status'); if (el) el.innerHTML = '';
+}
+
 async function loadCameraCompat(id) {
   const el = $('ce-compat'); if (!el) return;
   const cc = $('ce-compat-contrib'); if (cc) cc.innerHTML = '';
@@ -4658,7 +4671,7 @@ function renderCompat(id, r) {
   const manual = manualDeviceInfoBlock(id, r);
   // No make read yet: prompt to identify.
   if (!r.make && !r.model) {
-    return `<div class="card-hint" style="margin:0">Not identified yet. Use <b>Identify (ONVIF)</b> to read this camera's make and model, then Crumb checks the compatibility database. Cameras without ONVIF can be set manually below.</div>` + manual;
+    return `<div class="card-hint" style="margin:0">Not identified yet. If this camera supports ONVIF, use <b>Identify (ONVIF)</b> above to read its make and model automatically (Crumb then checks the compatibility database). Cameras with no ONVIF — e.g. added by a direct RTSP URL — have that button disabled; set make and model by hand below.</div>` + manual;
   }
   const idLine = `<div style="margin:0 0 6px 0"><b>${esc(r.make || '(unknown make)')}</b> ${esc(r.model || '')}${r.firmware ? ` <span style="color:var(--dim2)">· firmware ${esc(r.firmware)}</span>` : ''}</div>`;
 
@@ -8436,9 +8449,10 @@ function roleCapUI(pfx, caps) {
     <div style="margin-top:10px">
       <label class="field-label" style="margin-top:0">Bookmarks</label>
       <select id="${pfx}-cap-bookmarks" style="max-width:280px">
-        <option value="none"  ${bk==='none' ?'selected':''}>None, no bookmark access</option>
-        <option value="own"   ${bk==='own'  ?'selected':''}>Own, create &amp; view their own bookmarks</option>
-        <option value="all"   ${bk==='all'  ?'selected':''}>All, view and manage all users' bookmarks</option>
+        <option value="none"    ${bk==='none'    ?'selected':''}>None, no bookmark access</option>
+        <option value="own"     ${bk==='own'     ?'selected':''}>Own, create &amp; view their own bookmarks</option>
+        <option value="viewall" ${bk==='viewall' ?'selected':''}>View all, manage own, see everyone's, edit/delete only their own</option>
+        <option value="all"     ${bk==='all'     ?'selected':''}>All, view and manage everyone's bookmarks</option>
       </select>
     </div>
   </div>`;

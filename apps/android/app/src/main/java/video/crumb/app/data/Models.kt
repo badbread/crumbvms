@@ -289,6 +289,12 @@ data class LiveStreamsResponse(
     @SerialName("webrtc_sub_url") val webrtcSubUrl: String? = null,
     @SerialName("rtsp_main_url") val rtspMainUrl: String,
     @SerialName("rtsp_sub_url") val rtspSubUrl: String? = null,
+    /**
+     * On-demand low-res H.264 transcode for cellular "Data saver" fullscreen live.
+     * `null` when the server has the feature disabled or the camera is
+     * Frigate-served. Nullable-with-default so older servers deserialize cleanly.
+     */
+    @SerialName("rtsp_mobile_url") val rtspMobileUrl: String? = null,
 )
 
 // ─── export ──────────────────────────────────────────────────────────────────

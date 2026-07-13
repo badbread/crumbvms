@@ -3,6 +3,8 @@
 package video.crumb.app.ui.player
 
 import android.content.Context
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -27,6 +29,54 @@ object MediaFactory {
     /** A fresh ExoPlayer. Caller MUST call `release()` when done. */
     fun newPlayer(context: Context): ExoPlayer =
         ExoPlayer.Builder(context).build()
+
+    /** `USAGE_MEDIA` / movie audio attributes for recorded playback. Exposed so
+     *  the screen can (re-)apply them with audio-focus handling tied to the
+     *  mute/unmute toggle — see [newPlaybackPlayer]. */
+    val playbackAudioAttributes: AudioAttributes = AudioAttributes.Builder()
+        .setUsage(C.USAGE_MEDIA)
+        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+        .build()
+
+    /**
+     * ExoPlayer for RECORDED PLAYBACK (the timeline scrubber). Differs from the
+     * bare [newPlayer] in two ways that matter for footage review over a WAN:
+     *
+     * 1. **Media audio attributes (#106).** Unlike the deliberately-muted live-wall
+     *    tiles, recorded playback is watched WITH sound on purpose, so it declares
+     *    `USAGE_MEDIA` / `CONTENT_TYPE_MOVIE` attributes to route to the media
+     *    output path. Audio-**focus** handling is deliberately OFF at build time and
+     *    (re)enabled by the screen only while the audio toggle is ON (see the volume
+     *    effect in `PlaybackScreen`) — otherwise a silent scrub-through (the default,
+     *    `playbackAudioOn = false`) would grab focus and pause the user's music.
+     * 2. **WAN-tuned buffering.** A larger `DefaultLoadControl` window than the
+     *    ExoPlayer default plus a retained back-buffer, so small backward scrubs
+     *    replay from RAM instead of re-fetching, and a jittery cellular link has
+     *    more slack before it rebuffers. (This reduces thrash; it does not change
+     *    the source bitrate — that is what the `low.mp4` quality lever is for.)
+     *
+     * Caller MUST call `release()` when done.
+     */
+    fun newPlaybackPlayer(context: Context): ExoPlayer {
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                /* minBufferMs */ 15_000,
+                /* maxBufferMs */ 60_000,
+                /* bufferForPlaybackMs */ 2_500,
+                /* bufferForPlaybackAfterRebufferMs */ 5_000,
+            )
+            // Retain up to 30 s of already-played media so a small backward scrub
+            // replays from memory rather than re-downloading over the slow link.
+            .setBackBuffer(/* backBufferDurationMs */ 30_000, /* retainBackBufferFromKeyframe */ true)
+            .build()
+        return ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            // Focus handling starts OFF (default playback is muted review); the
+            // screen re-applies these attributes with focus = audioOn when the
+            // user toggles sound on.
+            .setAudioAttributes(playbackAudioAttributes, /* handleAudioFocus = */ false)
+            .build()
+    }
 
     /**
      * Low-latency ExoPlayer for LIVE RTSP. Thin buffers (start after ~100 ms,

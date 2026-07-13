@@ -8,6 +8,230 @@ revisit.
 
 ---
 
+## 2026-07-13, Recorded audio: ALWAYS re-encode to gap-filled 48 kHz AAC (supersedes the 2026-07-12 copy-when-safe split)
+
+**Context.** The 2026-07-12 decision recorded audio with a per-camera split:
+copy bit-exact when the source rate is "client-safe" (≤ 48 kHz), transcode only
+the rates Android/web reject (> 48 kHz). Its premise was that a ≤ 48 kHz rate is
+safe to copy. On-device diagnostics (Media3 1.4.1, SM-S921U) proved that **false**:
+recorded playback was silent on Android for a **48 kHz** camera on the copy path.
+
+**Root cause (measured).** A bit-exact `-c:a copy` preserves the camera's audio
+*timeline* verbatim, and cheap camera audio clocks drift ~1 %: the container
+timestamps promise more time than the AAC frames deliver (measured ~32 ms
+phantom gap per 4 s segment; 61 of 62 frames non-uniform). ExoPlayer's
+`DefaultAudioSink` enforces sample-continuous audio — once accumulated drift
+crosses ~200 ms it throws `UnexpectedDiscontinuityException` and, because the
+audio renderer is the player's master clock, the position lurches, segments
+"end" early, and the whole player wedges (silent audio, stalled video). libmpv
+(desktop) and the RTSP live path don't slave to strict sample continuity, which
+is why only Android fMP4 playback broke.
+
+**Decision.** The recorder ALWAYS re-encodes audio (when `record_audio`):
+`-af aresample=async=1:first_pts=0 -c:a aac -ar 48000`. Video stays a bit-exact
+`-c copy`.
+
+**Alternatives considered.**
+
+| Option | Verdict |
+|---|---|
+| **Always re-encode + `aresample=async`** | **Chosen.** `aresample=async=1` resamples onto a strictly continuous lattice, filling genuine gaps with silence (preserving A/V alignment). Measured 0/192 discontinuous frames after (vs 61/62 before). |
+| Keep the copy-when-safe split | Rejected: its premise is empirically false; timeline continuity — not sample rate — is what matters, and only re-encode guarantees it. |
+| Plain re-encode (`-c:a aac` without `aresample`) | Rejected: still inherits the input's jittery frame PTS (measured 75/187 discontinuous) — this is why SD/low.mp4 still threw the occasional discontinuity. `aresample=async` is the load-bearing part. |
+| Client-side (tolerate the discontinuity in a custom `AudioSink`) | Rejected/tested: making the sink swallow the discontinuity turned it into a silent continuous clock lurch that dragged **video** down too. No correct client-only fix exists (the audio renderer is the master clock). |
+| Per-client serve variant (video-copy + audio-reencode on demand) | Rejected: ships a workaround for defective recorded *data*; bad cache economics (full-segment-sized entries); export/iOS/web still inherit the broken timeline. Fix the data at the source instead. |
+
+**Trades accepted.** A mono/stereo AAC encode is < 1 % of a core per camera
+(negligible; the CPU-saving that motivated the copy path is not worth silent
+audio). `-copyinkf:a` is dropped (it only mattered for the `-c copy` keyframe
+gate — RECORDER-CORRECTNESS #23). Existing footage recorded on the copy path
+(only ~1–2 days, since #103) is **not** retroactively fixed, but it already
+plays with audio via Data-saver's on-demand re-encode (`/segments/{id}/low.mp4`).
+
+**Revisit triggers.** If the `aac` encoder ever becomes a measurable CPU problem
+on a large deployment, revisit selective copy — but only for sources *proven*
+sample-continuous, not merely ≤ 48 kHz. If a future ExoPlayer/Media3 gains a
+"trust sample count over container PTS" mode for progressive sources, the copy
+path could return.
+
+---
+
+## 2026-07-13, Mobile performance: on-demand per-segment low-bitrate transcode (not continuous stream / ABR), Auto default
+
+**Context.** Recorded playback and fullscreen live were unusable over poor
+cellular: `GET /segments/{id}` served the full main-stream bytes (multi-Mbps
+H.265) with no downscale option anywhere, and fullscreen live started on HD main.
+The 2026-07-07 scrub-preview decision listed "WAN/remote scrubbing becomes a
+first-class target" as an explicit revisit trigger — that trigger fired.
+
+**Decision.** Add an on-demand, cached, operator-side low-bitrate variant, and an
+Auto/Full/Data-saver client selector defaulting to **Auto**:
+
+- **Playback:** `GET /segments/{id}/low.mp4` transcodes one segment to
+  640p/15fps/CRF28 H.264 (+ AAC mono), produced on first request and cached
+  (`{export_dir}/segcache`, LRU, ETag'd). A near-copy of the `clips.rs`
+  preview machinery — same semaphore, same read-only media mount, same
+  path-traversal guard, same auth (`?token=`). The recorder is never touched.
+- **Live:** the reconcile loop registers a per-camera `<name>_mobile` go2rtc
+  ffmpeg transcode of the sub (or main) stream; go2rtc pulls it only while a
+  consumer is attached (zero idle cost). Gated by `MOBILE_STREAM_ENABLED`.
+- **Client (Android):** Auto = Full on unmetered, Low on metered; the on-demand
+  transcode therefore runs ONLY when a client actually asks for Low.
+
+Full write-up: `docs/MOBILE-PERFORMANCE.md`.
+
+**Alternatives considered.**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | **Per-segment `q=low` variant** | **Chosen.** One-line client URL change; cacheable/idempotent per segment (repeat scrubs hit cache); reuses clip machinery wholesale; failure isolation per 4 s unit. |
+| 2 | Continuous time-range transcode (`/play/.../low.mp4?start=`) | Rejected for v1: replaces the whole segment/prefetch/seek client model with a long-lived stream a seek must restart, holds a semaphore permit for the whole session, output not reusable across scrubs. Kept as the v2 shape (it also removes any residual segment-boundary audio seam). |
+| 3 | HLS/DASH ABR ladder | Rejected: ≥2 encode ladders (double CPU) + playlist generation + a client player-mode change, overkill for a single-operator VMS; a manual/auto two-level selector matches the commercial-app UX at a fraction of the complexity. |
+| 4 | Pre-transcode everything at record time | Rejected outright: permanent CPU+storage for footage mostly never watched, and it touches the sacred write path. On-demand + cache is strictly better. |
+| 5 | Cloud/third-party transcode or relay | Out of scope — violates the ratified direction (footage never leaves operator hardware). |
+
+**Trades knowingly accepted.**
+
+- One ffmpeg spawn per 4 s segment on a cache miss (mitigated by cache + the
+  N-deep prefetch; `-preset ultrafast` at 640p is many-× realtime).
+- The `<name>_mobile` live transcode runs beside the recorder (go2rtc is embedded
+  in the recorder container). On-demand and bounded to one process per active
+  mobile viewer, disable-able via `MOBILE_STREAM_ENABLED=false`.
+- Default-on mobile stream doubles the go2rtc stream table; inert until consumed.
+
+**Revisit triggers.**
+
+- Measured per-segment spawn overhead dominates on real hosts → switch playback
+  to option 2 (continuous-range transcode), which also subsumes any audio seam.
+- Multi-user remote viewing becomes common → reconsider option 3 (real ABR).
+- ROADMAP dual-stream recording ships → "Low" should prefer a *recorded* sub
+  segment over an on-the-fly transcode; design the selector so they compose.
+- Recorder-host CPU contention reports → make the live mobile transcode default
+  off, or move go2rtc to a separate restreamer host.
+
+---
+
+## 2026-07-12, Recorded audio: copy when client-safe, transcode only the rates Android rejects
+
+**Context.** The Android client played recorded footage silent while desktop
+played the same footage with sound. Device logs showed the segment's audio track
+present but rejected by the hardware decoder: `MediaCodecInfo: NoSupport
+[sampleRate.support, 64000] [c2.android.aac.decoder]`. The camera streams AAC at
+64 kHz; Android's/web hardware AAC decoders cap at 48 kHz, while desktop's
+software ffmpeg decoder handles higher rates — so a bit-exact copy was decodable
+on desktop only. AAC rates above 48 kHz (64/88.2/96 kHz) are the entire problem
+set; every standard rate ≤ 48 kHz plays on every client.
+
+**Decision — conditional: copy when already client-safe, transcode only the
+oddballs.** At record start the recorder probes the source audio sample rate
+(`probe_audio_sample_rate`, a bounded best-effort ffprobe of the go2rtc restream —
+a local consumer, not a camera connection) and `audio_segmenter_args` picks per
+camera:
+- source **≤ 48 kHz** → **bit-exact copy** (`-c:a copy -copyinkf:a`): zero
+  re-encode, zero added CPU, source fidelity preserved.
+- source **> 48 kHz** → **transcode to 48 kHz AAC** (`-c:a aac -ar 48000`) so it
+  plays on every client.
+- **probe failed / go2rtc not ready** → transcode (the always-safe default).
+
+The copy path keeps `-copyinkf:a` (RECORDER-CORRECTNESS #23: RTP-AAC audio is
+never key-flagged, so a plain `-c copy` would drop the whole declared audio
+track). The transcode path re-encodes from decoded PCM, so it has no keyframe
+gate.
+
+**Rejected — always transcode to 48 kHz (blanket).** Simplest (no probe), and it
+was the first cut — but it re-encodes EVERY camera's audio including the majority
+already at a safe rate: wasted CPU + a tiny generational quality loss for no
+benefit. The probe is cheap and the copy path is strictly better when the source
+is already fine.
+
+**Rejected — always keep bit-exact copy.** Leaves any > 48 kHz camera silent on
+Android/web.
+
+**Rejected — a per-client software decoder (Media3 FFmpeg extension on Android).**
+Heavyweight new dependency, build-from-source, Android-only; normalizing at the
+source fixes every client.
+
+**Trade-offs accepted.** A bounded best-effort ffprobe at each (re)connect (falls
+back to transcode on failure, so it never blocks or breaks recording); for the
+transcoded oddballs only, tiny quality loss + per-segment AAC encoder priming.
+Operators see which cameras are transcoding in the admin camera menu, with a hint
+to set the camera's audio ≤ 48 kHz to avoid it. The EXPORT path
+(`services/api/src/export.rs`) still copies audio unconditionally and is NOT yet
+rate-aware — a known follow-up so shared clips of > 48 kHz cameras play on phones.
+
+**Revisit if.** The per-connect probe cost matters (→ cache the rate per session);
+or a lossless requirement emerges for the > 48 kHz cameras (→ copy + document the
+Android caveat).
+
+---
+
+## 2026-07-12, Recorder audit hardening: the free-space floor frees real bytes, fail-open survives every seam, boot-reap tolerates contention
+
+**Context.** A two-round adversarial audit of the recorder (issues #70–#84, PR
+#85) found a class of footage-safety bugs. Fixing them forced several decisions
+where a plausible alternative was rejected, and the audit iterated
+(fix → re-audit → fix): a few round-1/round-2 fixes were themselves reverted or
+reshaped once a later pass proved them unsafe — those reversals are decisions too.
+
+**Decision — the free-space (ENOSPC) floor must FREE bytes, not relocate them.**
+When the floor is in deficit and a segment's archive move would land on the SAME
+filesystem as the live storage (the default compose layout: `/data/archive` on
+the live disk) AND that filesystem is the one actually in deficit, the sweep
+DELETES the oldest live segment instead of archive-moving it in place. This is a
+deliberate, narrow exception to correctness item #7 (the live sweep normally
+skips archive-enabled cameras, the archiver owns their deletion), in the exact
+spirit of item #22 (the `max_retention_days` ceiling also overrides #7): losing
+the OLDEST footage beats losing ALL FUTURE footage to a 100%-full disk that
+ENOSPC-halts recording on every camera. It stays bound by every other safety
+rule, oldest-first, protected bookmarks excluded, file-then-row (#10), serialized
+on `ARCHIVE_GUARD` (#8), and only triggers when a move genuinely cannot free the
+deficit disk (`st_dev` identity of segment-fs == archive-fs == floor-fs); a
+segment on a different disk falls through to the normal lossless move. A loud
+`premature_rollover` system event fires so the loss is visible, never silent.
+
+**Decision — fail-open is an invariant across EVERY seam, not just steady state
+(item #19 extended).** Concretely: (a) worker-lifetime motion state, the
+`MotionBuffer` / `MotionUnion` / `pending_signals` are carried across an ffmpeg
+reconnect (the R1 cache sweep gets a keep-set so it won't delete carried pre-roll,
+and a flip-guard prevents a cache/storage-flavour mismatch from self-copy-
+truncating an indexed segment), so a reconnect mid-event no longer drops the event
+tail; (b) the `MotionUnion` is kept consistent through an unhealthy (frozen)
+window, edges are folded and the newest is stashed and replayed on thaw, and a
+STOP replayed onto an Idle buffer enters `PostBuffer` (`apply_replayed_edge`) so
+an event that ran entirely inside the window still keeps its post-roll; (c) a
+detector reports HEALTHY only when it can actually produce a verdict, the Frigate
+source on a granted MQTT SubAck (not ConnAck), the pixel detector after warm-up;
+(d) a panicked motion-source task is supervised (a `JoinSet`, the motion-side twin
+of the service-task watchdog) and immediately reads unhealthy → fail-open; (e) a
+`MotionSignal` dropped on a full channel flips the source to fail-open via an
+interposed health watch rather than being silently lost.
+
+**Rejected / not chosen:**
+
+| Option | Verdict |
+|---|---|
+| Free-space floor **archive-moves** oldest live footage even when the move frees nothing (pre-fix behaviour) | Rejected, on the default shared-fs layout it freed 0 bytes every tick, the disk filled to 100%, and ffmpeg ENOSPC-halted recording on every camera. A no-op that reads as success is worse than a bounded, loud deletion. |
+| Free-space floor deletes any same-archive-fs segment **without checking it is on the deficit disk** (a round-2 fix, reverted in round-3) | Rejected, on a repointed-storage config it deleted footage on a disk that frees nothing on the full disk: unbounded loss, zero benefit. The delete now also requires segment-fs == floor(deficit)-fs. |
+| A **time-based `MotionUnion` stale-key expiry** to un-wedge a lost STOP (a round-2 fix, reverted in round-3) | Rejected, it can't tell a lost STOP from a genuinely-long event (an HA occupancy/contact sensor held on for hours; a pixel event through a storm). On a MULTI-source camera, expiring the long event's key let a second source's STOP close the union and DISCARD footage while a healthy source still asserted motion (golden rule 2). The wedge is covered the footage-safe way (over-record) by the #81 loss-debt fail-open + the motion-source supervision. |
+| Signal a dropped-`MotionSignal` fail-open by writing `false` into `motion.rs`'s `aggregate_health` watch | Rejected, that watch dedups on `last_sent`, so a foreign `false` would never be re-published `true`: permanent fail-open with no recovery. An interposed second watch (`forward_motion_health`) folds signal-loss into health and recovers when the channel drains. |
+| Boot index-reap **permanently skips** any `DROP INDEX` that hits a lock timeout | Rejected, it conflates a real in-progress manual `CREATE INDEX CONCURRENTLY` (must skip) with transient contention (a busy boot, autovacuum), leaving a droppable INVALID index un-dropped so a later `CREATE INDEX IF NOT EXISTS` silently no-ops. The reap now re-checks `pg_stat_progress_create_index` on a timeout: skip only a genuine build, retry transient contention. |
+| Keep the stall watchdog as a per-`select!`-iteration `timeout(read)` | Rejected, a co-scheduled telemetry tick (45s < 90s) returned from the select and rebuilt the timeout every iteration, so it never fired → silent dead recording on a half-open stream. The watchdog is now a dedicated arm anchored to the last segment receipt. |
+
+**Cost accepted.** The shared-fs floor deletes un-archived live footage of
+archive-enabled cameras when the disk would otherwise fill, an explicit, loud
+exception (not silent). Several fail-open paths deliberately OVER-record (a lost
+STOP over-records until the next event; a warm-up window persists idle footage),
+disk-waste bounded by retention, never loss, the correct direction per item #19.
+
+**Revisit triggers.** A source-identity-keyed `MotionUnion` (each open key tagged
+by source) lands → the lost-STOP wedge can be closed without over-record, and the
+"no time-based expiry" rejection can be revisited. Per-GPU decode accounting lands
+→ the floor's single-fs assumption could generalize to multi-disk deficit
+tracking. A hermetic api-integration-test harness lands (issue #88) → the
+`server_settings`-sharing test flakiness surfaced during this work is resolved.
+
+---
+
 ## 2026-07-11, Admin console: rebuild to a Frigate-style rail + list→detail model (not a reskin)
 
 **Context.** The web admin console (`services/api/src/admin.html`, also embedded

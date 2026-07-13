@@ -454,10 +454,27 @@ fn require_secret(key: &str) -> Result<String> {
 
 /// Parse an IANA timezone from `key`, falling back to `default` (and to
 /// `America/Los_Angeles` if even that fails to parse).
+///
+/// The fallback is deliberately non-fatal — a typo'd `RECORDER_TZ` must not
+/// stop the recorder from booting — but it must be LOUD: silently swallowing
+/// it runs the archive cron in the wrong timezone with no clue why (audit
+/// #84).
 fn parse_tz_env(key: &str, default: &str) -> chrono_tz::Tz {
-    optional_env(key, default)
-        .parse::<chrono_tz::Tz>()
-        .unwrap_or(chrono_tz::Tz::America__Los_Angeles)
+    let raw = optional_env(key, default);
+    match raw.parse::<chrono_tz::Tz>() {
+        Ok(tz) => tz,
+        Err(_) => {
+            let fallback = default
+                .parse::<chrono_tz::Tz>()
+                .unwrap_or(chrono_tz::Tz::America__Los_Angeles);
+            tracing::error!(
+                "env var '{key}' = '{raw}' is not a valid IANA timezone \
+                 (e.g. 'America/Los_Angeles'); falling back to '{fallback}' — \
+                 the archive cron will run in that zone"
+            );
+            fallback
+        }
+    }
 }
 
 fn optional_env(key: &str, default: &str) -> String {
@@ -501,5 +518,40 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
             }
         }
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tz_env;
+
+    /// Audit #84: an invalid TZ value must fall back (non-fatal, now loudly
+    /// logged) to the caller's default when that parses — never panic, never
+    /// silently pick a surprise zone.
+    #[test]
+    fn parse_tz_env_falls_back_on_invalid_value() {
+        // Unique key name: the process env is shared across parallel tests.
+        std::env::set_var("CRUMB_TEST_TZ_INVALID", "Not/AZone");
+        assert_eq!(
+            parse_tz_env("CRUMB_TEST_TZ_INVALID", "Europe/Berlin"),
+            chrono_tz::Tz::Europe__Berlin,
+            "an invalid env value must fall back to the caller's default"
+        );
+        std::env::remove_var("CRUMB_TEST_TZ_INVALID");
+    }
+
+    /// Control: a valid value parses, and an unset key yields the default.
+    #[test]
+    fn parse_tz_env_parses_valid_value_and_unset_default() {
+        std::env::set_var("CRUMB_TEST_TZ_VALID", "Asia/Tokyo");
+        assert_eq!(
+            parse_tz_env("CRUMB_TEST_TZ_VALID", "America/Los_Angeles"),
+            chrono_tz::Tz::Asia__Tokyo
+        );
+        std::env::remove_var("CRUMB_TEST_TZ_VALID");
+        assert_eq!(
+            parse_tz_env("CRUMB_TEST_TZ_UNSET", "America/Los_Angeles"),
+            chrono_tz::Tz::America__Los_Angeles
+        );
     }
 }

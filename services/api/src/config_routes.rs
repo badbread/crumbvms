@@ -3708,6 +3708,8 @@ async fn get_decode_status(
             active: s.active,
             fallback_reason: s.fallback_reason,
             updated_at: s.updated_at,
+            audio_sample_rate: s.audio_sample_rate,
+            audio_transcoding: s.audio_transcoding,
         })
         .collect();
 

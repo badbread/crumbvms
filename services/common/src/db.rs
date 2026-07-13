@@ -60,6 +60,16 @@ fn timeout_ms_env(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The pool's configured `statement_timeout`, in milliseconds — the single
+/// source of truth shared by [`build_pool`]'s post-create hook (which sets it
+/// on every fresh connection) and the migration runner's restore path (which
+/// must re-issue the SAME value after a CONCURRENTLY migration ran with the
+/// timeout disabled; see the "restore" comment in `run_migrations_locked`).
+/// Keeping both call sites on this one function means they cannot drift.
+fn pool_statement_timeout_ms() -> u64 {
+    timeout_ms_env("DB_STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS)
+}
+
 /// Build and return a `deadpool-postgres` connection pool.
 ///
 /// The `database_url` must be a valid `libpq`-style connection string, e.g.:
@@ -104,11 +114,11 @@ pub fn build_pool(database_url: &str, pool_size: usize) -> Result<Pool> {
     // Migrations exemption: `run_migrations_locked` uses this SAME pool to run
     // DDL, including `CREATE INDEX CONCURRENTLY` builds that can legitimately
     // take far longer than 30s on a large table. That function explicitly
-    // raises/clears `statement_timeout` around its own DDL (see the "migration
+    // disables `statement_timeout` around its own DDL and then re-issues this
+    // pool value via [`pool_statement_timeout_ms`] (see the "migration
     // timeout exemption" comments there) rather than us weakening the default
     // here — every other caller keeps the safety net.
-    let statement_timeout_ms =
-        timeout_ms_env("DB_STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS);
+    let statement_timeout_ms = pool_statement_timeout_ms();
     let lock_timeout_ms = timeout_ms_env("DB_LOCK_TIMEOUT_MS", DEFAULT_LOCK_TIMEOUT_MS);
     cfg.builder(NoTls)
         .context("failed to create deadpool-postgres pool builder")?
@@ -4759,6 +4769,130 @@ pub async fn ensure_bookmarks_table(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+/// ONVIF connection parts parsed out of an `onvif://` go2rtc source URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnvifSourceParts {
+    pub host: String,
+    /// `None` ⇒ caller uses the ONVIF default (80).
+    pub port: Option<i32>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Minimal percent-decode for URL userinfo (ONVIF creds embedded in a source
+/// URL may be `%`-encoded). Leaves malformed escapes as-is.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse an `onvif://[user[:pass]@]host[:port][/path][?query]` source URL into
+/// its connection parts. Returns `None` unless the scheme is `onvif://` and a
+/// host is present. Path/query are ignored. Splits userinfo at the LAST `@`
+/// (a host can't contain `@`) and the port at the LAST `:` only when the tail
+/// is a valid port number, so an IPv4 host with no port is handled correctly.
+#[must_use]
+pub fn parse_onvif_source(source_url: &str) -> Option<OnvifSourceParts> {
+    let rest = source_url.strip_prefix("onvif://")?;
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((ui, hp)) => (Some(ui), hp),
+        None => (None, authority),
+    };
+    if hostport.is_empty() {
+        return None;
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(n) if !h.is_empty() => (h.to_owned(), Some(i32::from(n))),
+            _ => (hostport.to_owned(), None),
+        },
+        None => (hostport.to_owned(), None),
+    };
+    let (user, password) = match userinfo.filter(|ui| !ui.is_empty()) {
+        Some(ui) => match ui.split_once(':') {
+            Some((u, p)) => (
+                Some(pct_decode(u)).filter(|s| !s.is_empty()),
+                Some(pct_decode(p)),
+            ),
+            None => (Some(pct_decode(ui)), None),
+        },
+        None => (None, None),
+    };
+    Some(OnvifSourceParts {
+        host,
+        port,
+        user,
+        password,
+    })
+}
+
+/// Backfill the dedicated `onvif_host`/`onvif_port`/`onvif_user`/`onvif_password`
+/// columns from a camera's `onvif://` `source_url` when the host column is empty
+/// (#ONVIF-Identify). Cameras added via ONVIF discovery stored their ONVIF
+/// endpoint + credentials in the go2rtc source URL but not in these columns, so
+/// Identify, Re-detect, and PTZ detection — all of which read the columns — were
+/// disabled even though full working ONVIF creds existed in the source. This
+/// mirrors that connection info into the columns (idempotent: only fills empty
+/// hosts, never overwrites an explicitly-set one). Streaming is unaffected —
+/// go2rtc keeps using `source_url`. Returns the number of rows repaired.
+pub async fn backfill_onvif_from_source(pool: &Pool) -> Result<u64> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, source_url FROM cameras \
+             WHERE source_url LIKE 'onvif://%' \
+               AND (onvif_host IS NULL OR onvif_host = '')",
+            &[],
+        )
+        .await
+        .context("backfill_onvif_from_source: select candidates")?;
+    let mut repaired = 0u64;
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let source_url: Option<String> = row.get("source_url");
+        let Some(parts) = source_url.as_deref().and_then(parse_onvif_source) else {
+            continue;
+        };
+        let n = client
+            .execute(
+                "UPDATE cameras SET \
+                     onvif_host = $2, \
+                     onvif_port = COALESCE($3, onvif_port), \
+                     onvif_user = COALESCE($4, onvif_user), \
+                     onvif_password = COALESCE($5, onvif_password) \
+                 WHERE id = $1 AND (onvif_host IS NULL OR onvif_host = '')",
+                &[&id, &parts.host, &parts.port, &parts.user, &parts.password],
+            )
+            .await
+            .context("backfill_onvif_from_source: update")?;
+        repaired += n;
+    }
+    if repaired > 0 {
+        tracing::info!(
+            repaired,
+            "backfilled ONVIF host/credentials from onvif:// source URLs"
+        );
+    }
+    Ok(repaired)
+}
+
 /// Columns selected for a [`Bookmark`], with the joined camera name.
 const BOOKMARK_SELECT: &str = r"
     SELECT b.id, b.camera_id, c.name AS camera_name, b.ts, b.description,
@@ -5160,6 +5294,36 @@ pub async fn upsert_camera_decode_status(
     Ok(())
 }
 
+/// Upsert one camera's recorded-audio status (source sample rate + whether the
+/// recorder is transcoding it to 48 kHz). Written by the record loop at each
+/// (re)connect so the admin console can show which cameras are being re-encoded.
+///
+/// # Errors
+/// Returns an error if the database query fails.
+pub async fn upsert_camera_audio_status(
+    pool: &Pool,
+    camera_id: Uuid,
+    sample_rate: Option<i32>,
+    transcoding: bool,
+) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            INSERT INTO camera_audio_status (camera_id, sample_rate, transcoding, updated_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (camera_id) DO UPDATE
+                SET sample_rate = EXCLUDED.sample_rate,
+                    transcoding = EXCLUDED.transcoding,
+                    updated_at  = now()
+            ",
+            &[&camera_id, &sample_rate, &transcoding],
+        )
+        .await
+        .context("upsert_camera_audio_status")?;
+    Ok(())
+}
+
 /// Delete one camera's decode-status row.
 ///
 /// Called by the supervisor when it stops the worker of a disabled/removed
@@ -5179,6 +5343,16 @@ pub async fn delete_camera_decode_status(pool: &Pool, camera_id: Uuid) -> Result
         )
         .await
         .context("delete_camera_decode_status")?;
+    // Clear the companion audio-status row too so the admin never shows a stale
+    // "transcoding" badge for a camera that stopped recording (camera deletion
+    // also cascades via the FK; this covers the disable case).
+    client
+        .execute(
+            "DELETE FROM camera_audio_status WHERE camera_id = $1",
+            &[&camera_id],
+        )
+        .await
+        .context("delete_camera_audio_status")?;
     Ok(())
 }
 
@@ -5194,9 +5368,12 @@ pub async fn list_camera_decode_status(pool: &Pool) -> Result<Vec<CameraDecodeSt
         .query(
             r"
             SELECT s.camera_id, c.name AS camera_name,
-                   s.requested, s.active, s.fallback_reason, s.updated_at
+                   s.requested, s.active, s.fallback_reason, s.updated_at,
+                   a.sample_rate AS audio_sample_rate,
+                   a.transcoding AS audio_transcoding
             FROM camera_decode_status s
             JOIN cameras c ON c.id = s.camera_id
+            LEFT JOIN camera_audio_status a ON a.camera_id = s.camera_id
             ORDER BY c.name, s.camera_id
             ",
             &[],
@@ -5212,6 +5389,8 @@ pub async fn list_camera_decode_status(pool: &Pool) -> Result<Vec<CameraDecodeSt
             active: row.get("active"),
             fallback_reason: row.get("fallback_reason"),
             updated_at: row.get("updated_at"),
+            audio_sample_rate: row.get("audio_sample_rate"),
+            audio_transcoding: row.get("audio_transcoding"),
         })
         .collect())
 }
@@ -7920,13 +8099,40 @@ const RUN_MIGRATIONS_LOCK_KEY: i64 = 917_342_002;
 /// just means the planner ignores the index and queries fall back to a slow
 /// path.
 ///
-/// Dropping and recreating is unconditionally safe here: [`run_migrations`]
-/// (the sole caller, via [`run_migrations_locked`]) holds
-/// [`RUN_MIGRATIONS_LOCK_KEY`] for the whole call, so no other process can be
-/// concurrently building the same index name, and the migrations that follow
-/// this check all use `CREATE INDEX IF NOT EXISTS` / `CREATE INDEX
-/// CONCURRENTLY IF NOT EXISTS`, which will simply rebuild whatever was just
-/// dropped.
+/// Dropping is safe here: an INVALID index provided no guarantees anyway (the
+/// planner never uses it, and an invalid UNIQUE index enforces nothing), and
+/// [`run_migrations`] (the sole caller, via [`run_migrations_locked`]) holds
+/// [`RUN_MIGRATIONS_LOCK_KEY`] for the whole call, so no other *Crumb* process
+/// can be concurrently building the same index name.
+///
+/// The advisory lock does NOT cover an **operator's manual**
+/// `CREATE INDEX CONCURRENTLY` running in a plain psql session, though — and a
+/// concurrent build IN PROGRESS is also marked `indisvalid = false` until it
+/// finishes, so a naive reap during an api/recorder restart mid-build would
+/// destroy the operator's hours-long build. Two guards prevent that:
+///
+/// 1. The catalog query excludes any index with a live row in
+///    `pg_stat_progress_create_index` (the build backend's progress entry for
+///    this database) — a healthy in-flight build is skipped, not dropped.
+/// 2. Belt-and-braces for the race where a build starts between that snapshot
+///    and the `DROP`: the pool's per-connection `lock_timeout` (set in
+///    [`build_pool`], default 10s) bounds how long `DROP INDEX` queues behind
+///    the build's locks, and a `55P03 lock_not_available` error is treated as
+///    skip-and-WARN rather than a hard failure — the index is re-examined on
+///    the next boot, when the build has either finished (now VALID, untouched)
+///    or died (truly orphaned, reaped).
+///
+/// Dropping is NOT always self-healing, though. The dropped index is rebuilt
+/// automatically only when the migration that creates it has **not yet been
+/// recorded** in `schema_migrations` (the crash-mid-migration case: the still-
+/// pending file's `CREATE INDEX ... IF NOT EXISTS` re-runs and now finds the
+/// name free). If that migration was ALREADY recorded, nothing re-runs it —
+/// already-applied migrations are skipped forever — so the index stays absent
+/// until an operator recreates it by hand from its `db/migrations/` file. That
+/// is still strictly better than keeping the INVALID index (which LOOKS
+/// present, blocking every future `IF NOT EXISTS` rebuild while guaranteeing
+/// nothing), and the WARN below names exactly what was dropped so the operator
+/// can act.
 ///
 /// Scoped to `current_schema()` only (never touches another tenant's schema
 /// in a shared-cluster / multi-schema test setup).
@@ -7941,13 +8147,28 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
     let rows = client
         .query(
             r"
-            SELECT ci.relname AS index_name, ct.relname AS table_name
+            SELECT ci.relname AS index_name, ct.relname AS table_name,
+                   pi.indexrelid AS index_oid
             FROM pg_index pi
             JOIN pg_class ci ON ci.oid = pi.indexrelid
             JOIN pg_class ct ON ct.oid = pi.indrelid
             JOIN pg_namespace ns ON ns.oid = ci.relnamespace
             WHERE NOT pi.indisvalid
               AND ns.nspname = current_schema()
+              -- Guard 1 (see the doc comment): an in-progress CREATE INDEX
+              -- CONCURRENTLY is ALSO indisvalid=false until it completes.
+              -- Skip any index whose build is live right now — it has a row
+              -- in pg_stat_progress_create_index (scoped to this database;
+              -- the view is cluster-wide and OIDs are only unique per-DB).
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_stat_progress_create_index prog
+                  WHERE prog.index_relid = pi.indexrelid
+                    AND prog.datid = (
+                        SELECT oid FROM pg_database
+                        WHERE datname = current_database()
+                    )
+              )
             ",
             &[],
         )
@@ -7957,234 +8178,311 @@ async fn reap_invalid_indexes(client: &deadpool_postgres::Client) -> Result<()> 
     for row in rows {
         let index_name: String = row.get("index_name");
         let table_name: String = row.get("table_name");
+        let index_oid: u32 = row.get("index_oid");
         tracing::warn!(
             index_name,
             table_name,
             "run_migrations: found INVALID index (left by an interrupted \
-             CREATE INDEX CONCURRENTLY) — dropping so the migration runner \
-             rebuilds it; the index provided NO guarantees while invalid"
+             CREATE INDEX CONCURRENTLY) — dropping it unless its locks are \
+             held; it provided NO guarantees while invalid. It is rebuilt \
+             automatically only if the migration that creates it is still \
+             pending; if that migration is already recorded in \
+             schema_migrations, recreate the index manually from its \
+             db/migrations/ file"
         );
         // Index names are catalog-sourced identifiers (not user input), but
         // quote them defensively since `format!` can't bind a DDL identifier
         // as a parameter.
-        client
-            .batch_execute(&format!(
-                r#"DROP INDEX IF EXISTS "{index_name}""#,
-                index_name = index_name.replace('"', "\"\"")
-            ))
-            .await
-            .with_context(|| format!("reap_invalid_indexes: drop invalid index {index_name}"))?;
+        //
+        // Guard 2 (see the doc comment): this DROP runs under the connection's
+        // `lock_timeout` (set by build_pool's post-create hook). A lock timeout
+        // (55P03) has TWO very different causes that must be handled
+        // differently, or the reap is non-deterministic under load:
+        //   (a) a live manual CREATE INDEX CONCURRENTLY holds the index's locks
+        //       — leave it alone (skip-and-warn); or
+        //   (b) transient/foreign contention (a busy boot, autovacuum, a
+        //       concurrent DDL elsewhere) — which must NOT permanently skip a
+        //       droppable INVALID index (that would leave it un-dropped so a
+        //       later CREATE INDEX IF NOT EXISTS silently no-ops against the
+        //       broken catalog entry).
+        // Distinguish them by RE-CHECKING pg_stat_progress_create_index for THIS
+        // index on a timeout: a genuine build → skip; otherwise retry a few
+        // times so momentary contention clears, and only skip (never boot-fail)
+        // if a foreign lock persists.
+        let drop_sql = format!(
+            r#"DROP INDEX IF EXISTS "{index_name}""#,
+            index_name = index_name.replace('"', "\"\"")
+        );
+        const DROP_MAX_ATTEMPTS: u32 = 4;
+        for attempt in 1..=DROP_MAX_ATTEMPTS {
+            match client.batch_execute(&drop_sql).await {
+                Ok(()) => break,
+                Err(e)
+                    if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) =>
+                {
+                    let build_in_progress: bool = client
+                        .query_one(
+                            "SELECT EXISTS (
+                                 SELECT 1 FROM pg_stat_progress_create_index
+                                 WHERE index_relid = $1
+                                   AND datid = (SELECT oid FROM pg_database
+                                                WHERE datname = current_database())
+                             )",
+                            &[&index_oid],
+                        )
+                        .await
+                        .map(|r| r.get(0))
+                        .unwrap_or(false);
+                    if build_in_progress {
+                        tracing::warn!(
+                            index_name,
+                            table_name,
+                            "run_migrations: DROP of INVALID index skipped — a manual \
+                             CREATE INDEX CONCURRENTLY build holds its locks; leaving it \
+                             alone, it will be re-examined on the next startup"
+                        );
+                        break;
+                    }
+                    if attempt == DROP_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            index_name,
+                            table_name,
+                            attempts = DROP_MAX_ATTEMPTS,
+                            "run_migrations: DROP of INVALID index kept timing out on a \
+                             lock with no build in progress; leaving it for the next \
+                             startup rather than boot-failing"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("reap_invalid_indexes: drop invalid index {index_name}")
+                    });
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
+/// The ordered list of (filename, SQL body) migration pairs, applied in order
+/// by [`run_migrations_locked`].  0001–0011 must be included so an EXTERNAL
+/// Postgres (not initdb-seeded) self-provisions.  On an existing prod DB they
+/// are baseline-skipped (see step 2 of [`run_migrations_locked`]).
+///
+/// Module-scoped (rather than local to the runner) so the tests module can
+/// assert that every registered file satisfies the runner's SQL-preprocessing
+/// invariants — see `migrations_satisfy_runner_parsing_invariants`.
+static MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial_schema.sql",
+        include_str!("../../../db/migrations/0001_initial_schema.sql"),
+    ),
+    (
+        "0002_views.sql",
+        include_str!("../../../db/migrations/0002_views.sql"),
+    ),
+    (
+        "0003_record_audio.sql",
+        include_str!("../../../db/migrations/0003_record_audio.sql"),
+    ),
+    (
+        "0004_recorder_heartbeat.sql",
+        include_str!("../../../db/migrations/0004_recorder_heartbeat.sql"),
+    ),
+    (
+        "0005_motion_grid.sql",
+        include_str!("../../../db/migrations/0005_motion_grid.sql"),
+    ),
+    (
+        "0006_motion_grid_score.sql",
+        include_str!("../../../db/migrations/0006_motion_grid_score.sql"),
+    ),
+    (
+        "0007_detection_events.sql",
+        include_str!("../../../db/migrations/0007_detection_events.sql"),
+    ),
+    (
+        "0008_segments_repair.sql",
+        include_str!("../../../db/migrations/0008_segments_repair.sql"),
+    ),
+    (
+        "0009_segments_indexes.sql",
+        include_str!("../../../db/migrations/0009_segments_indexes.sql"),
+    ),
+    (
+        "0010_bookmarks.sql",
+        include_str!("../../../db/migrations/0010_bookmarks.sql"),
+    ),
+    (
+        "0011_segments_storage_idx.sql",
+        include_str!("../../../db/migrations/0011_segments_storage_idx.sql"),
+    ),
+    (
+        "0012_server_settings_and_camera_ownership.sql",
+        include_str!("../../../db/migrations/0012_server_settings_and_camera_ownership.sql"),
+    ),
+    (
+        "0013_segments_indexes.sql",
+        include_str!("../../../db/migrations/0013_segments_indexes.sql"),
+    ),
+    (
+        "0014_frigate_api_split.sql",
+        include_str!("../../../db/migrations/0014_frigate_api_split.sql"),
+    ),
+    (
+        "0015_notifications.sql",
+        include_str!("../../../db/migrations/0015_notifications.sql"),
+    ),
+    (
+        "0016_motion_baseline.sql",
+        include_str!("../../../db/migrations/0016_motion_baseline.sql"),
+    ),
+    (
+        "0017_notification_settings.sql",
+        include_str!("../../../db/migrations/0017_notification_settings.sql"),
+    ),
+    (
+        "0018_consolidate_runtime_ensure_ddl.sql",
+        include_str!("../../../db/migrations/0018_consolidate_runtime_ensure_ddl.sql"),
+    ),
+    (
+        "0019_camera_effective_policy_view.sql",
+        include_str!("../../../db/migrations/0019_camera_effective_policy_view.sql"),
+    ),
+    (
+        "0020_grouped_cameras_clear_override.sql",
+        include_str!("../../../db/migrations/0020_grouped_cameras_clear_override.sql"),
+    ),
+    (
+        "0021_grouped_camera_no_override_trigger.sql",
+        include_str!("../../../db/migrations/0021_grouped_camera_no_override_trigger.sql"),
+    ),
+    (
+        "0022_clip_source.sql",
+        include_str!("../../../db/migrations/0022_clip_source.sql"),
+    ),
+    (
+        "0023_clip_views.sql",
+        include_str!("../../../db/migrations/0023_clip_views.sql"),
+    ),
+    (
+        "0024_clip_pre_roll.sql",
+        include_str!("../../../db/migrations/0024_clip_pre_roll.sql"),
+    ),
+    (
+        "0025_clip_motion_highlight.sql",
+        include_str!("../../../db/migrations/0025_clip_motion_highlight.sql"),
+    ),
+    (
+        "0026_segment_motion_bbox.sql",
+        include_str!("../../../db/migrations/0026_segment_motion_bbox.sql"),
+    ),
+    (
+        "0027_setup_complete.sql",
+        include_str!("../../../db/migrations/0027_setup_complete.sql"),
+    ),
+    (
+        "0028_roles.sql",
+        include_str!("../../../db/migrations/0028_roles.sql"),
+    ),
+    (
+        "0029_bookmarks_enabled.sql",
+        include_str!("../../../db/migrations/0029_bookmarks_enabled.sql"),
+    ),
+    (
+        "0030_view_owner.sql",
+        include_str!("../../../db/migrations/0030_view_owner.sql"),
+    ),
+    (
+        "0031_view_shares.sql",
+        include_str!("../../../db/migrations/0031_view_shares.sql"),
+    ),
+    (
+        "0032_system_alerts.sql",
+        include_str!("../../../db/migrations/0032_system_alerts.sql"),
+    ),
+    (
+        "0033_sessions.sql",
+        include_str!("../../../db/migrations/0033_sessions.sql"),
+    ),
+    (
+        "0034_frigate_heartbeat.sql",
+        include_str!("../../../db/migrations/0034_frigate_heartbeat.sql"),
+    ),
+    (
+        "0035_decode_status.sql",
+        include_str!("../../../db/migrations/0035_decode_status.sql"),
+    ),
+    (
+        "0036_embedded_go2rtc_api_base.sql",
+        include_str!("../../../db/migrations/0036_embedded_go2rtc_api_base.sql"),
+    ),
+    (
+        "0037_segment_motion_shadow.sql",
+        include_str!("../../../db/migrations/0037_segment_motion_shadow.sql"),
+    ),
+    (
+        "0038_motion_detector_unhealthy_alert.sql",
+        include_str!("../../../db/migrations/0038_motion_detector_unhealthy_alert.sql"),
+    ),
+    (
+        "0039_motion_cache_status.sql",
+        include_str!("../../../db/migrations/0039_motion_cache_status.sql"),
+    ),
+    (
+        "0040_motion_cache_unavailable_alert.sql",
+        include_str!("../../../db/migrations/0040_motion_cache_unavailable_alert.sql"),
+    ),
+    (
+        "0041_view_icon.sql",
+        include_str!("../../../db/migrations/0041_view_icon.sql"),
+    ),
+    (
+        "0042_policy_max_retention_days.sql",
+        include_str!("../../../db/migrations/0042_policy_max_retention_days.sql"),
+    ),
+    (
+        "0043_storage_persist_failed_alert.sql",
+        include_str!("../../../db/migrations/0043_storage_persist_failed_alert.sql"),
+    ),
+    (
+        "0044_beta_terms_acceptance.sql",
+        include_str!("../../../db/migrations/0044_beta_terms_acceptance.sql"),
+    ),
+    (
+        "0045_update_check.sql",
+        include_str!("../../../db/migrations/0045_update_check.sql"),
+    ),
+    (
+        "0046_scrub_pregen_settings.sql",
+        include_str!("../../../db/migrations/0046_scrub_pregen_settings.sql"),
+    ),
+    (
+        "0047_camera_device_info.sql",
+        include_str!("../../../db/migrations/0047_camera_device_info.sql"),
+    ),
+    (
+        "0048_ha_integration.sql",
+        include_str!("../../../db/migrations/0048_ha_integration.sql"),
+    ),
+    (
+        "0049_additive_motion_sources.sql",
+        include_str!("../../../db/migrations/0049_additive_motion_sources.sql"),
+    ),
+    (
+        "0050_camera_audio_status.sql",
+        include_str!("../../../db/migrations/0050_camera_audio_status.sql"),
+    ),
+];
+
 /// The actual migration-application body, run while [`run_migrations`] holds
 /// the advisory lock. Split out so the lock/unlock wrapping above has no `?`
 /// early-return between acquire and release.
 async fn run_migrations_locked(pool: &Pool) -> Result<()> {
-    // The ordered list of (filename, SQL body) pairs.  0001–0011 must be
-    // included so an EXTERNAL Postgres (not initdb-seeded) self-provisions.
-    // On an existing prod DB they are baseline-skipped (see step 2 above).
-    static MIGRATIONS: &[(&str, &str)] = &[
-        (
-            "0001_initial_schema.sql",
-            include_str!("../../../db/migrations/0001_initial_schema.sql"),
-        ),
-        (
-            "0002_views.sql",
-            include_str!("../../../db/migrations/0002_views.sql"),
-        ),
-        (
-            "0003_record_audio.sql",
-            include_str!("../../../db/migrations/0003_record_audio.sql"),
-        ),
-        (
-            "0004_recorder_heartbeat.sql",
-            include_str!("../../../db/migrations/0004_recorder_heartbeat.sql"),
-        ),
-        (
-            "0005_motion_grid.sql",
-            include_str!("../../../db/migrations/0005_motion_grid.sql"),
-        ),
-        (
-            "0006_motion_grid_score.sql",
-            include_str!("../../../db/migrations/0006_motion_grid_score.sql"),
-        ),
-        (
-            "0007_detection_events.sql",
-            include_str!("../../../db/migrations/0007_detection_events.sql"),
-        ),
-        (
-            "0008_segments_repair.sql",
-            include_str!("../../../db/migrations/0008_segments_repair.sql"),
-        ),
-        (
-            "0009_segments_indexes.sql",
-            include_str!("../../../db/migrations/0009_segments_indexes.sql"),
-        ),
-        (
-            "0010_bookmarks.sql",
-            include_str!("../../../db/migrations/0010_bookmarks.sql"),
-        ),
-        (
-            "0011_segments_storage_idx.sql",
-            include_str!("../../../db/migrations/0011_segments_storage_idx.sql"),
-        ),
-        (
-            "0012_server_settings_and_camera_ownership.sql",
-            include_str!("../../../db/migrations/0012_server_settings_and_camera_ownership.sql"),
-        ),
-        (
-            "0013_segments_indexes.sql",
-            include_str!("../../../db/migrations/0013_segments_indexes.sql"),
-        ),
-        (
-            "0014_frigate_api_split.sql",
-            include_str!("../../../db/migrations/0014_frigate_api_split.sql"),
-        ),
-        (
-            "0015_notifications.sql",
-            include_str!("../../../db/migrations/0015_notifications.sql"),
-        ),
-        (
-            "0016_motion_baseline.sql",
-            include_str!("../../../db/migrations/0016_motion_baseline.sql"),
-        ),
-        (
-            "0017_notification_settings.sql",
-            include_str!("../../../db/migrations/0017_notification_settings.sql"),
-        ),
-        (
-            "0018_consolidate_runtime_ensure_ddl.sql",
-            include_str!("../../../db/migrations/0018_consolidate_runtime_ensure_ddl.sql"),
-        ),
-        (
-            "0019_camera_effective_policy_view.sql",
-            include_str!("../../../db/migrations/0019_camera_effective_policy_view.sql"),
-        ),
-        (
-            "0020_grouped_cameras_clear_override.sql",
-            include_str!("../../../db/migrations/0020_grouped_cameras_clear_override.sql"),
-        ),
-        (
-            "0021_grouped_camera_no_override_trigger.sql",
-            include_str!("../../../db/migrations/0021_grouped_camera_no_override_trigger.sql"),
-        ),
-        (
-            "0022_clip_source.sql",
-            include_str!("../../../db/migrations/0022_clip_source.sql"),
-        ),
-        (
-            "0023_clip_views.sql",
-            include_str!("../../../db/migrations/0023_clip_views.sql"),
-        ),
-        (
-            "0024_clip_pre_roll.sql",
-            include_str!("../../../db/migrations/0024_clip_pre_roll.sql"),
-        ),
-        (
-            "0025_clip_motion_highlight.sql",
-            include_str!("../../../db/migrations/0025_clip_motion_highlight.sql"),
-        ),
-        (
-            "0026_segment_motion_bbox.sql",
-            include_str!("../../../db/migrations/0026_segment_motion_bbox.sql"),
-        ),
-        (
-            "0027_setup_complete.sql",
-            include_str!("../../../db/migrations/0027_setup_complete.sql"),
-        ),
-        (
-            "0028_roles.sql",
-            include_str!("../../../db/migrations/0028_roles.sql"),
-        ),
-        (
-            "0029_bookmarks_enabled.sql",
-            include_str!("../../../db/migrations/0029_bookmarks_enabled.sql"),
-        ),
-        (
-            "0030_view_owner.sql",
-            include_str!("../../../db/migrations/0030_view_owner.sql"),
-        ),
-        (
-            "0031_view_shares.sql",
-            include_str!("../../../db/migrations/0031_view_shares.sql"),
-        ),
-        (
-            "0032_system_alerts.sql",
-            include_str!("../../../db/migrations/0032_system_alerts.sql"),
-        ),
-        (
-            "0033_sessions.sql",
-            include_str!("../../../db/migrations/0033_sessions.sql"),
-        ),
-        (
-            "0034_frigate_heartbeat.sql",
-            include_str!("../../../db/migrations/0034_frigate_heartbeat.sql"),
-        ),
-        (
-            "0035_decode_status.sql",
-            include_str!("../../../db/migrations/0035_decode_status.sql"),
-        ),
-        (
-            "0036_embedded_go2rtc_api_base.sql",
-            include_str!("../../../db/migrations/0036_embedded_go2rtc_api_base.sql"),
-        ),
-        (
-            "0037_segment_motion_shadow.sql",
-            include_str!("../../../db/migrations/0037_segment_motion_shadow.sql"),
-        ),
-        (
-            "0038_motion_detector_unhealthy_alert.sql",
-            include_str!("../../../db/migrations/0038_motion_detector_unhealthy_alert.sql"),
-        ),
-        (
-            "0039_motion_cache_status.sql",
-            include_str!("../../../db/migrations/0039_motion_cache_status.sql"),
-        ),
-        (
-            "0040_motion_cache_unavailable_alert.sql",
-            include_str!("../../../db/migrations/0040_motion_cache_unavailable_alert.sql"),
-        ),
-        (
-            "0041_view_icon.sql",
-            include_str!("../../../db/migrations/0041_view_icon.sql"),
-        ),
-        (
-            "0042_policy_max_retention_days.sql",
-            include_str!("../../../db/migrations/0042_policy_max_retention_days.sql"),
-        ),
-        (
-            "0043_storage_persist_failed_alert.sql",
-            include_str!("../../../db/migrations/0043_storage_persist_failed_alert.sql"),
-        ),
-        (
-            "0044_beta_terms_acceptance.sql",
-            include_str!("../../../db/migrations/0044_beta_terms_acceptance.sql"),
-        ),
-        (
-            "0045_update_check.sql",
-            include_str!("../../../db/migrations/0045_update_check.sql"),
-        ),
-        (
-            "0046_scrub_pregen_settings.sql",
-            include_str!("../../../db/migrations/0046_scrub_pregen_settings.sql"),
-        ),
-        (
-            "0047_camera_device_info.sql",
-            include_str!("../../../db/migrations/0047_camera_device_info.sql"),
-        ),
-        (
-            "0048_ha_integration.sql",
-            include_str!("../../../db/migrations/0048_ha_integration.sql"),
-        ),
-        (
-            "0049_additive_motion_sources.sql",
-            include_str!("../../../db/migrations/0049_additive_motion_sources.sql"),
-        ),
-    ];
-
     // Baseline filenames: 0001–0011 are marked applied on an existing DB to
     // avoid re-running them.
     const BASELINE_FILENAMES: &[&str] = &[
@@ -8290,9 +8588,12 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
     // silently NEVER rebuilt, so queries either misbehave (a stale/partial
     // index is never used by the planner, which is safe but slow) or, for the
     // UNIQUE index, future inserts lose the duplicate-prevention guarantee
-    // entirely. Drop-and-let-the-migration-below-recreate-it is safe here
-    // because we hold [`RUN_MIGRATIONS_LOCK_KEY`] for the whole call, so no
-    // other process can be mid-build on the same name.
+    // entirely. Dropping is safe (we hold [`RUN_MIGRATIONS_LOCK_KEY`], and an
+    // INVALID index guaranteed nothing to begin with) but only self-HEALING
+    // when the index's migration is still pending in the loop below — an
+    // already-recorded migration never re-runs, so its dropped index must be
+    // recreated manually (see [`reap_invalid_indexes`] docs; the WARN it logs
+    // says so).
     reap_invalid_indexes(&client).await?;
 
     // 3. Apply each migration not yet in schema_migrations.
@@ -8376,11 +8677,20 @@ async fn run_migrations_locked(pool: &Pool) -> Result<()> {
                     format!("run_migrations: apply (concurrently stmt) {filename}")
                 })?;
             }
-            // Restore the pool default for the rest of this connection's life
-            // (it is about to be re-acquired fresh below anyway, but this
-            // keeps the invariant explicit rather than relying on that).
+            // Restore the POOL'S configured timeout for the rest of this
+            // connection's life. NOT `RESET`: `RESET statement_timeout`
+            // restores the Postgres SERVER default (typically 0 = disabled),
+            // not the 30s runaway-query backstop [`build_pool`]'s post-create
+            // hook set — the hook runs once per PHYSICAL connection at
+            // creation, not on every checkout, so this connection would
+            // return to the pool with NO statement timeout and a later
+            // hot-path query on it could hang indefinitely (exactly the
+            // pool-starvation hole the backstop exists to close). Re-issue
+            // the same value the hook set, via the shared
+            // [`pool_statement_timeout_ms`] source of truth.
+            let restore_ms = pool_statement_timeout_ms();
             client
-                .batch_execute("RESET statement_timeout")
+                .batch_execute(&format!("SET statement_timeout = '{restore_ms}ms'"))
                 .await
                 .context("run_migrations: restore statement_timeout after CONCURRENTLY")?;
         } else {
@@ -9823,6 +10133,200 @@ mod tests {
         assert_ne!(RUN_MIGRATIONS_LOCK_KEY, RECORDER_SINGLETON_LOCK_KEY);
     }
 
+    // ── migration-runner SQL-preprocessing invariants ────────────────────────
+    //
+    // `run_migrations_locked` does two ad-hoc textual transforms on every file
+    // in [`MIGRATIONS`] before sending it to Postgres:
+    //
+    //   1. it strips `--` line comments with a per-line `find("--")` that has
+    //      no quote awareness, and
+    //   2. it routes files containing CONCURRENTLY through a `split(';')`
+    //      statement splitter that likewise has no quote awareness.
+    //
+    // Those transforms are only correct if every migration file obeys a few
+    // lexical invariants. A future file that violates them would sail through
+    // review and CI and then fail AT PROD BOOT when the runner sends the
+    // corrupted SQL. The scanner below makes such a file fail `cargo test`
+    // instead. It deliberately does NOT touch the runner's preprocessor — it
+    // only rejects inputs the preprocessor cannot handle.
+
+    /// Scan one migration's SQL for constructs the runner's preprocessing
+    /// cannot handle. Returns `Err(description)` on the first violation:
+    ///
+    /// * `--` inside a single-quoted literal (the comment stripper would
+    ///   truncate the literal to end-of-line);
+    /// * `/*` block comment outside a literal (the stripper doesn't understand
+    ///   them; a `--` inside one would strip the closing `*/`);
+    /// * in a CONCURRENTLY file: any dollar-quoting, or a `;` inside a literal
+    ///   (the `;` splitter would split mid-statement);
+    /// * an unterminated quote of either kind.
+    ///
+    /// `--` inside a dollar-quoted body is allowed when it is a plpgsql line
+    /// comment (0018 has these): plpgsql shares SQL's comment-to-end-of-line
+    /// rule, so stripping it is semantics-preserving. Only a `--` inside a
+    /// quoted LITERAL (at either level) is corruption.
+    fn check_migration_parsing_invariants(
+        sql: &str,
+        concurrently: bool,
+    ) -> std::result::Result<(), String> {
+        let b = sql.as_bytes();
+        let mut i = 0usize;
+        let mut line = 1usize;
+        let mut in_line_comment = false;
+        let mut in_squote = false;
+        let mut dollar_tag: Option<&[u8]> = None;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\n' {
+                line += 1;
+            }
+            if in_line_comment {
+                if c == b'\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_squote {
+                if c == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2; // '' escape stays inside the literal
+                        continue;
+                    }
+                    in_squote = false;
+                    i += 1;
+                    continue;
+                }
+                if c == b'-' && b.get(i + 1) == Some(&b'-') {
+                    return Err(format!(
+                        "line {line}: `--` inside a single-quoted literal \
+                         (the runner's comment stripper would truncate it)"
+                    ));
+                }
+                if c == b';' && concurrently {
+                    return Err(format!(
+                        "line {line}: `;` inside a literal in a CONCURRENTLY \
+                         file (the runner's `;` splitter would split it)"
+                    ));
+                }
+                i += 1;
+                continue;
+            }
+            // Outside literals — identical handling whether or not we are
+            // inside a dollar-quoted body (plpgsql shares SQL's `--` comment
+            // and ''-escaped literal syntax, so the stripper is safe there).
+            match c {
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    in_line_comment = true;
+                    i += 2;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    return Err(format!(
+                        "line {line}: `/*` block comment (the runner's comment \
+                         stripper only understands `--` line comments)"
+                    ));
+                }
+                b'\'' => {
+                    in_squote = true;
+                    i += 1;
+                }
+                b'$' => {
+                    // Try to parse a `$tag$` dollar-quote delimiter.
+                    let mut j = i + 1;
+                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'$' {
+                        let tag = &b[i..=j];
+                        match dollar_tag {
+                            // Matching closer ends the body.
+                            Some(open) if open == tag => dollar_tag = None,
+                            // A different tag inside a body is plain text.
+                            Some(_) => {}
+                            None => {
+                                if concurrently {
+                                    return Err(format!(
+                                        "line {line}: dollar-quoting in a \
+                                         CONCURRENTLY file (the runner's `;` \
+                                         splitter would split inside the body)"
+                                    ));
+                                }
+                                dollar_tag = Some(tag);
+                            }
+                        }
+                        i = j + 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        if in_squote {
+            return Err("unterminated single-quoted literal".into());
+        }
+        if dollar_tag.is_some() {
+            return Err("unterminated dollar-quote".into());
+        }
+        Ok(())
+    }
+
+    /// Every registered migration must be processable by the runner's comment
+    /// stripper and CONCURRENTLY splitter — see the invariants on
+    /// [`check_migration_parsing_invariants`]. This is the CI tripwire for a
+    /// FUTURE migration file that would otherwise only fail at prod boot.
+    #[test]
+    fn migrations_satisfy_runner_parsing_invariants() {
+        for (filename, sql) in MIGRATIONS {
+            // Replicate the runner's CONCURRENTLY routing check byte-for-byte
+            // (strip `--` comments per line, then case-insensitive contains).
+            let stripped: String = sql
+                .lines()
+                .map(|l| l.find("--").map_or(l, |pos| &l[..pos]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let concurrently = stripped.to_ascii_uppercase().contains("CONCURRENTLY");
+            if let Err(violation) = check_migration_parsing_invariants(sql, concurrently) {
+                panic!(
+                    "{filename}: {violation} — the migration runner in db.rs \
+                     cannot preprocess this file safely; rewrite the SQL to \
+                     satisfy the invariant (see run_migrations_locked)"
+                );
+            }
+        }
+    }
+
+    /// The scanner itself must actually catch each class of violation —
+    /// otherwise the tripwire above is a no-op.
+    #[test]
+    fn migration_invariant_scanner_detects_violations() {
+        // `--` inside a quoted literal would be truncated by the stripper.
+        assert!(check_migration_parsing_invariants("SELECT 'a--b';", false).is_err());
+        // ... even when the literal is inside a dollar-quoted body.
+        let in_body = "DO $$ BEGIN PERFORM 'x--y'; END $$;";
+        assert!(check_migration_parsing_invariants(in_body, false).is_err());
+        // Block comments are not understood by the stripper.
+        assert!(check_migration_parsing_invariants("/* hi */ SELECT 1;", false).is_err());
+        // Dollar-quoting in a CONCURRENTLY file would be split on ';'.
+        assert!(check_migration_parsing_invariants("DO $$ BEGIN END $$;", true).is_err());
+        // `;` inside a literal in a CONCURRENTLY file would be split.
+        assert!(check_migration_parsing_invariants("SELECT 'a;b';", true).is_err());
+        // Unterminated literal.
+        assert!(check_migration_parsing_invariants("SELECT 'oops", false).is_err());
+
+        // Clean SQL passes: plpgsql `--` comments inside $$ bodies (0018's
+        // pattern), `''` escapes, `;` in plain statements, and `--` comment
+        // text containing apostrophes.
+        let clean = "-- it's fine\nDO $$ BEGIN -- note\n PERFORM 1; END $$;\nSELECT 'a''b';";
+        assert!(check_migration_parsing_invariants(clean, false).is_ok());
+        // Clean CONCURRENTLY SQL passes: plain statements + comments only
+        // (a `;` inside a comment is stripped before the splitter runs).
+        let conc = "-- build; carefully\nCREATE INDEX CONCURRENTLY i ON t (c);";
+        assert!(check_migration_parsing_invariants(conc, true).is_ok());
+    }
+
     // ── reap_invalid_indexes — throwaway-DB integration test ─────────────────
     //
     // Opt-in: skips (passes) unless `TEST_DATABASE_URL` points at a reachable
@@ -9928,6 +10432,21 @@ mod tests {
             .await
             .expect("create table + index");
 
+        // De-flake under `cargo test --workspace` parallelism (CI): the reap's
+        // `DROP INDEX` needs ACCESS EXCLUSIVE on `widgets`, and the only session
+        // that can otherwise contend for it on this test's private-schema table
+        // is autovacuum (SHARE UPDATE EXCLUSIVE, which conflicts). Under heavy
+        // parallel load a freshly created + catalog-UPDATE'd table can draw an
+        // autovacuum that holds that lock past the connection's `lock_timeout`,
+        // so the reap exhausts its retries and (correctly, safe-direction) SKIPS
+        // the drop — making this assertion flaky. Turning autovacuum off for the
+        // table removes the sole external lock contender so the drop is
+        // deterministic; it does not weaken what the test checks.
+        client
+            .batch_execute("ALTER TABLE widgets SET (autovacuum_enabled = false)")
+            .await
+            .expect("disable autovacuum on the fixture table");
+
         // Simulate the catalog state a killed CREATE INDEX CONCURRENTLY
         // leaves behind: the index exists but is marked NOT VALID.
         client
@@ -9950,22 +10469,42 @@ mod tests {
             .get(0);
         assert!(still_present_before, "fixture setup: index should exist");
 
-        reap_invalid_indexes(&client)
+        // De-flake under `cargo test --workspace`: this test races ~16 parallel
+        // DDL-heavy tests on a single Postgres, so a reap pass can hit transient
+        // contention and (correctly, safe-direction) SKIP the drop that pass.
+        // The production reaper runs on EVERY boot, so the real contract is
+        // "drops within a few passes", not "drops on the very first". Use a short
+        // per-attempt lock_timeout so a contended pass fails fast instead of
+        // stalling, and retry the idempotent reap until the index is gone.
+        // (Disabling autovacuum on the fixture table above was not enough on its
+        // own — the remaining contention is catalog-wide from the parallel DDL.)
+        client
+            .batch_execute("SET lock_timeout = '1s'")
             .await
-            .expect("reap_invalid_indexes");
+            .expect("shorten lock_timeout for the reap retries");
 
-        let still_present_after: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
-                &[],
-            )
-            .await
-            .expect("check index exists after reap")
-            .get(0);
+        let mut still_present_after = true;
+        for _ in 0..40 {
+            reap_invalid_indexes(&client)
+                .await
+                .expect("reap_invalid_indexes");
+            still_present_after = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                    &[],
+                )
+                .await
+                .expect("check index exists after reap")
+                .get(0);
+            if !still_present_after {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         assert!(
             !still_present_after,
-            "reap_invalid_indexes must DROP an INVALID index so a later \
-             CREATE INDEX IF NOT EXISTS rebuilds it"
+            "reap_invalid_indexes must DROP an INVALID index (within a few \
+             passes) so a later CREATE INDEX IF NOT EXISTS rebuilds it"
         );
 
         // A VALID index must be left completely alone.
@@ -9987,6 +10526,107 @@ mod tests {
         assert!(
             valid_index_survives,
             "reap_invalid_indexes must never touch a VALID index"
+        );
+    }
+
+    /// An INVALID index whose locks are HELD by another session must be
+    /// skipped (with a WARN), not dropped and not turned into a boot-failing
+    /// error — this is the "operator's manual CREATE INDEX CONCURRENTLY is
+    /// running right now" protection (guard 2 in [`reap_invalid_indexes`]'s
+    /// docs).
+    ///
+    /// A real in-progress CONCURRENTLY build can't be reproduced
+    /// deterministically in a test (and guard 1's
+    /// `pg_stat_progress_create_index` row can't be faked — it is a stat
+    /// view, not a table), so this simulates the lock footprint instead: a
+    /// second session holds `SHARE UPDATE EXCLUSIVE` on the table, which is
+    /// exactly the table lock a live `CREATE INDEX CONCURRENTLY` holds, and
+    /// which conflicts with the `ACCESS EXCLUSIVE` that `DROP INDEX` needs.
+    /// The reaper must hit its `lock_timeout`, map the `55P03` to
+    /// skip-and-warn, and reap successfully on the next pass once the lock
+    /// is released.
+    #[tokio::test]
+    async fn reap_invalid_indexes_skips_lock_held_index() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        let client = get_conn(&fx.pool).await.expect("get_conn");
+
+        client
+            .batch_execute(
+                r"
+                CREATE TABLE widgets (id int PRIMARY KEY, name text);
+                CREATE INDEX widgets_name_idx ON widgets (name);
+                UPDATE pg_index SET indisvalid = false
+                WHERE indexrelid = 'widgets_name_idx'::regclass;
+                ",
+            )
+            .await
+            .expect("create table + invalid index");
+
+        // Second session: hold the table lock a live CREATE INDEX
+        // CONCURRENTLY would hold, in an open transaction.
+        let (holder, holder_conn) = tokio_postgres::connect(&fx.base_url, NoTls)
+            .await
+            .expect("connect lock-holder session");
+        tokio::spawn(holder_conn);
+        holder
+            .batch_execute(&format!(
+                "BEGIN; LOCK TABLE {}.widgets IN SHARE UPDATE EXCLUSIVE MODE",
+                fx.schema
+            ))
+            .await
+            .expect("hold SHARE UPDATE EXCLUSIVE on widgets");
+
+        // Shorten the reaper connection's lock_timeout (pool default is 10s)
+        // so the blocked DROP fails fast and the test stays quick. Session-
+        // level SET, same mechanism the pool's post-create hook uses.
+        client
+            .batch_execute("SET lock_timeout = '500ms'")
+            .await
+            .expect("shorten lock_timeout for test");
+
+        // Must return Ok (skip-and-warn), and must NOT have dropped the
+        // lock-held index.
+        reap_invalid_indexes(&client)
+            .await
+            .expect("reap_invalid_indexes must skip a lock-held index, not error");
+        let survives_while_locked: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                &[],
+            )
+            .await
+            .expect("check index survives while locked")
+            .get(0);
+        assert!(
+            survives_while_locked,
+            "reap_invalid_indexes must NOT drop an INVALID index whose locks \
+             are held by another session (a live manual CONCURRENTLY build)"
+        );
+
+        // Release the lock; the next boot's reap pass now truly reaps it.
+        holder
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("release lock");
+        reap_invalid_indexes(&client)
+            .await
+            .expect("reap_invalid_indexes (lock released)");
+        let still_present_after_release: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'widgets_name_idx')",
+                &[],
+            )
+            .await
+            .expect("check index reaped after lock release")
+            .get(0);
+        assert!(
+            !still_present_after_release,
+            "once the blocking session is gone, the orphaned INVALID index \
+             must be reaped on the next pass"
         );
     }
 
@@ -10348,6 +10988,130 @@ mod tests {
             s.cache_ttl_seconds,
             Some(31_536_000),
             "must clamp to the 1-year ceiling"
+        );
+    }
+
+    // ── ONVIF source_url parsing + backfill (#ONVIF-Identify) ────────────────
+
+    #[test]
+    fn parse_onvif_source_full() {
+        let p = parse_onvif_source("onvif://admin:s3cr3t@192.0.2.5:8000").expect("parse");
+        assert_eq!(p.host, "192.0.2.5");
+        assert_eq!(p.port, Some(8000));
+        assert_eq!(p.user.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn parse_onvif_source_no_port_defaults_to_none() {
+        // No port ⇒ None (the caller applies the ONVIF default of 80).
+        let p = parse_onvif_source("onvif://admin:pw@192.0.2.6").expect("parse");
+        assert_eq!(p.host, "192.0.2.6");
+        assert_eq!(p.port, None);
+        assert_eq!(p.user.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn parse_onvif_source_percent_decodes_userinfo() {
+        // A `%40` in the password decodes to `@`; the LAST `@` still splits
+        // userinfo from host, so the encoded one stays inside the password.
+        let p = parse_onvif_source("onvif://user:p%40ss@cam.example.com:80/path?subtype=1")
+            .expect("parse");
+        assert_eq!(p.host, "cam.example.com");
+        assert_eq!(p.port, Some(80));
+        assert_eq!(p.user.as_deref(), Some("user"));
+        assert_eq!(p.password.as_deref(), Some("p@ss"));
+    }
+
+    #[test]
+    fn parse_onvif_source_ignores_path_and_query() {
+        let p = parse_onvif_source("onvif://192.0.2.9?subtype=MediaProfile00000").expect("parse");
+        assert_eq!(p.host, "192.0.2.9");
+        assert_eq!(p.port, None);
+        assert_eq!(p.user, None);
+        assert_eq!(p.password, None);
+    }
+
+    #[test]
+    fn parse_onvif_source_rejects_non_onvif_and_empty() {
+        assert!(parse_onvif_source("rtsp://admin:pw@192.0.2.2:554/cam").is_none());
+        assert!(parse_onvif_source("onvif://").is_none());
+        assert!(parse_onvif_source("onvif://user@").is_none());
+    }
+
+    #[tokio::test]
+    async fn backfill_onvif_from_source_fills_empty_columns() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        let client = get_conn(&fx.pool).await.expect("get_conn");
+
+        // A minimal `cameras` table with only the columns the backfill reads and
+        // writes. The isolated per-test schema can't run the full `run_migrations`
+        // (its catalog-scoped ensure queries clash across concurrent test schemas
+        // — the same reason `reap_invalid_indexes_*` builds its own table), so we
+        // stand up just what this behaviour needs. `gen_random_uuid()` is built in
+        // on the Postgres 16 test server.
+        client
+            .batch_execute(
+                "CREATE TABLE cameras (\
+                     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), \
+                     source_url text, \
+                     onvif_host text, onvif_port int, \
+                     onvif_user text, onvif_password text)",
+            )
+            .await
+            .expect("create minimal cameras table");
+        // The shape of an ONVIF-discovered camera predating the column split: its
+        // ONVIF endpoint lives ONLY in the onvif:// source_url, columns empty.
+        let cam_id: Uuid = client
+            .query_one(
+                "INSERT INTO cameras (source_url) \
+                 VALUES ('onvif://admin:s3cr3t%40x@192.0.2.9:8000') RETURNING id",
+                &[],
+            )
+            .await
+            .expect("insert onvif-sourced camera")
+            .get(0);
+
+        assert_eq!(
+            backfill_onvif_from_source(&fx.pool)
+                .await
+                .expect("backfill"),
+            1,
+            "the one onvif-sourced camera with an empty host must be repaired"
+        );
+        let row = client
+            .query_one(
+                "SELECT onvif_host, onvif_port, onvif_user, onvif_password FROM cameras WHERE id = $1",
+                &[&cam_id],
+            )
+            .await
+            .expect("re-read camera");
+        assert_eq!(
+            row.get::<_, Option<String>>("onvif_host").as_deref(),
+            Some("192.0.2.9")
+        );
+        assert_eq!(row.get::<_, Option<i32>>("onvif_port"), Some(8000));
+        assert_eq!(
+            row.get::<_, Option<String>>("onvif_user").as_deref(),
+            Some("admin")
+        );
+        // %40 in the source decoded to '@' in the stored password.
+        assert_eq!(
+            row.get::<_, Option<String>>("onvif_password").as_deref(),
+            Some("s3cr3t@x")
+        );
+
+        // Idempotent: a second run finds nothing left to repair.
+        assert_eq!(
+            backfill_onvif_from_source(&fx.pool)
+                .await
+                .expect("backfill again"),
+            0,
+            "backfill must not touch already-populated hosts"
         );
     }
 }

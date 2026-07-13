@@ -968,6 +968,12 @@ pub struct CameraDecodeStatusDto {
     pub fallback_reason: Option<String>,
     /// When the recorder last (re)started this camera's decode child.
     pub updated_at: DateTime<Utc>,
+    /// Source audio sample rate (Hz) probed at record start; `null` if unknown /
+    /// no audio / no status row yet.
+    pub audio_sample_rate: Option<i32>,
+    /// `true` when the recorder is re-encoding this camera's audio to 48 kHz AAC
+    /// (source rate > 48 kHz), `false` when bit-exact copied, `null` when unknown.
+    pub audio_transcoding: Option<bool>,
 }
 
 /// `GET /config/decode-status` response — what the recorder is ACTUALLY using
@@ -1210,6 +1216,13 @@ pub struct LiveStreamsResponse {
     pub rtsp_main_url: String,
     /// RTSP URL for the sub stream (same credential note as `rtsp_main_url`).
     pub rtsp_sub_url: Option<String>,
+    /// RTSP URL for the on-demand mobile transcode (`<name>_mobile`) — a low-res
+    /// H.264 variant produced by go2rtc only while a consumer is connected, for a
+    /// cellular "Data saver" fullscreen-live mode. `None` when the feature is
+    /// disabled (`MOBILE_STREAM_ENABLED=false`) or the camera is Frigate-served
+    /// (its go2rtc is a separate BYO instance Crumb does not manage). Same
+    /// embedded-credential + sensitivity note as `rtsp_main_url`.
+    pub rtsp_mobile_url: Option<String>,
 }
 
 // ─── export ───────────────────────────────────────────────────────────────────

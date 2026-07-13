@@ -221,6 +221,10 @@ authenticated with `GO2RTC_USER`/`GO2RTC_PASS`. Don't add a host port for it.
 (Upgrading an install that predates the embedding? `docker compose up -d
 --remove-orphans` removes the old standalone go2rtc container.)
 
+The `recorder` service sets `stop_grace_period: 90s` — its clean shutdown
+finalizes in-flight segments and storage-migration batches, and Docker's
+default 10 s grace would SIGKILL it mid-teardown. Don't remove or shorten it.
+
 Two more things run by default and need no action: the **nightly Postgres
 dump built into the `api` service** (no separate container, see Step 8) and
 the migrations/first-run seed baked into `recorder`/`api` startup.

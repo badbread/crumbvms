@@ -100,6 +100,7 @@ mod ptz;
 mod rate_limit;
 mod roles;
 mod scrub_settings;
+mod segment_low;
 mod state;
 mod stats;
 mod status;
@@ -224,6 +225,18 @@ async fn main() -> anyhow::Result<()> {
     // boot ahead of the recorder and 500 every camera read until 0012 lands.
     if let Err(e) = crumb_common::db::ensure_camera_ownership_columns(&pool).await {
         tracing::warn!(error = %e, "ensure_camera_ownership_columns failed (camera reads may 500 until migration 0012 is applied)");
+    }
+    // Mirror ONVIF host/creds from an `onvif://` source_url into the dedicated
+    // onvif_* columns for cameras discovered before they were split out (they'd
+    // otherwise have Identify / Re-detect / PTZ disabled despite working ONVIF
+    // creds in the source). Runs AFTER the ownership/ONVIF columns exist above.
+    // Non-fatal + idempotent; streaming is unaffected (go2rtc uses source_url).
+    match crumb_common::db::backfill_onvif_from_source(&pool).await {
+        Ok(n) if n > 0 => tracing::info!(repaired = n, "backfilled ONVIF columns from source_url"),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "backfill_onvif_from_source failed (ONVIF-discovered cameras may have Identify/PTZ disabled)");
+        }
     }
     if let Err(e) = crumb_common::db::ensure_detection_columns(&pool).await {
         tracing::warn!(error = %e, "ensure_detection_columns failed (detection events may be unavailable until migration 0007 is applied)");
@@ -481,6 +494,7 @@ async fn main() -> anyhow::Result<()> {
 
     let media_routes = Router::new()
         .merge(playback::routes())
+        .merge(segment_low::routes())
         .merge(export::routes())
         .merge(filmstrip::routes())
         // On-demand DB-vs-disk size verification: a filesystem walk that can run

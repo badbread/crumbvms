@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.NavigateNext
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -54,6 +56,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -76,7 +79,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.SeekParameters
 import android.view.TextureView
@@ -101,8 +106,10 @@ import video.crumb.app.ui.player.MediaFactory
 import video.crumb.app.ui.player.PlayerSurface
 import video.crumb.app.ui.player.ViewTransform
 import video.crumb.app.ui.player.ZoomableVideoSurface
+import video.crumb.app.feature.live.rememberIsMetered
 import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.NavySurface
+import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
 import java.time.Instant
 
@@ -112,8 +119,47 @@ import java.time.Instant
  * Segments are short (~4s), so this needs enough lead time for a resolve
  * round-trip on a slow link, without firing so early it refetches needlessly
  * on every short segment.
+ *
+ * Raised from 2 s to hide one more resolve+fetch round-trip on a slow link (on a
+ * LAN, resolves are instant so this changes nothing). Keep in sync with
+ * [PlaybackViewModel]'s own `PREFETCH_LEAD_MS`.
  */
-private const val PREFETCH_LEAD_MS_SCREEN = 2_000L
+private const val PREFETCH_LEAD_MS_SCREEN = 3_500L
+
+/**
+ * Playback quality selector values, persisted as a string in `SecureStore`.
+ *
+ * - [AUTO] (default): full on Wi-Fi/unmetered, [DATA_SAVER] on metered/cellular.
+ * - [FULL]: always the recorded main-stream bytes (`/segments/{id}`).
+ * - [DATA_SAVER]: always the server's on-demand 640p transcode
+ *   (`/segments/{id}/low.mp4`).
+ */
+object PlaybackQuality {
+    const val AUTO = "auto"
+    const val FULL = "full"
+    const val DATA_SAVER = "low"
+
+    /** Cycle order for the one-tap selector: Auto → Full → Data saver → Auto. */
+    fun next(current: String): String = when (current) {
+        AUTO -> FULL
+        FULL -> DATA_SAVER
+        else -> AUTO
+    }
+
+    /** Short label for the selector's tooltip / hint. */
+    fun label(current: String): String = when (current) {
+        FULL -> "Quality: Full"
+        DATA_SAVER -> "Quality: Data saver"
+        else -> "Quality: Auto"
+    }
+
+    /** Compact badge text for the in-bar chip. */
+    fun short(current: String): String = when (current) {
+        FULL -> "HD"
+        DATA_SAVER -> "SD"
+        else -> "AUTO"
+    }
+}
 
 /**
  * Full-screen single-camera recorded-playback screen.
@@ -230,11 +276,64 @@ fun PlaybackScreen(
     var bookmarkAtMs by remember { mutableLongStateOf(0L) }
 
     // ── ExoPlayer setup ─────────────────────────────────────────────────────────
+    // newPlaybackPlayer declares media audio attributes (#106) and a WAN-tuned
+    // buffer, unlike the muted live-wall tiles. Audio focus is applied below only
+    // while sound is ON.
     val player = remember {
-        MediaFactory.newPlayer(context).apply {
+        MediaFactory.newPlaybackPlayer(context).apply {
             setSeekParameters(SeekParameters.EXACT) // frame-accurate stepping
         }
     }
+
+    // Recorded-playback audio on/off (mirrors the fullscreen live view's toggle).
+    // Seeded from SecureStore (default OFF — reviewing footage is silent until the
+    // operator asks for sound) and persisted on every change. A segment recorded
+    // without an audio track just plays silent when this is on — no crash.
+    val store = container.store
+    var audioOn by remember { mutableStateOf(store.playbackAudioOn) }
+    // Drive volume from the toggle, and request audio focus ONLY while sound is on
+    // (so a silent scrub-through doesn't pause the user's music — Fable MED#3).
+    LaunchedEffect(player, audioOn) {
+        player.setAudioAttributes(MediaFactory.playbackAudioAttributes, /* handleAudioFocus = */ audioOn)
+        player.volume = if (audioOn) 1f else 0f
+    }
+    // Re-assert the intended volume across media transitions AND whenever the
+    // player-level volume changes out from under us (#106). The reported symptom is
+    // the AudioTrack going to volume 0 mid-playback while the toggle is on; whatever
+    // drives that, onVolumeChanged catches it and restores the intended level. The
+    // write converges (setting volume to the intended value re-fires onVolumeChanged
+    // with a matching value, which is then a no-op), so there is no feedback loop.
+    val currentAudioOn by rememberUpdatedState(audioOn)
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            private fun reassert() {
+                val intended = if (currentAudioOn) 1f else 0f
+                if (player.volume != intended) player.volume = intended
+            }
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = reassert()
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) reassert()
+            }
+            override fun onAudioSessionIdChanged(audioSessionId: Int) = reassert()
+            override fun onVolumeChanged(volume: Float) = reassert()
+        }
+        player.addListener(listener)
+        onDispose { player.removeListener(listener) }
+    }
+
+    // ── Playback quality (Auto / Full / Data saver) ─────────────────────────────
+    // Auto (default) = full on unmetered, low on metered/cellular; Full = always
+    // the recorded main-stream bytes; Data saver = always the server's on-demand
+    // 640p `low.mp4` transcode. The chosen "low" decision drives which segment URL
+    // the ViewModel builds (see PlaybackViewModel.setLowQuality).
+    var quality by remember { mutableStateOf(store.playbackQuality) }
+    val isMetered by rememberIsMetered()
+    val useLow = when (quality) {
+        PlaybackQuality.FULL -> false
+        PlaybackQuality.DATA_SAVER -> true
+        else -> isMetered // AUTO
+    }
+    LaunchedEffect(useLow) { vm.setLowQuality(useLow) }
 
     // Frame step (paused): nudge the player by ~one frame within the current
     // segment. We derive the frame interval from the decoded stream's actual frame
@@ -429,6 +528,21 @@ fun PlaybackScreen(
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
+                // Fall back off the low variant ONLY when the `/low.mp4` URL itself
+                // HTTP-errored (server has no such endpoint, or a transcode 5xx'd).
+                // A generic error — expired media token, a transient network blip —
+                // must NOT permanently disable Data saver for the session (Fable
+                // HIGH#1); the normal re-resolve below already refreshes the token.
+                var c: Throwable? = error
+                var badLowUrl = false
+                while (c != null) {
+                    if (c is HttpDataSource.InvalidResponseCodeException) {
+                        badLowUrl = c.dataSpec.uri.toString().contains("/low.mp4")
+                        break
+                    }
+                    c = c.cause
+                }
+                if (badLowUrl) vm.noteLowQualityFailed()
                 vm.onPlayerError()
             }
         }
@@ -606,6 +720,43 @@ fun PlaybackScreen(
                         }
                     }
                 },
+                // Audio on/off toggle lives here (portrait): a primary, always-
+                // visible control docked in the app bar, out of the video — NOT a
+                // floating overlay that lands over the footage on a letterboxed
+                // pane. Only meaningful once a segment is resolved to hear.
+                actions = {
+                    // Quality selector (Auto / Full / Data saver) — always visible so
+                    // the operator can pick a cellular-friendly stream before playing.
+                    HintTooltip(PlaybackQuality.label(quality)) {
+                        IconButton(
+                            onClick = {
+                                quality = PlaybackQuality.next(quality)
+                                store.playbackQuality = quality
+                            },
+                        ) {
+                            Text(
+                                text = PlaybackQuality.short(quality),
+                                color = if (quality == PlaybackQuality.AUTO) Color.White else TealAccent,
+                            )
+                        }
+                    }
+                    if (state.currentSegment != null) {
+                        HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
+                            IconButton(
+                                onClick = {
+                                    audioOn = !audioOn
+                                    store.playbackAudioOn = audioOn
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                    contentDescription = if (audioOn) "Mute audio" else "Play audio",
+                                    tint = if (audioOn) TealAccent else Color.White,
+                                )
+                            }
+                        }
+                    }
+                },
                 // Snapshot + Bookmark moved OUT of the app bar into the transport's
                 // 3-dot overflow menu (portrait), keeping the bar uncluttered and the
                 // secondary actions grouped where the user controls playback.
@@ -734,6 +885,9 @@ fun PlaybackScreen(
                         }
                     }
                 }
+                // (Audio toggle: portrait → top app bar actions; landscape → inline
+                // on the transport row below, next to Snapshot/Bookmark. It is NOT
+                // floated over the video in either orientation.)
             }
 
             // ── PINNED transport bar (controls + timeline) at the bottom ──────────
@@ -766,6 +920,21 @@ fun PlaybackScreen(
                     onSnapshot = onSnapshot,
                     // null hides the bookmark control (transport uses onBookmark?.let)
                     onBookmark = if (bookmarksEnabled) onBookmark else null,
+                    // Landscape hosts the audio toggle inline on this row (portrait
+                    // uses the app bar). Gate on a resolved segment, same as portrait.
+                    audioOn = audioOn,
+                    onToggleAudio = if (state.currentSegment != null) {
+                        { audioOn = !audioOn; store.playbackAudioOn = audioOn }
+                    } else {
+                        null
+                    },
+                    // Landscape hosts the quality selector inline too (portrait uses
+                    // the app bar).
+                    quality = quality,
+                    onCycleQuality = {
+                        quality = PlaybackQuality.next(quality)
+                        store.playbackQuality = quality
+                    },
                     // Portrait can't fit every control inline (the snapshot button was
                     // being clipped), so the SECONDARY actions (snapshot, bookmark,
                     // jump-to-time, speed) collapse into a 3-dot overflow menu. In
@@ -858,6 +1027,14 @@ private fun PlaybackControls(
     useOverflowMenu: Boolean = false,
     onSnapshot: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
+    // Audio toggle rides inline on the landscape transport row (in portrait it
+    // lives in the top app bar instead). null hides it.
+    audioOn: Boolean = false,
+    onToggleAudio: (() -> Unit)? = null,
+    // Quality selector (Auto/Full/Data saver) rides inline on the landscape row
+    // too. null hides it (portrait uses the app bar chip).
+    quality: String = PlaybackQuality.AUTO,
+    onCycleQuality: (() -> Unit)? = null,
 ) {
     // Landscape is vertically cramped, so the transport runs a notch smaller there
     // (this is what "shrinks the play/pause bar"). Portrait keeps its roomier sizes.
@@ -1037,13 +1214,39 @@ private fun PlaybackControls(
 
             // Snapshot + Bookmark share this transport row in landscape (the app bar
             // is hidden there). In portrait they live in the overflow menu above.
-            if (onSnapshot != null || onBookmark != null) {
+            if (onSnapshot != null || onBookmark != null || onToggleAudio != null || onCycleQuality != null) {
                 Spacer(Modifier.width(6.dp))
                 onSnapshot?.let {
                     SmallControl(Icons.Default.PhotoCamera, "Snapshot", ctlSize, ctlIcon, it)
                 }
                 onBookmark?.let {
                     SmallControl(Icons.Default.BookmarkAdd, "Add bookmark", ctlSize, ctlIcon, it)
+                }
+                // Quality selector (Auto/Full/Data saver) — a compact text chip
+                // matching the portrait app-bar control.
+                onCycleQuality?.let { cycle ->
+                    HintTooltip(PlaybackQuality.label(quality)) {
+                        IconButton(onClick = cycle, modifier = Modifier.size(ctlSize)) {
+                            Text(
+                                text = PlaybackQuality.short(quality),
+                                color = if (quality == PlaybackQuality.AUTO) Color.White else TealAccent,
+                            )
+                        }
+                    }
+                }
+                // Audio on/off — same row as Snapshot/Bookmark in landscape (teal
+                // when on), instead of a float that lands over the video.
+                onToggleAudio?.let { toggle ->
+                    HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
+                        IconButton(onClick = toggle, modifier = Modifier.size(ctlSize)) {
+                            Icon(
+                                imageVector = if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                contentDescription = if (audioOn) "Mute audio" else "Play audio",
+                                tint = if (audioOn) TealAccent else Color.White,
+                                modifier = Modifier.size(ctlIcon),
+                            )
+                        }
+                    }
                 }
             }
         }

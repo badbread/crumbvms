@@ -121,3 +121,86 @@ recorder, and later the API) must satisfy these *by construction*.
     (a human pin outranks the automatic cap); and batch-limited so first enabling a
     short cap converges over ticks instead of one mass delete. When set it can only
     remove footage *sooner* than the other knobs would, never keep it longer.
+
+## declared tracks must carry decodable packets, on every client (audio-integrity)
+23. **A recorded segment MUST contain decodable media PACKETS for every track it
+    declares — and those packets must be decodable AND sample-continuous on EVERY
+    client, not just desktop.** The recorder ALWAYS re-encodes audio (when
+    `record_audio`): `-af aresample=async=1:first_pts=0 -c:a aac -ar 48000`
+    (`audio_segmenter_args`; docs/DECISIONS.md 2026-07-13, superseding the
+    2026-07-12 copy-when-safe split). This guards two failure modes that a
+    bit-exact `-c:a copy` could not:
+    - **Sample-continuity (the reason for the 2026-07-13 change).** A copy
+      preserves the camera's audio *timeline* verbatim; cheap camera audio clocks
+      drift ~1 %, so the container timestamps promise more time than the AAC frames
+      deliver (~32 ms/segment). ExoPlayer's `DefaultAudioSink` requires
+      sample-continuous audio and, once accumulated drift crosses ~200 ms, throws
+      `UnexpectedDiscontinuityException`; since the audio renderer is the master
+      clock the position lurches and playback wedges (silent audio, stalled video)
+      — a 48 kHz copy plays silent on Android. `aresample=async=1` resamples onto a
+      strictly continuous lattice (fills genuine gaps with silence, preserving A/V
+      alignment): measured 0/192 discontinuous frames after vs 61/62 before. A
+      plain re-encode WITHOUT `aresample` still left 75/187 (it inherits the jittery
+      input frame PTS), so `aresample=async` is load-bearing, not decorative.
+    - **Cross-client playability.** Re-encoding to a universal 48 kHz AAC also
+      covers cameras whose native rate (64/88.2/96 kHz) Android's hardware/`c2`
+      decoders reject outright (`MediaCodecInfo: NoSupport [sampleRate.support,
+      64000]` → silent). One re-encode fixes both.
+
+    No `-copyinkf:a` any more: it only mattered for the `-c copy` keyframe gate
+    (RTP-AAC is never key-flagged → a bare copy declared a zero-packet track). The
+    re-encode decodes from PCM, so there is no keyframe gate. Video always stays a
+    bit-exact copy (the audio args override only audio; they do NOT touch the fMP4
+    crash-safety flags, item 1). **The export path is separate:**
+    `services/api/src/export.rs` still `-c:a copy`s — now against a *clean*
+    re-encoded source for new footage (so exports of new footage inherit the good
+    timeline for free); normalizing export itself remains a follow-up for
+    copy-path-era footage. Detector: `audio_segmenter_args` is unit-tested (always
+    AAC/48 k/`aresample` when recording, `-an` otherwise); any integration check
+    should assert both `nb_read_packets > 0` AND uniform audio packet deltas.
+
+## free-space floor (ENOSPC safety valve)
+24. **The floor keys off free space AVAILABLE to the recorder, and its response
+    must actually FREE bytes.** Read `statvfs` `f_bavail`/`f_frsize`, NOT `f_bfree`
+    (which includes the ext4 root reserve the non-root recorder cannot use, so the
+    valve would never fire). When the floor is in deficit, an archive-move that
+    lands on the SAME filesystem as the deficit disk frees nothing — on the default
+    compose layout that let the disk fill to 100% and ENOSPC-halt recording. So the
+    deficit path DELETES the oldest live segment (a narrow, loud exception to item
+    7, in the spirit of item 22) when — and only when — the segment's storage
+    shares the archive filesystem AND the deficit filesystem (`st_dev` identity); a
+    segment on any other disk falls through to the normal footage-preserving move.
+    Oldest-first, protected bookmarks excluded, file-then-row (10), serialized on
+    `ARCHIVE_GUARD` (8), and a `premature_rollover` event fires so the loss is
+    visible. See `docs/DECISIONS.md` (2026-07-12).
+
+## fail-open across every seam (extends item 19)
+25. **Fail-open state survives reconnect and stays consistent through an unhealthy
+    window.** `MotionBuffer`/`MotionUnion`/`pending_signals` are worker-lifetime
+    (carried across an ffmpeg reconnect; the R1 cache sweep spares carried pre-roll
+    via a keep-set; a flip-guard blocks a cache/storage-flavour self-copy-truncate),
+    so a reconnect mid-event never drops the tail. Through a frozen window the union
+    is kept in sync — edges fold, the newest is stashed and replayed on thaw, and a
+    replayed STOP onto an Idle buffer enters `PostBuffer` so a full event inside the
+    window keeps its post-roll. Do NOT add a blind time-based `MotionUnion` expiry:
+    it cannot tell a lost STOP from a genuinely-long event and on a multi-source
+    camera would discard footage a healthy source is still asserting (the wedge is
+    covered footage-safe by the loss-debt fail-open + source supervision instead).
+26. **A detector is HEALTHY only when it can produce a keep/discard verdict.** The
+    Frigate source reports healthy on a GRANTED MQTT SubAck, never on ConnAck (a
+    denied subscription is "healthy forever, zero events"); the pixel detector only
+    after warm-up; a panicked source task is supervised and immediately reads
+    unhealthy → fail-open; a `MotionSignal` dropped on a full channel flips the
+    source to fail-open via an interposed health watch (never silently lost).
+
+## stall watchdog & boot reap
+27. **The segment-receipt stall watchdog is anchored to the last received segment,
+    not a per-`select!`-iteration timeout.** A co-scheduled telemetry tick shorter
+    than the timeout must not be able to rebuild/reset the deadline every loop — that
+    left a half-open stream recording nothing indefinitely. It is a dedicated select
+    arm on `sleep_until(last_segment_at + timeout)`.
+28. **Boot index-reap skips only a GENUINE in-progress build.** An INVALID index is
+    dropped so a later `CREATE INDEX IF NOT EXISTS` rebuilds it; on a lock timeout,
+    re-check `pg_stat_progress_create_index` for that index — skip a real manual
+    `CREATE INDEX CONCURRENTLY`, but RETRY transient/foreign contention rather than
+    permanently skipping (which would silently leave a broken catalog entry).

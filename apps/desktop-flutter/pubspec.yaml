@@ -51,6 +51,25 @@ dependencies:
   # (host stats, later DPAPI secrets + discovery) go through flutter_rust_bridge.
   http: ^1.2.0
 
+  # ── Feature-port dependencies (union of the ported-feature requirements) ──
+  # Client-side prefs persistence: stream prefs, saved-view order/default,
+  # launch-fullscreen, client options, hotkey remaps, PTZ panels, update
+  # dismissals, last-server prefill.
+  shared_preferences: ^2.3.2
+  # Native save/open dialogs: clip-player snapshot PNG, export destination
+  # folder, image-tile picker.
+  file_selector: ^1.0.3
+  # Open URLs/folders externally: snapshot reveal-in-folder fallback, admin
+  # console "open in browser", update release links.
+  url_launcher: ^6.3.0
+  # OS window fullscreen control (fullscreen camera wall + launch preference).
+  window_manager: ^0.4.3
+  # WebView2 embed (Windows-first): embedded /admin management console and the
+  # web special-tile.
+  webview_windows: ^0.4.0
+  # Client build version for the update check's "newer than me" comparison.
+  package_info_plus: ^8.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

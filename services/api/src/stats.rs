@@ -917,8 +917,10 @@ fn storage_statvfs(path: &str) -> Option<(i64, i64)> {
         let bsize = buf.f_bsize as u64;
         #[allow(clippy::cast_lossless)]
         let total = (buf.f_blocks as u64).saturating_mul(bsize);
+        // f_bavail (available to a non-root writer), not f_bfree (includes the
+        // ext4 root reserve) — otherwise free space is over-reported (issue #72).
         #[allow(clippy::cast_lossless)]
-        let free = (buf.f_bfree as u64).saturating_mul(bsize);
+        let free = (buf.f_bavail as u64).saturating_mul(bsize);
         Some((
             i64::try_from(total).unwrap_or(i64::MAX),
             i64::try_from(free).unwrap_or(i64::MAX),

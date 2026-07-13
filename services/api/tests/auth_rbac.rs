@@ -790,6 +790,45 @@ async fn query_param_media_token_is_scope_checked_and_full_jwt_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn low_mp4_variant_enforces_camera_scope_like_segments() {
+    // The on-demand low-bitrate variant `/segments/{id}/low.mp4` is a NEW
+    // authenticated media endpoint (golden rule 1) and must enforce exactly the
+    // same camera scoping as its byte-transparent sibling `/segments/{id}`. We
+    // assert the auth FENCE only (403 cross-camera, 401 full-JWT) — both are
+    // decided before any transcode, so this test needs no ffmpeg.
+    let fx = build_rbac_fixture().await;
+    let pool = fx.app.pool().clone();
+    let storage_id = seed_storage(&pool, fx.storage_root.path().to_str().unwrap()).await;
+    let seg_b = seed_segment_with_file(&pool, fx.cam_b, storage_id, fx.storage_root.path()).await;
+
+    // A media token scoped to cam_a must NOT unlock cam_b's low variant.
+    let media_a = mint_media_token(&fx.app, &fx.viewer_token, fx.cam_a).await;
+    let other = fx
+        .app
+        .send(get(&format!("/segments/{seg_b}/low.mp4?token={media_a}")))
+        .await;
+    assert_eq!(
+        other.status(),
+        StatusCode::FORBIDDEN,
+        "low.mp4 must enforce the same per-camera scoping as /segments/{{id}}"
+    );
+
+    // A full login JWT via ?token= must be rejected on this fail-closed media route.
+    let full_jwt = fx
+        .app
+        .send(get(&format!(
+            "/segments/{seg_b}/low.mp4?token={}",
+            fx.viewer_token
+        )))
+        .await;
+    assert_eq!(
+        full_jwt.status(),
+        StatusCode::UNAUTHORIZED,
+        "a full login JWT via ?token= must be rejected on the low.mp4 media route"
+    );
+}
+
 // The camera snapshot route is now FAIL-CLOSED (audit 2026-07-05 #2): the web
 // console (admin.html) mints a scoped media token like every other client, so a
 // full login JWT via ?token= is rejected here — while a scoped media token still
@@ -1234,6 +1273,7 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::GET, "/play/aligned".into()),
         (Method::GET, format!("/play/{u}")),
         (Method::GET, format!("/segments/{u}")),
+        (Method::GET, format!("/segments/{u}/low.mp4")),
         (Method::GET, format!("/cameras/{u}/streams")),
         (Method::GET, format!("/cameras/{u}/motion-grid")),
         (Method::GET, format!("/live/{u}/stream.mp4")),
@@ -1289,7 +1329,14 @@ async fn no_protected_route_is_reachable_without_credentials() {
 /// not merely the client-side checkbox.
 #[tokio::test]
 async fn beta_terms_acceptance_recorded_and_surfaced() {
+    // This test asserts the fresh-install state of the process-wide
+    // `server_settings` singleton (beta_terms_accepted=false) and then mutates
+    // it. Serialize + reset so a concurrent settings test — or residue from a
+    // prior `cargo test` run against a reused Postgres — can't flip that shared
+    // row mid-assert (#88).
+    let _settings_guard = SERVER_SETTINGS_LOCK.lock().await;
     let app = TestApp::new().await;
+    reset_server_settings(app.pool()).await;
     let admin = seed_admin(app.pool()).await;
     let token = login(&app, &admin.username, &admin.password).await;
 
@@ -1405,7 +1452,14 @@ async fn scrub_preview_requires_admin() {
 /// assertion of this row in one sequential test avoids that race entirely.
 #[tokio::test]
 async fn scrub_preview_get_put_roundtrip_and_clamps() {
+    // Asserts every scrub knob falls back to its env default (`source: "env"`)
+    // on a fresh DB, then mutates them. Serialize + reset the shared
+    // `server_settings` singleton so a concurrent settings test — or leftover
+    // state from a prior `cargo test` run against a reused Postgres — can't make
+    // a knob read `source: "db"` before this test writes it (#88).
+    let _settings_guard = SERVER_SETTINGS_LOCK.lock().await;
     let app = TestApp::new().await;
+    reset_server_settings(app.pool()).await;
     let admin = seed_admin(app.pool()).await;
     let token = login(&app, &admin.username, &admin.password).await;
 
@@ -1476,4 +1530,93 @@ async fn scrub_preview_get_put_roundtrip_and_clamps() {
     assert_eq!(after_clamp["pregen_scan_secs"]["value"], default_scan_secs);
     assert_eq!(after_clamp["cache_ttl_seconds"]["source"], "env");
     assert_eq!(after_clamp["cache_ttl_seconds"]["value"], default_ttl);
+}
+
+// ─── bookmark scope: the read-all / manage-own tier (BookmarkScope::ViewAll) ──
+
+/// A `ViewAll` viewer SEES every bookmark on cameras it can access (like `All`)
+/// but may edit/delete only its OWN — the "view all, manage own" tier. Proven
+/// end-to-end: it lists another user's bookmark, is refused 403 on PATCH/DELETE
+/// of that bookmark, and can PATCH/DELETE one it created itself.
+#[tokio::test]
+async fn bookmark_viewall_sees_all_but_manages_only_own() {
+    use crumb_common::types::BookmarkScope;
+
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    // Owner (any bookmark-capable scope) + the ViewAll viewer, both scoped to
+    // the same camera so cross-visibility is about bookmark scope, not camera
+    // scope.
+    let owner = seed_viewer_with_bookmark_scope(app.pool(), &[cam], BookmarkScope::Own).await;
+    let viewer = seed_viewer_with_bookmark_scope(app.pool(), &[cam], BookmarkScope::ViewAll).await;
+    let owner_token = login(&app, &owner.username, &owner.password).await;
+    let viewer_token = login(&app, &viewer.username, &viewer.password).await;
+
+    // Each user creates a bookmark on the shared camera.
+    let mk = |token: &str| {
+        post_auth_json(
+            "/bookmarks",
+            token,
+            &serde_json::json!({ "camera_id": cam, "ts": "2026-06-21T17:03:52Z" }),
+        )
+    };
+    let resp = app.send(mk(&owner_token)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let owners_bookmark = body_json(resp).await["id"].as_str().unwrap().to_owned();
+
+    let resp = app.send(mk(&viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let viewers_bookmark = body_json(resp).await["id"].as_str().unwrap().to_owned();
+
+    // ViewAll SEES both (the owner's and its own).
+    let resp = app
+        .send(get_auth(
+            &format!("/bookmarks?camera_id={cam}"),
+            &viewer_token,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids: Vec<String> = body_json(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        ids.contains(&owners_bookmark) && ids.contains(&viewers_bookmark),
+        "ViewAll must see every bookmark on the camera, got {ids:?}"
+    );
+
+    let patch = |id: &str, token: &str| {
+        axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/bookmarks/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"description":"edited"}"#))
+            .unwrap()
+    };
+    let delete = |id: &str, token: &str| {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/bookmarks/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+
+    // Managing the OWNER's bookmark is refused — ViewAll is read-all, not
+    // manage-all.
+    let resp = app.send(patch(&owners_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app.send(delete(&owners_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Managing its OWN bookmark works.
+    let resp = app.send(patch(&viewers_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.send(delete(&viewers_bookmark, &viewer_token)).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
