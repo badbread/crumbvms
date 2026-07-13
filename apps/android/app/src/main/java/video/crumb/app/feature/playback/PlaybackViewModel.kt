@@ -115,9 +115,11 @@ private const val NEXT_SEGMENT_LOOKAHEAD_MS = 1L
  * How close to the end of the current segment (in playhead time) the screen
  * should trigger [PlaybackViewModel.prefetchNextSegment]. Segments are short
  * (~4s), so this needs to be small enough not to fire immediately on entry but
- * comfortably ahead of a resolve round-trip on a slow link.
+ * comfortably ahead of a resolve round-trip on a slow link. Raised from 2 s to
+ * hide one more round-trip on a slow link; keep in sync with the screen's
+ * `PREFETCH_LEAD_MS_SCREEN`.
  */
-private const val PREFETCH_LEAD_MS = 2_000L
+private const val PREFETCH_LEAD_MS = 3_500L
 
 /**
  * Motion histogram resolution over the loaded data window. 1440 buckets across
@@ -421,6 +423,32 @@ class PlaybackViewModel(
      *   retry ONCE at this exact time before falling back to the calm
      *   "no footage" state. Null for every other caller (plain seeks never retry).
      */
+    /**
+     * When true, playback fetches the server's on-demand low-bitrate transcode
+     * (`/segments/{id}/low.mp4`) instead of the recorded main-stream bytes. Driven
+     * by the screen's quality selector (Auto→metered / Full / Data saver).
+     */
+    private var lowQuality = false
+
+    /** Map a resolved segment URL to the active quality variant. */
+    private fun qualityUrl(segmentUrl: String): String =
+        if (lowQuality) "$segmentUrl/low.mp4" else segmentUrl
+
+    /**
+     * Switch the playback quality (full vs. low-bitrate transcode). If it actually
+     * changes, re-resolve the current playhead so the newly-built segment URL
+     * (with/without the `low.mp4` suffix) takes effect immediately, and drop any
+     * prefetched next segment (it was resolved for the old quality).
+     */
+    fun setLowQuality(low: Boolean) {
+        if (low == lowQuality) return
+        lowQuality = low
+        _state.update { it.copy(nextSegment = null, nextSegmentUrl = null) }
+        if (_state.value.currentSegment != null) {
+            seekTo(_state.value.playheadMs)
+        }
+    }
+
     fun seekTo(tsMs: Long, retryAtMs: Long? = null) {
         _state.update { it.copy(playheadMs = tsMs) }
         // Cancel any in-flight resolve so a stale result can't override this seek
@@ -441,7 +469,7 @@ class PlaybackViewModel(
             repo.resolveSegment(cameraId, tsIso).onSuccess { segment ->
                 val startMs = Time.parseToMillis(segment.start)
                 val offsetMs = (tsMs - startMs).coerceAtLeast(0L)
-                val authedUrl = repo.mediaUrls().scopedUrl(cameraId, segment.url)
+                val authedUrl = repo.mediaUrls().scopedUrl(cameraId, qualityUrl(segment.url))
                 _state.update {
                     it.copy(
                         // Belt-and-braces re-assertion (spec 5.): whatever else
@@ -524,7 +552,7 @@ class PlaybackViewModel(
                 // segment this prefetch was FOR while the network call was in
                 // flight, don't attach a stale "next" to the new current segment.
                 if (_state.value.currentSegment?.segmentId != targetSegmentId) return@onSuccess
-                val authedUrl = repo.mediaUrls().scopedUrl(cameraId, next.url)
+                val authedUrl = repo.mediaUrls().scopedUrl(cameraId, qualityUrl(next.url))
                 _state.update { it.copy(nextSegment = next, nextSegmentUrl = authedUrl) }
             }
             // Failures (including 404 at a span boundary edge case) are silently
