@@ -773,27 +773,9 @@ fun PlaybackScreen(
                         }
                     }
                 }
-
-                // Audio on/off toggle — LANDSCAPE ONLY: the top app bar is hidden
-                // then, so float it in the corner. In portrait it lives in the app
-                // bar's actions (above) instead of floating over the footage.
-                if (isLandscape && state.currentSegment != null) {
-                    HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
-                        IconButton(
-                            onClick = {
-                                audioOn = !audioOn
-                                store.playbackAudioOn = audioOn
-                            },
-                            modifier = Modifier.align(Alignment.TopEnd).padding(2.dp),
-                        ) {
-                            Icon(
-                                imageVector = if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
-                                contentDescription = if (audioOn) "Mute audio" else "Play audio",
-                                tint = if (audioOn) TealAccent else Color.White,
-                            )
-                        }
-                    }
-                }
+                // (Audio toggle: portrait → top app bar actions; landscape → inline
+                // on the transport row below, next to Snapshot/Bookmark. It is NOT
+                // floated over the video in either orientation.)
             }
 
             // ── PINNED transport bar (controls + timeline) at the bottom ──────────
@@ -826,6 +808,14 @@ fun PlaybackScreen(
                     onSnapshot = onSnapshot,
                     // null hides the bookmark control (transport uses onBookmark?.let)
                     onBookmark = if (bookmarksEnabled) onBookmark else null,
+                    // Landscape hosts the audio toggle inline on this row (portrait
+                    // uses the app bar). Gate on a resolved segment, same as portrait.
+                    audioOn = audioOn,
+                    onToggleAudio = if (state.currentSegment != null) {
+                        { audioOn = !audioOn; store.playbackAudioOn = audioOn }
+                    } else {
+                        null
+                    },
                     // Portrait can't fit every control inline (the snapshot button was
                     // being clipped), so the SECONDARY actions (snapshot, bookmark,
                     // jump-to-time, speed) collapse into a 3-dot overflow menu. In
@@ -918,6 +908,10 @@ private fun PlaybackControls(
     useOverflowMenu: Boolean = false,
     onSnapshot: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
+    // Audio toggle rides inline on the landscape transport row (in portrait it
+    // lives in the top app bar instead). null hides it.
+    audioOn: Boolean = false,
+    onToggleAudio: (() -> Unit)? = null,
 ) {
     // Landscape is vertically cramped, so the transport runs a notch smaller there
     // (this is what "shrinks the play/pause bar"). Portrait keeps its roomier sizes.
@@ -1097,13 +1091,27 @@ private fun PlaybackControls(
 
             // Snapshot + Bookmark share this transport row in landscape (the app bar
             // is hidden there). In portrait they live in the overflow menu above.
-            if (onSnapshot != null || onBookmark != null) {
+            if (onSnapshot != null || onBookmark != null || onToggleAudio != null) {
                 Spacer(Modifier.width(6.dp))
                 onSnapshot?.let {
                     SmallControl(Icons.Default.PhotoCamera, "Snapshot", ctlSize, ctlIcon, it)
                 }
                 onBookmark?.let {
                     SmallControl(Icons.Default.BookmarkAdd, "Add bookmark", ctlSize, ctlIcon, it)
+                }
+                // Audio on/off — same row as Snapshot/Bookmark in landscape (teal
+                // when on), instead of a float that lands over the video.
+                onToggleAudio?.let { toggle ->
+                    HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
+                        IconButton(onClick = toggle, modifier = Modifier.size(ctlSize)) {
+                            Icon(
+                                imageVector = if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                contentDescription = if (audioOn) "Mute audio" else "Play audio",
+                                tint = if (audioOn) TealAccent else Color.White,
+                                modifier = Modifier.size(ctlIcon),
+                            )
+                        }
+                    }
                 }
             }
         }
