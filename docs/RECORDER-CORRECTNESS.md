@@ -124,36 +124,40 @@ recorder, and later the API) must satisfy these *by construction*.
 
 ## declared tracks must carry decodable packets, on every client (audio-integrity)
 23. **A recorded segment MUST contain decodable media PACKETS for every track it
-    declares — and those packets must be decodable by EVERY client, not just
-    desktop.** The recorder picks the audio args per camera from the probed source
-    sample rate (`audio_segmenter_args` / `audio_needs_transcode` /
-    `probe_audio_sample_rate`; docs/DECISIONS.md 2026-07-12): **≤ 48 kHz → bit-exact
-    copy** (`-c:a copy -copyinkf:a`); **> 48 kHz, or an unknown/failed probe →
-    transcode to 48 kHz AAC** (`-c:a aac -ar 48000`). This guards two failure modes:
-    - **Cross-client playability (the transcode case).** Some cameras stream AAC at
-      rates that Android's hardware/`c2` decoders reject outright (a real device
-      logs `MediaCodecInfo: NoSupport [sampleRate.support, 64000] [c2.android.aac
-      .decoder]` and plays SILENT). A bit-exact copy plays on desktop's software
-      ffmpeg decoder but not on Android/web, so any rate > 48 kHz is transcoded down
-      to a universally-decodable 48 kHz.
-    - **Empty-track copy gate (the copy case still needs `-copyinkf:a`).** Under
-      `-c copy`, ffmpeg's CLI silently discards every packet on a stream until the
-      first keyframe-flagged one, and the RTP-AAC (MPEG4-GENERIC) depacketizer never
-      key-flags audio — so a plain copy yields a declared-but-EMPTY aac track (the
-      moov lists it from the SDP; zero samples), silent with no warning at any
-      normal log level. The copy path therefore keeps `-copyinkf:a`; the transcode
-      path re-encodes from decoded PCM and has no keyframe gate.
+    declares — and those packets must be decodable AND sample-continuous on EVERY
+    client, not just desktop.** The recorder ALWAYS re-encodes audio (when
+    `record_audio`): `-af aresample=async=1:first_pts=0 -c:a aac -ar 48000`
+    (`audio_segmenter_args`; docs/DECISIONS.md 2026-07-13, superseding the
+    2026-07-12 copy-when-safe split). This guards two failure modes that a
+    bit-exact `-c:a copy` could not:
+    - **Sample-continuity (the reason for the 2026-07-13 change).** A copy
+      preserves the camera's audio *timeline* verbatim; cheap camera audio clocks
+      drift ~1 %, so the container timestamps promise more time than the AAC frames
+      deliver (~32 ms/segment). ExoPlayer's `DefaultAudioSink` requires
+      sample-continuous audio and, once accumulated drift crosses ~200 ms, throws
+      `UnexpectedDiscontinuityException`; since the audio renderer is the master
+      clock the position lurches and playback wedges (silent audio, stalled video)
+      — a 48 kHz copy plays silent on Android. `aresample=async=1` resamples onto a
+      strictly continuous lattice (fills genuine gaps with silence, preserving A/V
+      alignment): measured 0/192 discontinuous frames after vs 61/62 before. A
+      plain re-encode WITHOUT `aresample` still left 75/187 (it inherits the jittery
+      input frame PTS), so `aresample=async` is load-bearing, not decorative.
+    - **Cross-client playability.** Re-encoding to a universal 48 kHz AAC also
+      covers cameras whose native rate (64/88.2/96 kHz) Android's hardware/`c2`
+      decoders reject outright (`MediaCodecInfo: NoSupport [sampleRate.support,
+      64000]` → silent). One re-encode fixes both.
 
-    Video always stays a bit-exact copy (the audio args override only audio; they do
-    NOT touch the fMP4 crash-safety flags, item 1). **The export path is separate:**
-    `services/api/src/export.rs`'s `-c:a copy` still emits `-copyinkf:a` against
-    the keyframe gate (the recorded fMP4's `trun` faithfully preserves the missing
-    key flag), and it does **not yet** normalize the sample rate — an exported
-    clip can still carry a rate a phone won't decode until export is normalized
-    too (a known follow-up). Detector: `audio_needs_transcode` is unit-tested (≤ 48 kHz
-    → copy, > 48 kHz / unknown → transcode) and `audio_segmenter_args` for both
-    branches; any integration check should assert `nb_read_packets > 0` on the audio
-    stream, not merely that the stream exists.
+    No `-copyinkf:a` any more: it only mattered for the `-c copy` keyframe gate
+    (RTP-AAC is never key-flagged → a bare copy declared a zero-packet track). The
+    re-encode decodes from PCM, so there is no keyframe gate. Video always stays a
+    bit-exact copy (the audio args override only audio; they do NOT touch the fMP4
+    crash-safety flags, item 1). **The export path is separate:**
+    `services/api/src/export.rs` still `-c:a copy`s — now against a *clean*
+    re-encoded source for new footage (so exports of new footage inherit the good
+    timeline for free); normalizing export itself remains a follow-up for
+    copy-path-era footage. Detector: `audio_segmenter_args` is unit-tested (always
+    AAC/48 k/`aresample` when recording, `-an` otherwise); any integration check
+    should assert both `nb_read_packets > 0` AND uniform audio packet deltas.
 
 ## free-space floor (ENOSPC safety valve)
 24. **The floor keys off free space AVAILABLE to the recorder, and its response

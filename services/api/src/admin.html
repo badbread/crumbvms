@@ -4620,25 +4620,14 @@ function renderCamInfoTab(c) {
    an "Identify" (ONVIF probe) action and a "Contribute this camera" flow that
    opens a pre-filled GitHub issue in the operator's own browser. */
 /* ── Audio-transcoding notice (per camera) ──
-   Shows a warning when the recorder is re-encoding this camera's audio to 48 kHz
-   because its source rate is one Android/web decoders can't play (> 48 kHz), with
-   a hint to set the camera's own audio to <=48 kHz to record bit-exact. Reads the
-   recorder-published per-camera audio status from GET /config/decode-status. */
+   Obsolete: recorded audio is now ALWAYS normalized to gap-filled 48 kHz AAC at
+   record time (docs/DECISIONS.md 2026-07-13), because a bit-exact copy of the
+   camera's drifting audio clock plays silent on Android. There is no longer a
+   per-camera copy-vs-transcode decision for the operator to act on, so this shows
+   nothing. Kept as a no-op so the #ce-audio-status slot + call site stay stable
+   (the /config/decode-status audio fields remain available for future use). */
 async function loadCameraAudioStatus(id) {
-  const el = $('ce-audio-status'); if (!el) return;
-  el.innerHTML = '';
-  try {
-    const r = await api('/config/decode-status');
-    const cam = (r.cameras || []).find(c => c.camera_id === id);
-    if (!cam || !cam.audio_transcoding) return; // copied (or unknown) — nothing to warn about
-    const khz = cam.audio_sample_rate ? Math.round(cam.audio_sample_rate / 1000) : null;
-    el.innerHTML = `<div class="card-hint" style="margin:0 0 10px 0;border-left:3px solid var(--warn);padding:6px 0 6px 10px">
-      <b style="color:var(--warn)">Audio is being re-encoded to 48&nbsp;kHz.</b>
-      This camera streams ${khz ? esc(khz + ' kHz') : 'a sample rate'} audio, which phones and browsers
-      can't decode, so Crumb transcodes it so recorded audio plays on every client (desktop copies it fine).
-      To record it <b>bit-exact</b> (no re-encode, no CPU), set this camera's own audio sample rate to
-      <b>&le;&nbsp;48&nbsp;kHz</b> (48&nbsp;kHz is ideal) in its web UI, then it will be copied automatically.</div>`;
-  } catch (e) { /* status unavailable (recorder not reporting yet) — no notice */ }
+  const el = $('ce-audio-status'); if (el) el.innerHTML = '';
 }
 
 async function loadCameraCompat(id) {
