@@ -332,6 +332,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
       context,
       plate: read.plate,
       title: 'Add to watchlist',
+      fuzz: _lprConfig?.watchlistFuzz,
+      onSaveFuzz: _lprConfig != null ? _saveFuzz : null,
     );
     if (choice == null || !mounted) return;
     try {
@@ -2619,6 +2621,8 @@ class _WatchlistPanelState extends State<_WatchlistPanel> {
       initialKind: entry.isIgnore ? 'ignore' : 'watch',
       initialLabel: entry.label,
       initialNotify: entry.notify,
+      fuzz: widget.fuzz,
+      onSaveFuzz: widget.fuzz != null ? widget.onSaveFuzz : null,
     );
     if (choice == null || !mounted) return;
     try {
@@ -3234,6 +3238,8 @@ Future<({String kind, String? label, bool notify})?> showWatchlistDialog(
   String initialKind = 'watch',
   String? initialLabel,
   bool initialNotify = true,
+  double? fuzz,
+  Future<void> Function(double fuzz)? onSaveFuzz,
 }) {
   return showDialog<({String kind, String? label, bool notify})>(
     context: context,
@@ -3280,8 +3286,9 @@ Future<({String kind, String? label, bool notify})?> showWatchlistDialog(
             title: Text(title,
                 style: const TextStyle(color: Colors.white, fontSize: 16)),
             content: SizedBox(
-              width: 320,
-              child: Column(
+              width: 340,
+              child: SingleChildScrollView(
+                child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -3332,7 +3339,19 @@ Future<({String kind, String? label, bool notify})?> showWatchlistDialog(
                       ),
                     ),
                   ]),
+                  // Global watchlist fuzziness, with a live preview of the
+                  // misreads it would accept for THIS plate. Admin-only; hidden
+                  // when the LPR config isn't available.
+                  if (fuzz != null && onSaveFuzz != null) ...[
+                    const Divider(height: 22, color: Colors.white12),
+                    _FuzzControl(
+                      fuzz: fuzz,
+                      plate: plate,
+                      onSave: onSaveFuzz,
+                    ),
+                  ],
                 ],
+                ),
               ),
             ),
             actions: [
