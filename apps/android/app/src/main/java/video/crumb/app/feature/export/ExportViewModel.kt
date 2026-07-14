@@ -33,8 +33,6 @@ import java.time.Instant
  * @property job The most recent [ExportJob] returned by the server (null until created).
  * @property jobError Human-readable error string when the job itself fails.
  * @property polling True while we are actively polling exportStatus.
- * @property downloadMsg Transient confirmation shown after an export file is saved
- *   to the device's public Downloads (reports the real saved location).
  */
 data class ExportUiState(
     val loadingCameras: Boolean = true,
@@ -47,7 +45,6 @@ data class ExportUiState(
     val job: ExportJob? = null,
     val jobError: String? = null,
     val polling: Boolean = false,
-    val downloadMsg: String? = null,
 )
 
 /**
@@ -133,7 +130,7 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
 
         viewModelScope.launch {
             // Reset any previous job state before submitting.
-            _state.update { it.copy(job = null, jobError = null, polling = false, downloadMsg = null) }
+            _state.update { it.copy(job = null, jobError = null, polling = false) }
 
             repo.createExport(
                 cameraIds = s.selectedCameraIds.toList(),
@@ -181,25 +178,6 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
                         }
                     }
             }
-        }
-    }
-
-    // ─── download / share helpers ───────────────────────────────────────────
-
-    /** Acknowledge the transient download confirmation banner. */
-    fun clearDownloadMsg() {
-        _state.update { it.copy(downloadMsg = null) }
-    }
-
-    /**
-     * Called by the UI after an export file has been written to the device's
-     * public Downloads collection. [location] is the user-visible saved path
-     * (e.g. `Downloads/CrumbVMS/crumb-export-…​.mp4`) so the confirmation reflects
-     * where the file actually landed rather than an app-private cache dir.
-     */
-    fun onDownloadSaved(location: String) {
-        _state.update {
-            it.copy(downloadMsg = "Saved to $location")
         }
     }
 

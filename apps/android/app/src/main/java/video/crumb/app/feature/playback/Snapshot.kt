@@ -4,23 +4,38 @@ package video.crumb.app.feature.playback
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileOutputStream
 
 /**
+ * A saved snapshot: where it landed (human-readable, for the "Snapshot saved to …"
+ * confirmation) plus a scoped `content://` [Uri] that can be handed to the system
+ * share sheet ([shareImageUri]).
+ *
+ * - On API 29+ the [shareUri] is the MediaStore image entry itself (already a
+ *   shareable `content://media/…` Uri — no FileProvider needed).
+ * - On pre-Q it's a [FileProvider] Uri over the app-external Pictures file (the
+ *   provider path is declared in `res/xml/file_paths.xml`).
+ */
+data class SavedSnapshot(val displayPath: String, val shareUri: Uri)
+
+/**
  * Save a captured video frame to the device gallery under Pictures/Crumb/
- * (commercial-VMS-style "Snapshot saved to Pictures/…"). Returns a human-readable
- * location on success, or null on failure.
+ * (commercial-VMS-style "Snapshot saved to Pictures/…"). Returns a [SavedSnapshot]
+ * (location + shareable Uri) on success, or null on failure.
  *
  * - Q+ (API 29+): MediaStore with RELATIVE_PATH — lands in the gallery, no
  *   storage permission required.
  * - Pre-Q: the app's external Pictures dir (no permission; not gallery-indexed).
  */
-fun saveFrameToGallery(context: Context, bitmap: Bitmap, camName: String): String? {
+fun saveFrameToGallery(context: Context, bitmap: Bitmap, camName: String): SavedSnapshot? {
     val safeCam = camName.replace(Regex("[^A-Za-z0-9_-]"), "_").ifBlank { "camera" }
     val stamp = android.text.format.DateFormat.format("yyyyMMdd_HHmmss", System.currentTimeMillis())
     val fileName = "crumb_${safeCam}_$stamp.jpg"
@@ -37,16 +52,41 @@ fun saveFrameToGallery(context: Context, bitmap: Bitmap, camName: String): Strin
             context.contentResolver.openOutputStream(uri)?.use { out ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
             } ?: return null
-            "Pictures/Crumb/$fileName"
+            // The MediaStore entry is itself a shareable content:// Uri.
+            SavedSnapshot(displayPath = "Pictures/Crumb/$fileName", shareUri = uri)
         } else {
             val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "Crumb")
             dir.mkdirs()
             val f = File(dir, fileName)
             FileOutputStream(f).use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out) }
-            f.absolutePath
+            val shareUri = FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", f,
+            )
+            SavedSnapshot(displayPath = f.absolutePath, shareUri = shareUri)
         }
     } catch (e: Exception) {
         android.util.Log.w("Snapshot", "snapshot save failed", e)
         null
+    }
+}
+
+/**
+ * Open the Android system share sheet for a saved snapshot [uri] (a JPEG image).
+ * The receiving app is granted read access to this one item only
+ * ([Intent.FLAG_GRANT_READ_URI_PERMISSION]); no persistent permission is granted.
+ */
+fun shareImageUri(context: Context, uri: Uri) {
+    try {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "image/jpeg"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            putExtra(Intent.EXTRA_SUBJECT, "CrumbVMS Snapshot")
+        }
+        context.startActivity(Intent.createChooser(intent, "Share snapshot"))
+    } catch (e: android.content.ActivityNotFoundException) {
+        android.widget.Toast
+            .makeText(context, "No app available to share", android.widget.Toast.LENGTH_SHORT)
+            .show()
     }
 }

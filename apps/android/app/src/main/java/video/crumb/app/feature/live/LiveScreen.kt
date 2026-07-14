@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddAPhoto
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
@@ -33,6 +34,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -61,9 +67,19 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import android.graphics.drawable.BitmapDrawable
+import coil.imageLoader
+import coil.request.CachePolicy
+import coil.request.ImageRequest
+import coil.request.SuccessResult
+import video.crumb.app.data.CameraDto
 import video.crumb.app.data.CameraView
+import video.crumb.app.data.MediaUrls
 import video.crumb.app.di.appContainer
 import video.crumb.app.feature.about.AboutDialog
+import video.crumb.app.feature.playback.SavedSnapshot
+import video.crumb.app.feature.playback.saveFrameToGallery
+import video.crumb.app.feature.playback.shareImageUri
 import video.crumb.app.feature.settings.SettingsDialog
 import video.crumb.app.feature.update.UpdateAvailableBanner
 import video.crumb.app.feature.update.UpdateViewModel
@@ -72,7 +88,6 @@ import video.crumb.app.ui.CrumbModeTabs
 import video.crumb.app.ui.GridLayoutToggle
 import video.crumb.app.ui.HintTooltip
 import video.crumb.app.ui.ImmersiveMode
-import video.crumb.app.ui.InlineDivider
 import video.crumb.app.ui.KeepScreenOn
 import video.crumb.app.ui.ViewChipsRow
 import video.crumb.app.ui.WallGridLayout
@@ -140,6 +155,14 @@ fun LiveScreen(
     var showSettings by remember { mutableStateOf(false) }
     var showViewsManager by remember { mutableStateOf(false) }
     var wallFullscreen by remember { mutableStateOf(false) }
+    // Snapshot (#163): when more than one camera is shown, tapping the snapshot
+    // action opens this menu to pick WHICH camera's live frame to grab.
+    var snapshotMenuOpen by remember { mutableStateOf(false) }
+    // Actionable "Snapshot saved to …" / "Saved to …" confirmations (#164 offers a
+    // Share action on them). Activity context (not applicationContext) so the share
+    // chooser launches without needing FLAG_ACTIVITY_NEW_TASK.
+    val snackbarHostState = remember { SnackbarHostState() }
+    val activityContext = LocalContext.current
     // Local saved views (named camera subsets) — phone-only, see SecureStore.
     var views by remember { mutableStateOf(store.cameraViews) }
     var activeViewId by remember { mutableStateOf(store.activeViewId) }
@@ -267,51 +290,53 @@ fun LiveScreen(
     // Low-bw mode: read from the VM state (which is seeded from SecureStore on init).
     val lowBandwidthMode = state.lowBandwidthMode
 
+    // Snapshot (#163): grab a camera's current live frame → device gallery, then a
+    // Share-able confirmation (#164). The wall tiles render on a SurfaceView (no
+    // readable pixel buffer), so rather than a surface grab we fetch the camera's
+    // server still (`/cameras/{id}/frame.jpg`, the same proxied frame the wall's
+    // placeholder/low-bw tiles use) — a full-resolution current frame, decoded via
+    // Coil and saved through the shared [saveFrameToGallery] path.
+    fun takeSnapshot(cam: CameraDto) {
+        viewScope.launch {
+            val saved = captureCameraSnapshot(activityContext, mediaUrls, cam.id, cam.name)
+            if (saved != null) {
+                val res = snackbarHostState.showSnackbar(
+                    message = "Snapshot saved to ${saved.displayPath}",
+                    actionLabel = "Share",
+                    duration = SnackbarDuration.Long,
+                )
+                if (res == SnackbarResult.ActionPerformed) {
+                    shareImageUri(activityContext, saved.shareUri)
+                }
+            } else {
+                snackbarHostState.showSnackbar("Snapshot failed — frame unavailable")
+            }
+        }
+    }
+
     Scaffold(
+        snackbarHost = {
+            SnackbarHost(hostState = snackbarHostState) { data -> Snackbar(snackbarData = data) }
+        },
         topBar = {
             if (!wallFullscreen) {
                 TopAppBar(
                     title = {
-                        // Live | Playback tabs. In LANDSCAPE the saved-view chips ride
-                        // inline to their right (separated by a rule; overflow scrolls
-                        // sideways) to save scarce vertical space; in PORTRAIT they're a
-                        // separate strip below (rendered in the body).
-                        if (isLandscape && views.isNotEmpty()) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                CrumbModeTabs(
-                                    selected = CrumbMode.LIVE,
-                                    onLive = {},
-                                    onPlayback = onOpenPlaybackMode,
-                                    onClips = onOpenClips,
-                                    onPlates = onOpenPlates,
-                                    showPlayback = caps.playback || store.isAdmin,
-                                    showClips = caps.clips || store.isAdmin,
-                                    showPlates = store.platesEnabled,
-                                )
-                                InlineDivider()
-                                ViewChipsRow(
-                                    views = views,
-                                    activeViewId = activeViewId,
-                                    onSelect = { setActive(it) },
-                                    modifier = Modifier.weight(1f),
-                                    showAllCamerasView = showAllCamerasView,
-                                )
-                            }
-                        } else {
-                            CrumbModeTabs(
-                                selected = CrumbMode.LIVE,
-                                onLive = {},
-                                onPlayback = onOpenPlaybackMode,
-                                onClips = onOpenClips,
-                                onPlates = onOpenPlates,
-                                showPlayback = caps.playback || store.isAdmin,
-                                showClips = caps.clips || store.isAdmin,
-                                showPlates = store.platesEnabled,
-                            )
-                        }
+                        // Live | Playback | Clips | LPR tabs. The grid/snapshot/
+                        // fullscreen actions used to share this row and squeezed the
+                        // tabs (#161); they now live on the second bar (the view-chips
+                        // row, in the body) so the tabs get the full title width and
+                        // keep their own horizontal scroll.
+                        CrumbModeTabs(
+                            selected = CrumbMode.LIVE,
+                            onLive = {},
+                            onPlayback = onOpenPlaybackMode,
+                            onClips = onOpenClips,
+                            onPlates = onOpenPlates,
+                            showPlayback = caps.playback || store.isAdmin,
+                            showClips = caps.clips || store.isAdmin,
+                            showPlates = store.platesEnabled,
+                        )
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = NavyDeep,
@@ -319,27 +344,9 @@ fun LiveScreen(
                         actionIconContentColor = MaterialTheme.colorScheme.onSurface,
                     ),
                     actions = {
-                        // Low-bandwidth mode now lives in Settings (overflow → Settings),
-                        // not as an app-bar icon. The auto-fallback banner (below the
-                        // tabs) still offers one-tap restore when it engages on its own.
-
-                        // Grid-density picker (shared control + value with Playback).
-                        GridLayoutToggle(layout, maxCols) { next ->
-                            layout = next
-                            store.liveGridLayout = next.ordinal
-                        }
-
-                        // Export lives under Playback now (not on the Live wall).
-
-                        // Wall fullscreen toggle.
-                        HintTooltip("Fullscreen wall") {
-                            IconButton(onClick = { wallFullscreen = true }) {
-                                Icon(
-                                    imageVector = Icons.Default.Fullscreen,
-                                    contentDescription = "Fullscreen",
-                                )
-                            }
-                        }
+                        // Low-bandwidth mode lives in Settings (overflow → Settings).
+                        // The grid-density, snapshot, and fullscreen actions moved to the
+                        // second bar (#161); only the overflow ⋮ stays in the app bar.
 
                         // Overflow menu (Settings / About / Logout).
                         Box {
@@ -420,18 +427,78 @@ fun LiveScreen(
                     )
                 }
 
-                // Saved-view chips strip (PORTRAIT only; landscape shows them inline in
-                // the title). Hidden in fullscreen kiosk mode. Tap to switch; persists.
-                if (!isLandscape && !wallFullscreen && views.isNotEmpty()) {
-                    ViewChipsRow(
-                        views = views,
-                        activeViewId = activeViewId,
-                        onSelect = { setActive(it) },
+                // ── Second bar (#161): saved-view chips + relocated actions ────────
+                // The grid-density, snapshot (#163), and fullscreen actions were moved
+                // off the top tab row to here so the tabs get more room. The chips take
+                // the remaining width and scroll horizontally (so a growing view list +
+                // the fixed action icons never run out of room); the icons stay pinned
+                // to the end. Hidden in fullscreen kiosk mode.
+                if (!wallFullscreen) {
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 8.dp, vertical = 2.dp),
-                        showAllCamerasView = showAllCamerasView,
-                    )
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        ViewChipsRow(
+                            views = views,
+                            activeViewId = activeViewId,
+                            onSelect = { setActive(it) },
+                            modifier = Modifier.weight(1f),
+                            showAllCamerasView = showAllCamerasView,
+                        )
+
+                        // Grid-density picker (shared control + value with Playback).
+                        GridLayoutToggle(layout, maxCols) { next ->
+                            layout = next
+                            store.liveGridLayout = next.ordinal
+                        }
+
+                        // Take snapshot (#163). One shown camera → grab it directly;
+                        // several → a small menu to pick which camera's frame to grab.
+                        Box {
+                            HintTooltip("Take snapshot") {
+                                IconButton(onClick = {
+                                    when (shownCameras.size) {
+                                        0 -> viewScope.launch {
+                                            snackbarHostState.showSnackbar("No camera to snapshot")
+                                        }
+                                        1 -> takeSnapshot(shownCameras.first())
+                                        else -> snapshotMenuOpen = true
+                                    }
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.AddAPhoto,
+                                        contentDescription = "Take snapshot",
+                                    )
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = snapshotMenuOpen,
+                                onDismissRequest = { snapshotMenuOpen = false },
+                            ) {
+                                shownCameras.forEach { cam ->
+                                    DropdownMenuItem(
+                                        text = { Text(cam.name) },
+                                        onClick = {
+                                            snapshotMenuOpen = false
+                                            takeSnapshot(cam)
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        // Wall fullscreen toggle.
+                        HintTooltip("Fullscreen wall") {
+                            IconButton(onClick = { wallFullscreen = true }) {
+                                Icon(
+                                    imageVector = Icons.Default.Fullscreen,
+                                    contentDescription = "Fullscreen",
+                                )
+                            }
+                        }
+                    }
                 }
 
                 Box(modifier = Modifier.fillMaxSize()) {
@@ -660,6 +727,40 @@ fun LiveScreen(
             onDismiss = { editorTarget = null },
         )
     }
+}
+
+// ─── live snapshot capture ───────────────────────────────────────────────────
+
+/**
+ * Fetch a camera's current server still frame (`GET /cameras/{id}/frame.jpg`,
+ * scoped-token authed via [MediaUrls]) and save it to the device gallery.
+ *
+ * The live wall renders tiles on a Media3 SurfaceView, whose pixel buffer can't
+ * be read back for an on-screen grab, so instead of a surface capture we pull the
+ * same API-proxied still the wall already uses for its placeholder / low-bandwidth
+ * tiles — a full-resolution current frame that works regardless of which go2rtc
+ * owns the camera. Decoded with Coil (hardware bitmaps disabled so it can be
+ * JPEG-compressed) and written through the shared [saveFrameToGallery] path.
+ *
+ * Returns the [SavedSnapshot] (location + share Uri) or null on any failure.
+ */
+private suspend fun captureCameraSnapshot(
+    context: android.content.Context,
+    mediaUrls: MediaUrls,
+    cameraId: String,
+    cameraName: String,
+): SavedSnapshot? {
+    val url = runCatching { mediaUrls.cameraFrameUrl(cameraId) }.getOrNull() ?: return null
+    val req = ImageRequest.Builder(context)
+        .data(url)
+        .memoryCachePolicy(CachePolicy.DISABLED)
+        .diskCachePolicy(CachePolicy.DISABLED)
+        .allowHardware(false)
+        .build()
+    val result = context.imageLoader.execute(req)
+    if (result !is SuccessResult) return null
+    val bmp = (result.drawable as? BitmapDrawable)?.bitmap ?: return null
+    return saveFrameToGallery(context, bmp, cameraName)
 }
 
 // ─── low-bandwidth auto-fallback banner ──────────────────────────────────────
