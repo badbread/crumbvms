@@ -124,6 +124,12 @@ Future<void> main() async {
   );
 }
 
+/// Launch-restore retry policy: how many times to re-attempt the token-
+/// validating `/cameras` fetch on a transient (non-auth) failure, and the base
+/// backoff between attempts (grows linearly per attempt).
+const _restoreMaxRetries = 4;
+const _restoreRetryBaseDelay = Duration(milliseconds: 1500);
+
 /// The real desktop client: login → live wall. Restores a DPAPI-persisted
 /// session on launch (so the user isn't asked to log in every time) and swaps
 /// between the login and wall screens.
@@ -196,15 +202,38 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   }
 
   /// Try to resume a DPAPI-persisted session so the user isn't asked to log in
-  /// every launch. A stored token that no longer works (expired/revoked) is
-  /// discarded and we fall back to the login screen.
+  /// every launch. Validates the stored token with a `/cameras` fetch.
+  ///
+  /// The saved session is discarded ONLY on an actual auth rejection
+  /// (401/403 — the token is expired/revoked). A transient failure at launch
+  /// (server still booting, DNS blip, timeout) must NOT wipe a still-valid
+  /// session and force a needless re-login (#146): those are retried with
+  /// backoff, and if the server stays unreachable we drop to the login screen
+  /// WITHOUT clearing the stored session, so the next launch can resume it.
   Future<void> _restore() async {
+    String? saved;
     try {
-      final saved = await loadSession();
-      if (saved != null) {
-        final session = Session.fromJson(
-          jsonDecode(saved) as Map<String, dynamic>,
-        );
+      saved = await loadSession();
+    } catch (_) {
+      // Store unreadable — nothing to resume, but don't destroy it either.
+      if (mounted) setState(() => _restoring = false);
+      return;
+    }
+    if (saved == null) {
+      if (mounted) setState(() => _restoring = false);
+      return;
+    }
+    final Session session;
+    try {
+      session = Session.fromJson(jsonDecode(saved) as Map<String, dynamic>);
+    } catch (_) {
+      // Corrupt payload (not an auth failure) — discard and start clean.
+      await clearSession();
+      if (mounted) setState(() => _restoring = false);
+      return;
+    }
+    for (var attempt = 0; ; attempt++) {
+      try {
         final cameras = await _api.listCameras(session); // validates the token
         if (mounted) {
           setState(() {
@@ -213,11 +242,26 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
           });
         }
         return;
+      } on CrumbApiException catch (e) {
+        if (e.statusCode == 401 || e.statusCode == 403) {
+          await clearSession(); // token genuinely rejected — start clean
+          if (mounted) setState(() => _restoring = false);
+          return;
+        }
+        // Any other server error (5xx, etc.) is treated as transient.
+      } catch (_) {
+        // Network/timeout/parse — transient; keep the session and retry.
       }
-    } catch (_) {
-      await clearSession(); // stale/invalid — start clean
+      if (!mounted) return;
+      if (attempt >= _restoreMaxRetries) {
+        // Server unreachable, but the token was never rejected — leave the
+        // stored session intact and fall back to login.
+        setState(() => _restoring = false);
+        return;
+      }
+      await Future<void>.delayed(_restoreRetryBaseDelay * (attempt + 1));
+      if (!mounted) return;
     }
-    if (mounted) setState(() => _restoring = false);
   }
 
   /// Stand up all session-scoped plumbing: 401 re-auth controller, scoped
@@ -240,6 +284,25 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     // Apply "launch into fullscreen wall" only after the initial camera load —
     // same ordering as the old client's applyLaunchPreferences().
     unawaited(applyLaunchFullscreenPreference(_fullscreen));
+  }
+
+  /// Re-fetch the camera list and push it into the shell (and thus the live
+  /// wall) without an app restart. Driven by the wall's `/status.config_version`
+  /// change signal (see [LiveStatusController.onConfigChanged], wired through
+  /// [MainShell] → [WallScreen]) so an admin/config edit — a camera added,
+  /// removed, renamed, or re-streamed — reflects on the wall live (#146).
+  /// Best-effort: a failed refresh keeps the existing list rather than blanking
+  /// the wall.
+  Future<void> _refreshCameras() async {
+    final controller = _sessionController;
+    if (controller == null) return;
+    try {
+      final cameras = await _api.listCameras(controller.session);
+      if (!mounted) return;
+      setState(() => _cameras = cameras);
+    } catch (_) {
+      // Keep the current list on a transient failure.
+    }
   }
 
   /// After a successful re-auth the fresh token must reach the media-token
@@ -344,6 +407,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
             mediaTokens: mediaTokens,
             cameras: _cameras,
             onLogout: _onLogout,
+            onRefreshCameras: _refreshCameras,
             recordingAlerts: _recordingAlerts!,
             updateCheck: _updateCheck!,
             fullscreen: _fullscreen,
@@ -383,6 +447,7 @@ class MainShell extends StatefulWidget {
     required this.updateCheck,
     required this.fullscreen,
     required this.statusBar,
+    this.onRefreshCameras,
     this.clientOptions,
     this.streamPrefs,
     this.hotkeys,
@@ -394,6 +459,11 @@ class MainShell extends StatefulWidget {
   final MediaTokenCache mediaTokens;
   final List<Camera> cameras;
   final VoidCallback onLogout;
+
+  /// Re-fetch the camera list from the server and rebuild the shell with it —
+  /// driven by the live wall's config-change signal so an admin/config edit
+  /// reflects without an app restart (#146). Null → no refresh wiring.
+  final Future<void> Function()? onRefreshCameras;
   final RecordingAlertsController recordingAlerts;
   final UpdateCheckController updateCheck;
   final FullscreenController fullscreen;
@@ -1252,6 +1322,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
           onMaximizedCameraChanged: (id) => _liveMaximizedId = id,
           // Perf/debug line → bottom status bar (not a floating wall overlay).
           statsSink: _wallStats,
+          // The wall's /status poller detects config_version bumps; bubble that
+          // up so an admin/config edit reloads the camera list live (#146).
+          onConfigChanged: widget.onRefreshCameras,
         );
     }
   }

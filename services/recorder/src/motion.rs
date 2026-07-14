@@ -170,6 +170,17 @@ const DILATE_ITERS: usize = 2;
 /// `bg` is still seeded from a single frame — reading as full-frame motion.
 const WARMUP_FRAMES: u64 = 60;
 
+/// Rolling window (in decoded frames) over which the long-GOP duplicate-frame
+/// ratio is measured (issue #144 item 5). At [`MOTION_ANALYSIS_FPS`] this is
+/// ~10 s, a quick-enough reaction without flapping on a brief hiccup.
+const GOP_DEGRADE_WINDOW_FRAMES: u64 = 50;
+
+/// Exact-duplicate percentage over [`GOP_DEGRADE_WINDOW_FRAMES`] at/above which
+/// the pixel detector is judged unable to produce a trustworthy verdict — the
+/// sub-stream is keyframes-only or has a very long GOP, so ffmpeg's `fps` filter
+/// is padding the output with byte-identical duplicates. See `long_gop_degraded`.
+const GOP_DEGRADE_DUP_PCT: u64 = 60;
+
 /// Live motion-tuner display grid resolution (columns × rows) published per
 /// camera. Fine (80×45 = 4×4-px cells on the 320×180 analysis frame) so the tuner
 /// paints the actual changing pixels (a foreground mask), not coarse boxes — the
@@ -1371,6 +1382,25 @@ fn pixel_verdict_capable(frames_seen: u64) -> bool {
     frames_seen > WARMUP_FRAMES
 }
 
+/// Pure decision (issue #144 item 5): over a window of `window_frames` decoded
+/// frames of which `dup_frames` were byte-identical duplicates of their
+/// predecessor, is the sub-stream too keyframe-sparse for reliable pixel motion?
+///
+/// ffmpeg's `fps` filter upsamples a source slower than [`MOTION_ANALYSIS_FPS`]
+/// by emitting EXACT duplicate frames; a live scene — even a static one — never
+/// produces exact duplicates (sensor noise differs every frame), so a high
+/// exact-duplicate ratio uniquely fingerprints a keyframes-only / long-GOP
+/// source. At/above [`GOP_DEGRADE_DUP_PCT`] the detector cannot see enough real
+/// frames to render a trustworthy keep/discard verdict, and the caller fails
+/// open (correctness items 19/26). Returns `false` for an empty window.
+#[must_use]
+fn long_gop_degraded(dup_frames: u64, window_frames: u64) -> bool {
+    if window_frames == 0 {
+        return false;
+    }
+    dup_frames.saturating_mul(100) >= window_frames.saturating_mul(GOP_DEGRADE_DUP_PCT)
+}
+
 // ─── public entry point ───────────────────────────────────────────────────────
 
 /// Run the motion detection task for `camera` until `cancel` is triggered.
@@ -2449,6 +2479,20 @@ async fn run_pixel_diff_loop(
     let mut analysis_frame_count: u64 = 0;
     let mut last_motion_instant: Option<std::time::Instant> = None;
 
+    // ── Long-GOP / keyframes-only degradation state (issue #144 item 5) ────────
+    // We fingerprint a sub-stream too keyframe-sparse for reliable pixel motion by
+    // counting BYTE-IDENTICAL consecutive decoded frames (ffmpeg's `fps` filter
+    // pads a slow source with exact duplicates; a live scene never repeats
+    // exactly). When they dominate a rolling window we FAIL OPEN (report unhealthy
+    // → recording keeps everything) and skip analysis until distinct frames
+    // return. `prev_analysis_frame` starts zeroed, so the first real frame is
+    // (correctly) not counted as a duplicate.
+    let mut prev_analysis_frame = vec![0u8; frame_size];
+    let mut gop_window_frames: u64 = 0;
+    let mut gop_window_dups: u64 = 0;
+    let mut gop_degraded = false;
+    let mut gop_degraded_logged = false;
+
     // ── 8. Frame loop ─────────────────────────────────────────────────────────
     // Tracks whether the loop ended because the stream closed (EOF) rather than a
     // genuine cancellation — the two share the same clean-up path but differ in
@@ -2535,7 +2579,61 @@ async fn run_pixel_diff_loop(
         // opening frame as full-frame motion). We diff against the PRE-update `bg`
         // and update it at the end of the frame (section j).
         if detector.seed_if_needed(&curr_frame) {
+            // Seed the duplicate-detection reference too, so the first compared
+            // frame isn't spuriously counted against the zeroed buffer.
+            prev_analysis_frame.copy_from_slice(&curr_frame);
             continue; // seed frame — nothing to compare yet
+        }
+
+        // ── a1. Long-GOP / keyframes-only degradation (issue #144 item 5) ──────
+        // Count byte-identical consecutive decoded frames over a rolling window.
+        // When exact duplicates dominate, ffmpeg is padding a keyframe-sparse
+        // source and the pixel detector cannot render a trustworthy verdict — so
+        // FAIL OPEN (correctness items 19/26): report unhealthy (recording then
+        // keeps EVERYTHING, exactly like Continuous mode), skip analysis so no
+        // false trigger leaks, and recover automatically when distinct frames
+        // return. This is a documented limitation: pixel motion needs a
+        // reasonably dense sub-stream; see docs/MOTION-RECORDING.md.
+        let is_dup = curr_frame == prev_analysis_frame;
+        prev_analysis_frame.copy_from_slice(&curr_frame);
+        gop_window_frames += 1;
+        if is_dup {
+            gop_window_dups += 1;
+        }
+        if gop_window_frames >= GOP_DEGRADE_WINDOW_FRAMES {
+            let now_degraded = long_gop_degraded(gop_window_dups, gop_window_frames);
+            if now_degraded && !gop_degraded_logged {
+                warn!(
+                    camera_id = %camera.id,
+                    dup_pct = gop_window_dups * 100 / gop_window_frames.max(1),
+                    "motion: sub-stream is keyframes-only / very long GOP — too few distinct \
+                     frames for reliable pixel motion; FAILING OPEN (recording keeps everything) \
+                     until distinct frames return"
+                );
+                gop_degraded_logged = true;
+            } else if !now_degraded && gop_degraded_logged {
+                info!(
+                    camera_id = %camera.id,
+                    "motion: distinct frames returned; resuming normal pixel motion detection"
+                );
+                gop_degraded_logged = false;
+            }
+            gop_degraded = now_degraded;
+            gop_window_frames = 0;
+            gop_window_dups = 0;
+        }
+        if gop_degraded {
+            report_health(
+                health_tx,
+                pool,
+                camera.id,
+                false,
+                "keyframes-only/long-GOP sub-stream: too few distinct frames for a pixel verdict",
+                alert_gate,
+                alert_after_secs,
+            )
+            .await;
+            continue; // fail open — skip analysis; recording keeps everything
         }
 
         // Fail-open recovery: report healthy only once the warm-up window has
@@ -4058,6 +4156,23 @@ async fn resolve_rtsp_bases_motion(pool: &Pool, config: &Config) -> (String, Str
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── long-GOP / keyframes-only degradation (issue #144 item 5) ────────────────
+
+    #[test]
+    fn long_gop_degraded_fires_only_when_duplicates_dominate() {
+        let w = GOP_DEGRADE_WINDOW_FRAMES;
+        // A live source (even a static scene) yields ~no exact duplicates.
+        assert!(!long_gop_degraded(0, w), "a dense stream is never degraded");
+        // ~2.5 fps native upsampled to 5 fps ⇒ 50% dups ⇒ still workable, below cut.
+        assert!(!long_gop_degraded(w / 2, w), "50% dups is below the cut");
+        // 1 fps native upsampled to 5 fps ⇒ ~80% dups ⇒ degraded.
+        assert!(long_gop_degraded(w * 4 / 5, w), "80% dups must degrade");
+        // Exactly at the threshold degrades.
+        assert!(long_gop_degraded(w * GOP_DEGRADE_DUP_PCT / 100, w));
+        // Empty window never degrades (avoids a div-by-zero / cold-start flap).
+        assert!(!long_gop_degraded(0, 0));
+    }
 
     // ── unhealthy-alert hysteresis (should_emit_unhealthy_alert) ─────────────────
 

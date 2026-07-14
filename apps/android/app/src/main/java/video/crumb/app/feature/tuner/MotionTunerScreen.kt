@@ -63,6 +63,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import coil.imageLoader
 import coil.request.CachePolicy
 import coil.request.ImageRequest
@@ -130,6 +133,7 @@ fun MotionTunerScreen(
     val mediaUrls = remember { repo.mediaUrls() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var cam by remember { mutableStateOf<CameraDto?>(null) }
     var grid by remember { mutableStateOf<MotionGridDto?>(null) }
@@ -175,13 +179,17 @@ fun MotionTunerScreen(
         )
     }
 
-    // Poll the live heatmap.
-    LaunchedEffect(cameraId) {
-        while (true) {
-            repo.motionGrid(cameraId).onSuccess { g ->
-                if (g != null && g.cols > 0 && g.rows > 0) grid = g
+    // Poll the live heatmap — only while the screen is at least STARTED, so a
+    // backgrounded tuner stops hitting the server (the loop suspends on ON_STOP and
+    // resumes on ON_START) rather than polling forever in the background (#147-5).
+    LaunchedEffect(cameraId, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                repo.motionGrid(cameraId).onSuccess { g ->
+                    if (g != null && g.cols > 0 && g.rows > 0) grid = g
+                }
+                delay(MT_POLL_MS)
             }
-            delay(MT_POLL_MS)
         }
     }
 
@@ -221,7 +229,7 @@ fun MotionTunerScreen(
     // (same as a browser <img> swapping its src — what the desktop tuner relies on).
     // Coil caching stays disabled + a per-fetch cache-buster: the endpoint is a single
     // mutable live frame, so caching would only churn the LRU with frames never reused.
-    LaunchedEffect(loadedCam.id) {
+    LaunchedEffect(loadedCam.id, lifecycleOwner) {
         // API-PROXIED, authed still-frame (same as the live tiles + playback wall).
         // NOT a direct go2rtc :1984 URL: go2rtc's API port is host-local only, so a
         // direct {host}:1984 URL is unreachable from the phone — that was the
@@ -232,26 +240,31 @@ fun MotionTunerScreen(
         // token's ~15 min lifetime — mediaUrls.cameraFrameUrl() only pays a network
         // round-trip when the cached token is missing/near-expiry, otherwise it's
         // a cheap cache hit.
+        //
+        // STARTED-gated so the frame fetches stop when the tuner is backgrounded and
+        // resume when it returns to the foreground (#147-5).
         val loader = context.imageLoader
         var cb = 0
-        while (true) {
-            val baseUrl = runCatching { mediaUrls.cameraFrameUrl(loadedCam.id) }.getOrNull()
-            if (baseUrl.isNullOrEmpty()) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                val baseUrl = runCatching { mediaUrls.cameraFrameUrl(loadedCam.id) }.getOrNull()
+                if (baseUrl.isNullOrEmpty()) {
+                    delay(MT_FRAME_MS)
+                    continue
+                }
+                val req = ImageRequest.Builder(context)
+                    .data("$baseUrl&cb=$cb")
+                    .memoryCachePolicy(CachePolicy.DISABLED)
+                    .diskCachePolicy(CachePolicy.DISABLED)
+                    .allowHardware(false) // software bitmap → safe to draw via Image()
+                    .build()
+                val result = loader.execute(req)
+                if (result is SuccessResult) {
+                    (result.drawable as? BitmapDrawable)?.bitmap?.let { frameBitmap = it.asImageBitmap() }
+                }
+                cb++
                 delay(MT_FRAME_MS)
-                continue
             }
-            val req = ImageRequest.Builder(context)
-                .data("$baseUrl&cb=$cb")
-                .memoryCachePolicy(CachePolicy.DISABLED)
-                .diskCachePolicy(CachePolicy.DISABLED)
-                .allowHardware(false) // software bitmap → safe to draw via Image()
-                .build()
-            val result = loader.execute(req)
-            if (result is SuccessResult) {
-                (result.drawable as? BitmapDrawable)?.bitmap?.let { frameBitmap = it.asImageBitmap() }
-            }
-            cb++
-            delay(MT_FRAME_MS)
         }
     }
 

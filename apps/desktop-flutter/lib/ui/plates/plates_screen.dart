@@ -1038,13 +1038,27 @@ class _PlateThumbState extends State<_PlateThumb> {
 
   @override
   Widget build(BuildContext context) {
+    // Decode the full-res JPEG down to roughly the thumbnail's pixel size
+    // rather than at native resolution — a 1080p snapshot shown in a 92px cell
+    // otherwise pins a multi-MB decoded bitmap in the image cache per row. The
+    // cached BYTES stay full-res (the report crop needs them); only the decode
+    // is downscaled. Gallery/expanded tiles pass an infinite width, so cap the
+    // decode target for those at a sensible thumbnail ceiling.
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final logicalW = widget.width.isFinite ? widget.width : 320.0;
+    final cacheW = (logicalW * dpr).round().clamp(1, 1024);
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
       child: SizedBox(
         width: widget.width,
         height: widget.height,
         child: _bytes != null
-            ? Image.memory(_bytes!, fit: BoxFit.cover, gaplessPlayback: true)
+            ? Image.memory(
+                _bytes!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                cacheWidth: cacheW,
+              )
             : Container(
                 color: Colors.black,
                 alignment: Alignment.center,
@@ -2719,20 +2733,35 @@ Color? _parseHexColor(String? hex) {
 
 // ─── shared thumbnail plumbing ─────────────────────────────────────────────
 
-/// Process-wide snapshot byte cache, keyed by event id, bounded so a long
-/// browsing session doesn't grow unbounded (mirrors the clips thumb cache).
+/// Process-wide snapshot byte cache, keyed by event id. These are FULL-RES
+/// JPEGs — the report path (`_fetchSnapshotBytes`) crops them to the plate
+/// bbox, so the raw bytes must be kept at native resolution here (the
+/// thumbnails downscale at decode time via `cacheWidth`, not by shrinking the
+/// cache). A single snapshot can be hundreds of KB, so the cache is bounded by
+/// BYTES rather than a fixed entry COUNT — a count budget of a few hundred
+/// full-frame JPEGs could balloon to well over 100 MB.
 final Map<String, Uint8List> _snapshotCache = {};
-final List<String> _snapshotCacheOrder = [];
-const _snapshotCacheMax = 300;
+final List<String> _snapshotCacheOrder = []; // LRU-ish, oldest first
+const _snapshotCacheMaxBytes = 48 * 1024 * 1024; // 48 MiB
+int _snapshotCacheBytes = 0;
 
 void _cacheSnapshot(String id, Uint8List bytes) {
-  if (!_snapshotCache.containsKey(id)) {
-    _snapshotCacheOrder.add(id);
-    if (_snapshotCacheOrder.length > _snapshotCacheMax) {
-      _snapshotCache.remove(_snapshotCacheOrder.removeAt(0));
-    }
+  final existing = _snapshotCache[id];
+  if (existing != null) {
+    _snapshotCacheBytes -= existing.lengthInBytes;
+    _snapshotCacheOrder.remove(id);
   }
   _snapshotCache[id] = bytes;
+  _snapshotCacheOrder.add(id);
+  _snapshotCacheBytes += bytes.lengthInBytes;
+  // Evict oldest until under budget, but always keep the entry we just cached
+  // (an outsized single frame stays rather than being evicted immediately).
+  while (_snapshotCacheBytes > _snapshotCacheMaxBytes &&
+      _snapshotCacheOrder.length > 1) {
+    final evicted = _snapshotCacheOrder.removeAt(0);
+    final removed = _snapshotCache.remove(evicted);
+    if (removed != null) _snapshotCacheBytes -= removed.lengthInBytes;
+  }
 }
 
 /// Fetch a detection-event snapshot JPEG (`GET /events/{event_id}/snapshot`,
@@ -2763,9 +2792,17 @@ class _ConcurrencyGate {
   _ConcurrencyGate(this.max);
   final int max;
   int _active = 0;
+  // Bumped by [reset]. Each in-flight [run] captures the epoch it started in;
+  // its `finally` only settles the counter/waiters when the epoch still
+  // matches. Without this, a task that was already running when [reset] zeroed
+  // `_active` would decrement past 0 on completion, leaving `_active` negative
+  // — after which the gate admits far more than [max] at once (a snapshot-fetch
+  // thundering herd on the next page load).
+  int _epoch = 0;
   final List<Completer<void>> _waiters = [];
 
   void reset() {
+    _epoch++;
     _active = 0;
     for (final c in _waiters) {
       if (!c.isCompleted) c.complete();
@@ -2779,14 +2816,21 @@ class _ConcurrencyGate {
       _waiters.add(c);
       await c.future;
     }
+    // Capture AFTER any wait: a waiter released by reset() belongs to the new
+    // generation and is counted/settled against it.
+    final epoch = _epoch;
     _active++;
     try {
       await task();
     } finally {
-      _active--;
-      if (_waiters.isNotEmpty) {
-        final next = _waiters.removeAt(0);
-        if (!next.isCompleted) next.complete();
+      // A reset() during this task already zeroed `_active` and released the
+      // waiters for the old generation — don't double-count against it.
+      if (epoch == _epoch) {
+        _active--;
+        if (_waiters.isNotEmpty) {
+          final next = _waiters.removeAt(0);
+          if (!next.isCompleted) next.complete();
+        }
       }
     }
   }

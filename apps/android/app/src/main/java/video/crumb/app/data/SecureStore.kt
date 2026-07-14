@@ -22,6 +22,23 @@ class SecureStore(context: Context) {
 
     private val appContext = context.applicationContext
 
+    /**
+     * Whether [prefs] is the real AES-256 [EncryptedSharedPreferences] store.
+     * `false` means the keystore was unavailable and we fell back to plaintext
+     * prefs — in which case the auth token is kept IN MEMORY ONLY (never written
+     * unencrypted to disk); see [token]. Set during [prefs] init below.
+     */
+    private var usingEncryptedPrefs: Boolean = false
+
+    /**
+     * Auth token when running on the plaintext fallback ([usingEncryptedPrefs] ==
+     * false): held only for this process, never persisted. On process death the
+     * app simply returns to the login screen rather than leaking a long-lived JWT
+     * in cleartext on disk. Unused (always null) in the normal encrypted path.
+     */
+    @Volatile
+    private var inMemoryToken: String? = null
+
     private val prefs: SharedPreferences = run {
         try {
             val masterKey = MasterKey.Builder(appContext)
@@ -33,16 +50,19 @@ class SecureStore(context: Context) {
                 masterKey,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
+            ).also { usingEncryptedPrefs = true }
         } catch (e: Exception) {
             // AndroidKeyStore / TEE can be unavailable (direct-boot, locked
             // keystore, or a corrupt master key after an OS/restore change),
             // which would otherwise crash the app on first launch. Fall back to
-            // plain prefs so the app still starts — the stored token is a
-            // short-lived JWT, not a long-term secret.
+            // plain prefs so the app still starts, but keep the auth token in
+            // memory only (see [inMemoryToken]) — never write the JWT to plaintext
+            // prefs. Non-secret settings (server URL, UI prefs) still persist.
+            usingEncryptedPrefs = false
             android.util.Log.w(
                 "SecureStore",
-                "EncryptedSharedPreferences unavailable; using plain prefs fallback",
+                "EncryptedSharedPreferences unavailable; using plain prefs fallback " +
+                    "(token kept in-memory only)",
                 e,
             )
             appContext.getSharedPreferences("crumb_fallback", Context.MODE_PRIVATE)
@@ -82,9 +102,21 @@ class SecureStore(context: Context) {
         }
     }
 
+    /**
+     * The JWT bearer. On the normal encrypted store it is persisted (AES-256); on
+     * the plaintext fallback it is held IN MEMORY ONLY ([inMemoryToken]) and never
+     * written to disk, so a keystore failure degrades to "session lost on restart"
+     * rather than "long-lived token sitting in cleartext prefs" (#147-6).
+     */
     var token: String?
-        get() = safeRead(null) { it.getString(KEY_TOKEN, null) }
-        set(value) = safeWrite { if (value == null) it.remove(KEY_TOKEN) else it.putString(KEY_TOKEN, value) }
+        get() = if (usingEncryptedPrefs) safeRead(null) { it.getString(KEY_TOKEN, null) } else inMemoryToken
+        set(value) {
+            if (usingEncryptedPrefs) {
+                safeWrite { if (value == null) it.remove(KEY_TOKEN) else it.putString(KEY_TOKEN, value) }
+            } else {
+                inMemoryToken = value
+            }
+        }
 
     /** Normalized server base URL with no trailing slash, e.g. `http://192.0.2.10:8080`. */
     var serverUrl: String
@@ -278,8 +310,9 @@ class SecureStore(context: Context) {
     /**
      * How the Plates tab renders its reads: "list" (dense rows, default),
      * "gallery" (snapshot grid), "grouped" (collapsed by plate), or "timeline"
-     * (big chronological feed). A device-level UI preference like [ptzStyle]/
-     * [playbackSpanMs]; NOT cleared on logout. Default "list" (the original view).
+     * (big chronological feed). Per-account UI residue: CLEARED on logout
+     * ([clearSession]) so a shared device doesn't carry one operator's choice into
+     * the next login (#147-7). Default "list" (the original view).
      */
     var platesViewMode: String
         get() = safeRead("list") { it.getString(KEY_PLATES_VIEW_MODE, "list") ?: "list" }
@@ -341,6 +374,8 @@ class SecureStore(context: Context) {
     val isAdmin: Boolean get() = role.equals("admin", ignoreCase = true)
 
     fun clearSession() {
+        // Drop the in-memory token used by the plaintext fallback (#147-6).
+        inMemoryToken = null
         safeWrite {
             it.remove(KEY_TOKEN)
                 .remove(KEY_ROLE)
@@ -348,6 +383,15 @@ class SecureStore(context: Context) {
                 .remove(KEY_LAST_LIVE_CAM)
                 .remove(KEY_CAPABILITIES)
                 .remove(KEY_PLATES_ENABLED)
+                // Per-account UI residue: on a SHARED device, the next principal to
+                // log in must not inherit the previous account's saved-view mirror,
+                // selected view, or Plates render mode (#147-7). These repopulate on
+                // first use / server reconcile; genuine device-chrome preferences
+                // (ptzStyle, showAllCamerasView, playback quality, grid layout, …)
+                // are deliberately NOT cleared.
+                .remove(KEY_VIEWS)
+                .remove(KEY_ACTIVE_VIEW)
+                .remove(KEY_PLATES_VIEW_MODE)
         }
     }
 

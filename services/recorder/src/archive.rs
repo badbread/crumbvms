@@ -1984,7 +1984,9 @@ pub async fn archive_retention_sweep(pool: &Pool, _config: &Config, camera: &Cam
 /// all future footage. In exactly that state the deficit-driven portion of
 /// the sweep DELETES the oldest segments instead (file-then-row, item 10, via
 /// the shared helper; protected bookmarks are still excluded by the candidate
-/// query; the whole sweep still holds [`ARCHIVE_GUARD`]), and emits
+/// query; each disposal is still done under [`ARCHIVE_GUARD`], now re-acquired
+/// per [`ARCHIVE_MOVE_BATCH`] sub-batch rather than pinned for the whole run —
+/// issue #144 item 4), and emits
 /// `premature_rollover` so the loss is loud. Cap-only pressure (no floor
 /// deficit) still MOVES as before — the exception applies only while real
 /// bytes must be freed and a move cannot free them.
@@ -1999,7 +2001,22 @@ pub async fn policy_size_eviction_sweep(
 ) -> Result<()> {
     // Serialize against any other archive job (see ARCHIVE_GUARD) — the eviction
     // sweep MOVES live→archive, so it must never overlap a cron archive_camera.
-    let _archive_guard = ARCHIVE_GUARD.lock().await;
+    //
+    // Item 4 (issue #144): held per SUB-BATCH of [`ARCHIVE_MOVE_BATCH`] disposals,
+    // NOT for the whole (up to [`EVICTION_BATCH_LIMIT`]-segment) run. The disposal
+    // loops below drop and re-acquire the guard with a `yield_now` every batch so
+    // a large eviction can no longer pin the guard — and the scheduler tick — for
+    // the entire sweep, which starved the cron archiver and the free-space floor.
+    // Releasing between disposals is safe exactly as it is for `archive_camera`
+    // (issue #80): each move/delete is independently guarded and crash-safe; a
+    // concurrent guard-holder that disposes of a candidate during our yield just
+    // makes our later disposal a source-gone no-op (dangling-row cleanup), and a
+    // slightly stale `used`/`deficit` self-corrects on the next tick.
+    // Underscore-prefixed: held purely for its RAII lock effect (never read), and
+    // re-bound below to cycle the lock — the prefix keeps the unused-binding lint
+    // quiet while `Drop` still releases the guard on every re-bind and at return.
+    let mut _archive_guard = Some(ARCHIVE_GUARD.lock().await);
+    let mut since_guard_yield: usize = 0;
     let policy_label: &str = policy.name.as_deref().unwrap_or("<unnamed>");
 
     // ── LIVE over-cap OR below physical free-space floor ───────────────────────
@@ -2167,6 +2184,16 @@ pub async fn policy_size_eviction_sweep(
                     .as_ref()
                     .map(|s| Path::new(s.path.as_str()));
                 for seg in &live {
+                    // Item 4: release + re-acquire ARCHIVE_GUARD every
+                    // ARCHIVE_MOVE_BATCH disposals so the guard/scheduler tick is
+                    // not pinned for the whole (up to EVICTION_BATCH_LIMIT) run.
+                    if since_guard_yield >= ARCHIVE_MOVE_BATCH {
+                        since_guard_yield = 0;
+                        _archive_guard = None; // release the guard
+                        tokio::task::yield_now().await;
+                        _archive_guard = Some(ARCHIVE_GUARD.lock().await);
+                    }
+                    since_guard_yield += 1;
                     // Stop once BOTH conditions are satisfied: under the live TARGET
                     // (cap - spill, if a cap exists) AND the free-space deficit
                     // (already padded by spill when below floor) is cleared. With
@@ -2426,6 +2453,14 @@ pub async fn policy_size_eviction_sweep(
                 let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
                     std::collections::HashMap::new();
                 for seg in &arch {
+                    // Item 4: same per-batch guard release as the live loop above.
+                    if since_guard_yield >= ARCHIVE_MOVE_BATCH {
+                        since_guard_yield = 0;
+                        _archive_guard = None; // release the guard
+                        tokio::task::yield_now().await;
+                        _archive_guard = Some(ARCHIVE_GUARD.lock().await);
+                    }
+                    since_guard_yield += 1;
                     if used <= arch_target {
                         break;
                     }

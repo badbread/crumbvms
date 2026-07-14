@@ -8,6 +8,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import retrofit2.HttpException
 import java.io.IOException
 
@@ -71,13 +72,53 @@ class CrumbRepository(private val container: AppContainer) {
             container.rebuildApi()
             val resp = api.login(LoginRequest(username.trim(), password, remember))
             store.token = resp.token
-            val me = api.me()
-            store.role = me.role
-            store.username = me.username
-            store.capabilities = me.effectiveCapabilities
-            store.platesEnabled = me.platesEnabled
-            me
+            // Fetch the profile with a short retry. A TRANSIENT /auth/me failure
+            // (network blip, 5xx) must NOT throw away the session we just obtained —
+            // fetchMeWithRetry returns null in that case and we keep the token,
+            // proceeding with fail-closed defaults until a later /auth/me succeeds.
+            // Only a REAL auth rejection (401/403) propagates, tripping the
+            // onFailure below that clears the token.
+            val me = fetchMeWithRetry()
+            if (me != null) {
+                store.role = me.role
+                store.username = me.username
+                store.capabilities = me.effectiveCapabilities
+                store.platesEnabled = me.platesEnabled
+                me
+            } else {
+                // Keep the session; record the username so the UI isn't blank. Role/
+                // capabilities/plates stay at their fail-closed defaults (viewer, no
+                // plates) until the next successful /auth/me.
+                store.username = username.trim()
+                UserDto(id = "", username = username.trim(), role = store.role ?: "viewer")
+            }
         }.onFailure { store.token = null }
+
+    /**
+     * `GET /auth/me` with a small retry budget. Returns the profile on success;
+     * returns null when it can't be reached after [attempts] tries for a TRANSIENT
+     * reason (network [IOException], or a 5xx server error) so the caller can keep
+     * the just-obtained session instead of discarding it (#147-8). A genuine auth
+     * rejection (HTTP 401/403) is re-thrown immediately — that session really is
+     * invalid and must be dropped.
+     */
+    private suspend fun fetchMeWithRetry(attempts: Int = 3): UserDto? {
+        repeat(attempts) { i ->
+            try {
+                return api.me()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: HttpException) {
+                // Auth rejection → the token is bad; let it propagate to discard it.
+                if (e.code() == 401 || e.code() == 403) throw e
+                // Any other HTTP status (5xx, etc.) is transient → fall through/retry.
+            } catch (e: IOException) {
+                // Network failure → transient → fall through/retry.
+            }
+            if (i < attempts - 1) delay(300L * (i + 1))
+        }
+        return null
+    }
 
     fun logout() {
         store.clearSession()

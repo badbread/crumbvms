@@ -9,6 +9,7 @@
 // [fetchSnapshot] callback wired to its existing bounded-concurrency snapshot
 // helper + cache, so this reuses the same fetch path the thumbnails do.
 
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -111,7 +112,7 @@ class _PlateReportDialogState extends State<_PlateReportDialog> {
       Uint8List? plateCrop;
       var cropIsFallback = true;
       if (fullSnapshot != null && read.bbox != null) {
-        final cropped = _cropToBbox(fullSnapshot, read.bbox!);
+        final cropped = await _cropToBbox(fullSnapshot, read.bbox!);
         if (cropped != null) {
           plateCrop = cropped;
           cropIsFallback = false;
@@ -290,9 +291,20 @@ class _PlateReportDialogState extends State<_PlateReportDialog> {
 
 /// Crop [fullBytes] to the normalized `[x, y, w, h]` [bbox] (fractions 0..1 of
 /// the snapshot). Returns re-encoded JPEG bytes, or null if the image can't be
-/// decoded (the caller then falls back to the full frame). The rect is clamped
+/// decoded (the caller then falls back to the full frame).
+///
+/// The decode/crop/encode (all `package:image`, which is isolate-safe) runs on
+/// a background isolate via [Isolate.run] so a full-frame JPEG doesn't freeze
+/// the UI isolate while the report builds. The closure captures only sendable
+/// data (the byte list + the bbox doubles) and calls a top-level function; the
+/// `pdf`/`printing` share step stays on the main isolate (see [_generate]).
+Future<Uint8List?> _cropToBbox(Uint8List fullBytes, List<double> bbox) {
+  return Isolate.run(() => _cropToBboxSync(fullBytes, bbox));
+}
+
+/// The synchronous crop, run inside the background isolate. The rect is clamped
 /// into the image so an out-of-range or degenerate box still yields a crop.
-Uint8List? _cropToBbox(Uint8List fullBytes, List<double> bbox) {
+Uint8List? _cropToBboxSync(Uint8List fullBytes, List<double> bbox) {
   final decoded = img.decodeImage(fullBytes);
   if (decoded == null) return null;
   final w = decoded.width;

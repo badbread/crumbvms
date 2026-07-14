@@ -74,7 +74,23 @@ Two rails make this safe to leave running unattended:
 - **Spill.** If the RAM cache nears full (many cameras, a burst of concurrent
   motion, or a paused/slow disk), the oldest buffered segments are persisted
   to disk rather than being evicted from RAM and lost. Cache pressure changes
-  *when* something is written, never *whether* it survives.
+  *when* something is written, never *whether* it survives. If the cache
+  filesystem is genuinely out of space (ENOSPC) and the spill cannot relieve
+  it, the camera fails open to **direct-to-storage** recording for the rest of
+  the worker's life and raises `motion_cache_unavailable`, rather than letting
+  the wedged cache silently stall recording.
+
+**Known limitation — the pixel detector needs a reasonably dense sub-stream.**
+The frame-diff detector runs on decoded sub-stream frames at
+`MOTION_ANALYSIS_FPS`. A camera that delivers **keyframes-only or a very long
+GOP** produces too few *distinct* decoded frames (ffmpeg's `fps` filter pads
+the output with byte-identical duplicate frames), so the detector cannot form a
+trustworthy keep/discard verdict. Crumb detects this condition (a sustained
+majority of exact-duplicate frames) and **fails open** exactly like any other
+unhealthy-detector case: the camera records everything and a health alert
+fires until distinct frames return. The fix on the camera side is to give the
+sub-stream a normal GOP (~1–2s / an I-frame interval at or below the analysis
+rate); until then, that camera effectively records in Continuous mode.
 
 Net effect: the only footage that is deliberately never written to disk is
 footage nobody ever flagged as motion, on a camera whose detector is

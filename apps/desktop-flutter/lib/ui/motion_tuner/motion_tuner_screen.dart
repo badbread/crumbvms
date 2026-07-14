@@ -201,6 +201,11 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
   // grid; set by each poll).
   MotionGridSnapshot? _grid;
   Timer? _pollTimer;
+  // Re-entrancy guard for the heatmap poll: without it the fixed-interval timer
+  // fires another `fetchMotionGrid` even while the previous one is still in
+  // flight, so a slow server accretes a backlog of redundant, overlapping
+  // requests that all resolve to the same near-instant grid.
+  bool _pollInFlight = false;
 
   // Live video backdrop.
   Player? _player;
@@ -280,8 +285,11 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
         _loading = false;
       });
       _startVideo(cfg);
+      // ~1.5 Hz is ample for a live tuning heatmap and roughly halves the
+      // steady-state request rate versus the old 400 ms cadence; the in-flight
+      // guard below keeps a slow tick from stacking redundant fetches.
       _pollTimer = Timer.periodic(
-        const Duration(milliseconds: 400),
+        const Duration(milliseconds: 700),
         (_) => _poll(),
       );
       unawaited(_poll());
@@ -295,6 +303,8 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
   }
 
   Future<void> _poll() async {
+    if (_pollInFlight) return; // a previous fetch is still running — skip
+    _pollInFlight = true;
     try {
       final g = await widget.api.fetchMotionGrid(
         widget.session,
@@ -304,6 +314,8 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
       setState(() => _grid = g);
     } catch (_) {
       /* transient — ignore, next tick retries */
+    } finally {
+      _pollInFlight = false;
     }
   }
 

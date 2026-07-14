@@ -743,8 +743,9 @@ private suspend fun saveExportToDownloads(
         try {
             val base = container.store.serverUrl.trimEnd('/')
             val path = outputFile.downloadUrl.let { if (it.startsWith("/")) it else "/$it" }
-            // NOT container.mediaUrls().authed(...) — that appends `?token=`. This
-            // URL carries no credential; the interceptor adds the header instead.
+            // Credential-free URL: the auth interceptor adds the bearer token as a
+            // header. (The old JWT-in-URL `MediaUrls.authed()` builder was removed —
+            // no code path puts the bearer token in a URL anymore. #147-9.)
             val absoluteUrl = "$base$path"
 
             val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
@@ -852,9 +853,9 @@ private suspend fun downloadExportFileToCache(
         try {
             val base = container.store.serverUrl.trimEnd('/')
             val path = outputFile.downloadUrl.let { if (it.startsWith("/")) it else "/$it" }
-            // Deliberately NOT container.mediaUrls().authed(...) — that appends
-            // `?token=`. This URL carries no credential; the interceptor adds
-            // the Authorization header instead.
+            // Credential-free URL: the auth interceptor adds the bearer token as
+            // the Authorization header. (The JWT-in-URL `MediaUrls.authed()` builder
+            // was removed — nothing puts the bearer token in a URL now. #147-9.)
             val absoluteUrl = "$base$path"
 
             val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")

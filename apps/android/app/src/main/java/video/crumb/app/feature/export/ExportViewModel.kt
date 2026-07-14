@@ -186,15 +186,6 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
 
     // ─── download / share helpers ───────────────────────────────────────────
 
-    /**
-     * Returns an authenticated URL for the given output file's download path,
-     * carrying the full login JWT (NOT a per-camera scoped token — an export can
-     * span multiple cameras/archive stages, which a scoped token can't authorize).
-     * Called from the UI immediately before enqueueing / sharing.
-     */
-    fun authedUrl(rawDownloadUrl: String): String =
-        repo.mediaUrls().authed(rawDownloadUrl, repo.store.token)
-
     /** Acknowledge the transient download confirmation banner. */
     fun clearDownloadMsg() {
         _state.update { it.copy(downloadMsg = null) }

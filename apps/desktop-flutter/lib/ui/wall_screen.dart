@@ -52,6 +52,7 @@ class WallScreen extends StatefulWidget {
     this.shortcuts,
     this.onMaximizedCameraChanged,
     this.statsSink,
+    this.onConfigChanged,
   });
 
   final CrumbApi api;
@@ -86,6 +87,12 @@ class WallScreen extends StatefulWidget {
   /// renders it in the bottom status bar on the Live tab instead of a floating
   /// overlay on the wall. Updated on each ~2s stats poll.
   final ValueNotifier<String?>? statsSink;
+
+  /// Called (debounced) when the server's `/status.config_version` changes —
+  /// the host re-fetches the camera list so an admin/config edit (camera added,
+  /// removed, renamed, re-streamed) reflects on the wall without a restart
+  /// (#146). Null → config changes are detected but nothing is reloaded.
+  final Future<void> Function()? onConfigChanged;
 
   /// Client options store. The wall LISTENS to it, so a preference change made
   /// while the wall is visible — e.g. toggling "Show tile info bar" in the
@@ -158,6 +165,9 @@ class _WallScreenState extends State<WallScreen> {
     );
     _liveStatus = LiveStatusController(api: widget.api, session: widget.session)
       ..cameraIds = _shown.map((c) => c.id).toList()
+      // A config_version bump means cameras/streams may have changed — ask the
+      // host to re-fetch the camera list so the wall picks it up live (#146).
+      ..onConfigChanged = _onConfigChanged
       ..start();
     _special = SpecialTileController(
       allCameraIds: () => _shown.map((c) => c.id).toList(),
@@ -187,6 +197,25 @@ class _WallScreenState extends State<WallScreen> {
       _maximizeWarmCtrl = null;
       _applyViewSpecs();
     }
+    // The camera set changed (e.g. a config-driven refresh added/removed one) —
+    // keep the /status + /events poller's camera list in step so new cameras
+    // get badges and dropped ones stop being polled.
+    final oldIds = old.cameras.map((c) => c.id).toList();
+    final newIds = widget.cameras.map((c) => c.id).toList();
+    var idsChanged = oldIds.length != newIds.length;
+    for (var i = 0; !idsChanged && i < oldIds.length; i++) {
+      if (oldIds[i] != newIds[i]) idsChanged = true;
+    }
+    if (idsChanged) {
+      _liveStatus.cameraIds = _shown.map((c) => c.id).toList();
+    }
+  }
+
+  /// The wall's config-change signal: re-fetch the camera list via the host.
+  /// Fire-and-forget — the host owns the list and rebuilds us with it.
+  void _onConfigChanged() {
+    final refresh = widget.onConfigChanged;
+    if (refresh != null) unawaited(refresh());
   }
 
   void _onSpecialChanged() {

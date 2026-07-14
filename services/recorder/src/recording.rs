@@ -54,7 +54,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -430,6 +430,13 @@ pub async fn run(
     // produces any segment (see `stream_healthy` below).
     let mut consecutive_no_seg_stalls: u32 = 0;
 
+    // Item 3 (issue #144): worker-lifetime motion-cache ENOSPC fail-open latch.
+    // Set by `run_ffmpeg_loop` when the RAM/tmpfs cache runs out of space; once
+    // set, every subsequent (re)spawn records direct-to-storage instead of into
+    // the full cache. Fresh per worker, so a respawn (config change / restart)
+    // re-tries the cache once the operator has freed RAM.
+    let cache_disabled = Arc::new(AtomicBool::new(false));
+
     loop {
         // Check for shutdown before attempting to start ffmpeg.
         if cancel.is_cancelled() {
@@ -469,6 +476,7 @@ pub async fn run(
             configured_watchdog_secs,
             &watchdog_secs,
             &mut gop_probe_spawned,
+            &cache_disabled,
         )
         .await;
 
@@ -712,6 +720,11 @@ async fn probe_audio_sample_rate(url: &str) -> Option<u32> {
             "-i",
             url,
         ])
+        // Reap the probe child if the timeout below drops this future (e.g. a
+        // reconnect cancels the run before the probe returns). Without this a
+        // wedged-audio camera that never answers the probe leaks one ffprobe
+        // process + its socket on every reconnect cycle (issue #144 item 1).
+        .kill_on_drop(true)
         .output();
     let out = tokio::time::timeout(std::time::Duration::from_secs(4), fut)
         .await
@@ -754,6 +767,12 @@ async fn run_ffmpeg_loop(
     watchdog_secs: &Arc<AtomicU64>,
     // P0-3: guards the one-shot GOP probe spawn across reconnects.
     gop_probe_spawned: &mut bool,
+    // Item 3 (issue #144): worker-lifetime latch set when the motion RAM/tmpfs
+    // cache runs out of space (ENOSPC). Once set, this and every subsequent
+    // (re)spawn record DIRECT-TO-STORAGE (fail-open) instead of into the full
+    // cache, so a wedged cache never silently stalls recording. Reset only by a
+    // worker respawn (config change / process restart).
+    cache_disabled: &Arc<AtomicBool>,
 ) -> Result<()> {
     // ── 1. Resolve live storage ────────────────────────────────────────────────
 
@@ -865,8 +884,12 @@ async fn run_ffmpeg_loop(
     // feature existed. `use_motion_cache` gates every cache-specific branch
     // below; when it is `false` this function is byte-for-byte the pre-feature
     // code path.
-    let use_motion_cache =
-        camera.policy.mode == RecordingMode::Motion && !config.motion_recording_shadow;
+    // Item 3: a prior ENOSPC on the cache latches `cache_disabled`, forcing this
+    // and all later (re)spawns to record direct-to-storage (fail-open) — the
+    // same footage-safe fallback the cache-dir-create failure below already uses.
+    let use_motion_cache = camera.policy.mode == RecordingMode::Motion
+        && !config.motion_recording_shadow
+        && !cache_disabled.load(Ordering::Relaxed);
 
     let write_dir = if use_motion_cache {
         match resolve_motion_cache_dir(pool, config, camera.id).await {
@@ -1515,6 +1538,60 @@ async fn run_ffmpeg_loop(
                                 .await
                                 {
                                     *indexed_ok = true;
+                                }
+
+                                // Item 3 (issue #144): ENOSPC fail-open. If the
+                                // motion cache filesystem is so full it cannot fit
+                                // even one more segment — and the spill inside
+                                // `finish_completed_segment` above could NOT relieve
+                                // it — the next ffmpeg write to the cache would
+                                // ENOSPC and silently stall recording. Fail open
+                                // loudly: latch the cache off for this worker, raise
+                                // the existing `motion_cache_unavailable` alert
+                                // (migration 0040), and error out so the reconnect
+                                // records DIRECT-TO-STORAGE (a different, larger
+                                // filesystem). Footage-safe: the flip-guard on the
+                                // next (fallback) spawn persists any carried ring to
+                                // storage; nothing in the ring is dropped.
+                                if caching_active
+                                    && cache_enospc_imminent(
+                                        effective_write_dir,
+                                        completed.size_bytes,
+                                    )
+                                {
+                                    error!(
+                                        camera_id = %camera.id,
+                                        cache_dir = ?effective_write_dir,
+                                        "motion cache filesystem out of space (cannot fit another \
+                                         segment even after spill); FAILING OPEN to \
+                                         direct-to-storage recording for this camera"
+                                    );
+                                    cache_disabled.store(true, Ordering::Relaxed);
+                                    let reason = format!(
+                                        "motion cache ENOSPC at {}: failing open to \
+                                         direct-to-storage recording",
+                                        effective_write_dir.display()
+                                    );
+                                    if let Err(ev) = crumb_common::db::insert_system_event(
+                                        pool,
+                                        "motion_cache_unavailable",
+                                        Some(camera.id),
+                                        Some(&reason),
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            camera_id = %camera.id,
+                                            error = %ev,
+                                            "failed to record motion_cache_unavailable (ENOSPC) event"
+                                        );
+                                    }
+                                    // Kill ffmpeg now so it stops hammering the full
+                                    // cache, then error out to trigger the reconnect.
+                                    kill_child(&mut child).await;
+                                    return Err(anyhow::anyhow!(
+                                        "motion cache ENOSPC; failing open to direct-to-storage"
+                                    ));
                                 }
                             }
 
@@ -2364,6 +2441,11 @@ fn decide_persist_for_segment(
 /// first successfully-indexed segment of a run and reset the reconnect
 /// backoff — a sub-floor skip or a failed fsync/insert does NOT count as a
 /// healthy segment).
+///
+/// `preserve_existing` (item 2, issue #144): when set, index defensively with a
+/// DO-NOTHING insert so an already-indexed segment at the same
+/// `(camera_id, stream, start_ts)` is never repointed/overwritten — used by the
+/// persist path when it detects a backward-clock filename collision.
 async fn index_segment(
     seg: &PendingSegment,
     camera: &Camera,
@@ -2371,6 +2453,7 @@ async fn index_segment(
     storage_root: &str,
     pool: &Pool,
     signals: &[MotionSignal],
+    preserve_existing: bool,
 ) -> bool {
     // SUB-FLOOR REJECT on the LIVE path (R3a): a header-only skeleton (ffmpeg
     // writes a ~28-byte `ftyp`+empty `moov` before any frame lands) is not a
@@ -2455,6 +2538,49 @@ async fn index_segment(
         size_bytes: seg.size_bytes,
         motion_bbox,
     };
+
+    // Item 2 (issue #144): when `preserve_existing` is set the caller has
+    // detected a backward wall-clock step / filename collision, so we must NOT
+    // let this write repoint or overwrite the segment row that already occupies
+    // `(camera_id, stream, start_ts)`. Use the DO-NOTHING insert: if a row is
+    // already there the EXISTING indexed footage wins and this new segment is
+    // left as an un-indexed on-disk orphan (footage preserved, never deleted),
+    // rather than an UPSERT that would steal the row from the older segment. The
+    // normal (non-regressed) path keeps the idempotent UPSERT so a legit
+    // re-index of the SAME segment after a reconnect still merges in place.
+    if preserve_existing {
+        return match db::insert_segment_if_absent(pool, &params).await {
+            Ok(Some(id)) => {
+                debug!(
+                    camera_id  = %camera.id,
+                    segment_id = %id,
+                    start_ts   = %seg.start_ts,
+                    "segment indexed (clock-regression: non-colliding key)"
+                );
+                true
+            }
+            Ok(None) => {
+                error!(
+                    camera_id = %camera.id,
+                    path      = %seg.path,
+                    start_ts  = %seg.start_ts,
+                    "clock-regression: a segment is already indexed at this timestamp; \
+                     PRESERVING the existing footage and leaving the new segment as an \
+                     un-indexed on-disk orphan (no footage deleted)"
+                );
+                false
+            }
+            Err(e) => {
+                error!(
+                    camera_id = %camera.id,
+                    path      = %seg.path,
+                    error     = %e,
+                    "failed to index segment (clock-regression path); continuing"
+                );
+                false
+            }
+        };
+    }
 
     match db::insert_segment(pool, &params).await {
         Ok(id) => {
@@ -2590,6 +2716,100 @@ async fn clear_dir_contents(dir: &Path, keep: &std::collections::HashSet<PathBuf
     Ok(())
 }
 
+// ─── clock-step / filename-collision helpers (issue #144 item 2) ─────────────
+
+/// Insert a `-rN` disambiguator before the extension of a segment filename.
+///
+/// Pure + unit-testable. Used only on the rare backward-clock collision path to
+/// derive a non-colliding sibling name so a persisted segment never overwrites
+/// existing footage. `"20260101T030000Z.mp4"`, `n=1` → `"20260101T030000Z-r1.mp4"`.
+/// A name with no extension gets the suffix appended (`"seg"` → `"seg-r1"`).
+///
+/// The result deliberately does NOT re-parse as a bare `%Y%m%dT%H%M%SZ` stem, so
+/// reconcile's orphan-adopt (which parses that exact format) will skip it — which
+/// is what we want: the disambiguated file is the loser of a clock collision and
+/// stays an on-disk orphan (footage preserved, never auto-indexed under a
+/// fabricated timestamp), while the original segment keeps its row.
+fn disambiguated_name(filename: &str, n: u32) -> String {
+    match filename.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}-r{n}.{ext}"),
+        None => format!("{filename}-r{n}"),
+    }
+}
+
+/// Maximum `-rN` disambiguation attempts before giving up (issue #144 item 2).
+/// A collision needs at most one free slot in practice; the bound only guards
+/// against an unbounded loop if the directory is somehow saturated.
+const MAX_COLLISION_DISAMBIGUATION: u32 = 64;
+
+/// Given a `desired` destination that already exists, find the first
+/// `desired`-with-`-rN` sibling that does NOT exist, so a colliding persist can
+/// write there instead of overwriting the existing file. Returns `None` if no
+/// free name is found within [`MAX_COLLISION_DISAMBIGUATION`] tries (caller then
+/// refuses to persist rather than risk clobbering footage). Each candidate is
+/// checked with `try_exists`; only an explicit `Ok(false)` (definitely absent)
+/// is accepted, so the returned path is safe to treat as exclusively ours.
+async fn resolve_noncolliding_dst(desired: &Path) -> Option<PathBuf> {
+    let parent = desired.parent()?;
+    let filename = desired.file_name()?.to_string_lossy().into_owned();
+    for n in 1..=MAX_COLLISION_DISAMBIGUATION {
+        let candidate = parent.join(disambiguated_name(&filename, n));
+        if matches!(tokio::fs::try_exists(&candidate).await, Ok(false)) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Copy `src` (a cache segment) into storage at `desired`, upholding two
+/// footage-safety invariants (issue #144 items 2 + 7):
+///
+/// * **Never overwrite existing footage (item 2).** If `desired` already exists
+///   — the backward-wall-clock filename-collision case — the bytes go to a
+///   non-colliding `-rN` sibling instead, so BOTH the existing segment and the
+///   new one survive. Returns `collided = true` in that case (the caller uses it
+///   to index defensively).
+/// * **No partial left behind on failure (item 7).** The chosen destination is
+///   ALWAYS confirmed absent immediately before the copy (either `desired` read
+///   `Ok(false)`, or a fresh disambiguated name did), so on a mid-copy failure
+///   the only file that can exist at that path is the partial THIS call started
+///   writing — which is removed before returning `Err`. It can never delete a
+///   completed/indexed segment (a colliding one was routed elsewhere).
+///
+/// Returns `Ok((final_path, collided))` on success, or `Err` if no free name was
+/// available or the copy failed (partial already cleaned up).
+async fn safe_copy_into_storage(src: &Path, desired: &Path) -> Result<(PathBuf, bool)> {
+    // `unwrap_or(true)`: on the rare `try_exists` Err (permission/exotic FS) treat
+    // the destination as present and take the safe non-overwriting branch.
+    let collided = tokio::fs::try_exists(desired).await.unwrap_or(true);
+    let dst = if collided {
+        resolve_noncolliding_dst(desired).await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no free non-colliding destination for {} (refusing to overwrite existing footage)",
+                desired.display()
+            )
+        })?
+    } else {
+        desired.to_path_buf()
+    };
+
+    // Cross-device copy (the cache dir is expected to be tmpfs, a different
+    // filesystem from the storage root, so a rename(2) would fail with EXDEV —
+    // `tokio::fs::copy` handles this correctly via read+write).
+    if let Err(e) = tokio::fs::copy(src, &dst).await {
+        // Item 7: remove the partial we just started writing. Safe because `dst`
+        // was confirmed absent immediately above. Best-effort; a NotFound
+        // (nothing written yet) or any other cleanup error is non-fatal.
+        let _ = tokio::fs::remove_file(&dst).await;
+        return Err(anyhow::Error::from(e).context(format!(
+            "copy {} -> {}",
+            src.display(),
+            dst.display()
+        )));
+    }
+    Ok((dst, collided))
+}
+
 // ─── persist / discard execution (RAM pre-buffer + persist-on-motion) ────────
 
 /// Copy a cached segment into storage, fsync it (+ parent dir), then index it —
@@ -2601,6 +2821,12 @@ async fn clear_dir_contents(dir: &Path, keep: &std::collections::HashSet<PathBuf
 /// parent dir (belt-and-suspenders — `index_segment` also fsyncs before
 /// insert; a redundant fsync on an already-durable file is cheap), THEN
 /// `index_segment` (which inserts the DB row), THEN delete the cache file.
+///
+/// The copy step is `safe_copy_into_storage`, which upholds two footage-safety
+/// invariants (issue #144 items 2 + 7): it NEVER overwrites an existing storage
+/// file (a backward-clock filename collision is routed to a `-rN` sibling and
+/// indexed defensively so the older segment keeps its row), and it never leaves
+/// a partial behind on a failed copy.
 ///
 /// A crash between the copy and the index leaves an orphan file in storage
 /// with no row — this is IDENTICAL to the existing direct-to-storage orphan
@@ -2635,56 +2861,72 @@ async fn persist_cached_segment(
             return false;
         }
     };
-    let storage_path = camera_dir.join(filename);
-    let storage_path_str = storage_path.to_string_lossy().into_owned();
+    let desired = camera_dir.join(filename);
 
-    // Cross-device copy (the cache dir is expected to be tmpfs, a different
-    // filesystem from the storage root, so a rename(2) would fail with EXDEV —
-    // `tokio::fs::copy` handles this correctly via read+write).
-    if let Err(e) = tokio::fs::copy(&seg.path, &storage_path).await {
-        error!(
-            camera_id = %camera.id,
-            src = %seg.path,
-            dst = %storage_path_str,
-            error = %e,
-            "failed to copy cached segment into storage; leaving in cache (footage may be lost \
-             if the cache is tmpfs and the process restarts)"
-        );
-        // R2 (audit 2026-07-05): a copy failure here is footage-THREATENING —
-        // storage full (ENOSPC) or read-only (EROFS) while the motion RAM buffer
-        // must spill. It was previously logged only ("silent"); surface it as an
-        // urgent `storage_persist_failed` system alert (migration 0043). Throttled
-        // to once/minute per process because one spill fails many buffered
-        // segments at once (the alert-rule cooldown throttles the operator-facing
-        // notification further).
-        {
-            use std::sync::atomic::{AtomicI64, Ordering};
-            static LAST_ALERT_TS: AtomicI64 = AtomicI64::new(0);
-            let now = chrono::Utc::now().timestamp();
-            let last = LAST_ALERT_TS.load(Ordering::Relaxed);
-            if now - last >= 60
-                && LAST_ALERT_TS
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
+    // Items 2 + 7 (issue #144): copy cache→storage WITHOUT overwriting existing
+    // footage (a backward-clock filename collision routes the new segment to a
+    // non-colliding sibling name) and WITHOUT leaving a partial behind on
+    // failure. `safe_copy_into_storage` owns both footage-safety invariants and
+    // is unit-tested with tempfiles; here we keep the operator-facing logging and
+    // the `storage_persist_failed` alert on failure.
+    let copied = safe_copy_into_storage(Path::new(&seg.path), &desired).await;
+    let (storage_path, collided) = match copied {
+        Ok(v) => v,
+        Err(e) => {
+            error!(
+                camera_id = %camera.id,
+                src = %seg.path,
+                dst = %desired.to_string_lossy(),
+                error = %e,
+                "failed to copy cached segment into storage; leaving in cache (footage may be \
+                 lost if the cache is tmpfs and the process restarts)"
+            );
+            // R2 (audit 2026-07-05): a copy failure here is footage-THREATENING —
+            // storage full (ENOSPC) or read-only (EROFS) while the motion RAM
+            // buffer must spill. Surface it as an urgent `storage_persist_failed`
+            // system alert (migration 0043). Throttled to once/minute per process
+            // because one spill fails many buffered segments at once (the
+            // alert-rule cooldown throttles the operator-facing notification
+            // further).
             {
-                let reason = format!("copy cache->storage failed: {e}");
-                if let Err(ev) = crumb_common::db::insert_system_event(
-                    pool,
-                    "storage_persist_failed",
-                    Some(camera.id),
-                    Some(&reason),
-                )
-                .await
+                use std::sync::atomic::{AtomicI64, Ordering};
+                static LAST_ALERT_TS: AtomicI64 = AtomicI64::new(0);
+                let now = chrono::Utc::now().timestamp();
+                let last = LAST_ALERT_TS.load(Ordering::Relaxed);
+                if now - last >= 60
+                    && LAST_ALERT_TS
+                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
                 {
-                    warn!(
-                        camera_id = %camera.id,
-                        error = %ev,
-                        "failed to record storage_persist_failed system event"
-                    );
+                    let reason = format!("copy cache->storage failed: {e}");
+                    if let Err(ev) = crumb_common::db::insert_system_event(
+                        pool,
+                        "storage_persist_failed",
+                        Some(camera.id),
+                        Some(&reason),
+                    )
+                    .await
+                    {
+                        warn!(
+                            camera_id = %camera.id,
+                            error = %ev,
+                            "failed to record storage_persist_failed system event"
+                        );
+                    }
                 }
             }
+            return false;
         }
-        return false;
+    };
+    let storage_path_str = storage_path.to_string_lossy().into_owned();
+    if collided {
+        warn!(
+            camera_id = %camera.id,
+            dst = %storage_path_str,
+            start_ts = %seg.start_ts,
+            "clock-step/filename collision: destination already held footage; persisted the new \
+             segment under a non-colliding name to preserve the existing footage"
+        );
     }
 
     // Belt-and-suspenders fsync here (index_segment fsyncs again before its own
@@ -2714,6 +2956,9 @@ async fn persist_cached_segment(
         storage_root,
         pool,
         signals,
+        // Item 2: on a detected collision, index defensively so the older
+        // already-indexed segment keeps its row (the new file is the orphan).
+        collided,
     )
     .await;
 
@@ -2814,7 +3059,13 @@ async fn execute_motion_decision(
             "a non-caching decision must never contain discards (nothing to discard without a cache)"
         );
         for seg in &decision.persist {
-            if index_segment(seg, camera, storage_id, storage_root, pool, signals).await {
+            // Direct-to-storage: ffmpeg wrote the file itself, so any backward-
+            // clock filename collision was already resolved by ffmpeg at the
+            // filesystem level before we see the segment (see the item 2 note in
+            // the module docs / DECISIONS.md); the recorder-controlled collision
+            // guard lives in `persist_cached_segment`. Index with the normal
+            // idempotent UPSERT here.
+            if index_segment(seg, camera, storage_id, storage_root, pool, signals, false).await {
                 any_indexed = true;
             }
         }
@@ -2897,16 +3148,60 @@ fn motion_cache_free_and_total(path: &Path) -> Option<(i64, i64)> {
         if rc != 0 {
             return None;
         }
+        // Use f_bavail (blocks available to a NON-privileged writer) × f_frsize,
+        // NOT f_bfree × f_bsize (issue #144 item 6). The recorder runs as
+        // non-root uid 1001; on a non-tmpfs cache backed by ext4 the ~5% root
+        // reserve is counted by f_bfree but is NOT usable by the recorder, so a
+        // f_bfree-based floor never fires and the spill/ENOSPC valve stays blind
+        // until the disk is genuinely 100% full. tmpfs has no root reserve, so
+        // f_bavail == f_bfree there and this is a no-op for the common tmpfs
+        // cache — it only corrects the non-tmpfs case. f_frsize is the POSIX
+        // fundamental block size that f_bavail/f_blocks are counted in. Mirrors
+        // `archive::fs_free_and_total` exactly.
         #[allow(clippy::cast_lossless)]
-        let free = (buf.f_bfree as u64).saturating_mul(buf.f_bsize as u64);
+        let free = (buf.f_bavail as u64).saturating_mul(buf.f_frsize as u64);
         #[allow(clippy::cast_lossless)]
-        let total = (buf.f_blocks as u64).saturating_mul(buf.f_bsize as u64);
+        let total = (buf.f_blocks as u64).saturating_mul(buf.f_frsize as u64);
         Some((i64::try_from(free).ok()?, i64::try_from(total).ok()?))
     }
     #[cfg(not(unix))]
     {
         let _ = path;
         None
+    }
+}
+
+/// Fallback minimum-segment size (bytes) for the ENOSPC-imminent check when the
+/// just-completed segment's size is unknown (0). A recorded segment is virtually
+/// always larger than this; 8 MiB is a conservative "can we fit one more" floor.
+const ENOSPC_MIN_SEGMENT_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Pure decision (item 3, issue #144): given the cache filesystem's free bytes
+/// and a recent segment's size, is the cache so full that the NEXT segment write
+/// would ENOSPC? True when free space cannot hold even one more segment. Kept
+/// separate from [`should_spill_cache`] (which fires much earlier, to relieve
+/// pressure) — this is the last-resort "spill could not save us" gate that
+/// triggers the direct-to-storage fail-open. Extracted as a pure fn so the
+/// boundary is unit-testable without a real filesystem.
+fn cache_enospc_reached(free_bytes: i64, recent_segment_bytes: i64) -> bool {
+    // Need = the recent segment size when we have a real measurement, else the
+    // conservative floor. (Using `max(floor)` unconditionally would abandon the
+    // cache while a whole segment still fits — a false ENOSPC on small segments.)
+    let need = if recent_segment_bytes > 0 {
+        recent_segment_bytes
+    } else {
+        ENOSPC_MIN_SEGMENT_BYTES
+    };
+    free_bytes < need
+}
+
+/// Read the cache filesystem's free space and decide whether an ENOSPC fail-open
+/// is warranted (item 3). Returns `false` when free space can't be read this
+/// tick (skip — never fail open on a bad reading) or the cache still has room.
+fn cache_enospc_imminent(cache_dir: &Path, recent_segment_bytes: i64) -> bool {
+    match motion_cache_free_and_total(cache_dir) {
+        Some((free, _total)) => cache_enospc_reached(free, recent_segment_bytes),
+        None => false,
     }
 }
 
@@ -4586,6 +4881,176 @@ mod tests {
         let result =
             motion_cache_free_and_total(Path::new("/this/path/does/not/exist/crumb-test-xyz"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn cache_enospc_reached_fires_only_when_a_segment_cannot_fit() {
+        // Item 3 (issue #144): the ENOSPC fail-open gate. Free space that can't
+        // hold even one more segment ⇒ fail open; ample free ⇒ don't.
+        let seg = 4 * 1024 * 1024i64;
+        // Free < one segment ⇒ ENOSPC reached.
+        assert!(cache_enospc_reached(seg - 1, seg));
+        assert!(cache_enospc_reached(0, seg));
+        // Free ≥ one segment ⇒ not reached.
+        assert!(!cache_enospc_reached(seg, seg));
+        assert!(!cache_enospc_reached(seg * 100, seg));
+        // Unknown/zero recent size falls back to the 8 MiB floor.
+        assert!(cache_enospc_reached(ENOSPC_MIN_SEGMENT_BYTES - 1, 0));
+        assert!(!cache_enospc_reached(ENOSPC_MIN_SEGMENT_BYTES, 0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn motion_cache_free_and_total_available_never_exceeds_total() {
+        // Item 6 (issue #144): the free figure is now f_bavail×f_frsize (space
+        // usable by the non-root recorder), which by definition can never exceed
+        // the filesystem total (f_blocks×f_frsize). A f_bfree-based reading could
+        // count root-reserved blocks; this guards the corrected semantics.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (free, total) = motion_cache_free_and_total(dir.path()).expect("statvfs on temp dir");
+        assert!(
+            free >= 0 && total > 0,
+            "free/total must be sane: {free}/{total}"
+        );
+        assert!(
+            free <= total,
+            "available-to-recorder free ({free}) must not exceed total ({total})"
+        );
+    }
+
+    // ── item 2 / 7: clock-step collision + partial-cleanup helpers ─────────────
+
+    #[test]
+    fn disambiguated_name_inserts_suffix_before_extension() {
+        assert_eq!(
+            disambiguated_name("20260101T030000Z.mp4", 1),
+            "20260101T030000Z-r1.mp4"
+        );
+        assert_eq!(
+            disambiguated_name("20260101T030000Z.mp4", 7),
+            "20260101T030000Z-r7.mp4"
+        );
+        // Multi-dot names split on the LAST dot only.
+        assert_eq!(disambiguated_name("a.b.mp4", 2), "a.b-r2.mp4");
+        // No extension → suffix appended.
+        assert_eq!(disambiguated_name("segment", 3), "segment-r3");
+    }
+
+    #[tokio::test]
+    async fn resolve_noncolliding_dst_skips_existing_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let desired = dir.path().join("20260101T030000Z.mp4");
+        // The desired name AND its first disambiguation already exist.
+        tokio::fs::write(&desired, b"old")
+            .await
+            .expect("write desired");
+        tokio::fs::write(dir.path().join("20260101T030000Z-r1.mp4"), b"old1")
+            .await
+            .expect("write r1");
+        let got = resolve_noncolliding_dst(&desired)
+            .await
+            .expect("a free name must be found");
+        assert_eq!(
+            got.file_name().unwrap().to_string_lossy(),
+            "20260101T030000Z-r2.mp4",
+            "must pick the first free -rN sibling"
+        );
+        assert!(
+            !got.exists(),
+            "the returned path must not already exist on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_copy_fresh_destination_copies_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("cache.mp4");
+        let desired = dir.path().join("20260101T030000Z.mp4");
+        tokio::fs::write(&src, b"NEWDATA").await.expect("write src");
+
+        let (dst, collided) = safe_copy_into_storage(&src, &desired)
+            .await
+            .expect("copy must succeed");
+        assert!(!collided, "no existing dest ⇒ not a collision");
+        assert_eq!(dst, desired, "fresh copy lands at the desired path");
+        assert_eq!(
+            tokio::fs::read(&desired).await.unwrap(),
+            b"NEWDATA",
+            "destination holds the copied bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_copy_collision_preserves_existing_footage() {
+        // Item 2 core footage-safety property: an existing (already-persisted)
+        // segment file is NEVER overwritten by a backward-clock collision.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("cache.mp4");
+        let desired = dir.path().join("20260101T030000Z.mp4");
+        tokio::fs::write(&src, b"NEWDATA").await.expect("write src");
+        tokio::fs::write(&desired, b"EXISTING_FOOTAGE")
+            .await
+            .expect("write existing");
+
+        let (dst, collided) = safe_copy_into_storage(&src, &desired)
+            .await
+            .expect("copy must succeed");
+        assert!(collided, "an existing dest must be reported as a collision");
+        assert_ne!(
+            dst, desired,
+            "the new segment must NOT land on the existing file"
+        );
+        // The existing footage is byte-for-byte intact.
+        assert_eq!(
+            tokio::fs::read(&desired).await.unwrap(),
+            b"EXISTING_FOOTAGE",
+            "existing footage must be preserved unmodified"
+        );
+        // The new segment survives under the disambiguated name.
+        assert_eq!(
+            tokio::fs::read(&dst).await.unwrap(),
+            b"NEWDATA",
+            "the new segment must be persisted under the non-colliding name"
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_copy_failure_leaves_no_partial_and_spares_existing() {
+        // Item 7: a failed copy (here: a nonexistent source) must not leave a
+        // partial at the destination, and must never touch a pre-existing file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_src = dir.path().join("does-not-exist.mp4");
+        let desired = dir.path().join("20260101T030000Z.mp4");
+
+        // (a) Fresh destination: failure leaves NOTHING behind.
+        let err = safe_copy_into_storage(&missing_src, &desired).await;
+        assert!(err.is_err(), "copy from a missing source must fail");
+        assert!(
+            !desired.exists(),
+            "no partial file may be left at the destination after a failed copy"
+        );
+
+        // (b) Pre-existing footage at the destination: a failed colliding copy
+        // must not delete or alter it (the partial cleanup only ever removes the
+        // disambiguated path this call chose, which never got written).
+        tokio::fs::write(&desired, b"EXISTING_FOOTAGE")
+            .await
+            .expect("write existing");
+        let err = safe_copy_into_storage(&missing_src, &desired).await;
+        assert!(
+            err.is_err(),
+            "colliding copy from a missing source must fail"
+        );
+        assert_eq!(
+            tokio::fs::read(&desired).await.unwrap(),
+            b"EXISTING_FOOTAGE",
+            "existing footage must be untouched by a failed colliding copy"
+        );
+        // And no stray disambiguated partial remains.
+        assert!(
+            !dir.path().join("20260101T030000Z-r1.mp4").exists(),
+            "no disambiguated partial may remain after a failed colliding copy"
+        );
     }
 
     #[test]
