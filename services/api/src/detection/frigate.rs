@@ -495,11 +495,18 @@ struct FrigateEventState {
     // tolerantly as raw JSON so a missing/odd-shaped attribute never fails the
     // whole-envelope parse (which would silently drop the detection) — same
     // tolerance discipline as `de_sub_label`. See `plate_box_from_attributes`.
-    // `alias = "attributes"` (issue #142): the MQTT state object uses
-    // `current_attributes`, but Frigate's HTTP `/api/events` `data` object names
-    // the same list `attributes` — accept either so a shape difference between
-    // the two ingest paths can't silently drop the plate crop box.
-    #[serde(default, alias = "attributes", deserialize_with = "de_attributes")]
+    //
+    // NO `alias = "attributes"` here (issue #151): the MQTT `after`/`before`
+    // state object carries the per-detection box list under `current_attributes`
+    // AND, separately, an object-shaped `attributes` summary map (label → max
+    // score). Aliasing `attributes` onto this field makes serde see the same
+    // field twice on every 0.18 event → a *duplicate field* error that fails the
+    // whole-envelope parse ("MQTT payload schema mismatch") and drops EVERY
+    // detection. The unaliased `attributes` key is simply ignored (unknown
+    // field). The HTTP `/api/events` `data` object is a *different* struct
+    // (`FrigateApiEventData`) where the list is named `attributes` and there is
+    // no `current_attributes` collision — that struct keeps the alias.
+    #[serde(default, deserialize_with = "de_attributes")]
     current_attributes: Vec<serde_json::Value>,
 }
 
@@ -1556,6 +1563,48 @@ mod tests {
         assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
         assert!((ev.plate_confidence.expect("confidence") - 0.994).abs() < 1e-3);
         let bbox = ev.plate_box.expect("plate_box captured on MQTT path");
+        assert!((bbox[0] - 0.797_395_8).abs() < 1e-5);
+        assert!((bbox[2] - 0.063_541_6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn frigate_018_mqtt_after_with_attributes_summary_map_parses() {
+        // Regression for #151. Frigate 0.18's live MQTT `after` object carries
+        // BOTH the per-detection box list (`current_attributes`, an array) AND a
+        // separate object-shaped `attributes` summary map (label → max score).
+        // The old `#[serde(alias = "attributes")]` on `current_attributes` made
+        // serde see the field twice → a duplicate-field error that failed the
+        // whole-envelope parse ("MQTT payload schema mismatch") on EVERY 0.18
+        // event, silently dropping all detections. The unaliased field must
+        // ignore the summary map and still read the box from `current_attributes`.
+        let cam_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "type": "new",
+            "before": null,
+            "after": {
+                "id": "abc123", "camera": "driveway", "label": "car",
+                "sub_label": null,
+                "recognized_license_plate": ["23134X1", 0.994f64],
+                "score": 0.9, "top_score": 0.95,
+                "start_time": 1_000_000.0f64, "end_time": null,
+                "current_zones": ["driveway"], "false_positive": false, "has_snapshot": true,
+                // The object-shaped summary map that 0.18 sends alongside.
+                "attributes": {"license_plate": 0.994, "car": 0.9},
+                "current_attributes": [
+                    {"label": "license_plate",
+                     "box": [0.797_395_8, 0.787_037, 0.063_541_6, 0.079_629_6],
+                     "score": 0.8}
+                ]
+            }
+        });
+        let mut map = HashMap::new();
+        map.insert("driveway".to_owned(), cam_id);
+        let bytes = bytes::Bytes::from(payload.to_string());
+        let ev = process_mqtt_payload(&bytes, &map, 0.3)
+            .expect("0.18 after with attributes summary map must parse")
+            .expect("event produced");
+        assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
+        let bbox = ev.plate_box.expect("plate_box captured despite attributes map");
         assert!((bbox[0] - 0.797_395_8).abs() < 1e-5);
         assert!((bbox[2] - 0.063_541_6).abs() < 1e-5);
     }
