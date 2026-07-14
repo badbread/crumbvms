@@ -1259,13 +1259,22 @@ class _PlateThumbState extends State<_PlateThumb> {
     final showCrop = wantCrop && crop != null;
     final showFull = wantFull || !showCrop;
 
+    // List / grouped / timeline "both" layout: a natural-aspect full frame plus
+    // a reserved crop slot (filled or empty), sized to content — NOT the wide
+    // fixed box, which would cover-crop the full frame into a stretched-looking
+    // horizontal slice when there's no crop. The reserved slot keeps the plate
+    // text aligned across rows whether or not a given read has a crop.
+    if (widget.sideBySide &&
+        widget.imageMode == PlateImageDisplay.both &&
+        full != null) {
+      return _sideBySide(full, crop, cacheW);
+    }
+
     Widget content;
     if (full == null && crop == null) {
       content = _placeholder();
     } else if (showCrop && showFull && full != null) {
-      content = widget.sideBySide
-          ? _sideBySide(full, crop, cacheW)
-          : _overlay(full, crop, cacheW);
+      content = _overlay(full, crop, cacheW);
     } else if (showCrop) {
       // Crop only: letterbox (a plate is wide/short) on black.
       content = _img(crop, BoxFit.contain, cacheW, background: true);
@@ -1354,24 +1363,49 @@ class _PlateThumbState extends State<_PlateThumb> {
     );
   }
 
-  /// Full frame and plate crop laid out horizontally — the list-row layout,
-  /// where there's room to show both at a glance. The crop's share of the width
-  /// scales with the crop-size preference.
-  Widget _sideBySide(Uint8List full, Uint8List crop, int cacheW) {
-    final cropFlex = switch (widget.cropSize) {
-      PlateCropSize.small => 2,
-      PlateCropSize.medium => 3,
-      PlateCropSize.large => 4,
+  /// Full frame + plate crop laid out horizontally (list / grouped / timeline).
+  /// The full frame is shown at its natural 16:9 aspect (so it never looks
+  /// stretched), and the crop sits in a fixed-width slot to its right — sized by
+  /// the crop-size preference. The slot is reserved even when there's no crop
+  /// (a subtle placeholder), so text stays aligned across rows. Intrinsic width.
+  Widget _sideBySide(Uint8List full, Uint8List? crop, int cacheW) {
+    final h = widget.height;
+    final fullW = h * 16 / 9;
+    final cropW = switch (widget.cropSize) {
+      PlateCropSize.small => h * 1.5,
+      PlateCropSize.medium => h * 2.0,
+      PlateCropSize.large => h * 2.6,
     };
-    return Row(
-      children: [
-        Expanded(flex: 4, child: _img(full, BoxFit.cover, cacheW)),
-        const SizedBox(width: 4),
-        Expanded(
-          flex: cropFlex,
-          child: _img(crop, BoxFit.contain, cacheW, background: true),
-        ),
-      ],
+    final r = BorderRadius.circular(widget.radius);
+    return SizedBox(
+      height: h,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ClipRRect(
+            borderRadius: r,
+            child: SizedBox(
+              width: fullW,
+              height: h,
+              child: _img(full, BoxFit.cover, cacheW),
+            ),
+          ),
+          const SizedBox(width: 6),
+          ClipRRect(
+            borderRadius: r,
+            child: Container(
+              width: cropW,
+              height: h,
+              color: Colors.black,
+              alignment: Alignment.center,
+              child: crop != null
+                  ? Image.memory(crop, fit: BoxFit.contain, gaplessPlayback: true)
+                  : Icon(Icons.no_photography_outlined,
+                      color: Colors.white24, size: widget.iconSize),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1938,6 +1972,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   // Drives the custom transport bar's play/pause icon (issue #143): we render
   // our own minimal controls, not media_kit's native overlay.
   bool _playing = false;
+  // Latches true once the clip has ever started playing. The cold-load watchdog
+  // must only retry a stalled INITIAL load — once playback has begun, a paused
+  // state is the user pausing (or a seek/frame-step), NOT a stall, so the
+  // watchdog must never re-open the clip from the start again.
+  bool _everPlayed = false;
 
   @override
   void initState() {
@@ -2035,7 +2074,10 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
         }
       }
       _playingSub = player.stream.playing.listen((playing) {
-        if (playing) _watchdog?.cancel();
+        if (playing) {
+          _everPlayed = true;
+          _watchdog?.cancel();
+        }
         if (mounted) setState(() => _playing = playing);
       });
       final controller = VideoController(player);
@@ -2053,8 +2095,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   /// expected; retry a stalled load a couple of times before giving up.
   void _armWatchdog() {
     _watchdog?.cancel();
+    // Only the initial cold load is watched. Once the clip has ever played, a
+    // non-playing state is a user pause/seek — never re-open on that.
+    if (_everPlayed) return;
     _watchdog = Timer(_plateClipLoadTimeout, () {
-      if (!mounted) return;
+      if (!mounted || _everPlayed) return;
       final st = _player?.state;
       final playing = st != null && st.playing && st.position > Duration.zero;
       if (playing) return;
