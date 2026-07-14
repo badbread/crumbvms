@@ -58,6 +58,26 @@ final class PlaybackViewModel: ObservableObject {
     /// so `onPlaybackTick` only resolves it once per segment.
     private var prefetchedForSegmentId: String?
 
+    // ── quality (low-bitrate playback) ──────────────────────────────────────────
+    /// The user/auto choice wants the low-bitrate `/segments/{id}/low.mp4`
+    /// transcode instead of the raw segment. Driven by `setLowQuality` from the
+    /// view (which resolves the Full/Data-saver/Auto preference + metered state).
+    private var lowQuality = false
+    /// The fallback LATCH: once a `/low.mp4` request fails with an expected
+    /// error (404 on an older server, or a segment it can't transcode), stop
+    /// requesting the low variant for the rest of this session and serve the raw
+    /// segment instead. Session-global + in-memory (mirrors Android's
+    /// `lowUnavailable`); cleared by re-selecting a low mode (`setLowQuality(true)`)
+    /// so a later retry gets another chance. Never persisted.
+    private var lowUnavailable = false
+
+    /// Append `/low.mp4` to a raw segment path when the low variant is both
+    /// wanted and not latched-off — the single choke point every segment/prefetch
+    /// URL passes through. `segmentUrl` is `ResolvedSegment.url` (`/segments/{id}`).
+    private func qualityPath(_ segmentUrl: String) -> String {
+        (lowQuality && !lowUnavailable) ? "\(segmentUrl)/low.mp4" : segmentUrl
+    }
+
     /// What the player needs to prefetch + queue the next segment. `Equatable`
     /// so `@Published` republishes only on a genuinely new next segment.
     struct PrefetchSignal: Equatable {
@@ -206,7 +226,7 @@ final class PlaybackViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
                 let startMs = parseMs(segment.start)
                 currentSegment = segment
-                currentSegmentURL = await container.mediaUrls().scopedURL(cameraId: cameraId, segment.url)
+                currentSegmentURL = await container.mediaUrls().scopedURL(cameraId: cameraId, qualityPath(segment.url))
                 guard !Task.isCancelled else { return }
                 segmentOffsetMs = max(tsMs - startMs, 0)
                 error = nil
@@ -227,7 +247,73 @@ final class PlaybackViewModel: ObservableObject {
         }
     }
 
-    func onPlayerError() { seekTo(playheadMs) }
+    /// Set the low-quality intent (from the view's resolved Full/Data-saver/Auto
+    /// + metered computation). Mirrors Android's `setLowQuality`: re-selecting a
+    /// low mode clears the fallback latch so it gets another chance.
+    func setLowQuality(_ low: Bool) {
+        if low { lowUnavailable = false } // re-selecting low clears the latch (retry)
+        guard low != lowQuality else { return }
+        lowQuality = low
+        resetPrefetch()                                  // queued next used the old variant
+        if currentSegment != nil { seekTo(playheadMs) }  // re-resolve at the new variant
+    }
+
+    /// Latch the low path off for the rest of the session after a `/low.mp4`
+    /// request failed with an expected error, then re-resolve the playhead onto
+    /// the raw segment. Mirrors Android's `noteLowQualityFailed`.
+    private func noteLowQualityFailed() {
+        guard lowQuality, !lowUnavailable else { return }
+        lowUnavailable = true
+        resetPrefetch()
+        seekTo(playheadMs)
+    }
+
+    /// The player failed. If it was on a `/low.mp4` variant, classify the failure
+    /// with a tiny probe: an expected hard error (404 on an older server / a
+    /// segment it can't transcode, or another 4xx/5xx) latches the low path off
+    /// for the session and re-resolves onto the raw segment; anything else — a
+    /// transient blip, an expired token (401), or the first-hit transcode the
+    /// player timed out on but the server has since cached — just re-resolves,
+    /// which retries the (now-ready) low variant. Non-low failures re-resolve
+    /// directly, exactly as before.
+    func onPlayerError() {
+        if lowQuality, !lowUnavailable, let url = currentSegmentURL,
+           url.absoluteString.contains("/low.mp4") {
+            let target = url
+            Task { [weak self] in
+                guard let self else { return }
+                if await Self.lowVariantIsUnavailable(target) {
+                    self.noteLowQualityFailed()
+                } else {
+                    self.seekTo(self.playheadMs)
+                }
+            }
+            return
+        }
+        seekTo(playheadMs)
+    }
+
+    /// Probe a `/low.mp4` URL to distinguish a hard "can't serve this" failure
+    /// (→ latch) from a transient one (→ retry). Returns true only for an expected
+    /// hard status — 404 (older server without the endpoint, or a segment it
+    /// can't handle) or another 4xx/5xx — and NOT 401 (token refresh) nor a
+    /// network error. A 2-byte ranged GET, so it's near-free and rides the same
+    /// media session; the generous timeout tolerates the server transcoding on
+    /// the first hit before it responds.
+    private static func lowVariantIsUnavailable(_ url: URL) async -> Bool {
+        var req = URLRequest(url: url)
+        req.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        req.timeoutInterval = 30
+        guard let (_, resp) = try? await URLSession.crumbMedia.data(for: req),
+              let http = resp as? HTTPURLResponse else {
+            return false // network error → transient, don't latch
+        }
+        switch http.statusCode {
+        case 200...299, 304: return false // low variant serves fine
+        case 401:            return false // expired token → re-resolve, not a latch
+        default:             return true  // 404 / other 4xx / 5xx → latch off
+        }
+    }
 
     func onSegmentEnded() {
         guard let seg = currentSegment else { return }
@@ -275,7 +361,7 @@ final class PlaybackViewModel: ObservableObject {
             // Bail if we seeked/switched away, or it resolved to the same segment.
             guard !Task.isCancelled, currentSegment?.segmentId == seg.segmentId,
                   next.segmentId != seg.segmentId else { return }
-            guard let url = await container.mediaUrls().scopedURL(cameraId: cameraId, next.url) else { return }
+            guard let url = await container.mediaUrls().scopedURL(cameraId: cameraId, qualityPath(next.url)) else { return }
             guard !Task.isCancelled, currentSegment?.segmentId == seg.segmentId else { return }
             prefetchedSegment = next
             prefetchNext = PrefetchSignal(url: url, startMs: parseMs(next.start), path: next.url)

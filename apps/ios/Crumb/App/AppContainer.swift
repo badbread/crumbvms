@@ -9,6 +9,8 @@ final class AppContainer: ObservableObject {
     let store: KeychainStore
     /// Observable user preferences (grid layout, toggles, saved views).
     let settings: AppSettings
+    /// App-wide metered-link signal driving the `.auto` quality mode.
+    let connectivity: ConnectivityMonitor
     private(set) var api: CrumbAPI
     /// Per-camera scoped media-token cache (P0-SESSIONS media-URL migration).
     /// Rebuilt alongside `api` in `rebuildApi()` so a token is never reused
@@ -32,6 +34,7 @@ final class AppContainer: ObservableObject {
         let store = KeychainStore()
         self.store = store
         self.settings = AppSettings()
+        self.connectivity = ConnectivityMonitor()
         self.api = CrumbAPI(store: store)
         self.mediaTokens = MediaTokenCache(api: self.api)
         self.updateChecker = UpdateChecker(api: self.api)

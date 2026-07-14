@@ -36,9 +36,16 @@ struct PlaybackView: View {
     @State private var jumpDraft = Date()
     @State private var showBookmarksList = false
     @Environment(\.verticalSizeClass) private var vSize
+    /// Selected media quality (Full/Data-saver/Auto), loaded from the secure
+    /// store on appear; the chip cycles + persists it.
+    @State private var quality: PlaybackQuality = .fallback
+    /// App-wide metered signal, observed so `.auto` re-resolves live when the
+    /// link flips metered mid-session.
+    @ObservedObject private var connectivity: ConnectivityMonitor
 
     init(camera: CameraDto, cameras: [CameraDto], container: AppContainer, startTime: Date? = nil, onBack: @escaping () -> Void) {
         _vm = StateObject(wrappedValue: PlaybackViewModel(cameraId: camera.id, container: container, startTime: startTime))
+        _connectivity = ObservedObject(wrappedValue: container.connectivity)
         self.cameras = cameras
         self.onBack = onBack
     }
@@ -111,12 +118,16 @@ struct PlaybackView: View {
         .onChange(of: vm.playing) { p in player.setPlaying(p && !vm.scrubbing) }
         .onChange(of: vm.speed) { s in player.setSpeed(s) }
         .onChange(of: vm.scrubbing) { s in player.setPlaying(!s && vm.playing) }
+        // `.auto`: re-resolve playback when the link flips metered/unmetered.
+        .onChange(of: connectivity.isMetered) { _ in applyQuality() }
         .onAppear {
             player.onEnded = { vm.onSegmentEnded() }
             player.onError = { vm.onPlayerError() }
             player.onTick = { ms in vm.onPlaybackTick(ms) }
             player.onAdvanced = { vm.commitAdvance() }
             restoreAudio()
+            quality = PlaybackQuality(persisted: vm.container.store.playbackQuality)
+            applyQuality()
         }
         .onDisappear { releaseAudioSession() }
         .sheet(isPresented: $showAddBookmark) {
@@ -266,6 +277,7 @@ struct PlaybackView: View {
                     Text(speedLabel(vm.speed)).font(.caption.bold()).foregroundColor(CrumbColors.tealAccent)
                         .frame(minWidth: ctlSize, minHeight: ctlSize)
                 }
+                qualityChip(minSize: ctlSize)
             }
             .padding(.top, compact ? 1 : 6)
 
@@ -347,6 +359,28 @@ struct PlaybackView: View {
         #endif
     }
 
+    // MARK: - quality
+
+    /// One-tap quality chip (Auto → Full → Data saver → Auto), mirroring
+    /// Android's playback-bar chip: `HD`/`SD`/`AUTO`, teal when a non-Auto
+    /// override is active. Persists the choice and re-resolves playback.
+    private func qualityChip(minSize: CGFloat) -> some View {
+        Button {
+            quality = quality.next
+            vm.container.store.playbackQuality = quality.rawValue
+            applyQuality()
+        } label: {
+            Text(quality.short)
+                .font(.caption2.bold())
+                .foregroundColor(quality == .auto ? .white : CrumbColors.tealAccent)
+                .frame(minWidth: minSize, minHeight: minSize)
+        }
+        .accessibilityLabel("Quality: \(quality.label)")
+        #if os(macOS)
+        .buttonStyle(.plain)
+        #endif
+    }
+
     /// Apply an audio on/off choice: mute the player, persist it for this camera,
     /// and acquire/release the shared `.playback` session so unmuted sound
     /// actually plays (through the speaker, ignoring the ring switch).
@@ -370,6 +404,14 @@ struct PlaybackView: View {
     /// Drop the audio session if we hold it (leaving the view).
     private func releaseAudioSession() {
         if audioSessionHeld { CrumbAudioSession.release(); audioSessionHeld = false }
+    }
+
+    /// Resolve the current quality preference + metered state into the low/full
+    /// decision and hand it to the view-model (which drives `/low.mp4` vs the raw
+    /// segment). Called on appear, on chip change, and whenever the link's
+    /// metered state flips (so `.auto` reacts live).
+    private func applyQuality() {
+        vm.setLowQuality(quality.useLow(metered: connectivity.isMetered))
     }
 
     // MARK: - macOS desktop transport
@@ -425,6 +467,7 @@ struct PlaybackView: View {
                             .foregroundColor(CrumbColors.tealAccent).frame(minWidth: 38)
                     }
                     .menuStyle(.borderlessButton).fixedSize()
+                    qualityChip(minSize: 34)
                 }
                 .frame(minWidth: 150, alignment: .trailing)
             }

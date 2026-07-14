@@ -33,6 +33,14 @@ struct LiveFullscreenView: View {
     // Motion tuner sheet
     @State private var showTuner = false
 
+    /// Selected media quality (Full/Data-saver/Auto), loaded from the secure
+    /// store; the chip cycles + persists it. On a metered link (or Data-saver)
+    /// the fullscreen feed switches to the native sub stream.
+    @State private var quality: PlaybackQuality = .fallback
+    /// App-wide metered signal, observed so `.auto` re-selects the stream live
+    /// when the link flips metered mid-session.
+    @ObservedObject private var connectivity: ConnectivityMonitor
+
     /// M6: Picture-in-Picture for the live feed (iOS only — see
     /// `PictureInPicture.swift`; macOS has no PiP concept here, matching the
     /// desktop Tauri client).
@@ -50,6 +58,7 @@ struct LiveFullscreenView: View {
         self.onBack = onBack
         self.onSwipeCamera = onSwipeCamera
         self.onOpenPlayback = onOpenPlayback
+        _connectivity = ObservedObject(wrappedValue: vm.container.connectivity)
     }
 
     var body: some View {
@@ -102,8 +111,9 @@ struct LiveFullscreenView: View {
         }
         .statusBarHiddenCompat(true)
         .task(id: camera.id) {
-            // Restore this camera's remembered audio choice (default off).
+            // Restore this camera's remembered audio choice (default off) + quality.
             audioOn = vm.container.settings.audioEnabled(for: camera.id)
+            quality = PlaybackQuality(persisted: vm.container.store.playbackQuality)
             frameUrl = nil
             frameUrl = await vm.mediaUrls().cameraFrameUrl(camera.id)
         }
@@ -131,26 +141,44 @@ struct LiveFullscreenView: View {
         }
     }
 
+    /// Whether to serve the low-bitrate variant for this camera right now —
+    /// the resolved Full/Data-saver/Auto choice against the metered signal.
+    private var useLow: Bool {
+        quality.useLow(metered: connectivity.isMetered)
+    }
+
+    /// On a metered link (or explicit Data-saver) prefer the camera's native
+    /// **sub** stream — already low-res H.264 and, unlike the go2rtc `_mobile`
+    /// transcode, reachable through the fMP4 proxy (`stream=sub`). This mirrors
+    /// the first half of Android's `rtsp_sub_url ?? rtsp_mobile_url`. A camera
+    /// with NO sub stays on main: the `_mobile` transcode (Android's fallback)
+    /// is NOT reachable from iOS's fMP4/WebRTC live path — see `rtspMobileUrl`
+    /// in `LiveStreamsResponse` and the task note.
+    private var useSubStream: Bool { useLow && camera.hasSubStream }
+
     /// `Fmp4VideoView` construction, split out because its `pip:` parameter
     /// only exists on iOS (`#if os(iOS)` in `Fmp4Player.swift`) — a single
     /// call site can't straddle that with a mid-argument-list `#if`.
     @ViewBuilder
     private func fmp4View(urls: MediaUrls, frameUrl: URL?) -> some View {
-        // Fullscreen shows the MAIN (full-res) stream; the URL is minted per
-        // connect through the authenticated /live proxy.
+        // Fullscreen shows MAIN (full-res) on an unmetered link / Full quality,
+        // and the native SUB (low-res) on a metered link / Data-saver. The
+        // stream key encodes the choice so flipping quality restarts the stream.
         let cameraId = camera.id
+        let sub = useSubStream
+        let key = "\(cameraId):\(sub ? "sub" : "main")"
         #if os(iOS)
         Fmp4VideoView(
-            streamKey: cameraId,
-            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: false) },
+            streamKey: key,
+            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: sub) },
             snapshotURL: frameUrl,
             muted: !audioOn,
             pip: pip
         )
         #else
         Fmp4VideoView(
-            streamKey: cameraId,
-            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: false) },
+            streamKey: key,
+            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: sub) },
             snapshotURL: frameUrl,
             muted: !audioOn
         )
@@ -239,6 +267,19 @@ struct LiveFullscreenView: View {
                 }
 
                 Spacer(minLength: 4)
+
+                // Quality chip (Auto → Full → Data saver): on a metered link /
+                // Data-saver the fullscreen feed uses the native sub stream.
+                Button {
+                    quality = quality.next
+                    vm.container.store.playbackQuality = quality.rawValue
+                } label: {
+                    Text(quality.short)
+                        .font(.caption.bold())
+                        .foregroundColor(quality == .auto ? .white : CrumbColors.tealAccent)
+                        .frame(minWidth: 34, minHeight: 30)
+                }
+                .accessibilityLabel("Quality: \(quality.label)")
 
                 // M6: Picture-in-Picture toggle (iOS only) — lets the operator
                 // keep watching this camera while backgrounding the app or

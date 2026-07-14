@@ -302,6 +302,14 @@ struct LiveStreamsResponse: Decodable {
     let webrtcSubUrl: String?
     let rtspMainUrl: String
     let rtspSubUrl: String?
+    /// On-demand low-res H.264 go2rtc transcode (`<name>_mobile`), present only
+    /// when the server has `MOBILE_STREAM_ENABLED` and the camera resolves.
+    /// NOTE: iOS live plays fMP4/WebRTC via the API's `/live/{id}/stream.mp4`
+    /// proxy, which only maps `main`/`sub` — it has no path to the go2rtc
+    /// `_mobile` src, and iOS has no RTSP player. So on a metered link iOS falls
+    /// back to the native `sub` stream (already low, no transcode); this raw
+    /// RTSP URL is not directly consumable here (see the live quality wiring).
+    let rtspMobileUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case cameraId = "camera_id"
@@ -309,6 +317,7 @@ struct LiveStreamsResponse: Decodable {
         case webrtcSubUrl = "webrtc_sub_url"
         case rtspMainUrl = "rtsp_main_url"
         case rtspSubUrl = "rtsp_sub_url"
+        case rtspMobileUrl = "rtsp_mobile_url"
     }
 }
 

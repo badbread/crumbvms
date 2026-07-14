@@ -27,6 +27,16 @@ final class KeychainStore: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: Keys.lastLiveCam) }
     }
 
+    /// Media-quality preference (Full / Data-saver / Auto), governing live and
+    /// recorded playback. Stored as the raw `PlaybackQuality` string; key and
+    /// default (`"auto"`) match Android's `SecureStore.playbackQuality`. A
+    /// device-level preference — deliberately NOT cleared on logout (see
+    /// `clearSession()`), same as Android.
+    var playbackQuality: String {
+        get { UserDefaults.standard.string(forKey: Keys.playbackQuality) ?? "auto" }
+        set { UserDefaults.standard.set(newValue, forKey: Keys.playbackQuality) }
+    }
+
     /// Effective per-user capabilities (persisted so feature gating is correct
     /// immediately on launch, before `GET /auth/me` refreshes it). Cleared on logout.
     var capabilities: Capabilities {
@@ -135,5 +145,6 @@ final class KeychainStore: ObservableObject {
         static let username = "username"
         static let lastLiveCam = "last_live_cam"
         static let capabilities = "capabilities"
+        static let playbackQuality = "playback_quality"
     }
 }
