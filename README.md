@@ -50,8 +50,9 @@ MP4 on a disk you own. That matters to me, but it's the how, not the why.
 
 It's a side project: one maintainer, built on his own time, running at home in production
 today. Eleven cameras, multiple storage volumes, recording day in and day out for months.
-**It's about 90% of where I want v1 to be.** The recorder, the Windows desktop client, and
-the Android app are the polished daily drivers; the macOS app is ready to try but still rough,
+**It's about 90% of where I want v1 to be**, and the next milestone is the first tagged
+release, **v0.1.0** — a stable "install it and go" cut — targeted soon. The recorder, the
+Windows desktop client, and the Android app are the polished daily drivers; the macOS app is ready to try but still rough,
 and the iOS app is built and ready for testing but not yet distributable (Apple requires a paid
 developer account, see [License](#license)). Client details: [install guide](docs/CLIENTS.md).
 
@@ -103,8 +104,9 @@ exclusion zones and pluggable detectors) for recording triggers and timeline eve
 never does object, face, or plate recognition itself. That's Frigate's job, and Frigate is
 better at it than anything I would bolt on.
 
-No Home Assistant integration yet but it is planned. If you have any thoughts on what it
-should include please open an issue.
+Home Assistant integration has started: you can link cameras to Home Assistant entities so
+their state rides along in Crumb, with more planned. If you have thoughts on what it should
+include next, please open an issue.
 
 > [!IMPORTANT]
 > ## Looking for testers
@@ -128,12 +130,14 @@ should include please open an issue.
 - Frame-level scrubbable timeline (H.265 native, no server transcode), with pre-generated previews so revisiting a spot is a ~1 ms cached read, not a ~250 ms re-decode
 - Jump to the next/previous motion event; digital zoom into a clip
 - Motion dots **and** Frigate object icons on one timeline bar
+- **License-plate reads** from Frigate on a searchable LPR tab: filter, jump to the clip, and set a watchlist that alerts you on a sighting (with fuzzy matching for OCR misreads)
 - Bookmarks with protected (never-auto-deleted) retention
 
 **Watch**
 - Multi-camera live wall with saveable, per-device layouts
 - Carousels, auto-hotspot tile that follows motion, PTZ tiles, clocks, web panes
 - On-video ONVIF PTZ / focus / iris control
+- Per-camera **Data-saver** stream (on-demand low-res transcode) for cheap remote / bandwidth-limited viewing
 
 **Keep**
 - Rust recorder; the Postgres segment index is the single source of truth
