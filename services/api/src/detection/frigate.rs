@@ -495,7 +495,11 @@ struct FrigateEventState {
     // tolerantly as raw JSON so a missing/odd-shaped attribute never fails the
     // whole-envelope parse (which would silently drop the detection) — same
     // tolerance discipline as `de_sub_label`. See `plate_box_from_attributes`.
-    #[serde(default, deserialize_with = "de_attributes")]
+    // `alias = "attributes"` (issue #142): the MQTT state object uses
+    // `current_attributes`, but Frigate's HTTP `/api/events` `data` object names
+    // the same list `attributes` — accept either so a shape difference between
+    // the two ingest paths can't silently drop the plate crop box.
+    #[serde(default, alias = "attributes", deserialize_with = "de_attributes")]
     current_attributes: Vec<serde_json::Value>,
 }
 
@@ -592,43 +596,70 @@ fn plate_box_from_attributes(attrs: &[serde_json::Value]) -> Option<[f32; 4]> {
 ///
 /// Frigate reports the `license_plate` attribute box as **normalized
 /// `[x, y, w, h]`** (top-left + size, each coord in `0..=1`), verified against a
-/// live `/api/events` payload — e.g. `[0.7646, 0.5611, 0.0536, 0.0556]`. And
-/// snapshots are full-frame (`snapshots.crop=false`), so these fractions map
-/// straight onto the snapshot the report crops. So the common path is a direct
-/// clamp-and-passthrough — no frame dimensions needed.
+/// live `/api/events` payload — e.g. `[0.7646, 0.5611, 0.0536, 0.0556]` and,
+/// on 0.18, `[0.7973958, 0.7870370, 0.0635416, 0.0796296]`. Snapshots are
+/// full-frame (`snapshots.crop=false`), so these fractions map straight onto the
+/// snapshot the report crops — the common path needs no frame dimensions.
 ///
-/// * Normalized `[x, y, w, h]` (all coords in `0..=1`): clamp the origin into the
-///   frame and the size so the box stays inside it. The primary/observed case.
-/// * Pixel `[x, y, w, h]` (any coord > 1) WITH frame dimensions: divide by the
-///   frame size. (Not exercised today — the ingest paths pass `None` — but kept
-///   so a future caller that has the detect resolution can hand it in.)
-/// * Pixel coords with no frame dimensions: `None` — we don't invent a scale.
+/// This is **defensive** parsing (issue #142): 0.18 was verified to use the
+/// same shape as before, but a future Frigate must not be able to silently
+/// break crops, so three plausible shapes are tolerated in a fixed precedence.
+///
+/// # Precedence (first match wins)
+///
+/// 1. **Normalized `[x, y, w, h]`** — all coords in `0..=1`, `w>0 && h>0`, and
+///    the box FITS as origin+size (`x+w <= 1 && y+h <= 1`). Returned as-is. This
+///    is the primary/observed Frigate shape and always wins when it applies, so
+///    a real (small) plate box is never re-interpreted as anything else.
+/// 2. **Normalized corners `[x1, y1, x2, y2]`** — all coords in `0..=1`,
+///    `x2>x1 && y2>y1`, reached only when the values do NOT already validate as
+///    a fitting `xywh` (rule 1). Converted to `[x1, y1, x2-x1, y2-y1]`. Since a
+///    real plate's `w`/`h` are small, an `xywh` plate has `x2<x1` (its `w` slot
+///    is smaller than its `x` slot) and can never satisfy the corners test —
+///    the disambiguation is robust for real plates.
+/// 3. **Clamped normalized `[x, y, w, h]`** — an in-unit box that overflows the
+///    frame and is not valid corners: clamp the size so it stays inside
+///    (best-effort for slightly-out-of-range data).
+/// 4. **Pixel `[x, y, w, h]`** (any coord `>1`) WITH frame dimensions: divide by
+///    the frame size. Not exercised today (the ingest paths pass `None`), kept
+///    so a future caller that has the detect resolution can hand it in.
+/// 5. Pixel coords with no frame dimensions: `None` — we don't invent a scale.
 ///
 /// Returns `None` for a `None` input or a degenerate (zero-area) box.
 fn normalize_plate_box(raw: Option<[f32; 4]>, frame: Option<(f32, f32)>) -> Option<[f32; 4]> {
-    let [x, y, w, h] = raw?;
+    let [a, b, c, d] = raw?;
     let in_unit = |v: f32| (0.0..=1.0).contains(&v);
 
-    // Normalized [x, y, w, h] — the shape Frigate actually sends. Clamp inside.
-    if in_unit(x) && in_unit(y) && in_unit(w) && in_unit(h) {
-        let cx = x.clamp(0.0, 1.0);
-        let cy = y.clamp(0.0, 1.0);
-        let cw = w.clamp(0.0, 1.0 - cx);
-        let ch = h.clamp(0.0, 1.0 - cy);
-        return (cw > 0.0 && ch > 0.0).then_some([cx, cy, cw, ch]);
+    if in_unit(a) && in_unit(b) && in_unit(c) && in_unit(d) {
+        // Rule 1 — clean, fitting [x, y, w, h] (the shape Frigate sends). Wins
+        // whenever it applies, so a real plate box is never read as corners.
+        if c > 0.0 && d > 0.0 && a + c <= 1.0 && b + d <= 1.0 {
+            return Some([a, b, c, d]);
+        }
+        // Rule 2 — normalized corners [x1, y1, x2, y2], only when NOT a fitting
+        // xywh above. All in-unit with x2>x1 && y2>y1 ⇒ the derived w/h are >0
+        // and the box is inside the frame by construction.
+        if c > a && d > b {
+            return Some([a, b, c - a, d - b]);
+        }
+        // Rule 3 — in-unit xywh that overflows the frame: clamp the size inside.
+        let cw = c.clamp(0.0, 1.0 - a);
+        let ch = d.clamp(0.0, 1.0 - b);
+        return (cw > 0.0 && ch > 0.0).then_some([a, b, cw, ch]);
     }
 
-    // Pixel [x, y, w, h]: only normalizable with frame dimensions.
+    // Rule 4 — pixel [x, y, w, h]: only normalizable with frame dimensions.
     if let Some((fw, fh)) = frame {
         if fw > 0.0 && fh > 0.0 {
-            let nx = (x / fw).clamp(0.0, 1.0);
-            let ny = (y / fh).clamp(0.0, 1.0);
-            let nw = (w / fw).clamp(0.0, 1.0 - nx);
-            let nh = (h / fh).clamp(0.0, 1.0 - ny);
+            let nx = (a / fw).clamp(0.0, 1.0);
+            let ny = (b / fh).clamp(0.0, 1.0);
+            let nw = (c / fw).clamp(0.0, 1.0 - nx);
+            let nh = (d / fh).clamp(0.0, 1.0 - ny);
             return (nw > 0.0 && nh > 0.0).then_some([nx, ny, nw, nh]);
         }
     }
 
+    // Rule 5 — pixel coords, no frame dims: don't guess a scale.
     None
 }
 
@@ -784,10 +815,13 @@ struct FrigateApiEventData {
     #[serde(default, deserialize_with = "de_plate_scored")]
     recognized_license_plate: Option<(String, Option<f32>)>,
     recognized_license_plate_score: Option<f32>,
-    // Plate crop box, mirroring the MQTT `current_attributes`. Tolerant/default
-    // so it's harmless if this backfill payload omits it or names it differently
-    // (yields no box → None). See `plate_box_from_attributes`.
-    #[serde(default, deserialize_with = "de_attributes")]
+    // Plate crop box. Frigate's HTTP `/api/events` `data` object names this list
+    // `attributes` (verified on 0.18: `data.attributes[].box`), whereas the MQTT
+    // state object uses `current_attributes` — accept BOTH via `alias` (issue
+    // #142) so the HTTP backfill actually captures the plate crop box instead of
+    // silently yielding None. Tolerant/default so an odd/absent shape is
+    // harmless. See `plate_box_from_attributes`.
+    #[serde(default, alias = "attributes", deserialize_with = "de_attributes")]
     current_attributes: Vec<serde_json::Value>,
 }
 
@@ -1387,6 +1421,166 @@ mod tests {
         assert_eq!(normalize_plate_box(Some([0.5, 0.5, 0.0, 0.1]), None), None);
         assert_eq!(normalize_plate_box(Some([0.5, 0.5, 0.1, 0.0]), None), None);
         assert_eq!(normalize_plate_box(None, Some((1000.0, 500.0))), None);
+    }
+
+    #[test]
+    fn normalize_plate_box_prefers_xywh_over_corners_for_the_real_018_shape() {
+        // The captured Frigate 0.18 attribute box is normalized [x, y, w, h]
+        // with a small w/h. It FITS as origin+size, so rule 1 (xywh) wins and it
+        // passes through unchanged — it must NOT be re-read as corners (as
+        // corners its x2=0.0635 < x1=0.7974, so the corners test can't even
+        // match — the disambiguation is robust for a real plate).
+        let got = normalize_plate_box(
+            Some([0.797_395_8, 0.787_037, 0.063_541_6, 0.079_629_6]),
+            None,
+        )
+        .expect("0.18 xywh box normalizes");
+        assert!((got[0] - 0.797_395_8).abs() < 1e-5, "x passthrough");
+        assert!((got[1] - 0.787_037).abs() < 1e-5, "y passthrough");
+        assert!(
+            (got[2] - 0.063_541_6).abs() < 1e-5,
+            "w passthrough (not x2-x1)"
+        );
+        assert!(
+            (got[3] - 0.079_629_6).abs() < 1e-5,
+            "h passthrough (not y2-y1)"
+        );
+    }
+
+    #[test]
+    fn normalize_plate_box_accepts_normalized_corners() {
+        // Corners [x1, y1, x2, y2] with x2>x1 && y2>y1 that do NOT fit as xywh
+        // (x+w = 0.10+0.95 = 1.05 > 1, so rule 1 can't claim it) → converted to
+        // [x1, y1, x2-x1, y2-y1].
+        let got = normalize_plate_box(Some([0.10, 0.20, 0.95, 0.98]), None)
+            .expect("corners box normalizes");
+        assert!((got[0] - 0.10).abs() < 1e-6, "x1");
+        assert!((got[1] - 0.20).abs() < 1e-6, "y1");
+        assert!((got[2] - 0.85).abs() < 1e-6, "w = x2 - x1");
+        assert!((got[3] - 0.78).abs() < 1e-6, "h = y2 - y1");
+    }
+
+    #[test]
+    fn normalize_plate_box_corners_stay_inside_frame() {
+        // A corners box near the far edge that does NOT fit as xywh
+        // (0.15 + 0.9 > 1) is read as corners → w/h keep it inside the frame by
+        // construction (x1+w = x2 <= 1, y1+h = y2 <= 1).
+        let got =
+            normalize_plate_box(Some([0.15, 0.10, 0.90, 0.95]), None).expect("edge corners box");
+        assert!((got[0] - 0.15).abs() < 1e-6, "x1");
+        assert!((got[1] - 0.10).abs() < 1e-6, "y1");
+        assert!((got[2] - 0.75).abs() < 1e-6, "w = x2 - x1, inside frame");
+        assert!((got[3] - 0.85).abs() < 1e-6, "h = y2 - y1, inside frame");
+        assert!(got[0] + got[2] <= 1.0 + 1e-6, "x1 + w <= 1");
+        assert!(got[1] + got[3] <= 1.0 + 1e-6, "y1 + h <= 1");
+    }
+
+    #[test]
+    fn frigate_018_http_event_extracts_plate_and_box() {
+        // The real Frigate 0.18 HTTP `/api/events` shape the maintainer captured:
+        // plate + scores + the `license_plate` attribute box all live under
+        // `data`, and the attribute list is named `attributes` (NOT
+        // `current_attributes`). Deserialize it and assert both the plate string
+        // and the normalized [x, y, w, h] crop box are extracted.
+        let body = serde_json::json!({
+            "id": "1700000000.123-abcd",
+            "camera": "driveway",
+            "label": "car",
+            "start_time": 1_700_000_000.0f64,
+            "end_time": 1_700_000_020.0f64,
+            "has_snapshot": true,
+            "false_positive": null,
+            "zones": ["driveway"],
+            "data": {
+                "score": 0.9,
+                "top_score": 0.95,
+                "recognized_license_plate": ["23134X1", 0.994f64],
+                "box": [0.79, 0.78, 0.86, 0.87],
+                "region": [0.7, 0.7, 0.95, 0.95],
+                "attributes": [
+                    {"label": "license_plate",
+                     "box": [0.797_395_8, 0.787_037, 0.063_541_6, 0.079_629_6],
+                     "score": 0.8}
+                ]
+            }
+        });
+        let ev: FrigateApiEvent =
+            serde_json::from_value(body).expect("0.18 HTTP event deserializes");
+        let data = ev.data.expect("data present");
+
+        // Plate string extracted from `data.recognized_license_plate` (HTTP).
+        let (plate, score) = data
+            .recognized_license_plate
+            .clone()
+            .expect("plate present under data");
+        assert_eq!(plate, "23134X1");
+        assert!((score.expect("plate score") - 0.994).abs() < 1e-3);
+
+        // Attribute box captured (via the `attributes` alias) and normalized.
+        let bbox = normalize_plate_box(plate_box_from_attributes(&data.current_attributes), None)
+            .expect("plate crop box extracted from data.attributes");
+        assert!((bbox[0] - 0.797_395_8).abs() < 1e-5);
+        assert!((bbox[1] - 0.787_037).abs() < 1e-5);
+        assert!((bbox[2] - 0.063_541_6).abs() < 1e-5);
+        assert!((bbox[3] - 0.079_629_6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn frigate_mqtt_event_extracts_plate_under_after() {
+        // Sibling to the HTTP test: the MQTT envelope carries the plate on
+        // `after.recognized_license_plate` (a [plate, score] array) and the box
+        // on `after.current_attributes`. Confirms the plate is read from `after`
+        // (not `data`) on the MQTT path.
+        let cam_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "type": "end",
+            "before": null,
+            "after": {
+                "id": "abc123", "camera": "driveway", "label": "car",
+                "sub_label": null,
+                "recognized_license_plate": ["23134X1", 0.994f64],
+                "score": 0.9, "top_score": 0.95,
+                "start_time": 1_000_000.0f64, "end_time": 1_000_020.0f64,
+                "current_zones": ["driveway"], "false_positive": false, "has_snapshot": true,
+                "current_attributes": [
+                    {"label": "license_plate",
+                     "box": [0.797_395_8, 0.787_037, 0.063_541_6, 0.079_629_6],
+                     "score": 0.8}
+                ]
+            }
+        });
+        let mut map = HashMap::new();
+        map.insert("driveway".to_owned(), cam_id);
+        let bytes = bytes::Bytes::from(payload.to_string());
+        let ev = process_mqtt_payload(&bytes, &map, 0.3).unwrap().unwrap();
+        assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
+        assert!((ev.plate_confidence.expect("confidence") - 0.994).abs() < 1e-3);
+        let bbox = ev.plate_box.expect("plate_box captured on MQTT path");
+        assert!((bbox[0] - 0.797_395_8).abs() < 1e-5);
+        assert!((bbox[2] - 0.063_541_6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn frigate_http_event_accepts_current_attributes_alias() {
+        // Defensive: if a Frigate build ever names the HTTP `data` list
+        // `current_attributes` (the MQTT name) instead of `attributes`, the
+        // alias still captures the box — neither name silently drops the crop.
+        let body = serde_json::json!({
+            "id": "x", "camera": "driveway", "label": "car",
+            "start_time": 1.0f64, "has_snapshot": true,
+            "data": {
+                "score": 0.9,
+                "current_attributes": [
+                    {"label": "license_plate", "box": [0.4, 0.5, 0.2, 0.15], "score": 0.8}
+                ]
+            }
+        });
+        let ev: FrigateApiEvent = serde_json::from_value(body).expect("deserializes");
+        let data = ev.data.expect("data present");
+        let bbox = normalize_plate_box(plate_box_from_attributes(&data.current_attributes), None)
+            .expect("box via current_attributes alias");
+        assert!((bbox[0] - 0.4).abs() < 1e-6);
+        assert!((bbox[2] - 0.2).abs() < 1e-6);
     }
 
     #[test]

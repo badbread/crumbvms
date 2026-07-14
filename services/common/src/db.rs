@@ -9162,6 +9162,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
             "../../../db/migrations/0056_stream_no_segments_storage_unwritable_alerts.sql"
         ),
     ),
+    (
+        "0057_update_available_alert.sql",
+        include_str!("../../../db/migrations/0057_update_available_alert.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds

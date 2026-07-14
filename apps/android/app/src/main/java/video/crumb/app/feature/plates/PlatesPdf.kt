@@ -244,20 +244,14 @@ private suspend fun fetchSnapshotBitmap(
 
 /**
  * Crop [src] to the normalized `[x, y, w, h]` (0..1 fractions of width/height)
- * [bbox]. Returns null when bbox is absent/malformed or the crop can't be made,
- * so the caller falls back to the full snapshot. Coordinates are clamped into the
- * bitmap so a slightly out-of-range box never throws.
+ * [bbox], reusing the shared [bboxToRect] geometry (same math the on-screen
+ * thumbnails crop with). Returns null when bbox is absent/malformed or the crop
+ * can't be made, so the caller falls back to the full snapshot.
  */
 private fun cropToBbox(src: Bitmap, bbox: List<Double>?): Bitmap? {
-    if (bbox == null || bbox.size < 4) return null
+    val rect = bboxToRect(bbox, src.width, src.height) ?: return null
     return runCatching {
-        val w = src.width
-        val h = src.height
-        val left = (bbox[0] * w).roundToInt().coerceIn(0, w - 1)
-        val top = (bbox[1] * h).roundToInt().coerceIn(0, h - 1)
-        val cw = (bbox[2] * w).roundToInt().coerceIn(1, w - left)
-        val ch = (bbox[3] * h).roundToInt().coerceIn(1, h - top)
-        Bitmap.createBitmap(src, left, top, cw, ch)
+        Bitmap.createBitmap(src, rect.left, rect.top, rect.width(), rect.height())
     }.getOrNull()
 }
 

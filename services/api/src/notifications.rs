@@ -2042,6 +2042,7 @@ fn system_alert_title(event_key: &str) -> &str {
         "stream_no_segments" => "Camera records nothing (no segments — check keyframe interval)",
         "storage_unwritable" => "Recorder can't write to storage — footage NOT being saved",
         "plate_watchlist_hit" => "License-plate watchlist hit",
+        "update_available" => "Crumb update available",
         other => other,
     }
 }

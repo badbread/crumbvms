@@ -31,6 +31,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 
@@ -982,6 +983,7 @@ class _PlateThumb extends StatefulWidget {
     this.height = 56,
     this.radius = 6,
     this.iconSize = 22,
+    this.cropToBbox = false,
   });
 
   final PlateRead read;
@@ -993,12 +995,19 @@ class _PlateThumb extends StatefulWidget {
   final double radius;
   final double iconSize;
 
+  /// When true and the read has a `bbox`, show the plate region cropped from
+  /// the fetched snapshot (client-side, off the UI isolate, cached) instead of
+  /// the full frame. Falls back to the full frame when bbox is null / crop
+  /// fails. Used by the gallery card; the list/timeline thumbs stay full-frame.
+  final bool cropToBbox;
+
   @override
   State<_PlateThumb> createState() => _PlateThumbState();
 }
 
 class _PlateThumbState extends State<_PlateThumb> {
   Uint8List? _bytes;
+  Uint8List? _crop; // plate-region crop (only when widget.cropToBbox)
   bool _requested = false;
   bool _disposed = false;
 
@@ -1020,6 +1029,7 @@ class _PlateThumbState extends State<_PlateThumb> {
     final cached = _snapshotCache[eventId];
     if (cached != null) {
       _bytes = cached;
+      _maybeCrop(cached); // may set _crop synchronously from the crop cache
       return;
     }
     if (_requested) return;
@@ -1034,6 +1044,28 @@ class _PlateThumbState extends State<_PlateThumb> {
     final bytes = await _fetchSnapshotBytes(widget.session, eventId);
     if (_disposed || bytes == null) return;
     if (mounted) setState(() => _bytes = bytes);
+    _maybeCrop(bytes);
+  }
+
+  /// Derive the plate-region crop from [bytes] (no network) when this thumb is
+  /// a cropping one and the read has a bbox. Uses the shared crop cache: a hit
+  /// is applied synchronously; a miss computes off the UI isolate and then
+  /// setState-s. Keyed by read id (bbox belongs to the read).
+  void _maybeCrop(Uint8List bytes) {
+    if (!widget.cropToBbox || _disposed) return;
+    final bbox = widget.read.bbox;
+    if (bbox == null || bbox.length < 4) return;
+    final key = widget.read.id;
+    final existing = peekPlateCrop(key);
+    if (existing != null) {
+      _crop = existing;
+      return;
+    }
+    unawaited(() async {
+      final crop = await cachedPlateCrop(key, bytes, bbox);
+      if (_disposed || crop == null) return;
+      if (mounted) setState(() => _crop = crop);
+    }());
   }
 
   @override
@@ -1047,15 +1079,19 @@ class _PlateThumbState extends State<_PlateThumb> {
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final logicalW = widget.width.isFinite ? widget.width : 320.0;
     final cacheW = (logicalW * dpr).round().clamp(1, 1024);
+    // Prefer the plate crop when we have one. A crop is wide/short, so it reads
+    // best letterboxed (contain) rather than cover-cropped again by the tile.
+    final displayBytes = _crop ?? _bytes;
+    final isCrop = _crop != null;
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
       child: SizedBox(
         width: widget.width,
         height: widget.height,
-        child: _bytes != null
+        child: displayBytes != null
             ? Image.memory(
-                _bytes!,
-                fit: BoxFit.cover,
+                displayBytes,
+                fit: isCrop ? BoxFit.contain : BoxFit.cover,
                 gaplessPlayback: true,
                 cacheWidth: cacheW,
               )
@@ -1209,6 +1245,9 @@ class _PlateGalleryCard extends StatelessWidget {
                 height: double.infinity,
                 radius: 0,
                 iconSize: 34,
+                // Gallery cards feature the plate itself: show the bbox crop
+                // (falls back to the full frame when there's no bbox).
+                cropToBbox: true,
               ),
             ),
             Padding(
@@ -1787,6 +1826,9 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
                 ],
               ),
             ),
+            // Prominent plate crop (bbox region of the already-fetched
+            // snapshot), when we have one — renders nothing otherwise.
+            _PlateDetailCrop(read: read),
             // Video pane.
             Expanded(
               child: Center(
@@ -1806,6 +1848,84 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
             ),
             const SizedBox(height: 16),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The prominent plate crop shown in the detail pop-up: the plate region
+/// cropped from the snapshot bytes already fetched for this read's tile (read
+/// straight from the shared snapshot cache — no network). The crop itself is
+/// computed off the UI isolate and cached (see plate_crop.dart). Renders
+/// nothing when there's no cached snapshot or no bbox, so the pop-up simply
+/// shows the clip in that case.
+class _PlateDetailCrop extends StatefulWidget {
+  const _PlateDetailCrop({required this.read});
+
+  final PlateRead read;
+
+  @override
+  State<_PlateDetailCrop> createState() => _PlateDetailCropState();
+}
+
+class _PlateDetailCropState extends State<_PlateDetailCrop> {
+  Uint8List? _crop;
+  bool _disposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _compute();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+
+  void _compute() {
+    final read = widget.read;
+    final bbox = read.bbox;
+    final eventId = read.eventId;
+    if (bbox == null || bbox.length < 4 || eventId == null || eventId.isEmpty) {
+      return;
+    }
+    // Cache-only: use the snapshot fetched for the tile. Never fetch here.
+    final bytes = _snapshotCache[eventId];
+    if (bytes == null) return;
+    final existing = peekPlateCrop(read.id);
+    if (existing != null) {
+      _crop = existing;
+      return;
+    }
+    unawaited(() async {
+      final crop = await cachedPlateCrop(read.id, bytes, bbox);
+      if (_disposed || crop == null) return;
+      if (mounted) setState(() => _crop = crop);
+    }());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final crop = _crop;
+    if (crop == null) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.only(top: 2, bottom: 6),
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: Image.memory(
+          crop,
+          height: 76,
+          fit: BoxFit.contain,
+          gaplessPlayback: true,
         ),
       ),
     );

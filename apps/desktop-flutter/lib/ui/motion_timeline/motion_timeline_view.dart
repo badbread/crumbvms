@@ -718,6 +718,10 @@ class _TimelinePainter extends CustomPainter {
           motionBottom, prominent: true);
       _drawMotionStarts(canvas, selCamId!, msToX, motionTop);
     }
+    // Highlight the span of any detection event the playhead is currently
+    // inside — drawn under the glyphs so the marker stays crisp on top.
+    _drawActiveEventSpans(
+        canvas, msToX, selCamId, motionTop, motionBottom, size.width);
     _drawDetectionGlyphs(canvas, msToX, selCamId, motionBottom);
 
     // ── recording-coverage line (bottom): where footage exists ──────────────
@@ -865,6 +869,56 @@ class _TimelinePainter extends CustomPainter {
         ..lineTo(x, top + s)
         ..close();
       canvas.drawPath(path, paint);
+    }
+  }
+
+  /// Highlight the time span of any detection event whose `[ts, endTs]`
+  /// currently contains the playhead: a faint band in the event's OWN legend
+  /// colour (the same `detectionIconFor(...).color` the glyph uses) across the
+  /// motion area, with thin colour edges at the start/end. This answers "the
+  /// playhead is inside this event" at a glance, tied to the legend colours so
+  /// it reads consistently and doesn't introduce a new palette.
+  ///
+  /// Only detection events get a span band: motion is shown as the continuous
+  /// intensity ribbon and carries no discrete `[start, end]` in this data
+  /// model, whereas a detection event has an explicit `endTs`. Events with no
+  /// `endTs` (instantaneous / still-open) are skipped — there's no span to draw.
+  void _drawActiveEventSpans(
+    Canvas canvas,
+    double Function(int) msToX,
+    String? selCamId,
+    double top,
+    double bottom,
+    double width,
+  ) {
+    if (motion.detections.isEmpty) return;
+    final phMs = timeline.playhead.millisecondsSinceEpoch;
+    final winStart = timeline.windowStart.millisecondsSinceEpoch;
+    final winEnd = timeline.windowEnd.millisecondsSinceEpoch;
+    for (final ev in motion.detections) {
+      final endTs = ev.endTs;
+      if (endTs == null) continue;
+      final startMs = ev.ts.millisecondsSinceEpoch;
+      final endMs = endTs.millisecondsSinceEpoch;
+      if (endMs <= startMs) continue;
+      // Only the event(s) whose span contains the playhead.
+      if (phMs < startMs || phMs > endMs) continue;
+      // Skip a span entirely off-screen (playhead can be off-window mid-drag).
+      if (endMs < winStart || startMs > winEnd) continue;
+      final spec = detectionIconFor(ev.iconKey);
+      final prominent = ev.cameraId == selCamId;
+      final x1 = msToX(startMs).clamp(0.0, width);
+      final x2 = msToX(endMs).clamp(0.0, width);
+      if (x2 - x1 < 0.5) continue;
+      canvas.drawRect(
+        Rect.fromLTRB(x1, top, x2, bottom),
+        Paint()..color = spec.color.withValues(alpha: prominent ? 0.16 : 0.09),
+      );
+      final edge = Paint()
+        ..color = spec.color.withValues(alpha: prominent ? 0.7 : 0.4)
+        ..strokeWidth = 1;
+      canvas.drawLine(Offset(x1, top), Offset(x1, bottom), edge);
+      canvas.drawLine(Offset(x2, top), Offset(x2, bottom), edge);
     }
   }
 

@@ -94,6 +94,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import coil.compose.AsyncImage
 import coil.imageLoader
+import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 import androidx.compose.ui.layout.ContentScale
 import video.crumb.app.data.CameraDto
@@ -333,6 +334,7 @@ fun PlatesScreen(
     if (reportRead != null) {
         PlateReportDialog(
             read = reportRead,
+            mediaUrls = mediaUrls,
             generating = generatingReport,
             onDownload = { caseText, zoneId, includeDossier ->
                 if (generatingReport) return@PlateReportDialog
@@ -973,11 +975,43 @@ private fun PlateRow(
     }
 }
 
-/** The read's snapshot: fetched from the sibling detection event's snapshot
- *  proxy (scoped-token authed via [MediaUrls.eventSnapshotUrl]). Reads with no
- *  linked event have no authed image source, so they show a placeholder. */
+/** Larger decode ceiling (px) for the report-dialog plate preview, so the crop of
+ *  a small plate region stays crisp. Only one such image is alive at a time (it's
+ *  a modal dialog), so this stays well within the P2 bitmap budget; the list/grid
+ *  thumbnails intentionally omit it and decode at their small display size. */
+private const val PLATE_DETAIL_DECODE_PX = 1024
+
+/** Convenience wrapper: the read's snapshot, cropped to the plate box. */
 @Composable
 private fun PlateThumb(read: PlateRead, mediaUrls: MediaUrls, modifier: Modifier = Modifier) {
+    PlateSnapshotImage(read = read, mediaUrls = mediaUrls, modifier = modifier)
+}
+
+/**
+ * The read's snapshot: fetched from the sibling detection event's snapshot proxy
+ * (scoped-token authed via [MediaUrls.eventSnapshotUrl]). Reads with no linked
+ * event have no authed image source, so they show a placeholder.
+ *
+ * When [crop] is set and the read carries a [PlateRead.bbox], the plate region is
+ * cropped **client-side** out of the already-loaded snapshot via
+ * [PlateCropTransformation] (no extra network round-trip) and shown letterboxed
+ * (`ContentScale.Fit`) so no plate characters are clipped. When the bbox is null
+ * (older reads / no box) it falls back to the full snapshot, cropped to fill
+ * (`ContentScale.Crop`) exactly as before.
+ *
+ * Memory: with [decodePx] null the snapshot decodes at the composable's display
+ * size (the small thumbnails), and the crop runs on that bounded bitmap. The
+ * report-dialog preview passes a bounded [decodePx] for a crisper crop.
+ */
+@Composable
+private fun PlateSnapshotImage(
+    read: PlateRead,
+    mediaUrls: MediaUrls,
+    modifier: Modifier = Modifier,
+    crop: Boolean = true,
+    decodePx: Int? = null,
+) {
+    val context = LocalContext.current
     var thumbUrl by remember(read.id) { mutableStateOf<String?>(null) }
     val eventId = read.eventId
     LaunchedEffect(read.id) {
@@ -992,11 +1026,29 @@ private fun PlateThumb(read: PlateRead, mediaUrls: MediaUrls, modifier: Modifier
             .background(Color.Black, RoundedCornerShape(6.dp)),
         contentAlignment = Alignment.Center,
     ) {
-        if (thumbUrl != null) {
+        val url = thumbUrl
+        if (url != null) {
+            val bbox = read.bbox?.takeIf { it.size >= 4 }
+            val cropping = crop && bbox != null
+            // A plain URL is enough unless we need a crop transform or a decode
+            // ceiling; only then build an ImageRequest.
+            val model: Any = if (cropping || decodePx != null) {
+                ImageRequest.Builder(context)
+                    .data(url)
+                    .apply {
+                        decodePx?.let { size(it) }
+                        if (crop) bbox?.let { transformations(PlateCropTransformation(it)) }
+                    }
+                    .build()
+            } else {
+                url
+            }
             AsyncImage(
-                model = thumbUrl,
+                model = model,
                 contentDescription = null,
-                contentScale = ContentScale.Crop,
+                // Fit for a plate crop (never clip characters); Crop to fill the box
+                // for the full-snapshot fallback.
+                contentScale = if (cropping) ContentScale.Fit else ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
         } else {
@@ -1341,6 +1393,7 @@ private val REPORT_COMMON_ZONES: List<String> = listOf(
 @Composable
 private fun PlateReportDialog(
     read: PlateRead,
+    mediaUrls: MediaUrls,
     generating: Boolean,
     onDownload: (caseText: String, zoneId: java.time.ZoneId, includeDossier: Boolean) -> Unit,
     onDismiss: () -> Unit,
@@ -1358,12 +1411,26 @@ private fun PlateReportDialog(
         title = { Text("Plate report") },
         text = {
             Column {
+                // Prominent plate crop (the same client-side bbox crop the report's
+                // "PLATE (zoomed)" image uses), with a bounded decode so a small
+                // plate region stays crisp; falls back to the full snapshot when the
+                // read has no bbox.
+                PlateSnapshotImage(
+                    read = read,
+                    mediaUrls = mediaUrls,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(120.dp),
+                    crop = true,
+                    decodePx = PLATE_DETAIL_DECODE_PX,
+                )
                 Text(
                     text = read.plate.ifEmpty { "—" },
                     color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.Bold,
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                     style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(top = 8.dp),
                 )
                 TextField(
                     value = caseText,
