@@ -119,6 +119,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   // Which layout the results render in (persisted via [PlatesPrefs]).
   PlatesViewMode _viewMode = PlatesViewMode.list;
+  // How plate previews show their image(s) (persisted via [PlatesPrefs]).
+  PlateImageDisplay _imageDisplay = PlateImageDisplay.both;
+  PlateCropCorner _cropCorner = PlateCropCorner.bottomRight;
+  PlateCropSize _cropSize = PlateCropSize.medium;
 
   Timer? _searchDebounce;
   final _thumbGate = _ConcurrencyGate(_thumbConcurrency);
@@ -137,14 +141,40 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   Future<void> _restoreViewMode() async {
     final mode = await PlatesPrefs.getViewMode();
+    final display = await PlatesPrefs.getImageDisplay();
+    final corner = await PlatesPrefs.getCropCorner();
+    final size = await PlatesPrefs.getCropSize();
     if (!mounted) return;
-    setState(() => _viewMode = mode);
+    setState(() {
+      _viewMode = mode;
+      _imageDisplay = display;
+      _cropCorner = corner;
+      _cropSize = size;
+    });
   }
 
   void _setViewMode(PlatesViewMode mode) {
     if (mode == _viewMode) return;
     setState(() => _viewMode = mode);
     PlatesPrefs.setViewMode(mode);
+  }
+
+  void _setImageDisplay(PlateImageDisplay mode) {
+    if (mode == _imageDisplay) return;
+    setState(() => _imageDisplay = mode);
+    PlatesPrefs.setImageDisplay(mode);
+  }
+
+  void _setCropCorner(PlateCropCorner corner) {
+    if (corner == _cropCorner) return;
+    setState(() => _cropCorner = corner);
+    PlatesPrefs.setCropCorner(corner);
+  }
+
+  void _setCropSize(PlateCropSize size) {
+    if (size == _cropSize) return;
+    setState(() => _cropSize = size);
+    PlatesPrefs.setCropSize(size);
   }
 
   /// Load the LPR config so the admin fuzziness control can render. A 403
@@ -293,15 +323,33 @@ class _PlatesScreenState extends State<PlatesScreen> {
     await _loadWatchlist();
   }
 
-  /// Per-read "add to watchlist" affordance: adds the row's already-normalized
-  /// plate with default notify-on. Feedback + graceful 403 via a SnackBar.
+  /// Per-read "add to watchlist" affordance: opens the Watch/Ignore chooser for
+  /// the row's already-normalized plate, then upserts the operator's choice.
+  /// Feedback + graceful 403 via a SnackBar.
   Future<void> _addReadToWatchlist(PlateRead read) async {
     if (read.plate.isEmpty) return;
+    final choice = await showWatchlistDialog(
+      context,
+      plate: read.plate,
+      title: 'Add to watchlist',
+      fuzz: _lprConfig?.watchlistFuzz,
+      onSaveFuzz: _lprConfig != null ? _saveFuzz : null,
+    );
+    if (choice == null || !mounted) return;
     try {
-      await _addToWatchlist(plate: read.plate);
+      await _addToWatchlist(
+        plate: read.plate,
+        kind: choice.kind,
+        label: choice.label,
+        notify: choice.notify,
+      );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${read.plate} added to watchlist')),
+        SnackBar(
+          content: Text(choice.kind == 'ignore'
+              ? '${read.plate} added to ignore list'
+              : '${read.plate} added to watchlist'),
+        ),
       );
     } on CrumbApiException catch (e) {
       if (!mounted) return;
@@ -444,6 +492,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 read: playing,
                 cameraName:
                     byId[playing.cameraId]?.name ?? '(unknown camera)',
+                imageMode: _imageDisplay,
+                cropSize: _cropSize,
                 onReport: () => _openPlateReport(playing),
                 onClose: () => setState(() => _playing = null),
                 // Same one-shot seek/focus hand-off the Clips "View on
@@ -557,6 +607,14 @@ class _PlatesScreenState extends State<PlatesScreen> {
               child: const Text('Now', style: TextStyle(fontSize: 12)),
             ),
           _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
+          _DisplayOptionsButton(
+            imageMode: _imageDisplay,
+            cropCorner: _cropCorner,
+            cropSize: _cropSize,
+            onModeChanged: _setImageDisplay,
+            onCornerChanged: _setCropCorner,
+            onSizeChanged: _setCropSize,
+          ),
           TextButton.icon(
             onPressed: () =>
                 setState(() => _showWatchlist = !_showWatchlist),
@@ -628,6 +686,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
               api: widget.api,
               session: widget.session,
               gate: _thumbGate,
+              imageMode: _imageDisplay,
+              cropCorner: _cropCorner,
+              cropSize: _cropSize,
               onTap: () => _openRead(p),
               canManage: widget.canManageWatchlist,
               watched: watched.contains(p.plate),
@@ -643,6 +704,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
+          imageMode: _imageDisplay,
+          cropCorner: _cropCorner,
+          cropSize: _cropSize,
           onTap: _openRead,
         );
       case PlatesViewMode.grouped:
@@ -652,6 +716,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
+          imageMode: _imageDisplay,
+          cropCorner: _cropCorner,
+          cropSize: _cropSize,
           onTap: _openRead,
           canManage: widget.canManageWatchlist,
           watched: watched,
@@ -665,6 +732,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
+          imageMode: _imageDisplay,
+          cropCorner: _cropCorner,
+          cropSize: _cropSize,
           onTap: _openRead,
         );
     }
@@ -713,6 +783,94 @@ class _ViewModeToggle extends StatelessWidget {
         seg(PlatesViewMode.gallery, Icons.grid_view, 'Gallery'),
         seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
         seg(PlatesViewMode.timeline, Icons.timeline, 'Timeline feed'),
+      ],
+    );
+  }
+}
+
+/// Toolbar popover to configure how plate previews show their image(s):
+/// full frame + crop / full only / crop only, and (when both) which corner the
+/// crop pins to over the full frame. Persisted via [PlatesPrefs].
+class _DisplayOptionsButton extends StatelessWidget {
+  const _DisplayOptionsButton({
+    required this.imageMode,
+    required this.cropCorner,
+    required this.cropSize,
+    required this.onModeChanged,
+    required this.onCornerChanged,
+    required this.onSizeChanged,
+  });
+
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
+  final ValueChanged<PlateImageDisplay> onModeChanged;
+  final ValueChanged<PlateCropCorner> onCornerChanged;
+  final ValueChanged<PlateCropSize> onSizeChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final cornersEnabled = imageMode == PlateImageDisplay.both;
+    final cropEnabled = imageMode != PlateImageDisplay.fullOnly;
+    PopupMenuItem<Object> header(String text) => PopupMenuItem<Object>(
+          enabled: false,
+          height: 26,
+          child: Text(
+            text,
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.4,
+            ),
+          ),
+        );
+    CheckedPopupMenuItem<Object> modeItem(PlateImageDisplay m, String label) =>
+        CheckedPopupMenuItem<Object>(
+          value: m,
+          checked: imageMode == m,
+          child: Text(label, style: const TextStyle(fontSize: 13)),
+        );
+    CheckedPopupMenuItem<Object> cornerItem(PlateCropCorner c, String label) =>
+        CheckedPopupMenuItem<Object>(
+          value: c,
+          checked: cropCorner == c,
+          enabled: cornersEnabled,
+          child: Text(label, style: const TextStyle(fontSize: 13)),
+        );
+    CheckedPopupMenuItem<Object> sizeItem(PlateCropSize s, String label) =>
+        CheckedPopupMenuItem<Object>(
+          value: s,
+          checked: cropSize == s,
+          enabled: cropEnabled,
+          child: Text(label, style: const TextStyle(fontSize: 13)),
+        );
+    return PopupMenuButton<Object>(
+      tooltip: 'Image display',
+      icon: const Icon(Icons.photo_size_select_large,
+          color: Colors.white70, size: 18),
+      color: const Color(0xFF23262E),
+      onSelected: (v) {
+        if (v is PlateImageDisplay) onModeChanged(v);
+        if (v is PlateCropCorner) onCornerChanged(v);
+        if (v is PlateCropSize) onSizeChanged(v);
+      },
+      itemBuilder: (context) => [
+        header('SHOW'),
+        modeItem(PlateImageDisplay.both, 'Full frame + plate crop'),
+        modeItem(PlateImageDisplay.fullOnly, 'Full frame only'),
+        modeItem(PlateImageDisplay.cropOnly, 'Plate crop only'),
+        const PopupMenuDivider(),
+        header('CROP SIZE'),
+        sizeItem(PlateCropSize.small, 'Small'),
+        sizeItem(PlateCropSize.medium, 'Medium'),
+        sizeItem(PlateCropSize.large, 'Large'),
+        const PopupMenuDivider(),
+        header('CROP CORNER (IN CARDS)'),
+        cornerItem(PlateCropCorner.topLeft, 'Top-left'),
+        cornerItem(PlateCropCorner.topRight, 'Top-right'),
+        cornerItem(PlateCropCorner.bottomLeft, 'Bottom-left'),
+        cornerItem(PlateCropCorner.bottomRight, 'Bottom-right'),
       ],
     );
   }
@@ -842,6 +1000,9 @@ class _PlateRow extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
     required this.canManage,
     required this.watched,
@@ -854,6 +1015,9 @@ class _PlateRow extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final VoidCallback onTap;
 
   /// Admin — may add this read's plate to the watchlist.
@@ -881,6 +1045,14 @@ class _PlateRow extends StatelessWidget {
               api: api,
               session: session,
               gate: gate,
+              imageMode: imageMode,
+              cropCorner: cropCorner,
+              cropSize: cropSize,
+              // The list row has plenty of horizontal room — show both large,
+              // side-by-side.
+              sideBySide: true,
+              width: imageMode == PlateImageDisplay.both ? 320 : 180,
+              height: 92,
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -983,7 +1155,10 @@ class _PlateThumb extends StatefulWidget {
     this.height = 56,
     this.radius = 6,
     this.iconSize = 22,
-    this.cropToBbox = false,
+    this.imageMode = PlateImageDisplay.fullOnly,
+    this.cropCorner = PlateCropCorner.bottomRight,
+    this.cropSize = PlateCropSize.medium,
+    this.sideBySide = false,
   });
 
   final PlateRead read;
@@ -995,11 +1170,23 @@ class _PlateThumb extends StatefulWidget {
   final double radius;
   final double iconSize;
 
-  /// When true and the read has a `bbox`, show the plate region cropped from
-  /// the fetched snapshot (client-side, off the UI isolate, cached) instead of
-  /// the full frame. Falls back to the full frame when bbox is null / crop
-  /// fails. Used by the gallery card; the list/timeline thumbs stay full-frame.
-  final bool cropToBbox;
+  /// Which image(s) to show — the full frame, the plate crop, or both. The crop
+  /// is derived client-side from the fetched snapshot (off the UI isolate,
+  /// cached) and always falls back to the full frame when the read has no bbox
+  /// or the crop fails.
+  final PlateImageDisplay imageMode;
+
+  /// When [imageMode] is `both` and [sideBySide] is false, the corner of the
+  /// full frame the crop is pinned to.
+  final PlateCropCorner cropCorner;
+
+  /// How large the crop renders (pinned inset fraction / side-by-side width).
+  final PlateCropSize cropSize;
+
+  /// When [imageMode] is `both`, lay the full frame and crop out side-by-side
+  /// (list rows, which have the horizontal room) instead of pinning the crop as
+  /// a corner inset over the full frame (compact/gallery thumbs).
+  final bool sideBySide;
 
   @override
   State<_PlateThumb> createState() => _PlateThumbState();
@@ -1007,7 +1194,7 @@ class _PlateThumb extends StatefulWidget {
 
 class _PlateThumbState extends State<_PlateThumb> {
   Uint8List? _bytes;
-  Uint8List? _crop; // plate-region crop (only when widget.cropToBbox)
+  Uint8List? _crop; // plate-region crop (when imageMode wants it + bbox exists)
   bool _requested = false;
   bool _disposed = false;
 
@@ -1052,7 +1239,7 @@ class _PlateThumbState extends State<_PlateThumb> {
   /// is applied synchronously; a miss computes off the UI isolate and then
   /// setState-s. Keyed by read id (bbox belongs to the read).
   void _maybeCrop(Uint8List bytes) {
-    if (!widget.cropToBbox || _disposed) return;
+    if (widget.imageMode == PlateImageDisplay.fullOnly || _disposed) return;
     final bbox = widget.read.bbox;
     if (bbox == null || bbox.length < 4) return;
     final key = widget.read.id;
@@ -1079,31 +1266,163 @@ class _PlateThumbState extends State<_PlateThumb> {
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final logicalW = widget.width.isFinite ? widget.width : 320.0;
     final cacheW = (logicalW * dpr).round().clamp(1, 1024);
-    // Prefer the plate crop when we have one. A crop is wide/short, so it reads
-    // best letterboxed (contain) rather than cover-cropped again by the tile.
-    final displayBytes = _crop ?? _bytes;
-    final isCrop = _crop != null;
+
+    final full = _bytes;
+    final crop = _crop;
+    // Resolve the operator's display preference against what we actually have.
+    // A crop only exists when the read had a bbox and the client crop succeeded;
+    // when it doesn't, every mode gracefully falls back to the full frame.
+    final wantCrop = widget.imageMode != PlateImageDisplay.fullOnly;
+    final wantFull = widget.imageMode != PlateImageDisplay.cropOnly;
+    final showCrop = wantCrop && crop != null;
+    final showFull = wantFull || !showCrop;
+
+    // List / grouped / timeline "both" layout: a natural-aspect full frame plus
+    // a reserved crop slot (filled or empty), sized to content — NOT the wide
+    // fixed box, which would cover-crop the full frame into a stretched-looking
+    // horizontal slice when there's no crop. The reserved slot keeps the plate
+    // text aligned across rows whether or not a given read has a crop.
+    if (widget.sideBySide &&
+        widget.imageMode == PlateImageDisplay.both &&
+        full != null) {
+      return _sideBySide(full, crop, cacheW);
+    }
+
+    Widget content;
+    if (full == null && crop == null) {
+      content = _placeholder();
+    } else if (showCrop && showFull && full != null) {
+      content = _overlay(full, crop, cacheW);
+    } else if (showCrop) {
+      // Crop only: letterbox (a plate is wide/short) on black.
+      content = _img(crop, BoxFit.contain, cacheW, background: true);
+    } else if (full != null) {
+      content = _img(full, BoxFit.cover, cacheW);
+    } else {
+      content = _placeholder();
+    }
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
-      child: SizedBox(
-        width: widget.width,
-        height: widget.height,
-        child: displayBytes != null
-            ? Image.memory(
-                displayBytes,
-                fit: isCrop ? BoxFit.contain : BoxFit.cover,
-                gaplessPlayback: true,
-                cacheWidth: cacheW,
-              )
-            : Container(
-                color: Colors.black,
-                alignment: Alignment.center,
-                child: Icon(
-                  Icons.directions_car_outlined,
-                  color: Colors.white24,
-                  size: widget.iconSize,
+      child: SizedBox(width: widget.width, height: widget.height, child: content),
+    );
+  }
+
+  Widget _img(Uint8List bytes, BoxFit fit, int cacheW, {bool background = false}) {
+    final image = Image.memory(
+      bytes,
+      fit: fit,
+      gaplessPlayback: true,
+      cacheWidth: cacheW,
+    );
+    if (!background) return image;
+    return Container(color: Colors.black, child: image);
+  }
+
+  Widget _placeholder() {
+    return Container(
+      color: Colors.black,
+      alignment: Alignment.center,
+      child: Icon(
+        Icons.directions_car_outlined,
+        color: Colors.white24,
+        size: widget.iconSize,
+      ),
+    );
+  }
+
+  /// Full frame with the plate crop pinned as a bordered inset in the chosen
+  /// corner — the compact/gallery layout.
+  Widget _overlay(Uint8List full, Uint8List crop, int cacheW) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _img(full, BoxFit.cover, cacheW),
+        Align(
+          alignment: switch (widget.cropCorner) {
+            PlateCropCorner.topLeft => Alignment.topLeft,
+            PlateCropCorner.topRight => Alignment.topRight,
+            PlateCropCorner.bottomLeft => Alignment.bottomLeft,
+            PlateCropCorner.bottomRight => Alignment.bottomRight,
+          },
+          child: Padding(
+            padding: const EdgeInsets.all(5),
+            child: FractionallySizedBox(
+              widthFactor: switch (widget.cropSize) {
+                PlateCropSize.small => 0.34,
+                PlateCropSize.medium => 0.46,
+                PlateCropSize.large => 0.62,
+              },
+              heightFactor: switch (widget.cropSize) {
+                PlateCropSize.small => 0.30,
+                PlateCropSize.medium => 0.42,
+                PlateCropSize.large => 0.56,
+              },
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.black,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.white70, width: 1),
+                  boxShadow: const [
+                    BoxShadow(color: Colors.black54, blurRadius: 4),
+                  ],
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: Image.memory(
+                  crop,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
                 ),
               ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Full frame + plate crop laid out horizontally (list / grouped / timeline).
+  /// The full frame is shown at its natural 16:9 aspect (so it never looks
+  /// stretched), and the crop sits in a fixed-width slot to its right — sized by
+  /// the crop-size preference. The slot is reserved even when there's no crop
+  /// (a subtle placeholder), so text stays aligned across rows. Intrinsic width.
+  Widget _sideBySide(Uint8List full, Uint8List? crop, int cacheW) {
+    final h = widget.height;
+    final fullW = h * 16 / 9;
+    final cropW = switch (widget.cropSize) {
+      PlateCropSize.small => h * 1.5,
+      PlateCropSize.medium => h * 2.0,
+      PlateCropSize.large => h * 2.6,
+    };
+    final r = BorderRadius.circular(widget.radius);
+    return SizedBox(
+      height: h,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ClipRRect(
+            borderRadius: r,
+            child: SizedBox(
+              width: fullW,
+              height: h,
+              child: _img(full, BoxFit.cover, cacheW),
+            ),
+          ),
+          const SizedBox(width: 6),
+          ClipRRect(
+            borderRadius: r,
+            child: Container(
+              width: cropW,
+              height: h,
+              color: Colors.black,
+              alignment: Alignment.center,
+              child: crop != null
+                  ? Image.memory(crop, fit: BoxFit.contain, gaplessPlayback: true)
+                  : Icon(Icons.no_photography_outlined,
+                      color: Colors.white24, size: widget.iconSize),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1169,6 +1488,9 @@ class _PlateGallery extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
   });
 
@@ -1177,6 +1499,9 @@ class _PlateGallery extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
 
   @override
@@ -1199,6 +1524,9 @@ class _PlateGallery extends StatelessWidget {
           api: api,
           session: session,
           gate: gate,
+          imageMode: imageMode,
+          cropCorner: cropCorner,
+          cropSize: cropSize,
           onTap: () => onTap(p),
         );
       },
@@ -1214,6 +1542,9 @@ class _PlateGalleryCard extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
   });
 
@@ -1222,6 +1553,9 @@ class _PlateGalleryCard extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final VoidCallback onTap;
 
   @override
@@ -1245,9 +1579,13 @@ class _PlateGalleryCard extends StatelessWidget {
                 height: double.infinity,
                 radius: 0,
                 iconSize: 34,
-                // Gallery cards feature the plate itself: show the bbox crop
-                // (falls back to the full frame when there's no bbox).
-                cropToBbox: true,
+                // Gallery cards feature the plate: the crop pins to the chosen
+                // corner over the full frame (or per the operator's display
+                // preference — full-only / crop-only). Falls back gracefully
+                // when there's no bbox.
+                imageMode: imageMode,
+                cropCorner: cropCorner,
+                cropSize: cropSize,
               ),
             ),
             Padding(
@@ -1341,6 +1679,9 @@ class _PlateGroupedList extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
     required this.canManage,
     required this.watched,
@@ -1353,6 +1694,9 @@ class _PlateGroupedList extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
   final bool canManage;
   final Set<String> watched;
@@ -1399,8 +1743,12 @@ class _PlateGroupedList extends StatelessWidget {
               api: api,
               session: session,
               gate: gate,
-              width: 64,
-              height: 40,
+              imageMode: imageMode,
+              cropCorner: cropCorner,
+              cropSize: cropSize,
+              sideBySide: imageMode == PlateImageDisplay.both,
+              width: imageMode == PlateImageDisplay.both ? 200 : 110,
+              height: 64,
             ),
             title: Text(
               g.plate,
@@ -1432,6 +1780,9 @@ class _PlateGroupedList extends StatelessWidget {
                   api: api,
                   session: session,
                   gate: gate,
+                  imageMode: imageMode,
+                  cropCorner: cropCorner,
+                  cropSize: cropSize,
                   onTap: () => onTap(r),
                   canManage: canManage,
                   watched: watched.contains(r.plate),
@@ -1458,6 +1809,9 @@ class _PlateTimeline extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
   });
 
@@ -1466,6 +1820,9 @@ class _PlateTimeline extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
 
   @override
@@ -1491,8 +1848,13 @@ class _PlateTimeline extends StatelessWidget {
                     api: api,
                     session: session,
                     gate: gate,
-                    width: 148,
-                    height: 92,
+                    imageMode: imageMode,
+                    cropCorner: cropCorner,
+                    cropSize: cropSize,
+                    // Big feed rows have the room — show both side-by-side, wide.
+                    sideBySide: imageMode == PlateImageDisplay.both,
+                    width: imageMode == PlateImageDisplay.both ? 320 : 190,
+                    height: 108,
                     iconSize: 34,
                   ),
                   const SizedBox(width: 14),
@@ -1587,6 +1949,8 @@ class _PlateClipPlayer extends StatefulWidget {
     required this.session,
     required this.read,
     required this.cameraName,
+    required this.imageMode,
+    required this.cropSize,
     required this.onReport,
     required this.onClose,
     required this.onViewOnTimeline,
@@ -1596,6 +1960,13 @@ class _PlateClipPlayer extends StatefulWidget {
   final Session session;
   final PlateRead read;
   final String cameraName;
+
+  /// Operator's plate-image preference — hides the prominent plate crop above
+  /// the clip when set to full-frame-only.
+  final PlateImageDisplay imageMode;
+
+  /// How tall the prominent plate crop renders above the clip.
+  final PlateCropSize cropSize;
   final VoidCallback onReport;
   final VoidCallback onClose;
   final VoidCallback onViewOnTimeline;
@@ -1619,6 +1990,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   // Drives the custom transport bar's play/pause icon (issue #143): we render
   // our own minimal controls, not media_kit's native overlay.
   bool _playing = false;
+  // Latches true once the clip has ever started playing. The cold-load watchdog
+  // must only retry a stalled INITIAL load — once playback has begun, a paused
+  // state is the user pausing (or a seek/frame-step), NOT a stall, so the
+  // watchdog must never re-open the clip from the start again.
+  bool _everPlayed = false;
 
   @override
   void initState() {
@@ -1707,6 +2083,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           ['demuxer-max-back-bytes', '1MiB'],
           ['network-timeout', '10'],
           ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+          // Frame-accurate seeking. Without exact seeks, a small backward seek
+          // snaps to the same keyframe (frame-back appears to do nothing) while
+          // forward crosses into the next frame — so the ± one-frame buttons in
+          // the transport only worked one direction. Force exact seeks.
+          ['hr-seek', 'yes'],
         ]) {
           try {
             await p.setProperty(kv[0], kv[1]);
@@ -1716,7 +2097,10 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
         }
       }
       _playingSub = player.stream.playing.listen((playing) {
-        if (playing) _watchdog?.cancel();
+        if (playing) {
+          _everPlayed = true;
+          _watchdog?.cancel();
+        }
         if (mounted) setState(() => _playing = playing);
       });
       final controller = VideoController(player);
@@ -1734,8 +2118,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   /// expected; retry a stalled load a couple of times before giving up.
   void _armWatchdog() {
     _watchdog?.cancel();
+    // Only the initial cold load is watched. Once the clip has ever played, a
+    // non-playing state is a user pause/seek — never re-open on that.
+    if (_everPlayed) return;
     _watchdog = Timer(_plateClipLoadTimeout, () {
-      if (!mounted) return;
+      if (!mounted || _everPlayed) return;
       final st = _player?.state;
       final playing = st != null && st.playing && st.position > Duration.zero;
       if (playing) return;
@@ -1830,9 +2217,16 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
                 ],
               ),
             ),
-            // Prominent plate crop (bbox region of the already-fetched
-            // snapshot), when we have one — renders nothing otherwise.
-            _PlateDetailCrop(read: read),
+            // Prominent plate crop (bbox region of the snapshot) pinned above
+            // the clip. Fetches the snapshot itself if a tile hasn't cached it,
+            // so it shows reliably. Renders nothing when the read has no bbox;
+            // hidden entirely when the operator chose full-frame-only.
+            if (widget.imageMode != PlateImageDisplay.fullOnly)
+              _PlateDetailCrop(
+                read: read,
+                session: widget.session,
+                cropSize: widget.cropSize,
+              ),
             // Video pane.
             Expanded(
               child: Center(
@@ -1862,6 +2256,19 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   }
 
   /// Minimal control bar: back-to-start and play/pause, driven by the player.
+  /// Nudge the clip by roughly one frame. media_kit has no frame-step API, so
+  /// pause and seek by ~1/30 s relative to the current position (clamped ≥ 0).
+  void _stepFrame(bool forward) {
+    final p = _player;
+    if (p == null) return;
+    p.pause();
+    const frame = Duration(milliseconds: 33);
+    final pos = p.state.position;
+    var target = forward ? pos + frame : pos - frame;
+    if (target < Duration.zero) target = Duration.zero;
+    p.seek(target);
+  }
+
   Widget _buildTransport() {
     return Padding(
       padding: const EdgeInsets.only(top: 8),
@@ -1880,6 +2287,12 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           ),
           const SizedBox(width: 8),
           IconButton(
+            tooltip: 'Back one frame',
+            onPressed: () => _stepFrame(false),
+            icon: const Icon(Icons.navigate_before,
+                color: Colors.white70, size: 26),
+          ),
+          IconButton(
             tooltip: _playing ? 'Pause' : 'Play',
             onPressed: () {
               final p = _player;
@@ -1896,6 +2309,12 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
               size: 28,
             ),
           ),
+          IconButton(
+            tooltip: 'Forward one frame',
+            onPressed: () => _stepFrame(true),
+            icon: const Icon(Icons.navigate_next,
+                color: Colors.white70, size: 26),
+          ),
         ],
       ),
     );
@@ -1909,9 +2328,15 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
 /// nothing when there's no cached snapshot or no bbox, so the pop-up simply
 /// shows the clip in that case.
 class _PlateDetailCrop extends StatefulWidget {
-  const _PlateDetailCrop({required this.read});
+  const _PlateDetailCrop({
+    required this.read,
+    required this.session,
+    required this.cropSize,
+  });
 
   final PlateRead read;
+  final Session session;
+  final PlateCropSize cropSize;
 
   @override
   State<_PlateDetailCrop> createState() => _PlateDetailCropState();
@@ -1933,47 +2358,55 @@ class _PlateDetailCropState extends State<_PlateDetailCrop> {
     super.dispose();
   }
 
-  void _compute() {
+  Future<void> _compute() async {
     final read = widget.read;
     final bbox = read.bbox;
     final eventId = read.eventId;
     if (bbox == null || bbox.length < 4 || eventId == null || eventId.isEmpty) {
       return;
     }
-    // Cache-only: use the snapshot fetched for the tile. Never fetch here.
-    final bytes = _snapshotCache[eventId];
-    if (bytes == null) return;
     final existing = peekPlateCrop(read.id);
     if (existing != null) {
-      _crop = existing;
+      setState(() => _crop = existing);
       return;
     }
-    unawaited(() async {
-      final crop = await cachedPlateCrop(read.id, bytes, bbox);
-      if (_disposed || crop == null) return;
-      if (mounted) setState(() => _crop = crop);
-    }());
+    // Prefer the tile's cached snapshot; if none (the popup was opened without
+    // the tile ever rendering), fetch it here so the crop still shows.
+    var bytes = _snapshotCache[eventId];
+    bytes ??= await _fetchSnapshotBytes(widget.session, eventId);
+    if (_disposed || bytes == null) return;
+    final crop = await cachedPlateCrop(read.id, bytes, bbox);
+    if (_disposed || crop == null) return;
+    if (mounted) setState(() => _crop = crop);
   }
 
   @override
   Widget build(BuildContext context) {
     final crop = _crop;
     if (crop == null) return const SizedBox.shrink();
-    return Container(
-      margin: const EdgeInsets.only(top: 2, bottom: 6),
-      padding: const EdgeInsets.all(4),
-      decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(4),
-        child: Image.memory(
-          crop,
-          height: 76,
-          fit: BoxFit.contain,
-          gaplessPlayback: true,
+    final height = switch (widget.cropSize) {
+      PlateCropSize.small => 60.0,
+      PlateCropSize.medium => 96.0,
+      PlateCropSize.large => 150.0,
+    };
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.only(top: 4, bottom: 8),
+        padding: const EdgeInsets.all(5),
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.white38),
+          boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 6)],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: Image.memory(
+            crop,
+            height: height,
+            fit: BoxFit.contain,
+            gaplessPlayback: true,
+          ),
         ),
       ),
     );
@@ -2174,6 +2607,44 @@ class _WatchlistPanelState extends State<_WatchlistPanel> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Remove failed: $e')),
+      );
+    }
+  }
+
+  /// Edit an existing entry: reuse the shared chooser prefilled from the entry,
+  /// then upsert via [onAdd] (keyed on the normalized plate).
+  Future<void> _editEntry(PlateWatchlistEntry entry) async {
+    final choice = await showWatchlistDialog(
+      context,
+      plate: entry.plate,
+      title: 'Edit watchlist entry',
+      initialKind: entry.isIgnore ? 'ignore' : 'watch',
+      initialLabel: entry.label,
+      initialNotify: entry.notify,
+      fuzz: widget.fuzz,
+      onSaveFuzz: widget.fuzz != null ? widget.onSaveFuzz : null,
+    );
+    if (choice == null || !mounted) return;
+    try {
+      await widget.onAdd(
+        plate: entry.plate,
+        kind: choice.kind,
+        label: choice.label,
+        notify: choice.notify,
+      );
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.statusCode == 403
+              ? 'Only admins can manage the watchlist.'
+              : e.message),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Save failed: $e')),
       );
     }
   }
@@ -2379,6 +2850,7 @@ class _WatchlistPanelState extends State<_WatchlistPanel> {
       itemBuilder: (context, i) {
         final e = widget.entries[i];
         return _WatchlistTile(
+          onEdit: () => _editEntry(e),
           entry: e,
           canManage: widget.canManage,
           onRemove: () => _remove(e),
@@ -2755,15 +3227,167 @@ class _FuzzControlState extends State<_FuzzControl> {
 
 /// One watchlist entry: optional color swatch, plate (mono), label subtitle, a
 /// notify indicator, and (admin only) a Remove button.
+/// Shared Watch/Ignore chooser — used both by the per-read quick-add (the star
+/// on a plate row) and by editing an existing watchlist entry. Returns null on
+/// cancel. `plate` is the normalized key, shown read-only. On confirm returns
+/// the chosen kind ('watch'/'ignore'), optional label, and notify flag.
+Future<({String kind, String? label, bool notify})?> showWatchlistDialog(
+  BuildContext context, {
+  required String plate,
+  required String title,
+  String initialKind = 'watch',
+  String? initialLabel,
+  bool initialNotify = true,
+  double? fuzz,
+  Future<void> Function(double fuzz)? onSaveFuzz,
+}) {
+  return showDialog<({String kind, String? label, bool notify})>(
+    context: context,
+    builder: (context) {
+      var kind = initialKind;
+      var notify = initialNotify;
+      final labelCtrl = TextEditingController(text: initialLabel ?? '');
+      return StatefulBuilder(
+        builder: (context, setLocal) {
+          final isIgnore = kind == 'ignore';
+          Widget kindChip(String k, String label, IconData icon, Color c) {
+            final active = kind == k;
+            return Expanded(
+              child: InkWell(
+                onTap: () => setLocal(() => kind = k),
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  decoration: BoxDecoration(
+                    color: active ? c.withValues(alpha: 0.22) : const Color(0xFF2A2D35),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                        color: active ? c : Colors.white12, width: 1),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(icon, size: 15, color: active ? c : Colors.white54),
+                      const SizedBox(width: 6),
+                      Text(label,
+                          style: TextStyle(
+                              color: active ? Colors.white : Colors.white54,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF23262E),
+            title: Text(title,
+                style: const TextStyle(color: Colors.white, fontSize: 16)),
+            content: SizedBox(
+              width: 340,
+              child: SingleChildScrollView(
+                child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(plate.isEmpty ? '—' : plate,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.4,
+                          fontFamily: 'monospace',
+                          fontSize: 18)),
+                  const SizedBox(height: 14),
+                  Row(children: [
+                    kindChip('watch', 'Watch', Icons.notifications_active,
+                        const Color(0xFF57C888)),
+                    const SizedBox(width: 8),
+                    kindChip('ignore', 'Ignore', Icons.block,
+                        const Color(0xFFE8A33D)),
+                  ]),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: labelCtrl,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    decoration: const InputDecoration(
+                      labelText: 'Label (optional)',
+                      labelStyle: TextStyle(color: Colors.white38),
+                      isDense: true,
+                      enabledBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white24)),
+                      focusedBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white54)),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Switch(
+                      value: isIgnore ? false : notify,
+                      onChanged:
+                          isIgnore ? null : (v) => setLocal(() => notify = v),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        isIgnore
+                            ? 'Ignore — drops matching reads'
+                            : 'Notify on sighting',
+                        style: const TextStyle(
+                            color: Colors.white54, fontSize: 12),
+                      ),
+                    ),
+                  ]),
+                  // Global watchlist fuzziness, with a live preview of the
+                  // misreads it would accept for THIS plate. Admin-only; hidden
+                  // when the LPR config isn't available.
+                  if (fuzz != null && onSaveFuzz != null) ...[
+                    const Divider(height: 22, color: Colors.white12),
+                    _FuzzControl(
+                      fuzz: fuzz,
+                      plate: plate,
+                      onSave: onSaveFuzz,
+                    ),
+                  ],
+                ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final l = labelCtrl.text.trim();
+                  Navigator.pop(
+                    context,
+                    (kind: kind, label: l.isEmpty ? null : l, notify: notify),
+                  );
+                },
+                child: Text(isIgnore ? 'Ignore' : 'Watch'),
+              ),
+            ],
+          );
+        },
+      );
+    },
+  );
+}
+
 class _WatchlistTile extends StatelessWidget {
   const _WatchlistTile({
     required this.entry,
     required this.canManage,
+    required this.onEdit,
     required this.onRemove,
   });
 
   final PlateWatchlistEntry entry;
   final bool canManage;
+  final VoidCallback onEdit;
   final VoidCallback onRemove;
 
   @override
@@ -2839,7 +3463,14 @@ class _WatchlistTile extends StatelessWidget {
               size: 15,
               color: entry.notify ? const Color(0xFF57C888) : Colors.white24,
             ),
-          if (canManage)
+          if (canManage) ...[
+            IconButton(
+              tooltip: 'Edit',
+              onPressed: onEdit,
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.edit_outlined,
+                  size: 15, color: Colors.white38),
+            ),
             IconButton(
               tooltip: 'Remove',
               onPressed: onRemove,
@@ -2847,6 +3478,7 @@ class _WatchlistTile extends StatelessWidget {
               icon: const Icon(Icons.delete_outline,
                   size: 16, color: Colors.white38),
             ),
+          ],
         ],
       ),
     );
