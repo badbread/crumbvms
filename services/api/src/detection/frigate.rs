@@ -1604,7 +1604,7 @@ mod tests {
             .expect("0.18 after with attributes summary map must parse")
             .expect("event produced");
         assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
-        let bbox = ev.plate_box.expect("plate_box captured despite attributes map");
+        let bbox = ev.plate_box.expect("plate_box captured");
         assert!((bbox[0] - 0.797_395_8).abs() < 1e-5);
         assert!((bbox[2] - 0.063_541_6).abs() < 1e-5);
     }
