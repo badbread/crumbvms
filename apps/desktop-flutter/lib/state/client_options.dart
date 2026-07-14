@@ -12,7 +12,7 @@
 // consolidation. Two fields already have a home and are intentionally NOT
 // duplicated here — read/write them through their existing owners:
 ///
-///  * `liveWallSub`     -> `StreamPrefsStore.wallUsesSub` (lib/state/stream_prefs.dart)
+///  * `liveWallSub`     -> `StreamPrefsStore.wallDefaultQuality` (lib/state/stream_prefs.dart)
 ///  * `launchFullscreen` -> `LaunchFullscreenPrefs` (lib/ui/fullscreen/launch_fullscreen_prefs.dart)
 //
 // Everything else the old Options dialog exposed lives here: showInfoBar,

@@ -34,14 +34,21 @@ class Camera {
 /// are go2rtc restreams and may embed `user:pass@` credentials — treat as
 /// sensitive, never log them.
 class StreamUrls {
-  StreamUrls({this.rtspMain, this.rtspSub});
+  StreamUrls({this.rtspMain, this.rtspSub, this.rtspMobile});
 
   final String? rtspMain;
   final String? rtspSub;
 
+  /// The on-demand low-bitrate `<name>_mobile` go2rtc transcode (the
+  /// "Data saver" tier). Nullable — absent when the server has mobile streams
+  /// disabled or the camera is Frigate-served. Callers must fall back
+  /// (sub → main) when this is null so a pane never goes black.
+  final String? rtspMobile;
+
   factory StreamUrls.fromJson(Map<String, dynamic> j) => StreamUrls(
     rtspMain: j['rtsp_main_url'] as String?,
     rtspSub: j['rtsp_sub_url'] as String?,
+    rtspMobile: j['rtsp_mobile_url'] as String?,
   );
 
   /// Wall default: prefer the lighter sub stream, fall back to main. (Maximize
