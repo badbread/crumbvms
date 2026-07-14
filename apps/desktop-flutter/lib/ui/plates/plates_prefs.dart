@@ -26,6 +26,11 @@ enum PlateImageDisplay { both, fullOnly, cropOnly }
 /// when both images are shown. Ignored in the side-by-side list layout.
 enum PlateCropCorner { topLeft, topRight, bottomLeft, bottomRight }
 
+/// How large the plate crop renders — the pinned inset in gallery/compact
+/// thumbs, the crop column width in the side-by-side list, and the crop height
+/// in the detail pop-up.
+enum PlateCropSize { small, medium, large }
+
 /// Reads/writes the Plates screen client preferences (view mode + how plate
 /// previews display their image(s)). All are purely local UI prefs, never sent
 /// to the server; a missing/broken shared_preferences channel degrades to the
@@ -36,6 +41,7 @@ class PlatesPrefs {
   static const String _kViewMode = 'crumb_plates_view_mode';
   static const String _kImageDisplay = 'crumb_plates_image_display';
   static const String _kCropCorner = 'crumb_plates_crop_corner';
+  static const String _kCropSize = 'crumb_plates_crop_size';
 
   /// The last-used view mode, or [PlatesViewMode.list] when the operator has
   /// never changed it (or persistence is unavailable).
@@ -103,6 +109,29 @@ class PlatesPrefs {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_kCropCorner, corner.name);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// How large the plate crop renders. Defaults to [PlateCropSize.medium].
+  static Future<PlateCropSize> getCropSize() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kCropSize);
+      for (final s in PlateCropSize.values) {
+        if (s.name == raw) return s;
+      }
+    } catch (_) {
+      /* fall through to the default */
+    }
+    return PlateCropSize.medium;
+  }
+
+  static Future<void> setCropSize(PlateCropSize size) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kCropSize, size.name);
     } catch (_) {
       /* best-effort persistence */
     }

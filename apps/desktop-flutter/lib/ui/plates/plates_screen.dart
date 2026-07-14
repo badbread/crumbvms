@@ -122,6 +122,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
   // How plate previews show their image(s) (persisted via [PlatesPrefs]).
   PlateImageDisplay _imageDisplay = PlateImageDisplay.both;
   PlateCropCorner _cropCorner = PlateCropCorner.bottomRight;
+  PlateCropSize _cropSize = PlateCropSize.medium;
 
   Timer? _searchDebounce;
   final _thumbGate = _ConcurrencyGate(_thumbConcurrency);
@@ -142,11 +143,13 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final mode = await PlatesPrefs.getViewMode();
     final display = await PlatesPrefs.getImageDisplay();
     final corner = await PlatesPrefs.getCropCorner();
+    final size = await PlatesPrefs.getCropSize();
     if (!mounted) return;
     setState(() {
       _viewMode = mode;
       _imageDisplay = display;
       _cropCorner = corner;
+      _cropSize = size;
     });
   }
 
@@ -166,6 +169,12 @@ class _PlatesScreenState extends State<PlatesScreen> {
     if (corner == _cropCorner) return;
     setState(() => _cropCorner = corner);
     PlatesPrefs.setCropCorner(corner);
+  }
+
+  void _setCropSize(PlateCropSize size) {
+    if (size == _cropSize) return;
+    setState(() => _cropSize = size);
+    PlatesPrefs.setCropSize(size);
   }
 
   /// Load the LPR config so the admin fuzziness control can render. A 403
@@ -466,6 +475,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 cameraName:
                     byId[playing.cameraId]?.name ?? '(unknown camera)',
                 imageMode: _imageDisplay,
+                cropSize: _cropSize,
                 onReport: () => _openPlateReport(playing),
                 onClose: () => setState(() => _playing = null),
                 // Same one-shot seek/focus hand-off the Clips "View on
@@ -582,8 +592,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
           _DisplayOptionsButton(
             imageMode: _imageDisplay,
             cropCorner: _cropCorner,
+            cropSize: _cropSize,
             onModeChanged: _setImageDisplay,
             onCornerChanged: _setCropCorner,
+            onSizeChanged: _setCropSize,
           ),
           TextButton.icon(
             onPressed: () =>
@@ -658,6 +670,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
               gate: _thumbGate,
               imageMode: _imageDisplay,
               cropCorner: _cropCorner,
+              cropSize: _cropSize,
               onTap: () => _openRead(p),
               canManage: widget.canManageWatchlist,
               watched: watched.contains(p.plate),
@@ -675,6 +688,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
           gate: _thumbGate,
           imageMode: _imageDisplay,
           cropCorner: _cropCorner,
+          cropSize: _cropSize,
           onTap: _openRead,
         );
       case PlatesViewMode.grouped:
@@ -686,6 +700,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
           gate: _thumbGate,
           imageMode: _imageDisplay,
           cropCorner: _cropCorner,
+          cropSize: _cropSize,
           onTap: _openRead,
           canManage: widget.canManageWatchlist,
           watched: watched,
@@ -701,6 +716,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
           gate: _thumbGate,
           imageMode: _imageDisplay,
           cropCorner: _cropCorner,
+          cropSize: _cropSize,
           onTap: _openRead,
         );
     }
@@ -761,18 +777,23 @@ class _DisplayOptionsButton extends StatelessWidget {
   const _DisplayOptionsButton({
     required this.imageMode,
     required this.cropCorner,
+    required this.cropSize,
     required this.onModeChanged,
     required this.onCornerChanged,
+    required this.onSizeChanged,
   });
 
   final PlateImageDisplay imageMode;
   final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final ValueChanged<PlateImageDisplay> onModeChanged;
   final ValueChanged<PlateCropCorner> onCornerChanged;
+  final ValueChanged<PlateCropSize> onSizeChanged;
 
   @override
   Widget build(BuildContext context) {
     final cornersEnabled = imageMode == PlateImageDisplay.both;
+    final cropEnabled = imageMode != PlateImageDisplay.fullOnly;
     PopupMenuItem<Object> header(String text) => PopupMenuItem<Object>(
           enabled: false,
           height: 26,
@@ -799,6 +820,13 @@ class _DisplayOptionsButton extends StatelessWidget {
           enabled: cornersEnabled,
           child: Text(label, style: const TextStyle(fontSize: 13)),
         );
+    CheckedPopupMenuItem<Object> sizeItem(PlateCropSize s, String label) =>
+        CheckedPopupMenuItem<Object>(
+          value: s,
+          checked: cropSize == s,
+          enabled: cropEnabled,
+          child: Text(label, style: const TextStyle(fontSize: 13)),
+        );
     return PopupMenuButton<Object>(
       tooltip: 'Image display',
       icon: const Icon(Icons.photo_size_select_large,
@@ -807,12 +835,18 @@ class _DisplayOptionsButton extends StatelessWidget {
       onSelected: (v) {
         if (v is PlateImageDisplay) onModeChanged(v);
         if (v is PlateCropCorner) onCornerChanged(v);
+        if (v is PlateCropSize) onSizeChanged(v);
       },
       itemBuilder: (context) => [
         header('SHOW'),
         modeItem(PlateImageDisplay.both, 'Full frame + plate crop'),
         modeItem(PlateImageDisplay.fullOnly, 'Full frame only'),
         modeItem(PlateImageDisplay.cropOnly, 'Plate crop only'),
+        const PopupMenuDivider(),
+        header('CROP SIZE'),
+        sizeItem(PlateCropSize.small, 'Small'),
+        sizeItem(PlateCropSize.medium, 'Medium'),
+        sizeItem(PlateCropSize.large, 'Large'),
         const PopupMenuDivider(),
         header('CROP CORNER (IN CARDS)'),
         cornerItem(PlateCropCorner.topLeft, 'Top-left'),
@@ -950,6 +984,7 @@ class _PlateRow extends StatelessWidget {
     required this.gate,
     required this.imageMode,
     required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
     required this.canManage,
     required this.watched,
@@ -964,6 +999,7 @@ class _PlateRow extends StatelessWidget {
   final _ConcurrencyGate gate;
   final PlateImageDisplay imageMode;
   final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final VoidCallback onTap;
 
   /// Admin — may add this read's plate to the watchlist.
@@ -993,10 +1029,12 @@ class _PlateRow extends StatelessWidget {
               gate: gate,
               imageMode: imageMode,
               cropCorner: cropCorner,
-              // The list row has the horizontal room to show both side-by-side.
+              cropSize: cropSize,
+              // The list row has plenty of horizontal room — show both large,
+              // side-by-side.
               sideBySide: true,
-              width: imageMode == PlateImageDisplay.both ? 150 : 96,
-              height: 58,
+              width: imageMode == PlateImageDisplay.both ? 320 : 180,
+              height: 92,
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -1101,6 +1139,7 @@ class _PlateThumb extends StatefulWidget {
     this.iconSize = 22,
     this.imageMode = PlateImageDisplay.fullOnly,
     this.cropCorner = PlateCropCorner.bottomRight,
+    this.cropSize = PlateCropSize.medium,
     this.sideBySide = false,
   });
 
@@ -1122,6 +1161,9 @@ class _PlateThumb extends StatefulWidget {
   /// When [imageMode] is `both` and [sideBySide] is false, the corner of the
   /// full frame the crop is pinned to.
   final PlateCropCorner cropCorner;
+
+  /// How large the crop renders (pinned inset fraction / side-by-side width).
+  final PlateCropSize cropSize;
 
   /// When [imageMode] is `both`, lay the full frame and crop out side-by-side
   /// (list rows, which have the horizontal room) instead of pinning the crop as
@@ -1279,8 +1321,16 @@ class _PlateThumbState extends State<_PlateThumb> {
           child: Padding(
             padding: const EdgeInsets.all(5),
             child: FractionallySizedBox(
-              widthFactor: 0.46,
-              heightFactor: 0.42,
+              widthFactor: switch (widget.cropSize) {
+                PlateCropSize.small => 0.34,
+                PlateCropSize.medium => 0.46,
+                PlateCropSize.large => 0.62,
+              },
+              heightFactor: switch (widget.cropSize) {
+                PlateCropSize.small => 0.30,
+                PlateCropSize.medium => 0.42,
+                PlateCropSize.large => 0.56,
+              },
               child: Container(
                 decoration: BoxDecoration(
                   color: Colors.black,
@@ -1305,13 +1355,22 @@ class _PlateThumbState extends State<_PlateThumb> {
   }
 
   /// Full frame and plate crop laid out horizontally — the list-row layout,
-  /// where there's room to show both at a glance.
+  /// where there's room to show both at a glance. The crop's share of the width
+  /// scales with the crop-size preference.
   Widget _sideBySide(Uint8List full, Uint8List crop, int cacheW) {
+    final cropFlex = switch (widget.cropSize) {
+      PlateCropSize.small => 2,
+      PlateCropSize.medium => 3,
+      PlateCropSize.large => 4,
+    };
     return Row(
       children: [
-        Expanded(flex: 3, child: _img(full, BoxFit.cover, cacheW)),
-        const SizedBox(width: 3),
-        Expanded(flex: 2, child: _img(crop, BoxFit.contain, cacheW, background: true)),
+        Expanded(flex: 4, child: _img(full, BoxFit.cover, cacheW)),
+        const SizedBox(width: 4),
+        Expanded(
+          flex: cropFlex,
+          child: _img(crop, BoxFit.contain, cacheW, background: true),
+        ),
       ],
     );
   }
@@ -1379,6 +1438,7 @@ class _PlateGallery extends StatelessWidget {
     required this.gate,
     required this.imageMode,
     required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
   });
 
@@ -1389,6 +1449,7 @@ class _PlateGallery extends StatelessWidget {
   final _ConcurrencyGate gate;
   final PlateImageDisplay imageMode;
   final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
 
   @override
@@ -1413,6 +1474,7 @@ class _PlateGallery extends StatelessWidget {
           gate: gate,
           imageMode: imageMode,
           cropCorner: cropCorner,
+          cropSize: cropSize,
           onTap: () => onTap(p),
         );
       },
@@ -1430,6 +1492,7 @@ class _PlateGalleryCard extends StatelessWidget {
     required this.gate,
     required this.imageMode,
     required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
   });
 
@@ -1440,6 +1503,7 @@ class _PlateGalleryCard extends StatelessWidget {
   final _ConcurrencyGate gate;
   final PlateImageDisplay imageMode;
   final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final VoidCallback onTap;
 
   @override
@@ -1469,6 +1533,7 @@ class _PlateGalleryCard extends StatelessWidget {
                 // when there's no bbox.
                 imageMode: imageMode,
                 cropCorner: cropCorner,
+                cropSize: cropSize,
               ),
             ),
             Padding(
@@ -1564,6 +1629,7 @@ class _PlateGroupedList extends StatelessWidget {
     required this.gate,
     required this.imageMode,
     required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
     required this.canManage,
     required this.watched,
@@ -1578,6 +1644,7 @@ class _PlateGroupedList extends StatelessWidget {
   final _ConcurrencyGate gate;
   final PlateImageDisplay imageMode;
   final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
   final bool canManage;
   final Set<String> watched;
@@ -1626,8 +1693,10 @@ class _PlateGroupedList extends StatelessWidget {
               gate: gate,
               imageMode: imageMode,
               cropCorner: cropCorner,
-              width: 64,
-              height: 40,
+              cropSize: cropSize,
+              sideBySide: imageMode == PlateImageDisplay.both,
+              width: imageMode == PlateImageDisplay.both ? 200 : 110,
+              height: 64,
             ),
             title: Text(
               g.plate,
@@ -1661,6 +1730,7 @@ class _PlateGroupedList extends StatelessWidget {
                   gate: gate,
                   imageMode: imageMode,
                   cropCorner: cropCorner,
+                  cropSize: cropSize,
                   onTap: () => onTap(r),
                   canManage: canManage,
                   watched: watched.contains(r.plate),
@@ -1689,6 +1759,7 @@ class _PlateTimeline extends StatelessWidget {
     required this.gate,
     required this.imageMode,
     required this.cropCorner,
+    required this.cropSize,
     required this.onTap,
   });
 
@@ -1699,6 +1770,7 @@ class _PlateTimeline extends StatelessWidget {
   final _ConcurrencyGate gate;
   final PlateImageDisplay imageMode;
   final PlateCropCorner cropCorner;
+  final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
 
   @override
@@ -1726,8 +1798,11 @@ class _PlateTimeline extends StatelessWidget {
                     gate: gate,
                     imageMode: imageMode,
                     cropCorner: cropCorner,
-                    width: 148,
-                    height: 92,
+                    cropSize: cropSize,
+                    // Big feed rows have the room — show both side-by-side, wide.
+                    sideBySide: imageMode == PlateImageDisplay.both,
+                    width: imageMode == PlateImageDisplay.both ? 320 : 190,
+                    height: 108,
                     iconSize: 34,
                   ),
                   const SizedBox(width: 14),
@@ -1823,6 +1898,7 @@ class _PlateClipPlayer extends StatefulWidget {
     required this.read,
     required this.cameraName,
     required this.imageMode,
+    required this.cropSize,
     required this.onReport,
     required this.onClose,
     required this.onViewOnTimeline,
@@ -1836,6 +1912,9 @@ class _PlateClipPlayer extends StatefulWidget {
   /// Operator's plate-image preference — hides the prominent plate crop above
   /// the clip when set to full-frame-only.
   final PlateImageDisplay imageMode;
+
+  /// How tall the prominent plate crop renders above the clip.
+  final PlateCropSize cropSize;
   final VoidCallback onReport;
   final VoidCallback onClose;
   final VoidCallback onViewOnTimeline;
@@ -2070,11 +2149,16 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
                 ],
               ),
             ),
-            // Prominent plate crop (bbox region of the already-fetched
-            // snapshot), when we have one — renders nothing otherwise. Hidden
-            // when the operator chose full-frame-only.
+            // Prominent plate crop (bbox region of the snapshot) pinned above
+            // the clip. Fetches the snapshot itself if a tile hasn't cached it,
+            // so it shows reliably. Renders nothing when the read has no bbox;
+            // hidden entirely when the operator chose full-frame-only.
             if (widget.imageMode != PlateImageDisplay.fullOnly)
-              _PlateDetailCrop(read: read),
+              _PlateDetailCrop(
+                read: read,
+                session: widget.session,
+                cropSize: widget.cropSize,
+              ),
             // Video pane.
             Expanded(
               child: Center(
@@ -2104,6 +2188,19 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   }
 
   /// Minimal control bar: back-to-start and play/pause, driven by the player.
+  /// Nudge the clip by roughly one frame. media_kit has no frame-step API, so
+  /// pause and seek by ~1/30 s relative to the current position (clamped ≥ 0).
+  void _stepFrame(bool forward) {
+    final p = _player;
+    if (p == null) return;
+    p.pause();
+    const frame = Duration(milliseconds: 33);
+    final pos = p.state.position;
+    var target = forward ? pos + frame : pos - frame;
+    if (target < Duration.zero) target = Duration.zero;
+    p.seek(target);
+  }
+
   Widget _buildTransport() {
     return Padding(
       padding: const EdgeInsets.only(top: 8),
@@ -2122,6 +2219,12 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           ),
           const SizedBox(width: 8),
           IconButton(
+            tooltip: 'Back one frame',
+            onPressed: () => _stepFrame(false),
+            icon: const Icon(Icons.navigate_before,
+                color: Colors.white70, size: 26),
+          ),
+          IconButton(
             tooltip: _playing ? 'Pause' : 'Play',
             onPressed: () {
               final p = _player;
@@ -2138,6 +2241,12 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
               size: 28,
             ),
           ),
+          IconButton(
+            tooltip: 'Forward one frame',
+            onPressed: () => _stepFrame(true),
+            icon: const Icon(Icons.navigate_next,
+                color: Colors.white70, size: 26),
+          ),
         ],
       ),
     );
@@ -2151,9 +2260,15 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
 /// nothing when there's no cached snapshot or no bbox, so the pop-up simply
 /// shows the clip in that case.
 class _PlateDetailCrop extends StatefulWidget {
-  const _PlateDetailCrop({required this.read});
+  const _PlateDetailCrop({
+    required this.read,
+    required this.session,
+    required this.cropSize,
+  });
 
   final PlateRead read;
+  final Session session;
+  final PlateCropSize cropSize;
 
   @override
   State<_PlateDetailCrop> createState() => _PlateDetailCropState();
@@ -2175,47 +2290,55 @@ class _PlateDetailCropState extends State<_PlateDetailCrop> {
     super.dispose();
   }
 
-  void _compute() {
+  Future<void> _compute() async {
     final read = widget.read;
     final bbox = read.bbox;
     final eventId = read.eventId;
     if (bbox == null || bbox.length < 4 || eventId == null || eventId.isEmpty) {
       return;
     }
-    // Cache-only: use the snapshot fetched for the tile. Never fetch here.
-    final bytes = _snapshotCache[eventId];
-    if (bytes == null) return;
     final existing = peekPlateCrop(read.id);
     if (existing != null) {
-      _crop = existing;
+      setState(() => _crop = existing);
       return;
     }
-    unawaited(() async {
-      final crop = await cachedPlateCrop(read.id, bytes, bbox);
-      if (_disposed || crop == null) return;
-      if (mounted) setState(() => _crop = crop);
-    }());
+    // Prefer the tile's cached snapshot; if none (the popup was opened without
+    // the tile ever rendering), fetch it here so the crop still shows.
+    var bytes = _snapshotCache[eventId];
+    bytes ??= await _fetchSnapshotBytes(widget.session, eventId);
+    if (_disposed || bytes == null) return;
+    final crop = await cachedPlateCrop(read.id, bytes, bbox);
+    if (_disposed || crop == null) return;
+    if (mounted) setState(() => _crop = crop);
   }
 
   @override
   Widget build(BuildContext context) {
     final crop = _crop;
     if (crop == null) return const SizedBox.shrink();
-    return Container(
-      margin: const EdgeInsets.only(top: 2, bottom: 6),
-      padding: const EdgeInsets.all(4),
-      decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(4),
-        child: Image.memory(
-          crop,
-          height: 76,
-          fit: BoxFit.contain,
-          gaplessPlayback: true,
+    final height = switch (widget.cropSize) {
+      PlateCropSize.small => 60.0,
+      PlateCropSize.medium => 96.0,
+      PlateCropSize.large => 150.0,
+    };
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.only(top: 4, bottom: 8),
+        padding: const EdgeInsets.all(5),
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.white38),
+          boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 6)],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: Image.memory(
+            crop,
+            height: height,
+            fit: BoxFit.contain,
+            gaplessPlayback: true,
+          ),
         ),
       ),
     );
