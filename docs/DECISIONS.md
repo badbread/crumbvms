@@ -8,6 +8,41 @@ revisit.
 
 ---
 
+## 2026-07-14, Live plate crop boxes: normalize Frigate's pixel-corner MQTT boxes with detect dims fetched from /api/config (issue #157)
+
+Frigate 0.18 sends the `license_plate` attribute box in **two different
+conventions by transport**, verified live against the same event: the HTTP
+`/api/events` `data.attributes` box is normalized `[x, y, w, h]`, while the
+live MQTT `current_attributes` / `snapshot.attributes` box is **pixel corners
+`[x1, y1, x2, y2]` at the camera's detect resolution** — which is not carried
+in the MQTT payload. Without the frame dimensions, live reads could never
+store a crop box at ingest (and there is no periodic HTTP backfill; only an
+API restart ever filled them in).
+
+**Chosen:** fetch each camera's detect resolution from Frigate `/api/config`
+at provider start and refresh it on the existing 1-minute camera-map reload
+tick; interpret a pixel box (with dims) as **corners first** — a real plate
+always has `x2>x1 && y2>y1` — with a defensive origin+size fallback. Also read
+the box from `snapshot.attributes` (the emitting frames have empty
+`current_attributes`, but Frigate keeps the snapshot frame's attributes on the
+`snapshot` sub-object). Best-effort throughout: a missing/failed dims fetch
+only costs the crop, never the plate text or detection.
+
+**Rejected / not chosen:**
+
+| Option | Why not |
+|---|---|
+| **One-shot HTTP `GET /api/events/{id}` per boxless read** (take the normalized HTTP box at emit time) | Adds a per-read HTTP round-trip and an availability dependency inside the MQTT hot loop; racy right at `end` (the event row may not be finalized). The config fetch is one small request a minute with the same self-heal property. |
+| **Derive dims from the payload** (e.g. `snapshot.region`) | Regions are square crops, not the frame; nothing in the MQTT payload states the detect resolution. Guessing a scale risks silently wrong crops — worse than no crop. |
+| **Interpret pixel boxes as `[x, y, w, h]`** (the old speculative rule 4) | Disproven by live capture; corners is the observed convention. A pixel plate box read as xywh would produce a garbage crop whenever `x2 ≤ 1 − x1` fails etc. The xywh reading is kept only as a fallback for values that cannot be corners. |
+
+**Revisit triggers:** a Frigate release that changes the MQTT attribute-box
+convention or starts carrying detect dims (or normalized boxes) in the event
+payload; crop-box support for a second detection provider (would motivate
+moving dims discovery behind the provider trait).
+
+---
+
 ## 2026-07-14, Backward wall-clock step: preserve existing footage over the colliding segment (recorder, issue #144 item 2)
 
 On an RTC-less SBC the wall clock can jump **backward** after an NTP sync. Since
