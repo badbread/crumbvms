@@ -322,14 +322,14 @@ If the user runs their cameras through Frigate with Frigate's native LPR enabled
 plate reads arrive on the event stream Crumb already ingests — flip
 **License-plate recognition** on there (and set a **retention** window; older
 plate reads are pruned automatically) to start capturing them into the
-searchable **Plates** tab. No new services or env keys; it reuses the Frigate
+searchable **LPR** tab. No new services or env keys; it reuses the Frigate
 integration. A plate database is privacy-sensitive, so it stays opt-in, and
 viewing it needs the **View license plates** role capability (Settings → Users &
 Security). Plate-read retention is independent of footage/storage retention.
 REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
 To be **alerted** when a specific plate is seen, add it to the **watchlist** in
-the **Plates** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
+the **LPR** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
 admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert
 routed over the same notification channels as every other alert — enable/tune it
 under Settings → Notifications → System alerts. No extra services or env keys.

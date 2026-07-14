@@ -744,7 +744,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
     (_liveIndex, Icons.grid_view, 'Live', Color(0xFFE8A33D)), // amber
     (_playbackIndex, Icons.play_circle_outline, 'Playback', Color(0xFF38BDD6)), // cyan
     (_clipsIndex, Icons.movie_outlined, 'Clips', Color(0xFFB57BEF)), // violet
-    (_platesIndex, Icons.directions_car_outlined, 'Plates', Color(0xFFE05A8A)), // pink
+    (_platesIndex, Icons.directions_car_outlined, 'LPR', Color(0xFFE05A8A)), // pink
     (_exportIndex, Icons.download_outlined, 'Export', Color(0xFF57C888)), // green
   ];
 

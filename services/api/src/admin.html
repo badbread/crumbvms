@@ -3921,7 +3921,7 @@ function renderTree() {
     item("select('detection-root')",     icon('integration',17), 'Detection &amp; clips', detActive, null) +
     // Plates: only when LPR capture is enabled (privacy-sensitive, off by default).
     ((LPR_CONFIG && LPR_CONFIG.enabled)
-      ? item("select('plates-root')", icon('cam_lpr',17), 'Plates', selKind==='plates-root', null)
+      ? item("select('plates-root')", icon('cam_lpr',17), 'LPR', selKind==='plates-root', null)
       : '') +
     item("select('notifications-root')",  icon('bell',17),        'Notifications',        notActive, null) +
     `<div class="rail-eyebrow">Administer</div>` +
@@ -8690,7 +8690,7 @@ const SYS_ALERT_META = {
   frigate_disconnected: { title: 'Frigate / MQTT disconnected',       desc: 'The Frigate detection integration has lost its MQTT connection.', unit: 'secs' },
   stream_no_segments:   { title: 'Camera records nothing',            desc: 'A camera keeps connecting but never produces a recordable segment before the stall watchdog reconnects it, so no footage is saved. Usually a long/adaptive keyframe interval (smart codec, e.g. Hikvision/Dahua H.264+/H.265+) or very low fps, exceeding the segment-receipt timeout. Fix the camera’s I-frame interval / disable the smart codec, or raise SEGMENT_RECEIPT_TIMEOUT_SECS.', unit: null },
   storage_unwritable:   { title: 'Storage not writable',              desc: 'The recorder cannot create a camera’s media directory under the storage root (permission denied) — footage is NOT being saved. Usually the host media dir is root-owned while the recorder runs as non-root uid 1001; fix the media dir ownership/permissions.', unit: null },
-  plate_watchlist_hit:  { title: 'License-plate watchlist hit',        desc: 'A watchlisted license plate was seen on a camera (managed in Plates → Watchlist).', unit: null },
+  plate_watchlist_hit:  { title: 'License-plate watchlist hit',        desc: 'A watchlisted license plate was seen on a camera (managed in LPR → Watchlist).', unit: null },
   update_available:     { title: 'Crumb update available',             desc: 'A newer Crumb release is available on GitHub. Off by default and only fires when the update-available check is also enabled (Settings → Updates) — notify-only, no download or install. Fires once per new version.', unit: null },
 };
 
@@ -8733,7 +8733,7 @@ function renderPlates() {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('cam_lpr',22)}</span>
         <div class="rp-head-titles">
-          <div class="rp-head-title">Plates</div>
+          <div class="rp-head-title">LPR</div>
           <div class="rp-head-sub">Recognised license-plate reads, most recent first</div>
         </div>
       </div>
