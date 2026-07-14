@@ -73,8 +73,7 @@ struct PlaybackWallView: View {
                         .foregroundColor(atLatest ? CrumbColors.tealAccent : .white)
                         .clipShape(Capsule())
                 }
-                Text(atLatest ? "Tap a camera to play its latest footage"
-                              : "Play from \(formatTime(Date(timeIntervalSince1970: Double(cursorMs)/1000), style: .clockLong))")
+                Text("Tap a camera for full playback control")
                     .font(.caption2).foregroundColor(CrumbColors.textSecondary)
                     .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 Button { showJump = true } label: {

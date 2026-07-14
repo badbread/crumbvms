@@ -467,12 +467,7 @@ fun PlaybackWallScreen(
                         Text("Latest", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
                     }
                     Text(
-                        text = if (atLatest) {
-                            "Tap a camera to play its latest footage"
-                        } else {
-                            "Tap a camera to play from " +
-                                Time.dateTime(Instant.ofEpochMilli(cursorMs))
-                        },
+                        text = "Tap a camera for full playback control",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary,
                         modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
