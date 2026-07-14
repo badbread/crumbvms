@@ -633,6 +633,37 @@ class _WallScreenState extends State<WallScreen> {
   }
 }
 
+/// Compact "SD" chip marking a pane that is playing the Data-saver (low-res
+/// `_mobile` transcode) tier — so it's visible at a glance which tiles are on
+/// the bandwidth-saving stream. Amber (the app's "warn" accent) on black text.
+class _SdBadge extends StatelessWidget {
+  const _SdBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Data saver (low-res)',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+        decoration: BoxDecoration(
+          color: Colors.amber.shade600.withValues(alpha: 0.9),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: const Text(
+          'SD',
+          style: TextStyle(
+            color: Colors.black,
+            fontSize: 9,
+            fontWeight: FontWeight.w800,
+            height: 1.0,
+            letterSpacing: 0.5,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Placeholder for a view slot with no camera assigned.
 class _EmptySlot extends StatelessWidget {
   const _EmptySlot();
@@ -705,6 +736,24 @@ class _WallTileState extends State<_WallTile> {
 
   String? _error;
   bool _firstFrame = false;
+
+  /// The last-fetched stream URLs for this camera. Retained so the per-tile
+  /// menu can gate the Data-saver option on `rtspMobile` availability, and the
+  /// tile badge can show which tier is actually playing.
+  StreamUrls? _streams;
+
+  /// The quality tier this pane is currently resolved to play (mirrors the URL
+  /// [StreamPrefsStore.liveStreamUrl] picked), for the tile's "SD" badge. Null
+  /// until the first stream fetch completes.
+  StreamQuality? get _activeQuality {
+    final s = _streams;
+    if (s == null) return null;
+    return widget.streamPrefs?.resolvedQuality(
+      widget.camera.id,
+      s,
+      isMaximized: _zoomedToMain,
+    );
+  }
 
   /// Per-pane stall watchdog: polls the ACTIVE player's frame/position
   /// progress and, on a confirmed freeze (camera reboot, go2rtc restart, PoE
@@ -783,8 +832,9 @@ class _WallTileState extends State<_WallTile> {
         widget.session,
         widget.camera.id,
       );
-      // Per-camera main/sub override (right-click menu) wins over the wall
-      // default; falls back to the plain wall preference if no prefs store.
+      _streams = streams; // gate the Data-saver menu item + drive the SD badge
+      // Per-camera main/sub/data-saver override (right-click menu) wins over
+      // the wall default; falls back to the plain wall preference if no store.
       final url =
           widget.streamPrefs?.liveStreamUrl(
             widget.camera.id,
@@ -918,6 +968,7 @@ class _WallTileState extends State<_WallTile> {
         widget.session,
         widget.camera.id,
       );
+      _streams = streams;
       final url =
           widget.streamPrefs?.liveStreamUrl(
             widget.camera.id,
@@ -1008,6 +1059,15 @@ class _WallTileState extends State<_WallTile> {
           checked: eff == StreamQuality.sub,
           child: const Text('Sub stream'),
         ),
+        // Data-saver (low-res `_mobile` transcode). Greyed out when this camera
+        // has no mobile URL (Frigate-served, or mobile streams disabled
+        // server-side) so it can never be picked into a dead/black pane.
+        CheckedPopupMenuItem(
+          value: 'data-saver',
+          checked: eff == StreamQuality.dataSaver,
+          enabled: _streams?.rtspMobile != null,
+          child: const Text('Data saver (low-res)'),
+        ),
         if (prefs?.hasOverride(widget.camera.id) ?? false)
           const PopupMenuItem(
             value: 'reset',
@@ -1030,6 +1090,9 @@ class _WallTileState extends State<_WallTile> {
         await _reloadStream();
       case 'sub':
         prefs?.setOverride(widget.camera.id, StreamQuality.sub);
+        await _reloadStream();
+      case 'data-saver':
+        prefs?.setOverride(widget.camera.id, StreamQuality.dataSaver);
         await _reloadStream();
       case 'reset':
         prefs?.setOverride(widget.camera.id, null);
@@ -1109,6 +1172,7 @@ class _WallTileState extends State<_WallTile> {
           recording: status?.recording ?? false,
           recentMotion: status?.recentMotion ?? false,
           detectionKeys: widget.liveStatus.detectionKeysFor(widget.camera.id),
+          dataSaver: _activeQuality == StreamQuality.dataSaver,
         );
       },
     );
@@ -1236,6 +1300,10 @@ class _WallTileState extends State<_WallTile> {
                               fontSize: 12,
                             ),
                           ),
+                          if (_activeQuality == StreamQuality.dataSaver) ...[
+                            const SizedBox(width: 6),
+                            const _SdBadge(),
+                          ],
                           if (_reconnecting) ...[
                             const SizedBox(width: 6),
                             const Text(

@@ -11,8 +11,9 @@
 //     ptzStyle, ptzWheelCorner),
 //   * the already-ported [LaunchFullscreenOption] widget
 //     (lib/ui/fullscreen/launch_fullscreen_option.dart), and
-//   * the already-ported [StreamPrefsStore.wallUsesSub]
-//     (lib/state/stream_prefs.dart) for "wall tiles use sub streams".
+//   * the already-ported [StreamPrefsStore.wallDefaultQuality]
+//     (lib/state/stream_prefs.dart) for the default live-wall stream tier
+//     (Main / Sub / Data saver).
 //
 // NOTE (integration): give the caller access to the SAME `StreamPrefsStore`
 // instance the live wall uses (so toggling "wall uses sub streams" here takes
@@ -75,10 +76,11 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
       setState(() => _o.zoomSwitchesToMain = v);
   void _setOpenClipsInHd(bool v) => setState(() => _o.openClipsInHd = v);
 
-  bool get _wallUsesSub => widget.streamPrefs?.wallUsesSub ?? true;
-  void _setWallUsesSub(bool v) {
+  StreamQuality get _wallDefaultQuality =>
+      widget.streamPrefs?.wallDefaultQuality ?? StreamQuality.sub;
+  void _setWallDefaultQuality(StreamQuality q) {
     setState(() {
-      if (widget.streamPrefs != null) widget.streamPrefs!.wallUsesSub = v;
+      widget.streamPrefs?.wallDefaultQuality = q;
     });
   }
 
@@ -161,13 +163,56 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Show "All Cameras" quick view',
             subtitle: 'Auto-build a grid of every camera as a selectable view.',
           ),
-          _switchRow(
-            value: _wallUsesSub,
-            onChanged: widget.streamPrefs == null ? null : _setWallUsesSub,
-            title: 'Wall tiles use sub streams',
-            subtitle: widget.streamPrefs == null
-                ? 'Unavailable — no stream preference store wired up for this screen.'
-                : 'Lower-bandwidth stream for the grid; maximizing a tile can still switch to main below.',
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 6, 16, 2),
+            child: Text(
+              'Default live-wall stream quality',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+            ),
+          ),
+          if (widget.streamPrefs == null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+              child: Text(
+                'Unavailable — no stream preference store wired up for this screen.',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          RadioListTile<StreamQuality>(
+            value: StreamQuality.main,
+            groupValue: _wallDefaultQuality,
+            onChanged: widget.streamPrefs == null
+                ? null
+                : (v) => _setWallDefaultQuality(v!),
+            title: const Text('Main (full quality)'),
+            subtitle: const Text('Highest bandwidth.'),
+            dense: true,
+          ),
+          RadioListTile<StreamQuality>(
+            value: StreamQuality.sub,
+            groupValue: _wallDefaultQuality,
+            onChanged: widget.streamPrefs == null
+                ? null
+                : (v) => _setWallDefaultQuality(v!),
+            title: const Text('Sub (lower bandwidth)'),
+            subtitle: const Text("Camera's built-in low-res stream."),
+            dense: true,
+          ),
+          RadioListTile<StreamQuality>(
+            value: StreamQuality.dataSaver,
+            groupValue: _wallDefaultQuality,
+            onChanged: widget.streamPrefs == null
+                ? null
+                : (v) => _setWallDefaultQuality(v!),
+            title: const Text('Data saver (low-res transcode)'),
+            subtitle: const Text(
+              'On-demand low-bitrate stream; falls back to sub when a '
+              'camera has none.',
+            ),
+            dense: true,
           ),
           if (widget.streamPrefs != null)
             Padding(

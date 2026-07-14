@@ -77,11 +77,16 @@ class TileInfoBar extends StatelessWidget {
     required this.recording,
     required this.recentMotion,
     required this.detectionKeys,
+    this.dataSaver = false,
     this.height = 18,
   });
 
   /// Camera display name.
   final String name;
+
+  /// The pane is playing the Data-saver (low-res `_mobile` transcode) tier —
+  /// show a small "SD" chip so the active stream tier is visible on the strip.
+  final bool dataSaver;
 
   /// First frame decoded and no error — drives the green "live" dot. When
   /// false (and not [hasError]) the dot is amber ("connecting").
@@ -131,6 +136,28 @@ class TileInfoBar extends StatelessWidget {
               ),
             ),
           ),
+          // Data-saver ("SD") chip, just after the name — marks the tile as on
+          // the low-res transcode tier.
+          if (dataSaver) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.amber.shade600.withValues(alpha: 0.9),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: const Text(
+                'SD',
+                style: TextStyle(
+                  color: Colors.black,
+                  fontSize: 8.5,
+                  fontWeight: FontWeight.w800,
+                  height: 1.0,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+            const SizedBox(width: 5),
+          ],
           // Indicators (right-aligned): specific detection glyphs take
           // precedence over the generic motion runner, then the REC dot —
           // same precedence as LiveStatusBadgeRow.

@@ -15,10 +15,45 @@ import 'dart:convert';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-enum StreamQuality { main, sub }
+/// Live-stream quality tier for a pane. `main` = full-res, `sub` = the
+/// low-bandwidth sub stream, `dataSaver` = the on-demand low-bitrate
+/// `<name>_mobile` go2rtc transcode ([StreamUrls.rtspMobile]).
+enum StreamQuality { main, sub, dataSaver }
+
+/// Wire form persisted to SharedPreferences / the overrides blob. `dataSaver`
+/// serializes as `'mobile'` (it plays the `_mobile` stream). Kept as a plain
+/// switch (not a const map) to sidestep Dart const-map pitfalls.
+String _qualityToWire(StreamQuality q) {
+  switch (q) {
+    case StreamQuality.main:
+      return 'main';
+    case StreamQuality.sub:
+      return 'sub';
+    case StreamQuality.dataSaver:
+      return 'mobile';
+  }
+}
+
+/// Parse a persisted quality tier; unknown/legacy values return null so the
+/// caller can fall back (to main, the safe full-quality default).
+StreamQuality? _qualityFromWire(String? s) {
+  switch (s) {
+    case 'main':
+      return StreamQuality.main;
+    case 'sub':
+      return StreamQuality.sub;
+    case 'mobile':
+      return StreamQuality.dataSaver;
+    default:
+      return null;
+  }
+}
 
 const String _kStreamPrefKey = 'crumb_stream_pref';
+// Legacy bool key ("wall uses sub") — read once on load and migrated into the
+// string quality key below, then never written again.
 const String _kWallDefaultSubKey = 'crumb_live_wall_sub';
+const String _kWallDefaultQualityKey = 'crumb_live_wall_quality';
 const String _kPtzDisabledKey = 'crumb_ptz_disabled';
 
 /// Holds per-camera stream-quality overrides and the wall-wide default
@@ -29,13 +64,13 @@ const String _kPtzDisabledKey = 'crumb_ptz_disabled';
 class StreamPrefsStore {
   StreamPrefsStore._(
     this._prefs,
-    this._wallDefaultSub,
+    this._wallDefault,
     this._overrides,
     this._ptzDisabled,
   );
 
   final SharedPreferences? _prefs;
-  bool _wallDefaultSub;
+  StreamQuality _wallDefault;
   final Map<String, StreamQuality> _overrides;
 
   /// Camera ids the operator has hidden PTZ controls for (per-camera, client
@@ -54,18 +89,27 @@ class StreamPrefsStore {
     } catch (_) {
       prefs = null; // package not wired up yet — fall back to in-memory only
     }
-    final wallSub = prefs?.getBool(_kWallDefaultSubKey) ?? true;
+    // Wall default: prefer the new string quality key; else migrate the legacy
+    // bool key ("wall uses sub": true→sub) so existing installs keep their
+    // choice; else the historical default (sub, bandwidth-friendly).
+    StreamQuality wallDefault;
+    final rawQ = prefs?.getString(_kWallDefaultQualityKey);
+    if (rawQ != null) {
+      wallDefault = _qualityFromWire(rawQ) ?? StreamQuality.sub;
+    } else {
+      final legacySub = prefs?.getBool(_kWallDefaultSubKey);
+      wallDefault = (legacySub ?? true)
+          ? StreamQuality.sub
+          : StreamQuality.main;
+    }
     final overrides = <String, StreamQuality>{};
     final raw = prefs?.getString(_kStreamPrefKey);
     if (raw != null) {
       try {
         final j = jsonDecode(raw) as Map<String, dynamic>;
         for (final entry in j.entries) {
-          if (entry.value == 'sub') {
-            overrides[entry.key] = StreamQuality.sub;
-          } else if (entry.value == 'main') {
-            overrides[entry.key] = StreamQuality.main;
-          }
+          final q = _qualityFromWire(entry.value as String?);
+          if (q != null) overrides[entry.key] = q;
         }
       } catch (_) {
         /* corrupt/legacy value — start clean */
@@ -74,20 +118,21 @@ class StreamPrefsStore {
     final ptzDisabled = <String>{};
     final rawPtz = prefs?.getStringList(_kPtzDisabledKey);
     if (rawPtz != null) ptzDisabled.addAll(rawPtz);
-    return StreamPrefsStore._(prefs, wallSub, overrides, ptzDisabled);
+    return StreamPrefsStore._(prefs, wallDefault, overrides, ptzDisabled);
   }
 
-  /// The DEFAULT wall stream when a camera has no explicit override — sub
-  /// when "wall uses sub" is on (bandwidth-friendly default), else main.
-  StreamQuality get wallDefault =>
-      _wallDefaultSub ? StreamQuality.sub : StreamQuality.main;
+  /// The DEFAULT stream tier for a camera with no explicit override.
+  StreamQuality get wallDefault => _wallDefault;
 
-  set wallUsesSub(bool v) {
-    _wallDefaultSub = v;
-    unawaited(_prefs?.setBool(_kWallDefaultSubKey, v));
+  /// The wall-wide default tier (Main / Sub / Data saver). Persisted as a
+  /// string under [_kWallDefaultQualityKey]; the legacy bool key is left in
+  /// place but never written again.
+  StreamQuality get wallDefaultQuality => _wallDefault;
+
+  set wallDefaultQuality(StreamQuality q) {
+    _wallDefault = q;
+    unawaited(_prefs?.setString(_kWallDefaultQualityKey, _qualityToWire(q)));
   }
-
-  bool get wallUsesSub => _wallDefaultSub;
 
   /// The EFFECTIVE wall stream for a camera: explicit override, else the
   /// wall default. (app.js `getStreamPref`.)
@@ -133,31 +178,79 @@ class StreamPrefsStore {
   Future<void> _persistOverrides() async {
     if (_prefs == null) return;
     final j = {
-      for (final e in _overrides.entries)
-        e.key: e.value == StreamQuality.sub ? 'sub' : 'main',
+      for (final e in _overrides.entries) e.key: _qualityToWire(e.value),
     };
     await _prefs.setString(_kStreamPrefKey, jsonEncode(j));
   }
 
-  /// The URL to actually play for a camera pane. `isMaximized` forces MAIN
+  /// The quality tier a pane will ACTUALLY play, given which URLs the server
+  /// returned — the effective choice, downgraded when its preferred stream is
+  /// missing (Data saver → sub → main; sub → main). `isMaximized` forces MAIN
   /// (full quality) unless this camera's main is known-dead this session, in
-  /// which case it falls back to sub rather than showing black.
-  /// (app.js `liveStreamUrl`.)
-  String? liveStreamUrl(
+  /// which case it downgrades to sub. [liveStreamUrl] is defined in terms of
+  /// this, so the tile badge never disagrees with the pixels on screen.
+  StreamQuality resolvedQuality(
     String cameraId,
     StreamUrls streams, {
     required bool isMaximized,
     bool maximizeUsesMain = true,
   }) {
     if (isMaximized && maximizeUsesMain) {
-      if (mainUnavailable.contains(cameraId)) {
-        return streams.rtspSub ?? streams.rtspMain;
+      if (mainUnavailable.contains(cameraId) && streams.rtspSub != null) {
+        return StreamQuality.sub;
       }
-      return streams.rtspMain ?? streams.rtspSub;
+      return streams.rtspMain != null
+          ? StreamQuality.main
+          : (streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main);
     }
-    return effectiveFor(cameraId) == StreamQuality.sub
-        ? (streams.rtspSub ?? streams.rtspMain)
-        : (streams.rtspMain ?? streams.rtspSub);
+    switch (effectiveFor(cameraId)) {
+      case StreamQuality.dataSaver:
+        if (streams.rtspMobile != null) return StreamQuality.dataSaver;
+        if (streams.rtspSub != null) return StreamQuality.sub;
+        return StreamQuality.main;
+      case StreamQuality.sub:
+        return streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main;
+      case StreamQuality.main:
+        return streams.rtspMain != null
+            ? StreamQuality.main
+            : (streams.rtspSub != null
+                  ? StreamQuality.sub
+                  : StreamQuality.main);
+    }
+  }
+
+  /// The URL for a given resolved tier, with a final safety fallback so a pane
+  /// never gets a null URL when any stream exists.
+  String? _urlForQuality(StreamQuality q, StreamUrls streams) {
+    switch (q) {
+      case StreamQuality.dataSaver:
+        return streams.rtspMobile ?? streams.rtspSub ?? streams.rtspMain;
+      case StreamQuality.sub:
+        return streams.rtspSub ?? streams.rtspMain ?? streams.rtspMobile;
+      case StreamQuality.main:
+        return streams.rtspMain ?? streams.rtspSub ?? streams.rtspMobile;
+    }
+  }
+
+  /// The URL to actually play for a camera pane. `isMaximized` forces MAIN
+  /// (full quality) unless this camera's main is known-dead this session, in
+  /// which case it falls back to sub rather than showing black. Data saver
+  /// falls back to sub → main when [StreamUrls.rtspMobile] is null (a
+  /// Frigate-served camera, or mobile streams disabled server-side).
+  /// (app.js `liveStreamUrl`, extended for the Data-saver tier.)
+  String? liveStreamUrl(
+    String cameraId,
+    StreamUrls streams, {
+    required bool isMaximized,
+    bool maximizeUsesMain = true,
+  }) {
+    final q = resolvedQuality(
+      cameraId,
+      streams,
+      isMaximized: isMaximized,
+      maximizeUsesMain: maximizeUsesMain,
+    );
+    return _urlForQuality(q, streams);
   }
 
   /// Record that maximizing this camera's main stream produced no frame, so
