@@ -347,6 +347,16 @@ impl DetectionSource for FrigateProvider {
         let hb_pool = self.pool.clone();
         let mut last_hb: Option<std::time::Instant> = None;
 
+        // Frigate emits the `license_plate` crop box on mid-track frames, but the
+        // recognized-plate text + snapshot arrive on later frames where the plate
+        // has already left view (empty `current_attributes`). Remember the last
+        // box seen per tracked object so the event that actually emits the read
+        // still carries the crop box. Bounded so a missed `end` can't leak memory
+        // (cleared past the cap) — the box is best-effort, a miss only costs a
+        // crop, never the plate text or footage.
+        const PLATE_BOX_MEMORY_MAX: usize = 1024;
+        let mut plate_boxes: HashMap<String, [f32; 4]> = HashMap::new();
+
         // Drive the event loop.
         loop {
             tokio::select! {
@@ -383,6 +393,15 @@ impl DetectionSource for FrigateProvider {
                             }
                         }
                         Ok(Event::Incoming(Packet::Publish(publish))) => {
+                            // Remember any license_plate crop box on this frame,
+                            // keyed by object id, so a later boxless event that
+                            // actually emits the read still carries the crop box.
+                            if let Some((id, Some(b))) = peek_plate_box(&publish.payload) {
+                                if plate_boxes.len() >= PLATE_BOX_MEMORY_MAX {
+                                    plate_boxes.clear();
+                                }
+                                plate_boxes.insert(id, b);
+                            }
                             // Read the map under a scoped guard so it's dropped
                             // before the `.await` below (RwLock guard is !Send).
                             let parsed = {
@@ -392,7 +411,18 @@ impl DetectionSource for FrigateProvider {
                                 process_mqtt_payload(&publish.payload, &map, min_score)
                             };
                             match parsed {
-                                Ok(Some(event)) => {
+                                Ok(Some(mut event)) => {
+                                    // Backfill the crop box from an earlier frame
+                                    // when this emitting event carried none itself.
+                                    if event.plate_box.is_none() {
+                                        event.plate_box = plate_boxes
+                                            .get(&event.provider_event_id)
+                                            .copied();
+                                    }
+                                    // Free the memory once the object ends.
+                                    if matches!(event.lifecycle, EventLifecycle::End) {
+                                        plate_boxes.remove(&event.provider_event_id);
+                                    }
                                     if tx.send(event).await.is_err() {
                                         info!("FrigateProvider: channel closed, stopping");
                                         break;
@@ -780,6 +810,29 @@ fn process_mqtt_payload(
         plate_box: normalize_plate_box(plate_box_from_attributes(&after.current_attributes), None),
         raw: raw_value,
     }))
+}
+
+/// Peek the license-plate crop box (and object id) out of a raw MQTT payload
+/// WITHOUT running the full filter pipeline. Used by the MQTT loop to remember
+/// a box across an object's lifecycle: Frigate emits the box on mid-track frames
+/// but the recognized text + snapshot on later frames whose `current_attributes`
+/// are empty, so the event that actually emits the read often has no box of its
+/// own. Returns `None` when the payload has no usable object id; the inner
+/// `Option` is the normalized box for this frame (absent when this frame has no
+/// `license_plate` attribute). Best-effort and allocation-light — a bad payload
+/// simply yields `None` and never disturbs the parse/emit path below.
+fn peek_plate_box(payload: &bytes::Bytes) -> Option<(String, Option<[f32; 4]>)> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let after = v.get("after")?;
+    let id = after
+        .get("id")
+        .and_then(serde_json::Value::as_str)?
+        .to_owned();
+    let boxed = after
+        .get("current_attributes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| normalize_plate_box(plate_box_from_attributes(a), None));
+    Some((id, boxed))
 }
 
 // ── HTTP backfill ─────────────────────────────────────────────────────────────
@@ -1659,5 +1712,45 @@ mod tests {
         assert!((bbox[1] - 0.5).abs() < 1e-6);
         assert!((bbox[2] - 0.2).abs() < 1e-6);
         assert!((bbox[3] - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn peek_plate_box_extracts_id_and_box_across_the_lifecycle() {
+        // The box-memory path (issue for missing crops on live reads): a mid-track
+        // frame carries the license_plate box, but the frame that finally emits
+        // the read (recognized text / snapshot) has empty current_attributes.
+        // peek_plate_box pulls the id + box off the box-bearing frame so the loop
+        // can remember it and backfill the boxless emitting frame.
+        let with_box = serde_json::json!({
+            "type": "update",
+            "after": {
+                "id": "car-42", "camera": "driveway",
+                "current_attributes": [
+                    {"label": "license_plate", "box": [0.4, 0.5, 0.2, 0.15], "score": 0.8}
+                ]
+            }
+        });
+        let (id, boxed) =
+            peek_plate_box(&bytes::Bytes::from(with_box.to_string())).expect("id parsed");
+        assert_eq!(id, "car-42");
+        let b = boxed.expect("box on this frame");
+        assert!((b[0] - 0.4).abs() < 1e-6 && (b[2] - 0.2).abs() < 1e-6);
+
+        // The emitting frame later: same object, but the plate has left view.
+        let boxless = serde_json::json!({
+            "type": "end",
+            "after": {
+                "id": "car-42", "camera": "driveway",
+                "recognized_license_plate": ["23134X1", 0.99f64],
+                "current_attributes": []
+            }
+        });
+        let (id2, boxed2) =
+            peek_plate_box(&bytes::Bytes::from(boxless.to_string())).expect("id parsed");
+        assert_eq!(id2, "car-42");
+        assert!(
+            boxed2.is_none(),
+            "no box on the emitting frame — must come from memory"
+        );
     }
 }
