@@ -76,7 +76,7 @@ fun CrumbModeTabs(
             ModeTab("Clips", selected == CrumbMode.CLIPS, Color(0xFFB07CD8), onClips)
         }
         if (showPlates) {
-            ModeTab("Plates", selected == CrumbMode.PLATES, TimelineColors.eventPlate, onPlates)
+            ModeTab("LPR", selected == CrumbMode.PLATES, TimelineColors.eventPlate, onPlates)
         }
     }
 }
