@@ -707,26 +707,31 @@ async fn test_channel(
         .build()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build reqwest client: {e}")))?;
 
-    // Fetch a live snapshot if the channel wants one and we can get it.
-    let snapshot = if ch.include_snapshot {
-        let b = resolve_bases(&state).await;
-        channel_notify::fetch_snapshot(
-            &http,
-            // Pick any accessible camera for the test — use the first camera_id in
-            // the channel's list, or try to find any enabled camera as fallback.
-            ch.camera_ids
-                .as_ref()
-                .and_then(|ids| ids.first().copied())
-                .unwrap_or(Uuid::nil()),
-            &b.crumb_api,
-            &b.frigate_go2rtc_api,
-            state.pool(),
-            &state.config().go2rtc_user,
-            &state.config().go2rtc_pass,
-        )
-        .await
-    } else {
-        None
+    // Fetch a live snapshot if the channel wants one AND is scoped to at least
+    // one camera. With no cameras there's nothing to snapshot — the old code
+    // fell back to `Uuid::nil()`, which just drove a guaranteed DB miss (and, on
+    // a broader lookup, risked resolving an unrelated camera). Send the test
+    // without an image instead.
+    let snapshot = match ch
+        .camera_ids
+        .as_ref()
+        .filter(|_| ch.include_snapshot)
+        .and_then(|ids| ids.first().copied())
+    {
+        Some(camera_id) => {
+            let b = resolve_bases(&state).await;
+            channel_notify::fetch_snapshot(
+                &http,
+                camera_id,
+                &b.crumb_api,
+                &b.frigate_go2rtc_api,
+                state.pool(),
+                &state.config().go2rtc_user,
+                &state.config().go2rtc_pass,
+            )
+            .await
+        }
+        None => None,
     };
 
     let msg = ChannelMessage {
@@ -1129,6 +1134,22 @@ pub async fn run_notification_engine(
 
         let now = Utc::now();
 
+        // ── per-tick snooze cache (P2 #5) ─────────────────────────────────────
+        // One query per tick for ALL active snoozes, grouped by device — instead
+        // of the old per-device-per-event `active_snoozes_for_device` call, which
+        // was an N+1 storm (devices × events queries every 3 s tick). Mirrors the
+        // owner_grants per-tick cache above. On a DB error we fail OPEN (empty
+        // map → nothing snoozed) so a transient blip does not silently suppress
+        // alerts.
+        let snooze_map: HashMap<Uuid, Vec<Option<Uuid>>> =
+            match db::active_snoozes_all(&pool, now).await {
+                Ok(rows) => group_active_snoozes(rows),
+                Err(err) => {
+                    tracing::warn!(error = %err, "notification engine: active_snoozes_all failed");
+                    HashMap::new()
+                }
+            };
+
         for event in &events {
             // Skip already-processed boundary events.
             if seen_ids.contains(&event.id) {
@@ -1272,19 +1293,9 @@ pub async fn run_notification_engine(
                     }
                 }
 
-                // ── Gate 7: snooze ────────────────────────────────────────────
-                let snoozes = match db::active_snoozes_for_device(&pool, device.id, now).await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::warn!(error = %err, device_id = %device.id, "engine: active_snoozes_for_device failed");
-                        Vec::new()
-                    }
-                };
-
-                let is_snoozed = snoozes
-                    .iter()
-                    .any(|(cam, _until)| cam.is_none() || cam == &Some(event.camera_id));
-                if is_snoozed {
+                // ── Gate 7: snooze (from the per-tick cache, not a per-device
+                //    query — see snooze_map above) ──────────────────────────────
+                if is_camera_snoozed(snooze_map.get(&device.id), event.camera_id) {
                     tracing::debug!(device_id = %device.id, "engine: gate snooze — drop");
                     continue;
                 }
@@ -1707,7 +1718,16 @@ async fn fetch_provider_snapshot(
         format!("{}{}", base.trim_end_matches('/'), snapshot_url)
     };
     match http_client.get(&full_url).send().await {
-        Ok(resp) if resp.status().is_success() => resp.bytes().await.ok().map(|b| b.to_vec()),
+        Ok(resp) if resp.status().is_success() => {
+            // Cap the read so a hostile/broken provider can't OOM the api.
+            match channel_notify::read_body_capped(resp, channel_notify::MAX_SNAPSHOT_BYTES).await {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::debug!(error = %e, "lpr alert snapshot: body read failed (or over cap)");
+                    None
+                }
+            }
+        }
         Ok(resp) => {
             tracing::debug!(status = %resp.status(), "lpr alert snapshot: provider non-2xx");
             None
@@ -2069,6 +2089,33 @@ fn owner_presence_from_devices(
     }
 }
 
+/// Group `(device_id, camera_id, until)` snooze rows into a per-device map of
+/// snoozed camera scopes (`None` = all cameras on that device). The `until` is
+/// dropped — the DB query already filtered to active snoozes (`until > now`).
+///
+/// Built once per engine tick from [`db::active_snoozes_all`], replacing the old
+/// per-device-per-event query (an N+1 storm).
+fn group_active_snoozes(
+    rows: Vec<(Uuid, Option<Uuid>, DateTime<Utc>)>,
+) -> HashMap<Uuid, Vec<Option<Uuid>>> {
+    let mut map: HashMap<Uuid, Vec<Option<Uuid>>> = HashMap::new();
+    for (device_id, camera_id, _until) in rows {
+        map.entry(device_id).or_default().push(camera_id);
+    }
+    map
+}
+
+/// Whether `camera_id` is snoozed for a device, given that device's active
+/// snooze scopes (from [`group_active_snoozes`]). An all-cameras snooze
+/// (`None`) matches every camera; a per-camera snooze matches only its camera.
+fn is_camera_snoozed(device_snoozes: Option<&Vec<Option<Uuid>>>, camera_id: Uuid) -> bool {
+    device_snoozes.is_some_and(|scopes| {
+        scopes
+            .iter()
+            .any(|scope| scope.is_none() || *scope == Some(camera_id))
+    })
+}
+
 /// Resolve the effective rule for an event: per-camera override → user default → None.
 ///
 /// `None` means "use system defaults".
@@ -2175,6 +2222,30 @@ mod tests {
         // A malformed/empty detail falls back to None (plateless key = safe).
         let malformed = sys_event("plate_watchlist_hit", Some(""));
         assert_eq!(plate_cooldown_discriminator(&malformed), None);
+    }
+
+    #[test]
+    fn group_and_match_snoozes() {
+        let dev_a = Uuid::new_v4();
+        let dev_b = Uuid::new_v4();
+        let cam1 = Uuid::new_v4();
+        let cam2 = Uuid::new_v4();
+        let until = Utc::now();
+
+        // dev_a: an all-cameras snooze; dev_b: a single-camera (cam1) snooze.
+        let rows = vec![(dev_a, None, until), (dev_b, Some(cam1), until)];
+        let map = group_active_snoozes(rows);
+
+        // dev_a's all-cameras snooze matches any camera.
+        assert!(is_camera_snoozed(map.get(&dev_a), cam1));
+        assert!(is_camera_snoozed(map.get(&dev_a), cam2));
+
+        // dev_b is snoozed only for cam1, not cam2.
+        assert!(is_camera_snoozed(map.get(&dev_b), cam1));
+        assert!(!is_camera_snoozed(map.get(&dev_b), cam2));
+
+        // A device with no snoozes at all is never snoozed.
+        assert!(!is_camera_snoozed(map.get(&Uuid::new_v4()), cam1));
     }
 
     #[test]

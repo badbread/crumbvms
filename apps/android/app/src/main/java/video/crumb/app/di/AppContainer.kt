@@ -90,21 +90,32 @@ class AppContainer(context: Context) {
     }
 
     /**
-     * Drop every pooled socket and cancel anything queued/in flight on the
-     * CURRENT client, WITHOUT swapping it out. Called on foreground return after
-     * a real background stint and from user-facing Retry actions: keep-alive
-     * connections routinely die silently while backgrounded, and a dead pooled
-     * connection (especially HTTP/2, where every request coalesces onto one
-     * socket) otherwise wedges all API traffic until the process is killed.
-     * Cheap and identity-preserving — api / mediaTokenCache / repository are
-     * untouched (unlike [rebuildApi], which shuts the executor down and would
-     * strand any cached `MediaUrls`); the next request just opens a fresh socket.
+     * Drop every **pooled** (idle) socket on the CURRENT client, WITHOUT swapping
+     * it out. Called on foreground return after a real background stint and from
+     * user-facing Retry actions: keep-alive connections routinely die silently
+     * while backgrounded, and a dead pooled connection (especially HTTP/2, where
+     * every request coalesces onto one socket) otherwise wedges all API traffic
+     * until the process is killed.
+     *
+     * We evict the connection pool only — we do NOT call
+     * `dispatcher.cancelAll()`. `cancelAll()` is a blanket kill of EVERY in-flight
+     * call on the shared client, including requests unrelated to the wedged
+     * transport (a Plates load, an export poll, a bookmark write) that are
+     * perfectly healthy — a heavy-handed side effect. Evicting the pool is exactly
+     * what the reconnect fix needs: the dead sockets are IDLE ones sitting in the
+     * pool (the pollers are STARTED-gated, so nothing is actively streaming on
+     * them at the moment this runs), and `evictAll()` closes precisely those idle
+     * connections so the next call opens a fresh socket instead of coalescing onto
+     * a corpse. Any call that IS genuinely in flight on a half-open socket is
+     * still covered by the client's `pingInterval` + `retryOnConnectionFailure` +
+     * `callTimeout` (see [Network.buildOkHttp]) — without cancelling its healthy
+     * neighbours. Cheap and identity-preserving — api / mediaTokenCache /
+     * repository are untouched (unlike [rebuildApi], which shuts the executor down
+     * and would strand any cached `MediaUrls`).
      */
     @Synchronized
     fun recoverConnections() {
-        val client = current.client
-        client.dispatcher.cancelAll()
-        client.connectionPool.evictAll()
+        current.client.connectionPool.evictAll()
     }
 
     /** A media-URL builder bound to the current server + scoped-token cache. Cheap; create per use. */

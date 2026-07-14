@@ -29,6 +29,40 @@ use uuid::Uuid;
 
 use crumb_common::db::NotificationChannel;
 
+/// Hard cap on a snapshot body proxied/fetched from an upstream provider
+/// (go2rtc / Frigate). A JPEG frame is well under this; the cap exists purely so
+/// a hostile or broken upstream that streams an unbounded body can't OOM the
+/// api. Shared by every snapshot-fetch path (channel dispatch, the LPR system
+/// alert path in `notifications.rs`, and the `/events/:id/snapshot` proxy).
+pub(crate) const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// Read an HTTP response body into memory, aborting if it exceeds `max` bytes.
+///
+/// `reqwest::Response::bytes()` buffers the whole body with no bound — an
+/// upstream that declares a huge (or omits its) Content-Length and keeps sending
+/// could exhaust memory. This reads chunk-by-chunk and bails the moment the
+/// accumulated size would exceed `max`, so a runaway body is dropped early
+/// rather than fully buffered. Also fast-rejects when the declared
+/// Content-Length already exceeds the cap.
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > max as u64 {
+            bail!("upstream body Content-Length {len} exceeds cap of {max} bytes");
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("read upstream body chunk")? {
+        if buf.len() + chunk.len() > max {
+            bail!("upstream body exceeds cap of {max} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// A notification message built once per engine event and shared across all
 /// matching channels.
 pub struct ChannelMessage {
@@ -442,16 +476,18 @@ pub async fn fetch_snapshot(
         req = req.basic_auth(go2rtc_user, Some(go2rtc_pass));
     }
     match req.send().await {
-        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-            Ok(b) => {
-                tracing::debug!(%camera_id, bytes = b.len(), "snapshot fetched");
-                Some(b.to_vec())
+        Ok(resp) if resp.status().is_success() => {
+            match read_body_capped(resp, MAX_SNAPSHOT_BYTES).await {
+                Ok(b) => {
+                    tracing::debug!(%camera_id, bytes = b.len(), "snapshot fetched");
+                    Some(b)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "snapshot: body read failed (or over cap)");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "snapshot: body read failed");
-                None
-            }
-        },
+        }
         Ok(resp) => {
             tracing::debug!(status = %resp.status(), "snapshot: non-2xx from go2rtc");
             None

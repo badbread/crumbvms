@@ -73,6 +73,19 @@ private const val MARGIN = 36f
  *  the strip to a single row within the content width. */
 private const val MAX_DOSSIER_THUMBS = 6
 
+/**
+ * Peak-memory guard (#147-1). Camera snapshots can be 1080p/4K; decoding several
+ * at full resolution and holding them all at once (primary + crop + up to
+ * [MAX_DOSSIER_THUMBS] thumbs) risks OOM on a share tap. We ask Coil to downsample
+ * each fetch to a bounded box: the primary/vehicle image is drawn into a ~150 pt
+ * A4 box (and cropped for the zoomed plate), so ~1400 px is ample; the dossier
+ * thumbs render tiny, so ~400 px is plenty. Report fetches also disable Coil's
+ * memory cache so the decoded bitmaps are exclusively ours to recycle after the
+ * PDF is written — never the shared instances the on-screen thumbnails use.
+ */
+private const val REPORT_IMAGE_TARGET_PX = 1400
+private const val DOSSIER_THUMB_TARGET_PX = 400
+
 /** Subdirectory of the app cache dir that `file_paths.xml` exposes via FileProvider. */
 private const val REPORTS_CACHE_SUBDIR = "reports"
 
@@ -121,7 +134,9 @@ suspend fun generatePlateReportPdf(
 
         // Full "vehicle" snapshot for the primary read (may be null: no event, or
         // a fetch miss → placeholder + full-snapshot fallback for the crop).
-        val fullSnapshot = fetchSnapshotBitmap(context, mediaUrls, imageLoader, read.cameraId, read.eventId)
+        val fullSnapshot = fetchSnapshotBitmap(
+            context, mediaUrls, imageLoader, read.cameraId, read.eventId, REPORT_IMAGE_TARGET_PX,
+        )
 
         // Zoomed plate crop from bbox; null bbox / crop failure → reuse the full
         // snapshot (labeled "vehicle" downstream).
@@ -135,7 +150,9 @@ suspend fun generatePlateReportPdf(
             val out = ArrayList<Bitmap>(MAX_DOSSIER_THUMBS)
             for (d in input.dossier) {
                 if (out.size >= MAX_DOSSIER_THUMBS) break
-                val bmp = fetchSnapshotBitmap(context, mediaUrls, imageLoader, d.cameraId, d.eventId) ?: continue
+                val bmp = fetchSnapshotBitmap(
+                    context, mediaUrls, imageLoader, d.cameraId, d.eventId, DOSSIER_THUMB_TARGET_PX,
+                ) ?: continue
                 out.add(bmp)
             }
             out
@@ -180,24 +197,44 @@ suspend fun generatePlateReportPdf(
             file
         } finally {
             doc.close()
+            // The PDF bytes are now fully written, so the source bitmaps can go.
+            // We own them (report fetches disable Coil's memory cache), so recycling
+            // frees memory immediately without touching the on-screen thumbnails'
+            // cached copies. A LinkedHashSet de-dupes the crop-is-fallback case where
+            // plateImage === fullSnapshot, so nothing is recycled twice.
+            val owned = LinkedHashSet<Bitmap>()
+            fullSnapshot?.let(owned::add)
+            plateImage?.let(owned::add)
+            dossierThumbs.forEach(owned::add)
+            owned.forEach { runCatching { it.recycle() } }
         }
     }
 }
 
-/** Fetch a read's sibling detection-event snapshot as a software [Bitmap], or null. */
+/**
+ * Fetch a read's sibling detection-event snapshot as a software [Bitmap]
+ * downsampled to a [targetPx]-bounded box, or null.
+ *
+ * The memory cache is DISABLED so the returned bitmap is decoded fresh and owned
+ * solely by the caller (safe to recycle after the PDF is written) rather than the
+ * shared instance the on-screen thumbnails render; the disk cache stays on for a
+ * fast re-fetch. [targetPx] bounds peak memory (see [REPORT_IMAGE_TARGET_PX]).
+ */
 private suspend fun fetchSnapshotBitmap(
     context: Context,
     mediaUrls: MediaUrls,
     imageLoader: ImageLoader,
     cameraId: String,
     eventId: String?,
+    targetPx: Int,
 ): Bitmap? {
     if (eventId.isNullOrBlank()) return null
     val url = runCatching { mediaUrls.eventSnapshotUrl(cameraId, eventId) }.getOrNull() ?: return null
     val req = ImageRequest.Builder(context)
         .data(url)
+        .size(targetPx) // downsample to a bounded box → guards against OOM
         .allowHardware(false) // need a software bitmap to draw into the PDF canvas + hash
-        .memoryCachePolicy(CachePolicy.ENABLED)
+        .memoryCachePolicy(CachePolicy.DISABLED)
         .diskCachePolicy(CachePolicy.ENABLED)
         .build()
     return (imageLoader.execute(req) as? SuccessResult)
@@ -485,6 +522,72 @@ private fun fmtTs(iso: String, fmt: DateTimeFormatter): String =
 
 private fun confidenceLabel(confidence: Float?): String =
     if (confidence == null) "—" else "${(confidence * 100).roundToInt()}%"
+
+// ─── watchlist / BOLO match (mirrors the server's fuzzy matcher) ──────────────
+
+/**
+ * Resolve the watchlist ("BOLO") entry a [plate] matches, so the report banner
+ * fires for FUZZY-alerted plates too — not only exact hits (#147-4). Replicates
+ * the server's `match_watchlist` exactly (`services/common/src/db.rs`): a read
+ * matches a `kind:"watch"` entry when the Levenshtein distance between their
+ * normalized forms is within `floor(fuzz · len)` edits, where `len` is the
+ * entry's normalized length and `fuzz` is clamped to `0.0..0.5`. Among all
+ * matches it returns the closest by edit distance (ties → first), matching the
+ * server's "closest wins" tie-break. `fuzz == 0` collapses to an exact
+ * (post-normalize) match — the historical behavior — so a caller that can't read
+ * the (admin-only) LPR config simply passes `0f` and loses nothing.
+ *
+ * Ignore entries never raise a banner, so they are skipped here.
+ */
+fun matchWatchlistBolo(
+    plate: String,
+    entries: List<PlateWatchlistEntry>,
+    fuzz: Float,
+): PlateWatchlistEntry? {
+    val read = normalizePlate(plate)
+    if (read.isEmpty()) return null
+    var best: PlateWatchlistEntry? = null
+    var bestDist = Int.MAX_VALUE
+    for (entry in entries) {
+        if (entry.isIgnore) continue
+        val ref = normalizePlate(entry.plate)
+        if (ref.isEmpty()) continue
+        val dist = levenshtein(read, ref)
+        if (dist <= allowedEdits(ref, fuzz) && dist < bestDist) {
+            best = entry
+            bestDist = dist
+            if (dist == 0) break // an exact match can't be beaten
+        }
+    }
+    return best
+}
+
+/** Uppercase ASCII-alphanumeric normalization — identical to the server's `normalize_plate`. */
+private fun normalizePlate(s: String): String =
+    buildString {
+        for (c in s) if (c in '0'..'9' || c in 'a'..'z' || c in 'A'..'Z') append(c.uppercaseChar())
+    }
+
+/** Edit budget `floor(fuzz.clamp(0,0.5) · len(reference))` — matches the server. */
+private fun allowedEdits(reference: String, fuzz: Float): Int =
+    (fuzz.coerceIn(0f, 0.5f) * reference.length).toInt()
+
+/** Classic two-row Levenshtein edit distance (plates are short). */
+private fun levenshtein(a: String, b: String): Int {
+    if (a.isEmpty()) return b.length
+    if (b.isEmpty()) return a.length
+    var prev = IntArray(b.length + 1) { it }
+    var curr = IntArray(b.length + 1)
+    for (i in a.indices) {
+        curr[0] = i + 1
+        for (j in b.indices) {
+            val cost = if (a[i] == b[j]) 0 else 1
+            curr[j + 1] = minOf(prev[j + 1] + 1, curr[j] + 1, prev[j] + cost)
+        }
+        val tmp = prev; prev = curr; curr = tmp
+    }
+    return prev[b.length]
+}
 
 // ─── share ──────────────────────────────────────────────────────────────────
 

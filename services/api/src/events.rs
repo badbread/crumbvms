@@ -320,23 +320,30 @@ async fn get_event_snapshot(
         .build()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("reqwest build: {e}")))?;
 
+    // Upstream (Frigate) failures are gateway errors, not our bug: map them to
+    // 502 (not 500) so a flapping/misconfigured provider doesn't read as an api
+    // fault or trip 5xx-based alerting. `ApiError::BadGateway` logs the detail at
+    // warn! and returns a generic message (no URL disclosure).
     let upstream = http_client
         .get(&full_url)
         .send()
         .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("snapshot fetch: {e}")))?;
+        .map_err(|e| ApiError::BadGateway(format!("snapshot fetch: {e}")))?;
 
     if !upstream.status().is_success() {
-        return Err(ApiError::Internal(anyhow::anyhow!(
+        return Err(ApiError::BadGateway(format!(
             "snapshot provider returned HTTP {}",
             upstream.status()
         )));
     }
 
-    let bytes = upstream
-        .bytes()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("snapshot body: {e}")))?;
+    // Cap the proxied body so a hostile/broken upstream can't OOM the api.
+    let bytes = crate::channel_notify::read_body_capped(
+        upstream,
+        crate::channel_notify::MAX_SNAPSHOT_BYTES,
+    )
+    .await
+    .map_err(|e| ApiError::BadGateway(format!("snapshot body: {e}")))?;
 
     Ok((
         StatusCode::OK,

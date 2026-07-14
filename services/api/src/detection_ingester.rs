@@ -87,6 +87,33 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedEvent>, pool: Pool) {
     info!("detection ingester: channel closed, exiting");
 }
 
+/// Outcome of consulting the LPR ignore-list for a plate read.
+#[derive(Debug, PartialEq, Eq)]
+enum IgnoreDecision {
+    /// Plate matched an `ignore` entry — drop the read entirely.
+    Drop,
+    /// Plate is not ignored — store the read.
+    Store,
+    /// The ignore-check itself failed (DB error). Fail CLOSED: skip (defer) this
+    /// read rather than risk storing a plate the operator ignored.
+    Skip,
+}
+
+/// Map the `is_plate_ignored` result to an [`IgnoreDecision`].
+///
+/// The security-relevant case is the error arm: it must resolve to [`Skip`],
+/// never [`Store`] — a DB blip must not defeat the ignore-list.
+///
+/// [`Skip`]: IgnoreDecision::Skip
+/// [`Store`]: IgnoreDecision::Store
+fn ignore_decision(check: &anyhow::Result<bool>) -> IgnoreDecision {
+    match check {
+        Ok(true) => IgnoreDecision::Drop,
+        Ok(false) => IgnoreDecision::Store,
+        Err(_) => IgnoreDecision::Skip,
+    }
+}
+
 /// Record a plate read for an event that carried one, but only when LPR capture
 /// is enabled (`lpr_config.enabled`). Off by default, so enabling Frigate
 /// detections alone never silently builds a plate database. The read is deduped
@@ -108,13 +135,26 @@ async fn maybe_record_plate(
             // dropped entirely — not stored, never alerted. The pragmatic
             // backstop for a nuisance plate (e.g. a parked car Frigate keeps
             // reading) when Frigate-side object masking isn't practical.
-            match is_plate_ignored(pool, &normalized, cfg.watchlist_fuzz).await {
-                Ok(true) => {
+            let check = is_plate_ignored(pool, &normalized, cfg.watchlist_fuzz).await;
+            match ignore_decision(&check) {
+                IgnoreDecision::Drop => {
                     tracing::debug!(plate = %plate_raw, camera = %ev.camera_id, "detection ingester: plate ignored (ignore-list) — dropped");
                     return;
                 }
-                Ok(false) => {}
-                Err(e) => warn!(error = %e, "detection ingester: is_plate_ignored failed"),
+                IgnoreDecision::Skip => {
+                    // Fail CLOSED for the ignore-list. A transient DB error must
+                    // NOT silently fall through and ingest a plate the operator
+                    // may have explicitly ignored (the list is a privacy/noise
+                    // control). Skip only this plate-read row — the detection
+                    // `events` row was already upserted above, so no
+                    // footage-relevant data is dropped; a later read of the same
+                    // plate re-attempts the check.
+                    if let Err(e) = &check {
+                        warn!(error = %e, plate = %plate_raw, camera = %ev.camera_id, "detection ingester: is_plate_ignored failed — skipping plate read (fail-closed)");
+                    }
+                    return;
+                }
+                IgnoreDecision::Store => {}
             }
             let params = UpsertPlateReadParams {
                 camera_id: ev.camera_id,
@@ -226,5 +266,29 @@ async fn maybe_alert_watchlist(
     // re-processed MQTT message) does not re-fire the alert.
     if let Err(e) = mark_plate_alerted(pool, plate_read_id).await {
         warn!(error = %e, "detection ingester: mark_plate_alerted failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ignore_decision, IgnoreDecision};
+
+    #[test]
+    fn ignore_decision_stores_when_not_ignored() {
+        assert_eq!(ignore_decision(&Ok(false)), IgnoreDecision::Store);
+    }
+
+    #[test]
+    fn ignore_decision_drops_when_ignored() {
+        assert_eq!(ignore_decision(&Ok(true)), IgnoreDecision::Drop);
+    }
+
+    #[test]
+    fn ignore_decision_skips_on_db_error_fail_closed() {
+        // The whole point of the fix: a DB error must resolve to Skip, NOT Store.
+        // Storing on error would ingest a plate the operator asked to ignore.
+        let err: anyhow::Result<bool> = Err(anyhow::anyhow!("connection reset"));
+        assert_eq!(ignore_decision(&err), IgnoreDecision::Skip);
+        assert_ne!(ignore_decision(&err), IgnoreDecision::Store);
     }
 }

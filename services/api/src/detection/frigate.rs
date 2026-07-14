@@ -295,19 +295,28 @@ impl DetectionSource for FrigateProvider {
         // ── 2. MQTT subscription ──────────────────────────────────────────────
         let topic = format!("{}/events", self.cfg.mqtt_prefix);
 
-        // Parse host + port from the MQTT URL.  rumqttc expects them separately.
-        let (host, port) = parse_mqtt_url(&self.cfg.mqtt_url)?;
+        // Parse host + port (+ any URL-embedded creds) from the MQTT URL.
+        // rumqttc expects host/port separately.
+        let endpoint = parse_mqtt_url(&self.cfg.mqtt_url)?;
 
-        let mut mqttoptions =
-            MqttOptions::new(format!("crumb-api-{}", uuid::Uuid::new_v4()), &host, port);
+        let mut mqttoptions = MqttOptions::new(
+            format!("crumb-api-{}", uuid::Uuid::new_v4()),
+            &endpoint.host,
+            endpoint.port,
+        );
         mqttoptions.set_keep_alive(Duration::from_secs(30));
         mqttoptions.set_clean_session(true);
         // Allow internal reconnection queue depth.
         mqttoptions.set_inflight(100);
         // Broker authentication (optional). The homelab broker Frigate already
-        // publishes to requires credentials; an anonymous broker leaves these unset.
-        if let Some(user) = &self.cfg.mqtt_user {
-            mqttoptions.set_credentials(user, self.cfg.mqtt_password.clone().unwrap_or_default());
+        // publishes to requires credentials; an anonymous broker leaves these
+        // unset. The explicit `mqtt_user`/`mqtt_password` config fields win;
+        // otherwise fall back to credentials embedded in the URL
+        // (`mqtt://user:pass@host`).
+        let mqtt_user = self.cfg.mqtt_user.clone().or(endpoint.username);
+        let mqtt_password = self.cfg.mqtt_password.clone().or(endpoint.password);
+        if let Some(user) = mqtt_user {
+            mqttoptions.set_credentials(user, mqtt_password.unwrap_or_default());
         }
 
         let (client, mut event_loop) = AsyncClient::new(mqttoptions, 512);
@@ -924,25 +933,67 @@ fn ts_from_f64(ts: f64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, nanos).unwrap_or_else(Utc::now)
 }
 
-/// Parse `host` and `port` from an `mqtt://host:port` URL.
-///
-/// Also accepts `mqtt://host` (defaults to port 1883).
-fn parse_mqtt_url(url: &str) -> Result<(String, u16)> {
-    let stripped = url
-        .strip_prefix("mqtt://")
-        .or_else(|| url.strip_prefix("mqtts://"))
-        .unwrap_or(url);
+/// A broker endpoint parsed from an MQTT URL: host, port, and any credentials
+/// embedded in the URL's userinfo (`mqtt://user:pass@host`).
+#[derive(Debug, PartialEq, Eq)]
+struct MqttEndpoint {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
 
-    let (host, port) = if let Some((h, p)) = stripped.split_once(':') {
-        let port: u16 = p
-            .parse()
-            .with_context(|| format!("MQTT URL port '{p}' is not a valid u16"))?;
-        (h.to_owned(), port)
+/// Parse an MQTT broker URL into host, port, and any embedded credentials.
+///
+/// Uses the `url` crate for a proper authority parse so it handles the cases the
+/// old naive `split_once(':')` got wrong:
+/// - **IPv6 literals** — `mqtt://[::1]:1883` (the bare `::1` splits at the first
+///   colon and mangles the host); the brackets are stripped from the returned
+///   host so rumqttc gets the bare address it needs to resolve.
+/// - **Userinfo** — `mqtt://user:pass@host` (the `user:pass@host` authority also
+///   splits wrong on the first colon). Any credentials are returned separately.
+///
+/// Accepts a bare `host[:port]` with no scheme (a default `mqtt://` is prepended)
+/// and `mqtts://`. Port defaults to 1883 when absent.
+fn parse_mqtt_url(url: &str) -> Result<MqttEndpoint> {
+    // The `url` crate needs a scheme to parse an authority; accept the legacy
+    // bare `host[:port]` form by supplying one.
+    let with_scheme = if url.contains("://") {
+        url.to_owned()
     } else {
-        (stripped.to_owned(), 1883u16)
+        format!("mqtt://{url}")
     };
 
-    Ok((host, port))
+    let parsed = ::url::Url::parse(&with_scheme)
+        .with_context(|| format!("MQTT URL '{url}' is not a valid URL"))?;
+
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .with_context(|| format!("MQTT URL '{url}' has no host"))?;
+    // `url` returns IPv6 hosts bracketed (`[::1]`); rumqttc wants the bare
+    // address for socket/DNS resolution.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_owned();
+
+    let port = parsed.port().unwrap_or(1883);
+
+    // Credentials embedded in the URL, if any. An empty username means none.
+    let username = match parsed.username() {
+        "" => None,
+        u => Some(u.to_owned()),
+    };
+    let password = parsed.password().map(ToOwned::to_owned);
+
+    Ok(MqttEndpoint {
+        host,
+        port,
+        username,
+        password,
+    })
 }
 
 // ── unit tests ────────────────────────────────────────────────────────────────
@@ -960,23 +1011,69 @@ mod tests {
 
     #[test]
     fn parse_mqtt_url_with_port() {
-        let (host, port) = parse_mqtt_url("mqtt://192.0.2.10:1883").unwrap();
-        assert_eq!(host, "192.0.2.10");
-        assert_eq!(port, 1883);
+        let ep = parse_mqtt_url("mqtt://192.0.2.10:1883").unwrap();
+        assert_eq!(ep.host, "192.0.2.10");
+        assert_eq!(ep.port, 1883);
+        assert_eq!(ep.username, None);
+        assert_eq!(ep.password, None);
     }
 
     #[test]
     fn parse_mqtt_url_without_port() {
-        let (host, port) = parse_mqtt_url("mqtt://192.0.2.10").unwrap();
-        assert_eq!(host, "192.0.2.10");
-        assert_eq!(port, 1883);
+        let ep = parse_mqtt_url("mqtt://192.0.2.10").unwrap();
+        assert_eq!(ep.host, "192.0.2.10");
+        assert_eq!(ep.port, 1883);
     }
 
     #[test]
     fn parse_mqtt_url_no_scheme() {
-        let (host, port) = parse_mqtt_url("192.0.2.10:1883").unwrap();
-        assert_eq!(host, "192.0.2.10");
-        assert_eq!(port, 1883);
+        let ep = parse_mqtt_url("192.0.2.10:1883").unwrap();
+        assert_eq!(ep.host, "192.0.2.10");
+        assert_eq!(ep.port, 1883);
+    }
+
+    #[test]
+    fn parse_mqtt_url_ipv6_literal() {
+        // The old split_once(':') parser mangled bracketed IPv6 literals. The
+        // brackets must be stripped so rumqttc gets the bare address.
+        let ep = parse_mqtt_url("mqtt://[::1]:1883").unwrap();
+        assert_eq!(ep.host, "::1");
+        assert_eq!(ep.port, 1883);
+
+        // IPv6 without an explicit port defaults to 1883.
+        let ep2 = parse_mqtt_url("mqtt://[2001:db8::1]").unwrap();
+        assert_eq!(ep2.host, "2001:db8::1");
+        assert_eq!(ep2.port, 1883);
+    }
+
+    #[test]
+    fn parse_mqtt_url_with_credentials() {
+        // user:pass@host — the old parser split on the first ':' and produced a
+        // bogus host/port; the creds must now be extracted and the host clean.
+        let ep = parse_mqtt_url("mqtt://frigate:s3cr3t@broker.lan:1884").unwrap();
+        assert_eq!(ep.host, "broker.lan");
+        assert_eq!(ep.port, 1884);
+        assert_eq!(ep.username.as_deref(), Some("frigate"));
+        assert_eq!(ep.password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn parse_mqtt_url_ipv6_with_credentials() {
+        // Both hard cases at once: userinfo AND a bracketed IPv6 literal.
+        let ep = parse_mqtt_url("mqtts://user:pw@[fe80::1]:8883").unwrap();
+        assert_eq!(ep.host, "fe80::1");
+        assert_eq!(ep.port, 8883);
+        assert_eq!(ep.username.as_deref(), Some("user"));
+        assert_eq!(ep.password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn parse_mqtt_url_username_only() {
+        // A username with no password is valid userinfo.
+        let ep = parse_mqtt_url("mqtt://frigate@broker.lan").unwrap();
+        assert_eq!(ep.host, "broker.lan");
+        assert_eq!(ep.username.as_deref(), Some("frigate"));
+        assert_eq!(ep.password, None);
     }
 
     #[test]

@@ -205,13 +205,21 @@ async fn get_camera_frame(
             req = req.basic_auth(user, Some(pass));
         }
         match req.send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(b) => {
-                    frame = Some(b);
-                    break;
+            // Cap the read so a hostile/broken upstream can't OOM the api.
+            Ok(resp) if resp.status().is_success() => {
+                match crate::channel_notify::read_body_capped(
+                    resp,
+                    crate::channel_notify::MAX_SNAPSHOT_BYTES,
+                )
+                .await
+                {
+                    Ok(b) => {
+                        frame = Some(b);
+                        break;
+                    }
+                    Err(e) => last_err = Some(format!("body: {e}")),
                 }
-                Err(e) => last_err = Some(format!("body: {e}")),
-            },
+            }
             Ok(resp) => last_status = Some(resp.status()),
             // `{:#}` on an anyhow-wrapped reqwest error prints the full source
             // chain ("error sending request ...: connection refused"), which a

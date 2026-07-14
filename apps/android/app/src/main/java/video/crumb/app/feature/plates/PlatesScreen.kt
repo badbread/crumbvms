@@ -346,10 +346,15 @@ fun PlatesScreen(
                 val exportedBy = store.username ?: "—"
                 scope.launch {
                     // Resolve the watchlist match (BOLO banner) + the sighting dossier
-                    // up front so the PDF builder stays a focused render step.
-                    val watchMatch = repo.watchlist().getOrNull()?.firstOrNull {
-                        !it.isIgnore && it.plate.equals(reportRead.plate, ignoreCase = true)
-                    }
+                    // up front so the PDF builder stays a focused render step. The
+                    // match honors the server's fuzz tolerance so a FUZZY-alerted plate
+                    // still shows the banner, not just an exact hit (#147-4). The fuzz
+                    // comes from the admin-only LPR config; a non-admin can't read it,
+                    // so it falls back to 0 (exact) — no regression, and admins (the
+                    // forensic-report users) get the correct fuzzy banner.
+                    val watchEntries = repo.watchlist().getOrNull().orEmpty()
+                    val fuzz = repo.lprConfig().getOrNull()?.watchlistFuzz ?: 0f
+                    val watchMatch = matchWatchlistBolo(reportRead.plate, watchEntries, fuzz)
                     val dossierResp = if (includeDossier && reportRead.plate.isNotBlank()) {
                         repo.plates(
                             cameraIds = allCamIds,
@@ -779,8 +784,18 @@ private fun PlatesFilterBar(
             TextButton(onClick = onResetToNow) { Text("Now") }
         }
         if (!state.loading) {
+            // The feed caps at 200 loaded reads (see PlatesViewModel.load), but the
+            // server reports the full match count. When they differ, say "N of total"
+            // so the grouped/timeline stats — computed only over the LOADED reads —
+            // don't imply completeness for older reads past the cap (#147-3).
+            val loaded = state.plates.size
+            val label = if (loaded < state.total) {
+                "$loaded of ${state.total} plates"
+            } else {
+                "${state.total} plate${if (state.total == 1) "" else "s"}"
+            }
             Text(
-                "${state.total} plate${if (state.total == 1) "" else "s"}",
+                label,
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
             )
@@ -921,10 +936,13 @@ private fun PlateRow(
                 )
                 val region = read.region
                 if (!region.isNullOrEmpty()) {
+                    // start-padding, not hardcoded leading spaces, so the gap sits on
+                    // the correct side under RTL (#147-11).
                     Text(
-                        text = "  $region",
+                        text = region,
                         color = TextSecondary,
                         style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(start = 6.dp),
                     )
                 }
             }

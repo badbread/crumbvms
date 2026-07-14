@@ -8,6 +8,38 @@ revisit.
 
 ---
 
+## 2026-07-14, Backward wall-clock step: preserve existing footage over the colliding segment (recorder, issue #144 item 2)
+
+On an RTC-less SBC the wall clock can jump **backward** after an NTP sync. Since
+segment filenames are strftime-encoded (`%Y%m%dT%H%M%SZ.mp4`, second
+resolution), a backward step makes a new segment's filename/timestamp collide
+with an **already-persisted, already-indexed** segment. The DB row key is
+`(camera_id, stream, start_ts)`, so the two segments are indistinguishable at
+the index level.
+
+**Chosen:** when the persist path (Motion-mode cache→storage copy, the step the
+recorder controls) detects that the destination file already exists, it (a)
+writes the new segment to a non-colliding `-rN` sibling name instead of
+overwriting, and (b) indexes it with a **DO-NOTHING** insert so the older
+segment keeps its row. Net: the **existing indexed footage always wins**; the
+colliding new segment survives on disk as an un-indexed orphan (never deleted).
+The partial-cleanup on a failed copy (item 7) only ever removes a destination
+confirmed absent immediately beforehand, so it can never delete good footage.
+
+**Rejected / not chosen:**
+
+| Option | Why not |
+|---|---|
+| **Index BOTH colliding segments** (change the conflict key to include `path` or add a monotonic counter) | Requires a schema migration + a filename-scheme change and ripples through reconcile/retention/export. Out of scope for a correctness fix; the safe outcome (keep the older, orphan the newer) loses no footage. |
+| **Let the UPSERT repoint the row to the new segment** | Steals the row from the older segment, turning *its* still-present file into an un-adoptable orphan — i.e. drops the older footage from the timeline. Backward from the goal. |
+| **Fully prevent the direct-to-storage (Continuous-mode) file truncation** | ffmpeg writes those files itself and O_TRUNCs the colliding name before the recorder ever sees the segment; preventing it needs a filename-uniqueness change (the schema option above). Flagged as a residual: the recorder-controlled cache path — the common SBC/Motion-mode case — is fully protected; the direct path is detected/logged only. |
+
+**Revisit triggers:** reports of clock-step footage loss on Continuous-mode
+cameras (would justify the monotonic-counter filename scheme), or a decision to
+support sub-second segment resolution (would change the collision surface).
+
+---
+
 ## 2026-07-13, Fuzzy plate matching: length-scaled character tolerance (edit distance), superseding pg_trgm trigram similarity
 
 The watchlist/ignore "fuzzy match" (from the same-day ignore-list + fuzzy entry

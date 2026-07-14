@@ -9995,6 +9995,35 @@ pub async fn active_snoozes_for_device(
         .collect())
 }
 
+/// All currently-active snoozes across every device (`until > now`), as
+/// `(device_id, camera_id, until)` rows.
+///
+/// The notification engine calls this once per tick to build an in-memory
+/// snooze cache, replacing the previous per-device-per-event
+/// [`active_snoozes_for_device`] call (an N+1 query storm). Mirrors the
+/// per-tick owner-grants cache the channel fan-out already uses.
+pub async fn active_snoozes_all(
+    pool: &Pool,
+    now: DateTime<Utc>,
+) -> Result<Vec<(Uuid, Option<Uuid>, DateTime<Utc>)>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT device_id, camera_id, until
+            FROM notification_snoozes
+            WHERE until > $1
+            ",
+            &[&now],
+        )
+        .await
+        .context("active_snoozes_all")?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("device_id"), r.get("camera_id"), r.get("until")))
+        .collect())
+}
+
 /// Insert a row into `notification_log`.
 ///
 /// On PASS the engine calls this with `status='suppressed'` and a human-readable

@@ -15,10 +15,11 @@ import android.net.Uri
  *   thumbnails/video): built by the `scoped*` / `authedScoped` suspend
  *   functions below, which use [MediaTokenCache] to attach a short-lived
  *   (~15 min) token valid ONLY for that one camera — never the full login JWT.
- * - **Cross-camera / archive** (export downloads): still carries the full
- *   login JWT via [authed], since an export can span multiple cameras and
- *   stages that a single-camera scoped token can't authorize. See
- *   `ExportViewModel.authedUrl`.
+ *
+ * The bearer login JWT is NEVER placed in a URL: cross-camera media (export
+ * downloads) is fetched with an authenticated in-app request that carries the
+ * token in the `Authorization` header instead (see
+ * `ExportScreen.downloadExportFileToCache` / `saveExportToDownloads`).
  *
  * RTSP live URLs come pre-formed from the API (go2rtc) and are returned as-is;
  * go2rtc on the LAN does not require a token at all.
@@ -84,21 +85,6 @@ class MediaUrls(
      * as camera-scoped relative paths).
      */
     suspend fun scopedUrl(cameraId: String, pathOrUrl: String): String = authedScoped(cameraId, pathOrUrl)
-
-    /**
-     * Resolve [pathOrUrl] against the server base, adding the full LOGIN JWT as
-     * `?token=`. Reserved for media that isn't scoped to one camera — currently
-     * only export downloads (`ExportViewModel.authedUrl`), which can span
-     * multiple cameras/archive stages. Do NOT use this for any new per-camera
-     * media URL — use [scopedUrl] / [cameraFrameUrl] / [clipThumbUrl] /
-     * [clipVideoUrl] instead so per-camera media never carries the full JWT.
-     */
-    fun authed(pathOrUrl: String, loginToken: String?): String {
-        val absolute = toAbsolute(pathOrUrl)
-        if (loginToken.isNullOrBlank()) return absolute
-        val sep = if (absolute.contains('?')) '&' else '?'
-        return "$absolute${sep}token=${Uri.encode(loginToken)}"
-    }
 
     private fun toAbsolute(pathOrUrl: String): String {
         if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) return pathOrUrl

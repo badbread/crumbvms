@@ -572,9 +572,17 @@ class _ConcurrencyGate {
   _ConcurrencyGate(this.max);
   final int max;
   int _active = 0;
+  // Bumped by [reset]. Each in-flight [run] captures the epoch it started in;
+  // its `finally` only settles the counter/waiters when the epoch still
+  // matches. Without this, a task that was already running when [reset] zeroed
+  // `_active` would decrement past 0 on completion, leaving `_active` negative
+  // — after which the gate admits far more than [max] at once (a snapshot-fetch
+  // thundering herd on the next page load).
+  int _epoch = 0;
   final List<Completer<void>> _waiters = [];
 
   void reset() {
+    _epoch++;
     _active = 0;
     for (final c in _waiters) {
       if (!c.isCompleted) c.complete();
@@ -588,14 +596,21 @@ class _ConcurrencyGate {
       _waiters.add(c);
       await c.future;
     }
+    // Capture AFTER any wait: a waiter released by reset() belongs to the new
+    // generation and is counted/settled against it.
+    final epoch = _epoch;
     _active++;
     try {
       await task();
     } finally {
-      _active--;
-      if (_waiters.isNotEmpty) {
-        final next = _waiters.removeAt(0);
-        if (!next.isCompleted) next.complete();
+      // A reset() during this task already zeroed `_active` and released the
+      // waiters for the old generation — don't double-count against it.
+      if (epoch == _epoch) {
+        _active--;
+        if (_waiters.isNotEmpty) {
+          final next = _waiters.removeAt(0);
+          if (!next.isCompleted) next.complete();
+        }
       }
     }
   }
