@@ -1644,9 +1644,18 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
 
     // Fetch segments eligible for deletion.  The db accessor already filters
     // out archive-enabled cameras (correctness item 7).
-    let segments = db::list_live_segments_older_than(pool, db_cutoff)
-        .await
-        .context("list_live_segments_older_than")?;
+    //
+    // Batch-limited (oldest-first) to [`MAX_RETENTION_BATCH_LIMIT`]: without a
+    // cap, shortening a camera's retention or a long recorder downtime would
+    // materialise MILLIONS of `Segment` rows into one `Vec` and OOM a small box
+    // (Pi/NUC). The query orders oldest-first, so a capped batch always makes
+    // forward progress and the sweep converges over its ~60s ticks — the same
+    // convergence-over-ticks pattern the reconcile, size-eviction, and
+    // max-retention sweeps already use.
+    let segments =
+        db::list_live_segments_older_than(pool, db_cutoff, Some(MAX_RETENTION_BATCH_LIMIT))
+            .await
+            .context("list_live_segments_older_than")?;
 
     if segments.is_empty() {
         return Ok(());

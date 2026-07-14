@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import video.crumb.app.data.ClipDescriptor
 import video.crumb.app.data.CrumbRepository
+import video.crumb.app.data.toUserMessage
 import java.time.Instant
 
 data class ClipsUiState(
@@ -70,7 +71,18 @@ class ClipsViewModel(private val repo: CrumbRepository) : ViewModel() {
     private fun load() {
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
-            val cams = repo.cameras().getOrDefault(emptyList()).map { it.id }
+            // Viewer-safe list: `cameras()` hits the ADMIN-only /config/cameras
+            // and 403s for non-admins, silently emptying the Clips tab for every
+            // viewer account. `visibleCameras()` is the caller-scoped list every
+            // other screen uses. Surface a real failure instead of swallowing it.
+            val camsResult = repo.visibleCameras()
+            val cams = camsResult.getOrNull()?.map { it.id }
+            if (cams == null) {
+                _state.update {
+                    it.copy(loading = false, error = camsResult.exceptionOrNull()?.toUserMessage())
+                }
+                return@launch
+            }
             if (cams.isEmpty()) {
                 _state.update { it.copy(loading = false, clips = emptyList()) }
                 return@launch

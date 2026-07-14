@@ -149,6 +149,10 @@ impl AuthUser {
     pub fn can_manage_views(&self) -> bool {
         self.is_admin() || self.capabilities.manage_views
     }
+    #[inline]
+    pub fn can_view_plates(&self) -> bool {
+        self.is_admin() || self.capabilities.view_plates
+    }
     /// Effective bookmark visibility (admins see all).
     #[inline]
     pub fn bookmarks_scope(&self) -> BookmarkScope {
@@ -181,6 +185,9 @@ impl AuthUser {
     pub fn require_ptz(&self) -> Result<(), ApiError> {
         Self::require(self.can_ptz(), "PTZ control")
     }
+    pub fn require_view_plates(&self) -> Result<(), ApiError> {
+        Self::require(self.can_view_plates(), "viewing license plates")
+    }
 }
 
 /// Conservative capabilities for a token that carries no resolvable role
@@ -196,6 +203,7 @@ fn fallback_caps(role: UserRole) -> Capabilities {
             ptz: false,
             bookmarks: BookmarkScope::Own,
             manage_views: true,
+            view_plates: false,
         },
     }
 }
@@ -513,6 +521,7 @@ fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
             ptz: false,
             bookmarks: BookmarkScope::None,
             manage_views: false,
+            view_plates: false,
         },
         role_id: None,
         // A media token is not a revocable session; it self-expires in ~15 min.

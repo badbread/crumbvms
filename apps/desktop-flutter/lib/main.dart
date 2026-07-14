@@ -19,10 +19,12 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:window_manager/window_manager.dart';
 
+import 'package:crumb_desktop/api/boot_api.dart';
 import 'package:crumb_desktop/api/clips_api.dart' show ClipDescriptor;
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/api/playback_api.dart' show PlaybackApi;
 import 'package:crumb_desktop/api/views_api.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/snapshot_service.dart';
@@ -51,6 +53,7 @@ import 'package:crumb_desktop/ui/motion_timeline/playback_legend_bar.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar.dart';
 import 'package:crumb_desktop/ui/notifications/status_bar_controller.dart';
 import 'package:crumb_desktop/ui/playback/playback_screen.dart';
+import 'package:crumb_desktop/ui/plates/plates_screen.dart';
 import 'package:crumb_desktop/ui/reauth/reauth_overlay.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alert_banner.dart';
 import 'package:crumb_desktop/ui/recording_alerts/recording_alerts_controller.dart';
@@ -245,6 +248,10 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     final controller = _sessionController;
     if (controller == null) return;
     _mediaTokens?.updateSession(controller.session);
+    // Long-lived admin-banner pollers also captured the session at construction
+    // and would keep polling with the dead token after an in-place re-auth (#131).
+    _recordingAlerts?.updateSession(controller.session);
+    _updateCheck?.updateSession(controller.session);
     if (controller.session.token != _session?.token) {
       _session = controller.session;
       unawaited(_persistSession(controller.session));
@@ -268,6 +275,10 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     // signs in next.
     _mediaTokens?.clear();
     _mediaTokens = null;
+    // The Playback timeline/segment media-token cache is a separate static map
+    // (PlaybackApi extension) — clear it too, or a signed-out admin's still-
+    // valid scoped tokens could resolve cameras the next user lacks grants for.
+    PlaybackApi.clearTokenCache();
     _recordingAlerts?.stop();
     _recordingAlerts?.dispose();
     _recordingAlerts = null;
@@ -415,6 +426,17 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// (not its own tab) so the live wall keeps running and updates behind it.
   bool _settingsOpen = false;
 
+  /// Server-side truth (from `GET /auth/me`) for whether this account may use
+  /// the license-plate (LPR) surface. The ONLY gate for the Plates tab: false
+  /// hides the tab button and falls its body back to Live. Fetched once on
+  /// shell init; stays false if `/auth/me` is unreachable (fail-closed).
+  bool _platesEnabled = false;
+
+  /// Whether this account is an admin (from `GET /auth/me`). Only used to gate
+  /// the Plates tab's watchlist management affordances (add/remove are
+  /// admin-only server-side); the server's 403 is still the authority.
+  bool _isAdmin = false;
+
   /// The applied saved view (null → the default "All Cameras" auto-grid wall),
   /// and the id used to highlight the active chip in the view-selector row.
   AppliedView? _appliedView;
@@ -434,6 +456,12 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// A moment handed off from Clips' "View on timeline" — opens Playback at
   /// that time. Cleared on manual tab nav.
   DateTime? _playbackSeekTo;
+
+  /// Whether the current Playback hand-off should start playing on entry rather
+  /// than land paused on the frame. Set true only by the Plates pop-up's "View
+  /// on timeline" (which asks for playback at the plate moment); the Clips and
+  /// bookmark hand-offs leave it false. One-shot: cleared on manual tab nav.
+  bool _playbackAutoPlay = false;
 
   /// Which camera is maximized on the live wall (or null) — carried into
   /// Playback so switching tabs keeps the same full-pane camera.
@@ -478,6 +506,25 @@ class _MainShellState extends State<MainShell> with WindowListener {
     // video tabs down on minimize, rebuild them fresh on restore.
     windowManager.addListener(this);
     _loadDefaultView();
+    _loadCapabilities();
+  }
+
+  /// Resolve the capability gate for the Plates tab. The app otherwise gates
+  /// nothing on capabilities, so this is the one `/auth/me` call the shell
+  /// makes; it stores only [MeResponse.platesEnabled]. Best-effort — a failure
+  /// leaves the tab hidden rather than surfacing an error.
+  Future<void> _loadCapabilities() async {
+    try {
+      final me = await widget.api.fetchMe(widget.sessionController.session);
+      if (!mounted) return;
+      if (me.platesEnabled == _platesEnabled && me.isAdmin == _isAdmin) return;
+      setState(() {
+        _platesEnabled = me.platesEnabled;
+        _isAdmin = me.isAdmin;
+      });
+    } catch (_) {
+      // Leave _platesEnabled false — the Plates tab simply stays hidden.
+    }
   }
 
   /// Honor the client-side "launch view" star on startup: if the user pinned a
@@ -521,11 +568,13 @@ class _MainShellState extends State<MainShell> with WindowListener {
     super.dispose();
   }
 
-  // ── window minimize/restore recovery (#91) ────────────────────────────────
+  // ── window minimize/restore recovery (#91, #128) ──────────────────────────
   // window_manager delivers these on the platform thread; both the
   // FullscreenController and this shell are registered listeners (the manager
-  // fans out to all of them). onWindowRestore fires on un-minimize AND
-  // un-maximize, so gate the rebuild on having actually been minimized.
+  // fans out to all of them). Which event signals "un-minimized" depends on the
+  // pre-minimize window state (plain restore vs. restore-of-maximized), so the
+  // un-blank is driven off several events below and every one is guarded on
+  // having actually been minimized.
   @override
   void onWindowMinimize() {
     if (!mounted || _minimized) return;
@@ -533,10 +582,30 @@ class _MainShellState extends State<MainShell> with WindowListener {
   }
 
   @override
-  void onWindowRestore() {
+  void onWindowRestore() => _clearMinimized();
+
+  // #128: restoring a window that was minimized *while maximized* makes
+  // window_manager emit onWindowMaximize (NOT onWindowRestore), so gating the
+  // un-blank purely on onWindowRestore left _minimized stuck true and the wall
+  // showed the blank placeholder forever. Clear the flag on every "we're
+  // visible again" signal — onWindowRestore, onWindowMaximize, and
+  // onWindowUnmaximize — defensively. Each is harmless when we weren't
+  // minimized (the guard in _clearMinimized early-returns).
+  //
+  // NOTE: exact window_manager event delivery for the minimize→restore path is
+  // platform- and version-specific — VERIFY ON WINBUILD HARDWARE that a
+  // maximized window minimized and then restored repaints the live wall.
+  @override
+  void onWindowMaximize() => _clearMinimized();
+
+  @override
+  void onWindowUnmaximize() => _clearMinimized();
+
+  /// Swap the minimize placeholder back for the real screen (the fresh
+  /// WallScreen/PlaybackScreen State opens brand-new players). Idempotent: a
+  /// no-op unless we were actually showing the placeholder.
+  void _clearMinimized() {
     if (!mounted || !_minimized) return;
-    // Leaving _minimized swaps the placeholder back for the real screen; the
-    // fresh WallScreen/PlaybackScreen State opens brand-new players.
     setState(() => _minimized = false);
   }
 
@@ -576,6 +645,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
     setState(() {
       _playbackFocusCameraId = null;
       _playbackSeekTo = null;
+      _playbackAutoPlay = false;
       _index = _originClip != null ? _clipsIndex : _liveIndex;
     });
   }
@@ -584,15 +654,27 @@ class _MainShellState extends State<MainShell> with WindowListener {
   static const int _playbackIndex = 1;
   static const int _clipsIndex = 2;
   static const int _exportIndex = 3;
+  // Appended LAST so indices 0-3 don't shift (the _buildBody switch stays
+  // correct). Capability-gated — only rendered when [_platesEnabled].
+  static const int _platesIndex = 4;
 
   // The body tabs (Settings is a panel toggle, not a body tab — see below).
   // Each carries its own accent color used for the active underline + label.
   // Live amber + Playback cyan match the old client (its --accent / mode-
-  // playback swap); Clips/Export/Settings get distinct, function-fitting hues.
+  // playback swap); Clips/Export/Plates get distinct, function-fitting hues.
+  //
+  // This list defines DISPLAY order (Live · Playback · Clips · Plates · Export),
+  // which deliberately differs from the numeric tab indices — Plates (index 4)
+  // renders before Export (index 3) so the LPR surface sits next to Clips. The
+  // stored `_index` and the `_buildBody` switch key off the index constants, so
+  // reordering this list is purely presentational; anything that maps an index
+  // back to its tab tuple looks it up by `.$1` (see [_accentColor]) rather than
+  // by list position.
   static const _tabs = <(int, IconData, String, Color)>[
     (_liveIndex, Icons.grid_view, 'Live', Color(0xFFE8A33D)), // amber
     (_playbackIndex, Icons.play_circle_outline, 'Playback', Color(0xFF38BDD6)), // cyan
     (_clipsIndex, Icons.movie_outlined, 'Clips', Color(0xFFB57BEF)), // violet
+    (_platesIndex, Icons.directions_car_outlined, 'Plates', Color(0xFFE05A8A)), // pink
     (_exportIndex, Icons.download_outlined, 'Export', Color(0xFF57C888)), // green
   ];
 
@@ -600,7 +682,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
   /// The active tab's accent color, used app-wide (selection outlines, active
   /// chips, highlights) — mirrors the old client swapping `--accent` per tab.
-  Color get _accentColor => _tabs[_index].$4;
+  /// Looked up by index value (`.$1`), not list position, since [_tabs] is
+  /// ordered for display (Plates before Export) rather than by index.
+  Color get _accentColor =>
+      _tabs.firstWhere((t) => t.$1 == _index, orElse: () => _tabs.first).$4;
 
   @override
   Widget build(BuildContext context) {
@@ -677,9 +762,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
     );
   }
 
-  /// The top tab bar: the 5 primary tabs (Live · Playback · Clips · Export ·
-  /// Settings) on the left, and the wall toolbar (Layouts · Views · Fullscreen ·
-  /// Logout) on the right — mirroring the old client's topbar.
+  /// The top tab bar: the primary tabs (Live · Playback · Clips · Plates ·
+  /// Export · Settings) on the left — Plates only when capability-enabled — and
+  /// the wall toolbar (Layouts · Views · Fullscreen · Logout) on the right,
+  /// mirroring the old client's topbar.
   Widget _buildTopBar(Session session) {
     final scheme = Theme.of(context).colorScheme;
     return Material(
@@ -693,7 +779,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
         child: Row(
           children: [
             for (final (i, icon, label, color) in _tabs)
-              _tabButton(i, icon, label, color),
+              // The Plates tab is capability-gated; every other tab always shows.
+              if (i != _platesIndex || _platesEnabled)
+                _tabButton(i, icon, label, color),
             // Settings is a floating-panel toggle, not a body tab.
             _settingsToggle(),
             const Spacer(),
@@ -787,6 +875,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
       onTap: () => setState(() {
         _playbackSeekTo = null;
         _playbackFocusCameraId = null;
+        _playbackAutoPlay = false;
         _originClip = null;
         _index = i;
       }),
@@ -887,6 +976,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
                 _originClip = null;
                 _playbackFocusCameraId = cameraId;
                 _playbackSeekTo = ts;
+                _playbackAutoPlay = false;
                 _index = _playbackIndex;
               });
             },
@@ -1007,7 +1097,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
     if (_minimized && (_index == _liveIndex || _index == _playbackIndex)) {
       return const ColoredBox(color: Color(0xFF14171C));
     }
-    switch (_index) {
+    // The Plates tab is capability-gated (its tab button is hidden when
+    // disabled); if _index still points at it while disabled, fall back to Live.
+    final index = (_index == _platesIndex && !_platesEnabled) ? _liveIndex : _index;
+    switch (index) {
       case _playbackIndex:
         return PlaybackScreen(
           // Remount when a "View on timeline" hand-off arrives (open at that
@@ -1016,7 +1109,8 @@ class _MainShellState extends State<MainShell> with WindowListener {
           key: ValueKey(
             'pb-${_activeViewId ?? "all"}-'
             '${_playbackFocusCameraId ?? ""}-'
-            '${_playbackSeekTo?.millisecondsSinceEpoch ?? 0}',
+            '${_playbackSeekTo?.millisecondsSinceEpoch ?? 0}-'
+            '${_playbackAutoPlay ? 1 : 0}',
           ),
           api: widget.api,
           session: session,
@@ -1027,6 +1121,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
           // (from Clips) has no layout, it just maximizes that camera.
           view: _playbackFocusCameraId != null ? null : _appliedView,
           initialTime: _playbackSeekTo,
+          autoPlay: _playbackAutoPlay,
           // Carry a maximized live pane (or the Clips focus) into Playback.
           initialMaximizedCameraId:
               _playbackFocusCameraId ?? _liveMaximizedId,
@@ -1095,6 +1190,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
             _originClip = clip;
             _playbackSeekTo = clip.startTs;
             _playbackFocusCameraId = clip.cameraId;
+            _playbackAutoPlay = false;
             _index = _playbackIndex;
           }),
         );
@@ -1111,6 +1207,26 @@ class _MainShellState extends State<MainShell> with WindowListener {
               ..clear()
               ..addAll(list);
           },
+        );
+      case _platesIndex:
+        return PlatesScreen(
+          api: widget.api,
+          session: session,
+          cameras: widget.cameras,
+          canManageWatchlist: _isAdmin,
+          // Row click → jump to Playback at that read's moment on that camera.
+          // Same one-shot seek/focus hand-off the Clips "View on timeline" uses
+          // (no origin clip → Esc/double-click returns to the live wall, since
+          // the plate's camera may not be in the current view).
+          onViewFootage: (cameraId, ts) => setState(() {
+            _originClip = null;
+            _playbackSeekTo = ts;
+            _playbackFocusCameraId = cameraId;
+            // The plate pop-up's "View on timeline" asks for playback at the
+            // moment, not a paused frame.
+            _playbackAutoPlay = true;
+            _index = _playbackIndex;
+          }),
         );
       case _liveIndex:
       default:

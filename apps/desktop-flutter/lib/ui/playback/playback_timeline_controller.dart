@@ -94,6 +94,28 @@ class PlaybackTimelineController extends ChangeNotifier {
     return true;
   }
 
+  /// Restore a persisted span (ms) — e.g. the device preference the operator
+  /// left the timeline zoomed to. The raw value is clamped to the valid zoom
+  /// range and snapped to the nearest zoom step, so `_spanMs` keeps the
+  /// invariant (always one of [zoomStepsMs]) the zoom stepping relies on.
+  /// Recenters the window on the current playhead. No-op if unchanged.
+  void restoreSpanMs(int ms) {
+    final clamped = ms.clamp(zoomStepsMs.first, zoomStepsMs.last).toInt();
+    var nearest = zoomStepsMs.first;
+    var nearestDelta = (clamped - nearest).abs();
+    for (final s in zoomStepsMs) {
+      final d = (clamped - s).abs();
+      if (d < nearestDelta) {
+        nearestDelta = d;
+        nearest = s;
+      }
+    }
+    if (nearest == _spanMs) return;
+    _spanMs = nearest;
+    _recenter();
+    notifyListeners();
+  }
+
   /// Jump straight to an absolute zoom-step index (e.g. from a slider).
   bool setZoomIndex(int idx) {
     final clamped = idx.clamp(0, zoomStepsMs.length - 1);

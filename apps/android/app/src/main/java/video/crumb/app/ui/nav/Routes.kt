@@ -23,6 +23,11 @@ object Routes {
 
     /** Cross-camera bookmarks list; tapping a row jumps to that camera+time. */
     const val BOOKMARKS = "bookmarks"
+
+    // License-plate reads (LPR) tab — a cross-camera list of recognized plates;
+    // tapping a row jumps to that camera+time on Playback (same hand-off as
+    // Bookmarks/Clips). Gated on `SecureStore.platesEnabled`.
+    const val PLATES = "plates"
     fun playback(cameraId: String): String = "playback/$cameraId"
     fun playbackAt(cameraId: String, timeMs: Long): String = "playback/$cameraId?t=$timeMs"
 

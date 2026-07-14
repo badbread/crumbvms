@@ -54,6 +54,8 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -186,7 +188,147 @@ fn classify_failure(saw_segment: bool, eof_no_data: bool) -> FailureClass {
 ///
 /// Back-off in the outer `run()` loop prevents restart storms on a persistently
 /// unreachable stream.
+///
+/// This is the DEFAULT only. The effective per-camera timeout is
+/// `max(configured, 2 × GOP_seconds)`, where `configured` comes from the
+/// `SEGMENT_RECEIPT_TIMEOUT_SECS` env override (clamped to
+/// `[MIN_SEGMENT_RECEIPT_TIMEOUT_SECS, MAX_SEGMENT_RECEIPT_TIMEOUT_SECS]`) and
+/// `GOP_seconds` is probed from the stream — see
+/// [`configured_segment_receipt_timeout_secs`] and
+/// [`probe_keyframe_interval_secs`]. The GOP-derived floor is what keeps a
+/// smart-codec / long-GOP camera (Hikvision/Dahua "H.264+/H.265+", adaptive or
+/// long keyframe intervals, or very low fps) from being falsely reconnected
+/// forever: with `-c copy -f segment` a segment only closes on a keyframe, so
+/// the segment cadence equals the camera's I-frame interval, NOT
+/// `segment_seconds`.
 const SEGMENT_RECEIPT_TIMEOUT_SECS: u64 = 90;
+
+/// Lower clamp for the `SEGMENT_RECEIPT_TIMEOUT_SECS` env override. Even an
+/// operator who wants a fast heal cannot set it so low that a couple of missed
+/// segments on a healthy stream cause a false eviction; the per-camera
+/// `2 × GOP` floor further protects cameras with a long keyframe interval.
+const MIN_SEGMENT_RECEIPT_TIMEOUT_SECS: u64 = 20;
+
+/// Upper clamp for the `SEGMENT_RECEIPT_TIMEOUT_SECS` env override. A camera
+/// that is genuinely dead must still heal within a bounded time (an hour is the
+/// most extreme "record on a very long GOP" case we tolerate before forcing a
+/// reconnect).
+const MAX_SEGMENT_RECEIPT_TIMEOUT_SECS: u64 = 3600;
+
+/// Consecutive stall→reconnect cycles that produced ZERO segments before we
+/// raise the camera-tagged `stream_no_segments` system event. Each cycle is at
+/// least one full watchdog timeout long, so three cycles is several minutes of
+/// "connects but records nothing" — long enough to be unambiguous, short enough
+/// to surface the misconfiguration before much footage is lost. The event's
+/// rule cooldown (900 s) throttles any re-emit.
+const NO_SEGMENT_STALL_ALERT_THRESHOLD: u32 = 3;
+
+/// Seconds of stream the keyframe (GOP) probe reads before giving up. A window
+/// this wide reliably captures two keyframes for the common 1–8 s keyframe
+/// intervals; a genuinely long-GOP camera whose interval exceeds the window
+/// yields <2 keyframes → `None` → the configured default is kept, and the
+/// `stream_no_segments` event (plus the env override) is the operator's remedy.
+/// Runs in the background at worker start so it never delays the start of
+/// recording (see the probe spawn in `run_ffmpeg_loop`).
+const GOP_PROBE_WINDOW_SECS: u64 = 12;
+
+/// Read the operator's `SEGMENT_RECEIPT_TIMEOUT_SECS` env override, clamped to a
+/// sane range, defaulting to [`SEGMENT_RECEIPT_TIMEOUT_SECS`] when unset or
+/// unparseable. Read once per worker (in [`run`]); an out-of-range value is
+/// clamped rather than rejected so a fat-fingered env never wedges the recorder.
+fn configured_segment_receipt_timeout_secs() -> u64 {
+    clamp_segment_receipt_timeout_secs(
+        std::env::var("SEGMENT_RECEIPT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+    )
+}
+
+/// Pure clamp/default logic behind [`configured_segment_receipt_timeout_secs`],
+/// split out so it is unit-testable without touching the process environment:
+/// `None` (unset/unparseable) → default; otherwise clamped to the sane range.
+fn clamp_segment_receipt_timeout_secs(raw: Option<u64>) -> u64 {
+    match raw {
+        Some(s) => s.clamp(
+            MIN_SEGMENT_RECEIPT_TIMEOUT_SECS,
+            MAX_SEGMENT_RECEIPT_TIMEOUT_SECS,
+        ),
+        None => SEGMENT_RECEIPT_TIMEOUT_SECS,
+    }
+}
+
+/// Best-effort probe of the stream's keyframe (GOP) interval, in seconds.
+///
+/// With `-c copy -f segment` a segment only closes on a keyframe, so the stall
+/// watchdog must be at least twice the keyframe interval or a long-GOP camera is
+/// reconnected forever without ever recording. We ffprobe the video packets over
+/// a bounded [`GOP_PROBE_WINDOW_SECS`] window and take the LARGEST gap between
+/// consecutive keyframe packets (so adaptive-GOP jitter can only make the floor
+/// more generous, never less).
+///
+/// Returns `None` on ANY failure — `ffprobe` missing, the stream unreachable, no
+/// video track, or fewer than two keyframes observed in the window (a GOP longer
+/// than the window) — in which case the caller keeps the configured default.
+/// Bounded timeout so a slow/unready source never stalls anything (this runs in
+/// a detached background task).
+async fn probe_keyframe_interval_secs(url: &str) -> Option<f64> {
+    let fut = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-of",
+            "csv=print_section=0",
+            // Read only the first GOP_PROBE_WINDOW_SECS of stream, then stop.
+            "-read_intervals",
+            &format!("%+{GOP_PROBE_WINDOW_SECS}"),
+            "-i",
+            url,
+        ])
+        // Reap the probe child if the timeout below drops this future, so a
+        // hung ffprobe never lingers (correctness item 6 spirit).
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(GOP_PROBE_WINDOW_SECS + 5), fut)
+        .await
+        .ok()? // timed out
+        .ok()?; // failed to spawn (e.g. ffprobe absent)
+    if !out.status.success() {
+        return None;
+    }
+    // Lines are "<pts_time>,<flags>"; keyframe packets carry a leading 'K' in
+    // the flags field (e.g. "1.400000,K__"). Collect keyframe timestamps.
+    let mut kf_times: Vec<f64> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut cols = line.split(',');
+        let pts = cols.next().and_then(|s| s.trim().parse::<f64>().ok());
+        let flags = cols.next().unwrap_or("");
+        if let Some(t) = pts {
+            if flags.trim_start().starts_with('K') {
+                kf_times.push(t);
+            }
+        }
+    }
+    if kf_times.len() < 2 {
+        // Fewer than two keyframes in the window → cannot measure the interval.
+        return None;
+    }
+    // Largest inter-keyframe gap (handles adaptive GOP): the watchdog floor must
+    // clear the WORST case seen, not the average.
+    let mut max_gap = 0.0f64;
+    for pair in kf_times.windows(2) {
+        let gap = pair[1] - pair[0];
+        if gap > max_gap {
+            max_gap = gap;
+        }
+    }
+    (max_gap > 0.0).then_some(max_gap)
+}
 
 /// How often each recording worker reports motion-cache telemetry (global
 /// filesystem free/total + this camera's ring occupancy) to the DB — see
@@ -263,6 +405,31 @@ pub async fn run(
     // it never lingers across an unrelated later failure.
     let mut cold_start_retries: u32 = 0;
 
+    // P0-3: per-camera segment-receipt stall-watchdog timeout, worker-lifetime.
+    //
+    // Seeded with the operator-configured default and only ever RAISED (never
+    // lowered) to `2 × GOP_seconds` once the background keyframe probe reports
+    // back — a smart-codec / long-GOP camera would otherwise stall the watchdog
+    // and be reconnected forever without recording. It is an `Arc<AtomicU64>`
+    // (not a plain field) because the probe runs in a DETACHED background task
+    // so it never delays the start of recording; the select loop reads the
+    // current value each iteration. Because the value can only increase, a
+    // late-arriving probe result can only make the watchdog MORE lenient, never
+    // cause a spurious eviction.
+    let configured_watchdog_secs = configured_segment_receipt_timeout_secs();
+    let watchdog_secs = Arc::new(AtomicU64::new(configured_watchdog_secs));
+    // The GOP probe is spawned at most once per worker (on the first
+    // `run_ffmpeg_loop` that reaches the point where the RTSP URL is known);
+    // this flag guards against re-probing on every reconnect.
+    let mut gop_probe_spawned = false;
+
+    // P0-3: count CONSECUTIVE stall→reconnect cycles that produced ZERO
+    // segments. When it reaches `NO_SEGMENT_STALL_ALERT_THRESHOLD` we raise the
+    // camera-tagged `stream_no_segments` event ONCE (further re-emits are
+    // throttled by the alert rule's cooldown). Reset the instant the stream
+    // produces any segment (see `stream_healthy` below).
+    let mut consecutive_no_seg_stalls: u32 = 0;
+
     loop {
         // Check for shutdown before attempting to start ffmpeg.
         if cancel.is_cancelled() {
@@ -280,6 +447,11 @@ pub async fn run(
         // together identify the "go2rtc not ready yet" cold-start failure class.
         let mut saw_segment = false;
         let mut eof_no_data = false;
+        // P0-3: set by `run_ffmpeg_loop` when THIS run ended via the
+        // segment-receipt stall watchdog (as opposed to a clean EOF / setup
+        // error). Combined with `!saw_segment` it identifies a "connected but
+        // recorded nothing" cycle for the `stream_no_segments` counter.
+        let mut watchdog_stalled = false;
         let outcome = run_ffmpeg_loop(
             &camera,
             &pool,
@@ -293,6 +465,10 @@ pub async fn run(
             &mut indexed_ok,
             &mut saw_segment,
             &mut eof_no_data,
+            &mut watchdog_stalled,
+            configured_watchdog_secs,
+            &watchdog_secs,
+            &mut gop_probe_spawned,
         )
         .await;
 
@@ -318,6 +494,51 @@ pub async fn run(
             // A confirmed-healthy stream is by definition not in the cold-start
             // window anymore; a later failure starts the fast-retry count fresh.
             cold_start_retries = 0;
+            // P0-3: a produced segment clears the "records nothing" streak.
+            consecutive_no_seg_stalls = 0;
+        }
+
+        // P0-3: a stall→reconnect cycle that produced ZERO segments is the
+        // long-GOP / smart-codec silent-failure signature (ffmpeg connects, no
+        // EOF, no error, but never closes a segment before the watchdog fires).
+        // Count consecutive such cycles and, on crossing the threshold, raise a
+        // camera-tagged `stream_no_segments` event ONCE so the operator sees it
+        // instead of a camera that silently records nothing forever. We fire at
+        // EXACTLY the threshold (not `>=`) so one sustained outage yields one
+        // event; the alert-rule cooldown throttles anything further, and the
+        // counter only re-arms after `stream_healthy` resets it above.
+        if watchdog_stalled && !saw_segment {
+            consecutive_no_seg_stalls = consecutive_no_seg_stalls.saturating_add(1);
+            if consecutive_no_seg_stalls == NO_SEGMENT_STALL_ALERT_THRESHOLD {
+                let effective = watchdog_secs.load(Ordering::Relaxed);
+                let reason = format!(
+                    "camera produced no segments across {NO_SEGMENT_STALL_ALERT_THRESHOLD} \
+                     consecutive {effective}s stall/reconnect cycles — check the camera's \
+                     keyframe (I-frame) interval or disable its smart codec \
+                     (H.264+/H.265+), or raise SEGMENT_RECEIPT_TIMEOUT_SECS"
+                );
+                error!(
+                    camera_id   = %camera.id,
+                    camera_name = %camera.name,
+                    effective_watchdog_secs = effective,
+                    "camera records nothing: no segments across {} stall cycles",
+                    NO_SEGMENT_STALL_ALERT_THRESHOLD
+                );
+                if let Err(e) = crumb_common::db::insert_system_event(
+                    &pool,
+                    "stream_no_segments",
+                    Some(camera.id),
+                    Some(&reason),
+                )
+                .await
+                {
+                    warn!(
+                        camera_id = %camera.id,
+                        error = %e,
+                        "failed to record stream_no_segments system event"
+                    );
+                }
+            }
         }
 
         match outcome {
@@ -519,6 +740,20 @@ async fn run_ffmpeg_loop(
     indexed_ok: &mut bool,
     saw_segment: &mut bool,
     eof_no_data: &mut bool,
+    // P0-3: set to `true` when this run ends via the segment-receipt stall
+    // watchdog arm (not a clean EOF or a setup/IO error), so the caller can
+    // count zero-segment stall cycles for the `stream_no_segments` event.
+    watchdog_stalled: &mut bool,
+    // P0-3: the operator-configured watchdog default (already env-read+clamped
+    // by `run`), used as the probe's baseline and the immediate select-loop
+    // deadline until the background GOP probe (if any) raises `watchdog_secs`.
+    configured_watchdog_secs: u64,
+    // P0-3: worker-lifetime effective watchdog timeout (seconds). Read each loop
+    // iteration; raised by the background keyframe probe to `max(configured,
+    // 2 × GOP)`. Never lowered, so it can only make the watchdog more lenient.
+    watchdog_secs: &Arc<AtomicU64>,
+    // P0-3: guards the one-shot GOP probe spawn across reconnects.
+    gop_probe_spawned: &mut bool,
 ) -> Result<()> {
     // ── 1. Resolve live storage ────────────────────────────────────────────────
 
@@ -577,9 +812,46 @@ async fn run_ffmpeg_loop(
     // day-rollover directory management.
     let camera_dir = PathBuf::from(&live_storage.path).join(camera.id.to_string());
 
-    tokio::fs::create_dir_all(&camera_dir)
-        .await
-        .with_context(|| format!("create_dir_all {:?}", camera_dir))?;
+    if let Err(e) = tokio::fs::create_dir_all(&camera_dir).await {
+        // P0-1: the default-install footgun — a root-owned host media dir makes
+        // this fail EACCES on the recorder's non-root uid (1001), and today it
+        // just errors per-reconnect so the operator sees a silent "no footage"
+        // with no obvious cause. Raise a distinct, LOUD system event on
+        // PermissionDenied specifically (the actionable misconfiguration) so the
+        // operator gets "recorder can't write to storage — footage is NOT being
+        // saved". Other errors (a transiently-unmounted disk, etc.) fall through
+        // to the normal error path unchanged. The event's rule cooldown throttles
+        // the per-reconnect re-emit, matching the `motion_cache_unavailable`
+        // precedent below.
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            let reason = format!(
+                "cannot create media directory {camera_dir:?}: {e} — footage is NOT being \
+                 saved; check the host media dir ownership/permissions (the recorder runs as \
+                 non-root uid 1001)"
+            );
+            error!(
+                camera_id = %camera.id,
+                dir = ?camera_dir,
+                error = %e,
+                "storage unwritable: cannot create camera media directory (footage NOT saved)"
+            );
+            if let Err(ev) = crumb_common::db::insert_system_event(
+                pool,
+                "storage_unwritable",
+                Some(camera.id),
+                Some(&reason),
+            )
+            .await
+            {
+                warn!(
+                    camera_id = %camera.id,
+                    error = %ev,
+                    "failed to record storage_unwritable system event"
+                );
+            }
+        }
+        return Err(anyhow::Error::from(e).context(format!("create_dir_all {camera_dir:?}")));
+    }
 
     // ── 2b. Motion-mode RAM cache dir (persist-on-motion) ──────────────────────
     //
@@ -797,6 +1069,54 @@ async fn run_ffmpeg_loop(
         url = %redacted_url,
         "recording from RTSP source"
     );
+
+    // ── 3b. P0-3: keyframe (GOP) probe → per-camera stall-watchdog floor ────────
+    //
+    // With `-c copy -f segment` a segment only closes on a keyframe, so the
+    // segment cadence equals the camera's I-frame interval, NOT `segment_seconds`.
+    // A smart-codec / long-GOP camera (Hikvision/Dahua "H.264+/H.265+", adaptive
+    // or long keyframe intervals, or very low fps) can therefore go longer than
+    // the watchdog between segments, be killed+reconnected forever, and record
+    // NOTHING. We probe the keyframe interval and raise the watchdog to at least
+    // `2 × GOP`.
+    //
+    // The probe runs in a DETACHED background task (spawned at most once per
+    // worker) so it never delays the start of recording: ffmpeg starts
+    // immediately using the configured default, and the watchdog only becomes
+    // MORE lenient once the probe reports back. Reading the shared `watchdog_secs`
+    // atomic each select iteration picks up the raised value with no further
+    // plumbing. A probe failure (no video, GOP longer than the probe window,
+    // ffprobe absent) leaves the configured default in place — the
+    // `stream_no_segments` event is the operator-facing backstop for that tail.
+    if !*gop_probe_spawned {
+        *gop_probe_spawned = true;
+        let probe_url = rtsp_url.clone();
+        let watchdog_secs = Arc::clone(watchdog_secs);
+        let configured = configured_watchdog_secs;
+        let camera_id = camera.id;
+        tokio::spawn(async move {
+            let Some(gop) = probe_keyframe_interval_secs(&probe_url).await else {
+                debug!(
+                    camera_id = %camera_id,
+                    "keyframe (GOP) probe did not yield an interval; keeping configured watchdog"
+                );
+                return;
+            };
+            // 2 × GOP, rounded up; the watchdog floor must clear the worst-case
+            // keyframe gap with headroom.
+            let floor = (gop * 2.0).ceil().max(0.0) as u64;
+            let effective = configured.max(floor).min(MAX_SEGMENT_RECEIPT_TIMEOUT_SECS);
+            // Publish only if it actually raises the timeout (never lower it).
+            let prev = watchdog_secs.fetch_max(effective, Ordering::Relaxed);
+            info!(
+                camera_id = %camera_id,
+                gop_secs = gop,
+                configured_secs = configured,
+                effective_secs = effective.max(prev),
+                "segment-receipt watchdog floored to 2 × keyframe interval"
+            );
+        });
+    }
 
     // ── 4. Build ffmpeg argv ───────────────────────────────────────────────────
     //
@@ -1228,22 +1548,34 @@ async fn run_ffmpeg_loop(
                 }
 
                 // Segment-receipt stall watchdog. Fires when no new segment-list
-                // line has arrived within SEGMENT_RECEIPT_TIMEOUT_SECS of the
+                // line has arrived within the effective per-camera timeout of the
                 // last one, forcing the loop to error out → reconnect. The
                 // deadline is anchored to `last_segment_at` (bumped ONLY by a
                 // real line in the read arm above), NOT rebuilt from "now" each
                 // iteration, so the telemetry tick below — which returns from
                 // the `select!` every MOTION_CACHE_STATUS_INTERVAL_SECS (45s <
-                // 90s) — can no longer push the deadline out and starve the
-                // watchdog forever. That silent-reset was the gap-#1 regression:
-                // a half-open RTSP stream (no EOF, no error, no segments) left
-                // the camera recording NOTHING indefinitely with no reconnect.
+                // the timeout) — can no longer push the deadline out and starve
+                // the watchdog forever. That silent-reset was the gap-#1
+                // regression: a half-open RTSP stream (no EOF, no error, no
+                // segments) left the camera recording NOTHING indefinitely with
+                // no reconnect.
+                //
+                // P0-3: the timeout is the worker-lifetime `watchdog_secs` atomic
+                // (`max(configured, 2 × GOP)`), read fresh each iteration so a
+                // late background-probe raise takes effect; it only ever
+                // increases, so re-reading can only push the deadline LATER,
+                // never cause a spurious early eviction. On fire we set
+                // `*watchdog_stalled` so the caller can count zero-segment stall
+                // cycles for the `stream_no_segments` event.
                 () = tokio::time::sleep_until(
-                    last_segment_at + Duration::from_secs(SEGMENT_RECEIPT_TIMEOUT_SECS)
+                    last_segment_at
+                        + Duration::from_secs(watchdog_secs.load(Ordering::Relaxed))
                 ) => {
+                    *watchdog_stalled = true;
+                    let timeout_secs = watchdog_secs.load(Ordering::Relaxed);
                     return Err(anyhow::anyhow!(
                         "recording stream stalled: no segment for {}s; forcing reconnect",
-                        SEGMENT_RECEIPT_TIMEOUT_SECS
+                        timeout_secs
                     ));
                 }
 
@@ -4460,6 +4792,64 @@ mod tests {
                 "watchdog must trigger within 5 minutes; stalls must not linger for hours"
             )
         }
+    }
+
+    /// P0-3: the env-override clamp defaults when unset/unparseable and clamps
+    /// out-of-range values into the sane band rather than rejecting them (a
+    /// fat-fingered env must never wedge the recorder or defeat the watchdog).
+    #[test]
+    fn segment_receipt_timeout_clamp_defaults_and_bounds() {
+        // Unset / unparseable → the generous default.
+        assert_eq!(
+            clamp_segment_receipt_timeout_secs(None),
+            SEGMENT_RECEIPT_TIMEOUT_SECS
+        );
+        // In-range passes through.
+        assert_eq!(clamp_segment_receipt_timeout_secs(Some(45)), 45);
+        // Too small → floored; too large → capped.
+        assert_eq!(
+            clamp_segment_receipt_timeout_secs(Some(1)),
+            MIN_SEGMENT_RECEIPT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            clamp_segment_receipt_timeout_secs(Some(u64::MAX)),
+            MAX_SEGMENT_RECEIPT_TIMEOUT_SECS
+        );
+    }
+
+    /// P0-3: the clamp band and default must stay coherent (MIN ≤ default ≤ MAX)
+    /// so the env override can never invert the bounds.
+    #[test]
+    fn segment_receipt_timeout_bounds_are_coherent() {
+        const {
+            assert!(MIN_SEGMENT_RECEIPT_TIMEOUT_SECS <= SEGMENT_RECEIPT_TIMEOUT_SECS);
+            assert!(SEGMENT_RECEIPT_TIMEOUT_SECS <= MAX_SEGMENT_RECEIPT_TIMEOUT_SECS);
+        }
+    }
+
+    /// P0-3: the effective watchdog only ever RISES to `2 × GOP` and is never
+    /// lowered below the configured baseline — the invariant that makes reading
+    /// the shared atomic each select iteration safe (a late probe result can
+    /// only push the deadline later, never cause a spurious eviction). Mirrors
+    /// the flooring arithmetic in the background probe task.
+    #[test]
+    fn watchdog_floor_only_raises_never_lowers() {
+        let configured = 90u64;
+        // Short GOP: 2×GOP below configured → no change.
+        let gop = 2.0f64;
+        let floor = (gop * 2.0).ceil() as u64;
+        assert_eq!(configured.max(floor), configured);
+        // Long GOP: 2×GOP above configured → raised to the floor.
+        let gop = 60.0f64;
+        let floor = (gop * 2.0).ceil() as u64;
+        assert_eq!(configured.max(floor), 120);
+        // The floor is capped at MAX.
+        let gop = 100_000.0f64;
+        let floor = (gop * 2.0).ceil() as u64;
+        assert_eq!(
+            configured.max(floor).min(MAX_SEGMENT_RECEIPT_TIMEOUT_SECS),
+            MAX_SEGMENT_RECEIPT_TIMEOUT_SECS
+        );
     }
 
     /// Regression for the gap-#1 silent-reset (issue #71): the segment-receipt

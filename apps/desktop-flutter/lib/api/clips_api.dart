@@ -20,6 +20,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// One entry in the `GET /clips` feed — either a detection or a merged motion
@@ -125,7 +126,7 @@ final Map<String, Future<String?>> _mediaTokenInflight = {};
 /// `CrumbApi`'s own [http.Client] is private to crumb_api.dart, so this
 /// extension (a separate file, per the port's file-boundary rule) uses its
 /// own. Same plain JSON/Bearer story as the rest of the API.
-final http.Client _client = http.Client();
+final http.Client _client = TimeoutClient();
 
 extension ClipsApi on CrumbApi {
   /// GET /media-token?camera=<id> → mint (or reuse a cached) scoped,

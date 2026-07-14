@@ -184,7 +184,10 @@ service entirely to drop TLS; nothing depends on it.
 
 A bundled MQTT broker for the Frigate integration, **profile-gated** so a plain
 `up -d` never starts it. You only need it if you don't already have a broker.
-Bound to `127.0.0.1:1883` only.
+Bound to `127.0.0.1:1883` **on the Crumb host only** — so it's reachable by a
+Frigate running on the *same* host, but **not** by a Frigate on another box. If
+your Frigate lives elsewhere, give it its own broker rather than exposing this
+one to the LAN (the localhost bind is deliberate; don't widen it by default).
 
 ```bash
 docker compose --profile frigate up -d            # stack + bundled broker

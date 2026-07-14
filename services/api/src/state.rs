@@ -8,6 +8,7 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use deadpool_postgres::Pool;
@@ -26,6 +27,52 @@ use crate::dto::ExportJob;
 /// "sign out all devices" from one replica takes effect everywhere within a few
 /// seconds.
 const REVOCATION_CACHE_TTL_SECS: i64 = 15;
+
+/// Consecutive failed logins for one username tolerated before the per-username
+/// backoff engages (issue #127). Below this, every attempt is let through to the
+/// normal credential check; at/above it, attempts are rejected with 429 until
+/// the backoff elapses.
+const LOGIN_FAIL_THRESHOLD: u32 = 5;
+
+/// Base backoff (seconds) applied at the moment the threshold is first crossed;
+/// it doubles for each additional failure (see [`login_backoff_secs`]).
+const LOGIN_BACKOFF_BASE_SECS: u64 = 2;
+
+/// Hard cap (seconds) on the per-username backoff — the exponential growth is
+/// clamped here so a sustained attack settles at a fixed 15-minute block rather
+/// than growing without bound.
+const LOGIN_BACKOFF_CAP_SECS: u64 = 900;
+
+/// Prune the login-failure map once it exceeds this many distinct usernames, so
+/// an attacker spraying random usernames cannot grow it without bound. Only
+/// entries no longer in backoff are dropped (an active block is always kept).
+const LOGIN_FAILURES_MAX_ENTRIES: usize = 10_000;
+
+/// Backoff duration (seconds) for `failures` consecutive login failures, or
+/// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
+/// `min(cap, base * 2^(failures - threshold))` — exponential, clamped. Pure and
+/// clock-free so the backoff schedule is unit-testable in isolation.
+fn login_backoff_secs(failures: u32) -> Option<u64> {
+    if failures < LOGIN_FAIL_THRESHOLD {
+        return None;
+    }
+    let steps = failures - LOGIN_FAIL_THRESHOLD;
+    // `2^steps`, saturating: a very large failure count must not overflow the
+    // shift (>=64 would be UB for `<<`); `checked_shl` yields None there.
+    let factor = 1_u64.checked_shl(steps).unwrap_or(u64::MAX);
+    let secs = LOGIN_BACKOFF_BASE_SECS.saturating_mul(factor);
+    Some(secs.min(LOGIN_BACKOFF_CAP_SECS))
+}
+
+/// Per-username failed-login state for the brute-force backoff (issue #127).
+#[derive(Clone, Copy)]
+struct FailState {
+    /// Consecutive failed logins since the last success/reset.
+    failures: u32,
+    /// Instant until which new attempts for this username are rejected. A value
+    /// at/before `now` means "not currently blocked".
+    blocked_until: Instant,
+}
 
 /// Inner state, heap-allocated once and reference-counted.
 struct Inner {
@@ -111,6 +158,17 @@ struct Inner {
     /// window is inherently transient, so losing it on an API restart is the
     /// safe default (alerts resume, never silently stay suppressed).
     maintenance_until: Arc<AtomicI64>,
+
+    /// Per-username failed-login tracker for the brute-force backoff (issue
+    /// #127). Keyed by the SUBMITTED username verbatim — applied identically
+    /// whether or not that account exists, so it leaks no existence oracle. The
+    /// login handler consults this BEFORE any DB lookup or password verify and
+    /// rejects a blocked username with 429 + `Retry-After` (it never sleeps and
+    /// holds the connection). Memory-only (no table/migration): a restart clears
+    /// it, which only ever RELAXES the limit — the fail-open direction, so lost
+    /// state can never lock a legitimate user out. This is IN ADDITION to the
+    /// shared per-IP request bucket, not a replacement.
+    login_failures: DashMap<String, FailState>,
 }
 
 /// Cheaply-cloneable handle to shared API state.
@@ -168,6 +226,7 @@ impl AppState {
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
+            login_failures: DashMap::new(),
         }))
     }
 
@@ -342,6 +401,62 @@ impl AppState {
     pub fn maintenance_until(&self) -> i64 {
         self.0.maintenance_until.load(Ordering::Relaxed)
     }
+
+    // ── per-username login backoff (issue #127) ───────────────────────────────
+
+    /// If `username` is currently within its failed-login backoff window, return
+    /// `Some(retry_after_secs)` (always ≥ 1 while blocked); otherwise `None`.
+    /// The login handler calls this FIRST and, on `Some`, rejects with 429 +
+    /// `Retry-After` before any DB lookup or password verification.
+    pub fn login_retry_after(&self, username: &str) -> Option<u64> {
+        let now = Instant::now();
+        let st = self.0.login_failures.get(username)?;
+        if st.blocked_until <= now {
+            return None;
+        }
+        // Round any sub-second remainder up to 1 so a still-blocked attempt never
+        // advertises `Retry-After: 0`.
+        Some(
+            st.blocked_until
+                .saturating_duration_since(now)
+                .as_secs()
+                .max(1),
+        )
+    }
+
+    /// Record one failed login for `username`, incrementing its consecutive
+    /// failure count and (once past the threshold) stamping/extending the
+    /// backoff window. Cheap, synchronous, lock-free per entry.
+    pub fn record_login_failure(&self, username: &str) {
+        let now = Instant::now();
+
+        // Bound memory against username-spray: once large, drop entries that are
+        // no longer blocked (an active block is always retained).
+        if self.0.login_failures.len() > LOGIN_FAILURES_MAX_ENTRIES {
+            self.0.login_failures.retain(|_, st| st.blocked_until > now);
+        }
+
+        let fresh = FailState {
+            failures: 0,
+            blocked_until: now,
+        };
+        let mut entry = self
+            .0
+            .login_failures
+            .entry(username.to_owned())
+            .or_insert(fresh);
+        entry.failures = entry.failures.saturating_add(1);
+        if let Some(secs) = login_backoff_secs(entry.failures) {
+            entry.blocked_until = now + Duration::from_secs(secs);
+        }
+    }
+
+    /// Clear any failed-login state for `username` after a successful login, so
+    /// a legitimate user who eventually gets their password right resets the
+    /// counter (and their next fat-finger starts from zero again).
+    pub fn record_login_success(&self, username: &str) {
+        self.0.login_failures.remove(username);
+    }
 }
 
 /// Pure predicate for "is the maintenance window in effect at `now`": armed
@@ -354,7 +469,41 @@ pub fn maintenance_active_at(until: i64, now: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::maintenance_active_at;
+    use super::{
+        login_backoff_secs, maintenance_active_at, LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS,
+        LOGIN_FAIL_THRESHOLD,
+    };
+
+    #[test]
+    fn login_backoff_none_below_threshold() {
+        for f in 0..LOGIN_FAIL_THRESHOLD {
+            assert_eq!(login_backoff_secs(f), None, "no backoff under threshold");
+        }
+    }
+
+    #[test]
+    fn login_backoff_exponential_then_capped() {
+        // At the threshold the block is exactly the base; each further failure
+        // doubles it, up to the hard cap.
+        assert_eq!(
+            login_backoff_secs(LOGIN_FAIL_THRESHOLD),
+            Some(LOGIN_BACKOFF_BASE_SECS)
+        );
+        assert_eq!(
+            login_backoff_secs(LOGIN_FAIL_THRESHOLD + 1),
+            Some(LOGIN_BACKOFF_BASE_SECS * 2)
+        );
+        assert_eq!(
+            login_backoff_secs(LOGIN_FAIL_THRESHOLD + 2),
+            Some(LOGIN_BACKOFF_BASE_SECS * 4)
+        );
+        // A large failure count saturates at the cap, never overflows the shift.
+        assert_eq!(
+            login_backoff_secs(LOGIN_FAIL_THRESHOLD + 200),
+            Some(LOGIN_BACKOFF_CAP_SECS)
+        );
+        assert_eq!(login_backoff_secs(u32::MAX), Some(LOGIN_BACKOFF_CAP_SECS));
+    }
 
     #[test]
     fn maintenance_off_when_unarmed() {

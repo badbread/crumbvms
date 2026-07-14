@@ -8,6 +8,215 @@ revisit.
 
 ---
 
+## 2026-07-13, Fuzzy plate matching: length-scaled character tolerance (edit distance), superseding pg_trgm trigram similarity
+
+The watchlist/ignore "fuzzy match" (from the same-day ignore-list + fuzzy entry
+below) originally matched a read against a watch/ignore plate with Postgres
+`pg_trgm` `similarity(read, target) >= 1 - fuzz`. In practice this was unusable:
+trigram similarity for short, word-boundary-free strings like plates is
+dominated by the padding trigrams, so a **single** wrong character on a 7-char
+plate scores ~0.45 — below the tightest reachable threshold (fuzz is clamped to
+0.5 → threshold 0.5). The feature therefore could not catch the exact case it
+exists for (Frigate ALPR misreading one character), and the "%" exposed to the
+operator mapped to nothing intuitive.
+
+**Chosen:** match by **normalized character edit distance**. Normalize both
+sides (uppercase, keep only `A–Z0–9`), and accept when
+`levenshtein(read, target) <= floor(fuzz * len(target))`. fuzz stays the same
+stored 0..0.5 float (no migration); its meaning becomes "what fraction of the
+plate's characters may differ" — 20 % ≈ 1 character on a 6–7 char plate, 0 % =
+exact. Computed in Rust over the (small) watch/ignore set, so it no longer
+issues any trigram SQL on these paths. The desktop watchlist panel reproduces
+the identical rule to render a **live preview** of the misreads a given fuzz
+would accept for the plate being typed (truthful only because both sides run the
+same arithmetic).
+
+**Rejected / not chosen:**
+
+| Option | Why not |
+|---|---|
+| **Keep pg_trgm, just lower the floor / relabel the %** | The metric itself is wrong for plates (padding-trigram dominated); no threshold in the allowed range catches a 1-char misread on a 7-char plate. Relabeling an unusable control is lipstick. |
+| **`fuzzystrmatch` `levenshtein()` in SQL** | Adds another Postgres contrib-extension dependency (same BYO-Postgres boot-fragility class as the pg_trgm issue just fixed); the watch/ignore sets are tiny, so Rust-side distance is simpler and dependency-free. |
+| **Store an integer edit budget instead of the 0..0.5 float** | Would need a migration + DTO/type churn and a length-independent budget (2 edits is lenient on a 3-char plate, strict on an 8-char one). Length-scaling off the existing float avoids the migration and behaves sensibly across plate lengths. |
+| **New separate control for the char model** | The existing fuzz field already means "how loose", so reinterpreting it keeps one knob; only the label/preview changed. |
+
+`pg_trgm` is still used (and still guarded by `pg_trgm_available()`) for the
+Plates **search box's** fuzzy `q` mode — that path is unaffected.
+
+**Revisit triggers:**
+- A non-Latin / variable-length plate region where character edit distance is a
+  poor similarity notion (e.g. scripts where OCR confusions are visual-radical,
+  not character-substitution).
+- Operators wanting position-weighted tolerance (e.g. "ignore the last digit")
+  — would argue for a richer rule than a flat edit budget.
+- Watch/ignore lists growing large enough (thousands) that per-read full-table
+  distance scans matter; then reintroduce an indexed prefilter.
+
+---
+
+## 2026-07-13, License-plate recognition: Frigate native LPR as the engine, engine-agnostic `plate_reads` + gated "Plates" surface; replaces the paid OpenALPR/Rekor cloud plan
+
+**Context.** The operator paid for the Rekor (OpenALPR) cloud plan solely for a
+searchable plate-reads dashboard. Crumb already ingests Frigate events, and the
+pipeline is plate-aware at the type level (`DetectionLabel::LicensePlate`,
+`sub_label`, `raw` JSONB); Frigate's native LPR emits plate strings on the
+already-consumed `frigate/events` stream (`recognized_license_plate`, and a
+matched-known-plate `sub_label`). The operator's requirement is **moving plates
+only** (they don't want static/parked plates) — which is exactly what Frigate's
+motion-gated LPR does, and what its "does not run on stationary vehicles"
+limitation makes it good at.
+
+**Decision — engine: Frigate native LPR; Crumb stays engine-agnostic.** The api
+parses the plate from the existing Frigate ingestion (`detection/frigate.rs`,
+MQTT + HTTP paths → `NormalizedEvent.recognized_plate`) and never embeds an OCR
+engine. A dedicated **`plate_reads`** table (normalized `plate` + `plate_raw`,
+confidence, region, vehicle jsonb, bbox, crop bytea, `source_id`, `event_id`
+FK, dedup on `(source_id, provider_event_id)`, `gin_trgm_ops` index; migration
+`0051`, registered) sits BESIDE the shared `events` row (each source keeps
+writing its labeled row, per the additive-motion-sources rule), so plate
+search / history / hotlists don't contort the shared `events` schema. Capture is
+gated on an **`lpr_config`** DB singleton (`enabled` DEFAULT false — a plate
+database is opt-in), same shape as `ha_config`. A new **`view_plates`**
+capability gates `GET /plates` (Crumb's FIRST capability-gated read endpoint;
+`/events` is deliberately left camera-scope-only). Clients gate the "Plates" tab
+on `MeResponse.plates_enabled` (LPR on AND `view_plates`); the desktop tab is
+appended last so existing tab indices don't shift. An **engine escape hatch**
+is designed-in (built later only if needed): an authed `POST /lpr/reads`
+(generated ingest token) lets an external engine — the operator's existing
+continuous-scan OpenALPR box, or a MIT `fast-alpr` sidecar reading a go2rtc
+`_sub` stream — write the same `plate_reads` via `source_id='openalpr'` etc.,
+with zero Crumb code change.
+
+**Rejected.** (a) Plate-in-`sub_label`-only / zero-migration: every UI query
+(fuzzy search, per-plate history, hotlist join, vehicle attrs) fights the
+shared `events` schema and mixed `sub_label` semantics. (b) OpenALPR OSS as the
+in-Crumb engine: AGPL-compatible but dormant since 2016, accuracy below the
+cloud plan — instead the operator's existing OpenALPR *box* stays an optional
+external source via the ingest endpoint. (c) CodeProject.AI ALPR: SSPL,
+(A)GPL-incompatible — never linked, bundled, or documented as an option.
+(d) Building a sidecar first: pays an engine + service cost for reads Frigate
+already produces on the existing stream. (e) Crops on the media volume: the api
+mount is read-only (seam) — crops are bytea in Postgres, retention-pruned api-side.
+
+**Trade-offs accepted.** Frigate LPR is prosumer (tuning required; no
+state/region or make/model — the one durable cloud-plan advantage) and reads
+plates off the lower-res/low-fps `detect` stream, so fast/distant plates trail
+a continuous-mainstream scanner — acceptable for the moving-plate use case, and
+the ingest endpoint keeps OpenALPR available if not. Plate data is
+privacy-sensitive: default-off, `view_plates`-gated, retention-pruned. Desktop
+gains its first feature-gated tab. `pg_trgm` enters the schema (trusted, in-image).
+
+**Revisit triggers.** A validation month shows Frigate LPR materially under the
+canceled cloud plan's hit rate on moving plates → wire the operator's OpenALPR
+box (or a `fast-alpr` sidecar) through `POST /lpr/reads`. A second
+capability-gated read surface appears → extract a shared client tab-gating
+helper (the desktop const-tab-list refactor deferred here). Frigate renames the
+LPR fields → re-verify the ingester parsing. Operator wants vehicle
+make/model/color search → reopen engine choice (paid add-on vs OSS classifiers).
+
+---
+
+## 2026-07-13, LPR alerts: plate watchlist rides the existing system-alerts pipeline (no new notification machinery)
+
+**Context.** LPR Phase 0 shipped plate capture + a searchable `plate_reads`
+surface. The operator asked for **alerts** — "tell me when this plate is seen".
+Crumb already has a mature system-alerts pipeline: `system_events` rows fanned
+out over six notification channels (Discord/Slack/Pushover/Telegram/ntfy/webhook)
+with per-event enable/cooldown/quiet-hours config (`system_alert_rules`,
+migration 0032; engine in `notifications.rs`). The health watchdogs
+(`alerts.rs`) already feed it.
+
+**Decision — a curated plate watchlist that emits a `system_events` row.** A new
+**`lpr_watchlist`** table (migration 0052; `plate` normalized + UNIQUE, `label`,
+`note`, `color`, `notify`) holds plates the operator cares about. The detection
+ingester (`detection_ingester.rs::maybe_alert_watchlist`), right after recording
+a read, does an **exact** normalized-plate lookup (`match_watchlist`, `notify =
+true` only) and, on a match, calls `insert_system_event("plate_watchlist_hit",
+camera_id, detail)` — reusing the entire existing fan-out, config UI, cooldown,
+and quiet-hours machinery. A seed row registers the `plate_watchlist_hit`
+event_key so it appears in the admin Notifications panel like any other alert.
+Watchlist CRUD is `/lpr/watchlist` (GET gated on `view_plates`; POST/DELETE
+**admin-only**). Managed in admin console (Plates → Watchlist) and both clients.
+
+**Dedup — alert once per read, on the match TRANSITION.** A per-read `alerted`
+boolean (`plate_reads`, migration 0053) latches the alert: the ingester checks
+the watchlist on every read (insert AND lifecycle-refinement UPDATE) but only
+while `alerted` is false, then sets it once fired. This fires exactly once per
+read AND catches a plate that only becomes the watchlisted value on a later
+refinement (a misread converging onto the BOLO plate mid-pass) — the original
+alert-on-INSERT-only (`xmax = 0`) design silently missed that case (Fable review
+H1). The rule's 300 s per-camera cooldown still backstops rapid distinct passes.
+
+**Rejected.** (a) A dedicated plate-alert delivery path (its own channels/config)
+— pointless duplication of a working six-channel pipeline the operator already
+configured. (b) Reusing `notification_rules` (the per-(user, camera) motion
+pipeline) — it carries owner/presence/object-label dimensions a plate hotlist
+doesn't have, exactly why `system_alert_rules` exists separately. (c) Fuzzy /
+prefix watchlist matching for v1 — trigram-close plates would fire false BOLO
+alerts; exact-only is the safe default (search already offers fuzzy for humans).
+(d) A `manage_watchlist` capability — no non-admin operator use case yet; writes
+stay admin-only (secure default), reads ride the existing `view_plates` gate.
+
+**Trade-offs accepted.** Cooldown is keyed `(event_key, camera_id)`, not per
+plate, so two different watchlisted plates crossing the same camera inside 300 s
+can suppress the second alert — acceptable given moving-plate reads are already
+one-per-pass and rare. Exact match means an OCR misread of a watchlisted plate
+won't alert (the read is still captured + searchable). Plate-read retention is
+independent of footage retention (its own daily prune); a watchlist entry never
+expires.
+
+**Revisit triggers.** Operators want per-plate cooldown or "alert on the second
+sighting" semantics → move the latch/cooldown key to include the plate. False
+misses from OCR variance hurt a real BOLO use case → add opt-in fuzzy matching
+with a similarity floor. A non-admin "watchlist manager" role is requested → add
+a `manage_watchlist` capability rather than widening admin.
+
+---
+
+## 2026-07-13, LPR ignore-list + fuzzy matching (two revisit triggers above fired same-day)
+
+**Context.** Live use surfaced two gaps the alerts entry above predicted. (1)
+Frigate zones don't restrict *detection* — a parked car outside the intended
+area is still detected + plate-read, and Frigate-side object masking is fiddly,
+so the plate DB fills with a nuisance plate. (2) Frigate's native ALPR misreads
+more than the retired OpenALPR cloud, so exact watchlist matching (chosen for v1
+to avoid false BOLO alerts) misses real hits — the "OCR variance hurts a real
+BOLO use case" revisit trigger.
+
+**Decision — ignore-list (skip-capture) + a global fuzziness knob** (migration
+0054). The watchlist gains a `kind`: `watch` (alert, unchanged) or `ignore`. An
+`ignore` plate is dropped at ingest — `detection_ingester` checks
+`is_plate_ignored` *before* upsert and returns, so a nuisance plate is neither
+stored nor alerted (skip-capture, matching OpenALPR's ignore-list semantics —
+the operator explicitly wants it gone, not archived). `lpr_config.watchlist_fuzz`
+(0..0.5, admin-set) loosens matching: when > 0 the ingester matches reads
+against watch/ignore entries by pg_trgm `similarity >= 1 - fuzz` (threshold
+floored so a stray large fuzz can't match everything), else exact. Fuzz applies
+to BOTH kinds — a near-misread of an ignored nuisance plate should also be
+dropped.
+
+**Rejected.** (a) Capture-but-hide for ignored plates — keeps the DB bloating
+with the exact nuisance the operator is trying to silence; skip-capture is the
+direct intent (they can un-ignore to resume capture). (b) Per-entry match mode
+instead of a global fuzz — more UI for no real gain; one similarity knob is
+easier to reason about, and Frigate's drift is roughly uniform. (c) Fixing this
+purely Frigate-side (object masks / `required_zones`) — correct but fiddly and
+not always practical; the ignore-list is the operator's own backstop, and both
+can be used together.
+
+**Trade-offs accepted.** Fuzzy matching can over-match at high fuzz (a distinct
+plate near an ignored one gets dropped) — hence the 0.5 cap + the floored
+threshold, and it's off (0) by default. Skip-capture means an ignored plate has
+no forensic record while ignored. `similarity()` on every ingested plate is one
+extra indexed query per read — negligible at plate-event rates.
+
+**Revisit triggers.** Over-matching complaints → move fuzz per-entry, or add a
+"why did this match" debug. Operators want ignored plates still recorded (just
+un-alerted/hidden) → add a capture-but-hidden third kind rather than changing
+`ignore`.
+
+---
+
 ## 2026-07-13, Recorded audio: ALWAYS re-encode to gap-filled 48 kHz AAC (supersedes the 2026-07-12 copy-when-safe split)
 
 **Context.** The 2026-07-12 decision recorded audio with a per-camera split:

@@ -75,6 +75,7 @@ class CrumbRepository(private val container: AppContainer) {
             store.role = me.role
             store.username = me.username
             store.capabilities = me.effectiveCapabilities
+            store.platesEnabled = me.platesEnabled
             me
         }.onFailure { store.token = null }
 
@@ -82,6 +83,12 @@ class CrumbRepository(private val container: AppContainer) {
         store.clearSession()
         container.clearMediaTokenCache()
     }
+
+    /** Drop dead pooled sockets on the current client — see
+     *  [AppContainer.recoverConnections]. Used by the resume + Retry paths so a
+     *  wall that failed against half-open sockets can recover without a
+     *  force-close. */
+    fun recoverConnections() = container.recoverConnections()
 
     /** Admin-only camera config list (source URLs, policy internals, motion config). */
     suspend fun cameras(): Result<List<CameraDto>> = runCatchingCancellable { api.cameras() }
@@ -325,6 +332,110 @@ class CrumbRepository(private val container: AppContainer) {
         byCam.mapValues { it.value.toList() }
     }
 
+    // ── license-plate reads (LPR) ───────────────────────────────────────────────
+    /**
+     * Newest-first plate reads for [cameraIds] over an optional [startIso,endIso]
+     * window (both null = all time), optionally filtered by [query]/[match].
+     * Short-circuits to an empty page when [cameraIds] is empty (the endpoint
+     * requires `camera_ids`) — the Plates screen's "no cameras selected" state
+     * relies on this rather than surfacing an error.
+     */
+    suspend fun plates(
+        cameraIds: List<String>,
+        startIso: String? = null,
+        endIso: String? = null,
+        query: String? = null,
+        match: String = "contains",
+        limit: Int = 200,
+        offset: Int = 0,
+    ): Result<PlatesResponse> = runCatchingCancellable {
+        if (cameraIds.isEmpty()) return@runCatchingCancellable PlatesResponse()
+        val q = query?.trim()?.ifBlank { null }
+        api.plates(
+            cameraIds = cameraIds.joinToString(","),
+            start = startIso,
+            end = endIso,
+            query = q,
+            // `match` is only meaningful with a non-blank query — omit it otherwise
+            // so an empty search doesn't accidentally narrow results server-side.
+            match = if (q != null) match else null,
+            limit = limit,
+            offset = offset,
+        )
+    }
+
+    // ── LPR plate watchlist ──────────────────────────────────────────────────────
+    /**
+     * The plate watchlist (plates that raise an alert when seen). Readable by any
+     * caller with the `view_plates` capability — the same gate as [plates].
+     */
+    suspend fun watchlist(): Result<List<PlateWatchlistEntry>> =
+        runCatchingCancellable { api.watchlist() }
+
+    /**
+     * Add [plate] to the watchlist, or edit the existing entry keyed on the same
+     * normalized plate. **Admin-only** server-side — a non-admin caller's
+     * [Result] fails with HTTP 403 ([Throwable.isForbidden]). Blank optional
+     * fields are dropped so they serialize as absent rather than empty strings.
+     */
+    suspend fun addWatchlist(
+        plate: String,
+        label: String? = null,
+        note: String? = null,
+        color: String? = null,
+        notify: Boolean = true,
+        kind: String = WATCHLIST_KIND_WATCH,
+    ): Result<PlateWatchlistEntry> =
+        runCatchingCancellable {
+            api.addWatchlist(
+                AddWatchlistRequest(
+                    plate = plate.trim(),
+                    label = label?.trim()?.ifBlank { null },
+                    note = note?.trim()?.ifBlank { null },
+                    color = color?.trim()?.ifBlank { null },
+                    notify = notify,
+                    kind = kind,
+                ),
+            )
+        }
+
+    /** Remove a watchlist entry by id. **Admin-only** server-side (403 for non-admin). */
+    suspend fun deleteWatchlist(id: String): Result<Unit> =
+        runCatchingCancellable {
+            // Retrofit does NOT throw for non-2xx on Response<T>, so surface the
+            // error explicitly — otherwise the admin-only 403 (stale role) or any
+            // server error would report a false success while the entry survives.
+            // 404 means already gone → treat as success.
+            val r = api.deleteWatchlist(id)
+            if (!r.isSuccessful && r.code() != 404) throw HttpException(r)
+            Unit
+        }
+
+    // ── LPR config (admin-only) ──────────────────────────────────────────────────
+    /**
+     * Platform LPR settings (enable flag, retention, watchlist fuzziness).
+     * **Admin-only** server-side — a non-admin caller's [Result] fails with HTTP
+     * 403 ([Throwable.isForbidden]).
+     */
+    suspend fun lprConfig(): Result<LprConfigDto> =
+        runCatchingCancellable { api.lprConfig() }
+
+    /**
+     * Update the platform LPR settings. **Admin-only** (403 for non-admin). The
+     * PUT replaces all writable fields, so the caller must pass the current
+     * [enabled]/[retentionDays] alongside the changed [watchlistFuzz] — editing
+     * fuzziness alone must not clobber the other two. The server clamps
+     * [retentionDays] (1..3650) and [watchlistFuzz] (0.0..0.5).
+     */
+    suspend fun updateLprConfig(
+        enabled: Boolean,
+        retentionDays: Int,
+        watchlistFuzz: Float,
+    ): Result<LprConfigDto> =
+        runCatchingCancellable {
+            api.updateLprConfig(LprConfigUpdate(enabled, retentionDays, watchlistFuzz))
+        }
+
     // ── update-available check (issue #7) ───────────────────────────────────
     /**
      * `GET /updates/latest`. [refresh] forces an immediate re-check ("Check
@@ -346,6 +457,15 @@ class CrumbRepository(private val container: AppContainer) {
  * "no footage here" state instead of the error snackbar.
  */
 fun Throwable.isNotFound(): Boolean = this is HttpException && code() == 404
+
+/**
+ * True when a repository call failed specifically with HTTP 403 (forbidden).
+ *
+ * The LPR watchlist mutations (`POST`/`DELETE /lpr/watchlist`) are admin-only; a
+ * non-admin viewer gets a 403. Callers use this to show a calm "only admins can
+ * manage the watchlist" message instead of the generic error snackbar.
+ */
+fun Throwable.isForbidden(): Boolean = this is HttpException && code() == 403
 
 /** Map a throwable from a repository call to a human-readable message for the UI. */
 fun Throwable.toUserMessage(): String = when (this) {

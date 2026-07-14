@@ -130,11 +130,47 @@ pub struct NormalizedEvent {
     /// `GET /events/{id}/snapshot` which proxies this URL.
     pub snapshot_url: Option<String>,
 
+    /// Recognized license plate (raw OCR string) if the provider read one on
+    /// this object — Frigate's native LPR `recognized_license_plate` field.
+    /// Drives the LPR `plate_reads` store; `None` for non-plate events.
+    pub recognized_plate: Option<String>,
+
+    /// Confidence of [`Self::recognized_plate`] (`0.0..=1.0`) if the provider
+    /// reports a plate-specific score, else `None`. The ingester stores this
+    /// verbatim and does NOT fall back to the object's `top_score` — that is the
+    /// *vehicle* detection score, not the plate OCR score, and using it would
+    /// green-light a mediocre read; clients render `None` as "—".
+    pub plate_confidence: Option<f32>,
+
+    /// Plate bounding box as `[x, y, w, h]` fractions (each `0.0..=1.0`) of the
+    /// full detection-snapshot frame — a tight crop region a client can apply to
+    /// `GET /events/{id}/snapshot` to render a "zoomed plate". `None` when the
+    /// provider gave no plate box, or gave one that could not be normalized to
+    /// frame fractions (best-effort; never guessed). Additive: drives only the
+    /// `plate_reads.bbox_*` columns, nothing in the shared `events` path.
+    pub plate_box: Option<[f32; 4]>,
+
     /// Full vendor payload preserved verbatim as JSONB.
     ///
     /// Used for debugging and future provider-specific feature extraction
     /// without requiring a schema migration.
     pub raw: serde_json::Value,
+}
+
+impl NormalizedEvent {
+    /// The license-plate string this event carries, if any: the raw OCR result
+    /// preferred, else a plate-typed `sub_label` (dedicated-LPR-mode, where the
+    /// tracked object itself is a `license_plate`). `None` for everything else.
+    #[must_use]
+    pub fn plate_string(&self) -> Option<String> {
+        self.recognized_plate.clone().or_else(|| {
+            if self.label == DetectionLabel::LicensePlate {
+                self.sub_label.clone()
+            } else {
+                None
+            }
+        })
+    }
 }
 
 // ── EventLifecycle ────────────────────────────────────────────────────────────

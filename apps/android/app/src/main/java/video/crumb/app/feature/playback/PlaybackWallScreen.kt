@@ -56,6 +56,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.imageLoader
@@ -131,6 +132,7 @@ fun PlaybackWallScreen(
     onOpenBookmarks: () -> Unit,
     onOpenExport: () -> Unit,
     onOpenClips: () -> Unit = {},
+    onOpenPlates: () -> Unit = {},
 ) {
     val container = appContainer()
     val repo = container.repository
@@ -158,6 +160,10 @@ fun PlaybackWallScreen(
         }
     }
     var activeViewId by remember { mutableStateOf(store.activeViewId) }
+    // Client-side preference: hide the auto-built "All Cameras" default view (desktop
+    // parity — `client_options.dart`'s `showAllCamerasView`), shared with the Live
+    // wall's setting (see SettingsDialog, reachable from the Live tab's overflow menu).
+    var showAllCamerasView by remember { mutableStateOf(store.showAllCamerasView) }
     var spans by remember { mutableStateOf<List<RecordedSpan>>(emptyList()) }
     // Combined motion histogram across ALL wall cameras (per-bucket max), so the
     // shared timeline shows WHERE there was movement on the busiest camera — quiet
@@ -170,7 +176,12 @@ fun PlaybackWallScreen(
     var windowEndMs by remember { mutableLongStateOf(0L) }
     var cursorMs by remember { mutableLongStateOf(0L) }
     var atLatest by remember { mutableStateOf(true) }
-    var visibleSpanMs by remember { mutableLongStateOf(WALL_DEFAULT_SPAN_MS) }
+    // Seed the timeline zoom from the persisted device preference (shared with
+    // single-camera playback) so it restores the last span the user left it on
+    // instead of resetting to the 1 h default. Coerced into the wall's own range.
+    var visibleSpanMs by remember {
+        mutableLongStateOf(store.playbackSpanMs.coerceIn(WALL_MIN_SPAN_MS, WALL_MAX_SPAN_MS))
+    }
     var layout by remember {
         mutableStateOf(WallGridLayout.entries.getOrElse(store.liveGridLayout) { WallGridLayout.TWO })
     }
@@ -264,10 +275,22 @@ fun PlaybackWallScreen(
     }
 
     val activeView = views.firstOrNull { it.id == activeViewId }
-    val shownCameras = activeView?.let { v ->
-        val byId = cameras.associateBy { it.id }
-        v.cameraIds.mapNotNull { byId[it] }
-    } ?: cameras
+    // See LiveScreen for the full rationale — same suppress-and-auto-adopt behavior,
+    // shared with the Live wall via the same persisted activeViewId/views/preference.
+    val suppressingAllCameras = !showAllCamerasView && activeView == null
+    val shownCameras = when {
+        activeView != null -> {
+            val byId = cameras.associateBy { it.id }
+            activeView.cameraIds.mapNotNull { byId[it] }
+        }
+        suppressingAllCameras -> emptyList()
+        else -> cameras
+    }
+    LaunchedEffect(showAllCamerasView, views, activeViewId) {
+        if (suppressingAllCameras && views.isNotEmpty()) {
+            setActive(views.first().id)
+        }
+    }
 
     Scaffold(
         containerColor = NavyDeep,
@@ -289,8 +312,10 @@ fun PlaybackWallScreen(
                                 onLive = onOpenLive,
                                 onPlayback = {},
                                 onClips = onOpenClips,
+                                onPlates = onOpenPlates,
                                 showPlayback = caps.playback || store.isAdmin,
                                 showClips = caps.clips || store.isAdmin,
+                                showPlates = store.platesEnabled,
                             )
                             InlineDivider()
                             ViewChipsRow(
@@ -298,6 +323,7 @@ fun PlaybackWallScreen(
                                 activeViewId = activeViewId,
                                 onSelect = { setActive(it) },
                                 modifier = Modifier.weight(1f),
+                                showAllCamerasView = showAllCamerasView,
                             )
                         }
                     } else {
@@ -306,8 +332,10 @@ fun PlaybackWallScreen(
                             onLive = onOpenLive,
                             onPlayback = {},
                             onClips = onOpenClips,
+                            onPlates = onOpenPlates,
                             showPlayback = caps.playback || store.isAdmin,
                             showClips = caps.clips || store.isAdmin,
+                            showPlates = store.platesEnabled,
                         )
                     }
                 },
@@ -357,6 +385,7 @@ fun PlaybackWallScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 8.dp, vertical = 2.dp),
+                    showAllCamerasView = showAllCamerasView,
                 )
             }
             // ── Snapshot grid (fills space above the controls) ───────────────────
@@ -386,9 +415,17 @@ fun PlaybackWallScreen(
                     }
 
                     shownCameras.isEmpty() -> Text(
-                        "No cameras available",
+                        text = if (suppressingAllCameras) {
+                            "No saved views — create one on the Live tab, or turn " +
+                                "\"Show All Cameras\" back on in Settings."
+                        } else {
+                            "No cameras available"
+                        },
                         color = TextSecondary,
-                        modifier = Modifier.align(Alignment.Center),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .padding(horizontal = 24.dp),
                     )
 
                     else -> LazyVerticalGrid(
@@ -472,7 +509,13 @@ fun PlaybackWallScreen(
                         if (ts < windowStartMs + margin || ts > windowEndMs - margin) recenterOn(ts)
                     },
                     onSpanChange = { sp ->
-                        visibleSpanMs = sp.coerceIn(WALL_MIN_SPAN_MS, WALL_MAX_SPAN_MS)
+                        val coerced = sp.coerceIn(WALL_MIN_SPAN_MS, WALL_MAX_SPAN_MS)
+                        if (coerced != visibleSpanMs) {
+                            visibleSpanMs = coerced
+                            // Persist as a device preference (shared with single-camera
+                            // playback) so the zoom level survives tab switches + restarts.
+                            store.playbackSpanMs = coerced
+                        }
                     },
                     modifier = Modifier
                         .fillMaxWidth()

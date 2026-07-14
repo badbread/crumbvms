@@ -13,6 +13,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// One `GET /timeline/intensity` response for a single camera + window: a
@@ -105,7 +106,7 @@ class DetectionEvent {
 // library-privacy is file-scoped), so this extension keeps one module-level
 // client for its own stateless GET calls — mirrors CrumbApi's own default
 // `http.Client()` construction, just not shared with it.
-final http.Client _client = http.Client();
+final http.Client _client = TimeoutClient();
 
 extension MotionTimelineApi on CrumbApi {
   /// GET /timeline/intensity?camera_id=<id>&start=<iso>&end=<iso>&buckets=<n>

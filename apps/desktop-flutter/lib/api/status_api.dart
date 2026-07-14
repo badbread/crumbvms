@@ -15,9 +15,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 import 'status_models.dart';
 
@@ -25,7 +24,7 @@ extension StatusApi on CrumbApi {
   /// GET /status → per-camera recording/motion health + config fingerprint +
   /// the platform-wide bookmarks toggle.
   Future<SystemStatus> getStatus(Session s) async {
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse('${s.base}/status'),
       headers: {'authorization': 'Bearer ${s.token}'},
     );
@@ -59,7 +58,7 @@ extension StatusApi on CrumbApi {
         'limit': '$limit',
       },
     );
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       uri,
       headers: {'authorization': 'Bearer ${s.token}'},
     );

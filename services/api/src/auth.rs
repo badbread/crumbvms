@@ -636,9 +636,24 @@ async fn login(
     if body.password.is_empty() {
         return Err(ApiError::BadRequest("password is required".to_owned()));
     }
+    let username = body.username.trim();
+
+    // ── per-username brute-force backoff (issue #127) ─────────────────────────
+    // If this username is already in backoff (too many recent consecutive
+    // failures), reject with 429 + Retry-After BEFORE any DB lookup or argon2
+    // verify. Keyed by the submitted username whether or not it exists, so the
+    // limiter leaks no account-existence signal, and we never sleep — the
+    // connection is freed immediately. This is IN ADDITION to the shared per-IP
+    // request bucket applied as a layer, not a replacement.
+    if let Some(retry_after) = state.login_retry_after(username) {
+        return Err(ApiError::TooManyRequestsRetry {
+            message: "too many failed login attempts; try again later".to_owned(),
+            retry_after,
+        });
+    }
 
     // ── fetch user row ────────────────────────────────────────────────────────
-    let user = db::get_user_by_username(state.pool(), body.username.trim())
+    let user = db::get_user_by_username(state.pool(), username)
         .await
         .map_err(ApiError::Internal)?;
 
@@ -654,10 +669,17 @@ async fn login(
     };
 
     if !valid {
+        // Count this failure toward the per-username backoff (issue #127). The
+        // response stays a plain 401 — the backoff only changes the NEXT
+        // attempt's outcome once the threshold is crossed.
+        state.record_login_failure(username);
         return Err(ApiError::Unauthorized(
             "invalid username or password".to_owned(),
         ));
     }
+
+    // Successful auth clears any accumulated failure count for this username.
+    state.record_login_success(username);
 
     // `user` is Some(_) iff `valid` is true — unwrap is safe here.
     let user = user.expect("user is Some when valid");
@@ -754,6 +776,15 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> Result<Json<MeResp
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("user {} not found", user.user_id)))?;
 
+    // Plates surface: shown only when LPR capture is enabled server-side AND the
+    // caller holds the view_plates capability. Read the singleton (cheap) so the
+    // client can gate the tab without a separate round-trip.
+    let plates_enabled = user.can_view_plates()
+        && db::get_lpr_settings(state.pool())
+            .await
+            .map_err(ApiError::Internal)?
+            .is_some_and(|s| s.enabled);
+
     // Effective role/capabilities/cameras come from the AuthUser extractor (resolved
     // from the assigned role); username comes from the fresh DB row.
     Ok(Json(MeResponse {
@@ -764,6 +795,7 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> Result<Json<MeResp
         capabilities: user.capabilities.clone(),
         camera_ids: user.camera_ids.clone(),
         role_id: user.role_id,
+        plates_enabled,
     }))
 }
 

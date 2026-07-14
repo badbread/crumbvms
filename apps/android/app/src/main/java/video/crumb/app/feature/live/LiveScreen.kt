@@ -102,6 +102,7 @@ fun LiveScreen(
     onOpenFullscreen: (String) -> Unit,
     onOpenPlaybackMode: () -> Unit,
     onOpenClips: () -> Unit = {},
+    onOpenPlates: () -> Unit = {},
     onLogout: () -> Unit,
 ) {
     val container = appContainer()
@@ -142,6 +143,11 @@ fun LiveScreen(
     // Local saved views (named camera subsets) — phone-only, see SecureStore.
     var views by remember { mutableStateOf(store.cameraViews) }
     var activeViewId by remember { mutableStateOf(store.activeViewId) }
+    // Client-side preference: hide the auto-built "All Cameras" default view (desktop
+    // parity — `client_options.dart`'s `showAllCamerasView`). Local mirror so the
+    // Settings dialog's toggle (below) takes effect immediately, without leaving and
+    // re-entering this screen.
+    var showAllCamerasView by remember { mutableStateOf(store.showAllCamerasView) }
     var editorTarget by remember { mutableStateOf<ViewEditorTarget?>(null) }
     // Paired in-memory + persisted writes so a store write can't be forgotten (the
     // store is the source of truth — selection/views survive navigate-away-and-back).
@@ -224,12 +230,35 @@ fun LiveScreen(
 
     // The active view (null = "All cameras"); a stale persisted id resolves to null.
     val activeView = views.firstOrNull { it.id == activeViewId }
+    // When "Show All Cameras" is off and nothing is explicitly selected, the whole
+    // point of the option is to NOT fall back to every camera — an operator's own
+    // saved views should be what shows instead (see the auto-adopt effect below,
+    // which picks a saved view for this case rather than leaving it stuck empty).
+    val suppressingAllCameras = !showAllCamerasView && activeView == null
     // Cameras to render: a view's cameras in its saved order (skipping any that no
-    // longer exist), or every camera when no view is active.
-    val shownCameras = activeView?.let { v ->
-        val byId = state.cameras.associateBy { it.id }
-        v.cameraIds.mapNotNull { byId[it] }
-    } ?: state.cameras
+    // longer exist); every camera when no view is active and "All" isn't suppressed;
+    // otherwise nothing (the empty state below prompts for a saved view instead).
+    val shownCameras = when {
+        activeView != null -> {
+            val byId = state.cameras.associateBy { it.id }
+            activeView.cameraIds.mapNotNull { byId[it] }
+        }
+        suppressingAllCameras -> emptyList()
+        else -> state.cameras
+    }
+    // Auto-adopt the operator's first saved view in place of the suppressed "All
+    // Cameras" default (persists via setActive, so this only fires once per
+    // suppression window — the next recomposition has a non-null activeViewId and
+    // suppressingAllCameras goes false). Re-evaluated whenever the option, the view
+    // list (e.g. the server refresh in refreshViews()), or the selection changes —
+    // e.g. deleting the active view resets activeViewId to null (see the view-editor
+    // onDelete below), which should re-adopt another saved view rather than fall
+    // through to "All".
+    LaunchedEffect(showAllCamerasView, views, activeViewId) {
+        if (suppressingAllCameras && views.isNotEmpty()) {
+            setActive(views.first().id)
+        }
+    }
     // Stable (id, name) pairs for the editor — only changes when the camera SET
     // changes, not on the 2 s motion/detection poll, so an open editor / in-progress
     // drag isn't churned by the poll.
@@ -257,8 +286,10 @@ fun LiveScreen(
                                     onLive = {},
                                     onPlayback = onOpenPlaybackMode,
                                     onClips = onOpenClips,
+                                    onPlates = onOpenPlates,
                                     showPlayback = caps.playback || store.isAdmin,
                                     showClips = caps.clips || store.isAdmin,
+                                    showPlates = store.platesEnabled,
                                 )
                                 InlineDivider()
                                 ViewChipsRow(
@@ -266,6 +297,7 @@ fun LiveScreen(
                                     activeViewId = activeViewId,
                                     onSelect = { setActive(it) },
                                     modifier = Modifier.weight(1f),
+                                    showAllCamerasView = showAllCamerasView,
                                 )
                             }
                         } else {
@@ -274,8 +306,10 @@ fun LiveScreen(
                                 onLive = {},
                                 onPlayback = onOpenPlaybackMode,
                                 onClips = onOpenClips,
+                                onPlates = onOpenPlates,
                                 showPlayback = caps.playback || store.isAdmin,
                                 showClips = caps.clips || store.isAdmin,
+                                showPlates = store.platesEnabled,
                             )
                         }
                     },
@@ -396,6 +430,7 @@ fun LiveScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 8.dp, vertical = 2.dp),
+                        showAllCamerasView = showAllCamerasView,
                     )
                 }
 
@@ -413,7 +448,7 @@ fun LiveScreen(
                         state.isViewerRestricted -> {
                             ViewerRestrictedState(
                                 modifier = Modifier.align(Alignment.Center),
-                                onRetry = { vm.refresh() },
+                                onRetry = { vm.retry() },
                             )
                         }
 
@@ -422,7 +457,7 @@ fun LiveScreen(
                             ErrorState(
                                 message = state.error!!,
                                 modifier = Modifier.align(Alignment.Center),
-                                onRetry = { vm.refresh() },
+                                onRetry = { vm.retry() },
                             )
                         }
 
@@ -430,8 +465,37 @@ fun LiveScreen(
                         state.cameras.isEmpty() -> {
                             EmptyState(
                                 modifier = Modifier.align(Alignment.Center),
-                                onRetry = { vm.refresh() },
+                                onRetry = { vm.retry() },
                             )
+                        }
+
+                        // ── "All Cameras" suppressed, no saved view to fall back to ──
+                        // (cameras exist, "Show All Cameras" is off, and there's nothing
+                        // in [views] yet for the auto-adopt effect above to pick).
+                        suppressingAllCameras && views.isEmpty() -> {
+                            Column(
+                                modifier = Modifier.align(Alignment.Center).padding(32.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "No saved views yet.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TextSecondary,
+                                )
+                                Text(
+                                    text = "\"Show All Cameras\" is off in Settings — " +
+                                        "create a view, or turn it back on.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary,
+                                )
+                                TextButton(onClick = { editorTarget = ViewEditorTarget.New }) {
+                                    Text("Create a view", color = TealAccent)
+                                }
+                                TextButton(onClick = { showSettings = true }) {
+                                    Text("Open Settings", color = TealAccent)
+                                }
+                            }
                         }
 
                         // ── Active view filtered to zero available cameras ───────────
@@ -524,6 +588,11 @@ fun LiveScreen(
             store = store,
             lowBandwidthMode = lowBandwidthMode,
             onLowBandwidthChange = { vm.setLowBandwidthMode(it) },
+            showAllCamerasView = showAllCamerasView,
+            onShowAllCamerasViewChange = {
+                showAllCamerasView = it
+                store.showAllCamerasView = it
+            },
             onDismiss = { showSettings = false },
         )
     }

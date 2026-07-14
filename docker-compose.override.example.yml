@@ -7,6 +7,10 @@
 # docs/OPS-BACKUP-RECOVERY.md). Recorder + API are stateless and just need to
 # reach the DB.
 #
+# Requires Docker Compose v2.24+ — this file uses the `!reset` merge tag (below)
+# to drop the local-postgres dependency, and older Compose can't parse it. That's
+# the same baseline the fresh-install smoke test already assumes.
+#
 # ── How to use ───────────────────────────────────────────────────────────────
 #   1. Copy this file:   cp docker-compose.override.example.yml docker-compose.override.yml
 #      (docker compose auto-merges docker-compose.override.yml on top of the base
@@ -15,9 +19,14 @@
 #         DATABASE_URL=postgresql://crumb:STRONGPASS@192.0.2.30:5432/crumb
 #      The api + recorder read DATABASE_URL directly (services/*/config.rs), so
 #      no code change is required — only this env var.
-#   3. Apply the schema on the remote DB ONCE (the bundled postgres did this via
-#      docker-entrypoint-initdb.d; a remote DB will not). See the runbook section
-#      "Provisioning a remote Postgres".
+#   3. On the remote host, create an EMPTY database + user (e.g. `CREATE DATABASE
+#      crumb;` and a role matching DATABASE_URL). You do NOT apply the schema by
+#      hand: the api + recorder run their EMBEDDED migrations against DATABASE_URL
+#      on every boot (advisory-locked + idempotent, services/common/src/db.rs), so
+#      they build and upgrade the remote schema automatically — exactly as they do
+#      for the bundled Postgres. (The bundled DB is NOT schema'd via
+#      docker-entrypoint-initdb.d either; db/migrations is deliberately kept out of
+#      it — see docs/COMPOSE.md.)
 #   4. docker compose up -d   (the local `postgres` service will NOT start)
 #
 # ── How this works ───────────────────────────────────────────────────────────
@@ -25,9 +34,10 @@
 #     `docker compose up` skips it entirely. The bundled-DB default in the base
 #     docker-compose.yml is UNCHANGED — delete/rename docker-compose.override.yml
 #     to go back to the embedded Postgres.
-#   * `depends_on` is cleared on api + recorder so they don't wait on the (now
-#     absent) local postgres healthcheck. They connect to the remote DB on boot;
-#     deadpool's create/wait timeouts (services/common/src/db.rs) fail fast and
+#   * `depends_on` is cleared on api + recorder (via the `!reset` merge tag, hence
+#     the Compose v2.24+ requirement above) so they don't wait on the (now absent)
+#     local postgres healthcheck. They connect to the remote DB on boot; deadpool's
+#     create/wait timeouts (services/common/src/db.rs) fail fast and
 #     restart-on-failure (restart: unless-stopped) handles a not-yet-ready DB.
 #
 # Leaving DATABASE_URL pointed at the remote host is the ONLY required change in

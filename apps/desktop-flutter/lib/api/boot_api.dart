@@ -10,9 +10,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// `GET /auth/me` response. Deliberately keeps `capabilities` as a raw JSON
@@ -28,6 +27,7 @@ class MeResponse {
     required this.capabilities,
     required this.cameraIds,
     this.roleId,
+    this.platesEnabled = false,
   });
 
   final String id; // UUID
@@ -38,6 +38,12 @@ class MeResponse {
   final List<String> cameraIds;
   final String? roleId; // UUID, null for legacy binary-role users
 
+  /// Server-side truth for whether the caller may use the license-plate (LPR)
+  /// surface: true only when LPR is enabled server-side AND this account holds
+  /// the `view_plates` capability. The single flag the Plates tab gates on —
+  /// clients must NOT re-derive it from [capabilities]. Absent → false.
+  final bool platesEnabled;
+
   factory MeResponse.fromJson(Map<String, dynamic> j) => MeResponse(
     id: j['id'] as String,
     username: j['username'] as String,
@@ -47,13 +53,14 @@ class MeResponse {
     cameraIds:
         (j['camera_ids'] as List<dynamic>?)?.cast<String>() ?? const [],
     roleId: j['role_id'] as String?,
+    platesEnabled: (j['plates_enabled'] as bool?) ?? false,
   );
 }
 
 extension BootApi on CrumbApi {
   /// `GET /auth/me` (mounted at the server root under `/auth`, Bearer JWT).
   ///
-  /// Uses a fresh, short-lived [http.Client] per call rather than reaching
+  /// Uses a fresh, short-lived [TimeoutClient] per call rather than reaching
   /// into [CrumbApi]'s internal client (private to crumb_api.dart, which this
   /// feature must not edit) — this is called once per boot attempt, not on a
   /// hot path.
@@ -66,7 +73,7 @@ extension BootApi on CrumbApi {
   ///   catching non-`CrumbApiException` errors) — treat as "server
   ///   unreachable" and retry.
   Future<MeResponse> fetchMe(Session s) async {
-    final client = http.Client();
+    final client = TimeoutClient();
     try {
       final resp = await client.get(
         Uri.parse('${s.base}/auth/me'),

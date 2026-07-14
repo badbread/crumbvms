@@ -16,6 +16,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// One ONVIF PTZ preset (`GET`-via-POST `action=presets` response entry).
@@ -128,4 +129,4 @@ extension PtzExtrasApi on CrumbApi {
 /// extra file keeps its own client instance. Cheap (no connection state is
 /// shared across `http.Client`s in the package) and avoids touching
 /// crumb_api.dart.
-final http.Client httpClientForExtras = http.Client();
+final http.Client httpClientForExtras = TimeoutClient();

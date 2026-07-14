@@ -21,7 +21,8 @@ staleness.
   as a background task at startup. It dumps over the same `DATABASE_URL` the
   api already uses, no new credentials, no extra container, one less image.
 - **When:** daily at **03:15 local time** by default (`DB_BACKUP_SCHEDULE`,
-  a wall-clock `HH:MM`; timezone from `TZ`, default `America/Los_Angeles`).
+  a wall-clock `HH:MM`; timezone from `TZ`, which `scripts/setup-env.sh` sets to
+  the detected host zone, or `UTC` when unset).
   Plus a **catch-up dump on boot** whenever the newest dump is missing or
   older than ~25 h, a fresh install gets its first backup within seconds of
   the api starting, and a host that was powered off at 03:15 self-heals on
@@ -89,7 +90,7 @@ All optional, sane defaults ship if you don't set them (see `.env.example`):
 | `DB_BACKUP_ENABLED` | `true` | Set `false` to disable the built-in job entirely. |
 | `DB_BACKUP_HOST_PATH` | `./backups` | Host directory dumps are written to (bind-mounted read-write to `/backups` in the api container). **Put this on a different disk than `MEDIA_HOST_PATH`** where practical, a live-disk failure shouldn't also destroy your backups. Must be writable by uid 1001. |
 | `DB_BACKUP_SCHEDULE` | `03:15` | Daily dump time, local wall clock `HH:MM` (in `TZ`). Legacy sidecar values (`@daily`, or a simple daily cron like `15 3 * * *`) are still accepted and mapped to the same daily behaviour. |
-| `TZ` | `America/Los_Angeles` | Timezone the schedule (and dump filenames) use. |
+| `TZ` | `UTC` | Timezone the schedule (and dump filenames) use. `scripts/setup-env.sh` writes the detected host zone into `.env`; UTC is the fallback when `TZ` is unset. |
 | `DB_BACKUP_KEEP_DAYS` | `7` | Daily dumps to retain. |
 | `DB_BACKUP_KEEP_WEEKS` | `4` | Weekly dumps to retain. |
 | `DB_BACKUP_KEEP_MONTHS` | `0` | Monthly dumps to retain (`0` disables the monthly tier). |

@@ -95,6 +95,7 @@ mod go2rtc;
 mod ha;
 mod metrics;
 mod notifications;
+mod plates;
 mod playback;
 mod ptz;
 mod rate_limit;
@@ -470,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
         // Detection events list (authenticated, subject to rate-limit + gzip).
         // Snapshot proxy is in media_routes below (authenticated via ?token=, no timeout).
         .merge(events::json_routes())
+        .merge(plates::json_routes())
         // Clips feed (detections + derived motion), source-abstracted.
         .merge(clips::json_routes())
         // Notification devices, rules, snooze, presence, and log.
@@ -551,6 +553,46 @@ async fn main() -> anyhow::Result<()> {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("session prune failed: {e}"),
                 }
+            }
+        });
+    }
+
+    // ── 6a3. plate-reads retention prune (LPR) ────────────────────────────────
+    // Enforce `lpr_config.retention_days`: delete `plate_reads` older than the
+    // window so the (privacy-sensitive) plate database self-bounds, matching the
+    // retention the admin console promises. Best-effort; correctness never
+    // depends on it. Two deliberate properties:
+    //   * runs whenever `retention_days > 0` REGARDLESS of `enabled` — disabling
+    //     capture is the natural "wind this down" action, and the stored plates
+    //     must still age out (they'd otherwise be kept forever, contradicting the
+    //     console's "pruned automatically" promise);
+    //   * first sweep ~5 min after boot, then daily — a host restarted daily
+    //     (nightly maintenance, flaky power) would never reach a 24 h-first tick.
+    {
+        let prune_pool = state.pool().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_mins(5)).await;
+            let tick = Duration::from_hours(24);
+            loop {
+                match crumb_common::db::get_lpr_settings(&prune_pool).await {
+                    Ok(Some(c)) if c.retention_days > 0 => {
+                        let cutoff = chrono::Utc::now()
+                            - chrono::Duration::days(i64::from(c.retention_days));
+                        match crumb_common::db::prune_plate_reads(&prune_pool, cutoff).await {
+                            Ok(n) if n > 0 => {
+                                info!(
+                                    "pruned {n} plate read(s) older than {} days",
+                                    c.retention_days
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("plate-reads prune failed: {e}"),
+                        }
+                    }
+                    Ok(_) => {} // no retention window set — nothing to prune
+                    Err(e) => tracing::warn!("plate-reads prune: get_lpr_settings failed: {e}"),
+                }
+                tokio::time::sleep(tick).await;
             }
         });
     }

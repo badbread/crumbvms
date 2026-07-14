@@ -169,18 +169,28 @@ fun CenteredTimeline(
                         val now = System.currentTimeMillis()
                         while (true) {
                             val event = awaitPointerEvent()
+                            val pressed = event.changes.count { it.pressed }
                             val zoom = event.calculateZoom()
                             if (zoom != 1f && zoom > 0f) {
                                 sp = (sp / zoom).roundToLong()
                                     .coerceIn(60_000L, 6L * 3600_000L)
                                 onSpanChange(sp)
                             }
-                            val pan = event.calculatePan()
-                            if (pan.x != 0f && size.width > 0) {
-                                // Drag right → earlier in time (content follows finger).
-                                val deltaMs = (-pan.x / size.width.toFloat() * sp).roundToLong()
-                                acc = (acc + deltaMs).coerceIn(0L, now)
-                                onScrub(acc)
+                            // Only a single-finger drag scrubs. While PINCHING (two
+                            // or more fingers) the incidental centroid drift that
+                            // `calculatePan()` reports must NOT move the playhead —
+                            // otherwise zooming also slides the current time, which
+                            // is maddening. The centered playhead therefore stays
+                            // fixed on the time the pinch started on; only the span
+                            // (zoom) changes.
+                            if (pressed < 2) {
+                                val pan = event.calculatePan()
+                                if (pan.x != 0f && size.width > 0) {
+                                    // Drag right → earlier in time (content follows finger).
+                                    val deltaMs = (-pan.x / size.width.toFloat() * sp).roundToLong()
+                                    acc = (acc + deltaMs).coerceIn(0L, now)
+                                    onScrub(acc)
+                                }
                             }
                             event.changes.forEach { if (it.positionChanged()) it.consume() }
                             if (event.changes.none { it.pressed }) break

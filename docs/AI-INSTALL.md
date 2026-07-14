@@ -123,8 +123,23 @@ and `SEED_ADMIN_PASSWORD`. **Do not** edit those secret values by hand or echo t
 into the chat; if the user needs the admin password, re-run with `--print` or read
 it back to them privately.
 
+It also detects two host facts and writes them (neither is a secret):
+
+- **`TZ`** — the host's IANA timezone (e.g. `Europe/Berlin`). It drives quiet
+  hours, the nightly DB-backup schedule, and every log timestamp. If detection
+  fails it falls back to **`UTC`** (printed as a NOTE) — **not** a local zone;
+  confirm it looks right and set it by hand if the host clock is unusual. The
+  compose default when `.env` has no `TZ` is also `UTC`.
+- **`WEBRTC_CANDIDATE`** — the host's LAN IP as `<lan-ip>:8556`. **Required for
+  iOS/WebRTC live view**: go2rtc advertises it as an ICE candidate so LAN clients
+  can connect; without it live silently degrades to ~1fps snapshots
+  (`docs/IOS-LIVE-VIDEO.md`). If detection fails it's left blank with a NOTE —
+  set it to the server's LAN IP + `:8556` before relying on iOS/WebRTC live.
+
 **Verify:** `.env` exists; `JWT_SECRET` is **not** the `change-me…` placeholder;
-`POSTGRES_PASSWORD` is non-empty. (Reference: `.env.example` for the full key list.)
+`POSTGRES_PASSWORD` is non-empty; `TZ` matches the host's zone (or UTC by design);
+`WEBRTC_CANDIDATE` is the host's LAN IP if iOS/WebRTC live is wanted. (Reference:
+`.env.example` for the full key list.)
 
 ---
 
@@ -300,6 +315,24 @@ via `PUT /config/beta-terms`). Then:
 
 You're finished; they take it from here. (Skipping the camera steps adds nothing —
 secure by default; steps 7–10 are all optional and skippable.)
+
+**After the wizard — License-plate recognition (optional).** Not a wizard step;
+it lives in the console under **Settings → Detection & clips**. OFF by default.
+If the user runs their cameras through Frigate with Frigate's native LPR enabled,
+plate reads arrive on the event stream Crumb already ingests — flip
+**License-plate recognition** on there (and set a **retention** window; older
+plate reads are pruned automatically) to start capturing them into the
+searchable **Plates** tab. No new services or env keys; it reuses the Frigate
+integration. A plate database is privacy-sensitive, so it stays opt-in, and
+viewing it needs the **View license plates** role capability (Settings → Users &
+Security). Plate-read retention is independent of footage/storage retention.
+REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
+
+To be **alerted** when a specific plate is seen, add it to the **watchlist** in
+the **Plates** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
+admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert
+routed over the same notification channels as every other alert — enable/tune it
+under Settings → Notifications → System alerts. No extra services or env keys.
 
 ### 6b. Drive it yourself via the REST API (full hands-off)
 All wizard steps have API equivalents. Do them in order:

@@ -65,7 +65,9 @@ grep -q "^DB_BACKUP_HOST_PATH=" "${ENV_FILE}" || echo "DB_BACKUP_HOST_PATH=${BAC
 # every segment row landed hours in the past and the live index froze). With
 # the recorder's in-child TZ=UTC pin in place this is harmless; if that pin
 # ever regresses, 4e's freshness check fails loudly.
-echo "TZ=America/Los_Angeles" >> "${ENV_FILE}"
+# (setup-env.sh now writes a detected TZ= line, so replace it rather than append
+# a duplicate key.)
+sed -i 's|^TZ=.*|TZ=America/Los_Angeles|' "${ENV_FILE}"
 # The api's built-in backup job writes here as uid 1001 (mktemp dirs are 700
 # and owned by whoever runs this script, so the container couldn't write).
 chown 1001:1001 "${BACKUP_DIR}" 2>/dev/null || chmod 777 "${BACKUP_DIR}"

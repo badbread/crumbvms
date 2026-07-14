@@ -67,7 +67,14 @@ class LiveStatusController extends ChangeNotifier {
   });
 
   final CrumbApi api;
-  final Session session;
+
+  /// The session whose bearer token authenticates every poll. NOT final: an
+  /// in-place re-auth (see `main.dart`'s session-change handler) mints a fresh
+  /// token, and this long-lived poller must adopt it via [updateSession] or it
+  /// keeps hitting `/status` + `/events` with the dead token — surfacing a
+  /// false "connection lost" and stale/empty badges forever.
+  Session session;
+
   final Duration pollInterval;
   final int failuresBeforeConnLost;
   final Duration detectionLinger;
@@ -130,6 +137,20 @@ class LiveStatusController extends ChangeNotifier {
   void stop() {
     _timer?.cancel();
     _timer = null;
+  }
+
+  /// Adopt a refreshed [session] (e.g. after an in-place re-auth) so subsequent
+  /// polls use the new bearer token. Safe to call while polling; the next tick
+  /// picks it up. Clears the connection-lost state so a stale-token banner
+  /// doesn't linger past a successful re-auth.
+  void updateSession(Session next) {
+    if (identical(session, next)) return;
+    session = next;
+    if (_connectionLost || _failStreak != 0) {
+      _failStreak = 0;
+      _connectionLost = false;
+      notifyListeners();
+    }
   }
 
   Future<void> _poll() async {

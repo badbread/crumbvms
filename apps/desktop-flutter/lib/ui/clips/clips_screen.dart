@@ -21,7 +21,6 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
@@ -29,6 +28,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:crumb_desktop/api/clips_api.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
@@ -664,7 +664,7 @@ class _ClipCardState extends State<_ClipCard> {
     );
     if (url == null || _disposed) return; // no JWT fallback — stays blank
     try {
-      final resp = await http.get(Uri.parse(url));
+      final resp = await sharedHttpClient.get(Uri.parse(url));
       if (_disposed || resp.statusCode != 200) return;
       _cacheThumb(widget.clip.id, resp.bodyBytes);
       if (mounted) setState(() => _bytes = resp.bodyBytes);

@@ -17,9 +17,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// `GET /media-token` response — a scoped token good for exactly one camera.
@@ -54,13 +53,13 @@ extension MediaTokenApi on CrumbApi {
   /// Requires the full bearer JWT; the server further checks the caller can
   /// access `cameraId` (403 if not).
   ///
-  /// Uses a fresh, short-lived [http.Client] per call rather than reaching
+  /// Uses a fresh, short-lived [TimeoutClient] per call rather than reaching
   /// into [CrumbApi]'s internal client (which is private to crumb_api.dart
   /// and this feature must not edit that file) — media-token calls are
   /// infrequent (each result is cached ~15 min per camera by
   /// [MediaTokenCache]) so this has no meaningful cost.
   Future<MediaToken> fetchMediaToken(Session s, String cameraId) async {
-    final client = http.Client();
+    final client = TimeoutClient();
     try {
       final resp = await client.get(
         Uri.parse(

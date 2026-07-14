@@ -26,9 +26,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 // ─── models ────────────────────────────────────────────────────────────────
@@ -178,9 +177,9 @@ final Map<String, _CachedMediaToken> _mediaTokenCache = {};
 const _mediaTokenRefreshMargin = Duration(seconds: 10);
 
 // ─── extension ─────────────────────────────────────────────────────────────
-// Uses the top-level http.get/post/delete functions (each a one-shot
-// connection), matching the existing bookmarks_api.dart convention rather
-// than threading CrumbApi's own private http.Client through here.
+// Routes through the shared timeout client (`sharedHttpClient`), matching the
+// existing bookmarks_api.dart convention rather than threading CrumbApi's own
+// private http.Client through here.
 
 extension ExportApi on CrumbApi {
   Map<String, String> _authHeaders(Session s) => {
@@ -200,7 +199,7 @@ extension ExportApi on CrumbApi {
             _mediaTokenRefreshMargin) {
       return cached.token;
     }
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse(
         '${s.base}/media-token?camera=${Uri.encodeQueryComponent(cameraId)}',
       ),
@@ -234,7 +233,7 @@ extension ExportApi on CrumbApi {
         'width': '$width',
       },
     );
-    final resp = await http.get(uri, headers: _authHeaders(s));
+    final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
     if (resp.statusCode != 200) {
       throw CrumbApiException(
         'Failed to load filmstrip (HTTP ${resp.statusCode}).',
@@ -268,7 +267,7 @@ extension ExportApi on CrumbApi {
       },
     );
     try {
-      final resp = await http.get(uri);
+      final resp = await sharedHttpClient.get(uri);
       if (resp.statusCode != 200) return null;
       return resp.bodyBytes;
     } catch (_) {
@@ -292,7 +291,7 @@ extension ExportApi on CrumbApi {
     String container = 'mp4',
     String? password,
   }) async {
-    final resp = await http.post(
+    final resp = await sharedHttpClient.post(
       Uri.parse('${s.base}/export/batch'),
       headers: {..._authHeaders(s), 'content-type': 'application/json'},
       body: jsonEncode({
@@ -329,7 +328,7 @@ extension ExportApi on CrumbApi {
 
   /// Poll job status/progress.
   Future<ExportJob> getExportStatus(Session s, String jobId) async {
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse('${s.base}/export/$jobId'),
       headers: _authHeaders(s),
     );
@@ -346,7 +345,7 @@ extension ExportApi on CrumbApi {
 
   /// Cancel a queued/running job. Idempotent server-side.
   Future<void> cancelExport(Session s, String jobId) async {
-    final resp = await http.delete(
+    final resp = await sharedHttpClient.delete(
       Uri.parse('${s.base}/export/$jobId'),
       headers: _authHeaders(s),
     );
@@ -370,7 +369,7 @@ extension ExportApi on CrumbApi {
     Session s,
     ExportOutputFile file,
   ) async {
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse('${s.base}${file.downloadUrl}'),
       headers: _authHeaders(s),
     );

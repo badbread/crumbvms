@@ -106,6 +106,18 @@ class LiveViewModel(
         refresh()
     }
 
+    /**
+     * User-facing Retry. Retry exists precisely because the last attempt failed,
+     * so assume the transport may be wedged (a dead pooled socket left by a
+     * background stint) and drop all pooled connections before reloading.
+     * `refresh()` alone reuses the same sockets — correct for the config-change
+     * reload path, but useless for recovering from a dead connection.
+     */
+    fun retry() {
+        repo.recoverConnections()
+        refresh()
+    }
+
     /** Reload cameras and re-resolve all RTSP URLs. Safe to call from the UI. */
     fun refresh() {
         viewModelScope.launch {

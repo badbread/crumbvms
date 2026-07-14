@@ -23,6 +23,7 @@ import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/live/pane_watchdog.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_imaging_controls.dart';
@@ -169,10 +170,14 @@ class _WallScreenState extends State<WallScreen> {
   @override
   void didUpdateWidget(WallScreen old) {
     super.didUpdateWidget(old);
-    // Fresh session after an in-place re-auth — keep PTZ panel calls authed.
+    // Fresh session after an in-place re-auth — keep PTZ panel calls authed,
+    // and hand the new token to the long-lived /status + /events poller so it
+    // doesn't keep hitting the server with the dead token (which shows a false
+    // "connection lost" banner and stale/empty badges).
     if (old.session.token != widget.session.token ||
         old.session.base != widget.session.base) {
       _ptzPanel.updateSession(widget.session);
+      _liveStatus.updateSession(widget.session);
     }
     // A different applied view (or none) → re-parse its special-tile specs.
     if (!identical(old.view, widget.view) || old.view?.id != widget.view?.id) {
@@ -653,6 +658,18 @@ class _WallTileState extends State<_WallTile> {
   String? _error;
   bool _firstFrame = false;
 
+  /// Per-pane stall watchdog: polls the ACTIVE player's frame/position
+  /// progress and, on a confirmed freeze (camera reboot, go2rtc restart, PoE
+  /// blip), reconnects the pane in place with exponential backoff + a
+  /// fleet-wide herd cap. Without it a wedged feed froze on its last frame
+  /// forever while still reading "LIVE" (P0-6). Recreated in [_adopt] so it
+  /// always tracks the current `_player` across a main/sub stream swap.
+  PaneWatchdog? _watchdog;
+
+  /// True while [_watchdog] is actively retrying a stalled feed — drives the
+  /// amber live-dot treatment so a frozen pane never reads as live.
+  bool _reconnecting = false;
+
   /// The tile's live controller, offered to the maximized pane as a warm-start
   /// surface. Null until a frame has decoded, and null while a stream swap is
   /// pending — the pending swap will dispose the current player, which must
@@ -708,6 +725,11 @@ class _WallTileState extends State<_WallTile> {
   }
 
   Future<void> _load() async {
+    // Track a Player created below so the catch can dispose it if open() throws
+    // before the pane adopts it — otherwise a failed initial load leaks the
+    // player and its native mpv handle (#132). Cleared once ownership passes to
+    // the pane (_adopt) or the pending swap slot.
+    Player? spawned;
     try {
       final streams = await widget.api.cameraStreams(
         widget.session,
@@ -729,6 +751,7 @@ class _WallTileState extends State<_WallTile> {
       }
       final player = Player();
       final controller = VideoController(player);
+      spawned = player;
       final p = player.platform;
       if (p is NativePlayer) {
         for (final kv in const [
@@ -771,7 +794,14 @@ class _WallTileState extends State<_WallTile> {
         _pending?.dispose(); // superseded by an even newer swap
         _pending = player;
       }
-    } catch (e) {
+      spawned = null; // ownership handed off — the catch must not dispose it
+    } catch (_) {
+      // A Player created before open() failed is orphaned; dispose it so its
+      // native mpv handle isn't leaked on a failed initial load (#132). On the
+      // success path spawned is nulled above once the pane adopts the player
+      // (or hands it to _pending), so the stall-watchdog/reconnect handling is
+      // untouched and a live player is never disposed here.
+      spawned?.dispose();
       if (mounted) {
         setState(() => _error = 'load failed');
       }
@@ -800,11 +830,62 @@ class _WallTileState extends State<_WallTile> {
       // looks selected but the audio toggle reports "select a camera".
       widget.audio?.setSelected(_paneId);
     }
+    // (Re)point the stall watchdog at the player we just made active. A
+    // main/sub swap adopts a fresh player and disposes the old one, so the
+    // watchdog must be rebuilt on the new player rather than left polling a
+    // disposed handle. The global herd budget (shared across every pane)
+    // survives this teardown, so fleet-wide storm protection is preserved.
+    _watchdog?.dispose();
+    _watchdog =
+        PaneWatchdog(
+          player: player,
+          reconnect: _reconnectStalled,
+          onReconnectingChanged: (on) {
+            if (mounted) setState(() => _reconnecting = on);
+          },
+        )..start();
     setState(() {
       _player = player;
       _controller = controller;
       _error = null;
     });
+  }
+
+  /// Watchdog reconnect for a confirmed-stalled pane: refetch the stream URL
+  /// (go2rtc's restream address can change across a Crumb reconcile) and
+  /// re-open the CURRENT player in place — same as the Tauri client's
+  /// `reload_pane` (loadfile into the existing pane). Deliberately distinct
+  /// from [_reloadStream], which spins up a second player to avoid a black
+  /// flash on a user-initiated main/sub swap; here the pane is already frozen,
+  /// so an in-place re-open keeps the watchdog's final `player` handle valid.
+  Future<void> _reconnectStalled() async {
+    final player = _player;
+    if (player == null) return;
+    // A user stream-swap is mid-flight (old player still rendering while the
+    // replacement decodes) — let that resolve rather than re-opening the
+    // outgoing player underneath it; the watchdog retries on its next tick.
+    if (_pending != null) return;
+    try {
+      final streams = await widget.api.cameraStreams(
+        widget.session,
+        widget.camera.id,
+      );
+      final url =
+          widget.streamPrefs?.liveStreamUrl(
+            widget.camera.id,
+            streams,
+            isMaximized: _zoomedToMain,
+          ) ??
+          streams.preferredForWall;
+      if (url == null) return;
+      // Reset the live indicator so a stale/reconnecting pane never reads as
+      // live; the width listener flips it back on the first decoded frame.
+      if (mounted) setState(() => _firstFrame = false);
+      await player.open(Media(url));
+      _watchdog?.resetBaseline();
+    } catch (_) {
+      // Left for the next backoff tick — the watchdog never gives up.
+    }
   }
 
   /// First decoded frame from [player]. For the pane's active player this
@@ -910,6 +991,7 @@ class _WallTileState extends State<_WallTile> {
 
   @override
   void dispose() {
+    _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
     _pending?.dispose();
@@ -1059,7 +1141,9 @@ class _WallTileState extends State<_WallTile> {
                     ),
                   ),
 
-                  // Camera-name label (bottom-left), with a live/offline dot.
+                  // Camera-name label (bottom-left), with a live/offline dot
+                  // and a subtle "Reconnecting…" badge while the watchdog is
+                  // retrying a stalled feed.
                   Positioned(
                     left: 6,
                     bottom: 6,
@@ -1071,6 +1155,9 @@ class _WallTileState extends State<_WallTile> {
                       decoration: BoxDecoration(
                         color: Colors.black.withValues(alpha: 0.55),
                         borderRadius: BorderRadius.circular(6),
+                        border: _reconnecting
+                            ? Border.all(color: Colors.amber.shade400, width: 1)
+                            : null,
                       ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
@@ -1082,9 +1169,9 @@ class _WallTileState extends State<_WallTile> {
                               shape: BoxShape.circle,
                               color: _error != null
                                   ? Colors.red
-                                  : (_firstFrame
-                                        ? Colors.greenAccent
-                                        : Colors.amber),
+                                  : (_reconnecting || !_firstFrame
+                                        ? Colors.amber
+                                        : Colors.greenAccent),
                             ),
                           ),
                           const SizedBox(width: 6),
@@ -1095,6 +1182,17 @@ class _WallTileState extends State<_WallTile> {
                               fontSize: 12,
                             ),
                           ),
+                          if (_reconnecting) ...[
+                            const SizedBox(width: 6),
+                            const Text(
+                              'Reconnecting…',
+                              style: TextStyle(
+                                color: Colors.amberAccent,
+                                fontSize: 11,
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -1173,6 +1271,15 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// until then the warm-start controller (if any) covers the wait.
   bool _firstFrame = false;
 
+  /// Per-pane stall watchdog for the maximized (main-stream) player: without
+  /// it a camera reboot / go2rtc restart / PoE blip froze the full-pane view
+  /// on its last frame forever (P0-6). Reconnects in place with backoff.
+  PaneWatchdog? _watchdog;
+
+  /// True while the watchdog is retrying a stalled main stream — drives the
+  /// "Reconnecting…" caption by the camera name.
+  bool _reconnecting = false;
+
   /// Decoded video dimensions — needed to undo the BoxFit.contain letterbox
   /// when mapping a click on the pane to a point ON THE VIDEO for PTZ.
   int? _videoW;
@@ -1215,6 +1322,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   }
 
   Future<void> _load() async {
+    // Track a Player created below so the catch can dispose it if open() throws
+    // before this pane adopts it — a failed initial load otherwise leaks the
+    // player and its native mpv handle (#132). Cleared once ownership passes to
+    // the pane (`_player`/`_controller`).
+    Player? spawned;
     try {
       final streams = await widget.api.cameraStreams(
         widget.session,
@@ -1228,6 +1340,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       }
       final player = Player();
       final controller = VideoController(player);
+      spawned = player;
       final p = player.platform;
       if (p is NativePlayer) {
         for (final kv in const [
@@ -1279,12 +1392,47 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         'max:${widget.camera.id}',
         AudioPane.forPlayer(player, hasAudio: () => mounted),
       );
+      _watchdog =
+          PaneWatchdog(
+            player: player,
+            reconnect: _reconnectStalled,
+            onReconnectingChanged: (on) {
+              if (mounted) setState(() => _reconnecting = on);
+            },
+          )..start();
       setState(() {
         _player = player;
         _controller = controller;
       });
+      spawned = null; // ownership handed off — the catch must not dispose it
     } catch (_) {
+      // A Player created before open() failed is orphaned; dispose it so its
+      // native mpv handle isn't leaked on a failed initial load (#132). On the
+      // success path spawned is nulled above (after _player/_controller adopt
+      // it), so a live/reconnecting player is never disposed here.
+      spawned?.dispose();
       if (mounted) setState(() => _error = 'load failed');
+    }
+  }
+
+  /// Watchdog reconnect for a confirmed-stalled maximized pane: refetch the
+  /// main stream URL and re-open the current player in place (the pane is
+  /// already frozen, so no black-flash concern). The full-pane view keeps its
+  /// last frame until the reconnected stream decodes, then resumes seamlessly.
+  Future<void> _reconnectStalled() async {
+    final player = _player;
+    if (player == null) return;
+    try {
+      final streams = await widget.api.cameraStreams(
+        widget.session,
+        widget.camera.id,
+      );
+      final url = streams.rtspMain ?? streams.preferredForWall;
+      if (url == null) return;
+      await player.open(Media(url));
+      _watchdog?.resetBaseline();
+    } catch (_) {
+      // Left for the next backoff tick — the watchdog never gives up.
     }
   }
 
@@ -1447,6 +1595,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   @override
   void dispose() {
+    _watchdog?.dispose();
     widget.ptzPanel?.removeListener(_onPtzPanelChanged);
     SnapshotRegistry.instance.unregister('maximized');
     widget.audio?.unregisterPane('max:${widget.camera.id}');
@@ -1629,6 +1778,17 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                                 style: const TextStyle(
                                   color: Colors.cyanAccent,
                                   fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                            if (_reconnecting) ...[
+                              const SizedBox(width: 10),
+                              const Text(
+                                'Reconnecting…',
+                                style: TextStyle(
+                                  color: Colors.amberAccent,
+                                  fontSize: 12,
+                                  fontStyle: FontStyle.italic,
                                 ),
                               ),
                             ],

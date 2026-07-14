@@ -63,8 +63,12 @@ bool isNewerVersion(String? latest, String? own) {
 class UpdateCheckController extends ChangeNotifier {
   UpdateCheckController({required this.api, required this.session});
 
+  /// Adopt a refreshed session (in-place re-auth) so the next poll uses the live
+  /// token instead of the dead one captured at construction. See #131.
+  void updateSession(Session s) => session = s;
+
   final CrumbApi api;
-  final Session session;
+  Session session;
 
   Timer? _timer;
   UpdateCheckResponse? _data;

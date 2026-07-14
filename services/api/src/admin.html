@@ -49,6 +49,13 @@ input::placeholder{color:var(--dim2);}
 select{appearance:none;-webkit-appearance:none;padding-right:30px;
   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2398a2ad' stroke-width='2.5'><path d='M6 9l6 6 6-6'/></svg>");
   background-repeat:no-repeat;background-position:right 10px center;}
+/* Segmented two-state toggle (used where a native <select> popup is unreliable
+   in the embedded webview, and a 2-option control reads better as a toggle). */
+.seg-toggle{display:inline-flex;border:1px solid var(--border2);border-radius:var(--radius);overflow:hidden;}
+.seg-btn{background:var(--surface2);color:var(--dim);border:none;padding:8px 12px;font:inherit;font-size:13px;line-height:1;cursor:pointer;min-height:32px;width:auto;}
+.seg-btn+.seg-btn{border-left:1px solid var(--border2);}
+.seg-btn.active{background:var(--accent-soft);color:var(--text);font-weight:600;}
+.seg-btn:hover:not(.active){color:var(--text);}
 label.field-label{display:block;font-size:12px;color:var(--dim);font-weight:500;letter-spacing:.1px;margin:var(--sp-4) 0 5px;}
 /* Visible focus rectangles (keyboard nav + native feel). Text inputs keep their
    accent border; everything else gets a dotted Windows-style focus rect. */
@@ -724,6 +731,11 @@ let CAMS = [], STORAGES = [], POLICIES = [], DEFAULT_POLICY = null, GROUPS = [],
    editing only their own subset of columns. */
 let DETECTION_SERVER = null;
 let SERVER_SETTINGS = null;
+/* License-plate recognition config (GET /config/lpr), fetched at boot and kept
+   fresh by the Detection & clips pane. Its `enabled` flag gates the left-nav
+   Plates entry + the Plates view, so plate reads never surface when capture is
+   off. */
+let LPR_CONFIG = null;
 /* Scrub-preview tunables (issue #10) last GET response — kept so the input
    onchange handlers can re-derive bounds without a re-fetch. */
 let SCRUB_PREVIEW = null;
@@ -3689,6 +3701,9 @@ function directCamsForProfile(profileId) {
 async function loadAll() {
   await ensureStorages(); await ensurePolicies(); await ensureDefaultPolicy();
   await ensureGroups(); await ensureCams(); await ensureUsers(); await ensureRoles();
+  // LPR config gates the Plates nav entry; fail-soft so a config hiccup never
+  // blanks the tree (Plates simply stays hidden).
+  try { LPR_CONFIG = await api('/config/lpr'); } catch { LPR_CONFIG = null; }
   renderTree();
   // Deep-link / refresh restore: a #/section route in the URL wins; else the
   // last route this tab was on (sessionStorage, survives the desktop embed's
@@ -3730,6 +3745,7 @@ function routeFor() {
   if (selKind === 'security-root')    return '/security';
   if (selKind === 'storage-root')     return '/storage';
   if (selKind === 'detection-root')   return '/detection';
+  if (selKind === 'plates-root')      return '/plates';
   if (selKind === 'notifications-root') return '/notifications';
   if (selKind === 'server-root')      return '/server';
   return '/';
@@ -3783,6 +3799,8 @@ function routeApply(r) {
       return select('security-root');
     }
     if (sec === 'detection')     return select('detection-root');
+    // Plates deep-link only resolves while LPR is enabled; otherwise fall through.
+    if (sec === 'plates' && LPR_CONFIG && LPR_CONFIG.enabled) return select('plates-root');
     if (sec === 'notifications') return select('notifications-root');
     if (sec === 'server')        return select('server-root');
     return selectNone();
@@ -3847,6 +3865,7 @@ function select(kind, id) {
   else if (kind === 'role') renderRole(id);
   else if (kind === 'add-camera') renderAddCamera();
   else if (kind === 'detection-root') renderDetectionClips();
+  else if (kind === 'plates-root') renderPlates();
   else if (kind === 'notifications-root') renderNotifications();
   else if (kind === 'server-root') renderServerSettings();
   else renderWelcome();
@@ -3900,6 +3919,10 @@ function renderTree() {
     item("select('storage-root')",  icon('storage',17),     'Storage',            stoActive, STORAGES.length) +
     `<div class="rail-eyebrow">Intelligence</div>` +
     item("select('detection-root')",     icon('integration',17), 'Detection &amp; clips', detActive, null) +
+    // Plates: only when LPR capture is enabled (privacy-sensitive, off by default).
+    ((LPR_CONFIG && LPR_CONFIG.enabled)
+      ? item("select('plates-root')", icon('cam_lpr',17), 'Plates', selKind==='plates-root', null)
+      : '') +
     item("select('notifications-root')",  icon('bell',17),        'Notifications',        notActive, null) +
     `<div class="rail-eyebrow">Administer</div>` +
     item("select('security-root')", icon('shield',17),      'Users &amp; security', secActive, USERS.length) +
@@ -3928,6 +3951,7 @@ function renderWelcome() {
     </p>
   </div>`;
 }
+
 function renderCamerasRoot() {
   const byName = (a,b)=>(a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
   const total = CAMS.length, rec = CAMS.filter(c => c.enabled).length;
@@ -5806,9 +5830,12 @@ async function loadMotionCacheGauge() {
 async function renderDetectionClips() {
   selKind = 'detection-root'; selId = null;
   $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('integration',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Detection &amp; clips</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
-  let c, s, ha;
-  try { [c, s, ha] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha')]); }
+  let c, s, ha, lpr;
+  try { [c, s, ha, lpr] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha'), api('/config/lpr')]); }
   catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
+  // Keep the cached LPR flag in step with what this pane just fetched, so the
+  // left-nav Plates entry appears/disappears the moment LPR is toggled here.
+  LPR_CONFIG = lpr;
   // Stash the full server settings so saveDetectionServer() can send a COMPLETE
   // /config/server body, that PUT is a whole-row replace with required Crumb
   // fields, so a partial body would 400 (missing fields) or blank the Crumb bases
@@ -5881,6 +5908,22 @@ async function renderDetectionClips() {
       </div>
       <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection).</div>
       <div id="ha-msg" class="form-msg"></div>
+    </div>
+
+    <!-- License-plate recognition (lpr_config): privacy-sensitive, off by default. -->
+    <div class="rp-section-head" style="margin-top:22px">
+      <div class="policy-section-title" style="margin-bottom:0">License-plate recognition</div>
+      <button class="primary sm" onclick="saveLpr()">Save</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Building a database of recognised license plates is <b>privacy-sensitive</b>, so plate capture is <b>off by default</b>. When enabled, plate reads are retained for the window below and are visible only to roles granted the <b>View license plates</b> capability.</div>
+      <label class="chk"><input type="checkbox" id="lpr-enabled" ${lpr.enabled?'checked':''}/> Enable license-plate capture</label>
+      <div class="grid2" style="margin-top:10px">
+        <div><label class="field-label" style="margin-top:0">Plate-read retention (days) ${infoHint('How long recognised plate reads are kept before automatic deletion. 1–3650 days. Independent of footage/storage retention — plate reads are small database records pruned on their own schedule, so deleting video never deletes plate reads and vice-versa.')}</label><input id="lpr-retention" type="number" min="1" max="3650" value="${esc(String(lpr.retention_days))}" /></div>
+        <div><label class="field-label" style="margin-top:0">Match fuzziness (tolerated misreads) ${infoHint('How many characters may differ when matching a read to a watch or ignore plate. Scales with plate length: 20% is about 1 wrong character on a 6-7 char plate; 0% = exact. Frigate ALPR sometimes misreads a character, and this catches those. Applies to both watch (alert) and ignore (drop) entries. Max 50%.')}</label><input id="lpr-fuzz" type="number" min="0" max="50" step="5" value="${esc(String(Math.round((lpr.watchlist_fuzz||0)*100)))}" /></div>
+      </div>
+      <div class="card-hint" style="margin-top:4px">Saving applies immediately, no restart.</div>
+      <div id="lpr-msg" class="form-msg"></div>
     </div>
 
     <!-- Frigate stream address bases (external go2rtc), writes server_settings. -->
@@ -6049,6 +6092,24 @@ async function testHa() {
   } catch (e) {
     if (el) { el.textContent = (e && e.message) || 'Failed'; el.style.color = 'var(--danger)'; }
   }
+}
+/* ── License-plate recognition config (lpr_config) ──
+   Toggles plate CAPTURE (privacy-sensitive, off by default) and the plate-read
+   retention window. On save we refresh the left nav so the Plates entry
+   appears/disappears with the enabled flag. */
+async function saveLpr() {
+  setMsg('lpr-msg', '');
+  const days = parseInt(($('lpr-retention') || {}).value, 10);
+  if (!Number.isFinite(days) || days < 1 || days > 3650) {
+    setMsg('lpr-msg', 'Retention must be between 1 and 3650 days.', 'err'); return;
+  }
+  const fuzzPct = Math.max(0, Math.min(50, parseInt(($('lpr-fuzz') || {}).value, 10) || 0));
+  const body = { enabled: $('lpr-enabled').checked, retention_days: days, watchlist_fuzz: fuzzPct / 100 };
+  try {
+    LPR_CONFIG = await api('/config/lpr', { method: 'PUT', body: JSON.stringify(body) });
+    renderTree();               // show/hide the Plates nav entry to match
+    toast('License-plate settings saved.');
+  } catch (e) { setMsg('lpr-msg', e.message, 'err'); }
 }
 /* ── Frigate URL-base test (POST /config/frigate/test-http) ──────────────────
    Server-side probe of the go2rtc REST base + Frigate HTTP API base (the
@@ -8434,6 +8495,7 @@ const ROLE_CAP_FIELDS = [
   { key: 'export',       label: 'Export',         hint: 'Build and download export batches.' },
   { key: 'ptz',          label: 'PTZ control',    hint: 'Operate pan / tilt / zoom on PTZ cameras.' },
   { key: 'manage_views', label: 'Manage views',   hint: 'Create, edit and delete saved live-wall views.' },
+  { key: 'view_plates',  label: 'View license plates', hint: 'Sensitive: see recognised license-plate reads and search the plate database for this role’s cameras.' },
 ];
 
 /** Build the capability checkboxes + bookmarks selector for a role form. pfx = field prefix. */
@@ -8626,6 +8688,9 @@ const SYS_ALERT_META = {
   policy_over_cap:      { title: 'Recording policy over cap',         desc: 'A policy’s live or archive footage is at/over its configured byte cap.', unit: null },
   backup_failed:        { title: 'Database backup failed',            desc: 'The Postgres backup job reported a failure.', unit: null },
   frigate_disconnected: { title: 'Frigate / MQTT disconnected',       desc: 'The Frigate detection integration has lost its MQTT connection.', unit: 'secs' },
+  stream_no_segments:   { title: 'Camera records nothing',            desc: 'A camera keeps connecting but never produces a recordable segment before the stall watchdog reconnects it, so no footage is saved. Usually a long/adaptive keyframe interval (smart codec, e.g. Hikvision/Dahua H.264+/H.265+) or very low fps, exceeding the segment-receipt timeout. Fix the camera’s I-frame interval / disable the smart codec, or raise SEGMENT_RECEIPT_TIMEOUT_SECS.', unit: null },
+  storage_unwritable:   { title: 'Storage not writable',              desc: 'The recorder cannot create a camera’s media directory under the storage root (permission denied) — footage is NOT being saved. Usually the host media dir is root-owned while the recorder runs as non-root uid 1001; fix the media dir ownership/permissions.', unit: null },
+  plate_watchlist_hit:  { title: 'License-plate watchlist hit',        desc: 'A watchlisted license plate was seen on a camera (managed in Plates → Watchlist).', unit: null },
 };
 
 /* Per-kind connection-field descriptors. */
@@ -8648,6 +8713,190 @@ const NOTIF_KIND_LABEL = {
   discord:'Discord', slack:'Slack', pushover:'Pushover',
   telegram:'Telegram', ntfy:'ntfy', webhook:'Webhook',
 };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PLATES, license-plate reads (GET /plates)
+   Only reachable while LPR capture is enabled (the nav entry is gated on
+   LPR_CONFIG.enabled). Camera-scoped + view_plates-gated server-side; we simply
+   scope the query to every camera the console holds and let the API filter.
+═══════════════════════════════════════════════════════════════════════════ */
+const PLATE_MATCH_MODES = ['contains', 'prefix', 'exact', 'fuzzy'];
+const PLATES_LIMIT = 200;
+
+function renderPlates() {
+  selKind = 'plates-root'; selId = null;
+  const modeOpts = PLATE_MATCH_MODES
+    .map(m => `<option value="${m}" ${m==='contains'?'selected':''}>${esc(m)}</option>`).join('');
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left">
+        <span class="rp-head-icon">${icon('cam_lpr',22)}</span>
+        <div class="rp-head-titles">
+          <div class="rp-head-title">Plates</div>
+          <div class="rp-head-sub">Recognised license-plate reads, most recent first</div>
+        </div>
+      </div>
+    </div>
+    <div class="policy-section" style="margin-top:0">
+      <div class="rp-section-head" style="margin-top:0">
+        <div class="policy-section-title" style="margin-bottom:0">Watchlist</div>
+      </div>
+      <div class="card-hint" style="margin:2px 0 8px 2px">Plates on this list raise a <b>License-plate watchlist hit</b> alert when seen, routed over your configured notification channels (Notifications → System alerts). Off unless a plate is added here.</div>
+      <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
+        <input id="wl-plate" placeholder="Plate (e.g. 7ABC123)" style="max-width:170px;font-family:var(--mono,monospace)" onkeydown="if(event.key==='Enter')addWatch()" />
+        <input id="wl-label" placeholder="Label (optional)" style="max-width:200px" onkeydown="if(event.key==='Enter')addWatch()" />
+        <input type="hidden" id="wl-kind" value="watch"/>
+        <div class="seg-toggle" role="group" aria-label="Watchlist entry kind">
+          <button type="button" id="wl-kind-watch" class="seg-btn active" onclick="setWlKind('watch')">Watch (alert)</button>
+          <button type="button" id="wl-kind-ignore" class="seg-btn" onclick="setWlKind('ignore')">Ignore (drop reads)</button>
+        </div>
+        <label class="chk" style="margin:0"><input type="checkbox" id="wl-notify" checked/> Alert on hit</label>
+        <button class="primary sm" onclick="addWatch()">Add</button>
+      </div>
+      <div id="wl-msg" class="form-msg"></div>
+      <div id="wl-list" style="margin-top:10px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
+    </div>
+    <div class="policy-section" style="margin-top:12px">
+      <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
+        <input id="plate-q" placeholder="Search plate…" style="max-width:240px" onkeydown="if(event.key==='Enter')loadPlates()" />
+        <select id="plate-match" style="max-width:150px">${modeOpts}</select>
+        <button class="primary sm" onclick="loadPlates()">Search</button>
+      </div>
+      <div class="card-hint" style="margin-top:6px">Showing up to ${PLATES_LIMIT} reads across your cameras. Match mode applies to the search text.</div>
+      <div id="plate-results" style="margin-top:12px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
+    </div>`;
+  loadWatchlist();
+  loadPlates();
+}
+
+/* ── plate watchlist (GET/POST/DELETE /lpr/watchlist) ── */
+/* Watch/Ignore segmented toggle: sets the hidden #wl-kind value addWatch reads,
+   and dims the "Alert on hit" checkbox for ignore (which drops the read before
+   it could alert). Replaces a native <select> that would not open in the
+   embedded webview. */
+function setWlKind(k) {
+  const el = $('wl-kind'); if (!el) return;
+  el.value = k;
+  const w = $('wl-kind-watch'), i = $('wl-kind-ignore');
+  if (w) w.classList.toggle('active', k === 'watch');
+  if (i) i.classList.toggle('active', k === 'ignore');
+  const n = $('wl-notify');
+  if (n && n.parentElement) n.parentElement.style.opacity = k === 'ignore' ? '0.4' : '1';
+}
+async function loadWatchlist() {
+  const host = $('wl-list'); if (!host) return;
+  let list;
+  try { list = await api('/lpr/watchlist'); }
+  catch (e) { host.innerHTML = `<div class="form-msg err">${esc(e.message)}</div>`; return; }
+  if (selKind !== 'plates-root' || !$('wl-list')) return; // navigated away
+  if (!list || !list.length) {
+    host.innerHTML = `<div class="card-hint" style="padding:6px 2px">No plates on the watchlist yet.</div>`;
+    return;
+  }
+  host.innerHTML = list.map(w => {
+    const ignore = w.kind === 'ignore';
+    const dot = ignore
+      ? `<span title="Ignored — matching reads are dropped" style="color:var(--danger)">⊘</span>`
+      : (w.notify
+        ? `<span title="Alerts on hit" style="color:var(--ok)">●</span>`
+        : `<span title="Silent (tracked, no alert)" style="color:var(--dim2)">○</span>`);
+    const kindTag = ignore ? `<span class="pill" style="font-size:10px">ignore</span>` : '';
+    const label = w.label ? `<span style="font-size:12px;color:var(--dim)">${esc(w.label)}</span>` : '';
+    return `
+    <div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border)">
+      ${dot}
+      <span style="flex:0 0 130px;font-weight:600;font-family:var(--mono,monospace)">${esc(w.plate)}</span>
+      ${kindTag}
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</span>
+      <button class="danger-ghost sm" onclick="delWatch('${esc(w.id)}','${esc(w.plate)}')">Remove</button>
+    </div>`;
+  }).join('');
+}
+
+async function addWatch() {
+  setMsg('wl-msg', '');
+  const plate = ($('wl-plate') || {}).value ? $('wl-plate').value.trim() : '';
+  if (!plate) { setMsg('wl-msg', 'Enter a plate to watch.', 'err'); return; }
+  const body = {
+    plate,
+    label: (($('wl-label') || {}).value || '').trim() || null,
+    notify: !!($('wl-notify') || {}).checked,
+    kind: ($('wl-kind') || {}).value || 'watch',
+  };
+  try {
+    await api('/lpr/watchlist', { method: 'POST', body: JSON.stringify(body) });
+    $('wl-plate').value = ''; $('wl-label').value = '';
+    toast('Added to watchlist.');
+    loadWatchlist();
+  } catch (e) { setMsg('wl-msg', e.message, 'err'); }
+}
+
+async function delWatch(id, plate) {
+  if (!confirm(`Remove ${plate} from the watchlist?`)) return;
+  try {
+    await api('/lpr/watchlist/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Removed from watchlist.');
+    loadWatchlist();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* Pre-fill the watchlist add box from a plate read row, then scroll to it. */
+function watchPlate(plate) {
+  const el = $('wl-plate'); if (!el) return;
+  el.value = plate;
+  el.focus();
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+/* Fetch + paint the plate table from the current search box / match mode. */
+async function loadPlates() {
+  const host = $('plate-results'); if (!host) return;
+  const q    = ($('plate-q') || {}).value ? $('plate-q').value.trim() : '';
+  const match = ($('plate-match') || {}).value || 'contains';
+  const camIds = (CAMS || []).map(c => c.id).join(',');
+  host.innerHTML = `<div class="card-hint" style="padding:6px 2px">Loading…</div>`;
+  const params = new URLSearchParams();
+  if (camIds) params.set('camera_ids', camIds);
+  if (q) { params.set('q', q); params.set('match', match); }
+  params.set('limit', String(PLATES_LIMIT));
+  let data;
+  try { data = await api('/plates?' + params.toString()); }
+  catch (e) { host.innerHTML = `<div class="form-msg err">${esc(e.message)}</div>`; return; }
+  if (selKind !== 'plates-root' || !$('plate-results')) return; // navigated away mid-fetch
+  renderPlateTable(host, data);
+}
+
+function renderPlateTable(host, data) {
+  const plates = (data && data.plates) || [];
+  if (!plates.length) {
+    host.innerHTML = `<div class="card-hint" style="padding:6px 2px">No plate reads found.</div>`;
+    return;
+  }
+  const camName = id => { const c = (CAMS || []).find(x => x.id === id); return c ? c.name : id; };
+  const rows = plates.map(p => {
+    const when = p.ts ? new Date(p.ts).toLocaleString() : '—';
+    const conf = (p.confidence == null) ? '—' : Math.round(p.confidence * 100) + '%';
+    const src  = p.source_id || '—';
+    const rawNote = (p.plate_raw && p.plate_raw !== p.plate) ? ` title="raw: ${esc(p.plate_raw)}"` : '';
+    return `
+    <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);min-width:0">
+      <span style="flex:0 0 130px;font-weight:600;font-family:var(--mono,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"${rawNote}>${esc(p.plate || '—')}</span>
+      <span style="flex:0 0 170px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(camName(p.camera_id))}">${esc(camName(p.camera_id))}</span>
+      <span style="flex:1;font-size:12px;color:var(--dim);white-space:nowrap">${esc(when)}</span>
+      <span style="flex:0 0 60px;font-size:12px;color:var(--dim)">${esc(conf)}</span>
+      <span style="flex:0 0 120px;font-size:12px;color:var(--dim2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(src)}">${esc(src)}</span>
+    </div>`;
+  }).join('');
+  const more = (data && data.has_more)
+    ? `<div class="card-hint" style="margin-top:8px">More reads exist, narrow your search to see them.</div>` : '';
+  host.innerHTML = `
+    <div style="display:flex;gap:10px;padding:2px 0 4px;font-size:11px;color:var(--dim2)">
+      <span style="flex:0 0 130px">Plate</span><span style="flex:0 0 170px">Camera</span><span style="flex:1">Time</span><span style="flex:0 0 60px">Conf.</span><span style="flex:0 0 120px">Source</span>
+    </div>
+    ${rows}
+    <div class="card-hint" style="margin-top:8px">${esc(String((data && data.total) != null ? data.total : plates.length))} total plate read${((data && data.total) === 1) ? '' : 's'}.</div>
+    ${more}`;
+}
 
 async function renderNotifications() {
   selKind = 'notifications-root'; selId = null;

@@ -551,6 +551,9 @@ async fn create_channel(
         return Err(ApiError::BadRequest("name must not be empty".to_owned()));
     }
 
+    // P0-5: a non-admin may not scope a channel to cameras outside their grants.
+    assert_camera_ids_in_scope(&user, body.camera_ids.as_deref())?;
+
     // Only Admins may create global channels (user_id = NULL).
     let owner = if body.global && matches!(user.role, UserRole::Admin) {
         None
@@ -578,6 +581,31 @@ async fn create_channel(
         "notification channel created"
     );
     Ok((StatusCode::CREATED, Json(ChannelResponse::from_channel(ch))))
+}
+
+/// Reject a non-admin caller supplying `camera_ids` outside their own grants
+/// (P0-5). A channel's camera scope must never exceed what its owner is allowed
+/// to see, so a Viewer may only list cameras in their assigned scope. Admins may
+/// set any cameras. An absent/empty list is always allowed — it means "all
+/// cameras the owner can access", which the fan-out already intersects with the
+/// owner's live grants, so it can never leak a camera the owner loses access to.
+fn assert_camera_ids_in_scope(
+    user: &AuthUser,
+    camera_ids: Option<&[Uuid]>,
+) -> Result<(), ApiError> {
+    if user.is_admin() {
+        return Ok(());
+    }
+    if let Some(ids) = camera_ids {
+        for id in ids {
+            if !user.camera_ids.contains(id) {
+                return Err(ApiError::Forbidden(format!(
+                    "camera {id} is not in your assigned camera list"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a channel and assert the caller owns it (or is Admin).
@@ -612,6 +640,10 @@ async fn update_channel(
     Json(body): Json<UpdateChannelRequest>,
 ) -> Result<Json<ChannelResponse>, ApiError> {
     let existing = resolve_owned_channel(state.pool(), id, &user).await?;
+
+    // P0-5: a non-admin may not widen a channel's camera scope beyond their
+    // grants (only checks a newly-supplied list; an absent list keeps existing).
+    assert_camera_ids_in_scope(&user, body.camera_ids.as_deref())?;
 
     let params = db::UpdateChannelParams {
         id,
@@ -1069,6 +1101,32 @@ pub async fn run_notification_engine(
             }
         }
 
+        // ── resolve channel-owner grants from the DB (P0-5) ───────────────────
+        // The channel fan-out must intersect delivery with the OWNER's real
+        // access (role + per-camera grants + capabilities), resolved fresh from
+        // the DB — NOT inferred from the push-device snapshot (an owner with no
+        // registered device would otherwise appear to have no access, or, worse,
+        // a channel's own camera_ids would silently replace the owner check).
+        // Global channels (user_id = None) have no owner and are unrestricted.
+        let mut owner_grants: HashMap<Uuid, db::UserGrants> = HashMap::new();
+        for ch in &enabled_channels {
+            if let Some(uid) = ch.user_id {
+                if let std::collections::hash_map::Entry::Vacant(e) = owner_grants.entry(uid) {
+                    match db::resolve_user_grants(&pool, uid).await {
+                        Ok(Some(g)) => {
+                            e.insert(g);
+                        }
+                        // Owner row missing (deleted) → leave absent; the
+                        // fan-out treats "no grants" as no camera access.
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, user_id = %uid, "notification engine: resolve_user_grants failed");
+                        }
+                    }
+                }
+            }
+        }
+
         let now = Utc::now();
 
         for event in &events {
@@ -1296,27 +1354,23 @@ pub async fn run_notification_engine(
                 // For global channels (no owner) only the channel's own
                 // camera_ids scope applies (empty = all).
                 if let Some(ch_owner_id) = ch.user_id {
-                    // Probe owner role + accessible cameras from devices_with_owners.
-                    // Owners who have no devices still get rule-based gating below,
-                    // but we can't determine their role from this cache — treat as
-                    // non-admin (safe: they'll only get cameras they're in camera_ids
-                    // for if that list is non-empty).
-                    let owner_entry = devices_with_owners
-                        .iter()
-                        .find(|(d, _, _)| d.user_id == ch_owner_id);
-                    let owner_is_admin =
-                        owner_entry.is_some_and(|(_, r, _)| matches!(r, UserRole::Admin));
-                    let owner_cam_ids: &[Uuid] =
-                        owner_entry.map_or(&[], |(_, _, ids)| ids.as_slice());
+                    // Owner access (role + per-camera grants) resolved from the
+                    // DB — the OUTER bound, always enforced (P0-5). A missing
+                    // entry means the owner was deleted / unresolvable → no
+                    // access (non-admin, empty cameras) → drop.
+                    let grants = owner_grants.get(&ch_owner_id);
+                    let owner_is_admin = grants.is_some_and(|g| g.is_admin);
+                    let owner_cam_ids: &[Uuid] = grants.map_or(&[], |g| g.camera_ids.as_slice());
 
-                    // Channel camera_ids scope (explicit override).
+                    // INTERSECT (not replace): the event's camera must be within
+                    // the owner's access AND (if the channel has an explicit
+                    // camera_ids scope) within that scope too. An empty channel
+                    // scope means "all cameras the owner can access".
+                    if !owner_is_admin && !owner_cam_ids.contains(&event.camera_id) {
+                        continue;
+                    }
                     let ch_cam_ids = ch.camera_ids.as_deref().unwrap_or(&[]);
-                    if ch_cam_ids.is_empty() {
-                        // No channel-level scope: fall back to owner access.
-                        if !owner_is_admin && !owner_cam_ids.contains(&event.camera_id) {
-                            continue;
-                        }
-                    } else if !ch_cam_ids.contains(&event.camera_id) {
+                    if !ch_cam_ids.is_empty() && !ch_cam_ids.contains(&event.camera_id) {
                         continue;
                     }
                 } else {
@@ -1620,7 +1674,55 @@ const NO_CAMERA_COOLDOWN_KEY: Uuid = Uuid::nil();
 /// camera-event path (re-read fresh each call — cheap, and this poller runs
 /// far less often than the 3 s camera-event tick would if it shared the
 /// enabled-cache; simplicity over micro-optimization here).
-async fn dispatch_system_events_tick(
+/// Fetch a stored detection snapshot (the `system_events.snapshot_url` set for
+/// `plate_watchlist_hit`) so an LPR alert can attach the car+plate image.
+///
+/// Resolves a provider-relative path against the Frigate HTTP API base from the
+/// DB (server settings' `frigate_http_api_base`, then legacy `frigate_api_base`,
+/// then the Frigate integration row's `api_base`); an absolute `http(s)://` URL
+/// is fetched as-is. Best-effort: any miss (no base configured, non-2xx, network
+/// error) returns `None` and the alert simply goes out without an image — never
+/// an error. Mirrors the resolution in `events.rs::get_event_snapshot` (minus
+/// the env fallback, which this background path can't reach).
+async fn fetch_provider_snapshot(
+    pool: &Pool,
+    http_client: &reqwest::Client,
+    snapshot_url: &str,
+) -> Option<Vec<u8>> {
+    let full_url = if snapshot_url.starts_with("http://") || snapshot_url.starts_with("https://") {
+        snapshot_url.to_owned()
+    } else {
+        let base = match db::get_server_settings(pool).await {
+            Ok(Some(s)) if !s.frigate_http_api_base.trim().is_empty() => {
+                Some(s.frigate_http_api_base)
+            }
+            Ok(Some(s)) if !s.frigate_api_base.trim().is_empty() => Some(s.frigate_api_base),
+            _ => db::get_frigate_settings(pool)
+                .await
+                .ok()
+                .flatten()
+                .map(|f| f.api_base)
+                .filter(|v| !v.trim().is_empty()),
+        }?;
+        format!("{}{}", base.trim_end_matches('/'), snapshot_url)
+    };
+    match http_client.get(&full_url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.bytes().await.ok().map(|b| b.to_vec()),
+        Ok(resp) => {
+            tracing::debug!(status = %resp.status(), "lpr alert snapshot: provider non-2xx");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "lpr alert snapshot: fetch failed");
+            None
+        }
+    }
+}
+
+// `pub(crate)` (not private) purely so the RBAC-fan-out integration test can
+// drive a single tick directly — it stays crate-internal (no public API
+// surface; the api is a binary-only crate).
+pub(crate) async fn dispatch_system_events_tick(
     pool: &Pool,
     http_client: &reqwest::Client,
     last_ts: &mut DateTime<Utc>,
@@ -1691,6 +1793,31 @@ async fn dispatch_system_events_tick(
         }
     };
 
+    // ── resolve owner grants for owned channels (P0-5) ────────────────────────
+    // System-event fan-out previously checked ONLY the channel's own camera_ids
+    // scope, never the owner's role/capabilities — so a low-privilege user's
+    // channel could receive a `plate_watchlist_hit` (plate string + crop) with
+    // no `view_plates` grant, or a camera-tagged health alert for a camera the
+    // owner can't see. Resolve each owner's real grants from the DB and gate on
+    // them below. Global channels (user_id = None, admin-managed) are the
+    // operator firehose and stay unrestricted.
+    let mut owner_grants: HashMap<Uuid, db::UserGrants> = HashMap::new();
+    for ch in &enabled_channels {
+        if let Some(uid) = ch.user_id {
+            if let std::collections::hash_map::Entry::Vacant(e) = owner_grants.entry(uid) {
+                match db::resolve_user_grants(pool, uid).await {
+                    Ok(Some(g)) => {
+                        e.insert(g);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, user_id = %uid, "notification engine: resolve_user_grants (system path) failed");
+                    }
+                }
+            }
+        }
+    }
+
     let rules = match db::list_system_alert_rules(pool).await {
         Ok(r) => r,
         Err(err) => {
@@ -1737,8 +1864,19 @@ async fn dispatch_system_events_tick(
         }
 
         // ── cooldown gate (in-memory, keyed by event_key + camera_id) ─────
+        //
+        // For `plate_watchlist_hit` the plate is folded into the identity
+        // (issue #126): keying on `(event_key, camera_id)` alone collapses two
+        // DIFFERENT watchlisted plates seen at the same camera within the
+        // window — the second BOLO would be silently suppressed. Same plate =>
+        // same key => still cooled down (no re-alert spam for one plate);
+        // different plate => different key => alerts independently.
+        let cooldown_ident = match plate_cooldown_discriminator(event) {
+            Some(plate) => format!("{}:{plate}", event.event_key),
+            None => event.event_key.clone(),
+        };
         let cooldown_key = (
-            event.event_key.clone(),
+            cooldown_ident,
             event.camera_id.unwrap_or(NO_CAMERA_COOLDOWN_KEY),
         );
         if let Some(&last_pass) = cooldown_map.get(&cooldown_key) {
@@ -1772,7 +1910,44 @@ async fn dispatch_system_events_tick(
         let title = system_alert_title(&event.event_key);
         cooldown_map.insert(cooldown_key, Instant::now());
 
+        // LPR watchlist hits carry a detection snapshot (the car+plate frame).
+        // Fetch it ONCE if any channel wants images; each channel then attaches
+        // it or not per its own `include_snapshot` toggle (the user's on/off).
+        let snapshot: Option<Vec<u8>> = match &event.snapshot_url {
+            Some(url) if enabled_channels.iter().any(|c| c.include_snapshot) => {
+                fetch_provider_snapshot(pool, http_client, url).await
+            }
+            _ => None,
+        };
+
         for ch in &enabled_channels {
+            // ── owner RBAC gate for OWNED channels (P0-5) ─────────────────────
+            // Global channels (no owner) skip this — admin-managed firehose.
+            if let Some(owner_id) = ch.user_id {
+                let grants = owner_grants.get(&owner_id);
+                let owner_is_admin = grants.is_some_and(|g| g.is_admin);
+
+                // A plate watchlist hit carries the plate string + crop: only
+                // deliver to a channel whose owner holds `view_plates`.
+                if event.event_key == "plate_watchlist_hit"
+                    && !owner_is_admin
+                    && !grants.is_some_and(|g| g.view_plates)
+                {
+                    continue;
+                }
+
+                // A camera-tagged system event requires the owner's camera grant
+                // (same intersect rule as the camera-event path). System-wide
+                // events (camera_id = None) are not about any one camera and are
+                // not camera-gated here.
+                if let Some(cam_id) = event.camera_id {
+                    let owner_cam_ids: &[Uuid] = grants.map_or(&[], |g| g.camera_ids.as_slice());
+                    if !owner_is_admin && !owner_cam_ids.contains(&cam_id) {
+                        continue;
+                    }
+                }
+            }
+
             if let (Some(cam_id), Some(ch_scope)) = (event.camera_id, ch.camera_ids.as_deref()) {
                 if !ch_scope.is_empty() && !ch_scope.contains(&cam_id) {
                     continue;
@@ -1787,7 +1962,11 @@ async fn dispatch_system_events_tick(
                 label: Some(title.to_owned()),
                 ts: event.ts,
                 web_url: None,
-                snapshot: None,
+                snapshot: if ch.include_snapshot {
+                    snapshot.clone()
+                } else {
+                    None
+                },
                 detail: event.detail.clone(),
             };
 
@@ -1840,8 +2019,27 @@ fn system_alert_title(event_key: &str) -> &str {
         "motion_detector_unhealthy" => "Motion detector unhealthy (recording every segment)",
         "motion_cache_unavailable" => "Motion cache unavailable (recording continuously)",
         "storage_persist_failed" => "Storage write failed — footage at risk",
+        "stream_no_segments" => "Camera records nothing (no segments — check keyframe interval)",
+        "storage_unwritable" => "Recorder can't write to storage — footage NOT being saved",
+        "plate_watchlist_hit" => "License-plate watchlist hit",
         other => other,
     }
+}
+
+/// Per-plate cooldown discriminator for `plate_watchlist_hit` (issue #126).
+///
+/// The system event carries no structured plate column, but the ingester writes
+/// the normalized plate (uppercase, no interior spaces) as the third
+/// whitespace token of the detail (`"watchlisted plate <PLATE> ..."`), so it is
+/// recovered by position — robust to the trailing label/confidence text, which
+/// varies between reads of the same plate. Returns `None` for any other event
+/// key, and (fail-safe) for a detail that doesn't parse: the caller then keys on
+/// the plateless identity, i.e. it over-suppresses rather than risks spamming.
+fn plate_cooldown_discriminator(event: &db::SystemEvent) -> Option<&str> {
+    if event.event_key != "plate_watchlist_hit" {
+        return None;
+    }
+    event.detail.as_deref()?.split_whitespace().nth(2)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -1918,6 +2116,66 @@ impl LocalHour for DateTime<chrono::Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sys_event(event_key: &str, detail: Option<&str>) -> db::SystemEvent {
+        db::SystemEvent {
+            id: Uuid::new_v4(),
+            event_key: event_key.to_owned(),
+            camera_id: Some(Uuid::new_v4()),
+            ts: Utc::now(),
+            detail: detail.map(ToOwned::to_owned),
+            snapshot_url: None,
+        }
+    }
+
+    #[test]
+    fn plate_discriminator_distinguishes_plates() {
+        // Two different plates at the same camera must yield different
+        // discriminators (so their cooldown keys differ → both alert).
+        let a = sys_event(
+            "plate_watchlist_hit",
+            Some("watchlisted plate ABC123 seen (confidence 90%)"),
+        );
+        let b = sys_event(
+            "plate_watchlist_hit",
+            Some("watchlisted plate XYZ789 (\"BOLO\") seen (confidence 71%)"),
+        );
+        assert_eq!(plate_cooldown_discriminator(&a), Some("ABC123"));
+        assert_eq!(plate_cooldown_discriminator(&b), Some("XYZ789"));
+        assert_ne!(
+            plate_cooldown_discriminator(&a),
+            plate_cooldown_discriminator(&b)
+        );
+    }
+
+    #[test]
+    fn plate_discriminator_stable_across_confidence_refinement() {
+        // The SAME plate with a different trailing confidence must yield the
+        // SAME discriminator (so the cooldown still suppresses re-alerts).
+        let first = sys_event(
+            "plate_watchlist_hit",
+            Some("watchlisted plate ABC123 seen (confidence 80%)"),
+        );
+        let refined = sys_event(
+            "plate_watchlist_hit",
+            Some("watchlisted plate ABC123 seen (confidence 95%)"),
+        );
+        assert_eq!(
+            plate_cooldown_discriminator(&first),
+            plate_cooldown_discriminator(&refined)
+        );
+    }
+
+    #[test]
+    fn plate_discriminator_only_for_watchlist_hits() {
+        // A non-plate system event never carries a plate discriminator, so its
+        // cooldown identity stays the bare event_key.
+        let health = sys_event("camera_offline", Some("camera Front Door went offline"));
+        assert_eq!(plate_cooldown_discriminator(&health), None);
+        // A malformed/empty detail falls back to None (plateless key = safe).
+        let malformed = sys_event("plate_watchlist_hit", Some(""));
+        assert_eq!(plate_cooldown_discriminator(&malformed), None);
+    }
 
     #[test]
     fn quiet_hours_no_wrap() {

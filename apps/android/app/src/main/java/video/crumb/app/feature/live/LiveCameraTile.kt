@@ -265,6 +265,21 @@ private fun LiveRtspContent(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
+    // #135: registry of every coroutine job that reads or re-prepares `player`
+    // (reconnect, connectivity-regained re-prepare, resume re-prepare, stall
+    // watchdog). ON_STOP cancels them ALL synchronously BEFORE player.release(),
+    // closing the race where a pending re-prepare calls setMediaSource/prepare on
+    // an already-released player — which throws IllegalStateException and can
+    // leave the tile permanently black. Everything here runs on `scope` (the
+    // composition's Main dispatcher), so the list is only ever touched on the main
+    // thread and needs no synchronization. Completed jobs are pruned on insert so
+    // it can't grow unbounded over a long-lived tile's many reconnects.
+    val playerOpsJobs = remember { mutableListOf<Job>() }
+    fun trackPlayerJob(job: Job) {
+        playerOpsJobs.removeAll { it.isCompleted }
+        playerOpsJobs.add(job)
+    }
+
     // Tile-level state driven by Player.Listener callbacks.
     var isBuffering by remember { mutableStateOf(true) }
     // Hard error: only set after auto-reconnect exhausts its FAST attempts. Shows
@@ -375,7 +390,7 @@ private fun LiveRtspContent(
                 player.setMediaSource(source)
                 player.prepare()
                 player.playWhenReady = true
-            }
+            }.also { trackPlayerJob(it) } // #135: cancellable on ON_STOP
         }
 
         val listener = object : Player.Listener {
@@ -484,6 +499,11 @@ private fun LiveRtspContent(
             }
         }
 
+        // #135: also track the watchdog so ON_STOP cancels it before release —
+        // otherwise it can read a released player or fire scheduleReconnect against
+        // one in the window before recomposition disposes this effect.
+        trackPlayerJob(watchdogJob)
+
         onDispose {
             watchdogJob.cancel()
             reconnectJob?.cancel()
@@ -507,7 +527,7 @@ private fun LiveRtspContent(
                 player.setMediaSource(source)
                 player.prepare()
                 player.playWhenReady = true
-            }
+            }.also { trackPlayerJob(it) } // #135
         }
         onDispose { job?.cancel() }
     }
@@ -560,29 +580,41 @@ private fun LiveRtspContent(
                             p.setMediaSource(source)
                             p.prepare()
                             p.playWhenReady = true
-                        }
+                        }.also { trackPlayerJob(it) } // #135
                     } else {
                         p?.play()
                     }
                 }
                 Lifecycle.Event.ON_STOP -> {
+                    // #135: cancel every pending player-touching job FIRST, so none
+                    // of them can call setMediaSource/prepare (or read state) on the
+                    // instance we're about to release — that race threw
+                    // IllegalStateException / left a permanently black tile on a fast
+                    // home-button. Only THEN release the decoder and mark released.
+                    playerOpsJobs.forEach { it.cancel() }
+                    playerOpsJobs.clear()
                     // Fully backgrounded: release the decoder now rather than holding
                     // it for an unbounded background stint.
                     player?.release()
                     tileReleased = true
                 }
                 Lifecycle.Event.ON_START -> {
-                    // Clearing this flips the `remember` key above, which builds a
-                    // BRAND NEW player (playWhenReady = true is set inside that
-                    // builder) — that's what actually starts playback again, not
-                    // anything in ON_RESUME below. ON_RESUME fires right after this
-                    // with `player` still closed-over as null (recomposition hasn't
-                    // run yet), so its branch is a harmless no-op for this path. If
-                    // the player was never actually released (a brief ON_PAUSE-only
-                    // dip that never reached ON_STOP), this is ALSO a no-op — it's
-                    // already false — and ON_RESUME's existing pause-duration check
-                    // handles that case exactly as before.
-                    tileReleased = false
+                    // Only act when returning from a real ON_STOP release (guard so the
+                    // initial LifecycleRegistry ON_START replay on first composition
+                    // doesn't needlessly rebuild the just-built player). Clearing
+                    // `tileReleased` flips the `remember` key above and builds a BRAND
+                    // NEW player (playWhenReady = true is set inside that builder) —
+                    // that, not anything in ON_RESUME, is what restarts playback. The
+                    // generation bump guarantees a fresh player instance so that even
+                    // if some stale job escaped the ON_STOP cancellation above, it can
+                    // only ever touch the OLD (released) instance, never the new live
+                    // one (#135). ON_RESUME fires right after this with `player` still
+                    // closed-over as null (recomposition hasn't run yet), so its branch
+                    // is a harmless no-op for this path.
+                    if (tileReleased) {
+                        playerGeneration += 1
+                        tileReleased = false
+                    }
                 }
                 else -> Unit
             }

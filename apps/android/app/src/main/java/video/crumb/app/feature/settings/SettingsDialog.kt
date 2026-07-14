@@ -58,6 +58,14 @@ fun SettingsDialog(
     store: SecureStore,
     lowBandwidthMode: Boolean,
     onLowBandwidthChange: (Boolean) -> Unit,
+    /**
+     * Whether the auto-built "All Cameras" quick-grid default view is offered on the
+     * Live/Playback wall. Mirrored (not read straight from [store]) so the caller's
+     * copy — which the wall itself reacts to live — stays in sync; see
+     * [onShowAllCamerasViewChange].
+     */
+    showAllCamerasView: Boolean,
+    onShowAllCamerasViewChange: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     // Local mirrors so controls update instantly; every change is persisted.
@@ -171,6 +179,36 @@ fun SettingsDialog(
                     Switch(
                         checked = lowBandwidthMode,
                         onCheckedChange = onLowBandwidthChange,
+                        colors = crumbSwitchColors(),
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                    ) {
+                        Text(
+                            text = "Show \"All Cameras\" quick view",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary,
+                        )
+                        Text(
+                            text = "Auto-build a grid of every camera as a selectable " +
+                                "default view. Turn off to have your own saved views " +
+                                "be the default instead.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                    Switch(
+                        checked = showAllCamerasView,
+                        onCheckedChange = onShowAllCamerasViewChange,
                         colors = crumbSwitchColors(),
                     )
                 }

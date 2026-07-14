@@ -11,6 +11,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'http_client.dart';
 import 'models.dart';
 
 class CrumbApiException implements Exception {
@@ -22,7 +23,7 @@ class CrumbApiException implements Exception {
 }
 
 class CrumbApi {
-  CrumbApi({http.Client? client}) : _http = client ?? http.Client();
+  CrumbApi({http.Client? client}) : _http = client ?? TimeoutClient();
 
   final http.Client _http;
 

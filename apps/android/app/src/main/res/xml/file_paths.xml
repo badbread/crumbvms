@@ -9,4 +9,10 @@
 -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path name="exports" path="exports/" />
+    <!--
+        Plates "Export PDF": the generated license-plate report PDF is written to
+        this app-private cache subdir and shared through the FileProvider as a
+        scoped content:// Uri (see PlatesPdf.kt). Same posture as the export path.
+    -->
+    <cache-path name="reports" path="reports/" />
 </paths>

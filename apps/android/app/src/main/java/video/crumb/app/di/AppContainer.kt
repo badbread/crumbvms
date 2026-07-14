@@ -14,6 +14,7 @@ import video.crumb.app.data.Network
 import video.crumb.app.data.SecureStore
 import video.crumb.app.data.CrumbApi
 import video.crumb.app.data.CrumbRepository
+import video.crumb.app.feature.live.NetworkStatusObserver
 
 /**
  * Manual dependency container — created once in [video.crumb.app.CrumbApp].
@@ -25,6 +26,14 @@ import video.crumb.app.data.CrumbRepository
 class AppContainer(context: Context) {
 
     val store = SecureStore(context.applicationContext)
+
+    /**
+     * The single app-wide connectivity observer. Live tiles subscribe to its
+     * [NetworkStatusObserver.online]/[NetworkStatusObserver.metered] flows instead
+     * of each registering their own [android.net.ConnectivityManager] callback —
+     * one shared callback for the whole process (#137).
+     */
+    val networkStatus = NetworkStatusObserver(context.applicationContext)
 
     /**
      * Emits when an authenticated request returns `401` (session expired or
@@ -54,7 +63,7 @@ class AppContainer(context: Context) {
     private fun buildApiAndClient(): ApiAndClient {
         // On any authenticated 401, clear the token immediately (stops further
         // requests from re-attaching a dead token) and signal the UI to log out.
-        val client = Network.buildOkHttp(store) {
+        val client = Network.buildOkHttp(store, callTimeoutSeconds = 60) {
             store.clearSession()
             _authExpired.tryEmit(Unit)
         }
@@ -78,6 +87,24 @@ class AppContainer(context: Context) {
         current = buildApiAndClient()
         old.dispatcher.executorService.shutdown()
         old.connectionPool.evictAll()
+    }
+
+    /**
+     * Drop every pooled socket and cancel anything queued/in flight on the
+     * CURRENT client, WITHOUT swapping it out. Called on foreground return after
+     * a real background stint and from user-facing Retry actions: keep-alive
+     * connections routinely die silently while backgrounded, and a dead pooled
+     * connection (especially HTTP/2, where every request coalesces onto one
+     * socket) otherwise wedges all API traffic until the process is killed.
+     * Cheap and identity-preserving — api / mediaTokenCache / repository are
+     * untouched (unlike [rebuildApi], which shuts the executor down and would
+     * strand any cached `MediaUrls`); the next request just opens a fresh socket.
+     */
+    @Synchronized
+    fun recoverConnections() {
+        val client = current.client
+        client.dispatcher.cancelAll()
+        client.connectionPool.evictAll()
     }
 
     /** A media-URL builder bound to the current server + scoped-token cache. Cheap; create per use. */

@@ -27,6 +27,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// `GET /cameras/{id}/motion-grid` response (`MotionGrid`, services/common/src/
@@ -185,7 +186,7 @@ class MotionConfigPatch {
 // library-privacy is file-scoped) — mirrors motion_timeline_api.dart /
 // server_dashboard_api.dart, each carrying its own module-level client rather
 // than editing crumb_api.dart.
-final http.Client _client = http.Client();
+final http.Client _client = TimeoutClient();
 
 extension MotionTunerApi on CrumbApi {
   /// `GET /cameras/{id}/motion-grid` — the live per-cell activity grid for the
