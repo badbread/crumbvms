@@ -70,6 +70,15 @@ const CAMERA_MAP_RELOAD: Duration = Duration::from_mins(1);
 /// minimal; reads are a brief `HashMap` lookup with no `.await` held.
 type SharedCameraMap = Arc<RwLock<HashMap<String, Uuid>>>;
 
+/// Frigate camera name → detect resolution `(width, height)` in pixels, from
+/// Frigate's `/api/config`. Needed because the live MQTT attribute boxes are
+/// **pixel corners at the detect resolution** (verified on 0.18 against the
+/// same event's normalized HTTP box) — without the frame dimensions no live
+/// crop box can be normalized and every fresh read renders crop-less until an
+/// API restart re-runs the HTTP backfill. Shared like [`SharedCameraMap`]:
+/// fetched at provider start, refreshed on the same reload tick.
+type SharedDetectDims = Arc<RwLock<HashMap<String, (f32, f32)>>>;
+
 /// Read a snapshot clone of the camera map (poison-tolerant). Cheap — the map is
 /// one small entry per camera — and avoids holding the lock across an `.await`.
 fn camera_map_snapshot(map: &SharedCameraMap) -> HashMap<String, Uuid> {
@@ -191,6 +200,11 @@ pub struct FrigateProvider {
     /// [`CAMERA_MAP_RELOAD`]) so a `source_camera_name` set after startup takes
     /// effect without an API restart.
     camera_map: SharedCameraMap,
+    /// Frigate camera name → detect `(width, height)`, from `/api/config`.
+    /// Empty until the first successful fetch (crop boxes then fall back to
+    /// `None`, exactly the old behavior); refreshed on the reload tick so a
+    /// Frigate that was down at start, or a detect-resolution change, self-heals.
+    detect_dims: SharedDetectDims,
     /// DB pool, used by the periodic camera-map reload task.
     pool: Pool,
     /// Atomic health flag.  `true` when the MQTT event loop last delivered a
@@ -213,6 +227,7 @@ impl FrigateProvider {
         Self {
             cfg,
             camera_map: Arc::new(RwLock::new(camera_map)),
+            detect_dims: Arc::new(RwLock::new(HashMap::new())),
             pool,
             healthy: Arc::new(AtomicBool::new(false)),
             stop_tx,
@@ -224,10 +239,15 @@ impl FrigateProvider {
     /// [`CAMERA_MAP_RELOAD`]. This is what makes a `source_camera_name` set after
     /// the provider started take effect without an API restart. The task stops
     /// when the provider's stop signal fires, and keeps the previous map on a
-    /// transient DB error (never blanks a working map).
+    /// transient DB error (never blanks a working map). The same tick also
+    /// refreshes the Frigate detect resolutions (see [`SharedDetectDims`]) so a
+    /// Frigate that was unreachable at start, or whose detect config changed,
+    /// self-heals within a cycle.
     fn spawn_camera_map_reload(&self) {
         let pool = self.pool.clone();
         let map = Arc::clone(&self.camera_map);
+        let dims = Arc::clone(&self.detect_dims);
+        let api_base = self.cfg.api_base.clone();
         let mut stop_rx = self.stop_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(CAMERA_MAP_RELOAD);
@@ -250,6 +270,28 @@ impl FrigateProvider {
                                 error = %e,
                                 "detection: camera map reload failed (keeping previous map)"
                             ),
+                        }
+                        // Refresh the detect resolutions on the same cadence.
+                        // Keep the previous map on error (never blank a working
+                        // one) — a fetch failure only means crop boxes normalize
+                        // with possibly stale dims until the next tick.
+                        if !api_base.trim().is_empty() {
+                            match fetch_detect_dims(&api_base).await {
+                                Ok(fresh) => {
+                                    let mut guard = dims
+                                        .write()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if *guard != fresh {
+                                        let n = fresh.len();
+                                        *guard = fresh;
+                                        info!(cameras = n, "detection: Frigate detect resolutions reloaded");
+                                    }
+                                }
+                                Err(e) => debug!(
+                                    error = %e,
+                                    "detection: Frigate detect-resolution reload failed (keeping previous)"
+                                ),
+                            }
                         }
                     }
                     res = stop_rx.changed() => {
@@ -292,6 +334,28 @@ impl DetectionSource for FrigateProvider {
             warn!(error = %e, "FrigateProvider: HTTP backfill failed (continuing with MQTT)");
         }
 
+        // ── 1.5 Frigate detect resolutions ────────────────────────────────────
+        // The live MQTT attribute boxes are pixel corners at each camera's
+        // detect resolution; without these dims no live crop box can be
+        // normalized (issue #157). Non-fatal: on failure the reload task retries
+        // on its tick, and until then reads simply carry no crop (old behavior).
+        if !self.cfg.api_base.trim().is_empty() {
+            match fetch_detect_dims(&self.cfg.api_base).await {
+                Ok(fresh) => {
+                    let n = fresh.len();
+                    *self
+                        .detect_dims
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+                    info!(cameras = n, "FrigateProvider: loaded detect resolutions");
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "FrigateProvider: detect-resolution fetch failed (crop boxes unavailable until retry)"
+                ),
+            }
+        }
+
         // ── 2. MQTT subscription ──────────────────────────────────────────────
         let topic = format!("{}/events", self.cfg.mqtt_prefix);
 
@@ -327,6 +391,7 @@ impl DetectionSource for FrigateProvider {
         let topic_clone = topic.clone();
         let healthy_clone = Arc::clone(&self.healthy);
         let camera_map_clone = Arc::clone(&self.camera_map);
+        let detect_dims_clone = Arc::clone(&self.detect_dims);
         let min_score = self.cfg.min_score;
         let mut stop_rx = self.stop_rx.clone();
 
@@ -393,22 +458,29 @@ impl DetectionSource for FrigateProvider {
                             }
                         }
                         Ok(Event::Incoming(Packet::Publish(publish))) => {
-                            // Remember any license_plate crop box on this frame,
-                            // keyed by object id, so a later boxless event that
-                            // actually emits the read still carries the crop box.
-                            if let Some((id, Some(b))) = peek_plate_box(&publish.payload) {
-                                if plate_boxes.len() >= PLATE_BOX_MEMORY_MAX {
-                                    plate_boxes.clear();
-                                }
-                                plate_boxes.insert(id, b);
-                            }
-                            // Read the map under a scoped guard so it's dropped
-                            // before the `.await` below (RwLock guard is !Send).
+                            // Read the maps under scoped guards so they're
+                            // dropped before the `.await` below (RwLock guard
+                            // is !Send).
                             let parsed = {
+                                let dims = detect_dims_clone
+                                    .read()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                // Remember any license_plate crop box on this
+                                // frame, keyed by object id, so a later boxless
+                                // event that actually emits the read still
+                                // carries the crop box.
+                                if let Some((id, Some(b))) =
+                                    peek_plate_box(&publish.payload, &dims)
+                                {
+                                    if plate_boxes.len() >= PLATE_BOX_MEMORY_MAX {
+                                        plate_boxes.clear();
+                                    }
+                                    plate_boxes.insert(id, b);
+                                }
                                 let map = camera_map_clone
                                     .read()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                process_mqtt_payload(&publish.payload, &map, min_score)
+                                process_mqtt_payload(&publish.payload, &map, min_score, &dims)
                             };
                             match parsed {
                                 Ok(Some(mut event)) => {
@@ -538,6 +610,14 @@ struct FrigateEventState {
     // no `current_attributes` collision — that struct keeps the alias.
     #[serde(default, deserialize_with = "de_attributes")]
     current_attributes: Vec<serde_json::Value>,
+    // The tracked object's best-snapshot summary. Frigate keeps the attributes
+    // OF THE SNAPSHOT FRAME here (`snapshot.attributes`, same pixel-corner box
+    // shape as `current_attributes` entries) — on the late frames that actually
+    // emit a plate read (`current_attributes` already empty, plate out of view)
+    // this is where the crop box still lives. Raw JSON so any shape change is
+    // harmless (same tolerance discipline as `current_attributes`).
+    #[serde(default)]
+    snapshot: Option<serde_json::Value>,
 }
 
 /// Deserialize Frigate's `sub_label`, tolerating both wire shapes.
@@ -599,13 +679,16 @@ fn de_attributes<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-/// Pull the `license_plate` attribute's raw box out of Frigate's
-/// `current_attributes` list, as `[x, y, w, h]` — Frigate's *attribute* box
-/// convention: **normalized** top-left + size (each coord in `0..=1`), confirmed
-/// against a live `/api/events` payload. (This differs from Frigate's *object*
-/// `box`, which is pixel corners; the attribute box is not.) Tolerant: a missing
-/// entry, a non-numeric or non-4-element `box`, or the plate attribute simply
-/// being absent all yield `None` — never an error.
+/// Pull the `license_plate` attribute's raw box out of a Frigate attribute
+/// list (`current_attributes` / `data.attributes` / `snapshot.attributes`),
+/// VERBATIM — no unit interpretation here. The wire convention differs by
+/// transport (both verified live on 0.18 against the same event, issue #157):
+/// the HTTP `/api/events` `data.attributes` box is **normalized `[x, y, w, h]`**
+/// (top-left + size in `0..=1`), while the MQTT `current_attributes` /
+/// `snapshot.attributes` box is **pixel corners `[x1, y1, x2, y2]`** at the
+/// camera's detect resolution. [`normalize_plate_box`] disambiguates and
+/// normalizes. Tolerant: a missing entry, a non-numeric or non-4-element `box`,
+/// or the plate attribute simply being absent all yield `None` — never an error.
 fn plate_box_from_attributes(attrs: &[serde_json::Value]) -> Option<[f32; 4]> {
     for a in attrs {
         if a.get("label").and_then(serde_json::Value::as_str) != Some("license_plate") {
@@ -657,9 +740,15 @@ fn plate_box_from_attributes(attrs: &[serde_json::Value]) -> Option<[f32; 4]> {
 /// 3. **Clamped normalized `[x, y, w, h]`** — an in-unit box that overflows the
 ///    frame and is not valid corners: clamp the size so it stays inside
 ///    (best-effort for slightly-out-of-range data).
-/// 4. **Pixel `[x, y, w, h]`** (any coord `>1`) WITH frame dimensions: divide by
-///    the frame size. Not exercised today (the ingest paths pass `None`), kept
-///    so a future caller that has the detect resolution can hand it in.
+/// 4. **Pixel corners `[x1, y1, x2, y2]`** (any coord `>1`) WITH frame
+///    dimensions: divide by the frame size. This is the **verified live MQTT
+///    shape** (issue #157): Frigate 0.18 publishes the attribute box as pixel
+///    corners at the camera's detect resolution — e.g. MQTT `[1569, 638, 1668,
+///    695]` for the very event whose HTTP form is the normalized `[0.8172,
+///    0.5907, 0.0516, 0.0528]` × a 1920x1080 detect. Corners win whenever
+///    `x2>x1 && y2>y1`; a pixel `[x, y, w, h]` that can't be corners (`w <= x`
+///    — a plate's width is far smaller than its typical offset) falls through
+///    to origin+size scaling, clamped inside the frame.
 /// 5. Pixel coords with no frame dimensions: `None` — we don't invent a scale.
 ///
 /// Returns `None` for a `None` input or a degenerate (zero-area) box.
@@ -685,11 +774,20 @@ fn normalize_plate_box(raw: Option<[f32; 4]>, frame: Option<(f32, f32)>) -> Opti
         return (cw > 0.0 && ch > 0.0).then_some([a, b, cw, ch]);
     }
 
-    // Rule 4 — pixel [x, y, w, h]: only normalizable with frame dimensions.
+    // Rule 4 — pixel coords: only normalizable with frame dimensions.
     if let Some((fw, fh)) = frame {
         if fw > 0.0 && fh > 0.0 {
             let nx = (a / fw).clamp(0.0, 1.0);
             let ny = (b / fh).clamp(0.0, 1.0);
+            // Corners [x1, y1, x2, y2] first — the verified Frigate MQTT shape.
+            // A real pixel-corners plate always has x2>x1 && y2>y1, so this
+            // reading wins whenever it applies.
+            if c > a && d > b {
+                let nx2 = (c / fw).clamp(0.0, 1.0);
+                let ny2 = (d / fh).clamp(0.0, 1.0);
+                return (nx2 > nx && ny2 > ny).then_some([nx, ny, nx2 - nx, ny2 - ny]);
+            }
+            // Pixel [x, y, w, h] fallback (defensive; not observed on the wire).
             let nw = (c / fw).clamp(0.0, 1.0 - nx);
             let nh = (d / fh).clamp(0.0, 1.0 - ny);
             return (nw > 0.0 && nh > 0.0).then_some([nx, ny, nw, nh]);
@@ -700,12 +798,31 @@ fn normalize_plate_box(raw: Option<[f32; 4]>, frame: Option<(f32, f32)>) -> Opti
     None
 }
 
+/// Pull the plate attribute box out of a `snapshot` sub-object's `attributes`
+/// list (raw JSON). Frigate keeps the snapshot FRAME's attributes here, so the
+/// late, boxless frames that actually emit a plate read (empty
+/// `current_attributes` — the plate already left view) still carry the crop
+/// box of the moment the snapshot was taken. Same tolerant contract as
+/// [`plate_box_from_attributes`]: any missing/odd shape yields `None`.
+fn plate_box_from_snapshot(snapshot: Option<&serde_json::Value>) -> Option<[f32; 4]> {
+    snapshot
+        .and_then(|s| s.get("attributes"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| plate_box_from_attributes(a))
+}
+
 /// Process one MQTT payload and, if it passes all filters, return a
 /// [`NormalizedEvent`].  Returns `Ok(None)` when the event is filtered.
+///
+/// `detect_dims` maps the Frigate camera name to its detect resolution (from
+/// `/api/config`) — required to normalize the pixel-corner attribute boxes the
+/// live MQTT feed carries (issue #157). An absent entry only costs the crop
+/// box, never the plate text or the detection.
 fn process_mqtt_payload(
     payload: &bytes::Bytes,
     camera_map: &HashMap<String, Uuid>,
     min_score: f32,
+    detect_dims: &HashMap<String, (f32, f32)>,
 ) -> Result<Option<NormalizedEvent>> {
     let raw_value: serde_json::Value =
         serde_json::from_slice(payload).context("MQTT payload is not valid JSON")?;
@@ -802,12 +919,18 @@ fn process_mqtt_payload(
             .as_ref()
             .and_then(|(_, s)| *s)
             .or(after.recognized_license_plate_score),
-        // Plate crop box. Frigate MQTT boxes are absolute pixels and the event
-        // carries no frame dimensions, so this normalizes only when the box is
-        // already in 0..1 fractions; a pixel box yields None (the raw box is
-        // still preserved verbatim in `raw` for inspection). Best-effort — a
-        // None here never affects the plate text / detection path.
-        plate_box: normalize_plate_box(plate_box_from_attributes(&after.current_attributes), None),
+        // Plate crop box. The live MQTT attribute box is pixel corners at the
+        // camera's detect resolution (issue #157), so normalization needs the
+        // dims fetched from Frigate's /api/config; a normalized 0..1 box (the
+        // HTTP shape) passes through regardless. The emitting frames usually
+        // have an empty `current_attributes` (plate already out of view) but
+        // still carry the snapshot frame's attributes — fall back to those.
+        // Best-effort — None never affects the plate text / detection path.
+        plate_box: normalize_plate_box(
+            plate_box_from_attributes(&after.current_attributes)
+                .or_else(|| plate_box_from_snapshot(after.snapshot.as_ref())),
+            detect_dims.get(&after.camera).copied(),
+        ),
         raw: raw_value,
     }))
 }
@@ -817,22 +940,86 @@ fn process_mqtt_payload(
 /// a box across an object's lifecycle: Frigate emits the box on mid-track frames
 /// but the recognized text + snapshot on later frames whose `current_attributes`
 /// are empty, so the event that actually emits the read often has no box of its
-/// own. Returns `None` when the payload has no usable object id; the inner
-/// `Option` is the normalized box for this frame (absent when this frame has no
+/// own. The box is looked for on `current_attributes` first, then on the
+/// snapshot frame's `snapshot.attributes`; both are pixel corners at the
+/// camera's detect resolution, normalized via `detect_dims` (issue #157).
+/// Returns `None` when the payload has no usable object id; the inner `Option`
+/// is the normalized box for this frame (absent when this frame has no
 /// `license_plate` attribute). Best-effort and allocation-light — a bad payload
 /// simply yields `None` and never disturbs the parse/emit path below.
-fn peek_plate_box(payload: &bytes::Bytes) -> Option<(String, Option<[f32; 4]>)> {
+fn peek_plate_box(
+    payload: &bytes::Bytes,
+    detect_dims: &HashMap<String, (f32, f32)>,
+) -> Option<(String, Option<[f32; 4]>)> {
     let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let after = v.get("after")?;
     let id = after
         .get("id")
         .and_then(serde_json::Value::as_str)?
         .to_owned();
-    let boxed = after
+    let dims = after
+        .get("camera")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|c| detect_dims.get(c).copied());
+    let raw_box = after
         .get("current_attributes")
         .and_then(serde_json::Value::as_array)
-        .and_then(|a| normalize_plate_box(plate_box_from_attributes(a), None));
-    Some((id, boxed))
+        .and_then(|a| plate_box_from_attributes(a))
+        .or_else(|| plate_box_from_snapshot(after.get("snapshot")));
+    Some((id, normalize_plate_box(raw_box, dims)))
+}
+
+/// Fetch each camera's detect resolution from Frigate's `/api/config` —
+/// `cameras.<name>.detect.{width,height}`. The live MQTT attribute boxes are
+/// pixel corners at this resolution, so without these dims no live crop box
+/// can be normalized (issue #157). Parsed leniently off raw JSON (the config
+/// document is huge and version-varying); cameras without usable dims are
+/// simply absent from the map.
+async fn fetch_detect_dims(api_base: &str) -> Result<HashMap<String, (f32, f32)>> {
+    let url = format!("{}/api/config", api_base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build reqwest client")?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("Frigate /api/config request")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Frigate /api/config returned HTTP {}", resp.status());
+    }
+    let config: serde_json::Value = resp
+        .json()
+        .await
+        .context("parse Frigate /api/config JSON")?;
+    Ok(detect_dims_from_config(&config))
+}
+
+/// Pure extraction half of [`fetch_detect_dims`] (unit-testable): pull
+/// `cameras.<name>.detect.{width,height}` pairs out of a Frigate config
+/// document, skipping cameras with missing or non-positive dimensions.
+fn detect_dims_from_config(config: &serde_json::Value) -> HashMap<String, (f32, f32)> {
+    let mut out = HashMap::new();
+    let Some(cameras) = config.get("cameras").and_then(serde_json::Value::as_object) else {
+        return out;
+    };
+    for (name, cam) in cameras {
+        let detect = cam.get("detect");
+        let w = detect
+            .and_then(|d| d.get("width"))
+            .and_then(serde_json::Value::as_f64);
+        let h = detect
+            .and_then(|d| d.get("height"))
+            .and_then(serde_json::Value::as_f64);
+        if let (Some(w), Some(h)) = (w, h) {
+            #[allow(clippy::cast_possible_truncation)]
+            if w > 0.0 && h > 0.0 {
+                out.insert(name.clone(), (w as f32, h as f32));
+            }
+        }
+    }
+    out
 }
 
 // ── HTTP backfill ─────────────────────────────────────────────────────────────
@@ -1191,7 +1378,7 @@ mod tests {
         });
         let map = HashMap::new();
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(result.is_none(), "false_positive must be filtered");
     }
 
@@ -1217,7 +1404,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), Uuid::new_v4());
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(result.is_none(), "score below min must be filtered");
     }
 
@@ -1248,7 +1435,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(
             result.is_some(),
             "type=new must be accepted (surfaced early)"
@@ -1281,7 +1468,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(
             result.is_none(),
             "update without snapshot transition must be filtered"
@@ -1310,7 +1497,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(
             result.is_some(),
             "snapshot transition update must be accepted"
@@ -1337,7 +1524,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(result.is_some(), "type=end must always be accepted");
         let ev = result.unwrap();
         assert_eq!(ev.lifecycle, EventLifecycle::End);
@@ -1363,7 +1550,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(result.is_some(), "scored sub_label array must parse");
         assert_eq!(result.unwrap().sub_label.as_deref(), Some("Jay's Car"));
     }
@@ -1383,7 +1570,7 @@ mod tests {
         });
         let map = HashMap::new(); // empty — no mapping
         let bytes = bytes::Bytes::from(payload.to_string());
-        let result = process_mqtt_payload(&bytes, &map, 0.3).unwrap();
+        let result = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new()).unwrap();
         assert!(result.is_none(), "unmapped camera must return None");
     }
 
@@ -1436,13 +1623,29 @@ mod tests {
 
     #[test]
     fn normalize_plate_box_with_frame_dims() {
-        // Pixel [x,y,w,h] over a 1000x500 frame → [x,y,w,h] fractions.
+        // Pixel corners [x1,y1,x2,y2] — the VERIFIED live Frigate 0.18 MQTT
+        // shape (issue #157): the real captured attribute box [1569, 638,
+        // 1668, 695] on a 1920x1080 detect must match the normalized xywh
+        // ([0.8172, 0.5907, 0.0516, 0.0528]) the HTTP API returned for the
+        // very same event.
+        let got = normalize_plate_box(Some([1569.0, 638.0, 1668.0, 695.0]), Some((1920.0, 1080.0)))
+            .expect("pixel corners normalize with dims");
+        assert!((got[0] - 0.817_187_5).abs() < 1e-5, "x1 = 1569/1920");
+        assert!((got[1] - 0.590_740_7).abs() < 1e-5, "y1 = 638/1080");
+        assert!((got[2] - 0.051_562_5).abs() < 1e-5, "w = (1668-1569)/1920");
+        assert!((got[3] - 0.052_777_8).abs() < 1e-5, "h = (695-638)/1080");
+    }
+
+    #[test]
+    fn normalize_plate_box_pixel_xywh_fallback_with_frame_dims() {
+        // A pixel box that CANNOT be corners (c <= a: 100 <= 300) falls through
+        // to the defensive origin+size scaling.
         let got =
-            normalize_plate_box(Some([100.0, 50.0, 300.0, 150.0]), Some((1000.0, 500.0))).unwrap();
-        assert!((got[0] - 0.1).abs() < 1e-6, "x = 100/1000");
-        assert!((got[1] - 0.1).abs() < 1e-6, "y = 50/500");
-        assert!((got[2] - 0.3).abs() < 1e-6, "w = 300/1000");
-        assert!((got[3] - 0.3).abs() < 1e-6, "h = 150/500");
+            normalize_plate_box(Some([300.0, 150.0, 100.0, 50.0]), Some((1000.0, 500.0))).unwrap();
+        assert!((got[0] - 0.3).abs() < 1e-6, "x = 300/1000");
+        assert!((got[1] - 0.3).abs() < 1e-6, "y = 150/500");
+        assert!((got[2] - 0.1).abs() < 1e-6, "w = 100/1000");
+        assert!((got[3] - 0.1).abs() < 1e-6, "h = 50/500");
     }
 
     #[test]
@@ -1612,7 +1815,9 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let ev = process_mqtt_payload(&bytes, &map, 0.3).unwrap().unwrap();
+        let ev = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
         assert!((ev.plate_confidence.expect("confidence") - 0.994).abs() < 1e-3);
         let bbox = ev.plate_box.expect("plate_box captured on MQTT path");
@@ -1653,7 +1858,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let ev = process_mqtt_payload(&bytes, &map, 0.3)
+        let ev = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new())
             .expect("0.18 after with attributes summary map must parse")
             .expect("event produced");
         assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
@@ -1706,7 +1911,9 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("driveway".to_owned(), cam_id);
         let bytes = bytes::Bytes::from(payload.to_string());
-        let ev = process_mqtt_payload(&bytes, &map, 0.3).unwrap().unwrap();
+        let ev = process_mqtt_payload(&bytes, &map, 0.3, &HashMap::new())
+            .unwrap()
+            .unwrap();
         let bbox = ev.plate_box.expect("plate_box captured");
         assert!((bbox[0] - 0.4).abs() < 1e-6);
         assert!((bbox[1] - 0.5).abs() < 1e-6);
@@ -1716,25 +1923,39 @@ mod tests {
 
     #[test]
     fn peek_plate_box_extracts_id_and_box_across_the_lifecycle() {
-        // The box-memory path (issue for missing crops on live reads): a mid-track
-        // frame carries the license_plate box, but the frame that finally emits
-        // the read (recognized text / snapshot) has empty current_attributes.
-        // peek_plate_box pulls the id + box off the box-bearing frame so the loop
-        // can remember it and backfill the boxless emitting frame.
+        // The box-memory path (issue #157, missing crops on live reads): a
+        // mid-track frame carries the license_plate box — as PIXEL CORNERS at
+        // the detect resolution, the verified live 0.18 shape — but the frame
+        // that finally emits the read (recognized text) has empty
+        // current_attributes. peek_plate_box pulls the id + normalized box off
+        // the box-bearing frame so the loop can remember it and backfill the
+        // boxless emitting frame.
+        let mut dims = HashMap::new();
+        dims.insert("driveway".to_owned(), (1920.0_f32, 1080.0_f32));
         let with_box = serde_json::json!({
             "type": "update",
             "after": {
                 "id": "car-42", "camera": "driveway",
                 "current_attributes": [
-                    {"label": "license_plate", "box": [0.4, 0.5, 0.2, 0.15], "score": 0.8}
+                    {"label": "license_plate", "box": [1569, 638, 1668, 695], "score": 0.8}
                 ]
             }
         });
         let (id, boxed) =
-            peek_plate_box(&bytes::Bytes::from(with_box.to_string())).expect("id parsed");
+            peek_plate_box(&bytes::Bytes::from(with_box.to_string()), &dims).expect("id parsed");
         assert_eq!(id, "car-42");
         let b = boxed.expect("box on this frame");
-        assert!((b[0] - 0.4).abs() < 1e-6 && (b[2] - 0.2).abs() < 1e-6);
+        assert!(
+            (b[0] - 0.817_187_5).abs() < 1e-5 && (b[2] - 0.051_562_5).abs() < 1e-5,
+            "pixel corners normalized against the camera's detect dims"
+        );
+
+        // Without detect dims for the camera, a pixel box cannot be scaled —
+        // the id still parses (so `end` cleanup works) but no box is stored.
+        let (_, no_dims_box) =
+            peek_plate_box(&bytes::Bytes::from(with_box.to_string()), &HashMap::new())
+                .expect("id parsed");
+        assert!(no_dims_box.is_none(), "no dims → no invented scale");
 
         // The emitting frame later: same object, but the plate has left view.
         let boxless = serde_json::json!({
@@ -1746,11 +1967,106 @@ mod tests {
             }
         });
         let (id2, boxed2) =
-            peek_plate_box(&bytes::Bytes::from(boxless.to_string())).expect("id parsed");
+            peek_plate_box(&bytes::Bytes::from(boxless.to_string()), &dims).expect("id parsed");
         assert_eq!(id2, "car-42");
         assert!(
             boxed2.is_none(),
             "no box on the emitting frame — must come from memory"
         );
+    }
+
+    #[test]
+    fn peek_plate_box_falls_back_to_snapshot_attributes() {
+        // Real 0.18 `end` frame shape (captured live, issue #157): the tracked
+        // object's `current_attributes` is already empty, but the snapshot
+        // sub-object still carries the snapshot FRAME's attributes — including
+        // the license_plate pixel-corner box. peek must find it there.
+        let mut dims = HashMap::new();
+        dims.insert("lpr".to_owned(), (1920.0_f32, 1080.0_f32));
+        let end_frame = serde_json::json!({
+            "type": "end",
+            "after": {
+                "id": "1784063140.938766-5howdf", "camera": "lpr",
+                "current_attributes": [],
+                "snapshot": {
+                    "frame_time": 1_784_063_141.5f64,
+                    "attributes": [
+                        {"label": "license_plate", "box": [1569, 638, 1668, 695], "score": 0.79}
+                    ]
+                }
+            }
+        });
+        let (id, boxed) =
+            peek_plate_box(&bytes::Bytes::from(end_frame.to_string()), &dims).expect("id parsed");
+        assert_eq!(id, "1784063140.938766-5howdf");
+        let b = boxed.expect("box recovered from snapshot.attributes");
+        assert!((b[0] - 0.817_187_5).abs() < 1e-5);
+        assert!((b[1] - 0.590_740_7).abs() < 1e-5);
+        assert!((b[2] - 0.051_562_5).abs() < 1e-5);
+        assert!((b[3] - 0.052_777_8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn process_mqtt_end_frame_gets_box_from_snapshot_attributes() {
+        // Full-pipeline sibling of the peek test: an `end` frame with empty
+        // current_attributes but a snapshot carrying the pixel-corner plate box
+        // must emit an event whose plate_box is normalized — this is the frame
+        // that actually creates the plate read, so the crop box lands AT INGEST
+        // instead of waiting for a restart's HTTP backfill (issue #157).
+        let cam_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "type": "end",
+            "before": null,
+            "after": {
+                "id": "abc123", "camera": "lpr", "label": "car",
+                "sub_label": null,
+                "recognized_license_plate": ["23134X1", 0.994f64],
+                "score": 0.9, "top_score": 0.95,
+                "start_time": 1_000_000.0f64, "end_time": 1_000_020.0f64,
+                "current_zones": [], "false_positive": false, "has_snapshot": true,
+                "current_attributes": [],
+                "snapshot": {
+                    "frame_time": 1_000_010.0f64,
+                    "attributes": [
+                        {"label": "license_plate", "box": [1569, 638, 1668, 695], "score": 0.79}
+                    ]
+                }
+            }
+        });
+        let mut map = HashMap::new();
+        map.insert("lpr".to_owned(), cam_id);
+        let mut dims = HashMap::new();
+        dims.insert("lpr".to_owned(), (1920.0_f32, 1080.0_f32));
+        let bytes = bytes::Bytes::from(payload.to_string());
+        let ev = process_mqtt_payload(&bytes, &map, 0.3, &dims)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.recognized_plate.as_deref(), Some("23134X1"));
+        let bbox = ev
+            .plate_box
+            .expect("plate_box from snapshot.attributes at ingest");
+        assert!((bbox[0] - 0.817_187_5).abs() < 1e-5);
+        assert!((bbox[2] - 0.051_562_5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn detect_dims_from_config_parses_cameras() {
+        // The subset of Frigate /api/config we consume: cameras.<name>.detect.
+        // Cameras with missing or non-positive dims are skipped, never invented.
+        let config = serde_json::json!({
+            "mqtt": {"host": "127.0.0.1"},
+            "cameras": {
+                "lpr": {"detect": {"width": 1920, "height": 1080, "enabled": true}},
+                "driveway": {"detect": {"width": 1280, "height": 720}},
+                "nodetect": {"ffmpeg": {}},
+                "zero": {"detect": {"width": 0, "height": 720}}
+            }
+        });
+        let dims = detect_dims_from_config(&config);
+        assert_eq!(dims.get("lpr"), Some(&(1920.0, 1080.0)));
+        assert_eq!(dims.get("driveway"), Some(&(1280.0, 720.0)));
+        assert_eq!(dims.get("nodetect"), None, "no detect block → skipped");
+        assert_eq!(dims.get("zero"), None, "non-positive dims → skipped");
+        assert_eq!(detect_dims_from_config(&serde_json::json!({})).len(), 0);
     }
 }
