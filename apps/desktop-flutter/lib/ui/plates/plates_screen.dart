@@ -1616,6 +1616,9 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   // clip has exactly these two renditions (there is no live "Auto" to pick).
   String _quality = 'preview';
   bool _qualityBusy = false;
+  // Drives the custom transport bar's play/pause icon (issue #143): we render
+  // our own minimal controls, not media_kit's native overlay.
+  bool _playing = false;
 
   @override
   void initState() {
@@ -1714,6 +1717,7 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
       }
       _playingSub = player.stream.playing.listen((playing) {
         if (playing) _watchdog?.cancel();
+        if (mounted) setState(() => _playing = playing);
       });
       final controller = VideoController(player);
       setState(() {
@@ -1841,14 +1845,58 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
                         ? const CircularProgressIndicator()
                         : Video(
                             controller: _controller!,
-                            controls: MaterialDesktopVideoControls,
+                            controls: NoVideoControls,
                             fit: BoxFit.contain,
                           ),
               ),
             ),
+            // Our own minimal transport (issue #143): restart + play/pause,
+            // styled like the rest of the pop-up. Native media_kit controls are
+            // suppressed above via NoVideoControls.
+            if (_error == null && _controller != null) _buildTransport(),
             const SizedBox(height: 16),
           ],
         ),
+      ),
+    );
+  }
+
+  /// Minimal control bar: back-to-start and play/pause, driven by the player.
+  Widget _buildTransport() {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          IconButton(
+            tooltip: 'Back to start',
+            onPressed: () {
+              final p = _player;
+              if (p == null) return;
+              p.seek(Duration.zero);
+              p.play();
+            },
+            icon: const Icon(Icons.replay, color: Colors.white70, size: 24),
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            tooltip: _playing ? 'Pause' : 'Play',
+            onPressed: () {
+              final p = _player;
+              if (p == null) return;
+              if (p.state.playing) {
+                p.pause();
+              } else {
+                p.play();
+              }
+            },
+            icon: Icon(
+              _playing ? Icons.pause : Icons.play_arrow,
+              color: Colors.white,
+              size: 28,
+            ),
+          ),
+        ],
       ),
     );
   }
