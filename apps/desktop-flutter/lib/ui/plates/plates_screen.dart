@@ -323,15 +323,31 @@ class _PlatesScreenState extends State<PlatesScreen> {
     await _loadWatchlist();
   }
 
-  /// Per-read "add to watchlist" affordance: adds the row's already-normalized
-  /// plate with default notify-on. Feedback + graceful 403 via a SnackBar.
+  /// Per-read "add to watchlist" affordance: opens the Watch/Ignore chooser for
+  /// the row's already-normalized plate, then upserts the operator's choice.
+  /// Feedback + graceful 403 via a SnackBar.
   Future<void> _addReadToWatchlist(PlateRead read) async {
     if (read.plate.isEmpty) return;
+    final choice = await showWatchlistDialog(
+      context,
+      plate: read.plate,
+      title: 'Add to watchlist',
+    );
+    if (choice == null || !mounted) return;
     try {
-      await _addToWatchlist(plate: read.plate);
+      await _addToWatchlist(
+        plate: read.plate,
+        kind: choice.kind,
+        label: choice.label,
+        notify: choice.notify,
+      );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${read.plate} added to watchlist')),
+        SnackBar(
+          content: Text(choice.kind == 'ignore'
+              ? '${read.plate} added to ignore list'
+              : '${read.plate} added to watchlist'),
+        ),
       );
     } on CrumbApiException catch (e) {
       if (!mounted) return;
@@ -2065,6 +2081,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           ['demuxer-max-back-bytes', '1MiB'],
           ['network-timeout', '10'],
           ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+          // Frame-accurate seeking. Without exact seeks, a small backward seek
+          // snaps to the same keyframe (frame-back appears to do nothing) while
+          // forward crosses into the next frame — so the ± one-frame buttons in
+          // the transport only worked one direction. Force exact seeks.
+          ['hr-seek', 'yes'],
         ]) {
           try {
             await p.setProperty(kv[0], kv[1]);
@@ -2588,6 +2609,42 @@ class _WatchlistPanelState extends State<_WatchlistPanel> {
     }
   }
 
+  /// Edit an existing entry: reuse the shared chooser prefilled from the entry,
+  /// then upsert via [onAdd] (keyed on the normalized plate).
+  Future<void> _editEntry(PlateWatchlistEntry entry) async {
+    final choice = await showWatchlistDialog(
+      context,
+      plate: entry.plate,
+      title: 'Edit watchlist entry',
+      initialKind: entry.isIgnore ? 'ignore' : 'watch',
+      initialLabel: entry.label,
+      initialNotify: entry.notify,
+    );
+    if (choice == null || !mounted) return;
+    try {
+      await widget.onAdd(
+        plate: entry.plate,
+        kind: choice.kind,
+        label: choice.label,
+        notify: choice.notify,
+      );
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.statusCode == 403
+              ? 'Only admins can manage the watchlist.'
+              : e.message),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Save failed: $e')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -2789,6 +2846,7 @@ class _WatchlistPanelState extends State<_WatchlistPanel> {
       itemBuilder: (context, i) {
         final e = widget.entries[i];
         return _WatchlistTile(
+          onEdit: () => _editEntry(e),
           entry: e,
           canManage: widget.canManage,
           onRemove: () => _remove(e),
@@ -3165,15 +3223,152 @@ class _FuzzControlState extends State<_FuzzControl> {
 
 /// One watchlist entry: optional color swatch, plate (mono), label subtitle, a
 /// notify indicator, and (admin only) a Remove button.
+/// Shared Watch/Ignore chooser — used both by the per-read quick-add (the star
+/// on a plate row) and by editing an existing watchlist entry. Returns null on
+/// cancel. `plate` is the normalized key, shown read-only. On confirm returns
+/// the chosen kind ('watch'/'ignore'), optional label, and notify flag.
+Future<({String kind, String? label, bool notify})?> showWatchlistDialog(
+  BuildContext context, {
+  required String plate,
+  required String title,
+  String initialKind = 'watch',
+  String? initialLabel,
+  bool initialNotify = true,
+}) {
+  return showDialog<({String kind, String? label, bool notify})>(
+    context: context,
+    builder: (context) {
+      var kind = initialKind;
+      var notify = initialNotify;
+      final labelCtrl = TextEditingController(text: initialLabel ?? '');
+      return StatefulBuilder(
+        builder: (context, setLocal) {
+          final isIgnore = kind == 'ignore';
+          Widget kindChip(String k, String label, IconData icon, Color c) {
+            final active = kind == k;
+            return Expanded(
+              child: InkWell(
+                onTap: () => setLocal(() => kind = k),
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  decoration: BoxDecoration(
+                    color: active ? c.withValues(alpha: 0.22) : const Color(0xFF2A2D35),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                        color: active ? c : Colors.white12, width: 1),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(icon, size: 15, color: active ? c : Colors.white54),
+                      const SizedBox(width: 6),
+                      Text(label,
+                          style: TextStyle(
+                              color: active ? Colors.white : Colors.white54,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF23262E),
+            title: Text(title,
+                style: const TextStyle(color: Colors.white, fontSize: 16)),
+            content: SizedBox(
+              width: 320,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(plate.isEmpty ? '—' : plate,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.4,
+                          fontFamily: 'monospace',
+                          fontSize: 18)),
+                  const SizedBox(height: 14),
+                  Row(children: [
+                    kindChip('watch', 'Watch', Icons.notifications_active,
+                        const Color(0xFF57C888)),
+                    const SizedBox(width: 8),
+                    kindChip('ignore', 'Ignore', Icons.block,
+                        const Color(0xFFE8A33D)),
+                  ]),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: labelCtrl,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    decoration: const InputDecoration(
+                      labelText: 'Label (optional)',
+                      labelStyle: TextStyle(color: Colors.white38),
+                      isDense: true,
+                      enabledBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white24)),
+                      focusedBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white54)),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Switch(
+                      value: isIgnore ? false : notify,
+                      onChanged:
+                          isIgnore ? null : (v) => setLocal(() => notify = v),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        isIgnore
+                            ? 'Ignore — drops matching reads'
+                            : 'Notify on sighting',
+                        style: const TextStyle(
+                            color: Colors.white54, fontSize: 12),
+                      ),
+                    ),
+                  ]),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final l = labelCtrl.text.trim();
+                  Navigator.pop(
+                    context,
+                    (kind: kind, label: l.isEmpty ? null : l, notify: notify),
+                  );
+                },
+                child: Text(isIgnore ? 'Ignore' : 'Watch'),
+              ),
+            ],
+          );
+        },
+      );
+    },
+  );
+}
+
 class _WatchlistTile extends StatelessWidget {
   const _WatchlistTile({
     required this.entry,
     required this.canManage,
+    required this.onEdit,
     required this.onRemove,
   });
 
   final PlateWatchlistEntry entry;
   final bool canManage;
+  final VoidCallback onEdit;
   final VoidCallback onRemove;
 
   @override
@@ -3249,7 +3444,14 @@ class _WatchlistTile extends StatelessWidget {
               size: 15,
               color: entry.notify ? const Color(0xFF57C888) : Colors.white24,
             ),
-          if (canManage)
+          if (canManage) ...[
+            IconButton(
+              tooltip: 'Edit',
+              onPressed: onEdit,
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.edit_outlined,
+                  size: 15, color: Colors.white38),
+            ),
             IconButton(
               tooltip: 'Remove',
               onPressed: onRemove,
@@ -3257,6 +3459,7 @@ class _WatchlistTile extends StatelessWidget {
               icon: const Icon(Icons.delete_outline,
                   size: 16, color: Colors.white38),
             ),
+          ],
         ],
       ),
     );
