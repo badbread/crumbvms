@@ -119,6 +119,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   // Which layout the results render in (persisted via [PlatesPrefs]).
   PlatesViewMode _viewMode = PlatesViewMode.list;
+  // How plate previews show their image(s) (persisted via [PlatesPrefs]).
+  PlateImageDisplay _imageDisplay = PlateImageDisplay.both;
+  PlateCropCorner _cropCorner = PlateCropCorner.bottomRight;
 
   Timer? _searchDebounce;
   final _thumbGate = _ConcurrencyGate(_thumbConcurrency);
@@ -137,14 +140,32 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   Future<void> _restoreViewMode() async {
     final mode = await PlatesPrefs.getViewMode();
+    final display = await PlatesPrefs.getImageDisplay();
+    final corner = await PlatesPrefs.getCropCorner();
     if (!mounted) return;
-    setState(() => _viewMode = mode);
+    setState(() {
+      _viewMode = mode;
+      _imageDisplay = display;
+      _cropCorner = corner;
+    });
   }
 
   void _setViewMode(PlatesViewMode mode) {
     if (mode == _viewMode) return;
     setState(() => _viewMode = mode);
     PlatesPrefs.setViewMode(mode);
+  }
+
+  void _setImageDisplay(PlateImageDisplay mode) {
+    if (mode == _imageDisplay) return;
+    setState(() => _imageDisplay = mode);
+    PlatesPrefs.setImageDisplay(mode);
+  }
+
+  void _setCropCorner(PlateCropCorner corner) {
+    if (corner == _cropCorner) return;
+    setState(() => _cropCorner = corner);
+    PlatesPrefs.setCropCorner(corner);
   }
 
   /// Load the LPR config so the admin fuzziness control can render. A 403
@@ -444,6 +465,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 read: playing,
                 cameraName:
                     byId[playing.cameraId]?.name ?? '(unknown camera)',
+                imageMode: _imageDisplay,
                 onReport: () => _openPlateReport(playing),
                 onClose: () => setState(() => _playing = null),
                 // Same one-shot seek/focus hand-off the Clips "View on
@@ -557,6 +579,12 @@ class _PlatesScreenState extends State<PlatesScreen> {
               child: const Text('Now', style: TextStyle(fontSize: 12)),
             ),
           _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
+          _DisplayOptionsButton(
+            imageMode: _imageDisplay,
+            cropCorner: _cropCorner,
+            onModeChanged: _setImageDisplay,
+            onCornerChanged: _setCropCorner,
+          ),
           TextButton.icon(
             onPressed: () =>
                 setState(() => _showWatchlist = !_showWatchlist),
@@ -628,6 +656,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
               api: widget.api,
               session: widget.session,
               gate: _thumbGate,
+              imageMode: _imageDisplay,
+              cropCorner: _cropCorner,
               onTap: () => _openRead(p),
               canManage: widget.canManageWatchlist,
               watched: watched.contains(p.plate),
@@ -643,6 +673,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
+          imageMode: _imageDisplay,
+          cropCorner: _cropCorner,
           onTap: _openRead,
         );
       case PlatesViewMode.grouped:
@@ -652,6 +684,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
+          imageMode: _imageDisplay,
+          cropCorner: _cropCorner,
           onTap: _openRead,
           canManage: widget.canManageWatchlist,
           watched: watched,
@@ -665,6 +699,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
+          imageMode: _imageDisplay,
+          cropCorner: _cropCorner,
           onTap: _openRead,
         );
     }
@@ -713,6 +749,76 @@ class _ViewModeToggle extends StatelessWidget {
         seg(PlatesViewMode.gallery, Icons.grid_view, 'Gallery'),
         seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
         seg(PlatesViewMode.timeline, Icons.timeline, 'Timeline feed'),
+      ],
+    );
+  }
+}
+
+/// Toolbar popover to configure how plate previews show their image(s):
+/// full frame + crop / full only / crop only, and (when both) which corner the
+/// crop pins to over the full frame. Persisted via [PlatesPrefs].
+class _DisplayOptionsButton extends StatelessWidget {
+  const _DisplayOptionsButton({
+    required this.imageMode,
+    required this.cropCorner,
+    required this.onModeChanged,
+    required this.onCornerChanged,
+  });
+
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
+  final ValueChanged<PlateImageDisplay> onModeChanged;
+  final ValueChanged<PlateCropCorner> onCornerChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final cornersEnabled = imageMode == PlateImageDisplay.both;
+    PopupMenuItem<Object> header(String text) => PopupMenuItem<Object>(
+          enabled: false,
+          height: 26,
+          child: Text(
+            text,
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.4,
+            ),
+          ),
+        );
+    CheckedPopupMenuItem<Object> modeItem(PlateImageDisplay m, String label) =>
+        CheckedPopupMenuItem<Object>(
+          value: m,
+          checked: imageMode == m,
+          child: Text(label, style: const TextStyle(fontSize: 13)),
+        );
+    CheckedPopupMenuItem<Object> cornerItem(PlateCropCorner c, String label) =>
+        CheckedPopupMenuItem<Object>(
+          value: c,
+          checked: cropCorner == c,
+          enabled: cornersEnabled,
+          child: Text(label, style: const TextStyle(fontSize: 13)),
+        );
+    return PopupMenuButton<Object>(
+      tooltip: 'Image display',
+      icon: const Icon(Icons.photo_size_select_large,
+          color: Colors.white70, size: 18),
+      color: const Color(0xFF23262E),
+      onSelected: (v) {
+        if (v is PlateImageDisplay) onModeChanged(v);
+        if (v is PlateCropCorner) onCornerChanged(v);
+      },
+      itemBuilder: (context) => [
+        header('SHOW'),
+        modeItem(PlateImageDisplay.both, 'Full frame + plate crop'),
+        modeItem(PlateImageDisplay.fullOnly, 'Full frame only'),
+        modeItem(PlateImageDisplay.cropOnly, 'Plate crop only'),
+        const PopupMenuDivider(),
+        header('CROP CORNER (IN CARDS)'),
+        cornerItem(PlateCropCorner.topLeft, 'Top-left'),
+        cornerItem(PlateCropCorner.topRight, 'Top-right'),
+        cornerItem(PlateCropCorner.bottomLeft, 'Bottom-left'),
+        cornerItem(PlateCropCorner.bottomRight, 'Bottom-right'),
       ],
     );
   }
@@ -842,6 +948,8 @@ class _PlateRow extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
     required this.onTap,
     required this.canManage,
     required this.watched,
@@ -854,6 +962,8 @@ class _PlateRow extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
   final VoidCallback onTap;
 
   /// Admin — may add this read's plate to the watchlist.
@@ -881,6 +991,12 @@ class _PlateRow extends StatelessWidget {
               api: api,
               session: session,
               gate: gate,
+              imageMode: imageMode,
+              cropCorner: cropCorner,
+              // The list row has the horizontal room to show both side-by-side.
+              sideBySide: true,
+              width: imageMode == PlateImageDisplay.both ? 150 : 96,
+              height: 58,
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -983,7 +1099,9 @@ class _PlateThumb extends StatefulWidget {
     this.height = 56,
     this.radius = 6,
     this.iconSize = 22,
-    this.cropToBbox = false,
+    this.imageMode = PlateImageDisplay.fullOnly,
+    this.cropCorner = PlateCropCorner.bottomRight,
+    this.sideBySide = false,
   });
 
   final PlateRead read;
@@ -995,11 +1113,20 @@ class _PlateThumb extends StatefulWidget {
   final double radius;
   final double iconSize;
 
-  /// When true and the read has a `bbox`, show the plate region cropped from
-  /// the fetched snapshot (client-side, off the UI isolate, cached) instead of
-  /// the full frame. Falls back to the full frame when bbox is null / crop
-  /// fails. Used by the gallery card; the list/timeline thumbs stay full-frame.
-  final bool cropToBbox;
+  /// Which image(s) to show — the full frame, the plate crop, or both. The crop
+  /// is derived client-side from the fetched snapshot (off the UI isolate,
+  /// cached) and always falls back to the full frame when the read has no bbox
+  /// or the crop fails.
+  final PlateImageDisplay imageMode;
+
+  /// When [imageMode] is `both` and [sideBySide] is false, the corner of the
+  /// full frame the crop is pinned to.
+  final PlateCropCorner cropCorner;
+
+  /// When [imageMode] is `both`, lay the full frame and crop out side-by-side
+  /// (list rows, which have the horizontal room) instead of pinning the crop as
+  /// a corner inset over the full frame (compact/gallery thumbs).
+  final bool sideBySide;
 
   @override
   State<_PlateThumb> createState() => _PlateThumbState();
@@ -1007,7 +1134,7 @@ class _PlateThumb extends StatefulWidget {
 
 class _PlateThumbState extends State<_PlateThumb> {
   Uint8List? _bytes;
-  Uint8List? _crop; // plate-region crop (only when widget.cropToBbox)
+  Uint8List? _crop; // plate-region crop (when imageMode wants it + bbox exists)
   bool _requested = false;
   bool _disposed = false;
 
@@ -1052,7 +1179,7 @@ class _PlateThumbState extends State<_PlateThumb> {
   /// is applied synchronously; a miss computes off the UI isolate and then
   /// setState-s. Keyed by read id (bbox belongs to the read).
   void _maybeCrop(Uint8List bytes) {
-    if (!widget.cropToBbox || _disposed) return;
+    if (widget.imageMode == PlateImageDisplay.fullOnly || _disposed) return;
     final bbox = widget.read.bbox;
     if (bbox == null || bbox.length < 4) return;
     final key = widget.read.id;
@@ -1079,32 +1206,113 @@ class _PlateThumbState extends State<_PlateThumb> {
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final logicalW = widget.width.isFinite ? widget.width : 320.0;
     final cacheW = (logicalW * dpr).round().clamp(1, 1024);
-    // Prefer the plate crop when we have one. A crop is wide/short, so it reads
-    // best letterboxed (contain) rather than cover-cropped again by the tile.
-    final displayBytes = _crop ?? _bytes;
-    final isCrop = _crop != null;
+
+    final full = _bytes;
+    final crop = _crop;
+    // Resolve the operator's display preference against what we actually have.
+    // A crop only exists when the read had a bbox and the client crop succeeded;
+    // when it doesn't, every mode gracefully falls back to the full frame.
+    final wantCrop = widget.imageMode != PlateImageDisplay.fullOnly;
+    final wantFull = widget.imageMode != PlateImageDisplay.cropOnly;
+    final showCrop = wantCrop && crop != null;
+    final showFull = wantFull || !showCrop;
+
+    Widget content;
+    if (full == null && crop == null) {
+      content = _placeholder();
+    } else if (showCrop && showFull && full != null) {
+      content = widget.sideBySide
+          ? _sideBySide(full, crop, cacheW)
+          : _overlay(full, crop, cacheW);
+    } else if (showCrop) {
+      // Crop only: letterbox (a plate is wide/short) on black.
+      content = _img(crop, BoxFit.contain, cacheW, background: true);
+    } else if (full != null) {
+      content = _img(full, BoxFit.cover, cacheW);
+    } else {
+      content = _placeholder();
+    }
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
-      child: SizedBox(
-        width: widget.width,
-        height: widget.height,
-        child: displayBytes != null
-            ? Image.memory(
-                displayBytes,
-                fit: isCrop ? BoxFit.contain : BoxFit.cover,
-                gaplessPlayback: true,
-                cacheWidth: cacheW,
-              )
-            : Container(
-                color: Colors.black,
-                alignment: Alignment.center,
-                child: Icon(
-                  Icons.directions_car_outlined,
-                  color: Colors.white24,
-                  size: widget.iconSize,
+      child: SizedBox(width: widget.width, height: widget.height, child: content),
+    );
+  }
+
+  Widget _img(Uint8List bytes, BoxFit fit, int cacheW, {bool background = false}) {
+    final image = Image.memory(
+      bytes,
+      fit: fit,
+      gaplessPlayback: true,
+      cacheWidth: cacheW,
+    );
+    if (!background) return image;
+    return Container(color: Colors.black, child: image);
+  }
+
+  Widget _placeholder() {
+    return Container(
+      color: Colors.black,
+      alignment: Alignment.center,
+      child: Icon(
+        Icons.directions_car_outlined,
+        color: Colors.white24,
+        size: widget.iconSize,
+      ),
+    );
+  }
+
+  /// Full frame with the plate crop pinned as a bordered inset in the chosen
+  /// corner — the compact/gallery layout.
+  Widget _overlay(Uint8List full, Uint8List crop, int cacheW) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _img(full, BoxFit.cover, cacheW),
+        Align(
+          alignment: switch (widget.cropCorner) {
+            PlateCropCorner.topLeft => Alignment.topLeft,
+            PlateCropCorner.topRight => Alignment.topRight,
+            PlateCropCorner.bottomLeft => Alignment.bottomLeft,
+            PlateCropCorner.bottomRight => Alignment.bottomRight,
+          },
+          child: Padding(
+            padding: const EdgeInsets.all(5),
+            child: FractionallySizedBox(
+              widthFactor: 0.46,
+              heightFactor: 0.42,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.black,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.white70, width: 1),
+                  boxShadow: const [
+                    BoxShadow(color: Colors.black54, blurRadius: 4),
+                  ],
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: Image.memory(
+                  crop,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
                 ),
               ),
-      ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Full frame and plate crop laid out horizontally — the list-row layout,
+  /// where there's room to show both at a glance.
+  Widget _sideBySide(Uint8List full, Uint8List crop, int cacheW) {
+    return Row(
+      children: [
+        Expanded(flex: 3, child: _img(full, BoxFit.cover, cacheW)),
+        const SizedBox(width: 3),
+        Expanded(flex: 2, child: _img(crop, BoxFit.contain, cacheW, background: true)),
+      ],
     );
   }
 }
@@ -1169,6 +1377,8 @@ class _PlateGallery extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
     required this.onTap,
   });
 
@@ -1177,6 +1387,8 @@ class _PlateGallery extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
   final void Function(PlateRead) onTap;
 
   @override
@@ -1199,6 +1411,8 @@ class _PlateGallery extends StatelessWidget {
           api: api,
           session: session,
           gate: gate,
+          imageMode: imageMode,
+          cropCorner: cropCorner,
           onTap: () => onTap(p),
         );
       },
@@ -1214,6 +1428,8 @@ class _PlateGalleryCard extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
     required this.onTap,
   });
 
@@ -1222,6 +1438,8 @@ class _PlateGalleryCard extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
   final VoidCallback onTap;
 
   @override
@@ -1245,9 +1463,12 @@ class _PlateGalleryCard extends StatelessWidget {
                 height: double.infinity,
                 radius: 0,
                 iconSize: 34,
-                // Gallery cards feature the plate itself: show the bbox crop
-                // (falls back to the full frame when there's no bbox).
-                cropToBbox: true,
+                // Gallery cards feature the plate: the crop pins to the chosen
+                // corner over the full frame (or per the operator's display
+                // preference — full-only / crop-only). Falls back gracefully
+                // when there's no bbox.
+                imageMode: imageMode,
+                cropCorner: cropCorner,
               ),
             ),
             Padding(
@@ -1341,6 +1562,8 @@ class _PlateGroupedList extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
     required this.onTap,
     required this.canManage,
     required this.watched,
@@ -1353,6 +1576,8 @@ class _PlateGroupedList extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
   final void Function(PlateRead) onTap;
   final bool canManage;
   final Set<String> watched;
@@ -1399,6 +1624,8 @@ class _PlateGroupedList extends StatelessWidget {
               api: api,
               session: session,
               gate: gate,
+              imageMode: imageMode,
+              cropCorner: cropCorner,
               width: 64,
               height: 40,
             ),
@@ -1432,6 +1659,8 @@ class _PlateGroupedList extends StatelessWidget {
                   api: api,
                   session: session,
                   gate: gate,
+                  imageMode: imageMode,
+                  cropCorner: cropCorner,
                   onTap: () => onTap(r),
                   canManage: canManage,
                   watched: watched.contains(r.plate),
@@ -1458,6 +1687,8 @@ class _PlateTimeline extends StatelessWidget {
     required this.api,
     required this.session,
     required this.gate,
+    required this.imageMode,
+    required this.cropCorner,
     required this.onTap,
   });
 
@@ -1466,6 +1697,8 @@ class _PlateTimeline extends StatelessWidget {
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final PlateImageDisplay imageMode;
+  final PlateCropCorner cropCorner;
   final void Function(PlateRead) onTap;
 
   @override
@@ -1491,6 +1724,8 @@ class _PlateTimeline extends StatelessWidget {
                     api: api,
                     session: session,
                     gate: gate,
+                    imageMode: imageMode,
+                    cropCorner: cropCorner,
                     width: 148,
                     height: 92,
                     iconSize: 34,
@@ -1587,6 +1822,7 @@ class _PlateClipPlayer extends StatefulWidget {
     required this.session,
     required this.read,
     required this.cameraName,
+    required this.imageMode,
     required this.onReport,
     required this.onClose,
     required this.onViewOnTimeline,
@@ -1596,6 +1832,10 @@ class _PlateClipPlayer extends StatefulWidget {
   final Session session;
   final PlateRead read;
   final String cameraName;
+
+  /// Operator's plate-image preference — hides the prominent plate crop above
+  /// the clip when set to full-frame-only.
+  final PlateImageDisplay imageMode;
   final VoidCallback onReport;
   final VoidCallback onClose;
   final VoidCallback onViewOnTimeline;
@@ -1831,8 +2071,10 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
               ),
             ),
             // Prominent plate crop (bbox region of the already-fetched
-            // snapshot), when we have one — renders nothing otherwise.
-            _PlateDetailCrop(read: read),
+            // snapshot), when we have one — renders nothing otherwise. Hidden
+            // when the operator chose full-frame-only.
+            if (widget.imageMode != PlateImageDisplay.fullOnly)
+              _PlateDetailCrop(read: read),
             // Video pane.
             Expanded(
               child: Center(
