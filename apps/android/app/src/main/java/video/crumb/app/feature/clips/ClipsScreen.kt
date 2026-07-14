@@ -444,10 +444,10 @@ private fun ClipPlayerDialog(
         val bmp = (playerView?.videoSurfaceView as? TextureView)?.takeIf { it.isAvailable }?.bitmap
         if (bmp != null) {
             scope.launch {
-                val path = saveFrameToGallery(context, bmp, clip.cameraName.ifBlank { "clip" })
+                val saved = saveFrameToGallery(context, bmp, clip.cameraName.ifBlank { "clip" })
                 Toast.makeText(
                     context,
-                    if (path != null) "Snapshot saved to $path" else "Snapshot failed",
+                    if (saved != null) "Snapshot saved to ${saved.displayPath}" else "Snapshot failed",
                     Toast.LENGTH_SHORT,
                 ).show()
             }

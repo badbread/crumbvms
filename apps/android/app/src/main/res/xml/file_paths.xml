@@ -15,4 +15,11 @@
         scoped content:// Uri (see PlatesPdf.kt). Same posture as the export path.
     -->
     <cache-path name="reports" path="reports/" />
+    <!--
+        Camera snapshots on pre-Q (API < 29): saved to the app-external Pictures
+        dir (getExternalFilesDir(PICTURES)/Crumb) and shared through the
+        FileProvider as a scoped content:// Uri (see Snapshot.kt). On Q+ the
+        MediaStore image entry is shared directly and this path is unused.
+    -->
+    <external-files-path name="snapshots" path="Pictures/" />
 </paths>

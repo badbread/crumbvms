@@ -48,8 +48,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -625,10 +627,19 @@ fun PlaybackScreen(
                 } else {
                     full
                 }
-                val path = saveFrameToGallery(context, bmp, state.cameraName ?: cameraId)
-                snackbarHostState.showSnackbar(
-                    if (path != null) "Snapshot saved to $path" else "Snapshot failed",
-                )
+                val saved = saveFrameToGallery(context, bmp, state.cameraName ?: cameraId)
+                if (saved != null) {
+                    val res = snackbarHostState.showSnackbar(
+                        message = "Snapshot saved to ${saved.displayPath}",
+                        actionLabel = "Share",
+                        duration = SnackbarDuration.Long,
+                    )
+                    if (res == SnackbarResult.ActionPerformed) {
+                        shareImageUri(context, saved.shareUri)
+                    }
+                } else {
+                    snackbarHostState.showSnackbar("Snapshot failed")
+                }
             } else {
                 snackbarHostState.showSnackbar("Snapshot unavailable — video not ready")
             }

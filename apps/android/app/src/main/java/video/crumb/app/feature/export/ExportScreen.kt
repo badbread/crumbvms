@@ -41,15 +41,16 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -103,13 +104,6 @@ fun ExportScreen(onBack: () -> Unit) {
     )
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
-
-    // Show transient download confirmation in a snackbar.
-    LaunchedEffect(state.downloadMsg) {
-        val msg = state.downloadMsg ?: return@LaunchedEffect
-        snackbarHostState.showSnackbar(msg)
-        vm.clearDownloadMsg()
-    }
 
     Scaffold(
         snackbarHost = {
@@ -203,7 +197,6 @@ fun ExportScreen(onBack: () -> Unit) {
                     polling = state.polling,
                     job = job,
                     jobError = jobError,
-                    onDownloadSaved = vm::onDownloadSaved,
                     snackbarHostState = snackbarHostState,
                 )
             }
@@ -492,7 +485,6 @@ private fun JobStatusSection(
     polling: Boolean,
     job: ExportJob?,
     jobError: String?,
-    onDownloadSaved: (String) -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -556,7 +548,6 @@ private fun JobStatusSection(
                 OutputFileRow(
                     container = container,
                     outputFile = outputFile,
-                    onDownloadSaved = onDownloadSaved,
                     snackbarHostState = snackbarHostState,
                 )
             }
@@ -583,17 +574,17 @@ private fun jobStatusLabel(job: ExportJob?): String = when {
  * They differ in destination (#134):
  * - **Download** streams to the device's **public Downloads** collection via
  *   [saveExportToDownloads] (MediaStore on API 29+, the public Downloads dir on
- *   ≤ 28) so the file is user-findable and not silently purged, then reports the
- *   real saved location via [onDownloadSaved].
+ *   ≤ 28) so the file is user-findable and not silently purged, then shows a
+ *   "Saved to …" confirmation with an actionable **Share** action (#164).
  * - **Share** downloads to app-private cache ([downloadExportFileToCache]) and
  *   hands the receiving app a scoped `content://` [FileProvider] Uri (read-only,
- *   this file only) — a transient copy is the right lifetime for a share.
+ *   this file only) — a transient copy is the right lifetime for a share. The
+ *   Download confirmation's Share action reuses this same stage-then-share path.
  */
 @Composable
 private fun OutputFileRow(
     container: AppContainer,
     outputFile: ExportOutputFile,
-    onDownloadSaved: (String) -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
     val context = LocalContext.current
@@ -636,12 +627,33 @@ private fun OutputFileRow(
                         if (busy) return@FilledTonalButton
                         busy = true
                         scope.launch {
-                            saveExportToDownloads(context, container, outputFile)
-                                .onSuccess { location -> onDownloadSaved(location) }
+                            val result = saveExportToDownloads(context, container, outputFile)
+                            busy = false
+                            result
+                                .onSuccess { location ->
+                                    // #164: the "Saved to …" confirmation is now
+                                    // actionable — a "Share" action opens the system
+                                    // share sheet. The public-Downloads copy isn't a
+                                    // FileProvider path, so Share re-stages the file in
+                                    // app cache (downloadExportFileToCache) and shares
+                                    // that scoped content:// Uri (the proven path the
+                                    // dedicated Share button already uses).
+                                    val res = snackbarHostState.showSnackbar(
+                                        message = "Saved to $location",
+                                        actionLabel = "Share",
+                                        duration = SnackbarDuration.Long,
+                                    )
+                                    if (res == SnackbarResult.ActionPerformed) {
+                                        downloadExportFileToCache(context, container, outputFile)
+                                            .onSuccess { file -> shareLocalFile(context, file) }
+                                            .onFailure { e ->
+                                                snackbarHostState.showSnackbar("Share failed: ${e.message}")
+                                            }
+                                    }
+                                }
                                 .onFailure { e ->
                                     snackbarHostState.showSnackbar("Download failed: ${e.message}")
                                 }
-                            busy = false
                         }
                     },
                     enabled = !busy,
