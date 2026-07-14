@@ -10,9 +10,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// `GET /auth/me` response. Deliberately keeps `capabilities` as a raw JSON
@@ -61,7 +60,7 @@ class MeResponse {
 extension BootApi on CrumbApi {
   /// `GET /auth/me` (mounted at the server root under `/auth`, Bearer JWT).
   ///
-  /// Uses a fresh, short-lived [http.Client] per call rather than reaching
+  /// Uses a fresh, short-lived [TimeoutClient] per call rather than reaching
   /// into [CrumbApi]'s internal client (private to crumb_api.dart, which this
   /// feature must not edit) — this is called once per boot attempt, not on a
   /// hot path.
@@ -74,7 +73,7 @@ extension BootApi on CrumbApi {
   ///   catching non-`CrumbApiException` errors) — treat as "server
   ///   unreachable" and retry.
   Future<MeResponse> fetchMe(Session s) async {
-    final client = http.Client();
+    final client = TimeoutClient();
     try {
       final resp = await client.get(
         Uri.parse('${s.base}/auth/me'),

@@ -64,6 +64,12 @@ pub enum ApiError {
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
+    /// Rate limit hit with an explicit client backoff hint: renders 429 plus a
+    /// `Retry-After: <secs>` header (issue #127, the per-username login
+    /// brute-force backoff).
+    #[error("too many requests: {message}")]
+    TooManyRequestsRetry { message: String, retry_after: u64 },
+
     // ── 500 ──────────────────────────────────────────────────────────────────
     /// Unexpected internal error.  Detail is logged but NOT sent to the client.
     #[error("internal server error")]
@@ -88,7 +94,9 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::TooManyRequests(_) | Self::TooManyRequestsRetry { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
         }
@@ -103,7 +111,7 @@ impl ApiError {
             Self::NotFound(_) => "Not Found",
             Self::Conflict(_) => "Conflict",
             Self::UnprocessableEntity(_) => "Unprocessable Entity",
-            Self::TooManyRequests(_) => "Too Many Requests",
+            Self::TooManyRequests(_) | Self::TooManyRequestsRetry { .. } => "Too Many Requests",
             Self::Internal(_) => "Internal Server Error",
             Self::BadGateway(_) => "Bad Gateway",
         }
@@ -144,7 +152,19 @@ impl IntoResponse for ApiError {
             "message": message,
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+
+        // 429 backoff hint: attach `Retry-After: <secs>` so a well-behaved
+        // client (or the login UI) knows how long to wait (issue #127).
+        if let Self::TooManyRequestsRetry { retry_after, .. } = &self {
+            if let Ok(val) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, val);
+            }
+        }
+
+        response
     }
 }
 

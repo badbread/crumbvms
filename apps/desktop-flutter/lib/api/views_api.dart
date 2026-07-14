@@ -22,6 +22,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// A saved wall arrangement (`GET /views` row / `POST /views` response).
@@ -338,7 +339,7 @@ extension SavedViewsApi on CrumbApi {
     }
   }
 
-  Future<http.Response> _get(Session s, String path) => http.get(
+  Future<http.Response> _get(Session s, String path) => sharedHttpClient.get(
     Uri.parse('${s.base}$path'),
     headers: {'authorization': 'Bearer ${s.token}'},
   );
@@ -347,7 +348,7 @@ extension SavedViewsApi on CrumbApi {
     Session s,
     String path,
     Map<String, dynamic> body,
-  ) => http.post(
+  ) => sharedHttpClient.post(
     Uri.parse('${s.base}$path'),
     headers: {
       'authorization': 'Bearer ${s.token}',
@@ -360,7 +361,7 @@ extension SavedViewsApi on CrumbApi {
     Session s,
     String path,
     Map<String, dynamic> body,
-  ) => http.put(
+  ) => sharedHttpClient.put(
     Uri.parse('${s.base}$path'),
     headers: {
       'authorization': 'Bearer ${s.token}',
@@ -369,8 +370,9 @@ extension SavedViewsApi on CrumbApi {
     body: jsonEncode(body),
   );
 
-  Future<http.Response> _delete(Session s, String path) => http.delete(
-    Uri.parse('${s.base}$path'),
-    headers: {'authorization': 'Bearer ${s.token}'},
-  );
+  Future<http.Response> _delete(Session s, String path) =>
+      sharedHttpClient.delete(
+        Uri.parse('${s.base}$path'),
+        headers: {'authorization': 'Bearer ${s.token}'},
+      );
 }

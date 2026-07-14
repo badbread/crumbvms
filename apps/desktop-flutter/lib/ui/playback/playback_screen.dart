@@ -39,6 +39,7 @@ import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'gapless_segment_pane_controller.dart';
+import 'playback_prefs.dart';
 import 'playback_timeline_controller.dart';
 
 class PlaybackScreen extends StatefulWidget {
@@ -54,6 +55,7 @@ class PlaybackScreen extends StatefulWidget {
     this.clientOptions,
     this.onExportRange,
     this.initialTime,
+    this.autoPlay = false,
     this.initialMaximizedCameraId,
     this.onExitFocus,
     this.onMotionController,
@@ -98,6 +100,12 @@ class PlaybackScreen extends StatefulWidget {
   /// Open the playhead at this moment on entry (e.g. Clips "View on timeline")
   /// instead of jumping to the latest footage.
   final DateTime? initialTime;
+
+  /// Start playing at [initialTime] on entry instead of landing paused on that
+  /// frame. Set by the Plates pop-up's "View on timeline" hand-off (which asks
+  /// for playback at the plate moment); the other hand-offs (Clips, bookmarks)
+  /// leave it false and open paused as before.
+  final bool autoPlay;
 
   /// Set when this Playback is a clip-originated single-camera focus
   /// (Clips "View on timeline"): there is no grid behind the maximized pane,
@@ -163,6 +171,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     session: widget.session,
   );
   Timer? _motionDebounce;
+
+  // Debounced write of the timeline zoom span to shared_preferences, so a
+  // continuous wheel-zoom / repeated ±-button press persists only the settled
+  // value instead of hammering the prefs channel on every step.
+  Timer? _spanPersistDebounce;
 
   String? _selectedCameraId;
   String? _maximizedCameraId;
@@ -274,6 +287,23 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     });
   }
 
+  @override
+  void didUpdateWidget(covariant PlaybackScreen old) {
+    super.didUpdateWidget(old);
+    // Fresh session after an in-place re-auth — hand the new token to the
+    // long-lived pollers/panes that captured the session at construction, or
+    // they keep resolving segments + motion with the dead token (stuck
+    // "connection lost" and false "no footage"). Per-tick fetches read
+    // `widget.session` directly and are already fresh.
+    if (old.session.token != widget.session.token ||
+        old.session.base != widget.session.base) {
+      _motion.updateSession(widget.session);
+      for (final pane in _panes.values) {
+        pane.updateSession(widget.session);
+      }
+    }
+  }
+
   void _onTimelineChanged() {
     if (mounted) setState(() {});
     _scheduleMotionRefresh();
@@ -308,6 +338,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _shuttleTimer?.cancel();
     _idleTimer?.cancel();
     _motionDebounce?.cancel();
+    _spanPersistDebounce?.cancel();
     _timeline.removeListener(_onTimelineChanged);
     // Drop the host's reference to our motion controller before disposing it,
     // so the status-bar legend never reads a disposed controller.
@@ -344,6 +375,15 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   // ── entry / spans ─────────────────────────────────────────────────────────
 
   Future<void> _enter() async {
+    // Restore the operator's last timeline zoom span (device preference) before
+    // the first window is centered, so Playback reopens at the scale they left
+    // rather than the controller's default. Done first (a fast local read)
+    // ahead of the slower timeline fetch below. Out-of-range/unset values fall
+    // back to the default (restoreSpanMs clamps; null skips).
+    final storedSpanMs = await PlaybackPrefs.getSpanMs();
+    if (!mounted) return;
+    if (storedSpanMs != null) _timeline.restoreSpanMs(storedSpanMs);
+
     final now = DateTime.now().toUtc();
     setState(() => _statusMessage = 'Loading timeline…');
 
@@ -385,6 +425,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _entering = false;
       _statusMessage = null;
     });
+    // A hand-off that requested playback (the Plates pop-up's "View on
+    // timeline") starts playing at the target moment rather than landing
+    // paused. The resolve above just opened each pane paused ON the target
+    // frame, so this resumes from there.
+    if (widget.autoPlay) _startPlayback();
   }
 
   // ── recording coverage (the timeline's thin bottom line) ──────────────────
@@ -608,8 +653,23 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   Future<void> _onZoomChanged() async {
+    // Every span change (both the ±-buttons and the wheel-zoom in the timeline
+    // view) funnels through here — the single choke point to persist the new
+    // zoom scale as a device preference, debounced so a continuous gesture
+    // writes only the settled value.
+    _persistSpanDebounced();
     unawaited(_syncCoverage());
     await _resolveAll(_timeline.playhead, force: true);
+  }
+
+  /// Schedule a debounced write of the current timeline span to prefs.
+  void _persistSpanDebounced() {
+    final ms = _timeline.span.inMilliseconds;
+    _spanPersistDebounce?.cancel();
+    _spanPersistDebounce = Timer(
+      const Duration(milliseconds: 300),
+      () => unawaited(PlaybackPrefs.setSpanMs(ms)),
+    );
   }
 
   /// Step the timeline zoom (−/＋ buttons). +1 = zoom out (longer window).
@@ -769,6 +829,17 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _tickTimer?.cancel();
       _tickTimer = null;
     }
+  }
+
+  /// Begin playback (idempotent) — used by the [PlaybackScreen.autoPlay]
+  /// entry hand-off. No-op while shuttling or already playing.
+  void _startPlayback() {
+    if (_shuttling || _playing) return;
+    setState(() => _playing = true);
+    for (final pane in _panes.values) {
+      pane.player.play();
+    }
+    _startTick();
   }
 
   void _setSpeed(int idx) {

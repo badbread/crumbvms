@@ -31,9 +31,10 @@ use uuid::Uuid;
 use crate::types::{
     Bookmark, Camera, CameraDecodeStatus, CameraGroup, CameraHaLink, CameraMotionCacheStatus,
     Capabilities, FrigateSettings, HaSettings, LprSettings, MotionCacheStatus, MotionGrid,
-    MotionSensitivity, MotionSignal, PlateRead, RecordStream, RecorderCapabilities,
-    RecorderHeartbeat, RecordingMode, RecordingPolicy, Role, Segment, SegmentStage, SegmentStream,
-    ServerSettings, Session, Storage, StorageMigration, User, UserRole, View,
+    MotionSensitivity, MotionSignal, PlateRead, PlateWatchlistEntry, RecordStream,
+    RecorderCapabilities, RecorderHeartbeat, RecordingMode, RecordingPolicy, Role, Segment,
+    SegmentStage, SegmentStream, ServerSettings, Session, Storage, StorageMigration, User,
+    UserRole, View,
 };
 
 // ─── pool creation ───────────────────────────────────────────────────────────
@@ -1523,6 +1524,7 @@ fn lpr_settings_from_row(row: &tokio_postgres::Row) -> LprSettings {
         enabled: row.get("enabled"),
         ingest_token: row.get("ingest_token"),
         retention_days: row.get("retention_days"),
+        watchlist_fuzz: row.get("watchlist_fuzz"),
         version: row.get("version"),
     }
 }
@@ -1538,7 +1540,7 @@ pub async fn get_lpr_settings(pool: &Pool) -> Result<Option<LprSettings>> {
     let client = get_conn(pool).await?;
     let opt = client
         .query_opt(
-            "SELECT enabled, ingest_token, retention_days, version FROM lpr_config WHERE id = 1",
+            "SELECT enabled, ingest_token, retention_days, watchlist_fuzz, version FROM lpr_config WHERE id = 1",
             &[],
         )
         .await
@@ -1571,6 +1573,7 @@ pub async fn update_lpr_settings(
     pool: &Pool,
     enabled: bool,
     retention_days: i32,
+    watchlist_fuzz: f32,
     set_token: bool,
     ingest_token: Option<&str>,
 ) -> Result<LprSettings> {
@@ -1581,12 +1584,19 @@ pub async fn update_lpr_settings(
             UPDATE lpr_config SET
                 enabled        = $1,
                 retention_days = $2,
+                watchlist_fuzz = $5,
                 ingest_token   = CASE WHEN $3::boolean THEN $4 ELSE ingest_token END,
                 version        = version + 1,
                 updated_at     = now()
             WHERE id = 1
             ",
-            &[&enabled, &retention_days, &set_token, &ingest_token],
+            &[
+                &enabled,
+                &retention_days,
+                &set_token,
+                &ingest_token,
+                &watchlist_fuzz,
+            ],
         )
         .await
         .context("update_lpr_settings")?;
@@ -1746,11 +1756,24 @@ pub async fn delete_segment_row(pool: &Pool, segment_id: Uuid) -> Result<()> {
 ///
 /// Correctness item 7: archive-enabled cameras are excluded here so the
 /// retention ticker never races with the archive job.
+///
+/// `limit`: pass `Some(n)` so the sweep only materialises the OLDEST `n`-row
+/// prefix per tick (the caller re-queries next tick until the backlog drains) —
+/// the same convergence-over-ticks pattern the size-eviction and max-retention
+/// sweeps use. Without a cap, shortening a camera's retention or a long recorder
+/// downtime makes this query return MILLIONS of rows into a single `Vec`, OOM-ing
+/// a small box (Pi/NUC). `ORDER BY s.start_ts` keeps the batch oldest-first so a
+/// capped sweep always makes forward progress. Pass `None` only where the full
+/// set is genuinely required.
 pub async fn list_live_segments_older_than(
     pool: &Pool,
     older_than: DateTime<Utc>,
+    limit: Option<i64>,
 ) -> Result<Vec<Segment>> {
     let client = get_conn(pool).await?;
+    // `$2::bigint IS NULL` is not needed: `LIMIT NULL` is a no-op cap in
+    // Postgres, so one prepared statement serves both the capped and uncapped
+    // cases (mirrors `list_policy_segments_oldest_first`).
     let rows = client
         .query(
             r"
@@ -1778,8 +1801,9 @@ pub async fn list_live_segments_older_than(
                     AND bk.protect_end_ts   >= s.start_ts
               )
             ORDER BY s.start_ts
+            LIMIT $2::bigint
             ",
-            &[&older_than],
+            &[&older_than, &limit],
         )
         .await
         .context("list_live_segments_older_than")?;
@@ -7534,38 +7558,86 @@ pub struct UpsertPlateReadParams {
     pub provider_event_id: Option<String>,
     pub event_id: Option<Uuid>,
     pub snapshot_url: Option<String>,
+    /// Plate box as `[x, y, w, h]` fractions (`0..1`) of the snapshot frame, or
+    /// `None`. Persisted to the `bbox_x1..bbox_y2` corner columns (migration
+    /// 0051) as `x1=x, y1=y, x2=x+w, y2=y+h`; see [`plate_read_from_row`] for the
+    /// read-back to `[x, y, w, h]`.
+    pub bbox: Option<[f32; 4]>,
     pub raw: serde_json::Value,
+}
+
+/// Result of [`upsert_plate_read`]: the row id, whether this call INSERTed a new
+/// read (`true`) vs UPDATEing an existing one over a Frigate event's lifecycle,
+/// and whether the row has ALREADY fired a watchlist alert (`alerted`). The
+/// alert path keys off `alerted` (not `inserted`) so it fires exactly once per
+/// read but still catches a plate that only becomes the watchlisted value on a
+/// later refinement UPDATE (Fable review H1).
+#[derive(Debug, Clone, Copy)]
+pub struct PlateReadUpsert {
+    pub id: Uuid,
+    pub inserted: bool,
+    pub alerted: bool,
 }
 
 /// Upsert one plate read into `plate_reads`, deduped on `(source_id,
 /// provider_event_id)` exactly like the events table — so a Frigate event that
-/// updates over its lifecycle refines the same row (keeping the highest
-/// confidence). Returns the row id.
+/// updates over its lifecycle refines the same row. Returns the row id, whether
+/// it was a fresh INSERT, and the row's current `alerted` state.
+///
+/// The `xmax = 0` test distinguishes INSERT from ON CONFLICT UPDATE: on a fresh
+/// insert the row has no updating xid (xmax 0); a conflict-update stamps the
+/// tuple's xmax with the updating transaction, so it is non-zero. This is used
+/// only for the debug log now — alert dedup keys off the persisted `alerted`
+/// column, which is robust even if these upserts ever move inside an explicit
+/// transaction (where `xmax` semantics differ).
+///
+/// Confidence: refreshed as a UNIT with the plate text. When the refined plate
+/// STRING changes, the new `confidence` is taken verbatim (a `GREATEST` across a
+/// plate change would pin a stale higher score to a different plate — Fable M4);
+/// when the plate string is unchanged, keep the highest score seen for it.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result<Uuid> {
+pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result<PlateReadUpsert> {
     let client = get_conn(pool).await?;
+    // Plate box stored as normalized corners (migration 0051's bbox_x1..bbox_y2):
+    // the wire/param shape is [x, y, w, h] fractions, persisted x1=x, y1=y,
+    // x2=x+w, y2=y+h. `plate_read_from_row` reverses it back to [x, y, w, h].
+    let bbox_x1: Option<f32> = p.bbox.map(|b| b[0]);
+    let bbox_y1: Option<f32> = p.bbox.map(|b| b[1]);
+    let bbox_x2: Option<f32> = p.bbox.map(|b| b[0] + b[2]);
+    let bbox_y2: Option<f32> = p.bbox.map(|b| b[1] + b[3]);
     let row = client
         .query_one(
             r"
             INSERT INTO plate_reads (
                 camera_id, ts, plate, plate_raw, confidence,
-                source_id, provider_event_id, event_id, snapshot_url, raw
+                source_id, provider_event_id, event_id, snapshot_url, raw,
+                bbox_x1, bbox_y1, bbox_x2, bbox_y2
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (source_id, provider_event_id)
             WHERE source_id IS NOT NULL AND provider_event_id IS NOT NULL
             DO UPDATE SET
                 ts           = EXCLUDED.ts,
                 plate        = EXCLUDED.plate,
                 plate_raw    = EXCLUDED.plate_raw,
-                confidence   = GREATEST(EXCLUDED.confidence, plate_reads.confidence),
+                confidence   = CASE
+                    WHEN EXCLUDED.plate IS DISTINCT FROM plate_reads.plate
+                        THEN EXCLUDED.confidence
+                    ELSE GREATEST(EXCLUDED.confidence, plate_reads.confidence)
+                END,
                 event_id     = COALESCE(EXCLUDED.event_id, plate_reads.event_id),
                 snapshot_url = COALESCE(EXCLUDED.snapshot_url, plate_reads.snapshot_url),
+                -- Keep a previously captured box if this refinement carries none
+                -- (a later lifecycle update without attributes must not wipe it).
+                bbox_x1      = COALESCE(EXCLUDED.bbox_x1, plate_reads.bbox_x1),
+                bbox_y1      = COALESCE(EXCLUDED.bbox_y1, plate_reads.bbox_y1),
+                bbox_x2      = COALESCE(EXCLUDED.bbox_x2, plate_reads.bbox_x2),
+                bbox_y2      = COALESCE(EXCLUDED.bbox_y2, plate_reads.bbox_y2),
                 raw          = EXCLUDED.raw
-            RETURNING id
+            RETURNING id, (xmax = 0) AS inserted, alerted
             ",
             &[
                 &p.camera_id,
@@ -7578,11 +7650,299 @@ pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result
                 &p.event_id,
                 &p.snapshot_url,
                 &p.raw,
+                &bbox_x1,
+                &bbox_y1,
+                &bbox_x2,
+                &bbox_y2,
             ],
         )
         .await
         .context("upsert_plate_read")?;
-    Ok(row.get("id"))
+    Ok(PlateReadUpsert {
+        id: row.get("id"),
+        inserted: row.get("inserted"),
+        alerted: row.get("alerted"),
+    })
+}
+
+/// Mark a plate read as having fired its watchlist alert, so a later refinement
+/// UPDATE of the same row does not re-alert. Idempotent.
+///
+/// # Errors
+///
+/// Returns an error if the update fails.
+pub async fn mark_plate_alerted(pool: &Pool, id: Uuid) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            "UPDATE plate_reads SET alerted = true WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .context("mark_plate_alerted")?;
+    Ok(())
+}
+
+// ─── plate watchlist (lpr_watchlist, migration 0052) ────────────────────────
+
+/// Columns selected into a [`PlateWatchlistEntry`] (kept in one place so the
+/// several queries below can't drift out of sync with `watchlist_from_row`).
+const WATCHLIST_COLS: &str = "id, plate, label, note, color, notify, kind, created_at";
+
+fn watchlist_from_row(row: &tokio_postgres::Row) -> PlateWatchlistEntry {
+    PlateWatchlistEntry {
+        id: row.get("id"),
+        plate: row.get("plate"),
+        label: row.get("label"),
+        note: row.get("note"),
+        color: row.get("color"),
+        notify: row.get("notify"),
+        kind: row.get("kind"),
+        created_at: row.get("created_at"),
+    }
+}
+
+/// List every watch/ignore entry, most recently added first.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_watchlist(pool: &Pool) -> Result<Vec<PlateWatchlistEntry>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            &format!("SELECT {WATCHLIST_COLS} FROM lpr_watchlist ORDER BY created_at DESC"),
+            &[],
+        )
+        .await
+        .context("list_watchlist")?;
+    Ok(rows.iter().map(watchlist_from_row).collect())
+}
+
+/// Parameters for [`upsert_watchlist_entry`]. `plate` must already be normalized
+/// (see [`normalize_plate`]); `kind` is `"watch"` or `"ignore"`.
+pub struct UpsertWatchlistParams {
+    pub plate: String,
+    pub label: Option<String>,
+    pub note: Option<String>,
+    pub color: Option<String>,
+    pub notify: bool,
+    pub kind: String,
+}
+
+/// Add or update a watch/ignore entry, keyed on the normalized plate (a second
+/// add of the same plate edits the existing row rather than duplicating it —
+/// including flipping its `kind`). Returns the resulting entry.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn upsert_watchlist_entry(
+    pool: &Pool,
+    p: &UpsertWatchlistParams,
+) -> Result<PlateWatchlistEntry> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            &format!(
+                r"
+            INSERT INTO lpr_watchlist (plate, label, note, color, notify, kind)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (plate) DO UPDATE SET
+                label      = EXCLUDED.label,
+                note       = EXCLUDED.note,
+                color      = EXCLUDED.color,
+                notify     = EXCLUDED.notify,
+                kind       = EXCLUDED.kind,
+                updated_at = now()
+            RETURNING {WATCHLIST_COLS}
+            "
+            ),
+            &[&p.plate, &p.label, &p.note, &p.color, &p.notify, &p.kind],
+        )
+        .await
+        .context("upsert_watchlist_entry")?;
+    Ok(watchlist_from_row(&row))
+}
+
+/// Delete a watch/ignore entry by id. Returns `true` if a row was removed.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub async fn delete_watchlist_entry(pool: &Pool, id: Uuid) -> Result<bool> {
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute("DELETE FROM lpr_watchlist WHERE id = $1", &[&id])
+        .await
+        .context("delete_watchlist_entry")?;
+    Ok(n > 0)
+}
+
+/// Levenshtein edit distance between two strings, counted over Unicode `char`s
+/// (classic two-row dynamic program). Plates are short, so the O(a·b) cost is
+/// negligible. This is the core of the character-tolerance watchlist/ignore
+/// matcher: how many single-character insert/delete/substitute edits separate a
+/// read from a watch/ignore plate.
+#[must_use]
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    // `prev`/`curr` are two rows of the DP table (row = position in `a`).
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            // deletion, insertion, substitution.
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// How many character edits a read may differ from `reference` and still count
+/// as a match, under the length-scaled character-tolerance model:
+/// `floor(fuzz · len)` where `len` is the normalized length of the *reference*
+/// (the watch/ignore entry's) plate and `fuzz` is clamped to `0.0..=0.5`.
+/// `fuzz == 0` yields 0 edits, i.e. an exact match after normalization. The
+/// desktop client implements this identical rule so its match previews agree
+/// with the server.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn allowed_edits(reference: &str, fuzz: f32) -> usize {
+    let len = normalize_plate(reference).chars().count() as f32;
+    (fuzz.clamp(0.0, 0.5) * len).floor() as usize
+}
+
+/// Cached result of the one-time `pg_trgm` availability probe. Only a
+/// *definitive* answer is stored (see [`pg_trgm_available`]); a transient probe
+/// error leaves it unset so the next call re-probes.
+static PG_TRGM_AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+/// Whether the `pg_trgm` extension is installed in the connected database.
+///
+/// The bundled `postgres:16-alpine` always has it; an external / BYO-Postgres
+/// may not (migration `0051_lpr.sql` guards the `CREATE EXTENSION` so a missing
+/// extension no longer aborts the migration chain). When absent, the fuzzy
+/// plate search path (`list_plate_reads` fuzzy mode) MUST NOT issue trigram
+/// operators (`%` / `similarity()`) — Postgres would reject them — so it
+/// degrades to `contains` instead. (Watchlist/ignore matching no longer uses
+/// trigram at all; it runs the character-tolerance model in Rust.)
+///
+/// Probed lazily and cached for the process lifetime (the extension set of a
+/// running DB does not change under us; a rare after-the-fact `CREATE EXTENSION`
+/// is picked up on the next restart). Never errors: a probe failure is treated
+/// as "absent" (the safe direction — degraded search always parses) and is not
+/// cached, so a transient blip doesn't permanently disable fuzzy search.
+pub async fn pg_trgm_available(pool: &Pool) -> bool {
+    if let Some(&v) = PG_TRGM_AVAILABLE.get() {
+        return v;
+    }
+    let client = match get_conn(pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "pg_trgm probe: no connection; assuming absent");
+            return false;
+        }
+    };
+    match client
+        .query_opt("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'", &[])
+        .await
+    {
+        Ok(opt) => {
+            let present = opt.is_some();
+            // Cache only this definitive answer (set() is a no-op if another
+            // task raced us to it — the value is identical either way).
+            let _ = PG_TRGM_AVAILABLE.set(present);
+            present
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pg_trgm probe failed; assuming absent this call");
+            false
+        }
+    }
+}
+
+/// Whether `plate` matches an `ignore`-kind entry — the ingester drops such a
+/// read entirely (not stored, never alerted). Matching uses the length-scaled
+/// character-tolerance model: the read matches an ignore entry when
+/// `levenshtein(normalize(read), normalize(entry.plate))` is within
+/// [`allowed_edits`]`(entry.plate, fuzz)`. `fuzz == 0` is exact-after-normalize;
+/// larger `fuzz` tolerates more of Frigate's ALPR misreads on an ignored
+/// nuisance plate. No trigram SQL: the comparison runs in Rust over every ignore
+/// entry (a small, human-curated set).
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn is_plate_ignored(pool: &Pool, plate: &str, fuzz: f32) -> Result<bool> {
+    let read = normalize_plate(plate);
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query("SELECT plate FROM lpr_watchlist WHERE kind = 'ignore'", &[])
+        .await
+        .context("is_plate_ignored")?;
+    Ok(rows.iter().any(|row| {
+        let entry: String = row.get("plate");
+        levenshtein(&read, &normalize_plate(&entry)) <= allowed_edits(&entry, fuzz)
+    }))
+}
+
+/// Look up a notifying `watch`-kind entry matching `plate`, for the alert hook.
+/// Returns `None` when no watched+notifying plate matches under the length-scaled
+/// character-tolerance model (see [`allowed_edits`]). Among all entries within
+/// tolerance it returns the *closest* by edit distance; ties break
+/// deterministically by shortest (normalized) plate, then lexicographically. No
+/// trigram SQL: the comparison runs in Rust over the notifying watch entries.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn match_watchlist(
+    pool: &Pool,
+    plate: &str,
+    fuzz: f32,
+) -> Result<Option<PlateWatchlistEntry>> {
+    let read = normalize_plate(plate);
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            &format!(
+                "SELECT {WATCHLIST_COLS} FROM lpr_watchlist \
+                 WHERE kind = 'watch' AND notify = true"
+            ),
+            &[],
+        )
+        .await
+        .context("match_watchlist")?;
+    let best = rows
+        .iter()
+        .filter_map(|row| {
+            let entry = watchlist_from_row(row);
+            let norm = normalize_plate(&entry.plate);
+            let dist = levenshtein(&read, &norm);
+            (dist <= allowed_edits(&entry.plate, fuzz)).then_some((dist, norm, entry))
+        })
+        .min_by(|(da, na, _), (db, nb, _)| {
+            da.cmp(db)
+                .then_with(|| na.len().cmp(&nb.len()))
+                .then_with(|| na.cmp(nb))
+        })
+        .map(|(_, _, entry)| entry);
+    Ok(best)
 }
 
 /// Delete plate reads older than `cutoff` (the retention prune). Returns the
@@ -7628,6 +7988,18 @@ pub struct PlateReadQuery {
 }
 
 fn plate_read_from_row(row: &tokio_postgres::Row) -> PlateRead {
+    // Reassemble the [x, y, w, h] fractions from the stored normalized corners
+    // (bbox_x1..bbox_y2). Present only when all four are non-null; a partial box
+    // (shouldn't happen — they're written as a unit) collapses to None.
+    let bbox = match (
+        row.get::<_, Option<f32>>("bbox_x1"),
+        row.get::<_, Option<f32>>("bbox_y1"),
+        row.get::<_, Option<f32>>("bbox_x2"),
+        row.get::<_, Option<f32>>("bbox_y2"),
+    ) {
+        (Some(x1), Some(y1), Some(x2), Some(y2)) => Some([x1, y1, x2 - x1, y2 - y1]),
+        _ => None,
+    };
     PlateRead {
         id: row.get("id"),
         camera_id: row.get("camera_id"),
@@ -7639,6 +8011,7 @@ fn plate_read_from_row(row: &tokio_postgres::Row) -> PlateRead {
         source_id: row.get("source_id"),
         event_id: row.get("event_id"),
         snapshot_url: row.get("snapshot_url"),
+        bbox,
     }
 }
 
@@ -7668,10 +8041,19 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
         conds.push(format!("ts < ${n}"));
         params.push(e);
     }
+    // pg_trgm may be absent on an external BYO-Postgres (migration 0051 guards
+    // its CREATE EXTENSION). Degrade fuzzy → contains so we never issue a
+    // `%` / `similarity()` query the server can't parse.
+    let match_mode = if matches!(q.match_mode, PlateMatch::Fuzzy) && !pg_trgm_available(pool).await
+    {
+        PlateMatch::Contains
+    } else {
+        q.match_mode
+    };
     let mut order = "ts DESC".to_owned();
     if let Some(ref plate) = q.plate {
         n += 1;
-        match q.match_mode {
+        match match_mode {
             PlateMatch::Exact => conds.push(format!("plate = ${n}")),
             PlateMatch::Prefix => conds.push(format!("plate LIKE ${n} || '%'")),
             PlateMatch::Contains => conds.push(format!("plate LIKE '%' || ${n} || '%'")),
@@ -7695,8 +8077,8 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
     let offset_idx = n + 2;
     let list_sql = format!(
         "SELECT id, camera_id, ts, plate, plate_raw, confidence, region, source_id, event_id, \
-         snapshot_url FROM plate_reads WHERE {where_clause} ORDER BY {order} \
-         LIMIT ${limit_idx} OFFSET ${offset_idx}"
+         snapshot_url, bbox_x1, bbox_y1, bbox_x2, bbox_y2 FROM plate_reads WHERE {where_clause} \
+         ORDER BY {order} LIMIT ${limit_idx} OFFSET ${offset_idx}"
     );
     params.push(&q.limit);
     params.push(&q.offset);
@@ -8758,6 +9140,28 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0051_lpr.sql",
         include_str!("../../../db/migrations/0051_lpr.sql"),
     ),
+    (
+        "0052_lpr_watchlist.sql",
+        include_str!("../../../db/migrations/0052_lpr_watchlist.sql"),
+    ),
+    (
+        "0053_plate_read_alerted.sql",
+        include_str!("../../../db/migrations/0053_plate_read_alerted.sql"),
+    ),
+    (
+        "0054_lpr_ignore_fuzzy.sql",
+        include_str!("../../../db/migrations/0054_lpr_ignore_fuzzy.sql"),
+    ),
+    (
+        "0055_system_event_snapshot.sql",
+        include_str!("../../../db/migrations/0055_system_event_snapshot.sql"),
+    ),
+    (
+        "0056_stream_no_segments_storage_unwritable_alerts.sql",
+        include_str!(
+            "../../../db/migrations/0056_stream_no_segments_storage_unwritable_alerts.sql"
+        ),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds
@@ -9808,6 +10212,88 @@ pub async fn list_devices_with_owner(
         .collect()
 }
 
+/// Effective authorization facts for a notification-channel **owner**, resolved
+/// from the DB (assigned role → capabilities + camera scope), NOT from a cached
+/// token or the push-device snapshot. Used by the notification engine to
+/// intersect a channel's delivery with what its owner is actually allowed to see
+/// (P0-5): a channel can never widen its owner's access.
+#[derive(Debug, Clone)]
+pub struct UserGrants {
+    /// Admin owner — bypasses the camera + capability checks (sees everything).
+    pub is_admin: bool,
+    /// Cameras the owner may access (empty for admins, who bypass the check).
+    pub camera_ids: Vec<Uuid>,
+    /// Whether the owner's role carries the `view_plates` capability — gates
+    /// `plate_watchlist_hit` fan-out to owned channels.
+    pub view_plates: bool,
+}
+
+/// Conservative grants for a user whose RBAC role can't be resolved (a legacy
+/// pre-RBAC row, or a role deleted out from under the user). Mirrors
+/// `auth_mw::fallback_caps`: admins keep everything; viewers get their legacy
+/// per-user camera list and NOT `view_plates`.
+fn user_fallback_grants(user: &User) -> UserGrants {
+    match user.role {
+        UserRole::Admin => UserGrants {
+            is_admin: true,
+            camera_ids: Vec::new(),
+            view_plates: true,
+        },
+        UserRole::Viewer => UserGrants {
+            is_admin: false,
+            camera_ids: user.camera_ids.clone(),
+            view_plates: false,
+        },
+    }
+}
+
+/// Resolve a user's effective [`UserGrants`] the same way the `AuthUser`
+/// extractor does: prefer the assigned RBAC role (source of truth for
+/// capabilities + camera scope), falling back to the legacy `users.role` with
+/// conservative caps when there is no `role_id` or the role was deleted.
+///
+/// The effective camera scope is the role's cameras UNION the user's legacy
+/// per-user `camera_ids` (matching `auth_mw`'s resolution), so a viewer granted
+/// extra cameras without a bespoke role is still scoped correctly.
+///
+/// Returns `Ok(None)` when no such user exists (e.g. a channel whose owner was
+/// deleted); the caller should treat that as "no access".
+///
+/// # Errors
+///
+/// Returns an error only if a DB query fails.
+pub async fn resolve_user_grants(pool: &Pool, user_id: Uuid) -> Result<Option<UserGrants>> {
+    let Some(user) = get_user_by_id(pool, user_id).await? else {
+        return Ok(None);
+    };
+    let grants = match user.role_id {
+        Some(rid) => match get_role(pool, rid).await? {
+            Some(role) if role.is_admin => UserGrants {
+                is_admin: true,
+                camera_ids: Vec::new(),
+                view_plates: true,
+            },
+            Some(role) => {
+                let mut cams = role.camera_ids.clone();
+                for id in &user.camera_ids {
+                    if !cams.contains(id) {
+                        cams.push(*id);
+                    }
+                }
+                let caps = role.effective_caps();
+                UserGrants {
+                    is_admin: false,
+                    camera_ids: cams,
+                    view_plates: caps.view_plates,
+                }
+            }
+            None => user_fallback_grants(&user),
+        },
+        None => user_fallback_grants(&user),
+    };
+    Ok(Some(grants))
+}
+
 // ─── notification channels ────────────────────────────────────────────────────
 
 /// A third-party outbound notification channel (`notification_channels`).
@@ -10323,6 +10809,9 @@ pub struct SystemEvent {
     pub camera_id: Option<Uuid>,
     pub ts: DateTime<Utc>,
     pub detail: Option<String>,
+    /// Provider-relative snapshot path (migration 0055), set for
+    /// `plate_watchlist_hit`; the notification engine resolves + attaches it.
+    pub snapshot_url: Option<String>,
 }
 
 /// Record one system/health event occurrence. Called by the watchdogs in
@@ -10358,6 +10847,37 @@ pub async fn insert_system_event(
     Ok(row.get("id"))
 }
 
+/// Like [`insert_system_event`] but also stores a provider-relative
+/// `snapshot_url` (migration 0055) so the notification engine can attach the
+/// detection image. Used by the LPR watchlist-hit path; the plain
+/// [`insert_system_event`] leaves `snapshot_url` NULL for image-less health
+/// alerts.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn insert_system_event_with_snapshot(
+    pool: &Pool,
+    event_key: &str,
+    camera_id: Option<Uuid>,
+    detail: Option<&str>,
+    snapshot_url: Option<&str>,
+) -> Result<Uuid> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            INSERT INTO system_events (event_key, camera_id, detail, snapshot_url)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            ",
+            &[&event_key, &camera_id, &detail, &snapshot_url],
+        )
+        .await
+        .context("insert_system_event_with_snapshot")?;
+    Ok(row.get("id"))
+}
+
 /// Return system events with `ts > after`, oldest first, capped at `limit`.
 ///
 /// Mirrors [`events_since`] — the engine's system-event poller uses this to
@@ -10375,7 +10895,7 @@ pub async fn system_events_since(
     let rows = client
         .query(
             r"
-            SELECT id, event_key, camera_id, ts, detail
+            SELECT id, event_key, camera_id, ts, detail, snapshot_url
             FROM system_events
             WHERE ts > $1
             ORDER BY ts ASC
@@ -10393,6 +10913,7 @@ pub async fn system_events_since(
             camera_id: r.get("camera_id"),
             ts: r.get("ts"),
             detail: r.get("detail"),
+            snapshot_url: r.get("snapshot_url"),
         })
         .collect())
 }

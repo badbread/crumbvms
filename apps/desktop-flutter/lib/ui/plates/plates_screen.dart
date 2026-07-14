@@ -1,9 +1,16 @@
 // Plates tab: newest-first browser of license-plate reads (LPR). A filter bar
 // (plate search + match mode, camera multi-select, time range) over a list of
 // reads; each row shows the plate, the sibling snapshot, camera, local time,
-// and a confidence chip, and clicking a row jumps to Playback at that read's
-// moment on that camera (the same hand-off the Clips tab uses for "View on
-// timeline").
+// and a confidence chip. Clicking a row with a linked detection event opens a
+// dismissible pop-up that plays the short plate-hit clip (the same style as the
+// Clips tab's clip player — closes on Esc / a close button), with a "View on
+// timeline" button that hands off to Playback at that read's moment (the same
+// one-shot seek/focus hand-off the Clips tab uses). A read with no linked event
+// has no clip, so its row falls back to that timeline hand-off directly.
+//
+// The pop-up resolves the clip exactly like Clips resolves a detection clip:
+// the read's event_id becomes the `d:<event-uuid>` clip id and plays via
+// GET /clip/d:<event-uuid>/clip.mp4?q=preview on a scoped media `?token=`.
 //
 // Data comes from GET /plates (see plates_api.dart). Snapshots ride the
 // detection-event snapshot proxy GET /events/{event_id}/snapshot (Bearer,
@@ -15,11 +22,23 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 
+import 'package:crumb_desktop/api/clips_api.dart' show ClipsApi;
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
+import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
+
+/// A plate-hit clip that stalls this long without progressing is retried (the
+/// clip is transcoded on demand server-side, so a cold clip can be slow). Same
+/// watchdog shape as the Clips tab's clip player.
+const _plateClipLoadTimeout = Duration(milliseconds: 4500);
+const _plateClipMaxRetries = 2;
 
 /// Time-range presets. `0` is the "all time" sentinel (no start/end sent);
 /// every other key is a window length in hours ending at the anchor.
@@ -43,15 +62,25 @@ class PlatesScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onViewFootage,
+    this.canManageWatchlist = false,
   });
 
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
 
-  /// Row click → jump to Playback at [ts] on [cameraId]. Wired in main.dart to
-  /// the same one-shot seek/focus hand-off the Clips "View on timeline" uses.
+  /// Hand off to Playback at [ts] on [cameraId] — driven by the pop-up clip
+  /// player's "View on timeline" button (and, for a read with no linked clip,
+  /// directly from the row). Wired in main.dart to the same one-shot seek/focus
+  /// hand-off the Clips "View on timeline" uses.
   final void Function(String cameraId, DateTime ts) onViewFootage;
+
+  /// Whether this account may add/remove watchlist entries (admin-only on the
+  /// server). Reading the watchlist is allowed for any `view_plates` account,
+  /// so the panel always renders; when false the add form and the per-row/
+  /// per-entry management affordances are hidden. Server-side 403s are still
+  /// handled defensively even when this is true (stale/edge cases).
+  final bool canManageWatchlist;
 
   @override
   State<PlatesScreen> createState() => _PlatesScreenState();
@@ -70,6 +99,26 @@ class _PlatesScreenState extends State<PlatesScreen> {
   List<PlateRead> _plates = const [];
   int _total = 0;
 
+  // The read whose pop-up clip player is open (null = none). Set by tapping a
+  // row that has a linked detection event; the overlay plays that read's clip.
+  PlateRead? _playing;
+
+  // Watchlist side panel. Readable by any account that can see this tab; the
+  // add/remove affordances are gated on [widget.canManageWatchlist].
+  bool _showWatchlist = true;
+  List<PlateWatchlistEntry> _watchlist = const [];
+  bool _watchlistLoading = false;
+  String? _watchlistError;
+
+  // LPR feature config — only fetched for admins (GET /config/lpr is admin-
+  // only). Holds the current watchlist fuzziness the admin can tune; null until
+  // loaded (or when the caller isn't an admin / the load 403s).
+  LprConfig? _lprConfig;
+  bool _lprConfigLoading = false;
+
+  // Which layout the results render in (persisted via [PlatesPrefs]).
+  PlatesViewMode _viewMode = PlatesViewMode.list;
+
   Timer? _searchDebounce;
   final _thumbGate = _ConcurrencyGate(_thumbConcurrency);
 
@@ -79,7 +128,56 @@ class _PlatesScreenState extends State<PlatesScreen> {
     // Default to every visible camera selected — the natural "show me
     // everything" starting point for a plate log.
     _selectedCameraIds = {for (final c in widget.cameras) c.id};
+    _restoreViewMode();
     _load();
+    _loadWatchlist();
+    if (widget.canManageWatchlist) _loadLprConfig();
+  }
+
+  Future<void> _restoreViewMode() async {
+    final mode = await PlatesPrefs.getViewMode();
+    if (!mounted) return;
+    setState(() => _viewMode = mode);
+  }
+
+  void _setViewMode(PlatesViewMode mode) {
+    if (mode == _viewMode) return;
+    setState(() => _viewMode = mode);
+    PlatesPrefs.setViewMode(mode);
+  }
+
+  /// Load the LPR config so the admin fuzziness control can render. A 403
+  /// (stale admin flag) just leaves the control hidden — never throws to the
+  /// UI. Non-admins never call this.
+  Future<void> _loadLprConfig() async {
+    setState(() => _lprConfigLoading = true);
+    try {
+      final cfg = await widget.api.getLprConfig(widget.session);
+      if (!mounted) return;
+      setState(() {
+        _lprConfig = cfg;
+        _lprConfigLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _lprConfigLoading = false);
+    }
+  }
+
+  /// Persist a new watchlist fuzziness, preserving `enabled`/`retention_days`
+  /// (the desktop client only edits fuzziness). Rethrows so the panel can
+  /// surface a 403 inline.
+  Future<void> _saveFuzz(double fuzz) async {
+    final cfg = _lprConfig;
+    if (cfg == null) return;
+    final updated = await widget.api.putLprConfig(
+      widget.session,
+      enabled: cfg.enabled,
+      retentionDays: cfg.retentionDays,
+      watchlistFuzz: fuzz,
+    );
+    if (!mounted) return;
+    setState(() => _lprConfig = updated);
   }
 
   @override
@@ -148,6 +246,81 @@ class _PlatesScreenState extends State<PlatesScreen> {
     }
   }
 
+  Future<void> _loadWatchlist() async {
+    setState(() {
+      _watchlistLoading = true;
+      _watchlistError = null;
+    });
+    try {
+      final entries = await widget.api.listWatchlist(widget.session);
+      if (!mounted) return;
+      setState(() {
+        _watchlist = entries;
+        _watchlistLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _watchlistError = '$e';
+        _watchlistLoading = false;
+      });
+    }
+  }
+
+  /// Add (or, keyed on the normalized plate, edit) a watchlist entry, then
+  /// refresh the panel. Rethrows so callers can surface the message (e.g. a
+  /// non-admin 403) inline or via a SnackBar.
+  Future<void> _addToWatchlist({
+    required String plate,
+    String? label,
+    bool notify = true,
+    String kind = 'watch',
+  }) async {
+    await widget.api.addWatchlist(
+      widget.session,
+      plate: plate,
+      label: label,
+      notify: notify,
+      kind: kind,
+    );
+    await _loadWatchlist();
+  }
+
+  /// Remove a watchlist entry, then refresh. Rethrows for the caller to report.
+  Future<void> _removeFromWatchlist(PlateWatchlistEntry entry) async {
+    await widget.api.deleteWatchlist(widget.session, entry.id);
+    await _loadWatchlist();
+  }
+
+  /// Per-read "add to watchlist" affordance: adds the row's already-normalized
+  /// plate with default notify-on. Feedback + graceful 403 via a SnackBar.
+  Future<void> _addReadToWatchlist(PlateRead read) async {
+    if (read.plate.isEmpty) return;
+    try {
+      await _addToWatchlist(plate: read.plate);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${read.plate} added to watchlist')),
+      );
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.statusCode == 403
+                ? 'Only admins can manage the watchlist.'
+                : e.message,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Add to watchlist failed: $e')),
+      );
+    }
+  }
+
   void _onSearchChanged(String v) {
     setState(() => _query = v); // keep the clear button in sync as you type
     _searchDebounce?.cancel();
@@ -191,15 +364,95 @@ class _PlatesScreenState extends State<PlatesScreen> {
     _load();
   }
 
+  /// Row tap. A read linked to a detection event opens the pop-up clip player
+  /// on that read's short plate-hit clip; a read with no event has no clip, so
+  /// it falls back to the Playback timeline hand-off directly (the previous
+  /// row-click behavior).
+  void _openRead(PlateRead read) {
+    final eventId = read.eventId;
+    if (eventId == null || eventId.isEmpty) {
+      widget.onViewFootage(read.cameraId, read.ts);
+      return;
+    }
+    setState(() => _playing = read);
+  }
+
+  /// Open the single-plate report builder for [read] (OpenALPR-style: case
+  /// reference + timezone + section toggles → a one-page forensic PDF). The
+  /// builder reuses this screen's bounded-concurrency snapshot helper/cache via
+  /// the [fetchSnapshot] callback so it hits the same fetch path the thumbnails
+  /// do (for the plate crop, vehicle photo, and dossier thumbnails).
+  void _openPlateReport(PlateRead read) {
+    showPlateReportBuilder(
+      context,
+      api: widget.api,
+      session: widget.session,
+      read: read,
+      cameras: widget.cameras,
+      fetchSnapshot: (eventId) async {
+        Uint8List? out;
+        await _thumbGate.run(() async {
+          out = await _fetchSnapshotBytes(widget.session, eventId);
+        });
+        return out;
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final playing = _playing;
+    final byId = {for (final c in widget.cameras) c.id: c};
     return Scaffold(
       backgroundColor: const Color(0xFF17181C),
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            _buildFilterBar(context),
-            Expanded(child: _buildBody(context)),
+            Column(
+              children: [
+                _buildFilterBar(context),
+                Expanded(
+                  child: Row(
+                    children: [
+                      Expanded(child: _buildBody(context)),
+                      if (_showWatchlist)
+                        _WatchlistPanel(
+                          entries: _watchlist,
+                          loading: _watchlistLoading,
+                          error: _watchlistError,
+                          canManage: widget.canManageWatchlist,
+                          fuzz: _lprConfig?.watchlistFuzz,
+                          fuzzLoading: _lprConfigLoading,
+                          onSaveFuzz: _saveFuzz,
+                          onAdd: _addToWatchlist,
+                          onRemove: _removeFromWatchlist,
+                          onRefresh: _loadWatchlist,
+                          onClose: () =>
+                              setState(() => _showWatchlist = false),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            if (playing != null)
+              _PlateClipPlayer(
+                key: ValueKey(playing.id),
+                api: widget.api,
+                session: widget.session,
+                read: playing,
+                cameraName:
+                    byId[playing.cameraId]?.name ?? '(unknown camera)',
+                onReport: () => _openPlateReport(playing),
+                onClose: () => setState(() => _playing = null),
+                // Same one-shot seek/focus hand-off the Clips "View on
+                // timeline" uses: close the pop-up, then jump Playback to this
+                // read's moment on its camera.
+                onViewOnTimeline: () {
+                  setState(() => _playing = null);
+                  widget.onViewFootage(playing.cameraId, playing.ts);
+                },
+              ),
           ],
         ),
       ),
@@ -302,6 +555,24 @@ class _PlatesScreenState extends State<PlatesScreen> {
               },
               child: const Text('Now', style: TextStyle(fontSize: 12)),
             ),
+          _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
+          TextButton.icon(
+            onPressed: () =>
+                setState(() => _showWatchlist = !_showWatchlist),
+            icon: Icon(
+              _showWatchlist
+                  ? Icons.playlist_add_check
+                  : Icons.playlist_add,
+              size: 16,
+              color: Colors.white70,
+            ),
+            label: Text(
+              _watchlist.isEmpty
+                  ? 'Watchlist'
+                  : 'Watchlist (${_watchlist.length})',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ),
           IconButton(
             tooltip: 'Refresh',
             onPressed: _load,
@@ -338,23 +609,110 @@ class _PlatesScreenState extends State<PlatesScreen> {
       );
     }
     final byId = {for (final c in widget.cameras) c.id: c};
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      itemCount: _plates.length,
-      separatorBuilder: (_, _) =>
-          const Divider(height: 1, color: Colors.white10),
-      itemBuilder: (context, i) {
-        final p = _plates[i];
-        return _PlateRow(
-          key: ValueKey(p.id),
-          read: p,
-          cameraName: byId[p.cameraId]?.name ?? '(unknown camera)',
+    final watched = {for (final e in _watchlist) e.plate};
+    String camName(String id) => byId[id]?.name ?? '(unknown camera)';
+    switch (_viewMode) {
+      case PlatesViewMode.list:
+        return ListView.separated(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          itemCount: _plates.length,
+          separatorBuilder: (_, _) =>
+              const Divider(height: 1, color: Colors.white10),
+          itemBuilder: (context, i) {
+            final p = _plates[i];
+            return _PlateRow(
+              key: ValueKey(p.id),
+              read: p,
+              cameraName: camName(p.cameraId),
+              api: widget.api,
+              session: widget.session,
+              gate: _thumbGate,
+              onTap: () => _openRead(p),
+              canManage: widget.canManageWatchlist,
+              watched: watched.contains(p.plate),
+              onAddToWatchlist: () => _addReadToWatchlist(p),
+              onReport: () => _openPlateReport(p),
+            );
+          },
+        );
+      case PlatesViewMode.gallery:
+        return _PlateGallery(
+          reads: _plates,
+          camName: camName,
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
-          onTap: () => widget.onViewFootage(p.cameraId, p.ts),
+          onTap: _openRead,
         );
-      },
+      case PlatesViewMode.grouped:
+        return _PlateGroupedList(
+          reads: _plates,
+          camName: camName,
+          api: widget.api,
+          session: widget.session,
+          gate: _thumbGate,
+          onTap: _openRead,
+          canManage: widget.canManageWatchlist,
+          watched: watched,
+          onAddToWatchlist: _addReadToWatchlist,
+          onReport: _openPlateReport,
+        );
+      case PlatesViewMode.timeline:
+        return _PlateTimeline(
+          reads: _plates,
+          camName: camName,
+          api: widget.api,
+          session: widget.session,
+          gate: _thumbGate,
+          onTap: _openRead,
+        );
+    }
+  }
+}
+
+// ─── view-mode switcher ────────────────────────────────────────────────────
+
+/// Segmented control for the four Plates layouts, styled to match
+/// [_MatchToggle] (icon-only ChoiceChips with tooltips to stay compact in the
+/// filter bar's Wrap).
+class _ViewModeToggle extends StatelessWidget {
+  const _ViewModeToggle({required this.value, required this.onChanged});
+  final PlatesViewMode value;
+  final ValueChanged<PlatesViewMode> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
+    Widget seg(PlatesViewMode mode, IconData icon, String tip) {
+      final active = value == mode;
+      return Padding(
+        padding: const EdgeInsets.only(right: 4),
+        child: Tooltip(
+          message: tip,
+          child: ChoiceChip(
+            label: Icon(
+              icon,
+              size: 16,
+              color: active ? Colors.black : Colors.white70,
+            ),
+            selected: active,
+            onSelected: (_) => onChanged(mode),
+            showCheckmark: false,
+            selectedColor: accent,
+            backgroundColor: const Color(0xFF2A2D35),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        seg(PlatesViewMode.list, Icons.view_list, 'List'),
+        seg(PlatesViewMode.gallery, Icons.grid_view, 'Gallery'),
+        seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
+        seg(PlatesViewMode.timeline, Icons.timeline, 'Timeline feed'),
+      ],
     );
   }
 }
@@ -484,6 +842,10 @@ class _PlateRow extends StatelessWidget {
     required this.session,
     required this.gate,
     required this.onTap,
+    required this.canManage,
+    required this.watched,
+    required this.onAddToWatchlist,
+    required this.onReport,
   });
 
   final PlateRead read;
@@ -492,6 +854,18 @@ class _PlateRow extends StatelessWidget {
   final Session session;
   final _ConcurrencyGate gate;
   final VoidCallback onTap;
+
+  /// Admin — may add this read's plate to the watchlist.
+  final bool canManage;
+
+  /// This read's plate is already on the watchlist (shows a filled star).
+  final bool watched;
+
+  /// Add this read's plate to the watchlist.
+  final VoidCallback onAddToWatchlist;
+
+  /// Open the single-plate report builder for this read.
+  final VoidCallback onReport;
 
   @override
   Widget build(BuildContext context) {
@@ -560,6 +934,30 @@ class _PlateRow extends StatelessWidget {
                 ],
               ),
             ),
+            if (canManage && read.plate.isNotEmpty) ...[
+              const SizedBox(width: 4),
+              IconButton(
+                tooltip: watched ? 'On watchlist' : 'Add to watchlist',
+                visualDensity: VisualDensity.compact,
+                onPressed: watched ? null : onAddToWatchlist,
+                icon: Icon(
+                  watched ? Icons.star : Icons.star_border,
+                  size: 18,
+                  color: watched ? const Color(0xFFE8A33D) : Colors.white38,
+                ),
+              ),
+            ],
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: 'Report (PDF)',
+              visualDensity: VisualDensity.compact,
+              onPressed: onReport,
+              icon: const Icon(
+                Icons.description_outlined,
+                size: 18,
+                color: Colors.white38,
+              ),
+            ),
             const SizedBox(width: 8),
             _ConfidenceChip(read.confidence),
             const SizedBox(width: 6),
@@ -580,12 +978,20 @@ class _PlateThumb extends StatefulWidget {
     required this.api,
     required this.session,
     required this.gate,
+    this.width = 92,
+    this.height = 56,
+    this.radius = 6,
+    this.iconSize = 22,
   });
 
   final PlateRead read;
   final CrumbApi api;
   final Session session;
   final _ConcurrencyGate gate;
+  final double width;
+  final double height;
+  final double radius;
+  final double iconSize;
 
   @override
   State<_PlateThumb> createState() => _PlateThumbState();
@@ -595,9 +1001,6 @@ class _PlateThumbState extends State<_PlateThumb> {
   Uint8List? _bytes;
   bool _requested = false;
   bool _disposed = false;
-
-  static const double _w = 92;
-  static const double _h = 56;
 
   @override
   void initState() {
@@ -628,37 +1031,27 @@ class _PlateThumbState extends State<_PlateThumb> {
     if (_disposed) return;
     final eventId = widget.read.eventId;
     if (eventId == null || eventId.isEmpty) return;
-    final s = widget.session;
-    final url = '${s.base}/events/${Uri.encodeComponent(eventId)}/snapshot';
-    try {
-      final resp = await http.get(
-        Uri.parse(url),
-        headers: {'authorization': 'Bearer ${s.token}'},
-      );
-      if (_disposed || resp.statusCode != 200) return;
-      _cacheSnapshot(eventId, resp.bodyBytes);
-      if (mounted) setState(() => _bytes = resp.bodyBytes);
-    } catch (_) {
-      // Leave the placeholder.
-    }
+    final bytes = await _fetchSnapshotBytes(widget.session, eventId);
+    if (_disposed || bytes == null) return;
+    if (mounted) setState(() => _bytes = bytes);
   }
 
   @override
   Widget build(BuildContext context) {
     return ClipRRect(
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(widget.radius),
       child: SizedBox(
-        width: _w,
-        height: _h,
+        width: widget.width,
+        height: widget.height,
         child: _bytes != null
             ? Image.memory(_bytes!, fit: BoxFit.cover, gaplessPlayback: true)
             : Container(
                 color: Colors.black,
                 alignment: Alignment.center,
-                child: const Icon(
+                child: Icon(
                   Icons.directions_car_outlined,
                   color: Colors.white24,
-                  size: 22,
+                  size: widget.iconSize,
                 ),
               ),
       ),
@@ -713,6 +1106,1617 @@ class _ChipBox extends StatelessWidget {
   }
 }
 
+// ─── gallery view ──────────────────────────────────────────────────────────
+
+/// Responsive grid of plate cards: snapshot thumbnail (or placeholder), the
+/// plate (mono), camera, time, and a confidence chip. A card tap routes through
+/// the same [onTap] the list uses (pop-up clip player, or timeline hand-off for
+/// a read with no linked event).
+class _PlateGallery extends StatelessWidget {
+  const _PlateGallery({
+    required this.reads,
+    required this.camName,
+    required this.api,
+    required this.session,
+    required this.gate,
+    required this.onTap,
+  });
+
+  final List<PlateRead> reads;
+  final String Function(String cameraId) camName;
+  final CrumbApi api;
+  final Session session;
+  final _ConcurrencyGate gate;
+  final void Function(PlateRead) onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GridView.builder(
+      padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 260,
+        mainAxisSpacing: 12,
+        crossAxisSpacing: 12,
+        childAspectRatio: 1.15,
+      ),
+      itemCount: reads.length,
+      itemBuilder: (context, i) {
+        final p = reads[i];
+        return _PlateGalleryCard(
+          key: ValueKey(p.id),
+          read: p,
+          cameraName: camName(p.cameraId),
+          api: api,
+          session: session,
+          gate: gate,
+          onTap: () => onTap(p),
+        );
+      },
+    );
+  }
+}
+
+class _PlateGalleryCard extends StatelessWidget {
+  const _PlateGalleryCard({
+    super.key,
+    required this.read,
+    required this.cameraName,
+    required this.api,
+    required this.session,
+    required this.gate,
+    required this.onTap,
+  });
+
+  final PlateRead read;
+  final String cameraName;
+  final CrumbApi api;
+  final Session session;
+  final _ConcurrencyGate gate;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF1E2026),
+      borderRadius: BorderRadius.circular(8),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: _PlateThumb(
+                read: read,
+                api: api,
+                session: session,
+                gate: gate,
+                width: double.infinity,
+                height: double.infinity,
+                radius: 0,
+                iconSize: 34,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          read.plate.isEmpty ? '—' : read.plate,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.3,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      _ConfidenceChip(read.confidence),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      const Icon(Icons.videocam_outlined,
+                          size: 12, color: Colors.white38),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          cameraName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    _fmtDateTime(read.ts),
+                    style: const TextStyle(color: Colors.white54, fontSize: 10),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── grouped-by-plate view ─────────────────────────────────────────────────
+
+/// One collapsed group: a unique normalized plate, its sighting count,
+/// first/last seen, and the distinct cameras it was seen on.
+class _PlateGroup {
+  _PlateGroup(this.plate);
+  final String plate;
+  final List<PlateRead> reads = [];
+  final Set<String> cameraIds = {};
+  DateTime? first;
+  DateTime? last;
+
+  void add(PlateRead r) {
+    reads.add(r);
+    cameraIds.add(r.cameraId);
+    if (first == null || r.ts.isBefore(first!)) first = r.ts;
+    if (last == null || r.ts.isAfter(last!)) last = r.ts;
+  }
+}
+
+/// Collapses the fetched page by normalized plate — one expandable row per
+/// unique plate (count + first/last seen + camera list), expanding to the
+/// individual reads (reusing [_PlateRow]). Pure client-side grouping over the
+/// current page; groups are ordered by most-recent sighting.
+class _PlateGroupedList extends StatelessWidget {
+  const _PlateGroupedList({
+    required this.reads,
+    required this.camName,
+    required this.api,
+    required this.session,
+    required this.gate,
+    required this.onTap,
+    required this.canManage,
+    required this.watched,
+    required this.onAddToWatchlist,
+    required this.onReport,
+  });
+
+  final List<PlateRead> reads;
+  final String Function(String cameraId) camName;
+  final CrumbApi api;
+  final Session session;
+  final _ConcurrencyGate gate;
+  final void Function(PlateRead) onTap;
+  final bool canManage;
+  final Set<String> watched;
+  final void Function(PlateRead) onAddToWatchlist;
+  final void Function(PlateRead) onReport;
+
+  List<_PlateGroup> _group() {
+    final byPlate = <String, _PlateGroup>{};
+    for (final r in reads) {
+      final key = r.plate.isEmpty ? '—' : r.plate;
+      (byPlate[key] ??= _PlateGroup(key)).add(r);
+    }
+    final groups = byPlate.values.toList()
+      ..sort((a, b) => (b.last ?? DateTime(0)).compareTo(a.last ?? DateTime(0)));
+    return groups;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final groups = _group();
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      itemCount: groups.length,
+      separatorBuilder: (_, _) =>
+          const Divider(height: 1, color: Colors.white10),
+      itemBuilder: (context, i) {
+        final g = groups[i];
+        final cams = g.cameraIds.map(camName).toList()..sort();
+        final camLabel = cams.length == 1
+            ? cams.first
+            : '${cams.length} cameras';
+        // Newest-first within the group so the expansion mirrors the list view.
+        final sorted = g.reads.toList()
+          ..sort((a, b) => b.ts.compareTo(a.ts));
+        return Theme(
+          // Strip ExpansionTile's default dividers so it blends with the list.
+          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+          child: ExpansionTile(
+            tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+            iconColor: Colors.white54,
+            collapsedIconColor: Colors.white54,
+            leading: _PlateThumb(
+              read: sorted.first,
+              api: api,
+              session: session,
+              gate: gate,
+              width: 64,
+              height: 40,
+            ),
+            title: Text(
+              g.plate,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.4,
+                fontFamily: 'monospace',
+              ),
+            ),
+            subtitle: Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Text(
+                '${g.reads.length} sighting${g.reads.length == 1 ? '' : 's'}  •  '
+                '$camLabel\n'
+                'First ${_fmtDateTime(g.first ?? sorted.last.ts)}  •  '
+                'Last ${_fmtDateTime(g.last ?? sorted.first.ts)}',
+                style: const TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+            ),
+            childrenPadding: const EdgeInsets.only(bottom: 4),
+            children: [
+              for (final r in sorted)
+                _PlateRow(
+                  key: ValueKey(r.id),
+                  read: r,
+                  cameraName: camName(r.cameraId),
+                  api: api,
+                  session: session,
+                  gate: gate,
+                  onTap: () => onTap(r),
+                  canManage: canManage,
+                  watched: watched.contains(r.plate),
+                  onAddToWatchlist: () => onAddToWatchlist(r),
+                  onReport: () => onReport(r),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ─── timeline feed view ────────────────────────────────────────────────────
+
+/// Chronological (newest-first) large-row feed — bigger thumbnail, plate,
+/// camera, and time per row for touch/scan-friendly browsing. Taps route
+/// through the same [onTap] as the list.
+class _PlateTimeline extends StatelessWidget {
+  const _PlateTimeline({
+    required this.reads,
+    required this.camName,
+    required this.api,
+    required this.session,
+    required this.gate,
+    required this.onTap,
+  });
+
+  final List<PlateRead> reads;
+  final String Function(String cameraId) camName;
+  final CrumbApi api;
+  final Session session;
+  final _ConcurrencyGate gate;
+  final void Function(PlateRead) onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+      itemCount: reads.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 8),
+      itemBuilder: (context, i) {
+        final p = reads[i];
+        return Material(
+          color: const Color(0xFF1E2026),
+          borderRadius: BorderRadius.circular(8),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: () => onTap(p),
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Row(
+                children: [
+                  _PlateThumb(
+                    read: p,
+                    api: api,
+                    session: session,
+                    gate: gate,
+                    width: 148,
+                    height: 92,
+                    iconSize: 34,
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          p.plate.isEmpty ? '—' : p.plate,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 2,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            const Icon(Icons.videocam_outlined,
+                                size: 14, color: Colors.white38),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                camName(p.cameraId),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                            if (p.region != null && p.region!.isNotEmpty) ...[
+                              const SizedBox(width: 8),
+                              Text(
+                                p.region!,
+                                style: const TextStyle(
+                                  color: Colors.white38,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _fmtDateTime(p.ts),
+                          style: const TextStyle(
+                            color: Colors.white54,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  _ConfidenceChip(p.confidence),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.chevron_right,
+                      color: Colors.white24, size: 22),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ─── pop-up plate-hit clip player ──────────────────────────────────────────
+
+/// Dismissible overlay that plays a plate read's short detection clip — the
+/// same style/behavior as the Clips tab's clip player (Positioned.fill overlay
+/// over the tab, closes on Esc and a close button), trimmed to what a plate hit
+/// needs: no zoom/snapshot/bookmark, plus a "View on timeline" hand-off.
+///
+/// The clip is resolved exactly like a Clips detection clip: the read's
+/// [PlateRead.eventId] is the `d:<event-uuid>` clip id, played from
+/// `/clip/d:<event-uuid>/clip.mp4?q=preview` on a scoped media `?token=`
+/// minted for the read's camera (mirrors `_ClipPlayerState._open`). Only opened
+/// for reads that have an event_id, so a clip always exists to resolve.
+class _PlateClipPlayer extends StatefulWidget {
+  const _PlateClipPlayer({
+    super.key,
+    required this.api,
+    required this.session,
+    required this.read,
+    required this.cameraName,
+    required this.onReport,
+    required this.onClose,
+    required this.onViewOnTimeline,
+  });
+
+  final CrumbApi api;
+  final Session session;
+  final PlateRead read;
+  final String cameraName;
+  final VoidCallback onReport;
+  final VoidCallback onClose;
+  final VoidCallback onViewOnTimeline;
+
+  @override
+  State<_PlateClipPlayer> createState() => _PlateClipPlayerState();
+}
+
+class _PlateClipPlayerState extends State<_PlateClipPlayer> {
+  Player? _player;
+  VideoController? _controller;
+  int _loadAttempt = 0;
+  Timer? _watchdog;
+  StreamSubscription<bool>? _playingSub;
+  String? _error;
+  // Clip rendition: 'preview' (SD, fast on-demand transcode) or 'full' (HD, the
+  // original segment quality). Mirrors the Clips player's quality toggle — a
+  // clip has exactly these two renditions (there is no live "Auto" to pick).
+  String _quality = 'preview';
+  bool _qualityBusy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Esc closes the pop-up regardless of which node holds keyboard focus — a
+    // HardwareKeyboard handler fires for every key event, independent of the
+    // focus chain (same rationale as the Clips clip player's _onKeyEvent).
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
+    unawaited(_open(resetAttempt: true));
+  }
+
+  /// Lifetime-of-the-open-clip Esc handler; consumes only the Esc it acts on.
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.escape) return false;
+    if (!mounted) return false;
+    // A pushed route on top (dialog, menu) owns Esc — don't close under it.
+    if (Navigator.of(context).canPop()) return false;
+    widget.onClose();
+    return true;
+  }
+
+  /// `/clip/d:<event-uuid>/clip.mp4?q=preview` — the detection clip for this
+  /// read's sibling event, the same media route the Clips tab plays.
+  String? _clipRelUrl({int? retry}) {
+    final eventId = widget.read.eventId;
+    if (eventId == null || eventId.isEmpty) return null;
+    final id = Uri.encodeComponent('d:$eventId');
+    final r = retry != null ? '&_r=$retry' : '';
+    return '/clip/$id/clip.mp4?q=$_quality$r';
+  }
+
+  /// Switch the clip rendition (SD=preview / HD=full) and re-open in place at
+  /// the current position-agnostic start, mirroring the Clips player's toggle.
+  Future<void> _setQuality(String q) async {
+    if (_qualityBusy || _player == null || q == _quality) return;
+    setState(() {
+      _quality = q;
+      _qualityBusy = true;
+      _error = null;
+    });
+    try {
+      final rel = _clipRelUrl();
+      if (rel == null) return;
+      final url = await widget.api.mediaUrlForCamera(
+        widget.session,
+        widget.read.cameraId,
+        rel,
+      );
+      if (url == null || !mounted) return;
+      await _player?.open(Media(url));
+      await _player?.play();
+      _armWatchdog();
+    } finally {
+      if (mounted) setState(() => _qualityBusy = false);
+    }
+  }
+
+  Future<void> _open({bool resetAttempt = false, int? retry}) async {
+    if (resetAttempt) _loadAttempt = 0;
+    final rel = _clipRelUrl(retry: retry);
+    if (rel == null) {
+      if (mounted) setState(() => _error = 'No clip for this read.');
+      return;
+    }
+    final url = await widget.api.mediaUrlForCamera(
+      widget.session,
+      widget.read.cameraId,
+      rel,
+    );
+    if (!mounted) return;
+    if (url == null) {
+      setState(() => _error = 'Could not authorize this clip.');
+      return;
+    }
+    var player = _player;
+    if (player == null) {
+      player = Player();
+      final p = player.platform;
+      if (p is NativePlayer) {
+        for (final kv in const [
+          ['hwdec', 'auto'],
+          ['cache', 'yes'],
+          ['demuxer-readahead-secs', '2.0'],
+          ['demuxer-max-bytes', '32MiB'],
+          ['demuxer-max-back-bytes', '1MiB'],
+          ['network-timeout', '10'],
+          ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
+        ]) {
+          try {
+            await p.setProperty(kv[0], kv[1]);
+          } catch (_) {
+            /* non-fatal */
+          }
+        }
+      }
+      _playingSub = player.stream.playing.listen((playing) {
+        if (playing) _watchdog?.cancel();
+      });
+      final controller = VideoController(player);
+      setState(() {
+        _player = player;
+        _controller = controller;
+      });
+    }
+    await player.open(Media(url));
+    await player.play();
+    _armWatchdog();
+  }
+
+  /// A cold plate-hit clip is transcoded on demand, so a slow first load is
+  /// expected; retry a stalled load a couple of times before giving up.
+  void _armWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = Timer(_plateClipLoadTimeout, () {
+      if (!mounted) return;
+      final st = _player?.state;
+      final playing = st != null && st.playing && st.position > Duration.zero;
+      if (playing) return;
+      unawaited(_retryLoad());
+    });
+  }
+
+  Future<void> _retryLoad() async {
+    _watchdog?.cancel();
+    if (_loadAttempt >= _plateClipMaxRetries) {
+      if (mounted) setState(() => _error = 'Clip is slow to load — try again.');
+      return;
+    }
+    _loadAttempt++;
+    final rel = _clipRelUrl(retry: _loadAttempt);
+    if (rel == null) return;
+    final url = await widget.api.mediaUrlForCamera(
+      widget.session,
+      widget.read.cameraId,
+      rel,
+    );
+    if (url == null || !mounted) return;
+    await _player?.open(Media(url));
+    await _player?.play();
+    _armWatchdog();
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    _watchdog?.cancel();
+    _playingSub?.cancel();
+    _player?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final read = widget.read;
+    final plate = read.plate.isEmpty ? '—' : read.plate;
+    return Positioned.fill(
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.92),
+        child: Column(
+          children: [
+            // Title bar.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '$plate — ${widget.cameraName}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1.2,
+                        fontFamily: 'monospace',
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  _QualityToggle(
+                    quality: _quality,
+                    busy: _qualityBusy,
+                    onChanged: _setQuality,
+                  ),
+                  const SizedBox(width: 4),
+                  TextButton.icon(
+                    onPressed: widget.onReport,
+                    icon: const Icon(Icons.description_outlined,
+                        size: 16, color: Colors.white70),
+                    label: const Text(
+                      'Report',
+                      style: TextStyle(fontSize: 12, color: Colors.white70),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: widget.onViewOnTimeline,
+                    icon: const Icon(Icons.timeline, size: 16, color: Colors.white70),
+                    label: const Text(
+                      'View on timeline',
+                      style: TextStyle(fontSize: 12, color: Colors.white70),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Close (Esc)',
+                    onPressed: widget.onClose,
+                    icon: const Icon(Icons.close, color: Colors.white70, size: 22),
+                  ),
+                ],
+              ),
+            ),
+            // Video pane.
+            Expanded(
+              child: Center(
+                child: _error != null
+                    ? Text(
+                        _error!,
+                        style: const TextStyle(color: Colors.redAccent),
+                      )
+                    : _controller == null
+                        ? const CircularProgressIndicator()
+                        : Video(
+                            controller: _controller!,
+                            controls: MaterialDesktopVideoControls,
+                            fit: BoxFit.contain,
+                          ),
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact SD/HD rendition toggle for the plate-hit clip player. SD = the fast
+/// on-demand preview transcode, HD = the original full-quality clip. A clip has
+/// exactly these two renditions, so there is no live "Auto" to choose.
+class _QualityToggle extends StatelessWidget {
+  const _QualityToggle({
+    required this.quality,
+    required this.busy,
+    required this.onChanged,
+  });
+
+  final String quality; // 'preview' (SD) | 'full' (HD)
+  final bool busy;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
+    Widget seg(String label, String value) {
+      final sel = quality == value;
+      return InkWell(
+        onTap: (busy || sel) ? null : () => onChanged(value),
+        borderRadius: BorderRadius.circular(4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: sel ? FontWeight.w700 : FontWeight.w500,
+              color: sel ? accent : Colors.white54,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Opacity(
+      opacity: busy ? 0.5 : 1,
+      child: Container(
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.white24),
+          borderRadius: BorderRadius.circular(5),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            seg('SD', 'preview'),
+            Container(width: 1, height: 16, color: Colors.white24),
+            seg('HD', 'full'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── watchlist panel ───────────────────────────────────────────────────────
+
+/// Right-hand side panel: the LPR plate watchlist. Any account that can see
+/// the Plates tab may read it; [canManage] (admin) gates the add form and the
+/// per-entry Remove button. Add/remove call back into the screen (which owns
+/// the list + refresh) via [onAdd]/[onRemove], which rethrow so this panel can
+/// surface a friendly message — notably the non-admin 403.
+class _WatchlistPanel extends StatefulWidget {
+  const _WatchlistPanel({
+    required this.entries,
+    required this.loading,
+    required this.error,
+    required this.canManage,
+    required this.fuzz,
+    required this.fuzzLoading,
+    required this.onSaveFuzz,
+    required this.onAdd,
+    required this.onRemove,
+    required this.onRefresh,
+    required this.onClose,
+  });
+
+  final List<PlateWatchlistEntry> entries;
+  final bool loading;
+  final String? error;
+  final bool canManage;
+
+  /// Current watchlist fuzziness (0.0..0.5) from `GET /config/lpr`, or null
+  /// when not an admin / not yet loaded — the control only renders when set.
+  final double? fuzz;
+  final bool fuzzLoading;
+
+  /// Persist a new fuzziness (0.0..0.5). Rethrows so a 403 can surface inline.
+  final Future<void> Function(double fuzz) onSaveFuzz;
+
+  final Future<void> Function({
+    required String plate,
+    String? label,
+    bool notify,
+    String kind,
+  }) onAdd;
+  final Future<void> Function(PlateWatchlistEntry entry) onRemove;
+  final VoidCallback onRefresh;
+  final VoidCallback onClose;
+
+  @override
+  State<_WatchlistPanel> createState() => _WatchlistPanelState();
+}
+
+class _WatchlistPanelState extends State<_WatchlistPanel> {
+  final TextEditingController _plateCtrl = TextEditingController();
+  final TextEditingController _labelCtrl = TextEditingController();
+  bool _notify = true;
+  String _kind = 'watch'; // "watch" | "ignore"
+  bool _saving = false;
+  String? _addError;
+
+  @override
+  void initState() {
+    super.initState();
+    // Rebuild as the operator types so the fuzziness control can preview the
+    // accepted misreads for the plate currently in the add field.
+    _plateCtrl.addListener(_onPlateChanged);
+  }
+
+  void _onPlateChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _plateCtrl.removeListener(_onPlateChanged);
+    _plateCtrl.dispose();
+    _labelCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _add() async {
+    final plate = _plateCtrl.text.trim();
+    if (plate.isEmpty) {
+      setState(() => _addError = 'Enter a plate.');
+      return;
+    }
+    setState(() {
+      _saving = true;
+      _addError = null;
+    });
+    try {
+      final label = _labelCtrl.text.trim();
+      await widget.onAdd(
+        plate: plate,
+        label: label.isEmpty ? null : label,
+        notify: _notify,
+        kind: _kind,
+      );
+      if (!mounted) return;
+      _plateCtrl.clear();
+      _labelCtrl.clear();
+      setState(() {
+        _notify = true;
+        _kind = 'watch';
+        _saving = false;
+      });
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _addError = e.statusCode == 403
+            ? 'Only admins can manage the watchlist.'
+            : e.message;
+        _saving = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _addError = 'Add failed: $e';
+        _saving = false;
+      });
+    }
+  }
+
+  Future<void> _remove(PlateWatchlistEntry entry) async {
+    try {
+      await widget.onRemove(entry);
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.statusCode == 403
+                ? 'Only admins can manage the watchlist.'
+                : e.message,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Remove failed: $e')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 300,
+      decoration: const BoxDecoration(
+        color: Color(0xFF1E2026),
+        border: Border(left: BorderSide(color: Colors.white12)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildHeader(context),
+          const Divider(height: 1, color: Colors.white12),
+          if (widget.canManage)
+            _buildAddForm(context)
+          else
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: Text(
+                'Only admins can manage the watchlist.',
+                style: TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+            ),
+          if (widget.canManage && widget.fuzz != null) ...[
+            const Divider(height: 1, color: Colors.white12),
+            _FuzzControl(
+              fuzz: widget.fuzz!,
+              plate: _plateCtrl.text,
+              onSave: widget.onSaveFuzz,
+            ),
+          ] else if (widget.canManage && widget.fuzzLoading) ...[
+            const Divider(height: 1, color: Colors.white12),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 8),
+                  Text(
+                    'Loading match fuzziness…',
+                    style: TextStyle(color: Colors.white38, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const Divider(height: 1, color: Colors.white12),
+          Expanded(child: _buildList(context)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 6, 8),
+      child: Row(
+        children: [
+          const Icon(Icons.fact_check_outlined,
+              size: 16, color: Colors.white70),
+          const SizedBox(width: 8),
+          const Text(
+            'Watchlist',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '${widget.entries.length}',
+            style: const TextStyle(color: Colors.white38, fontSize: 12),
+          ),
+          const Spacer(),
+          IconButton(
+            tooltip: 'Refresh',
+            onPressed: widget.onRefresh,
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.refresh, color: Colors.white54, size: 16),
+          ),
+          IconButton(
+            tooltip: 'Hide watchlist',
+            onPressed: widget.onClose,
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.close, color: Colors.white54, size: 16),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAddForm(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _KindSelector(
+            value: _kind,
+            onChanged: _saving ? null : (v) => setState(() => _kind = v),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _plateCtrl,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              letterSpacing: 1.2,
+              fontFamily: 'monospace',
+            ),
+            textCapitalization: TextCapitalization.characters,
+            onSubmitted: (_) {
+              if (!_saving) _add();
+            },
+            decoration: _fieldDecoration('Plate'),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _labelCtrl,
+            style: const TextStyle(color: Colors.white, fontSize: 13),
+            onSubmitted: (_) {
+              if (!_saving) _add();
+            },
+            decoration: _fieldDecoration('Label (optional)'),
+          ),
+          // Notifying only makes sense for a "watch" — an "ignore" drops the
+          // read before it could alert, so the switch is disabled there.
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            value: _kind == 'ignore' ? false : _notify,
+            onChanged: (_saving || _kind == 'ignore')
+                ? null
+                : (v) => setState(() => _notify = v),
+            title: Text(
+              _kind == 'ignore' ? 'Drops matching reads' : 'Notify on sighting',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ),
+          if (_addError != null) ...[
+            const SizedBox(height: 2),
+            Text(
+              _addError!,
+              style: const TextStyle(color: Color(0xFFD65C5C), fontSize: 12),
+            ),
+          ],
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton.icon(
+              onPressed: _saving ? null : _add,
+              icon: _saving
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.add, size: 16),
+              label: Text(_kind == 'ignore' ? 'Add to ignore' : 'Add to watch'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildList(BuildContext context) {
+    if (widget.loading && widget.entries.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (widget.error != null) {
+      return Padding(
+        padding: const EdgeInsets.all(12),
+        child: Text(
+          "Couldn't load watchlist: ${widget.error}",
+          style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+        ),
+      );
+    }
+    if (widget.entries.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(12),
+        child: Text(
+          'No watched plates yet.',
+          style: TextStyle(color: Colors.white38, fontSize: 12),
+        ),
+      );
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      itemCount: widget.entries.length,
+      separatorBuilder: (_, _) =>
+          const Divider(height: 1, color: Colors.white10),
+      itemBuilder: (context, i) {
+        final e = widget.entries[i];
+        return _WatchlistTile(
+          entry: e,
+          canManage: widget.canManage,
+          onRemove: () => _remove(e),
+        );
+      },
+    );
+  }
+
+  InputDecoration _fieldDecoration(String hint) => InputDecoration(
+        isDense: true,
+        hintText: hint,
+        hintStyle: const TextStyle(color: Colors.white38, fontSize: 13),
+        filled: true,
+        fillColor: const Color(0xFF2A2D35),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide.none,
+        ),
+      );
+}
+
+/// Watch/Ignore toggle for the add form. "Watch" alerts on a sighting;
+/// "Ignore" tells the server to drop matching reads.
+class _KindSelector extends StatelessWidget {
+  const _KindSelector({required this.value, required this.onChanged});
+  final String value;
+  final ValueChanged<String>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget seg(String v, IconData icon, String label, Color activeColor) {
+      final active = value == v;
+      return Expanded(
+        child: GestureDetector(
+          onTap: onChanged == null ? null : () => onChanged!(v),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 7),
+            decoration: BoxDecoration(
+              color: active
+                  ? activeColor.withValues(alpha: 0.18)
+                  : const Color(0xFF2A2D35),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: active ? activeColor : Colors.transparent,
+              ),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  icon,
+                  size: 14,
+                  color: active ? activeColor : Colors.white54,
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: active ? activeColor : Colors.white54,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      children: [
+        seg('watch', Icons.notifications_active, 'Watch',
+            const Color(0xFF57C888)),
+        const SizedBox(width: 6),
+        seg('ignore', Icons.block, 'Ignore', const Color(0xFFE8A33D)),
+      ],
+    );
+  }
+}
+
+/// Admin-only "Match fuzziness" slider (0–50%, mapped to `watchlist_fuzz`
+/// 0.0–0.5). Debounces the PUT until the operator settles on a value; a 403
+/// (stale admin flag) surfaces inline. Tolerates OCR misreads for both watch
+/// and ignore matching.
+// ─── fuzzy-match model (mirrors the server's watchlist/ignore matching) ──────
+// The backend matches a read against a watch/ignore plate by *character
+// tolerance*: normalize both (uppercase, keep only A–Z0–9), and accept when the
+// edit distance is within `floor(fuzz * plateLength)`. These helpers reproduce
+// that rule exactly so the slider can preview which misreads it would accept.
+
+/// Uppercase and keep only alphanumerics (drops spaces, dashes, punctuation).
+String _normalizePlate(String s) {
+  final b = StringBuffer();
+  for (final r in s.toUpperCase().runes) {
+    final c = String.fromCharCode(r);
+    if (RegExp(r'[A-Z0-9]').hasMatch(c)) b.write(c);
+  }
+  return b.toString();
+}
+
+/// Allowed character edits for a reference plate at [fuzz] (0..0.5).
+int _allowedEdits(String reference, double fuzz) =>
+    (fuzz.clamp(0.0, 0.5) * _normalizePlate(reference).length).floor();
+
+/// Classic Levenshtein edit distance over characters.
+int _levenshtein(String a, String b) {
+  if (a == b) return 0;
+  if (a.isEmpty) return b.length;
+  if (b.isEmpty) return a.length;
+  var prev = List<int>.generate(b.length + 1, (i) => i);
+  var cur = List<int>.filled(b.length + 1, 0);
+  for (var i = 0; i < a.length; i++) {
+    cur[0] = i + 1;
+    for (var j = 0; j < b.length; j++) {
+      final cost = a.codeUnitAt(i) == b.codeUnitAt(j) ? 0 : 1;
+      final del = prev[j + 1] + 1;
+      final ins = cur[j] + 1;
+      final sub = prev[j] + cost;
+      cur[j + 1] = del < ins ? (del < sub ? del : sub) : (ins < sub ? ins : sub);
+    }
+    final tmp = prev;
+    prev = cur;
+    cur = tmp;
+  }
+  return prev[b.length];
+}
+
+/// Common ALPR character confusions (the pairs Frigate's OCR most often swaps).
+const Map<String, String> _ocrConfusions = {
+  '0': 'O', 'O': '0', '1': 'I', 'I': '1', 'L': '1', '2': 'Z', 'Z': '2',
+  '5': 'S', 'S': '5', '8': 'B', 'B': '8', '6': 'G', 'G': '6', '4': 'A',
+  'A': '4', 'D': '0', 'Q': 'O', '7': 'T',
+};
+
+/// A few realistic misreads of [plate] that the server WOULD accept at the
+/// given [allowed] tolerance — one/two OCR-confusion substitutions, verified by
+/// the same edit-distance rule the server uses. Returns [] when tolerance is 0
+/// (exact only) or the plate is empty.
+List<String> _acceptedMisreadExamples(String plate, int allowed) {
+  final norm = _normalizePlate(plate);
+  if (norm.isEmpty || allowed <= 0) return const [];
+  final out = <String>[];
+  // Distance-1 variants first: swap one confusable character.
+  for (var i = 0; i < norm.length && out.length < 4; i++) {
+    final rep = _ocrConfusions[norm[i]];
+    if (rep == null) continue;
+    final cand = norm.substring(0, i) + rep + norm.substring(i + 1);
+    if (cand != norm &&
+        !out.contains(cand) &&
+        _levenshtein(cand, norm) <= allowed) {
+      out.add(cand);
+    }
+  }
+  // If two edits are allowed, add a couple of double-swaps to show the range.
+  if (allowed >= 2) {
+    for (var i = 0; i < norm.length && out.length < 4; i++) {
+      final r1 = _ocrConfusions[norm[i]];
+      if (r1 == null) continue;
+      for (var j = i + 1; j < norm.length && out.length < 4; j++) {
+        final r2 = _ocrConfusions[norm[j]];
+        if (r2 == null) continue;
+        final cand = norm.substring(0, i) +
+            r1 +
+            norm.substring(i + 1, j) +
+            r2 +
+            norm.substring(j + 1);
+        if (cand != norm &&
+            !out.contains(cand) &&
+            _levenshtein(cand, norm) <= allowed) {
+          out.add(cand);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+class _FuzzControl extends StatefulWidget {
+  const _FuzzControl({
+    required this.fuzz,
+    required this.plate,
+    required this.onSave,
+  });
+  final double fuzz;
+
+  /// The plate currently typed into the add form (may be empty). Drives the
+  /// live "accepted misreads" preview so the slider means something concrete.
+  final String plate;
+  final Future<void> Function(double fuzz) onSave;
+
+  @override
+  State<_FuzzControl> createState() => _FuzzControlState();
+}
+
+class _FuzzControlState extends State<_FuzzControl> {
+  late double _value = widget.fuzz.clamp(0.0, 0.5);
+  bool _saving = false;
+  String? _error;
+
+  /// The plate to illustrate with — the typed plate, or a sample when empty.
+  String get _sampleBasis {
+    final n = _normalizePlate(widget.plate);
+    return n.isEmpty ? '7ABC123' : n;
+  }
+
+  bool get _usingSample => _normalizePlate(widget.plate).isEmpty;
+
+  @override
+  void didUpdateWidget(_FuzzControl old) {
+    super.didUpdateWidget(old);
+    // Adopt a server-confirmed value when it changes and we're not mid-drag.
+    if (!_saving && widget.fuzz != old.fuzz) {
+      _value = widget.fuzz.clamp(0.0, 0.5);
+    }
+  }
+
+  Future<void> _commit(double v) async {
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await widget.onSave(v);
+      if (mounted) setState(() => _saving = false);
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.statusCode == 403
+            ? 'Only admins can change fuzziness.'
+            : e.message;
+        _saving = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Save failed: $e';
+        _saving = false;
+      });
+    }
+  }
+
+  /// A pill showing an accepted misread [cand], with the character(s) that
+  /// differ from [basis] highlighted in the accent colour.
+  Widget _misreadChip(String basis, String cand, Color accent) {
+    final spans = <TextSpan>[
+      for (var i = 0; i < cand.length; i++)
+        TextSpan(
+          text: cand[i],
+          style: TextStyle(
+            color: (i >= basis.length || cand[i] != basis[i])
+                ? accent
+                : Colors.white70,
+            fontWeight: (i >= basis.length || cand[i] != basis[i])
+                ? FontWeight.w800
+                : FontWeight.w500,
+          ),
+        ),
+    ];
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Text.rich(
+        TextSpan(children: spans),
+        style: const TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 12,
+          letterSpacing: 1,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (_value * 100).round();
+    final basis = _sampleBasis;
+    final allowed = _allowedEdits(basis, _value);
+    final examples = _acceptedMisreadExamples(basis, allowed);
+    final accent = Theme.of(context).colorScheme.primary;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Text(
+                'Match fuzziness',
+                style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              if (_saving)
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                Text(
+                  allowed == 0
+                      ? 'Exact'
+                      : '$pct%  ·  up to $allowed char${allowed == 1 ? '' : 's'}',
+                  style: TextStyle(
+                    color: allowed == 0 ? Colors.white70 : accent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 3,
+              overlayShape:
+                  const RoundSliderOverlayShape(overlayRadius: 12),
+            ),
+            child: Slider(
+              value: _value,
+              max: 0.5,
+              divisions: 50,
+              label: '$pct%',
+              onChanged: _saving
+                  ? null
+                  : (v) => setState(() => _value = v),
+              onChangeEnd: (v) => _commit(v),
+            ),
+          ),
+          if (allowed == 0)
+            const Text(
+              'Exact match only. A single misread character will not match.',
+              style: TextStyle(color: Colors.white38, fontSize: 11),
+            )
+          else ...[
+            Text(
+              _usingSample
+                  ? 'Tolerates up to $allowed misread character${allowed == 1 ? '' : 's'}. Example on a 7-char plate — type a plate above to preview yours:'
+                  : 'Tolerates up to $allowed misread character${allowed == 1 ? '' : 's'} on this plate. Would still match:',
+              style: const TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+            if (examples.isNotEmpty) ...[
+              const SizedBox(height: 7),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final ex in examples) _misreadChip(basis, ex, accent),
+                ],
+              ),
+            ],
+          ],
+          if (_error != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              _error!,
+              style: const TextStyle(color: Color(0xFFD65C5C), fontSize: 11),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// One watchlist entry: optional color swatch, plate (mono), label subtitle, a
+/// notify indicator, and (admin only) a Remove button.
+class _WatchlistTile extends StatelessWidget {
+  const _WatchlistTile({
+    required this.entry,
+    required this.canManage,
+    required this.onRemove,
+  });
+
+  final PlateWatchlistEntry entry;
+  final bool canManage;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final swatch = _parseHexColor(entry.color);
+    final isIgnore = entry.isIgnore;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 6, 8),
+      child: Row(
+        children: [
+          if (swatch != null) ...[
+            Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                color: swatch,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white24),
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        entry.plate.isEmpty ? '—' : entry.plate,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.2,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                    if (isIgnore) ...[
+                      const SizedBox(width: 6),
+                      const _KindBadge(),
+                    ],
+                  ],
+                ),
+                if (entry.label != null && entry.label!.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    entry.label!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          // Notify state is only meaningful for a "watch"; an "ignore" carries
+          // the badge above instead.
+          if (!isIgnore)
+            Icon(
+              entry.notify
+                  ? Icons.notifications_active
+                  : Icons.notifications_off_outlined,
+              size: 15,
+              color: entry.notify ? const Color(0xFF57C888) : Colors.white24,
+            ),
+          if (canManage)
+            IconButton(
+              tooltip: 'Remove',
+              onPressed: onRemove,
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.delete_outline,
+                  size: 16, color: Colors.white38),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Small "IGNORE" pill shown on ignore-kind watchlist rows.
+class _KindBadge extends StatelessWidget {
+  const _KindBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    const color = Color(0xFFE8A33D);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.6)),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.block, size: 10, color: color),
+          SizedBox(width: 3),
+          Text(
+            'IGNORE',
+            style: TextStyle(
+              color: color,
+              fontSize: 9,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Parse a `"#rrggbb"` (or `"#aarrggbb"`) hex string into a [Color], or null
+/// if absent/malformed — the watchlist color is an optional annotation.
+Color? _parseHexColor(String? hex) {
+  if (hex == null) return null;
+  var h = hex.trim();
+  if (h.startsWith('#')) h = h.substring(1);
+  if (h.length == 6) h = 'FF$h';
+  if (h.length != 8) return null;
+  final v = int.tryParse(h, radix: 16);
+  return v == null ? null : Color(v);
+}
+
 // ─── shared thumbnail plumbing ─────────────────────────────────────────────
 
 /// Process-wide snapshot byte cache, keyed by event id, bounded so a long
@@ -729,6 +2733,27 @@ void _cacheSnapshot(String id, Uint8List bytes) {
     }
   }
   _snapshotCache[id] = bytes;
+}
+
+/// Fetch a detection-event snapshot JPEG (`GET /events/{event_id}/snapshot`,
+/// Bearer-authed), returning cached bytes when present. Returns null on any
+/// non-200 or error — callers fall back to a placeholder. Shared by the lazy
+/// thumbnails and the PDF export so both hit the same bounded cache.
+Future<Uint8List?> _fetchSnapshotBytes(Session s, String eventId) async {
+  final cached = _snapshotCache[eventId];
+  if (cached != null) return cached;
+  final url = '${s.base}/events/${Uri.encodeComponent(eventId)}/snapshot';
+  try {
+    final resp = await sharedHttpClient.get(
+      Uri.parse(url),
+      headers: {'authorization': 'Bearer ${s.token}'},
+    );
+    if (resp.statusCode != 200) return null;
+    _cacheSnapshot(eventId, resp.bodyBytes);
+    return resp.bodyBytes;
+  } catch (_) {
+    return null;
+  }
 }
 
 /// Bounded-concurrency gate for snapshot loads (mirrors the Clips tab's cap).

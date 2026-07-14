@@ -7,64 +7,81 @@
 <title>CrumbVMS, Management</title>
 <style>
 :root {
-  /* commercial-VMS-style layered neutral grays: window / panel / inset / border. */
-  --bg:#1e2226; --surface:#262b30; --surface2:#2b3136; --surface3:#323840;
-  --border:#3a4046; --border2:#4a515a;
-  --text:#dfe2e6; --dim:#99a1ab; --dim2:#707781;
-  --accent:#E8A33D; --accent-dim:#7a5520; --accent2:#38BDD6;
-  --ok:#34C759; --danger:#E5484D; --warn:#F5A623;
-  /* Native management-tool geometry: flat, square-ish, no glows. */
-  --radius:3px; --radius-lg:4px; --radius-xl:4px;
-  --shadow:0 1px 4px rgba(0,0,0,.3);
-  --shadow-lg:0 2px 10px rgba(0,0,0,.45);
-  /* spacing scale, dense 4/8px rhythm */
+  /* Dark-committed ops console: cool near-black ground + ONE warm accent.
+     Token NAMES are unchanged, so every downstream rule re-skins for free;
+     only the values (and the high-traffic component rules) were retuned. */
+  --bg:#0e1114; --surface:#12161b; --surface2:#1c222a; --surface3:#232b34;
+  --border:#242b33; --border2:#2f3945;
+  --text:#e7ebef; --dim:#98a2ad; --dim2:#68727d;
+  --accent:#E8A33D; --accent-dim:#6b5024; --accent2:#6d8aa3;
+  --ok:#40C463; --danger:#E5484D; --warn:#E5B33D;
+  /* Softer, rounder product geometry (was flat 3px squares). */
+  --radius:6px; --radius-lg:8px; --radius-xl:11px;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+  --shadow-lg:0 8px 28px rgba(0,0,0,.5);
+  /* spacing scale, 4/8px rhythm */
   --sp-1:2px; --sp-2:4px; --sp-3:8px; --sp-4:10px; --sp-5:12px; --sp-6:14px;
+  /* raised card fill sitting on --bg, and the soft accent tint for
+     selected/hover states (new, additive tokens). */
+  --card-bg:#161b21; --accent-soft:rgba(232,163,61,.12);
 }
 *{box-sizing:border-box;margin:0;padding:0;}
 html,body{height:100%;}
-body{font:13px/1.4 "Segoe UI",system-ui,Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+body{font:13.5px/1.5 "Segoe UI",system-ui,Roboto,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased;}
 a{color:var(--accent2);}
-h1,h2,h3,h4{font-weight:600;}
-button{font:inherit;font-size:12px;cursor:pointer;border:none;border-radius:var(--radius);padding:3px 10px;min-height:26px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);transition:background .12s,border-color .12s;}
-button:hover{background:var(--surface3);border-color:var(--dim2);}
+h1,h2,h3,h4{font-weight:650;letter-spacing:-.01em;}
+button{font:inherit;font-size:13px;font-weight:500;cursor:pointer;border-radius:var(--radius);padding:6px 13px;min-height:30px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);transition:background .12s,border-color .12s;}
+button:hover{background:var(--surface3);border-color:#3b4653;}
 button:active{background:var(--surface);}
-button.primary{background:var(--accent);color:#1a1206;border-color:transparent;font-weight:600;}
-button.primary:hover{filter:brightness(1.08);}
+button.primary{background:var(--accent);color:#1c1305;border-color:transparent;font-weight:600;}
+button.primary:hover{background:#f0b054;filter:none;}
 button.ghost{background:transparent;border-color:var(--border2);}
 button.ghost:hover{background:var(--surface2);}
 button.danger-ghost{background:transparent;color:var(--danger);border-color:var(--danger);opacity:.85;}
 button.danger-ghost:hover{opacity:1;background:rgba(229,72,77,.08);}
-button.sm{padding:2px 8px;font-size:12px;min-height:24px;}
-button.xs{padding:1px 6px;font-size:11px;min-height:20px;}
+button.sm{padding:5px 10px;font-size:12.5px;min-height:27px;}
+button.xs{padding:2px 8px;font-size:11.5px;min-height:22px;}
 button:disabled{opacity:.4;cursor:default;filter:none;}
-input,select,textarea{font:inherit;font-size:13px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:var(--radius);padding:3px 8px;min-height:26px;width:100%;outline:none;transition:border-color .15s;}
-input:focus,select:focus,textarea:focus{border-color:var(--accent);}
+input,select,textarea{font:inherit;font-size:13.5px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:var(--radius);padding:8px 11px;min-height:32px;width:100%;outline:none;transition:border-color .12s,box-shadow .12s;}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
 input::placeholder{color:var(--dim2);}
-label.field-label{display:block;font-size:11px;color:var(--dim);font-weight:500;letter-spacing:.2px;margin:var(--sp-3) 0 3px;}
+/* Native select chevron (keeps the retuned control geometry consistent). */
+select{appearance:none;-webkit-appearance:none;padding-right:30px;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2398a2ad' stroke-width='2.5'><path d='M6 9l6 6 6-6'/></svg>");
+  background-repeat:no-repeat;background-position:right 10px center;}
+/* Segmented two-state toggle (used where a native <select> popup is unreliable
+   in the embedded webview, and a 2-option control reads better as a toggle). */
+.seg-toggle{display:inline-flex;border:1px solid var(--border2);border-radius:var(--radius);overflow:hidden;}
+.seg-btn{background:var(--surface2);color:var(--dim);border:none;padding:8px 12px;font:inherit;font-size:13px;line-height:1;cursor:pointer;min-height:32px;width:auto;}
+.seg-btn+.seg-btn{border-left:1px solid var(--border2);}
+.seg-btn.active{background:var(--accent-soft);color:var(--text);font-weight:600;}
+.seg-btn:hover:not(.active){color:var(--text);}
+label.field-label{display:block;font-size:12px;color:var(--dim);font-weight:500;letter-spacing:.1px;margin:var(--sp-4) 0 5px;}
 /* Visible focus rectangles (keyboard nav + native feel). Text inputs keep their
    accent border; everything else gets a dotted Windows-style focus rect. */
 button:focus-visible,select:focus-visible,summary:focus-visible,a:focus-visible,
 [role=button]:focus-visible,input[type=checkbox]:focus-visible,
 input[type=radio]:focus-visible,input[type=range]:focus-visible{outline:1px dotted var(--text);outline-offset:1px;}
-/* ── Label-left form grid (commercial-VMS property-sheet layout) ──
-   Fixed right-aligned muted label column + control column. Put label text in
-   .fg-label, the control (input/select + trailing buttons) in .fg-ctl; a row
-   spanning both columns (hints, notes) uses .fg-full. */
-.form-grid{display:grid;grid-template-columns:minmax(140px,180px) 1fr;gap:7px 10px;align-items:center;}
-.form-grid.narrow{grid-template-columns:minmax(100px,130px) 1fr;}
-.form-grid .fg-label{font-size:12px;color:var(--dim);text-align:right;justify-self:end;line-height:1.25;margin:0;max-width:100%;}
+/* ── Label-over-input form stack (modern control layout) ──
+   Was a right-aligned property-sheet grid (the dated-dialog tell). Now a
+   vertical stack: each .fg-label sits directly above its .fg-ctl, with pairs
+   separated by a little more space than the label→control gap. A row spanning
+   the old two columns (hints, notes) uses .fg-full and just flows full-width. */
+.form-grid{display:flex;flex-direction:column;gap:6px;}
+.form-grid .fg-label{font-size:12px;color:var(--dim);font-weight:500;text-align:left;line-height:1.3;margin:10px 0 0;max-width:100%;}
+.form-grid>.fg-label:first-child{margin-top:0;}
 .form-grid .fg-ctl{min-width:0;display:flex;align-items:center;gap:6px;}
 .form-grid .fg-ctl>input,.form-grid .fg-ctl>select{flex:1 1 auto;min-width:0;width:auto;}
 .form-grid .fg-ctl>button{flex:0 0 auto;}
-.form-grid .fg-full{grid-column:1/-1;min-width:0;}
+.form-grid .fg-full{min-width:0;}
 .hidden{display:none!important;}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 /* Inline SVG glyphs (Lucide) inherit text color; keep them baseline-aligned. */
 .icn{display:inline-block;vertical-align:-0.18em;flex-shrink:0;}
 /* ── Top bar ── */
-.topbar{display:flex;align-items:center;gap:10px;padding:0 12px;height:40px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;}
-.brand{font-weight:600;letter-spacing:.3px;display:flex;align-items:center;gap:8px;font-size:13px;}
-.brand-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--accent);flex-shrink:0;}
+.topbar{display:flex;align-items:center;gap:10px;padding:0 16px;height:48px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;}
+.brand{font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:9px;font-size:14px;}
+.brand-dot{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--accent);flex-shrink:0;box-shadow:0 0 0 3px rgba(232,163,61,.15);}
 .brand-sub{color:var(--dim);font-weight:400;font-size:12px;}
 .topbar-spacer{flex:1;}
 .who{color:var(--dim);font-size:13px;}
@@ -77,43 +94,47 @@ body.embedded .topbar{display:none;}
    │             ├───────────────────────────┤
    │             │ bottom pane (snapshot)    │
    └─────────────┴───────────────────────────┘ */
-.mgmt{display:flex;flex:1;min-height:0;height:calc(100vh - 40px);}
-.tree-pane{width:224px;flex-shrink:0;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;overflow-y:auto;}
+.mgmt{display:flex;flex:1;min-height:0;height:calc(100vh - 48px);}
+.tree-pane{width:236px;flex-shrink:0;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;overflow-y:auto;padding:8px 8px 12px;}
 .right-col{flex:1;min-width:0;display:flex;flex-direction:column;}
-.right-pane{flex:1;min-height:0;overflow-y:auto;padding:var(--sp-5);}
-.bottom-pane{flex-shrink:0;height:200px;border-top:1px solid var(--border);background:var(--surface);overflow-y:auto;padding:var(--sp-3) var(--sp-4);}
-/* ── Tree ── */
-.tree-root{border-bottom:1px solid var(--border);}
-.tree-root-head{display:flex;align-items:center;gap:5px;padding:5px 8px;min-height:24px;cursor:pointer;user-select:none;font-size:11px;font-weight:600;letter-spacing:.3px;color:var(--dim);text-transform:uppercase;}
+.right-pane{flex:1;min-height:0;overflow-y:auto;padding:20px 22px;}
+.bottom-pane{flex-shrink:0;height:200px;border-top:1px solid var(--border);background:var(--surface);overflow-y:auto;padding:var(--sp-4) var(--sp-5);}
+/* ── Tree / rail nav ──
+   Section heads read as proper nav rows (sentence-case, icon, rounded, an amber
+   left-marker + tint when active) rather than the old cramped uppercase labels. */
+.tree-root{margin-bottom:1px;}
+.tree-root-head{display:flex;align-items:center;gap:9px;padding:7px 10px;min-height:34px;cursor:pointer;user-select:none;font-size:13px;font-weight:600;letter-spacing:0;color:var(--dim);text-transform:none;border-radius:var(--radius);position:relative;transition:background .12s,color .12s;}
 .tree-root-head:hover{background:var(--surface2);color:var(--text);}
+.tree-root-head:hover .tw-icon{color:var(--dim);}
 .tree-root-head .tw-chev{font-size:9px;width:10px;flex-shrink:0;color:var(--dim2);transition:transform .12s;}
 .tree-root-head.collapsed .tw-chev{transform:rotate(-90deg);}
-.tree-root-head .tw-icon{width:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.tree-root-head .tw-icon{width:18px;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--dim2);transition:color .12s;}
 .tree-root-head .tw-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.tree-root-head .tw-add{font-size:14px;line-height:1;color:var(--dim2);padding:0 4px;border-radius:4px;}
+.tree-root-head .tw-add{font-size:15px;line-height:1;color:var(--dim2);padding:1px 5px;border-radius:5px;}
 .tree-root-head .tw-add:hover{color:var(--accent);background:var(--surface3);}
-.tree-root-head.selected{background:rgba(232,163,61,.08);color:var(--accent);}
+.tree-root-head.selected{background:var(--accent-soft);color:var(--text);box-shadow:inset 3px 0 0 var(--accent);}
 .tree-root-head.selected .tw-icon{color:var(--accent);}
-.tree-children{display:flex;flex-direction:column;}
+.tree-children{display:flex;flex-direction:column;padding:1px 0 4px 4px;}
 .tree-children.collapsed{display:none;}
 /* Labelled divider inside a section's children (Roles / Users under Users &
    security), typography only, no box. */
-.tree-subhead{display:flex;align-items:center;gap:6px;padding:7px 10px 3px 22px;font-size:10px;font-weight:700;letter-spacing:.5px;color:var(--dim2);text-transform:uppercase;}
-.tree-subhead .tw-add{margin-left:auto;font-size:14px;line-height:1;color:var(--dim2);padding:0 4px;border-radius:4px;cursor:pointer;}
+.tree-subhead{display:flex;align-items:center;gap:6px;padding:9px 10px 4px 18px;font-size:10px;font-weight:700;letter-spacing:.6px;color:var(--dim2);text-transform:uppercase;}
+.tree-subhead .tw-add{margin-left:auto;font-size:15px;line-height:1;color:var(--dim2);padding:1px 5px;border-radius:5px;cursor:pointer;}
 .tree-subhead .tw-add:hover{color:var(--accent);background:var(--surface3);}
-.tree-row{display:flex;align-items:center;gap:5px;padding:3px 8px 3px 14px;min-height:24px;cursor:pointer;font-size:12px;color:var(--text);border-left:2px solid transparent;}
-.tree-row:hover{background:var(--surface2);}
-.tree-row.selected{background:rgba(232,163,61,.08);border-left-color:var(--accent);}
-.tree-row .tr-icon{width:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--dim);}
+.tree-row{display:flex;align-items:center;gap:8px;padding:5px 9px 5px 12px;min-height:30px;cursor:pointer;font-size:12.5px;color:var(--dim);border-left:2px solid transparent;border-radius:0 var(--radius) var(--radius) 0;transition:background .1s,color .1s;}
+.tree-row:hover{background:var(--surface2);color:var(--text);}
+.tree-row.selected{background:var(--accent-soft);border-left-color:var(--accent);color:var(--text);font-weight:500;}
+.tree-row .tr-icon{width:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--dim2);}
+.tree-row:hover .tr-icon{color:var(--dim);}
 .tree-row.selected .tr-icon{color:var(--accent);}
 .tree-row .tr-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .tree-row .tr-status{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex-shrink:0;}
-.tree-row .tr-status.on{background:var(--ok);}
+.tree-row .tr-status.on{background:var(--ok);box-shadow:0 0 6px rgba(64,196,99,.5);}
 .tree-row .tr-meta{font-size:11px;color:var(--dim2);flex-shrink:0;}
 /* group node (collapsible camera folder) */
-.tree-group-head{display:flex;align-items:center;gap:5px;padding:3px 8px 3px 12px;min-height:24px;cursor:pointer;user-select:none;font-size:12px;color:var(--text);border-left:2px solid transparent;}
+.tree-group-head{display:flex;align-items:center;gap:7px;padding:5px 9px 5px 11px;min-height:30px;cursor:pointer;user-select:none;font-size:12.5px;color:var(--text);border-left:2px solid transparent;border-radius:0 var(--radius) var(--radius) 0;transition:background .1s;}
 .tree-group-head:hover{background:var(--surface2);}
-.tree-group-head.selected{background:rgba(232,163,61,.08);border-left-color:var(--accent);color:var(--text);}
+.tree-group-head.selected{background:var(--accent-soft);border-left-color:var(--accent);color:var(--text);}
 .tree-group-head.selected .tg-chev{color:var(--dim2);}
 .tree-group-head.selected .tg-icon{color:var(--accent);}
 .tree-group-head.selected .tg-count{color:var(--dim2);}
@@ -126,14 +147,36 @@ body.embedded .topbar{display:none;}
 .tree-group-cams.collapsed{display:none;}
 .tree-group-cams .tree-row{padding-left:30px;}
 .tree-empty{padding:6px 14px;font-size:12px;color:var(--dim2);font-style:italic;}
+/* ── Rail: grouped section nav (Frigate-style). Sections only — the content
+   pane shows each section's list/detail, so the rail carries no nested items. */
+.rail-eyebrow{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim2);font-weight:600;padding:14px 12px 5px;}
+.rail-eyebrow:first-child{padding-top:4px;}
+.tree-root-head .tw-count{margin-left:auto;font:600 11px/1 ui-monospace,monospace;color:var(--dim2);background:var(--surface2);padding:3px 7px;border-radius:999px;font-variant-numeric:tabular-nums;}
+.tree-root-head.selected .tw-count{color:var(--accent);background:rgba(232,163,61,.14);}
+/* ── Content-list views (section = header + stat tiles + list table → detail) ── */
+.stat-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:12px;margin-bottom:18px;}
+.stat-tile{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:13px 15px;}
+.stat-tile .st-k{font-size:11.5px;color:var(--dim);display:flex;align-items:center;gap:7px;font-weight:500;}
+.stat-tile .st-k svg{width:14px;height:14px;color:var(--dim2);flex:none;}
+.stat-tile .st-v{font:650 23px/1.1 "Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums;margin-top:8px;letter-spacing:-.02em;}
+.stat-tile .st-v small{font-size:13px;color:var(--dim);font-weight:500;letter-spacing:0;}
+.stat-tile .st-t{font-size:11.5px;margin-top:5px;color:var(--dim2);}
+.stat-tile .st-t.ok{color:var(--ok);} .stat-tile .st-t.warn{color:var(--warn);}
+.rp-back{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--dim);background:none;border:none;min-height:0;padding:2px 0;margin-bottom:4px;cursor:pointer;font-weight:500;}
+.rp-back:hover{color:var(--accent);background:none;border:none;}
+table.list-tbl tbody tr{cursor:pointer;}
+.lt-name{display:flex;align-items:center;gap:11px;min-width:0;}
+.lt-name .lt-ico{width:20px;color:var(--dim2);display:flex;flex-shrink:0;justify-content:center;}
+.lt-name .lt-main{font-weight:600;overflow:hidden;text-overflow:ellipsis;}
+.lt-name .lt-sub{font-size:11.5px;color:var(--dim2);margin-top:1px;}
 /* ── Right-pane header → slim sticky toolbar strip ──
    Title (small) on the left, the pane's action buttons on the right. When the
    header is a DIRECT child of the scrolling right-pane it pins to the top
    (commercial-VMS toolbar); inside .editor-sticky (camera editor) the parent already
    pins, so only the base style applies. */
-.rp-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:34px;padding:3px 0 5px;border-bottom:1px solid var(--border);margin-bottom:var(--sp-4);}
-.right-pane>.rp-head{position:sticky;top:calc(var(--sp-5) * -1);z-index:6;background:var(--bg);
-  margin:calc(var(--sp-5) * -1) calc(var(--sp-5) * -1) var(--sp-4);padding:4px var(--sp-5) 5px;}
+.rp-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:38px;padding:4px 0 8px;border-bottom:1px solid var(--border);margin-bottom:var(--sp-5);}
+.right-pane>.rp-head{position:sticky;top:-20px;z-index:6;background:var(--bg);
+  margin:-20px -22px var(--sp-5);padding:14px 22px 10px;}
 .rp-head-left{display:flex;align-items:center;gap:8px;min-width:0;}
 .rp-head-icon{flex-shrink:0;color:var(--accent);display:flex;align-items:center;}
 .rp-head-icon svg{width:16px;height:16px;}
@@ -167,20 +210,20 @@ body.embedded .topbar{display:none;}
 .cm-meter-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--accent);transition:width .15s linear;}
 .cm-meter-mark{position:absolute;top:-2px;bottom:-2px;width:2px;background:#fff;display:none;}
 .cm-meter-text{font-size:12px;color:var(--dim);white-space:nowrap;min-width:155px;text-align:right;}
-.rp-head-title{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.rp-head-sub{font-size:11px;color:var(--dim);margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rp-head-title{font-size:15px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rp-head-sub{font-size:12px;color:var(--dim);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .rp-head-actions{display:flex;gap:6px;flex-shrink:0;align-items:center;}
 /* ── Camera tab strip (under the name) ── */
-.tab-strip{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:var(--sp-4);}
-.tab-strip .ts-btn{padding:4px 12px;min-height:0;color:var(--dim);border-bottom:2px solid transparent;background:none;border-radius:0;border-left:none;border-right:none;border-top:none;font-size:12px;}
-.tab-strip .ts-btn:hover{color:var(--text);filter:none;}
+.tab-strip{display:flex;gap:18px;border-bottom:1px solid var(--border);margin-bottom:var(--sp-5);}
+.tab-strip .ts-btn{padding:11px 2px;min-height:0;color:var(--dim);border-bottom:2px solid transparent;background:none;border-radius:0;border-left:none;border-right:none;border-top:none;font-size:13px;font-weight:600;margin-bottom:-1px;transition:color .12s,border-color .12s;}
+.tab-strip .ts-btn:hover{color:var(--text);filter:none;background:none;border-color:transparent;}
 .tab-strip .ts-btn.active{color:var(--text);border-bottom-color:var(--accent);}
 /* ── Sticky editor header (camera name + tab strip pinned while the body scrolls).
    The right-pane is the scroll container, so a sticky child sticks to its top. A
    matching background + a small negative-margin/padding inlay hides body content
    sliding behind it, and a bottom border separates it from the scrolled body. */
-.editor-sticky{position:sticky;top:calc(var(--sp-5) * -1);z-index:5;background:var(--bg);
-  margin:calc(var(--sp-5) * -1) calc(var(--sp-5) * -1) 0;padding:var(--sp-5) var(--sp-5) 0;}
+.editor-sticky{position:sticky;top:-20px;z-index:5;background:var(--bg);
+  margin:-20px -22px 0;padding:14px 22px 0;}
 .editor-sticky .tab-strip{margin-bottom:0;}
 .editor-body{padding-top:var(--sp-4);}
 /* ── Collapsible secondary detail (<details> with an at-a-glance summary). Used
@@ -242,10 +285,10 @@ details.detail-section .ds-body>.policy-section>.policy-section-title{position:s
 .adv-suggest{margin-top:9px;display:flex;flex-direction:column;gap:4px;}
 .adv-suggest-item{display:flex;gap:7px;align-items:flex-start;font-size:12px;color:var(--dim);line-height:1.5;padding:3px 0;}
 .adv-suggest-item .asi-ico{flex:0 0 auto;color:var(--accent);margin-top:1px;}
-/* ── Cards → flat bordered group panels ── */
-.card{border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;margin-bottom:var(--sp-4);}
-.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:4px;}
-.card-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--dim);}
+/* ── Cards → raised group panels (fill + hairline + soft shadow) ── */
+.card{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:var(--sp-5);box-shadow:var(--shadow);}
+.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px;}
+.card-title{font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);}
 .card-hint{color:var(--dim);font-size:12px;margin-top:4px;line-height:1.45;}
 /* ── Grid helpers ── */
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;}
@@ -253,21 +296,21 @@ details.detail-section .ds-body>.policy-section>.policy-section-title{position:s
 /* ── Tables, dense grid rows (12px text, ~30px rows, hover + selection bar) ── */
 .table-wrap{overflow-x:auto;}
 table{width:100%;border-collapse:collapse;}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px;vertical-align:top;}
-th{color:var(--dim);font-weight:600;font-size:11px;letter-spacing:.4px;text-transform:uppercase;padding-top:5px;padding-bottom:5px;background:var(--surface2);border-bottom:1px solid var(--border2);}
+th,td{text-align:left;padding:10px 11px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle;}
+th{color:var(--dim2);font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;padding-top:9px;padding-bottom:9px;background:transparent;border-bottom:1px solid var(--border);}
 tbody tr:last-child td{border-bottom:none;}
-tbody tr:hover{background:rgba(255,255,255,.04);}
-tbody tr.selected{background:rgba(232,163,61,.07);}
-tbody tr.selected td:first-child{box-shadow:inset 2px 0 0 var(--accent);}
+tbody tr:hover{background:var(--surface2);}
+tbody tr.selected{background:var(--accent-soft);}
+tbody tr.selected td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
 .td-right{text-align:right;white-space:nowrap;}
 .td-actions{display:flex;gap:6px;justify-content:flex-end;}
-/* ── Pills / badges, flattened to plain colored text labels ── */
-.pill{display:inline-flex;align-items:center;font-size:11px;font-weight:600;color:var(--dim2);gap:4px;white-space:nowrap;letter-spacing:.2px;}
-.pill.ok{color:var(--ok);}
-.pill.warn{color:var(--warn);}
-.pill.accent{color:var(--accent);}
-.pill.accent2{color:var(--accent2);}
-.pill.danger{color:var(--danger);}
+/* ── Pills / badges → soft-tinted rounded status chips ── */
+.pill{display:inline-flex;align-items:center;font-size:11.5px;font-weight:600;color:var(--dim);gap:5px;white-space:nowrap;letter-spacing:.1px;padding:3px 9px;border-radius:999px;background:var(--surface2);line-height:1.35;}
+.pill.ok{color:#7ee39a;background:rgba(64,196,99,.14);}
+.pill.warn{color:#f0d488;background:rgba(229,179,61,.14);}
+.pill.accent{color:var(--accent);background:var(--accent-soft);}
+.pill.accent2{color:#a6bccd;background:rgba(109,138,163,.16);}
+.pill.danger{color:#f0888c;background:rgba(229,72,77,.14);}
 /* ── Advanced storage management + tier cascade explainer, flattened ── */
 .tier-explainer{border-top:1px solid var(--border);padding:10px 0 8px;margin-bottom:12px;}
 .tier-explainer .tx-title{font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:7px;}
@@ -306,17 +349,17 @@ tbody tr.selected td:first-child{box-shadow:inset 2px 0 0 var(--accent);}
 .empty-state p{font-size:13px;margin-top:4px;}
 /* ── Login ── */
 .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;}
-.login-card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius-lg);padding:22px 24px;width:360px;box-shadow:var(--shadow-lg);}
-.login-brand{display:flex;align-items:center;gap:10px;margin-bottom:6px;}
-.login-brand span{font-size:15px;font-weight:600;}
-.login-sub{color:var(--dim);font-size:12px;margin-bottom:18px;}
+.login-card{background:var(--card-bg);border:1px solid var(--border2);border-radius:var(--radius-lg);padding:26px 28px;width:372px;box-shadow:var(--shadow-lg);}
+.login-brand{display:flex;align-items:center;gap:11px;margin-bottom:6px;}
+.login-brand span{font-size:17px;font-weight:650;letter-spacing:-.01em;}
+.login-sub{color:var(--dim);font-size:12.5px;margin-bottom:20px;}
 .login-actions{margin-top:16px;}
 /* ── Modals (stream test + scan + folder browse), flat dialog chrome ── */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:5vh 16px 40px;overflow-y:auto;z-index:100;}
-.modal-box{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius-lg);padding:14px 16px;width:620px;max-width:100%;box-shadow:var(--shadow-lg);position:relative;}
+.modal-box{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius-lg);padding:18px 20px;width:620px;max-width:100%;box-shadow:var(--shadow-lg);position:relative;}
 .modal-box.wide{width:780px;}
-.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding-bottom:7px;border-bottom:1px solid var(--border);}
-.modal-title{font-size:13px;font-weight:600;}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border);}
+.modal-title{font-size:15px;font-weight:650;letter-spacing:-.01em;}
 .modal-close{background:transparent;border:none;color:var(--dim);font-size:20px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:4px;}
 .modal-close:hover{color:var(--text);background:var(--surface2);}
 .modal-actions{display:flex;gap:10px;margin-top:22px;justify-content:flex-end;}
@@ -335,9 +378,9 @@ tbody tr.selected td:first-child{box-shadow:inset 2px 0 0 var(--accent);}
    lays out the trailing action button (top-right of the box). */
 .policy-section>.rp-section-head{justify-content:flex-end;margin:-6px 0 6px;}
 .mode-cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
-.mode-card{border:1px solid var(--border2);border-radius:var(--radius);padding:7px 10px;cursor:pointer;transition:border-color .15s,background .15s;position:relative;}
-.mode-card:hover{border-color:var(--border2);background:var(--surface3);}
-.mode-card.selected{border-color:var(--accent);background:rgba(232,163,61,.06);}
+.mode-card{border:1px solid var(--border2);border-radius:var(--radius);padding:10px 12px;cursor:pointer;transition:border-color .15s,background .15s;position:relative;}
+.mode-card:hover{border-color:#3b4653;background:var(--surface2);}
+.mode-card.selected{border-color:var(--accent);background:var(--accent-soft);}
 .mode-card input[type=radio]{position:absolute;opacity:0;width:0;height:0;}
 .mode-card-title{font-weight:600;font-size:13px;margin-bottom:3px;}
 .mode-card-desc{font-size:12px;color:var(--dim);line-height:1.45;}
@@ -437,11 +480,11 @@ code{background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:12px
 .snap-caption{font-size:12px;color:var(--dim);line-height:1.6;}
 .snap-caption .sc-title{font-size:13px;color:var(--text);font-weight:600;margin-bottom:2px;}
 .bottom-context{font-size:13px;color:var(--dim);display:flex;align-items:center;height:100%;gap:8px;}
-/* ── Scrollbar, thin, squared, native-ish ── */
-::-webkit-scrollbar{width:9px;height:9px;}
-::-webkit-scrollbar-track{background:var(--surface);}
-::-webkit-scrollbar-thumb{background:var(--border2);border-radius:0;border:2px solid var(--surface);}
-::-webkit-scrollbar-thumb:hover{background:var(--dim2);}
+/* ── Scrollbar, thin, rounded ── */
+::-webkit-scrollbar{width:10px;height:10px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#2a323c;border-radius:6px;border:2px solid var(--bg);}
+::-webkit-scrollbar-thumb:hover{background:#37414d;}
 
 /* ── Folder-browser modal (Browse… server-side picker) ── */
 .fsb-crumbs{display:flex;align-items:center;gap:3px;flex-wrap:wrap;font-size:12px;margin-bottom:8px;min-height:18px;}
@@ -3698,6 +3741,8 @@ function routeFor() {
   if (selKind === 'role' && selId)    return '/security/roles/' + selId;
   if (selKind === 'cameras-root')     return '/cameras';
   if (selKind === 'add-camera')       return '/cameras/add';
+  if (selKind === 'profiles-root')    return '/recording';
+  if (selKind === 'security-root')    return '/security';
   if (selKind === 'storage-root')     return '/storage';
   if (selKind === 'detection-root')   return '/detection';
   if (selKind === 'plates-root')      return '/plates';
@@ -3742,8 +3787,7 @@ function routeApply(r) {
     if (sec === 'recording') {
       const p = parts[1] ? profileById(parts[1]) : null;
       if (p) return select('profile', p.id);
-      const first = allProfiles()[0];
-      return first ? select('profile', first.id) : selectNone();
+      return select('profiles-root');
     }
     if (sec === 'storage') {
       if (parts[1] && STORAGES.find(s => s.id === parts[1])) return select('storage', parts[1]);
@@ -3752,7 +3796,7 @@ function routeApply(r) {
     if (sec === 'security') {
       if (parts[1] === 'users' && USERS.find(u => u.id === parts[2])) return select('user', parts[2]);
       if (parts[1] === 'roles' && ROLES.find(x => x.id === parts[2])) return select('role', parts[2]);
-      return selectNone();
+      return select('security-root');
     }
     if (sec === 'detection')     return select('detection-root');
     // Plates deep-link only resolves while LPR is enabled; otherwise fall through.
@@ -3794,11 +3838,8 @@ function restoreSelection() {
   } else if (selKind === 'add-camera') {
     renderAddCamera(); renderBottom(); routeWrite(); return;
   }
-  // Nothing valid selected.
-  selKind = null; selId = null;
-  renderWelcome();
-  renderBottom();
-  routeWrite();
+  // Nothing valid selected → land on the Cameras list (the default section).
+  return select('cameras-root');
 }
 
 /* Valid camera tabs for the current context, Motion is dropped when embedded in
@@ -3853,141 +3894,45 @@ function treeKey(ev, el) {
   }
 }
 
+/* Sections-only rail (Frigate model): the rail carries just the seven sections,
+   grouped under three eyebrows. Selecting a section renders its list/detail in
+   the content pane — cameras, profiles, storages, users are NO LONGER nested in
+   the rail; they live in each section's content view. Active state highlights
+   the section whose family (root OR any item under it) is currently open. */
 function renderTree() {
-  const camRows = renderCameraTreeRows();
-  const profRows = allProfiles().map(p => {
-    const isDef = !!p.is_default;
-    return `<div class="tree-row ${selKind==='profile'&&selId===p.id?'selected':''}" role="button" tabindex="0" onclick="select('profile','${p.id}')" onkeydown="treeKey(event,this)" title="${esc(p.name || 'Default')}">
-      <span class="tr-icon">${icon(isDef?'star':'profiles',14)}</span>
-      <span class="tr-label">${esc(p.name || 'Default')}</span>
-    </div>`;
-  }).join('') || `<div class="tree-empty">No profiles</div>`;
-
-  const stRows = (STORAGES.length
-    ? STORAGES.map(s => `<div class="tree-row ${selKind==='storage'&&selId===s.id?'selected':''}" role="button" tabindex="0" onclick="select('storage','${s.id}')" onkeydown="treeKey(event,this)" title="${esc(s.name)}">
-        <span class="tr-icon">${icon(storageIcon(s.name, s.icon),14)}</span>
-        <span class="tr-label">${esc(s.name)}</span>
-      </div>`).join('')
-    : `<div class="tree-empty" onclick="select('storage-root')" style="cursor:pointer">No locations, click to add</div>`);
-
-  // Users & security: one section, ROLES listed first (the reusable thing), then
-  // USERS (the instances), each under a small labelled sub-heading (§5e). No
-  // separate top-level Roles/Users roots any more (S5/S9).
-  const roleRows = (ROLES.length
-    ? ROLES.map(r => `<div class="tree-row ${selKind==='role'&&selId===r.id?'selected':''}" role="button" tabindex="0" onclick="select('role','${r.id}')" onkeydown="treeKey(event,this)" title="${esc(r.name)}">
-        <span class="tr-icon">${icon(r.is_admin?'shield':'roles',14)}</span>
-        <span class="tr-label">${esc(r.name)}</span>
-      </div>`).join('')
-    : `<div class="tree-empty">No roles</div>`);
-
-  const userRows = (USERS.length
-    ? USERS.map(u => {
-        const roleObj = ROLES.find(r => r.id === u.role_id);
-        const sublabel = u.role === 'admin' ? 'Administrator' : (roleObj ? esc(roleObj.name) : 'No role');
-        return `<div class="tree-row ${selKind==='user'&&selId===u.id?'selected':''}" role="button" tabindex="0" onclick="select('user','${u.id}')" onkeydown="treeKey(event,this)" title="${esc(u.username)}, ${sublabel}">
-        <span class="tr-icon">${icon(u.role==='admin'?'shield':'user',14)}</span>
-        <span class="tr-label">${esc(u.username)}</span>
-      </div>`;
-      }).join('')
-    : `<div class="tree-empty">No users</div>`);
-
-  // Combined "Users & security" children: a Roles sub-group (with its own + add)
-  // above a Users sub-group (with its own + add), so the two concepts stay
-  // distinct inside one section.
-  const securityRows =
-    subHead('Roles', `newRole()`) + roleRows +
-    subHead('Users', `newUser()`) + userRows;
-
-  // Six workflow-ordered sections + a Server leaf last (§4.1):
-  //  Cameras · Recording · Storage · Detection & clips · Notifications · Users & security  (· Server)
+  const camActive = ['cameras-root','camera','group','add-camera'].includes(selKind);
+  const recActive = ['profiles-root','profile'].includes(selKind);
+  const stoActive = ['storage-root','storage'].includes(selKind);
+  const detActive = selKind === 'detection-root';
+  const notActive = selKind === 'notifications-root';
+  const secActive = ['security-root','user','role'].includes(selKind);
+  const srvActive = selKind === 'server-root';
+  const item = (onclick, ic, label, active, count) => {
+    const badge = (count != null) ? `<span class="tw-count">${count}</span>` : '';
+    return `<div class="tree-root"><div class="tree-root-head leaf ${active?'selected':''}" role="button" tabindex="0" onclick="${onclick}" onkeydown="treeKey(event,this)">
+      <span class="tw-icon">${ic}</span><span class="tw-label">${label}</span>${badge}</div></div>`;
+  };
   $('tree-pane').innerHTML =
-    root('cameras', icon('cameras',15), 'Cameras', camRows, "select('cameras-root')", `newCamera()`, selKind==='cameras-root') +
-    root('profiles', icon('profiles',15), 'Recording', profRows, null, `newProfile()`, false) +
-    root('storages', icon('storage',15), 'Storage', stRows, "select('storage-root')", `select('storage-root')`, selKind==='storage-root') +
-    leafRoot('detection-root', icon('integration',15), 'Detection &amp; clips', selKind==='detection-root') +
-    leafRoot('notifications-root', icon('bell',15), 'Notifications', selKind==='notifications-root') +
+    `<div class="rail-eyebrow">Configure</div>` +
+    item("select('cameras-root')",  icon('cameras',17),     'Cameras',            camActive, CAMS.length) +
+    item("select('profiles-root')", icon('profiles',17),    'Recording',          recActive, allProfiles().length) +
+    item("select('storage-root')",  icon('storage',17),     'Storage',            stoActive, STORAGES.length) +
+    `<div class="rail-eyebrow">Intelligence</div>` +
+    item("select('detection-root')",     icon('integration',17), 'Detection &amp; clips', detActive, null) +
     // Plates: only when LPR capture is enabled (privacy-sensitive, off by default).
     ((LPR_CONFIG && LPR_CONFIG.enabled)
-      ? leafRoot('plates-root', icon('cam_lpr',15), 'Plates', selKind==='plates-root')
+      ? item("select('plates-root')", icon('cam_lpr',17), 'Plates', selKind==='plates-root', null)
       : '') +
-    root('security', icon('shield',15), 'Users &amp; security', securityRows, null, null, false) +
-    leafRoot('server-root', icon('storage',15), 'Server', selKind==='server-root');
+    item("select('notifications-root')",  icon('bell',17),        'Notifications',        notActive, null) +
+    `<div class="rail-eyebrow">Administer</div>` +
+    item("select('security-root')", icon('shield',17),      'Users &amp; security', secActive, USERS.length) +
+    item("select('server-root')",   icon('storage',17),     'Server',               srvActive, null);
 }
 
-/* A small labelled divider inside a section's children (e.g. "Roles" / "Users"
-   under Users & security), with an optional + add affordance. Typography-only,
-   no bordered box, matches the visual-hierarchy rule (§4.1). */
-function subHead(label, addFn) {
-  const add = addFn ? `<span class="tw-add" title="Add" onclick="event.stopPropagation();${addFn}">+</span>` : '';
-  return `<div class="tree-subhead">${esc(label)}${add}</div>`;
-}
-
-/* A standalone top-level entry that selects a whole-pane view (no children, no
-   +add), e.g. Integrations. Styled like a root head but acts as a row. */
-function leafRoot(kind, icon, label, selected) {
-  return `<div class="tree-root">
-    <div class="tree-root-head leaf ${selected?'selected':''}" role="button" tabindex="0"
-         onclick="select('${kind}')" onkeydown="treeKey(event,this)">
-      <span class="tw-icon">${icon}</span>
-      <span class="tw-label">${label}</span>
-    </div>
-  </div>`;
-}
-
-/* One top-level root section with a + add affordance. headClick fires when the
-   root label itself is clicked (used for Cameras/Storage "add when empty"). */
-function root(key, icon, label, childrenHTML, headClickFn, addFn, selected) {
-  const collapsed = isCollapsed(key);
-  const headClick = headClickFn ? `onclick="event.stopPropagation();${headClickFn}"` : '';
-  // A section may have no top-level + add (e.g. Users & security adds per sub-group).
-  const add = addFn ? `<span class="tw-add" title="Add" onclick="event.stopPropagation();${addFn}">+</span>` : '';
-  return `<div class="tree-root">
-    <div class="tree-root-head ${collapsed?'collapsed':''} ${selected?'selected':''}">
-      <span class="tw-chev" onclick="event.stopPropagation();toggleCollapse('${key}')">&#x25BC;</span>
-      <span class="tw-icon" onclick="event.stopPropagation();toggleCollapse('${key}')">${icon}</span>
-      <span class="tw-label" ${headClick}>${label}</span>
-      ${add}
-    </div>
-    <div class="tree-children ${collapsed?'collapsed':''}">${childrenHTML}</div>
-  </div>`;
-}
-
-/* Cameras root contents: ungrouped cameras first (by name), then each group as a
-   collapsible folder node (chevron + folder + member count) expanding to its
-   cameras (indented). */
-function renderCameraTreeRows() {
-  const byName = (a, b) => (a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
-  const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).slice().sort(byName);
-  let html = '';
-  // Add-camera ghost row when in add mode (keeps the tree's selection coherent).
-  if (selKind === 'add-camera') {
-    html += `<div class="tree-row selected"><span class="tr-icon">${icon('add',14)}</span><span class="tr-label">Add camera…</span></div>`;
-  }
-  html += ungrouped.map(camRow).join('');
-  // Groups (sorted by name), each a collapsible folder.
-  (GROUPS || []).slice().sort(byName).forEach(g => {
-    const key = 'grp:' + g.id;
-    const collapsed = isCollapsed(key);
-    const members = (g.camera_ids || [])
-      .map(cid => CAMS.find(c => c.id === cid)).filter(Boolean).sort(byName);
-    html += `<div class="tree-group-head ${collapsed?'collapsed':''} ${selKind==='group'&&selId===g.id?'selected':''}" role="button" tabindex="0" onclick="select('group','${g.id}')" onkeydown="treeKey(event,this)" title="${esc(g.name)}">
-      <span class="tg-chev" onclick="event.stopPropagation();toggleCollapse('${key}')" title="Expand / collapse">&#x25BC;</span>
-      <span class="tg-icon" onclick="event.stopPropagation();toggleCollapse('${key}')">${icon('group',13)}</span>
-      <span class="tg-label">${esc(g.name)}</span>
-      <span class="tg-count">${members.length}</span>
-    </div>
-    <div class="tree-group-cams ${collapsed?'collapsed':''}">${members.map(camRow).join('') || `<div class="tree-empty" style="padding-left:30px">Empty</div>`}</div>`;
-  });
-  if (!html) html = `<div class="tree-empty" onclick="newCamera()" style="cursor:pointer">No cameras, click to add</div>`;
-  return html;
-}
-function camRow(c) {
-  return `<div class="tree-row ${selKind==='camera'&&selId===c.id?'selected':''}" role="button" tabindex="0" onclick="select('camera','${c.id}')" onkeydown="treeKey(event,this)" title="${esc(c.name)} (${esc(c.camera_type||'other')})">
-    <span class="tr-icon">${icon(camIcon(c),14)}</span>
-    <span class="tr-label">${esc(c.name)}</span>
-    <span class="tr-status ${c.enabled?'on':''}" title="${c.enabled?'Recording':'Disabled'}"></span>
-  </div>`;
-}
+/* (Removed with the Frigate-model rebuild: subHead / leafRoot / root /
+   renderCameraTreeRows / camRow — the old nested-tree builders. The rail is now
+   sections-only (see renderTree above) and cameras/groups live in the Cameras
+   content view (renderCamerasRoot), not the rail.) */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    RIGHT PANE, welcome / cameras-root / storage-root
@@ -3995,47 +3940,133 @@ function camRow(c) {
 function renderWelcome() {
   if (selKind === 'cameras-root') return renderCamerasRoot();
   if (selKind === 'storage-root') return renderStorageRoot();
+  if (selKind === 'profiles-root') return renderRecordingRoot();
+  if (selKind === 'security-root') return renderSecurityRoot();
   $('right-pane').innerHTML = `<div class="empty-state" style="padding-top:80px">
     <div class="empty-icon">${icon('cameras',40)}</div>
-    <p>Select an item from the tree on the left to view and edit it.</p>
+    <p>Select a section on the left to get started.</p>
     <p style="margin-top:12px">
       <button class="primary sm" onclick="newCamera()">+ Add camera</button>
       <button class="ghost sm" onclick="newCamera()" title="Discover cameras from the Add-camera pane">Scan network</button>
     </p>
   </div>`;
 }
+
 function renderCamerasRoot() {
+  const byName = (a,b)=>(a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
   const total = CAMS.length, rec = CAMS.filter(c => c.enabled).length;
+  const groupCount = (GROUPS||[]).length;
+  const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).length;
+  const camBody = CAMS.slice().sort(byName).map(c => {
+    const g = groupOfCamera(c.id);
+    const model = (c.model || c.make) ? esc(c.model || c.make) : '<span style="color:var(--dim2)">—</span>';
+    const type = esc(c.camera_type || 'other');
+    const status = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
+    return `<tr onclick="select('camera','${c.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div></td>
+      <td>${g ? esc(g.name) : '<span style="color:var(--dim2)">Ungrouped</span>'}</td>
+      <td>${model}</td>
+      <td>${status}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="4" style="color:var(--dim2);padding:20px;text-align:center">No cameras yet — click “Add camera” to get started.</td></tr>`;
+
+  const groupBody = (GROUPS||[]).slice().sort(byName).map(g => {
+    const gp = g.policy_id ? profileById(g.policy_id) : null;
+    const n = (g.camera_ids||[]).length;
+    return `<tr onclick="select('group','${g.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon('group',18)}</span><div class="lt-main">${esc(g.name)}</div></div></td>
+      <td>${gp ? esc(gp.name) : 'Default'}</td>
+      <td>${n} camera${n!==1?'s':''}</td>
+    </tr>`;
+  }).join('');
+
+  const tile = (ic, k, v) => `<div class="stat-tile"><div class="st-k">${icon(ic,14)} ${k}</div><div class="st-v">${v}</div></div>`;
+
   $('right-pane').innerHTML = `
     <div class="rp-head">
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('cameras',22)}</span>
         <div class="rp-head-titles">
           <div class="rp-head-title">Cameras</div>
-          <div class="rp-head-sub">${total} total · ${rec} recording</div>
+          <div class="rp-head-sub">Add, tune, and monitor every camera Crumb records</div>
         </div>
       </div>
       <div class="rp-head-actions">
-        <button class="primary sm" onclick="newCamera()">+ Add camera</button>
-        <button class="ghost sm" onclick="newGroup()">+ New group</button>
         <button class="ghost sm" onclick="newCamera()" title="Discover cameras from the Add-camera pane">Scan network</button>
+        <button class="primary sm" onclick="newCamera()">+ Add camera</button>
       </div>
     </div>
-    <div class="card-hint">Pick a camera in the tree to edit it, or add a new one. Cameras can be organized into groups; a group inherits a recording profile that its cameras use unless individually overridden.</div>
-
-    <div class="policy-section">
-      <div class="policy-section-title">Camera groups</div>
-      ${(GROUPS||[]).length ? `<div style="display:flex;flex-direction:column;gap:4px">` + (GROUPS||[]).slice().sort((a,b)=>(a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase())).map(g => {
-        const gp = g.policy_id ? profileById(g.policy_id) : null;
-        const n = (g.camera_ids||[]).length;
-        return `<div class="tree-row" role="button" tabindex="0" onclick="select('group','${g.id}')" onkeydown="treeKey(event,this)">
-          <span class="tr-icon">${icon('group',14)}</span>
-          <span class="tr-label">${esc(g.name)}</span>
-          <span class="tr-meta" style="margin-left:auto;color:var(--dim2)">${gp?esc(gp.name):'Default'}</span>
-          <span class="tr-meta" style="margin-left:8px">${n} cam${n!==1?'s':''}</span>
-        </div>`;
-      }).join('') + `</div>` : '<div style="color:var(--dim2);font-size:12px">No groups yet. Create one to assign a shared recording profile to several cameras at once.</div>'}
-      <div style="margin-top:10px"><button class="ghost sm" onclick="newGroup()">+ New group</button></div>
+    <div class="stat-tiles">
+      ${tile('cameras','Cameras',total)}
+      ${tile('profiles','Recording',`${rec}<small> / ${total}</small>`)}
+      ${tile('group','Groups',groupCount)}
+      ${tile('cameras','Ungrouped',ungrouped)}
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)">
+        <div class="card-title">All cameras</div>
+      </div>
+      <div class="table-wrap">
+        <table class="list-tbl"><thead><tr><th>Camera</th><th>Group</th><th>Model</th><th>Recording</th></tr></thead>
+        <tbody>${camBody}</tbody></table>
+      </div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title">Camera groups</div>
+        <button class="ghost sm" onclick="newGroup()">+ New group</button>
+      </div>
+      ${groupCount ? `<div class="table-wrap"><table class="list-tbl"><thead><tr><th>Group</th><th>Recording profile</th><th>Cameras</th></tr></thead><tbody>${groupBody}</tbody></table></div>`
+        : `<div class="card-hint" style="padding:14px 16px">No groups yet. Create one to assign a shared recording profile to several cameras at once.</div>`}
+    </div>`;
+}
+/* Recording section list: the reusable profiles cameras/groups inherit. */
+function renderRecordingRoot() {
+  const profs = allProfiles();
+  const body = profs.map(p => {
+    const def = p.is_default ? '<span style="margin-left:auto"><span class="pill accent">Default</span></span>' : '';
+    return `<tr onclick="select('profile','${p.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(p.is_default?'star':'profiles',18)}</span><div class="lt-main">${esc(p.name||'Default')}</div>${def}</div></td>
+    </tr>`;
+  }).join('') || `<tr><td style="color:var(--dim2);padding:20px;text-align:center">No recording profiles.</td></tr>`;
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left"><span class="rp-head-icon">${icon('profiles',22)}</span>
+        <div class="rp-head-titles"><div class="rp-head-title">Recording</div><div class="rp-head-sub">Reusable recording profiles that cameras and groups inherit</div></div></div>
+      <div class="rp-head-actions"><button class="primary sm" onclick="newProfile()">+ New profile</button></div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)"><div class="card-title">Recording profiles</div></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Profile</th></tr></thead><tbody>${body}</tbody></table></div>
+    </div>`;
+}
+/* Users & security section list: roles (capabilities) + users (sign-in accounts). */
+function renderSecurityRoot() {
+  const roleBody = ROLES.map(r => `<tr onclick="select('role','${r.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(r.is_admin?'shield':'roles',18)}</span><div class="lt-main">${esc(r.name)}</div>${r.is_admin?'<span style="margin-left:auto"><span class="pill accent">Admin</span></span>':''}</div></td>
+    </tr>`).join('') || `<tr><td style="color:var(--dim2);padding:20px;text-align:center">No roles.</td></tr>`;
+  const userBody = USERS.map(u => {
+    const roleObj = ROLES.find(r => r.id === u.role_id);
+    const sub = u.role === 'admin' ? 'Administrator' : (roleObj ? esc(roleObj.name) : '<span style="color:var(--dim2)">No role</span>');
+    return `<tr onclick="select('user','${u.id}')">
+      <td><div class="lt-name"><span class="lt-ico">${icon(u.role==='admin'?'shield':'user',18)}</span><div class="lt-main">${esc(u.username)}</div></div></td>
+      <td>${sub}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="2" style="color:var(--dim2);padding:20px;text-align:center">No users.</td></tr>`;
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left"><span class="rp-head-icon">${icon('shield',22)}</span>
+        <div class="rp-head-titles"><div class="rp-head-title">Users &amp; security</div><div class="rp-head-sub">Roles define capabilities; each user signs in with a role</div></div></div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title">Roles</div><button class="ghost sm" onclick="newRole()">+ New role</button></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Role</th></tr></thead><tbody>${roleBody}</tbody></table></div>
+    </div>
+    <div class="card" style="padding:0">
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title">Users</div><button class="primary sm" onclick="newUser()">+ New user</button></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>User</th><th>Role</th></tr></thead><tbody>${userBody}</tbody></table></div>
     </div>`;
 }
 function renderStorageRoot() {
@@ -4321,6 +4352,7 @@ function renderAddCamera() {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('cam_other',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('cameras-root')" title="Back to all cameras">‹ Cameras</button>
           <div class="rp-head-title">Add cameras</div>
           <div class="rp-head-sub">Scan the network, pick what you want, add them in one go</div>
         </div>
@@ -4453,6 +4485,7 @@ function renderCamera(id) {
         <div class="rp-head-left">
           <span class="rp-head-icon">${icon(camIcon(c),22)}</span>
           <div class="rp-head-titles">
+            <button class="rp-back" onclick="select('cameras-root')" title="Back to all cameras">‹ Cameras</button>
             <div class="rp-head-title">${esc(c.name)} ${statusBadge}</div>
             <div class="rp-head-sub">${sub}</div>
           </div>
@@ -5886,7 +5919,8 @@ async function renderDetectionClips() {
       <div class="card-hint" style="margin:-2px 0 10px 2px">Building a database of recognised license plates is <b>privacy-sensitive</b>, so plate capture is <b>off by default</b>. When enabled, plate reads are retained for the window below and are visible only to roles granted the <b>View license plates</b> capability.</div>
       <label class="chk"><input type="checkbox" id="lpr-enabled" ${lpr.enabled?'checked':''}/> Enable license-plate capture</label>
       <div class="grid2" style="margin-top:10px">
-        <div><label class="field-label" style="margin-top:0">Plate-read retention (days) ${infoHint('How long recognised plate reads are kept before automatic deletion. 1–3650 days.')}</label><input id="lpr-retention" type="number" min="1" max="3650" value="${esc(String(lpr.retention_days))}" /></div>
+        <div><label class="field-label" style="margin-top:0">Plate-read retention (days) ${infoHint('How long recognised plate reads are kept before automatic deletion. 1–3650 days. Independent of footage/storage retention — plate reads are small database records pruned on their own schedule, so deleting video never deletes plate reads and vice-versa.')}</label><input id="lpr-retention" type="number" min="1" max="3650" value="${esc(String(lpr.retention_days))}" /></div>
+        <div><label class="field-label" style="margin-top:0">Match fuzziness (tolerated misreads) ${infoHint('How many characters may differ when matching a read to a watch or ignore plate. Scales with plate length: 20% is about 1 wrong character on a 6-7 char plate; 0% = exact. Frigate ALPR sometimes misreads a character, and this catches those. Applies to both watch (alert) and ignore (drop) entries. Max 50%.')}</label><input id="lpr-fuzz" type="number" min="0" max="50" step="5" value="${esc(String(Math.round((lpr.watchlist_fuzz||0)*100)))}" /></div>
       </div>
       <div class="card-hint" style="margin-top:4px">Saving applies immediately, no restart.</div>
       <div id="lpr-msg" class="form-msg"></div>
@@ -6069,7 +6103,8 @@ async function saveLpr() {
   if (!Number.isFinite(days) || days < 1 || days > 3650) {
     setMsg('lpr-msg', 'Retention must be between 1 and 3650 days.', 'err'); return;
   }
-  const body = { enabled: $('lpr-enabled').checked, retention_days: days };
+  const fuzzPct = Math.max(0, Math.min(50, parseInt(($('lpr-fuzz') || {}).value, 10) || 0));
+  const body = { enabled: $('lpr-enabled').checked, retention_days: days, watchlist_fuzz: fuzzPct / 100 };
   try {
     LPR_CONFIG = await api('/config/lpr', { method: 'PUT', body: JSON.stringify(body) });
     renderTree();               // show/hide the Plates nav entry to match
@@ -7519,6 +7554,7 @@ function renderGroup(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon('group',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('cameras-root')" title="Back to all cameras">‹ Cameras</button>
           <div class="rp-head-title">${esc(g.name)}</div>
           <div class="rp-head-sub">${members.length} camera${members.length!==1?'s':''}</div>
         </div>
@@ -7769,6 +7805,7 @@ function renderProfile(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(isDefault?'star':'profiles',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('profiles-root')" title="Back to recording profiles">‹ Recording</button>
           <div class="rp-head-title">${esc(p.name || 'Default')}</div>
           <div class="rp-head-sub">${isDefault?'Default profile · ':''}${direct.length} camera${direct.length!==1?'s':''} direct${viaGroups.length?` · ${viaGroups.length} group${viaGroups.length!==1?'s':''}`:''}</div>
         </div>
@@ -8128,6 +8165,7 @@ function renderStorage(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(storageIcon(s.name, s.icon),22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('storage-root')" title="Back to storage">‹ Storage</button>
           <div class="rp-head-title">${esc(s.name)}</div>
           <div class="rp-head-sub mono">${esc(s.path)}</div>
         </div>
@@ -8347,6 +8385,7 @@ function renderUser(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(u.role==='admin'?'shield':'user',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('security-root')" title="Back to users &amp; security">‹ Users</button>
           <div class="rp-head-title">${esc(u.username)}</div>
           <div class="rp-head-sub">${roleSub}</div>
         </div>
@@ -8533,6 +8572,7 @@ function renderRole(id) {
       <div class="rp-head-left">
         <span class="rp-head-icon">${icon(isBuiltinAdmin?'shield':'roles',22)}</span>
         <div class="rp-head-titles">
+          <button class="rp-back" onclick="select('security-root')" title="Back to users &amp; security">‹ Users</button>
           <div class="rp-head-title">${esc(r.name)}</div>
           <div class="rp-head-sub">${isBuiltinAdmin ? 'Built-in administrator role, full access, cannot be modified' : 'Custom role'}</div>
         </div>
@@ -8648,6 +8688,9 @@ const SYS_ALERT_META = {
   policy_over_cap:      { title: 'Recording policy over cap',         desc: 'A policy’s live or archive footage is at/over its configured byte cap.', unit: null },
   backup_failed:        { title: 'Database backup failed',            desc: 'The Postgres backup job reported a failure.', unit: null },
   frigate_disconnected: { title: 'Frigate / MQTT disconnected',       desc: 'The Frigate detection integration has lost its MQTT connection.', unit: 'secs' },
+  stream_no_segments:   { title: 'Camera records nothing',            desc: 'A camera keeps connecting but never produces a recordable segment before the stall watchdog reconnects it, so no footage is saved. Usually a long/adaptive keyframe interval (smart codec, e.g. Hikvision/Dahua H.264+/H.265+) or very low fps, exceeding the segment-receipt timeout. Fix the camera’s I-frame interval / disable the smart codec, or raise SEGMENT_RECEIPT_TIMEOUT_SECS.', unit: null },
+  storage_unwritable:   { title: 'Storage not writable',              desc: 'The recorder cannot create a camera’s media directory under the storage root (permission denied) — footage is NOT being saved. Usually the host media dir is root-owned while the recorder runs as non-root uid 1001; fix the media dir ownership/permissions.', unit: null },
+  plate_watchlist_hit:  { title: 'License-plate watchlist hit',        desc: 'A watchlisted license plate was seen on a camera (managed in Plates → Watchlist).', unit: null },
 };
 
 /* Per-kind connection-field descriptors. */
@@ -8695,6 +8738,25 @@ function renderPlates() {
       </div>
     </div>
     <div class="policy-section" style="margin-top:0">
+      <div class="rp-section-head" style="margin-top:0">
+        <div class="policy-section-title" style="margin-bottom:0">Watchlist</div>
+      </div>
+      <div class="card-hint" style="margin:2px 0 8px 2px">Plates on this list raise a <b>License-plate watchlist hit</b> alert when seen, routed over your configured notification channels (Notifications → System alerts). Off unless a plate is added here.</div>
+      <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
+        <input id="wl-plate" placeholder="Plate (e.g. 7ABC123)" style="max-width:170px;font-family:var(--mono,monospace)" onkeydown="if(event.key==='Enter')addWatch()" />
+        <input id="wl-label" placeholder="Label (optional)" style="max-width:200px" onkeydown="if(event.key==='Enter')addWatch()" />
+        <input type="hidden" id="wl-kind" value="watch"/>
+        <div class="seg-toggle" role="group" aria-label="Watchlist entry kind">
+          <button type="button" id="wl-kind-watch" class="seg-btn active" onclick="setWlKind('watch')">Watch (alert)</button>
+          <button type="button" id="wl-kind-ignore" class="seg-btn" onclick="setWlKind('ignore')">Ignore (drop reads)</button>
+        </div>
+        <label class="chk" style="margin:0"><input type="checkbox" id="wl-notify" checked/> Alert on hit</label>
+        <button class="primary sm" onclick="addWatch()">Add</button>
+      </div>
+      <div id="wl-msg" class="form-msg"></div>
+      <div id="wl-list" style="margin-top:10px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
+    </div>
+    <div class="policy-section" style="margin-top:12px">
       <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
         <input id="plate-q" placeholder="Search plate…" style="max-width:240px" onkeydown="if(event.key==='Enter')loadPlates()" />
         <select id="plate-match" style="max-width:150px">${modeOpts}</select>
@@ -8703,7 +8765,87 @@ function renderPlates() {
       <div class="card-hint" style="margin-top:6px">Showing up to ${PLATES_LIMIT} reads across your cameras. Match mode applies to the search text.</div>
       <div id="plate-results" style="margin-top:12px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
     </div>`;
+  loadWatchlist();
   loadPlates();
+}
+
+/* ── plate watchlist (GET/POST/DELETE /lpr/watchlist) ── */
+/* Watch/Ignore segmented toggle: sets the hidden #wl-kind value addWatch reads,
+   and dims the "Alert on hit" checkbox for ignore (which drops the read before
+   it could alert). Replaces a native <select> that would not open in the
+   embedded webview. */
+function setWlKind(k) {
+  const el = $('wl-kind'); if (!el) return;
+  el.value = k;
+  const w = $('wl-kind-watch'), i = $('wl-kind-ignore');
+  if (w) w.classList.toggle('active', k === 'watch');
+  if (i) i.classList.toggle('active', k === 'ignore');
+  const n = $('wl-notify');
+  if (n && n.parentElement) n.parentElement.style.opacity = k === 'ignore' ? '0.4' : '1';
+}
+async function loadWatchlist() {
+  const host = $('wl-list'); if (!host) return;
+  let list;
+  try { list = await api('/lpr/watchlist'); }
+  catch (e) { host.innerHTML = `<div class="form-msg err">${esc(e.message)}</div>`; return; }
+  if (selKind !== 'plates-root' || !$('wl-list')) return; // navigated away
+  if (!list || !list.length) {
+    host.innerHTML = `<div class="card-hint" style="padding:6px 2px">No plates on the watchlist yet.</div>`;
+    return;
+  }
+  host.innerHTML = list.map(w => {
+    const ignore = w.kind === 'ignore';
+    const dot = ignore
+      ? `<span title="Ignored — matching reads are dropped" style="color:var(--danger)">⊘</span>`
+      : (w.notify
+        ? `<span title="Alerts on hit" style="color:var(--ok)">●</span>`
+        : `<span title="Silent (tracked, no alert)" style="color:var(--dim2)">○</span>`);
+    const kindTag = ignore ? `<span class="pill" style="font-size:10px">ignore</span>` : '';
+    const label = w.label ? `<span style="font-size:12px;color:var(--dim)">${esc(w.label)}</span>` : '';
+    return `
+    <div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border)">
+      ${dot}
+      <span style="flex:0 0 130px;font-weight:600;font-family:var(--mono,monospace)">${esc(w.plate)}</span>
+      ${kindTag}
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</span>
+      <button class="danger-ghost sm" onclick="delWatch('${esc(w.id)}','${esc(w.plate)}')">Remove</button>
+    </div>`;
+  }).join('');
+}
+
+async function addWatch() {
+  setMsg('wl-msg', '');
+  const plate = ($('wl-plate') || {}).value ? $('wl-plate').value.trim() : '';
+  if (!plate) { setMsg('wl-msg', 'Enter a plate to watch.', 'err'); return; }
+  const body = {
+    plate,
+    label: (($('wl-label') || {}).value || '').trim() || null,
+    notify: !!($('wl-notify') || {}).checked,
+    kind: ($('wl-kind') || {}).value || 'watch',
+  };
+  try {
+    await api('/lpr/watchlist', { method: 'POST', body: JSON.stringify(body) });
+    $('wl-plate').value = ''; $('wl-label').value = '';
+    toast('Added to watchlist.');
+    loadWatchlist();
+  } catch (e) { setMsg('wl-msg', e.message, 'err'); }
+}
+
+async function delWatch(id, plate) {
+  if (!confirm(`Remove ${plate} from the watchlist?`)) return;
+  try {
+    await api('/lpr/watchlist/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Removed from watchlist.');
+    loadWatchlist();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* Pre-fill the watchlist add box from a plate read row, then scroll to it. */
+function watchPlate(plate) {
+  const el = $('wl-plate'); if (!el) return;
+  el.value = plate;
+  el.focus();
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
 /* Fetch + paint the plate table from the current search box / match mode. */

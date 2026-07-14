@@ -22,14 +22,13 @@
 //       tokens.
 //
 // This file only ADDS an extension on the existing `CrumbApi` — it does not
-// touch crumb_api.dart. It uses `package:http` directly (module-level calls)
-// since `CrumbApi._http` is private to that file.
+// touch crumb_api.dart. `CrumbApi._http` is private to that file, so it routes
+// its calls through the shared timeout client (`sharedHttpClient`) instead.
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// A merged recorded span for one camera (`GET /timeline` -> `spans[]`).
@@ -112,6 +111,17 @@ extension PlaybackApi on CrumbApi {
   static final Map<String, _CachedMediaToken> _tokenCache = {};
   static final Map<String, Future<String?>> _tokenInflight = {};
 
+  /// Drop every cached (and in-flight) media token. Called from session
+  /// teardown (`main.dart`) so a signed-out principal's still-valid scoped
+  /// tokens can never be reused by whoever signs in next on a shared
+  /// workstation. The token-keyed cache below already makes a *different*
+  /// principal miss, but this also clears an intervening re-login on the same
+  /// account and frees the entries.
+  static void clearTokenCache() {
+    _tokenCache.clear();
+    _tokenInflight.clear();
+  }
+
   Map<String, String> _authHeaders(Session s) => {
     'authorization': 'Bearer ${s.token}',
   };
@@ -143,7 +153,7 @@ extension PlaybackApi on CrumbApi {
       },
     );
     try {
-      final resp = await http.get(uri, headers: _authHeaders(s));
+      final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return const [];
       final j = jsonDecode(resp.body) as Map<String, dynamic>;
       final spans = (j['spans'] as List<dynamic>? ?? const [])
@@ -168,7 +178,7 @@ extension PlaybackApi on CrumbApi {
       queryParameters: {'ts': ts.toUtc().toIso8601String(), 'stream': stream},
     );
     try {
-      final resp = await http.get(uri, headers: _authHeaders(s));
+      final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return null;
       return ResolvedSegment.fromJson(
         jsonDecode(resp.body) as Map<String, dynamic>,
@@ -197,7 +207,7 @@ extension PlaybackApi on CrumbApi {
       },
     );
     try {
-      final resp = await http.get(uri, headers: _authHeaders(s));
+      final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return const [];
       final list = jsonDecode(resp.body) as List<dynamic>;
       return list
@@ -215,7 +225,11 @@ extension PlaybackApi on CrumbApi {
   /// `mediaTokenInflight`). Returns `null` on failure — callers should treat
   /// that like "no segment" and retry later.
   Future<String?> mediaToken(Session s, String cameraId) async {
-    final key = '${s.base}|$cameraId';
+    // Key by the session TOKEN (not the server base) so a new principal's
+    // different token misses a prior principal's cached entry — mirrors
+    // clips_api.dart. Cross-principal token reuse on a shared workstation is a
+    // golden-rule-1 (secure-by-default) violation.
+    final key = '${s.token}|$cameraId';
     final now = DateTime.now().toUtc();
     final cached = _tokenCache[key];
     if (cached != null &&
@@ -230,7 +244,7 @@ extension PlaybackApi on CrumbApi {
         final uri = Uri.parse(
           '${s.base}/media-token',
         ).replace(queryParameters: {'camera': cameraId});
-        final resp = await http.get(uri, headers: _authHeaders(s));
+        final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
         if (resp.statusCode != 200) return null;
         final j = jsonDecode(resp.body) as Map<String, dynamic>;
         final token = j['token'] as String;

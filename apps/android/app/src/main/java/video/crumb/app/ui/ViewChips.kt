@@ -39,18 +39,27 @@ fun ViewChipsRow(
     activeViewId: String?,
     onSelect: (String?) -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * Whether the "All" (All Cameras) chip is offered at all — the client-side
+     * [video.crumb.app.data.SecureStore.showAllCamerasView] preference (desktop
+     * parity: `client_options.dart`'s `showAllCamerasView`). Default true so every
+     * existing caller keeps today's behavior unless it opts in to hiding it.
+     */
+    showAllCamerasView: Boolean = true,
 ) {
     Row(
         modifier = modifier.horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        FilterChip(
-            selected = activeViewId == null,
-            onClick = { onSelect(null) },
-            label = { Text("All", style = MaterialTheme.typography.labelMedium) },
-            modifier = Modifier.height(30.dp),
-        )
+        if (showAllCamerasView) {
+            FilterChip(
+                selected = activeViewId == null,
+                onClick = { onSelect(null) },
+                label = { Text("All", style = MaterialTheme.typography.labelMedium) },
+                modifier = Modifier.height(30.dp),
+            )
+        }
         views.forEach { v ->
             FilterChip(
                 selected = activeViewId == v.id,

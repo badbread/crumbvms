@@ -12,6 +12,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 import 'server_dashboard_models.dart';
 
@@ -155,5 +156,5 @@ extension ServerDashboardApi on CrumbApi {
 // CrumbApi doesn't expose its internal http.Client, so this extension carries
 // its own — cheap (no connection pool of its own to manage beyond the default
 // client) and keeps this file from needing an edit to crumb_api.dart.
-final http.Client _sharedClient = http.Client();
+final http.Client _sharedClient = TimeoutClient();
 http.Client _client(CrumbApi _) => _sharedClient;

@@ -197,6 +197,57 @@ interface CrumbApi {
     @POST("clips/viewed")
     suspend fun markClipViewed(@Body body: MarkViewedRequest)
 
+    /**
+     * License-plate reads (LPR) for the Plates tab — newest-first over
+     * [cameraIds] (further viewer-scoped server-side; the route requires
+     * `camera_ids`). [query]/[match] filter by plate text
+     * ("exact"|"prefix"|"contains"|"fuzzy"); meaningful only when [query] is
+     * non-blank. Never errors for scoping/disabled reasons — an empty or
+     * LPR-disabled server returns an empty page.
+     */
+    @GET("plates")
+    suspend fun plates(
+        @Query("camera_ids") cameraIds: String,
+        @Query("start") start: String? = null,
+        @Query("end") end: String? = null,
+        @Query("q") query: String? = null,
+        @Query("match") match: String? = null,
+        @Query("limit") limit: Int = 200,
+        @Query("offset") offset: Int = 0,
+    ): PlatesResponse
+
+    // ── LPR plate watchlist ──────────────────────────────────────────────────────
+    /**
+     * The plate watchlist — plates that raise an alert when seen. Readable by any
+     * caller with the `view_plates` capability (same gate as [plates]).
+     */
+    @GET("lpr/watchlist")
+    suspend fun watchlist(): List<PlateWatchlistEntry>
+
+    /**
+     * Add a plate to the watchlist, or edit the existing entry when the
+     * normalized plate already exists (the server keys on the normalized plate).
+     * **Admin-only** — a non-admin viewer gets HTTP 403.
+     */
+    @POST("lpr/watchlist")
+    suspend fun addWatchlist(@Body body: AddWatchlistRequest): PlateWatchlistEntry
+
+    /** Remove a watchlist entry by id (204 on success, 404 if already gone).
+     *  **Admin-only** — a non-admin viewer gets HTTP 403. */
+    @DELETE("lpr/watchlist/{id}")
+    suspend fun deleteWatchlist(@Path("id") id: String): Response<Unit>
+
+    // ── LPR config (admin-only) ──────────────────────────────────────────────────
+    /** Platform LPR settings (enable flag, retention, watchlist fuzziness).
+     *  **Admin-only** — a non-admin caller gets HTTP 403. */
+    @GET("config/lpr")
+    suspend fun lprConfig(): LprConfigDto
+
+    /** Update the platform LPR settings. **Admin-only** (HTTP 403 otherwise).
+     *  The body carries all writable fields — the PUT replaces them wholesale. */
+    @PUT("config/lpr")
+    suspend fun updateLprConfig(@Body body: LprConfigUpdate): LprConfigDto
+
     // ── saved views (server-side, per-user; shared with desktop/web) ────────────
     /** Views visible to the caller: own + legacy-global + shared (admins: all). */
     @GET("views")

@@ -223,6 +223,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # QEMU so the release (push) build can cross-build arm64 alongside amd64
+      # (Apple Silicon / ARM SBCs). Cheap to set up; only the push path actually
+      # builds multi-arch (the local-load CI path stays single amd64, since
+      # `docker load` can't take a multi-arch manifest).
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@v3
+
       # Decide where images go. If REGISTRY + a push token are present we push to
       # a real registry; otherwise we build locally only (load into the runner's
       # docker) so the build is still validated. No hard failure on missing creds.
@@ -273,6 +280,10 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          # Release (push) builds are multi-arch so Apple Silicon / ARM SBCs get a
+          # native image; the local-load CI path stays single amd64 because
+          # `docker load` cannot import a multi-arch manifest.
+          platforms: ${{ steps.cfg.outputs.push == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ steps.cfg.outputs.push }}
           load: ${{ steps.cfg.outputs.push == 'false' }}
           tags: ${{ steps.meta.outputs.tags }}

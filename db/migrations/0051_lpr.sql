@@ -21,9 +21,27 @@
 --
 -- Safe to run multiple times (IF NOT EXISTS / ON CONFLICT guards).
 
--- Trigram index support for partial/fuzzy plate search. Trusted extension since
--- PG13; present in the postgres:16-alpine image the stack ships.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+-- Trigram support for partial/fuzzy plate search. Trusted extension since PG13;
+-- present in the postgres:16-alpine image the stack ships, so the bundled
+-- happy-path always gets it. On an EXTERNAL / BYO-Postgres it may be missing:
+-- an older server, a contrib-less package, or a non-superuser DB role that
+-- lacks CREATE-EXTENSION privilege. A bare `CREATE EXTENSION` would then raise,
+-- abort THIS migration, and — because the boot migration loop stops at the
+-- first failure — leave 0052..0055 unapplied; the recorder treats a migration
+-- failure as fatal and crash-loops on upgrade. So guard it: swallow only the
+-- two "can't install it" errors (insufficient_privilege / undefined_file for a
+-- missing contrib .so) and carry on. When the extension is absent the fuzzy
+-- index below is skipped and the API degrades fuzzy search to `contains`/exact
+-- at runtime (see db::pg_trgm_available). Minimum PG for the bundled fuzzy path
+-- is PG13 (trusted pg_trgm); external servers without pg_trgm still work, just
+-- without trigram fuzziness.
+DO $$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_trgm;
+EXCEPTION
+    WHEN insufficient_privilege OR undefined_file THEN
+        RAISE NOTICE 'pg_trgm unavailable (%); fuzzy plate search will degrade to contains/exact', SQLERRM;
+END $$;
 
 CREATE TABLE IF NOT EXISTS plate_reads (
     id                uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -53,9 +71,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS plate_reads_provider_dedup
     ON plate_reads (source_id, provider_event_id)
     WHERE source_id IS NOT NULL AND provider_event_id IS NOT NULL;
 
--- Partial/fuzzy plate search (LIKE '%x%', similarity()).
-CREATE INDEX IF NOT EXISTS plate_reads_plate_trgm
-    ON plate_reads USING gin (plate gin_trgm_ops);
+-- Partial/fuzzy plate search (LIKE '%x%', similarity()). Conditional on the
+-- extension: `gin_trgm_ops` only exists once pg_trgm is installed, so on a
+-- BYO-Postgres where the CREATE EXTENSION above was skipped this index would
+-- fail with "operator class gin_trgm_ops does not exist" and abort the
+-- migration. Guard it on pg_extension so the table (and the rest of the
+-- migration chain) still applies; fuzzy search degrades to contains/exact.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+        CREATE INDEX IF NOT EXISTS plate_reads_plate_trgm
+            ON plate_reads USING gin (plate gin_trgm_ops);
+    END IF;
+END $$;
 
 -- Primary list/query pattern: reads for a camera, newest first.
 CREATE INDEX IF NOT EXISTS plate_reads_camera_ts

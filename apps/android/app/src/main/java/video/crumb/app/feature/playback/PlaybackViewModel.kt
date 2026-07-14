@@ -196,7 +196,13 @@ class PlaybackViewModel(
     /** The id of the camera currently shown (for the screen's swipe-nav math). */
     val currentCameraId: String get() = cameraId
 
-    private val _state = MutableStateFlow(PlaybackUiState())
+    // Seed the visible span from the persisted device preference so the timeline
+    // reopens on the zoom level the user last left it on (shared with the playback
+    // wall), instead of resetting to the 1 h default. Coerced defensively in case a
+    // value written by a surface with a different max lands out of this screen's range.
+    private val _state = MutableStateFlow(
+        PlaybackUiState(visibleSpanMs = repo.store.playbackSpanMs.coerceIn(MIN_SPAN_MS, MAX_SPAN_MS)),
+    )
     val state: StateFlow<PlaybackUiState> = _state.asStateFlow()
 
     private var filmstripJob: Job? = null
@@ -978,9 +984,14 @@ class PlaybackViewModel(
         seekTo(tsMs)
     }
 
-    /** Set the centered-timeline visible span (pinch-to-zoom), clamped. */
+    /** Set the centered-timeline visible span (pinch-to-zoom), clamped. Persists the
+     *  coerced span as a device preference so the zoom level is restored on the next
+     *  entry (shared with the playback wall). */
     fun setVisibleSpan(spanMs: Long) {
-        _state.update { it.copy(visibleSpanMs = spanMs.coerceIn(MIN_SPAN_MS, MAX_SPAN_MS)) }
+        val coerced = spanMs.coerceIn(MIN_SPAN_MS, MAX_SPAN_MS)
+        if (coerced == _state.value.visibleSpanMs) return
+        _state.update { it.copy(visibleSpanMs = coerced) }
+        repo.store.playbackSpanMs = coerced
     }
 
     /**

@@ -2,8 +2,13 @@
 
 package video.crumb.app.feature.export
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import androidx.annotation.RequiresApi
 import androidx.core.content.FileProvider
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -77,6 +82,7 @@ import video.crumb.app.ui.theme.NavySurface
 import video.crumb.app.ui.theme.NavySurfaceVariant
 import video.crumb.app.ui.theme.TextSecondary
 import java.io.File
+import java.io.InputStream
 import java.time.Instant
 
 // ─── screen entry point ───────────────────────────────────────────────────────
@@ -197,7 +203,7 @@ fun ExportScreen(onBack: () -> Unit) {
                     polling = state.polling,
                     job = job,
                     jobError = jobError,
-                    onDownloadEnqueued = vm::onDownloadEnqueued,
+                    onDownloadSaved = vm::onDownloadSaved,
                     snackbarHostState = snackbarHostState,
                 )
             }
@@ -486,7 +492,7 @@ private fun JobStatusSection(
     polling: Boolean,
     job: ExportJob?,
     jobError: String?,
-    onDownloadEnqueued: (String) -> Unit,
+    onDownloadSaved: (String) -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -550,7 +556,7 @@ private fun JobStatusSection(
                 OutputFileRow(
                     container = container,
                     outputFile = outputFile,
-                    onDownloadEnqueued = onDownloadEnqueued,
+                    onDownloadSaved = onDownloadSaved,
                     snackbarHostState = snackbarHostState,
                 )
             }
@@ -569,23 +575,25 @@ private fun jobStatusLabel(job: ExportJob?): String = when {
 // ─── output file row ──────────────────────────────────────────────────────────
 
 /**
- * #1/#5 fix: Download and Share both go through [downloadExportFileToCache],
- * which fetches the export bytes with the session token in an `Authorization`
- * header (never in the URL). The previous implementation built a
- * `?token=<JWT>` URL and handed it to DownloadManager (persisted verbatim into
- * the system Downloads DB — #5) and to the system share sheet's EXTRA_TEXT
- * (handed to whatever arbitrary app the user picked — #1); with "remember me"
- * that token is long-lived, so either path was a one-tap exfiltration of the
- * session. Both actions now operate on the downloaded local file (app-private
- * cache) instead — Share uses a `content://` [FileProvider] Uri with
- * `FLAG_GRANT_READ_URI_PERMISSION` scoped to just that file, and Download
- * reuses the same cached file, confirming completion via [onDownloadEnqueued].
+ * Both actions fetch the export bytes with the session token in an `Authorization`
+ * header (never in the URL — the #1/#5 fix; the old code built a `?token=<JWT>` URL
+ * and handed it to DownloadManager / the share sheet, leaking the long-lived
+ * session token into the system Downloads DB and to whatever app the user picked).
+ *
+ * They differ in destination (#134):
+ * - **Download** streams to the device's **public Downloads** collection via
+ *   [saveExportToDownloads] (MediaStore on API 29+, the public Downloads dir on
+ *   ≤ 28) so the file is user-findable and not silently purged, then reports the
+ *   real saved location via [onDownloadSaved].
+ * - **Share** downloads to app-private cache ([downloadExportFileToCache]) and
+ *   hands the receiving app a scoped `content://` [FileProvider] Uri (read-only,
+ *   this file only) — a transient copy is the right lifetime for a share.
  */
 @Composable
 private fun OutputFileRow(
     container: AppContainer,
     outputFile: ExportOutputFile,
-    onDownloadEnqueued: (String) -> Unit,
+    onDownloadSaved: (String) -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
     val context = LocalContext.current
@@ -628,8 +636,8 @@ private fun OutputFileRow(
                         if (busy) return@FilledTonalButton
                         busy = true
                         scope.launch {
-                            downloadExportFileToCache(context, container, outputFile)
-                                .onSuccess { onDownloadEnqueued(outputFile.cameraId) }
+                            saveExportToDownloads(context, container, outputFile)
+                                .onSuccess { location -> onDownloadSaved(location) }
                                 .onFailure { e ->
                                     snackbarHostState.showSnackbar("Download failed: ${e.message}")
                                 }
@@ -701,6 +709,117 @@ private fun OutputFileRow(
 
 /** Subdirectory of the app cache dir that [file_paths.xml] exposes via FileProvider. */
 private const val EXPORT_CACHE_SUBDIR = "exports"
+
+/** Sub-folder created under the device Downloads dir for exported clips (#134). */
+private const val DOWNLOAD_SUBDIR = "CrumbVMS"
+
+/**
+ * #134: Save one export output file to the device's **public Downloads** so it's
+ * user-findable (Files app, other apps) and not silently purged like the
+ * app-private cache the Share path uses.
+ *
+ * Uses the SAME authenticated request as [downloadExportFileToCache] — bearer
+ * token in the `Authorization` header, never in the URL (the #1/#5 fix stays
+ * intact) — and streams the response body straight into the destination:
+ * - API 29+ (scoped storage): inserts into [MediaStore.Downloads] under
+ *   `Downloads/CrumbVMS/`, `IS_PENDING` until the copy finishes. **No storage
+ *   permission required.**
+ * - API ≤ 28: writes to the public Downloads dir directly, which needs the legacy
+ *   `WRITE_EXTERNAL_STORAGE` permission already declared (`maxSdkVersion=28`). If
+ *   that isn't granted the copy throws and surfaces as a normal "Download failed".
+ *
+ * Returns the user-visible saved location on success.
+ */
+private suspend fun saveExportToDownloads(
+    context: Context,
+    container: AppContainer,
+    outputFile: ExportOutputFile,
+): Result<String> = withContext(Dispatchers.IO) {
+    runCatching {
+        // One-shot authenticated client (bearer header via Network.buildOkHttp),
+        // kept off the shared Retrofit client's pool and shut down below — same
+        // pattern as downloadExportFileToCache / AppContainer.rebuildApi().
+        val client = Network.buildOkHttp(container.store)
+        try {
+            val base = container.store.serverUrl.trimEnd('/')
+            val path = outputFile.downloadUrl.let { if (it.startsWith("/")) it else "/$it" }
+            // NOT container.mediaUrls().authed(...) — that appends `?token=`. This
+            // URL carries no credential; the interceptor adds the header instead.
+            val absoluteUrl = "$base$path"
+
+            val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            // Timestamp so repeated downloads don't collide / silently overwrite.
+            val fileName = "crumb-export-$safeId-${System.currentTimeMillis()}.mp4"
+
+            val request = Request.Builder().url(absoluteUrl).build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    error("Server returned HTTP ${response.code}")
+                }
+                val body = response.body ?: error("Empty response body")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    writeToMediaStoreDownloads(context, fileName, body.byteStream())
+                } else {
+                    writeToLegacyDownloads(fileName, body.byteStream())
+                }
+            }
+        } finally {
+            client.dispatcher.executorService.shutdown()
+            client.connectionPool.evictAll()
+        }
+    }
+}
+
+/**
+ * API 29+ path: stream [input] into a new [MediaStore.Downloads] entry under
+ * `Downloads/CrumbVMS/`. Uses `IS_PENDING` so the file isn't visible to other apps
+ * until the copy completes, and rolls the entry back if the copy fails so no
+ * 0-byte ghost is left behind. Returns the user-visible location.
+ */
+@RequiresApi(Build.VERSION_CODES.Q)
+private fun writeToMediaStoreDownloads(
+    context: Context,
+    fileName: String,
+    input: InputStream,
+): String {
+    val resolver = context.contentResolver
+    val values = ContentValues().apply {
+        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+        put(MediaStore.Downloads.MIME_TYPE, "video/mp4")
+        put(
+            MediaStore.Downloads.RELATIVE_PATH,
+            Environment.DIRECTORY_DOWNLOADS + "/" + DOWNLOAD_SUBDIR,
+        )
+        put(MediaStore.Downloads.IS_PENDING, 1)
+    }
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        ?: error("Could not create a Downloads entry")
+    try {
+        resolver.openOutputStream(uri)?.use { out -> input.copyTo(out) }
+            ?: error("Could not open the Downloads output stream")
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    } catch (t: Throwable) {
+        runCatching { resolver.delete(uri, null, null) }
+        throw t
+    }
+    return "Downloads/$DOWNLOAD_SUBDIR/$fileName"
+}
+
+/**
+ * API ≤ 28 path: write [input] to the public Downloads dir directly (needs the
+ * legacy `WRITE_EXTERNAL_STORAGE` permission declared for `maxSdkVersion=28`).
+ * Returns the user-visible location.
+ */
+@Suppress("DEPRECATION")
+private fun writeToLegacyDownloads(fileName: String, input: InputStream): String {
+    val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+    val dir = File(downloads, DOWNLOAD_SUBDIR).apply { mkdirs() }
+    val dest = File(dir, fileName)
+    dest.outputStream().use { out -> input.copyTo(out) }
+    return "Downloads/$DOWNLOAD_SUBDIR/$fileName"
+}
 
 /**
  * Download one export output file to app-private cache storage, using an

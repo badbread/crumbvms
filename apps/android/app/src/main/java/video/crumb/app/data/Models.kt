@@ -94,6 +94,15 @@ data class UserDto(
     /** Fine-grained capability set. Absent on older servers → defaults to all-false
      *  (admins bypass this via [isAdmin]; viewers fall back to live-only). */
     val capabilities: CapabilitiesDto = CapabilitiesDto(),
+    /**
+     * Whether the Plates (license-plate recognition) surface is available to this
+     * caller: server-side LPR enabled AND the caller has the `view_plates`
+     * capability. Computed entirely server-side (including the admin bypass) —
+     * the client gates the Plates tab on this field directly and never re-derives
+     * it from [capabilities]. Absent on older servers → defaults false (tab
+     * hidden), matching the fail-closed posture of the rest of this DTO.
+     */
+    @SerialName("plates_enabled") val platesEnabled: Boolean = false,
 ) {
     /**
      * True when this user has full admin access. Checks the explicit [isAdminFlag]
@@ -471,6 +480,142 @@ data class UpdateCheckResponse(
     @SerialName("server_version") val serverVersion: String? = null,
     @SerialName("server_update_available") val serverUpdateAvailable: Boolean? = null,
     @SerialName("checked_at") val checkedAt: String? = null,
+)
+
+// ─── license-plate reads (LPR) ──────────────────────────────────────────────
+
+/**
+ * One recognized license-plate read from `GET /plates`. Mirrors the desktop
+ * client's `PlateRead` (`apps/desktop-flutter/lib/api/plates_api.dart`) and the
+ * Rust wire type exactly.
+ *
+ * [plate] is the normalized (uppercase alphanumeric) string used for
+ * matching/display; [plateRaw] is the provider's original text. [confidence]
+ * is 0..1 or null. [eventId] links to the sibling detection event (may be
+ * null) — the Plates screen fetches the read's snapshot via the authed
+ * per-camera event-snapshot proxy (see [MediaUrls.eventSnapshotUrl]) when
+ * present, and shows a placeholder otherwise. [snapshotUrl] is a raw provider
+ * path the client cannot authenticate against directly and is not fetched.
+ */
+@Serializable
+data class PlateRead(
+    val id: String,
+    @SerialName("camera_id") val cameraId: String,
+    /** ISO 8601 instant of the read. */
+    val ts: String,
+    val plate: String = "",
+    @SerialName("plate_raw") val plateRaw: String = "",
+    val confidence: Float? = null,
+    val region: String? = null,
+    @SerialName("source_id") val sourceId: String? = null,
+    @SerialName("event_id") val eventId: String? = null,
+    @SerialName("snapshot_url") val snapshotUrl: String? = null,
+    /**
+     * Plate bounding box within the sibling detection-event snapshot, as
+     * normalized `[x, y, w, h]` fractions (0..1) of the image's width/height —
+     * used by the single-plate report to crop a zoomed plate image out of the
+     * full snapshot. May be null (older servers, or a provider that doesn't
+     * report a box); the report then falls back to the full snapshot.
+     */
+    @SerialName("bbox") val bbox: List<Double>? = null,
+)
+
+/**
+ * Wire envelope for `GET /plates` — a page of reads plus the total match count
+ * and a has-more flag for offset paging. An empty/LPR-disabled server returns
+ * an empty page (never an error), so [plates] defaulting to empty is safe.
+ */
+@Serializable
+data class PlatesResponse(
+    val plates: List<PlateRead> = emptyList(),
+    val total: Int = 0,
+    @SerialName("has_more") val hasMore: Boolean = false,
+)
+
+/**
+ * One entry in the LPR plate watchlist (`GET /lpr/watchlist`). A watchlisted
+ * plate raises an alert — delivered via the configured notification channels —
+ * whenever it is seen. [plate] is the normalized (uppercase alphanumeric) key
+ * the server matches on; [label]/[note]/[color] are optional operator
+ * annotations and [notify] gates whether a sighting actually fires a
+ * notification.
+ *
+ * Reading the list needs the `view_plates` capability (same gate as
+ * [PlateRead]); adding or removing entries is admin-only (a non-admin viewer
+ * gets HTTP 403 — see [Throwable.isForbidden]).
+ */
+@Serializable
+data class PlateWatchlistEntry(
+    val id: String,
+    val plate: String,
+    val label: String? = null,
+    val note: String? = null,
+    /** `#rrggbb` accent for the entry, or null. */
+    val color: String? = null,
+    val notify: Boolean = true,
+    /**
+     * `"watch"` (raise an alert on a sighting) or `"ignore"` (drop matching reads
+     * entirely — never stored, never alerted). Older servers that predate the
+     * kind column omit this field → defaults to `"watch"`, the historical behavior.
+     */
+    val kind: String = WATCHLIST_KIND_WATCH,
+    @SerialName("created_at") val createdAt: String,
+) {
+    /** True for an "ignore" (suppress) entry rather than a "watch" (alert) entry. */
+    val isIgnore: Boolean get() = kind.equals(WATCHLIST_KIND_IGNORE, ignoreCase = true)
+}
+
+/** Watchlist entry kinds (`PlateWatchlistEntry.kind` / [AddWatchlistRequest.kind]). */
+const val WATCHLIST_KIND_WATCH: String = "watch"
+const val WATCHLIST_KIND_IGNORE: String = "ignore"
+
+/**
+ * `POST /lpr/watchlist` body. [plate] is the raw text; the server normalizes it
+ * (uppercase ASCII alphanumerics) and keys the entry on the result, so a re-POST
+ * of the same normalized plate edits the existing entry rather than duplicating
+ * it.
+ */
+@Serializable
+data class AddWatchlistRequest(
+    val plate: String,
+    val label: String? = null,
+    val note: String? = null,
+    val color: String? = null,
+    val notify: Boolean = true,
+    /** `"watch"` (alert) or `"ignore"` (suppress). Server defaults to `"watch"`. */
+    val kind: String = WATCHLIST_KIND_WATCH,
+)
+
+// ─── LPR config (admin-only; `GET`/`PUT /config/lpr`) ────────────────────────
+
+/**
+ * `GET /config/lpr` response — the platform LPR settings. **Admin-only** (a
+ * non-admin caller gets HTTP 403). Mirrors the Rust `LprConfigDto`
+ * (`services/api/src/plates.rs`); the ingest token itself is never exposed, only
+ * [hasIngestToken]. [watchlistFuzz] is the watchlist/ignore match fuzziness on a
+ * 0.0 (exact) .. 0.5 scale.
+ */
+@Serializable
+data class LprConfigDto(
+    val enabled: Boolean = false,
+    @SerialName("retention_days") val retentionDays: Int = 90,
+    @SerialName("watchlist_fuzz") val watchlistFuzz: Float = 0f,
+    @SerialName("has_ingest_token") val hasIngestToken: Boolean = false,
+    val version: Long = 0,
+)
+
+/**
+ * `PUT /config/lpr` body — mirrors the Rust `LprConfigUpdate`. Only these three
+ * fields are writable; the server clamps [retentionDays] to 1..3650 and
+ * [watchlistFuzz] to 0.0..0.5, and bumps the config version. Callers must send
+ * the CURRENT [enabled]/[retentionDays] alongside a changed [watchlistFuzz] so
+ * editing fuzziness doesn't clobber the other two (the PUT replaces all three).
+ */
+@Serializable
+data class LprConfigUpdate(
+    val enabled: Boolean,
+    @SerialName("retention_days") val retentionDays: Int,
+    @SerialName("watchlist_fuzz") val watchlistFuzz: Float,
 )
 
 // ─── saved views (server-side, per-user; the same /views the desktop/web use) ──

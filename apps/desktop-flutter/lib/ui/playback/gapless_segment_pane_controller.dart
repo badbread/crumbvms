@@ -96,6 +96,16 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   bool _resolving = false;
   bool _advancing = false;
 
+  // Coalesced follow-up resolve. A [resolveAt] call that arrives while another
+  // is in-flight is NOT dropped (that desynced the pane from the playhead when
+  // two quick seeks raced — #130); its target is stashed here and replayed once
+  // the in-flight resolve finishes. Only the newest target is kept, but
+  // [_pendingForceReload] is sticky so a forced jump in the window is never
+  // silently lost.
+  DateTime? _pendingResolveTs;
+  bool _pendingForceReload = false;
+  bool _pendingResolvePlaying = false;
+
   /// Playback rate to reassert after a fresh `open()`. mpv keeps `speed`
   /// across a playlist advance (the gapless path), but a fallback `loadfile`
   /// would reset an operator-chosen 4x back to 1x without this. Kept in sync
@@ -297,7 +307,16 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     bool forceReload = false,
     bool playing = false,
   }) async {
-    if (_resolving) return;
+    if (_resolving) {
+      // Coalesce to the newest request and replay it after the in-flight
+      // resolve finishes (see the fields above) rather than dropping it. A
+      // forced jump stays forced even if a later non-forced call overwrites the
+      // target.
+      _pendingResolveTs = ts;
+      _pendingForceReload = _pendingForceReload || forceReload;
+      _pendingResolvePlaying = playing;
+      return;
+    }
     _resolving = true;
     try {
       final cur = _current;
@@ -328,7 +347,16 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       // back in the same segment) just needs a seek.
       final sameFile = cur != null && cur.url == seg.url;
       if (!sameFile) {
-        await _player.open(Playlist([Media(url)]), play: playing);
+        // Open PAUSED, then seek, then resume below — never `play: playing`.
+        // Opening with play=true starts decoding from the segment START at
+        // once, and the seek to the target offset only lands a beat later
+        // (after loadfile + the first frames), so the pane visibly plays
+        // wrong-time footage and then does a big forward jump to the target.
+        // That is the "huge jump" seen when opening a plate/bookmark deep into
+        // a segment — and it is worse on a slower machine, where the open→seek
+        // gap is larger. Seeking while paused renders the exact target frame
+        // first; playback (if any) resumes only after it has landed.
+        await _player.open(Playlist([Media(url)]), play: false);
         try {
           await _player.setRate(rate);
         } catch (_) {
@@ -343,6 +371,15 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       } catch (_) {
         /* non-fatal */
       }
+      // Resume only after the seek has landed on a freshly opened file, so the
+      // first shown frame is the target rather than the segment start.
+      if (!sameFile && playing) {
+        try {
+          await _player.play();
+        } catch (_) {
+          /* non-fatal — the transport owner reasserts play on its next change */
+        }
+      }
       _current = seg;
       _prefetched = null;
       noFootage = false;
@@ -353,6 +390,24 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       notifyListeners();
     } finally {
       _resolving = false;
+      // Replay the newest request that raced this resolve, if any. Snapshot and
+      // clear the pending slot first so a request arriving during the replay
+      // coalesces afresh instead of being lost.
+      final pendingTs = _pendingResolveTs;
+      if (pendingTs != null) {
+        final pendingForce = _pendingForceReload;
+        final pendingPlaying = _pendingResolvePlaying;
+        _pendingResolveTs = null;
+        _pendingForceReload = false;
+        _pendingResolvePlaying = false;
+        unawaited(
+          resolveAt(
+            pendingTs,
+            forceReload: pendingForce,
+            playing: pendingPlaying,
+          ),
+        );
+      }
     }
   }
 

@@ -10,14 +10,11 @@ import android.net.NetworkRequest
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.State
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import video.crumb.app.di.appContainer
 
 /**
  * Self-contained network-connectivity observer for the live wall / fullscreen
@@ -63,158 +60,129 @@ object NetworkConnectivityObserver {
 }
 
 /**
- * Remembers a live [State]<Boolean> tracking whether the active network is
- * metered (see [NetworkConnectivityObserver.isMeteredNow]). Re-samples on every
- * connectivity change over the same lifecycle-gated callback pattern as
- * [rememberIsOnline]. Drives the playback quality selector's Auto mode.
+ * ONE process-wide connectivity observer (#137), owned by
+ * [video.crumb.app.di.AppContainer]. It registers a **single**
+ * [ConnectivityManager.registerNetworkCallback] for the whole app and exposes the
+ * result as [online]/[metered] [StateFlow]s that any number of tiles subscribe to.
+ *
+ * This replaces the old per-composable registration: a full live wall calls
+ * [rememberIsOnline] once per tile, so the previous design registered one system
+ * callback per tile. Past the per-app callback ceiling (~100) that throws
+ * `TooManyRequestsException` (API 30+) and, on some Android 11 builds, a spurious
+ * `SecurityException` — crashing the app the moment a large wall opened. A single
+ * shared callback makes the ceiling unreachable, and registration is additionally
+ * wrapped so that even a framework refusal degrades to the last static snapshot
+ * instead of crashing.
+ *
+ * Subscribers ref-count via [acquire]/[release]; the callback is registered on the
+ * first subscriber and unregistered when the last leaves, so an app with no live
+ * surfaces on screen holds no system callback.
  */
-@Composable
-fun rememberIsMetered(): State<Boolean> {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var metered by remember { mutableStateOf(NetworkConnectivityObserver.isMeteredNow(context)) }
+class NetworkStatusObserver(context: Context) {
 
-    DisposableEffect(lifecycleOwner) {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-        var callback: ConnectivityManager.NetworkCallback? = null
+    private val appContext = context.applicationContext
+    private val cm = appContext.getSystemService(ConnectivityManager::class.java)
 
-        fun resync() {
-            metered = NetworkConnectivityObserver.isMeteredNow(context)
+    private val _online = MutableStateFlow(NetworkConnectivityObserver.isOnlineNow(appContext))
+    /** Validated default network with INTERNET (see [NetworkConnectivityObserver.isOnlineNow]). */
+    val online: StateFlow<Boolean> = _online.asStateFlow()
+
+    private val _metered = MutableStateFlow(NetworkConnectivityObserver.isMeteredNow(appContext))
+    /** Active network is metered (see [NetworkConnectivityObserver.isMeteredNow]). */
+    val metered: StateFlow<Boolean> = _metered.asStateFlow()
+
+    private var callback: ConnectivityManager.NetworkCallback? = null
+    private var refCount = 0
+
+    /** Add a subscriber; registers the shared callback on the first one. */
+    @Synchronized
+    fun acquire() {
+        if (refCount++ == 0) register()
+    }
+
+    /** Drop a subscriber; unregisters the shared callback when the last leaves. */
+    @Synchronized
+    fun release() {
+        if (refCount > 0 && --refCount == 0) unregister()
+    }
+
+    private fun register() {
+        if (cm == null || callback != null) return
+        resync()
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = resync()
+            override fun onLost(network: Network) = resync()
+            override fun onCapabilitiesChanged(
+                network: Network,
+                capabilities: NetworkCapabilities,
+            ) = resync()
+            override fun onUnavailable() = resync()
         }
-
-        fun register() {
-            if (cm == null || callback != null) return
-            resync()
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-            val cb = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) = resync()
-                override fun onLost(network: Network) = resync()
-                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = resync()
-            }
-            callback = cb
+        // #137: never let a callback-registration failure crash the wall.
+        try {
             cm.registerNetworkCallback(request, cb)
-        }
-
-        fun unregister() {
-            callback?.let { cm?.unregisterNetworkCallback(it) }
+            callback = cb
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "registerNetworkCallback failed; using static snapshot", t)
             callback = null
-        }
-
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> register()
-                Lifecycle.Event.ON_STOP -> unregister()
-                else -> Unit
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        register()
-
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            unregister()
         }
     }
 
-    return remember { DerivedOnlineState { metered } }
+    private fun unregister() {
+        val cb = callback ?: return
+        callback = null
+        try {
+            cm?.unregisterNetworkCallback(cb)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "unregisterNetworkCallback failed", t)
+        }
+    }
+
+    /** Recompute both flows from the current active network. */
+    private fun resync() {
+        _online.value = NetworkConnectivityObserver.isOnlineNow(appContext)
+        _metered.value = NetworkConnectivityObserver.isMeteredNow(appContext)
+    }
+
+    private companion object {
+        const val TAG = "NetworkStatus"
+    }
 }
 
 /**
- * Remembers a live [State]<Boolean> tracking device connectivity, updated via
- * [ConnectivityManager.registerNetworkCallback]. Defaults to the current
- * synchronous read ([NetworkConnectivityObserver.isOnlineNow]) until the
- * callback fires, and falls back to `true` (assume online, i.e. never block
- * reconnects) if [ConnectivityManager] is unavailable for some reason.
- *
- * The callback is only registered while the host lifecycle is STARTED or
- * above — mirrors the ON_PAUSE/ON_RESUME (tile) and ON_START/ON_STOP
- * (fullscreen) gating already used for the player watchdogs, so a backgrounded
- * screen doesn't keep a system callback registered.
+ * Subscribe this composition to the shared [NetworkStatusObserver] for as long as
+ * it is composed (ref-counted [acquire]/[release]). Reads are lifecycle-gated by
+ * the [collectAsStateWithLifecycle] in the public wrappers below.
  */
 @Composable
-fun rememberIsOnline(): State<Boolean> {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var online by remember { mutableStateOf(NetworkConnectivityObserver.isOnlineNow(context)) }
-
-    DisposableEffect(lifecycleOwner) {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-        var callback: ConnectivityManager.NetworkCallback? = null
-
-        fun register() {
-            if (cm == null) {
-                online = true
-                return
-            }
-            // Idempotency guard: androidx.lifecycle.LifecycleRegistry synchronously
-            // REPLAYS the missed events (ON_CREATE, ON_START, …) to an observer added
-            // while already at/above STARTED — so the explicit register() call below
-            // (right after addObserver) could otherwise race with the observer's own
-            // ON_START replay and attempt to register the SAME callback twice, which
-            // throws. Guard on `callback == null` so whichever fires first wins and
-            // the second call is a no-op.
-            if (callback != null) return
-            // Re-sync immediately — connectivity may have changed while this
-            // composable's lifecycle was below STARTED and the callback was
-            // unregistered.
-            online = NetworkConnectivityObserver.isOnlineNow(context)
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-            val cb = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) {
-                    online = true
-                }
-                override fun onLost(network: Network) {
-                    // A non-default network can die while Wi-Fi is fine, so
-                    // recheck via the active network rather than trusting this
-                    // single callback in isolation.
-                    online = NetworkConnectivityObserver.isOnlineNow(context)
-                }
-                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-                    online = NetworkConnectivityObserver.isOnlineNow(context)
-                }
-                override fun onUnavailable() {
-                    online = false
-                }
-            }
-            callback = cb
-            cm.registerNetworkCallback(request, cb)
-        }
-
-        fun unregister() {
-            callback?.let { cm?.unregisterNetworkCallback(it) }
-            callback = null
-        }
-
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> register()
-                Lifecycle.Event.ON_STOP -> unregister()
-                else -> Unit
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        // Belt-and-suspenders: LifecycleRegistry.addObserver() above already
-        // synchronously REPLAYS ON_START to `observer` (and thus calls register())
-        // when the lifecycle is already at/above STARTED, but call it once more
-        // explicitly in case this DisposableEffect ever runs in a context where
-        // that replay doesn't happen. Safe either way — register() is idempotent
-        // (see the `callback != null` guard above).
-        register()
-
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            unregister()
-        }
+private fun rememberNetworkStatus(): NetworkStatusObserver {
+    val observer = appContainer().networkStatus
+    DisposableEffect(observer) {
+        observer.acquire()
+        onDispose { observer.release() }
     }
-
-    return remember { DerivedOnlineState { online } }
+    return observer
 }
 
-/** Trivial [State] wrapper so [rememberIsOnline] can expose a stable snapshot read. */
-private class DerivedOnlineState(private val getter: () -> Boolean) : State<Boolean> {
-    override val value: Boolean get() = getter()
-}
+/**
+ * Live [State]<Boolean> tracking whether the active network is metered. Backed by
+ * the shared [NetworkStatusObserver] (one callback for the whole app). Drives the
+ * playback quality selector's Auto mode.
+ */
+@Composable
+fun rememberIsMetered(): State<Boolean> =
+    rememberNetworkStatus().metered.collectAsStateWithLifecycle()
+
+/**
+ * Live [State]<Boolean> tracking device connectivity, backed by the shared
+ * [NetworkStatusObserver]. Defaults to the current synchronous read
+ * ([NetworkConnectivityObserver.isOnlineNow]) until the callback fires, and falls
+ * back to `true` (assume online, i.e. never block reconnects) when
+ * [ConnectivityManager] is unavailable.
+ */
+@Composable
+fun rememberIsOnline(): State<Boolean> =
+    rememberNetworkStatus().online.collectAsStateWithLifecycle()

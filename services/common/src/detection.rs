@@ -136,9 +136,19 @@ pub struct NormalizedEvent {
     pub recognized_plate: Option<String>,
 
     /// Confidence of [`Self::recognized_plate`] (`0.0..=1.0`) if the provider
-    /// reports a plate-specific score, else `None` (the ingester falls back to
-    /// `top_score`).
+    /// reports a plate-specific score, else `None`. The ingester stores this
+    /// verbatim and does NOT fall back to the object's `top_score` — that is the
+    /// *vehicle* detection score, not the plate OCR score, and using it would
+    /// green-light a mediocre read; clients render `None` as "—".
     pub plate_confidence: Option<f32>,
+
+    /// Plate bounding box as `[x, y, w, h]` fractions (each `0.0..=1.0`) of the
+    /// full detection-snapshot frame — a tight crop region a client can apply to
+    /// `GET /events/{id}/snapshot` to render a "zoomed plate". `None` when the
+    /// provider gave no plate box, or gave one that could not be normalized to
+    /// frame fractions (best-effort; never guessed). Additive: drives only the
+    /// `plate_reads.bbox_*` columns, nothing in the shared `events` path.
+    pub plate_box: Option<[f32; 4]>,
 
     /// Full vendor payload preserved verbatim as JSONB.
     ///

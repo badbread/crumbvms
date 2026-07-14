@@ -50,8 +50,12 @@ const double _heartbeatStaleSecs = 60;
 class RecordingAlertsController extends ChangeNotifier {
   RecordingAlertsController({required this.api, required this.session});
 
+  /// Adopt a refreshed session (in-place re-auth) so the next poll uses the live
+  /// token instead of the dead one captured at construction. See #131.
+  void updateSession(Session s) => session = s;
+
   final CrumbApi api;
-  final Session session;
+  Session session;
 
   Timer? _timer;
   List<RecordingWarning> _warnings = const [];

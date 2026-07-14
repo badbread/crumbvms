@@ -18,8 +18,10 @@ clients within mobile constraints.
   0.5–8× speed, jump to next/prev motion, jump to time. Continuous playback
   stitches consecutive segments.
 - **Export**, pick cameras + a time window, burn-in toggle, submit an export
-  job, poll to completion, then download the MP4 to the device (DownloadManager)
-  or share the link.
+  job, poll to completion, then save the MP4 to the device's public **Downloads**
+  (`MediaStore`, folder `CrumbVMS/`) or share it. Both fetch the bytes with the
+  session token in an `Authorization` header (never in the URL) — Download writes
+  to Downloads, Share hands off a scoped `content://` FileProvider Uri.
 
 ## Architecture
 
@@ -36,9 +38,11 @@ app/src/main/java/com/crumb/nvr/
   MainActivity.kt   NavHost wiring
 ```
 
-Browser-style elements (ExoPlayer/Coil/DownloadManager) can't set an `Authorization`
-header, so media URLs carry the JWT as `?token=`, the API accepts this on
-`/segments`, `/filmstrip/*/frame`, and `/export/*/files/*`.
+Browser-style media elements (ExoPlayer/Coil) can't set an `Authorization`
+header, so streaming media URLs carry a short-lived scoped `?token=`, the API
+accepts this on `/segments` and `/filmstrip/*/frame`. Export downloads, by
+contrast, go through an in-app authenticated request (bearer header, never a
+token in the URL) — see `feature/export`.
 
 ## Build
 

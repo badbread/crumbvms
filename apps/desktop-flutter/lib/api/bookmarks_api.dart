@@ -14,9 +14,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 
 /// A saved playback moment (`GET/POST /bookmarks` → the `Bookmark` DTO in
@@ -106,7 +105,7 @@ extension BookmarksApi on CrumbApi {
   /// gate the Bookmarks nav entry; ignores every other field in the (large,
   /// admin-oriented) status payload.
   Future<bool> bookmarksEnabled(Session s) async {
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse('${s.base}/status'),
       headers: _authHeaders(s),
     );
@@ -129,7 +128,7 @@ extension BookmarksApi on CrumbApi {
     final uri = Uri.parse('${s.base}/bookmarks').replace(
       queryParameters: cameraId == null ? null : {'camera_id': cameraId},
     );
-    final resp = await http.get(uri, headers: _authHeaders(s));
+    final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
     if (resp.statusCode == 403) {
       throw CrumbApiException(
         'Your role does not permit bookmark access.',
@@ -165,7 +164,7 @@ extension BookmarksApi on CrumbApi {
           : description.trim(),
       ...?protection?.toJson(),
     };
-    final resp = await http.post(
+    final resp = await sharedHttpClient.post(
       Uri.parse('${s.base}/bookmarks'),
       headers: _jsonHeaders(s),
       body: jsonEncode(body),
@@ -186,7 +185,7 @@ extension BookmarksApi on CrumbApi {
     String? description,
   ) async {
     final trimmed = description?.trim();
-    final resp = await http.patch(
+    final resp = await sharedHttpClient.patch(
       Uri.parse('${s.base}/bookmarks/${Uri.encodeComponent(id)}'),
       headers: _jsonHeaders(s),
       body: jsonEncode({
@@ -208,7 +207,7 @@ extension BookmarksApi on CrumbApi {
   /// DELETE /bookmarks/:id. A 404 (already gone) is treated as success, same
   /// as the old Tauri client's row-removal-on-404 behavior.
   Future<void> deleteBookmark(Session s, String id) async {
-    final resp = await http.delete(
+    final resp = await sharedHttpClient.delete(
       Uri.parse('${s.base}/bookmarks/${Uri.encodeComponent(id)}'),
       headers: _authHeaders(s),
     );

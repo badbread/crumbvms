@@ -112,6 +112,7 @@ fun ClipsScreen(
     onOpenLive: () -> Unit,
     onOpenPlayback: () -> Unit,
     onOpenClipAt: (cameraId: String, timeMs: Long) -> Unit = { _, _ -> },
+    onOpenPlates: () -> Unit = {},
 ) {
     val container = appContainer()
     val vm: ClipsViewModel = viewModel(
@@ -149,8 +150,10 @@ fun ClipsScreen(
                                 onLive = onOpenLive,
                                 onPlayback = onOpenPlayback,
                                 onClips = {},
+                                onPlates = onOpenPlates,
                                 showPlayback = caps.playback || store.isAdmin,
                                 showClips = caps.clips || store.isAdmin,
+                                showPlates = store.platesEnabled,
                             )
                             InlineDivider()
                             ClipsFilters(
@@ -167,8 +170,10 @@ fun ClipsScreen(
                             onLive = onOpenLive,
                             onPlayback = onOpenPlayback,
                             onClips = {},
+                            onPlates = onOpenPlates,
                             showPlayback = caps.playback || store.isAdmin,
                             showClips = caps.clips || store.isAdmin,
+                            showPlates = store.platesEnabled,
                         )
                     }
                 },

@@ -64,14 +64,33 @@ object Network {
     }
 
     /**
+     * @param callTimeoutSeconds Optional whole-call ceiling. Set for the JSON API
+     *   client so a wedged socket can never spin the UI indefinitely; leave null
+     *   for one-shot transfer clients (export download) whose transfer time is
+     *   legitimately unbounded.
      * @param onUnauthorized invoked (possibly off the main thread) when an
      *   authenticated request returns `401`. Keep it cheap + thread-safe.
      */
-    fun buildOkHttp(store: SecureStore, onUnauthorized: () -> Unit = {}): OkHttpClient {
+    fun buildOkHttp(
+        store: SecureStore,
+        callTimeoutSeconds: Long? = null,
+        onUnauthorized: () -> Unit = {},
+    ): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .addInterceptor(AuthInterceptor(store, onUnauthorized))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
+            // Keep-alive sockets die silently while the app is backgrounded (Wi-Fi
+            // power save, NAT/proxy idle timeouts drop the connection with no
+            // FIN/RST). For HTTP/2 a dead pooled connection otherwise wedges EVERY
+            // request — including manual retries — because new calls coalesce onto
+            // the same broken socket and a per-stream timeout never evicts it. PING
+            // frames make OkHttp notice within one interval and tear it down.
+            .pingInterval(15, TimeUnit.SECONDS)
+            // Explicit (it is the default): a request that fails on a stale pooled
+            // connection before send is transparently retried on a fresh socket.
+            .retryOnConnectionFailure(true)
+        if (callTimeoutSeconds != null) builder.callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
         // Log ONLY in debug builds: BASIC logs request URLs, and media URLs carry the
         // JWT as ?token= — never write that to logcat in a release build.
         if (BuildConfig.DEBUG) {

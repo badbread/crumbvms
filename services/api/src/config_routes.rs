@@ -2173,6 +2173,32 @@ async fn check_fs(
              Point Crumb at a disk with real free space."
                 .to_owned(),
         )
+    } else if writable != Some(true) {
+        // writable is None here (Some(false) already errored above, Some(true)
+        // makes this false): the api mounts /data READ-ONLY, so a write probe
+        // couldn't affirmatively confirm the recorder (RW mount, uid 1001) can
+        // write. Do NOT green-light on free space alone — the root-owned-`_data`
+        // default-install bug reports plenty of free space while the recorder
+        // silently can't write a single segment (P0-1). Return an honest warning
+        // the wizard surfaces instead of a false "ok". (When the recorder starts
+        // publishing a storage-writability signal, prefer surfacing that here.)
+        let space = match free_bytes {
+            Some(f) => format!(
+                " ({} free of {})",
+                fmt_bytes_dec(f),
+                total_bytes.map_or_else(|| "?".to_owned(), fmt_bytes_dec)
+            ),
+            None => String::new(),
+        };
+        (
+            "warn",
+            format!(
+                "Can't confirm the recorder can write here{space} — the API sees \
+                 this disk read-only, which is normal, so writability can't be \
+                 verified from here. If recordings or playback stay empty, fix \
+                 the media directory ownership so the recorder (uid 1001) can write."
+            ),
+        )
     } else if let Some(f) = free_bytes {
         if f < LOW_FREE_BYTES {
             (
@@ -2194,8 +2220,8 @@ async fn check_fs(
             )
         }
     } else {
-        // Writable and under the media root, but statvfs couldn't read the size —
-        // usable but unverified (e.g. an exotic mount).
+        // Writability affirmatively confirmed and under the media root, but
+        // statvfs couldn't read the size — usable but unverified (exotic mount).
         (
             "warn",
             "This folder is writable, but its free space couldn't be read. \

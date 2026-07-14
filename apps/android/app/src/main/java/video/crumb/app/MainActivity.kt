@@ -45,6 +45,7 @@ import video.crumb.app.feature.live.LiveScreen
 import video.crumb.app.feature.playback.BookmarksScreen
 import video.crumb.app.feature.playback.PlaybackScreen
 import video.crumb.app.feature.playback.PlaybackWallScreen
+import video.crumb.app.feature.plates.PlatesScreen
 import video.crumb.app.feature.tuner.MotionTunerScreen
 import video.crumb.app.ui.nav.Routes
 import video.crumb.app.ui.theme.CrumbTheme
@@ -55,6 +56,33 @@ class MainActivity : FragmentActivity() {
     private val inPipState = mutableStateOf(false)
     private var videoActive = false
     private val pipAspect = Rational(16, 9)
+
+    // When the app was last backgrounded, to decide whether to reset the HTTP
+    // transport on return (see onStart).
+    private var lastStoppedAtMs = 0L
+
+    override fun onStop() {
+        lastStoppedAtMs = System.currentTimeMillis()
+        super.onStop()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // A background stint long enough for keep-alive sockets to have died
+        // (Wi-Fi power save, NAT/proxy idle timeouts drop the connection with no
+        // FIN/RST — leaving half-open sockets that wedge every request incl.
+        // manual retries). Evict the HTTP pool BEFORE the STARTED-gated pollers
+        // restart, so their first calls get fresh sockets instead of corpses.
+        if (lastStoppedAtMs > 0L &&
+            System.currentTimeMillis() - lastStoppedAtMs > NETWORK_RECOVERY_AFTER_BG_MS
+        ) {
+            (application as CrumbApp).container.recoverConnections()
+        }
+    }
+
+    private companion object {
+        const val NETWORK_RECOVERY_AFTER_BG_MS = 20_000L
+    }
 
     private val pipController = object : PipController {
         override val isInPip: Boolean get() = inPipState.value
@@ -227,6 +255,9 @@ private fun CrumbNavHost() {
                 onOpenClips = {
                     if (store.isAdmin || caps.clips) navigateTab(Routes.CLIPS)
                 },
+                onOpenPlates = {
+                    if (store.platesEnabled) navigateTab(Routes.PLATES)
+                },
                 onLogout = {
                     container.repository.logout()
                     navController.navigate(Routes.LOGIN) {
@@ -282,6 +313,9 @@ private fun CrumbNavHost() {
                 onOpenClips = {
                     if (store.isAdmin || caps.clips) navigateTab(Routes.CLIPS)
                 },
+                onOpenPlates = {
+                    if (store.platesEnabled) navigateTab(Routes.PLATES)
+                },
             )
         }
 
@@ -326,6 +360,27 @@ private fun CrumbNavHost() {
                 onOpenPlayback = { navigateTab(Routes.PLAYBACK_STANDALONE) },
                 // Jump to the clip's moment on the recorded-playback timeline.
                 onOpenClipAt = { cameraId, timeMs ->
+                    navController.navigate(Routes.playbackAt(cameraId, timeMs))
+                },
+                onOpenPlates = {
+                    if (container.store.platesEnabled) navigateTab(Routes.PLATES)
+                },
+            )
+        }
+
+        // Plates tab — license-plate reads (LPR); tapping a row jumps to that
+        // camera's playback at the read's moment. Gated on `platesEnabled`
+        // (fetched at login, see CrumbRepository.login) both here and at every
+        // tab-row entry point above; this route itself does not re-check it.
+        composable(Routes.PLATES) {
+            PlatesScreen(
+                onOpenLive = { navigateTab(Routes.LIVE) },
+                onOpenPlayback = { navigateTab(Routes.PLAYBACK_STANDALONE) },
+                onOpenClips = {
+                    val s = container.store
+                    if (s.isAdmin || s.capabilities.clips) navigateTab(Routes.CLIPS)
+                },
+                onOpenPlateAt = { cameraId, timeMs ->
                     navController.navigate(Routes.playbackAt(cameraId, timeMs))
                 },
             )

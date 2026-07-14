@@ -69,6 +69,16 @@ class MediaUrls(
         authedScoped(cameraId, "/clip/${Uri.encode(clipId)}/clip.mp4?q=$quality")
 
     /**
+     * Scoped-token URL for a plate read's sibling detection-event snapshot JPEG
+     * (`GET /events/{event_id}/snapshot`), used by the Plates tab. The event's
+     * camera scope is enforced server-side; this endpoint accepts the same
+     * per-camera scoped media token as the other single-camera media routes
+     * (never the full login JWT).
+     */
+    suspend fun eventSnapshotUrl(cameraId: String, eventId: String): String =
+        authedScoped(cameraId, "/events/${Uri.encode(eventId)}/snapshot")
+
+    /**
      * Scoped-token URL for any other [cameraId]-owned relative media path/URL
      * (recorded segment files, filmstrip frame URLs — both returned by the API
      * as camera-scoped relative paths).

@@ -83,6 +83,61 @@ POSTGRES_USER="${POSTGRES_USER:-crumb}"
 POSTGRES_DB="${POSTGRES_DB:-crumb}"
 SEED_ADMIN_USERNAME="${SEED_ADMIN_USERNAME:-admin}"
 
+# ── Host facts: timezone + LAN IP ────────────────────────────────────────────
+# Detected so a stock .env is correct-by-default without hand-editing. Neither
+# is a secret; both are host-local facts written only into the (gitignored) .env.
+
+# TZ drives quiet hours, the nightly DB backup schedule, and all log timestamps.
+# Read the host's IANA zone; fall back to UTC (NOT a hardcoded local zone) so a
+# non-US operator never silently inherits someone else's clock.
+detect_tz() {
+  if [[ -r /etc/timezone ]]; then
+    local tz; tz="$(tr -d '[:space:]' < /etc/timezone || true)"
+    [[ -n "${tz}" ]] && { printf '%s' "${tz}"; return 0; }
+  fi
+  if [[ -L /etc/localtime ]]; then
+    # /etc/localtime → …/zoneinfo/Area/City ; strip everything up to zoneinfo/.
+    local target; target="$(readlink /etc/localtime || true)"
+    case "${target}" in
+      */zoneinfo/*) printf '%s' "${target#*/zoneinfo/}"; return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+if TZ_VALUE="$(detect_tz)"; then
+  log "detected host timezone: ${TZ_VALUE}"
+else
+  TZ_VALUE="UTC"
+  log "NOTE: could not detect host timezone — defaulting TZ=UTC. Edit TZ in .env to your IANA zone (e.g. Europe/Berlin) so quiet hours, backups, and log timestamps use local time."
+fi
+
+# WEBRTC_CANDIDATE is the server's LAN IP that go2rtc advertises to WebRTC/iOS
+# live clients as an ICE candidate (docs/IOS-LIVE-VIDEO.md). Detect the primary
+# LAN IPv4; if we can't, leave it blank (iOS/WebRTC live simply won't work until
+# the operator fills it in) rather than guessing a wrong address.
+detect_lan_ip() {
+  local ip=""
+  # Preferred: the source address the kernel would use to reach off-host.
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1 || true)"
+  fi
+  # Fallback: first RFC-1918-looking address from hostname -I.
+  if [[ -z "${ip}" ]] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+  fi
+  [[ -n "${ip}" ]] && { printf '%s' "${ip}"; return 0; }
+  return 1
+}
+
+if LAN_IP="$(detect_lan_ip)"; then
+  WEBRTC_CANDIDATE_VALUE="${LAN_IP}:8556"
+  log "detected host LAN IP: ${LAN_IP} (WEBRTC_CANDIDATE=${WEBRTC_CANDIDATE_VALUE})"
+else
+  WEBRTC_CANDIDATE_VALUE=""
+  log "NOTE: could not detect a host LAN IP — leaving WEBRTC_CANDIDATE blank. Set it to <server-LAN-ip>:8556 in .env for iOS/WebRTC live view (docs/IOS-LIVE-VIDEO.md)."
+fi
+
 # Write atomically: build in a temp file, then move into place.
 TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
 trap 'rm -f "${TMP}"' EXIT
@@ -94,6 +149,12 @@ cat > "${TMP}" <<EOF
 #
 # After 'docker compose up -d', create your admin in the browser at /admin
 # (first-run wizard). No admin password needs to be set here.
+
+# --- Time zone ---
+# Detected from this host. Drives quiet hours, the nightly DB backup schedule,
+# the offsite-sync cron, and all log timestamps. Change to any IANA zone name
+# (e.g. Europe/Berlin); UTC is the fallback when detection fails.
+TZ=${TZ_VALUE}
 
 # --- PostgreSQL ---
 POSTGRES_USER=${POSTGRES_USER}
@@ -129,6 +190,13 @@ GO2RTC_PASS=${GO2RTC_PASS}
 # GO2RTC_USER/PASS above are never sent to it.
 GO2RTC_RTSP_BASE=
 GO2RTC_API_BASE=
+
+# --- WebRTC live (iOS/browser) ---
+# Detected LAN IP of THIS host (form <server-LAN-ip>:8556). go2rtc hands this to
+# WebRTC/iOS clients as an ICE candidate; without it, LAN clients never complete
+# ICE and live silently degrades to ~1fps snapshots (docs/IOS-LIVE-VIDEO.md).
+# Blank = detection failed; set it yourself if you use the iOS/WebRTC live path.
+WEBRTC_CANDIDATE=${WEBRTC_CANDIDATE_VALUE}
 
 # --- Recording ---
 SEGMENT_SECONDS=4
@@ -237,6 +305,29 @@ EOF
 chmod 600 "${TMP}"
 mv "${TMP}" "${ENV_FILE}"
 trap - EXIT
+
+# ── Media (recording) directory prep ─────────────────────────────────────────
+# The recorder container (uid 1001) writes ALL footage under MEDIA_HOST_PATH
+# (default ./_data → /data). If Docker auto-creates this bind-mount dir it ends
+# up root:root, the recorder gets EACCES on mkdir /data/live/<camera>, and
+# NOTHING is recorded — while live view (go2rtc restream, no disk) still works
+# and the setup wizard shows green (the api mounts /data read-only so it can't
+# probe writability). Prep it here with the right ownership so a stock install
+# actually records. Best-effort: a non-root run without sudo prints exactly what
+# to fix, and the recorder now also raises a loud `storage_unwritable` alert.
+MEDIA_DIR_HOST="${REPO_ROOT}/_data"
+mkdir -p "${MEDIA_DIR_HOST}" 2>/dev/null || true
+if [[ -d "${MEDIA_DIR_HOST}" ]]; then
+  if chown 1001:1001 "${MEDIA_DIR_HOST}" 2>/dev/null; then
+    log "prepared ${MEDIA_DIR_HOST} (owned by uid 1001 — the recorder can write footage)"
+  else
+    log "NOTE: could not chown ${MEDIA_DIR_HOST} to uid 1001 (not root?)."
+    log "      Run: sudo chown -R 1001:1001 ${MEDIA_DIR_HOST}"
+    log "      Otherwise the recorder CANNOT write footage and playback stays empty."
+  fi
+else
+  log "NOTE: could not create ${MEDIA_DIR_HOST} — create it and chown 1001:1001 before 'docker compose up', or the recorder records nothing."
+fi
 
 # ── DB-backup directory prep ─────────────────────────────────────────────────
 # The api container (uid 1001) writes nightly pg_dumps into ./backups (see

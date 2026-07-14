@@ -69,6 +69,16 @@ dependencies:
   webview_windows: ^0.4.0
   # Client build version for the update check's "newer than me" comparison.
   package_info_plus: ^8.0.0
+  # Plates single-plate report: compose the OpenALPR-style dossier (`pdf`) and
+  # hand it to the OS share/save dialog (`printing`). `image` decodes the
+  # detection snapshot to crop it to the plate bounding box; `crypto` hashes
+  # each embedded image (SHA-256) for the report's tamper-evident footer. Both
+  # were already in the tree transitively — promoted to direct deps here since
+  # the report imports them directly.
+  pdf: ^3.11.1
+  printing: ^5.13.4
+  image: ^4.8.0
+  crypto: ^3.0.7
 
 dev_dependencies:
   flutter_test:

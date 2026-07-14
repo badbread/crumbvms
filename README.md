@@ -252,7 +252,10 @@ identifiers). To get detection icons on the timeline:
 
 1. Set `FRIGATE_MQTT_URL` (in `.env` or the admin UI) to the MQTT broker your Frigate already
    publishes to. (No broker? A bundled `mosquitto` is available behind a compose profile:
-   `docker compose --profile frigate up -d`, then point your Frigate at it.)
+   `docker compose --profile frigate up -d`. It binds **`127.0.0.1:1883` on the Crumb host
+   only** — reachable by a Frigate running on the *same* host, but **not** by a Frigate on a
+   different box. If your Frigate runs elsewhere, give it its own broker and point both it and
+   `FRIGATE_MQTT_URL` at that; don't expose the bundled one to the LAN.)
 2. For each camera, set its **Frigate camera name** (`source_camera_name`) in the admin camera
    editor so CrumbVMS maps Frigate's events to your cameras.
 

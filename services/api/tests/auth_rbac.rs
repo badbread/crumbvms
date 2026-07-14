@@ -110,6 +110,100 @@ async fn login_wrong_password_is_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Fire one login attempt and return the raw response (status + headers), so a
+/// test can assert on the 429 + `Retry-After` backoff (issue #127) rather than
+/// the `login()` helper which panics on non-2xx.
+async fn login_attempt(
+    app: &TestApp,
+    username: &str,
+    password: &str,
+) -> axum::http::Response<axum::body::Body> {
+    app.send(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                login_body(username, password).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn login_backoff_blocks_after_repeated_failures() {
+    // Issue #127: consecutive failed logins for one username must trip a
+    // per-username backoff — 429 + Retry-After — on top of the shared per-IP
+    // bucket (which this test router doesn't mount, so 429 here can only come
+    // from the backoff).
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+
+    // The threshold is 5 (state::LOGIN_FAIL_THRESHOLD): the first 5 wrong-
+    // password attempts are plain 401s.
+    for i in 0..5 {
+        let resp = login_attempt(&app, &admin.username, "wrong-password").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {i} should be a plain 401 (still under threshold)"
+        );
+    }
+
+    // The 6th attempt is now blocked: 429 with a Retry-After header, WITHOUT
+    // reaching the credential check.
+    let blocked = login_attempt(&app, &admin.username, "wrong-password").await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = blocked
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("429 must carry a numeric Retry-After header");
+    assert!(retry_after >= 1, "Retry-After must be a positive backoff");
+
+    // Even the CORRECT password is rejected while blocked (the limiter runs
+    // before verification) — proving it doesn't sleep-and-verify.
+    let blocked_correct = login_attempt(&app, &admin.username, &admin.password).await;
+    assert_eq!(blocked_correct.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A DIFFERENT username is unaffected — the backoff is per-username, not a
+    // global brake (and unknown users get the same 401 shape, no oracle).
+    let other = login_attempt(&app, &unique("other-user"), "whatever").await;
+    assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_backoff_resets_on_success() {
+    // A successful login must clear the failure counter so a legitimate user who
+    // eventually types the right password isn't punished for earlier typos.
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+
+    // 4 failures — one shy of the threshold, so no block yet.
+    for _ in 0..4 {
+        let resp = login_attempt(&app, &admin.username, "wrong-password").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // A correct login succeeds and resets the counter.
+    let ok = login_attempt(&app, &admin.username, &admin.password).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // Because the counter reset, four more failures again stay 401 (had the
+    // count NOT reset, the 2nd of these — the 6th cumulative failure — would be
+    // a 429).
+    for i in 0..4 {
+        let resp = login_attempt(&app, &admin.username, "wrong-password").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "post-reset attempt {i} should be 401, not blocked"
+        );
+    }
+}
+
 #[tokio::test]
 async fn login_unknown_user_is_401_with_same_message_as_wrong_password() {
     // Uniform-401 invariant (auth.rs's own stated design: "no oracle" — the

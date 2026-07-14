@@ -56,7 +56,16 @@ class MotionTimelineController extends ChangeNotifier {
   MotionTimelineController({required this.api, required this.session});
 
   final CrumbApi api;
-  final Session session;
+
+  /// The authenticating session. NOT final: an in-place re-auth mints a fresh
+  /// token, and this long-lived controller must adopt it via [updateSession] or
+  /// its motion/detection fetches keep using the dead token. Mirrors
+  /// `GaplessSegmentPaneController.updateSession`.
+  Session session;
+
+  /// Swap in a refreshed [session] (e.g. after re-auth) without tearing down
+  /// the controller; subsequent fetches use the new bearer token.
+  void updateSession(Session next) => session = next;
 
   /// Visible window, ms epoch. Callers (the playback host) own scrubbing and
   /// call [configure] when it changes.

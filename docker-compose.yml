@@ -63,7 +63,7 @@ services:
       GO2RTC_PASS: ${GO2RTC_PASS:?GO2RTC_PASS is required (run scripts/setup-env.sh)}
       GO2RTC_EMBEDDED: ${GO2RTC_EMBEDDED:-true}          # false only if you run an external restreamer
       WEBRTC_CANDIDATE: ${WEBRTC_CANDIDATE:-}            # set <server-LAN-ip>:8556 so WebRTC reaches LAN clients
-      TZ: ${TZ:-America/Los_Angeles}
+      TZ: ${TZ:-UTC}                                     # local wall-clock for quiet hours, backups, log timestamps (setup-env.sh detects the host TZ)
       GO2RTC_RTSP_BASE: ${GO2RTC_RTSP_BASE:-}            # external BYO-Frigate go2rtc (served_by='frigate' only)
       GO2RTC_API_BASE: ${GO2RTC_API_BASE:-}
       MEDIA_ROOT: ${MEDIA_ROOT:-/data}
@@ -152,7 +152,7 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-json}
       # Built-in nightly pg_dump of the segments index (the mp4→camera/time map). docs/BACKUP.md
       BACKUP_DIR: ${BACKUP_DIR:-/backups}
-      TZ: ${TZ:-America/Los_Angeles}
+      TZ: ${TZ:-UTC}
       DB_BACKUP_SCHEDULE: ${DB_BACKUP_SCHEDULE:-03:15}  # local wall-clock "HH:MM" in TZ
       DB_BACKUP_KEEP_DAYS: ${DB_BACKUP_KEEP_DAYS:-7}
       DB_BACKUP_KEEP_WEEKS: ${DB_BACKUP_KEEP_WEEKS:-4}
@@ -189,7 +189,7 @@ services:
       # container-side port would break HTTPS the moment an operator customized it.
       - "0.0.0.0:${CRUMB_HTTPS_PORT:-8443}:${CRUMB_HTTPS_PORT:-8443}"
     environment:
-      - TZ=${TZ:-America/Los_Angeles}
+      - TZ=${TZ:-UTC}
       - CRUMB_HTTPS_PORT=${CRUMB_HTTPS_PORT:-8443}
 
   # Mosquitto — bundled MQTT broker for Frigate detection, OPT-IN via the `frigate` profile (a
@@ -204,7 +204,7 @@ services:
     ports:
       - "127.0.0.1:1883:1883"   # LAN-local only; not forwarded to WAN
     environment:
-      - TZ=${TZ:-America/Los_Angeles}
+      - TZ=${TZ:-UTC}
 
   # Off-host backup sync — OPTIONAL, opt-in via the `offsite` profile. Pushes DB_BACKUP_HOST_PATH to
   # an rclone remote (SFTP/S3/B2/NAS) so one disk failure can't take out footage AND backups. Simpler
@@ -215,7 +215,7 @@ services:
     profiles: ["offsite"]
     restart: unless-stopped
     environment:
-      - TZ=${TZ:-America/Los_Angeles}
+      - TZ=${TZ:-UTC}
       - BACKUP_OFFSITE_REMOTE=${BACKUP_OFFSITE_REMOTE:-}          # rclone remote:path; empty ⇒ idle no-op
       - BACKUP_OFFSITE_SCHEDULE=${BACKUP_OFFSITE_SCHEDULE:-15 5 * * *}   # 5-field cron (busybox crond)
     volumes:

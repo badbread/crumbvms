@@ -22,9 +22,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 import 'updates_models.dart';
 
@@ -40,7 +39,7 @@ extension UpdatesApi on CrumbApi {
     final uri = Uri.parse(
       '${s.base}/updates/latest${refresh ? '?refresh=1' : ''}',
     );
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       uri,
       headers: {'authorization': 'Bearer ${s.token}'},
     );

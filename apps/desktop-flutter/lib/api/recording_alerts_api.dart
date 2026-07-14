@@ -14,9 +14,8 @@
 
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
-
 import 'crumb_api.dart';
+import 'http_client.dart';
 import 'models.dart';
 import 'recording_alerts_models.dart';
 
@@ -25,7 +24,7 @@ extension RecordingAlertsApi on CrumbApi {
   /// fields this feature needs. Non-admin sessions get an empty/null result,
   /// not an error.
   Future<RecordingStatusSnapshot> getRecordingStatus(Session s) async {
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse('${s.base}/status'),
       headers: {'authorization': 'Bearer ${s.token}'},
     );
@@ -44,7 +43,7 @@ extension RecordingAlertsApi on CrumbApi {
   /// session) so callers can skip the policy-derived warnings without
   /// treating it as a transient failure.
   Future<PolicyStatsResponse?> getPolicyStats(Session s) async {
-    final resp = await http.get(
+    final resp = await sharedHttpClient.get(
       Uri.parse('${s.base}/stats/policies'),
       headers: {'authorization': 'Bearer ${s.token}'},
     );

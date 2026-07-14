@@ -23,7 +23,8 @@ use tracing::{info, warn};
 
 use crumb_common::{
     db::{
-        get_lpr_settings, normalize_plate, upsert_detection_event, upsert_plate_read,
+        get_lpr_settings, insert_system_event_with_snapshot, is_plate_ignored, mark_plate_alerted,
+        match_watchlist, normalize_plate, upsert_detection_event, upsert_plate_read,
         UpsertDetectionEventParams, UpsertPlateReadParams,
     },
     detection::NormalizedEvent,
@@ -103,10 +104,22 @@ async fn maybe_record_plate(
     }
     match get_lpr_settings(pool).await {
         Ok(Some(cfg)) if cfg.enabled => {
+            // Ignore-list (migration 0054): a plate on an `ignore` entry is
+            // dropped entirely — not stored, never alerted. The pragmatic
+            // backstop for a nuisance plate (e.g. a parked car Frigate keeps
+            // reading) when Frigate-side object masking isn't practical.
+            match is_plate_ignored(pool, &normalized, cfg.watchlist_fuzz).await {
+                Ok(true) => {
+                    tracing::debug!(plate = %plate_raw, camera = %ev.camera_id, "detection ingester: plate ignored (ignore-list) — dropped");
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => warn!(error = %e, "detection ingester: is_plate_ignored failed"),
+            }
             let params = UpsertPlateReadParams {
                 camera_id: ev.camera_id,
                 ts: ev.start_ts,
-                plate: normalized,
+                plate: normalized.clone(),
                 plate_raw: Some(plate_raw.to_owned()),
                 // ONLY the plate-specific OCR score. NOT the object's top_score:
                 // that's the *vehicle* detection confidence (often 0.9+), and
@@ -119,15 +132,31 @@ async fn maybe_record_plate(
                 provider_event_id: Some(ev.provider_event_id.clone()),
                 event_id: Some(event_id),
                 snapshot_url: ev.snapshot_url.clone(),
+                // Plate crop box, normalized [x, y, w, h] fractions of the
+                // snapshot frame (None when the provider gave none / it couldn't
+                // be normalized). Best-effort, purely additive.
+                bbox: ev.plate_box,
                 raw: ev.raw.clone(),
             };
             match upsert_plate_read(pool, &params).await {
-                Ok(id) => tracing::debug!(
-                    plate_read_id = %id,
-                    plate = %plate_raw,
-                    camera = %ev.camera_id,
-                    "detection ingester: recorded plate read"
-                ),
+                Ok(up) => {
+                    tracing::debug!(
+                        plate_read_id = %up.id,
+                        plate = %plate_raw,
+                        camera = %ev.camera_id,
+                        inserted = up.inserted,
+                        "detection ingester: recorded plate read"
+                    );
+                    // Check the watchlist on every read (insert AND lifecycle
+                    // refinement), gated on the row's persisted `alerted` flag so
+                    // it fires exactly once — but still catches a plate that only
+                    // becomes the watchlisted value on a later refinement UPDATE
+                    // (a misread that converges onto the BOLO plate mid-pass).
+                    if !up.alerted {
+                        maybe_alert_watchlist(pool, ev, &normalized, up.id, cfg.watchlist_fuzz)
+                            .await;
+                    }
+                }
                 Err(e) => warn!(
                     error = %e,
                     source = %ev.source_id,
@@ -137,5 +166,65 @@ async fn maybe_record_plate(
         }
         Ok(_) => { /* LPR disabled — capture nothing */ }
         Err(e) => warn!(error = %e, "detection ingester: get_lpr_settings failed"),
+    }
+}
+
+/// Emit a `plate_watchlist_hit` system event when the just-recorded plate
+/// matches a notifying watchlist entry, then mark the read `alerted` so a later
+/// refinement UPDATE of the same row cannot re-fire. The notification engine
+/// (`notifications.rs`) fans it out over the configured channels and prepends
+/// the camera name, so the detail here carries only the plate-specific facts.
+/// Best-effort: a lookup/insert failure is logged, never fatal to ingestion.
+async fn maybe_alert_watchlist(
+    pool: &Pool,
+    ev: &NormalizedEvent,
+    normalized: &str,
+    plate_read_id: uuid::Uuid,
+    fuzz: f32,
+) {
+    let entry = match match_watchlist(pool, normalized, fuzz).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return, // not watchlisted (or notify disabled) — leave `alerted` false
+        Err(e) => {
+            warn!(error = %e, "detection ingester: match_watchlist failed");
+            return;
+        }
+    };
+
+    let label = entry
+        .label
+        .as_deref()
+        .filter(|l| !l.is_empty())
+        .map(|l| format!(" (\"{l}\")"))
+        .unwrap_or_default();
+    let conf = ev
+        .plate_confidence
+        .map_or_else(|| "—".to_owned(), |c| format!("{:.0}%", c * 100.0));
+    let detail = format!(
+        "watchlisted plate {plate}{label} seen (confidence {conf})",
+        plate = entry.plate
+    );
+
+    // Carry the detection snapshot (the car+plate frame) so image-capable
+    // notification channels can attach it — the notification engine resolves +
+    // fetches it, gated by each channel's own `include_snapshot` toggle.
+    if let Err(e) = insert_system_event_with_snapshot(
+        pool,
+        "plate_watchlist_hit",
+        Some(ev.camera_id),
+        Some(&detail),
+        ev.snapshot_url.as_deref(),
+    )
+    .await
+    {
+        // Leave `alerted` false so a later refinement UPDATE retries the alert.
+        warn!(error = %e, "detection ingester: insert_system_event(plate_watchlist_hit) failed");
+        return;
+    }
+    info!(plate = %entry.plate, camera = %ev.camera_id, "detection ingester: watchlist hit alerted");
+    // Latch the row so a subsequent lifecycle UPDATE of the same read (or a
+    // re-processed MQTT message) does not re-fire the alert.
+    if let Err(e) = mark_plate_alerted(pool, plate_read_id).await {
+        warn!(error = %e, "detection ingester: mark_plate_alerted failed");
     }
 }

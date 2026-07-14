@@ -133,13 +133,18 @@ pub struct LprSettings {
     pub ingest_token: Option<String>,
     /// Days to keep `plate_reads` before the daily prune deletes them.
     pub retention_days: i32,
+    /// Global watchlist/ignore match fuzziness (`0.0` = exact, up to `0.5`).
+    /// When > 0 the ingester matches reads against watch/ignore entries by
+    /// trigram similarity (`similarity >= 1 - fuzz`) — Frigate's ALPR misreads,
+    /// so exact-only misses. Migration 0054.
+    pub watchlist_fuzz: f32,
     /// Monotonic version, bumped on every update.
     pub version: i64,
 }
 
 /// One license-plate read (`plate_reads`, migration 0051), as served to clients
-/// by `GET /plates`. Omits the heavy `crop`/`raw`/`vehicle`/`bbox` columns from
-/// the list shape; a crop is fetched separately.
+/// by `GET /plates`. Omits the heavy `crop`/`raw`/`vehicle` columns from the
+/// list shape; a crop is fetched separately.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlateRead {
     pub id: uuid::Uuid,
@@ -155,6 +160,34 @@ pub struct PlateRead {
     /// The sibling `events` row, if any (for "view footage" jump).
     pub event_id: Option<uuid::Uuid>,
     pub snapshot_url: Option<String>,
+    /// Plate bounding box as `[x, y, w, h]` fractions (each `0..1`) of the
+    /// `GET /events/{id}/snapshot` image — a client can crop the snapshot to
+    /// just the plate. `None` when no box was captured/normalizable. Assembled
+    /// from the `bbox_x1..bbox_y2` corner columns.
+    pub bbox: Option<[f32; 4]>,
+}
+
+/// One plate-watchlist entry (`lpr_watchlist`, migration 0052). A curated plate
+/// the operator wants flagged; a matching read with `notify = true` fires a
+/// `plate_watchlist_hit` alert. `plate` is stored normalized (uppercase
+/// alphanumerics), matched exactly against an ingested read's normalized plate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlateWatchlistEntry {
+    pub id: uuid::Uuid,
+    /// Normalized plate (uppercase alphanumerics).
+    pub plate: String,
+    /// Friendly name shown in alerts + clients ("Mom's car").
+    pub label: Option<String>,
+    pub note: Option<String>,
+    /// Optional UI tag color (`#rrggbb`); clients may ignore it.
+    pub color: Option<String>,
+    /// Whether a match fires an alert (false = track/label but stay silent).
+    /// Only meaningful for `kind = "watch"`.
+    pub notify: bool,
+    /// `"watch"` (alert on a hit) or `"ignore"` (drop matching reads entirely —
+    /// not stored, never alerted). Migration 0054.
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// One camera ↔ HA entity link (`camera_ha_links`, migration 0048).
