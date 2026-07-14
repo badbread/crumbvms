@@ -341,6 +341,175 @@ async fn get_release_info(force: bool) -> Option<CachedRelease> {
     guard.data.clone()
 }
 
+// ─── background update-available notifier (issue #35) ──────────────────────────
+
+/// System-event key emitted when a newer release is detected. Seeded OFF by
+/// default into `system_alert_rules` by migration
+/// `0057_update_available_alert.sql`, and dispatched over the configured
+/// notification channels by `notifications.rs`.
+const UPDATE_AVAILABLE_EVENT_KEY: &str = "update_available";
+
+/// How often the notifier re-evaluates. Aligned with the 6h cache TTL: a poll
+/// that finds the cache stale triggers exactly one `GitHub` fetch, so this
+/// cadence bounds `GitHub` contact to ~once per 6h (well inside the 60/h/IP
+/// unauthenticated limit) while still surfacing a new release within a few hours
+/// of it landing.
+const UPDATE_NOTIFY_POLL_SECS: u64 = 6 * 60 * 60;
+
+/// Edge-trigger decision for the update-available notifier. Kept pure (no DB, no
+/// network) so the once-per-version de-dupe is exhaustively unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateNotifyDecision {
+    /// A newer version is available that has NOT already been notified — emit an
+    /// `update_available` system event for it, then latch this version.
+    Notify(String),
+    /// Server is up to date (or the local build is newer than latest): clear the
+    /// latch so the NEXT distinct release re-fires.
+    ClearLatch,
+    /// No actionable change — already notified this version, or no parseable
+    /// signal (unreachable `GitHub` / unparseable dev build). Latch untouched.
+    Skip,
+}
+
+/// Decide whether to emit an update-available notification this tick.
+///
+/// * `update_available` — the [`is_update_available`] result: `Some(true)`
+///   newer, `Some(false)` up to date, `None` no signal.
+/// * `latest_version` — the version tag `GitHub` reported (if any).
+/// * `last_notified` — the version this task last emitted an event for (the
+///   in-memory latch), or `None` if it has not emitted for the current streak.
+///
+/// De-dupe rules: a given version fires at most once (latched); a return to
+/// up-to-date clears the latch so a later release fires again; an
+/// unparseable/absent signal is a no-op that specifically does NOT clear a valid
+/// latch (a transient `GitHub` outage must not cause a re-fire when it recovers).
+fn update_notify_decision(
+    update_available: Option<bool>,
+    latest_version: Option<&str>,
+    last_notified: Option<&str>,
+) -> UpdateNotifyDecision {
+    match (update_available, latest_version) {
+        (Some(true), Some(latest)) => {
+            if last_notified == Some(latest) {
+                UpdateNotifyDecision::Skip
+            } else {
+                UpdateNotifyDecision::Notify(latest.to_owned())
+            }
+        }
+        // Up to date (or local build newer than latest) — reset the latch.
+        (Some(false), _) => UpdateNotifyDecision::ClearLatch,
+        // No signal (GitHub unreachable, or an unparseable local version).
+        _ => UpdateNotifyDecision::Skip,
+    }
+}
+
+/// Background task (issue #35): periodically checks whether a newer release is
+/// available and, on the edge where one first appears, fires an
+/// `update_available` system event that the notification engine
+/// (`notifications.rs`) fans out over the configured channels.
+///
+/// Opt-in on BOTH gates, honoring Crumb's no-phone-home posture:
+/// 1. the update-available check must be enabled
+///    (`server_settings.update_check_enabled` / `UPDATE_CHECK_ENABLED`, off by
+///    default per D3) — while off this task makes ZERO `GitHub` requests; and
+/// 2. the `update_available` system-alert rule must be enabled (off by default,
+///    migration 0057) — while off the task neither fetches nor latches.
+///
+/// De-dupe is a per-version in-memory latch (see [`update_notify_decision`]): a
+/// given version emits one event and only a later distinct release re-fires.
+/// The latch resets on process restart — at worst one repeat event for a
+/// still-available version after a restart, itself bounded by the rule's 6h
+/// cooldown in the engine.
+pub async fn run_update_notifier(pool: Pool, cfg: ApiConfig) {
+    let server_version = VERSION.trim().to_owned();
+    let mut last_notified: Option<String> = None;
+
+    let poll_interval = std::time::Duration::from_secs(UPDATE_NOTIFY_POLL_SECS);
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    tracing::info!(
+        poll_secs = UPDATE_NOTIFY_POLL_SECS,
+        "update-available notifier started"
+    );
+
+    loop {
+        ticker.tick().await;
+
+        // ── Gate 1: update-available check enabled? (else zero GitHub contact —
+        //    the no-phone-home invariant.) ────────────────────────────────────
+        match resolve_enabled(&pool, &cfg).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Off — reset so re-enabling re-notifies for the current release.
+                last_notified = None;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "update notifier: resolve_enabled failed; skipping tick");
+                continue;
+            }
+        }
+
+        // ── Gate 2: the `update_available` system-alert rule must be on (else
+        //    nothing would dispatch — don't fetch or latch). ──────────────────
+        match crumb_common::db::get_system_alert_rule(&pool, UPDATE_AVAILABLE_EVENT_KEY).await {
+            Ok(Some(rule)) if rule.enabled => {}
+            Ok(_) => {
+                last_notified = None; // rule off/missing — re-enabling re-notifies
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "update notifier: get_system_alert_rule failed; skipping tick");
+                continue;
+            }
+        }
+
+        // ── Both gates open: consult the shared, cached release info. A `None`
+        //    here is "no signal" (GitHub unreachable / no data yet) — leave the
+        //    latch untouched. ─────────────────────────────────────────────────
+        let Some(release) = get_release_info(false).await else {
+            continue;
+        };
+        let available = is_update_available(&server_version, &release.latest_version);
+
+        match update_notify_decision(
+            available,
+            Some(&release.latest_version),
+            last_notified.as_deref(),
+        ) {
+            UpdateNotifyDecision::Notify(version) => {
+                let detail = format!(
+                    "Crumb {version} is available (this server runs {server_version}). \
+                     Release notes: {}",
+                    release.notes_url
+                );
+                match crumb_common::db::insert_system_event(
+                    &pool,
+                    UPDATE_AVAILABLE_EVENT_KEY,
+                    None,
+                    Some(&detail),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            version = %version,
+                            "update notifier: newer release detected — system event emitted"
+                        );
+                        last_notified = Some(version);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "update notifier: insert_system_event(update_available) failed");
+                    }
+                }
+            }
+            UpdateNotifyDecision::ClearLatch => last_notified = None,
+            UpdateNotifyDecision::Skip => {}
+        }
+    }
+}
+
 // ─── tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -573,5 +742,62 @@ mod tests {
         assert_eq!(resp.latest_version.as_deref(), Some("0.0.2"));
         assert_eq!(resp.server_update_available, Some(true));
         assert_eq!(resp.checked_at, Some(checked));
+    }
+
+    // ── update-available notifier: edge-trigger + per-version de-dupe (#35) ──
+
+    #[test]
+    fn notify_fires_once_when_a_newer_version_first_appears() {
+        // First sighting of a newer version, nothing latched yet → Notify.
+        assert_eq!(
+            update_notify_decision(Some(true), Some("0.0.2"), None),
+            UpdateNotifyDecision::Notify("0.0.2".to_owned())
+        );
+    }
+
+    #[test]
+    fn notify_deduped_for_the_same_version_already_notified() {
+        // Same newer version, already latched → Skip (no re-fire every poll).
+        assert_eq!(
+            update_notify_decision(Some(true), Some("0.0.2"), Some("0.0.2")),
+            UpdateNotifyDecision::Skip
+        );
+    }
+
+    #[test]
+    fn notify_refires_for_a_different_newer_version() {
+        // A DISTINCT later release supersedes the latched one → Notify again.
+        assert_eq!(
+            update_notify_decision(Some(true), Some("0.0.3"), Some("0.0.2")),
+            UpdateNotifyDecision::Notify("0.0.3".to_owned())
+        );
+    }
+
+    #[test]
+    fn up_to_date_clears_the_latch_so_a_future_release_refires() {
+        // Server caught up (or is newer) → clear latch; then the next newer
+        // release fires as a fresh edge.
+        assert_eq!(
+            update_notify_decision(Some(false), Some("0.0.2"), Some("0.0.2")),
+            UpdateNotifyDecision::ClearLatch
+        );
+        assert_eq!(
+            update_notify_decision(Some(true), Some("0.0.3"), None),
+            UpdateNotifyDecision::Notify("0.0.3".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_signal_never_clears_a_valid_latch() {
+        // A transient GitHub outage / unparseable local version = None: a no-op
+        // that must NOT clear the latch (else recovery would spuriously re-fire).
+        assert_eq!(
+            update_notify_decision(None, None, Some("0.0.2")),
+            UpdateNotifyDecision::Skip
+        );
+        assert_eq!(
+            update_notify_decision(None, Some("0.0.2"), Some("0.0.2")),
+            UpdateNotifyDecision::Skip
+        );
     }
 }

@@ -8691,6 +8691,7 @@ const SYS_ALERT_META = {
   stream_no_segments:   { title: 'Camera records nothing',            desc: 'A camera keeps connecting but never produces a recordable segment before the stall watchdog reconnects it, so no footage is saved. Usually a long/adaptive keyframe interval (smart codec, e.g. Hikvision/Dahua H.264+/H.265+) or very low fps, exceeding the segment-receipt timeout. Fix the camera’s I-frame interval / disable the smart codec, or raise SEGMENT_RECEIPT_TIMEOUT_SECS.', unit: null },
   storage_unwritable:   { title: 'Storage not writable',              desc: 'The recorder cannot create a camera’s media directory under the storage root (permission denied) — footage is NOT being saved. Usually the host media dir is root-owned while the recorder runs as non-root uid 1001; fix the media dir ownership/permissions.', unit: null },
   plate_watchlist_hit:  { title: 'License-plate watchlist hit',        desc: 'A watchlisted license plate was seen on a camera (managed in Plates → Watchlist).', unit: null },
+  update_available:     { title: 'Crumb update available',             desc: 'A newer Crumb release is available on GitHub. Off by default and only fires when the update-available check is also enabled (Settings → Updates) — notify-only, no download or install. Fires once per new version.', unit: null },
 };
 
 /* Per-kind connection-field descriptors. */

@@ -9,15 +9,14 @@
 // [fetchSnapshot] callback wired to its existing bounded-concurrency snapshot
 // helper + cache, so this reuses the same fetch path the thumbnails do.
 
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 import 'package:crumb_desktop/ui/plates/plate_pdf_report.dart';
 
 /// How many other sightings to embed in the dossier's thumbnail strip.
@@ -112,7 +111,7 @@ class _PlateReportDialogState extends State<_PlateReportDialog> {
       Uint8List? plateCrop;
       var cropIsFallback = true;
       if (fullSnapshot != null && read.bbox != null) {
-        final cropped = await _cropToBbox(fullSnapshot, read.bbox!);
+        final cropped = await cropPlateToBbox(fullSnapshot, read.bbox!);
         if (cropped != null) {
           plateCrop = cropped;
           cropIsFallback = false;
@@ -289,34 +288,8 @@ class _PlateReportDialogState extends State<_PlateReportDialog> {
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
-/// Crop [fullBytes] to the normalized `[x, y, w, h]` [bbox] (fractions 0..1 of
-/// the snapshot). Returns re-encoded JPEG bytes, or null if the image can't be
-/// decoded (the caller then falls back to the full frame).
-///
-/// The decode/crop/encode (all `package:image`, which is isolate-safe) runs on
-/// a background isolate via [Isolate.run] so a full-frame JPEG doesn't freeze
-/// the UI isolate while the report builds. The closure captures only sendable
-/// data (the byte list + the bbox doubles) and calls a top-level function; the
-/// `pdf`/`printing` share step stays on the main isolate (see [_generate]).
-Future<Uint8List?> _cropToBbox(Uint8List fullBytes, List<double> bbox) {
-  return Isolate.run(() => _cropToBboxSync(fullBytes, bbox));
-}
-
-/// The synchronous crop, run inside the background isolate. The rect is clamped
-/// into the image so an out-of-range or degenerate box still yields a crop.
-Uint8List? _cropToBboxSync(Uint8List fullBytes, List<double> bbox) {
-  final decoded = img.decodeImage(fullBytes);
-  if (decoded == null) return null;
-  final w = decoded.width;
-  final h = decoded.height;
-  final cx = (bbox[0] * w).round().clamp(0, w - 1);
-  final cy = (bbox[1] * h).round().clamp(0, h - 1);
-  final cw = (bbox[2] * w).round().clamp(1, w - cx);
-  final ch = (bbox[3] * h).round().clamp(1, h - cy);
-  final cropped =
-      img.copyCrop(decoded, x: cx, y: cy, width: cw, height: ch);
-  return img.encodeJpg(cropped, quality: 90);
-}
+// The plate crop (bbox → cropped JPEG) lives in plate_crop.dart, shared with
+// the Plates gallery/detail crop so all three paths use one implementation.
 
 /// The device-local zone plus UTC and whole-hour offsets. Crumb ships no IANA
 /// tz database, so a fixed-offset picker is the honest, dependency-free option

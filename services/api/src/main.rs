@@ -631,6 +631,22 @@ async fn main() -> anyhow::Result<()> {
         info!("notification engine started");
     }
 
+    // ── 6c-2. update-available notifier (issue #35) ───────────────────────────
+    //
+    // Edge-triggered "a newer Crumb release is available" → `system_events`,
+    // fanned out over the same channels as health/plate alerts. Doubly opt-in
+    // and off by default: it makes ZERO GitHub requests unless the update-check
+    // is enabled AND the `update_available` system-alert rule is on, preserving
+    // the no-phone-home posture (docs/DECISIONS.md "Update-available check").
+    {
+        let update_pool = state.pool().clone();
+        let update_cfg = cfg.clone();
+        tokio::spawn(async move {
+            updates::run_update_notifier(update_pool, update_cfg).await;
+        });
+        info!("update-available notifier started");
+    }
+
     // ── 6d. system/health watchdogs (P0-HEALTH-NOTIFY) ────────────────────────
     //
     // Always on (no env var gate, unlike the legacy ALERT_WEBHOOK_URL path) —

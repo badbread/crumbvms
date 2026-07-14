@@ -37,6 +37,25 @@ import 'package:crumb_desktop/ui/special_tiles/special_tile_controller.dart';
 import 'package:crumb_desktop/ui/special_tiles/special_tile_spec.dart';
 import 'package:crumb_desktop/ui/special_tiles/special_tile_widgets.dart';
 
+/// Tear down an mpv-backed [Player] without blocking the caller.
+///
+/// media_kit/libmpv `Player.dispose()` can block the calling isolate for
+/// seconds while the native mpv handle winds down. Calling it synchronously
+/// from a widget `dispose()` on the maximize / restore / close path freezes the
+/// UI (~10s stall, #105). Scheduling it in a fresh microtask/event lets widget
+/// teardown and navigation complete first, so the frame that removes the pane
+/// paints immediately and the native teardown runs afterwards.
+///
+/// Callers MUST null their player field before calling this so nothing else
+/// touches the handle that is being disposed. Only the Player teardown is
+/// detached — the stall-watchdog is still disposed synchronously by the caller.
+///
+/// NOTE: needs on-hardware confirmation that the maximize/restore/close freeze
+/// is actually gone (can only be observed against real libmpv on Windows).
+void _disposePlayerDetached(Player? p) {
+  if (p != null) unawaited(Future(() => p.dispose()));
+}
+
 class WallScreen extends StatefulWidget {
   const WallScreen({
     super.key,
@@ -1023,8 +1042,14 @@ class _WallTileState extends State<_WallTile> {
     _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
-    _pending?.dispose();
-    _player?.dispose();
+    // Detach the (potentially seconds-long) libmpv teardown from the teardown
+    // path so restore/close doesn't freeze the UI (#105). Null first.
+    final pending = _pending;
+    final player = _player;
+    _pending = null;
+    _player = null;
+    _disposePlayerDetached(pending);
+    _disposePlayerDetached(player);
     super.dispose();
   }
 
@@ -1642,7 +1667,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       _ptzSteering = false;
       widget.api.ptzStop(widget.session, widget.camera.id).catchError((_) {});
     }
-    _player?.dispose();
+    // Detach the (potentially seconds-long) libmpv teardown from the restore /
+    // double-click-restore path so the UI doesn't freeze (#105). Null first.
+    final player = _player;
+    _player = null;
+    _disposePlayerDetached(player);
     super.dispose();
   }
 
