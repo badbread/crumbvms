@@ -1,6 +1,8 @@
-// Data shapes for the Home Assistant on-video overlay feature (issue #170).
-// Snake_case JSON -> camelCase Dart, mirroring the server DTOs exactly:
-// `HaLinkDto` / `HaEntityState` / `HaStatesResponse` (services/api/src/ha.rs).
+// Data shapes for the Home Assistant integration (issue #52 connection +
+// entity linking, issue #170 on-video overlay). Snake_case JSON -> camelCase
+// Dart, mirroring the server DTOs exactly (services/api/src/ha.rs):
+// `HaConfigDto` / `HaEntity` / `HaLinkDto` / `HaEntityState` /
+// `HaStatesResponse`.
 
 /// A camera's linked HA entity (`GET /cameras/:id/ha/links`), including its
 /// on-video overlay placement, if any. One link -> at most one badge.
@@ -65,6 +67,99 @@ class HaLink {
     overlayY: (j['overlay_y'] as num?)?.toDouble(),
     overlaySize: (j['overlay_size'] as num?)?.toDouble(),
   );
+}
+
+/// The Home Assistant connection config (`GET /config/ha`). The token itself
+/// is NEVER returned — write-only server-side (`HaConfigDto`,
+/// services/api/src/ha.rs) — [hasToken] is the only signal a client gets
+/// about whether one is stored.
+class HaConfig {
+  HaConfig({required this.enabled, required this.baseUrl, required this.hasToken});
+
+  final bool enabled;
+  final String baseUrl;
+
+  /// True when a non-empty token is already stored server-side.
+  final bool hasToken;
+
+  factory HaConfig.fromJson(Map<String, dynamic> j) => HaConfig(
+    enabled: (j['enabled'] as bool?) ?? false,
+    baseUrl: (j['base_url'] as String?) ?? '',
+    hasToken: (j['has_token'] as bool?) ?? false,
+  );
+}
+
+/// One HA entity from the picker's data source (`GET /ha/entities`) — NOT
+/// yet linked to any camera. Mirrors the server's `HaEntity` DTO
+/// (services/api/src/ha.rs), which itself proxies HA's `/api/states` so the
+/// HA token never reaches the client.
+class HaEntity {
+  HaEntity({required this.entityId, required this.friendlyName, this.deviceClass});
+
+  final String entityId;
+  final String friendlyName;
+
+  /// HA `device_class` (`door`, `motion`, ...) — `binary_sensor` entities
+  /// only; null for lights/switches/scenes.
+  final String? deviceClass;
+
+  /// The entity_id's domain prefix (`binary_sensor`, `light`, `switch`,
+  /// `scene`, ...); empty string if [entityId] has no dot.
+  String get domain {
+    final i = entityId.indexOf('.');
+    return i < 0 ? '' : entityId.substring(0, i);
+  }
+
+  factory HaEntity.fromJson(Map<String, dynamic> j) => HaEntity(
+    entityId: j['entity_id'] as String,
+    friendlyName: (j['friendly_name'] as String?) ?? (j['entity_id'] as String),
+    deviceClass: j['device_class'] as String?,
+  );
+}
+
+/// One entry of the `PUT /cameras/:id/ha/links` request body — mirrors the
+/// admin console's link-editing working set (`HA_LINKS`,
+/// services/api/src/admin.html's `saveHaLinks()`): the FULL desired link set
+/// is sent on every save, not a diff.
+class HaLinkInput {
+  HaLinkInput({
+    required this.entityId,
+    required this.role,
+    this.deviceClass,
+    this.label,
+    required this.sortOrder,
+  });
+
+  final String entityId;
+
+  /// `"motion"` (binary_sensor picker) or `"actuator"` (light/switch/scene
+  /// picker) — the desktop linking dialog only ever produces these two, same
+  /// as the admin console's `haOpenPicker('motion' | 'actuator')`. `"sensor"`
+  /// is reserved server-side for a later status-only-overlay role and is
+  /// never written by this UI.
+  final String role;
+  final String? deviceClass;
+  final String? label;
+  final int sortOrder;
+
+  /// Round-trip an already-saved [HaLink] back into an editable input (e.g.
+  /// loading the working set from `GET /cameras/:id/ha/links`, or carrying
+  /// an unchanged link forward into the next save).
+  factory HaLinkInput.fromLink(HaLink l) => HaLinkInput(
+    entityId: l.entityId,
+    role: l.role,
+    deviceClass: l.deviceClass,
+    label: l.label,
+    sortOrder: l.sortOrder,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'entity_id': entityId,
+    'role': role,
+    'device_class': deviceClass,
+    'label': label,
+    'sort_order': sortOrder,
+  };
 }
 
 /// One entity's current reading from `GET /ha/states`.

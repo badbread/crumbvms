@@ -973,6 +973,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
       session: session,
       cameras: widget.cameras,
       updateCheck: widget.updateCheck,
+      isAdmin: _isAdmin,
       clientOptions: widget.clientOptions,
       streamPrefs: widget.streamPrefs,
       hotkeys: widget.hotkeys,
@@ -1305,6 +1306,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
           session: session,
           cameras: widget.cameras,
           onLogout: widget.onLogout,
+          // Gates the tile right-click menu's "Link HA entities…" item
+          // (issue #52 desktop port) — `PUT /cameras/:id/ha/links` is
+          // admin-enforced server-side regardless.
+          isAdmin: _isAdmin,
           // The wall listens to client options so the per-tile header bar
           // (showInfoBar) restyles live when toggled in the Settings panel.
           clientOptions: widget.clientOptions,
