@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@file:OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+)
 
 package video.crumb.app.feature.plates
 
@@ -11,6 +14,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -36,6 +40,7 @@ import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -85,7 +90,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -1113,6 +1122,9 @@ private fun WatchlistDialog(
     var notify by remember { mutableStateOf(true) }
     // "watch" (alert on a sighting) vs "ignore" (suppress matching reads).
     var kind by remember { mutableStateOf(WATCHLIST_KIND_WATCH) }
+    // The entry an admin tapped to edit (kind/label/notify), or null. Opens a
+    // small chooser layered over this dialog; saving upserts via [onAdd] (#139).
+    var editingEntry by remember { mutableStateOf<PlateWatchlistEntry?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Plate watchlist") },
@@ -1122,6 +1134,7 @@ private fun WatchlistDialog(
                 if (isAdmin && state.lprConfig != null) {
                     FuzzinessSlider(
                         fuzz = state.lprConfig.watchlistFuzz,
+                        plate = plate,
                         onFuzzChange = onFuzzChange,
                     )
                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
@@ -1234,6 +1247,7 @@ private fun WatchlistDialog(
                                 WatchlistRow(
                                     entry = entry,
                                     isAdmin = isAdmin,
+                                    onEdit = { editingEntry = entry },
                                     onRemove = { onRemove(entry.id) },
                                 )
                             }
@@ -1243,6 +1257,106 @@ private fun WatchlistDialog(
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
     )
+
+    // Layered edit chooser for an existing entry (admin tap on a row / its edit
+    // icon). Saving upserts through the same [onAdd] path, keyed on the normalized
+    // plate server-side, so it replaces the entry rather than duplicating it (#139).
+    editingEntry?.let { entry ->
+        EditWatchlistEntryDialog(
+            entry = entry,
+            onSave = { newLabel, newNotify, newKind ->
+                onAdd(entry.plate, newLabel, newNotify, newKind)
+                editingEntry = null
+            },
+            onDismiss = { editingEntry = null },
+        )
+    }
+}
+
+/**
+ * Edit an existing watchlist entry (#139): change its kind (watch/ignore), label,
+ * and notify flag. The plate itself is the entry's normalized key and is shown
+ * read-only; saving re-POSTs to `/lpr/watchlist`, which upserts on that key, so an
+ * edit replaces the entry in place. Mirrors the desktop client's shared
+ * Watch/Ignore chooser (`showWatchlistDialog` in `plates_screen.dart`).
+ */
+@Composable
+private fun EditWatchlistEntryDialog(
+    entry: PlateWatchlistEntry,
+    onSave: (label: String, notify: Boolean, kind: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var label by remember { mutableStateOf(entry.label ?: "") }
+    var notify by remember { mutableStateOf(entry.notify) }
+    var kind by remember {
+        mutableStateOf(if (entry.isIgnore) WATCHLIST_KIND_IGNORE else WATCHLIST_KIND_WATCH)
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit watchlist entry") },
+        text = {
+            Column {
+                Text(
+                    text = entry.plate.ifEmpty { "—" },
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilterChip(
+                        selected = kind == WATCHLIST_KIND_WATCH,
+                        onClick = { kind = WATCHLIST_KIND_WATCH },
+                        leadingIcon = { Icon(Icons.Filled.Star, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                        label = { Text("Watch") },
+                    )
+                    FilterChip(
+                        selected = kind == WATCHLIST_KIND_IGNORE,
+                        onClick = { kind = WATCHLIST_KIND_IGNORE },
+                        leadingIcon = { Icon(Icons.Filled.Block, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                        label = { Text("Ignore") },
+                    )
+                }
+                TextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    placeholder = { Text("Label (optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                // "Notify on sighting" only applies to Watch entries.
+                if (kind == WATCHLIST_KIND_WATCH) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Notify on sighting",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Switch(checked = notify, onCheckedChange = { notify = it })
+                    }
+                } else {
+                    Text(
+                        "Ignored plates are dropped on capture — never stored or alerted.",
+                        color = TextSecondary,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(label, notify, kind) }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 /**
@@ -1250,14 +1364,31 @@ private fun WatchlistDialog(
  * `watchlist_fuzz` config value to a 0–50% control; commits on release via
  * [onFuzzChange] (a `PUT /config/lpr` that preserves enabled + retention). Seeds
  * its position from [fuzz] but tracks the drag locally so the thumb is smooth.
+ *
+ * As the slider moves (or the [plate] in the add field changes) it previews, live,
+ * a few OCR misreads the current tolerance would still accept — computed by the
+ * exact same normalize + Levenshtein + `floor(fuzz·len)` rule the server matches
+ * on ([acceptedMisreadExamples]), so the preview is truthful. Matches the desktop
+ * client and the admin console. When the add field is empty it illustrates on a
+ * sample plate and invites the operator to type one to preview theirs (#140).
  */
 @Composable
 private fun FuzzinessSlider(
     fuzz: Float,
+    plate: String,
     onFuzzChange: (Float) -> Unit,
 ) {
     // Local drag position, re-seeded whenever the persisted config value changes.
     var pos by remember(fuzz) { mutableFloatStateOf(fuzz.coerceIn(0f, 0.5f)) }
+    val accent = TealAccent
+    val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+
+    val typed = normalizePlate(plate)
+    val usingSample = typed.isEmpty()
+    val basis = if (usingSample) "7ABC123" else typed
+    val allowed = allowedEdits(basis, pos)
+    val examples = acceptedMisreadExamples(basis, allowed)
+
     Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -1267,9 +1398,14 @@ private fun FuzzinessSlider(
             )
             Spacer(Modifier.weight(1f))
             Text(
-                "${(pos * 100).roundToInt()}%",
-                color = TextSecondary,
+                if (allowed == 0) {
+                    "Exact"
+                } else {
+                    "${(pos * 100).roundToInt()}% · up to $allowed char${if (allowed == 1) "" else "s"}"
+                },
+                color = if (allowed == 0) TextSecondary else accent,
                 style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
             )
         }
         Slider(
@@ -1278,10 +1414,64 @@ private fun FuzzinessSlider(
             valueRange = 0f..0.5f,
             onValueChangeFinished = { onFuzzChange(pos) },
         )
+        if (allowed == 0) {
+            Text(
+                "Exact match only. A single misread character will not match.",
+                color = TextSecondary,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        } else {
+            Text(
+                if (usingSample) {
+                    "Tolerates up to $allowed misread character${if (allowed == 1) "" else "s"}. " +
+                        "Example on a sample plate — type a plate above to preview yours:"
+                } else {
+                    "Tolerates up to $allowed misread character${if (allowed == 1) "" else "s"} on this plate. " +
+                        "Would still match:"
+                },
+                color = TextSecondary,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            if (examples.isNotEmpty()) {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    examples.forEach { MisreadChip(basis = basis, candidate = it, accent = accent, base = faint) }
+                }
+            }
+        }
+    }
+}
+
+/** A pill showing an accepted misread [candidate], with the character(s) that
+ *  differ from [basis] highlighted in the [accent] colour (the rest in [base]). */
+@Composable
+private fun MisreadChip(basis: String, candidate: String, accent: Color, base: Color) {
+    val text = buildAnnotatedString {
+        for (i in candidate.indices) {
+            val changed = i >= basis.length || candidate[i] != basis[i]
+            withStyle(
+                SpanStyle(
+                    color = if (changed) accent else base,
+                    fontWeight = if (changed) FontWeight.ExtraBold else FontWeight.Medium,
+                ),
+            ) {
+                append(candidate[i])
+            }
+        }
+    }
+    Box(
+        modifier = Modifier
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(4.dp))
+            .border(1.dp, MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(4.dp))
+            .padding(horizontal = 7.dp, vertical = 3.dp),
+    ) {
         Text(
-            "0% matches plates exactly; higher tolerates OCR misreads.",
-            color = TextSecondary,
-            style = MaterialTheme.typography.labelSmall,
+            text = text,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.labelMedium,
         )
     }
 }
@@ -1290,10 +1480,16 @@ private fun FuzzinessSlider(
 private fun WatchlistRow(
     entry: PlateWatchlistEntry,
     isAdmin: Boolean,
+    onEdit: () -> Unit,
     onRemove: () -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            // Admins can tap the row to edit it (parity with the desktop client);
+            // viewers see it read-only.
+            .then(if (isAdmin) Modifier.clickable(onClick = onEdit) else Modifier)
+            .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -1347,6 +1543,13 @@ private fun WatchlistRow(
             )
         }
         if (isAdmin) {
+            IconButton(onClick = onEdit) {
+                Icon(
+                    Icons.Filled.Edit,
+                    contentDescription = "Edit watchlist entry",
+                    tint = TextSecondary,
+                )
+            }
             IconButton(onClick = onRemove) {
                 Icon(
                     Icons.Filled.Delete,
