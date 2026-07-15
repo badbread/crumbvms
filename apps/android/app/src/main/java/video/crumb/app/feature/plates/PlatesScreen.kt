@@ -352,7 +352,6 @@ fun PlatesScreen(
                 val camNames = state.cameras.associate { it.id to it.name }
                 val allCamIds = state.cameras.map { it.id }
                 val loader = context.imageLoader
-                val exportedBy = store.username ?: "—"
                 scope.launch {
                     // Resolve the watchlist match (BOLO banner) + the sighting dossier
                     // up front so the PDF builder stays a focused render step. The
@@ -377,7 +376,6 @@ fun PlatesScreen(
                     val input = PlateReportInput(
                         read = reportRead,
                         cameraNames = camNames,
-                        exportedBy = exportedBy,
                         zoneId = zoneId,
                         includeDossier = includeDossier,
                         watchMatch = watchMatch,
