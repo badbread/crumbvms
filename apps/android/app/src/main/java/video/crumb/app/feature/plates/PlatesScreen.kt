@@ -984,16 +984,25 @@ private fun PlateRow(
     }
 }
 
-/** Larger decode ceiling (px) for the report-dialog plate preview, so the crop of
- *  a small plate region stays crisp. Only one such image is alive at a time (it's
- *  a modal dialog), so this stays well within the P2 bitmap budget; the list/grid
- *  thumbnails intentionally omit it and decode at their small display size. */
-private const val PLATE_DETAIL_DECODE_PX = 1024
+/** Decode ceiling (px) for plate-crop images. A plate is a small fraction of its
+ *  snapshot, so without this Coil decodes the snapshot at the tiny thumbnail
+ *  display size and the crop is a blurry upscale of a handful of pixels. Decoding
+ *  to ~1024 first makes the crop sharp. Memory stays bounded: the decode is
+ *  transient per image and Coil's memory cache holds only the (small) cropped
+ *  result — not the full-size decode — so this fits the P2 bitmap budget. Used by
+ *  both the list/grid thumbnails and the report-dialog preview. */
+private const val PLATE_CROP_DECODE_PX = 1024
 
-/** Convenience wrapper: the read's snapshot, cropped to the plate box. */
+/** Convenience wrapper: the read's snapshot, cropped to the plate box. Decodes at
+ *  [PLATE_CROP_DECODE_PX] so the cropped plate stays sharp at thumbnail size. */
 @Composable
 private fun PlateThumb(read: PlateRead, mediaUrls: MediaUrls, modifier: Modifier = Modifier) {
-    PlateSnapshotImage(read = read, mediaUrls = mediaUrls, modifier = modifier)
+    PlateSnapshotImage(
+        read = read,
+        mediaUrls = mediaUrls,
+        modifier = modifier,
+        decodePx = PLATE_CROP_DECODE_PX,
+    )
 }
 
 /**
@@ -1625,7 +1634,7 @@ private fun PlateReportDialog(
                         .fillMaxWidth()
                         .height(120.dp),
                     crop = true,
-                    decodePx = PLATE_DETAIL_DECODE_PX,
+                    decodePx = PLATE_CROP_DECODE_PX,
                 )
                 Text(
                     text = read.plate.ifEmpty { "—" },
