@@ -13,6 +13,8 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:flutter/gestures.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/ha_api.dart';
+import 'package:crumb_desktop/api/ha_models.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/ptz_panel_store.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
@@ -22,10 +24,15 @@ import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_entity_palette.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/live/pane_watchdog.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
+import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_bar.dart';
+import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_layer.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_imaging_controls.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_panel_controller.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_panel_editor_bar.dart';
@@ -172,6 +179,35 @@ class _WallScreenState extends State<WallScreen> {
     store: _ptzPanelStore,
   );
 
+  /// HA on-video badge placements (issue #170 P0) — one adapter shared by
+  /// every maximized pane, mirroring `_ptzPanel`'s shared-controller pattern.
+  /// Only the maximized pane ever enters its edit session (WYSIWYG, same
+  /// rule as the PTZ panel editor); the wall tracks which camera that
+  /// session belongs to itself (`_haEditCameraId`) since the shared editor
+  /// controller is camera-agnostic by design.
+  late final HaOverlayController _haOverlay = HaOverlayController(
+    api: widget.api,
+    session: widget.session,
+  );
+  String? _haEditCameraId;
+
+  /// Per-camera "has ≥1 placed HA badge" flag, reported by each tile/pane as
+  /// it (re)loads its own links (mirrors how each pane self-fetches
+  /// `cameraStreams` — desktop P0 plan §4.4). Drives `_liveStatus.wantHaStates`
+  /// so `/ha/states` is polled only while at least one VISIBLE camera has a
+  /// placement — the client half of the server's demand-driven-cache
+  /// contract (services/api/src/ha.rs `HA_STATES_TTL`).
+  final Set<String> _camerasWithHaPlacements = {};
+
+  /// Fresh per-maximize `GlobalKey` for the maximized pane (mirrors
+  /// `_tileKeyFor`'s per-camera keys, but this pane only ever shows ONE
+  /// camera at a time so a single field — reassigned on every `_maximize` —
+  /// is enough). Lets the wall push a refreshed HA-links list into the pane
+  /// after an edit session saves, the same way it reaches into a tile via
+  /// `_tileKeys`.
+  GlobalKey<_MaximizedPaneState> _maximizedPaneKey =
+      GlobalKey<_MaximizedPaneState>();
+
   List<Camera> get _shown =>
       widget.cameras.where((c) => c.enabled).toList(growable: false);
 
@@ -206,6 +242,7 @@ class _WallScreenState extends State<WallScreen> {
     if (old.session.token != widget.session.token ||
         old.session.base != widget.session.base) {
       _ptzPanel.updateSession(widget.session);
+      _haOverlay.updateSession(widget.session);
       _liveStatus.updateSession(widget.session);
     }
     // A different applied view (or none) → re-parse its special-tile specs.
@@ -235,6 +272,16 @@ class _WallScreenState extends State<WallScreen> {
   void _onConfigChanged() {
     final refresh = widget.onConfigChanged;
     if (refresh != null) unawaited(refresh());
+    // HA links/placements can change server-side independently of the
+    // camera list itself (an admin edits links in the console) — refresh
+    // every currently-mounted tile's cached copy, and the maximized pane's
+    // if one is up, so badges don't go stale without a full wall remount.
+    for (final key in _tileKeys.values) {
+      final state = key.currentState;
+      if (state != null) unawaited(state.reloadHaLinks());
+    }
+    final maxCam = _maximized;
+    if (maxCam != null) unawaited(_refreshHaLinksFor(maxCam.id));
   }
 
   void _onSpecialChanged() {
@@ -321,6 +368,7 @@ class _WallScreenState extends State<WallScreen> {
       );
     }
     _ptzPanel.dispose();
+    _haOverlay.dispose();
     super.dispose();
   }
 
@@ -330,6 +378,10 @@ class _WallScreenState extends State<WallScreen> {
     // edit — the editor chrome must not follow the wrong camera.
     if (_ptzPanel.editMode && _ptzPanel.editCameraId != cam.id) {
       unawaited(_ptzPanel.endEdit());
+    }
+    // Same guard for an in-progress HA-overlay edit session.
+    if (_haOverlay.editor.editMode && _haEditCameraId != cam.id) {
+      unawaited(_endHaOverlayEdit());
     }
     // Load the camera's saved custom PTZ panel (if any) so the maximized
     // pane can render it in view mode.
@@ -342,6 +394,11 @@ class _WallScreenState extends State<WallScreen> {
       // own main-stream player waits ~a GOP for its first keyframe.
       _maximizeWarmCtrl = _tileKeys[cam.id]?.currentState?.warmController;
       _maximized = cam;
+      // Fresh key per maximize — lets the wall reach this pane's State later
+      // (e.g. to push refreshed HA links after an edit saves) while keeping
+      // the exact same "always a clean remount" identity a plain per-camera
+      // ValueKey gave (see the field doc).
+      _maximizedPaneKey = GlobalKey<_MaximizedPaneState>();
     });
   }
 
@@ -349,6 +406,7 @@ class _WallScreenState extends State<WallScreen> {
   void _restore() {
     // Leaving the maximized view mid panel-edit ends (and persists) the edit.
     if (_ptzPanel.editMode) unawaited(_ptzPanel.endEdit());
+    if (_haOverlay.editor.editMode) unawaited(_endHaOverlayEdit());
     widget.audio?.setMaximized(null);
     widget.onMaximizedCameraChanged?.call(null);
     setState(() {
@@ -361,8 +419,106 @@ class _WallScreenState extends State<WallScreen> {
   /// (the panel is composed over the full-pane video, WYSIWYG) and enter the
   /// panel editor.
   void _editPtzPanel(Camera cam) {
+    // Mutually exclusive with an in-progress HA-overlay edit session (only
+    // one editor open on the maximized pane at a time).
+    if (_haOverlay.editor.editMode) unawaited(_endHaOverlayEdit());
     if (_maximized?.id != cam.id) _maximize(cam);
     unawaited(_ptzPanel.beginEdit(cam.id));
+  }
+
+  /// "Edit HA overlay…" from a tile's right-click menu, or the
+  /// maximized-pane pencil affordance: maximize the camera (badges are
+  /// placed WYSIWYG over the full-pane video, same rule as the PTZ panel
+  /// editor) and enter the placement editor.
+  ///
+  /// Host-loads-first (desktop P0 plan §3.3, and
+  /// `HaOverlayController`'s own class doc): loads the camera's links
+  /// BEFORE maximizing/entering edit mode, guarded by `editor.editToken` so
+  /// a fast camera-switch mid-load can't clobber a newer session — this is
+  /// the funnel that avoids the PTZ builder's D3/D4 races by construction.
+  Future<void> _beginHaOverlayEdit(Camera cam) async {
+    // Mutually exclusive with a PTZ-panel edit session.
+    if (_ptzPanel.editMode) unawaited(_ptzPanel.endEdit());
+    // Editing a DIFFERENT camera's HA overlay ends (and persists) that
+    // first — mirrors _maximize's PTZ-panel guard.
+    if (_haOverlay.editor.editMode && _haEditCameraId != cam.id) {
+      await _endHaOverlayEdit();
+    }
+
+    final token = _haOverlay.editor.editToken;
+    List<HaLink> links;
+    try {
+      links = await _haOverlay.loadLinks(cam.id);
+    } catch (_) {
+      return; // best-effort — no edit session if the links fetch failed
+    }
+    if (!mounted || _haOverlay.editor.editToken != token) {
+      return; // stale — another edit session started/ended meanwhile
+    }
+    if (_maximized?.id != cam.id) _maximize(cam);
+    _haOverlay.beginEditFromLoadedLinks();
+    _haEditCameraId = cam.id;
+    // Keep this camera's own tile cache in step immediately (the tile
+    // right-click menu's gate and the palette's "placed" checkmarks both
+    // read live link data) rather than waiting for Done.
+    _tileKeys[cam.id]?.currentState?.setHaLinks(links);
+  }
+
+  /// End the current HA-overlay edit session (Done / Esc / a forced
+  /// transition from `_maximize`/`_restore`/`_editPtzPanel`) and persist:
+  /// `HaOverlayController.endEditAndSave` PUTs/clears each placement
+  /// server-side. Best-effort — a failed save still closes the session (the
+  /// controller never touches storage either way, so there's nothing to roll
+  /// back); refreshes the affected camera's cached links afterward so its
+  /// tile/pane badge layer reflects what was actually saved.
+  Future<void> _endHaOverlayEdit() async {
+    if (!_haOverlay.editor.editMode) return;
+    final cam = _haEditCameraId;
+    _haEditCameraId = null;
+    try {
+      await _haOverlay.endEditAndSave();
+    } catch (_) {
+      // HaOverlaySaveException: one or more placements didn't save. The POC
+      // has no toast/snackbar surface in this file (matches its existing
+      // silent-best-effort style for PTZ dispatch calls) — a future pass can
+      // add a retry prompt.
+    }
+    if (cam != null) unawaited(_refreshHaLinksFor(cam));
+  }
+
+  /// Re-fetch `cameraId`'s HA links and push them into whichever mounted
+  /// surfaces are showing that camera (its wall tile, and the maximized pane
+  /// if it's the one showing it) — mirrors `_tileKeys`' per-camera
+  /// GlobalKey access pattern. Called after an HA-overlay edit session saves
+  /// (the server-side placement PUT/clear happens without any of the normal
+  /// stream/config-reload signals firing) and from the config-changed
+  /// reload path.
+  Future<void> _refreshHaLinksFor(String cameraId) async {
+    try {
+      final links = await widget.api.cameraHaLinks(widget.session, cameraId);
+      if (!mounted) return;
+      _tileKeys[cameraId]?.currentState?.setHaLinks(links);
+      if (_maximized?.id == cameraId) {
+        _maximizedPaneKey.currentState?.setHaLinks(links);
+      }
+    } catch (_) {
+      // best-effort — a stale cache just means one tile's badges lag until
+      // its next natural reload.
+    }
+  }
+
+  /// Reported by every tile/pane as it (re)loads its own HA links — recomputes
+  /// `_liveStatus.wantHaStates` so `/ha/states` is polled only while at least
+  /// one VISIBLE camera has a placed badge (desktop P0 plan §4.4's
+  /// energy-lean "poll on demand" contract, client half).
+  void _onHaLinksLoaded(String cameraId, List<HaLink> links) {
+    final hasPlacement = links.any((l) => l.hasPlacement);
+    final changed = hasPlacement
+        ? _camerasWithHaPlacements.add(cameraId)
+        : _camerasWithHaPlacements.remove(cameraId);
+    if (changed) {
+      _liveStatus.wantHaStates = _camerasWithHaPlacements.isNotEmpty;
+    }
   }
 
   @override
@@ -409,7 +565,7 @@ class _WallScreenState extends State<WallScreen> {
           // Maximized single-camera view (main stream + zoom/pan), on top.
           if (_maximized != null)
             _MaximizedPane(
-              key: ValueKey('max-${_maximized!.id}'),
+              key: _maximizedPaneKey,
               api: widget.api,
               session: widget.session,
               camera: _maximized!,
@@ -424,6 +580,10 @@ class _WallScreenState extends State<WallScreen> {
               ptzWheelCorner:
                   widget.clientOptions?.ptzWheelCorner ??
                   PtzWheelCorner.bottomLeft,
+              haOverlay: _haOverlay,
+              onEditHaOverlay: () => unawaited(_beginHaOverlayEdit(_maximized!)),
+              onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
+              onHaLinksLoaded: _onHaLinksLoaded,
               onClose: _restore,
             ),
         ],
@@ -449,12 +609,16 @@ class _WallScreenState extends State<WallScreen> {
         }
       },
       // Esc leaves panel-edit mode first (persisting the layout); the next
-      // Esc restores the wall — same layered-Esc model as fullscreen.
+      // Esc restores the wall — same layered-Esc model as fullscreen. The
+      // HA-overlay editor is another such layer (mutually exclusive with the
+      // PTZ one, so at most one of these two branches is ever live).
       onEscape: _maximized == null
           ? null
           : () {
               if (_ptzPanel.editMode) {
                 unawaited(_ptzPanel.endEdit());
+              } else if (_haOverlay.editor.editMode) {
+                unawaited(_endHaOverlayEdit());
               } else {
                 _restore();
               }
@@ -558,6 +722,9 @@ class _WallScreenState extends State<WallScreen> {
                       _maximize(cam);
                     },
                     onEditPtzPanel: () => _editPtzPanel(cam),
+                    onEditHaOverlay: () =>
+                        unawaited(_beginHaOverlayEdit(cam)),
+                    onHaLinksLoaded: _onHaLinksLoaded,
                   );
           }
           children.add(
@@ -623,6 +790,9 @@ class _WallScreenState extends State<WallScreen> {
                 fit: BoxFit.contain,
                 onTap: () => _maximize(cam),
                 onEditPtzPanel: () => _editPtzPanel(cam),
+                onEditHaOverlay: () =>
+                    unawaited(_beginHaOverlayEdit(cam)),
+                onHaLinksLoaded: _onHaLinksLoaded,
               ),
             ),
           );
@@ -695,6 +865,8 @@ class _WallTile extends StatefulWidget {
     this.fit = BoxFit.cover,
     this.zoomToMain = false,
     this.onEditPtzPanel,
+    this.onEditHaOverlay,
+    this.onHaLinksLoaded,
   });
 
   final CrumbApi api;
@@ -709,6 +881,16 @@ class _WallTile extends StatefulWidget {
   /// "Edit PTZ panel…" from the right-click menu (PTZ cameras only): the wall
   /// maximizes this camera and opens the custom-panel editor over it.
   final VoidCallback? onEditPtzPanel;
+
+  /// "Edit HA overlay…" from the right-click menu (any camera with ≥1 HA
+  /// link, not gated on PTZ): the wall maximizes this camera and opens the
+  /// drag-to-place badge editor over it (issue #170 P0).
+  final VoidCallback? onEditHaOverlay;
+
+  /// Reported every time this tile (re)loads its own HA links, so the wall
+  /// can track which visible cameras have a placed badge and drive
+  /// `LiveStatusController.wantHaStates` (desktop P0 plan §4.4).
+  final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
 
   /// When true, digitally zooming this tile past 100% temporarily loads its
   /// main stream (reverting to sub at 100%). From the "Zoom switches to main
@@ -741,6 +923,19 @@ class _WallTileState extends State<_WallTile> {
   /// menu can gate the Data-saver option on `rtspMobile` availability, and the
   /// tile badge can show which tier is actually playing.
   StreamUrls? _streams;
+
+  /// This camera's HA links (issue #170 P0), fetched once at mount like
+  /// [_streams] — see [_loadHaLinks]. Only the PLACED ones (`hasPlacement`)
+  /// render a badge; the full set gates the right-click menu's "Edit HA
+  /// overlay…" item.
+  List<HaLink> _haLinks = const [];
+
+  /// Decoded video pixel size — needed to map an HA badge's video-frame
+  /// fraction onto the letterboxed video rect (mirrors `_MaximizedPaneState`'s
+  /// `_videoW`/`_videoH`). Retained across frames; badges render nothing
+  /// until both are known.
+  int? _videoW;
+  int? _videoH;
 
   /// The quality tier this pane is currently resolved to play (mirrors the URL
   /// [StreamPrefsStore.liveStreamUrl] picked), for the tile's "SD" badge. Null
@@ -819,6 +1014,7 @@ class _WallTileState extends State<_WallTile> {
   void initState() {
     super.initState();
     _load();
+    unawaited(_loadHaLinks());
   }
 
   Future<void> _load() async {
@@ -875,9 +1071,13 @@ class _WallTileState extends State<_WallTile> {
         }
       }
       player.stream.width.listen((w) {
+        if (w != null && w > 0) _videoW = w;
         if (w != null && w > 0 && mounted) {
           _onFirstFrame(player, controller);
         }
+      });
+      player.stream.height.listen((h) {
+        if (h != null && h > 0) _videoH = h;
       });
       await player.open(Media(url));
       if (!mounted) {
@@ -1014,6 +1214,41 @@ class _WallTileState extends State<_WallTile> {
   /// blanking the pane for that wait was the 1–2 s black flash.
   Future<void> _reloadStream() => _load();
 
+  /// Fetch this camera's HA links, exactly like [_load]'s `cameraStreams`
+  /// self-fetch (issue #170 P0 plan §4.4). Best-effort: a failed fetch just
+  /// means no HA badges/menu item this tile, same tolerance as a failed
+  /// stream load being surfaced via [_error] rather than crashing the tile.
+  Future<void> _loadHaLinks() async {
+    try {
+      final links = await widget.api.cameraHaLinks(
+        widget.session,
+        widget.camera.id,
+      );
+      if (!mounted) return;
+      _applyHaLinks(links);
+    } catch (_) {
+      // best-effort — see doc above
+    }
+  }
+
+  /// Re-fetch this tile's HA links from the server — called by the wall on
+  /// the config-changed reload path (an admin's link/placement edit in the
+  /// console) so a mounted tile's badges don't go stale without a full
+  /// remount.
+  Future<void> reloadHaLinks() => _loadHaLinks();
+
+  /// External push of already-fetched links — used by the wall right after
+  /// an HA-overlay edit session opens/saves on the MAXIMIZED pane (a
+  /// different State than this tile), so this tile's own cached copy (and
+  /// its right-click menu / badge layer) doesn't wait for its next natural
+  /// reload to reflect what just changed.
+  void setHaLinks(List<HaLink> links) => _applyHaLinks(links);
+
+  void _applyHaLinks(List<HaLink> links) {
+    if (mounted) setState(() => _haLinks = links);
+    widget.onHaLinksLoaded?.call(widget.camera.id, links);
+  }
+
   /// Right-click menu: per-camera PTZ-controls toggle + stream main/sub
   /// override (overriding the global "wall uses sub" setting).
   Future<void> _showTileMenu(Offset globalPos) async {
@@ -1047,6 +1282,18 @@ class _WallTileState extends State<_WallTile> {
               value: 'ptz-panel',
               child: Text('Edit PTZ panel…'),
             ),
+          const PopupMenuDivider(),
+        ],
+        // HA on-video badges (issue #170 P0) — deliberately OUTSIDE the
+        // `camera.ptz` block above: HA badges must work on non-PTZ cameras
+        // too. Gated on the camera actually having linked entities (not on
+        // any of them being PLACED yet — the editor's palette is where an
+        // operator places the first one).
+        if (_haLinks.isNotEmpty && widget.onEditHaOverlay != null) ...[
+          const PopupMenuItem(
+            value: 'ha-overlay',
+            child: Text('Edit HA overlay…'),
+          ),
           const PopupMenuDivider(),
         ],
         CheckedPopupMenuItem(
@@ -1085,6 +1332,8 @@ class _WallTileState extends State<_WallTile> {
         setState(() {}); // no reload needed — only affects maximized PTZ UI
       case 'ptz-panel':
         widget.onEditPtzPanel?.call();
+      case 'ha-overlay':
+        widget.onEditHaOverlay?.call();
       case 'main':
         prefs?.setOverride(widget.camera.id, StreamQuality.main);
         await _reloadStream();
@@ -1105,6 +1354,10 @@ class _WallTileState extends State<_WallTile> {
     _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
+    // Report "no links" so the wall drops this camera from its
+    // has-a-placement set (_camerasWithHaPlacements) — otherwise a removed
+    // tile's last-known placement would keep /ha/states polling forever.
+    widget.onHaLinksLoaded?.call(widget.camera.id, const []);
     // Detach the (potentially seconds-long) libmpv teardown from the teardown
     // path so restore/close doesn't freeze the UI (#105). Null first.
     final pending = _pending;
@@ -1234,6 +1487,28 @@ class _WallTileState extends State<_WallTile> {
                           ),
                   ),
 
+                // HA on-video badges (issue #170 P0), view mode only — this
+                // tile never enters the edit session (WYSIWYG, maximized-pane
+                // only, same rule as the PTZ panel editor). Non-interactive
+                // except the badge glyphs themselves, so tile select /
+                // double-click-maximize / right-click / wheel-zoom above keep
+                // working through the gaps. Only built when there's at least
+                // one placed badge, so non-HA tiles are untouched.
+                if (_haLinks.any((l) => l.hasPlacement))
+                  Positioned.fill(
+                    child: ListenableBuilder(
+                      listenable: widget.liveStatus,
+                      builder: (context, _) => HaOverlayLayer(
+                        links: _haLinks,
+                        stateFor: widget.liveStatus.haStateFor,
+                        stale: widget.liveStatus.haStale,
+                        videoW: _videoW,
+                        videoH: _videoH,
+                        hideBadges: _scale > 1.01,
+                      ),
+                    ),
+                  ),
+
                 // Floating overlays: only when the header strip is OFF (in
                 // header-bar mode the name + indicators live in the strip).
                 if (!widget.showInfoBar) ...[
@@ -1347,6 +1622,10 @@ class _MaximizedPane extends StatefulWidget {
     this.ptzClickMode = PtzClickMode.center,
     this.ptzStyle = PtzStyle.edges,
     this.ptzWheelCorner = PtzWheelCorner.bottomLeft,
+    this.haOverlay,
+    this.onEditHaOverlay,
+    this.onHaOverlayDone,
+    this.onHaLinksLoaded,
   });
 
   final CrumbApi api;
@@ -1379,6 +1658,28 @@ class _MaximizedPane extends StatefulWidget {
   /// box (Options → "PTZ style"), plus which corner the wheel box pins to.
   final PtzStyle ptzStyle;
   final PtzWheelCorner ptzWheelCorner;
+
+  /// HA on-video badge placements (issue #170 P0) — shared, owned by the
+  /// wall (mirrors [ptzPanel]). Non-null enables the "Edit HA overlay…"
+  /// pencil affordance and the drag-to-place editor session; null (e.g. a
+  /// host that hasn't wired it) just means view-mode badges never render.
+  final HaOverlayController? haOverlay;
+
+  /// The maximized-pane pencil affordance next to the name pill: maximizes
+  /// (already maximized here) and begins the HA-overlay edit session for
+  /// this camera. Gated by the caller on this camera having ≥1 HA link.
+  final VoidCallback? onEditHaOverlay;
+
+  /// The HA-overlay editor bar's Done button: the wall ends + persists the
+  /// edit session (`HaOverlayController.endEditAndSave`) and refreshes the
+  /// affected tile/pane caches. Kept as a callback (rather than this pane
+  /// calling `haOverlay!.endEditAndSave()` itself) because the cross-tile
+  /// refresh needs the wall's `_tileKeys`/`_maximizedPaneKey`.
+  final VoidCallback? onHaOverlayDone;
+
+  /// Reported every time this pane (re)loads its own HA links — see
+  /// `_WallTile.onHaLinksLoaded`'s doc; same contract.
+  final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
 
   @override
   State<_MaximizedPane> createState() => _MaximizedPaneState();
@@ -1433,6 +1734,34 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     }
   }
 
+  /// This camera's HA links (issue #170 P0), fetched once at mount like the
+  /// tile's own copy — see [_loadHaLinks]. Independent of `_haLinks` on any
+  /// `_WallTileState` for the same camera (each pane self-caches, mirroring
+  /// `cameraStreams`); [setHaLinks] lets the wall push a refresh into
+  /// whichever one is showing.
+  List<HaLink> _haLinks = const [];
+
+  /// Mirror of `widget.haOverlay!.editor.editMode` for THIS pane (analogous
+  /// to `_panelEditing` above) — kept as a field updated by a
+  /// change-comparing listener so the pane only rebuilds its editor chrome
+  /// on an actual mode transition, not on every drag/selection tick
+  /// (`OverlayEditorLayer`/`OverlayEditorBar` have their own
+  /// `AnimatedBuilder` for that).
+  bool _haEditing = false;
+
+  void _onHaOverlayChanged() {
+    if (!mounted) return;
+    final editing = widget.haOverlay?.editor.editMode ?? false;
+    if (editing == _haEditing) return;
+    final wasEditing = _haEditing;
+    setState(() => _haEditing = editing);
+    if (wasEditing && !editing) {
+      // Edit session just ended (Done/Esc) — placements may have changed;
+      // refresh this pane's own view-mode link cache.
+      unawaited(_loadHaLinks());
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -1440,7 +1769,41 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     final rec = widget.ptzPanel?.activePanelFor(widget.camera.id);
     _panelActive = rec != null;
     _panelEditing = rec?.$2 ?? false;
+    widget.haOverlay?.editor.addListener(_onHaOverlayChanged);
+    _haEditing = widget.haOverlay?.editor.editMode ?? false;
     _load();
+    unawaited(_loadHaLinks());
+  }
+
+  /// Fetch this camera's HA links, exactly like [_load]'s `cameraStreams`
+  /// self-fetch (issue #170 P0 plan §4.4). Best-effort — see
+  /// `_WallTileState._loadHaLinks`'s identical doc.
+  Future<void> _loadHaLinks() async {
+    try {
+      final links = await widget.api.cameraHaLinks(
+        widget.session,
+        widget.camera.id,
+      );
+      if (!mounted) return;
+      _applyHaLinks(links);
+    } catch (_) {
+      // best-effort — see doc above
+    }
+  }
+
+  /// Re-fetch from the config-changed reload path — see
+  /// `_WallTileState.reloadHaLinks`'s identical doc.
+  Future<void> reloadHaLinks() => _loadHaLinks();
+
+  /// External push of already-fetched links — see
+  /// `_WallTileState.setHaLinks`'s identical doc (here: pushed right after
+  /// `_beginHaOverlayEdit` loads them, so the pencil-affordance gate and any
+  /// view-mode badges reflect the just-loaded set immediately).
+  void setHaLinks(List<HaLink> links) => _applyHaLinks(links);
+
+  void _applyHaLinks(List<HaLink> links) {
+    if (mounted) setState(() => _haLinks = links);
+    widget.onHaLinksLoaded?.call(widget.camera.id, links);
   }
 
   Future<void> _load() async {
@@ -1595,9 +1958,13 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   bool get _ptzCenter =>
       _ptzEnabled &&
       !_panelEditing &&
+      !_haEditing &&
       widget.ptzClickMode == PtzClickMode.center;
   bool get _ptzPan =>
-      _ptzEnabled && !_panelEditing && widget.ptzClickMode == PtzClickMode.pan;
+      _ptzEnabled &&
+      !_panelEditing &&
+      !_haEditing &&
+      widget.ptzClickMode == PtzClickMode.pan;
 
   // ── PTZ optical zoom via the mouse wheel ────────────────────────────────
   // The wheel is discrete but ONVIF zoom is continuous (move → stop), so each
@@ -1719,6 +2086,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   void dispose() {
     _watchdog?.dispose();
     widget.ptzPanel?.removeListener(_onPtzPanelChanged);
+    widget.haOverlay?.editor.removeListener(_onHaOverlayChanged);
+    // Mirrors `_WallTileState.dispose`'s report — drops this camera from the
+    // wall's has-a-placement set so a closed maximized pane can't keep
+    // /ha/states polling forever.
+    widget.onHaLinksLoaded?.call(widget.camera.id, const []);
     SnapshotRegistry.instance.unregister('maximized');
     widget.audio?.unregisterPane('max:${widget.camera.id}');
     // Guaranteed stop: if any PTZ motion could still be in flight (an active
@@ -1800,10 +2172,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           onPointerCancel: (_) => _ptzStopSteer(),
                           onPointerSignal: (e) {
                             if (e is PointerScrollEvent) {
-                              // Panel editor open: the wheel must not move
-                              // the camera (or scale the video under the
-                              // fixed-position editor overlay).
-                              if (_panelEditing) return;
+                              // Panel/HA-overlay editor open: the wheel must
+                              // not move the camera (or scale the video
+                              // under the fixed-position editor overlay).
+                              if (_panelEditing || _haEditing) return;
                               if (_ptzEnabled) {
                                 // PTZ camera → drive OPTICAL zoom, not digital.
                                 _ptzWheelZoom(e.scrollDelta.dy);
@@ -1860,6 +2232,40 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     child: PtzPanelOverlay(
                       controller: widget.ptzPanel!,
                       cameraId: widget.camera.id,
+                    ),
+                  ),
+
+                // HA on-video badges (issue #170 P0): a per-camera set of
+                // drag-placed entity badges, camera-pinned like PTZ panels
+                // but persisted server-side. Edit mode swaps in the shared
+                // drag-to-place editor layer instead of the read-only view
+                // layer — never both at once (same `_scale > 1.01` hide-on-
+                // digital-zoom POC rule as the wall tile's copy).
+                if (widget.haOverlay != null && _haEditing)
+                  Positioned.fill(
+                    child: OverlayEditorLayer(
+                      controller: widget.haOverlay!.editor,
+                      editing: true,
+                      videoW: _videoW,
+                      videoH: _videoH,
+                      buildItem: haBadgeItemBuilder(
+                        stateFor: widget.liveStatus.haStateFor,
+                        stale: widget.liveStatus.haStale,
+                      ),
+                    ),
+                  )
+                else if (_haLinks.any((l) => l.hasPlacement))
+                  Positioned.fill(
+                    child: ListenableBuilder(
+                      listenable: widget.liveStatus,
+                      builder: (context, _) => HaOverlayLayer(
+                        links: _haLinks,
+                        stateFor: widget.liveStatus.haStateFor,
+                        stale: widget.liveStatus.haStale,
+                        videoW: _videoW,
+                        videoH: _videoH,
+                        hideBadges: _scale > 1.01,
+                      ),
                     ),
                   ),
 
@@ -1921,6 +2327,27 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           ],
                         ),
                       ),
+                      // "Edit HA overlay…" pencil (issue #170 P0): a second,
+                      // always-visible entry point alongside the tile
+                      // right-click menu — gated on this camera actually
+                      // having HA links, and hidden while either editor is
+                      // already open (mutual exclusion, no re-entry).
+                      if (widget.onEditHaOverlay != null &&
+                          _haLinks.isNotEmpty &&
+                          !_haEditing &&
+                          !_panelEditing) ...[
+                        const SizedBox(width: 8),
+                        Material(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          shape: const CircleBorder(),
+                          child: IconButton(
+                            tooltip: 'Edit HA overlay…',
+                            icon: const Icon(Icons.edit_outlined, size: 18),
+                            color: Colors.white,
+                            onPressed: widget.onEditHaOverlay,
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -1998,6 +2425,37 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     child: PtzPanelEditorBar(controller: widget.ptzPanel!),
                   ),
                 ],
+
+                // HA-overlay editor bar (issue #170 P0): the palette (this
+                // camera's linked entities, grouped+searched) + Done/Clear +
+                // selected-badge size stepper. Mutually exclusive with the
+                // PTZ chrome above by construction (`_haEditing`/
+                // `_panelEditing` can't both be true — see the wall's
+                // `_beginHaOverlayEdit`/`_editPtzPanel` guards).
+                if (widget.haOverlay != null && _haEditing)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: OverlayEditorBar(
+                      controller: widget.haOverlay!.editor,
+                      paletteSlot: AnimatedBuilder(
+                        // Independent rebuild on every editor tick (drag/
+                        // add/remove), so the palette's "placed" checkmarks
+                        // stay live without the whole pane rebuilding.
+                        animation: widget.haOverlay!.editor,
+                        builder: (context, _) => HaEntityPalette(
+                          links: widget.haOverlay!.links,
+                          placedIds: widget.haOverlay!.placedIdsInSession,
+                          onPick: widget.haOverlay!.pickFromPalette,
+                        ),
+                      ),
+                      itemLabel: (item) =>
+                          (item as HaOverlayBadgeItem).link.displayLabel,
+                      onClear: widget.haOverlay!.editor.clearAll,
+                      onDone: () => widget.onHaOverlayDone?.call(),
+                    ),
+                  ),
               ],
             );
           },

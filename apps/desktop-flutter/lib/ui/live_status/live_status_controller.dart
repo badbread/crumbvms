@@ -25,6 +25,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/ha_api.dart';
+import 'package:crumb_desktop/api/ha_models.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/status_api.dart';
 import 'package:crumb_desktop/api/status_models.dart';
@@ -87,6 +89,13 @@ class LiveStatusController extends ChangeNotifier {
   /// (still drives recording/motion + config/bookmarks) but skips `/events`.
   List<String> cameraIds = const [];
 
+  /// Whether to also poll `GET /ha/states` this tick (issue #170 P0 plan
+  /// §4.4). The owner sets this to `true` iff at least one visible camera has
+  /// at least one placed HA badge — while `false`, `/ha/states` is NEVER
+  /// fetched at all (the client half of the energy-lean "poll on demand"
+  /// contract; the server side already caches/no-ops when nobody asks).
+  bool wantHaStates = false;
+
   /// Called (debounced) when `/status.config_version` changes after the first
   /// observation — the owner should re-fetch cameras + streams and re-sync
   /// panes. Optional; if unset, config changes are still tracked in
@@ -104,6 +113,17 @@ class LiveStatusController extends ChangeNotifier {
   String? _configVersion; // null = not yet observed
   bool _bookmarksEnabled = true;
   bool _connectionLost = false;
+
+  /// Last-known `/ha/states` snapshot (kept across a failed poll — never
+  /// blank the badges on one bad tick, same rationale as `_byCameraId`).
+  /// Null until the first successful fetch while [wantHaStates] is true.
+  HaStatesSnapshot? _haStates;
+
+  /// Consecutive `/ha/states` fetch failures while [wantHaStates] is true;
+  /// mirrors `_failStreak` but scoped to the HA feed only (an HA outage must
+  /// grey the badges without flipping the whole-wall `connectionLost`
+  /// banner).
+  int _haMissStreak = 0;
 
   /// Latest per-camera status, keyed by camera id. Empty until the first
   /// successful poll.
@@ -126,6 +146,21 @@ class LiveStatusController extends ChangeNotifier {
 
   Set<String> detectionKeysFor(String cameraId) =>
       _detectionKeysByCameraId[cameraId] ?? const {};
+
+  /// Latest known state for `entityId` from the last successful `/ha/states`
+  /// poll, or null when no state is known yet (never polled, or the entity
+  /// isn't in the caller-visible set). A null return is "unknown", NOT
+  /// "off" — callers (e.g. `ha_overlay/ha_icons.dart`'s `haVisualFor`) must
+  /// treat it as indeterminate, matching the backend's `edge_on` invariant.
+  HaEntityState? haStateFor(String entityId) => _haStates?.byEntity[entityId];
+
+  /// True when the HA badges should render the grey/stale treatment: either
+  /// the server's own snapshot is marked stale (HA unreachable past its
+  /// cache TTL) or this poller has missed 2+ consecutive `/ha/states` fetches
+  /// itself. Mirrors `connectionLost`'s "never lie about staleness" rule, but
+  /// scoped to the HA feed so an HA outage doesn't trip the whole-wall
+  /// connection-lost banner.
+  bool get haStale => (_haStates?.stale ?? false) || _haMissStreak >= 2;
 
   void start() {
     _timer?.cancel();
@@ -160,9 +195,10 @@ class LiveStatusController extends ChangeNotifier {
       final now = DateTime.now();
       SystemStatus? status;
       EventsResponse? events;
+      HaStatesSnapshot? haSnapshot;
       Object? statusError;
       try {
-        final results = await Future.wait([
+        final futures = <Future<Object?>>[
           api.getStatus(session),
           api
               .getEvents(
@@ -175,9 +211,23 @@ class LiveStatusController extends ChangeNotifier {
               // existing glyphs — surface as null and keep the last-known set.
               .then<EventsResponse?>((v) => v)
               .catchError((_) => null),
-        ], eagerError: false);
+        ];
+        // Only polled when at least one visible camera has a placed badge —
+        // the energy-lean half of the "poll on demand" contract (issue #170
+        // P0 plan §4.4). Same failure isolation as /events: a bad tick keeps
+        // the last-known snapshot rather than blanking the badges.
+        if (wantHaStates) {
+          futures.add(
+            api
+                .haStates(session)
+                .then<HaStatesSnapshot?>((v) => v)
+                .catchError((_) => null),
+          );
+        }
+        final results = await Future.wait(futures, eagerError: false);
         status = results[0] as SystemStatus;
         events = results[1] as EventsResponse?;
+        if (wantHaStates) haSnapshot = results[2] as HaStatesSnapshot?;
       } catch (e) {
         statusError = e;
       }
@@ -201,6 +251,17 @@ class LiveStatusController extends ChangeNotifier {
         _detectionKeysByCameraId = _activeDetectionKeys(events, now);
       }
       // else: keep the previous _detectionKeysByCameraId as-is.
+
+      if (wantHaStates) {
+        if (haSnapshot != null) {
+          _haStates = haSnapshot;
+          _haMissStreak = 0;
+        } else {
+          // Keep the previous _haStates as-is (last-known); count the miss
+          // toward haStale.
+          _haMissStreak += 1;
+        }
+      }
 
       _failStreak = 0;
       _connectionLost = false;
