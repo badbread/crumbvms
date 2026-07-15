@@ -39,6 +39,45 @@
 // [onTick] once per playhead tick for every active camera, and [resolveAt]
 // with `forceReload` for explicit jumps/seeks.
 //
+// ── Two clocks, and who wins at a segment boundary ────────────────────────
+// There are two independent clocks in play: the screen's shared playhead
+// (wall-clock × speed) and mpv's actual decode position. They are NEVER in
+// perfect lockstep — a fallback `open()` has open→seek→first-frame latency,
+// and a mid-segment decode/IO stall puts mpv behind the wall clock by the
+// stall length. Forcing the boundary advance (`_player.next()`) off the WALL
+// clock therefore jumps mpv past every frame it hadn't shown yet: the
+// operator sees smooth playback, then a "BAM" skip forward at the segment /
+// motion-event boundary — worse after a stall, and non-deterministic because
+// open/decode latency varies run to run. That was the frame-skip bug this
+// header block documents the fix for.
+//
+// The fix is mode-dependent (see [onTick]'s `mpvDriven` flag):
+//
+//  * SINGLE active pane (maximized, or a 1-camera layout — the frame-accurate
+//    review case): the screen slaves the shared playhead to [mpvPlayhead]
+//    (segment start + mpv's real position), so the playhead can never run
+//    ahead of the video, and the boundary is crossed by mpv ITSELF hitting
+//    the real end of file: `prefetch-playlist=yes` + the appended next
+//    segment make mpv auto-advance the playlist at EOF with a warm decoder
+//    (the exact same mpv mechanism `playlist-next weak` rides on), showing
+//    every frame of the outgoing segment. [_onPlaylistChanged] observes that
+//    auto-advance and updates the segment bookkeeping after the fact. The
+//    wall-clock forced `next()` is disabled in this mode.
+//
+//  * MULTIPLE visible panes: cross-camera time alignment matters more than
+//    any one pane's last few frames, so the shared wall clock stays in charge
+//    and the boundary advance stays wall-driven (a lagging pane is yanked
+//    forward to stay in sync — the accepted trade-off, matching the old
+//    Tauri client's behavior).
+//
+// `/play/{camera_id}` only ever resolves a segment COVERING the requested ts
+// (404 otherwise — see services/api/src/playback.rs), so a prefetched
+// playlist entry is always time-contiguous with the current segment: mpv's
+// EOF auto-advance can never wander across a coverage gap into wrong-time
+// footage. Gaps therefore still play out exactly as before: no prefetch
+// resolves, mpv completes at EOF, the wall clock walks the gap, and the
+// per-tick resolve loads footage when the playhead reaches it.
+//
 // Segment-resolve and scoped-media-token logic is NOT duplicated here — it
 // calls the existing `PlaybackApi` extension (lib/api/playback_api.dart),
 // mirroring app.js's `pbFetchSegment` (which itself calls
@@ -62,6 +101,16 @@ const Duration kPrefetchLeadTime = Duration(milliseconds: 1000);
 /// Mirrors app.js's `segEndMs - 100` check.
 const Duration kBoundaryTolerance = Duration(milliseconds: 100);
 
+/// Trust window after [GaplessSegmentPaneController._current] changes before
+/// [GaplessSegmentPaneController.mpvPlayhead] reports a position. media_kit's
+/// `state.position` is updated from an async mpv property-change stream, so
+/// for a beat after an `open()` / playlist advance it can still hold the
+/// PREVIOUS file's position; `newSegment.start + oldPosition` would teleport
+/// the slaved playhead (forward by up to a whole segment). During this grace
+/// the screen falls back to its wall clock — indistinguishable from the old
+/// behavior for a few ticks, and the slaved model resumes immediately after.
+const Duration kMpvPlayheadGrace = Duration(milliseconds: 300);
+
 class GaplessSegmentPaneController extends ChangeNotifier {
   GaplessSegmentPaneController({
     required this.api,
@@ -71,6 +120,12 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   }) : _session = session {
     _player = Player();
     _videoController = VideoController(_player);
+    // Watch mpv's playlist pointer: with `prefetch-playlist=yes` and the next
+    // segment appended, mpv auto-advances the playlist at the REAL end of the
+    // current file. In the single-pane mpv-driven mode that auto-advance IS
+    // the boundary crossing (no forced `next()` involved), so the segment
+    // bookkeeping must follow it after the fact — see [_onPlaylistChanged].
+    _playlistSub = _player.stream.playlist.listen(_onPlaylistChanged);
     unawaited(_configurePlayer());
   }
 
@@ -80,6 +135,7 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   final String stream;
 
   late final Player _player;
+
   /// The underlying media_kit player — register it with whatever owns
   /// play/pause/speed for the pane grid (e.g.
   /// `PlaybackTransportController.registerPane(slot, controller.player)`).
@@ -91,6 +147,14 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   ResolvedSegment? _current;
   ResolvedSegment? get currentSegment => _current;
   ResolvedSegment? _prefetched;
+
+  /// When [_current] last changed — gates [mpvPlayhead] behind
+  /// [kMpvPlayheadGrace] so a stale `state.position` from the previous file
+  /// never gets attributed to the new segment (see the const's doc).
+  DateTime? _currentSince;
+
+  /// Subscription to `player.stream.playlist` (see the constructor).
+  StreamSubscription<Playlist>? _playlistSub;
 
   bool _prefetching = false;
   bool _resolving = false;
@@ -159,6 +223,80 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     }
   }
 
+  // ── mpv-truth position + EOF auto-advance bookkeeping ───────────────────
+
+  /// The absolute time of the frame mpv is ACTUALLY showing —
+  /// `currentSegment.start + player position`, clamped into the segment —
+  /// or `null` when that mapping can't be trusted and the caller should fall
+  /// back to its wall clock:
+  ///
+  ///  * no segment loaded / a resolve or advance is in flight (`position`
+  ///    may belong to the outgoing file);
+  ///  * within [kMpvPlayheadGrace] of the segment changing (same reason —
+  ///    media_kit's position stream is async, see the const's doc);
+  ///  * mpv completed the playlist (EOF with nothing appended — a coverage
+  ///    gap or a lost prefetch race): position is frozen at the file end, and
+  ///    slaving to it would DEADLOCK the playhead at `cur.end` forever. The
+  ///    wall clock must take over to walk the gap so the per-tick resolve can
+  ///    re-arm footage under it;
+  ///  * not playing (paused/idle) — the transport owns pauses; a wedged pane
+  ///    must not freeze the shared playhead.
+  ///
+  /// The playback screen slaves the shared playhead to this in the
+  /// single-active-pane mode, which is what makes the UI playhead and the
+  /// video physically unable to disagree (the frame-skip fix — see the file
+  /// header). Polled from the screen's existing 100 ms tick rather than
+  /// pushing `stream.position` events upstream: the tick already exists, and
+  /// 10 Hz is well inside the timeline's visual granularity.
+  DateTime? get mpvPlayhead {
+    final cur = _current;
+    if (cur == null || _resolving || _advancing) return null;
+    final since = _currentSince;
+    if (since == null || DateTime.now().difference(since) < kMpvPlayheadGrace) {
+      return null;
+    }
+    if (_player.state.completed || !_player.state.playing) return null;
+    final ms = (cur.startMs + _player.state.position.inMilliseconds)
+        .clamp(cur.startMs, cur.endMs)
+        .toInt();
+    return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+  }
+
+  /// mpv moved its playlist pointer. If that was mpv's own EOF auto-advance
+  /// onto the appended prefetch (single-pane mpv-driven boundaries — and, as
+  /// a latent-desync fix, a wall-mode pane whose decode outran the wall
+  /// clock), adopt the prefetched segment as current so [mpvPlayhead] and the
+  /// covers()-based tick logic stay truthful. Explicit [_advanceOrResolve]
+  /// advances and in-flight resolves do their own bookkeeping and are
+  /// excluded via the `_advancing` / `_resolving` guards (a stale playlist
+  /// event landing mid-`open()` must not resurrect a dropped prefetch).
+  ///
+  /// Contiguity is guaranteed: `/play/` only resolves segments COVERING
+  /// `cur.end + 1ms` (see the file header), so this can never skip the
+  /// playhead across a coverage gap.
+  void _onPlaylistChanged(Playlist pl) {
+    if (_advancing || _resolving) return;
+    final pre = _prefetched;
+    if (pre == null || pl.index <= 0) return;
+    // State flips are synchronous (before any await) so a burst of playlist
+    // events can't double-apply the same prefetch.
+    _current = pre;
+    _currentSince = DateTime.now();
+    _prefetched = null;
+    noFootage = false;
+    error = null;
+    notifyListeners();
+    // Trim the played entry so the playlist never grows past {current, next}
+    // — the async twin of the explicit advance's `remove(0)`.
+    unawaited(() async {
+      try {
+        await _player.remove(0);
+      } catch (_) {
+        /* best-effort trim */
+      }
+    }());
+  }
+
   // ── the per-pane tick body (port of pbTick's per-slot segment bookkeeping,
   //    called once per tick by the shared playhead clock) ────────────────
 
@@ -170,7 +308,21 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   /// footage under the advancing playhead loads as soon as it exists —
   /// mirrors `pbTick` re-resolving empty slots every tick. `playing` is the
   /// transport's play/pause state, applied to any fallback `loadfile`.
-  Future<void> onTick(DateTime playhead, {bool playing = false}) async {
+  ///
+  /// `mpvDriven` selects the boundary-crossing model (see the file header):
+  /// `false` (multi-pane wall-clock mode, the historical behavior) forces the
+  /// playlist advance the moment the SHARED playhead hits the boundary — even
+  /// if mpv is behind and would skip unseen frames — because cross-camera
+  /// alignment wins there. `true` (single active pane, playhead slaved to
+  /// [mpvPlayhead]) leaves the crossing to mpv's own EOF auto-advance so no
+  /// decoded-but-unshown frame is ever jumped over; the wall-clock trigger
+  /// below then only acts as the FALLBACK for the cases mpv can't advance
+  /// itself out of (a coverage gap or a lost prefetch race → `completed`).
+  Future<void> onTick(
+    DateTime playhead, {
+    bool playing = false,
+    bool mpvDriven = false,
+  }) async {
     final cur = _current;
     if (cur == null) {
       if (!_resolving) await resolveAt(playhead, playing: playing);
@@ -178,6 +330,17 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     }
 
     if (playhead.isBefore(cur.start)) {
+      // Ride-through tolerance: when a segment FILE is slightly shorter than
+      // its indexed span, mpv hits EOF "early" and auto-advances onto the
+      // next segment ([_onPlaylistChanged] adopts it) while the playhead is
+      // still just shy of its start. Resolving here would reopen the OLD
+      // file only to replay/skip its missing tail — a pointless stutter at
+      // the boundary. Let the playhead catch up instead (a beat of the next
+      // segment's first frame; the slaved clock snaps forward ≤ this bound).
+      // Anything further behind is a genuine backward move — really resolve.
+      if (cur.start.difference(playhead) <= const Duration(milliseconds: 750)) {
+        return;
+      }
       // The playhead is BEHIND the loaded segment (a backwards nudge, or a
       // pane re-activated after the operator scrubbed back while it was
       // hidden) — the linear boundary logic below can never get there, so do
@@ -186,15 +349,47 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       return;
     }
 
+    // Prefetch lead is scaled by the playback rate: at 8× the playhead covers
+    // 8 s of timeline per real second, so a fixed 1 s lead left only ~125 ms
+    // of real time for the resolve+append round-trip and the boundary kept
+    // losing the race (falling back to a stuttery fresh load). The scaled
+    // lead keeps ~1 s of REAL time regardless of speed.
+    final leadMs = (kPrefetchLeadTime.inMilliseconds * (rate > 1 ? rate : 1))
+        .round();
     final untilEnd = cur.end.difference(playhead);
-    if (untilEnd <= kPrefetchLeadTime && _prefetched == null && !_prefetching) {
+    if (untilEnd.inMilliseconds <= leadMs &&
+        _prefetched == null &&
+        !_prefetching) {
       unawaited(_prefetchNext());
     }
 
     if (!playhead.isBefore(cur.end.subtract(kBoundaryTolerance)) &&
         !_advancing &&
         !_resolving) {
-      unawaited(_advanceOrResolve(playhead, playing: playing));
+      if (!mpvDriven) {
+        // Wall-clock mode: force the crossing now to keep panes time-aligned.
+        unawaited(_advanceOrResolve(playhead, playing: playing));
+      } else if (_player.state.completed &&
+          (_player.state.playlist.medias.length <= 1 ||
+              playhead.isAfter(cur.end.add(const Duration(seconds: 1))))) {
+        // mpv-driven mode: normally mpv auto-advances at real EOF and
+        // [_onPlaylistChanged] has already moved [_current] on before the
+        // playhead (slaved to mpv) can even sit at the boundary — so reaching
+        // here with `completed` means mpv genuinely ran out of playlist:
+        // nothing was appended (gap / prefetch too slow), or the appended
+        // entry failed to play (the `playhead > end + 1s` escape hatch, wall
+        // clock having taken over via [mpvPlayhead] returning null). Fall
+        // back to a plain resolve at the playhead — for contiguous footage
+        // that loads the next segment (non-gapless but correct); in a gap it
+        // resolves null → noFootage and the wall clock walks the gap exactly
+        // as before. The `medias.length <= 1` guard keeps a transient
+        // completed flicker during a normal auto-advance (next entry still
+        // queued) from racing [_onPlaylistChanged] with a redundant open().
+        unawaited(resolveAt(playhead, playing: playing));
+      }
+      // else: mpv is still showing real frames from this segment while the
+      // slaved playhead waits (clamped) at `cur.end` — its EOF auto-advance
+      // will cross the boundary without skipping any of them.
     }
   }
 
@@ -234,7 +429,9 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   }
 
   // ── boundary crossing (port of the gapless branch in
-  //    pbResolveAllPanesInner) ────────────────────────────────────────────
+  //    pbResolveAllPanesInner) — WALL-CLOCK MODE ONLY: the single-pane
+  //    mpv-driven mode never forces this; mpv's own EOF auto-advance +
+  //    [_onPlaylistChanged] cross the boundary there (see onTick) ─────────
 
   Future<void> _advanceOrResolve(
     DateTime playhead, {
@@ -246,7 +443,11 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       try {
         // mpv `playlist-next weak` — the prefetch already demuxed this file
         // (prefetch-playlist=yes), so this is just a pointer move: no
-        // re-init stutter.
+        // re-init stutter. If mpv is still mid-segment this deliberately
+        // jumps it forward (the multi-pane sync-over-smoothness trade-off);
+        // if mpv already auto-advanced at EOF on its own, `next()` on the
+        // last playlist entry is a no-op and [_onPlaylistChanged] (or the
+        // bookkeeping below) has already/will have converged `_current`.
         await _player.next();
         // mpv `playlist-clear` (keeps the now-current file) — drop the
         // played entry so the playlist never grows past {current, next}
@@ -257,6 +458,7 @@ class GaplessSegmentPaneController extends ChangeNotifier {
           /* best-effort trim */
         }
         _current = pre;
+        _currentSince = DateTime.now();
         _prefetched = null;
         noFootage = false;
         error = null;
@@ -326,10 +528,16 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         return; // still covered — nothing to do (matches the cached-skip in app.js)
       }
 
-      final seg = await api.resolveSegment(_session, cameraId, ts, stream: stream);
+      final seg = await api.resolveSegment(
+        _session,
+        cameraId,
+        ts,
+        stream: stream,
+      );
       if (seg == null) {
         await _dropPrefetch();
         _current = null;
+        _currentSince = null; // no segment → mpvPlayhead has nothing to map
         noFootage = true;
         error = null;
         notifyListeners();
@@ -381,6 +589,7 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         }
       }
       _current = seg;
+      _currentSince = DateTime.now();
       _prefetched = null;
       noFootage = false;
       error = null;
@@ -390,24 +599,206 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       notifyListeners();
     } finally {
       _resolving = false;
-      // Replay the newest request that raced this resolve, if any. Snapshot and
-      // clear the pending slot first so a request arriving during the replay
-      // coalesces afresh instead of being lost.
-      final pendingTs = _pendingResolveTs;
-      if (pendingTs != null) {
-        final pendingForce = _pendingForceReload;
-        final pendingPlaying = _pendingResolvePlaying;
-        _pendingResolveTs = null;
-        _pendingForceReload = false;
-        _pendingResolvePlaying = false;
-        unawaited(
-          resolveAt(
-            pendingTs,
-            forceReload: pendingForce,
-            playing: pendingPlaying,
-          ),
-        );
+      _replayPendingResolve();
+    }
+  }
+
+  /// Replay the newest [resolveAt] request that raced an in-flight resolve
+  /// (or a boundary-crossing frame-step, which holds the same `_resolving`
+  /// lock), if any. Snapshot and clear the pending slot first so a request
+  /// arriving during the replay coalesces afresh instead of being lost.
+  /// Extracted so every `_resolving = false` path releases the queue the
+  /// same way.
+  void _replayPendingResolve() {
+    final pendingTs = _pendingResolveTs;
+    if (pendingTs == null) return;
+    final pendingForce = _pendingForceReload;
+    final pendingPlaying = _pendingResolvePlaying;
+    _pendingResolveTs = null;
+    _pendingForceReload = false;
+    _pendingResolvePlaying = false;
+    unawaited(
+      resolveAt(pendingTs, forceReload: pendingForce, playing: pendingPlaying),
+    );
+  }
+
+  // ── frame-step (port of pbFrameStep, app.js:7627 →
+  //    `frame_step_pane`, src-tauri/src/lib.rs:1219) ───────────────────────
+
+  /// Step exactly ONE frame forward/backward using libmpv's native
+  /// `frame-step` / `frame-back-step` commands — the same commands the old
+  /// Tauri client invoked over IPC. The previous approximation (seek by
+  /// `1000/estimated-vf-fps` ms) broke down stepping BACKWARD: mpv resolves
+  /// a backward seek to the nearest keyframe, so repeated back-steps snapped
+  /// to the same keyframe forever — the "back button does nothing / gets
+  /// stuck" symptom. The native commands are frame-exact in both directions.
+  ///
+  /// Boundary crossing: when a back-step lands at (or a forward-step at the
+  /// end can't leave) the current file, this resolves the ADJACENT segment,
+  /// opens it paused, and lands on its nearest edge frame — so stepping
+  /// walks across segment boundaries instead of dead-ending at them.
+  ///
+  /// Returns the absolute time of the frame now showing (for the caller to
+  /// snap the shared playhead to, keeping the two clocks consistent — the
+  /// old code never updated the playhead on a step at all), or `null` if
+  /// nothing moved (no footage loaded, adjacent-segment miss, or an error —
+  /// all non-fatal, mirroring pbFrameStep's per-slot `.catch(warn)`).
+  ///
+  /// Caller contract: pause the transport BEFORE stepping (mpv's step
+  /// commands pause the player themselves; the transport state must agree).
+  Future<DateTime?> frameStep(bool forward) async {
+    final cur = _current;
+    if (cur == null || _resolving || _advancing) return null;
+    final p = _player.platform;
+    if (p is! NativePlayer) return null; // desktop is always NativePlayer
+    final before = _player.state.position;
+    final idxBefore = _player.state.playlist.index;
+    try {
+      await p.command([forward ? 'frame-step' : 'frame-back-step']);
+    } catch (_) {
+      return null;
+    }
+    // The step decodes asynchronously — wait for the position to actually
+    // move (or time out: mpv's step commands are silent no-ops at the file
+    // edges, which is exactly the boundary case handled below).
+    final after = await _positionAfter(before);
+    // A forward step at the very last frame trips EOF instead of showing a
+    // new frame. `completed` (playlist ran out) is checked BEFORE trusting a
+    // position emission, because media_kit may reset the position on
+    // playlist end — mapping that reset as "movement" would snap the
+    // playhead to the segment start.
+    if (_player.state.completed) {
+      return forward ? _openAdjacentForStep(cur, forward: true) : null;
+    }
+    if (after != null) {
+      if (_player.state.playlist.index != idxBefore) {
+        // The forward step at the last frame tripped EOF and mpv auto-
+        // advanced onto the appended prefetch (only possible when the
+        // operator paused within the prefetch window). [_onPlaylistChanged]
+        // adopts the new segment; give the position stream a beat to reflect
+        // the NEW file before mapping, then fall through to the re-read of
+        // [_current] below.
+        await Future<void>.delayed(const Duration(milliseconds: 50));
       }
+      final seg = _current ?? cur;
+      final ms = (seg.startMs + _player.state.position.inMilliseconds)
+          .clamp(seg.startMs, seg.endMs)
+          .toInt();
+      return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+    }
+    // No movement — at a file edge (or a very slow decode; the thresholds
+    // keep a mid-file timeout from being misread as an edge).
+    if (!forward && before <= const Duration(milliseconds: 200)) {
+      return _openAdjacentForStep(cur, forward: false);
+    }
+    final dur = _player.state.duration;
+    if (forward &&
+        dur > Duration.zero &&
+        dur - before <= const Duration(milliseconds: 200)) {
+      return _openAdjacentForStep(cur, forward: true);
+    }
+    return null;
+  }
+
+  /// First position emitted by the player that differs from [before], or
+  /// `null` on timeout. Used to observe an async mpv command (frame-step)
+  /// landing.
+  Future<Duration?> _positionAfter(
+    Duration before, {
+    Duration timeout = const Duration(milliseconds: 300),
+  }) async {
+    try {
+      return await _player.stream.position
+          .firstWhere((pos) => pos != before)
+          .timeout(timeout);
+    } catch (_) {
+      // TimeoutException, or the stream closed under us (dispose race).
+      return null;
+    }
+  }
+
+  /// Frame-step ran off the edge of the current file: resolve the segment
+  /// adjacent to it, open it paused, and land near the edge we stepped over
+  /// (its first frame going forward; just shy of its last frame going
+  /// backward). Returns the landed absolute time, or `null` when there is no
+  /// adjacent footage (retention edge, or a coverage gap — stepping does NOT
+  /// jump gaps; that's a scrub/jump decision, not a one-frame nudge).
+  ///
+  /// Probes the edge ±1 ms first (contiguous files), then ±750 ms as a
+  /// fallback for the sub-second indexing seams a recorder restart can leave
+  /// (still under the server's 1 s span-merge tolerance, so anything the
+  /// timeline paints as continuous is steppable). `/play/` only resolves
+  /// COVERING segments, so a probe inside a real gap misses both times.
+  ///
+  /// Holds the `_resolving` lock (and replays coalesced [resolveAt] requests
+  /// on release) so a concurrent seek/jump can't open a different file
+  /// mid-step.
+  Future<DateTime?> _openAdjacentForStep(
+    ResolvedSegment cur, {
+    required bool forward,
+  }) async {
+    if (_resolving) return null;
+    _resolving = true;
+    try {
+      ResolvedSegment? seg;
+      for (final probeMs
+          in forward
+              ? [cur.endMs + 1, cur.endMs + 750]
+              : [cur.startMs - 1, cur.startMs - 750]) {
+        seg = await api.resolveSegment(
+          _session,
+          cameraId,
+          DateTime.fromMillisecondsSinceEpoch(probeMs, isUtc: true),
+          stream: stream,
+        );
+        if (seg != null) break;
+      }
+      if (seg == null) return null; // no adjacent footage — stay put
+      // Direction sanity: the probe must have found a genuinely earlier /
+      // later file, never the current one again (mirrors _prefetchNext's
+      // same/overlapping guard).
+      if (forward
+          ? seg.startMs < cur.endMs - 250
+          : seg.startMs >= cur.startMs) {
+        return null;
+      }
+      final url = await api.mediaUrlForSegment(_session, seg);
+      if (url == null) return null;
+      // open() replaces the whole playlist, taking any appended prefetch
+      // with it — forget the bookkeeping to match.
+      _prefetched = null;
+      await _player.open(Playlist([Media(url)]), play: false);
+      try {
+        await _player.setRate(rate);
+      } catch (_) {
+        /* non-fatal — the transport owner reasserts speed on its next change */
+      }
+      // Landing offset: first frame going forward. Going backward, aim a few
+      // frames shy of the end (200 ms) rather than the exact last frame —
+      // the indexed duration can slightly overshoot the real file, and a
+      // paused seek pinned to/past EOF risks tripping playlist-end (a black
+      // pane). Absolute seeks are hr-precise in mpv, so this lands where it
+      // aims.
+      final offMs = forward
+          ? 0
+          : (seg.durationMs - 200).clamp(0, seg.durationMs).toInt();
+      try {
+        await _player.seek(Duration(milliseconds: offMs));
+      } catch (_) {
+        /* non-fatal */
+      }
+      _current = seg;
+      _currentSince = DateTime.now();
+      noFootage = false;
+      error = null;
+      notifyListeners();
+      final ms = (seg.startMs + offMs).clamp(seg.startMs, seg.endMs).toInt();
+      return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+    } catch (_) {
+      return null;
+    } finally {
+      _resolving = false;
+      _replayPendingResolve();
     }
   }
 
@@ -430,6 +821,10 @@ class GaplessSegmentPaneController extends ChangeNotifier {
 
   @override
   void dispose() {
+    // Cancel before disposing the player so a final playlist event can't
+    // touch a disposed Player from [_onPlaylistChanged].
+    unawaited(_playlistSub?.cancel());
+    _playlistSub = null;
     _player.dispose();
     super.dispose();
   }
