@@ -1,18 +1,31 @@
-// The overlay editor's render + gesture layer (edit + view mode) — lifted
-// from `ptz/ptz_panel_overlay.dart`'s Stack/hit-test structure and
-// generalized over any `OverlayItem`. Item VISUALS (body/selection styling)
-// come from a host delegate ([OverlayItemBuilder]); this layer owns only the
-// generic chrome: the opaque per-item hit target (so gaps between items fall
-// through to whatever's underneath — the video pane's own gestures), the
-// delete (x) / resize handles in edit mode, and the snap-guide lines.
-// Handles are suppressed below [kOverlayHandleMinRenderedPx] (repairs the PTZ
-// panel's D6 defect — a small button's handles could cover its whole body,
-// see the desktop P0 plan §3.2) — use the editor bar's size stepper /
-// selected-item Delete button instead at that size.
+// The overlay editor's render + gesture layer (edit + view mode). Item
+// VISUALS (body/selection styling) come from a host delegate
+// ([OverlayItemBuilder]); this layer owns only the generic chrome: the opaque
+// per-item hit target (so gaps between items fall through to whatever's
+// underneath — the video pane's own gestures in VIEW mode), the delete (x) /
+// resize handles in edit mode, the snap-guide lines, and the marquee
+// box-select.
+//
+// ── Rebuild discipline (the anti-stutter contract, see
+//    `overlay_editor_controller.dart`'s file doc) ─────────────────────────────
+// The layer's STRUCTURE (item set, selection, mode) rebuilds on the
+// controller's own notifications. Per-pointer-move drag ticks fire only
+// `controller.geometry`; each item subscribes just its `Positioned` wrapper
+// to that (the item's visual subtree is passed as a prebuilt `child`, wrapped
+// in a `RepaintBoundary`), so a drag re-positions a few boxes per frame
+// instead of rebuilding every item, the editor bar and the host palette.
+//
+// ── Edit-mode gestures ──────────────────────────────────────────────────────
+// * click an item — select it (its whole group); Shift/Ctrl-click toggles it
+//   in/out of the selection.
+// * drag an item — moves the whole selection; hold Alt to suppress snapping
+//   for the gesture.
+// * drag empty space — marquee box-select; click empty space — clear
+//   selection. (The edit-mode background is an opaque hit target, so video
+//   gestures — double-click restore, PTZ steering — can't fire mid-edit.)
 //
 // Usage: stack this INSIDE the same-sized `Positioned.fill` video pane that
-// hosts the Video widget, above it in z-order — same placement rule as
-// `PtzPanelOverlay`:
+// hosts the Video widget, above it in z-order:
 //
 //   Stack(children: [
 //     Video(controller: videoController),
@@ -25,6 +38,7 @@
 //   ])
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'overlay_editor_controller.dart';
 import 'overlay_geometry.dart';
@@ -45,7 +59,7 @@ typedef OverlayItemBuilder =
 /// bar's size stepper / selected-item Delete button instead at this size.
 const double kOverlayHandleMinRenderedPx = 24;
 
-class OverlayEditorLayer extends StatelessWidget {
+class OverlayEditorLayer extends StatefulWidget {
   const OverlayEditorLayer({
     super.key,
     required this.controller,
@@ -55,6 +69,7 @@ class OverlayEditorLayer extends StatelessWidget {
     this.videoW,
     this.videoH,
     this.onTapItem,
+    this.onHoverItem,
     this.emptyEditHint,
   });
 
@@ -64,8 +79,8 @@ class OverlayEditorLayer extends StatelessWidget {
   final OverlayItemBuilder buildItem;
 
   /// True renders the LIVE edit session (`controller.items`, drag/resize,
-  /// handles, snap guides). False renders a read-only view-mode layer from
-  /// [items] (badges/buttons only, tap dispatches [onTapItem]).
+  /// handles, snap guides, marquee). False renders a read-only view-mode
+  /// layer from [items] (badges/buttons only, tap dispatches [onTapItem]).
   final bool editing;
 
   /// View-mode item list — required (and used) when [editing] is false;
@@ -82,19 +97,51 @@ class OverlayEditorLayer extends StatelessWidget {
   /// the item instead and never call this.
   final void Function(OverlayItem item)? onTapItem;
 
+  /// View-mode hover dispatch (mouse enter/leave over an item's hit target) —
+  /// e.g. the HA host's hover-reveal of the badge's live state. Null adds no
+  /// MouseRegion at all.
+  final void Function(OverlayItem item, bool hovering)? onHoverItem;
+
   /// Edit-mode placeholder text shown centered when there are no items yet
   /// (e.g. "Add controls from the bar, then drag them where you want"). Null
   /// shows nothing.
   final String? emptyEditHint;
 
   @override
+  State<OverlayEditorLayer> createState() => _OverlayEditorLayerState();
+}
+
+class _OverlayEditorLayerState extends State<OverlayEditorLayer> {
+  /// Live marquee rect (pane-local px) while box-selecting, else null. A
+  /// ValueNotifier so only the marquee visual repaints per pointer move — the
+  /// selection updates it drives already no-op unless membership changes.
+  final ValueNotifier<Rect?> _marquee = ValueNotifier<Rect?>(null);
+  Offset? _marqueeStart;
+
+  @override
+  void dispose() {
+    _marquee.dispose();
+    super.dispose();
+  }
+
+  static bool get _toggleModifier =>
+      HardwareKeyboard.instance.isShiftPressed ||
+      HardwareKeyboard.instance.isControlPressed;
+
+  static bool get _snapForGesture => !HardwareKeyboard.instance.isAltPressed;
+
+  @override
   Widget build(BuildContext context) {
+    final controller = widget.controller;
     return AnimatedBuilder(
       animation: controller,
       builder: (context, _) {
-        final source = editing ? controller.items : (items ?? const []);
-        final hasVideoDims =
-            videoW != null && videoH != null && videoW! > 0 && videoH! > 0;
+        final source =
+            widget.editing ? controller.items : (widget.items ?? const []);
+        final hasVideoDims = widget.videoW != null &&
+            widget.videoH != null &&
+            widget.videoW! > 0 &&
+            widget.videoH! > 0;
         final visible = [
           for (final item in source)
             if (item.anchor != OverlayAnchor.videoFrame || hasVideoDims) item,
@@ -104,9 +151,20 @@ class OverlayEditorLayer extends StatelessWidget {
             final w = constraints.maxWidth;
             final h = constraints.maxHeight;
             if (w <= 0 || h <= 0) return const SizedBox.shrink();
+            if (widget.editing) {
+              // Selection ops / marquee math need the pane metrics; plain
+              // field writes, safe during build.
+              controller.updatePaneMetrics(
+                w,
+                h,
+                videoW: widget.videoW,
+                videoH: widget.videoH,
+              );
+            }
             return Stack(
               clipBehavior: Clip.hardEdge,
               children: [
+                if (widget.editing) Positioned.fill(child: _marqueeTarget()),
                 for (final item in visible)
                   _OverlayItemWidget(
                     key: ValueKey(item.id),
@@ -114,21 +172,104 @@ class OverlayEditorLayer extends StatelessWidget {
                     item: item,
                     paneW: w,
                     paneH: h,
-                    videoW: videoW,
-                    videoH: videoH,
-                    editing: editing,
-                    selected: editing && controller.selectedId == item.id,
-                    buildItem: buildItem,
-                    onTap: onTapItem,
+                    videoW: widget.videoW,
+                    videoH: widget.videoH,
+                    editing: widget.editing,
+                    selected: widget.editing && controller.isSelected(item.id),
+                    // The match-size / properties reference: the primary
+                    // (last-clicked) item, marked only while it's one of
+                    // several selected (issue #5).
+                    isReference: widget.editing &&
+                        controller.selectedIds.length > 1 &&
+                        controller.primarySelectedId == item.id,
+                    buildItem: widget.buildItem,
+                    onTap: widget.onTapItem,
+                    onHover: widget.onHoverItem,
                   ),
-                if (editing) ..._snapGuideLines(controller.snapGuides, w, h),
-                if (editing && visible.isEmpty && emptyEditHint != null)
-                  Center(child: _hintChip(emptyEditHint!)),
+                if (widget.editing)
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: AnimatedBuilder(
+                        animation: controller.geometry,
+                        builder: (context, _) => Stack(
+                          children:
+                              _snapGuideLines(controller.snapGuides, w, h),
+                        ),
+                      ),
+                    ),
+                  ),
+                if (widget.editing)
+                  // Positioned stays a DIRECT child of a Stack (the inner
+                  // one) — the repo has been bitten by Positioned under a
+                  // builder blanking the release UI (see wall_screen.dart's
+                  // ConnLostBanner note), so the builder wraps a Stack, not
+                  // a Positioned.
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: ValueListenableBuilder<Rect?>(
+                        valueListenable: _marquee,
+                        builder: (context, r, _) => Stack(
+                          children: [
+                            if (r != null)
+                              Positioned(
+                                left: r.left,
+                                top: r.top,
+                                width: r.width,
+                                height: r.height,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color: const Color(0x224CC9FF),
+                                    border: Border.all(
+                                      color: const Color(0x884CC9FF),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                if (widget.editing &&
+                    visible.isEmpty &&
+                    widget.emptyEditHint != null)
+                  Center(child: _hintChip(widget.emptyEditHint!)),
               ],
             );
           },
         );
       },
+    );
+  }
+
+  /// The edit-mode background: opaque (blocks the video pane's own gestures —
+  /// no accidental double-click restore or PTZ steer mid-edit), tap clears
+  /// the selection, drag draws the marquee box-select.
+  Widget _marqueeTarget() {
+    final controller = widget.controller;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: controller.clearSelection,
+      onPanStart: (d) {
+        _marqueeStart = d.localPosition;
+        _marquee.value = Rect.fromPoints(d.localPosition, d.localPosition);
+      },
+      onPanUpdate: (d) {
+        final s = _marqueeStart;
+        if (s == null) return;
+        final r = Rect.fromPoints(s, d.localPosition);
+        _marquee.value = r;
+        controller.marqueeSelect(r.left, r.top, r.right, r.bottom);
+      },
+      onPanEnd: (_) {
+        _marqueeStart = null;
+        _marquee.value = null;
+      },
+      onPanCancel: () {
+        _marqueeStart = null;
+        _marquee.value = null;
+      },
+      child: const SizedBox.expand(),
     );
   }
 
@@ -175,8 +316,10 @@ class _OverlayItemWidget extends StatelessWidget {
     required this.videoH,
     required this.editing,
     required this.selected,
+    required this.isReference,
     required this.buildItem,
     required this.onTap,
+    required this.onHover,
   });
 
   final OverlayEditorController controller;
@@ -187,108 +330,188 @@ class _OverlayItemWidget extends StatelessWidget {
   final int? videoH;
   final bool editing;
   final bool selected;
+  final bool isReference;
   final OverlayItemBuilder buildItem;
   final void Function(OverlayItem item)? onTap;
+  final void Function(OverlayItem item, bool hovering)? onHover;
 
   static const double _handle = 16;
 
   @override
   Widget build(BuildContext context) {
-    final (x, y, w, h) = OverlayGeometry.rectFor(
-      item,
-      paneW,
-      paneH,
-      videoW: videoW,
-      videoH: videoH,
+    // Built ONCE per structure change; the geometry AnimatedBuilder below
+    // only re-positions it per drag tick (see the file doc's rebuild
+    // discipline). RepaintBoundary keeps a moving item's repaint from
+    // spilling into the rest of the layer.
+    //
+    // Structure note: this widget is a direct child of the layer's Stack,
+    // and renders `Positioned.fill` → AnimatedBuilder → INNER Stack →
+    // Positioned, so every Positioned stays the DIRECT child of a Stack
+    // (a Positioned under a builder has blanked the release UI before —
+    // see wall_screen.dart's ConnLostBanner note). The fill wrapper itself
+    // claims no hits: only the inner GestureDetector's rect is a target,
+    // so gaps between items still fall through to the video pane.
+    final body = RepaintBoundary(
+      child: editing ? _editBody() : _viewBody(),
     );
-    return Positioned(
-      left: x,
-      top: y,
-      width: w,
-      height: h,
-      child: editing ? _editBody(w, h) : _viewBody(),
+    return Positioned.fill(
+      child: AnimatedBuilder(
+        animation: controller.geometry,
+        child: body,
+        builder: (context, child) {
+          final (x, y, w, h) = OverlayGeometry.rectFor(
+            item,
+            paneW,
+            paneH,
+            videoW: videoW,
+            videoH: videoH,
+          );
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned(
+                left: x,
+                top: y,
+                width: w,
+                height: h,
+                child: child!,
+              ),
+            ],
+          );
+        },
+      ),
     );
   }
 
   // ─── Edit-mode: draggable body + delete/resize handles ─────────────────
 
-  Widget _editBody(double w, double h) {
-    final showHandles =
-        w >= kOverlayHandleMinRenderedPx && h >= kOverlayHandleMinRenderedPx;
+  Widget _editBody() {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: () => controller.selectItem(item.id),
-      onPanStart: (_) => controller.selectItem(item.id),
-      onPanUpdate: (d) => controller.moveItemByDelta(
-        item.id,
-        paneW,
-        paneH,
+      onTap: () {
+        if (_OverlayEditorLayerState._toggleModifier) {
+          controller.toggleSelect(item.id);
+        } else {
+          controller.selectItem(item.id);
+        }
+      },
+      onPanStart: (_) => controller.beginDrag(item.id),
+      onPanUpdate: (d) => controller.updateDrag(
         d.delta.dx,
         d.delta.dy,
-        videoW: videoW,
-        videoH: videoH,
+        snap: _OverlayEditorLayerState._snapForGesture,
       ),
-      onPanEnd: (_) => controller.commitDrag(),
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          // Explicit SizedBox: a Stack loosens the constraints of a
-          // non-positioned child, so the delegate's returned widget must be
-          // told its exact target size rather than relying on it to
-          // self-size correctly under loose constraints (mirrors
-          // `PtzPanelOverlay`'s `Container(width: w, height: h, ...)`).
-          SizedBox(
-            width: w,
-            height: h,
-            child: buildItem(item, editing: true, selected: selected),
-          ),
-          // Delete (x) handle, top-right.
-          if (showHandles)
-            Positioned(
-              right: 0,
-              top: 0,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => controller.removeItem(item.id),
-                child: Container(
-                  width: _handle,
-                  height: _handle,
-                  decoration: const BoxDecoration(color: Color(0xCC2030D0)),
-                  alignment: Alignment.center,
-                  child: const Text(
-                    '×',
-                    style: TextStyle(color: Colors.white, fontSize: 13, height: 1),
+      onPanEnd: (_) => controller.endDrag(),
+      onPanCancel: controller.endDrag,
+      // LayoutBuilder (fed by the tight Positioned constraints) rather than
+      // captured w/h, so a resize drag re-sizes the visual without a
+      // structure rebuild.
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final w = constraints.maxWidth;
+          final h = constraints.maxHeight;
+          final showHandles = w >= kOverlayHandleMinRenderedPx &&
+              h >= kOverlayHandleMinRenderedPx;
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              // Explicit SizedBox: a Stack loosens the constraints of a
+              // non-positioned child, so the delegate's returned widget must
+              // be told its exact target size rather than relying on it to
+              // self-size correctly under loose constraints. Opacity is
+              // applied to the item visual only (not the handles/ref marker).
+              SizedBox(
+                width: w,
+                height: h,
+                child: _withOpacity(
+                  buildItem(item, editing: true, selected: selected),
+                ),
+              ),
+              // Match-size reference marker (issue #5): a small "REF" chip on
+              // the primary (last-clicked) item of a multi-selection, so it's
+              // clear which item Match-W/H/size and the properties target.
+              if (isReference)
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 3,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2CA3E8),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                      child: const Text(
+                        'REF',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 8,
+                          fontWeight: FontWeight.w800,
+                          height: 1,
+                          letterSpacing: 0.4,
+                        ),
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
-          // Resize handle, bottom-right — only when selected AND the item
-          // opts into drag-resize (`OverlayItem.resizable`).
-          if (showHandles && selected && item.resizable)
-            Positioned(
-              right: 0,
-              bottom: 0,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onPanUpdate: (d) => controller.resizeItemByDelta(
-                  item.id,
-                  paneW,
-                  paneH,
-                  d.delta.dx,
-                  d.delta.dy,
-                  videoW: videoW,
-                  videoH: videoH,
+              // Delete (x) handle, top-right.
+              if (showHandles)
+                Positioned(
+                  right: 0,
+                  top: 0,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => controller.removeItem(item.id),
+                    child: Container(
+                      width: _handle,
+                      height: _handle,
+                      decoration: const BoxDecoration(color: Color(0xCC2030D0)),
+                      alignment: Alignment.center,
+                      child: const Text(
+                        '×',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          height: 1,
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-                onPanEnd: (_) => controller.commitDrag(),
-                child: Container(
-                  width: _handle,
-                  height: _handle,
-                  decoration: const BoxDecoration(color: Color(0xE62CA3E8)),
-                  child: const Icon(Icons.south_east, size: 12, color: Colors.white),
+              // Resize handle, bottom-right — only when selected AND the item
+              // opts into drag-resize (`OverlayItem.resizable`).
+              if (showHandles && selected && item.resizable)
+                Positioned(
+                  right: 0,
+                  bottom: 0,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanStart: (_) => controller.beginResizeDrag(item.id),
+                    onPanUpdate: (d) => controller.updateResizeDrag(
+                      d.delta.dx,
+                      d.delta.dy,
+                      snap: _OverlayEditorLayerState._snapForGesture,
+                    ),
+                    onPanEnd: (_) => controller.endResizeDrag(),
+                    onPanCancel: controller.endResizeDrag,
+                    child: Container(
+                      width: _handle,
+                      height: _handle,
+                      decoration: const BoxDecoration(color: Color(0xE62CA3E8)),
+                      child: const Icon(
+                        Icons.south_east,
+                        size: 12,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-            ),
-        ],
+            ],
+          );
+        },
       ),
     );
   }
@@ -296,10 +519,25 @@ class _OverlayItemWidget extends StatelessWidget {
   // ─── View mode: only the item glyph is an opaque hit target ────────────
 
   Widget _viewBody() {
-    return GestureDetector(
+    final Widget body = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap == null ? null : () => onTap!(item),
-      child: buildItem(item, editing: false, selected: false),
+      child: _withOpacity(buildItem(item, editing: false, selected: false)),
     );
+    final hover = onHover;
+    if (hover == null) return body;
+    return MouseRegion(
+      onEnter: (_) => hover(item, true),
+      onExit: (_) => hover(item, false),
+      child: body,
+    );
+  }
+
+  /// Wrap `child` in an [Opacity] only when the item is actually translucent
+  /// (opacity is a relatively costly layer — skip it at full opacity).
+  Widget _withOpacity(Widget child) {
+    final o = item.opacity;
+    if (o >= 0.999) return child;
+    return Opacity(opacity: o.clamp(0.0, 1.0).toDouble(), child: child);
   }
 }

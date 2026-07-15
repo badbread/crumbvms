@@ -1,8 +1,17 @@
-// Renders a camera's custom PTZ panel over the video pane, as real Flutter
-// widgets (per the port brief) instead of app.js's mpv-ASS drawing
-// (`ptzBuildCustomAss`) + physical-px hit-testing (`ptzCustomHit`). Handles
-// both view mode (press-and-hold direction/zoom, tap home/preset/imaging)
-// and edit mode (select / drag-with-snap / resize / delete).
+// Renders a camera's custom PTZ panel over the video pane, as a thin skin on
+// the shared drag-to-place overlay editor (`overlay_editor/`, the P1 port —
+// this file used to carry its own Stack/hit-test/drag machinery). This file
+// keeps only what is PTZ-specific: the button visual language and the
+// view-mode dispatch gestures (press-and-hold direction/zoom, tap
+// home/preset/imaging — ported from app.js's `ptzBuildCustomAss` /
+// `ptzCustomHit`).
+//
+// Edit mode renders the live shared-editor session (drag/multi-select/
+// marquee/snap all come from `OverlayEditorLayer`); view mode renders the
+// saved layout with each button carrying its own gesture handling — the
+// layer's generic wrapper stays inert (no `onTapItem`) so the button-local
+// detectors receive the events, and gaps between buttons still fall through
+// to the video pane's click-to-center / hold-to-pan / wheel-zoom.
 //
 // Usage: stack this INSIDE the same-sized Positioned.fill video pane that
 // hosts the Video widget, above it in z-order:
@@ -17,6 +26,8 @@ import 'package:flutter/material.dart';
 
 import '../../api/ptz_extras_api.dart';
 import '../../api/ptz_panel_models.dart';
+import '../overlay_editor/overlay_editor_layer.dart';
+import '../overlay_editor/overlay_item.dart';
 import 'ptz_panel_controller.dart';
 
 class PtzPanelOverlay extends StatelessWidget {
@@ -37,221 +48,88 @@ class PtzPanelOverlay extends StatelessWidget {
         final panel = controller.activePanelFor(cameraId);
         if (panel == null) return const SizedBox.shrink();
         final (buttons, editing) = panel;
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final w = constraints.maxWidth;
-            final h = constraints.maxHeight;
-            if (w <= 0 || h <= 0) return const SizedBox.shrink();
-            return Stack(
-              clipBehavior: Clip.hardEdge,
-              children: [
-                for (final btn in buttons)
-                  _PtzPanelButtonWidget(
-                    key: ValueKey(btn.id),
-                    controller: controller,
-                    button: btn,
-                    paneW: w,
-                    paneH: h,
-                    editing: editing,
-                    selected: editing && controller.selectedId == btn.id,
-                  ),
-                if (editing) ..._snapGuideLines(controller.snapGuides, w, h),
-                if (editing && buttons.isEmpty)
-                  Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.55),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: const Text(
-                        'Add controls from the bar, then drag them where you want',
-                        style: TextStyle(color: Colors.white, fontSize: 13),
-                      ),
-                    ),
-                  ),
-              ],
-            );
-          },
+        if (editing) {
+          return OverlayEditorLayer(
+            controller: controller.editor,
+            editing: true,
+            buildItem: _buildEditItem,
+            emptyEditHint:
+                'Add controls from the bar, then drag them where you want',
+          );
+        }
+        return OverlayEditorLayer(
+          controller: controller.editor,
+          editing: false,
+          items: [for (final b in buttons) PtzOverlayButtonItem(b)],
+          buildItem: _buildViewItem,
         );
       },
     );
   }
 
-  List<Widget> _snapGuideLines(PtzSnapGuides g, double w, double h) {
-    const color = Color(0x664CC9FF);
-    return [
-      for (final x in g.vx)
-        Positioned(
-          left: x,
-          top: 0,
-          width: 1,
-          height: h,
-          child: Container(color: color),
+  // ─── Edit-mode visual (selection styling only; the shared layer owns the
+  //     hit target, handles and drag) ──────────────────────────────────────
+
+  Widget _buildEditItem(
+    OverlayItem item, {
+    required bool editing,
+    required bool selected,
+  }) {
+    final button = (item as PtzOverlayButtonItem).button;
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.45),
+        border: Border.all(
+          color: selected ? const Color(0xFF2CA3E8) : const Color(0xFF4CC9FF),
+          width: selected ? 2.4 : 1.4,
         ),
-      for (final y in g.hy)
-        Positioned(
-          left: 0,
-          top: y,
-          width: w,
-          height: 1,
-          child: Container(color: color),
-        ),
-    ];
+        borderRadius: BorderRadius.circular(4),
+      ),
+      alignment: Alignment.center,
+      child: LayoutBuilder(
+        builder: (context, constraints) =>
+            _PtzGlyphOrLabel(button: button, boxHeight: constraints.maxHeight),
+      ),
+    );
+  }
+
+  // ─── View-mode visual + dispatch gestures ───────────────────────────────
+
+  Widget _buildViewItem(
+    OverlayItem item, {
+    required bool editing,
+    required bool selected,
+  }) {
+    final button = (item as PtzOverlayButtonItem).button;
+    return _PtzViewButton(controller: controller, button: button);
   }
 }
 
-class _PtzPanelButtonWidget extends StatelessWidget {
-  const _PtzPanelButtonWidget({
-    super.key,
-    required this.controller,
-    required this.button,
-    required this.paneW,
-    required this.paneH,
-    required this.editing,
-    required this.selected,
-  });
+/// One live (view-mode) panel button: press-and-hold direction/zoom, tap
+/// home/preset/imaging — the same dispatch table as the old renderer, now with
+/// hover-highlight + pressed/active feedback so steering has a clear response
+/// (#14).
+class _PtzViewButton extends StatefulWidget {
+  const _PtzViewButton({required this.controller, required this.button});
 
   final PtzPanelController controller;
   final PtzPanelButton button;
-  final double paneW;
-  final double paneH;
-  final bool editing;
-  final bool selected;
-
-  static const double _delHandle = 16;
-  static const double _resizeHandle = 16;
 
   @override
-  Widget build(BuildContext context) {
-    final (x, y, w, h) = PtzPanelGeometry.rectFor(button, paneW, paneH);
-    return Positioned(
-      left: x,
-      top: y,
-      width: w,
-      height: h,
-      child: editing ? _editBody(context, w, h) : _viewBody(context, w, h),
-    );
-  }
+  State<_PtzViewButton> createState() => _PtzViewButtonState();
+}
 
-  // ─── Edit-mode: draggable body + delete/resize handles ─────────────────
+class _PtzViewButtonState extends State<_PtzViewButton> {
+  bool _hovered = false;
+  bool _pressed = false;
 
-  Widget _editBody(BuildContext context, double w, double h) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => controller.selectButton(button.id),
-      onPanStart: (_) => controller.selectButton(button.id),
-      onPanUpdate: (d) => controller.moveButtonByDelta(
-        button.id,
-        paneW,
-        paneH,
-        d.delta.dx,
-        d.delta.dy,
-      ),
-      onPanEnd: (_) => controller.commitDrag(),
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          Container(
-            width: w,
-            height: h,
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.45),
-              border: Border.all(
-                color: selected
-                    ? const Color(0xFF2CA3E8)
-                    : const Color(0xFF4CC9FF),
-                width: selected ? 2.4 : 1.4,
-              ),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            alignment: Alignment.center,
-            child: _glyphOrLabel(w, h),
-          ),
-          // Delete (x) handle, top-right, always live in edit mode.
-          Positioned(
-            right: 0,
-            top: 0,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => controller.deleteButton(button.id),
-              child: Container(
-                width: _delHandle,
-                height: _delHandle,
-                decoration: const BoxDecoration(
-                  color: Color(0xCC2030D0),
-                ),
-                alignment: Alignment.center,
-                child: const Text(
-                  '×',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    height: 1,
-                  ),
-                ),
-              ),
-            ),
-          ),
-          // Resize handle, bottom-right, only when selected.
-          if (selected)
-            Positioned(
-              right: 0,
-              bottom: 0,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onPanUpdate: (d) => controller.resizeButtonByDelta(
-                  button.id,
-                  paneW,
-                  paneH,
-                  d.delta.dx,
-                  d.delta.dy,
-                ),
-                onPanEnd: (_) => controller.commitDrag(),
-                child: Container(
-                  width: _resizeHandle,
-                  height: _resizeHandle,
-                  decoration: const BoxDecoration(
-                    color: Color(0xE62CA3E8),
-                  ),
-                  child: const Icon(
-                    Icons.south_east,
-                    size: 12,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
+  /// Per-cell hover/press state for the d-pad kind (its nine cells are their
+  /// own hit targets).
+  int? _hoverCell;
+  int? _pressedCell;
 
-  // ─── View mode: press-and-hold direction/zoom, tap home/preset/imaging ──
-
-  Widget _viewBody(BuildContext context, double w, double h) {
-    if (button.kind == PtzButtonKind.dpad) return _dpad(w, h);
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: _isMomentary ? null : (_) => _dispatchDown(),
-      onTapUp: _isMomentary ? null : (_) => controller.stopContinuous(),
-      onTapCancel: _isMomentary ? null : () => controller.stopContinuous(),
-      onTap: _isMomentary ? _dispatchTap : null,
-      child: Container(
-        width: w,
-        height: h,
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.4),
-          borderRadius: BorderRadius.circular(4),
-        ),
-        alignment: Alignment.center,
-        child: _glyphOrLabel(w, h),
-      ),
-    );
-  }
+  PtzPanelController get controller => widget.controller;
+  PtzPanelButton get button => widget.button;
 
   bool get _isMomentary =>
       button.kind == PtzButtonKind.home ||
@@ -262,6 +140,66 @@ class _PtzPanelButtonWidget extends StatelessWidget {
       button.kind == PtzButtonKind.irisOpen ||
       button.kind == PtzButtonKind.irisClose ||
       button.kind == PtzButtonKind.irisAuto;
+
+  void _setPressed(bool v) {
+    if (_pressed != v && mounted) setState(() => _pressed = v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (button.kind == PtzButtonKind.dpad) {
+      return LayoutBuilder(
+        builder: (context, constraints) => _dpad(
+          constraints.maxWidth,
+          constraints.maxHeight,
+        ),
+      );
+    }
+    // Pressed = active blue tint; hover = lighter scrim; idle = the base
+    // black scrim (matches the badge/name-label visual language).
+    final bg = _pressed
+        ? const Color(0xFF2CA3E8).withValues(alpha: 0.55)
+        : Colors.black.withValues(alpha: _hovered ? 0.6 : 0.4);
+    final border = _pressed
+        ? const Color(0xFF4CC9FF)
+        : (_hovered ? Colors.white54 : Colors.transparent);
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: (_) {
+          _setPressed(true);
+          if (!_isMomentary) _dispatchDown();
+        },
+        onTapUp: (_) {
+          _setPressed(false);
+          if (!_isMomentary) controller.stopContinuous();
+        },
+        onTapCancel: () {
+          _setPressed(false);
+          if (!_isMomentary) controller.stopContinuous();
+        },
+        onTap: _isMomentary ? _dispatchTap : null,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 90),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: border, width: 1.2),
+          ),
+          alignment: Alignment.center,
+          child: LayoutBuilder(
+            builder: (context, constraints) => _PtzGlyphOrLabel(
+              button: button,
+              boxHeight: constraints.maxHeight,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   void _dispatchDown() {
     switch (button.kind) {
@@ -344,37 +282,75 @@ class _PtzPanelButtonWidget extends StatelessWidget {
     if (row == 2 && col == 1) icon = Icons.keyboard_arrow_down;
     if (row == 1 && col == 0) icon = Icons.keyboard_arrow_left;
     if (row == 1 && col == 2) icon = Icons.keyboard_arrow_right;
+    final pressed = _pressedCell == i;
+    final hovered = _hoverCell == i;
     return Positioned(
       left: col * cw,
       top: row * ch,
       width: cw,
       height: ch,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTapDown: isCenter
-            ? null
-            : (_) => controller.moveContinuous(
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hoverCell = i),
+        onExit: (_) =>
+            setState(() => _hoverCell = _hoverCell == i ? null : _hoverCell),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (_) {
+            setState(() => _pressedCell = i);
+            if (!isCenter) {
+              controller.moveContinuous(
                 pan: (vec?.$1 ?? 0) * 0.6,
                 tilt: (vec?.$2 ?? 0) * 0.6,
-              ),
-        onTapUp: isCenter ? null : (_) => controller.stopContinuous(),
-        onTapCancel: isCenter ? null : () => controller.stopContinuous(),
-        onTap: isCenter ? () => controller.home() : null,
-        child: Center(
-          child: icon != null
-              ? Icon(icon, color: Colors.white70, size: 16)
-              : isCenter
-              ? const Icon(Icons.home, color: Colors.white70, size: 16)
-              : const Text(
-                  '•',
-                  style: TextStyle(color: Colors.white38, fontSize: 12),
-                ),
+              );
+            }
+          },
+          onTapUp: (_) {
+            setState(() => _pressedCell = null);
+            if (!isCenter) controller.stopContinuous();
+          },
+          onTapCancel: () {
+            setState(() => _pressedCell = null);
+            if (!isCenter) controller.stopContinuous();
+          },
+          onTap: isCenter ? () => controller.home() : null,
+          child: Container(
+            decoration: BoxDecoration(
+              color: pressed
+                  ? const Color(0xFF2CA3E8).withValues(alpha: 0.5)
+                  : (hovered
+                      ? Colors.white.withValues(alpha: 0.12)
+                      : Colors.transparent),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Center(
+              child: icon != null
+                  ? Icon(icon, color: Colors.white70, size: 16)
+                  : isCenter
+                  ? const Icon(Icons.home, color: Colors.white70, size: 16)
+                  : const Text(
+                      '•',
+                      style: TextStyle(color: Colors.white38, fontSize: 12),
+                    ),
+            ),
+          ),
         ),
       ),
     );
   }
+}
 
-  Widget _glyphOrLabel(double w, double h) {
+/// A button's glyph (arrow kinds) or text label, sized against the button's
+/// rendered height — shared by the edit and view visuals so the two modes
+/// read identically.
+class _PtzGlyphOrLabel extends StatelessWidget {
+  const _PtzGlyphOrLabel({required this.button, required this.boxHeight});
+
+  final PtzPanelButton button;
+  final double boxHeight;
+
+  @override
+  Widget build(BuildContext context) {
     final spec = kPtzPanelKinds[button.kind];
     if (spec?.arrow != null) {
       final icon = switch (spec!.arrow) {
@@ -387,12 +363,12 @@ class _PtzPanelButtonWidget extends StatelessWidget {
       return Icon(
         icon,
         color: Colors.white,
-        size: (h * 0.6).clamp(10, 24).toDouble(),
+        size: (boxHeight * 0.6).clamp(10, 24).toDouble(),
       );
     }
     final label = button.displayLabel();
     if (label.isEmpty) return const SizedBox.shrink();
-    final fs = (h * 0.42).clamp(9, 16).toDouble();
+    final fs = (boxHeight * 0.42).clamp(9, 16).toDouble();
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 3),
       child: Text(

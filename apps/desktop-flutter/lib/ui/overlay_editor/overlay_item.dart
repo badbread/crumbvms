@@ -1,11 +1,10 @@
 // Shared "thing placed on a video pane" abstraction used by the generic
 // drag-to-place overlay editor (`overlay_editor_controller.dart` /
-// `overlay_editor_layer.dart`, issue #170 §3.3). One concrete implementation
-// exists today: HA on-video badges (`ha_overlay/ha_overlay_controller.dart`'s
-// `HaOverlayBadgeItem`, video-frame-anchored). A PTZ custom-panel-button
-// adapter (`PtzPanelButton` implementing this) is a later follow-up per the
-// desktop P0 plan §3.3/§5 P1 — NOT part of this change; `PtzPanelButton`
-// (`api/ptz_panel_models.dart`) keeps its own pane-fraction geometry for now.
+// `overlay_editor_layer.dart`, issue #170 §3.3). Two concrete implementations
+// exist: HA on-video badges (`ha_overlay/ha_overlay_controller.dart`'s
+// `HaOverlayBadgeItem`, video-frame-anchored) and custom PTZ panel buttons
+// (`ptz/ptz_panel_controller.dart`'s `PtzOverlayButtonItem`, pane-anchored —
+// the P1 port that retired the PTZ builder's private drag/snap code).
 
 /// What an item's normalized x/y is a fraction OF.
 enum OverlayAnchor {
@@ -55,4 +54,28 @@ abstract class OverlayItem {
   /// via the editor bar's size stepper, which calls [setBaseSize] directly —
   /// this flag ONLY gates the drag handle, not resizability in general.
   bool get resizable;
+
+  /// Group membership: items sharing a non-null group id select, move and
+  /// resize as one unit in the editor (`OverlayEditorController`'s selection
+  /// expands to whole groups). `null` = ungrouped. Persistence is up to the
+  /// host: PTZ buttons persist it in their JSON (`PtzPanelButton.group`); HA
+  /// badges keep it session-only (the placement PUT has no group field —
+  /// grouping badges is a layout-time convenience).
+  String? get groupId;
+  set groupId(String? v);
+
+  /// Rendered opacity (0.05..1.0, 1 = fully opaque), applied to the item's
+  /// visual in both edit and view mode. Persistence is host-owned: PTZ
+  /// buttons store it in their JSON (`PtzPanelButton.opacity`), HA badges in
+  /// the `overlay_opacity` placement column (migration 0060).
+  double get opacity;
+  set opacity(double v);
+
+  /// Opaque snapshot of this item's mutable editor state (position, size,
+  /// group, opacity, and any host-specific style) for the controller's
+  /// undo/redo stack. Round-trips through [restoreState]; the controller
+  /// never inspects it, so implementations pick any convenient shape (a
+  /// record, a small holder class, …).
+  Object captureState();
+  void restoreState(Object state);
 }

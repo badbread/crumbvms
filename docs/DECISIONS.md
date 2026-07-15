@@ -8,6 +8,67 @@ revisit.
 
 ---
 
+## 2026-07-15, One shared drag-to-place overlay editor (PTZ panels + HA badges) with raw-tracked snapping; per-badge HA style stored on camera_ha_links (migration 0059)
+
+The desktop client had two drag-to-place editors: the shared
+`apps/desktop-flutter/lib/ui/overlay_editor/` (used only by HA badges) and
+the PTZ panel builder's own older copy in `lib/ui/ptz/`. Both had the same
+unusable UX: aggressive snapping that trapped drags/resizes, and per-pointer-
+move `notifyListeners()` rebuilding the whole layer + editor bar + palette
+(the stutter).
+
+**Chosen:**
+
+- **One editor.** The PTZ builder was ported onto the shared
+  `overlay_editor/` (a `PtzOverlayButtonItem` adapter over `PtzPanelButton`;
+  view-mode ONVIF dispatch and button visuals stay PTZ-local in
+  `ptz_panel_overlay.dart`/`ptz_panel_palette.dart`). The PTZ builder's
+  private drag/snap/bar code was deleted (`ptz_panel_editor_bar.dart`, plus
+  the never-wired `ptz_custom_panel.dart`/`ptz_interaction_overlay.dart`).
+- **Raw-tracked snapping.** The root cause of "snaps like crazy": the old
+  code applied the snap delta to the already-snapped position every tick, so
+  a snapped item could only escape if one pointer event out-ran the radius.
+  The editor now accumulates the UNSNAPPED gesture position and snaps that —
+  standard editor feel; escape is just moving past the radius. Plus: radius
+  7→6px, resize snaps to edges only (never centers), hold-Alt bypasses
+  snapping per gesture, and a Snap on/off toggle lives in the bar.
+- **Split notifications.** The controller notifies structure changes
+  (selection/add/remove/mode) normally, but drag ticks fire only a
+  lightweight `geometry` ticker that just re-positions each item's
+  `Positioned` (visual subtrees are prebuilt and wrapped in
+  `RepaintBoundary`).
+- **Selection tooling** shared by both hosts: multi-select
+  (click/Shift-Ctrl-toggle/marquee), align/distribute, match-width/height/
+  size to the last-clicked item, an explicit numeric size field, and
+  group/ungroup (`OverlayItem.groupId` — persisted in PTZ button JSON;
+  session-only for HA badges, whose placement PUT has no group field).
+- **Per-badge HA style on `camera_ha_links`** (migration 0059, mirroring
+  0058's placement columns): `overlay_color` ('#RRGGBB'), `overlay_icon`
+  (curated slug), `overlay_show_state`/`overlay_show_age` (pin the live
+  state text / relative age next to the badge). Written by the existing
+  placement PUT (admin), carried over by `replace_camera_ha_links`, reset
+  when a placement is cleared. The link-level `label` can also be edited via
+  the placement PUT with the `PUT /config/ha` token convention (omitted =
+  unchanged, "" = clear). Badge captions/hover/tap-card are all anchored to
+  the badge's placed position (the old tile-corner card collided with the
+  camera-name label and back button).
+
+**Rejected:**
+
+| Option | Why not |
+|---|---|
+| Fix the PTZ editor in place and keep two editors | Two copies of drag/snap/selection logic to maintain and the HA editor had the same defects; the shared editor was always the plan (issue #170 §3.3 P1). |
+| Snap hysteresis (larger escape threshold once snapped) | Treats the symptom; raw-position tracking is how every layout tool behaves and needs no second tunable. |
+| A separate `ha_badge_style` table | Same wipe/join issues that rejected a separate placements table in 0058; the style is 1:1 with the placement. |
+| Storing HA badge groups server-side | Needs a schema field for a purely layout-time convenience; revisit if operators ask for persistent badge groups. |
+
+**Revisit triggers:** operators asking for roaming (server-side) PTZ panels
+(would reuse the placement plumbing precedent); persistent HA badge groups;
+a second client (Android/web) porting the overlay editor (the
+geometry/controller layer is Flutter-foundation-only by design).
+
+---
+
 ## 2026-07-14, Live plate crop boxes: normalize Frigate's pixel-corner MQTT boxes with detect dims fetched from /api/config (issue #157)
 
 Frigate 0.18 sends the `license_plate` attribute box in **two different

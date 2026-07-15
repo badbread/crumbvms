@@ -1,23 +1,55 @@
-// Generic drag-to-place overlay editor: selection, drag/resize with
-// alignment-snap guides, and an explicit SYNCHRONOUS edit lifecycle. Lifted
-// from `ptz/ptz_panel_controller.dart` (`ptzSnapLines`/`ptzSnapAxis`,
-// `ptzPanelMoveButton`/`ptzPanelResizeButton` in the old client's app.js) and
-// repaired per the desktop P0 plan (issue #170 §3.2/§3.3): the PTZ
-// controller's `beginEdit`/`endEdit` `await` storage calls BEFORE their only
-// `notifyListeners()`, which produces an interleave-clobber race between two
-// back-to-back edit sessions (D3) and a UI-lag-behind-the-click window (D5).
+// Generic drag-to-place overlay editor: multi-selection (click / modifier
+// toggle / marquee / groups), drag + resize with a LIGHT alignment-snap
+// assist, align/distribute/match-size tooling, and an explicit SYNCHRONOUS
+// edit lifecycle. Serves both hosts: HA on-video badges
+// (`ha_overlay/ha_overlay_controller.dart`) and custom PTZ panels
+// (`ptz/ptz_panel_controller.dart`).
 //
-// This controller never touches storage: `beginEdit` takes an
-// ALREADY-LOADED item list and fires `notifyListeners()` synchronously;
-// `endEdit` returns the final items synchronously so the HOST persists.
-// Hosts own storage entirely — a client-local store for PTZ panels (future
-// adapter), a server PUT for HA badge placements
-// (`ha_overlay/ha_overlay_controller.dart`).
+// ── Notification model (the anti-stutter contract) ─────────────────────────
+// This controller is itself a `ChangeNotifier` for STRUCTURAL changes only:
+// edit begin/end, selection, add/remove/reorder, align/resize ops, snap
+// toggle, drag END. Per-pointer-move drag/resize ticks fire ONLY the
+// lightweight [geometry] ticker — `OverlayEditorLayer` subscribes each item's
+// `Positioned` (and the snap-guide lines) to [geometry], so a drag relayouts
+// a handful of positioned boxes per frame instead of rebuilding the whole
+// layer + editor bar + palette (the old per-tick `notifyListeners()` did
+// exactly that and was the stutter). Hosts/bars listen to the controller
+// itself and never see drag ticks.
 //
-// One [OverlayEditorController] is owned by whatever host adapts a specific
-// overlay kind. The host drives [OverlayEditorLayer] (rendering/gestures,
-// `overlay_editor_layer.dart`) and [OverlayEditorBar] (palette/props chrome,
-// `overlay_editor_bar.dart`).
+// ── Snapping (the "snaps like crazy" fix) ──────────────────────────────────
+// The old implementation applied the snap delta to the item's CURRENT
+// (already snapped) position on every tick, so once an item snapped it could
+// only escape if a single pointer event moved farther than the snap radius —
+// the item felt glued and resizing fought the guides. This version tracks the
+// UNSNAPPED ("raw") position across the whole gesture and snaps that, so the
+// item follows the pointer and simply lets go the moment the raw position
+// leaves the radius. Additionally: the radius is smaller ([kOverlaySnapPx]),
+// resize snaps only to real edges (never centers), holding Alt suppresses
+// snapping for the duration of the gesture (the layer passes `snap: false`),
+// and [snapEnabled] is an editor-bar toggle.
+//
+// ── Undo / redo ─────────────────────────────────────────────────────────────
+// A bounded history of item-state snapshots (via `OverlayItem.captureState`).
+// Discrete ops (align/distribute/match/resize/group/delete/z-order/opacity)
+// push an undo entry themselves; a drag/resize gesture pushes ONE entry the
+// first time it actually moves; host-side style edits (HA color/icon/pins,
+// PTZ rename) call [pushUndo] before mutating. `undo`/`redo` restore the
+// snapshot and tick geometry so the change paints immediately.
+//
+// ── Applying non-drag geometry changes (the "align doesn't move" fix) ────────
+// Selection ops mutate item x/y/size and call [notifyListeners], but the
+// per-item `Positioned` wrappers are driven by [geometry] (the smoothness
+// split), so a structure notify alone doesn't reposition them until the next
+// drag tick. Those ops therefore use [_notifyGeometry] (notify + `geometry`
+// tick) so the move paints this frame.
+//
+// ── Lifecycle ──────────────────────────────────────────────────────────────
+// `beginEdit` takes an ALREADY-LOADED item list and fires notifications
+// synchronously; `endEdit` returns the final items synchronously so the HOST
+// persists. The controller never touches storage (fixes the PTZ builder's
+// D3/D4/D5 races by construction — see the desktop P0 plan §3.2).
+
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
@@ -32,26 +64,131 @@ class OverlaySnapGuides {
   static const none = OverlaySnapGuides();
 }
 
-/// Snap threshold in logical px (`PTZ_SNAP_PX` in the old client /
-/// `kPtzSnapPx`).
-const double kOverlaySnapPx = 7;
+/// Snap radius in logical px. Deliberately smaller than the old PTZ editor's
+/// 7px — combined with raw-position tracking (see the file doc) snapping is a
+/// light assist, not a trap.
+const double kOverlaySnapPx = 6;
+
+/// Align operations for [OverlayEditorController.alignSelected]. Targets are
+/// the selection's bounding box (the convention of every layout tool).
+enum OverlayAlign { left, hCenter, right, top, vCenter, bottom }
+
+/// Lightweight notifier for per-pointer-move geometry ticks — see the file
+/// doc's notification model. Only positioned wrappers/guides subscribe.
+class OverlayGeometryTicker extends ChangeNotifier {
+  void tick() => notifyListeners();
+}
+
+/// Raw-tracked state for an in-flight move gesture (possibly multi-item).
+class _MoveDrag {
+  _MoveDrag({
+    required this.origins,
+    required this.startLeft,
+    required this.startTop,
+    required this.width,
+    required this.height,
+    required this.lines,
+  })  : rawLeft = startLeft,
+        rawTop = startTop;
+
+  /// Each moving item's rendered top-left (px) at gesture start.
+  final Map<String, ({double x, double y})> origins;
+
+  /// Moving-set bounding box at gesture start.
+  final double startLeft;
+  final double startTop;
+  final double width;
+  final double height;
+
+  /// UNSNAPPED accumulated bbox position — the pointer's truth.
+  double rawLeft;
+  double rawTop;
+
+  /// Snap candidates from the NON-moving items + the anchor field, computed
+  /// once at gesture start (they cannot change mid-drag).
+  final OverlaySnapGuides lines;
+}
+
+/// Raw-tracked state for an in-flight resize gesture (single item).
+class _ResizeDrag {
+  _ResizeDrag({
+    required this.id,
+    required this.left,
+    required this.top,
+    required double w,
+    required double h,
+    required this.lines,
+  })  : rawW = w,
+        rawH = h;
+
+  final String id;
+  final double left;
+  final double top;
+  double rawW;
+  double rawH;
+  final OverlaySnapGuides lines;
+}
+
+/// One undo/redo history entry: the item list (order) plus each item's
+/// `captureState` memento and the selection at snapshot time.
+class _History {
+  _History(this.items, this.mementos, this.selected, this.primary);
+  final List<OverlayItem> items;
+  final Map<String, Object> mementos;
+  final Set<String> selected;
+  final String? primary;
+}
 
 class OverlayEditorController extends ChangeNotifier {
   bool editMode = false;
-  String? selectedId;
+
+  /// Editor-bar snap toggle. Off ⇒ no gesture ever snaps (Alt additionally
+  /// suppresses per-gesture while this is on).
+  bool snapEnabled = true;
+
   OverlaySnapGuides snapGuides = OverlaySnapGuides.none;
 
-  List<OverlayItem> _items = const [];
+  /// Per-drag-tick notifier — see the file doc's notification model.
+  final OverlayGeometryTicker geometry = OverlayGeometryTicker();
+
+  List<OverlayItem> _items = [];
   OverlayAnchor _anchor = OverlayAnchor.pane;
   int _editToken = 0;
 
+  final Set<String> _selected = {};
+  String? _primaryId;
+
+  _MoveDrag? _moveDrag;
+  _ResizeDrag? _resizeDrag;
+
+  /// Pending undo snapshot for an in-flight gesture — captured at gesture
+  /// start, committed to [_undo] on the first tick that actually moves, so a
+  /// click-without-drag never creates a no-op history entry.
+  _History? _pendingGestureUndo;
+
+  final List<_History> _undo = [];
+  final List<_History> _redo = [];
+  static const int _maxHistory = 60;
+
+  // Last-known pane metrics, reported by the layer on every build (plain
+  // field writes, no notification) so selection ops (align/distribute/match)
+  // and marquee hit-testing can do pixel math without the bar/host having to
+  // thread pane dimensions around.
+  double _paneW = 0;
+  double _paneH = 0;
+  int? _videoW;
+  int? _videoH;
+
+  /// Bottom occlusion (logical px) reserved for the editor toolbar, set by the
+  /// host pane. A drag can't push an item below this line so it never gets
+  /// lost under the bar (issue #13). Plain field — no notification.
+  double _editBottomInset = 0;
+
   /// Bumped on every `beginEdit`/`endEdit`. Hosts that kick off an async load
-  /// BEFORE calling `beginEdit` (the mandated "host-loads-first" order, see
-  /// `ha_overlay/ha_overlay_controller.dart`) should capture this beforehand
-  /// and compare it once the load resolves — if it changed, another edit
-  /// session started or ended in the meantime, and the late `beginEdit`
-  /// call must be skipped (a stale continuation would otherwise clobber
-  /// whatever the user is doing now).
+  /// BEFORE calling `beginEdit` (the mandated "host-loads-first" order)
+  /// should capture this beforehand and compare it once the load resolves —
+  /// if it changed, another edit session started or ended in the meantime and
+  /// the late `beginEdit` must be skipped.
   int get editToken => _editToken;
 
   /// Live item list for the current edit session (empty outside edit mode —
@@ -60,14 +197,110 @@ class OverlayEditorController extends ChangeNotifier {
 
   OverlayAnchor get anchor => _anchor;
 
+  /// Current selection (item ids). Do not mutate — use the select methods.
+  Set<String> get selectedIds => _selected;
+
+  /// The reference item for match-size ops: the last explicitly
+  /// clicked/grabbed item of the selection.
+  String? get primarySelectedId => _primaryId;
+
+  /// The primary selected item (bar props target), or null.
   OverlayItem? get selected {
-    final id = selectedId;
+    final id = _primaryId;
     if (id == null) return null;
-    for (final i in _items) {
-      if (i.id == id) return i;
-    }
-    return null;
+    return _find(id);
   }
+
+  bool isSelected(String id) => _selected.contains(id);
+
+  /// True when any selected item belongs to a group.
+  bool get selectionGrouped =>
+      _selectedItems().any((i) => i.groupId != null);
+
+  /// Called by [OverlayEditorLayer] on every build with its current pane (and
+  /// decoded-video) dimensions. Plain field writes — no notification (this
+  /// runs during build).
+  void updatePaneMetrics(double paneW, double paneH, {int? videoW, int? videoH}) {
+    _paneW = paneW;
+    _paneH = paneH;
+    _videoW = videoW;
+    _videoH = videoH;
+  }
+
+  /// Reserve `px` of bottom occlusion for the editor toolbar so a drag can't
+  /// drop an item under it (issue #13). Plain field write — set by the host
+  /// pane when it lays out a bottom bar; 0 when the chrome is a side panel.
+  void setEditBottomInset(double px) => _editBottomInset = px;
+
+  /// Notify the bar/host (structure) AND tick geometry so a non-drag position
+  /// change (align/distribute/match/opacity/undo) repaints the per-item
+  /// wrappers this frame — see the file doc.
+  void _notifyGeometry() {
+    notifyListeners();
+    geometry.tick();
+  }
+
+  // ─── Undo / redo ────────────────────────────────────────────────────────
+
+  bool get canUndo => _undo.isNotEmpty;
+  bool get canRedo => _redo.isNotEmpty;
+
+  _History _snapshot() => _History(
+        List.of(_items),
+        {for (final i in _items) i.id: i.captureState()},
+        Set.of(_selected),
+        _primaryId,
+      );
+
+  /// Push the current state onto the undo stack (clearing redo). Discrete ops
+  /// call this internally after their guards; hosts call it before a host-side
+  /// style mutation; interactive controls (opacity slider) call it once at
+  /// gesture start.
+  void pushUndo() {
+    _undo.add(_snapshot());
+    if (_undo.length > _maxHistory) _undo.removeAt(0);
+    _redo.clear();
+  }
+
+  void _commitGestureUndo() {
+    final s = _pendingGestureUndo;
+    if (s == null) return;
+    _pendingGestureUndo = null;
+    _undo.add(s);
+    if (_undo.length > _maxHistory) _undo.removeAt(0);
+    _redo.clear();
+  }
+
+  void undo() {
+    if (_undo.isEmpty) return;
+    _redo.add(_snapshot());
+    _restore(_undo.removeLast());
+  }
+
+  void redo() {
+    if (_redo.isEmpty) return;
+    _undo.add(_snapshot());
+    _restore(_redo.removeLast());
+  }
+
+  void _restore(_History h) {
+    _items = List.of(h.items);
+    for (final i in _items) {
+      final m = h.mementos[i.id];
+      if (m != null) i.restoreState(m);
+    }
+    final live = {for (final i in _items) i.id};
+    _selected
+      ..clear()
+      ..addAll(h.selected.where(live.contains));
+    _primaryId = (h.primary != null && _selected.contains(h.primary))
+        ? h.primary
+        : (_selected.isEmpty ? null : _selected.first);
+    snapGuides = OverlaySnapGuides.none;
+    _notifyGeometry();
+  }
+
+  // ─── Edit lifecycle ─────────────────────────────────────────────────────
 
   /// Begin an edit session with `items` the host has ALREADY loaded (and
   /// `anchor`, since an empty item list still needs a coordinate space for
@@ -78,7 +311,13 @@ class OverlayEditorController extends ChangeNotifier {
     editMode = true;
     _items = List.of(items);
     _anchor = anchor;
-    selectedId = null;
+    _selected.clear();
+    _primaryId = null;
+    _moveDrag = null;
+    _resizeDrag = null;
+    _pendingGestureUndo = null;
+    _undo.clear();
+    _redo.clear();
     snapGuides = OverlaySnapGuides.none;
     notifyListeners();
   }
@@ -89,53 +328,498 @@ class OverlayEditorController extends ChangeNotifier {
     _editToken++;
     final result = _items;
     editMode = false;
-    _items = const [];
-    selectedId = null;
+    _items = [];
+    _selected.clear();
+    _primaryId = null;
+    _moveDrag = null;
+    _resizeDrag = null;
+    _pendingGestureUndo = null;
+    _undo.clear();
+    _redo.clear();
     snapGuides = OverlaySnapGuides.none;
     notifyListeners();
     return result;
   }
 
+  // ─── Selection ──────────────────────────────────────────────────────────
+
+  /// Select exactly `id` (expanded to its whole group), or clear with null.
   void selectItem(String? id) {
-    if (selectedId == id) return;
-    selectedId = id;
+    if (id == null) {
+      clearSelection();
+      return;
+    }
+    final expanded = _expandGroups({id});
+    if (setEquals(_selected, expanded) && _primaryId == id) return;
+    _selected
+      ..clear()
+      ..addAll(expanded);
+    _primaryId = id;
     notifyListeners();
   }
+
+  /// Shift/Ctrl-click: toggle `id` (and its group) in/out of the selection.
+  void toggleSelect(String id) {
+    final expanded = _expandGroups({id});
+    if (_selected.containsAll(expanded)) {
+      _selected.removeAll(expanded);
+      if (expanded.contains(_primaryId)) {
+        _primaryId = _selected.isEmpty ? null : _selected.first;
+      }
+    } else {
+      _selected.addAll(expanded);
+      _primaryId = id;
+    }
+    notifyListeners();
+  }
+
+  void clearSelection() {
+    if (_selected.isEmpty && _primaryId == null) return;
+    _selected.clear();
+    _primaryId = null;
+    notifyListeners();
+  }
+
+  /// Replace the selection wholesale (marquee). Group-expanded; no-op when
+  /// the expanded set already equals the current selection.
+  void setSelection(Set<String> ids) {
+    final expanded = _expandGroups(ids);
+    if (setEquals(_selected, expanded)) return;
+    _selected
+      ..clear()
+      ..addAll(expanded);
+    if (_primaryId == null || !_selected.contains(_primaryId)) {
+      _primaryId = _selected.isEmpty ? null : _selected.first;
+    }
+    notifyListeners();
+  }
+
+  /// Marquee box-select: replaces the selection with every item whose
+  /// rendered rect intersects the (pane-px) rect.
+  void marqueeSelect(double left, double top, double right, double bottom) {
+    final hits = <String>{};
+    for (final i in _items) {
+      final (x, y, w, h) = _rect(i);
+      if (x < right && x + w > left && y < bottom && y + h > top) {
+        hits.add(i.id);
+      }
+    }
+    setSelection(hits);
+  }
+
+  Set<String> _expandGroups(Set<String> ids) {
+    final gids = <String>{};
+    for (final i in _items) {
+      if (ids.contains(i.id) && i.groupId != null) gids.add(i.groupId!);
+    }
+    if (gids.isEmpty) return {...ids};
+    return {
+      ...ids,
+      for (final i in _items)
+        if (i.groupId != null && gids.contains(i.groupId)) i.id,
+    };
+  }
+
+  List<OverlayItem> _selectedItems() =>
+      [for (final i in _items) if (_selected.contains(i.id)) i];
+
+  // ─── Items ──────────────────────────────────────────────────────────────
 
   /// Add a new item to the session (e.g. a palette pick) and select it. Pure
   /// in-memory — the host persists on `endEdit`.
   void addItem(OverlayItem item) {
-    _items = [..._items, item];
-    selectedId = item.id;
+    pushUndo();
+    _items.add(item);
+    _selected
+      ..clear()
+      ..add(item.id);
+    _primaryId = item.id;
     notifyListeners();
   }
 
-  /// Remove an item from the session (the on-canvas delete handle, or the
-  /// selected-item bar's Delete button). Pure in-memory.
+  /// Remove an item from the session (the on-canvas delete handle). Pure
+  /// in-memory.
   void removeItem(String id) {
-    _items = _items.where((i) => i.id != id).toList(growable: false);
-    if (selectedId == id) selectedId = null;
+    if (_find(id) == null) return;
+    pushUndo();
+    _items.removeWhere((i) => i.id == id);
+    _selected.remove(id);
+    if (_primaryId == id) {
+      _primaryId = _selected.isEmpty ? null : _selected.first;
+    }
+    notifyListeners();
+  }
+
+  /// Remove every selected item (the bar's Delete with a multi-selection).
+  void removeSelected() {
+    if (_selected.isEmpty) return;
+    pushUndo();
+    _items.removeWhere((i) => _selected.contains(i.id));
+    _selected.clear();
+    _primaryId = null;
     notifyListeners();
   }
 
   void clearAll() {
-    _items = const [];
-    selectedId = null;
+    if (_items.isEmpty) return;
+    pushUndo();
+    _items = [];
+    _selected.clear();
+    _primaryId = null;
     notifyListeners();
   }
 
-  /// Nudge the selected item's size by `factor` (editor bar +/- stepper —
-  /// `ptzPanelResizeSelected` in the old client). Works for every item,
-  /// drag-resizable or not (HA badges use this exclusively).
+  /// Structure re-notify for HOST-side mutations of item content (e.g. a PTZ
+  /// button rename, an HA badge recolor) so the layer/bar repaint without the
+  /// host reaching into private state.
+  void notifyItemsChanged() => notifyListeners();
+
+  /// Z-order: last item renders (and hit-tests) on top.
+  void bringToFront(String id) {
+    final i = _items.indexWhere((b) => b.id == id);
+    if (i < 0 || i == _items.length - 1) return;
+    pushUndo();
+    _items.add(_items.removeAt(i));
+    notifyListeners();
+  }
+
+  void sendToBack(String id) {
+    final i = _items.indexWhere((b) => b.id == id);
+    if (i <= 0) return;
+    pushUndo();
+    _items.insert(0, _items.removeAt(i));
+    notifyListeners();
+  }
+
+  void toggleSnap() {
+    snapEnabled = !snapEnabled;
+    notifyListeners();
+  }
+
+  // ─── Size ops ───────────────────────────────────────────────────────────
+
+  /// Nudge the selection's size by `factor` (editor bar +/- stepper). With
+  /// 2+ items selected this scales the whole cluster — sizes AND positions
+  /// relative to the selection's bounding-box top-left — so a grouped d-pad
+  /// + buttons layout grows as one unit instead of drifting apart.
   void resizeSelected(double factor) {
-    final item = selected;
-    if (item == null) return;
-    final (bw, bh) = item.baseSize();
-    item.setBaseSize(bw * factor, bh * factor);
+    final sel = _selectedItems();
+    if (sel.isEmpty) return;
+    pushUndo();
+    if (sel.length == 1 || _paneW <= 0 || _paneH <= 0) {
+      for (final item in sel) {
+        final (bw, bh) = item.baseSize();
+        item.setBaseSize(bw * factor, bh * factor);
+      }
+      _notifyGeometry();
+      return;
+    }
+    var minX = double.infinity, minY = double.infinity;
+    for (final item in sel) {
+      final (x, y, _, _) = _rect(item);
+      minX = math.min(minX, x);
+      minY = math.min(minY, y);
+    }
+    for (final item in sel) {
+      final (x, y, _, _) = _rect(item);
+      final (bw, bh) = item.baseSize();
+      item.setBaseSize(bw * factor, bh * factor);
+      _setNormPos(item, minX + (x - minX) * factor, minY + (y - minY) * factor);
+    }
+    _notifyGeometry();
+  }
+
+  /// Explicit numeric size: set every selected item's base WIDTH to `w`
+  /// (height scaled to keep each item's aspect; item impls clamp/keep-square
+  /// as they see fit).
+  void setSelectedBaseWidth(double w) {
+    if (w <= 0 || !w.isFinite) return;
+    final sel = _selectedItems();
+    if (sel.isEmpty) return;
+    pushUndo();
+    for (final item in sel) {
+      final (bw, bh) = item.baseSize();
+      final k = bw <= 0 ? 1.0 : w / bw;
+      item.setBaseSize(w, bh * k);
+    }
+    _notifyGeometry();
+  }
+
+  /// Set every selected item's opacity (0.05..1.0). NOT self-undoing —
+  /// slider-driven: the bar calls [pushUndo] once on slider-drag start.
+  void setSelectedOpacity(double v) {
+    final sel = _selectedItems();
+    if (sel.isEmpty) return;
+    final o = v.clamp(0.05, 1.0).toDouble();
+    for (final item in sel) {
+      item.opacity = o;
+    }
+    _notifyGeometry();
+  }
+
+  /// Match every selected item's base size to the PRIMARY (last-clicked)
+  /// item's — width, height, or both.
+  void matchSelectedSize({required bool width, required bool height}) {
+    final ref = selected;
+    final sel = _selectedItems();
+    if (ref == null || sel.length < 2) return;
+    pushUndo();
+    final (rw, rh) = ref.baseSize();
+    for (final item in sel) {
+      if (identical(item, ref)) continue;
+      final (bw, bh) = item.baseSize();
+      item.setBaseSize(width ? rw : bw, height ? rh : bh);
+    }
+    _notifyGeometry();
+  }
+
+  // ─── Align / distribute ─────────────────────────────────────────────────
+
+  /// Align the selected items (2+) against the selection's bounding box.
+  void alignSelected(OverlayAlign a) {
+    final sel = _selectedItems();
+    if (sel.length < 2 || _paneW <= 0 || _paneH <= 0) return;
+    pushUndo();
+    var minX = double.infinity, minY = double.infinity;
+    var maxX = -double.infinity, maxY = -double.infinity;
+    for (final item in sel) {
+      final (x, y, w, h) = _rect(item);
+      minX = math.min(minX, x);
+      minY = math.min(minY, y);
+      maxX = math.max(maxX, x + w);
+      maxY = math.max(maxY, y + h);
+    }
+    for (final item in sel) {
+      final (x, y, w, h) = _rect(item);
+      var nx = x, ny = y;
+      switch (a) {
+        case OverlayAlign.left:
+          nx = minX;
+        case OverlayAlign.hCenter:
+          nx = (minX + maxX) / 2 - w / 2;
+        case OverlayAlign.right:
+          nx = maxX - w;
+        case OverlayAlign.top:
+          ny = minY;
+        case OverlayAlign.vCenter:
+          ny = (minY + maxY) / 2 - h / 2;
+        case OverlayAlign.bottom:
+          ny = maxY - h;
+      }
+      _setNormPos(item, nx, ny);
+    }
+    _notifyGeometry();
+  }
+
+  /// Distribute the selected items (3+) with equal gaps along one axis; the
+  /// outermost two stay put.
+  void distributeSelected({required bool horizontal}) {
+    final sel = _selectedItems();
+    if (sel.length < 3 || _paneW <= 0 || _paneH <= 0) return;
+    pushUndo();
+    final entries = [
+      for (final item in sel)
+        (item: item, rect: _rect(item)),
+    ]..sort((a, b) => horizontal
+        ? a.rect.$1.compareTo(b.rect.$1)
+        : a.rect.$2.compareTo(b.rect.$2));
+    double sizeOf((double, double, double, double) r) =>
+        horizontal ? r.$3 : r.$4;
+    double posOf((double, double, double, double) r) =>
+        horizontal ? r.$1 : r.$2;
+    final first = entries.first.rect;
+    final last = entries.last.rect;
+    final span = posOf(last) + sizeOf(last) - posOf(first);
+    var total = 0.0;
+    for (final e in entries) {
+      total += sizeOf(e.rect);
+    }
+    final gap = (span - total) / (entries.length - 1);
+    var cursor = posOf(first) + sizeOf(first) + gap;
+    for (var i = 1; i < entries.length - 1; i++) {
+      final e = entries[i];
+      final (x, y, _, _) = e.rect;
+      _setNormPos(
+        e.item,
+        horizontal ? cursor : x,
+        horizontal ? y : cursor,
+      );
+      cursor += sizeOf(e.rect) + gap;
+    }
+    _notifyGeometry();
+  }
+
+  // ─── Group / ungroup ────────────────────────────────────────────────────
+
+  void groupSelected() {
+    final sel = _selectedItems();
+    if (sel.length < 2) return;
+    pushUndo();
+    final gid = 'g${DateTime.now().microsecondsSinceEpoch}';
+    for (final item in sel) {
+      item.groupId = gid;
+    }
     notifyListeners();
   }
 
-  // ─── Drag / resize with snapping ────────────────────────────────────────
+  void ungroupSelected() {
+    final sel = _selectedItems();
+    if (!sel.any((i) => i.groupId != null)) return;
+    pushUndo();
+    for (final item in sel) {
+      item.groupId = null;
+    }
+    notifyListeners();
+  }
+
+  // ─── Drag (move) — raw-tracked, see the file doc ────────────────────────
+
+  /// Start a move gesture on `grabbedId`. If it isn't part of the selection
+  /// the selection collapses to it (group-expanded) first; dragging any
+  /// selected item moves the WHOLE selection.
+  void beginDrag(String grabbedId) {
+    if (!editMode || _paneW <= 0 || _paneH <= 0) return;
+    if (!_selected.contains(grabbedId)) {
+      selectItem(grabbedId);
+    } else if (_primaryId != grabbedId) {
+      _primaryId = grabbedId;
+      notifyListeners();
+    }
+    final moving = _selectedItems();
+    if (moving.isEmpty) return;
+    final origins = <String, ({double x, double y})>{};
+    var minX = double.infinity, minY = double.infinity;
+    var maxX = -double.infinity, maxY = -double.infinity;
+    for (final item in moving) {
+      final (x, y, w, h) = _rect(item);
+      origins[item.id] = (x: x, y: y);
+      minX = math.min(minX, x);
+      minY = math.min(minY, y);
+      maxX = math.max(maxX, x + w);
+      maxY = math.max(maxY, y + h);
+    }
+    _moveDrag = _MoveDrag(
+      origins: origins,
+      startLeft: minX,
+      startTop: minY,
+      width: maxX - minX,
+      height: maxY - minY,
+      lines: _snapLines(excludeIds: _selected, includeCenters: true),
+    );
+    _pendingGestureUndo = _snapshot();
+  }
+
+  /// Apply a pointer-movement delta to the in-flight move. `snap: false`
+  /// (Alt held) bypasses snapping for this tick; [snapEnabled] gates it
+  /// globally. Fires only [geometry] — see the notification model.
+  void updateDrag(double dx, double dy, {required bool snap}) {
+    final d = _moveDrag;
+    if (d == null) return;
+    if (dx != 0 || dy != 0) _commitGestureUndo();
+    d.rawLeft += dx;
+    d.rawTop += dy;
+    final (fx, fy, fw, fh) = _field();
+    // Clamp the whole moving bbox inside the anchor field so a multi-drag
+    // keeps its shape at the edges instead of squashing item-by-item, and
+    // never below the editor toolbar (issue #13).
+    final maxLeft = math.max(fx, fx + fw - d.width);
+    final maxTop = math.max(
+      fy,
+      math.min(fy + fh - d.height, _paneH - _editBottomInset - d.height),
+    );
+    var left = d.rawLeft.clamp(fx, maxLeft).toDouble();
+    var top = d.rawTop.clamp(fy, maxTop).toDouble();
+    double? gx, gy;
+    if (snap && snapEnabled) {
+      final sx =
+          _snapAxis([left, left + d.width / 2, left + d.width], d.lines.vx);
+      final sy =
+          _snapAxis([top, top + d.height / 2, top + d.height], d.lines.hy);
+      left += sx.$1;
+      top += sy.$1;
+      gx = sx.$2;
+      gy = sy.$2;
+    }
+    snapGuides = OverlaySnapGuides(
+      vx: gx != null ? [gx] : const [],
+      hy: gy != null ? [gy] : const [],
+    );
+    final offX = left - d.startLeft;
+    final offY = top - d.startTop;
+    for (final item in _items) {
+      final o = d.origins[item.id];
+      if (o == null) continue;
+      _setNormPos(item, o.x + offX, o.y + offY);
+    }
+    geometry.tick();
+  }
+
+  /// End of a move gesture: clear guides, structure-notify once (syncs the
+  /// bar's numeric fields). No persistence — the host persists at `endEdit`.
+  void endDrag() {
+    _moveDrag = null;
+    _pendingGestureUndo = null; // discard if the gesture never moved
+    snapGuides = OverlaySnapGuides.none;
+    notifyListeners();
+  }
+
+  // ─── Drag (resize handle, single item) ──────────────────────────────────
+
+  void beginResizeDrag(String id) {
+    if (!editMode || _paneW <= 0 || _paneH <= 0) return;
+    final item = _find(id);
+    if (item == null || !item.resizable) return;
+    if (!_selected.contains(id)) selectItem(id);
+    final (x, y, w, h) = _rect(item);
+    _resizeDrag = _ResizeDrag(
+      id: id,
+      left: x,
+      top: y,
+      w: w,
+      h: h,
+      // Resize snaps to real EDGES only — an item's center is not a
+      // meaningful size target and made the old editor feel trapped.
+      lines: _snapLines(excludeIds: {id}, includeCenters: false),
+    );
+    _pendingGestureUndo = _snapshot();
+  }
+
+  void updateResizeDrag(double dx, double dy, {required bool snap}) {
+    final d = _resizeDrag;
+    if (d == null) return;
+    final item = _find(d.id);
+    if (item == null) return;
+    if (dx != 0 || dy != 0) _commitGestureUndo();
+    d.rawW += dx;
+    d.rawH += dy;
+    var nw = math.max(d.rawW, OverlayGeometry.minRenderedPx);
+    var nh = math.max(d.rawH, OverlayGeometry.minRenderedPx);
+    double? gx, gy;
+    if (snap && snapEnabled) {
+      final sx = _snapAxis([d.left + nw], d.lines.vx);
+      final sy = _snapAxis([d.top + nh], d.lines.hy);
+      nw += sx.$1;
+      nh += sy.$1;
+      gx = sx.$2;
+      gy = sy.$2;
+    }
+    snapGuides = OverlaySnapGuides(
+      vx: gx != null ? [gx] : const [],
+      hy: gy != null ? [gy] : const [],
+    );
+    final s = OverlayGeometry.paneScale(_paneW, _paneH);
+    item.setBaseSize(s <= 0 ? nw : nw / s, s <= 0 ? nh : nh / s);
+    geometry.tick();
+  }
+
+  void endResizeDrag() {
+    _resizeDrag = null;
+    _pendingGestureUndo = null; // discard if the gesture never moved
+    snapGuides = OverlaySnapGuides.none;
+    notifyListeners();
+  }
+
+  // ─── Internals ──────────────────────────────────────────────────────────
 
   OverlayItem? _find(String id) {
     for (final i in _items) {
@@ -144,35 +828,48 @@ class OverlayEditorController extends ChangeNotifier {
     return null;
   }
 
-  /// Candidate snap lines from the OTHER items' edges/centres + the anchor
-  /// field's edges/centre, in logical px.
-  OverlaySnapGuides _snapLines(
-    String exceptId,
-    double paneW,
-    double paneH, {
-    int? videoW,
-    int? videoH,
-  }) {
-    final (fx, fy, fw, fh) = OverlayGeometry.fieldRect(
-      _anchor,
-      paneW,
-      paneH,
-      videoW: videoW,
-      videoH: videoH,
-    );
-    final vx = <double>[fx, fx + fw / 2, fx + fw];
-    final hy = <double>[fy, fy + fh / 2, fy + fh];
-    for (final o in _items) {
-      if (o.id == exceptId) continue;
-      final (x, y, w, h) = OverlayGeometry.rectFor(
-        o,
-        paneW,
-        paneH,
-        videoW: videoW,
-        videoH: videoH,
+  (double, double, double, double) _rect(OverlayItem item) =>
+      OverlayGeometry.rectFor(
+        item,
+        _paneW,
+        _paneH,
+        videoW: _videoW,
+        videoH: _videoH,
       );
-      vx.addAll([x, x + w / 2, x + w]);
-      hy.addAll([y, y + h / 2, y + h]);
+
+  (double, double, double, double) _field() => OverlayGeometry.fieldRect(
+        _anchor,
+        _paneW,
+        _paneH,
+        videoW: _videoW,
+        videoH: _videoH,
+      );
+
+  /// Write a pane-px top-left back to the item's normalized coordinates.
+  void _setNormPos(OverlayItem item, double px, double py) {
+    final (fx, fy, fw, fh) = _field();
+    item.x = fw <= 0 ? 0 : ((px - fx) / fw).clamp(0, 1).toDouble();
+    item.y = fh <= 0 ? 0 : ((py - fy) / fh).clamp(0, 1).toDouble();
+  }
+
+  /// Candidate snap lines from the non-moving items' edges (+ centers for
+  /// move gestures) and the anchor field's edges/center, in logical px.
+  OverlaySnapGuides _snapLines({
+    required Set<String> excludeIds,
+    required bool includeCenters,
+  }) {
+    final (fx, fy, fw, fh) = _field();
+    final vx = <double>[fx, fx + fw, if (includeCenters) fx + fw / 2];
+    final hy = <double>[fy, fy + fh, if (includeCenters) fy + fh / 2];
+    for (final o in _items) {
+      if (excludeIds.contains(o.id)) continue;
+      final (x, y, w, h) = _rect(o);
+      vx.addAll([x, x + w]);
+      hy.addAll([y, y + h]);
+      if (includeCenters) {
+        vx.add(x + w / 2);
+        hy.add(y + h / 2);
+      }
     }
     return OverlaySnapGuides(vx: vx, hy: hy);
   }
@@ -196,93 +893,9 @@ class OverlayEditorController extends ChangeNotifier {
     return (bestDelta ?? 0, bestGuide);
   }
 
-  /// Nudge `id` by a pointer-movement delta (px, pane-local); snaps the
-  /// resulting edges/centre to alignment guides. Does NOT persist — call on
-  /// every drag-update tick; the host persists once at `endEdit`.
-  void moveItemByDelta(
-    String id,
-    double paneW,
-    double paneH,
-    double dx,
-    double dy, {
-    int? videoW,
-    int? videoH,
-  }) {
-    final item = _find(id);
-    if (item == null) return;
-    final (curX, curY, bw, bh) = OverlayGeometry.rectFor(
-      item,
-      paneW,
-      paneH,
-      videoW: videoW,
-      videoH: videoH,
-    );
-    var px = curX + dx;
-    var py = curY + dy;
-    final lines = _snapLines(id, paneW, paneH, videoW: videoW, videoH: videoH);
-    final sx = _snapAxis([px, px + bw / 2, px + bw], lines.vx);
-    final sy = _snapAxis([py, py + bh / 2, py + bh], lines.hy);
-    px += sx.$1;
-    py += sy.$1;
-    snapGuides = OverlaySnapGuides(
-      vx: sx.$2 != null ? [sx.$2!] : const [],
-      hy: sy.$2 != null ? [sy.$2!] : const [],
-    );
-    final (fx, fy, fw, fh) = OverlayGeometry.fieldRect(
-      _anchor,
-      paneW,
-      paneH,
-      videoW: videoW,
-      videoH: videoH,
-    );
-    item.x = fw <= 0 ? 0 : ((px - fx) / fw).clamp(0, 1).toDouble();
-    item.y = fh <= 0 ? 0 : ((py - fy) / fh).clamp(0, 1).toDouble();
-    notifyListeners();
-  }
-
-  /// Resize `id` by a pointer-movement delta applied to its bottom-right
-  /// edge; snaps to alignment guides. Only meaningful for `item.resizable`
-  /// items — the layer only shows the drag-resize handle for those; a
-  /// non-resizable item's caller shouldn't invoke this (defensive no-op if
-  /// it does).
-  void resizeItemByDelta(
-    String id,
-    double paneW,
-    double paneH,
-    double dx,
-    double dy, {
-    int? videoW,
-    int? videoH,
-  }) {
-    final item = _find(id);
-    if (item == null || !item.resizable) return;
-    final s = OverlayGeometry.paneScale(paneW, paneH);
-    final (left, top, curW, curH) = OverlayGeometry.rectFor(
-      item,
-      paneW,
-      paneH,
-      videoW: videoW,
-      videoH: videoH,
-    );
-    var nw = curW + dx;
-    var nh = curH + dy;
-    final lines = _snapLines(id, paneW, paneH, videoW: videoW, videoH: videoH);
-    final sx = _snapAxis([left + nw], lines.vx);
-    final sy = _snapAxis([top + nh], lines.hy);
-    nw += sx.$1;
-    nh += sy.$1;
-    snapGuides = OverlaySnapGuides(
-      vx: sx.$2 != null ? [sx.$2!] : const [],
-      hy: sy.$2 != null ? [sy.$2!] : const [],
-    );
-    item.setBaseSize(s <= 0 ? nw : nw / s, s <= 0 ? nh : nh / s);
-    notifyListeners();
-  }
-
-  /// End of a drag/resize gesture: clear guides. No persistence — see the
-  /// class doc; the host persists once at `endEdit`.
-  void commitDrag() {
-    snapGuides = OverlaySnapGuides.none;
-    notifyListeners();
+  @override
+  void dispose() {
+    geometry.dispose();
+    super.dispose();
   }
 }

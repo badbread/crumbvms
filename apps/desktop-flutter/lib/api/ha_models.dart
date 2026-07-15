@@ -17,6 +17,11 @@ class HaLink {
     this.overlayX,
     this.overlayY,
     this.overlaySize,
+    this.overlayColor,
+    this.overlayIcon,
+    this.overlayShowState = false,
+    this.overlayShowAge = false,
+    this.overlayOpacity,
   });
 
   final String id; // UUID
@@ -42,6 +47,21 @@ class HaLink {
   /// Badge scale multiplier (1.0 = default) when placed, else null.
   final double? overlaySize;
 
+  /// Per-badge display overrides (migration 0059). [overlayColor] is a
+  /// '#RRGGBB' hex string overriding the state-derived badge color;
+  /// [overlayIcon] a curated icon slug overriding the class-derived glyph
+  /// (`ha_overlay/ha_icons.dart`'s `kHaBadgeIconChoices`). Null = default.
+  final String? overlayColor;
+  final String? overlayIcon;
+
+  /// Pin the live state text ("Open"/"On") / relative last-changed age next
+  /// to the badge on the wall (default off — hover/tap reveal only).
+  final bool overlayShowState;
+  final bool overlayShowAge;
+
+  /// Badge opacity (0.05..1.0, migration 0060), or null for fully opaque.
+  final double? overlayOpacity;
+
   bool get hasPlacement => overlayX != null && overlayY != null;
 
   /// The entity_id's domain prefix (`binary_sensor`, `light`, `switch`,
@@ -66,6 +86,11 @@ class HaLink {
     overlayX: (j['overlay_x'] as num?)?.toDouble(),
     overlayY: (j['overlay_y'] as num?)?.toDouble(),
     overlaySize: (j['overlay_size'] as num?)?.toDouble(),
+    overlayColor: j['overlay_color'] as String?,
+    overlayIcon: j['overlay_icon'] as String?,
+    overlayShowState: (j['overlay_show_state'] as bool?) ?? false,
+    overlayShowAge: (j['overlay_show_age'] as bool?) ?? false,
+    overlayOpacity: (j['overlay_opacity'] as num?)?.toDouble(),
   );
 }
 

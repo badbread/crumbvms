@@ -15,11 +15,13 @@
 // spirit, applied to state honesty rather than footage).
 //
 // NOTE for the reviewing human: `sensor_door`, `sensor_window`, `garage`,
-// `sensors_occupied`, `movie_filter`, `lightbulb`, `power`, `power_off` are
-// NOT used anywhere else in this codebase yet (grepped at write time) — this
-// file was written without a local Flutter SDK to verify against
-// `Icons.<name>`, so please double check these compile on `flutter analyze`.
-// `directions_run` and `sensors` ARE already used elsewhere (confirmed safe).
+// `movie_filter`, `lightbulb`, `power`, `power_off` — plus the
+// [kHaBadgeIconChoices] set below (`doorbell`, `notifications_active`,
+// `water_drop`, `local_fire_department`, `thermostat`, `lock`, `videocam`,
+// `pets`, `window`) — were written without a local Flutter SDK to verify
+// against `Icons.<name>`, so please double check these compile on
+// `flutter analyze`. `directions_run` and `sensors` ARE already used
+// elsewhere (confirmed safe).
 
 import 'package:flutter/material.dart';
 
@@ -98,6 +100,52 @@ String labelForDeviceClass(String? deviceClass) {
   }
 }
 
+/// Curated per-badge icon OVERRIDES an operator can pick in the badge editor
+/// (migration 0059 `overlay_icon`) — slug -> (glyph, picker label). Slugs are
+/// what the server stores; unknown slugs (from a newer client, say) fall back
+/// to the class-derived default rather than breaking rendering.
+const Map<String, (IconData, String)> kHaBadgeIconChoices = {
+  'door': (Icons.sensor_door, 'Door'),
+  'window': (Icons.sensor_window, 'Window'),
+  'garage': (Icons.garage, 'Garage'),
+  'gate': (Icons.fence, 'Gate'),
+  'motion': (Icons.directions_run, 'Motion'),
+  'person': (Icons.person, 'Person'),
+  'lightbulb': (Icons.lightbulb, 'Light'),
+  'power': (Icons.power, 'Power'),
+  'plug': (Icons.electrical_services, 'Plug'),
+  'lock': (Icons.lock, 'Lock'),
+  'doorbell': (Icons.doorbell, 'Doorbell'),
+  'bell': (Icons.notifications_active, 'Bell'),
+  'water': (Icons.water_drop, 'Water/leak'),
+  'fire': (Icons.local_fire_department, 'Fire/smoke'),
+  'thermostat': (Icons.thermostat, 'Temperature'),
+  'fan': (Icons.air, 'Fan'),
+  'camera': (Icons.videocam, 'Camera'),
+  'pet': (Icons.pets, 'Pet'),
+  'scene': (Icons.movie_filter, 'Scene'),
+  'sensor': (Icons.sensors, 'Generic sensor'),
+};
+
+/// Parse a stored '#RRGGBB' badge color override into a [Color] (full
+/// opacity), or null for absent/malformed values.
+Color? parseOverlayColorHex(String? hex) {
+  if (hex == null || hex.length != 7 || !hex.startsWith('#')) return null;
+  final v = int.tryParse(hex.substring(1), radix: 16);
+  if (v == null) return null;
+  return Color(0xFF000000 | v);
+}
+
+/// Relative "N ago" for a badge caption / state card, from HA `last_changed`.
+String haRelativeAgo(DateTime t) {
+  final d = DateTime.now().difference(t);
+  if (d.inSeconds < 5) return 'just now';
+  if (d.inMinutes < 1) return '${d.inSeconds} s ago';
+  if (d.inHours < 1) return '${d.inMinutes} m ago';
+  if (d.inDays < 1) return '${d.inHours} h ago';
+  return '${d.inDays} d ago';
+}
+
 /// Resolve the icon + color (+ optional label) to render for a linked
 /// entity's current reading.
 ///
@@ -109,7 +157,48 @@ String labelForDeviceClass(String? deviceClass) {
 /// - `stale` forces the indeterminate/grey treatment regardless of `state`
 ///   (the HA states feed has gone stale — never trust a possibly-stale
 ///   reading as authoritative).
+/// - `iconOverride`/`colorOverride` are the operator's per-badge picks
+///   (migration 0059). The icon override always applies (icon identity is
+///   static). The color override applies ONLY to a KNOWN reading — active
+///   at full strength, inactive dimmed — and NEVER to unknown/unavailable/
+///   stale, where the grey honesty treatment always wins (a recolored badge
+///   must not read "alive" on a dead HA connection).
 HaVisual haVisualFor({
+  required String domain,
+  String? deviceClass,
+  required String? state,
+  required bool stale,
+  String? iconOverride,
+  Color? colorOverride,
+}) {
+  final v = _haVisualDefault(
+    domain: domain,
+    deviceClass: deviceClass,
+    state: state,
+    stale: stale,
+  );
+  final overrideIcon = iconOverride == null
+      ? null
+      : kHaBadgeIconChoices[iconOverride]?.$1;
+  final on = (state == null || stale || domain == 'scene')
+      ? null
+      : edgeOn(state);
+  final Color color;
+  if (colorOverride != null && on != null) {
+    color = on ? colorOverride : colorOverride.withValues(alpha: 0.45);
+  } else {
+    color = v.color;
+  }
+  if (overrideIcon == null && identical(color, v.color)) return v;
+  return HaVisual(
+    overrideIcon ?? v.icon,
+    color,
+    label: v.label,
+    pulsing: v.pulsing,
+  );
+}
+
+HaVisual _haVisualDefault({
   required String domain,
   String? deviceClass,
   required String? state,
