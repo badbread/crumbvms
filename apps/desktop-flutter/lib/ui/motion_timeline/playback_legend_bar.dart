@@ -163,6 +163,7 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
       title: 'Color for ${_nameFor(cameraId)}',
       current: cameraMotionColor(cameraId),
       allowReset: hasCameraColorOverride(cameraId),
+      allowCustom: true,
       usedBy: usedBy,
     );
     if (result == null) return;

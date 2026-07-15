@@ -19,11 +19,7 @@ import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
-
-bool _focusedIsTextField() {
-  final focused = FocusManager.instance.primaryFocus;
-  return focused?.context?.widget is EditableText;
-}
+import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
 
 /// Wraps [child] with the playback-transport shortcuts. Mount this only
 /// while playback is the active tab/screen.
@@ -94,7 +90,7 @@ class PlaybackHotkeysListener extends StatelessWidget {
       autofocus: autofocus,
       onKeyEvent: (node, event) {
         if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        if (_focusedIsTextField()) return KeyEventResult.ignored;
+        if (textInputHasFocus()) return KeyEventResult.ignored;
 
         if (event.logicalKey == LogicalKeyboardKey.escape) {
           if (isMaximized && onExitMaximize != null) {

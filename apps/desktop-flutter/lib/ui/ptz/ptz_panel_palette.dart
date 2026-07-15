@@ -34,6 +34,45 @@ class PtzPanelPalette extends StatelessWidget {
     (PtzButtonKind.irisAuto, 'IrisA'),
   ];
 
+  Future<void> _addPreset(BuildContext context) async {
+    final presets = controller.presets;
+    if (presets.isEmpty) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(
+          content: Text('This camera reports no ONVIF presets.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    final chosen = await showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Add preset button'),
+        children: [
+          for (var i = 0; i < presets.length; i++)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, i),
+              child: Row(
+                children: [
+                  const Icon(Icons.star, size: 16, color: Color(0xFFFFB143)),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(presets[i].label)),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null) return;
+    final p = presets[chosen];
+    controller.addButton(
+      PtzButtonKind.preset,
+      presetToken: p.token,
+      presetName: p.label,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // Listens to the HOST controller (not the shared editor): the preset
@@ -52,15 +91,12 @@ class PtzPanelPalette extends StatelessWidget {
           ),
           for (final (kind, label) in _addKinds)
             _PaletteButton(label: label, onTap: () => controller.addButton(kind)),
-          for (final p in controller.presets)
-            _PaletteButton(
-              label: '★ ${p.label}',
-              onTap: () => controller.addButton(
-                PtzButtonKind.preset,
-                presetToken: p.token,
-                presetName: p.label,
-              ),
-            ),
+          // A single "+ Preset" button opening a picker of the camera's ONVIF
+          // presets — replaces the old one-button-per-preset clutter (#8).
+          _PaletteButton(
+            label: '★ Preset…',
+            onTap: () => _addPreset(context),
+          ),
         ],
       ),
     );
@@ -90,11 +126,23 @@ class PtzSelectedButtonExtras extends StatefulWidget {
 
 class _PtzSelectedButtonExtrasState extends State<PtzSelectedButtonExtras> {
   final _renameCtrl = TextEditingController();
+  final _renameFocus = FocusNode();
   String? _renameForId;
+
+  @override
+  void initState() {
+    super.initState();
+    // One undo step per rename session (snapshot on focus gain, not per
+    // keystroke) — matches the HA badge label field (issue #4).
+    _renameFocus.addListener(() {
+      if (_renameFocus.hasFocus) widget.controller.editor.pushUndo();
+    });
+  }
 
   @override
   void dispose() {
     _renameCtrl.dispose();
+    _renameFocus.dispose();
     super.dispose();
   }
 
@@ -116,6 +164,7 @@ class _PtzSelectedButtonExtrasState extends State<PtzSelectedButtonExtras> {
             height: 30,
             child: TextField(
               controller: _renameCtrl,
+              focusNode: _renameFocus,
               style: const TextStyle(color: Colors.white, fontSize: 13),
               decoration: const InputDecoration(
                 isDense: true,

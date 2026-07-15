@@ -28,6 +28,21 @@
 // snapping for the duration of the gesture (the layer passes `snap: false`),
 // and [snapEnabled] is an editor-bar toggle.
 //
+// ── Undo / redo ─────────────────────────────────────────────────────────────
+// A bounded history of item-state snapshots (via `OverlayItem.captureState`).
+// Discrete ops (align/distribute/match/resize/group/delete/z-order/opacity)
+// push an undo entry themselves; a drag/resize gesture pushes ONE entry the
+// first time it actually moves; host-side style edits (HA color/icon/pins,
+// PTZ rename) call [pushUndo] before mutating. `undo`/`redo` restore the
+// snapshot and tick geometry so the change paints immediately.
+//
+// ── Applying non-drag geometry changes (the "align doesn't move" fix) ────────
+// Selection ops mutate item x/y/size and call [notifyListeners], but the
+// per-item `Positioned` wrappers are driven by [geometry] (the smoothness
+// split), so a structure notify alone doesn't reposition them until the next
+// drag tick. Those ops therefore use [_notifyGeometry] (notify + `geometry`
+// tick) so the move paints this frame.
+//
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 // `beginEdit` takes an ALREADY-LOADED item list and fires notifications
 // synchronously; `endEdit` returns the final items synchronously so the HOST
@@ -114,6 +129,16 @@ class _ResizeDrag {
   final OverlaySnapGuides lines;
 }
 
+/// One undo/redo history entry: the item list (order) plus each item's
+/// `captureState` memento and the selection at snapshot time.
+class _History {
+  _History(this.items, this.mementos, this.selected, this.primary);
+  final List<OverlayItem> items;
+  final Map<String, Object> mementos;
+  final Set<String> selected;
+  final String? primary;
+}
+
 class OverlayEditorController extends ChangeNotifier {
   bool editMode = false;
 
@@ -136,6 +161,15 @@ class OverlayEditorController extends ChangeNotifier {
   _MoveDrag? _moveDrag;
   _ResizeDrag? _resizeDrag;
 
+  /// Pending undo snapshot for an in-flight gesture — captured at gesture
+  /// start, committed to [_undo] on the first tick that actually moves, so a
+  /// click-without-drag never creates a no-op history entry.
+  _History? _pendingGestureUndo;
+
+  final List<_History> _undo = [];
+  final List<_History> _redo = [];
+  static const int _maxHistory = 60;
+
   // Last-known pane metrics, reported by the layer on every build (plain
   // field writes, no notification) so selection ops (align/distribute/match)
   // and marquee hit-testing can do pixel math without the bar/host having to
@@ -144,6 +178,11 @@ class OverlayEditorController extends ChangeNotifier {
   double _paneH = 0;
   int? _videoW;
   int? _videoH;
+
+  /// Bottom occlusion (logical px) reserved for the editor toolbar, set by the
+  /// host pane. A drag can't push an item below this line so it never gets
+  /// lost under the bar (issue #13). Plain field — no notification.
+  double _editBottomInset = 0;
 
   /// Bumped on every `beginEdit`/`endEdit`. Hosts that kick off an async load
   /// BEFORE calling `beginEdit` (the mandated "host-loads-first" order)
@@ -188,6 +227,79 @@ class OverlayEditorController extends ChangeNotifier {
     _videoH = videoH;
   }
 
+  /// Reserve `px` of bottom occlusion for the editor toolbar so a drag can't
+  /// drop an item under it (issue #13). Plain field write — set by the host
+  /// pane when it lays out a bottom bar; 0 when the chrome is a side panel.
+  void setEditBottomInset(double px) => _editBottomInset = px;
+
+  /// Notify the bar/host (structure) AND tick geometry so a non-drag position
+  /// change (align/distribute/match/opacity/undo) repaints the per-item
+  /// wrappers this frame — see the file doc.
+  void _notifyGeometry() {
+    notifyListeners();
+    geometry.tick();
+  }
+
+  // ─── Undo / redo ────────────────────────────────────────────────────────
+
+  bool get canUndo => _undo.isNotEmpty;
+  bool get canRedo => _redo.isNotEmpty;
+
+  _History _snapshot() => _History(
+        List.of(_items),
+        {for (final i in _items) i.id: i.captureState()},
+        Set.of(_selected),
+        _primaryId,
+      );
+
+  /// Push the current state onto the undo stack (clearing redo). Discrete ops
+  /// call this internally after their guards; hosts call it before a host-side
+  /// style mutation; interactive controls (opacity slider) call it once at
+  /// gesture start.
+  void pushUndo() {
+    _undo.add(_snapshot());
+    if (_undo.length > _maxHistory) _undo.removeAt(0);
+    _redo.clear();
+  }
+
+  void _commitGestureUndo() {
+    final s = _pendingGestureUndo;
+    if (s == null) return;
+    _pendingGestureUndo = null;
+    _undo.add(s);
+    if (_undo.length > _maxHistory) _undo.removeAt(0);
+    _redo.clear();
+  }
+
+  void undo() {
+    if (_undo.isEmpty) return;
+    _redo.add(_snapshot());
+    _restore(_undo.removeLast());
+  }
+
+  void redo() {
+    if (_redo.isEmpty) return;
+    _undo.add(_snapshot());
+    _restore(_redo.removeLast());
+  }
+
+  void _restore(_History h) {
+    _items = List.of(h.items);
+    for (final i in _items) {
+      final m = h.mementos[i.id];
+      if (m != null) i.restoreState(m);
+    }
+    final live = {for (final i in _items) i.id};
+    _selected
+      ..clear()
+      ..addAll(h.selected.where(live.contains));
+    _primaryId = (h.primary != null && _selected.contains(h.primary))
+        ? h.primary
+        : (_selected.isEmpty ? null : _selected.first);
+    snapGuides = OverlaySnapGuides.none;
+    _notifyGeometry();
+  }
+
   // ─── Edit lifecycle ─────────────────────────────────────────────────────
 
   /// Begin an edit session with `items` the host has ALREADY loaded (and
@@ -203,6 +315,9 @@ class OverlayEditorController extends ChangeNotifier {
     _primaryId = null;
     _moveDrag = null;
     _resizeDrag = null;
+    _pendingGestureUndo = null;
+    _undo.clear();
+    _redo.clear();
     snapGuides = OverlaySnapGuides.none;
     notifyListeners();
   }
@@ -218,6 +333,9 @@ class OverlayEditorController extends ChangeNotifier {
     _primaryId = null;
     _moveDrag = null;
     _resizeDrag = null;
+    _pendingGestureUndo = null;
+    _undo.clear();
+    _redo.clear();
     snapGuides = OverlaySnapGuides.none;
     notifyListeners();
     return result;
@@ -310,6 +428,7 @@ class OverlayEditorController extends ChangeNotifier {
   /// Add a new item to the session (e.g. a palette pick) and select it. Pure
   /// in-memory — the host persists on `endEdit`.
   void addItem(OverlayItem item) {
+    pushUndo();
     _items.add(item);
     _selected
       ..clear()
@@ -321,6 +440,8 @@ class OverlayEditorController extends ChangeNotifier {
   /// Remove an item from the session (the on-canvas delete handle). Pure
   /// in-memory.
   void removeItem(String id) {
+    if (_find(id) == null) return;
+    pushUndo();
     _items.removeWhere((i) => i.id == id);
     _selected.remove(id);
     if (_primaryId == id) {
@@ -332,6 +453,7 @@ class OverlayEditorController extends ChangeNotifier {
   /// Remove every selected item (the bar's Delete with a multi-selection).
   void removeSelected() {
     if (_selected.isEmpty) return;
+    pushUndo();
     _items.removeWhere((i) => _selected.contains(i.id));
     _selected.clear();
     _primaryId = null;
@@ -339,6 +461,8 @@ class OverlayEditorController extends ChangeNotifier {
   }
 
   void clearAll() {
+    if (_items.isEmpty) return;
+    pushUndo();
     _items = [];
     _selected.clear();
     _primaryId = null;
@@ -354,6 +478,7 @@ class OverlayEditorController extends ChangeNotifier {
   void bringToFront(String id) {
     final i = _items.indexWhere((b) => b.id == id);
     if (i < 0 || i == _items.length - 1) return;
+    pushUndo();
     _items.add(_items.removeAt(i));
     notifyListeners();
   }
@@ -361,6 +486,7 @@ class OverlayEditorController extends ChangeNotifier {
   void sendToBack(String id) {
     final i = _items.indexWhere((b) => b.id == id);
     if (i <= 0) return;
+    pushUndo();
     _items.insert(0, _items.removeAt(i));
     notifyListeners();
   }
@@ -379,12 +505,13 @@ class OverlayEditorController extends ChangeNotifier {
   void resizeSelected(double factor) {
     final sel = _selectedItems();
     if (sel.isEmpty) return;
+    pushUndo();
     if (sel.length == 1 || _paneW <= 0 || _paneH <= 0) {
       for (final item in sel) {
         final (bw, bh) = item.baseSize();
         item.setBaseSize(bw * factor, bh * factor);
       }
-      notifyListeners();
+      _notifyGeometry();
       return;
     }
     var minX = double.infinity, minY = double.infinity;
@@ -399,7 +526,7 @@ class OverlayEditorController extends ChangeNotifier {
       item.setBaseSize(bw * factor, bh * factor);
       _setNormPos(item, minX + (x - minX) * factor, minY + (y - minY) * factor);
     }
-    notifyListeners();
+    _notifyGeometry();
   }
 
   /// Explicit numeric size: set every selected item's base WIDTH to `w`
@@ -409,12 +536,25 @@ class OverlayEditorController extends ChangeNotifier {
     if (w <= 0 || !w.isFinite) return;
     final sel = _selectedItems();
     if (sel.isEmpty) return;
+    pushUndo();
     for (final item in sel) {
       final (bw, bh) = item.baseSize();
       final k = bw <= 0 ? 1.0 : w / bw;
       item.setBaseSize(w, bh * k);
     }
-    notifyListeners();
+    _notifyGeometry();
+  }
+
+  /// Set every selected item's opacity (0.05..1.0). NOT self-undoing —
+  /// slider-driven: the bar calls [pushUndo] once on slider-drag start.
+  void setSelectedOpacity(double v) {
+    final sel = _selectedItems();
+    if (sel.isEmpty) return;
+    final o = v.clamp(0.05, 1.0).toDouble();
+    for (final item in sel) {
+      item.opacity = o;
+    }
+    _notifyGeometry();
   }
 
   /// Match every selected item's base size to the PRIMARY (last-clicked)
@@ -423,13 +563,14 @@ class OverlayEditorController extends ChangeNotifier {
     final ref = selected;
     final sel = _selectedItems();
     if (ref == null || sel.length < 2) return;
+    pushUndo();
     final (rw, rh) = ref.baseSize();
     for (final item in sel) {
       if (identical(item, ref)) continue;
       final (bw, bh) = item.baseSize();
       item.setBaseSize(width ? rw : bw, height ? rh : bh);
     }
-    notifyListeners();
+    _notifyGeometry();
   }
 
   // ─── Align / distribute ─────────────────────────────────────────────────
@@ -438,6 +579,7 @@ class OverlayEditorController extends ChangeNotifier {
   void alignSelected(OverlayAlign a) {
     final sel = _selectedItems();
     if (sel.length < 2 || _paneW <= 0 || _paneH <= 0) return;
+    pushUndo();
     var minX = double.infinity, minY = double.infinity;
     var maxX = -double.infinity, maxY = -double.infinity;
     for (final item in sel) {
@@ -466,7 +608,7 @@ class OverlayEditorController extends ChangeNotifier {
       }
       _setNormPos(item, nx, ny);
     }
-    notifyListeners();
+    _notifyGeometry();
   }
 
   /// Distribute the selected items (3+) with equal gaps along one axis; the
@@ -474,6 +616,7 @@ class OverlayEditorController extends ChangeNotifier {
   void distributeSelected({required bool horizontal}) {
     final sel = _selectedItems();
     if (sel.length < 3 || _paneW <= 0 || _paneH <= 0) return;
+    pushUndo();
     final entries = [
       for (final item in sel)
         (item: item, rect: _rect(item)),
@@ -503,7 +646,7 @@ class OverlayEditorController extends ChangeNotifier {
       );
       cursor += sizeOf(e.rect) + gap;
     }
-    notifyListeners();
+    _notifyGeometry();
   }
 
   // ─── Group / ungroup ────────────────────────────────────────────────────
@@ -511,6 +654,7 @@ class OverlayEditorController extends ChangeNotifier {
   void groupSelected() {
     final sel = _selectedItems();
     if (sel.length < 2) return;
+    pushUndo();
     final gid = 'g${DateTime.now().microsecondsSinceEpoch}';
     for (final item in sel) {
       item.groupId = gid;
@@ -519,14 +663,13 @@ class OverlayEditorController extends ChangeNotifier {
   }
 
   void ungroupSelected() {
-    var changed = false;
-    for (final item in _selectedItems()) {
-      if (item.groupId != null) {
-        item.groupId = null;
-        changed = true;
-      }
+    final sel = _selectedItems();
+    if (!sel.any((i) => i.groupId != null)) return;
+    pushUndo();
+    for (final item in sel) {
+      item.groupId = null;
     }
-    if (changed) notifyListeners();
+    notifyListeners();
   }
 
   // ─── Drag (move) — raw-tracked, see the file doc ────────────────────────
@@ -563,6 +706,7 @@ class OverlayEditorController extends ChangeNotifier {
       height: maxY - minY,
       lines: _snapLines(excludeIds: _selected, includeCenters: true),
     );
+    _pendingGestureUndo = _snapshot();
   }
 
   /// Apply a pointer-movement delta to the in-flight move. `snap: false`
@@ -571,13 +715,20 @@ class OverlayEditorController extends ChangeNotifier {
   void updateDrag(double dx, double dy, {required bool snap}) {
     final d = _moveDrag;
     if (d == null) return;
+    if (dx != 0 || dy != 0) _commitGestureUndo();
     d.rawLeft += dx;
     d.rawTop += dy;
     final (fx, fy, fw, fh) = _field();
     // Clamp the whole moving bbox inside the anchor field so a multi-drag
-    // keeps its shape at the edges instead of squashing item-by-item.
-    var left = d.rawLeft.clamp(fx, math.max(fx, fx + fw - d.width)).toDouble();
-    var top = d.rawTop.clamp(fy, math.max(fy, fy + fh - d.height)).toDouble();
+    // keeps its shape at the edges instead of squashing item-by-item, and
+    // never below the editor toolbar (issue #13).
+    final maxLeft = math.max(fx, fx + fw - d.width);
+    final maxTop = math.max(
+      fy,
+      math.min(fy + fh - d.height, _paneH - _editBottomInset - d.height),
+    );
+    var left = d.rawLeft.clamp(fx, maxLeft).toDouble();
+    var top = d.rawTop.clamp(fy, maxTop).toDouble();
     double? gx, gy;
     if (snap && snapEnabled) {
       final sx =
@@ -607,6 +758,7 @@ class OverlayEditorController extends ChangeNotifier {
   /// bar's numeric fields). No persistence — the host persists at `endEdit`.
   void endDrag() {
     _moveDrag = null;
+    _pendingGestureUndo = null; // discard if the gesture never moved
     snapGuides = OverlaySnapGuides.none;
     notifyListeners();
   }
@@ -629,6 +781,7 @@ class OverlayEditorController extends ChangeNotifier {
       // meaningful size target and made the old editor feel trapped.
       lines: _snapLines(excludeIds: {id}, includeCenters: false),
     );
+    _pendingGestureUndo = _snapshot();
   }
 
   void updateResizeDrag(double dx, double dy, {required bool snap}) {
@@ -636,6 +789,7 @@ class OverlayEditorController extends ChangeNotifier {
     if (d == null) return;
     final item = _find(d.id);
     if (item == null) return;
+    if (dx != 0 || dy != 0) _commitGestureUndo();
     d.rawW += dx;
     d.rawH += dy;
     var nw = math.max(d.rawW, OverlayGeometry.minRenderedPx);
@@ -660,6 +814,7 @@ class OverlayEditorController extends ChangeNotifier {
 
   void endResizeDrag() {
     _resizeDrag = null;
+    _pendingGestureUndo = null; // discard if the gesture never moved
     snapGuides = OverlaySnapGuides.none;
     notifyListeners();
   }

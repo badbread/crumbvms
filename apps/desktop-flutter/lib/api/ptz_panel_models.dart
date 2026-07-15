@@ -120,6 +120,7 @@ class PtzPanelButton {
     this.presetToken,
     this.presetName,
     this.group,
+    this.opacity = 1.0,
   });
 
   final String id;
@@ -144,6 +145,10 @@ class PtzPanelButton {
   /// non-null group select/move/resize as one unit in the shared overlay
   /// editor). Persisted so a saved panel re-opens with its groups intact.
   String? group;
+
+  /// Rendered opacity (0.05..1.0, `OverlayItem.opacity`). Persisted so a
+  /// dimmed button stays dimmed across relaunches.
+  double opacity;
 
   /// Effective base size honoring a user resize + kind bounds/defaults
   /// (`ptzBtnSize` in app.js). D-pad is always square.
@@ -180,6 +185,7 @@ class PtzPanelButton {
         presetToken: presetToken,
         presetName: presetName,
         group: group,
+        opacity: opacity,
       );
 
   Map<String, dynamic> toJson() => {
@@ -193,6 +199,7 @@ class PtzPanelButton {
     if (presetToken != null) 'preset': presetToken,
     if (presetName != null) 'preset_name': presetName,
     if (group != null) 'group': group,
+    if (opacity != 1.0) 'opacity': opacity,
   };
 
   factory PtzPanelButton.fromJson(Map<String, dynamic> j) => PtzPanelButton(
@@ -205,6 +212,7 @@ class PtzPanelButton {
     label: j['label'] as String?,
     presetToken: j['preset'] as String?,
     presetName: j['preset_name'] as String?,
+    opacity: (j['opacity'] as num?)?.toDouble() ?? 1.0,
     group: j['group'] as String?,
   );
 }

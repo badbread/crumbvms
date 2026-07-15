@@ -16,8 +16,11 @@ nvml-wrapper = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 # CPU-time + working-set memory of the client process (GetProcessTimes /
-# GetProcessMemoryInfo). Same crate + feature set the Tauri desktop already uses.
-winapi = { version = "0.3", features = ["processthreadsapi", "psapi", "minwindef", "handleapi", "dpapi", "wincrypt", "winbase"] }
+# GetProcessMemoryInfo). Same crate + feature set the Tauri desktop already
+# uses. `pdh` adds the Performance Data Helper API for the vendor-neutral "GPU
+# Engine" utilization counters (Intel/AMD/NVIDIA — the perf-HUD Decode/GPU
+# fallback when NVML isn't present, see host.rs).
+winapi = { version = "0.3", features = ["processthreadsapi", "psapi", "minwindef", "handleapi", "dpapi", "wincrypt", "winbase", "pdh"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

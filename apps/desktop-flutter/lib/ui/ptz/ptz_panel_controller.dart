@@ -84,6 +84,42 @@ class PtzOverlayButtonItem implements OverlayItem {
   String? get groupId => button.group;
   @override
   set groupId(String? v) => button.group = v;
+
+  @override
+  double get opacity => button.opacity;
+  @override
+  set opacity(double v) => button.opacity = v;
+
+  @override
+  Object captureState() => (
+        x: button.x,
+        y: button.y,
+        w: button.w,
+        h: button.h,
+        label: button.label,
+        group: button.group,
+        opacity: button.opacity,
+      );
+
+  @override
+  void restoreState(Object state) {
+    final s = state as ({
+      double x,
+      double y,
+      double? w,
+      double? h,
+      String? label,
+      String? group,
+      double opacity,
+    });
+    button.x = s.x;
+    button.y = s.y;
+    button.w = s.w;
+    button.h = s.h;
+    button.label = s.label;
+    button.group = s.group;
+    button.opacity = s.opacity;
+  }
 }
 
 class PtzPanelController extends ChangeNotifier {

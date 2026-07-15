@@ -106,12 +106,30 @@ class PtzPanelOverlay extends StatelessWidget {
 }
 
 /// One live (view-mode) panel button: press-and-hold direction/zoom, tap
-/// home/preset/imaging — the same dispatch table as the old renderer.
-class _PtzViewButton extends StatelessWidget {
+/// home/preset/imaging — the same dispatch table as the old renderer, now with
+/// hover-highlight + pressed/active feedback so steering has a clear response
+/// (#14).
+class _PtzViewButton extends StatefulWidget {
   const _PtzViewButton({required this.controller, required this.button});
 
   final PtzPanelController controller;
   final PtzPanelButton button;
+
+  @override
+  State<_PtzViewButton> createState() => _PtzViewButtonState();
+}
+
+class _PtzViewButtonState extends State<_PtzViewButton> {
+  bool _hovered = false;
+  bool _pressed = false;
+
+  /// Per-cell hover/press state for the d-pad kind (its nine cells are their
+  /// own hit targets).
+  int? _hoverCell;
+  int? _pressedCell;
+
+  PtzPanelController get controller => widget.controller;
+  PtzPanelButton get button => widget.button;
 
   bool get _isMomentary =>
       button.kind == PtzButtonKind.home ||
@@ -123,6 +141,10 @@ class _PtzViewButton extends StatelessWidget {
       button.kind == PtzButtonKind.irisClose ||
       button.kind == PtzButtonKind.irisAuto;
 
+  void _setPressed(bool v) {
+    if (_pressed != v && mounted) setState(() => _pressed = v);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (button.kind == PtzButtonKind.dpad) {
@@ -133,22 +155,46 @@ class _PtzViewButton extends StatelessWidget {
         ),
       );
     }
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: _isMomentary ? null : (_) => _dispatchDown(),
-      onTapUp: _isMomentary ? null : (_) => controller.stopContinuous(),
-      onTapCancel: _isMomentary ? null : () => controller.stopContinuous(),
-      onTap: _isMomentary ? _dispatchTap : null,
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.4),
-          borderRadius: BorderRadius.circular(4),
-        ),
-        alignment: Alignment.center,
-        child: LayoutBuilder(
-          builder: (context, constraints) => _PtzGlyphOrLabel(
-            button: button,
-            boxHeight: constraints.maxHeight,
+    // Pressed = active blue tint; hover = lighter scrim; idle = the base
+    // black scrim (matches the badge/name-label visual language).
+    final bg = _pressed
+        ? const Color(0xFF2CA3E8).withValues(alpha: 0.55)
+        : Colors.black.withValues(alpha: _hovered ? 0.6 : 0.4);
+    final border = _pressed
+        ? const Color(0xFF4CC9FF)
+        : (_hovered ? Colors.white54 : Colors.transparent);
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: (_) {
+          _setPressed(true);
+          if (!_isMomentary) _dispatchDown();
+        },
+        onTapUp: (_) {
+          _setPressed(false);
+          if (!_isMomentary) controller.stopContinuous();
+        },
+        onTapCancel: () {
+          _setPressed(false);
+          if (!_isMomentary) controller.stopContinuous();
+        },
+        onTap: _isMomentary ? _dispatchTap : null,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 90),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: border, width: 1.2),
+          ),
+          alignment: Alignment.center,
+          child: LayoutBuilder(
+            builder: (context, constraints) => _PtzGlyphOrLabel(
+              button: button,
+              boxHeight: constraints.maxHeight,
+            ),
           ),
         ),
       ),
@@ -236,31 +282,58 @@ class _PtzViewButton extends StatelessWidget {
     if (row == 2 && col == 1) icon = Icons.keyboard_arrow_down;
     if (row == 1 && col == 0) icon = Icons.keyboard_arrow_left;
     if (row == 1 && col == 2) icon = Icons.keyboard_arrow_right;
+    final pressed = _pressedCell == i;
+    final hovered = _hoverCell == i;
     return Positioned(
       left: col * cw,
       top: row * ch,
       width: cw,
       height: ch,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTapDown: isCenter
-            ? null
-            : (_) => controller.moveContinuous(
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hoverCell = i),
+        onExit: (_) =>
+            setState(() => _hoverCell = _hoverCell == i ? null : _hoverCell),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (_) {
+            setState(() => _pressedCell = i);
+            if (!isCenter) {
+              controller.moveContinuous(
                 pan: (vec?.$1 ?? 0) * 0.6,
                 tilt: (vec?.$2 ?? 0) * 0.6,
-              ),
-        onTapUp: isCenter ? null : (_) => controller.stopContinuous(),
-        onTapCancel: isCenter ? null : () => controller.stopContinuous(),
-        onTap: isCenter ? () => controller.home() : null,
-        child: Center(
-          child: icon != null
-              ? Icon(icon, color: Colors.white70, size: 16)
-              : isCenter
-              ? const Icon(Icons.home, color: Colors.white70, size: 16)
-              : const Text(
-                  '•',
-                  style: TextStyle(color: Colors.white38, fontSize: 12),
-                ),
+              );
+            }
+          },
+          onTapUp: (_) {
+            setState(() => _pressedCell = null);
+            if (!isCenter) controller.stopContinuous();
+          },
+          onTapCancel: () {
+            setState(() => _pressedCell = null);
+            if (!isCenter) controller.stopContinuous();
+          },
+          onTap: isCenter ? () => controller.home() : null,
+          child: Container(
+            decoration: BoxDecoration(
+              color: pressed
+                  ? const Color(0xFF2CA3E8).withValues(alpha: 0.5)
+                  : (hovered
+                      ? Colors.white.withValues(alpha: 0.12)
+                      : Colors.transparent),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Center(
+              child: icon != null
+                  ? Icon(icon, color: Colors.white70, size: 16)
+                  : isCenter
+                  ? const Icon(Icons.home, color: Colors.white70, size: 16)
+                  : const Text(
+                      '•',
+                      style: TextStyle(color: Colors.white38, fontSize: 12),
+                    ),
+            ),
+          ),
         ),
       ),
     );

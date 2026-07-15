@@ -34,6 +34,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
+import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
 
 /// A keydown -> hotkey token ("3", "s3", "n3"), or null. Uses the PHYSICAL key
 /// (independent of layout/shift symbol) — the Flutter equivalent of app.js's
@@ -46,6 +47,7 @@ String? _hotkeyTokenFromEvent(KeyEvent event) {
   if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
     return null;
   }
+  // Ctrl/Alt/Meta already returned above; the remaining guard is text focus.
   // Numpad bank first — its physical keys are distinct from the digit row.
   // (final, not const: PhysicalKeyboardKey overrides ==, disallowed as a
   // const map key.)
@@ -81,11 +83,6 @@ String? _hotkeyTokenFromEvent(KeyEvent event) {
   return keys.isShiftPressed ? 's$digit' : digit;
 }
 
-bool _focusedIsTextField() {
-  final focused = FocusManager.instance.primaryFocus;
-  return focused?.context?.widget is EditableText;
-}
-
 /// Wraps [child] with the global number-key/HUD/snapshot/audio/escape
 /// shortcuts. [cameras] should be the current viewer-visible camera list
 /// (same list the wall builds tiles from) — pass a live/rebuilt list so the
@@ -101,6 +98,8 @@ class GlobalHotkeysListener extends StatelessWidget {
     this.onSnapshot,
     this.onToggleAudio,
     this.onEscape,
+    this.onUndo,
+    this.onRedo,
     this.autofocus = false,
     this.shortcuts,
     this.options,
@@ -145,6 +144,12 @@ class GlobalHotkeysListener extends StatelessWidget {
   /// (app.js:4121-4129.)
   final VoidCallback? onEscape;
 
+  /// Ctrl+Z / Ctrl+Y — undo/redo for the active overlay editor (issue #4).
+  /// Only fire while an editor is open; null → no-op. Suppressed while a text
+  /// field is focused (so the field gets native text undo).
+  final VoidCallback? onUndo;
+  final VoidCallback? onRedo;
+
   /// Whether this Focus node should grab focus immediately. Leave false if
   /// an ancestor `Focus`/`FullscreenEscHandler` already autofocuses — only
   /// one autofocus is needed per screen.
@@ -156,10 +161,11 @@ class GlobalHotkeysListener extends StatelessWidget {
       autofocus: autofocus,
       onKeyEvent: (node, event) {
         if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        if (_focusedIsTextField()) return KeyEventResult.ignored;
+        final textFocused = textInputHasFocus();
 
-        // Esc: restore from maximize. Checked BEFORE the master toggle —
-        // Esc must always work or a maximized pane becomes a trap.
+        // Esc: restore from maximize. Checked BEFORE the text-focus guard AND
+        // the master toggle — Esc must always work or a maximized pane becomes
+        // a trap (a focused editor text field must still yield to Esc).
         if (event.logicalKey == LogicalKeyboardKey.escape) {
           if (onEscape != null) {
             onEscape!();
@@ -167,6 +173,38 @@ class GlobalHotkeysListener extends StatelessWidget {
           }
           return KeyEventResult.ignored;
         }
+
+        final keys = HardwareKeyboard.instance;
+        // Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) — overlay-editor undo/redo. Only
+        // when NOT typing (a focused text field keeps native undo), and only
+        // while an editor is open (the callbacks are null otherwise).
+        if (!textFocused &&
+            keys.isControlPressed &&
+            !keys.isAltPressed &&
+            !keys.isMetaPressed) {
+          final isZ = event.logicalKey == LogicalKeyboardKey.keyZ;
+          final isY = event.logicalKey == LogicalKeyboardKey.keyY;
+          if (isZ && keys.isShiftPressed) {
+            if (onRedo != null) {
+              onRedo!();
+              return KeyEventResult.handled;
+            }
+          } else if (isZ) {
+            if (onUndo != null) {
+              onUndo!();
+              return KeyEventResult.handled;
+            }
+          } else if (isY) {
+            if (onRedo != null) {
+              onRedo!();
+              return KeyEventResult.handled;
+            }
+          }
+        }
+
+        // Every single-key shortcut below stands down while a text input has
+        // focus (issue #2).
+        if (textFocused) return KeyEventResult.ignored;
 
         // Master "Enable keyboard shortcuts" toggle: everything below —
         // actions AND camera number keys — is inert while it's off.

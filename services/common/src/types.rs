@@ -228,6 +228,8 @@ pub struct CameraHaLink {
     pub overlay_show_state: bool,
     /// Pin the relative last-changed age ("2 m ago") next to the badge.
     pub overlay_show_age: bool,
+    /// Badge opacity (0.05..1.0, migration 0060). `None` = fully opaque.
+    pub overlay_opacity: Option<f32>,
 }
 
 // ─── recording_policies ──────────────────────────────────────────────────────

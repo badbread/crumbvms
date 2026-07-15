@@ -63,4 +63,19 @@ abstract class OverlayItem {
   /// grouping badges is a layout-time convenience).
   String? get groupId;
   set groupId(String? v);
+
+  /// Rendered opacity (0.05..1.0, 1 = fully opaque), applied to the item's
+  /// visual in both edit and view mode. Persistence is host-owned: PTZ
+  /// buttons store it in their JSON (`PtzPanelButton.opacity`), HA badges in
+  /// the `overlay_opacity` placement column (migration 0060).
+  double get opacity;
+  set opacity(double v);
+
+  /// Opaque snapshot of this item's mutable editor state (position, size,
+  /// group, opacity, and any host-specific style) for the controller's
+  /// undo/redo stack. Round-trips through [restoreState]; the controller
+  /// never inspects it, so implementations pick any convenient shape (a
+  /// record, a small holder class, …).
+  Object captureState();
+  void restoreState(Object state);
 }

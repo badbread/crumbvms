@@ -224,6 +224,7 @@ extension HaApi on CrumbApi {
     String? icon,
     bool showState = false,
     bool showAge = false,
+    double opacity = 1.0,
     String? label,
   }) async {
     final resp = await _putPlacement(s, cameraId, linkId, {
@@ -234,6 +235,7 @@ extension HaApi on CrumbApi {
       if (icon != null) 'icon': icon,
       'show_state': showState,
       'show_age': showAge,
+      'opacity': opacity,
       if (label != null) 'label': label,
     });
     if (resp.statusCode != 200) {

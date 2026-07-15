@@ -40,6 +40,7 @@ class HaOverlayBadgeItem implements OverlayItem {
     : _x = x ?? link.overlayX ?? 0.46,
       _y = y ?? link.overlayY ?? 0.46,
       _scale = (link.overlaySize ?? 1.0).clamp(0.1, 8.0).toDouble(),
+      _opacity = (link.overlayOpacity ?? 1.0).clamp(0.05, 1.0).toDouble(),
       labelText = link.label,
       colorHex = link.overlayColor,
       iconKey = link.overlayIcon,
@@ -51,6 +52,7 @@ class HaOverlayBadgeItem implements OverlayItem {
   double _x;
   double _y;
   double _scale;
+  double _opacity;
 
   /// Editable caption for this link (null/blank falls back to the entity id
   /// in display). Written back as the LINK's `label` on save when changed.
@@ -120,6 +122,51 @@ class HaOverlayBadgeItem implements OverlayItem {
   String? get groupId => _groupId;
   @override
   set groupId(String? v) => _groupId = v;
+
+  @override
+  double get opacity => _opacity;
+  @override
+  set opacity(double v) => _opacity = v.clamp(0.05, 1.0).toDouble();
+
+  @override
+  Object captureState() => (
+        x: _x,
+        y: _y,
+        scale: _scale,
+        opacity: _opacity,
+        label: labelText,
+        color: colorHex,
+        icon: iconKey,
+        showState: showState,
+        showAge: showAge,
+        group: _groupId,
+      );
+
+  @override
+  void restoreState(Object state) {
+    final s = state as ({
+      double x,
+      double y,
+      double scale,
+      double opacity,
+      String? label,
+      String? color,
+      String? icon,
+      bool showState,
+      bool showAge,
+      String? group,
+    });
+    _x = s.x;
+    _y = s.y;
+    _scale = s.scale;
+    _opacity = s.opacity;
+    labelText = s.label;
+    colorHex = s.color;
+    iconKey = s.icon;
+    showState = s.showState;
+    showAge = s.showAge;
+    _groupId = s.group;
+  }
 }
 
 /// One or more of an edit session's badge placements failed to save. The
@@ -240,6 +287,7 @@ class HaOverlayController {
           icon: item.iconKey,
           showState: item.showState,
           showAge: item.showAge,
+          opacity: item.opacity,
           label: newLabel == oldLabel ? null : newLabel,
         );
       } catch (e) {

@@ -26,7 +26,6 @@ import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/ha_link/ha_link_dialog.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
-import 'package:crumb_desktop/ui/ha_overlay/ha_entity_palette.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
@@ -34,6 +33,7 @@ import 'package:crumb_desktop/ui/live/pane_watchdog.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
 import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_bar.dart';
+import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_controller.dart';
 import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_layer.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_imaging_controls.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_panel_controller.dart';
@@ -350,11 +350,14 @@ class _WallScreenState extends State<WallScreen> {
     _lastCpuTime = s.cpuTimeSecs;
     _lastSample = now;
     // Perf/debug line for the bottom status bar (no wall rebuild needed).
+    // GPU/Decode are vendor-neutral now (NVML on NVIDIA, else the Windows
+    // "GPU Engine" perf counters — see rust/src/api/host.rs), so the label is
+    // the generic "Decode" rather than the NVIDIA-only "NVDEC" (#12).
     widget.statsSink?.value =
         '${_shown.length} cameras     '
         'CPU ${cpuPct?.toStringAsFixed(0) ?? "—"}%   '
         'GPU ${s.gpuUtil?.toStringAsFixed(0) ?? "—"}%   '
-        'NVDEC ${s.gpuDecUtil?.toStringAsFixed(0) ?? "—"}%   '
+        'Decode ${s.gpuDecUtil?.toStringAsFixed(0) ?? "—"}%   '
         'RSS ${s.memMb.toStringAsFixed(0)}MB';
   }
 
@@ -600,9 +603,11 @@ class _WallScreenState extends State<WallScreen> {
                   widget.clientOptions?.ptzWheelCorner ??
                   PtzWheelCorner.bottomLeft,
               haOverlay: _haOverlay,
+              isAdmin: widget.isAdmin,
               onEditHaOverlay: () => unawaited(_beginHaOverlayEdit(_maximized!)),
               onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
               onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(_maximized!)),
+              onLinkHaEntities: () => unawaited(_refreshHaLinksFor(_maximized!.id)),
               onHaLinksLoaded: _onHaLinksLoaded,
               onClose: _restore,
             ),
@@ -646,8 +651,22 @@ class _WallScreenState extends State<WallScreen> {
       onToggleAudio: widget.audio == null
           ? null
           : () => widget.audio!.toggleAudio(),
+      // Ctrl+Z / Ctrl+Y drive the active overlay editor's undo/redo (issue
+      // #4). Non-null only while an editor is open on the maximized pane, so
+      // the shortcut is inert on the plain wall. The two editors are mutually
+      // exclusive, so `_activeOverlayEditor` picks whichever is live.
+      onUndo: () => _activeOverlayEditor?.undo(),
+      onRedo: () => _activeOverlayEditor?.redo(),
       child: scaffold,
     );
+  }
+
+  /// The overlay-editor controller currently in edit mode (PTZ or HA), or null
+  /// when neither is editing — drives the Ctrl+Z/Y wiring above.
+  OverlayEditorController? get _activeOverlayEditor {
+    if (_ptzPanel.editing) return _ptzPanel.editor;
+    if (_haOverlay.editor.editMode) return _haOverlay.editor;
+    return null;
   }
 
   /// Pick what fills the wall: an applied view's custom layout, the empty-state
@@ -1678,9 +1697,11 @@ class _MaximizedPane extends StatefulWidget {
     this.ptzStyle = PtzStyle.edges,
     this.ptzWheelCorner = PtzWheelCorner.bottomLeft,
     this.haOverlay,
+    this.isAdmin = false,
     this.onEditHaOverlay,
     this.onHaOverlayDone,
     this.onEditPtzPanel,
+    this.onLinkHaEntities,
     this.onHaLinksLoaded,
   });
 
@@ -1691,6 +1712,11 @@ class _MaximizedPane extends StatefulWidget {
   final VoidCallback onClose;
   final StreamPrefsStore? streamPrefs;
   final AudioFollowController? audio;
+
+  /// Server-side admin flag — gates the right-click menu's "Link HA
+  /// entities…" item (mirrors `_WallTile.isAdmin`; the PUT is admin-enforced
+  /// server-side regardless).
+  final bool isAdmin;
 
   /// The wall tile's live controller for this camera, if it was already
   /// decoding when we maximized. Painted full-pane (sub stream, upscaled) as
@@ -1733,11 +1759,15 @@ class _MaximizedPane extends StatefulWidget {
   /// refresh needs the wall's `_tileKeys`/`_maximizedPaneKey`.
   final VoidCallback? onHaOverlayDone;
 
-  /// The maximized-pane "Edit PTZ panel…" affordance next to the HA pencil —
-  /// the missing edit entry point on the surface where the panel actually
-  /// renders (the old builder's primary UX hole, plan §3.2 D1). The pane
-  /// itself gates rendering on [ptzPanel] being usable (`_ptzEnabled`).
+  /// "Edit PTZ panel…" from the maximized pane's right-click menu — begins
+  /// the panel editor over the full-pane video (the old builder's primary UX
+  /// hole, plan §3.2 D1). The pane gates the menu item on `_ptzEnabled`.
   final VoidCallback? onEditPtzPanel;
+
+  /// Called after the maximized-pane right-click "Link HA entities…" dialog
+  /// saves, so the wall can refresh this camera's links across surfaces
+  /// (mirrors `_WallTile`'s `onSaved` reload).
+  final VoidCallback? onLinkHaEntities;
 
   /// Reported every time this pane (re)loads its own HA links — see
   /// `_WallTile.onHaLinksLoaded`'s doc; same contract.
@@ -1770,6 +1800,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   int? _videoW;
   int? _videoH;
 
+  /// Last-fetched stream URLs (retained to gate the right-click menu's
+  /// Data-saver item on `rtspMobile` availability, mirroring `_WallTile`).
+  StreamUrls? _streams;
+
   double _scale = 1.0;
   Offset _offset = Offset.zero;
   static const double _maxZoom = 8.0;
@@ -1789,6 +1823,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     final active = rec != null;
     final editing = rec?.$2 ?? false;
     if (active != _panelActive || editing != _panelEditing) {
+      // Reserve room for the bottom editor toolbar so a drag can't drop a
+      // button under it (issue #13). The PTZ bar is the taller one (hint +
+      // palette + selection controls, up to ~2 wrapped rows).
+      widget.ptzPanel?.editor.setEditBottomInset(editing ? 112 : 0);
       setState(() {
         _panelActive = active;
         _panelEditing = editing;
@@ -1815,13 +1853,19 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     if (!mounted) return;
     final editing = widget.haOverlay?.editor.editMode ?? false;
     if (editing == _haEditing) return;
-    final wasEditing = _haEditing;
+    // Reserve room for the slim HA bottom bar (generic ops only — the badge
+    // style lives in the right-side panel now), so a badge drag can't hide
+    // under it (issue #13).
+    widget.haOverlay?.editor.setEditBottomInset(editing ? 78 : 0);
     setState(() => _haEditing = editing);
-    if (wasEditing && !editing) {
-      // Edit session just ended (Done/Esc) — placements may have changed;
-      // refresh this pane's own view-mode link cache.
-      unawaited(_loadHaLinks());
-    }
+    // NOTE (issue #3): this pane deliberately does NOT re-fetch links when the
+    // edit session ends. `editor.endEdit()` flips editMode false SYNCHRONOUSLY
+    // — before `endEditAndSave` has awaited its placement PUTs — so a reload
+    // fired here reads pre-save state and can land AFTER the wall's
+    // post-PUT refresh, clobbering the just-saved style (the pins/color/icon
+    // "didn't stick through save/reload" symptom). The wall's
+    // `_endHaOverlayEdit` → `_refreshHaLinksFor` pushes the authoritative
+    // post-save links into this pane via `setHaLinks`, so no reload is needed.
   }
 
   @override
@@ -1868,6 +1912,113 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     widget.onHaLinksLoaded?.call(widget.camera.id, links);
   }
 
+  /// Right-click menu for the maximized pane (issue #7): the same actions the
+  /// wall tile offers — Edit PTZ panel / Edit HA overlay / Link HA entities,
+  /// PTZ enable-disable, and the stream main/sub/data-saver override — so the
+  /// surface where the panel/badges actually render has a proper entry point
+  /// (replaces the top-bar pencils). Suppressed while an editor is open (the
+  /// bar owns the interaction then).
+  Future<void> _showMaximizedMenu(Offset globalPos) async {
+    if (_panelEditing || _haEditing) return;
+    final prefs = widget.streamPrefs;
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final eff = prefs?.effectiveFor(widget.camera.id);
+    final canEditPtz = _ptzEnabled && widget.onEditPtzPanel != null;
+    final canEditHa = _haLinks.isNotEmpty && widget.onEditHaOverlay != null;
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPos & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        if (canEditPtz)
+          const PopupMenuItem(
+            value: 'ptz-panel',
+            child: Text('Edit PTZ panel…'),
+          ),
+        if (widget.camera.ptz && prefs != null)
+          PopupMenuItem(
+            value: 'ptz',
+            child: Text(
+              prefs.ptzDisabledFor(widget.camera.id)
+                  ? 'Enable PTZ controls'
+                  : 'Disable PTZ controls',
+            ),
+          ),
+        if (canEditPtz || (widget.camera.ptz && prefs != null))
+          const PopupMenuDivider(),
+        if (widget.isAdmin)
+          const PopupMenuItem(
+            value: 'ha-link',
+            child: Text('Link HA entities…'),
+          ),
+        if (canEditHa)
+          const PopupMenuItem(
+            value: 'ha-overlay',
+            child: Text('Edit HA overlay…'),
+          ),
+        if (widget.isAdmin || canEditHa) const PopupMenuDivider(),
+        CheckedPopupMenuItem(
+          value: 'main',
+          checked: eff == StreamQuality.main,
+          child: const Text('Main stream'),
+        ),
+        CheckedPopupMenuItem(
+          value: 'sub',
+          checked: eff == StreamQuality.sub,
+          child: const Text('Sub stream'),
+        ),
+        CheckedPopupMenuItem(
+          value: 'data-saver',
+          checked: eff == StreamQuality.dataSaver,
+          enabled: _streams?.rtspMobile != null,
+          child: const Text('Data saver (low-res)'),
+        ),
+        if (prefs?.hasOverride(widget.camera.id) ?? false)
+          const PopupMenuItem(
+            value: 'reset',
+            child: Text('Reset to wall default'),
+          ),
+      ],
+    );
+    if (result == null || !mounted) return;
+    switch (result) {
+      case 'ptz-panel':
+        widget.onEditPtzPanel?.call();
+      case 'ha-overlay':
+        widget.onEditHaOverlay?.call();
+      case 'ha-link':
+        unawaited(
+          showHaLinkDialog(
+            context,
+            api: widget.api,
+            session: widget.session,
+            cameraId: widget.camera.id,
+            cameraName: widget.camera.name,
+            onSaved: () {
+              unawaited(_loadHaLinks());
+              widget.onLinkHaEntities?.call();
+            },
+          ),
+        );
+      case 'ptz':
+        prefs?.setPtzDisabled(
+          widget.camera.id,
+          !prefs.ptzDisabledFor(widget.camera.id),
+        );
+        setState(() {}); // affects PTZ affordances/menu gating
+      case 'main':
+        prefs?.setOverride(widget.camera.id, StreamQuality.main);
+      case 'sub':
+        prefs?.setOverride(widget.camera.id, StreamQuality.sub);
+      case 'data-saver':
+        prefs?.setOverride(widget.camera.id, StreamQuality.dataSaver);
+      case 'reset':
+        prefs?.setOverride(widget.camera.id, null);
+    }
+  }
+
   Future<void> _load() async {
     // Track a Player created below so the catch can dispose it if open() throws
     // before this pane adopts it — a failed initial load otherwise leaks the
@@ -1879,6 +2030,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         widget.session,
         widget.camera.id,
       );
+      _streams = streams; // gate the right-click Data-saver item
       // Prefer MAIN for the maximized view; fall back to sub.
       final url = streams.rtspMain ?? streams.preferredForWall;
       if (url == null) {
@@ -2254,6 +2406,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                             // Double-click in the maximized view returns to the
                             // wall (matches the old client).
                             onDoubleTap: widget.onClose,
+                            // Right-click opens the same context menu the wall
+                            // tile has (Edit PTZ panel / HA overlay, Link HA,
+                            // stream override) — issue #7.
+                            onSecondaryTapDown: (d) =>
+                                _showMaximizedMenu(d.globalPosition),
                             // PTZ center mode: single click recenters on the
                             // clicked point. (PTZ pan mode is driven by the
                             // raw-pointer Listener above, so a stationary hold
@@ -2389,43 +2546,31 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           ],
                         ),
                       ),
-                      // "Edit HA overlay…" pencil (issue #170 P0): a second,
-                      // always-visible entry point alongside the tile
-                      // right-click menu — gated on this camera actually
-                      // having HA links, and hidden while either editor is
-                      // already open (mutual exclusion, no re-entry).
-                      if (widget.onEditHaOverlay != null &&
-                          _haLinks.isNotEmpty &&
-                          !_haEditing &&
-                          !_panelEditing) ...[
+                      // A subtle "right-click for options" hint next to the
+                      // name (the Edit PTZ panel / HA overlay pencils were
+                      // replaced by the right-click menu, issue #7) — shown
+                      // only when there's actually something to configure and
+                      // no editor is open.
+                      if (!_haEditing &&
+                          !_panelEditing &&
+                          ((widget.onEditPtzPanel != null && _ptzEnabled) ||
+                              (widget.onEditHaOverlay != null &&
+                                  _haLinks.isNotEmpty) ||
+                              widget.isAdmin)) ...[
                         const SizedBox(width: 8),
-                        Material(
-                          color: Colors.black.withValues(alpha: 0.55),
-                          shape: const CircleBorder(),
-                          child: IconButton(
-                            tooltip: 'Edit HA overlay…',
-                            icon: const Icon(Icons.edit_outlined, size: 18),
-                            color: Colors.white,
-                            onPressed: widget.onEditHaOverlay,
-                          ),
-                        ),
-                      ],
-                      // "Edit PTZ panel…" affordance ON the surface where the
-                      // panel renders (the old builder's D1 hole: the only
-                      // entry point was the wall tile's right-click menu).
-                      if (widget.onEditPtzPanel != null &&
-                          _ptzEnabled &&
-                          !_haEditing &&
-                          !_panelEditing) ...[
-                        const SizedBox(width: 8),
-                        Material(
-                          color: Colors.black.withValues(alpha: 0.55),
-                          shape: const CircleBorder(),
-                          child: IconButton(
-                            tooltip: 'Edit PTZ panel…',
-                            icon: const Icon(Icons.tune, size: 18),
-                            color: Colors.white,
-                            onPressed: widget.onEditPtzPanel,
+                        Tooltip(
+                          message: 'Right-click for camera options',
+                          child: Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.55),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.more_horiz,
+                              size: 18,
+                              color: Colors.white70,
+                            ),
                           ),
                         ),
                       ],
@@ -2521,42 +2666,35 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                   ),
                 ],
 
-                // HA-overlay editor bar (issue #170 P0): the palette (this
-                // camera's linked entities, grouped+searched) + Done/Clear +
-                // selected-badge size stepper. Mutually exclusive with the
-                // PTZ chrome above by construction (`_haEditing`/
-                // `_panelEditing` can't both be true — see the wall's
-                // `_beginHaOverlayEdit`/`_beginPtzPanelEdit` guards).
-                if (widget.haOverlay != null && _haEditing)
+                // HA-overlay editor (issue #170 P0 + readability #9): the
+                // badge-specific chrome — the entity palette + the selected
+                // badge's grouped style form (label/size/opacity/color/icon/
+                // pins) — lives in a vertical RIGHT-SIDE panel (uses the
+                // available height), while the bottom bar keeps only the
+                // generic multi-select geometry ops (align/group/match/undo).
+                // Mutually exclusive with the PTZ chrome above by construction.
+                if (widget.haOverlay != null && _haEditing) ...[
+                  Positioned(
+                    right: 14,
+                    top: 64,
+                    child: HaOverlayEditPanel(host: widget.haOverlay!),
+                  ),
                   Positioned(
                     left: 0,
                     right: 0,
                     bottom: 0,
                     child: OverlayEditorBar(
                       controller: widget.haOverlay!.editor,
-                      paletteSlot: AnimatedBuilder(
-                        // Rebuilds on the editor's STRUCTURE notifications
-                        // (add/remove/select — drag ticks fire only the
-                        // geometry ticker), so the palette's "placed"
-                        // checkmarks stay live without the whole pane, or
-                        // the palette itself, rebuilding per pointer move.
-                        animation: widget.haOverlay!.editor,
-                        builder: (context, _) => HaEntityPalette(
-                          links: widget.haOverlay!.links,
-                          placedIds: widget.haOverlay!.placedIdsInSession,
-                          onPick: widget.haOverlay!.pickFromPalette,
-                        ),
-                      ),
+                      paletteSlot: const SizedBox.shrink(),
+                      showSizeControls: false,
+                      showOpacityControl: false,
                       itemLabel: (item) =>
                           (item as HaOverlayBadgeItem).displayLabel,
-                      selectedExtrasBuilder: (item) => HaBadgeStyleEditor(
-                        editor: widget.haOverlay!.editor,
-                        item: item as HaOverlayBadgeItem,
-                      ),
                       onClear: widget.haOverlay!.editor.clearAll,
                       onDone: () => widget.onHaOverlayDone?.call(),
                     ),
                   ),
+                ],
               ],
             );
           },

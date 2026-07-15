@@ -176,6 +176,12 @@ class _OverlayEditorLayerState extends State<OverlayEditorLayer> {
                     videoH: widget.videoH,
                     editing: widget.editing,
                     selected: widget.editing && controller.isSelected(item.id),
+                    // The match-size / properties reference: the primary
+                    // (last-clicked) item, marked only while it's one of
+                    // several selected (issue #5).
+                    isReference: widget.editing &&
+                        controller.selectedIds.length > 1 &&
+                        controller.primarySelectedId == item.id,
                     buildItem: widget.buildItem,
                     onTap: widget.onTapItem,
                     onHover: widget.onHoverItem,
@@ -310,6 +316,7 @@ class _OverlayItemWidget extends StatelessWidget {
     required this.videoH,
     required this.editing,
     required this.selected,
+    required this.isReference,
     required this.buildItem,
     required this.onTap,
     required this.onHover,
@@ -323,6 +330,7 @@ class _OverlayItemWidget extends StatelessWidget {
   final int? videoH;
   final bool editing;
   final bool selected;
+  final bool isReference;
   final OverlayItemBuilder buildItem;
   final void Function(OverlayItem item)? onTap;
   final void Function(OverlayItem item, bool hovering)? onHover;
@@ -410,12 +418,45 @@ class _OverlayItemWidget extends StatelessWidget {
               // Explicit SizedBox: a Stack loosens the constraints of a
               // non-positioned child, so the delegate's returned widget must
               // be told its exact target size rather than relying on it to
-              // self-size correctly under loose constraints.
+              // self-size correctly under loose constraints. Opacity is
+              // applied to the item visual only (not the handles/ref marker).
               SizedBox(
                 width: w,
                 height: h,
-                child: buildItem(item, editing: true, selected: selected),
+                child: _withOpacity(
+                  buildItem(item, editing: true, selected: selected),
+                ),
               ),
+              // Match-size reference marker (issue #5): a small "REF" chip on
+              // the primary (last-clicked) item of a multi-selection, so it's
+              // clear which item Match-W/H/size and the properties target.
+              if (isReference)
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 3,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2CA3E8),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                      child: const Text(
+                        'REF',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 8,
+                          fontWeight: FontWeight.w800,
+                          height: 1,
+                          letterSpacing: 0.4,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               // Delete (x) handle, top-right.
               if (showHandles)
                 Positioned(
@@ -481,7 +522,7 @@ class _OverlayItemWidget extends StatelessWidget {
     final Widget body = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap == null ? null : () => onTap!(item),
-      child: buildItem(item, editing: false, selected: false),
+      child: _withOpacity(buildItem(item, editing: false, selected: false)),
     );
     final hover = onHover;
     if (hover == null) return body;
@@ -490,5 +531,13 @@ class _OverlayItemWidget extends StatelessWidget {
       onExit: (_) => hover(item, false),
       child: body,
     );
+  }
+
+  /// Wrap `child` in an [Opacity] only when the item is actually translucent
+  /// (opacity is a relatively costly layer — skip it at full opacity).
+  Widget _withOpacity(Widget child) {
+    final o = item.opacity;
+    if (o >= 0.999) return child;
+    return Opacity(opacity: o.clamp(0.0, 1.0).toDouble(), child: child);
   }
 }

@@ -21,6 +21,7 @@ class HaLink {
     this.overlayIcon,
     this.overlayShowState = false,
     this.overlayShowAge = false,
+    this.overlayOpacity,
   });
 
   final String id; // UUID
@@ -58,6 +59,9 @@ class HaLink {
   final bool overlayShowState;
   final bool overlayShowAge;
 
+  /// Badge opacity (0.05..1.0, migration 0060), or null for fully opaque.
+  final double? overlayOpacity;
+
   bool get hasPlacement => overlayX != null && overlayY != null;
 
   /// The entity_id's domain prefix (`binary_sensor`, `light`, `switch`,
@@ -86,6 +90,7 @@ class HaLink {
     overlayIcon: j['overlay_icon'] as String?,
     overlayShowState: (j['overlay_show_state'] as bool?) ?? false,
     overlayShowAge: (j['overlay_show_age'] as bool?) ?? false,
+    overlayOpacity: (j['overlay_opacity'] as num?)?.toDouble(),
   );
 }
 

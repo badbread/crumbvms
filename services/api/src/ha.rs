@@ -169,6 +169,8 @@ struct HaLinkDto {
     /// Pin the live state text / relative age next to the badge on the wall.
     overlay_show_state: bool,
     overlay_show_age: bool,
+    /// Badge opacity (0.05..1.0, migration 0060); `null` = fully opaque.
+    overlay_opacity: Option<f32>,
 }
 
 impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
@@ -187,6 +189,7 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             overlay_icon: l.overlay_icon,
             overlay_show_state: l.overlay_show_state,
             overlay_show_age: l.overlay_show_age,
+            overlay_opacity: l.overlay_opacity,
         }
     }
 }
@@ -215,11 +218,18 @@ struct PlacementInput {
     show_state: bool,
     #[serde(default)]
     show_age: bool,
+    /// Badge opacity (migration 0060); omitted = fully opaque.
+    #[serde(default = "default_overlay_opacity")]
+    opacity: f32,
     #[serde(default)]
     label: Option<String>,
 }
 
 fn default_overlay_size() -> f32 {
+    1.0
+}
+
+fn default_overlay_opacity() -> f32 {
     1.0
 }
 
@@ -400,9 +410,10 @@ async fn put_placement(
     let placement = match &body {
         None => None,
         Some(p) => {
-            if !p.x.is_finite() || !p.y.is_finite() || !p.size.is_finite() {
+            if !p.x.is_finite() || !p.y.is_finite() || !p.size.is_finite() || !p.opacity.is_finite()
+            {
                 return Err(ApiError::BadRequest(
-                    "placement x/y/size must be finite numbers".to_owned(),
+                    "placement x/y/size/opacity must be finite numbers".to_owned(),
                 ));
             }
             if let Some(c) = &p.color {
@@ -437,6 +448,7 @@ async fn put_placement(
                 icon: p.icon.clone(),
                 show_state: p.show_state,
                 show_age: p.show_age,
+                opacity: Some(p.opacity.clamp(0.05, 1.0)),
             })
         }
     };
@@ -648,6 +660,7 @@ mod tests {
         assert_eq!(p.icon, None);
         assert!(!p.show_state);
         assert!(!p.show_age);
+        assert!((p.opacity - 1.0).abs() < f32::EPSILON); // migration 0060 default
         assert_eq!(p.label, None);
 
         // A null body deserializes to None (clears the placement).
@@ -660,7 +673,7 @@ mod tests {
         let p: PlacementInput = serde_json::from_value(json!({
             "x": 0.4, "y": 0.6, "size": 1.5,
             "color": "#FFB143", "icon": "doorbell",
-            "show_state": true, "show_age": true,
+            "show_state": true, "show_age": true, "opacity": 0.5,
             "label": "Front door"
         }))
         .unwrap();
@@ -668,6 +681,7 @@ mod tests {
         assert_eq!(p.icon.as_deref(), Some("doorbell"));
         assert!(p.show_state);
         assert!(p.show_age);
+        assert!((p.opacity - 0.5).abs() < f32::EPSILON);
         assert_eq!(p.label.as_deref(), Some("Front door"));
     }
 
