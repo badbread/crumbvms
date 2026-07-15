@@ -51,6 +51,11 @@ fun PlayerSurface(
             }
             view.apply {
                 this.useController = useController
+                // Don't auto-pop the transport controls over the video when
+                // playback starts (they briefly cover the clip before timing
+                // out); the user taps to reveal them. Only relevant when the
+                // controller is enabled (the clip player).
+                if (useController) controllerAutoShow = false
                 this.resizeMode = resizeMode
                 setKeepContentOnPlayerReset(keepContentOnReset)
                 setShutterBackgroundColor(android.graphics.Color.BLACK)
