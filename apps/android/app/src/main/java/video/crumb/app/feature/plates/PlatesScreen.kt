@@ -345,15 +345,13 @@ fun PlatesScreen(
             read = reportRead,
             mediaUrls = mediaUrls,
             generating = generatingReport,
-            onDownload = { caseText, zoneId, includeDossier ->
+            onDownload = { zoneId, includeDossier ->
                 if (generatingReport) return@PlateReportDialog
                 generatingReport = true
                 val repo = container.repository
                 val camNames = state.cameras.associate { it.id to it.name }
                 val allCamIds = state.cameras.map { it.id }
                 val loader = context.imageLoader
-                val serverHost = runCatching { android.net.Uri.parse(store.serverUrl).authority }
-                    .getOrNull()?.takeIf { it.isNotBlank() } ?: store.serverUrl
                 val exportedBy = store.username ?: "—"
                 scope.launch {
                     // Resolve the watchlist match (BOLO banner) + the sighting dossier
@@ -379,9 +377,7 @@ fun PlatesScreen(
                     val input = PlateReportInput(
                         read = reportRead,
                         cameraNames = camNames,
-                        serverHost = serverHost,
                         exportedBy = exportedBy,
-                        caseText = caseText,
                         zoneId = zoneId,
                         includeDossier = includeDossier,
                         watchMatch = watchMatch,
@@ -1601,20 +1597,19 @@ private val REPORT_COMMON_ZONES: List<String> = listOf(
 )
 
 /**
- * Builder for the OpenALPR-style single-plate report: a Case #/description field,
- * a timezone picker (defaulting to device-local), and a toggle for the sighting
- * dossier — then "Download PDF" (which builds the report and hands it to the
- * system share sheet). Mirrors the [WatchlistDialog]/[CameraPickerDialog] pattern.
+ * Builder for the single-plate report: a timezone picker (defaulting to
+ * device-local) and a toggle for the sighting dossier — then "Download PDF"
+ * (which builds the report and hands it to the system share sheet). Mirrors the
+ * [WatchlistDialog]/[CameraPickerDialog] pattern.
  */
 @Composable
 private fun PlateReportDialog(
     read: PlateRead,
     mediaUrls: MediaUrls,
     generating: Boolean,
-    onDownload: (caseText: String, zoneId: java.time.ZoneId, includeDossier: Boolean) -> Unit,
+    onDownload: (zoneId: java.time.ZoneId, includeDossier: Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var caseText by remember { mutableStateOf("") }
     var includeDossier by remember { mutableStateOf(true) }
     val defaultZone = remember { java.time.ZoneId.systemDefault().id }
     // Device-local first (the default), then the curated common set, de-duplicated.
@@ -1647,14 +1642,6 @@ private fun PlateReportDialog(
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                     style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(top = 8.dp),
-                )
-                TextField(
-                    value = caseText,
-                    onValueChange = { caseText = it },
-                    placeholder = { Text("Case # / description") },
-                    singleLine = true,
-                    leadingIcon = { Icon(Icons.Filled.Event, contentDescription = null) },
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
                 // Timezone picker.
                 Row(
@@ -1702,7 +1689,7 @@ private fun PlateReportDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onDownload(caseText, java.time.ZoneId.of(zoneId), includeDossier) },
+                onClick = { onDownload(java.time.ZoneId.of(zoneId), includeDossier) },
                 enabled = !generating,
             ) {
                 if (generating) {

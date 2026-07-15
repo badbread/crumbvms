@@ -465,10 +465,8 @@ pw.Widget _imagePanel({
 }
 
 pw.Widget _detailsBlock(PlateRead read) {
-  final region = (read.region ?? '').trim();
   final rows = <List<String>>[
     ['OCR raw', read.plateRaw.isEmpty ? '-' : read.plateRaw],
-    if (region.isNotEmpty) ['Region', region],
     ['Source', (read.sourceId ?? '').isEmpty ? '-' : read.sourceId!],
   ];
   return pw.Container(

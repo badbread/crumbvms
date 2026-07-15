@@ -38,8 +38,7 @@ import kotlin.math.roundToInt
  * third-party PDF dependency).
  *
  * Layout (one A4 portrait page):
- *  - **Forensic header**: server host, exported-by, export timestamp, a random
- *    report id, and the operator's Case #/description.
+ *  - **Header**: exported-by, export timestamp, and a random report id.
  *  - **Watchlist/BOLO banner** (red) when the plate matches a `kind:"watch"`
  *    entry from `GET /lpr/watchlist`.
  *  - **Header block**: the plate (large monospace), confidence, the date+time in
@@ -47,7 +46,7 @@ import kotlin.math.roundToInt
  *  - **Two images**: a zoomed plate crop (the snapshot cropped to [PlateRead.bbox])
  *    and the full "vehicle" snapshot. When bbox is null / the crop fails, the
  *    first image falls back to the full snapshot, labeled "vehicle".
- *  - **Details**: `plate_raw`, region, source.
+ *  - **Details**: `plate_raw`, source.
  *  - **Dossier** (optional): every sighting of this plate — total, distinct
  *    cameras, first/last seen, and a small thumbnail strip.
  *  - **Footer**: the SHA-256 of each embedded image's bytes, labeled
@@ -100,12 +99,8 @@ data class PlateReportInput(
     val read: PlateRead,
     /** Camera id → display name (resolves both the primary camera and dossier cameras). */
     val cameraNames: Map<String, String>,
-    /** Connected server host (from the session base URL). */
-    val serverHost: String,
     /** Username that exported the report (from the session / `/auth/me`). */
     val exportedBy: String,
-    /** Operator's Case # / free-text description (may be blank). */
-    val caseText: String,
     /** Timezone the timestamps are rendered in (defaults to device-local at the call site). */
     val zoneId: ZoneId,
     /** Whether to render the sighting-history dossier section. */
@@ -118,6 +113,10 @@ data class PlateReportInput(
     /** Server-reported total match count for the dossier query (may exceed `dossier.size`). */
     val dossierTotal: Int,
 )
+
+/** One sighting-history thumbnail: the decoded image paired with that sighting's
+ *  timestamp (ISO), so the strip can caption each thumbnail with its date/time. */
+private class DossierThumb(val bitmap: Bitmap, val ts: String)
 
 /**
  * Build the single-plate report PDF for [input]. Returns the written [File] on
@@ -144,16 +143,17 @@ suspend fun generatePlateReportPdf(
         val cropIsFallback = crop == null
         val plateImage = crop ?: fullSnapshot
 
-        // Dossier thumbnail strip (bounded). Skip the primary read's own event to
-        // avoid a duplicate of the header image where possible.
-        val dossierThumbs: List<Bitmap> = if (input.includeDossier) {
-            val out = ArrayList<Bitmap>(MAX_DOSSIER_THUMBS)
+        // Dossier thumbnail strip (bounded). Each thumb keeps its sighting's
+        // timestamp so the strip can caption it with a date/time (captions stay
+        // aligned even when a fetch is skipped, since ts travels with the image).
+        val dossierThumbs: List<DossierThumb> = if (input.includeDossier) {
+            val out = ArrayList<DossierThumb>(MAX_DOSSIER_THUMBS)
             for (d in input.dossier) {
                 if (out.size >= MAX_DOSSIER_THUMBS) break
                 val bmp = fetchSnapshotBitmap(
                     context, mediaUrls, imageLoader, d.cameraId, d.eventId, DOSSIER_THUMB_TARGET_PX,
                 ) ?: continue
-                out.add(bmp)
+                out.add(DossierThumb(bmp, d.ts))
             }
             out
         } else {
@@ -205,7 +205,7 @@ suspend fun generatePlateReportPdf(
             val owned = LinkedHashSet<Bitmap>()
             fullSnapshot?.let(owned::add)
             plateImage?.let(owned::add)
-            dossierThumbs.forEach(owned::add)
+            dossierThumbs.forEach { owned.add(it.bitmap) }
             owned.forEach { runCatching { it.recycle() } }
         }
     }
@@ -269,7 +269,7 @@ private fun drawReport(
     plateImage: Bitmap?,
     cropIsFallback: Boolean,
     vehicleImage: Bitmap?,
-    dossierThumbs: List<Bitmap>,
+    dossierThumbs: List<DossierThumb>,
     shaPlate: String?,
     shaVehicle: String?,
     reportId: String,
@@ -358,10 +358,8 @@ private fun drawReport(
         c.drawText(value, contentLeft + 78f, y, metaPaint)
         y += 13f
     }
-    metaLine("SERVER", input.serverHost.ifBlank { "—" })
     metaLine("EXPORTED BY", input.exportedBy.ifBlank { "—" })
     metaLine("EXPORTED AT", exportedAt)
-    metaLine("CASE", input.caseText.ifBlank { "—" })
     y += 4f
     c.drawLine(contentLeft, y, contentRight, y, linePaint)
     y += 14f
@@ -416,7 +414,6 @@ private fun drawReport(
         y += 14f
     }
     detailLine("PLATE RAW", read.plateRaw.ifBlank { "—" })
-    detailLine("REGION", read.region?.takeIf { it.isNotBlank() } ?: "—")
     detailLine("SOURCE", read.sourceId?.takeIf { it.isNotBlank() } ?: "—")
     y += 6f
 
@@ -448,17 +445,27 @@ private fun drawReport(
             y += 14f
             c.drawText("Last seen  $lastSeen", contentLeft, y, cellPaint)
             y += 16f
-            // Thumbnail strip (single bounded row).
+            // Thumbnail strip (single bounded row), each captioned with its
+            // sighting's date/time in the report's timezone.
             if (dossierThumbs.isNotEmpty()) {
+                val thumbTsFmt = DateTimeFormatter
+                    .ofPattern("MMM d, HH:mm", Locale.US)
+                    .withZone(input.zoneId)
+                val thumbCapPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = AndroidColor.rgb(0x5a, 0x66, 0x78)
+                    textSize = 6.5f
+                    textAlign = Paint.Align.CENTER
+                }
                 val thumbGap = 8f
                 val thumbW = (contentWidth - thumbGap * (MAX_DOSSIER_THUMBS - 1)) / MAX_DOSSIER_THUMBS
                 val thumbH = thumbW * 0.62f
                 var tx = contentLeft
-                for (bmp in dossierThumbs) {
-                    drawImageBox(c, bmp, tx, y, thumbW, thumbH, placeholderPaint, placeholderTextPaint)
+                for (t in dossierThumbs) {
+                    drawImageBox(c, t.bitmap, tx, y, thumbW, thumbH, placeholderPaint, placeholderTextPaint)
+                    c.drawText(fmtTs(t.ts, thumbTsFmt), tx + thumbW / 2f, y + thumbH + 9f, thumbCapPaint)
                     tx += thumbW + thumbGap
                 }
-                y += thumbH + 8f
+                y += thumbH + 8f + 11f
             }
         }
     }
