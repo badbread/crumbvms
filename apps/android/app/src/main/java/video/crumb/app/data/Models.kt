@@ -636,11 +636,19 @@ data class ViewDto(
 )
 
 /** `POST /views` body. Cameras are encoded as bare-string slots `{"0": id, …}` so
- *  the `{slotIndex: cameraId}` contract shared with web/desktop stays clean. */
+ *  the `{slotIndex: cameraId}` contract shared with web/desktop stays clean.
+ *
+ *  [layout] deliberately has NO Kotlin default: kotlinx.serialization runs with
+ *  `encodeDefaults = false` (see [video.crumb.app.data.Network]), so any property
+ *  left at its declared default is dropped from the wire body. A `layout = "auto"`
+ *  default made `layout` vanish from `POST /views`, and the server's own
+ *  `CreateViewRequest.layout` has no serde default (it is required), so it rejected
+ *  the body with HTTP 422 — breaking every view save/reorder (#159). Keeping the
+ *  field default-less forces it onto the wire; callers pass "auto" explicitly. */
 @Serializable
 data class CreateViewRequest(
     val name: String,
-    val layout: String = "auto",
+    val layout: String,
     val slots: JsonObject,
 )
 

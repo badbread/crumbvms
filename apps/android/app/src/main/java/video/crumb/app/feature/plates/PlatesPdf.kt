@@ -556,18 +556,22 @@ fun matchWatchlistBolo(
     return best
 }
 
-/** Uppercase ASCII-alphanumeric normalization — identical to the server's `normalize_plate`. */
-private fun normalizePlate(s: String): String =
+/** Uppercase ASCII-alphanumeric normalization — identical to the server's `normalize_plate`.
+ *  `internal` so the watchlist fuzziness preview ([acceptedMisreadExamples]) reuses the
+ *  exact same normalization the server matcher uses, keeping the preview truthful. */
+internal fun normalizePlate(s: String): String =
     buildString {
         for (c in s) if (c in '0'..'9' || c in 'a'..'z' || c in 'A'..'Z') append(c.uppercaseChar())
     }
 
-/** Edit budget `floor(fuzz.clamp(0,0.5) · len(reference))` — matches the server. */
-private fun allowedEdits(reference: String, fuzz: Float): Int =
+/** Edit budget `floor(fuzz.clamp(0,0.5) · len(reference))` — matches the server
+ *  (`allowed_edits` in `services/common/src/db.rs`). [reference] must already be
+ *  normalized. `internal` so the fuzziness-preview slider shares this exact rule. */
+internal fun allowedEdits(reference: String, fuzz: Float): Int =
     (fuzz.coerceIn(0f, 0.5f) * reference.length).toInt()
 
 /** Classic two-row Levenshtein edit distance (plates are short). */
-private fun levenshtein(a: String, b: String): Int {
+internal fun levenshtein(a: String, b: String): Int {
     if (a.isEmpty()) return b.length
     if (b.isEmpty()) return a.length
     var prev = IntArray(b.length + 1) { it }
@@ -581,6 +585,67 @@ private fun levenshtein(a: String, b: String): Int {
         val tmp = prev; prev = curr; curr = tmp
     }
     return prev[b.length]
+}
+
+// ─── fuzzy-match preview model (mirrors the desktop + admin console) ──────────
+//
+// The watchlist match tolerance is *character edit distance* — a read matches an
+// entry when `levenshtein(normalize(read), normalize(entry)) <= allowedEdits`. To
+// make the admin fuzziness slider mean something concrete, the preview generates a
+// few plausible OCR misreads of the plate being typed that the CURRENT tolerance
+// would still accept — each verified by the very same edit-distance rule the
+// server uses, so the preview never over-promises. Ported verbatim from the
+// desktop Dart (`plates_screen.dart`) and the admin console JS (`admin.html`).
+
+/** Common ALPR character confusions (the pairs Frigate's OCR most often swaps). */
+internal val OCR_CONFUSIONS: Map<Char, Char> = mapOf(
+    '0' to 'O', 'O' to '0', '1' to 'I', 'I' to '1', 'L' to '1', '2' to 'Z', 'Z' to '2',
+    '5' to 'S', 'S' to '5', '8' to 'B', 'B' to '8', '6' to 'G', 'G' to '6', '4' to 'A',
+    'A' to '4', 'D' to '0', 'Q' to 'O', '7' to 'T',
+)
+
+/**
+ * A few realistic misreads of [plate] that the server WOULD accept at the given
+ * [allowed] tolerance — one/two OCR-confusion substitutions, each verified by the
+ * same edit-distance rule the server uses. Returns an empty list when tolerance is
+ * 0 (exact only) or the plate normalizes to empty. Mirrors the desktop's
+ * `_acceptedMisreadExamples`.
+ */
+internal fun acceptedMisreadExamples(plate: String, allowed: Int): List<String> {
+    val norm = normalizePlate(plate)
+    if (norm.isEmpty() || allowed <= 0) return emptyList()
+    val out = mutableListOf<String>()
+    // Distance-1 variants first: swap one confusable character.
+    var i = 0
+    while (i < norm.length && out.size < 4) {
+        val rep = OCR_CONFUSIONS[norm[i]]
+        if (rep != null) {
+            val cand = norm.substring(0, i) + rep + norm.substring(i + 1)
+            if (cand != norm && cand !in out && levenshtein(cand, norm) <= allowed) out.add(cand)
+        }
+        i++
+    }
+    // If two edits are allowed, add a couple of double-swaps to show the range.
+    if (allowed >= 2) {
+        i = 0
+        while (i < norm.length && out.size < 4) {
+            val r1 = OCR_CONFUSIONS[norm[i]]
+            if (r1 != null) {
+                var j = i + 1
+                while (j < norm.length && out.size < 4) {
+                    val r2 = OCR_CONFUSIONS[norm[j]]
+                    if (r2 != null) {
+                        val cand = norm.substring(0, i) + r1 +
+                            norm.substring(i + 1, j) + r2 + norm.substring(j + 1)
+                        if (cand != norm && cand !in out && levenshtein(cand, norm) <= allowed) out.add(cand)
+                    }
+                    j++
+                }
+            }
+            i++
+        }
+    }
+    return out
 }
 
 // ─── share ──────────────────────────────────────────────────────────────────
