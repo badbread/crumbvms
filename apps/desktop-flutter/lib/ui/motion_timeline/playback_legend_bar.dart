@@ -9,6 +9,7 @@
 import 'package:flutter/material.dart';
 
 import '../../api/models.dart';
+import '../color_swatch_picker.dart';
 import 'camera_colors.dart';
 import 'motion_timeline_controller.dart';
 import 'motion_timeline_view.dart' show kLegendCameraMax;
@@ -148,93 +149,25 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
     );
   }
 
-  /// Palette color picker (right-click a swatch). Colors already used by another
+  /// Palette color picker (right-click a swatch) — the shared
+  /// `ui/color_swatch_picker.dart` dialog. Colors already used by another
   /// camera are flagged (badge + tooltip) but stay selectable.
   Future<void> _pickCameraColor(String cameraId) async {
-    final current = cameraMotionColor(cameraId);
-    final overridden = hasCameraColorOverride(cameraId);
     final usedBy = <int, List<String>>{};
     for (final c in widget.cameras) {
       if (c.id == cameraId) continue;
       (usedBy[cameraMotionColor(c.id).toARGB32()] ??= []).add(c.name);
     }
-    final chosen = await showDialog<Object?>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Color for ${_nameFor(cameraId)}'),
-        content: SizedBox(
-          width: 300,
-          child: Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: [
-              for (final color in kCameraPickerPalette)
-                _colorSwatch(ctx, color, current, usedBy[color.toARGB32()]),
-            ],
-          ),
-        ),
-        actions: [
-          if (overridden)
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, 'reset'),
-              child: const Text('Reset to default'),
-            ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-        ],
-      ),
+    final result = await showColorSwatchPicker(
+      context,
+      title: 'Color for ${_nameFor(cameraId)}',
+      current: cameraMotionColor(cameraId),
+      allowReset: hasCameraColorOverride(cameraId),
+      usedBy: usedBy,
     );
-    if (chosen == null) return;
-    if (chosen == 'reset') {
-      await setCameraColorOverride(cameraId, null);
-    } else if (chosen is Color) {
-      await setCameraColorOverride(cameraId, chosen);
-    }
+    if (result == null) return;
+    await setCameraColorOverride(cameraId, result.cleared ? null : result.color);
     if (mounted) setState(() {});
-  }
-
-  Widget _colorSwatch(
-    BuildContext ctx,
-    Color color,
-    Color current,
-    List<String>? usedByNames,
-  ) {
-    final isCurrent = color == current;
-    final used = usedByNames != null && usedByNames.isNotEmpty;
-    final swatch = InkWell(
-      onTap: () => Navigator.pop(ctx, color),
-      customBorder: const CircleBorder(),
-      child: Container(
-        width: 30,
-        height: 30,
-        decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: isCurrent ? Colors.white : Colors.transparent,
-            width: 2,
-          ),
-        ),
-        child: used
-            ? Align(
-                alignment: Alignment.bottomRight,
-                child: Container(
-                  width: 12,
-                  height: 12,
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.6),
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(Icons.check, size: 9, color: Colors.white),
-                ),
-              )
-            : null,
-      ),
-    );
-    if (!used) return swatch;
-    return Tooltip(message: 'In use by ${usedByNames.join(', ')}', child: swatch);
   }
 }
 

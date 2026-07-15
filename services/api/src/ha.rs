@@ -162,6 +162,13 @@ struct HaLinkDto {
     overlay_y: Option<f64>,
     /// Badge scale multiplier (1.0 = default) when placed, else `null`.
     overlay_size: Option<f32>,
+    /// Per-badge display overrides (migration 0059): '#RRGGBB' color and a
+    /// curated icon slug, `null` = the state/class-derived default.
+    overlay_color: Option<String>,
+    overlay_icon: Option<String>,
+    /// Pin the live state text / relative age next to the badge on the wall.
+    overlay_show_state: bool,
+    overlay_show_age: bool,
 }
 
 impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
@@ -176,23 +183,62 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             overlay_x: l.overlay_x,
             overlay_y: l.overlay_y,
             overlay_size: l.overlay_size,
+            overlay_color: l.overlay_color,
+            overlay_icon: l.overlay_icon,
+            overlay_show_state: l.overlay_show_state,
+            overlay_show_age: l.overlay_show_age,
         }
     }
 }
 
 /// Body of `PUT /cameras/:id/ha/links/:link_id/placement`. A literal `null`
-/// clears the placement; an object pins the badge at `(x, y)` on the video frame
-/// with an optional size multiplier.
+/// clears the placement (display overrides reset with it); an object pins the
+/// badge at `(x, y)` on the video frame with an optional size multiplier and
+/// optional per-badge display overrides (migration 0059).
+///
+/// `label` edits the LINK-level caption (shared with the admin console's link
+/// list) and follows the `PUT /config/ha` token convention: omitted ⇒
+/// unchanged, `""` ⇒ cleared, non-empty ⇒ set.
 #[derive(Deserialize)]
 struct PlacementInput {
     x: f64,
     y: f64,
     #[serde(default = "default_overlay_size")]
     size: f32,
+    /// '#RRGGBB' badge color override; `null`/omitted = state-derived default.
+    #[serde(default)]
+    color: Option<String>,
+    /// Curated icon slug override; `null`/omitted = class-derived default.
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    show_state: bool,
+    #[serde(default)]
+    show_age: bool,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 fn default_overlay_size() -> f32 {
     1.0
+}
+
+/// Validate a '#RRGGBB' badge color override (mirrors the migration-0059 CHECK
+/// so a bad value 400s with a clear message instead of a 500 from Postgres).
+fn valid_overlay_color(c: &str) -> bool {
+    match c.strip_prefix('#') {
+        Some(hex) => hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// Validate a curated icon-slug override: short, lowercase `[a-z0-9_]` — the
+/// clients own the slug → glyph mapping, the server only sanity-checks shape.
+fn valid_overlay_icon(i: &str) -> bool {
+    !i.is_empty()
+        && i.len() <= 64
+        && i.chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 /// One entity's current state in the `GET /ha/states` feed.
@@ -339,16 +385,19 @@ async fn put_links(
 }
 
 /// `PUT /cameras/:id/ha/links/:link_id/placement` — admin. Pin (or, with a
-/// `null` body, clear) a linked entity's on-video badge. Coordinates are clamped
-/// to the video frame `[0,1]`; size to a sane range. Returns the updated link,
-/// 404 if no such link exists on that camera.
+/// `null` body, clear) a linked entity's on-video badge, including its
+/// per-badge display overrides (color/icon/pinned captions, migration 0059).
+/// Coordinates are clamped to the video frame `[0,1]`; size to a sane range;
+/// color/icon are format-validated. Returns the updated link, 404 if no such
+/// link exists on that camera.
 async fn put_placement(
     _admin: AdminUser,
     State(state): State<AppState>,
     Path((camera_id, link_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<Option<PlacementInput>>,
 ) -> Result<Json<HaLinkDto>, ApiError> {
-    let placement = match body {
+    let mut label_update: Option<Option<&str>> = None;
+    let placement = match &body {
         None => None,
         Some(p) => {
             if !p.x.is_finite() || !p.y.is_finite() || !p.size.is_finite() {
@@ -356,17 +405,51 @@ async fn put_placement(
                     "placement x/y/size must be finite numbers".to_owned(),
                 ));
             }
-            Some((
-                p.x.clamp(0.0, 1.0),
-                p.y.clamp(0.0, 1.0),
-                p.size.clamp(0.1, 8.0),
-            ))
+            if let Some(c) = &p.color {
+                if !valid_overlay_color(c) {
+                    return Err(ApiError::BadRequest(
+                        "placement color must be a '#RRGGBB' hex string".to_owned(),
+                    ));
+                }
+            }
+            if let Some(i) = &p.icon {
+                if !valid_overlay_icon(i) {
+                    return Err(ApiError::BadRequest(
+                        "placement icon must be a short lowercase [a-z0-9_] slug".to_owned(),
+                    ));
+                }
+            }
+            // Label edit rides the placement PUT: omitted = unchanged,
+            // "" = cleared, non-empty = set (trimmed).
+            label_update = p.label.as_deref().map(|l| {
+                let t = l.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            });
+            Some(db::HaOverlayPlacement {
+                x: p.x.clamp(0.0, 1.0),
+                y: p.y.clamp(0.0, 1.0),
+                size: p.size.clamp(0.1, 8.0),
+                color: p.color.clone(),
+                icon: p.icon.clone(),
+                show_state: p.show_state,
+                show_age: p.show_age,
+            })
         }
     };
-    let link = db::update_ha_link_placement(state.pool(), camera_id, link_id, placement)
-        .await
-        .map_err(ApiError::Internal)?
-        .ok_or_else(|| ApiError::NotFound("no HA link with that id on this camera".to_owned()))?;
+    let link = db::update_ha_link_placement(
+        state.pool(),
+        camera_id,
+        link_id,
+        placement.as_ref(),
+        label_update,
+    )
+    .await
+    .map_err(ApiError::Internal)?
+    .ok_or_else(|| ApiError::NotFound("no HA link with that id on this camera".to_owned()))?;
     Ok(Json(link.into()))
 }
 
@@ -560,9 +643,51 @@ mod tests {
         assert!((p.x.clamp(0.0, 1.0) - 1.0).abs() < f64::EPSILON);
         assert!((p.y.clamp(0.0, 1.0) - 0.0).abs() < f64::EPSILON);
         assert!((p.size - 1.0).abs() < f32::EPSILON);
+        // Display overrides default to "unset"/off (migration 0059).
+        assert_eq!(p.color, None);
+        assert_eq!(p.icon, None);
+        assert!(!p.show_state);
+        assert!(!p.show_age);
+        assert_eq!(p.label, None);
 
         // A null body deserializes to None (clears the placement).
         let cleared: Option<PlacementInput> = serde_json::from_value(json!(null)).unwrap();
         assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn placement_input_accepts_badge_style_overrides() {
+        let p: PlacementInput = serde_json::from_value(json!({
+            "x": 0.4, "y": 0.6, "size": 1.5,
+            "color": "#FFB143", "icon": "doorbell",
+            "show_state": true, "show_age": true,
+            "label": "Front door"
+        }))
+        .unwrap();
+        assert_eq!(p.color.as_deref(), Some("#FFB143"));
+        assert_eq!(p.icon.as_deref(), Some("doorbell"));
+        assert!(p.show_state);
+        assert!(p.show_age);
+        assert_eq!(p.label.as_deref(), Some("Front door"));
+    }
+
+    #[test]
+    fn overlay_color_and_icon_validation() {
+        // Color: exactly '#' + 6 hex digits (mirrors the migration-0059 CHECK).
+        assert!(valid_overlay_color("#000000"));
+        assert!(valid_overlay_color("#FFb143"));
+        assert!(!valid_overlay_color("FFB143")); // missing '#'
+        assert!(!valid_overlay_color("#FFB14")); // too short
+        assert!(!valid_overlay_color("#FFB1433")); // too long
+        assert!(!valid_overlay_color("#GGB143")); // not hex
+        assert!(!valid_overlay_color("")); // empty
+
+        // Icon: 1..=64 chars of lowercase [a-z0-9_].
+        assert!(valid_overlay_icon("sensor_door"));
+        assert!(valid_overlay_icon("doorbell"));
+        assert!(!valid_overlay_icon("")); // empty
+        assert!(!valid_overlay_icon("Sensor_Door")); // uppercase
+        assert!(!valid_overlay_icon("door bell")); // space
+        assert!(!valid_overlay_icon(&"x".repeat(65))); // too long
     }
 }

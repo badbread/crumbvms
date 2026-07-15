@@ -7,9 +7,11 @@
 //
 // Layout coordinates: button `x`/`y` are FRACTIONS (0..1) of the video pane
 // so positions scale with the tile. Button `w`/`h` are BASE (unscaled) px;
-// the rendered size is `base * paneScale(w,h)` (see [PtzPanelGeometry]), so
-// the whole cluster looks identical whether arranged on a big maximized tile
-// or viewed on a small grid tile (WYSIWYG, matches app.js's rationale).
+// the rendered size is `base * OverlayGeometry.paneScale(...)` (see
+// `ui/overlay_editor/overlay_geometry.dart` — the shared editor's geometry,
+// which absorbed this file's old `PtzPanelGeometry`), so the whole cluster
+// looks identical whether arranged on a big maximized tile or viewed on a
+// small grid tile (WYSIWYG, matches app.js's rationale).
 
 /// One button kind in a custom panel. Mirrors `PTZ_PANEL_KINDS` in app.js.
 enum PtzButtonKind {
@@ -117,6 +119,7 @@ class PtzPanelButton {
     this.label,
     this.presetToken,
     this.presetName,
+    this.group,
   });
 
   final String id;
@@ -136,6 +139,11 @@ class PtzPanelButton {
   /// ONVIF preset token + display name (kind == preset only).
   String? presetToken;
   String? presetName;
+
+  /// Editor group membership (`OverlayItem.groupId` — buttons sharing a
+  /// non-null group select/move/resize as one unit in the shared overlay
+  /// editor). Persisted so a saved panel re-opens with its groups intact.
+  String? group;
 
   /// Effective base size honoring a user resize + kind bounds/defaults
   /// (`ptzBtnSize` in app.js). D-pad is always square.
@@ -171,6 +179,7 @@ class PtzPanelButton {
         label: label,
         presetToken: presetToken,
         presetName: presetName,
+        group: group,
       );
 
   Map<String, dynamic> toJson() => {
@@ -183,6 +192,7 @@ class PtzPanelButton {
     if (label != null) 'label': label,
     if (presetToken != null) 'preset': presetToken,
     if (presetName != null) 'preset_name': presetName,
+    if (group != null) 'group': group,
   };
 
   factory PtzPanelButton.fromJson(Map<String, dynamic> j) => PtzPanelButton(
@@ -195,36 +205,6 @@ class PtzPanelButton {
     label: j['label'] as String?,
     presetToken: j['preset'] as String?,
     presetName: j['preset_name'] as String?,
+    group: j['group'] as String?,
   );
-}
-
-/// Geometry helpers shared by the overlay renderer and its hit-testing —
-/// pure functions so both edit and view mode agree pixel-for-pixel.
-class PtzPanelGeometry {
-  /// Reference tile short-side (`PTZ_PANEL_REF` in app.js) at which base
-  /// button sizes render 1:1.
-  static const double refShortSide = 320;
-
-  /// Whole-cluster scale factor for a `w`x`h` pane (`ptzPanelScale`).
-  static double paneScale(double w, double h) {
-    final s = (w < h ? w : h) / refShortSide;
-    return s.clamp(0.5, 3.0).toDouble();
-  }
-
-  /// Rendered pixel rect (x, y, w, h) of a button within a `w`x`h` pane
-  /// (`ptzPanelBtnRect` in app.js). Floors rendered size at 8px so a
-  /// shrunk button never disappears; clamps inside the pane bounds.
-  static (double x, double y, double w, double h) rectFor(
-    PtzPanelButton btn,
-    double paneW,
-    double paneH,
-  ) {
-    final (baseW, baseH) = btn.baseSize();
-    final s = paneScale(paneW, paneH);
-    final bw = (baseW * s).clamp(8, double.infinity).toDouble();
-    final bh = (baseH * s).clamp(8, double.infinity).toDouble();
-    final x = (btn.x * paneW).clamp(0, paneW - bw).toDouble();
-    final y = (btn.y * paneH).clamp(0, paneH - bh).toDouble();
-    return (x, y, bw, bh);
-  }
 }

@@ -29,17 +29,55 @@ import '../overlay_editor/overlay_item.dart';
 /// [OverlayItem] adapter over a placed [HaLink] — video-frame anchored,
 /// always-square badge, resized via the editor bar's size stepper only (no
 /// on-canvas drag-resize handle; see [resizable]).
+///
+/// Also carries the badge's editable per-badge style (migration 0059) —
+/// [labelText], [colorHex], [iconKey], [showState], [showAge] — seeded from
+/// the link and mutated in-session by the badge style editor
+/// (`ha_badge_style_editor.dart`); persisted by
+/// [HaOverlayController.endEditAndSave].
 class HaOverlayBadgeItem implements OverlayItem {
   HaOverlayBadgeItem(this.link, {double? x, double? y})
     : _x = x ?? link.overlayX ?? 0.46,
       _y = y ?? link.overlayY ?? 0.46,
-      _scale = (link.overlaySize ?? 1.0).clamp(0.1, 8.0).toDouble();
+      _scale = (link.overlaySize ?? 1.0).clamp(0.1, 8.0).toDouble(),
+      labelText = link.label,
+      colorHex = link.overlayColor,
+      iconKey = link.overlayIcon,
+      showState = link.overlayShowState,
+      showAge = link.overlayShowAge;
 
   final HaLink link;
 
   double _x;
   double _y;
   double _scale;
+
+  /// Editable caption for this link (null/blank falls back to the entity id
+  /// in display). Written back as the LINK's `label` on save when changed.
+  String? labelText;
+
+  /// '#RRGGBB' badge color override, or null for the state-derived default.
+  String? colorHex;
+
+  /// Curated icon-slug override (`ha_icons.dart`'s `kHaBadgeIconChoices`),
+  /// or null for the class-derived default.
+  String? iconKey;
+
+  /// Pin the live state text / relative age next to the badge on the wall.
+  bool showState;
+  bool showAge;
+
+  /// Display caption honoring the in-session edit (mirrors
+  /// `HaLink.displayLabel`, against [labelText] instead of `link.label`).
+  String get displayLabel =>
+      (labelText != null && labelText!.trim().isNotEmpty)
+          ? labelText!
+          : link.entityId;
+
+  /// Session-only group membership — the placement PUT has no group field
+  /// (see `OverlayItem.groupId`'s doc), so HA badge groups exist only within
+  /// one edit session as a layout convenience.
+  String? _groupId;
 
   @override
   String get id => link.id;
@@ -77,6 +115,11 @@ class HaOverlayBadgeItem implements OverlayItem {
 
   @override
   bool get resizable => false;
+
+  @override
+  String? get groupId => _groupId;
+  @override
+  set groupId(String? v) => _groupId = v;
 }
 
 /// One or more of an edit session's badge placements failed to save. The
@@ -181,6 +224,11 @@ class HaOverlayController {
     for (final item in result) {
       if (item is! HaOverlayBadgeItem) continue;
       try {
+        // Label rides the placement PUT only when the session actually
+        // changed it: null = leave the link's label untouched, '' = clear
+        // (the `PUT /config/ha` token convention).
+        final oldLabel = (item.link.label ?? '').trim();
+        final newLabel = (item.labelText ?? '').trim();
         await _api.saveHaPlacement(
           _session,
           cameraId,
@@ -188,6 +236,11 @@ class HaOverlayController {
           x: item.x,
           y: item.y,
           size: item.scale,
+          color: item.colorHex,
+          icon: item.iconKey,
+          showState: item.showState,
+          showAge: item.showAge,
+          label: newLabel == oldLabel ? null : newLabel,
         );
       } catch (e) {
         failures[item.id] = e;

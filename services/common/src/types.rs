@@ -217,6 +217,17 @@ pub struct CameraHaLink {
     /// Scale multiplier on the base badge size (1.0 = default). `None` when not
     /// placed; the API clamps it to a sane range on write.
     pub overlay_size: Option<f32>,
+    /// Per-badge display overrides (migration 0059). `overlay_color` is a
+    /// '#RRGGBB' hex string overriding the state-derived badge color;
+    /// `overlay_icon` is a curated icon slug overriding the
+    /// `device_class`-derived glyph. `None` ⇒ the client's default mapping.
+    pub overlay_color: Option<String>,
+    pub overlay_icon: Option<String>,
+    /// Pin the entity's live state text ("Open"/"On"/...) next to the badge
+    /// on the wall (migration 0059; default false = tap/hover only).
+    pub overlay_show_state: bool,
+    /// Pin the relative last-changed age ("2 m ago") next to the badge.
+    pub overlay_show_age: bool,
 }
 
 // ─── recording_policies ──────────────────────────────────────────────────────

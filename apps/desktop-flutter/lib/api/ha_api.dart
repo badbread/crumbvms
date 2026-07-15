@@ -29,9 +29,13 @@
 //                                                       Replaces the
 //                                                       camera's FULL link
 //                                                       set (not a diff).
-//   PUT  /cameras/{id}/ha/links/{link_id}/placement   body {x,y,size} pins the
-//                                                       badge; a literal JSON
-//                                                       `null` body clears it.
+//   PUT  /cameras/{id}/ha/links/{link_id}/placement   body {x,y,size, color?,
+//                                                       icon?, show_state?,
+//                                                       show_age?, label?} pins
+//                                                       the badge (+ per-badge
+//                                                       style, migration 0059);
+//                                                       a literal JSON `null`
+//                                                       body clears it.
 //                                                       Admin-only server-side
 //                                                       (matches link writes).
 //                                                       Returns the updated
@@ -202,7 +206,12 @@ extension HaApi on CrumbApi {
   }
 
   /// PUT .../placement — pin the badge at `(x, y)` [each 0..1, a fraction of
-  /// the video frame] with a size multiplier (server clamps/validates).
+  /// the video frame] with a size multiplier (server clamps/validates), plus
+  /// the per-badge display overrides (migration 0059): `color` is a
+  /// '#RRGGBB' hex string, `icon` a curated slug, `showState`/`showAge` pin
+  /// the live state text / relative age next to the badge on the wall.
+  /// `label` edits the LINK-level caption and follows the `PUT /config/ha`
+  /// token convention: null ⇒ unchanged, `''` ⇒ cleared, non-empty ⇒ set.
   /// Returns the updated link.
   Future<HaLink> saveHaPlacement(
     Session s,
@@ -211,11 +220,21 @@ extension HaApi on CrumbApi {
     required double x,
     required double y,
     double size = 1.0,
+    String? color,
+    String? icon,
+    bool showState = false,
+    bool showAge = false,
+    String? label,
   }) async {
     final resp = await _putPlacement(s, cameraId, linkId, {
       'x': x,
       'y': y,
       'size': size,
+      if (color != null) 'color': color,
+      if (icon != null) 'icon': icon,
+      'show_state': showState,
+      'show_age': showAge,
+      if (label != null) 'label': label,
     });
     if (resp.statusCode != 200) {
       throw CrumbApiException(

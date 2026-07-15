@@ -24,8 +24,19 @@ const _prefsKey = 'crumb_ptz_panels';
 class PtzPanelStore {
   Map<String, List<PtzPanelButton>>? _cache;
 
-  Future<Map<String, List<PtzPanelButton>>> _load() async {
-    if (_cache != null) return _cache!;
+  /// In-flight first load, memoized so two concurrent callers (e.g.
+  /// `loadForView` + an edit-session prepare fired back-to-back) share ONE
+  /// load and ONE cache map — the old check-then-act version let each build
+  /// a fresh map with the last assignment winning, orphaning any mutations
+  /// made against the loser (the PTZ builder's D4 cold-store race).
+  Future<Map<String, List<PtzPanelButton>>>? _loading;
+
+  Future<Map<String, List<PtzPanelButton>>> _load() {
+    if (_cache != null) return Future.value(_cache!);
+    return _loading ??= _loadFresh();
+  }
+
+  Future<Map<String, List<PtzPanelButton>>> _loadFresh() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_prefsKey);
     final out = <String, List<PtzPanelButton>>{};
@@ -45,6 +56,7 @@ class PtzPanelStore {
       }
     }
     _cache = out;
+    _loading = null; // done — later calls short-circuit on _cache
     return out;
   }
 
@@ -66,24 +78,12 @@ class PtzPanelStore {
     return map[cameraId];
   }
 
-  /// Get-or-create the (possibly empty) mutable button list for `cameraId`,
-  /// for the editor to mutate in place before calling [save]. Call this once
-  /// (e.g. on entering edit mode) to prime the in-memory cache, then use
-  /// [panelForEditSync] for the synchronous per-gesture-tick access an
-  /// active drag/resize needs.
-  Future<List<PtzPanelButton>> panelForEdit(String cameraId) async {
-    final map = await _load();
-    return map.putIfAbsent(cameraId, () => []);
-  }
-
-  /// Synchronous access to the mutable button list for `cameraId`, valid
-  /// only after [panelForEdit] (or any other load-triggering call) has
-  /// resolved at least once in this store's lifetime. Returns null if the
-  /// cache isn't warm yet or the camera has no entry — callers that need a
-  /// list unconditionally should await [panelForEdit] first.
-  List<PtzPanelButton>? panelForEditSync(String cameraId) => _cache?[cameraId];
-
   /// Replace `cameraId`'s panel wholesale and persist.
+  ///
+  /// (The old `panelForEdit`/`panelForEditSync` mutate-the-cache-in-place
+  /// editing API is gone: the shared overlay editor session owns its own
+  /// working copy and hands the final list back through here on save —
+  /// see `ui/ptz/ptz_panel_controller.dart`.)
   Future<void> save(String cameraId, List<PtzPanelButton> buttons) async {
     final map = await _load();
     map[cameraId] = buttons;

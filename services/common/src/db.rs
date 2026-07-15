@@ -1617,6 +1617,10 @@ fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
         overlay_x: row.get("overlay_x"),
         overlay_y: row.get("overlay_y"),
         overlay_size: row.get("overlay_size"),
+        overlay_color: row.get("overlay_color"),
+        overlay_icon: row.get("overlay_icon"),
+        overlay_show_state: row.get("overlay_show_state"),
+        overlay_show_age: row.get("overlay_show_age"),
     }
 }
 
@@ -1630,7 +1634,8 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
     let rows = client
         .query(
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
-                    overlay_x, overlay_y, overlay_size
+                    overlay_x, overlay_y, overlay_size,
+                    overlay_color, overlay_icon, overlay_show_state, overlay_show_age
              FROM camera_ha_links WHERE camera_id = $1
              ORDER BY sort_order, entity_id",
             &[&camera_id],
@@ -1656,7 +1661,8 @@ pub async fn get_camera_ha_links(
     let rows = client
         .query(
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
-                    overlay_x, overlay_y, overlay_size
+                    overlay_x, overlay_y, overlay_size,
+                    overlay_color, overlay_icon, overlay_show_state, overlay_show_age
              FROM camera_ha_links WHERE camera_id = $1 AND role = $2
              ORDER BY sort_order, entity_id",
             &[&camera_id, &role],
@@ -1691,15 +1697,25 @@ pub async fn replace_camera_ha_links(
         .transaction()
         .await
         .context("replace_camera_ha_links: begin")?;
-    // Snapshot existing placements before the delete so surviving links keep
-    // their on-video position. Keyed by (entity_id, role) — the table's natural
+    // Snapshot existing placements (and their per-badge display overrides,
+    // migration 0059) before the delete so surviving links keep their on-video
+    // position and styling. Keyed by (entity_id, role) — the table's natural
     // identity for a link (see the UNIQUE(camera_id, entity_id, role)).
-    type Placement = (Option<f64>, Option<f64>, Option<f32>);
+    type Placement = (
+        Option<f64>,
+        Option<f64>,
+        Option<f32>,
+        Option<String>,
+        Option<String>,
+        bool,
+        bool,
+    );
     let mut placements: std::collections::HashMap<(String, String), Placement> =
         std::collections::HashMap::new();
     let old_rows = tx
         .query(
-            "SELECT entity_id, role, overlay_x, overlay_y, overlay_size
+            "SELECT entity_id, role, overlay_x, overlay_y, overlay_size,
+                    overlay_color, overlay_icon, overlay_show_state, overlay_show_age
              FROM camera_ha_links WHERE camera_id = $1",
             &[&camera_id],
         )
@@ -1713,6 +1729,10 @@ pub async fn replace_camera_ha_links(
                 row.get("overlay_x"),
                 row.get("overlay_y"),
                 row.get("overlay_size"),
+                row.get("overlay_color"),
+                row.get("overlay_icon"),
+                row.get("overlay_show_state"),
+                row.get("overlay_show_age"),
             ),
         );
     }
@@ -1723,15 +1743,16 @@ pub async fn replace_camera_ha_links(
     .await
     .context("replace_camera_ha_links: delete")?;
     for (entity_id, role, device_class, label, sort_order) in links {
-        let (ox, oy, osize) = placements
+        let (ox, oy, osize, ocolor, oicon, oshow_state, oshow_age) = placements
             .get(&(entity_id.clone(), role.clone()))
-            .copied()
-            .unwrap_or((None, None, None));
+            .cloned()
+            .unwrap_or((None, None, None, None, None, false, false));
         tx.execute(
             "INSERT INTO camera_ha_links
                  (camera_id, entity_id, role, device_class, label, sort_order,
-                  overlay_x, overlay_y, overlay_size)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                  overlay_x, overlay_y, overlay_size,
+                  overlay_color, overlay_icon, overlay_show_state, overlay_show_age)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             &[
                 &camera_id,
                 entity_id,
@@ -1742,6 +1763,10 @@ pub async fn replace_camera_ha_links(
                 &ox,
                 &oy,
                 &osize,
+                &ocolor,
+                &oicon,
+                &oshow_state,
+                &oshow_age,
             ],
         )
         .await
@@ -1759,12 +1784,35 @@ pub async fn replace_camera_ha_links(
     list_camera_ha_links(pool, camera_id).await
 }
 
-/// Set (or clear) one link's on-video overlay placement (migration 0058).
+/// One link's on-video badge placement + per-badge display overrides
+/// (migrations 0058/0059), as written by `PUT .../placement`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HaOverlayPlacement {
+    /// Normalized fraction of the displayed video frame (top-left anchor).
+    pub x: f64,
+    pub y: f64,
+    /// Scale multiplier on the base badge size (1.0 = default).
+    pub size: f32,
+    /// '#RRGGBB' color override, or `None` for the state-derived default.
+    pub color: Option<String>,
+    /// Curated icon slug override, or `None` for the class-derived default.
+    pub icon: Option<String>,
+    /// Pin the live state text / relative age next to the badge on the wall.
+    pub show_state: bool,
+    pub show_age: bool,
+}
+
+/// Set (or clear) one link's on-video overlay placement (migrations 0058/0059).
 ///
-/// `placement = Some((x, y, size))` pins the badge; `None` clears it (badge
-/// removed). Scoped to `(link_id, camera_id)` so a caller can't move a link that
-/// belongs to another camera. Returns the updated link, or `None` if no link
-/// with that id exists on that camera (⇒ 404 at the API). Does **not** bump
+/// `placement = Some(p)` pins the badge (position + display overrides written
+/// together); `None` clears it — badge removed, overrides reset with it (a
+/// re-placed badge starts from the defaults). `label` is the link-level
+/// caption shared with the admin console's link list: `None` leaves it
+/// untouched, `Some(None)` clears it, `Some(Some(x))` sets it — so a
+/// placement clear never nukes the operator's rename. Scoped to
+/// `(link_id, camera_id)` so a caller can't move a link that belongs to
+/// another camera. Returns the updated link, or `None` if no link with that
+/// id exists on that camera (⇒ 404 at the API). Does **not** bump
 /// `ha_config.version`: a placement is a per-camera display tweak, and the
 /// recorder's motion loop (the version's main consumer) does not read overlay
 /// columns.
@@ -1776,21 +1824,48 @@ pub async fn update_ha_link_placement(
     pool: &Pool,
     camera_id: Uuid,
     link_id: Uuid,
-    placement: Option<(f64, f64, f32)>,
+    placement: Option<&HaOverlayPlacement>,
+    label: Option<Option<&str>>,
 ) -> Result<Option<CameraHaLink>> {
-    let (x, y, size) = match placement {
-        Some((x, y, s)) => (Some(x), Some(y), Some(s)),
-        None => (None, None, None),
+    let (x, y, size, color, icon, show_state, show_age) = match placement {
+        Some(p) => (
+            Some(p.x),
+            Some(p.y),
+            Some(p.size),
+            p.color.as_deref(),
+            p.icon.as_deref(),
+            p.show_state,
+            p.show_age,
+        ),
+        None => (None, None, None, None, None, false, false),
     };
+    let set_label = label.is_some();
+    let label_value: Option<&str> = label.flatten();
     let client = get_conn(pool).await?;
     let row = client
         .query_opt(
             "UPDATE camera_ha_links
-                SET overlay_x = $3, overlay_y = $4, overlay_size = $5
+                SET overlay_x = $3, overlay_y = $4, overlay_size = $5,
+                    overlay_color = $6, overlay_icon = $7,
+                    overlay_show_state = $8, overlay_show_age = $9,
+                    label = CASE WHEN $10 THEN $11 ELSE label END
               WHERE id = $1 AND camera_id = $2
           RETURNING id, camera_id, entity_id, role, device_class, label, sort_order,
-                    overlay_x, overlay_y, overlay_size",
-            &[&link_id, &camera_id, &x, &y, &size],
+                    overlay_x, overlay_y, overlay_size,
+                    overlay_color, overlay_icon, overlay_show_state, overlay_show_age",
+            &[
+                &link_id,
+                &camera_id,
+                &x,
+                &y,
+                &size,
+                &color,
+                &icon,
+                &show_state,
+                &show_age,
+                &set_label,
+                &label_value,
+            ],
         )
         .await
         .context("update_ha_link_placement")?;
@@ -9290,6 +9365,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0058_ha_overlay_placement.sql",
         include_str!("../../../db/migrations/0058_ha_overlay_placement.sql"),
+    ),
+    (
+        "0059_ha_overlay_badge_style.sql",
+        include_str!("../../../db/migrations/0059_ha_overlay_badge_style.sql"),
     ),
 ];
 

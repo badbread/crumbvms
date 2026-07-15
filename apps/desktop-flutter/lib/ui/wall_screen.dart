@@ -25,6 +25,7 @@ import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/ha_link/ha_link_dialog.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_entity_palette.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
@@ -36,8 +37,8 @@ import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_bar.dart';
 import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_layer.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_imaging_controls.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_panel_controller.dart';
-import 'package:crumb_desktop/ui/ptz/ptz_panel_editor_bar.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_panel_overlay.dart';
+import 'package:crumb_desktop/ui/ptz/ptz_panel_palette.dart';
 import 'package:crumb_desktop/ui/ptz/ptz_presets_panel.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
     show AppliedView;
@@ -363,19 +364,11 @@ class _WallScreenState extends State<WallScreen> {
     _liveStatus.removeListener(_onLiveStatusTick);
     _special.dispose();
     _liveStatus.dispose();
-    // Persist any in-flight panel edit straight to the store — the async
-    // endEdit() would notifyListeners on the controller after dispose().
-    // (Every discrete edit already persisted itself; this only covers a
-    // mid-drag move.)
-    final editCam = _ptzPanel.editMode ? _ptzPanel.editCameraId : null;
-    if (editCam != null) {
-      unawaited(
-        _ptzPanelStore.save(
-          editCam,
-          _ptzPanelStore.panelForEditSync(editCam) ?? const [],
-        ),
-      );
-    }
+    // Persist any in-flight panel edit. The session teardown (and the store
+    // write's snapshot) happens synchronously inside endEditAndSave before
+    // its first await, so firing-and-forgetting here is safe — the store's
+    // async write completes on its own after this State is gone.
+    if (_ptzPanel.editing) unawaited(_ptzPanel.endEditAndSave());
     _ptzPanel.dispose();
     _haOverlay.dispose();
     super.dispose();
@@ -384,9 +377,11 @@ class _WallScreenState extends State<WallScreen> {
   /// Maximize a camera + make it the audio-active pane.
   void _maximize(Camera cam) {
     // Maximizing a different camera mid panel-edit ends (and persists) the
-    // edit — the editor chrome must not follow the wrong camera.
-    if (_ptzPanel.editMode && _ptzPanel.editCameraId != cam.id) {
-      unawaited(_ptzPanel.endEdit());
+    // edit — the editor chrome must not follow the wrong camera. The session
+    // teardown is synchronous inside endEditAndSave (only the store write is
+    // async), so the fire-and-forget can't clobber a newer session.
+    if (_ptzPanel.editing && _ptzPanel.editCameraId != cam.id) {
+      unawaited(_ptzPanel.endEditAndSave());
     }
     // Same guard for an in-progress HA-overlay edit session.
     if (_haOverlay.editor.editMode && _haEditCameraId != cam.id) {
@@ -414,7 +409,7 @@ class _WallScreenState extends State<WallScreen> {
   /// Restore from the maximized pane back to the grid.
   void _restore() {
     // Leaving the maximized view mid panel-edit ends (and persists) the edit.
-    if (_ptzPanel.editMode) unawaited(_ptzPanel.endEdit());
+    if (_ptzPanel.editing) unawaited(_ptzPanel.endEditAndSave());
     if (_haOverlay.editor.editMode) unawaited(_endHaOverlayEdit());
     widget.audio?.setMaximized(null);
     widget.onMaximizedCameraChanged?.call(null);
@@ -424,15 +419,30 @@ class _WallScreenState extends State<WallScreen> {
     });
   }
 
-  /// "Edit PTZ panel…" from a tile's right-click menu: maximize the camera
-  /// (the panel is composed over the full-pane video, WYSIWYG) and enter the
-  /// panel editor.
-  void _editPtzPanel(Camera cam) {
+  /// "Edit PTZ panel…" from a tile's right-click menu or the maximized-pane
+  /// pencil: maximize the camera (the panel is composed over the full-pane
+  /// video, WYSIWYG) and enter the shared overlay editor with the saved
+  /// panel.
+  ///
+  /// Host-loads-first (the shared editor's synchronous-edit contract, same
+  /// funnel shape as [_beginHaOverlayEdit]): the saved layout is loaded
+  /// BEFORE maximizing/entering edit mode, guarded by `editor.editToken` so
+  /// a fast camera-switch mid-load can't clobber a newer session.
+  Future<void> _beginPtzPanelEdit(Camera cam) async {
     // Mutually exclusive with an in-progress HA-overlay edit session (only
     // one editor open on the maximized pane at a time).
-    if (_haOverlay.editor.editMode) unawaited(_endHaOverlayEdit());
+    if (_haOverlay.editor.editMode) await _endHaOverlayEdit();
+    // Editing a DIFFERENT camera's panel ends (and persists) that first.
+    if (_ptzPanel.editing && _ptzPanel.editCameraId != cam.id) {
+      await _ptzPanel.endEditAndSave();
+    }
+    final token = _ptzPanel.editor.editToken;
+    final saved = await _ptzPanel.prepareEdit(cam.id);
+    if (!mounted || _ptzPanel.editor.editToken != token) {
+      return; // stale — another edit session started/ended meanwhile
+    }
     if (_maximized?.id != cam.id) _maximize(cam);
-    unawaited(_ptzPanel.beginEdit(cam.id));
+    _ptzPanel.beginEditFromLoaded(cam.id, saved);
   }
 
   /// "Edit HA overlay…" from a tile's right-click menu, or the
@@ -447,7 +457,7 @@ class _WallScreenState extends State<WallScreen> {
   /// the funnel that avoids the PTZ builder's D3/D4 races by construction.
   Future<void> _beginHaOverlayEdit(Camera cam) async {
     // Mutually exclusive with a PTZ-panel edit session.
-    if (_ptzPanel.editMode) unawaited(_ptzPanel.endEdit());
+    if (_ptzPanel.editing) unawaited(_ptzPanel.endEditAndSave());
     // Editing a DIFFERENT camera's HA overlay ends (and persists) that
     // first — mirrors _maximize's PTZ-panel guard.
     if (_haOverlay.editor.editMode && _haEditCameraId != cam.id) {
@@ -474,7 +484,7 @@ class _WallScreenState extends State<WallScreen> {
   }
 
   /// End the current HA-overlay edit session (Done / Esc / a forced
-  /// transition from `_maximize`/`_restore`/`_editPtzPanel`) and persist:
+  /// transition from `_maximize`/`_restore`/`_beginPtzPanelEdit`) and persist:
   /// `HaOverlayController.endEditAndSave` PUTs/clears each placement
   /// server-side. Best-effort — a failed save still closes the session (the
   /// controller never touches storage either way, so there's nothing to roll
@@ -592,6 +602,7 @@ class _WallScreenState extends State<WallScreen> {
               haOverlay: _haOverlay,
               onEditHaOverlay: () => unawaited(_beginHaOverlayEdit(_maximized!)),
               onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
+              onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(_maximized!)),
               onHaLinksLoaded: _onHaLinksLoaded,
               onClose: _restore,
             ),
@@ -624,8 +635,8 @@ class _WallScreenState extends State<WallScreen> {
       onEscape: _maximized == null
           ? null
           : () {
-              if (_ptzPanel.editMode) {
-                unawaited(_ptzPanel.endEdit());
+              if (_ptzPanel.editing) {
+                unawaited(_ptzPanel.endEditAndSave());
               } else if (_haOverlay.editor.editMode) {
                 unawaited(_endHaOverlayEdit());
               } else {
@@ -730,7 +741,7 @@ class _WallScreenState extends State<WallScreen> {
                       _special.routeHotspotClick(i, cam.id);
                       _maximize(cam);
                     },
-                    onEditPtzPanel: () => _editPtzPanel(cam),
+                    onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(cam)),
                     onEditHaOverlay: () =>
                         unawaited(_beginHaOverlayEdit(cam)),
                     onHaLinksLoaded: _onHaLinksLoaded,
@@ -799,7 +810,7 @@ class _WallScreenState extends State<WallScreen> {
                 // rather than crop, matching _viewGrid and the old client.
                 fit: BoxFit.contain,
                 onTap: () => _maximize(cam),
-                onEditPtzPanel: () => _editPtzPanel(cam),
+                onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(cam)),
                 onEditHaOverlay: () =>
                     unawaited(_beginHaOverlayEdit(cam)),
                 onHaLinksLoaded: _onHaLinksLoaded,
@@ -1669,6 +1680,7 @@ class _MaximizedPane extends StatefulWidget {
     this.haOverlay,
     this.onEditHaOverlay,
     this.onHaOverlayDone,
+    this.onEditPtzPanel,
     this.onHaLinksLoaded,
   });
 
@@ -1720,6 +1732,12 @@ class _MaximizedPane extends StatefulWidget {
   /// calling `haOverlay!.endEditAndSave()` itself) because the cross-tile
   /// refresh needs the wall's `_tileKeys`/`_maximizedPaneKey`.
   final VoidCallback? onHaOverlayDone;
+
+  /// The maximized-pane "Edit PTZ panel…" affordance next to the HA pencil —
+  /// the missing edit entry point on the surface where the panel actually
+  /// renders (the old builder's primary UX hole, plan §3.2 D1). The pane
+  /// itself gates rendering on [ptzPanel] being usable (`_ptzEnabled`).
+  final VoidCallback? onEditPtzPanel;
 
   /// Reported every time this pane (re)loads its own HA links — see
   /// `_WallTile.onHaLinksLoaded`'s doc; same contract.
@@ -2392,6 +2410,25 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           ),
                         ),
                       ],
+                      // "Edit PTZ panel…" affordance ON the surface where the
+                      // panel renders (the old builder's D1 hole: the only
+                      // entry point was the wall tile's right-click menu).
+                      if (widget.onEditPtzPanel != null &&
+                          _ptzEnabled &&
+                          !_haEditing &&
+                          !_panelEditing) ...[
+                        const SizedBox(width: 8),
+                        Material(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          shape: const CircleBorder(),
+                          child: IconButton(
+                            tooltip: 'Edit PTZ panel…',
+                            icon: const Icon(Icons.tune, size: 18),
+                            color: Colors.white,
+                            onPressed: widget.onEditPtzPanel,
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -2436,8 +2473,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
                 // Panel-editor chrome: live presets/imaging on the right (so
                 // the operator can exercise the camera while arranging) and
-                // the palette/properties toolbar along the bottom (its Done
-                // button ends the edit; Esc does too, via the wall hotkeys).
+                // the SHARED overlay-editor toolbar along the bottom (PTZ
+                // palette + rename/duplicate/z-order extras injected; its
+                // Done ends + persists via the host, Esc does too via the
+                // wall hotkeys).
                 if (_ptzEnabled &&
                     widget.ptzPanel != null &&
                     _panelEditing) ...[
@@ -2466,7 +2505,19 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     left: 0,
                     right: 0,
                     bottom: 0,
-                    child: PtzPanelEditorBar(controller: widget.ptzPanel!),
+                    child: OverlayEditorBar(
+                      controller: widget.ptzPanel!.editor,
+                      paletteSlot: PtzPanelPalette(controller: widget.ptzPanel!),
+                      itemLabel: (item) =>
+                          (item as PtzOverlayButtonItem).button.displayLabel(),
+                      selectedExtrasBuilder: (item) => PtzSelectedButtonExtras(
+                        controller: widget.ptzPanel!,
+                        button: (item as PtzOverlayButtonItem).button,
+                      ),
+                      onClear: widget.ptzPanel!.editor.clearAll,
+                      onDone: () =>
+                          unawaited(widget.ptzPanel!.endEditAndSave()),
+                    ),
                   ),
                 ],
 
@@ -2475,7 +2526,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                 // selected-badge size stepper. Mutually exclusive with the
                 // PTZ chrome above by construction (`_haEditing`/
                 // `_panelEditing` can't both be true — see the wall's
-                // `_beginHaOverlayEdit`/`_editPtzPanel` guards).
+                // `_beginHaOverlayEdit`/`_beginPtzPanelEdit` guards).
                 if (widget.haOverlay != null && _haEditing)
                   Positioned(
                     left: 0,
@@ -2484,9 +2535,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     child: OverlayEditorBar(
                       controller: widget.haOverlay!.editor,
                       paletteSlot: AnimatedBuilder(
-                        // Independent rebuild on every editor tick (drag/
-                        // add/remove), so the palette's "placed" checkmarks
-                        // stay live without the whole pane rebuilding.
+                        // Rebuilds on the editor's STRUCTURE notifications
+                        // (add/remove/select — drag ticks fire only the
+                        // geometry ticker), so the palette's "placed"
+                        // checkmarks stay live without the whole pane, or
+                        // the palette itself, rebuilding per pointer move.
                         animation: widget.haOverlay!.editor,
                         builder: (context, _) => HaEntityPalette(
                           links: widget.haOverlay!.links,
@@ -2495,7 +2548,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                         ),
                       ),
                       itemLabel: (item) =>
-                          (item as HaOverlayBadgeItem).link.displayLabel,
+                          (item as HaOverlayBadgeItem).displayLabel,
+                      selectedExtrasBuilder: (item) => HaBadgeStyleEditor(
+                        editor: widget.haOverlay!.editor,
+                        item: item as HaOverlayBadgeItem,
+                      ),
                       onClear: widget.haOverlay!.editor.clearAll,
                       onDone: () => widget.onHaOverlayDone?.call(),
                     ),

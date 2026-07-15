@@ -23,6 +23,8 @@ class HaStateCard extends StatelessWidget {
     this.deviceClass,
     this.state,
     this.stale = false,
+    this.iconOverride,
+    this.colorOverride,
     this.onDismiss,
   });
 
@@ -32,6 +34,12 @@ class HaStateCard extends StatelessWidget {
   final String? deviceClass;
   final HaEntityState? state;
   final bool stale;
+
+  /// Per-badge display overrides (migration 0059) so the card's header icon/
+  /// color match the badge it opened from — see `haVisualFor`'s doc.
+  final String? iconOverride;
+  final Color? colorOverride;
+
   final VoidCallback? onDismiss;
 
   @override
@@ -41,6 +49,8 @@ class HaStateCard extends StatelessWidget {
       deviceClass: deviceClass,
       state: state?.state,
       stale: stale,
+      iconOverride: iconOverride,
+      colorOverride: colorOverride,
     );
     return GestureDetector(
       // Swallow taps on the card so a tap-away scrim behind it (drawn by the
@@ -100,7 +110,7 @@ class HaStateCard extends StatelessWidget {
               if (state?.lastChanged != null) ...[
                 const SizedBox(height: 2),
                 Text(
-                  _relativeAgo(state!.lastChanged!),
+                  haRelativeAgo(state!.lastChanged!),
                   style: const TextStyle(color: Colors.white54, fontSize: 11),
                 ),
               ],
@@ -131,12 +141,4 @@ class HaStateCard extends StatelessWidget {
     );
   }
 
-  static String _relativeAgo(DateTime t) {
-    final d = DateTime.now().difference(t);
-    if (d.inSeconds < 5) return 'just now';
-    if (d.inMinutes < 1) return '${d.inSeconds} s ago';
-    if (d.inHours < 1) return '${d.inMinutes} m ago';
-    if (d.inDays < 1) return '${d.inHours} h ago';
-    return '${d.inDays} d ago';
-  }
 }
