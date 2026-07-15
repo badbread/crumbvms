@@ -8744,7 +8744,7 @@ function renderPlates() {
       </div>
       <div class="card-hint" style="margin:2px 0 8px 2px">Plates on this list raise a <b>License-plate watchlist hit</b> alert when seen, routed over your configured notification channels (Notifications → System alerts). Off unless a plate is added here.</div>
       <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
-        <input id="wl-plate" placeholder="Plate (e.g. 7ABC123)" style="max-width:170px;font-family:var(--mono,monospace)" onkeydown="if(event.key==='Enter')addWatch()" />
+        <input id="wl-plate" placeholder="Plate (e.g. 7ABC123)" style="max-width:170px;font-family:var(--mono,monospace)" oninput="onWlFuzzInput()" onkeydown="if(event.key==='Enter')addWatch()" />
         <input id="wl-label" placeholder="Label (optional)" style="max-width:200px" onkeydown="if(event.key==='Enter')addWatch()" />
         <input type="hidden" id="wl-kind" value="watch"/>
         <div class="seg-toggle" role="group" aria-label="Watchlist entry kind">
@@ -8756,6 +8756,15 @@ function renderPlates() {
       </div>
       <div id="wl-msg" class="form-msg"></div>
       <div id="wl-list" style="margin-top:10px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
+      <div style="margin-top:14px;border-top:1px solid var(--border,#232a33);padding-top:10px">
+        <label class="field-label" style="margin-top:0;display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span>Match fuzziness ${infoHint('How many characters may differ when matching a read to a watch or ignore plate. Scales with plate length: 20% is about 1 wrong character on a 6-7 char plate; 0% = exact. Frigate ALPR sometimes misreads a character, and this catches those. Applies to both watch (alert) and ignore (drop) entries. Max 50%.')}</span>
+          <span id="wl-fuzz-lbl" style="color:var(--warn,#E8A33D);font-weight:600;white-space:nowrap"></span>
+        </label>
+        <input id="wl-fuzz" type="range" min="0" max="50" step="5" value="${(LPR_CONFIG && Math.round((LPR_CONFIG.watchlist_fuzz||0)*100)) || 0}" style="width:100%;accent-color:var(--warn,#E8A33D)" oninput="onWlFuzzInput()" onchange="saveWlFuzz()" />
+        <div class="card-hint" style="margin-top:4px">Tolerates OCR misreads when matching a read to a watch or ignore plate. 0% is exact; higher scales with plate length. Type a plate above to preview what it would accept:</div>
+        <div id="wl-fuzz-examples" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"></div>
+      </div>
     </div>
     <div class="policy-section" style="margin-top:12px">
       <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
@@ -8768,6 +8777,96 @@ function renderPlates() {
     </div>`;
   loadWatchlist();
   loadPlates();
+  onWlFuzzInput();
+}
+
+/* ── watchlist match-fuzziness control (issue #141) ──
+   Mirrors the desktop/Android fuzzy model exactly (edit-distance over an OCR
+   confusion map) so the live "accepted misreads" preview matches what the
+   server would actually accept. Lives here, next to the watchlist, because
+   that is where watch/ignore matching is configured. Persists via the same
+   PUT /config/lpr the LPR settings panel uses (watchlist_fuzz, 0..0.5). */
+const OCR_CONFUSIONS = {
+  '0':'O','O':'0','1':'I','I':'1','L':'1','2':'Z','Z':'2','5':'S','S':'5',
+  '8':'B','B':'8','6':'G','G':'6','4':'A','A':'4','D':'0','Q':'O','7':'T',
+};
+function normPlate(s){ return (s||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+function plateLev(a,b){
+  if (a===b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev=[...Array(b.length+1).keys()], cur=new Array(b.length+1).fill(0);
+  for (let i=0;i<a.length;i++){
+    cur[0]=i+1;
+    for (let j=0;j<b.length;j++){
+      const cost = a[i]===b[j] ? 0 : 1;
+      cur[j+1]=Math.min(prev[j+1]+1, cur[j]+1, prev[j]+cost);
+    }
+    [prev,cur]=[cur,prev];
+  }
+  return prev[b.length];
+}
+function plateAllowedEdits(ref,fuzz){ return Math.floor(Math.max(0,Math.min(0.5,fuzz)) * normPlate(ref).length); }
+function plateAcceptedMisreads(plate,allowed){
+  const norm=normPlate(plate);
+  if (!norm || allowed<=0) return [];
+  const out=[];
+  for (let i=0;i<norm.length && out.length<4;i++){
+    const rep=OCR_CONFUSIONS[norm[i]]; if(!rep) continue;
+    const cand=norm.slice(0,i)+rep+norm.slice(i+1);
+    if (cand!==norm && out.indexOf(cand)<0 && plateLev(cand,norm)<=allowed) out.push(cand);
+  }
+  if (allowed>=2){
+    for (let i=0;i<norm.length && out.length<4;i++){
+      const r1=OCR_CONFUSIONS[norm[i]]; if(!r1) continue;
+      for (let j=i+1;j<norm.length && out.length<4;j++){
+        const r2=OCR_CONFUSIONS[norm[j]]; if(!r2) continue;
+        const cand=norm.slice(0,i)+r1+norm.slice(i+1,j)+r2+norm.slice(j+1);
+        if (cand!==norm && out.indexOf(cand)<0 && plateLev(cand,norm)<=allowed) out.push(cand);
+      }
+    }
+  }
+  return out;
+}
+function onWlFuzzInput(){
+  const slider=$('wl-fuzz'); if(!slider) return;
+  const pct=parseInt(slider.value,10)||0;
+  const typed=normPlate(($('wl-plate')||{}).value||'');
+  const basis=typed||'7ABC123';
+  const allowed=plateAllowedEdits(basis, pct/100);
+  const lbl=$('wl-fuzz-lbl');
+  if (lbl) lbl.textContent = pct+'% · up to '+allowed+' char'+(allowed===1?'':'s');
+  const host=$('wl-fuzz-examples'); if(!host) return;
+  if (allowed<=0){ host.innerHTML=`<span class="card-hint">Exact match only.</span>`; return; }
+  const ex=plateAcceptedMisreads(basis, allowed);
+  if (!ex.length){ host.innerHTML=`<span class="card-hint">No sample misreads for this plate.</span>`; return; }
+  const chip = (cand)=>{
+    let spans='';
+    for (let i=0;i<cand.length;i++){
+      const diff=(i>=basis.length || cand[i]!==basis[i]);
+      spans += `<span style="${diff?'color:var(--warn,#E8A33D);font-weight:800':'opacity:.65'}">${esc(cand[i])}</span>`;
+    }
+    return `<span style="font-family:var(--mono,monospace);border:1px solid var(--border,#2a2d35);border-radius:4px;padding:2px 6px;font-size:12px">${spans}</span>`;
+  };
+  host.innerHTML = ex.map(chip).join('') +
+    (typed ? '' : `<span class="card-hint" style="align-self:center">example: ${esc(basis)}</span>`);
+}
+let _wlFuzzSaveT=null;
+function saveWlFuzz(){
+  const slider=$('wl-fuzz'); if(!slider) return;
+  const pct=Math.max(0, Math.min(50, parseInt(slider.value,10)||0));
+  clearTimeout(_wlFuzzSaveT);
+  _wlFuzzSaveT=setTimeout(async ()=>{
+    try{
+      const body={
+        enabled: !!(LPR_CONFIG && LPR_CONFIG.enabled),
+        retention_days: (LPR_CONFIG && LPR_CONFIG.retention_days) || 90,
+        watchlist_fuzz: pct/100,
+      };
+      LPR_CONFIG = await api('/config/lpr', { method:'PUT', body: JSON.stringify(body) });
+      toast('Match fuzziness saved.');
+    } catch(e){ toast('Could not save fuzziness: '+e.message); }
+  }, 400);
 }
 
 /* ── plate watchlist (GET/POST/DELETE /lpr/watchlist) ── */
