@@ -64,6 +64,20 @@ fn login_backoff_secs(failures: u32) -> Option<u64> {
     Some(secs.min(LOGIN_BACKOFF_CAP_SECS))
 }
 
+/// Cached Home Assistant `/api/states` snapshot backing `GET /ha/states`
+/// (issue #170). There is no standing poller: the handler refreshes on demand
+/// when this is older than the TTL, so a wall with no HA badges (or no client
+/// open) costs HA zero traffic. The `states` are the raw `/api/states` array
+/// (shared behind an `Arc` so a caller clones the handle, not the payload, out
+/// from under the lock); the per-caller RBAC projection happens after.
+#[derive(Clone)]
+pub struct HaStatesCache {
+    /// When this snapshot was fetched from HA (monotonic).
+    pub fetched_at: Instant,
+    /// Raw HA `/api/states` array.
+    pub states: Arc<Vec<serde_json::Value>>,
+}
+
 /// Per-username failed-login state for the brute-force backoff (issue #127).
 #[derive(Clone, Copy)]
 struct FailState {
@@ -169,6 +183,12 @@ struct Inner {
     /// state can never lock a legitimate user out. This is IN ADDITION to the
     /// shared per-IP request bucket, not a replacement.
     login_failures: DashMap<String, FailState>,
+
+    /// Demand-driven cache behind `GET /ha/states` (issue #170). `None` until
+    /// the first request. The `tokio::sync::Mutex` makes a refresh single-flight:
+    /// concurrent callers on a stale cache collapse to one HA `/api/states`
+    /// request (the others wait on the lock, then read the fresh snapshot).
+    ha_states: tokio::sync::Mutex<Option<HaStatesCache>>,
 }
 
 /// Cheaply-cloneable handle to shared API state.
@@ -227,7 +247,16 @@ impl AppState {
             revoked_jtis_loaded_at: AtomicI64::new(0),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
+            ha_states: tokio::sync::Mutex::new(None),
         }))
+    }
+
+    /// Borrow the demand-driven HA `/api/states` cache (issue #170). The
+    /// `GET /ha/states` handler locks it, refreshes on TTL expiry, and reads the
+    /// snapshot back out; the lock serializes refreshes into a single HA request.
+    #[inline]
+    pub fn ha_states_cache(&self) -> &tokio::sync::Mutex<Option<HaStatesCache>> {
+        &self.0.ha_states
     }
 
     /// Resolve a permission role by id, caching the result. Returns `None` if the

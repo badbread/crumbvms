@@ -9,9 +9,12 @@
 //! Config + links edits are admin-only; reading a camera's links needs only
 //! access to that camera.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -21,17 +24,30 @@ use uuid::Uuid;
 use crate::{
     auth_mw::{AdminUser, AuthUser},
     error::ApiError,
-    state::AppState,
+    state::{AppState, HaStatesCache},
 };
 use crumb_common::db;
 use crumb_common::types::HaSettings;
+
+/// TTL for the on-demand `GET /ha/states` cache. Clients poll on the live-status
+/// 3s tick, so Crumb→HA is at most one `/api/states` request per this window
+/// while at least one wall with placements is open (0 otherwise).
+const HA_STATES_TTL: Duration = Duration::from_secs(2);
+/// How long a last-known snapshot may keep being served (marked `stale`) after
+/// HA starts failing, before `GET /ha/states` gives up with a 502.
+const HA_STATES_STALE_MAX: Duration = Duration::from_secs(30);
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/config/ha", get(get_config).put(put_config))
         .route("/config/ha/test", post(test_config))
         .route("/ha/entities", get(get_entities))
+        .route("/ha/states", get(get_states))
         .route("/cameras/:id/ha/links", get(get_links).put(put_links))
+        .route(
+            "/cameras/:id/ha/links/:link_id/placement",
+            put(put_placement),
+        )
 }
 
 // ─── HTTP: shared client + picker filter ──────────────────────────────────────
@@ -139,6 +155,13 @@ struct HaLinkDto {
     device_class: Option<String>,
     label: Option<String>,
     sort_order: i32,
+    /// On-video overlay placement (issue #170): normalized x/y as a fraction of
+    /// the displayed video frame, or `null` when the link is not placed. Set
+    /// together with `overlay_y`.
+    overlay_x: Option<f64>,
+    overlay_y: Option<f64>,
+    /// Badge scale multiplier (1.0 = default) when placed, else `null`.
+    overlay_size: Option<f32>,
 }
 
 impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
@@ -150,8 +173,47 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             device_class: l.device_class,
             label: l.label,
             sort_order: l.sort_order,
+            overlay_x: l.overlay_x,
+            overlay_y: l.overlay_y,
+            overlay_size: l.overlay_size,
         }
     }
+}
+
+/// Body of `PUT /cameras/:id/ha/links/:link_id/placement`. A literal `null`
+/// clears the placement; an object pins the badge at `(x, y)` on the video frame
+/// with an optional size multiplier.
+#[derive(Deserialize)]
+struct PlacementInput {
+    x: f64,
+    y: f64,
+    #[serde(default = "default_overlay_size")]
+    size: f32,
+}
+
+fn default_overlay_size() -> f32 {
+    1.0
+}
+
+/// One entity's current state in the `GET /ha/states` feed.
+#[derive(Serialize)]
+struct HaEntityState {
+    entity_id: String,
+    state: String,
+    /// HA `last_changed` (RFC3339), passed through verbatim for "N ago" display.
+    last_changed: Option<String>,
+}
+
+/// `GET /ha/states` response: the caller-visible entity states plus cache age so
+/// the client can show a "stale" treatment without guessing.
+#[derive(Serialize)]
+struct HaStatesResponse {
+    /// Age of the served snapshot in milliseconds.
+    fetched_at_ms_ago: u64,
+    /// True when HA is currently unreachable and this is a last-known snapshot;
+    /// clients grey the badges and never read a stale value as authoritative.
+    stale: bool,
+    states: Vec<HaEntityState>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +338,142 @@ async fn put_links(
     Ok(Json(links.into_iter().map(HaLinkDto::from).collect()))
 }
 
+/// `PUT /cameras/:id/ha/links/:link_id/placement` — admin. Pin (or, with a
+/// `null` body, clear) a linked entity's on-video badge. Coordinates are clamped
+/// to the video frame `[0,1]`; size to a sane range. Returns the updated link,
+/// 404 if no such link exists on that camera.
+async fn put_placement(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path((camera_id, link_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<Option<PlacementInput>>,
+) -> Result<Json<HaLinkDto>, ApiError> {
+    let placement = match body {
+        None => None,
+        Some(p) => {
+            if !p.x.is_finite() || !p.y.is_finite() || !p.size.is_finite() {
+                return Err(ApiError::BadRequest(
+                    "placement x/y/size must be finite numbers".to_owned(),
+                ));
+            }
+            Some((
+                p.x.clamp(0.0, 1.0),
+                p.y.clamp(0.0, 1.0),
+                p.size.clamp(0.1, 8.0),
+            ))
+        }
+    };
+    let link = db::update_ha_link_placement(state.pool(), camera_id, link_id, placement)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound("no HA link with that id on this camera".to_owned()))?;
+    Ok(Json(link.into()))
+}
+
+/// `GET /ha/states` — any authenticated user. Current state of every HA entity
+/// linked to a camera the caller can access, from the demand-driven cache. A
+/// viewer sees only entities linked to cameras in their grant. Never fabricates
+/// state: HA unreachable ⇒ last-known snapshot marked `stale`, or a 502 once the
+/// snapshot ages past [`HA_STATES_STALE_MAX`].
+async fn get_states(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<HaStatesResponse>, ApiError> {
+    let s = effective_settings(&state).await?;
+    if !s.enabled {
+        return Err(ApiError::BadRequest(
+            "Home Assistant is not enabled".to_owned(),
+        ));
+    }
+    let client = ha_client(&s)?;
+
+    // Refresh-or-serve under the single-flight lock: concurrent callers on a
+    // stale cache collapse to one HA request.
+    let (states, age, is_stale) = {
+        let mut guard = state.ha_states_cache().lock().await;
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|c| c.fetched_at.elapsed() < HA_STATES_TTL);
+        if fresh {
+            let c = guard.as_ref().expect("fresh implies a present cache");
+            (Arc::clone(&c.states), c.fetched_at.elapsed(), false)
+        } else {
+            match client.get_states().await {
+                Ok(v) => {
+                    let states = Arc::new(v);
+                    *guard = Some(HaStatesCache {
+                        fetched_at: Instant::now(),
+                        states: Arc::clone(&states),
+                    });
+                    (states, Duration::ZERO, false)
+                }
+                // HA is down: serve last-known while it's recent (clients grey
+                // it); give up once it ages out rather than lie about state.
+                Err(e) => match guard.as_ref() {
+                    Some(c) if c.fetched_at.elapsed() < HA_STATES_STALE_MAX => {
+                        (Arc::clone(&c.states), c.fetched_at.elapsed(), true)
+                    }
+                    _ => {
+                        return Err(ApiError::BadGateway(format!(
+                            "Home Assistant unreachable: {e}"
+                        )))
+                    }
+                },
+            }
+        }
+    };
+
+    // RBAC: project the snapshot down to entities linked to caller-visible
+    // cameras (admins see all). A viewer never learns about entities linked only
+    // to cameras outside their grant.
+    let cam_filter = if user.is_admin() {
+        None
+    } else {
+        Some(user.camera_ids.clone())
+    };
+    let linked = db::list_ha_linked_entities(state.pool(), cam_filter.as_deref())
+        .await
+        .map_err(ApiError::Internal)?;
+    let wanted: std::collections::HashSet<&str> = linked.iter().map(String::as_str).collect();
+
+    Ok(Json(HaStatesResponse {
+        fetched_at_ms_ago: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+        stale: is_stale,
+        states: project_states(&states, &wanted),
+    }))
+}
+
+/// Project a raw HA `/api/states` array down to the `wanted` entity ids, keeping
+/// each entity's `state` and `last_changed`. Pure (no HA/DB), so the RBAC
+/// filtering it backs is unit-testable. Entities not in `wanted` are dropped —
+/// the caller passes only the entity ids linked to cameras it may access.
+fn project_states(
+    states: &[serde_json::Value],
+    wanted: &std::collections::HashSet<&str>,
+) -> Vec<HaEntityState> {
+    states
+        .iter()
+        .filter_map(|v| {
+            let eid = v.get("entity_id")?.as_str()?;
+            if !wanted.contains(eid) {
+                return None;
+            }
+            Some(HaEntityState {
+                entity_id: eid.to_owned(),
+                state: v
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                last_changed: v
+                    .get("last_changed")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +512,57 @@ mod tests {
         let controls = entities_from_states(arr, &["light", "switch", "scene"]);
         assert_eq!(controls.len(), 1);
         assert_eq!(controls[0].entity_id, "light.kitchen");
+    }
+
+    #[test]
+    fn project_states_keeps_only_wanted_with_state_and_last_changed() {
+        let states = json!([
+            {"entity_id": "binary_sensor.front_door", "state": "off",
+             "last_changed": "2026-07-14T18:22:04Z"},
+            {"entity_id": "light.kitchen", "state": "on"},
+            {"entity_id": "binary_sensor.garage", "state": "open",
+             "last_changed": "2026-07-14T10:00:00Z"}
+        ]);
+        let arr = states.as_array().unwrap();
+
+        // Caller can see only the front door + kitchen light; garage is linked
+        // to a camera outside their grant and must not leak.
+        let wanted: std::collections::HashSet<&str> = ["binary_sensor.front_door", "light.kitchen"]
+            .into_iter()
+            .collect();
+        let out = project_states(arr, &wanted);
+        let ids: Vec<&str> = out.iter().map(|e| e.entity_id.as_str()).collect();
+        assert_eq!(out.len(), 2);
+        assert!(ids.contains(&"binary_sensor.front_door"));
+        assert!(ids.contains(&"light.kitchen"));
+        assert!(!ids.contains(&"binary_sensor.garage"));
+
+        let door = out
+            .iter()
+            .find(|e| e.entity_id == "binary_sensor.front_door")
+            .unwrap();
+        assert_eq!(door.state, "off");
+        assert_eq!(door.last_changed.as_deref(), Some("2026-07-14T18:22:04Z"));
+        // last_changed is optional and absent here.
+        let light = out.iter().find(|e| e.entity_id == "light.kitchen").unwrap();
+        assert_eq!(light.state, "on");
+        assert_eq!(light.last_changed, None);
+
+        // Empty wanted set ⇒ nothing projected (a viewer with no linked cameras).
+        assert!(project_states(arr, &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn placement_input_clamps_and_defaults_size() {
+        // Out-of-range coordinates clamp into the video frame; missing size
+        // defaults to 1.0. (Mirrors the clamp the handler applies.)
+        let p: PlacementInput = serde_json::from_value(json!({"x": 1.4, "y": -0.2})).unwrap();
+        assert!((p.x.clamp(0.0, 1.0) - 1.0).abs() < f64::EPSILON);
+        assert!((p.y.clamp(0.0, 1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((p.size - 1.0).abs() < f32::EPSILON);
+
+        // A null body deserializes to None (clears the placement).
+        let cleared: Option<PlacementInput> = serde_json::from_value(json!(null)).unwrap();
+        assert!(cleared.is_none());
     }
 }
