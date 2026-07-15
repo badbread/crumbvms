@@ -24,6 +24,7 @@ import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
+import 'package:crumb_desktop/ui/ha_link/ha_link_dialog.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_entity_palette.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
@@ -70,6 +71,7 @@ class WallScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onLogout,
+    required this.isAdmin,
     this.clientOptions,
     this.streamPrefs,
     this.view,
@@ -85,6 +87,13 @@ class WallScreen extends StatefulWidget {
   final Session session;
   final List<Camera> cameras;
   final VoidCallback onLogout;
+
+  /// Server-side truth (`GET /auth/me`, see `main.dart`'s `_isAdmin`) for
+  /// whether this account is an admin. Gates the tile right-click menu's
+  /// "Link HA entities…" item (issue #52 desktop port) — reads of a
+  /// camera's HA links need only camera access, but writing them
+  /// (`PUT /cameras/:id/ha/links`) is admin-enforced server-side regardless.
+  final bool isAdmin;
 
   /// Play-on-focus audio controller (single audible pane). Tiles register
   /// their Player; selection/maximize pick the active pane.
@@ -725,6 +734,7 @@ class _WallScreenState extends State<WallScreen> {
                     onEditHaOverlay: () =>
                         unawaited(_beginHaOverlayEdit(cam)),
                     onHaLinksLoaded: _onHaLinksLoaded,
+                    isAdmin: widget.isAdmin,
                   );
           }
           children.add(
@@ -793,6 +803,7 @@ class _WallScreenState extends State<WallScreen> {
                 onEditHaOverlay: () =>
                     unawaited(_beginHaOverlayEdit(cam)),
                 onHaLinksLoaded: _onHaLinksLoaded,
+                isAdmin: widget.isAdmin,
               ),
             ),
           );
@@ -867,6 +878,7 @@ class _WallTile extends StatefulWidget {
     this.onEditPtzPanel,
     this.onEditHaOverlay,
     this.onHaLinksLoaded,
+    this.isAdmin = false,
   });
 
   final CrumbApi api;
@@ -891,6 +903,12 @@ class _WallTile extends StatefulWidget {
   /// can track which visible cameras have a placed badge and drive
   /// `LiveStatusController.wantHaStates` (desktop P0 plan §4.4).
   final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
+
+  /// Gates the right-click menu's "Link HA entities…" item (issue #52
+  /// desktop port) — `PUT /cameras/:id/ha/links` is admin-enforced
+  /// server-side regardless; this only avoids showing an item that would
+  /// 403 for a non-admin.
+  final bool isAdmin;
 
   /// When true, digitally zooming this tile past 100% temporarily loads its
   /// main stream (reverting to sub at 100%). From the "Zoom switches to main
@@ -1284,16 +1302,27 @@ class _WallTileState extends State<_WallTile> {
             ),
           const PopupMenuDivider(),
         ],
-        // HA on-video badges (issue #170 P0) — deliberately OUTSIDE the
-        // `camera.ptz` block above: HA badges must work on non-PTZ cameras
-        // too. Gated on the camera actually having linked entities (not on
-        // any of them being PLACED yet — the editor's palette is where an
-        // operator places the first one).
-        if (_haLinks.isNotEmpty && widget.onEditHaOverlay != null) ...[
-          const PopupMenuItem(
-            value: 'ha-overlay',
-            child: Text('Edit HA overlay…'),
-          ),
+        // HA entity linking (issue #52 desktop port) + on-video badges
+        // (issue #170 P0) — deliberately OUTSIDE the `camera.ptz` block
+        // above: HA works on non-PTZ cameras too. "Link HA entities…" is
+        // admin-only (matches `PUT /cameras/:id/ha/links` server-side) and
+        // shown regardless of whether the camera has any links yet — it's
+        // the entry point to CREATE the first one. "Edit HA overlay…" is
+        // placement (unchanged) and stays gated on the camera actually
+        // having linked entities (not on any of them being PLACED yet — the
+        // editor's palette is where an operator places the first one).
+        if (widget.isAdmin ||
+            (_haLinks.isNotEmpty && widget.onEditHaOverlay != null)) ...[
+          if (widget.isAdmin)
+            const PopupMenuItem(
+              value: 'ha-link',
+              child: Text('Link HA entities…'),
+            ),
+          if (_haLinks.isNotEmpty && widget.onEditHaOverlay != null)
+            const PopupMenuItem(
+              value: 'ha-overlay',
+              child: Text('Edit HA overlay…'),
+            ),
           const PopupMenuDivider(),
         ],
         CheckedPopupMenuItem(
@@ -1332,6 +1361,21 @@ class _WallTileState extends State<_WallTile> {
         setState(() {}); // no reload needed — only affects maximized PTZ UI
       case 'ptz-panel':
         widget.onEditPtzPanel?.call();
+      case 'ha-link':
+        unawaited(
+          showHaLinkDialog(
+            context,
+            api: widget.api,
+            session: widget.session,
+            cameraId: widget.camera.id,
+            cameraName: widget.camera.name,
+            // Refresh this tile's own cached links immediately on each save
+            // (not just on dialog close) so "Edit HA overlay…" and the
+            // badges pick up new/removed links right away — reuses the same
+            // reload path the config-changed signal already drives.
+            onSaved: () => unawaited(_loadHaLinks()),
+          ),
+        );
       case 'ha-overlay':
         widget.onEditHaOverlay?.call();
       case 'main':

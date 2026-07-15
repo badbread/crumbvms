@@ -27,6 +27,7 @@ import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/keyboard_shortcuts_screen.dart';
 import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
+import 'package:crumb_desktop/ui/settings/ha_settings_screen.dart';
 import 'package:crumb_desktop/ui/updates/about_panel.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
 
@@ -38,6 +39,10 @@ enum SettingsSection {
       pane: true),
   hotkeys(Icons.keyboard_outlined, 'Camera Hotkeys', pane: true),
   serverDashboard(Icons.dns_outlined, 'Server dashboard', pane: true),
+  // Admin-only (issue #52 desktop port) — SettingsWindow hides this nav
+  // entry entirely for non-admins (see `_leftNav`); `PUT/POST /config/ha*`
+  // are admin-enforced server-side regardless.
+  homeAssistant(Icons.home_outlined, 'Home Assistant', pane: true),
   about(Icons.info_outline, 'About', pane: true),
   serverConsole(Icons.admin_panel_settings_outlined, 'Server console',
       pane: false),
@@ -63,6 +68,7 @@ class SettingsWindow extends StatefulWidget {
     required this.onOpenServerConsole,
     required this.onOpenMotionTuner,
     required this.updateCheck,
+    required this.isAdmin,
     this.clientOptions,
     this.streamPrefs,
     this.hotkeys,
@@ -72,6 +78,13 @@ class SettingsWindow extends StatefulWidget {
   final CrumbApi api;
   final Session session;
   final List<Camera> cameras;
+
+  /// Server-side truth (`GET /auth/me`, see `main.dart`'s `_isAdmin`) for
+  /// whether this account is an admin. Gates the "Home Assistant" nav entry
+  /// entirely (hidden, not just disabled, for non-admins) — the server is
+  /// still the authority (`PUT`/`POST /config/ha*` are admin-enforced there
+  /// regardless), this only avoids showing a section that would 403 anyway.
+  final bool isAdmin;
 
   /// Close the panel (X button, or after a LAUNCH section is picked).
   final VoidCallback onClose;
@@ -245,11 +258,14 @@ class _SettingsWindowState extends State<SettingsWindow> {
         child: ListView(
           padding: const EdgeInsets.symmetric(vertical: 6),
           children: [
-            for (final s in SettingsSection.values) ...[
-              if (s == SettingsSection.serverConsole)
-                Divider(height: 9, color: scheme.outlineVariant),
-              _navTile(scheme, s),
-            ],
+            for (final s in SettingsSection.values)
+              // Non-admins never see the entry at all (not just disabled) —
+              // it would just 403 server-side.
+              if (s != SettingsSection.homeAssistant || widget.isAdmin) ...[
+                if (s == SettingsSection.serverConsole)
+                  Divider(height: 9, color: scheme.outlineVariant),
+                _navTile(scheme, s),
+              ],
           ],
         ),
       ),
@@ -313,6 +329,12 @@ class _SettingsWindowState extends State<SettingsWindow> {
         return HotkeyRemapScreen(store: hk, cameras: widget.cameras);
       case SettingsSection.serverDashboard:
         return ServerDashboardScreen(api: widget.api, session: widget.session);
+      case SettingsSection.homeAssistant:
+        // Defensive fallback: the nav entry is hidden for non-admins (see
+        // `_leftNav`), so this only fires if `_section` is somehow forced to
+        // this value some other way.
+        if (!widget.isAdmin) return const _Unavailable('Home Assistant');
+        return HaSettingsScreen(api: widget.api, session: widget.session);
       case SettingsSection.about:
         return AboutPanel(controller: widget.updateCheck);
       case SettingsSection.serverConsole:
