@@ -223,12 +223,12 @@ class SecureStore(context: Context) {
         set(value) = safeWrite { it.putString(KEY_PLAYBACK_QUALITY, value) }
 
     /**
-     * LPR thumbnail image mode: "plate" (default) crops the thumbnail to the
-     * license plate; "vehicle" shows the full detection snapshot (the whole car).
+     * LPR thumbnail image mode: "vehicle" (default) shows the full detection
+     * snapshot (the whole car); "plate" crops the thumbnail to the license plate.
      * A device-level display preference, persisted across sessions.
      */
     var lprImageMode: String
-        get() = safeRead("plate") { it.getString(KEY_LPR_IMAGE_MODE, "plate") ?: "plate" }
+        get() = safeRead("vehicle") { it.getString(KEY_LPR_IMAGE_MODE, "vehicle") ?: "vehicle" }
         set(value) = safeWrite { it.putString(KEY_LPR_IMAGE_MODE, value) }
 
     /**

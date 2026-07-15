@@ -994,7 +994,7 @@ private fun PlateRow(
 private const val PLATE_CROP_DECODE_PX = 1024
 
 /** Convenience wrapper: the read's snapshot. Honors the "LPR thumbnail image" app
- *  option — cropped to the plate box (default) or the full vehicle snapshot.
+ *  option — the full vehicle snapshot (default) or cropped to the plate box.
  *  Decodes at [PLATE_CROP_DECODE_PX] so the cropped plate stays sharp at thumbnail
  *  size (harmless for the full-image mode, which just shows a crisp downscale). */
 @Composable
