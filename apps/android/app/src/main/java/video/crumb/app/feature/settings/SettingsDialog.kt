@@ -72,6 +72,7 @@ fun SettingsDialog(
     var ptzStyle by remember { mutableStateOf(store.ptzStyle) }
     var motionTunerOn by remember { mutableStateOf(store.motionTunerEnabled) }
     var snapshotView by remember { mutableStateOf(store.snapshotCapturesView) }
+    var lprImageMode by remember { mutableStateOf(store.lprImageMode) }
 
     // Security — biometric app lock.
     val context = LocalContext.current
@@ -236,6 +237,32 @@ fun SettingsDialog(
                     onSelect = {
                         snapshotView = true
                         store.snapshotCapturesView = true
+                    },
+                )
+
+                // ── LPR section ───────────────────────────────────────────────────
+                Text(
+                    text = "LPR — thumbnail image",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                PtzStyleRow(
+                    label = "License plate",
+                    description = "Crop each thumbnail to just the license plate.",
+                    selected = lprImageMode == "plate",
+                    onSelect = {
+                        lprImageMode = "plate"
+                        store.lprImageMode = "plate"
+                    },
+                )
+                PtzStyleRow(
+                    label = "Full image",
+                    description = "Show the whole detection snapshot (the vehicle).",
+                    selected = lprImageMode == "vehicle",
+                    onSelect = {
+                        lprImageMode = "vehicle"
+                        store.lprImageMode = "vehicle"
                     },
                 )
 

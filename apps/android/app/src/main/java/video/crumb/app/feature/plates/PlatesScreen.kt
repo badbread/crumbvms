@@ -993,14 +993,18 @@ private fun PlateRow(
  *  both the list/grid thumbnails and the report-dialog preview. */
 private const val PLATE_CROP_DECODE_PX = 1024
 
-/** Convenience wrapper: the read's snapshot, cropped to the plate box. Decodes at
- *  [PLATE_CROP_DECODE_PX] so the cropped plate stays sharp at thumbnail size. */
+/** Convenience wrapper: the read's snapshot. Honors the "LPR thumbnail image" app
+ *  option — cropped to the plate box (default) or the full vehicle snapshot.
+ *  Decodes at [PLATE_CROP_DECODE_PX] so the cropped plate stays sharp at thumbnail
+ *  size (harmless for the full-image mode, which just shows a crisp downscale). */
 @Composable
 private fun PlateThumb(read: PlateRead, mediaUrls: MediaUrls, modifier: Modifier = Modifier) {
+    val showCrop = appContainer().store.lprImageMode != "vehicle"
     PlateSnapshotImage(
         read = read,
         mediaUrls = mediaUrls,
         modifier = modifier,
+        crop = showCrop,
         decodePx = PLATE_CROP_DECODE_PX,
     )
 }

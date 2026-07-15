@@ -223,6 +223,15 @@ class SecureStore(context: Context) {
         set(value) = safeWrite { it.putString(KEY_PLAYBACK_QUALITY, value) }
 
     /**
+     * LPR thumbnail image mode: "plate" (default) crops the thumbnail to the
+     * license plate; "vehicle" shows the full detection snapshot (the whole car).
+     * A device-level display preference, persisted across sessions.
+     */
+    var lprImageMode: String
+        get() = safeRead("plate") { it.getString(KEY_LPR_IMAGE_MODE, "plate") ?: "plate" }
+        set(value) = safeWrite { it.putString(KEY_LPR_IMAGE_MODE, value) }
+
+    /**
      * Live wall grid-layout ordinal (GridLayout: 0=single, 1=2x2, 2=list).
      * Persisted so the chosen layout survives navigating in/out of a camera AND
      * app restarts (a plain `remember` was resetting it to 2x2 on every return).
@@ -413,6 +422,7 @@ class SecureStore(context: Context) {
         private const val KEY_SHOW_ALL_CAMERAS_VIEW = "show_all_cameras_view"
         private const val KEY_PLAYBACK_SPAN_MS = "playback_span_ms"
         private const val KEY_PLATES_VIEW_MODE = "plates_view_mode"
+        private const val KEY_LPR_IMAGE_MODE = "lpr_image_mode"
         private const val KEY_SNAPSHOT_VIEW = "snapshot_captures_view"
         private const val KEY_VIEWS = "camera_views_json"
         private const val KEY_ACTIVE_VIEW = "active_view_id"
