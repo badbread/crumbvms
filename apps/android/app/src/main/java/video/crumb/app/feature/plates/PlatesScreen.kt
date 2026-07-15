@@ -345,16 +345,13 @@ fun PlatesScreen(
             read = reportRead,
             mediaUrls = mediaUrls,
             generating = generatingReport,
-            onDownload = { caseText, zoneId, includeDossier ->
+            onDownload = { zoneId, includeDossier ->
                 if (generatingReport) return@PlateReportDialog
                 generatingReport = true
                 val repo = container.repository
                 val camNames = state.cameras.associate { it.id to it.name }
                 val allCamIds = state.cameras.map { it.id }
                 val loader = context.imageLoader
-                val serverHost = runCatching { android.net.Uri.parse(store.serverUrl).authority }
-                    .getOrNull()?.takeIf { it.isNotBlank() } ?: store.serverUrl
-                val exportedBy = store.username ?: "—"
                 scope.launch {
                     // Resolve the watchlist match (BOLO banner) + the sighting dossier
                     // up front so the PDF builder stays a focused render step. The
@@ -379,9 +376,6 @@ fun PlatesScreen(
                     val input = PlateReportInput(
                         read = reportRead,
                         cameraNames = camNames,
-                        serverHost = serverHost,
-                        exportedBy = exportedBy,
-                        caseText = caseText,
                         zoneId = zoneId,
                         includeDossier = includeDossier,
                         watchMatch = watchMatch,
@@ -984,16 +978,29 @@ private fun PlateRow(
     }
 }
 
-/** Larger decode ceiling (px) for the report-dialog plate preview, so the crop of
- *  a small plate region stays crisp. Only one such image is alive at a time (it's
- *  a modal dialog), so this stays well within the P2 bitmap budget; the list/grid
- *  thumbnails intentionally omit it and decode at their small display size. */
-private const val PLATE_DETAIL_DECODE_PX = 1024
+/** Decode ceiling (px) for plate-crop images. A plate is a small fraction of its
+ *  snapshot, so without this Coil decodes the snapshot at the tiny thumbnail
+ *  display size and the crop is a blurry upscale of a handful of pixels. Decoding
+ *  to ~1024 first makes the crop sharp. Memory stays bounded: the decode is
+ *  transient per image and Coil's memory cache holds only the (small) cropped
+ *  result — not the full-size decode — so this fits the P2 bitmap budget. Used by
+ *  both the list/grid thumbnails and the report-dialog preview. */
+private const val PLATE_CROP_DECODE_PX = 1024
 
-/** Convenience wrapper: the read's snapshot, cropped to the plate box. */
+/** Convenience wrapper: the read's snapshot. Honors the "LPR thumbnail image" app
+ *  option — the full vehicle snapshot (default) or cropped to the plate box.
+ *  Decodes at [PLATE_CROP_DECODE_PX] so the cropped plate stays sharp at thumbnail
+ *  size (harmless for the full-image mode, which just shows a crisp downscale). */
 @Composable
 private fun PlateThumb(read: PlateRead, mediaUrls: MediaUrls, modifier: Modifier = Modifier) {
-    PlateSnapshotImage(read = read, mediaUrls = mediaUrls, modifier = modifier)
+    val showCrop = appContainer().store.lprImageMode != "vehicle"
+    PlateSnapshotImage(
+        read = read,
+        mediaUrls = mediaUrls,
+        modifier = modifier,
+        crop = showCrop,
+        decodePx = PLATE_CROP_DECODE_PX,
+    )
 }
 
 /**
@@ -1588,20 +1595,19 @@ private val REPORT_COMMON_ZONES: List<String> = listOf(
 )
 
 /**
- * Builder for the OpenALPR-style single-plate report: a Case #/description field,
- * a timezone picker (defaulting to device-local), and a toggle for the sighting
- * dossier — then "Download PDF" (which builds the report and hands it to the
- * system share sheet). Mirrors the [WatchlistDialog]/[CameraPickerDialog] pattern.
+ * Builder for the single-plate report: a timezone picker (defaulting to
+ * device-local) and a toggle for the sighting dossier — then "Download PDF"
+ * (which builds the report and hands it to the system share sheet). Mirrors the
+ * [WatchlistDialog]/[CameraPickerDialog] pattern.
  */
 @Composable
 private fun PlateReportDialog(
     read: PlateRead,
     mediaUrls: MediaUrls,
     generating: Boolean,
-    onDownload: (caseText: String, zoneId: java.time.ZoneId, includeDossier: Boolean) -> Unit,
+    onDownload: (zoneId: java.time.ZoneId, includeDossier: Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var caseText by remember { mutableStateOf("") }
     var includeDossier by remember { mutableStateOf(true) }
     val defaultZone = remember { java.time.ZoneId.systemDefault().id }
     // Device-local first (the default), then the curated common set, de-duplicated.
@@ -1625,7 +1631,7 @@ private fun PlateReportDialog(
                         .fillMaxWidth()
                         .height(120.dp),
                     crop = true,
-                    decodePx = PLATE_DETAIL_DECODE_PX,
+                    decodePx = PLATE_CROP_DECODE_PX,
                 )
                 Text(
                     text = read.plate.ifEmpty { "—" },
@@ -1634,14 +1640,6 @@ private fun PlateReportDialog(
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                     style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(top = 8.dp),
-                )
-                TextField(
-                    value = caseText,
-                    onValueChange = { caseText = it },
-                    placeholder = { Text("Case # / description") },
-                    singleLine = true,
-                    leadingIcon = { Icon(Icons.Filled.Event, contentDescription = null) },
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
                 // Timezone picker.
                 Row(
@@ -1689,7 +1687,7 @@ private fun PlateReportDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onDownload(caseText, java.time.ZoneId.of(zoneId), includeDossier) },
+                onClick = { onDownload(java.time.ZoneId.of(zoneId), includeDossier) },
                 enabled = !generating,
             ) {
                 if (generating) {

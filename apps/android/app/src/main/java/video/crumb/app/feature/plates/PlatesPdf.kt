@@ -21,25 +21,20 @@ import kotlinx.coroutines.withContext
 import video.crumb.app.data.MediaUrls
 import video.crumb.app.data.PlateRead
 import video.crumb.app.data.PlateWatchlistEntry
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import java.util.UUID
 import kotlin.math.roundToInt
 
 /**
- * Renders a single plate read to an OpenALPR-style **single-plate report** PDF —
- * one sighting, forensically framed — using Android's built-in [PdfDocument] (no
- * third-party PDF dependency).
+ * Renders a single plate read to a **single-plate report** PDF using Android's
+ * built-in [PdfDocument] (no third-party PDF dependency).
  *
  * Layout (one A4 portrait page):
- *  - **Forensic header**: server host, exported-by, export timestamp, a random
- *    report id, and the operator's Case #/description.
+ *  - **Title** + divider.
  *  - **Watchlist/BOLO banner** (red) when the plate matches a `kind:"watch"`
  *    entry from `GET /lpr/watchlist`.
  *  - **Header block**: the plate (large monospace), confidence, the date+time in
@@ -47,16 +42,15 @@ import kotlin.math.roundToInt
  *  - **Two images**: a zoomed plate crop (the snapshot cropped to [PlateRead.bbox])
  *    and the full "vehicle" snapshot. When bbox is null / the crop fails, the
  *    first image falls back to the full snapshot, labeled "vehicle".
- *  - **Details**: `plate_raw`, region, source.
+ *  - **Details**: `plate_raw`, source.
  *  - **Dossier** (optional): every sighting of this plate — total, distinct
- *    cameras, first/last seen, and a small thumbnail strip.
- *  - **Footer**: the SHA-256 of each embedded image's bytes, labeled
- *    "tamper-evident".
+ *    cameras, first/last seen, and a thumbnail strip captioned with each
+ *    sighting's date/time.
  *
  * Snapshots are loaded exactly like the on-screen `PlateThumb`: each read's
  * sibling detection-event JPEG via the scoped-token proxy
  * ([MediaUrls.eventSnapshotUrl]), fetched through the shared Coil [ImageLoader]
- * with `allowHardware(false)` so we get a software bitmap to draw + hash.
+ * with `allowHardware(false)` so we get a software bitmap to draw.
  *
  * The finished PDF is written to the app-private `reports/` cache subdir (exposed
  * by `res/xml/file_paths.xml`) so [sharePlatesPdf] can hand it to the system
@@ -100,12 +94,6 @@ data class PlateReportInput(
     val read: PlateRead,
     /** Camera id → display name (resolves both the primary camera and dossier cameras). */
     val cameraNames: Map<String, String>,
-    /** Connected server host (from the session base URL). */
-    val serverHost: String,
-    /** Username that exported the report (from the session / `/auth/me`). */
-    val exportedBy: String,
-    /** Operator's Case # / free-text description (may be blank). */
-    val caseText: String,
     /** Timezone the timestamps are rendered in (defaults to device-local at the call site). */
     val zoneId: ZoneId,
     /** Whether to render the sighting-history dossier section. */
@@ -118,6 +106,10 @@ data class PlateReportInput(
     /** Server-reported total match count for the dossier query (may exceed `dossier.size`). */
     val dossierTotal: Int,
 )
+
+/** One sighting-history thumbnail: the decoded image paired with that sighting's
+ *  timestamp (ISO), so the strip can caption each thumbnail with its date/time. */
+private class DossierThumb(val bitmap: Bitmap, val ts: String)
 
 /**
  * Build the single-plate report PDF for [input]. Returns the written [File] on
@@ -144,32 +136,26 @@ suspend fun generatePlateReportPdf(
         val cropIsFallback = crop == null
         val plateImage = crop ?: fullSnapshot
 
-        // Dossier thumbnail strip (bounded). Skip the primary read's own event to
-        // avoid a duplicate of the header image where possible.
-        val dossierThumbs: List<Bitmap> = if (input.includeDossier) {
-            val out = ArrayList<Bitmap>(MAX_DOSSIER_THUMBS)
+        // Dossier thumbnail strip (bounded). Each thumb keeps its sighting's
+        // timestamp so the strip can caption it with a date/time (captions stay
+        // aligned even when a fetch is skipped, since ts travels with the image).
+        val dossierThumbs: List<DossierThumb> = if (input.includeDossier) {
+            val out = ArrayList<DossierThumb>(MAX_DOSSIER_THUMBS)
             for (d in input.dossier) {
                 if (out.size >= MAX_DOSSIER_THUMBS) break
                 val bmp = fetchSnapshotBitmap(
                     context, mediaUrls, imageLoader, d.cameraId, d.eventId, DOSSIER_THUMB_TARGET_PX,
                 ) ?: continue
-                out.add(bmp)
+                out.add(DossierThumb(bmp, d.ts))
             }
             out
         } else {
             emptyList()
         }
 
-        // Tamper-evident hashes of the exact bytes embedded (each bitmap re-encoded
-        // to PNG deterministically). Null when the image is absent.
-        val shaPlate = plateImage?.let { sha256Hex(it.toPngBytes()) }
-        val shaVehicle = fullSnapshot?.let { sha256Hex(it.toPngBytes()) }
-
-        val reportId = "CR-" + UUID.randomUUID().toString().replace("-", "").take(8).uppercase(Locale.US)
         val tsFmt = DateTimeFormatter
             .ofPattern("EEE, MMM d yyyy · HH:mm:ss z", Locale.US)
             .withZone(input.zoneId)
-        val exportedAt = tsFmt.format(Instant.now())
 
         val doc = PdfDocument()
         try {
@@ -180,10 +166,6 @@ suspend fun generatePlateReportPdf(
                 cropIsFallback = cropIsFallback,
                 vehicleImage = fullSnapshot,
                 dossierThumbs = dossierThumbs,
-                shaPlate = shaPlate,
-                shaVehicle = shaVehicle,
-                reportId = reportId,
-                exportedAt = exportedAt,
                 tsFmt = tsFmt,
             )
             val dir = File(context.cacheDir, REPORTS_CACHE_SUBDIR).apply { mkdirs() }
@@ -205,7 +187,7 @@ suspend fun generatePlateReportPdf(
             val owned = LinkedHashSet<Bitmap>()
             fullSnapshot?.let(owned::add)
             plateImage?.let(owned::add)
-            dossierThumbs.forEach(owned::add)
+            dossierThumbs.forEach { owned.add(it.bitmap) }
             owned.forEach { runCatching { it.recycle() } }
         }
     }
@@ -255,12 +237,6 @@ private fun cropToBbox(src: Bitmap, bbox: List<Double>?): Bitmap? {
     }.getOrNull()
 }
 
-private fun sha256Hex(bytes: ByteArray): String =
-    MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-
-private fun Bitmap.toPngBytes(): ByteArray =
-    ByteArrayOutputStream().also { compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
-
 // ─── drawing ────────────────────────────────────────────────────────────────
 
 private fun drawReport(
@@ -269,11 +245,7 @@ private fun drawReport(
     plateImage: Bitmap?,
     cropIsFallback: Boolean,
     vehicleImage: Bitmap?,
-    dossierThumbs: List<Bitmap>,
-    shaPlate: String?,
-    shaVehicle: String?,
-    reportId: String,
-    exportedAt: String,
+    dossierThumbs: List<DossierThumb>,
     tsFmt: DateTimeFormatter,
 ) {
     val read = input.read
@@ -282,20 +254,10 @@ private fun drawReport(
         textSize = 18f
         isFakeBoldText = true
     }
-    val idPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.rgb(0x5a, 0x66, 0x78)
-        textSize = 10f
-        textAlign = Paint.Align.RIGHT
-        typeface = android.graphics.Typeface.MONOSPACE
-    }
     val metaLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = AndroidColor.rgb(0x8a, 0x93, 0xa2)
         textSize = 9f
         isFakeBoldText = true
-    }
-    val metaPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.rgb(0x33, 0x3b, 0x48)
-        textSize = 10f
     }
     val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = AndroidColor.rgb(0x5a, 0x66, 0x78)
@@ -349,20 +311,9 @@ private fun drawReport(
 
     var y = MARGIN + 6f
 
-    // ── forensic header ────────────────────────────────────────────────────────
+    // ── header ──────────────────────────────────────────────────────────────────
     c.drawText("CrumbVMS — License Plate Report", contentLeft, y, titlePaint)
-    c.drawText("REPORT $reportId", contentRight, y, idPaint)
-    y += 16f
-    fun metaLine(label: String, value: String) {
-        c.drawText(label, contentLeft, y, metaLabelPaint)
-        c.drawText(value, contentLeft + 78f, y, metaPaint)
-        y += 13f
-    }
-    metaLine("SERVER", input.serverHost.ifBlank { "—" })
-    metaLine("EXPORTED BY", input.exportedBy.ifBlank { "—" })
-    metaLine("EXPORTED AT", exportedAt)
-    metaLine("CASE", input.caseText.ifBlank { "—" })
-    y += 4f
+    y += 14f
     c.drawLine(contentLeft, y, contentRight, y, linePaint)
     y += 14f
 
@@ -416,7 +367,6 @@ private fun drawReport(
         y += 14f
     }
     detailLine("PLATE RAW", read.plateRaw.ifBlank { "—" })
-    detailLine("REGION", read.region?.takeIf { it.isNotBlank() } ?: "—")
     detailLine("SOURCE", read.sourceId?.takeIf { it.isNotBlank() } ?: "—")
     y += 6f
 
@@ -448,39 +398,30 @@ private fun drawReport(
             y += 14f
             c.drawText("Last seen  $lastSeen", contentLeft, y, cellPaint)
             y += 16f
-            // Thumbnail strip (single bounded row).
+            // Thumbnail strip (single bounded row), each captioned with its
+            // sighting's date/time in the report's timezone.
             if (dossierThumbs.isNotEmpty()) {
+                val thumbTsFmt = DateTimeFormatter
+                    .ofPattern("MMM d, HH:mm", Locale.US)
+                    .withZone(input.zoneId)
+                val thumbCapPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = AndroidColor.rgb(0x5a, 0x66, 0x78)
+                    textSize = 6.5f
+                    textAlign = Paint.Align.CENTER
+                }
                 val thumbGap = 8f
                 val thumbW = (contentWidth - thumbGap * (MAX_DOSSIER_THUMBS - 1)) / MAX_DOSSIER_THUMBS
                 val thumbH = thumbW * 0.62f
                 var tx = contentLeft
-                for (bmp in dossierThumbs) {
-                    drawImageBox(c, bmp, tx, y, thumbW, thumbH, placeholderPaint, placeholderTextPaint)
+                for (t in dossierThumbs) {
+                    drawImageBox(c, t.bitmap, tx, y, thumbW, thumbH, placeholderPaint, placeholderTextPaint)
+                    c.drawText(fmtTs(t.ts, thumbTsFmt), tx + thumbW / 2f, y + thumbH + 9f, thumbCapPaint)
                     tx += thumbW + thumbGap
                 }
-                y += thumbH + 8f
+                y += thumbH + 8f + 11f
             }
         }
     }
-
-    // ── footer: tamper-evident image hashes ─────────────────────────────────────
-    val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.rgb(0x8a, 0x93, 0xa2)
-        textSize = 7.5f
-        typeface = android.graphics.Typeface.MONOSPACE
-    }
-    val footerLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.rgb(0x5a, 0x66, 0x78)
-        textSize = 8f
-        isFakeBoldText = true
-    }
-    var fy = PAGE_H - MARGIN - 26f
-    c.drawLine(contentLeft, fy - 8f, contentRight, fy - 8f, linePaint)
-    c.drawText("TAMPER-EVIDENT — SHA-256 of each embedded image", contentLeft, fy, footerLabelPaint)
-    fy += 11f
-    c.drawText("plate:   ${shaPlate ?: "(no image)"}", contentLeft, fy, footerPaint)
-    fy += 10f
-    c.drawText("vehicle: ${shaVehicle ?: "(no image)"}", contentLeft, fy, footerPaint)
 
     doc.finishPage(page)
 }
