@@ -208,6 +208,15 @@ pub struct CameraHaLink {
     pub label: Option<String>,
     /// Display order within the camera.
     pub sort_order: i32,
+    /// On-video overlay placement (migration 0058, issue #170): normalized x/y
+    /// as a fraction of the DISPLAYED VIDEO FRAME (not the pane), so a badge
+    /// stays on the physical thing it marks as the tile aspect changes. `None`
+    /// (both null) ⇒ the link is not placed and draws no badge. Set together.
+    pub overlay_x: Option<f64>,
+    pub overlay_y: Option<f64>,
+    /// Scale multiplier on the base badge size (1.0 = default). `None` when not
+    /// placed; the API clamps it to a sane range on write.
+    pub overlay_size: Option<f32>,
 }
 
 // ─── recording_policies ──────────────────────────────────────────────────────

@@ -1614,6 +1614,9 @@ fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
         device_class: row.get("device_class"),
         label: row.get("label"),
         sort_order: row.get("sort_order"),
+        overlay_x: row.get("overlay_x"),
+        overlay_y: row.get("overlay_y"),
+        overlay_size: row.get("overlay_size"),
     }
 }
 
@@ -1626,7 +1629,8 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
     let client = get_conn(pool).await?;
     let rows = client
         .query(
-            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
+                    overlay_x, overlay_y, overlay_size
              FROM camera_ha_links WHERE camera_id = $1
              ORDER BY sort_order, entity_id",
             &[&camera_id],
@@ -1651,7 +1655,8 @@ pub async fn get_camera_ha_links(
     let client = get_conn(pool).await?;
     let rows = client
         .query(
-            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
+                    overlay_x, overlay_y, overlay_size
              FROM camera_ha_links WHERE camera_id = $1 AND role = $2
              ORDER BY sort_order, entity_id",
             &[&camera_id, &role],
@@ -1668,6 +1673,11 @@ pub type HaLinkInsert = (String, String, Option<String>, Option<String>, i32);
 /// Replace the full set of a camera's HA links (delete-then-insert in one
 /// transaction) and bump `ha_config.version` so consumers hot-reload.
 ///
+/// On-video overlay placements (migration 0058) are **carried over** by
+/// `(entity_id, role)`: re-saving the link list from the admin console must not
+/// wipe a badge an operator placed. A link that survives the re-save keeps its
+/// placement; a link that is removed loses it (there is nowhere to put it).
+///
 /// # Errors
 ///
 /// Returns an error if the transaction fails.
@@ -1681,6 +1691,31 @@ pub async fn replace_camera_ha_links(
         .transaction()
         .await
         .context("replace_camera_ha_links: begin")?;
+    // Snapshot existing placements before the delete so surviving links keep
+    // their on-video position. Keyed by (entity_id, role) — the table's natural
+    // identity for a link (see the UNIQUE(camera_id, entity_id, role)).
+    type Placement = (Option<f64>, Option<f64>, Option<f32>);
+    let mut placements: std::collections::HashMap<(String, String), Placement> =
+        std::collections::HashMap::new();
+    let old_rows = tx
+        .query(
+            "SELECT entity_id, role, overlay_x, overlay_y, overlay_size
+             FROM camera_ha_links WHERE camera_id = $1",
+            &[&camera_id],
+        )
+        .await
+        .context("replace_camera_ha_links: read placements")?;
+    for row in &old_rows {
+        let key: (String, String) = (row.get("entity_id"), row.get("role"));
+        placements.insert(
+            key,
+            (
+                row.get("overlay_x"),
+                row.get("overlay_y"),
+                row.get("overlay_size"),
+            ),
+        );
+    }
     tx.execute(
         "DELETE FROM camera_ha_links WHERE camera_id = $1",
         &[&camera_id],
@@ -1688,10 +1723,26 @@ pub async fn replace_camera_ha_links(
     .await
     .context("replace_camera_ha_links: delete")?;
     for (entity_id, role, device_class, label, sort_order) in links {
+        let (ox, oy, osize) = placements
+            .get(&(entity_id.clone(), role.clone()))
+            .copied()
+            .unwrap_or((None, None, None));
         tx.execute(
-            "INSERT INTO camera_ha_links (camera_id, entity_id, role, device_class, label, sort_order)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-            &[&camera_id, entity_id, role, device_class, label, sort_order],
+            "INSERT INTO camera_ha_links
+                 (camera_id, entity_id, role, device_class, label, sort_order,
+                  overlay_x, overlay_y, overlay_size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &camera_id,
+                entity_id,
+                role,
+                device_class,
+                label,
+                sort_order,
+                &ox,
+                &oy,
+                &osize,
+            ],
         )
         .await
         .context("replace_camera_ha_links: insert")?;
@@ -1706,6 +1757,76 @@ pub async fn replace_camera_ha_links(
         .await
         .context("replace_camera_ha_links: commit")?;
     list_camera_ha_links(pool, camera_id).await
+}
+
+/// Set (or clear) one link's on-video overlay placement (migration 0058).
+///
+/// `placement = Some((x, y, size))` pins the badge; `None` clears it (badge
+/// removed). Scoped to `(link_id, camera_id)` so a caller can't move a link that
+/// belongs to another camera. Returns the updated link, or `None` if no link
+/// with that id exists on that camera (⇒ 404 at the API). Does **not** bump
+/// `ha_config.version`: a placement is a per-camera display tweak, and the
+/// recorder's motion loop (the version's main consumer) does not read overlay
+/// columns.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn update_ha_link_placement(
+    pool: &Pool,
+    camera_id: Uuid,
+    link_id: Uuid,
+    placement: Option<(f64, f64, f32)>,
+) -> Result<Option<CameraHaLink>> {
+    let (x, y, size) = match placement {
+        Some((x, y, s)) => (Some(x), Some(y), Some(s)),
+        None => (None, None, None),
+    };
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "UPDATE camera_ha_links
+                SET overlay_x = $3, overlay_y = $4, overlay_size = $5
+              WHERE id = $1 AND camera_id = $2
+          RETURNING id, camera_id, entity_id, role, device_class, label, sort_order,
+                    overlay_x, overlay_y, overlay_size",
+            &[&link_id, &camera_id, &x, &y, &size],
+        )
+        .await
+        .context("update_ha_link_placement")?;
+    Ok(row.as_ref().map(ha_link_from_row))
+}
+
+/// Distinct HA `entity_id`s linked to any of the given cameras (or all cameras
+/// when `camera_ids` is `None`, for an admin). Used by `GET /ha/states` to
+/// project the cached HA state array down to only the entities a caller may see
+/// — a viewer never learns about entities linked to cameras they can't access.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_ha_linked_entities(
+    pool: &Pool,
+    camera_ids: Option<&[Uuid]>,
+) -> Result<Vec<String>> {
+    let client = get_conn(pool).await?;
+    let rows = match camera_ids {
+        None => client
+            .query("SELECT DISTINCT entity_id FROM camera_ha_links", &[])
+            .await
+            .context("list_ha_linked_entities: all")?,
+        Some(ids) => client
+            .query(
+                "SELECT DISTINCT entity_id FROM camera_ha_links WHERE camera_id = ANY($1)",
+                &[&ids],
+            )
+            .await
+            .context("list_ha_linked_entities: scoped")?,
+    };
+    Ok(rows
+        .iter()
+        .map(|r| r.get::<_, String>("entity_id"))
+        .collect())
 }
 
 /// Repair a segment row's `size_bytes` to the actual on-disk byte length.
@@ -9165,6 +9286,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0057_update_available_alert.sql",
         include_str!("../../../db/migrations/0057_update_available_alert.sql"),
+    ),
+    (
+        "0058_ha_overlay_placement.sql",
+        include_str!("../../../db/migrations/0058_ha_overlay_placement.sql"),
     ),
 ];
 
