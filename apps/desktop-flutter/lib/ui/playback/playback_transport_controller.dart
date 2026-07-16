@@ -99,17 +99,23 @@ class PlaybackTransportController extends ChangeNotifier {
 
   /// pbFrameStep (app.js:7627). Pauses first (stepping while playing makes no
   /// sense — matches the old client), then steps every registered pane by
-  /// ~1 frame.
+  /// exactly 1 frame.
   ///
-  /// The old client called a native libmpv `frame-step` / `frame-back-step`
-  /// command via a Tauri Rust command (src-tauri/src/lib.rs:1219). media_kit's
-  /// cross-platform `Player` API has no equivalent single-frame-step command,
-  /// so this approximates it: read the decoder's estimated fps off the native
-  /// mpv property (`estimated-vf-fps`; falls back to 30fps if unavailable —
-  /// same non-fatal-property pattern as wall_screen.dart's setProperty calls)
-  /// and seek by ±1 frame duration from the current position. Good enough for
-  /// a "nudge by a frame" review; not guaranteed keyframe/frame-exact the way
-  /// a real mpv frame-step is.
+  /// Uses libmpv's native `frame-step` / `frame-back-step` commands through
+  /// the media_kit [NativePlayer] command channel — the same commands the old
+  /// client invoked via a Tauri Rust command (src-tauri/src/lib.rs:1219).
+  /// These are frame-exact in BOTH directions. Do not "simplify" this back to
+  /// a `position ± 1000/fps` seek: mpv resolves backward seeks to the nearest
+  /// KEYFRAME, so a seek-based back-step repeatedly snapped to the same
+  /// keyframe and appeared dead (the frame-step-stuck bug). The fps-seek
+  /// remains only as the fallback for a non-native platform (never the case
+  /// on desktop).
+  ///
+  /// NOTE: this controller is segment-agnostic (see the class doc), so its
+  /// step dead-ends at the loaded file's edges. The playback screen's actual
+  /// transport uses `GaplessSegmentPaneController.frameStep`, which
+  /// additionally crosses segment boundaries and reports the landed frame
+  /// time for playhead sync.
   Future<void> frameStep(bool forward) async {
     if (_playing) {
       _playing = false;
@@ -123,22 +129,21 @@ class PlaybackTransportController extends ChangeNotifier {
 
   Future<void> _stepOnePane(Player player, bool forward) async {
     try {
-      double fps = 30;
       final p = player.platform;
       if (p is NativePlayer) {
-        try {
-          final raw = await p.getProperty('estimated-vf-fps');
-          final parsed = double.tryParse(raw);
-          if (parsed != null && parsed > 0) fps = parsed;
-        } catch (_) {
-          // Property unavailable on this platform/build — keep 30fps fallback.
-        }
+        // Frame-exact native step (pauses the pane itself — matches the
+        // transport pause above).
+        await p.command([forward ? 'frame-step' : 'frame-back-step']);
+        return;
       }
-      final frameMs = (1000 / fps).round().clamp(1, 1000);
+      // Non-native fallback: approximate a frame by the decoder's estimated
+      // fps (assume 30 when unknown) and seek. Backward seeks may snap to a
+      // keyframe here — acceptable for a platform that has no native step.
+      const frameMs = 1000 ~/ 30;
       final current = player.state.position;
       var target = forward
-          ? current + Duration(milliseconds: frameMs)
-          : current - Duration(milliseconds: frameMs);
+          ? current + const Duration(milliseconds: frameMs)
+          : current - const Duration(milliseconds: frameMs);
       if (target < Duration.zero) target = Duration.zero;
       await player.seek(target);
     } catch (_) {

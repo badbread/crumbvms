@@ -15,9 +15,12 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+// NOTE: no direct `package:media_kit/media_kit.dart` import — every mpv
+// interaction (frame-step commands, position mapping, playlist bookkeeping)
+// goes through GaplessSegmentPaneController now; this screen only renders and
+// drives play/pause/rate via the pane's Player members.
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
@@ -182,9 +185,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   // ── filmstrip scrubbing ──────────────────────────────────────────────────
   // While dragging the scrubber we DON'T reopen the video players (that caused
-  // black flashing crossing segment boundaries). Instead the focused pane shows
-  // a server-extracted filmstrip frame at the drag position — "rock solid"
-  // scrubbing — and the real video resolve happens once on release.
+  // black flashing crossing segment boundaries). While the drag position stays
+  // inside the focused pane's loaded segment the video itself tracks it via
+  // hr-exact in-segment seeks; once the drag LEAVES the loaded segment the
+  // focused pane shows a server-extracted filmstrip frame instead (4 s-grid
+  // granularity — see _liveSeek). The real resolve happens once on release.
   bool _scrubbing = false;
   final Map<String, Uint8List?> _scrubFrames = {};
   int _scrubToken = 0;
@@ -532,10 +537,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   /// Overlaps and sub-second seams are merged with the same 1 s tolerance as
   /// the server's GAP_TOLERANCE_MS so a live-edge top-up extends the current
   /// span instead of stacking a duplicate next to it.
-  List<RecordedSpan> _unionSpans(
-    List<RecordedSpan> a,
-    List<RecordedSpan> b,
-  ) {
+  List<RecordedSpan> _unionSpans(List<RecordedSpan> a, List<RecordedSpan> b) {
     const gapMs = 1000;
     final all = [...a, ...b]..sort((x, y) => x.startMs.compareTo(y.startMs));
     final out = <RecordedSpan>[];
@@ -578,10 +580,14 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   /// coverage gap or a lost prefetch race. See [GaplessSegmentPaneController].
   /// `playing` overrides the transport's play/pause state for freshly opened
   /// files (the forward shuttle decodes while `_playing` stays false).
+  /// `mpvDriven` = the single-active-pane playhead-slaved mode (see [_onTick]):
+  /// the pane then crosses segment boundaries on mpv's own EOF instead of the
+  /// wall clock, so it never skips frames mpv hasn't shown.
   Future<void> _resolveAll(
     DateTime t, {
     bool force = false,
     bool? playing,
+    bool mpvDriven = false,
   }) async {
     final play = playing ?? _playing;
     final futures = <Future<void>>[];
@@ -590,7 +596,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       futures.add(
         force
             ? pane.resolveAt(t, forceReload: true, playing: play)
-            : pane.onTick(t, playing: play),
+            : pane.onTick(t, playing: play, mpvDriven: mpvDriven),
       );
     }
     await Future.wait(futures);
@@ -599,10 +605,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   /// Live-scrub, fired continuously while dragging the scrubber. Panes are NOT
   /// reopened here (that flashes black across segment boundaries): panes whose
-  /// loaded segment covers `t` do a cheap in-segment keyframe seek, and the
-  /// focused pane additionally shows a server-extracted filmstrip frame so it
-  /// tracks the scrubber rock-solid even across segments. The real cross-segment
-  /// resolve happens once on release ([_commitSeek]).
+  /// loaded segment covers `t` do a cheap in-segment seek (absolute seeks are
+  /// hr-exact in mpv, so the video itself tracks `t`), and the focused pane
+  /// falls back to a server-extracted filmstrip frame only when `t` has LEFT
+  /// its loaded segment — the one case the video can't follow without a
+  /// (black-flashing) reopen. The real cross-segment resolve happens once on
+  /// release ([_commitSeek]).
   void _liveSeek(DateTime t) {
     if (!_scrubbing) {
       setState(() => _scrubbing = true);
@@ -612,10 +620,27 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       // cross-segment resolve happens once on release, in _commitSeek).
       unawaited(_panes[cam.id]?.seekWithinSegment(t) ?? Future.value());
     }
-    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
-    // server-side extract load, superseded-request-safe via a token.
     final focusId = _maximizedCameraId ?? _selectedCameraId;
     if (focusId == null) return;
+    // The server's frame endpoint snaps `ts` to a fixed 4 s grid
+    // (services/api/src/filmstrip.rs::serve_frame — shared cache keys), so
+    // the filmstrip is inherently 4 s-granular: fine for a coarse
+    // multi-segment drag, but a fine scrub (zoomed-in timeline, feeling
+    // through one motion event) moves `t` less than a grid cell and the
+    // overlay freezes on a single frame — while COVERING the live video that
+    // is tracking `t` exactly via the in-segment seeks above. So while `t`
+    // is inside the focused pane's loaded segment, drop the overlay and let
+    // the real video show through; the filmstrip remains the cross-segment
+    // fallback only.
+    if (_panes[focusId]?.currentSegment?.covers(t) ?? false) {
+      if (_scrubFrames.isNotEmpty) {
+        _scrubToken++; // an in-flight fetch must not repaint the overlay
+        setState(_scrubFrames.clear);
+      }
+      return;
+    }
+    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
+    // server-side extract load, superseded-request-safe via a token.
     final now = DateTime.now();
     if (now.difference(_lastScrubFetch) < const Duration(milliseconds: 120)) {
       return;
@@ -723,9 +748,13 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         : (m > 0 ? '${m}m ${sec}s' : '${sec}s');
     // Show the ACTUAL start/end times (local), not just the length — so a
     // precise export window can be read straight off the bar.
-    final startT = DateTime.fromMillisecondsSinceEpoch(ss, isUtc: true).toLocal();
+    final startT = DateTime.fromMillisecondsSinceEpoch(
+      ss,
+      isUtc: true,
+    ).toLocal();
     final endT = DateTime.fromMillisecondsSinceEpoch(se, isUtc: true).toLocal();
-    final sameDay = startT.year == endT.year &&
+    final sameDay =
+        startT.year == endT.year &&
         startT.month == endT.month &&
         startT.day == endT.day;
     final startLabel = '${_mmdd(startT)}${_hms(startT)}';
@@ -783,32 +812,37 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (target != null) await _seekToMs(target);
   }
 
-  /// Nudge every active pane's player by ±1 frame (pauses first). Approximate
-  /// (uses estimated-vf-fps), good enough for frame-by-frame review.
+  /// Step every active pane by exactly ±1 frame (pauses first) using libmpv's
+  /// native `frame-step` / `frame-back-step` via
+  /// [GaplessSegmentPaneController.frameStep]. Replaces the old fps-seek
+  /// approximation (`position ± 1000/estimated-vf-fps`), whose backward seeks
+  /// mpv resolved to the nearest KEYFRAME — so repeated back-steps snapped to
+  /// the same keyframe forever ("step back does nothing / gets stuck") and
+  /// could never cross a segment boundary. The pane's native step is
+  /// frame-exact and walks into the adjacent segment at a file edge.
+  ///
+  /// The shared playhead is then snapped to the reference pane's REAL
+  /// resulting frame time (maximized else selected camera) so the timeline
+  /// and the video stay consistent — the old code left the playhead where it
+  /// was, silently desyncing the two clocks with every step.
   Future<void> _frameStep(bool forward) async {
+    if (_shuttling) return; // the shuttle owns the transport until release
     if (_playing) _togglePlay();
+    final refId = _maximizedCameraId ?? _selectedCameraId;
+    DateTime? refTime;
     for (final cam in _activeCameras()) {
-      final player = _panes[cam.id]?.player;
-      if (player == null) continue;
-      try {
-        double fps = 30;
-        final p = player.platform;
-        if (p is NativePlayer) {
-          final raw = await p.getProperty('estimated-vf-fps');
-          final parsed = double.tryParse(raw);
-          if (parsed != null && parsed > 0) fps = parsed;
-        }
-        final frameMs = (1000 / fps).round().clamp(1, 1000);
-        final cur = player.state.position;
-        var target = forward
-            ? cur + Duration(milliseconds: frameMs)
-            : cur - Duration(milliseconds: frameMs);
-        if (target < Duration.zero) target = Duration.zero;
-        await player.seek(target);
-      } catch (_) {
-        /* non-fatal per-pane */
-      }
+      // Sequential on purpose: stepping is an explicit low-rate operator
+      // action, and the boundary-crossing path does its own /play/ resolve —
+      // no need to fan out.
+      final t = await _panes[cam.id]?.frameStep(forward);
+      if (t == null) continue;
+      // Prefer the focused camera's landing time; any pane's beats none.
+      if (refTime == null || cam.id == refId) refTime = t;
     }
+    if (refTime != null) {
+      _timeline.setPlayhead(refTime, now: DateTime.now().toUtc());
+    }
+    if (mounted) setState(() {});
   }
 
   // ── transport ─────────────────────────────────────────────────────────────
@@ -864,15 +898,55 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     final elapsedMs = wallNow.difference(_lastTickWall).inMilliseconds;
     _lastTickWall = wallNow;
 
-    final advanceMs = (elapsedMs * _speeds[_speedIdx]).round();
     final nowUtc = DateTime.now().toUtc();
-    var next = _timeline.playhead.add(Duration(milliseconds: advanceMs));
+
+    // ── which clock owns the playhead this tick? ──────────────────────────
+    // With exactly ONE active pane (maximized, or a single-camera layout —
+    // frame-accurate review of one camera), the playhead is SLAVED to that
+    // pane's real mpv position (`segment.start + position`): the UI playhead
+    // and the video physically cannot disagree, so there is never a wall-
+    // clock lead for the video to "catch up" to and the segment boundary
+    // can't jump mpv past frames it hasn't shown (the frame-skip bug — see
+    // the header of gapless_segment_pane_controller.dart). With MULTIPLE
+    // panes the free-running wall clock stays in charge because it's the one
+    // reference every camera can be aligned to (per-pane slaving would let
+    // one slow camera drag every other pane's time around).
+    //
+    // `mpvPlayhead` is null whenever the pane's position can't be trusted —
+    // no segment, mid-resolve, EOF'd into a coverage gap, just-swapped file —
+    // and this falls back to the wall clock for those ticks, which is exactly
+    // the old behavior. When slaving resumes after such a window the playhead
+    // may snap BACK slightly (the wall clock ran ahead of the video during
+    // an open); that direction is the safe one — the video never jumps.
+    final active = _activeCameras();
+    final soloPane = active.length == 1 ? _panes[active.first.id] : null;
+    // While the operator is dragging the scrubber the DRAG owns the playhead
+    // (filmstrip scrub, committed on release) — slaving during the drag would
+    // yank the playhead back to mpv's keyframe-lagged in-segment seeks and
+    // jitter the timeline under the cursor. The boundary model below still
+    // follows the pane count; only the clock source defers to the drag.
+    final mpvTime = _scrubbing ? null : soloPane?.mpvPlayhead;
+
+    DateTime next;
+    if (mpvTime != null) {
+      next = mpvTime;
+    } else {
+      // Free-running wall clock: advance by wall delta × speed.
+      final advanceMs = (elapsedMs * _speeds[_speedIdx]).round();
+      next = _timeline.playhead.add(Duration(milliseconds: advanceMs));
+    }
     if (next.isAfter(nowUtc)) next = nowUtc;
     _timeline.setPlayhead(next, now: nowUtc);
 
     if (!_resolvePending) {
       _resolvePending = true;
-      _resolveAll(next).whenComplete(() => _resolvePending = false);
+      // Boundary model follows the clock model: mpv-driven (EOF-crossing)
+      // whenever a single pane is active — even during a null-mpvPlayhead
+      // fallback tick, so the mode can't flip-flop mid-boundary.
+      _resolveAll(
+        next,
+        mpvDriven: soloPane != null,
+      ).whenComplete(() => _resolvePending = false);
     }
 
     // Pause at the live edge — caught up to "now", nothing more to play.
@@ -1103,8 +1177,18 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   static const List<String> _monthAbbr = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
   ];
 
   /// Compact local label for the goto button, e.g. "Jul 11, 6:26:41 PM".
@@ -1151,8 +1235,15 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     );
     // Newly-active panes (e.g. the whole grid again after un-maximizing)
     // may not hold the right segment yet — force a resolve at the current
-    // playhead for whichever set is now active.
-    _resolveAll(_timeline.playhead, force: false);
+    // playhead for whichever set is now active. Pass the boundary model that
+    // matches the NEW active-pane count so a maximize landing right on a
+    // segment boundary doesn't get one stray wall-forced advance (a skip)
+    // before the next tick re-evaluates it.
+    _resolveAll(
+      _timeline.playhead,
+      force: false,
+      mpvDriven: _activeCameras().length == 1,
+    );
   }
 
   // ── build ────────────────────────────────────────────────────────────────
@@ -2027,9 +2118,7 @@ class _PbTileState extends State<_PbTile> {
                       color: Colors.white,
                       fontSize: 13,
                       fontWeight: FontWeight.w700,
-                      shadows: [
-                        Shadow(color: Colors.black, blurRadius: 4),
-                      ],
+                      shadows: [Shadow(color: Colors.black, blurRadius: 4)],
                     ),
                   ),
                   if (subtitle != null) ...[
