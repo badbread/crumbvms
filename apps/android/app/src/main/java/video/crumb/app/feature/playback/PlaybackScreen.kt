@@ -350,11 +350,21 @@ fun PlaybackScreen(
             vm.setPlaying(false)
             player.pause()
             player.playWhenReady = false
-            val fps = player.videoFormat?.frameRate?.takeIf { it > 1f } ?: 30f
+            // Clamp to a sane frame rate: some containers report garbage (e.g.
+            // 90000 fps → frameMs 0 → a 1 ms no-op step) or 0/undecoded. Anything
+            // outside 1.5–120 fps is not a real playback rate; fall back to 30.
+            val fps = player.videoFormat?.frameRate?.takeIf { it in 1.5f..120f } ?: 30f
             val frameMs = (1000f / fps).toLong().coerceAtLeast(1L)
             val duration = player.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
-            val target = (player.currentPosition + if (forward) frameMs else -frameMs)
-                .coerceIn(0L, duration)
+            // currentPosition sits at (roughly) the START of the frame on screen, so
+            // seeking by exactly one frame can round back INTO the current frame's
+            // window and not visibly move. Overshoot into the ADJACENT frame's
+            // window — ~1.5 frames forward, ~0.5 back — and let SeekParameters.EXACT
+            // (set on the player) snap to that neighbouring frame. Requires a
+            // seekable SeekMap, which the recorder's `+global_sidx` segments provide;
+            // without it every seek collapsed to 0 (the original bug).
+            val deltaMs = if (forward) frameMs + frameMs / 2 else -(frameMs / 2 + 1)
+            val target = (player.currentPosition + deltaMs).coerceIn(0L, duration)
             player.seekTo(target)
         }
     }
