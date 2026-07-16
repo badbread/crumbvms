@@ -47,6 +47,12 @@ recordings/
 *.mkv
 *.log
 
+# Exception: tiny synthetic fragmented-mp4 fixtures for the Android recorded-
+# playback seek regression test (SidxSeekTest). NOT footage — ~28 KB each,
+# generated from ffmpeg `testsrc` with the recorder's exact mux flags (see the
+# ffmpeg command in that test). These MUST be committed or the test can't run.
+!apps/android/app/src/test/resources/seek/*.mp4
+
 # claude code tooling state (session transcripts, memory, agent worktrees) —
 # never commit; .claude/worktrees holds a full nested copy of the repo
 .claude/

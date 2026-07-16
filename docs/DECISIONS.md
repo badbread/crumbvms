@@ -8,6 +8,67 @@ revisit.
 
 ---
 
+## 2026-07-16, Android recorded-playback seeking: add `+global_sidx` to the recorder mux (not HLS, not a server index)
+
+**Problem.** On the Android client, recorded-playback seeking was completely
+broken — frame-step (both directions), scrubbing, and datetime-jump all snapped
+back to the start of the current segment. Desktop (mpv/libmpv) seeks the same
+footage fine. Reported as "Android frame stepping doesn't work at all, forward
+and back."
+
+**Root cause (proven on-device via logcat + `ffprobe` across the whole segment
+fleet).** The recorder writes fragmented MP4 (`+frag_keyframe+empty_moov+default_base_moof`)
+with **no `sidx` (segment-index) box**. Media3/ExoPlayer's `FragmentedMp4Extractor`
+builds a seekable `SeekMap` *only* from an `sidx`; absent one it reports the
+stream unseekable and every `seekTo` collapses to position 0 (observed as
+`onPositionDiscontinuity reason=2 (SEEK_ADJUSTMENT) -> 0`). libmpv scans the
+byte stream directly and never needed the box, which is why only Android broke.
+This is a footage-*playback* defect, not a footage-integrity one, but the fix
+touches the always-must-work recorder so it went through golden-rule-2 gates
+(below).
+
+**Options considered:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | **Add `+global_sidx` to the recorder's `-segment_format_options movflags`** | **CHOSEN.** One flag on the existing `-c copy` remux — no re-encode. Writes one `sidx` per finished segment (~176 B, into reserved space at finalize, not a rewrite). Makes the *same* footage seekable by ExoPlayer; desktop is byte-for-byte unaffected in behavior. |
+| 2 | **Re-mux/serve recorded playback as HLS** (fMP4 segments + a media playlist) | **REJECTED** (Fable adversarial round). Would replace a working native-mp4 seek model in every client with a playlist model, and regress the *good* desktop mpv in-segment scrub. Frigate's poor H.265 scrubbing is a *browser HEVC-decode* limitation, not an HLS win — Crumb decodes natively (mpv + ExoPlayer MediaCodec) and doesn't share it. No seek-smoothness upside for the cost. |
+| 3 | **Server-side seek index / custom container** | **REJECTED.** Same conclusion as the 2026-07-07 scrub-preview entry (option 4/5): nothing inside a ~2 MB / 4 s segment is worth indexing server-side, and an index cannot create keyframes. The real gap was purely the missing in-container `sidx` box, which the muxer already knows how to emit. |
+| 4 | **Client-only workaround** (custom ExoPlayer `SeekMap`, or force-decode-from-0) | **REJECTED.** Fragile per-client reimplementation of what the container standard already specifies; would have to be rebuilt for every future client. Fix the bytes once, at the source. |
+
+**Gates run before touching the recorder (golden rule 2 — recorder correctness):**
+
+- **Crash safety.** A segment killed mid-write is **byte-identical** with vs.
+  without the flag (786 460 B, same box layout) — the `sidx` only lands when the
+  muxer finalizes the file, so `+global_sidx` introduces **no new footage-loss
+  mode**. This is why it composes with the existing `+frag_keyframe+empty_moov`
+  crash-safety flags rather than weakening them.
+- **Finalize I/O.** +176 bytes/segment, filled into reserved space (`global_sidx`
+  reserves the box up-front); measured no full-file rewrite at close. Negligible.
+- **Objective seek proof (Gate 3, headless — no device).** A real Media3
+  `FragmentedMp4Extractor` unit test (`apps/android/.../SidxSeekTest.kt`) over two
+  real Crumb HEVC segments (same source, remuxed with vs. without `+global_sidx`):
+  the `+sidx` segment yields a seekable `SeekMap` that seeks to distinct
+  mid-segment frames; the no-`sidx` segment is not seekable (reproduces the bug).
+  This ships as a permanent regression test so a future mux change that drops the
+  box fails CI instead of silently re-breaking Android.
+
+**Trades knowingly accepted.** ~176 B/segment (well under 0.01% of a ~2 MB segment). The
+Android client still needs a step *redesign* (play-until-next-frame) for smooth
+per-frame stepping — seekability is necessary but the ms-seek stepping shape is
+a separate client change; tracked separately. Fix does nothing for, and is
+independent of, the desktop Driveway frame-step edge (that camera's GOP, handled
+client-side).
+
+**Revisit triggers:** a client appears that *does* want HLS/DASH for adaptive
+bitrate (re-evaluate option 2 as an *additional* delivery path, never a
+replacement for the native-mp4 seek model); segment length grows past minutes
+(then a coarser index inside a segment could matter); ExoPlayer/Media3 gains the
+ability to build a `SeekMap` without an `sidx` (then the flag is optional, though
+harmless).
+
+---
+
 ## 2026-07-16, CI publishes amd64-only Docker images (dropped the arm64 multi-arch leg)
 
 CI (`.github/workflows/ci.yml`) built the api + recorder images multi-arch

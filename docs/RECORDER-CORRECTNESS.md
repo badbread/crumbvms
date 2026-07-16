@@ -6,10 +6,16 @@ recorder, and later the API) must satisfy these *by construction*.
 
 ## ffmpeg / segmenting
 1. **fMP4 flags must reach the inner mp4 muxer.** With `-f segment -segment_format mp4`,
-   pass `-segment_format_options movflags=+frag_keyframe+empty_moov+default_base_moof`.
+   pass `-segment_format_options movflags=+frag_keyframe+empty_moov+default_base_moof+global_sidx`.
    A top-level `-movflags` is applied to the *segment* muxer and silently ignored →
    non-fragmented MP4s (moov written at close) that are unplayable if the process is
-   killed mid-segment.
+   killed mid-segment. `+global_sidx` writes a segment-index box that Android's
+   ExoPlayer (`FragmentedMp4Extractor`) requires to build a seekable `SeekMap`;
+   without it recorded playback on Android cannot seek (every `seekTo` collapses to
+   0). It stays a `-c copy` remux (~176 B/segment, written at finalize) and is
+   crash-safe: a segment killed mid-write is byte-identical with or without the flag
+   (the sidx lands only when the muxer finalizes). Guarded by
+   `apps/android/.../SidxSeekTest.kt` (a real-fixture Media3 extractor test).
 2. **Segments start on keyframes and are independently seekable:** `-c copy` (zero
    re-encode), `-segment_atclocktime 1`, `-reset_timestamps 1`.
 3. **Precise timestamps:** derive `start_ts` from the strftime-encoded filename
