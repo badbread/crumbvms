@@ -356,16 +356,23 @@ const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
 /// Post-roll padding after a clip's event window (pre-roll is an admin setting).
 const POST_ROLL_MS: i64 = 8_000;
 
-/// Hard cap on a single clip's media window. A detection/motion event with a
-/// broken `end_ts` — never closed (rendered as "until now") or absurd (e.g. a
-/// "car" that stayed "active" for 10 hours) — must NEVER make the renderer
-/// concat thousands of 4 s segments into a multi-hour transcode. In prod
-/// (2026-07-16) exactly that pinned the API at 600%+ CPU and starved ALL clip
-/// playback (black/retry). The list query is bounded by `MAX_CLIP_WINDOW_DAYS`,
-/// but the MEDIA window was not; beyond this the window is truncated to
-/// `[start, start + cap)`. Legit motion/detection clips are seconds to a couple
-/// minutes, so this only ever bites broken/stuck events.
-const MAX_CLIP_MEDIA_SECS: i64 = 5 * 60;
+/// Max length of a generated clip. A clip is an **overview** of an event — a
+/// short, representative snippet — NOT the full event: to watch a whole event
+/// the operator opens the timeline (which streams segments directly, with no
+/// whole-event transcode). So a clip render is short *by design*, independent of
+/// how long the underlying event is: a Frigate "car" detected for 5 hours, or a
+/// motion event that never settles, yields a ~30 s overview, not a 5-hour
+/// transcode. The window is truncated to `[start, start + cap)`.
+///
+/// This is also the hard safety backstop that keeps a broken `end_ts` (never
+/// closed → "until now", or a 10-hour event) from making the renderer concat
+/// thousands of 4 s segments into a multi-hour transcode — which in prod
+/// (2026-07-16) pinned the API at 600%+ CPU and starved ALL clip playback.
+///
+/// A fuller clip model (anchor on peak score, admin-tunable length, long-event
+/// "jump to timeline" UX, event-lifecycle bounding) is being designed
+/// separately (see docs/DECISIONS.md / issue #198); this cap stays as the floor.
+const MAX_CLIP_MEDIA_SECS: i64 = 30;
 
 /// Clamp a resolved clip window to at most [`MAX_CLIP_MEDIA_SECS`], also guarding
 /// an inverted (end < start) window down to a zero-length one.
@@ -1130,9 +1137,9 @@ mod tests {
     #[test]
     fn clip_window_clamped_to_cap() {
         let start = t(0);
-        // A normal short clip is left untouched.
-        let (s, e) = clamp_clip_window(start, t(30_000));
-        assert_eq!((s, e), (start, t(30_000)));
+        // A normal short clip (under the cap) is left untouched.
+        let (s, e) = clamp_clip_window(start, t(12_000));
+        assert_eq!((s, e), (start, t(12_000)));
         // A 10-hour "clip" (broken/unbounded event) is truncated to the cap.
         let (s, e) = clamp_clip_window(start, t(36_303_000));
         assert_eq!(s, start);
