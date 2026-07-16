@@ -350,7 +350,12 @@ fun PlaybackScreen(
             vm.setPlaying(false)
             player.pause()
             player.playWhenReady = false
-            val fps = player.videoFormat?.frameRate?.takeIf { it > 1f } ?: 30f
+            // Clamp to a plausible range: fragmented-mp4 segments often report a
+            // garbage container frame rate (a real camera here reports 90000 fps),
+            // which without an UPPER bound yields frameMs = 1000/90000 -> 0 -> a
+            // 1 ms "step" that never leaves the current frame. Reject anything
+            // outside 1.5..120 fps and fall back to 30.
+            val fps = player.videoFormat?.frameRate?.takeIf { it in 1.5f..120f } ?: 30f
             val frameMs = (1000f / fps).toLong().coerceAtLeast(1L)
             val duration = player.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
             val target = (player.currentPosition + if (forward) frameMs else -frameMs)
