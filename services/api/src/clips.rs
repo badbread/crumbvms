@@ -369,10 +369,7 @@ const MAX_CLIP_MEDIA_SECS: i64 = 5 * 60;
 
 /// Clamp a resolved clip window to at most [`MAX_CLIP_MEDIA_SECS`], also guarding
 /// an inverted (end < start) window down to a zero-length one.
-fn clamp_clip_window(
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> (DateTime<Utc>, DateTime<Utc>) {
+fn clamp_clip_window(start: DateTime<Utc>, end: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     let capped = end.min(start + Duration::seconds(MAX_CLIP_MEDIA_SECS));
     (start, capped.max(start))
 }
