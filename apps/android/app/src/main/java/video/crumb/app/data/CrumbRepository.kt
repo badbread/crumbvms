@@ -222,6 +222,14 @@ class CrumbRepository(private val container: AppContainer) {
     suspend fun liveStreams(cameraId: String): Result<LiveStreamsResponse> =
         runCatchingCancellable { api.liveStreams(cameraId) }
 
+    /** Home Assistant entities linked to a camera. Empty when HA is not set up. */
+    suspend fun haLinks(cameraId: String): Result<List<HaLinkDto>> =
+        runCatchingCancellable { api.haLinks(cameraId) }
+
+    /** Live HA entity states (demand-cached on the server). */
+    suspend fun haStates(): Result<HaStatesResponse> =
+        runCatchingCancellable { api.haStates() }
+
     // ── motion tuner ───────────────────────────────────────────────────────────
     /** Latest live per-cell motion heatmap (null when none published yet). */
     suspend fun motionGrid(cameraId: String): Result<MotionGridDto?> =
