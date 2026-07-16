@@ -85,6 +85,11 @@ pub struct ClipDescriptor {
     /// True if the requesting user has already opened this clip — clients render
     /// watched cards subtly dimmer.
     pub viewed: bool,
+    /// True while the underlying event is still open (`end_ts` NULL) — the clip is
+    /// an overview of the event's opening seconds, and the event has no known end
+    /// yet. Always false for motion clips (both bounds are known). Clients render
+    /// an "ongoing" badge and treat the clip as a truncated overview.
+    pub ongoing: bool,
     /// Normalized `[x, y, w, h]` (0..1 of the frame) of where the motion was, for
     /// the clip player's motion-highlight auto-zoom. Present for motion clips that
     /// captured a region; `null` for detections and bbox-less motion clips.
@@ -100,6 +105,11 @@ pub struct ClipsResponse {
     /// clip player auto-zooms to `motion_bbox` for this long at the start of a
     /// motion clip, then eases back to the full frame.
     pub motion_highlight_seconds: i64,
+    /// Server-configured clip overview length (seconds) — how long each clip
+    /// renders. Clients compute `truncated = ongoing || duration_ms >
+    /// overview_seconds * 1000` to show "N s overview — full event H:MM · View on
+    /// timeline" without a second round-trip.
+    pub overview_seconds: i64,
 }
 
 /// A normalized motion region `[x, y, w, h]` (0..1 fractions of the frame).
@@ -138,6 +148,9 @@ async fn get_clips(
             clips: vec![],
             total: 0,
             motion_highlight_seconds: 0,
+            overview_seconds: db::get_clip_overview_seconds(state.pool())
+                .await
+                .map_err(ApiError::Internal)?,
         }));
     }
     if q.start >= q.end {
@@ -199,6 +212,12 @@ async fn get_clips(
             if r.label == "motion" {
                 continue;
             }
+            // `ongoing` = the event is still open (no end yet). Preserve that here
+            // rather than destroying it with the `unwrap_or(r.ts)` fallback, so the
+            // feed can render an "ongoing" badge and treat the clip as a truncated
+            // overview. `end_ts`/`duration_ms` stay EVENT truth (the timeline shows
+            // the whole thing).
+            let ongoing = r.end_ts.is_none();
             let end = r.end_ts.unwrap_or(r.ts);
             let id = format!("d:{}", r.id);
             clips.push(ClipDescriptor {
@@ -219,6 +238,7 @@ async fn get_clips(
                 end_ts: end,
                 camera_id: r.camera_id,
                 viewed: false,
+                ongoing,
                 motion_bbox: None,
                 id,
             });
@@ -257,6 +277,9 @@ async fn get_clips(
                     end_ts: b,
                     camera_id: cam,
                     viewed: false,
+                    // Motion clips always have a known end (both bounds encoded in
+                    // the id), so they are never ongoing.
+                    ongoing: false,
                     motion_bbox: bbox,
                     id,
                 });
@@ -280,12 +303,16 @@ async fn get_clips(
     let motion_highlight_seconds = db::get_clip_motion_highlight_seconds(state.pool())
         .await
         .map_err(ApiError::Internal)?;
+    let overview_seconds = db::get_clip_overview_seconds(state.pool())
+        .await
+        .map_err(ApiError::Internal)?;
 
     let total = clips.len();
     Ok(Json(ClipsResponse {
         clips,
         total,
         motion_highlight_seconds,
+        overview_seconds,
     }))
 }
 
@@ -356,29 +383,68 @@ const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
 /// Post-roll padding after a clip's event window (pre-roll is an admin setting).
 const POST_ROLL_MS: i64 = 8_000;
 
-/// Max length of a generated clip. A clip is an **overview** of an event — a
-/// short, representative snippet — NOT the full event: to watch a whole event
-/// the operator opens the timeline (which streams segments directly, with no
-/// whole-event transcode). So a clip render is short *by design*, independent of
-/// how long the underlying event is: a Frigate "car" detected for 5 hours, or a
-/// motion event that never settles, yields a ~30 s overview, not a 5-hour
-/// transcode. The window is truncated to `[start, start + cap)`.
-///
-/// This is also the hard safety backstop that keeps a broken `end_ts` (never
-/// closed → "until now", or a 10-hour event) from making the renderer concat
+/// Compiled hard ceiling on a rendered clip's length (seconds), and the
+/// permanent safety floor of the clip-overview model. A clip is an **overview**
+/// of an event — a short, representative snippet — NOT the full event: to watch a
+/// whole event the operator opens the timeline (which streams segments directly,
+/// with no whole-event transcode). The render length is the admin-tunable
+/// `clip_overview_seconds` setting (default 30, clamped 10..=30), and this
+/// constant is the second lock: even if that setting were somehow out of range,
+/// the render window can never exceed 30 s, so a broken `end_ts` (never closed →
+/// "until now", or a 10-hour event) can never again make the renderer concat
 /// thousands of 4 s segments into a multi-hour transcode — which in prod
-/// (2026-07-16) pinned the API at 600%+ CPU and starved ALL clip playback.
-///
-/// A fuller clip model (anchor on peak score, admin-tunable length, long-event
-/// "jump to timeline" UX, event-lifecycle bounding) is being designed
-/// separately (see docs/DECISIONS.md / issue #198); this cap stays as the floor.
+/// (2026-07-16) pinned the API at 600%+ CPU and starved ALL clip playback. Equals
+/// `db::CLIP_OVERVIEW_SECONDS_MAX`. See docs/design/CLIP-MODEL.md §2.1.
 const MAX_CLIP_MEDIA_SECS: i64 = 30;
 
-/// Clamp a resolved clip window to at most [`MAX_CLIP_MEDIA_SECS`], also guarding
-/// an inverted (end < start) window down to a zero-length one.
-fn clamp_clip_window(start: DateTime<Utc>, end: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let capped = end.min(start + Duration::seconds(MAX_CLIP_MEDIA_SECS));
-    (start, capped.max(start))
+/// Compute the overview render window for an event `[ev_start, ev_end?)`:
+/// `[ev_start − pre, min(ev_start − pre + overview, ev_end + post))`, then capped
+/// at the compiled hard ceiling ([`MAX_CLIP_MEDIA_SECS`]) and guarded against an
+/// inverted (`end < start`) window. A short closed event keeps its natural length
+/// (the truncation term wins); a long one caps at the overview length. For an
+/// **ongoing** event (`ev_end` = `None`) there is no natural end to truncate to,
+/// so the window is the full overview length — missing-tail footage truncates
+/// naturally at render time (`prepare_clip_inputs` only concats existing
+/// segments). See docs/design/CLIP-MODEL.md §2.1.
+fn overview_window(
+    ev_start: DateTime<Utc>,
+    ev_end: Option<DateTime<Utc>>,
+    pre_secs: i64,
+    overview_secs: i64,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let win_start = ev_start - Duration::seconds(pre_secs);
+    let hard_cap = win_start + Duration::seconds(MAX_CLIP_MEDIA_SECS);
+    let mut win_end = win_start + Duration::seconds(overview_secs);
+    if let Some(end) = ev_end {
+        // Closed event: truncate to the event end (+ post-roll) so a short blip
+        // stays a short clip rather than padding out to the full overview length.
+        win_end = win_end.min(end + Duration::milliseconds(POST_ROLL_MS));
+    }
+    win_end = win_end.min(hard_cap).max(win_start);
+    (win_start, win_end)
+}
+
+/// A resolved clip window plus the metadata the media handlers need: the tunable
+/// window parameters (part of the cache key/ETag, so a settings change never
+/// serves a stale rendition), whether the underlying event is still open, and the
+/// raw event bounds (for the Frigate-proxy duration gate).
+struct ResolvedClip {
+    camera_id: Uuid,
+    /// Render window start = event onset − pre-roll.
+    start: DateTime<Utc>,
+    /// Render window end = overview-capped (and hard-ceiling-capped) end.
+    end: DateTime<Utc>,
+    /// Resolved `clip_overview_seconds` — part of the cache key/ETag.
+    overview_secs: i64,
+    /// Resolved `clip_pre_roll_seconds` — part of the cache key/ETag.
+    pre_secs: i64,
+    /// The event is still open (`end_ts` NULL). Only meaningful for detection
+    /// (`d:`) clips; always false for motion (`m:`) clips (both bounds are known).
+    ongoing: bool,
+    /// Raw event start, for the Frigate-proxy duration gate.
+    event_start: DateTime<Utc>,
+    /// Raw event end, for the Frigate-proxy duration gate. `None` while ongoing.
+    event_end: Option<DateTime<Utc>>,
 }
 
 /// Mount the clip media routes. Mounted in `media_routes` (no JSON timeout —
@@ -390,28 +456,35 @@ pub fn media_routes() -> Router<AppState> {
         .route("/clip/:id/thumbnail.jpg", get(get_clip_thumbnail))
 }
 
-/// Resolve a clip id to `(camera, window_start, window_end)` with pre/post-roll.
-async fn resolve_clip(
-    state: &AppState,
-    id: &str,
-) -> Result<(Uuid, DateTime<Utc>, DateTime<Utc>), ApiError> {
-    // Pre-roll is an admin-configurable server setting (default 2s, clamped 0..9);
-    // post-roll is fixed.
+/// Resolve a clip id to its overview render window + metadata. Pre-roll and
+/// overview length are admin-configurable server settings (defaults 2s / 30s,
+/// clamped 0..=9 and 10..=30); post-roll is fixed. See [`overview_window`].
+async fn resolve_clip(state: &AppState, id: &str) -> Result<ResolvedClip, ApiError> {
     let pre_secs = db::get_clip_pre_roll_seconds(state.pool())
         .await
         .unwrap_or(2);
-    let pre = Duration::seconds(pre_secs);
-    let post = Duration::milliseconds(POST_ROLL_MS);
+    let overview_secs = db::get_clip_overview_seconds(state.pool())
+        .await
+        .unwrap_or(30);
     if let Some(ev) = id.strip_prefix("d:") {
         let ev = ev
             .parse::<Uuid>()
             .map_err(|_| ApiError::BadRequest("malformed clip id".to_owned()))?;
-        let (cam, start, end) = db::get_clip_event_window(state.pool(), ev)
+        let (cam, ev_start, ev_end) = db::get_clip_event_window(state.pool(), ev)
             .await
             .map_err(ApiError::Internal)?
             .ok_or_else(|| ApiError::NotFound(format!("clip {id} not found")))?;
-        let (start, end) = clamp_clip_window(start - pre, end + post);
-        Ok((cam, start, end))
+        let (start, end) = overview_window(ev_start, ev_end, pre_secs, overview_secs);
+        Ok(ResolvedClip {
+            camera_id: cam,
+            start,
+            end,
+            overview_secs,
+            pre_secs,
+            ongoing: ev_end.is_none(),
+            event_start: ev_start,
+            event_end: ev_end,
+        })
     } else if let Some(rest) = id.strip_prefix("m:") {
         let mut it = rest.split(':');
         let cam = it.next().and_then(|s| s.parse::<Uuid>().ok());
@@ -419,16 +492,25 @@ async fn resolve_clip(
         let e_ms = it.next().and_then(|s| s.parse::<i64>().ok());
         match (cam, s_ms, e_ms) {
             (Some(cam), Some(s), Some(e)) => {
-                let start = Utc
+                let ev_start = Utc
                     .timestamp_millis_opt(s)
                     .single()
                     .ok_or_else(|| ApiError::BadRequest("malformed clip ts".to_owned()))?;
-                let end = Utc
+                let ev_end = Utc
                     .timestamp_millis_opt(e)
                     .single()
                     .ok_or_else(|| ApiError::BadRequest("malformed clip ts".to_owned()))?;
-                let (start, end) = clamp_clip_window(start - pre, end + post);
-                Ok((cam, start, end))
+                let (start, end) = overview_window(ev_start, Some(ev_end), pre_secs, overview_secs);
+                Ok(ResolvedClip {
+                    camera_id: cam,
+                    start,
+                    end,
+                    overview_secs,
+                    pre_secs,
+                    ongoing: false,
+                    event_start: ev_start,
+                    event_end: Some(ev_end),
+                })
             }
             _ => Err(ApiError::BadRequest("malformed clip id".to_owned())),
         }
@@ -464,7 +546,12 @@ pub struct MediaQuery {
 
 /// `GET /clip/{id}/clip.mp4` — generate (once, cached) + serve from our footage.
 /// `?q=preview` (default) returns a small reduced-res/fps clip; `?q=full`
-/// returns a source-resolution clip. Cached separately per quality.
+/// returns a source-resolution clip. Both renditions are the same overview
+/// window (§2.6): generated once to a seekable faststart file and served with
+/// `ServeFile` (Range/206), so the transcode semaphore covers only the transcode
+/// — never the client's read — and client retries are idempotent. Cached
+/// separately per quality, keyed by the window parameters so a settings change
+/// never serves a stale rendition.
 async fn get_clip_media(
     user: AuthUser,
     State(state): State<AppState>,
@@ -473,71 +560,91 @@ async fn get_clip_media(
     req: Request,
 ) -> Result<Response, ApiError> {
     user.require_clips()?;
-    let (cam, start, end) = resolve_clip(&state, &id).await?;
+    let rc = resolve_clip(&state, &id).await?;
     // Camera-access denial is 403 (Forbidden), matching playback.rs / events.rs —
     // NOT 404. `resolve_clip` above already 404s a genuinely missing clip; once it
     // resolves, the clip exists and the only question is authorization.
-    user.assert_camera_access(cam)?;
+    user.assert_camera_access(rc.camera_id)?;
     let preview = mq.q.as_deref() != Some("full");
+    let quality = if preview { "preview" } else { "full" };
 
-    // Preview clips are content-addressed by clip id (window + footage never
-    // change), so they cache hard like thumbnails — the grid's `<video>` previews
-    // then revalidate with a tiny 304 instead of re-fetching the whole clip. Full
-    // quality is a large, on-the-fly download → left uncached.
-    let preview_etag = preview.then(|| clip_etag(&id, "preview"));
-    if let Some(etag) = preview_etag.as_deref() {
-        if let Some(resp) = not_modified_if_match(req.headers(), etag) {
-            return Ok(resp);
-        }
+    // Both renditions are cached, seekable files content-addressed by clip id +
+    // window params, so both revalidate with a tiny 304 instead of re-fetching.
+    let etag = clip_media_etag(&id, quality, rc.overview_secs, rc.pre_secs);
+    if let Some(resp) = not_modified_if_match(req.headers(), &etag) {
+        return Ok(resp);
     }
 
-    // Frigate-sourced detection clips proxy Frigate's own recorded clip; any miss
-    // (no clip, Frigate down, source=crumb) falls back to own-footage generation.
+    // Frigate-sourced detection clips proxy Frigate's own recorded clip — but only
+    // for events short enough to be an overview (§2.4): a long or ongoing Frigate
+    // event would buffer its entire multi-hour clip into memory, so it falls
+    // straight through to the own-footage overview render below. Any other miss
+    // (no clip, Frigate down, source=crumb) also falls back.
     if let Some(ev) = id.strip_prefix("d:").and_then(|s| s.parse::<Uuid>().ok()) {
-        if clip_source_is_frigate(&state, cam).await {
+        if frigate_overview_eligible(&rc) && clip_source_is_frigate(&state, rc.camera_id).await {
             if let Some(bytes) = try_frigate_event_media(&state, ev, "clip.mp4").await {
                 let mut resp =
                     ([(header::CONTENT_TYPE, "video/mp4")], Body::from(bytes)).into_response();
-                if let Some(etag) = preview_etag.as_deref() {
-                    add_clip_cache_headers(&mut resp, etag);
-                }
+                add_clip_cache_headers(&mut resp, &etag);
                 return Ok(resp);
             }
         }
     }
 
-    // ── Preview: cache to a seekable file, serve via ServeFile ────────────────
-    // The preview is small (640p/10fps) and immutable (the clip's [start,end)
-    // footage never changes), so transcode it ONCE to a faststart MP4 and serve
-    // that with Range/Content-Length/206. HTML5 <video> (WebView2/Chromium) needs
-    // a known-length seekable resource to start promptly and scrub — a length-less
-    // chunked live stream makes it buffer a large chunk first (ExoPlayer is fine
-    // with the stream, which is why Android felt fast and desktop slow). Re-opens
-    // of any cached clip are then instant on every client.
-    if preview {
-        let cache_dir = PathBuf::from(&state.config().export_dir).join("clips");
-        tokio::fs::create_dir_all(&cache_dir).await.ok();
-        let out = cache_dir.join(format!("{}.preview.mp4", sanitize_id(&id)));
+    // ── Own-footage: transcode ONCE to a faststart file, serve via ServeFile ──
+    // HTML5 <video> (WebView2/Chromium) needs a known-length seekable resource to
+    // start promptly and scrub; a length-less streamed transcode makes it buffer
+    // a large chunk first. Re-opens of any cached clip are then instant on every
+    // client, and the permit is released the moment the transcode finishes.
+    let cache_dir = PathBuf::from(&state.config().export_dir).join("clips");
+    tokio::fs::create_dir_all(&cache_dir).await.ok();
+    let out = cache_dir.join(clip_cache_filename(
+        &id,
+        quality,
+        rc.overview_secs,
+        rc.pre_secs,
+    ));
+
+    // Per-clip singleflight: concurrent misses on the same rendition serialize on
+    // the cache path so they transcode exactly once (the second serves the file
+    // the first produced) — the direct fix for the retry-storm incident.
+    {
+        let lock = state.clip_inflight_lock(&out);
+        let _guard = lock.lock().await;
         if tokio::fs::metadata(&out).await.is_err() {
-            generate_preview_file(&state, cam, start, end, &out).await?;
-            prune_clip_cache(&cache_dir, PREVIEW_CACHE_MAX_BYTES).await;
+            generate_clip_file(&state, rc.camera_id, rc.start, rc.end, &out, preview).await?;
+            prune_clip_cache(&cache_dir, CLIP_RENDITION_CACHE_MAX_BYTES).await;
         }
-        let resp = ServeFile::new(&out)
-            .oneshot(req)
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("ServeFile: {e}")))?;
-        let (parts, body) = resp.into_parts();
-        let mut resp = Response::from_parts(parts, Body::new(body));
-        if let Some(etag) = preview_etag.as_deref() {
-            add_clip_cache_headers(&mut resp, etag);
-        }
-        return Ok(resp);
     }
 
-    // ── Full quality: stream progressively (large; not cached) ────────────────
-    // Fragmented MP4 straight from ffmpeg as it's produced, so playback starts
-    // after the first fragment instead of waiting for the whole transcode.
-    stream_clip(&state, cam, start, end, preview).await
+    let resp = ServeFile::new(&out)
+        .oneshot(req)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("ServeFile: {e}")))?;
+    let (parts, body) = resp.into_parts();
+    let mut resp = Response::from_parts(parts, Body::new(body));
+    add_clip_cache_headers(&mut resp, &etag);
+    Ok(resp)
+}
+
+/// The Frigate `clip.mp4` proxy only runs for events short enough to BE an
+/// overview: closed (not ongoing) and no longer than the overview envelope
+/// (`overview + pre + post`). Longer or ongoing events skip the proxy and render
+/// the own-footage overview instead, so Frigate's entire multi-hour clip never
+/// buffers into memory (§2.4). Thumbnails are exempt — a JPEG is bounded by
+/// nature — and keep proxying unconditionally.
+fn frigate_overview_eligible(rc: &ResolvedClip) -> bool {
+    if rc.ongoing {
+        return false; // ongoing → skip the proxy (unbounded memory otherwise)
+    }
+    match rc.event_end {
+        Some(end) => {
+            let envelope = Duration::seconds(rc.overview_secs + rc.pre_secs)
+                + Duration::milliseconds(POST_ROLL_MS);
+            (end - rc.event_start) <= envelope
+        }
+        None => false,
+    }
 }
 
 /// Long cache lifetime for clip media (thumbnail + preview). A clip's window and
@@ -555,6 +662,36 @@ fn clip_cache_control() -> String {
 /// fully identifies the bytes.
 fn clip_etag(id: &str, kind: &str) -> String {
     format!("\"{}-{}\"", sanitize_id(id), kind)
+}
+
+/// The window-parameter suffix that makes a clip rendition's cache identity
+/// depend on the (now tunable) overview length + pre-roll. Without it, a 30-day
+/// immutable `ETag` would pin a stale rendition client-side after a settings
+/// change (§2.5.3). E.g. `30s2s` for a 30 s overview with 2 s pre-roll.
+fn clip_window_tag(overview_secs: i64, pre_secs: i64) -> String {
+    format!("{overview_secs}s{pre_secs}s")
+}
+
+/// Cache filename for a clip rendition: `{sanitized_id}.{len}s{pre}s.{quality}.mp4`.
+/// The `.{quality}.mp4` tail is what [`prune_clip_cache`] matches; the window tag
+/// keys the file to the current settings so old-format files are simply ignored
+/// and age out via the sweeper.
+fn clip_cache_filename(id: &str, quality: &str, overview_secs: i64, pre_secs: i64) -> String {
+    format!(
+        "{}.{}.{}.mp4",
+        sanitize_id(id),
+        clip_window_tag(overview_secs, pre_secs),
+        quality
+    )
+}
+
+/// `ETag` for a clip rendition — id + quality + window params, so a settings
+/// change yields a distinct validator and never serves a stale cached rendition.
+fn clip_media_etag(id: &str, quality: &str, overview_secs: i64, pre_secs: i64) -> String {
+    clip_etag(
+        id,
+        &format!("{quality}-{}", clip_window_tag(overview_secs, pre_secs)),
+    )
 }
 
 /// Stamp `Cache-Control` (immutable) + `ETag` onto an already-built clip media
@@ -602,7 +739,8 @@ async fn get_clip_thumbnail(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     user.require_clips()?;
-    let (cam, start, end) = resolve_clip(&state, &id).await?;
+    let rc = resolve_clip(&state, &id).await?;
+    let (cam, start, end) = (rc.camera_id, rc.start, rc.end);
     // Camera-access denial is 403 (Forbidden), matching playback.rs / events.rs —
     // NOT 404. `resolve_clip` above already 404s a genuinely missing clip; once it
     // resolves, the clip exists and the only question is authorization.
@@ -640,102 +778,11 @@ async fn get_clip_thumbnail(
     Ok((cache_headers, Body::from(bytes)).into_response())
 }
 
-/// Spawn ffmpeg to cut `[start, end)` from the camera's footage (concat of
-/// overlapping segments) and STREAM the result to the client as a fragmented MP4,
-/// so playback can start after the first fragment instead of waiting for the full
-/// transcode. `preview` downscales (640p/10fps, no audio) for fast browsing; full
-/// keeps source resolution. ffmpeg is paced by the client's read of the pipe.
-async fn stream_clip(
-    state: &AppState,
-    camera_id: Uuid,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    preview: bool,
-) -> Result<Response, ApiError> {
-    // Bound concurrent transcodes. Held for the stream's lifetime (ffmpeg lives
-    // until the client finishes reading), so this caps simultaneous clip plays.
-    let permit = state
-        .clip_gen_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("clip-gen semaphore closed: {e}")))?;
-
-    let (concat_path, ss, dur) = prepare_clip_inputs(state, camera_id, start, end).await?;
-    // ultrafast for the throwaway downscaled preview; veryfast for full quality.
-    let preset = if preview { "ultrafast" } else { "veryfast" };
-
-    let mut args: Vec<String> = vec![
-        "-y".to_owned(),
-        "-f".to_owned(),
-        "concat".to_owned(),
-        "-safe".to_owned(),
-        "0".to_owned(),
-        "-i".to_owned(),
-        concat_path.to_string_lossy().into_owned(),
-        "-ss".to_owned(),
-        format!("{ss:.3}"),
-        "-t".to_owned(),
-        format!("{dur:.3}"),
-        "-c:v".to_owned(),
-        "libx264".to_owned(),
-        "-preset".to_owned(),
-        preset.to_owned(),
-        // -tune zerolatency keeps ffmpeg emitting output promptly (small GOP buffer)
-        // so the first fragment reaches the client quickly.
-        "-tune".to_owned(),
-        "zerolatency".to_owned(),
-    ];
-    if preview {
-        args.extend(["-vf", "scale=640:-2", "-r", "10", "-crf", "28", "-an"].map(str::to_owned));
-    } else {
-        args.extend(["-crf", "23", "-c:a", "aac"].map(str::to_owned));
-    }
-    // Fragmented MP4 to stdout — playable progressively as it streams (NOT
-    // +faststart, which needs the whole file first). A short fragment duration
-    // means the first playable fragment lands fast.
-    args.extend(
-        [
-            "-movflags",
-            "+frag_keyframe+empty_moov+default_base_moof",
-            "-frag_duration",
-            "1000000", // 1s fragments (µs)
-            "-f",
-            "mp4",
-            "pipe:1",
-        ]
-        .map(str::to_owned),
-    );
-
-    let mut child = Command::new(FFMPEG_BIN)
-        .args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn ffmpeg: {e}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("ffmpeg stdout unavailable")))?;
-
-    // Reap the child + delete the temp concat once ffmpeg exits — including when a
-    // client disconnects, which breaks the stdout pipe and makes ffmpeg exit, so
-    // nothing is orphaned. The permit is held until then (caps concurrent plays).
-    tokio::spawn(async move {
-        let _permit = permit;
-        let _ = child.wait().await;
-        let _ = tokio::fs::remove_file(&concat_path).await;
-    });
-
-    let stream = tokio_util::io::ReaderStream::new(stdout);
-    Ok((
-        [(header::CONTENT_TYPE, "video/mp4")],
-        Body::from_stream(stream),
-    )
-        .into_response())
-}
-
-/// Max bytes of cached preview clips kept on disk; oldest are pruned past this.
-const PREVIEW_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+/// Max bytes of cached clip renditions (preview + full) kept on disk by the
+/// in-request pruner; oldest by mtime are dropped past this. The periodic sweeper
+/// in `main.rs` (`sweep_clips_cache`) additionally enforces a TTL + the larger
+/// `CLIP_CACHE_MAX_BYTES` budget.
+const CLIP_RENDITION_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
 
 /// Build the ffmpeg concat list (a uniquely-named temp file the caller deletes)
 /// plus the `(start-offset, duration)` seconds for a clip window. Shared by the
@@ -782,16 +829,22 @@ async fn prepare_clip_inputs(
     Ok((concat_path, ss, dur))
 }
 
-/// Transcode the preview (640p/10fps, no audio) to a **faststart** MP4 at `out`,
-/// waiting for completion. Writes to a unique temp file then atomically renames so
-/// a crashed/concurrent run never leaves a half file for `ServeFile` to serve. Holds
-/// the clip-gen semaphore for the transcode.
-async fn generate_preview_file(
+/// Transcode a clip rendition to a **faststart** MP4 at `out`, waiting for
+/// completion. `preview` downscales (640p/10fps, no audio, ultrafast) for fast
+/// browsing; full quality keeps source resolution (veryfast, crf 23, AAC audio).
+/// Both are the same `[start, end)` overview window. Writes to a unique temp file
+/// then atomically renames so a crashed/concurrent run never leaves a half file
+/// for `ServeFile` to serve. Holds the clip-gen semaphore for the transcode only
+/// (never the client's read), which — together with the ≤30 s window and the
+/// per-clip singleflight in the caller — is what removed the slow-reader
+/// permit-starvation vector from the 2026-07-16 incident.
+async fn generate_clip_file(
     state: &AppState,
     camera_id: Uuid,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     out: &FsPath,
+    preview: bool,
 ) -> Result<(), ApiError> {
     let _permit = state
         .clip_gen_semaphore()
@@ -804,7 +857,9 @@ async fn generate_preview_file(
     }
     let (concat_path, ss, dur) = prepare_clip_inputs(state, camera_id, start, end).await?;
     let tmp = out.with_file_name(format!("{}.partial.mp4", Uuid::new_v4()));
-    let args: Vec<String> = vec![
+    // ultrafast for the throwaway downscaled preview; veryfast for full quality.
+    let preset = if preview { "ultrafast" } else { "veryfast" };
+    let mut args: Vec<String> = vec![
         "-y".to_owned(),
         "-f".to_owned(),
         "concat".to_owned(),
@@ -819,18 +874,15 @@ async fn generate_preview_file(
         "-c:v".to_owned(),
         "libx264".to_owned(),
         "-preset".to_owned(),
-        "ultrafast".to_owned(),
-        "-vf".to_owned(),
-        "scale=640:-2".to_owned(),
-        "-r".to_owned(),
-        "10".to_owned(),
-        "-crf".to_owned(),
-        "28".to_owned(),
-        "-an".to_owned(),
-        "-movflags".to_owned(),
-        "+faststart".to_owned(),
-        tmp.to_string_lossy().into_owned(),
+        preset.to_owned(),
     ];
+    if preview {
+        args.extend(["-vf", "scale=640:-2", "-r", "10", "-crf", "28", "-an"].map(str::to_owned));
+    } else {
+        args.extend(["-crf", "23", "-c:a", "aac"].map(str::to_owned));
+    }
+    args.extend(["-movflags".to_owned(), "+faststart".to_owned()]);
+    args.push(tmp.to_string_lossy().into_owned());
     let status = Command::new(FFMPEG_BIN)
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -841,18 +893,23 @@ async fn generate_preview_file(
     match status {
         Ok(s) if s.success() => tokio::fs::rename(&tmp, out)
             .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("cache preview rename: {e}"))),
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("cache clip rename: {e}"))),
         other => {
             let _ = tokio::fs::remove_file(&tmp).await;
             Err(ApiError::Internal(anyhow::anyhow!(
-                "ffmpeg preview transcode failed: {other:?}"
+                "ffmpeg clip transcode failed: {other:?}"
             )))
         }
     }
 }
 
-/// Keep the preview cache under `max_bytes` by deleting the oldest `*.preview.mp4`
-/// (by mtime) until it fits. Best-effort — any error just leaves the cache as-is.
+/// Keep the clip-rendition cache under `max_bytes` by deleting the oldest
+/// finished rendition files (by mtime) until it fits. Matches both `*.preview.mp4`
+/// and `*.full.mp4` — the two `{quality}.mp4` tails [`clip_cache_filename`]
+/// produces — so both renditions are prunable (landmine §3.5: this matcher must
+/// track the filename pattern or the cache stops pruning). In-progress
+/// `*.partial.mp4` temp files and `*.concat.txt` lists are deliberately skipped.
+/// Best-effort — any error just leaves the cache as-is.
 async fn prune_clip_cache(dir: &FsPath, max_bytes: u64) {
     let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
         return;
@@ -861,7 +918,8 @@ async fn prune_clip_cache(dir: &FsPath, max_bytes: u64) {
     let mut total: u64 = 0;
     while let Ok(Some(ent)) = rd.next_entry().await {
         let p = ent.path();
-        if !p.to_string_lossy().ends_with(".preview.mp4") {
+        let name = p.to_string_lossy();
+        if !(name.ends_with(".preview.mp4") || name.ends_with(".full.mp4")) {
             continue;
         }
         let Ok(md) = ent.metadata().await else {
@@ -1134,19 +1192,112 @@ mod tests {
         Utc.timestamp_millis_opt(ms).unwrap()
     }
 
+    /// Build a `ResolvedClip` for the Frigate-gate tests (the window fields are
+    /// irrelevant to the gate, which only reads `ongoing`/`event_*`/`*_secs`).
+    fn rc(event_start: DateTime<Utc>, event_end: Option<DateTime<Utc>>) -> ResolvedClip {
+        ResolvedClip {
+            camera_id: Uuid::nil(),
+            start: event_start,
+            end: event_end.unwrap_or(event_start),
+            overview_secs: 30,
+            pre_secs: 2,
+            ongoing: event_end.is_none(),
+            event_start,
+            event_end,
+        }
+    }
+
     #[test]
-    fn clip_window_clamped_to_cap() {
+    fn overview_window_short_closed_keeps_natural_length() {
+        // A 12 s event (pre 2 s, overview 30 s): the truncation term wins, so the
+        // window is [start-2, end+post], NOT padded out to 30 s.
+        let start = t(100_000);
+        let end = t(112_000);
+        let (s, e) = overview_window(start, Some(end), 2, 30);
+        assert_eq!(s, start - Duration::seconds(2));
+        assert_eq!(e, end + Duration::milliseconds(POST_ROLL_MS));
+        assert!(e < s + Duration::seconds(30), "short event stays short");
+    }
+
+    #[test]
+    fn overview_window_long_closed_caps_at_overview() {
+        // A 10-hour event caps at the overview length, never the far-off end.
         let start = t(0);
-        // A normal short clip (under the cap) is left untouched.
-        let (s, e) = clamp_clip_window(start, t(12_000));
-        assert_eq!((s, e), (start, t(12_000)));
-        // A 10-hour "clip" (broken/unbounded event) is truncated to the cap.
-        let (s, e) = clamp_clip_window(start, t(36_303_000));
-        assert_eq!(s, start);
-        assert_eq!(e, start + Duration::seconds(MAX_CLIP_MEDIA_SECS));
-        // An inverted window collapses to zero length, never negative.
-        let (s, e) = clamp_clip_window(t(10_000), t(0));
-        assert_eq!((s, e), (t(10_000), t(10_000)));
+        let end = t(36_000_000); // +10 h
+        let (s, e) = overview_window(start, Some(end), 2, 30);
+        assert_eq!(s, start - Duration::seconds(2));
+        assert_eq!(e, s + Duration::seconds(30));
+        assert_eq!((e - s).num_seconds(), 30);
+    }
+
+    #[test]
+    fn overview_window_ongoing_is_full_overview_length() {
+        // No end (ongoing): window is exactly [start-pre, start-pre+overview].
+        // Overview 25 s is within the 10..=30 clamp, so it's not touched by the
+        // 30 s ceiling — this isolates the ongoing (no-truncation) behavior.
+        let start = t(500_000);
+        let (s, e) = overview_window(start, None, 2, 25);
+        assert_eq!(s, start - Duration::seconds(2));
+        assert_eq!(e, s + Duration::seconds(25));
+    }
+
+    #[test]
+    fn overview_window_hard_ceiling_and_inverted_guard() {
+        // The 30 s compiled ceiling holds even for an out-of-range overview
+        // length (the DB clamp is the first lock; this is the second).
+        let start = t(0);
+        let (s, e) = overview_window(start, None, 0, 10_000);
+        assert_eq!((e - s).num_seconds(), MAX_CLIP_MEDIA_SECS);
+        // An inverted event (end before start) collapses to the window start,
+        // never a negative-length window.
+        let start = t(50_000);
+        let (s, e) = overview_window(start, Some(t(0)), 0, 30);
+        assert_eq!(e, s);
+    }
+
+    #[test]
+    fn frigate_gate_only_short_closed_events() {
+        // 20 s closed event fits the overview envelope (30+2+8 = 40 s) → proxy.
+        assert!(frigate_overview_eligible(&rc(t(0), Some(t(20_000)))));
+        // 10-minute closed event exceeds it → skip the proxy (own-footage render).
+        assert!(!frigate_overview_eligible(&rc(t(0), Some(t(600_000)))));
+        // Ongoing event → never proxy (unbounded memory otherwise).
+        assert!(!frigate_overview_eligible(&rc(t(0), None)));
+    }
+
+    #[test]
+    fn clip_cache_key_changes_with_window_params() {
+        let id = "d:11111111-1111-1111-1111-111111111111";
+        // ETag + filename both change when the tunable overview length changes …
+        assert_ne!(
+            clip_media_etag(id, "preview", 30, 2),
+            clip_media_etag(id, "preview", 60, 2)
+        );
+        assert_ne!(
+            clip_cache_filename(id, "preview", 30, 2),
+            clip_cache_filename(id, "preview", 60, 2)
+        );
+        // … and when the pre-roll changes …
+        assert_ne!(
+            clip_media_etag(id, "preview", 30, 2),
+            clip_media_etag(id, "preview", 30, 5)
+        );
+        // … and per quality.
+        assert_ne!(
+            clip_media_etag(id, "preview", 30, 2),
+            clip_media_etag(id, "full", 30, 2)
+        );
+        // Same params → stable.
+        assert_eq!(
+            clip_media_etag(id, "preview", 30, 2),
+            clip_media_etag(id, "preview", 30, 2)
+        );
+        // The `{quality}.mp4` tail is exactly what `prune_clip_cache` matches.
+        assert!(clip_cache_filename(id, "preview", 30, 2).ends_with(".preview.mp4"));
+        assert!(clip_cache_filename(id, "full", 30, 2).ends_with(".full.mp4"));
+        // ETag stays a valid quoted token with the `:`/`-` in the id sanitized.
+        let e = clip_media_etag(id, "preview", 30, 2);
+        assert!(e.starts_with('"') && e.ends_with('"') && !e.contains(':'));
     }
 
     #[test]

@@ -6013,12 +6013,18 @@ async function renderDetectionClips() {
       <div id="srv-preroll">Loading…</div>
     </div>
     <div class="policy-section" style="margin-top:14px">
+      <div class="policy-section-title">Clip overview length</div>
+      <div class="card-hint" style="margin-bottom:8px">How long a clip plays. A clip is a short <b>overview</b> of an event, not the whole thing — to watch a long event end to end, open it on the timeline. Longer events are trimmed to this length; short ones keep their natural length.</div>
+      <div id="srv-overview">Loading…</div>
+    </div>
+    <div class="policy-section" style="margin-top:14px">
       <div class="policy-section-title">Clip motion highlight</div>
       <div class="card-hint" style="margin-bottom:8px">For <b>motion</b> clips, the player can auto-zoom to where the motion was for the first few seconds, then pull back to the full frame, handy in the small clip viewer. Set to 0 to disable.</div>
       <div id="srv-motionhl">Loading…</div>
     </div>`;
   loadClipSources();
   loadClipPreRoll();
+  loadClipOverview();
   loadClipMotionHighlight();
   refreshDecodeStatus(); // live decode truth (strip + per-camera badges); hidden on older servers
 }
@@ -6348,6 +6354,36 @@ async function saveClipPreRoll(val) {
     await api('/config/clip-preroll', { method: 'PUT', body: JSON.stringify({ seconds: n }) });
     toast('Clip pre-roll saved (' + n + 's).');
     loadClipPreRoll();
+  } catch (e) { toast('Save failed: ' + (e.message || e)); }
+}
+
+/* ── Clip overview length (Clips: how long a generated clip renders) ── */
+let CLIP_OVERVIEW_MIN = 10, CLIP_OVERVIEW_MAX = 120;
+async function loadClipOverview() {
+  const el = $('srv-overview');
+  if (!el) return;
+  let data;
+  try { data = await api('/config/clip-overview'); }
+  catch (e) { el.innerHTML = `<span class="form-msg err">Couldn't load: ${esc(String(e.message || e))}</span>`; return; }
+  CLIP_OVERVIEW_MIN = Number.isFinite(data.min) ? data.min : 10;
+  CLIP_OVERVIEW_MAX = Number.isFinite(data.max) ? data.max : 120;
+  el.innerHTML =
+    `<label style="display:flex;align-items:center;gap:8px;font-size:13px">
+       Play the first
+       <input id="srv-overview-input" type="number" min="${CLIP_OVERVIEW_MIN}" max="${CLIP_OVERVIEW_MAX}" step="1" value="${data.seconds}"
+         class="mono" style="width:64px" onchange="saveClipOverview(this.value)">
+       seconds <span style="color:var(--dim2)">(${CLIP_OVERVIEW_MIN}–${CLIP_OVERVIEW_MAX}, default 30)</span>
+     </label>`;
+}
+
+async function saveClipOverview(val) {
+  let n = parseInt(val, 10);
+  if (!Number.isFinite(n)) n = 30;
+  n = Math.max(CLIP_OVERVIEW_MIN, Math.min(CLIP_OVERVIEW_MAX, n));
+  try {
+    await api('/config/clip-overview', { method: 'PUT', body: JSON.stringify({ seconds: n }) });
+    toast('Clip overview length saved (' + n + 's).');
+    loadClipOverview();
   } catch (e) { toast('Save failed: ' + (e.message || e)); }
 }
 

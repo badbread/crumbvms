@@ -223,6 +223,10 @@ pub fn routes() -> Router<AppState> {
         .route("/cameras/:id/clip-source", put(set_camera_clip_source))
         .route("/clip-preroll", get(get_clip_preroll).put(set_clip_preroll))
         .route(
+            "/clip-overview",
+            get(get_clip_overview).put(set_clip_overview),
+        )
+        .route(
             "/clip-motion-highlight",
             get(get_clip_motion_highlight).put(set_clip_motion_highlight),
         )
@@ -381,6 +385,48 @@ async fn set_clip_preroll(
     Json(body): Json<ClipPreRollRequest>,
 ) -> Result<StatusCode, ApiError> {
     db::set_clip_pre_roll_seconds(state.pool(), body.seconds)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── clip overview length (Clips: how long a generated clip renders) ────────────
+
+#[derive(serde::Serialize)]
+struct ClipOverviewDto {
+    seconds: i64,
+    /// The min/max the UI should allow (clamp bounds; also the render hard ceiling).
+    min: i64,
+    max: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct ClipOverviewRequest {
+    seconds: i64,
+}
+
+/// `GET /config/clip-overview` — current overview length + the allowed range.
+async fn get_clip_overview(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<ClipOverviewDto>, ApiError> {
+    let seconds = db::get_clip_overview_seconds(state.pool())
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(ClipOverviewDto {
+        seconds,
+        min: db::CLIP_OVERVIEW_SECONDS_MIN,
+        max: db::CLIP_OVERVIEW_SECONDS_MAX,
+    }))
+}
+
+/// `PUT /config/clip-overview` — set the overview length (db clamps to 10..=30).
+async fn set_clip_overview(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<ClipOverviewRequest>,
+) -> Result<StatusCode, ApiError> {
+    db::set_clip_overview_seconds(state.pool(), body.seconds)
         .await
         .map_err(ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)

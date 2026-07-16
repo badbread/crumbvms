@@ -140,6 +140,13 @@ struct Inner {
     /// on-demand request) extract once instead of both spawning ffmpeg.
     thumb_inflight: DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
 
+    /// Per-key in-flight locks for clip-media generation (singleflight). Keyed by
+    /// the final cache path; concurrent misses on the same clip serialize so it
+    /// transcodes exactly once (the direct fix for the 2026-07-16 retry-storm
+    /// incident, where each stalled retry spawned another full ffmpeg). Same
+    /// pattern and lifecycle as `thumb_inflight`.
+    clip_inflight: DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -240,6 +247,7 @@ impl AppState {
             export_cancels: DashMap::new(),
             play_semaphore,
             clip_gen_semaphore,
+            clip_inflight: DashMap::new(),
             thumb_semaphore,
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
@@ -393,6 +401,22 @@ impl AppState {
         }
         self.0
             .thumb_inflight
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Get (or create) the singleflight lock for a clip-media cache key. The
+    /// Clips media handler locks it around the "check file, else generate"
+    /// sequence so two concurrent misses on the same clip transcode exactly once
+    /// (the second serves the file the first produced). Same map-clear +
+    /// atomic-write correctness story as [`thumb_inflight_lock`].
+    pub fn clip_inflight_lock(&self, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        if self.0.clip_inflight.len() > 8192 {
+            self.0.clip_inflight.clear();
+        }
+        self.0
+            .clip_inflight
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

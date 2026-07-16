@@ -537,6 +537,32 @@ async fn main() -> anyhow::Result<()> {
         export_ttl_sweeper(sweeper_state, export_ttl).await;
     });
 
+    // ── 6a1. event janitor (close stale open events) ──────────────────────────
+    // Owns `end_ts` convergence for the `events` table: every open event whose
+    // liveness stamp (`updated_at`) is older than STALE_EVENT_CUTOFF is closed
+    // (`end_ts = GREATEST(ts, updated_at)`), so `end_ts` can never again be
+    // NULL-forever (the 2026-07-16 incident had ~123 never-closed rows). A late
+    // genuine provider `end` self-heals via the upsert's COALESCE. Deliberately
+    // API-side, NOT in the recorder (golden rule 2): the recorder's `events`
+    // writes are surfacing-only/best-effort, so it must not gain DB lifecycle
+    // duties near the footage path. See docs/design/CLIP-MODEL.md §2.3.
+    {
+        let janitor_pool = state.pool().clone();
+        tokio::spawn(async move {
+            let tick = Duration::from_mins(5);
+            loop {
+                tokio::time::sleep(tick).await;
+                let cutoff =
+                    chrono::Utc::now() - chrono::Duration::minutes(STALE_EVENT_CUTOFF_MINS);
+                match crumb_common::db::close_stale_open_events(&janitor_pool, cutoff).await {
+                    Ok(n) if n > 0 => info!("event janitor closed {n} stale open event(s)"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("event janitor failed: {e}"),
+                }
+            }
+        });
+    }
+
     // ── 6a2. session prune sweeper (P0-SESSIONS) ──────────────────────────────
     // Delete `sessions` rows whose token has already expired so the table (which
     // gains a row per login, including 10-year "remember me" tokens) stays
@@ -800,6 +826,14 @@ async fn version() -> Json<serde_json::Value> {
         "built_at": BUILD_TIME.unwrap_or("unknown"),
     }))
 }
+
+/// How long an event may stay open (no fresh provider signal) before the event
+/// janitor closes it. Mirrors the recorder's own footage-side judgment that no
+/// real single event runs longer without a signal (`MAX_OPEN_SIGNAL_SECS = 1800`
+/// in `recording.rs`) — but the two are DELIBERATELY separate constants: this one
+/// bounds what gets *displayed*, the recorder's bounds what gets *recorded*
+/// (docs/design/CLIP-MODEL.md §3.3). 30 minutes.
+const STALE_EVENT_CUTOFF_MINS: i64 = 30;
 
 // ─── export TTL sweeper ───────────────────────────────────────────────────────
 
