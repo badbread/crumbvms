@@ -219,7 +219,9 @@ pub struct ViewerCameraDto {
     pub enabled: bool,
     /// `true` when a sub-stream is configured (`sub_url` is `Some`).
     pub has_sub: bool,
-    /// `true` when ONVIF PTZ is configured (`onvif_host` is `Some`).
+    /// `true` when the camera has an ONVIF host AND its per-camera PTZ-controls
+    /// toggle is on (`onvif_host.is_some() && ptz_control_enabled`, migration
+    /// 0061). Every client gates its PTZ UI on this flag.
     pub ptz: bool,
     /// Physical form-factor glyph hint (`"ptz"`, `"dome"`, `"bullet"`, `"lpr"`,
     /// `"other"`). `null` for legacy rows that pre-date the type column.
@@ -301,6 +303,11 @@ pub struct CameraDto {
     /// itself is NEVER returned — this flag lets the UI show "•••• (change)" vs
     /// an empty field.
     pub onvif_has_password: bool,
+    /// Whether this camera exposes PTZ controls (migration 0061). RAW stored
+    /// value (not the computed `ViewerCameraDto.ptz` capability) so the admin
+    /// camera editor can show + toggle it independently of the ONVIF host. When
+    /// `false`, the client-facing `ptz` capability is forced off.
+    pub ptz_control_enabled: bool,
 }
 
 /// `POST /config/cameras` request body.
@@ -352,6 +359,10 @@ pub struct CreateCameraRequest {
     pub onvif_user: Option<String>,
     /// ONVIF password — **write-only**. Never returned in responses.
     pub onvif_password: Option<String>,
+    /// Whether this camera exposes PTZ controls (migration 0061). Omitted/`null`
+    /// defaults to `true` (an ONVIF camera shows PTZ unless turned off).
+    #[serde(default = "default_true")]
+    pub ptz_control_enabled: bool,
 }
 
 /// `PUT /config/cameras/{id}` request body.
@@ -443,6 +454,9 @@ pub struct UpdateCameraRequest {
     /// double-option semantics as [`Self::make`].
     #[serde(default, deserialize_with = "double_option")]
     pub firmware: Option<Option<String>>,
+    /// Whether this camera exposes PTZ controls (migration 0061). A provided
+    /// value sets it; omitted = unchanged. Simple bool like [`Self::enabled`].
+    pub ptz_control_enabled: Option<bool>,
 }
 
 fn default_true() -> bool {

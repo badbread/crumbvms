@@ -1483,6 +1483,7 @@ mod tests {
             onvif_port: None,
             onvif_user: None,
             onvif_password: None,
+            ptz_control_enabled: true,
             policy_id: Some(policy.id),
             group_id: None,
             policy,

@@ -199,6 +199,12 @@ async fn ptz_command(
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("camera {camera_id} not found")))?;
 
+    // ── 2b. defense in depth: honor the per-camera PTZ-controls toggle ────────
+    // The clients already hide PTZ when `camera.ptz` is false, but a stale client
+    // (or a hand-crafted request) must not be able to drive a camera whose PTZ
+    // the operator turned off. Reject before touching the network (migration 0061).
+    ensure_ptz_enabled(&camera)?;
+
     // ── 3. resolve ONVIF config (DB columns → env fallback) ───────────────────
     let onvif_cfg = resolve_onvif_config(&state, &camera)?;
 
@@ -357,6 +363,10 @@ async fn imaging_command(
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("camera {camera_id} not found")))?;
 
+    // Defense in depth: honor the per-camera PTZ-controls toggle (migration 0061),
+    // same as the PTZ move/preset path — focus/iris is a PTZ control too.
+    ensure_ptz_enabled(&camera)?;
+
     let onvif_cfg = resolve_onvif_config(&state, &camera)?;
 
     let (imaging_client, vst) = build_onvif_imaging(&onvif_cfg).await.map_err(|e| {
@@ -389,6 +399,22 @@ async fn imaging_command(
 }
 
 // ─── ONVIF helpers ────────────────────────────────────────────────────────────
+
+/// Reject a PTZ/imaging command when the operator has turned this camera's
+/// PTZ controls off (migration 0061). Returns `403 Forbidden` with a clear
+/// message. This is the server-side backstop behind the client-facing `ptz`
+/// capability (`ViewerCameraDto.ptz`), so a stale client cannot drive a camera
+/// whose PTZ is disabled.
+fn ensure_ptz_enabled(camera: &crumb_common::types::Camera) -> Result<(), ApiError> {
+    if camera.ptz_control_enabled {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(format!(
+            "PTZ controls are disabled for camera '{}'",
+            camera.name
+        )))
+    }
+}
 
 /// Resolve a camera's ONVIF connection config: DB columns are authoritative, with
 /// the legacy `ONVIF_CONFIG` env map as a fallback for pre-DB-column installs.

@@ -90,7 +90,10 @@ async fn list_visible_cameras(
             name: c.name,
             enabled: c.enabled,
             has_sub: c.sub_url.is_some(),
-            ptz: c.onvif_host.is_some(),
+            // PTZ capability = has an ONVIF host AND the operator hasn't turned
+            // PTZ controls off (migration 0061). Every client gates its PTZ UI on
+            // this single `ptz` flag, so the toggle needs no client change.
+            ptz: c.onvif_host.is_some() && c.ptz_control_enabled,
             camera_type: c.camera_type,
             icon: c.icon,
             served_by: c.served_by,

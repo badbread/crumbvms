@@ -606,6 +606,13 @@ pub struct Camera {
     /// Carried in the `Camera` struct ONLY so `ptz.rs` and `discover.rs` can read
     /// it from the DB without an extra query.
     pub onvif_password: Option<String>,
+    /// `cameras.ptz_control_enabled` (migration 0061) — operator switch for
+    /// whether this camera exposes pan/tilt/zoom controls. Default `true`. Folded
+    /// into the client-facing computed capability (`ViewerCameraDto.ptz =
+    /// onvif_host.is_some() && ptz_control_enabled`) so a FIXED ONVIF camera (one
+    /// that speaks ONVIF only for stream discovery, no motor) can have PTZ turned
+    /// off. Also enforced defensively at the PTZ/imaging endpoints in `ptz.rs`.
+    pub ptz_control_enabled: bool,
 }
 
 impl Camera {
