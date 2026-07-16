@@ -8,6 +8,84 @@ revisit.
 
 ---
 
+## 2026-07-16, Clips are fixed-length event overviews; the timeline owns whole-event viewing; open events are janitor-closed
+
+**Context.** `GET /clip/{id}/clip.mp4` rendered a detection/motion event's full
+`[start, end)` window: the renderer concatenates every overlapping 4 s segment
+and transcodes it (`services/api/src/clips.rs`). Event windows are unbounded in
+practice — Frigate tracks a parked car for hours, and ~123 `events` rows had
+`end_ts = NULL` (never closed; oldest a month old). In prod (2026-07-16) one
+~10-hour event made the renderer build a multi-hour transcode; concurrent
+client retries (each a fresh cache miss, since the cache file never finished)
+consumed all `CLIP_GEN_MAX_CONCURRENCY` permits and pinned the API at 600%+
+CPU, starving ALL clip playback. A 30 s hard clamp shipped as a stopgap
+(`fix/clip-window-clamp`).
+
+**Decision — a clip is an overview.** A clip is a short, representative
+snippet of an event, *by definition* independent of event length. The rendered
+window is `[start − pre_roll, start − pre_roll + overview_len)`, truncated to
+the event end (+ post-roll) when the event is shorter. `overview_len` is an
+admin-tunable server setting (`clip_overview_seconds`, default 30, clamped
+10–120, same pattern as `clip_pre_roll_seconds`); a compiled hard ceiling
+(120 s) remains as the safety floor. Watching the *whole* event is the
+timeline's job — recorded playback streams segments directly with no
+whole-event transcode — so clients surface event duration + an "ongoing" flag
+in the feed and make the existing "View on timeline" deep-link the explicit
+"see the whole event" affordance. `q=preview` and `q=full` are two renditions
+(640p vs source resolution) of the *same* overview window; both are generated
+once to the cache and served as files, with a per-clip singleflight so
+concurrent misses transcode exactly once, and cache keys/ETags that include
+the window parameters now that they are tunable.
+
+**Decision — events must close themselves.** `end_ts` correctness is owned by
+an API-side *event janitor* (new background task next to the existing cache
+sweeper): every open event whose `updated_at` (new column, stamped on every
+upsert) is older than a stale timeout (default 30 min) is closed with
+`end_ts = GREATEST(ts, updated_at)`, `lifecycle = 'end'`. A late genuine `end`
+from the provider self-heals via the existing
+`end_ts = COALESCE(EXCLUDED.end_ts, events.end_ts)` upsert. The recorder is
+deliberately untouched: its `events` writes are surfacing-only and best-effort
+by design, and the footage-affecting analogue already exists
+(`MAX_OPEN_SIGNAL_SECS` in `recording.rs`).
+
+**Rejected.**
+- *Clip = full event (status quo)*: the incident; also unbounded memory in the
+  Frigate proxy path.
+- *Peak-anchored clip window*: no peak timestamp exists (`events.top_score`
+  has no `peak_ts`, and Frigate `update` messages are mostly filtered out), so
+  it cannot be computed today; onset + pre-roll is where causality lives and
+  matches the thumbnail. Retrofit for motion clips only (via
+  `segments.motion_score`) is a later polish option.
+- *`q=full` = whole event*: recreates the incident and conflates quality with
+  scope; whole-event viewing is the timeline, whole-event *files* are exports.
+- *Bounding events at ingest (cap `end_ts − ts`)*: events are ground truth — a
+  car parked 10 h *is* a 10 h event; the render is what must be bounded.
+- *Janitor in the recorder / DB trigger*: the recorder must not gain DB
+  lifecycle duties near the footage path (golden rule 2); a trigger hides
+  policy in the schema and can't express "stale" cleanly.
+- *503 on semaphore exhaustion*: with singleflight + short (≤120 s) transcodes
+  the queue drains in seconds; bounded awaiting is simpler than teaching four
+  clients a retry-after protocol.
+
+**Consequences.** New migrations (`events.updated_at`,
+`server_settings.clip_overview_seconds`); `/clips` descriptors gain
+`ongoing` + the response gains `overview_seconds`; both clip caches (`preview`
+and now `full`) are files under `{export_dir}/clips` swept by the existing
+TTL/byte-budget sweeper; clients drop the `&_r=` cache-bust retry (server
+files make retries idempotent); the Frigate clip proxy only proxies events
+short enough to be overviews and falls back to own-footage rendering
+otherwise. The 123 legacy NULL rows close automatically one janitor period
+after deploy.
+
+**Revisit triggers.** Operators demand true whole-event clip *downloads* (→
+route through the export system, not the clip endpoint). A provider starts
+delivering a reliable peak timestamp (→ revisit peak-anchoring). The clips
+feed moves to pre-generated/notification-time media (→ revisit on-demand
+generation entirely). `clip_overview_seconds` upper clamp proves too small for
+a real workflow (→ raise ceiling, re-check transcode cost).
+
+---
+
 ## 2026-07-16, Android recorded-playback seeking: add `+global_sidx` to the recorder mux (not HLS, not a server index)
 
 **Problem.** On the Android client, recorded-playback seeking was completely

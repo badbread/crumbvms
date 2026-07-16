@@ -6975,6 +6975,49 @@ pub async fn set_clip_pre_roll_seconds(pool: &Pool, seconds: i64) -> Result<()> 
     Ok(())
 }
 
+/// Lower/upper clamp for the admin-tunable clip overview length (seconds). A clip
+/// is a short OVERVIEW of an event, not the full event; this bounds how long the
+/// renderer will transcode. The upper bound is also the compiled hard ceiling in
+/// the render path (`clips::MAX_CLIP_MEDIA_SECS`), so a compromised/buggy admin
+/// client can never re-arm the runaway-transcode DoS.
+pub const CLIP_OVERVIEW_SECONDS_MIN: i64 = 10;
+pub const CLIP_OVERVIEW_SECONDS_MAX: i64 = 120;
+
+/// Server-configurable clip overview length in seconds (how long a generated clip
+/// renders). Clamped to [`CLIP_OVERVIEW_SECONDS_MIN`]..=[`CLIP_OVERVIEW_SECONDS_MAX`];
+/// defaults to 30 when unset/out of range.
+pub async fn get_clip_overview_seconds(pool: &Pool) -> Result<i64> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT clip_overview_seconds FROM server_settings LIMIT 1",
+            &[],
+        )
+        .await
+        .context("get_clip_overview_seconds")?;
+    let secs = row
+        .and_then(|r| r.try_get::<_, i32>("clip_overview_seconds").ok())
+        .map_or(30_i64, i64::from);
+    Ok(secs.clamp(CLIP_OVERVIEW_SECONDS_MIN, CLIP_OVERVIEW_SECONDS_MAX))
+}
+
+/// Set the clip overview length (seconds). Clamped to
+/// [`CLIP_OVERVIEW_SECONDS_MIN`]..=[`CLIP_OVERVIEW_SECONDS_MAX`] before storing.
+pub async fn set_clip_overview_seconds(pool: &Pool, seconds: i64) -> Result<()> {
+    let client = get_conn(pool).await?;
+    let clamped =
+        i32::try_from(seconds.clamp(CLIP_OVERVIEW_SECONDS_MIN, CLIP_OVERVIEW_SECONDS_MAX))
+            .unwrap_or(30);
+    client
+        .execute(
+            "UPDATE server_settings SET clip_overview_seconds = $1",
+            &[&clamped],
+        )
+        .await
+        .context("set_clip_overview_seconds")?;
+    Ok(())
+}
+
 /// Whether the first-run setup wizard has been completed. `false` (the column
 /// default) on a fresh install makes the wizard show; migration 0027 backfills
 /// `true` for installs that already had an admin user. Missing row ⇒ `false`.
@@ -7390,12 +7433,15 @@ pub async fn frigate_http_base(pool: &Pool) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Resolve a detection event's `(camera_id, start, end)` for clip generation.
-/// `end` falls back to `start` when the event is still in progress.
+/// Resolve a detection event's `(camera_id, start, end_ts)` for clip generation.
+/// `end_ts` is `None` while the event is still open (ongoing) — the clip renderer
+/// treats that as "overview from the onset, bounded by the overview length"
+/// rather than a zero-length window, and the `/clips` feed surfaces it as
+/// `ongoing`.
 pub async fn get_clip_event_window(
     pool: &Pool,
     event_id: Uuid,
-) -> Result<Option<(Uuid, DateTime<Utc>, DateTime<Utc>)>> {
+) -> Result<Option<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>> {
     let client = get_conn(pool).await?;
     let row = client
         .query_opt(
@@ -7408,8 +7454,35 @@ pub async fn get_clip_event_window(
         let cam: Uuid = r.get("camera_id");
         let start: DateTime<Utc> = r.get("ts");
         let end: Option<DateTime<Utc>> = r.get("end_ts");
-        (cam, start, end.unwrap_or(start))
+        (cam, start, end)
     }))
+}
+
+/// Event janitor: close every still-open event (`end_ts IS NULL`) whose last
+/// liveness stamp (`updated_at`) predates `cutoff`, setting
+/// `end_ts = GREATEST(ts, updated_at)` (never inverted) and `lifecycle = 'end'`.
+/// Returns the number of rows closed.
+///
+/// This is the API-side owner of `end_ts` convergence (see
+/// `docs/design/CLIP-MODEL.md` §2.3 and `docs/DECISIONS.md` 2026-07-16). It is
+/// deliberately NOT in the recorder: the recorder's `events` writes are
+/// surfacing-only and best-effort (a failed row write can never cost footage,
+/// golden rule 2), so it must not gain DB lifecycle duties near the footage path.
+/// Self-heals: a genuine provider `end` arriving after a janitor close overwrites
+/// the estimate via the `end_ts = COALESCE(EXCLUDED.end_ts, events.end_ts)` upsert
+/// arm; a late mid-event `update` (NULL `end_ts`) keeps the janitor's close.
+pub async fn close_stale_open_events(pool: &Pool, cutoff: DateTime<Utc>) -> Result<u64> {
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute(
+            "UPDATE events \
+                SET end_ts = GREATEST(ts, updated_at), lifecycle = 'end' \
+              WHERE end_ts IS NULL AND updated_at < $1",
+            &[&cutoff],
+        )
+        .await
+        .context("close_stale_open_events")?;
+    Ok(n)
 }
 
 // ─── detection events — query ─────────────────────────────────────────────────
@@ -7646,9 +7719,9 @@ pub async fn upsert_detection_event(pool: &Pool, p: &UpsertDetectionEventParams)
                 camera_id, ts, label, score,
                 source_id, provider_event_id, sub_label,
                 top_score, end_ts, zones,
-                snapshot_url, raw, lifecycle
+                snapshot_url, raw, lifecycle, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
             ON CONFLICT (source_id, provider_event_id)
             WHERE source_id IS NOT NULL
             DO UPDATE SET
@@ -7659,7 +7732,12 @@ pub async fn upsert_detection_event(pool: &Pool, p: &UpsertDetectionEventParams)
                 snapshot_url = COALESCE(EXCLUDED.snapshot_url, events.snapshot_url),
                 raw          = EXCLUDED.raw,
                 sub_label    = COALESCE(EXCLUDED.sub_label, events.sub_label),
-                zones        = EXCLUDED.zones
+                zones        = EXCLUDED.zones,
+                -- Liveness stamp for the event janitor: every provider message
+                -- that touches a row proves it is still alive. The COALESCE on
+                -- end_ts above still lets a genuine provider `end` win over a
+                -- prior janitor close (self-heal).
+                updated_at   = now()
             RETURNING id
             ",
             &[
@@ -9452,6 +9530,14 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0063_ptz_control_default_off.sql",
         include_str!("../../../db/migrations/0063_ptz_control_default_off.sql"),
+    ),
+    (
+        "0064_clip_overview_seconds.sql",
+        include_str!("../../../db/migrations/0064_clip_overview_seconds.sql"),
+    ),
+    (
+        "0065_events_updated_at.sql",
+        include_str!("../../../db/migrations/0065_events_updated_at.sql"),
     ),
 ];
 
