@@ -1129,7 +1129,7 @@ class _WallTileState extends State<_WallTile> {
       });
       await player.open(Media(url));
       if (!mounted) {
-        player.dispose();
+        _disposePlayerDetached(player);
         return;
       }
       if (_player == null) {
@@ -1137,8 +1137,11 @@ class _WallTileState extends State<_WallTile> {
       } else {
         // A stream swap: keep the old player rendering while this one decodes
         // toward its first keyframe; _onFirstFrame does the visible swap.
-        _pending?.dispose(); // superseded by an even newer swap
+        // Reassign the field first, then detach the superseded player's teardown
+        // so the native mpv wind-down never stalls the swap (#105 contract).
+        final superseded = _pending;
         _pending = player;
+        _disposePlayerDetached(superseded);
       }
       spawned = null; // ownership handed off — the catch must not dispose it
     } catch (_) {
@@ -2078,7 +2081,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       });
       await player.open(Media(url));
       if (!mounted) {
-        player.dispose();
+        _disposePlayerDetached(player);
         return;
       }
       // While maximized, this pane is the snapshot + audio target.
