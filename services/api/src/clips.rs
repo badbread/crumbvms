@@ -356,6 +356,31 @@ const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
 /// Post-roll padding after a clip's event window (pre-roll is an admin setting).
 const POST_ROLL_MS: i64 = 8_000;
 
+/// Max length of a generated clip. A clip is an **overview** of an event — a
+/// short, representative snippet — NOT the full event: to watch a whole event
+/// the operator opens the timeline (which streams segments directly, with no
+/// whole-event transcode). So a clip render is short *by design*, independent of
+/// how long the underlying event is: a Frigate "car" detected for 5 hours, or a
+/// motion event that never settles, yields a ~30 s overview, not a 5-hour
+/// transcode. The window is truncated to `[start, start + cap)`.
+///
+/// This is also the hard safety backstop that keeps a broken `end_ts` (never
+/// closed → "until now", or a 10-hour event) from making the renderer concat
+/// thousands of 4 s segments into a multi-hour transcode — which in prod
+/// (2026-07-16) pinned the API at 600%+ CPU and starved ALL clip playback.
+///
+/// A fuller clip model (anchor on peak score, admin-tunable length, long-event
+/// "jump to timeline" UX, event-lifecycle bounding) is being designed
+/// separately (see docs/DECISIONS.md / issue #198); this cap stays as the floor.
+const MAX_CLIP_MEDIA_SECS: i64 = 30;
+
+/// Clamp a resolved clip window to at most [`MAX_CLIP_MEDIA_SECS`], also guarding
+/// an inverted (end < start) window down to a zero-length one.
+fn clamp_clip_window(start: DateTime<Utc>, end: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let capped = end.min(start + Duration::seconds(MAX_CLIP_MEDIA_SECS));
+    (start, capped.max(start))
+}
+
 /// Mount the clip media routes. Mounted in `media_routes` (no JSON timeout —
 /// generation can take a few seconds). `AuthUser` accepts `?token=`, so these
 /// serve directly as `<video>`/`<img>` sources.
@@ -385,7 +410,8 @@ async fn resolve_clip(
             .await
             .map_err(ApiError::Internal)?
             .ok_or_else(|| ApiError::NotFound(format!("clip {id} not found")))?;
-        Ok((cam, start - pre, end + post))
+        let (start, end) = clamp_clip_window(start - pre, end + post);
+        Ok((cam, start, end))
     } else if let Some(rest) = id.strip_prefix("m:") {
         let mut it = rest.split(':');
         let cam = it.next().and_then(|s| s.parse::<Uuid>().ok());
@@ -401,7 +427,8 @@ async fn resolve_clip(
                     .timestamp_millis_opt(e)
                     .single()
                     .ok_or_else(|| ApiError::BadRequest("malformed clip ts".to_owned()))?;
-                Ok((cam, start - pre, end + post))
+                let (start, end) = clamp_clip_window(start - pre, end + post);
+                Ok((cam, start, end))
             }
             _ => Err(ApiError::BadRequest("malformed clip id".to_owned())),
         }
@@ -1105,6 +1132,21 @@ mod tests {
 
     fn t(ms: i64) -> DateTime<Utc> {
         Utc.timestamp_millis_opt(ms).unwrap()
+    }
+
+    #[test]
+    fn clip_window_clamped_to_cap() {
+        let start = t(0);
+        // A normal short clip (under the cap) is left untouched.
+        let (s, e) = clamp_clip_window(start, t(12_000));
+        assert_eq!((s, e), (start, t(12_000)));
+        // A 10-hour "clip" (broken/unbounded event) is truncated to the cap.
+        let (s, e) = clamp_clip_window(start, t(36_303_000));
+        assert_eq!(s, start);
+        assert_eq!(e, start + Duration::seconds(MAX_CLIP_MEDIA_SECS));
+        // An inverted window collapses to zero length, never negative.
+        let (s, e) = clamp_clip_window(t(10_000), t(0));
+        assert_eq!((s, e), (t(10_000), t(10_000)));
     }
 
     #[test]
