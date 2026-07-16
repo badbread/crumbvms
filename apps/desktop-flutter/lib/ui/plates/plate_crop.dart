@@ -36,7 +36,34 @@ Uint8List? cropPlateToBboxSync(Uint8List fullBytes, List<double> bbox) {
   final cw = (bbox[2] * w).round().clamp(1, w - cx);
   final ch = (bbox[3] * h).round().clamp(1, h - cy);
   final cropped = img.copyCrop(decoded, x: cx, y: cy, width: cw, height: ch);
+  // Defense-in-depth (issue #179): if the box landed on a near-black region
+  // (a frame-mismatched box that points off the actual plate), treat it as a
+  // failed crop so the caller falls back to the full frame instead of showing
+  // a black thumbnail. The server-side fix (frame-consistent box) is the
+  // primary guard; this catches any residual bad box. Non-destructive — the
+  // full frame still contains the plate somewhere.
+  if (_isNearlyBlack(cropped)) return null;
   return img.encodeJpg(cropped, quality: 90);
+}
+
+/// True when [im] is almost entirely black — the signature of a crop box that
+/// landed off the plate (on void/sky) rather than on the plate itself. Samples
+/// a coarse grid (plate crops are small) and averages luminance; the threshold
+/// is deliberately low so a legitimately dark night-time plate (which still has
+/// IR/plate contrast) is not hidden.
+bool _isNearlyBlack(img.Image im) {
+  const step = 4;
+  var sum = 0.0;
+  var n = 0;
+  for (var y = 0; y < im.height; y += step) {
+    for (var x = 0; x < im.width; x += step) {
+      final p = im.getPixel(x, y);
+      sum += (p.r + p.g + p.b) / 3.0;
+      n++;
+    }
+  }
+  if (n == 0) return false;
+  return (sum / n) < 10.0; // ~4% of 255 — only near-pure-black regions
 }
 
 // ─── result cache ──────────────────────────────────────────────────────────

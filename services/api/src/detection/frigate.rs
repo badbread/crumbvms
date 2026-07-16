@@ -412,16 +412,6 @@ impl DetectionSource for FrigateProvider {
         let hb_pool = self.pool.clone();
         let mut last_hb: Option<std::time::Instant> = None;
 
-        // Frigate emits the `license_plate` crop box on mid-track frames, but the
-        // recognized-plate text + snapshot arrive on later frames where the plate
-        // has already left view (empty `current_attributes`). Remember the last
-        // box seen per tracked object so the event that actually emits the read
-        // still carries the crop box. Bounded so a missed `end` can't leak memory
-        // (cleared past the cap) — the box is best-effort, a miss only costs a
-        // crop, never the plate text or footage.
-        const PLATE_BOX_MEMORY_MAX: usize = 1024;
-        let mut plate_boxes: HashMap<String, [f32; 4]> = HashMap::new();
-
         // Drive the event loop.
         loop {
             tokio::select! {
@@ -465,36 +455,13 @@ impl DetectionSource for FrigateProvider {
                                 let dims = detect_dims_clone
                                     .read()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                // Remember any license_plate crop box on this
-                                // frame, keyed by object id, so a later boxless
-                                // event that actually emits the read still
-                                // carries the crop box.
-                                if let Some((id, Some(b))) =
-                                    peek_plate_box(&publish.payload, &dims)
-                                {
-                                    if plate_boxes.len() >= PLATE_BOX_MEMORY_MAX {
-                                        plate_boxes.clear();
-                                    }
-                                    plate_boxes.insert(id, b);
-                                }
                                 let map = camera_map_clone
                                     .read()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 process_mqtt_payload(&publish.payload, &map, min_score, &dims)
                             };
                             match parsed {
-                                Ok(Some(mut event)) => {
-                                    // Backfill the crop box from an earlier frame
-                                    // when this emitting event carried none itself.
-                                    if event.plate_box.is_none() {
-                                        event.plate_box = plate_boxes
-                                            .get(&event.provider_event_id)
-                                            .copied();
-                                    }
-                                    // Free the memory once the object ends.
-                                    if matches!(event.lifecycle, EventLifecycle::End) {
-                                        plate_boxes.remove(&event.provider_event_id);
-                                    }
+                                Ok(Some(event)) => {
                                     if tx.send(event).await.is_err() {
                                         info!("FrigateProvider: channel closed, stopping");
                                         break;
@@ -919,54 +886,25 @@ fn process_mqtt_payload(
             .as_ref()
             .and_then(|(_, s)| *s)
             .or(after.recognized_license_plate_score),
-        // Plate crop box. The live MQTT attribute box is pixel corners at the
-        // camera's detect resolution (issue #157), so normalization needs the
-        // dims fetched from Frigate's /api/config; a normalized 0..1 box (the
-        // HTTP shape) passes through regardless. The emitting frames usually
-        // have an empty `current_attributes` (plate already out of view) but
-        // still carry the snapshot frame's attributes — fall back to those.
+        // Plate crop box. The stored `snapshot_url` serves Frigate's
+        // best-snapshot, so only THAT frame's own `snapshot.attributes` box is
+        // guaranteed to line up with the image a client crops (issue #179). The
+        // live `current_attributes` is this MQTT frame, which is frequently a
+        // different frame than the best snapshot, so a crop to it lands off the
+        // plate — on the hood after the car moved, or off-frame (a black crop).
+        // Prefer the snapshot box; fall back to `current_attributes` only when
+        // the snapshot carries none. When neither exists the box is left None
+        // and the client renders the full frame instead of a mismatched crop.
+        // Boxes are pixel corners at the detect resolution (needs `detect_dims`);
+        // a normalized 0..1 box (the HTTP shape) passes through regardless.
         // Best-effort — None never affects the plate text / detection path.
         plate_box: normalize_plate_box(
-            plate_box_from_attributes(&after.current_attributes)
-                .or_else(|| plate_box_from_snapshot(after.snapshot.as_ref())),
+            plate_box_from_snapshot(after.snapshot.as_ref())
+                .or_else(|| plate_box_from_attributes(&after.current_attributes)),
             detect_dims.get(&after.camera).copied(),
         ),
         raw: raw_value,
     }))
-}
-
-/// Peek the license-plate crop box (and object id) out of a raw MQTT payload
-/// WITHOUT running the full filter pipeline. Used by the MQTT loop to remember
-/// a box across an object's lifecycle: Frigate emits the box on mid-track frames
-/// but the recognized text + snapshot on later frames whose `current_attributes`
-/// are empty, so the event that actually emits the read often has no box of its
-/// own. The box is looked for on `current_attributes` first, then on the
-/// snapshot frame's `snapshot.attributes`; both are pixel corners at the
-/// camera's detect resolution, normalized via `detect_dims` (issue #157).
-/// Returns `None` when the payload has no usable object id; the inner `Option`
-/// is the normalized box for this frame (absent when this frame has no
-/// `license_plate` attribute). Best-effort and allocation-light — a bad payload
-/// simply yields `None` and never disturbs the parse/emit path below.
-fn peek_plate_box(
-    payload: &bytes::Bytes,
-    detect_dims: &HashMap<String, (f32, f32)>,
-) -> Option<(String, Option<[f32; 4]>)> {
-    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    let after = v.get("after")?;
-    let id = after
-        .get("id")
-        .and_then(serde_json::Value::as_str)?
-        .to_owned();
-    let dims = after
-        .get("camera")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|c| detect_dims.get(c).copied());
-    let raw_box = after
-        .get("current_attributes")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|a| plate_box_from_attributes(a))
-        .or_else(|| plate_box_from_snapshot(after.get("snapshot")));
-    Some((id, normalize_plate_box(raw_box, dims)))
 }
 
 /// Fetch each camera's detect resolution from Frigate's `/api/config` —
@@ -1922,88 +1860,47 @@ mod tests {
     }
 
     #[test]
-    fn peek_plate_box_extracts_id_and_box_across_the_lifecycle() {
-        // The box-memory path (issue #157, missing crops on live reads): a
-        // mid-track frame carries the license_plate box — as PIXEL CORNERS at
-        // the detect resolution, the verified live 0.18 shape — but the frame
-        // that finally emits the read (recognized text) has empty
-        // current_attributes. peek_plate_box pulls the id + normalized box off
-        // the box-bearing frame so the loop can remember it and backfill the
-        // boxless emitting frame.
-        let mut dims = HashMap::new();
-        dims.insert("driveway".to_owned(), (1920.0_f32, 1080.0_f32));
-        let with_box = serde_json::json!({
-            "type": "update",
+    fn process_mqtt_prefers_snapshot_box_over_current_attributes() {
+        // Issue #179: the stored snapshot_url serves Frigate's best-snapshot, so
+        // the crop box MUST come from `snapshot.attributes` (that frame's own
+        // box), not `current_attributes` (this MQTT frame, frequently a
+        // different frame). When both are present they must resolve to the
+        // SNAPSHOT box so the crop lines up with the image the client renders.
+        let cam_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "type": "end",
             "after": {
-                "id": "car-42", "camera": "driveway",
+                "id": "abc123", "camera": "lpr", "label": "car",
+                "recognized_license_plate": ["23134X1", 0.994f64],
+                "score": 0.9, "top_score": 0.95,
+                "start_time": 1_000_000.0f64, "end_time": 1_000_020.0f64,
+                "current_zones": [], "false_positive": false, "has_snapshot": true,
+                // This MQTT frame's box — a DIFFERENT frame than the best snapshot.
                 "current_attributes": [
-                    {"label": "license_plate", "box": [1569, 638, 1668, 695], "score": 0.8}
-                ]
-            }
-        });
-        let (id, boxed) =
-            peek_plate_box(&bytes::Bytes::from(with_box.to_string()), &dims).expect("id parsed");
-        assert_eq!(id, "car-42");
-        let b = boxed.expect("box on this frame");
-        assert!(
-            (b[0] - 0.817_187_5).abs() < 1e-5 && (b[2] - 0.051_562_5).abs() < 1e-5,
-            "pixel corners normalized against the camera's detect dims"
-        );
-
-        // Without detect dims for the camera, a pixel box cannot be scaled —
-        // the id still parses (so `end` cleanup works) but no box is stored.
-        let (_, no_dims_box) =
-            peek_plate_box(&bytes::Bytes::from(with_box.to_string()), &HashMap::new())
-                .expect("id parsed");
-        assert!(no_dims_box.is_none(), "no dims → no invented scale");
-
-        // The emitting frame later: same object, but the plate has left view.
-        let boxless = serde_json::json!({
-            "type": "end",
-            "after": {
-                "id": "car-42", "camera": "driveway",
-                "recognized_license_plate": ["23134X1", 0.99f64],
-                "current_attributes": []
-            }
-        });
-        let (id2, boxed2) =
-            peek_plate_box(&bytes::Bytes::from(boxless.to_string()), &dims).expect("id parsed");
-        assert_eq!(id2, "car-42");
-        assert!(
-            boxed2.is_none(),
-            "no box on the emitting frame — must come from memory"
-        );
-    }
-
-    #[test]
-    fn peek_plate_box_falls_back_to_snapshot_attributes() {
-        // Real 0.18 `end` frame shape (captured live, issue #157): the tracked
-        // object's `current_attributes` is already empty, but the snapshot
-        // sub-object still carries the snapshot FRAME's attributes — including
-        // the license_plate pixel-corner box. peek must find it there.
-        let mut dims = HashMap::new();
-        dims.insert("lpr".to_owned(), (1920.0_f32, 1080.0_f32));
-        let end_frame = serde_json::json!({
-            "type": "end",
-            "after": {
-                "id": "1784063140.938766-5howdf", "camera": "lpr",
-                "current_attributes": [],
+                    {"label": "license_plate", "box": [100, 100, 200, 150], "score": 0.8}
+                ],
                 "snapshot": {
-                    "frame_time": 1_784_063_141.5f64,
+                    "frame_time": 1_000_010.0f64,
                     "attributes": [
                         {"label": "license_plate", "box": [1569, 638, 1668, 695], "score": 0.79}
                     ]
                 }
             }
         });
-        let (id, boxed) =
-            peek_plate_box(&bytes::Bytes::from(end_frame.to_string()), &dims).expect("id parsed");
-        assert_eq!(id, "1784063140.938766-5howdf");
-        let b = boxed.expect("box recovered from snapshot.attributes");
-        assert!((b[0] - 0.817_187_5).abs() < 1e-5);
-        assert!((b[1] - 0.590_740_7).abs() < 1e-5);
-        assert!((b[2] - 0.051_562_5).abs() < 1e-5);
-        assert!((b[3] - 0.052_777_8).abs() < 1e-5);
+        let mut map = HashMap::new();
+        map.insert("lpr".to_owned(), cam_id);
+        let mut dims = HashMap::new();
+        dims.insert("lpr".to_owned(), (1920.0_f32, 1080.0_f32));
+        let bytes = bytes::Bytes::from(payload.to_string());
+        let ev = process_mqtt_payload(&bytes, &map, 0.3, &dims)
+            .unwrap()
+            .unwrap();
+        let bbox = ev.plate_box.expect("snapshot plate_box");
+        // Snapshot box (1569/1920 ≈ 0.817), NOT the current-frame box (100/1920 ≈ 0.052).
+        assert!(
+            (bbox[0] - 0.817_187_5).abs() < 1e-5,
+            "must use the frame-consistent snapshot box, not current_attributes"
+        );
     }
 
     #[test]
