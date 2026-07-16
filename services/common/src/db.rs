@@ -9449,6 +9449,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0062_ha_overlay_shape_bg.sql",
         include_str!("../../../db/migrations/0062_ha_overlay_shape_bg.sql"),
     ),
+    (
+        "0063_ptz_control_default_off.sql",
+        include_str!("../../../db/migrations/0063_ptz_control_default_off.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds

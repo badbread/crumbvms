@@ -330,11 +330,12 @@ tbody tr.selected td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
 .form-msg.ok{display:block;color:var(--ok);background:rgba(52,199,89,.08);border:1px solid rgba(52,199,89,.2);}
 .form-msg.err{display:block;color:var(--danger);background:rgba(229,72,77,.08);border:1px solid rgba(229,72,77,.2);}
 /* ── Toast ── */
-#toast-container{position:fixed;bottom:24px;right:24px;z-index:200;display:flex;flex-direction:column;gap:8px;pointer-events:none;}
-.toast{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:10px 16px;font-size:13px;box-shadow:var(--shadow-lg);pointer-events:all;animation:slideUp .2s ease;max-width:340px;}
-.toast.ok{border-left:3px solid var(--ok);}
-.toast.err{border-left:3px solid var(--danger);}
-.toast.warn{border-left:3px solid var(--warn);}
+#toast-container{position:fixed;bottom:32px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:10px;align-items:center;pointer-events:none;}
+.toast{background:var(--surface);border:1px solid var(--border);border-left:5px solid var(--border);border-radius:var(--radius-lg);padding:14px 22px;font-size:15px;font-weight:600;box-shadow:var(--shadow-lg);pointer-events:all;animation:slideUp .2s ease;max-width:520px;text-align:center;}
+.toast.ok{border-left-color:var(--ok);}
+.toast.err{border-left-color:var(--danger);}
+.toast.warn{border-left-color:var(--warn);}
+.toast.info{border-left-color:var(--accent);text-align:left;font-weight:500;max-width:460px;}
 @keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 /* ── Checkbox ── */
 .chk{display:inline-flex;align-items:center;gap:8px;color:var(--text);font-size:13px;cursor:pointer;}
@@ -840,7 +841,12 @@ function storageIcon(name, override) {
 /* Small (i) info glyph with a hover/focus tooltip. Used on the detection
    source/algorithm pickers so each option's trade-off is one hover away. */
 function infoHint(text) {
-  return `<span class="info-hint" tabindex="0" title="${esc(text)}" aria-label="${esc(text)}">${icon('info',13)}</span>`;
+  const t = esc(text);
+  // Clickable (and hover/focus): a native title tooltip is easy to miss and
+  // does nothing on click, so clicking/entering shows the text as a toast.
+  // stopPropagation/preventDefault so clicking the icon inside a <label>
+  // doesn't toggle the control it annotates.
+  return `<span class="info-hint" tabindex="0" role="button" title="${t}" aria-label="${t}" data-info="${t}" onclick="event.preventDefault();event.stopPropagation();toast(this.getAttribute('data-info'),'info',7000)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toast(this.getAttribute('data-info'),'info',7000)}">${icon('info',13)}</span>`;
 }
 /* Tooltip copy for the motion detection controls (shared by the camera Motion
    tab and the dedicated Motion-tuning view). */
@@ -4602,7 +4608,7 @@ function renderCamInfoTab(c) {
         <label class="fg-label" for="ce-onvif-pass">ONVIF password</label>
         <div class="fg-ctl"><input id="ce-onvif-pass" type="password" autocomplete="new-password" placeholder="${c.onvif_has_password?'•••• (unchanged)':'(none set)'}" style="max-width:220px" /></div>
         <label class="fg-label" for="ce-ptz-enabled">PTZ controls</label>
-        <div class="fg-ctl"><label class="chk"><input type="checkbox" id="ce-ptz-enabled" ${(c.ptz_control_enabled ?? true)?'checked':''}/> This camera has pan/tilt/zoom controls ${infoHint('Turn OFF for a fixed ONVIF camera (no pan/tilt/zoom motor). Off hides the PTZ joystick on every client and rejects PTZ commands, even though the camera still uses ONVIF for stream discovery.')}</label></div>
+        <div class="fg-ctl"><label class="chk"><input type="checkbox" id="ce-ptz-enabled" ${(c.ptz_control_enabled ?? false)?'checked':''}/> This camera has pan/tilt/zoom controls ${infoHint('Turn ON only for a camera that actually pans/tilts/zooms. When on (and the camera is reachable over ONVIF), clients show the PTZ joystick and accept PTZ commands; off hides it.')}</label></div>
       </div>
     </div>
 
