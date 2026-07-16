@@ -8,6 +8,83 @@ revisit.
 
 ---
 
+## 2026-07-16, Recording policies: explicit named membership replaces NULL-inherit + anonymous COW forks
+
+**Status.** Phase 1 (server-only) landed here: the `origin` column + the
+collapse migration (`0067`), `create_camera` joins Default, the deviation-edit
+semantics, and the reaper predicate. Phases 2 (explicit membership: `policy_id
+NOT NULL`, groups retire) and 3 (admin UI) are staged per
+`docs/design/POLICY-MODEL.md` §8 and NOT yet landed — NULL-inherit and the
+camera-groups tables are intentionally still live.
+
+**Context.** A camera's effective recording policy resolved through a
+three-leg COALESCE (`v_camera_effective_policy`: own `policy_id` → group's
+`policy_id` → the `is_default` row), and three code paths minted **anonymous
+(`name IS NULL`) copy-on-write policy rows**: every `POST /config/cameras`
+cloned the Default into a fresh fork (`config_routes.rs` `create_camera` →
+`clone_default_policy`), every save from the admin Motion tab PUT
+`/config/cameras/{id}/policy` (the COW fork path) even with unchanged values,
+and the desktop Motion Tuner used the same endpoint. Result in prod: unnamed
+policies byte-identical to Default that no UI could see or manage ("ghosts"),
+exposed when the Storage Advisor started labelling them "Custom — \<camera\>".
+The NULL-inherit state also carried a real recorder hazard: an inheriting
+camera resolves through `(SELECT id FROM recording_policies WHERE
+is_default)`, so a missing/duplicated default row silently drops the camera
+from the recorder's inner JOIN — it just stops recording, no error.
+
+**Decision.** Every camera holds a NOT NULL `policy_id` to a **named** policy.
+(1) *Deviation auto-creates*: a camera-scoped settings edit on a shared policy
+mints a new policy auto-named after the camera (renameable), joins it — no
+naming dialog. (2) *De-dup on create*: if the edited field-set exactly matches
+an existing policy (all behavior columns, `IS NOT DISTINCT FROM`), the camera
+**joins** that policy instead; reverting to Default's values rejoins Default.
+(3) *Reap empties, keep templates*: a new `origin` column
+(`'operator'`|`'deviation'`) distinguishes auto-created deviation policies
+(reaped when memberless) from operator-created templates (kept at zero
+members); renaming a deviation policy promotes it to `'operator'`.
+(4) *Default is first-class*: new cameras join the Default **row** (no clone,
+no NULL); `is_default` keeps meaning "the policy new cameras join" and stays
+undeletable. (5) *Camera groups retire*: a policy's member list **is** the
+group; group tables/endpoints are dissolved into direct assignment + a bulk
+"assign policy to cameras" action (the 0020/0021 triggers already made a
+group nothing more than an indirection naming one policy assignment).
+One-shot migration collapses byte-identical forks into Default, names
+genuinely-distinct ones after their camera, and pins every camera, under the
+invariant that **no camera's effective policy field-values change** and no
+merge may make footage immediately eviction-eligible (byte-cap pools are
+compared before collapsing; unsafe merges keep the fork as a named policy
+instead).
+
+**Rejected.**
+- *Keep NULL-inherit + fix the fork leak*: keeps the invisible state and the
+  0-defaults-silently-stops-recording hazard; the DB cannot enforce "every
+  camera has a policy" while NULL means something.
+- *Interrogate on deviation* (naming dialog before every edit): friction on
+  the most common tuning action; auto-name + rename-later matches VMS
+  convention.
+- *Per-camera overlay/deltas on top of a policy* (Milestone-style "override
+  flags"): more faithful to "tweak one camera" but reintroduces two sources of
+  truth per knob; revisit if policy-count explosion materializes.
+- *Keep groups as a separate assignment layer*: a group was already
+  policy-exclusive and authoritative (migrations 0020/0021); two mechanisms
+  for one job is where the confusion came from.
+
+**Trade-offs accepted.** Collapsing/joining policies pools the shared
+`live_max_bytes`/`archive_max_bytes` budget across the merged membership
+(that is the intended meaning of "same policy"); a one-time worker respawn
+per repointed camera (the effective-policy id is in the recorder's change
+fingerprint); the policy list can grow with one policy per deviating camera
+(visible and manageable, unlike the ghosts).
+
+**Revisit triggers.** Operators with large fleets report the policy list
+becoming noise from many single-camera deviation policies (→ revisit the
+overlay model). A need re-emerges for camera grouping *unrelated to
+recording* (bulk ops, UI folders) (→ reintroduce groups as pure tags with no
+policy pointer). The recorder gains per-camera knobs that don't belong on a
+policy (→ keep them on `cameras`, as motion sources already are).
+
+---
+
 ## 2026-07-16, Clips are fixed-length event overviews; the timeline owns whole-event viewing; open events are janitor-closed
 
 **Context.** `GET /clip/{id}/clip.mp4` rendered a detection/motion event's full

@@ -1749,6 +1749,7 @@ mod tests {
                         id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                         name                    text,
                         is_default              boolean NOT NULL DEFAULT false,
+                        origin                  text NOT NULL DEFAULT 'operator',
                         mode                    text NOT NULL DEFAULT 'continuous',
                         live_storage_id         uuid REFERENCES storages(id),
                         live_retention_hours    integer NOT NULL DEFAULT 48,

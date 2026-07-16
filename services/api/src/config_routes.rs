@@ -8,7 +8,7 @@
 //! | Method   | Path                              | Description                              |
 //! |----------|-----------------------------------|------------------------------------------|
 //! | `GET`    | `/config/cameras`                 | List all cameras with joined policy      |
-//! | `POST`   | `/config/cameras`                 | Create camera; clones default policy     |
+//! | `POST`   | `/config/cameras`                 | Create camera; joins the Default policy   |
 //! | `GET`    | `/config/cameras/{id}`            | Single camera                            |
 //! | `PUT`    | `/config/cameras/{id}`            | Update camera fields (partial)           |
 //! | `DELETE` | `/config/cameras/{id}`            | Delete camera + its segments (cascade)   |
@@ -823,10 +823,15 @@ async fn create_camera(
 
     let pool = state.pool();
 
-    // Clone the default policy — each camera owns its own independent row.
-    let policy_id = db::clone_default_policy(pool)
+    // A new camera JOINS the Default policy row (no clone, no anonymous fork).
+    // "On Default" is `policy_id = Default.id`; a camera deviates only via an
+    // explicit per-camera edit, which mints/joins a named policy. This kills the
+    // "every camera born on a byte-identical ghost of Default" factory
+    // (policy-model redesign Phase 1).
+    let policy_id = db::get_default_policy(pool)
         .await
-        .context("clone_default_policy")?;
+        .context("get_default_policy")?
+        .id;
 
     // Motion source / algorithm: default to pixel/census; validate if supplied.
     let motion_source = match body.motion_source.as_deref() {
@@ -1392,60 +1397,138 @@ async fn update_camera_policy(
     Ok(Json(policy_to_dto(updated)))
 }
 
-/// The copy-on-write body of [`update_camera_policy`], run while holding the
-/// [`CAMERA_POLICY_COW_LOCK`] advisory lock so the ref-count check and the
-/// clone/reassign cannot interleave with a concurrent edit.
+/// The deviation-edit body of [`update_camera_policy`], run while holding the
+/// [`CAMERA_POLICY_COW_LOCK`] advisory lock so the resolve→decide→write is atomic
+/// against a concurrent edit (landmine L6).
+///
+/// Semantics (policy-model redesign, design section 3.1) — "a camera belongs to a
+/// policy; if it deviates it gets its own named one":
+///
+/// 1. **No-op / de-dup:** resolve the would-be field-set `W` (the request patched
+///    over the camera's current effective policy) and look for a NAMED policy that
+///    matches `W` exactly. If that policy IS the camera's current effective one,
+///    nothing changed → return it untouched (this alone stops the old Motion-tab
+///    "unchanged save forks a ghost" factory). If it is a DIFFERENT named policy,
+///    the camera JOINS it (revert-to-Default's-values rejoins Default), and the
+///    policy it left is inline-reaped if it is now an orphaned deviation.
+/// 2. **Edit-in-place:** if `W` matches no named policy and the camera SOLELY owns
+///    an auto-created `origin='deviation'` policy, edit that policy in place
+///    (keeping its name). Operator templates are never mutated by a camera edit.
+/// 3. **Mint:** otherwise create a new `origin='deviation'` policy auto-named after
+///    the camera, pin the camera to it, and inline-reap the policy it left.
+///
+/// Grouped cameras are rejected by the caller before the lock, so here the camera
+/// is always ungrouped (its effective policy is its own pin, else the default).
 async fn update_camera_policy_locked(
     pool: &Pool,
     id: Uuid,
     body: &UpdatePolicyRequest,
 ) -> Result<RecordingPolicy, ApiError> {
-    // Resolve the camera → get the policy_id (inside the lock for a race-free read).
+    // Resolve the camera + its CURRENT effective policy P, inside the lock.
     let camera = require_camera(pool, id).await?;
-
-    // Copy-on-write under inheritance: this endpoint edits THIS camera's recording
-    // settings only. The camera may edit its policy in place ONLY when it owns an
-    // ANONYMOUS per-camera fork — i.e. it has its own direct `policy_id`, that row
-    // is not the default, has no `name` (a named/reusable policy must never be
-    // mutated here — that would silently change every camera/group using it), and
-    // exactly one camera references it. In every other case (the camera inherits
-    // from its group/default, or shares a named/default policy) we fork a new
-    // anonymous row FROM THE EFFECTIVE policy, pin the camera to it, and edit the
-    // fork — leaving the source policy, other cameras, and groups untouched.
     let effective_id = camera.policy.id; // resolved own → group → default
-    let owns_anonymous_fork = match camera.policy_id {
-        Some(direct_id) if direct_id == effective_id => {
-            let direct = db::get_policy(pool, direct_id)
-                .await
-                .context("get_policy")?
-                .ok_or_else(|| ApiError::NotFound(format!("policy {direct_id} not found")))?;
-            let ref_count = db::count_cameras_for_policy(pool, direct_id)
-                .await
-                .context("count_cameras_for_policy")?;
-            !direct.is_default && direct.name.is_none() && ref_count <= 1
-        }
-        _ => false,
-    };
+    let direct_id = camera.policy_id; // the camera's OWN pin, if any
+    let camera_name = camera.name.clone();
 
-    let target_policy_id = if owns_anonymous_fork {
-        effective_id
-    } else {
-        let new_id = db::clone_policy(pool, effective_id)
-            .await
-            .context("clone_policy")?;
-        db::set_camera_policy(pool, camera.id, Some(new_id))
+    // W = the request patched over the current effective policy (no name yet).
+    let resolved = resolve_policy_fields(&camera.policy, body, None)?;
+
+    // No-op + de-dup in one NULL-safe SQL match over NAMED policies (prefers
+    // Default → operator template → named deviation).
+    if let Some(matched_id) = db::find_matching_policy(pool, &resolved.as_fields())
+        .await
+        .context("find_matching_policy")?
+    {
+        if matched_id == effective_id {
+            // W equals the camera's current effective policy → nothing to do.
+            return Ok(camera.policy);
+        }
+        // W matches a DIFFERENT named policy → join it, then inline-reap the policy
+        // we left iff it is now an orphaned deviation (repoint before reap).
+        db::set_camera_policy(pool, camera.id, Some(matched_id))
             .await
             .context("set_camera_policy")?;
-        tracing::info!(
-            camera_id = %id,
-            source_policy_id = %effective_id,
-            new_policy_id = %new_id,
-            "per-camera policy forked (copy-on-write)"
-        );
-        new_id
-    };
+        if let Some(old) = direct_id {
+            db::reap_policy_if_orphan_deviation(pool, old)
+                .await
+                .context("reap_policy_if_orphan_deviation")?;
+        }
+        tracing::info!(camera_id = %id, policy_id = %matched_id, "camera joined matching policy");
+        return db::get_policy(pool, matched_id)
+            .await
+            .context("get_policy")?
+            .ok_or_else(|| ApiError::NotFound(format!("policy {matched_id} not found")));
+    }
 
-    apply_policy_update(pool, target_policy_id, body).await
+    // W matches no named policy. Edit-in-place only when the camera SOLELY owns an
+    // auto-created deviation policy (never mutate a template or a shared policy).
+    if let Some(dir_id) = direct_id {
+        let direct = db::get_policy(pool, dir_id)
+            .await
+            .context("get_policy")?
+            .ok_or_else(|| ApiError::NotFound(format!("policy {dir_id} not found")))?;
+        if !direct.is_default
+            && direct.origin == "deviation"
+            && db::count_cameras_for_policy(pool, dir_id)
+                .await
+                .context("count_cameras_for_policy")?
+                == 1
+        {
+            let mut fields = resolved.as_fields();
+            fields.name = direct.name.as_deref(); // keep the policy's name + origin
+            let updated = db::update_policy(pool, dir_id, &fields)
+                .await
+                .context("update_policy")?
+                .ok_or_else(|| ApiError::NotFound(format!("policy {dir_id} not found")))?;
+            tracing::info!(camera_id = %id, policy_id = %dir_id, "deviation policy edited in place");
+            return Ok(updated);
+        }
+    }
+
+    // Mint a new named deviation policy after the camera, pin it, reap the old one.
+    let name = mint_deviation_name(pool, &camera_name).await?;
+    let mut fields = resolved.as_fields();
+    fields.name = Some(name.as_str());
+    let created = db::create_policy(pool, &fields, "deviation")
+        .await
+        .context("create_policy (deviation)")?;
+    db::set_camera_policy(pool, camera.id, Some(created.id))
+        .await
+        .context("set_camera_policy")?;
+    if let Some(old) = direct_id {
+        db::reap_policy_if_orphan_deviation(pool, old)
+            .await
+            .context("reap_policy_if_orphan_deviation")?;
+    }
+    tracing::info!(
+        camera_id = %id,
+        policy_id = %created.id,
+        name = %name,
+        "deviation minted a new named policy"
+    );
+    Ok(created)
+}
+
+/// Auto-name a new deviation policy after its camera, suffixing `" 2"`/`" 3"` on
+/// collision. Runs under [`CAMERA_POLICY_COW_LOCK`] so the check→insert is
+/// race-free. Falls back to `"Camera"` for a blank camera name.
+async fn mint_deviation_name(pool: &Pool, camera_name: &str) -> Result<String, ApiError> {
+    let trimmed = camera_name.trim();
+    let base = if trimmed.is_empty() {
+        "Camera"
+    } else {
+        trimmed
+    };
+    let mut cand = base.to_owned();
+    let mut n = 1;
+    while db::policy_name_taken(pool, &cand)
+        .await
+        .context("policy_name_taken")?
+    {
+        n += 1;
+        cand = format!("{base} {n}");
+    }
+    Ok(cand)
 }
 
 // ─── default policy ───────────────────────────────────────────────────────────
@@ -1536,7 +1619,9 @@ async fn create_policy(
         .await
         .context("get_default_policy (policy baseline)")?;
     let resolved = resolve_policy_fields(&base, &body.fields, Some(&name))?;
-    let created = db::create_policy(state.pool(), &resolved.as_fields())
+    // Operator-created templates are `origin='operator'`: kept at zero members,
+    // never de-duped, never reaped (design section 3.2/3.3).
+    let created = db::create_policy(state.pool(), &resolved.as_fields(), "operator")
         .await
         .context("create_policy")?;
     tracing::info!(policy_id = %created.id, name = %name, "named policy created");
@@ -1573,10 +1658,25 @@ async fn update_policy(
     };
 
     let resolved = resolve_policy_fields(&existing, &body.fields, name.as_deref())?;
-    let updated = db::update_policy(state.pool(), id, &resolved.as_fields())
+    let mut updated = db::update_policy(state.pool(), id, &resolved.as_fields())
         .await
         .context("update_policy")?
         .ok_or_else(|| ApiError::NotFound(format!("policy {id} not found")))?;
+
+    // Renaming a deviation policy promotes it to an operator template: an operator
+    // who explicitly named a thing has declared it a keeper, so it must survive at
+    // zero members (the reaper only touches `origin='deviation'`). Detected as a
+    // name CHANGE on a non-default deviation policy (design section 3.1/3.3).
+    if updated.origin == "deviation"
+        && !updated.is_default
+        && name.as_deref() != existing.name.as_deref()
+        && db::promote_policy_to_operator(state.pool(), id)
+            .await
+            .context("promote_policy_to_operator")?
+    {
+        "operator".clone_into(&mut updated.origin);
+        tracing::info!(policy_id = %id, "deviation policy promoted to operator (renamed)");
+    }
     tracing::info!(policy_id = %id, "named policy updated");
     Ok(Json(policy_to_dto(updated)))
 }
@@ -4174,6 +4274,7 @@ fn policy_to_dto(p: RecordingPolicy) -> RecordingPolicyDto {
         id: p.id,
         name: p.name,
         is_default: p.is_default,
+        origin: p.origin,
         mode: p.mode,
         live_storage_id: p.live_storage_id,
         live_retention_hours: p.live_retention_hours,
