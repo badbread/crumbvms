@@ -1172,3 +1172,50 @@ async fn migration_0068_pins_and_enforces_membership() {
         .get(0);
     assert_eq!(dup_names, 0, "policy names must be unique after 0068");
 }
+
+/// Whether `cameras.policy_id` currently carries a NOT NULL constraint.
+async fn cameras_policy_id_is_not_null(pool: &deadpool_postgres::Pool) -> bool {
+    let client = pool.get().await.expect("pool.get (is_nullable)");
+    let is_nullable: String = client
+        .query_one(
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'cameras' AND column_name = 'policy_id'",
+            &[],
+        )
+        .await
+        .expect("read is_nullable")
+        .get(0);
+    is_nullable == "NO"
+}
+
+/// Landmine L4 regression: the boot shim (`ensure_named_policies_and_groups`)
+/// must NEVER drop `cameras.policy_id`'s NOT NULL constraint that migration 0068
+/// established — it historically ran `ALTER COLUMN policy_id DROP NOT NULL` on
+/// every boot, which would silently undo the migration on the next restart.
+/// `TestApp::new()` has already run the full migration chain AND the boot shim
+/// once; run the shim twice more and assert the column stays NOT NULL.
+#[tokio::test]
+async fn boot_shim_keeps_policy_id_not_null_idempotently() {
+    let app = TestApp::new().await;
+    assert!(
+        cameras_policy_id_is_not_null(app.pool()).await,
+        "migration 0068 must leave cameras.policy_id NOT NULL"
+    );
+
+    db::ensure_named_policies_and_groups(app.pool())
+        .await
+        .expect("boot shim (run 2)");
+    assert!(
+        cameras_policy_id_is_not_null(app.pool()).await,
+        "boot shim run 2 must keep cameras.policy_id NOT NULL"
+    );
+
+    db::ensure_named_policies_and_groups(app.pool())
+        .await
+        .expect("boot shim (run 3)");
+    assert!(
+        cameras_policy_id_is_not_null(app.pool()).await,
+        "boot shim run 3 must keep cameras.policy_id NOT NULL (idempotent)"
+    );
+}

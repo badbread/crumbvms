@@ -12175,69 +12175,6 @@ mod tests {
         );
     }
 
-    /// Whether `cameras.policy_id` currently carries a NOT NULL constraint, read
-    /// from the catalog in the fixture's search-path schema.
-    async fn cameras_policy_id_is_not_null(pool: &Pool) -> bool {
-        let client = get_conn(pool).await.expect("get_conn (is_nullable)");
-        let is_nullable: String = client
-            .query_one(
-                "SELECT is_nullable FROM information_schema.columns \
-                 WHERE table_schema = current_schema() \
-                   AND table_name = 'cameras' AND column_name = 'policy_id'",
-                &[],
-            )
-            .await
-            .expect("read is_nullable")
-            .get(0);
-        is_nullable == "NO"
-    }
-
-    /// Landmine L4 regression: the boot shim ([`ensure_named_policies_and_groups`])
-    /// must NEVER drop `cameras.policy_id`'s NOT NULL constraint that migration
-    /// 0068 established — it historically ran `ALTER COLUMN policy_id DROP NOT
-    /// NULL` on every boot, which would silently undo the migration on the next
-    /// restart. Run the shim twice and assert the column stays NOT NULL.
-    #[tokio::test]
-    async fn boot_shim_keeps_policy_id_not_null_idempotently() {
-        // Accept either the db-tests convention (TEST_DATABASE_URL) or the plain
-        // DATABASE_URL the workspace gate uses, so this runs under both.
-        let Some(url) = std::env::var("TEST_DATABASE_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                std::env::var("DATABASE_URL")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
-        else {
-            eprintln!("skipping: neither TEST_DATABASE_URL nor DATABASE_URL set");
-            return;
-        };
-
-        let fx = setup_schema(&url).await;
-        run_migrations(&fx.pool).await.expect("run_migrations");
-        assert!(
-            cameras_policy_id_is_not_null(&fx.pool).await,
-            "migration 0068 must leave cameras.policy_id NOT NULL"
-        );
-
-        // The boot shim must NOT drop the constraint (L4) — run it twice.
-        ensure_named_policies_and_groups(&fx.pool)
-            .await
-            .expect("boot shim (run 1)");
-        assert!(
-            cameras_policy_id_is_not_null(&fx.pool).await,
-            "boot shim run 1 must keep cameras.policy_id NOT NULL"
-        );
-        ensure_named_policies_and_groups(&fx.pool)
-            .await
-            .expect("boot shim (run 2)");
-        assert!(
-            cameras_policy_id_is_not_null(&fx.pool).await,
-            "boot shim run 2 must keep cameras.policy_id NOT NULL (idempotent)"
-        );
-    }
-
     /// An INVALID index whose locks are HELD by another session must be
     /// skipped (with a WARN), not dropped and not turned into a boot-failing
     /// error — this is the "operator's manual CREATE INDEX CONCURRENTLY is
