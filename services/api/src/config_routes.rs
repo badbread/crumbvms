@@ -1261,28 +1261,27 @@ async fn update_camera(
         })?;
 
     // Recording-policy ASSIGNMENT (distinct from editing policy fields): pin the
-    // camera to a named policy, or clear it so the camera inherits from its group
-    // / the default. `Some(Some(id))` pins; `Some(None)` clears; omitted leaves it.
+    // camera to a named policy. `Some(Some(id))` pins to that policy;
+    // `Some(None)` — an old client's "clear to inherit" — now means "record like
+    // Default" (Phase 2: every camera belongs to a policy), so it joins the
+    // Default row. Omitted leaves the assignment untouched. The Phase-3
+    // grouped-camera rejection is gone: groups no longer resolve a camera's
+    // policy (they write through to `policy_id`).
     if let Some(assignment) = body.policy_id {
-        if let Some(pid) = assignment {
-            // Phase 3: a grouped camera is governed by its GROUP's profile and
-            // may not hold a direct per-camera policy. Reject the pin (but still
-            // allow `Some(None)`, i.e. clear-to-inherit — that's how you make a
-            // grouped camera follow its group). Ungrouped cameras pass through.
-            if let Some(group_name) = db::camera_group_name(pool, id)
-                .await
-                .context("camera_group_name")?
-            {
-                return Err(ApiError::BadRequest(format!(
-                    "camera is in group '{group_name}' — change the group's profile \
-                     or ungroup the camera first to give it its own recording profile"
-                )));
+        let target = match assignment {
+            Some(pid) => {
+                // Must exist (404, not an FK 500).
+                require_assignable_policy(pool, pid).await?;
+                pid
             }
-            // Must exist (404, not an FK 500) AND be assignable: a camera may only be
-            // pinned to a named or the default policy, never to an anonymous fork.
-            require_assignable_policy(pool, pid).await?;
-        }
-        db::set_camera_policy(pool, id, assignment)
+            None => {
+                db::get_default_policy(pool)
+                    .await
+                    .context("get_default_policy")?
+                    .id
+            }
+        };
+        db::set_camera_policy(pool, id, Some(target))
             .await
             .context("set_camera_policy")?;
     }
@@ -4188,15 +4187,11 @@ async fn cancel_migration(
 /// in `update_camera_policy_locked` silently mutate a now-shared policy. Rejecting
 /// non-named policies here is the clean invariant that closes both assignment paths.
 async fn require_assignable_policy(pool: &Pool, id: Uuid) -> Result<RecordingPolicy, ApiError> {
-    let policy = require_policy(pool, id).await?;
-    if !policy.is_default && policy.name.is_none() {
-        return Err(ApiError::BadRequest(
-            "cannot assign to an anonymous per-camera policy; choose a named policy \
-             (or clear the assignment to inherit)"
-                .to_owned(),
-        ));
-    }
-    Ok(policy)
+    // Phase 2: every policy is named (no anonymous per-camera forks exist), so
+    // "assignable" collapses to "exists". Kept as a distinct helper so the
+    // assignment call sites read intent-fully and still 404 (not FK-500) on a
+    // bogus id.
+    require_policy(pool, id).await
 }
 
 /// Load a camera group by ID or return `404 Not Found`.

@@ -519,6 +519,9 @@ async fn inline_reap_targets_only_orphan_deviations() {
 const MIGRATION_0067_SQL: &str =
     include_str!("../../../db/migrations/0067_recording_policy_origin_collapse.sql");
 
+const MIGRATION_0068_SQL: &str =
+    include_str!("../../../db/migrations/0068_recording_policy_explicit_membership.sql");
+
 /// A throwaway, fully-migrated database that DROPs itself on scope exit — the
 /// migration test mutates GLOBAL policy state (the single default row + every
 /// anonymous fork), so it must not share the public test schema.
@@ -679,6 +682,19 @@ async fn migration_collapse_pool_and_drain_guards_and_invariant() {
         return;
     };
     let pool = &iso.pool;
+
+    // The isolated DB is migrated through 0068, which makes recording_policies.name
+    // NOT NULL. This test reconstructs the PRE-0067 ghost state (anonymous
+    // NULL-name forks via clone_default_policy), so relax that one constraint
+    // first. The name-uniqueness index stays (Postgres treats NULLs as distinct,
+    // so multiple NULL-name forks coexist) and still validates 0067's survivor
+    // naming. Everything else 0068 established is irrelevant to the 0067 body.
+    pool.get()
+        .await
+        .expect("pool.get (relax name)")
+        .batch_execute("ALTER TABLE recording_policies ALTER COLUMN name DROP NOT NULL")
+        .await
+        .expect("relax recording_policies.name for pre-0067 simulation");
 
     // Default carries a small live cap so a large fork can't merge into it.
     let cap: i64 = 1000;
@@ -854,4 +870,305 @@ async fn migration_collapse_pool_and_drain_guards_and_invariant() {
         !policy_exists(pool, f5).await,
         "ownerless fork must be deleted"
     );
+}
+
+// ── Phase 2 (migration 0068 — explicit membership) ────────────────────────────
+
+/// Group write-through (Phase 2): adding a camera to a group PINS the member's
+/// `policy_id` to the group's policy; changing the group's policy re-pins the
+/// members. Inheritance is gone, so the group assigns the pointer directly.
+#[tokio::test]
+async fn group_assignment_writes_through_to_members() {
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+    let pool = app.pool();
+
+    let base = db::get_default_policy(pool).await.expect("default");
+    let mode = base.mode.as_str().to_owned();
+    let sens = base.motion_sensitivity.as_str().to_owned();
+    let stream = base.record_stream.as_str().to_owned();
+
+    // Two operator templates to move the group between.
+    let name_a = unique("GrpA");
+    let name_b = unique("GrpB");
+    let pa = db::create_policy(
+        pool,
+        &mk_fields(&name_a, uniq_hours(), &mode, &sens, &stream),
+        "operator",
+    )
+    .await
+    .expect("create pa");
+    let pb = db::create_policy(
+        pool,
+        &mk_fields(&name_b, uniq_hours(), &mode, &sens, &stream),
+        "operator",
+    )
+    .await
+    .expect("create pb");
+
+    let (cam_id, _n) = create_camera_on_default(&app, &token).await;
+
+    // Create a group on policy A and add the camera → the member is pinned to A.
+    let grp = db::create_group(pool, &unique("grp"), Some(pa.id))
+        .await
+        .expect("create_group");
+    db::set_group_members(pool, grp.id, &[cam_id])
+        .await
+        .expect("set_group_members");
+    assert_eq!(
+        camera_policy_id(pool, cam_id).await,
+        Some(pa.id),
+        "adding a camera to a group pins its policy_id to the group's policy"
+    );
+
+    // Move the group to policy B → the member is re-pinned to B.
+    db::update_group(pool, grp.id, &unique("grp"), Some(pb.id))
+        .await
+        .expect("update_group");
+    assert_eq!(
+        camera_policy_id(pool, cam_id).await,
+        Some(pb.id),
+        "changing the group's policy re-pins its members"
+    );
+}
+
+/// The migration-0068 body pins every inheriting camera to the SAME policy the
+/// effective-policy view resolves today (a grouped camera to its group's policy,
+/// an ungrouped inheritor to Default), enforces `cameras.policy_id NOT NULL`,
+/// names + de-nulls every policy uniquely, and holds the sacred invariant that no
+/// camera's effective policy VALUES change.
+#[tokio::test]
+async fn migration_0068_pins_and_enforces_membership() {
+    let Some(iso) = make_isolated_db().await else {
+        eprintln!("skipping: no reachable test Postgres / cannot CREATE DATABASE");
+        return;
+    };
+    let pool = &iso.pool;
+
+    // The isolated DB is migrated through 0068 (policy_id + name are NOT NULL and
+    // the triggers are gone). Reconstruct the PRE-0068 world — inheriting cameras
+    // (NULL policy_id) and an anonymous NULL-name fork — by relaxing exactly those
+    // two constraints, then re-run the migration body over the reconstructed state.
+    pool.get()
+        .await
+        .expect("pool.get (relax)")
+        .batch_execute(
+            "ALTER TABLE cameras ALTER COLUMN policy_id DROP NOT NULL; \
+             ALTER TABLE recording_policies ALTER COLUMN name DROP NOT NULL;",
+        )
+        .await
+        .expect("relax constraints for pre-0068 simulation");
+
+    let default_id = insert_default_policy_with_cap(pool, 1_000_000_000).await;
+
+    // Named operator templates used as group policies / a direct pin.
+    let p2_name = unique("P2");
+    let p3_name = unique("P3");
+    let p2 = db::create_policy(
+        pool,
+        &mk_fields(&p2_name, uniq_hours(), "continuous", "dynamic", "main"),
+        "operator",
+    )
+    .await
+    .expect("create p2")
+    .id;
+    let p3 = db::create_policy(
+        pool,
+        &mk_fields(&p3_name, uniq_hours(), "continuous", "dynamic", "main"),
+        "operator",
+    )
+    .await
+    .expect("create p3")
+    .id;
+
+    // Helper: a camera whose direct policy_id is then NULLed (an inheritor).
+    async fn null_policy_cam(pool: &deadpool_postgres::Pool, seed_policy: Uuid) -> Uuid {
+        let (id, _n) = seed_cam(pool, seed_policy).await;
+        pool.get()
+            .await
+            .unwrap()
+            .execute("UPDATE cameras SET policy_id = NULL WHERE id = $1", &[&id])
+            .await
+            .unwrap();
+        id
+    }
+    async fn add_member(pool: &deadpool_postgres::Pool, group_id: Uuid, cam_id: Uuid) {
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO camera_group_members (group_id, camera_id) VALUES ($1, $2)",
+                &[&group_id, &cam_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Group G on policy P2, group G2 with no policy (→ resolves to Default).
+    let g = db::create_group(pool, &unique("G"), Some(p2))
+        .await
+        .expect("create G");
+    let g2 = db::create_group(pool, &unique("G2"), None)
+        .await
+        .expect("create G2");
+
+    // cam_grouped: inheriting + member of G(P2) ⇒ effective = P2 today.
+    let cam_grouped = null_policy_cam(pool, default_id).await;
+    add_member(pool, g.id, cam_grouped).await;
+    // cam_group_nopol: inheriting + member of G2(no policy) ⇒ effective = Default.
+    let cam_group_nopol = null_policy_cam(pool, default_id).await;
+    add_member(pool, g2.id, cam_group_nopol).await;
+    // cam_inherit: inheriting + ungrouped ⇒ effective = Default.
+    let cam_inherit = null_policy_cam(pool, default_id).await;
+    // cam_pinned: already pinned to P3 ⇒ unchanged.
+    let (cam_pinned, _pn) = seed_cam(pool, p3).await;
+
+    // fork_pol: an anonymous NULL-name deviation fork with one owner (exercises
+    // step 5a naming). Distinct retention so it is a genuine survivor.
+    let fork_pol: Uuid = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            r"
+            INSERT INTO recording_policies
+                (is_default, name, origin, mode, live_retention_hours, archive_enabled,
+                 motion_pre_seconds, motion_post_seconds, motion_sensitivity,
+                 motion_keyframes_only, record_stream)
+            VALUES (false, NULL, 'deviation', 'continuous', $1, false, 5, 10, 'dynamic', false, 'main')
+            RETURNING id
+            ",
+            &[&uniq_hours()],
+        )
+        .await
+        .expect("insert fork_pol")
+        .get(0);
+    let (cam_fork, cam_fork_name) = seed_cam(pool, fork_pol).await;
+
+    // ── invariant: snapshot effective values BEFORE, run the migration on the
+    //    SAME connection (so the TEMP TABLE is visible), assert row-for-row equal.
+    let client = pool.get().await.expect("pool.get (invariant)");
+    client
+        .batch_execute(
+            r"
+            CREATE TEMP TABLE inv_before AS
+            SELECT c_id, p_mode, p_live_retention_hours, p_archive_enabled,
+                   p_archive_retention_hours, p_live_max_bytes, p_archive_max_bytes,
+                   p_motion_sensitivity, p_motion_threshold, p_record_stream,
+                   p_record_audio, p_live_storage_id, p_archive_storage_id,
+                   p_motion_pre_seconds, p_motion_post_seconds
+            FROM v_camera_effective_policy;
+            ",
+        )
+        .await
+        .expect("snapshot effective policy");
+
+    client
+        .batch_execute(MIGRATION_0068_SQL)
+        .await
+        .expect("run migration 0068 body");
+
+    let violations: i64 = client
+        .query_one(
+            r"
+            SELECT COUNT(*)::bigint
+            FROM v_camera_effective_policy v
+            JOIN inv_before b ON b.c_id = v.c_id
+            WHERE NOT (
+                    v.p_mode                    IS NOT DISTINCT FROM b.p_mode
+                AND v.p_live_retention_hours    IS NOT DISTINCT FROM b.p_live_retention_hours
+                AND v.p_archive_enabled         IS NOT DISTINCT FROM b.p_archive_enabled
+                AND v.p_archive_retention_hours IS NOT DISTINCT FROM b.p_archive_retention_hours
+                AND v.p_live_max_bytes          IS NOT DISTINCT FROM b.p_live_max_bytes
+                AND v.p_archive_max_bytes       IS NOT DISTINCT FROM b.p_archive_max_bytes
+                AND v.p_motion_sensitivity      IS NOT DISTINCT FROM b.p_motion_sensitivity
+                AND v.p_motion_threshold        IS NOT DISTINCT FROM b.p_motion_threshold
+                AND v.p_record_stream           IS NOT DISTINCT FROM b.p_record_stream
+                AND v.p_record_audio            IS NOT DISTINCT FROM b.p_record_audio
+                AND v.p_live_storage_id         IS NOT DISTINCT FROM b.p_live_storage_id
+                AND v.p_archive_storage_id      IS NOT DISTINCT FROM b.p_archive_storage_id
+                AND v.p_motion_pre_seconds      IS NOT DISTINCT FROM b.p_motion_pre_seconds
+                AND v.p_motion_post_seconds     IS NOT DISTINCT FROM b.p_motion_post_seconds
+            )
+            ",
+            &[],
+        )
+        .await
+        .expect("invariant compare")
+        .get(0);
+    assert_eq!(
+        violations, 0,
+        "MIGRATION 0068 INVARIANT VIOLATED: a camera's effective policy values changed"
+    );
+    drop(client);
+
+    // Every camera is now pinned (NOT NULL) to the value the view resolved before.
+    assert_eq!(
+        camera_policy_id(pool, cam_grouped).await,
+        Some(p2),
+        "a formerly-grouped camera resolves to its group's policy"
+    );
+    assert_eq!(
+        camera_policy_id(pool, cam_group_nopol).await,
+        Some(default_id),
+        "a grouped camera whose group had no policy resolves to Default"
+    );
+    assert_eq!(
+        camera_policy_id(pool, cam_inherit).await,
+        Some(default_id),
+        "an ungrouped inheritor resolves to Default"
+    );
+    assert_eq!(
+        camera_policy_id(pool, cam_pinned).await,
+        Some(p3),
+        "an already-pinned camera is unchanged"
+    );
+
+    // The NULL-name fork is named after its owning camera (step 5a).
+    assert_eq!(
+        camera_policy_id(pool, cam_fork).await,
+        Some(fork_pol),
+        "the fork's owner is unchanged"
+    );
+    assert_eq!(
+        policy_name(pool, fork_pol).await.as_deref(),
+        Some(cam_fork_name.as_str()),
+        "an anonymous fork is named after its owning camera"
+    );
+
+    // Structural guarantees: no NULL policy_id, no NULL name, names unique.
+    let client = pool.get().await.expect("pool.get (structural)");
+    let null_pids: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM cameras WHERE policy_id IS NULL",
+            &[],
+        )
+        .await
+        .expect("count null policy_id")
+        .get(0);
+    assert_eq!(
+        null_pids, 0,
+        "no camera may have a NULL policy_id after 0068"
+    );
+    let null_names: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM recording_policies WHERE name IS NULL",
+            &[],
+        )
+        .await
+        .expect("count null names")
+        .get(0);
+    assert_eq!(null_names, 0, "no policy may have a NULL name after 0068");
+    let dup_names: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM ( \
+               SELECT name FROM recording_policies GROUP BY name HAVING COUNT(*) > 1 \
+             ) d",
+            &[],
+        )
+        .await
+        .expect("count duplicate names")
+        .get(0);
+    assert_eq!(dup_names, 0, "policy names must be unique after 0068");
 }
