@@ -4044,24 +4044,101 @@ function renderCamerasRoot() {
     </div>`;
 }
 /* Recording section list: the reusable profiles cameras/groups inherit. */
+/* Retention summary for a policy-manager row: "Live 2d · Archive 30d · max 60d". */
+function fmtRetHours(h) {
+  if (h == null) return '—';
+  return (h % 24 === 0) ? (h / 24) + 'd' : h + 'h';
+}
+function retentionSummary(p) {
+  let s = 'Live ' + fmtRetHours(p.live_retention_hours);
+  if (p.archive_enabled && p.archive_retention_hours != null) s += ' · Archive ' + fmtRetHours(p.archive_retention_hours);
+  else if (p.archive_enabled) s += ' · Archive on';
+  if (p.max_retention_days != null) s += ' · max ' + p.max_retention_days + 'd';
+  return s;
+}
+
+/* Recording section = the policy manager: one row per profile with its mode,
+   the cameras that belong to it, where it records, and its retention. A
+   deviation profile (auto-created when a camera's Motion-tab edit diverged) gets
+   a subtle "auto-created when <camera> deviated" hint. Name is inline-renamed in
+   place; the row opens the full editor. Every camera belongs to exactly one
+   profile now (Phase 2), so member counts are exact. */
 function renderRecordingRoot() {
   const profs = allProfiles();
   const body = profs.map(p => {
-    const def = p.is_default ? '<span style="margin-left:auto"><span class="pill accent">Default</span></span>' : '';
-    return `<tr onclick="select('profile','${p.id}')">
-      <td><div class="lt-name"><span class="lt-ico">${icon(p.is_default?'star':'profiles',18)}</span><div class="lt-main">${esc(p.name||'Default')}</div>${def}</div></td>
+    const members = directCamsForProfile(p.id).slice()
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    const memNames = members.map(c => c.name || '(unnamed)');
+    const modeTxt = (p.mode || '').charAt(0).toUpperCase() + (p.mode || '').slice(1);
+    const st = policyStorageNames(p);
+    const stTxt = st.archive ? esc(st.live) + ' → ' + esc(st.archive) : esc(st.live);
+    const defPill = p.is_default ? '<span class="pill accent" style="margin-left:6px">Default</span>' : '';
+    const devHint = (p.origin === 'deviation' && memNames.length)
+      ? `<div style="color:var(--dim2);font-size:11px;margin-top:2px">Auto-created when ${esc(memNames[0])} deviated from its policy</div>`
+      : '';
+    const memCell = members.length
+      ? `<span title="${esc(memNames.join(', '))}">${members.length} camera${members.length === 1 ? '' : 's'}</span>`
+      : '<span style="color:var(--dim2)">No cameras</span>';
+    return `<tr onclick="select('profile','${p.id}')" style="cursor:pointer">
+      <td>
+        <div class="lt-name" style="align-items:flex-start">
+          <span class="lt-ico">${icon(p.is_default ? 'star' : 'profiles', 18)}</span>
+          <div class="lt-main" style="display:block">
+            <span style="display:inline-flex;align-items:center;gap:6px">
+              <span id="polname-${p.id}">${esc(p.name || 'Default')}</span>${defPill}
+              <button class="ghost xs" title="Rename" onclick="event.stopPropagation();startPolicyRename('${p.id}')" style="padding:1px 7px;font-size:11px">Rename</button>
+            </span>
+            ${devHint}
+          </div>
+        </div>
+      </td>
+      <td><span class="pill">${esc(modeTxt)}</span></td>
+      <td>${memCell}</td>
+      <td style="color:var(--dim)">${stTxt}</td>
+      <td style="color:var(--dim)">${esc(retentionSummary(p))}</td>
     </tr>`;
-  }).join('') || `<tr><td style="color:var(--dim2);padding:20px;text-align:center">No recording profiles.</td></tr>`;
+  }).join('') || `<tr><td colspan="5" style="color:var(--dim2);padding:20px;text-align:center">No recording profiles.</td></tr>`;
   $('right-pane').innerHTML = `
     <div class="rp-head">
       <div class="rp-head-left"><span class="rp-head-icon">${icon('profiles',22)}</span>
-        <div class="rp-head-titles"><div class="rp-head-title">Recording</div><div class="rp-head-sub">Reusable recording profiles that cameras and groups inherit</div></div></div>
+        <div class="rp-head-titles"><div class="rp-head-title">Recording</div><div class="rp-head-sub">Reusable recording profiles — every camera belongs to exactly one</div></div></div>
       <div class="rp-head-actions"><button class="primary sm" onclick="newProfile()">+ New profile</button></div>
     </div>
     <div class="card" style="padding:0">
       <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)"><div class="card-title">Recording profiles</div></div>
-      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Profile</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Profile</th><th>Mode</th><th>Cameras</th><th>Records to</th><th>Retention</th></tr></thead><tbody>${body}</tbody></table></div>
     </div>`;
+}
+
+/* Inline rename from the policy-manager list. Swaps the name to an input;
+   Enter/blur commits a name-only PUT (the backend keeps every other field —
+   resolve_policy_fields falls back to existing), Escape cancels. A rename of a
+   deviation profile promotes it to an operator template server-side. */
+function startPolicyRename(id) {
+  const span = document.getElementById('polname-' + id);
+  if (!span || span.dataset.editing === '1') return;
+  const cur = span.textContent;
+  span.dataset.editing = '1';
+  span.innerHTML = `<input value="${esc(cur)}" style="width:170px;font-size:13px"
+     onclick="event.stopPropagation()"
+     onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}else if(event.key==='Escape'){event.stopPropagation();this.dataset.cancel='1';this.blur();}"
+     onblur="commitPolicyRename('${id}', this.dataset.cancel==='1' ? null : this.value)" />`;
+  const inp = span.querySelector('input');
+  if (inp) { inp.focus(); inp.select(); }
+}
+async function commitPolicyRename(id, val) {
+  const span = document.getElementById('polname-' + id);
+  if (span) { if (span.dataset.editing !== '1') return; span.dataset.editing = ''; }
+  const p = profileById(id);
+  if (val === null || !p) { renderRecordingRoot(); return; }        // cancelled
+  const name = (val || '').trim();
+  if (!name || name === (p.name || '')) { renderRecordingRoot(); return; }
+  try {
+    await api('/config/policies/' + id, { method: 'PUT', body: JSON.stringify({ name }) });
+    await ensurePolicies();
+    toast('Renamed to "' + name + '".');
+  } catch (e) { toast('Rename failed: ' + (e.message || e)); }
+  renderRecordingRoot();
 }
 /* Users & security section list: roles (capabilities) + users (sign-in accounts). */
 function renderSecurityRoot() {
