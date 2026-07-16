@@ -53,7 +53,7 @@ touches the always-must-work recorder so it went through golden-rule-2 gates
   This ships as a permanent regression test so a future mux change that drops the
   box fails CI instead of silently re-breaking Android.
 
-**Trades knowingly accepted.** ~176 B/segment (<0.01% of a ~2 MB segment). The
+**Trades knowingly accepted.** ~176 B/segment (well under 0.01% of a ~2 MB segment). The
 Android client still needs a step *redesign* (play-until-next-frame) for smooth
 per-frame stepping — seekability is necessary but the ms-seek stepping shape is
 a separate client change; tracked separately. Fix does nothing for, and is
