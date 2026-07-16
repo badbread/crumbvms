@@ -7126,6 +7126,40 @@ pub async fn set_clip_overview_seconds(pool: &Pool, seconds: i64) -> Result<()> 
     Ok(())
 }
 
+/// Server-configurable quarantine retention in DAYS. The recorder's reconcile
+/// loop auto-purges files under `<storage_root>/_quarantine/` older than this.
+/// Clamped 0..=3650; `0` DISABLES the prune (keep quarantined files forever —
+/// the opt-out). Defaults to 14 when unset/out of range.
+pub async fn get_quarantine_retention_days(pool: &Pool) -> Result<i64> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT quarantine_retention_days FROM server_settings LIMIT 1",
+            &[],
+        )
+        .await
+        .context("get_quarantine_retention_days")?;
+    let days = row
+        .and_then(|r| r.try_get::<_, i32>("quarantine_retention_days").ok())
+        .map_or(14_i64, i64::from);
+    Ok(days.clamp(0, 3650))
+}
+
+/// Set the quarantine retention (days). Clamped 0..=3650 before storing; `0`
+/// disables the reconcile-loop prune.
+pub async fn set_quarantine_retention_days(pool: &Pool, days: i64) -> Result<()> {
+    let client = get_conn(pool).await?;
+    let clamped = i32::try_from(days.clamp(0, 3650)).unwrap_or(14);
+    client
+        .execute(
+            "UPDATE server_settings SET quarantine_retention_days = $1",
+            &[&clamped],
+        )
+        .await
+        .context("set_quarantine_retention_days")?;
+    Ok(())
+}
+
 /// Whether the first-run setup wizard has been completed. `false` (the column
 /// default) on a fresh install makes the wizard show; migration 0027 backfills
 /// `true` for installs that already had an admin user. Missing row ⇒ `false`.
@@ -9646,6 +9680,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0065_events_updated_at.sql",
         include_str!("../../../db/migrations/0065_events_updated_at.sql"),
+    ),
+    (
+        "0066_quarantine_retention_days.sql",
+        include_str!("../../../db/migrations/0066_quarantine_retention_days.sql"),
     ),
 ];
 

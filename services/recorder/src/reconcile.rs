@@ -807,6 +807,52 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
         total_orphans_found = total_orphans,
         "reconcile phase 2 complete"
     );
+
+    // ── quarantine retention prune ───────────────────────────────────────────
+    //
+    // The reconcile passes above MOVE unindexable junk into `_quarantine/` but
+    // nothing ever cleans it, so it grows unbounded (prod reached 110 GB / 36k
+    // files in a month before a manual purge). Auto-purge quarantine files older
+    // than the operator-configured retention. This is the ONLY code that ever
+    // deletes from `_quarantine/`; the orphan walk deliberately skips that dir
+    // (see `walk_storage`), so nothing here races the adoption logic.
+    //
+    // `0` DISABLES the prune (keep-forever opt-out); a read error skips the prune
+    // this pass rather than guessing a retention. See `prune_quarantine` for the
+    // deletion guards that keep this bounded to aged quarantine files only.
+    let retention_days = match db::get_quarantine_retention_days(&pool).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "reconcile phase 2: cannot read quarantine retention; skipping prune this pass");
+            0
+        }
+    };
+    if retention_days > 0 {
+        // Prod can carry DUPLICATE storage rows for the same on-disk path (see
+        // the orphan pass's note); pruning the same `_quarantine/` twice is
+        // harmless but noisy, so dedupe roots first.
+        let mut seen_roots: HashSet<PathBuf> = HashSet::new();
+        let mut pruned_files = 0u64;
+        let mut pruned_bytes = 0u64;
+        for (_id, storage_root, _stage) in &storages_to_scan {
+            if shutdown.is_cancelled() {
+                warn!("reconcile phase 2: shutdown requested; stopping quarantine prune");
+                break;
+            }
+            if !seen_roots.insert(storage_root.clone()) {
+                continue;
+            }
+            let (files, bytes) = prune_quarantine(storage_root, retention_days).await;
+            pruned_files += files;
+            pruned_bytes += bytes;
+        }
+        info!(
+            files = pruned_files,
+            bytes = pruned_bytes,
+            retention_days,
+            "reconcile phase 2: quarantine retention prune complete"
+        );
+    }
 }
 
 // ─── legacy entry point (kept for any external callers) ───────────────────────
@@ -1183,6 +1229,169 @@ fn libc_cross_device_error() -> i32 {
     18
 }
 
+// ─── prune_quarantine ────────────────────────────────────────────────────────
+
+/// Purge aged files from `<storage_root>/_quarantine/`.
+///
+/// This is a DELETION path in the footage-sacred recorder (golden rule 2 /
+/// `docs/RECORDER-CORRECTNESS.md`), so it is guarded so it is *impossible* for it
+/// to remove anything but aged quarantine files:
+///
+/// * **Scope** — it only ever descends the single directory
+///   `<storage_root>/_quarantine/`. That root is canonicalized ONCE up front, and
+///   every file it is about to delete is independently canonicalized and verified
+///   to still resolve *under* that canonical root. A `..` component or a symlink
+///   that would escape the quarantine subtree is refused, never followed out. The
+///   walk itself never traverses a symlinked directory, so it cannot wander into
+///   a camera recording dir or anywhere else.
+/// * **Kind + age** — it deletes only REGULAR files (never directories, never
+///   symlinks, never fifos/sockets) whose mtime is strictly older than
+///   `retention_days`. Directories-in-use, camera-id recording dirs, and tracked
+///   segments (which never live under `_quarantine/`) are all left untouched.
+/// * **Opt-out** — `retention_days <= 0` disables the prune entirely (keep
+///   quarantined files forever). The caller only invokes it for `> 0`, but the
+///   guard is repeated here so the function is safe on its own.
+/// * **Resilience** — a read/stat/delete error on one entry is logged and the
+///   walk continues; one bad file never aborts the sweep.
+///
+/// Returns `(files_deleted, bytes_deleted)`.
+async fn prune_quarantine(storage_root: &Path, retention_days: i64) -> (u64, u64) {
+    // OPT-OUT: 0 (or negative, defensively) = keep forever.
+    if retention_days <= 0 {
+        return (0, 0);
+    }
+
+    let quarantine_root = storage_root.join("_quarantine");
+
+    // Canonicalize the quarantine root ONCE. If it doesn't exist (nothing was
+    // ever quarantined on this disk) there is simply nothing to prune. Every file
+    // we delete below is verified to canonicalize to a path *under* this root, so
+    // resolving it here (following any symlink the operator may have made the
+    // quarantine dir itself) is the anchor the boundary check compares against.
+    let canon_root = match tokio::fs::canonicalize(&quarantine_root).await {
+        Ok(p) => p,
+        Err(_) => return (0, 0),
+    };
+
+    let cutoff = Utc::now() - Duration::days(retention_days);
+
+    let mut files_deleted = 0u64;
+    let mut bytes_deleted = 0u64;
+
+    // Explicit stack walk rooted at the canonical quarantine dir. We only ever
+    // push child directories discovered *under* canon_root (and never through a
+    // symlink), so the traversal can never leave the quarantine subtree.
+    let mut stack: Vec<PathBuf> = vec![canon_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(e) => {
+                warn!(dir = %dir.display(), error = %e, "prune_quarantine: cannot read dir; skipping");
+                continue;
+            }
+        };
+
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(dir = %dir.display(), error = %e, "prune_quarantine: error reading entry; skipping rest of dir");
+                    break;
+                }
+            };
+
+            let path = entry.path();
+
+            // lstat (symlink_metadata): never traverse or delete THROUGH a
+            // symlink. A symlink sitting inside _quarantine/ is left as-is —
+            // following it could touch footage outside the quarantine subtree.
+            let meta = match tokio::fs::symlink_metadata(&path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "prune_quarantine: cannot lstat entry; skipping");
+                    continue;
+                }
+            };
+            let ft = meta.file_type();
+
+            if ft.is_symlink() {
+                debug!(path = %path.display(), "prune_quarantine: symlink; leaving untouched");
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                // fifo/socket/device — not a quarantined segment; leave it.
+                continue;
+            }
+
+            // AGE GATE: only files strictly older than the retention cutoff. A
+            // missing/unreadable mtime fails SAFE toward keeping the file.
+            let mtime = match meta.modified() {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(path = %path.display(), error = %e, "prune_quarantine: no mtime; keeping");
+                    continue;
+                }
+            };
+            let mtime_utc: DateTime<Utc> = mtime.into();
+            if mtime_utc >= cutoff {
+                continue; // within the grace window — keep for review
+            }
+
+            // BOUNDARY RE-VERIFY (defense in depth): canonicalize the real file
+            // and confirm it STILL resolves under canon_root before deleting.
+            // read_dir never yields `.`/`..`, and we never followed a symlinked
+            // dir, so this holds by construction — but re-checking makes it
+            // impossible for any path trick or mid-walk rename to delete outside
+            // the quarantine subtree.
+            let canon_file = match tokio::fs::canonicalize(&path).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "prune_quarantine: cannot canonicalize; skipping");
+                    continue;
+                }
+            };
+            if !canon_file.starts_with(&canon_root) {
+                warn!(
+                    path = %canon_file.display(),
+                    root = %canon_root.display(),
+                    "prune_quarantine: resolved path escapes quarantine root; refusing to delete"
+                );
+                continue;
+            }
+
+            let size = meta.len();
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    files_deleted += 1;
+                    bytes_deleted += size;
+                    debug!(path = %path.display(), size, "prune_quarantine: deleted aged quarantine file");
+                }
+                Err(e) => {
+                    // One bad file must not abort the pass (log + continue).
+                    warn!(path = %path.display(), error = %e, "prune_quarantine: failed to delete aged quarantine file; continuing");
+                }
+            }
+        }
+    }
+
+    if files_deleted > 0 {
+        info!(
+            storage_root = %storage_root.display(),
+            files = files_deleted,
+            bytes = bytes_deleted,
+            retention_days,
+            "prune_quarantine: purged aged quarantine files"
+        );
+    }
+
+    (files_deleted, bytes_deleted)
+}
+
 // ─── walk_storage ────────────────────────────────────────────────────────────
 
 /// Walk a storage root directory and return all `.mp4` file paths.
@@ -1359,6 +1568,91 @@ mod tests {
             seg,
             twice
         ));
+    }
+
+    /// Quarantine-retention prune (DB-free): a `_quarantine/` tree with a mix of
+    /// aged and fresh files plus a sibling NON-quarantine recording dir. Asserts
+    /// the prune removes ONLY the aged quarantine files, leaves the fresh
+    /// quarantine files and the entire sibling dir untouched, and that
+    /// `retention_days = 0` deletes nothing (the opt-out).
+    #[tokio::test]
+    async fn prune_quarantine_deletes_only_aged_quarantine_files() {
+        const DAY: u64 = 86_400;
+        let root = tempfile::Builder::new()
+            .prefix("crumb-qprune")
+            .tempdir()
+            .expect("tempdir");
+        let root_path = root.path();
+
+        // _quarantine/<cam>/ with one aged (30d) and one fresh file.
+        let cam = Uuid::new_v4().to_string();
+        let q_cam = root_path.join("_quarantine").join(&cam);
+        tokio::fs::create_dir_all(&q_cam)
+            .await
+            .expect("mkdir q cam");
+
+        let aged = q_cam.join("20260101T000000Z.mp4");
+        tokio::fs::write(&aged, vec![0u8; 4096])
+            .await
+            .expect("write aged");
+        backdate(&aged, 30 * DAY).await;
+
+        let fresh = q_cam.join("20260716T000000Z.mp4");
+        tokio::fs::write(&fresh, vec![0u8; 2048])
+            .await
+            .expect("write fresh");
+        // fresh keeps its ~now mtime.
+
+        // A SIBLING non-quarantine recording dir with an aged "segment" — must
+        // NEVER be touched, even though it is older than the retention.
+        let rec_cam = root_path.join(&cam).join("2026").join("01").join("01");
+        tokio::fs::create_dir_all(&rec_cam)
+            .await
+            .expect("mkdir rec cam");
+        let tracked = rec_cam.join("20260101T000000Z.mp4");
+        tokio::fs::write(&tracked, vec![0u8; 800_000])
+            .await
+            .expect("write tracked");
+        backdate(&tracked, 30 * DAY).await;
+
+        // Retention 14d: aged quarantine file is 30d old → pruned; fresh kept.
+        let (files, bytes) = prune_quarantine(root_path, 14).await;
+        assert_eq!(files, 1, "exactly one aged quarantine file must be pruned");
+        assert_eq!(bytes, 4096, "reported bytes must be the aged file's size");
+        assert!(!aged.exists(), "aged quarantine file must be deleted");
+        assert!(
+            fresh.exists(),
+            "fresh quarantine file must survive the grace window"
+        );
+        assert!(
+            tracked.exists(),
+            "a sibling non-quarantine recording file must NEVER be touched"
+        );
+        assert!(
+            rec_cam.exists(),
+            "the sibling recording dir must be untouched"
+        );
+
+        // Opt-out: retention 0 must delete nothing, even the aged fresh-tree.
+        let root2 = tempfile::Builder::new()
+            .prefix("crumb-qprune-optout")
+            .tempdir()
+            .expect("tempdir2");
+        let q2 = root2.path().join("_quarantine").join(&cam);
+        tokio::fs::create_dir_all(&q2).await.expect("mkdir q2");
+        let aged2 = q2.join("20260101T000000Z.mp4");
+        tokio::fs::write(&aged2, vec![0u8; 4096])
+            .await
+            .expect("write aged2");
+        backdate(&aged2, 30 * DAY).await;
+
+        let (files0, bytes0) = prune_quarantine(root2.path(), 0).await;
+        assert_eq!(files0, 0, "retention 0 (opt-out) must delete nothing");
+        assert_eq!(bytes0, 0, "retention 0 must report zero bytes");
+        assert!(
+            aged2.exists(),
+            "retention 0 must keep even a 30-day-old file"
+        );
     }
 
     /// Prefers `CRUMB_TEST_DATABASE_URL`, falling back to the workspace-wide
