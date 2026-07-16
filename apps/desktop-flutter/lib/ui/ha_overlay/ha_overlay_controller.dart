@@ -45,7 +45,10 @@ class HaOverlayBadgeItem implements OverlayItem {
       colorHex = link.overlayColor,
       iconKey = link.overlayIcon,
       showState = link.overlayShowState,
-      showAge = link.overlayShowAge;
+      showAge = link.overlayShowAge,
+      shape = link.overlayShape,
+      bgColorHex = link.overlayBgColor,
+      outline = link.overlayOutline;
 
   final HaLink link;
 
@@ -69,12 +72,39 @@ class HaOverlayBadgeItem implements OverlayItem {
   bool showState;
   bool showAge;
 
+  /// Badge shape (migration 0062): `'dot'` (compact icon) or `'pill'`
+  /// (labelled); null = the default dot.
+  String? shape;
+
+  /// Solid background '#RRGGBB' override, or null for the default dark
+  /// background (migration 0062).
+  String? bgColorHex;
+
+  /// White outline + drop shadow so the badge pops on a busy scene.
+  bool outline;
+
+  /// True when this badge renders as a labelled pill (vs the compact dot).
+  bool get isPill => shape == 'pill';
+
   /// Display caption honoring the in-session edit (mirrors
   /// `HaLink.displayLabel`, against [labelText] instead of `link.label`).
   String get displayLabel =>
       (labelText != null && labelText!.trim().isNotEmpty)
           ? labelText!
           : link.entityId;
+
+  /// The text shown INSIDE a pill: the operator caption if set, else the
+  /// entity id minus its domain prefix (`binary_sensor.front_door` ->
+  /// `front_door`) — tidier than the raw id in a small chip. State is carried
+  /// by the icon color, not this text, so the pill width stays stable as the
+  /// entity changes.
+  String get pillLabel {
+    final t = labelText?.trim();
+    if (t != null && t.isNotEmpty) return t;
+    final id = link.entityId;
+    final dot = id.indexOf('.');
+    return dot < 0 ? id : id.substring(dot + 1);
+  }
 
   /// Session-only group membership — the placement PUT has no group field
   /// (see `OverlayItem.groupId`'s doc), so HA badge groups exist only within
@@ -103,7 +133,18 @@ class HaOverlayBadgeItem implements OverlayItem {
   static const double baseRefPx = 22;
 
   @override
-  (double w, double h) baseSize() => (baseRefPx * _scale, baseRefPx * _scale);
+  (double w, double h) baseSize() {
+    final h = baseRefPx * _scale;
+    if (!isPill) return (h, h);
+    // Pill: icon + label in one chip. The item box is a fixed size (badges
+    // aren't drag-resizable), so estimate the width from the label length in
+    // the same ref units as [baseRefPx]; the chip ellipsizes if the estimate
+    // runs short (`HaBadgeChip`), so an over-long label can't blow out the box.
+    final chars = pillLabel.length.clamp(1, 16);
+    final textRefPx = chars * baseRefPx * 0.42; // ~0.42 ref-px per glyph
+    final w = (baseRefPx * 1.5 + textRefPx) * _scale; // icon + paddings + text
+    return (w, h);
+  }
 
   @override
   void setBaseSize(double w, double h) {
@@ -139,6 +180,9 @@ class HaOverlayBadgeItem implements OverlayItem {
         icon: iconKey,
         showState: showState,
         showAge: showAge,
+        shape: shape,
+        bgColor: bgColorHex,
+        outline: outline,
         group: _groupId,
       );
 
@@ -154,6 +198,9 @@ class HaOverlayBadgeItem implements OverlayItem {
       String? icon,
       bool showState,
       bool showAge,
+      String? shape,
+      String? bgColor,
+      bool outline,
       String? group,
     });
     _x = s.x;
@@ -165,6 +212,9 @@ class HaOverlayBadgeItem implements OverlayItem {
     iconKey = s.icon;
     showState = s.showState;
     showAge = s.showAge;
+    shape = s.shape;
+    bgColorHex = s.bgColor;
+    outline = s.outline;
     _groupId = s.group;
   }
 }
@@ -288,6 +338,9 @@ class HaOverlayController {
           showState: item.showState,
           showAge: item.showAge,
           opacity: item.opacity,
+          shape: item.shape,
+          bgColor: item.bgColorHex,
+          outline: item.outline,
           label: newLabel == oldLabel ? null : newLabel,
         );
       } catch (e) {

@@ -230,6 +230,15 @@ pub struct CameraHaLink {
     pub overlay_show_age: bool,
     /// Badge opacity (0.05..1.0, migration 0060). `None` = fully opaque.
     pub overlay_opacity: Option<f32>,
+    /// Badge shape (migration 0062): `"dot"` (compact icon) or `"pill"`
+    /// (labelled). `None` ⇒ the default dot.
+    pub overlay_shape: Option<String>,
+    /// Solid background color as a '#RRGGBB' hex string (migration 0062).
+    /// `None` ⇒ the client's default dark background.
+    pub overlay_bg_color: Option<String>,
+    /// Draw a white outline + drop shadow so the badge pops on a busy scene
+    /// (migration 0062; default false).
+    pub overlay_outline: bool,
 }
 
 // ─── recording_policies ──────────────────────────────────────────────────────
