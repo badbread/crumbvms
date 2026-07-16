@@ -151,6 +151,14 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    testOptions {
+        unitTests {
+            // Robolectric needs Android resources + the resource fixtures under
+            // src/test/resources on the classpath (the sidx/no-sidx seek test).
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
@@ -190,6 +198,11 @@ dependencies {
     // which is why MainActivity is a FragmentActivity.
     implementation(libs.androidx.biometric)
 
-    // Local JVM unit tests (src/test) — currently just the update-checker SemVer compare.
+    // Local JVM unit tests (src/test) — SemVer compare + the Media3 seek-map
+    // extractor test (Gate 3: proves +global_sidx makes a fragmented segment
+    // seekable to ExoPlayer, and a no-sidx one is not).
     testImplementation(libs.junit)
+    testImplementation("androidx.media3:media3-test-utils:1.4.1")
+    testImplementation("org.robolectric:robolectric:4.11.1")
+    testImplementation("androidx.test.ext:junit:1.1.5")
 }

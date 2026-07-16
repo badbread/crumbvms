@@ -18,8 +18,11 @@
 //!
 //! # ffmpeg invocation rules (correctness items 1–4)
 //!
-//! 1. Pass `-segment_format_options movflags=+frag_keyframe+empty_moov+default_base_moof`
-//!    so fMP4 flags reach the inner mp4 muxer (not the segment muxer).
+//! 1. Pass `-segment_format_options
+//!    movflags=+frag_keyframe+empty_moov+default_base_moof+global_sidx` so fMP4
+//!    flags reach the inner mp4 muxer (not the segment muxer). `+global_sidx` is
+//!    required for Android/ExoPlayer to seek recorded playback (see the inline
+//!    comment on the arg and `docs/DECISIONS.md`).
 //! 2. Use `-c copy -segment_atclocktime 1 -reset_timestamps 1` for keyframe
 //!    alignment and clock-aligned timestamps.
 //! 3. Derive timestamps from strftime filenames, not from wall-clock at log
@@ -1232,9 +1235,23 @@ async fn run_ffmpeg_loop(
         .args(["-reset_timestamps", "1"]) // correctness #2: independent timestamps
         .args(["-segment_format", "mp4"])
         // Correctness #1: fMP4 flags must go to the inner mp4 muxer via -segment_format_options
+        //
+        // `+global_sidx` writes a single segment-index box at the front of each
+        // finished segment. Android's ExoPlayer (`FragmentedMp4Extractor`) builds
+        // its seekable `SeekMap` ONLY from an `sidx`; without one it treats the
+        // segment as unseekable and every `seekTo` (frame-step, scrub, jump)
+        // collapses to position 0. Adding it makes recorded playback seek to the
+        // requested keyframe on Android. This is still a `-c copy` remux — no
+        // re-encode — costing ~176 bytes per segment (the sidx is written into
+        // reserved space at finalize, not a rewrite), and is crash-safe: a
+        // segment killed mid-write is byte-identical with or without the flag
+        // (the sidx only lands when the muxer finalizes the file). Desktop
+        // (mpv/libmpv) scans the stream directly and is unaffected either way.
+        // See docs/DECISIONS.md ("Android recorded-playback seeking") and
+        // apps/android/.../SidxSeekTest.kt (Gate 3, the objective proof).
         .args([
             "-segment_format_options",
-            "movflags=+frag_keyframe+empty_moov+default_base_moof",
+            "movflags=+frag_keyframe+empty_moov+default_base_moof+global_sidx",
         ])
         .args(["-strftime", "1"]) // correctness #3: use strftime in filename
         // Correctness #4: stdout segment list for reliable boundary detection
