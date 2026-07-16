@@ -171,6 +171,12 @@ struct HaLinkDto {
     overlay_show_age: bool,
     /// Badge opacity (0.05..1.0, migration 0060); `null` = fully opaque.
     overlay_opacity: Option<f32>,
+    /// Badge shape (migration 0062): `"dot"` or `"pill"`; `null` = default dot.
+    overlay_shape: Option<String>,
+    /// Solid background '#RRGGBB' (migration 0062); `null` = default dark.
+    overlay_bg_color: Option<String>,
+    /// White outline + drop shadow (migration 0062; default false).
+    overlay_outline: bool,
 }
 
 impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
@@ -190,6 +196,9 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             overlay_show_state: l.overlay_show_state,
             overlay_show_age: l.overlay_show_age,
             overlay_opacity: l.overlay_opacity,
+            overlay_shape: l.overlay_shape,
+            overlay_bg_color: l.overlay_bg_color,
+            overlay_outline: l.overlay_outline,
         }
     }
 }
@@ -221,6 +230,15 @@ struct PlacementInput {
     /// Badge opacity (migration 0060); omitted = fully opaque.
     #[serde(default = "default_overlay_opacity")]
     opacity: f32,
+    /// Badge shape (migration 0062): `"dot"`/`"pill"`; omitted = default dot.
+    #[serde(default)]
+    shape: Option<String>,
+    /// Solid background '#RRGGBB' (migration 0062); omitted = default dark.
+    #[serde(default)]
+    bg_color: Option<String>,
+    /// White outline + drop shadow (migration 0062); omitted = false.
+    #[serde(default)]
+    outline: bool,
     #[serde(default)]
     label: Option<String>,
 }
@@ -240,6 +258,12 @@ fn valid_overlay_color(c: &str) -> bool {
         Some(hex) => hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()),
         None => false,
     }
+}
+
+/// Validate a badge shape token (migration 0062): the tiny closed vocabulary
+/// `dot` / `pill` (mirrors the migration CHECK so a bad value 400s clearly).
+fn valid_overlay_shape(s: &str) -> bool {
+    matches!(s, "dot" | "pill")
 }
 
 /// Validate a curated icon-slug override: short, lowercase `[a-z0-9_]` — the
@@ -430,6 +454,20 @@ async fn put_placement(
                     ));
                 }
             }
+            if let Some(s) = &p.shape {
+                if !valid_overlay_shape(s) {
+                    return Err(ApiError::BadRequest(
+                        "placement shape must be 'dot' or 'pill'".to_owned(),
+                    ));
+                }
+            }
+            if let Some(c) = &p.bg_color {
+                if !valid_overlay_color(c) {
+                    return Err(ApiError::BadRequest(
+                        "placement bg_color must be a '#RRGGBB' hex string".to_owned(),
+                    ));
+                }
+            }
             // Label edit rides the placement PUT: omitted = unchanged,
             // "" = cleared, non-empty = set (trimmed).
             label_update = p.label.as_deref().map(|l| {
@@ -449,6 +487,9 @@ async fn put_placement(
                 show_state: p.show_state,
                 show_age: p.show_age,
                 opacity: Some(p.opacity.clamp(0.05, 1.0)),
+                shape: p.shape.clone(),
+                bg_color: p.bg_color.clone(),
+                outline: p.outline,
             })
         }
     };
@@ -661,6 +702,9 @@ mod tests {
         assert!(!p.show_state);
         assert!(!p.show_age);
         assert!((p.opacity - 1.0).abs() < f32::EPSILON); // migration 0060 default
+        assert_eq!(p.shape, None); // shape/background/outline default off (0062)
+        assert_eq!(p.bg_color, None);
+        assert!(!p.outline);
         assert_eq!(p.label, None);
 
         // A null body deserializes to None (clears the placement).
@@ -674,6 +718,7 @@ mod tests {
             "x": 0.4, "y": 0.6, "size": 1.5,
             "color": "#FFB143", "icon": "doorbell",
             "show_state": true, "show_age": true, "opacity": 0.5,
+            "shape": "pill", "bg_color": "#101014", "outline": true,
             "label": "Front door"
         }))
         .unwrap();
@@ -682,7 +727,19 @@ mod tests {
         assert!(p.show_state);
         assert!(p.show_age);
         assert!((p.opacity - 0.5).abs() < f32::EPSILON);
+        assert_eq!(p.shape.as_deref(), Some("pill"));
+        assert_eq!(p.bg_color.as_deref(), Some("#101014"));
+        assert!(p.outline);
         assert_eq!(p.label.as_deref(), Some("Front door"));
+    }
+
+    #[test]
+    fn overlay_shape_validation() {
+        assert!(valid_overlay_shape("dot"));
+        assert!(valid_overlay_shape("pill"));
+        assert!(!valid_overlay_shape("square")); // not in the vocabulary
+        assert!(!valid_overlay_shape("Dot")); // case-sensitive
+        assert!(!valid_overlay_shape("")); // empty
     }
 
     #[test]

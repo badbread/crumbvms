@@ -39,6 +39,7 @@
 //   )
 
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 
 import '../../api/ha_models.dart';
 import '../overlay_editor/overlay_editor_controller.dart';
@@ -72,44 +73,204 @@ OverlayItemBuilder haBadgeItemBuilder({
       iconOverride: badge.iconKey,
       colorOverride: parseOverlayColorHex(badge.colorHex),
     );
-    return HaBadgeChip(visual: visual, selected: selected);
+    return HaBadgeChip(
+      visual: visual,
+      selected: selected,
+      isPill: badge.isPill,
+      pillLabel: badge.pillLabel,
+      bgColor: parseOverlayColorHex(badge.bgColorHex),
+      outline: badge.outline,
+      // Jelly motion (entrance pop + state-change squish) runs only in view
+      // mode; while editing the badge is a static drag target.
+      animate: !editing,
+      // A change in this key (state string / staleness) drives the squish.
+      stateKey: '${state?.state ?? ''}|$stale',
+    );
   };
 }
 
-/// The badge chip itself: a circular dark-scrim container with the resolved
-/// icon, matching the tile-badge visual language (black-0.55 rounded scrim,
-/// `live_status/live_status_badges.dart`). Sizes itself to fill whatever
-/// rect the overlay layer gives it (see `overlay_editor_layer.dart`'s
-/// `SizedBox` wrap) and scales the icon/border proportionally.
-class HaBadgeChip extends StatelessWidget {
-  const HaBadgeChip({super.key, required this.visual, this.selected = false});
+/// The default opaque badge background (migration 0062) — a near-black chip,
+/// dimmed only by the item's `overlay_opacity` (applied by the overlay layer's
+/// `Opacity` wrapper), NOT a hardcoded translucent scrim. This is the #170
+/// readability fix: at the default opacity the chip reads solid.
+const Color _kBadgeDefaultBg = Color(0xFF17171B);
+
+/// Snappy spring (matches the operator-chosen preview: k380 / damping 21).
+const SpringDescription _kJellySpring = SpringDescription(
+  mass: 1.0,
+  stiffness: 380.0,
+  damping: 21.0,
+);
+
+/// The badge chip: a `dot` (compact icon) or `pill` (icon + label) with a
+/// solid, opaque background (color pickable), an optional white outline + drop
+/// shadow so it pops on a busy scene, and snappy "jelly" motion in view mode —
+/// a spring pop-in on appear and a squish-and-rebound whenever the entity's
+/// state changes. Sizes itself to fill whatever rect the overlay layer gives it
+/// (`overlay_editor_layer.dart`'s `SizedBox`/`Positioned` wrap) — for a pill
+/// that rect is pre-widened by `HaOverlayBadgeItem.baseSize()`.
+class HaBadgeChip extends StatefulWidget {
+  const HaBadgeChip({
+    super.key,
+    required this.visual,
+    this.selected = false,
+    this.isPill = false,
+    this.pillLabel,
+    this.bgColor,
+    this.outline = false,
+    this.animate = false,
+    this.stateKey,
+  });
 
   final HaVisual visual;
   final bool selected;
 
+  /// Render as a labelled pill (vs the compact icon dot).
+  final bool isPill;
+
+  /// Text inside the pill (ignored for a dot).
+  final String? pillLabel;
+
+  /// Solid background color; null = the default dark chip ([_kBadgeDefaultBg]).
+  final Color? bgColor;
+
+  /// Draw a white outline + drop shadow.
+  final bool outline;
+
+  /// Run the jelly animation (view mode only — off while editing).
+  final bool animate;
+
+  /// Opaque token; a change (state/staleness) triggers the squish.
+  final Object? stateKey;
+
+  @override
+  State<HaBadgeChip> createState() => _HaBadgeChipState();
+}
+
+class _HaBadgeChipState extends State<HaBadgeChip>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _scale;
+
+  @override
+  void initState() {
+    super.initState();
+    _scale = AnimationController.unbounded(vsync: this, value: 1.0);
+    if (widget.animate) {
+      // Entrance pop: spring up from nothing with a slight overshoot.
+      _scale.value = 0.0;
+      _scale.animateWith(SpringSimulation(_kJellySpring, 0.0, 1.0, 0.0));
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant HaBadgeChip old) {
+    super.didUpdateWidget(old);
+    // State changed while live → squish: kick the spring with a negative
+    // velocity from the current scale so it dips then rebounds to 1.
+    if (widget.animate && widget.stateKey != old.stateKey) {
+      _scale.animateWith(
+        SpringSimulation(_kJellySpring, _scale.value, 1.0, -7.0),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _scale.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final side = constraints.biggest.shortestSide;
-        return DecoratedBox(
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.55),
-            shape: BoxShape.circle,
-            border: Border.all(
-              color: selected ? Colors.white : visual.color.withValues(alpha: 0.85),
-              width: selected ? 2.4 : (side * 0.06).clamp(1.0, 2.5).toDouble(),
-            ),
+    final chip = LayoutBuilder(
+      builder: (context, constraints) => widget.isPill
+          ? _pill(constraints.biggest.height)
+          : _dot(constraints.biggest.shortestSide),
+    );
+    if (!widget.animate) return chip;
+    return AnimatedBuilder(
+      animation: _scale,
+      builder: (context, child) => Transform.scale(
+        scale: _scale.value <= 0 ? 0.0 : _scale.value,
+        child: child,
+      ),
+      child: chip,
+    );
+  }
+
+  BoxDecoration _decoration(BoxShape shape, BorderRadius? radius) {
+    final bg = widget.bgColor ?? _kBadgeDefaultBg;
+    return BoxDecoration(
+      color: bg,
+      shape: shape,
+      borderRadius: radius,
+      border: widget.selected
+          ? Border.all(color: Colors.white, width: 2.4)
+          : (widget.outline
+              ? Border.all(color: Colors.white.withValues(alpha: 0.9), width: 1.6)
+              : null),
+      boxShadow: widget.outline
+          ? const [
+              BoxShadow(
+                color: Color(0x99000000),
+                blurRadius: 5,
+                offset: Offset(0, 2),
+              ),
+            ]
+          : null,
+    );
+  }
+
+  Widget _dot(double side) => DecoratedBox(
+        decoration: _decoration(BoxShape.circle, null),
+        child: Center(
+          child: Icon(
+            widget.visual.icon,
+            color: widget.visual.color,
+            size: (side * 0.58).clamp(10.0, 40.0).toDouble(),
           ),
-          child: Center(
-            child: Icon(
-              visual.icon,
-              color: visual.color,
-              size: (side * 0.58).clamp(10.0, 40.0).toDouble(),
+        ),
+      );
+
+  Widget _pill(double height) {
+    final iconSize = (height * 0.56).clamp(10.0, 40.0).toDouble();
+    final fontSize = (height * 0.40).clamp(8.0, 26.0).toDouble();
+    final padH = (height * 0.28).clamp(5.0, 16.0).toDouble();
+    final gap = (height * 0.14).clamp(3.0, 8.0).toDouble();
+    final bg = widget.bgColor ?? _kBadgeDefaultBg;
+    // Label uses a neutral that always reads on the chosen background; the
+    // icon carries the state color.
+    final labelColor =
+        bg.computeLuminance() > 0.5 ? Colors.black : Colors.white;
+    return DecoratedBox(
+      decoration: _decoration(
+        BoxShape.rectangle,
+        BorderRadius.circular(height / 2),
+      ),
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: padH),
+        child: Row(
+          mainAxisSize: MainAxisSize.max,
+          children: [
+            Icon(widget.visual.icon, color: widget.visual.color, size: iconSize),
+            SizedBox(width: gap),
+            Flexible(
+              child: Text(
+                widget.pillLabel ?? '',
+                maxLines: 1,
+                softWrap: false,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: labelColor,
+                  fontSize: fontSize,
+                  fontWeight: FontWeight.w600,
+                  height: 1.0,
+                ),
+              ),
             ),
-          ),
-        );
-      },
+          ],
+        ),
+      ),
     );
   }
 }

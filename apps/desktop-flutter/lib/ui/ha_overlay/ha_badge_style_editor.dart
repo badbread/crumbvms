@@ -143,6 +143,30 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
     widget.editor.notifyItemsChanged();
   }
 
+  Future<void> _pickBgColor() async {
+    final item = widget.item;
+    final result = await showColorSwatchPicker(
+      context,
+      title: 'Badge background',
+      current: parseOverlayColorHex(item.bgColorHex),
+      allowReset: item.bgColorHex != null,
+      resetLabel: 'Default (dark)',
+      allowCustom: true,
+    );
+    if (result == null || !mounted) return;
+    widget.editor.pushUndo();
+    item.bgColorHex = result.cleared ? null : overlayColorToHex(result.color!);
+    widget.editor.notifyItemsChanged();
+  }
+
+  void _setShape(String? shape) {
+    final item = widget.item;
+    if ((item.shape ?? 'dot') == (shape ?? 'dot')) return;
+    widget.editor.pushUndo();
+    item.shape = shape;
+    widget.editor.notifyItemsChanged();
+  }
+
   Future<void> _pickIcon() async {
     final item = widget.item;
     final chosen = await showDialog<Object?>(
@@ -236,6 +260,16 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
           ),
         ),
         _row(
+          'Shape',
+          Row(
+            children: [
+              _seg('Dot', !item.isPill, () => _setShape(null)),
+              const SizedBox(width: 6),
+              _seg('Pill', item.isPill, () => _setShape('pill')),
+            ],
+          ),
+        ),
+        _row(
           'Size',
           Row(
             children: [
@@ -305,6 +339,32 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
           ),
         ),
         _row(
+          'Background',
+          _propButton(
+            onTap: _pickBgColor,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 16,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    color: parseOverlayColorHex(item.bgColorHex) ??
+                        const Color(0xFF17171B),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: Colors.white54),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  item.bgColorHex == null ? 'Default dark' : 'Custom',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ),
+        _row(
           'Icon',
           _propButton(
             onTap: _pickIcon,
@@ -347,6 +407,17 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
           (v) {
             widget.editor.pushUndo();
             item.showAge = v;
+            widget.editor.notifyItemsChanged();
+          },
+        ),
+        _checkRow(
+          'Outline + shadow',
+          'Add a white outline and drop shadow so the badge pops on a busy '
+              'scene',
+          item.outline,
+          (v) {
+            widget.editor.pushUndo();
+            item.outline = v;
             widget.editor.notifyItemsChanged();
           },
         ),
@@ -416,6 +487,29 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(5)),
           ),
           child: child,
+        ),
+      );
+
+  Widget _seg(String label, bool active, VoidCallback onTap) => Expanded(
+        child: SizedBox(
+          height: 30,
+          child: TextButton(
+            onPressed: onTap,
+            style: TextButton.styleFrom(
+              backgroundColor:
+                  active ? const Color(0xFF2CA3E8) : const Color(0xFF2A2F36),
+              foregroundColor: Colors.white,
+              padding: EdgeInsets.zero,
+              minimumSize: Size.zero,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(5),
+              ),
+            ),
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+          ),
         ),
       );
 
