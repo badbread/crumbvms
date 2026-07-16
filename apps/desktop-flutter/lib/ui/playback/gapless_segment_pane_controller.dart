@@ -111,6 +111,22 @@ const Duration kBoundaryTolerance = Duration(milliseconds: 100);
 /// behavior for a few ticks, and the slaved model resumes immediately after.
 const Duration kMpvPlayheadGrace = Duration(milliseconds: 300);
 
+/// Positions at/below this count as "on the first frame of the file" for the
+/// backward frame-step edge decision (cross into the previous segment).
+/// One frame at 30 fps is ~33 ms, so 20 ms is safely inside frame zero for
+/// any camera at ≤ 50 fps. Deliberately TIGHT: a silent
+/// `frame-back-step` no-op anywhere above this falls back to an exact
+/// in-file reverse seek instead — treating a mid-file no-op as an edge is
+/// what made one back-click skip a whole segment.
+const Duration kFirstFrameEpsilon = Duration(milliseconds: 20);
+
+/// How far the exact-seek fallback steps backward when the native
+/// `frame-back-step` reports no movement mid-file: one frame at 30 fps.
+/// At lower frame rates the target still lands inside the previous frame
+/// (frames are wider); at higher ones it may skip a single frame — an
+/// acceptable rare-fallback error that can never skip a whole segment.
+const int kReverseStepFallbackMs = 33;
+
 class GaplessSegmentPaneController extends ChangeNotifier {
   GaplessSegmentPaneController({
     required this.api,
@@ -194,7 +210,16 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       ['cache', 'yes'],
       ['demuxer-readahead-secs', '2.0'],
       ['demuxer-max-bytes', '32MiB'],
-      ['demuxer-max-back-bytes', '1MiB'],
+      // The back-buffer must hold AT LEAST one full GOP or mpv's native
+      // `frame-back-step` cannot reach the previous frame from a paused
+      // mid-GOP position and silently no-ops (the "one back-click jumps a
+      // whole segment" bug: the no-movement fallback then misread the no-op
+      // as a file edge). Typical main streams here run a ~1 s keyframe
+      // interval at ~16 Mbps — 1 MiB was only ~0.5 s. 32 MiB retains the
+      // demuxed packets of an entire multi-second segment (4 s @ 16 Mbps is
+      // ~8 MiB), keeping reverse stepping cache-local; actual memory use per
+      // pane is bounded by the current file's size, not by this cap.
+      ['demuxer-max-back-bytes', '32MiB'],
       ['network-timeout', '10'],
       // Start muted, exactly like the live wall tiles (wall_screen.dart's
       // _WallTile sets mute=yes at creation). The shared AudioFollowController
@@ -660,8 +685,17 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     }
     // The step decodes asynchronously — wait for the position to actually
     // move (or time out: mpv's step commands are silent no-ops at the file
-    // edges, which is exactly the boundary case handled below).
-    final after = await _positionAfter(before);
+    // edges, which is exactly the boundary case handled below). Backward
+    // steps get a longer wait: a `frame-back-step` whose GOP fell out of the
+    // demuxer back-buffer is a real (possibly network) seek plus a
+    // decode-forward of up to a whole GOP, easily slower than the forward
+    // step's single-frame decode.
+    final after = await _positionAfter(
+      before,
+      timeout: forward
+          ? const Duration(milliseconds: 300)
+          : const Duration(milliseconds: 500),
+    );
     // A forward step at the very last frame trips EOF instead of showing a
     // new frame. `completed` (playlist ran out) is checked BEFORE trusting a
     // position emission, because media_kit may reset the position on
@@ -686,18 +720,65 @@ class GaplessSegmentPaneController extends ChangeNotifier {
           .toInt();
       return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
     }
-    // No movement — at a file edge (or a very slow decode; the thresholds
-    // keep a mid-file timeout from being misread as an edge).
-    if (!forward && before <= const Duration(milliseconds: 200)) {
-      return _openAdjacentForStep(cur, forward: false);
+    // No position emission inside the wait — but that is NOT proof of a
+    // file edge. Re-sample first: the step (or a just-finished open/seek's
+    // async position update) may have landed between the timeout and now.
+    final resampled = _player.state.position;
+    if (resampled != before) {
+      final seg = _current ?? cur;
+      final ms = (seg.startMs + resampled.inMilliseconds)
+          .clamp(seg.startMs, seg.endMs)
+          .toInt();
+      return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+    }
+    if (!forward) {
+      // A silent backward no-op mid-file means mpv could not REACH the
+      // previous frame (its GOP evicted from the demuxer back-buffer, or the
+      // internal re-seek outran the wait) — it does not mean there is no
+      // previous frame. Cross to the previous segment ONLY when the position
+      // is genuinely on the file's first frame; anywhere else, fall back to
+      // an exact in-file reverse seek of ~one frame, which can never skip a
+      // whole segment. (Misreading the mid-file no-op as an edge was the
+      // "one back-click jumps ~a whole segment" bug.)
+      if (before <= kFirstFrameEpsilon) {
+        return _openAdjacentForStep(cur, forward: false);
+      }
+      return _reverseStepFallback(cur, before);
     }
     final dur = _player.state.duration;
-    if (forward &&
-        dur > Duration.zero &&
+    if (dur > Duration.zero &&
         dur - before <= const Duration(milliseconds: 200)) {
       return _openAdjacentForStep(cur, forward: true);
     }
     return null;
+  }
+
+  /// The native `frame-back-step` reported no movement while mid-file (see
+  /// [frameStep]): step backward with an exact absolute seek instead.
+  /// Absolute seeks are hr-precise in mpv, so this decodes and shows the
+  /// frame covering `before − ~1 frame` — nearest-frame rather than
+  /// frame-exact at unusual frame rates, but strictly bounded to about one
+  /// frame of error. Returns the mapped absolute time of the target (using
+  /// the observed landing position when the player confirms it in time).
+  Future<DateTime?> _reverseStepFallback(
+    ResolvedSegment cur,
+    Duration before,
+  ) async {
+    final targetMs = (before.inMilliseconds - kReverseStepFallbackMs)
+        .clamp(0, before.inMilliseconds)
+        .toInt();
+    try {
+      await _player.seek(Duration(milliseconds: targetMs));
+    } catch (_) {
+      return null;
+    }
+    // Best-effort settle so `state.position` is truthful for the NEXT step;
+    // fall back to the seek target (the seek was issued — mpv will land it).
+    final landed = await _positionAfter(before);
+    final posMs = landed?.inMilliseconds ?? targetMs;
+    final seg = _current ?? cur;
+    final ms = (seg.startMs + posMs).clamp(seg.startMs, seg.endMs).toInt();
+    return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
   }
 
   /// First position emitted by the player that differs from [before], or
@@ -786,6 +867,19 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         await _player.seek(Duration(milliseconds: offMs));
       } catch (_) {
         /* non-fatal */
+      }
+      // Give the async position stream a bounded beat to reflect the fresh
+      // open+seek: `open()` resets `state.position` to zero, and an
+      // immediate follow-up [frameStep] reading that stale zero would judge
+      // itself "at the file start" and cross ANOTHER segment backward (the
+      // repeated whole-segment back-jump). Best-effort — stepping stays
+      // correct without it thanks to frameStep's re-sample, just less sharp.
+      try {
+        await _player.stream.position.first.timeout(
+          const Duration(milliseconds: 400),
+        );
+      } catch (_) {
+        /* best-effort */
       }
       _current = seg;
       _currentSince = DateTime.now();

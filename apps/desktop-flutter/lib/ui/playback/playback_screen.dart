@@ -185,9 +185,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   // ── filmstrip scrubbing ──────────────────────────────────────────────────
   // While dragging the scrubber we DON'T reopen the video players (that caused
-  // black flashing crossing segment boundaries). Instead the focused pane shows
-  // a server-extracted filmstrip frame at the drag position — "rock solid"
-  // scrubbing — and the real video resolve happens once on release.
+  // black flashing crossing segment boundaries). While the drag position stays
+  // inside the focused pane's loaded segment the video itself tracks it via
+  // hr-exact in-segment seeks; once the drag LEAVES the loaded segment the
+  // focused pane shows a server-extracted filmstrip frame instead (4 s-grid
+  // granularity — see _liveSeek). The real resolve happens once on release.
   bool _scrubbing = false;
   final Map<String, Uint8List?> _scrubFrames = {};
   int _scrubToken = 0;
@@ -603,10 +605,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   /// Live-scrub, fired continuously while dragging the scrubber. Panes are NOT
   /// reopened here (that flashes black across segment boundaries): panes whose
-  /// loaded segment covers `t` do a cheap in-segment keyframe seek, and the
-  /// focused pane additionally shows a server-extracted filmstrip frame so it
-  /// tracks the scrubber rock-solid even across segments. The real cross-segment
-  /// resolve happens once on release ([_commitSeek]).
+  /// loaded segment covers `t` do a cheap in-segment seek (absolute seeks are
+  /// hr-exact in mpv, so the video itself tracks `t`), and the focused pane
+  /// falls back to a server-extracted filmstrip frame only when `t` has LEFT
+  /// its loaded segment — the one case the video can't follow without a
+  /// (black-flashing) reopen. The real cross-segment resolve happens once on
+  /// release ([_commitSeek]).
   void _liveSeek(DateTime t) {
     if (!_scrubbing) {
       setState(() => _scrubbing = true);
@@ -616,10 +620,27 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       // cross-segment resolve happens once on release, in _commitSeek).
       unawaited(_panes[cam.id]?.seekWithinSegment(t) ?? Future.value());
     }
-    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
-    // server-side extract load, superseded-request-safe via a token.
     final focusId = _maximizedCameraId ?? _selectedCameraId;
     if (focusId == null) return;
+    // The server's frame endpoint snaps `ts` to a fixed 4 s grid
+    // (services/api/src/filmstrip.rs::serve_frame — shared cache keys), so
+    // the filmstrip is inherently 4 s-granular: fine for a coarse
+    // multi-segment drag, but a fine scrub (zoomed-in timeline, feeling
+    // through one motion event) moves `t` less than a grid cell and the
+    // overlay freezes on a single frame — while COVERING the live video that
+    // is tracking `t` exactly via the in-segment seeks above. So while `t`
+    // is inside the focused pane's loaded segment, drop the overlay and let
+    // the real video show through; the filmstrip remains the cross-segment
+    // fallback only.
+    if (_panes[focusId]?.currentSegment?.covers(t) ?? false) {
+      if (_scrubFrames.isNotEmpty) {
+        _scrubToken++; // an in-flight fetch must not repaint the overlay
+        setState(_scrubFrames.clear);
+      }
+      return;
+    }
+    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
+    // server-side extract load, superseded-request-safe via a token.
     final now = DateTime.now();
     if (now.difference(_lastScrubFetch) < const Duration(milliseconds: 120)) {
       return;
