@@ -275,6 +275,158 @@ class _HaBadgeChipState extends State<HaBadgeChip>
   }
 }
 
+/// The pinned/hover captions (live state text + relative age) for a set of
+/// placed badges, laid over the same video-frame geometry as the badges
+/// themselves. Extracted so BOTH view mode (`HaOverlayLayer`) and the maximized
+/// pane's EDIT mode can show them — in edit mode driven by the editor's live
+/// items, so toggling "Pin state"/"Pin time" previews immediately instead of
+/// only after save. Non-interactive (the whole layer is wrapped in
+/// `IgnorePointer` by the caller in edit mode; in view mode each chip is its
+/// own `IgnorePointer`). Caption size scales with the badge's rendered size, so
+/// it stays legible-but-proportional on a small wall tile (issue: captions were
+/// a fixed size in a fixed 180px anchor box that drifted off small tiles).
+class HaBadgeCaptions extends StatelessWidget {
+  const HaBadgeCaptions({
+    super.key,
+    required this.items,
+    required this.stateFor,
+    required this.stale,
+    required this.videoW,
+    required this.videoH,
+    this.hoverLinkId,
+  });
+
+  final List<HaOverlayBadgeItem> items;
+  final HaEntityState? Function(String entityId) stateFor;
+  final bool stale;
+  final int? videoW;
+  final int? videoH;
+
+  /// Link id currently hovered (view mode) — reveals its state+age even when
+  /// not pinned. Null in edit mode.
+  final String? hoverLinkId;
+
+  @override
+  Widget build(BuildContext context) {
+    if (videoW == null || videoH == null) return const SizedBox.shrink();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final paneW = constraints.maxWidth;
+        final paneH = constraints.maxHeight;
+        if (paneW <= 0 || paneH <= 0) return const SizedBox.shrink();
+        final children = <Widget>[];
+        for (final item in items) {
+          final hovered = item.id == hoverLinkId;
+          if (!item.showState && !item.showAge && !hovered) continue;
+          final w = _captionFor(item, paneW, paneH, hovered);
+          if (w != null) children.add(w);
+        }
+        if (children.isEmpty) return const SizedBox.shrink();
+        return Stack(clipBehavior: Clip.none, children: children);
+      },
+    );
+  }
+
+  Widget? _captionFor(
+    HaOverlayBadgeItem item,
+    double paneW,
+    double paneH,
+    bool hovered,
+  ) {
+    final (x, y, w, h) = OverlayGeometry.rectFor(
+      item,
+      paneW,
+      paneH,
+      videoW: videoW,
+      videoH: videoH,
+    );
+    final link = item.link;
+    final state = stateFor(link.entityId);
+    final visual = haVisualFor(
+      domain: link.domain,
+      deviceClass: link.deviceClass,
+      state: state?.state,
+      stale: stale,
+      iconOverride: item.iconKey,
+      colorOverride: parseOverlayColorHex(item.colorHex),
+    );
+
+    final showState = item.showState || hovered;
+    final showAge = (item.showAge || hovered) && state?.lastChanged != null;
+    if (!showState && !showAge && !hovered) return null;
+
+    // Scale text with the badge so captions stay proportional on small tiles.
+    final fState = (h * 0.42).clamp(8.0, 13.0).toDouble();
+    final fAge = (h * 0.34).clamp(7.0, 11.0).toDouble();
+    final gap = (h * 0.14).clamp(2.0, 6.0).toDouble();
+
+    final lines = <Widget>[
+      if (hovered)
+        Text(
+          item.displayLabel,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: fState,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      if (showState)
+        Text(
+          visual.label ?? (state?.state ?? 'Unknown'),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: visual.color,
+            fontSize: fState,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      if (showAge)
+        Text(
+          haRelativeAgo(state!.lastChanged!),
+          maxLines: 1,
+          style: TextStyle(color: Colors.white70, fontSize: fAge),
+        ),
+    ];
+    if (lines.isEmpty) return null;
+
+    final chip = Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: (h * 0.16).clamp(4.0, 8.0).toDouble(),
+        vertical: (h * 0.08).clamp(2.0, 4.0).toDouble(),
+      ),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.62),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: lines,
+      ),
+    );
+
+    // Center the chip on the badge horizontally (FractionalTranslation, so no
+    // fixed anchor box to drift), placed just below — flipped above near the
+    // bottom edge. Overflow at the tile edge is clipped by the tile, far less
+    // wrong than the old center-in-a-wide-box drift.
+    final cx = x + w / 2;
+    final estH = fState * (lines.length) * 1.4 + 8;
+    final below = y + h + gap + estH <= paneH;
+    return Positioned(
+      left: cx,
+      top: below ? y + h + gap : null,
+      bottom: below ? null : (paneH - y + gap),
+      child: FractionalTranslation(
+        translation: const Offset(-0.5, 0),
+        child: chip,
+      ),
+    );
+  }
+}
+
 class HaOverlayLayer extends StatefulWidget {
   const HaOverlayLayer({
     super.key,
@@ -333,7 +485,6 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
   /// Rough height estimates for flip/clamp decisions (the real widgets
   /// self-size; these only pick which side of the badge to render on).
   static const double _cardEstHeight = 150;
-  static const double _captionEstHeight = 40;
 
   @override
   void dispose() {
@@ -398,12 +549,20 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
               ),
             ),
 
-            // Pinned / hover-revealed captions, anchored to each badge.
-            for (final item in items)
-              if (item.showState ||
-                  item.showAge ||
-                  item.id == _hoverLinkId)
-                ..._captionFor(item, rectOf(item), paneW, paneH),
+            // Pinned / hover-revealed captions (shared with the edit-mode
+            // live preview via HaBadgeCaptions).
+            Positioned.fill(
+              child: IgnorePointer(
+                child: HaBadgeCaptions(
+                  items: items,
+                  stateFor: widget.stateFor,
+                  stale: widget.stale,
+                  videoW: widget.videoW,
+                  videoH: widget.videoH,
+                  hoverLinkId: _hoverLinkId,
+                ),
+              ),
+            ),
 
             if (open != null) ...[
               // Tap-away scrim: any tap outside the card dismisses it. Sits
@@ -432,104 +591,6 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
     return null;
   }
 
-  /// The caption chip(s) for one badge: live state text (pinned via
-  /// `overlay_show_state` or hover) and/or relative age (`overlay_show_age`
-  /// or hover), rendered just below the badge — flipped above it near the
-  /// bottom edge, clamped horizontally. Non-interactive (IgnorePointer) so
-  /// the video pane's own gestures keep working through them.
-  List<Widget> _captionFor(
-    HaOverlayBadgeItem item,
-    (double, double, double, double) rect,
-    double paneW,
-    double paneH,
-  ) {
-    final (x, y, w, h) = rect;
-    final link = item.link;
-    final hovered = item.id == _hoverLinkId;
-    final state = widget.stateFor(link.entityId);
-    final visual = haVisualFor(
-      domain: link.domain,
-      deviceClass: link.deviceClass,
-      state: state?.state,
-      stale: widget.stale,
-      iconOverride: item.iconKey,
-      colorOverride: parseOverlayColorHex(item.colorHex),
-    );
-
-    final showState = item.showState || hovered;
-    final showAge = (item.showAge || hovered) && state?.lastChanged != null;
-    if (!showState && !showAge) return const [];
-
-    final lines = <Widget>[
-      if (hovered)
-        Text(
-          item.displayLabel,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 10.5,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      if (showState)
-        Text(
-          visual.label ?? (state?.state ?? 'Unknown'),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: visual.color,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      if (showAge)
-        Text(
-          haRelativeAgo(state!.lastChanged!),
-          maxLines: 1,
-          style: const TextStyle(color: Colors.white54, fontSize: 10),
-        ),
-    ];
-
-    final chip = IgnorePointer(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.55),
-          borderRadius: BorderRadius.circular(5),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: lines,
-        ),
-      ),
-    );
-
-    // A fixed-width anchor box centered on the badge (clamped into the
-    // pane); the chip centers itself inside and hugs its content.
-    const anchorW = 180.0;
-    final left = (x + w / 2 - anchorW / 2)
-        .clamp(2.0, (paneW - anchorW - 2).clamp(2.0, double.infinity))
-        .toDouble();
-    final below = y + h + 4 + _captionEstHeight <= paneH;
-    return [
-      if (below)
-        Positioned(
-          left: left,
-          top: y + h + 4,
-          width: anchorW,
-          child: Center(child: chip),
-        )
-      else
-        Positioned(
-          left: left,
-          bottom: paneH - y + 4,
-          width: anchorW,
-          child: Center(child: chip),
-        ),
-    ];
-  }
 
   /// The tap card, placed BESIDE the tapped badge (right by preference,
   /// flipped left near the right edge; vertically clamped into the pane) —

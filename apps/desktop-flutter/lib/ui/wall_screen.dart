@@ -2491,6 +2491,31 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     ),
                   ),
 
+                // While editing, mirror the pinned state/time captions from the
+                // in-session editor items so toggling "Pin state"/"Pin time"
+                // previews immediately (not only after Done + save). Layered
+                // above the editor, IgnorePointer so it never eats a drag.
+                if (widget.haOverlay != null && _haEditing)
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: AnimatedBuilder(
+                        animation: widget.haOverlay!.editor,
+                        builder: (context, _) => ListenableBuilder(
+                          listenable: widget.liveStatus,
+                          builder: (context, _) => HaBadgeCaptions(
+                            items: widget.haOverlay!.editor.items
+                                .whereType<HaOverlayBadgeItem>()
+                                .toList(),
+                            stateFor: widget.liveStatus.haStateFor,
+                            stale: widget.liveStatus.haStale,
+                            videoW: _videoW,
+                            videoH: _videoH,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
                 // Close (back to wall) + camera name + zoom level.
                 Positioned(
                   top: 12,

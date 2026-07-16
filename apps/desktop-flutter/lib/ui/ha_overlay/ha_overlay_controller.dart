@@ -148,8 +148,11 @@ class HaOverlayBadgeItem implements OverlayItem {
 
   @override
   void setBaseSize(double w, double h) {
-    final v = (w > h ? w : h) / baseRefPx;
-    _scale = v.clamp(0.1, 8.0).toDouble();
+    // Derive scale from HEIGHT — the shape-invariant. A pill's baseSize width
+    // is wider than tall, so using max(w,h) made every resize multiply the
+    // scale by the pill's width factor and balloon the badge (and the dot
+    // after switching back). Height is baseRefPx*scale for both shapes.
+    _scale = (h / baseRefPx).clamp(0.1, 8.0).toDouble();
   }
 
   /// The `overlay_size` multiplier to persist (mirrors the server's clamp,

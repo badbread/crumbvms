@@ -20,6 +20,25 @@ import 'ha_entity_palette.dart';
 import 'ha_icons.dart';
 import 'ha_overlay_controller.dart' show HaOverlayBadgeItem, HaOverlayController;
 
+/// Full-gamut swatch set for the badge color + background pickers — NOT the
+/// pastel camera palette (which is tuned for timeline distinguishability).
+/// Neutrals (black → white) plus saturated hues across bright and deep, so an
+/// operator can pick anything from a solid black chip to a bright accent; the
+/// custom wheel covers everything in between.
+const List<Color> kBadgeSwatchPalette = [
+  // neutrals
+  Color(0xFF000000), Color(0xFF3A3A3A), Color(0xFF757575),
+  Color(0xFFBDBDBD), Color(0xFFFFFFFF),
+  // bright saturated
+  Color(0xFFF44336), Color(0xFFFF7043), Color(0xFFFF9800), Color(0xFFFFC107),
+  Color(0xFFFFEB3B), Color(0xFFCDDC39), Color(0xFF8BC34A), Color(0xFF4CAF50),
+  Color(0xFF009688), Color(0xFF00BCD4), Color(0xFF03A9F4), Color(0xFF2196F3),
+  Color(0xFF3F51B5), Color(0xFF673AB7), Color(0xFF9C27B0), Color(0xFFE91E63),
+  // deep / dark
+  Color(0xFFB71C1C), Color(0xFFE65100), Color(0xFF1B5E20), Color(0xFF006064),
+  Color(0xFF0D47A1), Color(0xFF4A148C),
+];
+
 /// Format a picked color back to the stored '#RRGGBB' form
 /// (the inverse of `parseOverlayColorHex`).
 String overlayColorToHex(Color c) =>
@@ -136,6 +155,7 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
       allowReset: item.colorHex != null,
       resetLabel: 'Use state color',
       allowCustom: true,
+      palette: kBadgeSwatchPalette,
     );
     if (result == null || !mounted) return;
     widget.editor.pushUndo();
@@ -152,6 +172,7 @@ class _HaBadgeStyleFormState extends State<HaBadgeStyleForm> {
       allowReset: item.bgColorHex != null,
       resetLabel: 'Default (dark)',
       allowCustom: true,
+      palette: kBadgeSwatchPalette,
     );
     if (result == null || !mounted) return;
     widget.editor.pushUndo();
