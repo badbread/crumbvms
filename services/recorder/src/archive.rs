@@ -3555,9 +3555,9 @@ mod tests {
                 let policy_row = client
                     .query_one(
                         "INSERT INTO recording_policies
-                            (is_default, live_storage_id, archive_storage_id,
+                            (name, is_default, live_storage_id, archive_storage_id,
                              live_max_bytes, archive_max_bytes, archive_enabled)
-                         VALUES (true, $1, $2, $3, $4, $5)
+                         VALUES ('Default', true, $1, $2, $3, $4, $5)
                          RETURNING id",
                         &[
                             &live_storage.id,

@@ -1919,8 +1919,8 @@ mod tests {
             let client = pool.get().await.expect("conn");
             let policy = client
                 .query_one(
-                    "INSERT INTO recording_policies (is_default, live_storage_id)
-                     VALUES (true, $1) RETURNING id",
+                    "INSERT INTO recording_policies (name, is_default, live_storage_id)
+                     VALUES ('Default', true, $1) RETURNING id",
                     &[&live_storage.id],
                 )
                 .await

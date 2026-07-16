@@ -12420,13 +12420,13 @@ mod tests {
             .query_one(
                 r"
                 INSERT INTO recording_policies (
-                    is_default, mode, live_storage_id, live_retention_hours,
+                    name, is_default, mode, live_storage_id, live_retention_hours,
                     archive_enabled, archive_storage_id, archive_schedule, archive_retention_hours,
                     motion_pre_seconds, motion_post_seconds, motion_sensitivity,
                     motion_keyframes_only, record_stream
                 )
                 VALUES (
-                    false, 'continuous', NULL, 48,
+                    'Test Non-Default Policy', false, 'continuous', NULL, 48,
                     false, NULL, NULL, NULL,
                     5, 10, 'dynamic',
                     false, 'main'
