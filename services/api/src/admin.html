@@ -282,6 +282,23 @@ details.detail-section .ds-body>.policy-section>.policy-section-title{position:s
 .adv-contrib-row .acr-fill{height:100%;min-width:3px;background:var(--accent2);border-radius:3px;}
 .adv-contrib-row .acr-val{flex:0 0 auto;color:var(--dim);min-width:78px;text-align:right;}
 .adv-contrib-row .acr-mode{flex:0 0 auto;color:var(--dim2);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:90px;}
+.adv-cam-tbl{font-size:12px;}
+.act-row{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(96px,1.5fr) 82px 66px minmax(0,1.4fr);gap:10px;align-items:center;padding:3px 0;}
+.act-head span{color:var(--dim);font-size:11px;font-weight:600;letter-spacing:.2px;white-space:nowrap;cursor:pointer;user-select:none;}
+.act-head{border-bottom:1px solid var(--border);padding-bottom:4px;margin-bottom:2px;}
+.act-head span:hover{color:var(--text);}
+.act-head .act-pol{cursor:default;}
+.act-cam{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);min-width:0;}
+.act-cam .act-meta{color:var(--dim2);font-size:11px;margin-left:6px;font-weight:400;}
+.act-fp{display:flex;align-items:center;gap:7px;min-width:0;}
+.act-fpbar{flex:1 1 auto;min-width:28px;height:6px;background:var(--surface3);border-radius:3px;overflow:hidden;}
+.act-fpfill{display:block;height:100%;min-width:3px;background:var(--accent2);border-radius:3px;}
+.act-fpnum{flex:0 0 auto;color:var(--text);white-space:nowrap;}
+.act-fpnum small,.act-rate small{color:var(--dim2);font-weight:400;}
+.act-rate,.act-ret{color:var(--dim);white-space:nowrap;text-align:right;}
+.act-pol{display:flex;align-items:center;gap:6px;min-width:0;color:var(--dim);}
+.act-pol .act-polname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.act-poldot{width:9px;height:9px;border-radius:2px;flex:0 0 auto;}
 .adv-suggest{margin-top:9px;display:flex;flex-direction:column;gap:4px;}
 .adv-suggest-item{display:flex;gap:7px;align-items:flex-start;font-size:12px;color:var(--dim);line-height:1.5;padding:3px 0;}
 .adv-suggest-item .asi-ico{flex:0 0 auto;color:var(--accent);margin-top:1px;}
@@ -4125,9 +4142,9 @@ function renderStorageRoot() {
 }
 
 /* ── Storage advisor (item #5) ── fetch GET /stats/storage and render a card per
-   storage: usage gauge, fill rate, eviction-aware days-until-full, top
-   contributors, and actionable suggestions. Admin-only endpoint; degrades to a
-   note on error so the add-location form is never blocked. */
+   storage: usage gauge, fill rate, eviction-aware days-until-full, a sortable
+   per-camera footprint table, and actionable suggestions. Admin-only endpoint;
+   degrades to a note on error so the add-location form is never blocked. */
 async function loadStorageAdvisor() {
   const host = $('storage-advisor'); if (!host) return;
   host.innerHTML = `<div class="card-hint" style="padding:6px 2px">Loading storage analytics…</div>`;
@@ -4146,7 +4163,29 @@ async function loadStorageAdvisor() {
   // Guard: $('storage-advisor') may have been replaced if the user navigated away
   // while the fetch was in flight.
   if (!$('storage-advisor')) return;
-  host.innerHTML = list.map(advStorageCard).join('');
+  ADV_STORAGES = list;
+  advRenderCards();
+}
+
+/* Last-fetched storage list + per-storage sort state for the per-camera table,
+   so a sort click can re-render the cards without re-fetching. Keyed by storage
+   id → {key, dir}; default is footprint (bytes) descending. */
+let ADV_STORAGES = [];
+const ADV_CAM_SORT = {};
+
+function advRenderCards() {
+  const host = $('storage-advisor'); if (!host) return;
+  host.innerHTML = ADV_STORAGES.map(advStorageCard).join('');
+}
+
+/* Sort the per-camera table for one storage card (toggles direction on repeat).
+   Camera sorts A→Z first; the numeric columns sort high→low first. */
+function advSortCams(sid, key) {
+  const cur = ADV_CAM_SORT[sid] || { key: 'bytes', dir: 'desc' };
+  if (cur.key === key) cur.dir = cur.dir === 'desc' ? 'asc' : 'desc';
+  else { cur.key = key; cur.dir = key === 'camera' ? 'asc' : 'desc'; }
+  ADV_CAM_SORT[sid] = cur;
+  advRenderCards();
 }
 
 /* Distinct colours for profile segments in the stacked utilization bar. Assigned
@@ -4234,24 +4273,16 @@ function advStorageCard(s) {
     ['Retention (configured)', cfgRet ? esc(cfgRet) : '<small>none, capacity-bound</small>'],
   ].map(([k, v]) => `<div class="adv-stat"><div class="as-k">${esc(k)}</div><div class="as-v">${v}</div></div>`).join('');
 
-  // Top contributors (bytes/day), bar-scaled to the largest.
-  const contribs = Array.isArray(s.top_contributors) ? s.top_contributors.slice(0, 5) : [];
-  const maxBpd = contribs.reduce((m, c) => Math.max(m, Number(c.bytes_per_day) || 0), 0) || 1;
-  const contribHTML = contribs.length ? `
-    <div class="adv-contrib">
-      <div class="adv-contrib-title">Top contributors</div>
-      ${contribs.map(c => {
-        const bpd = Number(c.bytes_per_day) || 0;
-        const w = Math.max(2, Math.round(bpd / maxBpd * 100));
-        const meta = [c.stream, c.mode].filter(Boolean).map(esc).join(' · ');
-        return `<div class="adv-contrib-row">
-          <span class="acr-name" title="${esc(c.camera || '')}">${esc(c.camera || '—')}</span>
-          <span class="acr-bar"><span class="acr-fill" style="width:${w}%"></span></span>
-          <span class="acr-val">${fmtBytes(bpd)}/day</span>
-          ${meta ? `<span class="acr-mode">${meta}</span>` : ''}
-        </div>`;
-      }).join('')}
-    </div>` : '';
+  // Per-profile colour map, keyed by policy_id in the SAME order the stacked bar
+  // above assigns colours (filtered to bytes>0), so the table's Policy column and
+  // the bar read as one picture.
+  const policyColor = {};
+  (Array.isArray(s.usage_by_policy) ? s.usage_by_policy.filter(u => Number(u.bytes) > 0) : [])
+    .forEach((u, i) => { if (u.policy_id != null) policyColor[u.policy_id] = STK_PALETTE[i % STK_PALETTE.length]; });
+
+  // Per-camera storage breakdown (footprint on disk, %, GB/day, days retained,
+  // policy) — replaces the old fill-rate-only "Top contributors" list.
+  const contribHTML = advCamTable(s, policyColor);
 
   // Suggestions (actionable strings from the backend) + a synthesized retention nudge.
   const sug = Array.isArray(s.suggestions) ? s.suggestions.slice() : [];
@@ -4283,6 +4314,68 @@ function advStorageCard(s) {
     <div class="adv-stats">${stats}</div>
     ${contribHTML}
     ${sugHTML}
+  </div>`;
+}
+
+/* Compact percentage string for the footprint column (keeps tiny slices honest). */
+function advPct(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return '0%';
+  if (n < 0.1) return '<0.1%';
+  if (n < 10) return `${n.toFixed(1)}%`;
+  return `${Math.round(n)}%`;
+}
+
+/* Per-camera storage-breakdown table for one storage card — answers "what's eating
+   my disk and why". One row per camera: footprint (bytes on disk + % of the drive,
+   with an inline bar), recent fill rate, days of footage retained, stream/mode, and
+   the properly-named policy (colour-keyed to the stacked bar via policyColor).
+   Sortable by header click; defaults to footprint descending. All values esc()'d. */
+function advCamTable(s, policyColor) {
+  const rows = Array.isArray(s.camera_footprints) ? s.camera_footprints.slice() : [];
+  if (!rows.length) return '';
+  const total = s.total_bytes || 0;
+  const sort = ADV_CAM_SORT[s.id] || { key: 'bytes', dir: 'desc' };
+  const cmp = {
+    camera: (a, b) => String(a.camera || '').localeCompare(String(b.camera || '')),
+    bytes: (a, b) => (Number(a.bytes) || 0) - (Number(b.bytes) || 0),
+    rate: (a, b) => (Number(a.bytes_per_day) || 0) - (Number(b.bytes_per_day) || 0),
+    days: (a, b) => (Number(a.days_retained) || 0) - (Number(b.days_retained) || 0),
+  }[sort.key] || (() => 0);
+  rows.sort((a, b) => sort.dir === 'asc' ? cmp(a, b) : -cmp(a, b));
+
+  const maxFp = rows.reduce((m, r) => Math.max(m, Number(r.bytes) || 0), 0) || 1;
+  const arrow = k => sort.key === k ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+  const sid = esc(s.id);
+  const head = `<div class="act-row act-head">
+    <span class="act-cam" onclick="advSortCams('${sid}','camera')">Camera${arrow('camera')}</span>
+    <span class="act-fp" onclick="advSortCams('${sid}','bytes')">Footprint${arrow('bytes')}</span>
+    <span class="act-rate" onclick="advSortCams('${sid}','rate')">Fill${arrow('rate')}</span>
+    <span class="act-ret" onclick="advSortCams('${sid}','days')">Retained${arrow('days')}</span>
+    <span class="act-pol">Policy</span>
+  </div>`;
+  const body = rows.map(r => {
+    const fp = Number(r.bytes) || 0;
+    const bpd = Number(r.bytes_per_day) || 0;
+    const pctDrive = total ? (fp / total * 100) : 0;
+    const w = Math.max(2, Math.round(fp / maxFp * 100));
+    const meta = [r.stream, r.mode].filter(Boolean).map(esc).join(' · ');
+    const days = r.days_retained != null ? advDays(r.days_retained) : '—';
+    const color = policyColor[r.policy_id] || 'var(--dim2)';
+    return `<div class="act-row">
+      <span class="act-cam" title="${esc(r.camera || '')}">${esc(r.camera || '—')}${meta ? `<small class="act-meta">${meta}</small>` : ''}</span>
+      <span class="act-fp">
+        <span class="act-fpbar"><span class="act-fpfill" style="width:${w}%"></span></span>
+        <span class="act-fpnum">${fmtBytes(fp)}<small> · ${advPct(pctDrive)}</small></span>
+      </span>
+      <span class="act-rate">${bpd > 0 ? `${fmtBytes(bpd)}<small>/day</small>` : '—'}</span>
+      <span class="act-ret">${esc(days)}</span>
+      <span class="act-pol"><span class="act-poldot" style="background:${color}"></span><span class="act-polname" title="${esc(r.policy_name || '')}">${esc(r.policy_name || '—')}</span></span>
+    </div>`;
+  }).join('');
+  return `<div class="adv-contrib">
+    <div class="adv-contrib-title">Per-camera storage — what's on disk now</div>
+    <div class="adv-cam-tbl">${head}${body}</div>
   </div>`;
 }
 
