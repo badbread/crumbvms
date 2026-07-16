@@ -865,6 +865,7 @@ async fn create_camera(
         onvif_port: body.onvif_port,
         onvif_user: onvif_user_create,
         onvif_password: onvif_password_create,
+        ptz_control_enabled: body.ptz_control_enabled,
     };
 
     let camera = db::create_camera(pool, &params).await.map_err(|e| {
@@ -926,6 +927,11 @@ async fn update_camera(
         .to_owned();
     let enabled = body.enabled.unwrap_or(existing.enabled);
     let onvif_motion = body.onvif_motion.unwrap_or(existing.onvif_motion);
+    // PTZ-controls toggle (migration 0061): a provided value sets it; omitted
+    // keeps the existing value. Simple bool, same pattern as `enabled`.
+    let ptz_control_enabled = body
+        .ptz_control_enabled
+        .unwrap_or(existing.ptz_control_enabled);
 
     // source_url / source_sub_url: Option<Option<String>>; trimmed to non-empty.
     let clean = |s: Option<String>| s.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
@@ -1155,7 +1161,8 @@ async fn update_camera(
                 motion_ha_enabled      = $25,
                 make                   = $26,
                 model                  = $27,
-                firmware               = $28
+                firmware               = $28,
+                ptz_control_enabled    = $29
             WHERE id = $1
             ",
             &[
@@ -1187,6 +1194,7 @@ async fn update_camera(
                 &make,
                 &model,
                 &firmware,
+                &ptz_control_enabled,
             ],
         )
         .await
@@ -4111,6 +4119,7 @@ fn camera_to_dto(c: Camera) -> CameraDto {
         onvif_port: c.onvif_port,
         onvif_user: c.onvif_user,
         onvif_has_password,
+        ptz_control_enabled: c.ptz_control_enabled,
     }
 }
 

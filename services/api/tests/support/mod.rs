@@ -576,6 +576,7 @@ pub async fn seed_camera(pool: &Pool) -> Uuid {
         onvif_port: None,
         onvif_user: None,
         onvif_password: None,
+        ptz_control_enabled: true,
     };
     let camera = db::create_camera(pool, &params)
         .await

@@ -495,6 +495,9 @@ fn camera_from_row(row: &tokio_postgres::Row) -> Result<Camera> {
         onvif_port: row.try_get("c_onvif_port").unwrap_or(None),
         onvif_user: row.try_get("c_onvif_user").unwrap_or(None),
         onvif_password: row.try_get("c_onvif_password").unwrap_or(None),
+        // migration 0061 — default true if the view predates the column (mirrors
+        // the served_by shim above), so a PTZ camera keeps working during upgrade.
+        ptz_control_enabled: row.try_get("c_ptz_control_enabled").unwrap_or(true),
     })
 }
 
@@ -3286,6 +3289,9 @@ pub struct CreateCameraParams<'a> {
     pub onvif_user: Option<&'a str>,
     /// ONVIF authentication password (nullable; never returned by the API).
     pub onvif_password: Option<&'a str>,
+    /// Whether this camera exposes PTZ controls (migration 0061). Callers pass
+    /// `true` unless the operator has explicitly turned PTZ off.
+    pub ptz_control_enabled: bool,
 }
 
 /// Insert a new camera row and return the full `Camera` (with joined policy).
@@ -3301,14 +3307,17 @@ pub async fn create_camera(pool: &Pool, p: &CreateCameraParams<'_>) -> Result<Ca
                  motion_source, motion_algorithm, camera_type, icon,
                  served_by, source_camera_name,
                  onvif_host, onvif_port, onvif_user, onvif_password,
-                 motion_pixel_enabled, motion_frigate_enabled, motion_ha_enabled)
+                 motion_pixel_enabled, motion_frigate_enabled, motion_ha_enabled,
+                 ptz_control_enabled)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                     $15, $16, $17, $18, $19, $20,
                     -- additive source set (migration 0049) derived from the
                     -- legacy motion_source until callers set the booleans directly
                     ($11::text = '' OR $11::text = 'pixel'),
                     ($11::text = 'frigate'),
-                    ($11::text = 'ha'))
+                    ($11::text = 'ha'),
+                    -- PTZ-controls toggle (migration 0061)
+                    $21)
             RETURNING id
             ",
             &[
@@ -3332,6 +3341,7 @@ pub async fn create_camera(pool: &Pool, p: &CreateCameraParams<'_>) -> Result<Ca
                 &p.onvif_port,
                 &p.onvif_user,
                 &p.onvif_password,
+                &p.ptz_control_enabled,
             ],
         )
         .await
@@ -9388,6 +9398,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0060_ha_overlay_opacity.sql",
         include_str!("../../../db/migrations/0060_ha_overlay_opacity.sql"),
     ),
+    (
+        "0061_camera_ptz_control.sql",
+        include_str!("../../../db/migrations/0061_camera_ptz_control.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds
@@ -11813,6 +11827,7 @@ mod tests {
             onvif_port: None,
             onvif_user: None,
             onvif_password: None,
+            ptz_control_enabled: true,
         };
         create_camera(pool, &params)
             .await

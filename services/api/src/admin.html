@@ -4601,6 +4601,8 @@ function renderCamInfoTab(c) {
         <div class="fg-ctl"><input id="ce-onvif-user" autocomplete="off" value="${esc(c.onvif_user||'')}" style="max-width:220px" /></div>
         <label class="fg-label" for="ce-onvif-pass">ONVIF password</label>
         <div class="fg-ctl"><input id="ce-onvif-pass" type="password" autocomplete="new-password" placeholder="${c.onvif_has_password?'•••• (unchanged)':'(none set)'}" style="max-width:220px" /></div>
+        <label class="fg-label" for="ce-ptz-enabled">PTZ controls</label>
+        <div class="fg-ctl"><label class="chk"><input type="checkbox" id="ce-ptz-enabled" ${(c.ptz_control_enabled ?? true)?'checked':''}/> This camera has pan/tilt/zoom controls ${infoHint('Turn OFF for a fixed ONVIF camera (no pan/tilt/zoom motor). Off hides the PTZ joystick on every client and rejects PTZ commands, even though the camera still uses ONVIF for stream discovery.')}</label></div>
       </div>
     </div>
 
@@ -6897,6 +6899,8 @@ async function saveCamEdit() {
     if ($('ce-onvif-user')) camBody.onvif_user = $('ce-onvif-user').value.trim() || null;
     if ($('ce-onvif-port')) { const pv = $('ce-onvif-port').value.trim(); camBody.onvif_port = pv === '' ? null : Number(pv); }
     if ($('ce-onvif-pass') && $('ce-onvif-pass').value) camBody.onvif_password = $('ce-onvif-pass').value;
+    // PTZ-controls toggle (Info tab). Only present when the Info tab DOM is mounted.
+    if ($('ce-ptz-enabled')) camBody.ptz_control_enabled = $('ce-ptz-enabled').checked;
     if ($('ce-src')) {
       const src = $('ce-src').value.trim();
       const sub = $('ce-src-sub').value.trim() || null;
