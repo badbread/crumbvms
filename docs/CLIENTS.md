@@ -6,8 +6,8 @@ cameras through a **client**. There are five:
 | Client | Platform | Tech | How you get it |
 |---|---|---|---|
 | **Web admin** | any browser | served by the API at `/admin` | nothing to install |
-| **Desktop** | Windows 10/11 | Tauri + native libmpv | installer (.exe/.msi) from Releases |
-| **Desktop** | Linux | Tauri + GTK/mpv | build from source |
+| **Desktop** | Windows 10/11 | Flutter + native libmpv | installer (.exe/.msi) from Releases |
+| **Desktop** | Linux | Flutter + libmpv | build from source |
 | **Apple** | macOS 13+ | native SwiftUI | zip from Releases |
 | **Apple / mobile** | iOS 16+ | native SwiftUI | *TestFlight, not set up yet* |
 | **Android** | Android 8.0+ | Kotlin / Media3 | `.apk` from Releases |
@@ -133,10 +133,10 @@ automatically.
 
 ## Linux desktop (from source)
 
-There's no prebuilt Linux artifact yet. Build the Tauri client from source on a
-machine with Rust, Node, and GTK/mpv dev libraries, see `apps/desktop/`.
-Wayland-native mpv rendering is used; a software-GL fallback works but uses more
-memory.
+There's no prebuilt Linux artifact yet. Build the Flutter client from source on a
+machine with the Flutter SDK, Rust (the client keeps a Rust core via
+`flutter_rust_bridge`), and libmpv dev libraries, see `apps/desktop-flutter/`.
+Video renders through `media_kit`/libmpv.
 
 ---
 

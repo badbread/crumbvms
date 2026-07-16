@@ -334,6 +334,21 @@ admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert
 routed over the same notification channels as every other alert — enable/tune it
 under Settings → Notifications → System alerts. No extra services or env keys.
 
+**After the wizard — Home Assistant (optional).** Also not a wizard step; it
+lives in the console under **Settings → Detection & clips → Home Assistant**
+(same panel as Frigate). OFF by default, fully self-hosted, footage never leaves
+Crumb. If the user runs Home
+Assistant, connect Crumb to it with the HA **base URL** and a **long-lived
+access token** (generate it from a dedicated *non-admin* HA user's profile), so
+cameras can be linked to HA entities and entity **badges** (door/lock/sensor
+state) dropped onto the live video. Configure it in the console
+(`PUT /config/ha {"base_url":"http://<ha-host>:8123","token":"…","enabled":true}`;
+the token is write-only, never returned, and travels only in the `Authorization`
+header). No new services, ports, or generated secrets — it reuses the existing
+stack. A headless env fallback exists (`HA_BASE_URL` + `HA_TOKEN` or, preferred,
+`HA_TOKEN_FILE` a Docker-secret path; see `.env.example`), but the console value
+wins when both are set, and the integration stays dormant until enabled.
+
 ### 6b. Drive it yourself via the REST API (full hands-off)
 All wizard steps have API equivalents. Do them in order:
 
