@@ -95,10 +95,15 @@ async fn janitor_closes_stale_open_event() {
         seed_open_event_backdated(pool, cam, &pid, Utc::now() - Duration::hours(2)).await;
 
     let cutoff = Utc::now() - Duration::minutes(30);
-    let n = db::close_stale_open_events(pool, cutoff)
+    // The janitor closes ALL stale open events globally, so a concurrent
+    // DB-backed test's janitor call may have already closed ours by the time
+    // this one runs — the returned count is therefore not deterministic under
+    // parallel test execution against the shared DB. Assert the OUTCOME on our
+    // specific event instead (below): after this call returns, our stale event
+    // must be closed, whichever call did it.
+    db::close_stale_open_events(pool, cutoff)
         .await
         .expect("close_stale_open_events");
-    assert!(n >= 1, "at least our stale event was closed");
 
     let (end_ts, lifecycle) = read_event(pool, id).await;
     let end_ts = end_ts.expect("stale event now has a non-NULL end_ts");
