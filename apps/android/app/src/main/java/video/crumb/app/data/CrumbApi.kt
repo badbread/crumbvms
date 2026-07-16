@@ -197,6 +197,14 @@ interface CrumbApi {
     @POST("clips/viewed")
     suspend fun markClipViewed(@Body body: MarkViewedRequest)
 
+    /** Home Assistant entities linked to a camera (any user with camera access). */
+    @GET("cameras/{camera_id}/ha/links")
+    suspend fun haLinks(@Path("camera_id") cameraId: String): List<HaLinkDto>
+
+    /** Live state of every HA entity (demand-cached, ~2s TTL). Any authed user. */
+    @GET("ha/states")
+    suspend fun haStates(): HaStatesResponse
+
     /**
      * License-plate reads (LPR) for the Plates tab — newest-first over
      * [cameraIds] (further viewer-scoped server-side; the route requires

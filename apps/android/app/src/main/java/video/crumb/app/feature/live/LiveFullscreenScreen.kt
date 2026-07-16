@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.ControlCamera
 import androidx.compose.material.icons.filled.DirectionsRun
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.VolumeOff
@@ -53,6 +54,8 @@ import video.crumb.app.ui.CameraNav
 import video.crumb.app.ui.HintTooltip
 import video.crumb.app.ui.ImmersiveMode
 import video.crumb.app.ui.KeepScreenOn
+import video.crumb.app.data.HaLinkDto
+import video.crumb.app.data.HaStatesResponse
 import video.crumb.app.data.PtzPresetDto
 import video.crumb.app.di.appContainer
 import video.crumb.app.ui.player.MediaFactory
@@ -111,9 +114,31 @@ fun LiveFullscreenScreen(
     var currentCameraId by remember { mutableStateOf(cameraId) }
     // Ordered enabled-camera ids (same order as the live wall) for swipe nav.
     var cameraIds by remember { mutableStateOf<List<String>>(emptyList()) }
+    var cameraNames by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     LaunchedEffect(Unit) {
         repo.visibleCameras().onSuccess { list ->
             cameraIds = list.filter { it.enabled }.map { it.id }
+            cameraNames = list.associate { it.id to it.name }
+        }
+    }
+
+    // Home Assistant: the entities linked to the current camera (drives whether
+    // the HA button shows). Read-only status sheet — no on-video badges on the
+    // small screen; a button opens the list instead.
+    var haLinks by remember { mutableStateOf<List<HaLinkDto>>(emptyList()) }
+    var haStates by remember { mutableStateOf<HaStatesResponse?>(null) }
+    var haSheetOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(currentCameraId) {
+        haLinks = emptyList()
+        haSheetOpen = false
+        repo.haLinks(currentCameraId).onSuccess { haLinks = it }
+    }
+    // Poll HA states only while the sheet is open (server demand-cache, ~2s TTL).
+    LaunchedEffect(haSheetOpen, currentCameraId) {
+        if (!haSheetOpen) return@LaunchedEffect
+        while (true) {
+            repo.haStates().onSuccess { haStates = it }
+            kotlinx.coroutines.delay(2000)
         }
     }
 
@@ -761,6 +786,20 @@ fun LiveFullscreenScreen(
                 }
             }
 
+            // Home Assistant — the camera's linked entities in an HA-style sheet.
+            // Shown only when this camera has links, so a non-HA camera stays clean.
+            if (haLinks.isNotEmpty()) {
+                HintTooltip("Home Assistant") {
+                    IconButton(onClick = { haSheetOpen = true }) {
+                        Icon(
+                            imageVector = Icons.Default.Home,
+                            contentDescription = "Home Assistant entities",
+                            tint = Color.White,
+                        )
+                    }
+                }
+            }
+
             // Motion tuner (admin-only, and hideable once cameras are dialled in).
             if (store.isAdmin && store.motionTunerEnabled) {
                 HintTooltip("Tune motion detection") {
@@ -790,6 +829,17 @@ fun LiveFullscreenScreen(
                 }
             }
         }
+        }
+
+        // Home Assistant entity sheet (read-only status). Opens over the video
+        // from the HA button; renders in HA's own dark theme so it feels native.
+        if (haSheetOpen) {
+            HaEntitiesSheet(
+                cameraName = cameraNames[currentCameraId] ?: "Camera",
+                links = haLinks,
+                states = haStates,
+                onDismiss = { haSheetOpen = false },
+            )
         }
 
         // ── In-view PTZ controls — wheel (joystick ring) OR edge-pinned arrows ──
