@@ -473,6 +473,13 @@ pub struct RecordingPolicyDto {
     /// per-camera copy-on-write fork ("custom"), not offered for reuse.
     pub name: Option<String>,
     pub is_default: bool,
+    /// `'operator'` (an operator-created/renamed template, kept at zero members)
+    /// vs `'deviation'` (auto-created after a camera; reaped when memberless).
+    /// Additive field — existing clients ignore it. Authoritative only when the
+    /// policy was read from `recording_policies` (the policy-list + policy-edit
+    /// endpoints); a policy embedded in a camera comes through the effective-policy
+    /// view, which does not carry origin, so it reads `'operator'` there.
+    pub origin: String,
     pub mode: RecordingMode,
     pub live_storage_id: Option<Uuid>,
     pub live_retention_hours: i32,

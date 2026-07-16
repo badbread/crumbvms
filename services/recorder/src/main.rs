@@ -1443,6 +1443,7 @@ mod tests {
             id: Uuid::nil(),
             name: Some("Default".to_owned()),
             is_default: true,
+            origin: "operator".to_owned(),
             mode: RecordingMode::Continuous,
             live_storage_id: None,
             live_retention_hours: 48,

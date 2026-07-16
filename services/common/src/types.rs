@@ -336,6 +336,19 @@ pub struct RecordingPolicy {
     pub name: Option<String>,
     /// `recording_policies.is_default`
     pub is_default: bool,
+    /// `recording_policies.origin` — `'operator'` for templates an operator
+    /// created (or promoted by renaming) vs `'deviation'` for a policy the
+    /// deviation-edit path auto-created after a camera. Only `'deviation'`
+    /// policies are reaped when they become memberless (`reap_orphan_policy_forks`);
+    /// `'operator'` templates are kept at zero members. Added by migration
+    /// `0067_recording_policy_origin_collapse.sql`. NOTE: this field is only
+    /// authoritative when the row was read straight from `recording_policies`
+    /// (`policy_from_row`); when a policy is resolved through
+    /// `v_camera_effective_policy` (`camera_from_row`) the view does not carry
+    /// `origin`, so it falls back to `'operator'` — never make a footage/reaper
+    /// decision from a view-derived `RecordingPolicy.origin`; read the row via
+    /// [`crate::db::get_policy`] instead.
+    pub origin: String,
     /// `recording_policies.mode`
     pub mode: RecordingMode,
     /// `recording_policies.live_storage_id`

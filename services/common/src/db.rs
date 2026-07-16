@@ -426,6 +426,15 @@ fn camera_from_row(row: &tokio_postgres::Row) -> Result<Camera> {
         id: row.get("p_id"),
         name: row.get("p_name"),
         is_default: row.get("p_is_default"),
+        // `v_camera_effective_policy` does not carry `origin` (the recorder's
+        // effective-policy view is deliberately untouched in Phase 1), so this
+        // is a placeholder — NOT the true origin. Origin-sensitive logic (the
+        // deviation-edit path, the reaper) reads the row via `get_policy`, never
+        // this view-derived value. `try_get` keeps the recorder's own test-fixture
+        // views (which also lack the column) working.
+        origin: row
+            .try_get::<_, String>("p_origin")
+            .unwrap_or_else(|_| "operator".to_owned()),
         mode,
         live_storage_id: row.get("p_live_storage_id"),
         live_retention_hours: row.get("p_live_retention_hours"),
@@ -2599,7 +2608,7 @@ pub async fn get_default_policy(pool: &Pool) -> Result<RecordingPolicy> {
     let row = client
         .query_one(
             r"
-            SELECT id, name, is_default, mode,
+            SELECT id, name, is_default, origin, mode,
                    live_storage_id, live_retention_hours,
                    archive_enabled, archive_storage_id, archive_schedule,
                    archive_retention_hours,
@@ -2628,7 +2637,7 @@ pub async fn get_policy(pool: &Pool, id: Uuid) -> Result<Option<RecordingPolicy>
     let opt = client
         .query_opt(
             r"
-            SELECT id, name, is_default, mode,
+            SELECT id, name, is_default, origin, mode,
                    live_storage_id, live_retention_hours,
                    archive_enabled, archive_storage_id, archive_schedule,
                    archive_retention_hours,
@@ -2666,6 +2675,7 @@ fn policy_from_row(row: &tokio_postgres::Row) -> Result<RecordingPolicy> {
         id: row.get("id"),
         name: row.get("name"),
         is_default: row.get("is_default"),
+        origin: row.get("origin"),
         mode,
         live_storage_id: row.get("live_storage_id"),
         live_retention_hours: row.get("live_retention_hours"),
@@ -3658,24 +3668,26 @@ pub async fn clone_policy(pool: &Pool, src_id: Uuid) -> Result<Uuid> {
     Ok(row.get(0))
 }
 
-/// Reap orphaned anonymous per-camera copy-on-write policy forks.
+/// Reap orphaned auto-created (`origin = 'deviation'`) recording policies.
 ///
-/// A COW fork ([`clone_policy`]) is an `is_default = false`, `name IS NULL` row
-/// owned by exactly one camera. When that camera is deleted (its `segments`
-/// cascade but the fork is intentionally left behind) or repointed at another
-/// policy, the fork becomes unreferenced. This deletes every such row that NO
-/// camera and NO group still references — named policies and the default are never
-/// touched (both fail the `name IS NULL` / `is_default = false` guard). Idempotent;
-/// returns the number of forks reaped. This is the "separate vacuum" the
-/// config-routes COW design refers to (run periodically by the recorder).
+/// A deviation policy is one the camera-scoped deviation-edit path (or the
+/// Phase-1 collapse migration) minted after a single camera. When that camera is
+/// deleted (its `segments` cascade but the policy is intentionally left behind)
+/// or repointed at another policy, the deviation policy becomes unreferenced.
+/// This deletes every `origin = 'deviation'` row that NO camera and NO group
+/// still references. Operator templates (`origin = 'operator'`, including a
+/// renamed-and-promoted former deviation) and the default are never touched —
+/// zero-member operator templates are the point. Idempotent; returns the number
+/// of policies reaped. Run periodically by the recorder as the backstop for the
+/// inline reap ([`reap_policy_if_orphan_deviation`]) on the write path.
 pub async fn reap_orphan_policy_forks(pool: &Pool) -> Result<u64> {
     let client = get_conn(pool).await?;
     let n = client
         .execute(
             r"
             DELETE FROM recording_policies p
-            WHERE p.is_default = false
-              AND p.name IS NULL
+            WHERE p.origin = 'deviation'
+              AND p.is_default = false
               AND NOT EXISTS (SELECT 1 FROM cameras c       WHERE c.policy_id = p.id)
               AND NOT EXISTS (SELECT 1 FROM camera_groups g WHERE g.policy_id = p.id)
             ",
@@ -3684,6 +3696,181 @@ pub async fn reap_orphan_policy_forks(pool: &Pool) -> Result<u64> {
         .await
         .context("reap_orphan_policy_forks")?;
     Ok(n)
+}
+
+/// Inline-reap a SINGLE policy iff it is now an orphaned deviation policy.
+///
+/// Called right after the deviation-edit path repoints a camera off `policy_id`
+/// (de-dup join or mint), so the UI never shows a dead policy for up to the
+/// hourly-reaper interval. Same predicate as [`reap_orphan_policy_forks`] scoped
+/// to one id: deletes only when `origin = 'deviation'`, not the default, and no
+/// camera/group references it — so it can never drop a still-referenced policy
+/// (landmine L2) or an operator template. Returns `true` if a row was deleted.
+pub async fn reap_policy_if_orphan_deviation(pool: &Pool, policy_id: Uuid) -> Result<bool> {
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute(
+            r"
+            DELETE FROM recording_policies p
+            WHERE p.id = $1
+              AND p.origin = 'deviation'
+              AND p.is_default = false
+              AND NOT EXISTS (SELECT 1 FROM cameras c       WHERE c.policy_id = p.id)
+              AND NOT EXISTS (SELECT 1 FROM camera_groups g WHERE g.policy_id = p.id)
+            ",
+            &[&policy_id],
+        )
+        .await
+        .context("reap_policy_if_orphan_deviation")?;
+    Ok(n > 0)
+}
+
+/// Promote a `'deviation'` policy to `'operator'` (it is now a keeper).
+///
+/// The deviation-edit auto-name is a convenience; when an operator explicitly
+/// renames a deviation policy they have declared it a template worth keeping, so
+/// it must survive at zero members (the reaper only touches `'deviation'` rows).
+/// No-op on a policy that is already `'operator'` or the default. Returns `true`
+/// if a row flipped.
+pub async fn promote_policy_to_operator(pool: &Pool, policy_id: Uuid) -> Result<bool> {
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute(
+            r"
+            UPDATE recording_policies
+               SET origin = 'operator'
+             WHERE id = $1 AND origin = 'deviation' AND NOT is_default
+            ",
+            &[&policy_id],
+        )
+        .await
+        .context("promote_policy_to_operator")?;
+    Ok(n > 0)
+}
+
+/// The 20 **behaviour** columns that define a policy's recording identity — every
+/// `recording_policies` column EXCEPT the identity columns `id`, `name`,
+/// `is_default`, `origin`. Two policies are "the same policy" for de-dup /
+/// collapse purposes iff they are `IS NOT DISTINCT FROM` on every column here.
+///
+/// This is the paired list to [`POLICY_COLUMNS`]; a `#[test]`
+/// ([`behaviour_columns_match_policy_columns`]) asserts the two stay in sync so a
+/// future `ALTER TABLE` that adds a knob cannot silently make two distinct
+/// policies compare equal (landmine L7), mirroring the warning [`clone_policy`]
+/// carries.
+#[cfg(test)]
+const POLICY_BEHAVIOUR_COLUMNS: &[&str] = &[
+    "mode",
+    "live_storage_id",
+    "live_retention_hours",
+    "archive_enabled",
+    "archive_storage_id",
+    "archive_schedule",
+    "archive_retention_hours",
+    "live_max_bytes",
+    "archive_max_bytes",
+    "live_min_free_pct",
+    "live_min_free_bytes",
+    "live_spill_low_water_bytes",
+    "max_retention_days",
+    "motion_pre_seconds",
+    "motion_post_seconds",
+    "motion_sensitivity",
+    "motion_threshold",
+    "motion_keyframes_only",
+    "record_stream",
+    "record_audio",
+];
+
+/// Find a NAMED policy whose behaviour columns exactly (`IS NOT DISTINCT FROM`,
+/// NULL-safe) match the given field-set — the de-dup lookup for the
+/// deviation-edit path (§3.2 of the policy-model design).
+///
+/// Comparison is done IN SQL (not in Rust) so the `real`-typed `motion_threshold`
+/// / `live_min_free_pct` compare against the exact bound value the API would
+/// write, with no float round-trip asymmetry and no epsilon (a revert writes back
+/// the exact value it read, so exact equality is the correct predicate).
+///
+/// Only `name IS NOT NULL` rows are candidates: a camera "joins" a *named* policy
+/// (Default, an operator template, or another camera's named deviation), never a
+/// stray anonymous fork left by a mixed-version writer. Preference order —
+/// `is_default DESC, (origin = 'operator') DESC, name ASC` — makes a field-set
+/// equal to Default's rejoin **Default**, then any operator template, with a
+/// deterministic name tiebreak. Returns the winning policy id, or `None` when no
+/// named policy matches (the caller then edits-in-place or mints a new one).
+pub async fn find_matching_policy(pool: &Pool, f: &PolicyFields<'_>) -> Result<Option<Uuid>> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt(
+            r"
+            SELECT id FROM recording_policies
+            WHERE name IS NOT NULL
+              AND mode                       IS NOT DISTINCT FROM $1
+              AND live_storage_id            IS NOT DISTINCT FROM $2
+              AND live_retention_hours       IS NOT DISTINCT FROM $3
+              AND archive_enabled            IS NOT DISTINCT FROM $4
+              AND archive_storage_id         IS NOT DISTINCT FROM $5
+              AND archive_schedule           IS NOT DISTINCT FROM $6
+              AND archive_retention_hours    IS NOT DISTINCT FROM $7
+              AND live_max_bytes             IS NOT DISTINCT FROM $8
+              AND archive_max_bytes          IS NOT DISTINCT FROM $9
+              AND live_min_free_pct          IS NOT DISTINCT FROM $10
+              AND live_min_free_bytes        IS NOT DISTINCT FROM $11
+              AND live_spill_low_water_bytes IS NOT DISTINCT FROM $12
+              AND max_retention_days         IS NOT DISTINCT FROM $13
+              AND motion_pre_seconds         IS NOT DISTINCT FROM $14
+              AND motion_post_seconds        IS NOT DISTINCT FROM $15
+              AND motion_sensitivity         IS NOT DISTINCT FROM $16
+              AND motion_threshold           IS NOT DISTINCT FROM $17
+              AND motion_keyframes_only      IS NOT DISTINCT FROM $18
+              AND record_stream              IS NOT DISTINCT FROM $19
+              AND record_audio               IS NOT DISTINCT FROM $20
+            ORDER BY is_default DESC, (origin = 'operator') DESC, name ASC
+            LIMIT 1
+            ",
+            &[
+                &f.mode,
+                &f.live_storage_id,
+                &f.live_retention_hours,
+                &f.archive_enabled,
+                &f.archive_storage_id,
+                &f.archive_schedule,
+                &f.archive_retention_hours,
+                &f.live_max_bytes,
+                &f.archive_max_bytes,
+                &f.live_min_free_pct,
+                &f.live_min_free_bytes,
+                &f.live_spill_low_water_bytes,
+                &f.max_retention_days,
+                &f.motion_pre_seconds,
+                &f.motion_post_seconds,
+                &f.motion_sensitivity,
+                &f.motion_threshold,
+                &f.motion_keyframes_only,
+                &f.record_stream,
+                &f.record_audio,
+            ],
+        )
+        .await
+        .context("find_matching_policy")?;
+    Ok(opt.map(|r| r.get::<_, Uuid>("id")))
+}
+
+/// True if any recording policy already carries `name` (case-sensitive exact).
+///
+/// Used by the deviation-edit mint to auto-name a new policy after its camera
+/// with `" 2"`/`" 3"` suffixes on collision, under the `CAMERA_POLICY_COW_LOCK`
+/// advisory lock (so the check→insert is race-free).
+pub async fn policy_name_taken(pool: &Pool, name: &str) -> Result<bool> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM recording_policies WHERE name = $1)",
+            &[&name],
+        )
+        .await
+        .context("policy_name_taken")?;
+    Ok(row.get(0))
 }
 
 /// Count how many cameras currently reference `policy_id`.
@@ -3777,7 +3964,7 @@ pub async fn set_camera_policy(
 /// All policy columns except `id` — the canonical column list for SELECTs and
 /// the basis for clones/inserts. Keep in sync with [`policy_from_row`].
 const POLICY_COLUMNS: &str = r"
-    id, name, is_default, mode,
+    id, name, is_default, origin, mode,
     live_storage_id, live_retention_hours,
     archive_enabled, archive_storage_id, archive_schedule,
     archive_retention_hours,
@@ -3841,14 +4028,24 @@ pub struct PolicyFields<'a> {
 }
 
 /// Create a new **named** (non-default) recording policy and return it.
-pub async fn create_policy(pool: &Pool, f: &PolicyFields<'_>) -> Result<RecordingPolicy> {
+///
+/// `origin` is `'operator'` for an operator-created template (the console's
+/// create-policy flow) or `'deviation'` for a policy the camera-scoped
+/// deviation-edit path auto-created after a camera (only the latter is reaped
+/// when memberless — see [`reap_orphan_policy_forks`]). Callers pass a value
+/// the `origin` CHECK accepts; the DB default is `'operator'`.
+pub async fn create_policy(
+    pool: &Pool,
+    f: &PolicyFields<'_>,
+    origin: &str,
+) -> Result<RecordingPolicy> {
     let client = get_conn(pool).await?;
     let row = client
         .query_one(
             &format!(
                 r"
                 INSERT INTO recording_policies (
-                    name, is_default, mode,
+                    name, is_default, origin, mode,
                     live_storage_id, live_retention_hours,
                     archive_enabled, archive_storage_id, archive_schedule,
                     archive_retention_hours,
@@ -3862,7 +4059,7 @@ pub async fn create_policy(pool: &Pool, f: &PolicyFields<'_>) -> Result<Recordin
                     -- positional placeholders below need no renumbering.
                     max_retention_days
                 )
-                VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                VALUES ($1, false, $22, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
                 RETURNING {POLICY_COLUMNS}
                 "
@@ -3889,6 +4086,7 @@ pub async fn create_policy(pool: &Pool, f: &PolicyFields<'_>) -> Result<Recordin
                 &f.record_stream,
                 &f.record_audio,
                 &f.max_retention_days,
+                &origin,
             ],
         )
         .await
@@ -9685,6 +9883,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0066_quarantine_retention_days.sql",
         include_str!("../../../db/migrations/0066_quarantine_retention_days.sql"),
     ),
+    (
+        "0067_recording_policy_origin_collapse.sql",
+        include_str!("../../../db/migrations/0067_recording_policy_origin_collapse.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds
@@ -11485,6 +11687,45 @@ mod tests {
         assert_ne!(ENSURE_POLICIES_LOCK_KEY, RUN_MIGRATIONS_LOCK_KEY);
         assert_ne!(ENSURE_POLICIES_LOCK_KEY, RECORDER_SINGLETON_LOCK_KEY);
         assert_ne!(RUN_MIGRATIONS_LOCK_KEY, RECORDER_SINGLETON_LOCK_KEY);
+    }
+
+    /// L7 tripwire: the de-dup / collapse behaviour-column list
+    /// ([`POLICY_BEHAVIOUR_COLUMNS`]) plus the four identity columns (`id`,
+    /// `name`, `is_default`, `origin`) must EXACTLY cover [`POLICY_COLUMNS`] (the
+    /// full row). A future `ALTER TABLE recording_policies ADD COLUMN` that adds a
+    /// recording knob but forgets to add it to the behaviour list would make two
+    /// genuinely-different policies compare equal in `find_matching_policy` and
+    /// the collapse migration — silently merging their footage budgets. This test
+    /// fails the moment the two lists diverge.
+    #[test]
+    fn behaviour_columns_match_policy_columns() {
+        use std::collections::BTreeSet;
+        let all: BTreeSet<&str> = POLICY_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let identity = ["id", "name", "is_default", "origin"];
+        let mut expected: BTreeSet<&str> = POLICY_BEHAVIOUR_COLUMNS.iter().copied().collect();
+        expected.extend(identity);
+        assert_eq!(
+            all, expected,
+            "POLICY_COLUMNS and POLICY_BEHAVIOUR_COLUMNS + identity columns have \
+             diverged — a recording_policies column was added/removed without \
+             updating both lists (see landmine L7 in docs/design/POLICY-MODEL.md)"
+        );
+        // No identity column may leak into the behaviour set.
+        for id_col in identity {
+            assert!(
+                !POLICY_BEHAVIOUR_COLUMNS.contains(&id_col),
+                "identity column '{id_col}' must not appear in POLICY_BEHAVIOUR_COLUMNS"
+            );
+        }
+        assert_eq!(
+            POLICY_BEHAVIOUR_COLUMNS.len(),
+            20,
+            "expected 20 behaviour columns"
+        );
     }
 
     // ── migration-runner SQL-preprocessing invariants ────────────────────────

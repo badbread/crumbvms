@@ -143,7 +143,7 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Recorder code | `services/recorder/src/recording.rs`, `archive.rs`, `reconcile.rs`, `motion.rs` | |
 | Tests | mandatory for this area, no exceptions | |
 | Design docs | `docs/MOTION-RECORDING.md` if the mechanism changes | Documents the ratified mechanism |
-| Policy UI | `admin.html` policy/storage editors; desktop Recorder Health panels in `app.js` | Per-policy knobs (size caps, headroom, `max_retention_days`) surface here |
+| Policy UI | `admin.html` policy/storage editors; desktop Recorder Health panels in `app.js` | Per-policy knobs (size caps, headroom, `max_retention_days`) surface here. Policy MODEL (named membership, `origin`, deviation-edit, collapse migration) is `docs/design/POLICY-MODEL.md`; Phase 1 is server-only (endpoint shapes unchanged, so no client change), Phase 3 reworks this UI |
 | Decision log | `docs/DECISIONS.md` | Retention/recording design choices are exactly what it exists for |
 | Migration | rows C above if schema changes | |
 
