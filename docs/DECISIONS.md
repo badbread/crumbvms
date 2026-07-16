@@ -8,6 +8,33 @@ revisit.
 
 ---
 
+## 2026-07-16, CI publishes amd64-only Docker images (dropped the arm64 multi-arch leg)
+
+CI (`.github/workflows/ci.yml`) built the api + recorder images multi-arch
+(`linux/amd64,linux/arm64`) on every push to `main`. The arm64 leg is a
+QEMU-emulated Rust release compile that took ~60-70 min, so every backend
+deploy off a `main` sha waited well over an hour for an image, versus ~7 min
+for amd64 alone.
+
+**Chosen:** build `linux/amd64` only (dropped the arm64 platform and the QEMU
+setup step).
+
+**Rejected:** amd64 on every push + arm64 only on release tags (`v*`). Cleaner
+in theory, but the project has no tagged releases yet and no known ARM
+operator, so it was ceremony for a hypothetical.
+
+**Trade-off accepted:** anyone wanting to run the **Crumb server** (recorder +
+api) on ARM hardware — a Raspberry Pi / ARM SBC, an ARM cloud instance, or an
+Apple Silicon Mac via Docker Desktop — no longer gets a native image and would
+run amd64 under emulation (slow) or build it locally. The clients are
+unaffected (Android ships its own APK; the desktop app is a separate build).
+
+**Revisit when:** a real operator wants to self-host the server on ARM, or the
+project starts cutting tagged public releases for varied hardware — at which
+point re-add arm64, ideally gated to `tags: v*` so per-push deploys stay fast.
+
+---
+
 ## 2026-07-15, One shared drag-to-place overlay editor (PTZ panels + HA badges) with raw-tracked snapping; per-badge HA style stored on camera_ha_links (migration 0059)
 
 The desktop client had two drag-to-place editors: the shared
