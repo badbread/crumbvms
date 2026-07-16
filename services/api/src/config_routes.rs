@@ -420,7 +420,7 @@ async fn get_clip_overview(
     }))
 }
 
-/// `PUT /config/clip-overview` — set the overview length (db clamps to 10..=120).
+/// `PUT /config/clip-overview` — set the overview length (db clamps to 10..=30).
 async fn set_clip_overview(
     _admin: AdminUser,
     State(state): State<AppState>,

@@ -6981,7 +6981,7 @@ pub async fn set_clip_pre_roll_seconds(pool: &Pool, seconds: i64) -> Result<()> 
 /// the render path (`clips::MAX_CLIP_MEDIA_SECS`), so a compromised/buggy admin
 /// client can never re-arm the runaway-transcode DoS.
 pub const CLIP_OVERVIEW_SECONDS_MIN: i64 = 10;
-pub const CLIP_OVERVIEW_SECONDS_MAX: i64 = 120;
+pub const CLIP_OVERVIEW_SECONDS_MAX: i64 = 30;
 
 /// Server-configurable clip overview length in seconds (how long a generated clip
 /// renders). Clamped to [`CLIP_OVERVIEW_SECONDS_MIN`]..=[`CLIP_OVERVIEW_SECONDS_MAX`];

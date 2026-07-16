@@ -388,14 +388,14 @@ const POST_ROLL_MS: i64 = 8_000;
 /// of an event — a short, representative snippet — NOT the full event: to watch a
 /// whole event the operator opens the timeline (which streams segments directly,
 /// with no whole-event transcode). The render length is the admin-tunable
-/// `clip_overview_seconds` setting (default 30, clamped 10..=120), and this
+/// `clip_overview_seconds` setting (default 30, clamped 10..=30), and this
 /// constant is the second lock: even if that setting were somehow out of range,
-/// the render window can never exceed 120 s, so a broken `end_ts` (never closed →
+/// the render window can never exceed 30 s, so a broken `end_ts` (never closed →
 /// "until now", or a 10-hour event) can never again make the renderer concat
 /// thousands of 4 s segments into a multi-hour transcode — which in prod
 /// (2026-07-16) pinned the API at 600%+ CPU and starved ALL clip playback. Equals
 /// `db::CLIP_OVERVIEW_SECONDS_MAX`. See docs/design/CLIP-MODEL.md §2.1.
-const MAX_CLIP_MEDIA_SECS: i64 = 120;
+const MAX_CLIP_MEDIA_SECS: i64 = 30;
 
 /// Compute the overview render window for an event `[ev_start, ev_end?)`:
 /// `[ev_start − pre, min(ev_start − pre + overview, ev_end + post))`, then capped
@@ -458,7 +458,7 @@ pub fn media_routes() -> Router<AppState> {
 
 /// Resolve a clip id to its overview render window + metadata. Pre-roll and
 /// overview length are admin-configurable server settings (defaults 2s / 30s,
-/// clamped 0..=9 and 10..=120); post-roll is fixed. See [`overview_window`].
+/// clamped 0..=9 and 10..=30); post-roll is fixed. See [`overview_window`].
 async fn resolve_clip(state: &AppState, id: &str) -> Result<ResolvedClip, ApiError> {
     let pre_secs = db::get_clip_pre_roll_seconds(state.pool())
         .await
@@ -835,7 +835,7 @@ async fn prepare_clip_inputs(
 /// Both are the same `[start, end)` overview window. Writes to a unique temp file
 /// then atomically renames so a crashed/concurrent run never leaves a half file
 /// for `ServeFile` to serve. Holds the clip-gen semaphore for the transcode only
-/// (never the client's read), which — together with the ≤120 s window and the
+/// (never the client's read), which — together with the ≤30 s window and the
 /// per-clip singleflight in the caller — is what removed the slow-reader
 /// permit-starvation vector from the 2026-07-16 incident.
 async fn generate_clip_file(
@@ -1233,15 +1233,17 @@ mod tests {
     #[test]
     fn overview_window_ongoing_is_full_overview_length() {
         // No end (ongoing): window is exactly [start-pre, start-pre+overview].
+        // Overview 25 s is within the 10..=30 clamp, so it's not touched by the
+        // 30 s ceiling — this isolates the ongoing (no-truncation) behavior.
         let start = t(500_000);
-        let (s, e) = overview_window(start, None, 2, 45);
+        let (s, e) = overview_window(start, None, 2, 25);
         assert_eq!(s, start - Duration::seconds(2));
-        assert_eq!(e, s + Duration::seconds(45));
+        assert_eq!(e, s + Duration::seconds(25));
     }
 
     #[test]
     fn overview_window_hard_ceiling_and_inverted_guard() {
-        // The 120 s compiled ceiling holds even for an out-of-range overview
+        // The 30 s compiled ceiling holds even for an out-of-range overview
         // length (the DB clamp is the first lock; this is the second).
         let start = t(0);
         let (s, e) = overview_window(start, None, 0, 10_000);

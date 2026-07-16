@@ -26,8 +26,9 @@ snippet of an event, *by definition* independent of event length. The rendered
 window is `[start − pre_roll, start − pre_roll + overview_len)`, truncated to
 the event end (+ post-roll) when the event is shorter. `overview_len` is an
 admin-tunable server setting (`clip_overview_seconds`, default 30, clamped
-10–120, same pattern as `clip_pre_roll_seconds`); a compiled hard ceiling
-(120 s) remains as the safety floor. Watching the *whole* event is the
+10–30, same pattern as `clip_pre_roll_seconds`); a compiled hard ceiling
+(30 s) remains as the safety floor — a clip is a glance-level overview, and
+beyond ~30 s it drifts back toward "watch the event". Watching the *whole* event is the
 timeline's job — recorded playback streams segments directly with no
 whole-event transcode — so clients surface event duration + an "ongoing" flag
 in the feed and make the existing "View on timeline" deep-link the explicit
@@ -63,7 +64,7 @@ by design, and the footage-affecting analogue already exists
 - *Janitor in the recorder / DB trigger*: the recorder must not gain DB
   lifecycle duties near the footage path (golden rule 2); a trigger hides
   policy in the schema and can't express "stale" cleanly.
-- *503 on semaphore exhaustion*: with singleflight + short (≤120 s) transcodes
+- *503 on semaphore exhaustion*: with singleflight + short (≤30 s) transcodes
   the queue drains in seconds; bounded awaiting is simpler than teaching four
   clients a retry-after protocol.
 
