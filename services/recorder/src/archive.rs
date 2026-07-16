@@ -3555,9 +3555,9 @@ mod tests {
                 let policy_row = client
                     .query_one(
                         "INSERT INTO recording_policies
-                            (is_default, live_storage_id, archive_storage_id,
+                            (name, is_default, live_storage_id, archive_storage_id,
                              live_max_bytes, archive_max_bytes, archive_enabled)
-                         VALUES (true, $1, $2, $3, $4, $5)
+                         VALUES ('Default', true, $1, $2, $3, $4, $5)
                          RETURNING id",
                         &[
                             &live_storage.id,
@@ -5997,10 +5997,11 @@ mod tests {
             (p, g)
         }
 
-        /// Phase 3 (a): set_group_members ADDING a camera that had a direct policy
-        /// clears its policy_id (NULL) and the view resolves it to the GROUP profile.
+        /// Phase 2 (write-through): set_group_members ADDING a camera PINS its
+        /// policy_id directly to the group's policy (no inheritance), and the view
+        /// resolves it to that same policy.
         #[tokio::test]
-        async fn set_group_members_clears_added_camera_override() {
+        async fn set_group_members_pins_added_camera_to_group_policy() {
             let Some(url) = test_db_url() else {
                 eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
                 return;
@@ -6008,12 +6009,12 @@ mod tests {
             let fx = setup_policy(&url, None, None, false).await;
             let (p2, grp) = named_policy_and_group(&fx.pool, "P2", "G").await;
 
-            // A camera that initially holds a DIRECT override distinct from the group's.
+            // A camera that initially holds a DIRECT policy distinct from the group's.
             let cam = insert_cam(&fx.pool, Some(fx.policy_id)).await;
             assert_eq!(
                 cam_policy_id(&fx.pool, cam).await,
                 Some(fx.policy_id),
-                "precondition: camera has a direct override"
+                "precondition: camera has its own direct policy"
             );
 
             // Add it to the group (the wire path the admin UI / config-routes use).
@@ -6021,8 +6022,8 @@ mod tests {
 
             assert_eq!(
                 cam_policy_id(&fx.pool, cam).await,
-                None,
-                "joining a group must clear the direct policy_id"
+                Some(p2),
+                "joining a group PINS the member's policy_id to the group's policy"
             );
             assert_eq!(
                 effective_pid(&fx.pool, cam).await,
@@ -6031,10 +6032,9 @@ mod tests {
             );
         }
 
-        /// Phase 3 (b): a camera NOT added to any group keeps its direct policy.
-        /// set_group_members must only clear the cameras it ADDS — a pre-existing
-        /// member dropped from the new set, and an unrelated ungrouped camera, are
-        /// untouched.
+        /// Phase 2 (write-through): set_group_members must only re-pin the cameras
+        /// it ADDS — a pre-existing member dropped from the new set, and an
+        /// unrelated ungrouped camera, keep whatever policy they hold.
         #[tokio::test]
         async fn set_group_members_leaves_nonmembers_override_intact() {
             let Some(url) = test_db_url() else {
@@ -6065,17 +6065,17 @@ mod tests {
                 fx.policy_id,
                 "ungrouped camera still resolves to its own direct policy"
             );
-            // The joiner was cleared.
+            // The joiner was re-pinned to the group's policy.
             assert_eq!(
                 cam_policy_id(&fx.pool, joiner).await,
-                None,
-                "the added camera's override is cleared"
+                Some(p2),
+                "the added camera is pinned to the group's policy"
             );
 
             // Now DROP the joiner from the group (members = []) — it becomes ungrouped
-            // and is NOT re-cleared (it was already NULL; the point is the UPDATE only
-            // touches camera_ids, never a removed member). Give it a direct policy back
-            // first to prove dropped members are left alone by the clear.
+            // and is NOT re-pinned (the UPDATE only touches camera_ids, never a removed
+            // member). Give it a different direct policy first to prove dropped members
+            // are left alone by the write-through.
             db::set_camera_policy_id(&fx.pool, joiner, fx.policy_id)
                 .await
                 .unwrap();

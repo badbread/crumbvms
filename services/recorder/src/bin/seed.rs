@@ -271,6 +271,7 @@ async fn seed_default_policy(
         .query_one(
             r"
             INSERT INTO recording_policies (
+                name,
                 is_default,
                 mode,
                 live_storage_id,
@@ -286,6 +287,7 @@ async fn seed_default_policy(
                 record_stream
             )
             VALUES (
+                'Default',  -- name
                 true,       -- is_default
                 'continuous',
                 $1,         -- live_storage_id

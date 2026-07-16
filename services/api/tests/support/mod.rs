@@ -301,13 +301,13 @@ async fn seed_default_policy_if_absent(pool: &Pool) {
         .execute(
             r"
             INSERT INTO recording_policies (
-                is_default, mode, live_storage_id, live_retention_hours,
+                name, is_default, mode, live_storage_id, live_retention_hours,
                 archive_enabled, archive_storage_id, archive_schedule, archive_retention_hours,
                 motion_pre_seconds, motion_post_seconds, motion_sensitivity,
                 motion_keyframes_only, record_stream
             )
             VALUES (
-                true, 'continuous', NULL, 48,
+                'Default', true, 'continuous', NULL, 48,
                 false, NULL, NULL, NULL,
                 5, 10, 'dynamic',
                 false, 'main'
@@ -547,14 +547,16 @@ pub async fn seed_storage(pool: &Pool, path: &str) -> Uuid {
     storage.id
 }
 
-/// Seed a minimal camera (own policy cloned from the global default) and
-/// return its id.
+/// Seed a minimal camera JOINED to the global Default policy row and return its
+/// id. (Phase 2: cameras belong to a named policy; `recording_policies.name` is
+/// `NOT NULL`, so the old `clone_default_policy` NULL-name fork is gone.)
 pub async fn seed_camera(pool: &Pool) -> Uuid {
     let name = unique("cam");
     let go2rtc_name = unique("go2rtc");
-    let policy_id = db::clone_default_policy(pool)
+    let policy_id = db::get_default_policy(pool)
         .await
-        .expect("clone_default_policy");
+        .expect("get_default_policy")
+        .id;
     let params = db::CreateCameraParams {
         name: &name,
         go2rtc_name: &go2rtc_name,

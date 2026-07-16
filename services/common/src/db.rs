@@ -4286,17 +4286,23 @@ pub async fn create_group(pool: &Pool, name: &str, policy_id: Option<Uuid>) -> R
     Ok(camera_group_from_row(&row))
 }
 
-/// Update a camera group's name and/or policy. `policy_id = None` clears the
-/// group's policy (members then inherit the global default). Returns the updated
-/// group, or `None` if no such group.
+/// Update a camera group's name and/or policy, then WRITE THROUGH the (new)
+/// policy onto every current member's `policy_id`. `policy_id = None` pins the
+/// members to the global Default row. Returns the updated group, or `None` if no
+/// such group.
+///
+/// Phase 2: a group PINS its members (no inheritance), so changing the group's
+/// policy must re-pin the members in the same transaction — otherwise the group
+/// row and the cameras it names would disagree.
 pub async fn update_group(
     pool: &Pool,
     id: Uuid,
     name: &str,
     policy_id: Option<Uuid>,
 ) -> Result<Option<CameraGroup>> {
-    let client = get_conn(pool).await?;
-    let opt = client
+    let mut client = get_conn(pool).await?;
+    let tx = client.transaction().await.context("update_group: begin")?;
+    let opt = tx
         .query_opt(
             r"
             UPDATE camera_groups SET name = $2, policy_id = $3 WHERE id = $1
@@ -4306,6 +4312,23 @@ pub async fn update_group(
         )
         .await
         .context("update_group")?;
+    if opt.is_some() {
+        // Write-through: re-pin every current member to the group's effective
+        // policy (its policy_id, else the Default row).
+        tx.execute(
+            r"
+            UPDATE cameras SET policy_id = COALESCE(
+                $2,
+                (SELECT id FROM recording_policies WHERE is_default LIMIT 1)
+            )
+            WHERE id IN (SELECT camera_id FROM camera_group_members WHERE group_id = $1)
+            ",
+            &[&id, &policy_id],
+        )
+        .await
+        .context("update_group: re-pin members to the group policy")?;
+    }
+    tx.commit().await.context("update_group: commit")?;
     Ok(opt.as_ref().map(camera_group_from_row))
 }
 
@@ -4328,17 +4351,17 @@ pub async fn delete_group(pool: &Pool, id: Uuid) -> Result<u64> {
 /// 1. delete all current members of THIS group,
 /// 2. delete any membership of the incoming cameras in OTHER groups (the move),
 /// 3. insert the new memberships,
-/// 4. clear the DIRECT per-camera `policy_id` on every added camera.
+/// 4. PIN each added camera's `policy_id` to the group's effective policy
+///    (write-through).
 ///
-/// Step 4 enforces the Phase-3 authoritative-grouping invariant: a grouped
-/// camera is governed by its GROUP's recording profile, so it may not also hold
-/// a direct per-camera policy/fork. The effective-policy COALESCE puts
-/// `cameras.policy_id` FIRST (it would shadow the group), so leaving it set
-/// would silently ignore the group profile. Clearing it makes the group win.
-/// Only the cameras being ADDED here are touched; a camera DROPPED from this
-/// group (a former member not in `camera_ids`) becomes ungrouped and keeps its
-/// `policy_id` — an ungrouped camera is allowed a direct override. A cleared
-/// camera's now-unreferenced anonymous fork (if any) is left for the periodic
+/// Step 4 is the Phase-2 write-through: inheritance is gone (`cameras.policy_id`
+/// is `NOT NULL`), so a group no longer resolves a member's policy through the
+/// effective-policy view — it assigns the pointer directly. Each ADDED camera is
+/// pinned to the group's own `policy_id`, or the Default row when the group has
+/// none. Only the cameras being ADDED here are touched; a camera DROPPED from
+/// this group (a former member not in `camera_ids`) keeps whatever policy it
+/// holds — an ungrouped camera may deviate freely. A camera repointed away from
+/// a now-memberless deviation policy leaves it for the periodic
 /// [`reap_orphan_policy_forks`] reaper.
 pub async fn set_group_members(pool: &Pool, group_id: Uuid, camera_ids: &[Uuid]) -> Result<()> {
     let mut client = get_conn(pool).await?;
@@ -4376,17 +4399,25 @@ pub async fn set_group_members(pool: &Pool, group_id: Uuid, camera_ids: &[Uuid])
         .await
         .context("set_group_members: insert")?;
 
-        // 4. Phase 3: a grouped camera is AUTHORITATIVELY governed by its
-        //    group's profile and may not also hold a direct per-camera
-        //    override. Clear the direct policy_id on exactly the cameras being
-        //    added so the group wins (the effective-policy COALESCE puts
-        //    camera.policy_id first). Same transaction as the membership change.
+        // 4. Phase 2 (write-through): inheritance is gone (cameras.policy_id is
+        //    NOT NULL), so a group no longer RESOLVES a member's policy — it PINS
+        //    it. Set each ADDED camera's policy_id directly to the group's
+        //    effective policy (its own policy_id, else the Default row), in the
+        //    same transaction as the membership change. Only the cameras being
+        //    added are touched; a camera DROPPED from this group keeps whatever
+        //    policy it holds (an ungrouped camera may deviate freely).
         tx.execute(
-            "UPDATE cameras SET policy_id = NULL WHERE id = ANY($1)",
-            &[&camera_ids],
+            r"
+            UPDATE cameras SET policy_id = COALESCE(
+                (SELECT g.policy_id FROM camera_groups g WHERE g.id = $2),
+                (SELECT id FROM recording_policies WHERE is_default LIMIT 1)
+            )
+            WHERE id = ANY($1)
+            ",
+            &[&camera_ids, &group_id],
         )
         .await
-        .context("set_group_members: clear direct policy on added members")?;
+        .context("set_group_members: pin added members to the group policy")?;
     }
 
     tx.commit().await.context("set_group_members: commit")?;
@@ -6362,12 +6393,14 @@ pub async fn ensure_policy_advanced_storage_columns(pool: &Pool) -> Result<()> {
 /// * `recording_policies.name` — adds a nullable label; backfills only the
 ///   single default row to `"Default"`. Every other (cloned per-camera) policy
 ///   keeps `name = NULL` ("custom").
-/// * `cameras.policy_id` becomes nullable so a camera can INHERIT (NULL ⇒ its
-///   group's policy, else the global default). Every existing camera already has
-///   a non-NULL `policy_id`, so the `COALESCE` join keeps its exact current
-///   policy — zero behaviour change.
-/// * `camera_groups` / `camera_group_members` are created empty; with no groups,
-///   inheritance is inert until an operator creates one.
+/// * `cameras.policy_id` is kept `NOT NULL` (Phase 2, migration 0068): every
+///   camera belongs to a named policy. The shim re-adds the constraint, guarded
+///   on "no NULL rows exist" so a mixed-version boot that left an inheriting
+///   camera won't crash it. (It historically DROPped NOT NULL here — landmine
+///   L4; that is the line this phase inverts.)
+/// * `camera_groups` / `camera_group_members` are retained (dormant) for
+///   rollback comfort; groups no longer resolve a camera's policy (write-through
+///   pins members directly). A later cleanup migration drops the tables.
 /// * `one_group_per_camera` enforces a camera belongs to AT MOST ONE group.
 ///
 /// Safe to re-run on every startup (`IF NOT EXISTS` / `IF EXISTS` / idempotent
@@ -6401,11 +6434,25 @@ pub async fn ensure_named_policies_and_groups(pool: &Pool) -> Result<()> {
                 ALTER TABLE recording_policies ADD COLUMN IF NOT EXISTS name text;
                 UPDATE recording_policies SET name = 'Default' WHERE is_default AND name IS NULL;
 
-                -- 2. Allow a camera to inherit (NULL policy_id). Idempotent: DROP NOT
-                --    NULL is a no-op if already nullable.
-                ALTER TABLE cameras ALTER COLUMN policy_id DROP NOT NULL;
+                -- 2. Every camera belongs to a policy (Phase 2, migration 0068).
+                --    RE-ADD the NOT NULL constraint that migration established, so
+                --    this per-boot shim can never silently undo it (landmine L4:
+                --    it previously DROPed NOT NULL on every boot). GUARDED on the
+                --    absence of NULL policy_id rows so a mixed-version boot that
+                --    left an inheriting camera (only an OLD binary can still write
+                --    NULL) will not crash the shim -- the new code never writes
+                --    NULL, and the next clean boot re-adds it. No-op once already SET.
+                DO $ensure_policy_not_null$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM cameras WHERE policy_id IS NULL) THEN
+                        ALTER TABLE cameras ALTER COLUMN policy_id SET NOT NULL;
+                    END IF;
+                END
+                $ensure_policy_not_null$;
 
-                -- 3. Camera groups + their (optional) shared policy.
+                -- 3. Camera groups + their (optional) shared policy. Retained
+                --    (dormant) post-Phase-2 for rollback comfort; a later cleanup
+                --    migration drops them.
                 CREATE TABLE IF NOT EXISTS camera_groups (
                     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                     name       text NOT NULL,
@@ -9887,6 +9934,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0067_recording_policy_origin_collapse.sql",
         include_str!("../../../db/migrations/0067_recording_policy_origin_collapse.sql"),
     ),
+    (
+        "0068_recording_policy_explicit_membership.sql",
+        include_str!("../../../db/migrations/0068_recording_policy_explicit_membership.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds
@@ -12306,13 +12357,13 @@ mod tests {
             .query_one(
                 r"
                 INSERT INTO recording_policies (
-                    is_default, mode, live_storage_id, live_retention_hours,
+                    name, is_default, mode, live_storage_id, live_retention_hours,
                     archive_enabled, archive_storage_id, archive_schedule, archive_retention_hours,
                     motion_pre_seconds, motion_post_seconds, motion_sensitivity,
                     motion_keyframes_only, record_stream
                 )
                 VALUES (
-                    false, 'continuous', NULL, 48,
+                    'Test Non-Default Policy', false, 'continuous', NULL, 48,
                     false, NULL, NULL, NULL,
                     5, 10, 'dynamic',
                     false, 'main'

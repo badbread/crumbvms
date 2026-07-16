@@ -10,12 +10,24 @@ revisit.
 
 ## 2026-07-16, Recording policies: explicit named membership replaces NULL-inherit + anonymous COW forks
 
-**Status.** Phase 1 (server-only) landed here: the `origin` column + the
-collapse migration (`0067`), `create_camera` joins Default, the deviation-edit
-semantics, and the reaper predicate. Phases 2 (explicit membership: `policy_id
-NOT NULL`, groups retire) and 3 (admin UI) are staged per
-`docs/design/POLICY-MODEL.md` §8 and NOT yet landed — NULL-inherit and the
-camera-groups tables are intentionally still live.
+**Status.** Phase 1 (server-only) landed the `origin` column + the collapse
+migration (`0067`), `create_camera` joins Default, the deviation-edit semantics,
+and the reaper predicate. **Phase 2 (server-only) landed here:** migration
+`0068` drops the 0020/0021 grouped-camera triggers, pins every inheriting camera
+to the policy the effective-policy view resolved (grouped → group's policy, else
+Default), and enforces `cameras.policy_id NOT NULL` + `recording_policies.name
+NOT NULL` + a unique index on `name`; the boot shim
+(`ensure_named_policies_and_groups`) that previously ran `ALTER COLUMN policy_id
+DROP NOT NULL` on **every boot** was inverted to a guarded `SET NOT NULL` (L4);
+the group endpoints became **write-through** (a group pins its members'
+`policy_id` directly — no inheritance), `camera` policy assignment maps the old
+`Some(None)` "clear to inherit" to joining Default, and `require_assignable_policy`
+reduced to existence. The `camera_groups`/`camera_group_members` tables are kept
+DORMANT for one release (rollback comfort); `v_camera_effective_policy` is
+untouched (its COALESCE degenerates to leg 1). Phase 3 (admin UI: policy
+manager, member lists, bulk assign, group-UI retirement, dropping the `"Custom —
+…"` label fallbacks, and the final groups-table drop) is staged per
+`docs/design/POLICY-MODEL.md` §8 and NOT yet landed.
 
 **Context.** A camera's effective recording policy resolved through a
 three-leg COALESCE (`v_camera_effective_policy`: own `policy_id` → group's
