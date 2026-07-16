@@ -3254,6 +3254,114 @@ pub async fn storage_top_contributors(pool: &Pool) -> Result<Vec<StorageContribu
         .collect())
 }
 
+/// One camera's on-disk footprint on a single storage device — the row behind
+/// the storage advisor's per-camera breakdown table.
+///
+/// Returned by [`storage_camera_footprints`]; one row per (storage, camera) that
+/// has at least one segment on that storage, sorted by descending `bytes`.
+#[derive(Debug, Clone)]
+pub struct StorageCameraFootprint {
+    pub storage_id: Uuid,
+    pub camera_id: Uuid,
+    pub camera_name: String,
+    /// Effective recording policy id (own → group → default) — the key the UI
+    /// colour-matches against the stacked-by-profile utilization bar.
+    pub policy_id: Uuid,
+    /// Effective recording mode (`continuous` / `motion`).
+    pub mode: String,
+    /// The stream (`main` / `sub`) that accounts for the most bytes on this
+    /// storage for this camera.
+    pub stream: String,
+    /// `SUM(size_bytes)` (all stages, all time) for this camera on this storage —
+    /// the actual footprint sitting on disk.
+    pub bytes: i64,
+    /// `SUM(size_bytes)` over the trailing 7 days / 7.0 — the recent fill rate in
+    /// bytes/day (zero when the camera wrote nothing in the last week).
+    pub bytes_per_day: f64,
+    /// Observed footage age span in days (`MAX(end_ts) - MIN(start_ts)`). `None`
+    /// when the camera has no segment with an `end_ts` yet.
+    pub span_days: Option<f64>,
+}
+
+/// Per-(storage, camera) on-disk footprint for the storage advisor's per-camera
+/// breakdown table.
+///
+/// One aggregate pass computes, per camera on each storage: the total tracked
+/// bytes on disk (the footprint), the trailing-7d fill rate, and the observed
+/// footage age span. A companion CTE picks each camera's dominant stream (the one
+/// holding the most bytes). The effective mode/policy come from
+/// `v_camera_effective_policy` (same own→group→default resolution as
+/// [`storage_top_contributors`]). O(1) round-trips.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn storage_camera_footprints(pool: &Pool) -> Result<Vec<StorageCameraFootprint>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            WITH per_stream AS (
+                SELECT s.storage_id, s.camera_id, s.stream,
+                       SUM(s.size_bytes) AS stream_bytes
+                FROM segments s
+                GROUP BY s.storage_id, s.camera_id, s.stream
+            ),
+            dominant AS (
+                SELECT DISTINCT ON (storage_id, camera_id)
+                       storage_id, camera_id, stream
+                FROM per_stream
+                ORDER BY storage_id, camera_id, stream_bytes DESC
+            ),
+            agg AS (
+                SELECT
+                    s.storage_id,
+                    s.camera_id,
+                    SUM(s.size_bytes)::bigint AS bytes,
+                    COALESCE(
+                        SUM(s.size_bytes) FILTER (WHERE s.start_ts >= now() - interval '7 days'),
+                        0
+                    )::double precision / 7.0 AS bytes_per_day,
+                    EXTRACT(EPOCH FROM (MAX(s.end_ts) - MIN(s.start_ts)))::double precision
+                        / 86400.0 AS span_days
+                FROM segments s
+                GROUP BY s.storage_id, s.camera_id
+            )
+            SELECT
+                a.storage_id,
+                a.camera_id,
+                v.c_name                          AS camera_name,
+                v.p_id                            AS policy_id,
+                COALESCE(v.p_mode, 'continuous')  AS mode,
+                d.stream                          AS stream,
+                a.bytes,
+                a.bytes_per_day,
+                a.span_days
+            FROM agg a
+            JOIN v_camera_effective_policy v ON v.c_id = a.camera_id
+            JOIN dominant d ON d.storage_id = a.storage_id AND d.camera_id = a.camera_id
+            ORDER BY a.storage_id, a.bytes DESC
+            ",
+            &[],
+        )
+        .await
+        .context("storage_camera_footprints")?;
+    Ok(rows
+        .iter()
+        .map(|row| StorageCameraFootprint {
+            storage_id: row.get("storage_id"),
+            camera_id: row.get("camera_id"),
+            camera_name: row.get("camera_name"),
+            policy_id: row.get("policy_id"),
+            mode: row.get("mode"),
+            stream: row.get("stream"),
+            bytes: row.get("bytes"),
+            bytes_per_day: row.get("bytes_per_day"),
+            span_days: row.get("span_days"),
+        })
+        .collect())
+}
+
 /// Map every camera to its EFFECTIVE policy id (own → group → default), with the
 /// camera's display name. Same COALESCE resolution as [`policy_usage_rollup`] but
 /// without the segment join — used to attach camera_count / camera_names to each

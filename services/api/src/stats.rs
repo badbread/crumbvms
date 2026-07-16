@@ -554,6 +554,33 @@ pub struct TopContributorDto {
     pub mode: String,
 }
 
+/// One camera's on-disk footprint on a storage device, for the per-camera
+/// storage-breakdown table ("what's eating my disk and why").
+#[derive(Debug, Serialize)]
+pub struct CameraFootprintDto {
+    /// Camera display name.
+    pub camera: String,
+    /// Total bytes this camera occupies on this storage right now (all stages,
+    /// all time) — the actual footprint on disk.
+    pub bytes: i64,
+    /// Recent fill rate in bytes/day (trailing 7 days). `0` when idle.
+    pub bytes_per_day: f64,
+    /// Dominant stream on this storage — `"main"` or `"sub"`.
+    pub stream: String,
+    /// Recording mode of the camera's effective policy — `"continuous"` or
+    /// `"motion"`.
+    pub mode: String,
+    /// Observed footage age span in days (`max(end_ts) − min(start_ts)`). `null`
+    /// when unknown (no completed segments yet).
+    pub days_retained: Option<f64>,
+    /// Effective policy id — matches a `usage_by_policy[].policy_id` so the UI
+    /// colour-keys this row to the stacked bar above.
+    pub policy_id: Uuid,
+    /// Properly-resolved policy label (named policy, `"Default"`, or
+    /// `"<camera> · custom"` for a per-camera override).
+    pub policy_name: String,
+}
+
 /// One recording-profile's share of a storage device's used space, for the
 /// stacked-by-profile utilization bar.
 #[derive(Debug, Serialize)]
@@ -607,6 +634,9 @@ pub struct StorageAdvisorDto {
     /// Per-recording-profile share of this storage's used space (largest first).
     /// The remainder up to `used_bytes` is footage Crumb didn't write ("other").
     pub usage_by_policy: Vec<StoragePolicyUsageDto>,
+    /// One row per camera with footage on this storage, sorted by footprint
+    /// (bytes on disk) descending — the "what's eating my disk and why" table.
+    pub camera_footprints: Vec<CameraFootprintDto>,
     /// Actionable suggestion strings (0–3).
     pub suggestions: Vec<String>,
 }
@@ -638,7 +668,9 @@ const STEADY_STATE_FILL_FRACTION: f64 = 0.90;
 /// * 24h and 7d fill rates from the `segments` index (two efficient aggregate
 ///   queries grouped by `storage_id`; no N+1).
 /// * Effective and configured retention, steady-state detection, days-to-full.
-/// * Top-5 cameras by bytes/day and actionable suggestions.
+/// * Per-camera on-disk footprint breakdown (bytes, %, fill rate, age span,
+///   properly-labelled policy) and actionable suggestions. The top-5 by
+///   bytes/day still feed the suggestion heuristics.
 ///
 /// # Errors
 ///
@@ -652,17 +684,26 @@ async fn storage_advisor(
     let pool = state.pool();
 
     // Fetch all data sources concurrently; they are independent reads.
-    let (storages, fill_24h, fill_7d, contributors, policies, cam_policy_rows, policy_usage) =
-        tokio::try_join!(
-            db::list_storages(pool),
-            db::storage_fill_rate_stats(pool, 24),
-            db::storage_fill_rate_stats(pool, 168), // 7d = 168 h
-            db::storage_top_contributors(pool),
-            db::list_policies(pool),
-            db::cameras_by_effective_policy(pool),
-            db::storage_usage_by_policy(pool),
-        )
-        .map_err(ApiError::Internal)?;
+    let (
+        storages,
+        fill_24h,
+        fill_7d,
+        contributors,
+        policies,
+        cam_policy_rows,
+        policy_usage,
+        cam_footprints,
+    ) = tokio::try_join!(
+        db::list_storages(pool),
+        db::storage_fill_rate_stats(pool, 24),
+        db::storage_fill_rate_stats(pool, 168), // 7d = 168 h
+        db::storage_top_contributors(pool),
+        db::list_policies(pool),
+        db::cameras_by_effective_policy(pool),
+        db::storage_usage_by_policy(pool),
+        db::storage_camera_footprints(pool),
+    )
+    .map_err(ApiError::Internal)?;
 
     // Index fill-rate rows by storage_id for O(1) lookup.
     let fill_24h_map: HashMap<Uuid, &db::StorageFillRateStat> =
@@ -684,15 +725,37 @@ async fn storage_advisor(
             });
     }
 
+    // First camera that resolves to each policy, for labelling per-camera custom
+    // (unnamed, non-default) overrides. Such a policy is referenced by exactly one
+    // camera, and cam_policy_rows is already ordered by camera name.
+    let mut cam_name_for_policy: HashMap<Uuid, String> = HashMap::new();
+    for (pid, _cid, cname) in &cam_policy_rows {
+        cam_name_for_policy
+            .entry(*pid)
+            .or_insert_with(|| cname.clone());
+    }
+
     // Build storage_id → [per-profile usage slice] for the stacked utilization bar.
-    // Policy names come from the policies list; an unknown/orphaned policy id falls
-    // back to a generic label so a slice is never silently dropped.
+    // Label resolution: a NAMED policy uses its name; the single real default (name
+    // NULL but is_default) is "Default"; an anonymous per-camera fork (name NULL,
+    // not default) is a per-camera override → label it by its owning camera
+    // ("<camera> · custom"), never the misleading "Default". An orphaned/unknown
+    // policy id falls back to a generic label so a slice is never silently dropped.
     let policy_name_for = |pid: &Uuid| -> String {
-        policies
-            .iter()
-            .find(|p| &p.id == pid)
-            .and_then(|p| p.name.clone())
-            .unwrap_or_else(|| "Default".to_owned())
+        match policies.iter().find(|p| &p.id == pid) {
+            Some(p) => {
+                if let Some(name) = p.name.clone() {
+                    name
+                } else if p.is_default {
+                    "Default".to_owned()
+                } else {
+                    cam_name_for_policy
+                        .get(pid)
+                        .map_or_else(|| "Custom".to_owned(), |c| format!("{c} · custom"))
+                }
+            }
+            None => "Custom".to_owned(),
+        }
     };
     let mut usage_map: HashMap<Uuid, Vec<StoragePolicyUsageDto>> = HashMap::new();
     for u in &policy_usage {
@@ -708,6 +771,27 @@ async fn storage_advisor(
     // Largest profile first so the stacked bar reads big→small left→right.
     for v in usage_map.values_mut() {
         v.sort_by_key(|u| std::cmp::Reverse(u.bytes));
+    }
+
+    // Build storage_id → [per-camera footprint row]. The query already orders by
+    // bytes desc within each storage, so the default sort is footprint-first. Each
+    // row's policy label reuses the Problem-1-fixed policy_name_for so the table
+    // and the stacked bar above read as one picture.
+    let mut footprint_map: HashMap<Uuid, Vec<CameraFootprintDto>> = HashMap::new();
+    for f in &cam_footprints {
+        footprint_map
+            .entry(f.storage_id)
+            .or_default()
+            .push(CameraFootprintDto {
+                camera: f.camera_name.clone(),
+                bytes: f.bytes,
+                bytes_per_day: f.bytes_per_day,
+                stream: f.stream.clone(),
+                mode: f.mode.clone(),
+                days_retained: f.span_days,
+                policy_id: f.policy_id,
+                policy_name: policy_name_for(&f.policy_id),
+            });
     }
 
     // Build storage_id → configured_retention_days.
@@ -884,6 +968,7 @@ async fn storage_advisor(
             suggested_retention_days: effective_retention_days,
             top_contributors: contributors,
             usage_by_policy: usage_map.remove(&sid).unwrap_or_default(),
+            camera_footprints: footprint_map.remove(&sid).unwrap_or_default(),
             suggestions,
         });
     }
