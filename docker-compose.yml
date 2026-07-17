@@ -220,10 +220,14 @@ services:
     depends_on:
       - api
     environment:
+      # NOTE: no `${VAR:?required}` here — Compose interpolates the WHOLE file
+      # before profile filtering, so a `:?` would break a plain `docker compose
+      # up -d` (alpr profile inactive) on every install. The worker's own _req()
+      # gives a clear error at start if these are unset when the profile IS run.
       CRUMB_API_BASE: ${LPR_API_BASE:-http://api:8080}
-      LPR_INGEST_TOKEN: ${LPR_INGEST_TOKEN:?set LPR_INGEST_TOKEN (Admin -> LPR -> rotate token)}
-      LPR_CAMERA_ID: ${LPR_CAMERA_ID:?set LPR_CAMERA_ID (the Crumb camera UUID to read)}
-      LPR_RTSP_URL: ${LPR_RTSP_URL:?set LPR_RTSP_URL (the camera's go2rtc restream RTSP)}
+      LPR_INGEST_TOKEN: ${LPR_INGEST_TOKEN:-}
+      LPR_CAMERA_ID: ${LPR_CAMERA_ID:-}
+      LPR_RTSP_URL: ${LPR_RTSP_URL:-}
       LPR_MIN_CONFIDENCE: ${LPR_MIN_CONFIDENCE:-0.80}
       LPR_SAMPLE_FPS: ${LPR_SAMPLE_FPS:-5}
       LPR_LOG_LEVEL: ${LPR_LOG_LEVEL:-info}

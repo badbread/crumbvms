@@ -1,4 +1,4 @@
--- 0056_camera_lpr.sql
+-- 0069_camera_lpr.sql
 --
 -- Per-camera LPR settings for the Crumb-native engine (the `crumb-alpr`
 -- fast-alpr worker) and engine selection. All additive + nullable/defaulted, so

@@ -156,6 +156,28 @@ async fn post_lpr_read(
 ) -> Result<StatusCode, ApiError> {
     verify_ingest_token(&state, &headers).await?;
 
+    // Per-camera enforcement: the camera must exist, have LPR enabled, and use an
+    // engine that accepts crumb-alpr reads. The global token check is not enough —
+    // a per-camera OFF is the operator's privacy control and must actually stop
+    // capture (not just decorate the UI). Unknown camera -> 404 (also catches a
+    // worker configured with a mistyped LPR_CAMERA_ID, which would otherwise 202
+    // forever while the FK-violating read is silently dropped by the ingester).
+    let cam = db::get_camera_lpr_config(state.pool(), body.camera_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("camera {} not found", body.camera_id)))?;
+    if !cam.enabled {
+        return Err(ApiError::Forbidden(
+            "LPR is disabled for this camera".to_owned(),
+        ));
+    }
+    if cam.engine != "crumb-alpr" && cam.engine != "both" {
+        return Err(ApiError::Forbidden(format!(
+            "this camera's LPR engine is '{}', which does not accept crumb-alpr reads",
+            cam.engine
+        )));
+    }
+
     if db::normalize_plate(&body.plate).is_empty() {
         return Err(ApiError::BadRequest(
             "plate must contain at least one alphanumeric character".to_owned(),
@@ -163,6 +185,9 @@ async fn post_lpr_read(
     }
 
     // Decode the crop up front so a malformed blob is a 400, not a silent drop.
+    // Cap the decoded size so a flood of large crops can't amplify into the
+    // bounded ingester channel and pin API memory.
+    const MAX_CROP_BYTES: usize = 512 * 1024;
     let crop = match body.crop_jpeg_b64.as_deref() {
         Some(b64) if !b64.is_empty() => {
             use base64::Engine as _;
@@ -171,18 +196,36 @@ async fn post_lpr_read(
                 .map_err(|_| {
                     ApiError::BadRequest("crop_jpeg_b64 is not valid base64".to_owned())
                 })?;
+            if bytes.len() > MAX_CROP_BYTES {
+                return Err(ApiError::BadRequest(format!(
+                    "crop_jpeg_b64 decodes to {} bytes, over the {MAX_CROP_BYTES}-byte cap",
+                    bytes.len()
+                )));
+            }
             Some(bytes)
         }
         _ => None,
     };
 
-    let ts = body.ts.unwrap_or_else(Utc::now);
-    let score = body.confidence.unwrap_or(1.0);
+    // Clamp the client-supplied timestamp: a far-future ts would defeat retention
+    // pruning (a permanent plate record — retention is the core privacy control);
+    // a far-past ts pollutes/loses history. Outside a small window around now,
+    // fall back to now. (The worker always sends ts=null anyway.)
+    let now = Utc::now();
+    let ts = match body.ts {
+        Some(t) if (t - now).num_seconds().abs() <= 3600 => t,
+        _ => now,
+    };
+    // Clamp confidence + bbox to valid ranges so out-of-range values never reach
+    // the store or clients.
+    let confidence = body.confidence.map(|c| c.clamp(0.0, 1.0));
+    let score = confidence.unwrap_or(1.0);
+    let bbox = body.bbox.map(|b| b.map(|v| v.clamp(0.0, 1.0)));
     let raw = serde_json::json!({
         "source": "crumb-alpr",
         "plate": body.plate,
         "region": body.region,
-        "confidence": body.confidence,
+        "confidence": confidence,
     });
 
     let event = crumb_common::detection::NormalizedEvent {
@@ -203,8 +246,8 @@ async fn post_lpr_read(
         zones: vec![],
         snapshot_url: None,
         recognized_plate: Some(body.plate.clone()),
-        plate_confidence: body.confidence,
-        plate_box: body.bbox,
+        plate_confidence: confidence,
+        plate_box: bbox,
         plate_crop: crop,
         raw,
     };

@@ -237,46 +237,65 @@ def run():
             time.sleep(5)
             continue
         log.info("stream open; watching for plates")
+        last_process = 0.0
         try:
             while True:
+                # Read (and thus DRAIN) EVERY frame so the FFmpeg buffer never
+                # grows — a sleep-per-frame would let latency and timestamp drift
+                # accumulate on a live stream.
                 ok, frame = cap.read()
                 if not ok:
                     log.warning("stream read failed — reconnecting")
                     break
                 now = time.monotonic()
 
-                # ── refresh per-camera config (zones + min-confidence) ──
+                # Refresh per-camera config periodically.
                 if now - last_cfg >= CONFIG_POLL_S:
                     cfg = fetch_config(session) or cfg
                     last_cfg = now
-                min_conf = float(cfg.get("min_confidence", MIN_CONF))
-                zones = cfg.get("zones")
 
-                # ── motion gate ──
-                mask = bg.apply(frame)
-                frac = float(np.count_nonzero(mask)) / mask.size
-                if frac >= MOTION_MIN_FRAC:
-                    last_motion = now
-                    got = read_frame(alpr, frame)
-                    if got and got[1] >= min_conf:
-                        plate, conf, crop, bbox, region = got
-                        # Zone filter: keep only plates whose box centroid is in
-                        # the allowed region (include ∧ ¬exclude).
-                        cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
-                        if in_zones(cx, cy, zones):
-                            vote.add(plate, conf, crop, bbox, region)
+                # Defense-in-depth (the server enforces these too): honor the
+                # per-camera enable + engine. Keep draining, but do no analysis.
+                engine = cfg.get("engine", "crumb-alpr")
+                if cfg.get("enabled") is False or engine not in ("crumb-alpr", "both"):
+                    continue
 
-                # ── end-of-pass: motion settled or safety cap → emit the vote ──
-                if vote.active():
-                    quiet = now - last_motion >= PASS_GAP_S
-                    too_long = now - vote.started >= PASS_MAX_S
-                    if quiet or too_long:
+                # Pace the expensive detect+OCR to SAMPLE_FPS while still draining
+                # every frame above.
+                if now - last_process < period:
+                    continue
+                last_process = now
+
+                # A malformed zone shape / bad frame must never crash the loop
+                # (which would crash-restart-crash forever under `restart:
+                # unless-stopped`). Log and skip the frame instead.
+                try:
+                    min_conf = float(cfg.get("min_confidence", MIN_CONF))
+                    zones = cfg.get("zones")
+                    mask = bg.apply(frame)
+                    frac = float(np.count_nonzero(mask)) / mask.size
+                    if frac >= MOTION_MIN_FRAC:
+                        last_motion = now
+                        got = read_frame(alpr, frame)
+                        if got and got[1] >= min_conf:
+                            plate, conf, crop, bbox, region = got
+                            # Zone filter: keep only plates whose box centroid is
+                            # in the allowed region (include ∧ ¬exclude).
+                            cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
+                            if in_zones(cx, cy, zones):
+                                vote.add(plate, conf, crop, bbox, region)
+
+                    # End-of-pass: motion settled or safety cap → emit the vote.
+                    if vote.active() and (
+                        now - last_motion >= PASS_GAP_S
+                        or now - vote.started >= PASS_MAX_S
+                    ):
                         w = vote.winner()
                         if w:
                             post_read(session, w[0], w[1], vote)
                         vote.reset()
-
-                time.sleep(period)
+                except Exception:
+                    log.exception("frame processing error — skipping this frame")
         finally:
             cap.release()
 
