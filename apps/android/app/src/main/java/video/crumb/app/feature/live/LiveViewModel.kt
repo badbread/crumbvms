@@ -12,11 +12,15 @@ import video.crumb.app.data.toUserMessage
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
+import java.net.SocketTimeoutException
 import retrofit2.HttpException
 
 /**
@@ -37,6 +41,13 @@ import retrofit2.HttpException
  */
 data class LiveUiState(
     val loading: Boolean = true,
+    /**
+     * Non-null while an initial load is retrying under a weak/flaky link, e.g.
+     * "Weak connection, still trying…". Shown under the loading spinner so the
+     * wall is never a silent multi-second spinner (issue #176). Cleared once the
+     * load resolves to success or a hard error.
+     */
+    val connecting: String? = null,
     val error: String? = null,
     val cameras: List<CameraDto> = emptyList(),
     val streams: Map<String, LiveStreamsResponse> = emptyMap(),
@@ -121,9 +132,11 @@ class LiveViewModel(
     /** Reload cameras and re-resolve all RTSP URLs. Safe to call from the UI. */
     fun refresh() {
         viewModelScope.launch {
-            _uiState.update { it.copy(loading = true, error = null, isViewerRestricted = false) }
+            _uiState.update {
+                it.copy(loading = true, connecting = null, error = null, isViewerRestricted = false)
+            }
 
-            val camerasResult = repo.visibleCameras()
+            val camerasResult = loadCamerasWithRetry()
 
             camerasResult.fold(
                 onSuccess = { cameras ->
@@ -141,6 +154,7 @@ class LiveViewModel(
                     _uiState.update {
                         it.copy(
                             loading = false,
+                            connecting = null,
                             cameras = enabledCameras,
                             streams = streams,
                             error = null,
@@ -153,6 +167,7 @@ class LiveViewModel(
                     _uiState.update {
                         it.copy(
                             loading = false,
+                            connecting = null,
                             cameras = emptyList(),
                             streams = emptyMap(),
                             isViewerRestricted = is403,
@@ -162,6 +177,42 @@ class LiveViewModel(
                 },
             )
         }
+    }
+
+    /**
+     * Load the camera list tolerant of a weak/flaky link (issue #176): a few
+     * bounded attempts, each capped well under the client's 60 s call timeout so
+     * the wall never sits on a silent minute-long spinner. Between tries it drops
+     * pooled connections (a bad link often leaves a half-open socket that would
+     * wedge the retry too) and shows a "still trying…" hint. Returns the first
+     * success, or the last failure after all attempts — which the caller surfaces
+     * as the ErrorState + Retry. A 403 (viewer-restricted) is returned
+     * immediately; it is a permission answer, not a transient failure to retry.
+     */
+    private suspend fun loadCamerasWithRetry(): Result<List<CameraDto>> {
+        var last: Throwable? = null
+        for (attempt in 1..LOAD_MAX_ATTEMPTS) {
+            // Surface "still trying…" once the first attempt runs long, or right
+            // away on any re-attempt, so the spinner is never silent for long.
+            val hintJob = viewModelScope.launch {
+                delay(if (attempt == 1) LOAD_SLOW_HINT_MS else 0L)
+                _uiState.update { if (it.loading) it.copy(connecting = "Weak connection, still trying…") else it }
+            }
+            val result = withTimeoutOrNull(LOAD_ATTEMPT_TIMEOUT_MS) { repo.visibleCameras() }
+            hintJob.cancel()
+
+            when {
+                result == null -> last = SocketTimeoutException("live load attempt $attempt timed out")
+                result.isSuccess -> return result
+                (result.exceptionOrNull() as? HttpException)?.code() == 403 -> return result
+                else -> last = result.exceptionOrNull()
+            }
+            // Drop wedged/half-open pooled sockets before the next try (mirrors the
+            // manual Retry path); then back off briefly.
+            repo.recoverConnections()
+            if (attempt < LOAD_MAX_ATTEMPTS) delay(LOAD_BACKOFF_MS * attempt)
+        }
+        return Result.failure(last ?: IOException("Can't reach the server."))
     }
 
     // ── low-bandwidth mode ────────────────────────────────────────────────────
@@ -250,6 +301,15 @@ class LiveViewModel(
     }
 
     companion object {
+        /** Initial-load resilience (issue #176): how many bounded attempts, the
+         *  per-attempt ceiling (well under the client's 60 s call timeout so the
+         *  wall never sits on one silent minute), the delay before the first
+         *  "still trying…" hint, and the base inter-attempt backoff (×attempt). */
+        private const val LOAD_MAX_ATTEMPTS = 3
+        private const val LOAD_ATTEMPT_TIMEOUT_MS = 15_000L
+        private const val LOAD_SLOW_HINT_MS = 5_000L
+        private const val LOAD_BACKOFF_MS = 1_500L
+
         /**
          * Number of distinct cameras that must each stall at least
          * [STALLS_PER_CAMERA_THRESHOLD] times within [AUTO_FALLBACK_WINDOW_MS]

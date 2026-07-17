@@ -59,7 +59,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -127,6 +129,17 @@ fun LiveScreen(
         },
     )
     val state by vm.uiState.collectAsStateWithLifecycle()
+
+    // Auto-recover (issue #176): when validated connectivity RETURNS after the
+    // initial load gave up with a "can't reach the server" error, kick a fresh
+    // Retry so the wall recovers on its own — no user tap needed. `retry()` drops
+    // any wedged pooled socket first. Fires only on the offline→online transition
+    // (LaunchedEffect keyed on the online flag), so a persistent server-unreachable
+    // error while already online doesn't hammer — that path keeps the manual Retry.
+    val isOnline = rememberIsOnline()
+    LaunchedEffect(isOnline) {
+        if (isOnline && state.error != null) vm.retry()
+    }
 
     // Update-available check (issue #7) — lives here because Live is the root
     // destination (always on the back stack, see MainActivity's popUpTo(LIVE)),
@@ -504,11 +517,25 @@ fun LiveScreen(
                 Box(modifier = Modifier.fillMaxSize()) {
                     when {
                         // ── Loading ─────────────────────────────────────────────────
+                        // Under a weak/flaky link the initial load retries (issue
+                        // #176); once it runs long, a "still trying…" hint appears
+                        // under the spinner so the wall is never a silent spinner.
                         state.loading -> {
-                            CircularProgressIndicator(
-                                modifier = Modifier.align(Alignment.Center),
-                                color = TealAccent,
-                            )
+                            Column(
+                                modifier = Modifier.align(Alignment.Center).padding(24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(14.dp),
+                            ) {
+                                CircularProgressIndicator(color = TealAccent)
+                                state.connecting?.let { msg ->
+                                    Text(
+                                        text = msg,
+                                        color = Color.White.copy(alpha = 0.72f),
+                                        fontSize = 13.sp,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                }
+                            }
                         }
 
                         // ── Viewer restricted (403) ──────────────────────────────────
