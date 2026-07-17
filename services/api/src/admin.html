@@ -6787,111 +6787,43 @@ async function saveScrubPregenTtl(daysStr) {
   }
 }
 
-/* ── Camera tab 3: Storage & group ──
-   Phase 3, camera GROUPS are AUTHORITATIVE. A camera in a group ALWAYS uses
-   the group's assigned profile; it cannot hold a per-camera policy/storage
-   override while grouped. So the tab branches:
-     • GROUPED   → read-only "Controlled by the <group> group → <profile> profile"
-                   summary + Edit-group + Ungroup-to-customize. NO override path.
-     • UNGROUPED → the inherit / named-profile / custom radios (per-camera
-                   overrides are allowed only when ungrouped). */
+/* ── Camera tab 3: Recording policy ──
+   Phase 3: camera GROUPS are retired and every camera belongs to exactly one
+   NAMED policy (Phase 2 made cameras.policy_id NOT NULL). The tab collapses to a
+   single control — pick the policy — plus the effective-settings banner and the
+   deliberate "Save current settings as a new policy…" template-create path. The
+   assignment persists on the camera's Save button (saveCamEdit). */
 function renderCamStorageTab(c) {
-  const grp = groupOfCamera(c.id);
-  if (grp) return renderCamStorageGrouped(c, grp);
-  return renderCamStorageUngrouped(c);
-}
-
-/* GROUPED: authoritative, read-only. The group's profile governs; the only ways
-   to differ are editing the group's profile or ungrouping the camera. */
-function renderCamStorageGrouped(c, grp) {
-  // Resolve the group's effective profile exactly as effectivePolicy's group leg:
-  // the group's assigned policy, else the global Default.
-  const gp = grp.policy_id
-    ? profileById(grp.policy_id)
-    : (DEFAULT_POLICY || allProfiles().find(p => p.is_default) || null);
-  const profName = gp ? (gp.name || 'Default') : 'Default';
-  const summary = gp ? bannerHTMLForGroup(gp, !grp.policy_id) : '';
-  $('cam-tab-body').innerHTML = `
-    <div class="policy-section" style="margin-top:0">
-      <div class="policy-section-title">Controlled by group</div>
-      <div class="opt-sub" style="margin-bottom:10px">
-        This camera is in the <strong>${esc(grp.name)}</strong> group, so it always uses the
-        <strong>${esc(profName)}</strong> policy. A direct per-camera policy is only available for
-        ungrouped cameras, edit the group's policy to change all its cameras at once, or
-        ungroup this camera to give it its own.
-      </div>
-      ${summary}
-      <div class="inherit-banner-actions" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="ghost sm" onclick="select('group','${grp.id}')">Edit group "${esc(grp.name)}"</button>
-        <button class="ghost sm" onclick="ceUngroup('${c.id}')">Ungroup to customize</button>
-      </div>
-    </div>`;
-}
-
-/* UNGROUPED: ONE assignment model (group → policy), with the direct camera→policy
-   pin tucked inside a collapsed "exception" section. The old 3-way radio (inherit
-   / named-profile directly / custom copy-on-write fork) is GONE (S1): there is no
-   "custom" mode any more, and the anonymous fork is no longer creatable from the
-   UI, its replacement is "Save current settings as a new policy…", which POSTs a
-   NAMED policy (pre-filled from the effective one) and pins it, so every policy
-   stays visible in Recording (§5c / §6).
-
-   `assignMode` is now just 'inherit' (follow group / Default) or 'profile' (a
-   direct pin), used only to seed which control is shown, not a radio group. */
-function renderCamStorageUngrouped(c) {
-  const grp = groupOfCamera(c.id); // null on this path, kept for parity with banner code
-  const pinned = !!c.policy_id;    // a direct camera→policy pin is in force
-
-  const groupOpts = `<option value="">Ungrouped (uses Default policy)</option>` +
-    (GROUPS||[]).map(g => {
-      const gp = g.policy_id ? profileById(g.policy_id) : null;
-      const lbl = gp ? `${g.name} → ${gp.name}` : `${g.name} → Default`;
-      return `<option value="${g.id}" ${grp && grp.id===g.id ? 'selected':''}>${esc(lbl)}</option>`;
-    }).join('') +
-    `<option value="__new__">+ New group…</option>`;
-
   const profileOpts = allProfiles().map(p =>
     `<option value="${p.id}" ${c.policy_id===p.id?'selected':''}>${esc(profileSelectLabel(p))}</option>`).join('');
-
-  // The exception section starts OPEN when a direct pin is already in force (so the
-  // operator can see/change it); otherwise collapsed (the recommended path).
   $('cam-tab-body').innerHTML = `
     <div id="ce-inherit-banner"></div>
 
     <div class="policy-section" style="margin-top:0">
       <div class="policy-section-title">Recording policy</div>
-      <div class="card-hint" style="margin:-2px 0 12px 2px">A <b>camera group</b> is the usual way to choose how a camera records, put it in a group, the group picks the policy. Ungrouped cameras follow the <b>Default</b> policy.</div>
+      <div class="card-hint" style="margin:-2px 0 12px 2px">Every camera records under one named policy. Pick which policy governs this camera; edit the policy itself to change how it records (and every camera on it).</div>
       <div class="form-grid">
-        <label class="fg-label" for="ce-group">Group ${infoHint('When a camera joins a group, the group\'s policy takes over, any direct per-camera pin is cleared.')}</label>
-        <div class="fg-ctl"><select id="ce-group" onchange="ceGroupChanged()" style="font-size:13px;max-width:420px">${groupOpts}</select></div>
-        <div class="fg-full"><div class="opt-sub" id="ce-inherit-sub"></div></div>
+        <label class="fg-label" for="ce-profile">Policy</label>
+        <div class="fg-ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="ce-profile" onchange="ceAssignPreview()" style="font-size:13px;max-width:420px">${profileOpts}</select>
+          <button class="ghost sm" onclick="ceEditSelectedPolicy()">Edit policy…</button>
+        </div>
       </div>
 
-      <details class="detail-section" id="ce-exception" ${pinned?'open':''} style="margin-top:14px">
-        <summary>
-          <span class="ds-chev">&#x25B6;</span>
-          <span class="ds-title">This camera doesn't follow its group</span>
-          <span class="ds-glance">${pinned?'A specific policy is pinned':'Advanced, pin a specific policy'}</span>
-        </summary>
-        <div class="ds-body">
-          <div class="card-hint" style="margin:0 0 10px 2px">The exception: pin one specific policy to <b>this camera only</b>, or capture the effective settings as a new named policy. Prefer a group for anything you might configure in bulk later.</div>
-          <label class="chk" style="margin-bottom:10px"><input type="checkbox" id="ce-pin-enable" ${pinned?'checked':''} onchange="cePinToggle()" /> Pin a specific policy to this camera</label>
-          <div id="ce-pin-wrap" class="${pinned?'':'hidden'}">
-            <div class="form-grid">
-              <label class="fg-label" for="ce-profile">Policy</label>
-              <div class="fg-ctl"><select id="ce-profile" onchange="ceAssignPreview()" style="font-size:13px;max-width:420px">${profileOpts}</select></div>
-            </div>
-          </div>
-          <div style="margin-top:12px">
-            <button class="ghost sm" onclick="ceSaveAsNewPolicy()">Save current settings as a new policy…</button>
-            <div class="card-hint" style="margin-top:4px">Creates a named copy of this camera's effective policy in <b>Recording</b> and pins it here.</div>
-          </div>
-          <div id="ce-assign-msg" class="form-msg"></div>
-        </div>
-      </details>
+      <div style="margin-top:14px">
+        <button class="ghost sm" onclick="ceSaveAsNewPolicy()">Save current settings as a new policy…</button>
+        <div class="card-hint" style="margin-top:4px">Creates a named copy of this camera's current policy in <b>Recording</b> and assigns it here.</div>
+      </div>
+      <div id="ce-assign-msg" class="form-msg"></div>
     </div>`;
 
   ceAssignChanged();
+}
+
+/* Open the policy editor for whatever policy is currently selected in the tab. */
+function ceEditSelectedPolicy() {
+  const sel = $('ce-profile');
+  if (sel && sel.value) select('profile', sel.value);
 }
 
 /* Human label + one-line description for each pixel motion algorithm. */
@@ -6951,48 +6883,17 @@ function ceGroupChanged() {
   ceAssignChanged();
 }
 
-/* Assignment "mode" is derived, not radio-selected: a pinned policy (the
-   exception) → 'profile'; otherwise 'inherit' (follow group / Default). */
-function ceCurrentMode() {
-  const pin = $('ce-pin-enable');
-  return (pin && pin.checked) ? 'profile' : 'inherit';
-}
-function ceAssignChanged() {
-  const mode = ceCurrentMode();
-  const gsel = $('ce-group');
-  const gid = gsel ? gsel.value : '';
-  const grp = gid && gid !== '__new__' ? (GROUPS||[]).find(g => g.id === gid) : null;
-  const gp = grp && grp.policy_id ? profileById(grp.policy_id) : null;
-  if ($('ce-inherit-sub')) $('ce-inherit-sub').textContent = grp
-    ? `Currently: ${grp.name} (would use the ${gp ? gp.name : 'Default'} policy)`
-    : 'Currently: Ungrouped (would follow the Default policy)';
-  renderCeBanner(mode);
-}
-function ceAssignPreview() { renderCeBanner('profile'); }
-/* Show/hide the direct-pin policy picker as its checkbox toggles. */
-function cePinToggle() {
-  const on = $('ce-pin-enable') && $('ce-pin-enable').checked;
-  if ($('ce-pin-wrap')) $('ce-pin-wrap').classList.toggle('hidden', !on);
-  ceAssignChanged();
-}
+/* Phase 3: one control — the policy select. The banner previews whatever policy
+   is currently selected; the assignment persists on the camera's Save button. */
+function ceAssignChanged() { renderCeBanner(); }
+function ceAssignPreview() { renderCeBanner(); }
 
-function renderCeBanner(mode) {
+function renderCeBanner() {
   const c = CAMS.find(x => x.id === selId); if (!c) return;
   const bannerEl = $('ce-inherit-banner'); if (!bannerEl) return;
-  let p, via, srcText, borderCls;
-  if (mode === 'profile') {
-    p = profileById($('ce-profile') ? $('ce-profile').value : c.policy_id) || c.policy;
-    via = 'own'; borderCls = 'own';
-    srcText = 'directly assigned to this camera';
-  } else {
-    const gsel = $('ce-group');
-    const gid = gsel ? gsel.value : '';
-    const grp = gid && gid !== '__new__' ? (GROUPS||[]).find(g => g.id === gid) : null;
-    if (grp && grp.policy_id) { p = profileById(grp.policy_id); via='group'; borderCls=''; srcText = `via the ${grp.name} group`; }
-    else { p = DEFAULT_POLICY || profileById((c.policy||{}).id); via='default'; borderCls='default-profile'; srcText = grp ? `via the ${grp.name} group (which uses the Default policy)` : 'using the Default policy (no group assigned)'; }
-  }
+  const p = profileById($('ce-profile') ? $('ce-profile').value : c.policy_id) || c.policy;
   if (!p) { bannerEl.innerHTML = ''; return; }
-  bannerEl.innerHTML = bannerHTML(p, borderCls, srcText, c.id);
+  bannerEl.innerHTML = bannerHTML(p, 'own', 'directly assigned to this camera', c.id);
   renderRetentionHint();
 }
 
@@ -7126,45 +7027,26 @@ async function saveCamEdit() {
     if ($('ce-motion-ha')) camBody.motion_ha_enabled = $('ce-motion-ha').checked;
     if ($('ce-motion-algorithm')) camBody.motion_algorithm = $('ce-motion-algorithm').value;
 
-    // Phase 3: a grouped camera is AUTHORITATIVELY governed by its group's
-    // profile and may NOT acquire a direct per-camera policy/override. The
-    // GROUPED Storage tab renders no override controls, but the Storage- and
-    // Motion-tab override writes below also live in this save path, so gate them
-    // all on !isGrouped, belt-and-suspenders independent of the rendered DOM.
-    // (The backend rejects these too; this keeps the UI from issuing a 4xx.)
+    // Groups are retired (Phase 3), so a camera is never "grouped" now. The flag
+    // is kept because the Motion-tab override write below still reads it (it stays
+    // false, so that path is simply always allowed for an ungrouped camera).
     const isGrouped = !!groupOfCamera(id);
 
-    // Recording assignment (Recording tab, ungrouped only, a grouped camera's tab
-    // is read-only). ONE model now (S1): pick a GROUP (→ inherit its policy), or,
-    // as the collapsed exception, PIN a specific policy directly. The old 3-way
-    // radio and the anonymous "custom" copy-on-write fork are gone.
-    //   • group chosen (non-empty)  → join it; group authority clears any pin.
-    //   • else pin enabled          → set a direct policy_id.
-    //   • else                      → clear (follow the Default policy).
-    const chosenGroup = (!isGrouped && $('ce-group')) ? $('ce-group').value : '';
-    const joiningGroup = !!(chosenGroup && chosenGroup !== '__new__');
-    const pinEnabled = !isGrouped && $('ce-pin-enable') && $('ce-pin-enable').checked;
-    // mode is null when the Recording tab isn't mounted (saving from another tab).
+    // Recording assignment (Recording tab): ONE control now — a single policy
+    // select. Every camera belongs to exactly one named policy (Phase 2), so the
+    // save just pins the chosen policy_id. `mode` stays null when the Recording
+    // tab isn't mounted (saving from another tab), leaving the assignment as-is.
     let mode = null;
-    if (!isGrouped && ($('ce-group') || $('ce-pin-enable'))) {
-      if (joiningGroup) { mode = 'inherit'; camBody.policy_id = null; }
-      else if (pinEnabled && $('ce-profile')) { mode = 'profile'; camBody.policy_id = $('ce-profile').value; }
-      else { mode = 'inherit'; camBody.policy_id = null; }
+    if ($('ce-profile')) {
+      mode = 'profile';
+      camBody.policy_id = $('ce-profile').value;
     }
 
     // Phase 4: if this reassignment changes the camera's EFFECTIVE storage disk,
     // warn (footage-safe, no per-camera move) before persisting.
     if (mode) {
       const fromPol = effectivePolicy(c).policy;
-      let toPol = fromPol;
-      if (mode === 'profile') {
-        toPol = profileById($('ce-profile').value) || fromPol;
-      } else {
-        // inherit resolves through the chosen group: group policy → else Default.
-        const grp = joiningGroup ? (GROUPS || []).find(g => g.id === chosenGroup) : null;
-        const gp = grp && grp.policy_id ? profileById(grp.policy_id) : null;
-        toPol = gp || DEFAULT_POLICY || (POLICIES || []).find(p => p.is_default) || fromPol;
-      }
+      const toPol = profileById($('ce-profile').value) || fromPol;
       if (!confirmStorageReassign(fromPol, toPol, 'this camera')) {
         setMsg('ce-msg', 'No changes saved.');
         return;
@@ -7172,10 +7054,6 @@ async function saveCamEdit() {
     }
 
     await api('/config/cameras/' + id, { method: 'PUT', body: JSON.stringify(camBody) });
-
-    if (mode === 'inherit') {
-      await applyGroupMembership(id, chosenGroup);
-    }
     // Motion tab: persist per-camera motion sensitivity/buffers as a custom policy
     // override (copy-on-write), only when those fields were edited on the tab.
     // motion_sensitivity is sent ALONGSIDE motion_threshold so the threshold is
