@@ -556,8 +556,14 @@ struct FrigateEventState {
     false_positive: Option<bool>,
     #[serde(default)]
     has_snapshot: bool,
-    // Pixel box [x, y, w, h] — object bounding_box normalisation is Phase 2.
-    // box: Option<[i32; 4]>,
+    // The tracked object's OWN bounding box. For a Frigate 0.18 `license_plate`
+    // OBJECT this IS the plate box (MQTT: pixel corners at the detect resolution
+    // → needs `detect_dims` to normalize; HTTP form is already normalized).
+    // `normalize_plate_box` disambiguates the shape. For a `car`/motorcycle
+    // object it is the whole vehicle, so `frigate_plate_box` only reads it when
+    // the object itself is the license plate.
+    #[serde(default, rename = "box", deserialize_with = "de_box")]
+    object_box: Option<[f32; 4]>,
     //
     // Sub-detections within the tracked object (Frigate's native LPR fills a
     // `license_plate` entry here whose `box` is the plate region). Captured
@@ -604,6 +610,30 @@ fn de_sub_label<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
             .and_then(|v| v.as_str().map(str::to_owned)),
         _ => None,
     })
+}
+
+/// Deserialize an object's own `box` (`[x, y, w, h]` or corners, pixel or
+/// normalized — [`normalize_plate_box`] disambiguates later), tolerating any
+/// non-4-number shape as `None`. A malformed box must never fail the whole
+/// envelope parse (which would silently drop the detection). Ints and floats
+/// both accepted.
+#[allow(clippy::cast_possible_truncation)]
+fn de_box<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<[f32; 4]>, D::Error> {
+    use serde_json::Value;
+    let Some(Value::Array(a)) = Option::<Value>::deserialize(d)? else {
+        return Ok(None);
+    };
+    if a.len() != 4 {
+        return Ok(None);
+    }
+    let mut out = [0f32; 4];
+    for (slot, v) in out.iter_mut().zip(&a) {
+        match v.as_f64() {
+            Some(f) => *slot = f as f32,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Deserialize a scored recognition field (`recognized_license_plate`) that
@@ -778,6 +808,38 @@ fn plate_box_from_snapshot(snapshot: Option<&serde_json::Value>) -> Option<[f32;
         .and_then(|a| plate_box_from_attributes(a))
 }
 
+/// Pick a read's plate crop box, tolerant of Frigate's two LPR data models
+/// (issue #142) so crops work on 0.17 and 0.18 alike, auto-selected per event:
+///
+/// * **≤0.17** — the read is a `car`/motorcycle object and the plate is a nested
+///   `license_plate` attribute; the box comes from the snapshot frame's
+///   attributes (preferred, aligns with the served image — issue #179) or the
+///   live `current_attributes`.
+/// * **0.18+** — the read is a standalone `license_plate` OBJECT; `attributes`
+///   is empty and the plate box IS the object's own box.
+///
+/// The object's own box is only trusted when the object itself is the plate
+/// (`label == "license_plate"`) — on a `car` it would be the whole vehicle.
+/// The result still passes through [`normalize_plate_box`] to resolve pixel vs.
+/// normalized / corners vs. xywh.
+fn frigate_plate_box(
+    label: &str,
+    snapshot: Option<&serde_json::Value>,
+    current_attributes: &[serde_json::Value],
+    object_box: Option<[f32; 4]>,
+) -> Option<[f32; 4]> {
+    let attr_box =
+        plate_box_from_snapshot(snapshot).or_else(|| plate_box_from_attributes(current_attributes));
+    if label == "license_plate" {
+        // The object is the plate: its own box wins, with the nested attribute
+        // box as a forward-compatible fallback.
+        object_box.or(attr_box)
+    } else {
+        // A car/motorcycle: only the nested license_plate attribute is the plate.
+        attr_box
+    }
+}
+
 /// Process one MQTT payload and, if it passes all filters, return a
 /// [`NormalizedEvent`].  Returns `Ok(None)` when the event is filtered.
 ///
@@ -899,8 +961,12 @@ fn process_mqtt_payload(
         // a normalized 0..1 box (the HTTP shape) passes through regardless.
         // Best-effort — None never affects the plate text / detection path.
         plate_box: normalize_plate_box(
-            plate_box_from_snapshot(after.snapshot.as_ref())
-                .or_else(|| plate_box_from_attributes(&after.current_attributes)),
+            frigate_plate_box(
+                &after.label,
+                after.snapshot.as_ref(),
+                &after.current_attributes,
+                after.object_box,
+            ),
             detect_dims.get(&after.camera).copied(),
         ),
         // Frigate hands Crumb a snapshot URL to proxy, not raw crop bytes.
@@ -1010,6 +1076,11 @@ struct FrigateApiEventData {
     // harmless. See `plate_box_from_attributes`.
     #[serde(default, alias = "attributes", deserialize_with = "de_attributes")]
     current_attributes: Vec<serde_json::Value>,
+    // The object's own box. On Frigate 0.18 a `license_plate` OBJECT event carries
+    // the plate region here as a normalized `[x, y, w, h]` (verified live). Used
+    // only when the object itself is the plate — see `frigate_plate_box`.
+    #[serde(default, rename = "box", deserialize_with = "de_box")]
+    object_box: Option<[f32; 4]>,
 }
 
 /// Fetch recent events from Frigate's HTTP API and forward them to `tx`.
@@ -1101,7 +1172,11 @@ async fn http_backfill(
                 .or(d.recognized_license_plate_score)
         });
         let plate_box = ev.data.as_ref().and_then(|d| {
-            normalize_plate_box(plate_box_from_attributes(&d.current_attributes), None)
+            // HTTP `data.box` (0.18) is already normalized, so no frame dims.
+            normalize_plate_box(
+                frigate_plate_box(&ev.label, None, &d.current_attributes, d.object_box),
+                None,
+            )
         });
 
         let event = NormalizedEvent {
@@ -1677,6 +1752,73 @@ mod tests {
         assert!((got[3] - 0.85).abs() < 1e-6, "h = y2 - y1, inside frame");
         assert!(got[0] + got[2] <= 1.0 + 1e-6, "x1 + w <= 1");
         assert!(got[1] + got[3] <= 1.0 + 1e-6, "y1 + h <= 1");
+    }
+
+    fn approx4(got: [f32; 4], want: [f32; 4]) {
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "got {got:?} want {want:?}");
+        }
+    }
+
+    #[test]
+    fn frigate_plate_box_018_uses_license_plate_objects_own_box() {
+        // 0.18: standalone `license_plate` object — attributes empty, the plate
+        // box IS the object's own box.
+        let own = Some([0.35, 0.22, 0.024, 0.022]);
+        let got = frigate_plate_box("license_plate", None, &[], own).expect("own box");
+        approx4(got, [0.35, 0.22, 0.024, 0.022]);
+    }
+
+    #[test]
+    fn frigate_plate_box_017_car_uses_nested_attribute_not_own_box() {
+        // 0.17: the read is a `car`; its own box is the whole vehicle and must be
+        // IGNORED — the plate is the nested `license_plate` attribute.
+        let car_box = Some([0.10, 0.20, 0.50, 0.40]); // whole car
+        let attrs = vec![serde_json::json!(
+            {"label": "license_plate", "box": [0.4, 0.5, 0.05, 0.04]}
+        )];
+        let got = frigate_plate_box("car", None, &attrs, car_box).expect("nested plate box");
+        approx4(got, [0.4, 0.5, 0.05, 0.04]);
+    }
+
+    #[test]
+    fn frigate_plate_box_car_without_plate_attribute_yields_none() {
+        // A `car` with an own box but NO license_plate attribute must NOT leak the
+        // car box as a "plate" crop.
+        assert!(frigate_plate_box("car", None, &[], Some([0.1, 0.2, 0.5, 0.4])).is_none());
+    }
+
+    #[test]
+    fn frigate_plate_box_license_plate_falls_back_to_attribute_when_no_own_box() {
+        // Forward-compat: a `license_plate` object with no own box still resolves
+        // via a nested attribute box if one is present.
+        let attrs = vec![serde_json::json!(
+            {"label": "license_plate", "box": [0.6, 0.7, 0.05, 0.04]}
+        )];
+        let got = frigate_plate_box("license_plate", None, &attrs, None).expect("fallback box");
+        approx4(got, [0.6, 0.7, 0.05, 0.04]);
+    }
+
+    #[test]
+    fn de_box_tolerates_bad_shapes() {
+        // Valid 4-number array (ints + floats) parses; everything else is None,
+        // never an error that would drop the whole detection.
+        #[derive(serde::Deserialize)]
+        struct W {
+            #[serde(default, rename = "box", deserialize_with = "de_box")]
+            object_box: Option<[f32; 4]>,
+        }
+        let ok: W = serde_json::from_value(serde_json::json!({"box": [1, 2, 3.5, 4]})).unwrap();
+        approx4(ok.object_box.expect("valid box"), [1.0, 2.0, 3.5, 4.0]);
+        for bad in [
+            serde_json::json!({"box": null}),
+            serde_json::json!({"box": [1, 2, 3]}),
+            serde_json::json!({"box": "nope"}),
+            serde_json::json!({}),
+        ] {
+            let w: W = serde_json::from_value(bad).unwrap();
+            assert!(w.object_box.is_none());
+        }
     }
 
     #[test]
