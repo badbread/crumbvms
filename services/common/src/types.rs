@@ -184,6 +184,26 @@ pub struct PlateRead {
     pub bbox: Option<[f32; 4]>,
 }
 
+/// Operator-confirmed ground truth for one derived vehicle "pass"
+/// (`lpr_pass_truth`, migration 0070) — the LPR A/B benchmark's accuracy
+/// anchor. Keyed by `(camera_id, bucket_ts)` where `bucket_ts` is the pass's
+/// earliest read timestamp truncated to whole seconds (see
+/// `crumb_common::lpr_ab`). `true_plate` is stored normalized (uppercase
+/// alphanumerics), so an engine's read is correct iff its normalized plate
+/// equals it exactly.
+#[derive(Debug, Clone, Serialize)]
+pub struct LprPassTruth {
+    pub id: uuid::Uuid,
+    pub camera_id: uuid::Uuid,
+    /// Pass key: earliest read ts in the pass, second precision.
+    pub bucket_ts: DateTime<Utc>,
+    /// Normalized true plate (uppercase alphanumerics).
+    pub true_plate: String,
+    /// The confirming admin (`users.id`); NULL after that user is deleted.
+    pub confirmed_by: Option<uuid::Uuid>,
+    pub confirmed_at: DateTime<Utc>,
+}
+
 /// One plate-watchlist entry (`lpr_watchlist`, migration 0052). A curated plate
 /// the operator wants flagged; a matching read with `notify = true` fires a
 /// `plate_watchlist_hit` alert. `plate` is stored normalized (uppercase

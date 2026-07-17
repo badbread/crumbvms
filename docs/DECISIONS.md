@@ -8,6 +8,75 @@ revisit.
 
 ---
 
+## 2026-07-17, LPR A/B benchmark: passes derived at report time (two-phase clustering), truth keyed on (camera_id, bucket_ts)
+
+**Status.** Built on `feat/lpr-ab-benchmark`. Backend: `GET /lpr/ab-report` +
+`POST /lpr/ab-confirm` in `plates.rs`, pure pairing logic in
+`services/common/src/lpr_ab.rs`, `lpr_pass_truth` table (migration 0070).
+Desktop: a Benchmark dialog off the Plates screen, visible only when the server
+reports a `lpr_engine = 'both'` camera. This is the "engine comparison" item
+the 2026-07-17 native-engine plan deferred (its §10), now scoped to the two
+built-in engines.
+
+**Context.** With `lpr_engine = 'both'` every physical vehicle pass produces
+`plate_reads` rows from BOTH Frigate's native LPR and the crumb-alpr worker —
+plus Frigate's own self-duplication (it re-emits a read for the same pass as
+its OCR refines, e.g. `9GXVL98` then `9GXV498` ~5 s apart, under different
+provider event ids). To score the engines head-to-head (hit rate, agreement,
+accuracy against operator-confirmed truth) the reads must be grouped into
+per-vehicle "passes", but no pass entity exists in the schema and the two
+engines share no join key.
+
+**Decision.** Passes are **derived at report time, never stored**: a pure
+in-memory clustering (`lpr_ab.rs`, unit-tested without a DB) over the raw
+reads in the requested range. Two phases: (1) intra-engine collapse — reads
+chain into a cluster when within the pairing window (default 8 s, query-tunable)
+of the cluster's latest read AND fuzzy-matching its plate under the **same
+length-scaled Levenshtein model the watchlist uses** (`levenshtein` /
+`allowed_edits`, reused not reimplemented; pairing fuzz defaults to 0.25,
+independent of the operator's alert fuzz which is often 0), keeping one best
+read (highest confidence) per engine-cluster; (2) cross-engine one-to-one
+pairing, greedy by fuzzy-plate agreement first, then pure time proximity — so
+two cars passing close together pair with their own reads, while a wild
+engine disagreement still lands in ONE pass (a disagreement to surface, not
+two fake misses). Ground truth (`lpr_pass_truth`) is keyed on
+**`(camera_id, bucket_ts)`** where `bucket_ts` is the pass's earliest kept-read
+timestamp floored to whole seconds — echoed verbatim by the client on confirm.
+
+**Rejected.**
+
+- *Storing passes (a `lpr_passes` table maintained at ingest).* A stored
+  grouping freezes today's clustering bugs into data, needs migration/backfill
+  churn to tune the window, and adds ingest-path risk for a reporting feature.
+  Derived-on-read costs a few ms over ≤10 k reads and lets the operator re-run
+  the same data under a different window/fuzz instantly.
+- *Truth keyed on a representative read id.* Simpler-looking, but retention
+  prunes `plate_reads` (the id dangles) and the "representative" read can
+  change as clustering parameters move; the time-bucket key survives both and
+  degrades benignly (an orphaned truth just shows the pass unconfirmed again).
+- *Time-only cross-engine pairing.* Merges two cars that pass within the
+  window; the fuzzy-first tier fixes that without splitting genuine
+  disagreements.
+- *SQL window-function clustering.* The fuzzy-plate chain condition
+  (Levenshtein against the cluster's evolving best) doesn't express cleanly in
+  SQL; in Rust it is trivially unit-testable.
+
+**Trade-offs accepted.** A pass's `bucket_ts` can shift if a straggler read
+arrives after an operator confirms (orphaning that truth row) — benign and
+rare, since engines finish refining within seconds and operators confirm
+minutes later. Report stats cap at the newest 10 000 reads per query
+(`truncated` flag tells the client to narrow the range). Intra-engine garbage
+reads far outside the fuzzy budget split into separate passes and inflate
+"miss" counts slightly.
+
+**Revisit triggers.** A third engine joins the comparison (the pairing is
+two-engine-shaped; N-way needs a different pass model). Operators report
+orphaned confirmations in practice → move truth to a stored-pass model.
+Cameras with continuous traffic (parking lots) where the >10 k-read cap or the
+greedy pairing visibly misgroups → revisit stored passes / SQL pre-bucketing.
+
+---
+
 ## 2026-07-17, Crumb-native LPR engine: `fast-alpr` sidecar via `POST /lpr/reads`, keeping `plate_reads` engine-agnostic
 
 **Status.** Building on `feat/lpr-native`. Backend (ingest endpoint + crop

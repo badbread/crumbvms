@@ -48,6 +48,11 @@ pub fn json_routes() -> Router<AppState> {
         // The crumb-alpr worker polls its effective per-camera config (zones,
         // min-conf, engine). Ingest-token-auth like /lpr/reads, not a user JWT.
         .route("/lpr/worker-config", get(get_worker_config))
+        // Dual-engine A/B benchmark: derived-pass report (view_plates-gated)
+        // and operator ground-truth confirmation (admin-only, like the
+        // watchlist writes).
+        .route("/lpr/ab-report", get(get_ab_report))
+        .route("/lpr/ab-confirm", post(post_ab_confirm))
         .route("/config/lpr", get(get_lpr_config).put(put_lpr_config))
         .route("/config/lpr/rotate-token", post(rotate_lpr_token))
         .route(
@@ -435,6 +440,327 @@ async fn delete_watchlist(
             "watchlist entry {id} not found"
         )))
     }
+}
+
+// ── dual-engine A/B benchmark (`/lpr/ab-report`, `/lpr/ab-confirm`) ─────────
+
+/// `GET /lpr/ab-report` query. All optional; see [`get_ab_report`].
+#[derive(Debug, Deserialize)]
+pub struct AbReportQuery {
+    /// Restrict to one camera (must be a `both`-engine camera in the caller's
+    /// scope; anything else yields the empty report, mirroring `/plates`).
+    pub camera_id: Option<Uuid>,
+    /// Pass-pairing window in seconds (reads of one physical vehicle pass).
+    /// Default 8, clamped 2..=120.
+    pub window: Option<i64>,
+    /// Pairing fuzziness (length-scaled Levenshtein, same model as the
+    /// watchlist). Default 0.25, clamped 0.0..=0.5.
+    pub fuzz: Option<f32>,
+    /// Report range start (ISO 8601, inclusive). Default: `end - 24h`.
+    pub start: Option<DateTime<Utc>>,
+    /// Report range end (ISO 8601, exclusive). Default: now.
+    pub end: Option<DateTime<Utc>>,
+    /// Max passes returned. Default 100, max 500.
+    pub limit: Option<i64>,
+    /// Passes to skip (stats always cover the whole range, only the pass list
+    /// pages).
+    pub offset: Option<i64>,
+}
+
+/// A `both`-engine camera included in the report.
+#[derive(Debug, Serialize)]
+pub struct AbCameraDto {
+    pub id: Uuid,
+    pub name: String,
+}
+
+/// One engine's aggregate block in the report.
+#[derive(Debug, Serialize)]
+pub struct AbEngineStatsDto {
+    pub total_reads: usize,
+    pub passes_seen: usize,
+    pub avg_confidence: Option<f32>,
+    pub hit_rate: Option<f32>,
+    pub confirmed: usize,
+    pub correct: usize,
+    pub accuracy: Option<f32>,
+}
+
+impl From<crumb_common::lpr_ab::EngineAggregate> for AbEngineStatsDto {
+    fn from(a: crumb_common::lpr_ab::EngineAggregate) -> Self {
+        Self {
+            total_reads: a.total_reads,
+            passes_seen: a.passes_seen,
+            avg_confidence: a.avg_confidence,
+            hit_rate: a.hit_rate,
+            confirmed: a.confirmed,
+            correct: a.correct,
+            accuracy: a.accuracy,
+        }
+    }
+}
+
+/// One engine's best read within a paired pass.
+#[derive(Debug, Serialize)]
+pub struct AbReadDto {
+    pub read_id: Uuid,
+    pub plate: String,
+    pub confidence: Option<f32>,
+    /// Sibling detection event — the client fetches the pass image via the
+    /// existing `GET /events/:id/snapshot` (or `GET /plates/:id/crop`).
+    pub event_id: Option<Uuid>,
+    pub ts: DateTime<Utc>,
+    /// Raw reads collapsed into this engine's entry (dup-refinement count).
+    pub read_count: usize,
+}
+
+fn ab_read_dto(b: &crumb_common::lpr_ab::EngineBest) -> AbReadDto {
+    AbReadDto {
+        read_id: b.read_id,
+        plate: b.plate.clone(),
+        confidence: b.confidence,
+        event_id: b.event_id,
+        ts: b.ts,
+        read_count: b.read_count,
+    }
+}
+
+/// One paired pass row. `(camera_id, bucket_ts)` is the stable pass key the
+/// confirm endpoint takes back.
+#[derive(Debug, Serialize)]
+pub struct AbPassDto {
+    pub camera_id: Uuid,
+    pub bucket_ts: DateTime<Utc>,
+    pub frigate: Option<AbReadDto>,
+    pub crumb_alpr: Option<AbReadDto>,
+    /// Both engines read it and agreed (`null` when either missed).
+    pub agree: Option<bool>,
+    /// Operator-confirmed truth, when recorded.
+    pub true_plate: Option<String>,
+    pub frigate_correct: Option<bool>,
+    pub crumb_alpr_correct: Option<bool>,
+}
+
+/// `GET /lpr/ab-report` response.
+#[derive(Debug, Serialize)]
+pub struct AbReportResponse {
+    pub window_secs: i64,
+    pub fuzz: f32,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// The `both`-engine cameras (caller-scoped) this report covers. Empty ⇒
+    /// the benchmark is not applicable (clients hide the Benchmark UI).
+    pub cameras: Vec<AbCameraDto>,
+    pub total_passes: usize,
+    pub both_seen: usize,
+    pub agreement_rate: Option<f32>,
+    pub frigate: AbEngineStatsDto,
+    pub crumb_alpr: AbEngineStatsDto,
+    /// One page of passes, newest first.
+    pub passes: Vec<AbPassDto>,
+    pub pass_total: usize,
+    pub has_more: bool,
+    /// True when the range held more reads than the report ceiling (stats
+    /// cover only the newest slice — narrow the range).
+    pub truncated: bool,
+}
+
+/// Report read ceiling: the newest reads fed to the pairing pass. A `both`
+/// LPR camera produces a handful of reads per vehicle, so 10 000 covers weeks
+/// of realistic traffic; beyond it the response flags `truncated`.
+const AB_MAX_READS: i64 = 10_000;
+
+/// `GET /lpr/ab-report` — head-to-head comparison of the two LPR engines on
+/// `lpr_engine = 'both'` cameras: reads in the range are clustered into
+/// physical vehicle passes (see `crumb_common::lpr_ab`), each pass carrying at
+/// most one best read per engine, plus per-engine aggregates (hit rate,
+/// agreement, confidence, and accuracy against operator-confirmed truths).
+///
+/// `view_plates`-gated and camera-scoped like `/plates`: out-of-scope or
+/// non-`both` cameras are silently dropped; no eligible cameras yields the
+/// empty report (`cameras: []`), never an error.
+///
+/// # Errors
+///
+/// * `400` — `start >= end`.
+/// * `401` / `403` — auth failure / missing `view_plates`.
+async fn get_ab_report(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<AbReportQuery>,
+) -> Result<Json<AbReportResponse>, ApiError> {
+    use crumb_common::lpr_ab;
+
+    user.require_view_plates()?;
+
+    let window_secs = q.window.unwrap_or(8).clamp(2, 120);
+    let fuzz = q.fuzz.unwrap_or(0.25).clamp(0.0, 0.5);
+    let end = q.end.unwrap_or_else(Utc::now);
+    let start = q.start.unwrap_or(end - chrono::Duration::hours(24));
+    if start >= end {
+        return Err(ApiError::BadRequest(
+            "start must be strictly before end".to_owned(),
+        ));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let limit = q.limit.unwrap_or(100).clamp(1, 500) as usize;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let offset = q.offset.unwrap_or(0).max(0) as usize;
+
+    // Eligible cameras: lpr_engine = 'both', intersected with the caller's
+    // camera scope, optionally narrowed to one requested camera.
+    let all = db::list_lpr_ab_cameras(state.pool())
+        .await
+        .map_err(ApiError::Internal)?;
+    let all_ids: Vec<Uuid> = all.iter().map(|(id, _)| *id).collect();
+    let scoped = user.filter_camera_ids(&all_ids);
+    let mut cameras: Vec<AbCameraDto> = all
+        .into_iter()
+        .filter(|(id, _)| scoped.contains(id))
+        .map(|(id, name)| AbCameraDto { id, name })
+        .collect();
+    if let Some(cid) = q.camera_id {
+        cameras.retain(|c| c.id == cid);
+    }
+    if cameras.is_empty() {
+        return Ok(Json(AbReportResponse {
+            window_secs,
+            fuzz,
+            start,
+            end,
+            cameras,
+            total_passes: 0,
+            both_seen: 0,
+            agreement_rate: None,
+            frigate: AbEngineStatsDto::from(lpr_ab::EngineAggregate::default()),
+            crumb_alpr: AbEngineStatsDto::from(lpr_ab::EngineAggregate::default()),
+            passes: vec![],
+            pass_total: 0,
+            has_more: false,
+            truncated: false,
+        }));
+    }
+    let ids: Vec<Uuid> = cameras.iter().map(|c| c.id).collect();
+
+    let (reads, read_total) = db::list_plate_reads(
+        state.pool(),
+        &db::PlateReadQuery {
+            camera_ids: ids.clone(),
+            start: Some(start),
+            end: Some(end),
+            plate: None,
+            match_mode: db::PlateMatch::Contains,
+            limit: AB_MAX_READS,
+            offset: 0,
+        },
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    let truncated = read_total > AB_MAX_READS;
+
+    // Truth rows for the range. `bucket_ts` is a read ts floored to whole
+    // seconds, so widen the lower bound by a second to catch a pass whose
+    // earliest read sits in the range's first partial second.
+    let truths_rows = db::list_lpr_pass_truth(
+        state.pool(),
+        &ids,
+        start - chrono::Duration::seconds(1),
+        end,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    let truths: std::collections::HashMap<(Uuid, DateTime<Utc>), String> = truths_rows
+        .into_iter()
+        .map(|t| ((t.camera_id, t.bucket_ts), t.true_plate))
+        .collect();
+
+    let passes = lpr_ab::pair_passes(&reads, window_secs, fuzz);
+    let stats = lpr_ab::compute_stats(&reads, &passes, &truths);
+    let pass_total = passes.len();
+
+    let page: Vec<AbPassDto> = passes
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|p| {
+            let truth = lpr_ab::truth_for(p, &truths);
+            AbPassDto {
+                camera_id: p.camera_id,
+                bucket_ts: p.bucket_ts,
+                frigate: p.frigate.as_ref().map(ab_read_dto),
+                crumb_alpr: p.crumb_alpr.as_ref().map(ab_read_dto),
+                agree: p.agree(),
+                true_plate: truth.cloned(),
+                frigate_correct: lpr_ab::engine_correct(p.frigate.as_ref(), truth),
+                crumb_alpr_correct: lpr_ab::engine_correct(p.crumb_alpr.as_ref(), truth),
+            }
+        })
+        .collect();
+    let has_more = offset.saturating_add(page.len()) < pass_total;
+
+    Ok(Json(AbReportResponse {
+        window_secs,
+        fuzz,
+        start,
+        end,
+        cameras,
+        total_passes: stats.total_passes,
+        both_seen: stats.both_seen,
+        agreement_rate: stats.agreement_rate,
+        frigate: stats.frigate.into(),
+        crumb_alpr: stats.crumb_alpr.into(),
+        passes: page,
+        pass_total,
+        has_more,
+        truncated,
+    }))
+}
+
+/// `POST /lpr/ab-confirm` body: the pass key echoed from an `ab-report` row
+/// plus the operator-verified plate (normalized server-side).
+#[derive(Debug, Deserialize)]
+pub struct AbConfirmBody {
+    pub camera_id: Uuid,
+    pub bucket_ts: DateTime<Utc>,
+    pub true_plate: String,
+}
+
+/// `POST /lpr/ab-confirm` — record the operator-confirmed true plate for one
+/// derived pass (upsert on the `(camera_id, bucket_ts)` pass key, so
+/// re-confirming corrects a typo). Admin-only, matching the watchlist writes:
+/// ground truth drives the published accuracy numbers.
+///
+/// # Errors
+///
+/// * `400` — `true_plate` normalizes to empty.
+/// * `401` / `403` — auth failure / not an admin.
+/// * `404` — unknown camera.
+async fn post_ab_confirm(
+    admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<AbConfirmBody>,
+) -> Result<Json<crumb_common::types::LprPassTruth>, ApiError> {
+    let plate = db::normalize_plate(&body.true_plate);
+    if plate.is_empty() {
+        return Err(ApiError::BadRequest(
+            "true_plate must contain at least one alphanumeric character".to_owned(),
+        ));
+    }
+    // Unknown camera -> 404 (otherwise the FK insert would surface as a 500).
+    db::get_camera_lpr_config(state.pool(), body.camera_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("camera {} not found", body.camera_id)))?;
+    let truth = db::upsert_lpr_pass_truth(
+        state.pool(),
+        body.camera_id,
+        crumb_common::lpr_ab::bucket_key(body.bucket_ts),
+        &plate,
+        admin.0.user_id,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    Ok(Json(truth))
 }
 
 // ── admin: LPR enable/retention config (`/config/lpr`) ──────────────────────

@@ -31,6 +31,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
@@ -118,6 +119,12 @@ class _PlatesScreenState extends State<PlatesScreen> {
   LprConfig? _lprConfig;
   bool _lprConfigLoading = false;
 
+  // Whether the dual-engine A/B benchmark applies here (the server reports at
+  // least one `lpr_engine == 'both'` camera in this account's scope). Probed
+  // once via a minimal GET /lpr/ab-report; the Benchmark button only renders
+  // when true, so single-engine setups never see it.
+  bool _abAvailable = false;
+
   // Which layout the results render in (persisted via [PlatesPrefs]).
   PlatesViewMode _viewMode = PlatesViewMode.list;
   // How plate previews show their image(s) (persisted via [PlatesPrefs]).
@@ -141,6 +148,28 @@ class _PlatesScreenState extends State<PlatesScreen> {
     _load();
     _loadWatchlist();
     if (widget.canManageWatchlist) _loadLprConfig();
+    _probeAbBenchmark();
+  }
+
+  /// Cheap applicability probe for the A/B benchmark: a minimal report over
+  /// the last minute. The server returns its `both`-engine camera list even
+  /// when the range holds no reads, so `cameras.isNotEmpty` is exactly "show
+  /// the Benchmark button". Any error (403, offline, old server without the
+  /// endpoint) just leaves the button hidden — never surfaced to the UI.
+  Future<void> _probeAbBenchmark() async {
+    try {
+      final end = DateTime.now();
+      final report = await widget.api.getAbReport(
+        widget.session,
+        start: end.subtract(const Duration(minutes: 1)),
+        end: end,
+        limit: 1,
+      );
+      if (!mounted) return;
+      setState(() => _abAvailable = report.cameras.isNotEmpty);
+    } catch (_) {
+      // Leave hidden.
+    }
   }
 
   Future<void> _restoreViewMode() async {
@@ -643,6 +672,20 @@ class _PlatesScreenState extends State<PlatesScreen> {
             onCornerChanged: _setCropCorner,
             onSizeChanged: _setCropSize,
           ),
+          if (_abAvailable)
+            TextButton.icon(
+              onPressed: () => showAbBenchmark(
+                context,
+                api: widget.api,
+                session: widget.session,
+                canConfirm: widget.canManageWatchlist,
+              ),
+              icon: const Icon(Icons.speed, size: 16, color: Colors.white70),
+              label: const Text(
+                'Benchmark',
+                style: TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ),
           TextButton.icon(
             onPressed: () =>
                 setState(() => _showWatchlist = !_showWatchlist),
