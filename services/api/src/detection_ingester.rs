@@ -176,6 +176,10 @@ async fn maybe_record_plate(
                 // snapshot frame (None when the provider gave none / it couldn't
                 // be normalized). Best-effort, purely additive.
                 bbox: ev.plate_box,
+                // Raw plate-crop JPEG bytes when the engine supplied them
+                // (external-OCR path, e.g. crumb-alpr); None for Frigate, which
+                // carries only a proxied snapshot_url.
+                crop: ev.plate_crop.clone(),
                 raw: ev.raw.clone(),
             };
             match upsert_plate_read(pool, &params).await {

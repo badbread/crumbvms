@@ -150,6 +150,15 @@ pub struct NormalizedEvent {
     /// `plate_reads.bbox_*` columns, nothing in the shared `events` path.
     pub plate_box: Option<[f32; 4]>,
 
+    /// Plate crop as raw JPEG bytes, when the provider hands Crumb the image
+    /// directly instead of a proxied snapshot URL. This is the external-OCR path
+    /// (e.g. the `crumb-alpr` fast-alpr worker POSTing to `/lpr/reads`): the
+    /// engine has already cropped the plate, so Crumb stores the bytes in
+    /// `plate_reads.crop` rather than proxying a Frigate snapshot. `None` for the
+    /// Frigate path, which carries only [`Self::snapshot_url`]. Additive: drives
+    /// only the `plate_reads.crop` column, nothing in the shared `events` path.
+    pub plate_crop: Option<Vec<u8>>,
+
     /// Full vendor payload preserved verbatim as JSONB.
     ///
     /// Used for debugging and future provider-specific feature extraction

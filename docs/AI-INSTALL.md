@@ -328,6 +328,17 @@ viewing it needs the **View license plates** role capability (Settings → Users
 Security). Plate-read retention is independent of footage/storage retention.
 REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
+Alternatively — or for better accuracy than Frigate's native LPR — run Crumb's
+**own** local OCR engine, the opt-in **`crumb-alpr`** worker (fast-alpr; no cloud,
+no third-party agent). It pulls a camera's go2rtc restream, motion-gates, reads
+plates, and POSTs them to the same LPR store. Enable LPR (above), then in
+**Admin → LPR** mint an **ingest token** (rotate token), set the `LPR_*` vars in
+`.env` (`LPR_INGEST_TOKEN`, `LPR_CAMERA_ID`, `LPR_RTSP_URL`; see `.env.example`),
+and start it: `docker compose --profile alpr up -d --build crumb-alpr`. It's
+CPU-only and profile-gated (a plain `up -d` never starts it); one instance per
+camera. Model weights download at first run (not vendored — see
+`docs/LPR-NATIVE-ENGINE-PLAN.md` for the licensing note and air-gapped pre-fetch).
+
 To be **alerted** when a specific plate is seen, add it to the **watchlist** in
 the **LPR** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
 admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert

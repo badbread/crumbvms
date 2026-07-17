@@ -8,6 +8,65 @@ revisit.
 
 ---
 
+## 2026-07-17, Crumb-native LPR engine: `fast-alpr` sidecar via `POST /lpr/reads`, keeping `plate_reads` engine-agnostic
+
+**Status.** Building on `feat/lpr-native`. Backend (ingest endpoint + crop
+plumbing + per-camera columns + worker-config) done and gated; the `crumb-alpr`
+worker and admin/wizard surfaces follow. Fires the revisit trigger of the
+2026-07-13 LPR entry below ("a validation month shows Frigate LPR materially
+under the canceled cloud plan's hit rate → wire the operator's OpenALPR box or a
+`fast-alpr` sidecar through `POST /lpr/reads`").
+
+**Context.** The 2026-07-13 decision chose Frigate native LPR as the only engine.
+Validation on Frigate `0.18-beta` showed it materially weak on the operator's
+overview angle. The paid OpenALPR/Rekor engine reads better, but its "Watchman
+Home" (Basic) license was proven to **hard-block all non-cloud data delivery** —
+the agent's own log refuses a local destination and force-restarts — and the Pro
+tier that unlocks a local webhook is too costly. The open-source OpenALPR C++
+engine is 2018-era, worse than current Frigate, and painful to build. So Crumb
+needs its own free, fully-local, better-than-Frigate engine.
+
+**Decision.** Add a Crumb-native OCR engine, **`fast-alpr`** (a YOLOv9-t ONNX
+plate detector plus a CCT-xs ONNX OCR), run as an **opt-in `crumb-alpr` Python
+sidecar** (compose `alpr` profile). It pulls a camera's go2rtc restream,
+motion-gates, votes across a vehicle pass, and POSTs one read to a new
+**`POST /lpr/reads`** (authenticated by the `lpr_config` ingest token, not a user
+JWT). The endpoint builds a `crumb-alpr` `NormalizedEvent` and pushes it into the
+**same detection-ingester channel Frigate uses**, so dedup, ignore-list,
+watchlist, alerts, and the timeline mirror are reused verbatim — the only new
+plumbing is carrying the crop JPEG bytes into `plate_reads.crop`. `plate_reads`
+stays engine-agnostic (already tags each read by `source_id`). Per-camera
+`lpr_engine` (`frigate` / `crumb-alpr` / `both`), `lpr_min_confidence`, and
+`lpr_zones` (include/exclude polygons) columns (migration 0069) drive the worker,
+which polls `GET /lpr/worker-config` so admin edits apply without a restart.
+Benchmarked on real operator footage: 24 of 25 frames correct at ~0.99 char
+confidence, ~37 ms/frame CPU-only, so ~7 percent of one core motion-gated. No GPU.
+
+**Alternatives rejected.** (1) **OpenALPR Pro** (~72 USD/mo/camera) — cost, and
+still a cloud-license gate. (2) **Resurrect OSS OpenALPR** — old engine, worse
+than Frigate, build pain. (3) **Rust-native ONNX via the `ort` crate** — deferred:
+reimplementing the YOLOv9 and CCT pre/post-processing in Rust is real work; the
+Python sidecar ships now and reuses `fast-alpr`'s CCTV tuning. (4) **OpenALPR
+local 8355 pull API on Basic** — its `/list` needs a diagnostic mode that appears
+license-gated; unreliable.
+
+**Trade-offs accepted.** A new optional Python service and image (golden rule 6):
+justified because it is opt-in, isolated, and only runs when enabled. Model
+weights are **YOLOv9-derived (GPL-3.0)** — compatible with Crumb's AGPL-3.0 — and
+are **not vendored**: they download at first run, so Crumb never redistributes
+them (air-gapped installs pre-fetch; see `docs/LPR-NATIVE-ENGINE-PLAN.md`). The
+Python sidecar is heavier per-inference than the paid engine's C++, but light
+enough for a single gated camera. `plate_reads.crop` now stores bytea for the
+external path (Frigate still uses `snapshot_url`).
+
+**Revisit triggers.** `fast-alpr` accuracy underperforms in real use → try a
+different open model, add the CCTV re-detect/upscale tuning, or the Rust-native
+port. The Python dependency or image size becomes a maintenance burden → port to
+Rust `ort` (weights are already ONNX). A maintained permissively-licensed
+detector appears → swap it to drop the GPL-weight exposure entirely. An operator
+wants a live three-way `crumb-alpr` vs `frigate` vs `openalpr` comparison → build
+the deferred stats panel (every read is already `source_id`-tagged).
+
 ## 2026-07-16, Recording policies: explicit named membership replaces NULL-inherit + anonymous COW forks
 
 **Status.** Phase 1 (server-only) landed the `origin` column + the collapse

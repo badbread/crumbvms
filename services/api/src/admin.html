@@ -4828,6 +4828,11 @@ function renderCamInfoTab(c) {
       <div id="ce-ha"><div class="card-hint" style="margin:0">Loading Home Assistant links&hellip;</div></div>
     </div>
 
+    <div class="policy-section">
+      <div class="policy-section-title">License-plate recognition (this camera)</div>
+      <div id="ce-lpr"><div class="card-hint" style="margin:0">Loading LPR settings&hellip;</div></div>
+    </div>
+
     <details class="detail-section" id="ce-probe-details">
       <summary>
         <span class="ds-chev">&#x25B6;</span>
@@ -4870,6 +4875,7 @@ function renderCamInfoTab(c) {
   loadCameraCompat(c.id);
   loadCameraAudioStatus(c.id);
   loadCameraHaLinks(c.id);
+  loadCameraLpr(c.id);
 }
 
 /* ── Camera compatibility (issue #48) ──
@@ -5027,6 +5033,52 @@ let HA_PICKER_SEARCH = '';
 let HA_PICKER_SHOWALL = false;
 // device_classes worth linking to a camera; the rest hide under "Other sensors".
 const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
+
+/* Per-camera LPR settings (engine / min-confidence / detection zones), fetched
+   on camera-edit open (GET /config/cameras/:id/lpr) and saved on its own button
+   (PUT /config/cameras/:id/lpr). Self-contained, like the HA-links section. */
+async function loadCameraLpr(camId) {
+  const el = $('ce-lpr'); if (!el) return;
+  let cfg;
+  try { cfg = await api('/config/cameras/' + camId + '/lpr'); }
+  catch (e) { el.innerHTML = `<div class="form-msg err" style="margin:0">${esc((e && e.message) || 'Failed to load LPR settings')}</div>`; return; }
+  const eng = cfg.engine || 'frigate';
+  const opt = (v, label) => `<option value="${v}" ${eng===v?'selected':''}>${label}</option>`;
+  const zonesStr = cfg.zones ? JSON.stringify(cfg.zones, null, 2) : '';
+  el.innerHTML = `
+    <div class="card-hint" style="margin:0 0 10px 0">Which engine reads plates on this camera. The Crumb-native <b>crumb-alpr</b> worker (fast-alpr) reads only the include zones (or the whole frame if none) and ignores the exclude zones.</div>
+    <div class="grid2">
+      <div><label class="field-label" style="margin-top:0">Engine ${infoHint('Frigate = plates from Frigate&#39;s native LPR on the event stream. crumb-alpr = Crumb&#39;s own local fast-alpr worker (POST /lpr/reads). Both = accept reads from either engine.')}</label>
+        <select id="ce-lpr-engine" style="font-size:13px">${opt('frigate','Frigate native LPR')}${opt('crumb-alpr','Crumb-native (fast-alpr worker)')}${opt('both','Both')}</select></div>
+      <div><label class="field-label" style="margin-top:0">Min OCR confidence ${infoHint('crumb-alpr drops reads below this mean character confidence (0–1). 0.8 is a good default.')}</label>
+        <input id="ce-lpr-minconf" type="number" min="0" max="1" step="0.05" value="${esc(String(cfg.min_confidence ?? 0.8))}" /></div>
+    </div>
+    <label class="chk" style="margin-top:10px"><input type="checkbox" id="ce-lpr-enabled" ${cfg.enabled?'checked':''}/> crumb-alpr worker should read this camera</label>
+    <label class="field-label">Detection zones (JSON) ${infoHint('{"include":[[[x,y],…]], "exclude":[[[x,y],…]]} with normalized 0–1 coordinates. include = only read plates whose box centroid is inside one of these; exclude = ignore plates inside these. Blank = whole frame. A visual zone editor is planned; for now paste polygon JSON.')}</label>
+    <textarea id="ce-lpr-zones" class="mono" style="width:100%;min-height:76px;font-size:12px" placeholder='{"include":[],"exclude":[]}'>${esc(zonesStr)}</textarea>
+    <div style="margin-top:8px"><button class="primary sm" onclick="saveCameraLpr('${camId}')">Save LPR settings</button></div>
+    <div id="ce-lpr-msg" class="form-msg"></div>`;
+}
+
+async function saveCameraLpr(camId) {
+  setMsg('ce-lpr-msg', '');
+  let zones = null;
+  const raw = ($('ce-lpr-zones') || {}).value;
+  if (raw && raw.trim()) {
+    try { zones = JSON.parse(raw); }
+    catch { setMsg('ce-lpr-msg', 'Zones must be valid JSON (or left blank).', 'err'); return; }
+  }
+  const body = {
+    enabled: $('ce-lpr-enabled').checked,
+    engine: $('ce-lpr-engine').value,
+    min_confidence: Math.max(0, Math.min(1, parseFloat(($('ce-lpr-minconf')||{}).value) || 0.8)),
+    zones: zones,
+  };
+  try {
+    await api('/config/cameras/' + camId + '/lpr', { method: 'PUT', body: JSON.stringify(body) });
+    toast('LPR settings saved for this camera.');
+  } catch (e) { setMsg('ce-lpr-msg', (e && e.message) || 'Save failed', 'err'); }
+}
 
 async function loadCameraHaLinks(camId) {
   const el = $('ce-ha'); if (!el) return;
@@ -6132,6 +6184,15 @@ async function renderDetectionClips() {
         <div><label class="field-label" style="margin-top:0">Match fuzziness (tolerated misreads) ${infoHint('How many characters may differ when matching a read to a watch or ignore plate. Scales with plate length: 20% is about 1 wrong character on a 6-7 char plate; 0% = exact. Frigate ALPR sometimes misreads a character, and this catches those. Applies to both watch (alert) and ignore (drop) entries. Max 50%.')}</label><input id="lpr-fuzz" type="number" min="0" max="50" step="5" value="${esc(String(Math.round((lpr.watchlist_fuzz||0)*100)))}" /></div>
       </div>
       <div class="card-hint" style="margin-top:4px">Saving applies immediately, no restart.</div>
+      <!-- Ingest token for the opt-in crumb-alpr worker (Crumb-native fast-alpr engine). -->
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+        <label class="field-label" style="margin-top:0">Crumb-native LPR worker ${infoHint('The optional crumb-alpr worker (fast-alpr) is Crumb&#39;s own local plate OCR — no cloud, no third-party agent, better than Frigate on hard angles. It authenticates to POST /lpr/reads with the ingest token below. Rotate to mint a new one; the old token stops working immediately. Run the worker with: docker compose --profile alpr up -d --build crumb-alpr')}</label>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <span id="lpr-token-status" class="card-hint" style="margin:0">${lpr.has_ingest_token ? 'An ingest token is set.' : 'No ingest token yet — rotate to create one.'}</span>
+          <button class="sm" type="button" onclick="rotateLprToken()">Rotate ingest token</button>
+        </div>
+        <div id="lpr-token-reveal" class="form-msg" style="display:none;margin-top:8px"></div>
+      </div>
       <div id="lpr-msg" class="form-msg"></div>
     </div>
 
@@ -6324,6 +6385,24 @@ async function saveLpr() {
     LPR_CONFIG = await api('/config/lpr', { method: 'PUT', body: JSON.stringify(body) });
     renderTree();               // show/hide the Plates nav entry to match
     toast('License-plate settings saved.');
+  } catch (e) { setMsg('lpr-msg', e.message, 'err'); }
+}
+/* Mint a new crumb-alpr ingest token (POST /config/lpr/rotate-token). The token
+   is returned exactly once and never retrievable again, so reveal it inline for
+   the operator to copy into the worker's LPR_INGEST_TOKEN. */
+async function rotateLprToken() {
+  if (!confirm('Rotate the LPR ingest token?\n\nThe current token stops working immediately, and any running crumb-alpr worker must be updated with the new one.')) return;
+  try {
+    const r = await api('/config/lpr/rotate-token', { method: 'POST' });
+    const el = $('lpr-token-reveal');
+    if (el) {
+      el.style.display = 'block';
+      el.className = 'form-msg ok';
+      el.innerHTML = 'New ingest token (copy it now — it is never shown again):<br><code style="user-select:all;word-break:break-all">' + esc(r.ingest_token) + '</code>';
+    }
+    const st = $('lpr-token-status');
+    if (st) st.textContent = 'An ingest token is set.';
+    if (LPR_CONFIG) LPR_CONFIG.has_ingest_token = true;
   } catch (e) { setMsg('lpr-msg', e.message, 'err'); }
 }
 /* ── Frigate URL-base test (POST /config/frigate/test-http) ──────────────────

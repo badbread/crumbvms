@@ -221,6 +221,7 @@ pub fn routes() -> Router<AppState> {
         .route("/clip-sources", get(get_clip_sources))
         .route("/clip-source-default", put(set_clip_source_default))
         .route("/cameras/:id/clip-source", put(set_camera_clip_source))
+        .route("/cameras/:id/lpr", put(set_camera_lpr).get(get_camera_lpr))
         .route("/clip-preroll", get(get_clip_preroll).put(set_clip_preroll))
         .route(
             "/clip-overview",
@@ -351,6 +352,75 @@ async fn set_camera_clip_source(
         .await
         .map_err(ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── per-camera LPR settings (migration 0069: engine + zones + min-confidence) ──
+
+/// `PUT /config/cameras/:id/lpr` body — per-camera settings for the crumb-alpr
+/// worker. `engine` selects which plate source feeds this camera; `zones` is the
+/// `{include,exclude}` detection-polygon config (or null to clear).
+#[derive(serde::Deserialize)]
+struct CameraLprRequest {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_lpr_engine")]
+    engine: String,
+    #[serde(default = "default_lpr_min_conf")]
+    min_confidence: f32,
+    zones: Option<serde_json::Value>,
+}
+
+fn default_lpr_engine() -> String {
+    "frigate".to_owned()
+}
+
+fn default_lpr_min_conf() -> f32 {
+    0.80
+}
+
+/// `PUT /config/cameras/:id/lpr` — set a camera's LPR engine, min-confidence, and
+/// detection zones (admin-only). The crumb-alpr worker picks these up via its
+/// `GET /lpr/worker-config` poll, so edits apply without a worker restart.
+async fn set_camera_lpr(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CameraLprRequest>,
+) -> Result<StatusCode, ApiError> {
+    let engine = match body.engine.as_str() {
+        "frigate" | "crumb-alpr" | "both" => body.engine,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "engine must be 'frigate', 'crumb-alpr', or 'both', got '{other}'"
+            )))
+        }
+    };
+    let min_conf = body.min_confidence.clamp(0.0, 1.0);
+    db::update_camera_lpr(
+        state.pool(),
+        id,
+        body.enabled,
+        &engine,
+        min_conf,
+        body.zones,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /config/cameras/:id/lpr` — current per-camera LPR settings, for
+/// pre-populating the admin camera-edit form (admin-only).
+async fn get_camera_lpr(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crumb_common::types::CameraLprConfig>, ApiError> {
+    let cfg = db::get_camera_lpr_config(state.pool(), id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("camera {id} not found")))?;
+    Ok(Json(cfg))
 }
 
 // ─── clip pre-roll (Clips feature: seconds before the event a clip starts) ──────
