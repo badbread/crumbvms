@@ -19,6 +19,7 @@ import 'package:flutter/material.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
+import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
 
 // Palette shared with the Plates screen (kept literal — those consts are
