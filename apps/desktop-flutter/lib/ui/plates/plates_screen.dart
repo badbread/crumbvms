@@ -31,6 +31,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
@@ -123,6 +124,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
   PlateImageDisplay _imageDisplay = PlateImageDisplay.both;
   PlateCropCorner _cropCorner = PlateCropCorner.bottomRight;
   PlateCropSize _cropSize = PlateCropSize.medium;
+  // Collapse duplicate reads of one car (both engines + Frigate OCR refinements)
+  // into a single row (persisted via [PlatesPrefs]).
+  bool _collapse = true;
 
   Timer? _searchDebounce;
   final _thumbGate = _ConcurrencyGate(_thumbConcurrency);
@@ -144,13 +148,21 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final display = await PlatesPrefs.getImageDisplay();
     final corner = await PlatesPrefs.getCropCorner();
     final size = await PlatesPrefs.getCropSize();
+    final collapse = await PlatesPrefs.getCollapseDuplicates();
     if (!mounted) return;
     setState(() {
       _viewMode = mode;
       _imageDisplay = display;
       _cropCorner = corner;
       _cropSize = size;
+      _collapse = collapse;
     });
+  }
+
+  void _setCollapse(bool on) {
+    if (on == _collapse) return;
+    setState(() => _collapse = on);
+    PlatesPrefs.setCollapseDuplicates(on);
   }
 
   void _setViewMode(PlatesViewMode mode) {
@@ -607,6 +619,22 @@ class _PlatesScreenState extends State<PlatesScreen> {
               child: const Text('Now', style: TextStyle(fontSize: 12)),
             ),
           _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
+          if (_viewMode == PlatesViewMode.list)
+            Tooltip(
+              message: _collapse
+                  ? 'Collapsing duplicate reads of the same car (both engines +\nrepeat reads) into one row. Click to show every raw read.'
+                  : 'Showing every raw read. Click to collapse duplicates of the\nsame car into one row.',
+              child: IconButton(
+                onPressed: () => _setCollapse(!_collapse),
+                icon: Icon(
+                  _collapse ? Icons.layers : Icons.layers_clear,
+                  size: 18,
+                  color: _collapse
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.white54,
+                ),
+              ),
+            ),
           _DisplayOptionsButton(
             imageMode: _imageDisplay,
             cropCorner: _cropCorner,
@@ -672,16 +700,23 @@ class _PlatesScreenState extends State<PlatesScreen> {
     String camName(String id) => byId[id]?.name ?? '(unknown camera)';
     switch (_viewMode) {
       case PlatesViewMode.list:
+        // Collapse duplicate reads of one car (both engines + Frigate's own OCR
+        // refinements) into a single representative row; off = every raw read.
+        final groups = _collapse
+            ? collapsePlateReads(_plates)
+            : [for (final p in _plates) PlateGroup(p, [p])];
         return ListView.separated(
           padding: const EdgeInsets.symmetric(vertical: 6),
-          itemCount: _plates.length,
+          itemCount: groups.length,
           separatorBuilder: (_, _) =>
               const Divider(height: 1, color: Colors.white10),
           itemBuilder: (context, i) {
-            final p = _plates[i];
+            final g = groups[i];
+            final p = g.representative;
             return _PlateRow(
               key: ValueKey(p.id),
               read: p,
+              group: g,
               cameraName: camName(p.cameraId),
               api: widget.api,
               session: widget.session,
@@ -1008,9 +1043,15 @@ class _PlateRow extends StatelessWidget {
     required this.watched,
     required this.onAddToWatchlist,
     required this.onReport,
+    this.group,
   });
 
   final PlateRead read;
+
+  /// The collapsed group this row represents — which engine(s) saw the car, how
+  /// many raw reads merged, and any disagreeing readings. Null renders a plain
+  /// row (no engine chips). A single-read group shows just its source chip.
+  final PlateGroup? group;
   final String cameraName;
   final CrumbApi api;
   final Session session;
@@ -1031,6 +1072,59 @@ class _PlateRow extends StatelessWidget {
 
   /// Open the single-plate report builder for this read.
   final VoidCallback onReport;
+
+  /// A small engine chip per source that saw this car (Frigate / Crumb), plus a
+  /// "×N" badge when more than one raw read collapsed here. Empty when there's
+  /// no group or no known source.
+  List<Widget> _engineChips() {
+    final g = group;
+    if (g == null) return const [];
+    final chips = <Widget>[];
+    for (final s in g.sources) {
+      chips
+        ..add(const SizedBox(width: 6))
+        ..add(_engineChip(s));
+    }
+    if (g.count > 1) {
+      chips
+        ..add(const SizedBox(width: 6))
+        ..add(Text(
+          '×${g.count}',
+          style: const TextStyle(
+            color: Colors.white38,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+          ),
+        ));
+    }
+    return chips;
+  }
+
+  /// When the engines disagreed on the plate, a subtle line naming each engine's
+  /// alternate reading — the at-a-glance A/B signal in the collapsed list.
+  List<Widget> _disagreementLine() {
+    final d = group?.disagreements;
+    if (d == null || d.isEmpty) return const [];
+    final parts =
+        d.entries.map((e) => '${_engineLabel(e.key)} read ${e.value}').join('  •  ');
+    return [
+      const SizedBox(height: 2),
+      Row(
+        children: [
+          const Icon(Icons.compare_arrows, size: 12, color: Color(0xFFE8A33D)),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              parts,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Color(0xFFE8A33D), fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    ];
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1097,6 +1191,7 @@ class _PlateRow extends StatelessWidget {
                           ),
                         ),
                       ],
+                      ..._engineChips(),
                     ],
                   ),
                   const SizedBox(height: 2),
@@ -1104,6 +1199,7 @@ class _PlateRow extends StatelessWidget {
                     _fmtDateTime(read.ts),
                     style: const TextStyle(color: Colors.white54, fontSize: 11),
                   ),
+                  ..._disagreementLine(),
                 ],
               ),
             ),
@@ -3653,4 +3749,51 @@ String _fmtDateTime(DateTime t) {
   final mm = local.minute.toString().padLeft(2, '0');
   final ss = local.second.toString().padLeft(2, '0');
   return '${_months[local.month - 1]} ${local.day}, $h12:$mm:$ss $ampm';
+}
+
+/// Short, human label for a plate read's `source_id` engine tag.
+String _engineLabel(String source) {
+  switch (source) {
+    case 'crumb-alpr':
+      return 'Crumb';
+    case 'frigate':
+      return 'Frigate';
+    default:
+      return source;
+  }
+}
+
+/// The accent color for an engine's chip — Crumb green vs Frigate blue, distinct
+/// from the amber disagreement marker.
+Color _engineColor(String source) {
+  switch (source) {
+    case 'crumb-alpr':
+      return const Color(0xFF3DA35D);
+    case 'frigate':
+      return const Color(0xFF4C82C3);
+    default:
+      return const Color(0xFF6B7280);
+  }
+}
+
+/// A compact, color-coded chip naming the engine that produced a read.
+Widget _engineChip(String source) {
+  final c = _engineColor(source);
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+    decoration: BoxDecoration(
+      color: c.withValues(alpha: 0.18),
+      borderRadius: BorderRadius.circular(4),
+      border: Border.all(color: c.withValues(alpha: 0.55)),
+    ),
+    child: Text(
+      _engineLabel(source),
+      style: TextStyle(
+        color: c,
+        fontSize: 10,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.3,
+      ),
+    ),
+  );
 }
