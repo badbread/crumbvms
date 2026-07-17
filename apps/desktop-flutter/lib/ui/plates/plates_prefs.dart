@@ -42,6 +42,7 @@ class PlatesPrefs {
   static const String _kImageDisplay = 'crumb_plates_image_display';
   static const String _kCropCorner = 'crumb_plates_crop_corner';
   static const String _kCropSize = 'crumb_plates_crop_size';
+  static const String _kCollapse = 'crumb_plates_collapse_dupes';
 
   /// The last-used view mode, or [PlatesViewMode.list] when the operator has
   /// never changed it (or persistence is unavailable).
@@ -132,6 +133,28 @@ class PlatesPrefs {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_kCropSize, size.name);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Whether the list collapses duplicate reads of one car (both engines +
+  /// Frigate's own OCR refinements) into a single row. Defaults to true — the
+  /// clutter it removes is almost never wanted raw; operators comparing the two
+  /// engines can turn it off to see every read.
+  static Future<bool> getCollapseDuplicates() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_kCollapse) ?? true;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  static Future<void> setCollapseDuplicates(bool on) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kCollapse, on);
     } catch (_) {
       /* best-effort persistence */
     }
