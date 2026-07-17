@@ -8291,6 +8291,10 @@ pub struct UpsertPlateReadParams {
     /// 0051) as `x1=x, y1=y, x2=x+w, y2=y+h`; see [`plate_read_from_row`] for the
     /// read-back to `[x, y, w, h]`.
     pub bbox: Option<[f32; 4]>,
+    /// Plate crop as raw JPEG bytes (external-engine path, e.g. `crumb-alpr`), or
+    /// `None`. Persisted to `plate_reads.crop` (migration 0051). The Frigate path
+    /// leaves this `None` and relies on `snapshot_url` instead.
+    pub crop: Option<Vec<u8>>,
     pub raw: serde_json::Value,
 }
 
@@ -8342,9 +8346,9 @@ pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result
             INSERT INTO plate_reads (
                 camera_id, ts, plate, plate_raw, confidence,
                 source_id, provider_event_id, event_id, snapshot_url, raw,
-                bbox_x1, bbox_y1, bbox_x2, bbox_y2
+                bbox_x1, bbox_y1, bbox_x2, bbox_y2, crop
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (source_id, provider_event_id)
             WHERE source_id IS NOT NULL AND provider_event_id IS NOT NULL
             DO UPDATE SET
@@ -8364,6 +8368,8 @@ pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result
                 bbox_y1      = COALESCE(EXCLUDED.bbox_y1, plate_reads.bbox_y1),
                 bbox_x2      = COALESCE(EXCLUDED.bbox_x2, plate_reads.bbox_x2),
                 bbox_y2      = COALESCE(EXCLUDED.bbox_y2, plate_reads.bbox_y2),
+                -- Keep a previously captured crop if this refinement carries none.
+                crop         = COALESCE(EXCLUDED.crop, plate_reads.crop),
                 raw          = EXCLUDED.raw
             RETURNING id, (xmax = 0) AS inserted, alerted
             ",
@@ -8382,6 +8388,7 @@ pub async fn upsert_plate_read(pool: &Pool, p: &UpsertPlateReadParams) -> Result
                 &bbox_y1,
                 &bbox_x2,
                 &bbox_y2,
+                &p.crop,
             ],
         )
         .await
@@ -8408,6 +8415,84 @@ pub async fn mark_plate_alerted(pool: &Pool, id: Uuid) -> Result<()> {
         )
         .await
         .context("mark_plate_alerted")?;
+    Ok(())
+}
+
+/// Fetch a plate read's owning `camera_id` and its stored crop JPEG bytes for the
+/// `GET /plates/:id/crop` serving path. Returns `None` when the read id does not
+/// exist; the inner `Option<Vec<u8>>` is `None` when the read has no stored crop
+/// (the Frigate path stores `snapshot_url` instead). The `camera_id` is returned
+/// so the handler can enforce the caller's per-camera scope before serving bytes.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_plate_read_crop(pool: &Pool, id: Uuid) -> Result<Option<(Uuid, Option<Vec<u8>>)>> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT camera_id, crop FROM plate_reads WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .context("get_plate_read_crop")?;
+    Ok(row.map(|r| (r.get("camera_id"), r.get("crop"))))
+}
+
+/// Effective per-camera LPR config (migration 0069) for the `crumb-alpr` worker's
+/// `GET /lpr/worker-config` poll. Returns `None` if the camera id is unknown.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_camera_lpr_config(
+    pool: &Pool,
+    camera_id: Uuid,
+) -> Result<Option<crate::types::CameraLprConfig>> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT id, lpr_enabled, lpr_engine, lpr_min_confidence, lpr_zones
+             FROM cameras WHERE id = $1",
+            &[&camera_id],
+        )
+        .await
+        .context("get_camera_lpr_config")?;
+    Ok(row.map(|r| crate::types::CameraLprConfig {
+        camera_id: r.get("id"),
+        enabled: r.get("lpr_enabled"),
+        engine: r.get("lpr_engine"),
+        min_confidence: r.get("lpr_min_confidence"),
+        zones: r.get("lpr_zones"),
+    }))
+}
+
+/// Update a camera's per-camera LPR settings (migration 0069) from the admin
+/// console. `engine` is validated by the caller (and the `cameras_lpr_engine_chk`
+/// constraint); `zones` is `{include,exclude}` JSON or `None` to clear.
+///
+/// # Errors
+///
+/// Returns an error if the update fails (e.g. unknown camera id updates 0 rows,
+/// which is not an error here — the handler treats it as a no-op).
+pub async fn update_camera_lpr(
+    pool: &Pool,
+    id: Uuid,
+    enabled: bool,
+    engine: &str,
+    min_confidence: f32,
+    zones: Option<serde_json::Value>,
+) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            "UPDATE cameras
+             SET lpr_enabled = $2, lpr_engine = $3, lpr_min_confidence = $4, lpr_zones = $5
+             WHERE id = $1",
+            &[&id, &enabled, &engine, &min_confidence, &zones],
+        )
+        .await
+        .context("update_camera_lpr")?;
     Ok(())
 }
 
@@ -9937,6 +10022,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0068_recording_policy_explicit_membership.sql",
         include_str!("../../../db/migrations/0068_recording_policy_explicit_membership.sql"),
+    ),
+    (
+        "0069_camera_lpr.sql",
+        include_str!("../../../db/migrations/0069_camera_lpr.sql"),
     ),
 ];
 

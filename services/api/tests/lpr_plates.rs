@@ -58,6 +58,7 @@ async fn seed_plate(pool: &Pool, camera_id: Uuid, plate: &str) {
             event_id: None,
             snapshot_url: None,
             bbox: None,
+            crop: None,
             raw: serde_json::json!({}),
         },
     )
@@ -374,6 +375,7 @@ async fn watchlist_match_and_upsert_inserted_flag() {
         event_id: None,
         snapshot_url: None,
         bbox: None,
+        crop: None,
         raw: serde_json::json!({}),
     };
     let first = db::upsert_plate_read(pool, &mk(0.8)).await.unwrap();

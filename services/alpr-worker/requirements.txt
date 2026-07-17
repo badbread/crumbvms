@@ -1,0 +1,6 @@
+# crumb-alpr worker deps. Model weights are fetched at first run (not pinned
+# here and not vendored — see README "Licensing").
+fast-alpr[onnx]>=0.3
+opencv-python-headless>=4.10
+requests>=2.32
+numpy>=1.26

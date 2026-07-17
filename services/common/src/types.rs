@@ -142,6 +142,23 @@ pub struct LprSettings {
     pub version: i64,
 }
 
+/// Effective per-camera LPR config for the `crumb-alpr` worker, served by
+/// `GET /lpr/worker-config` (migration 0069 columns on `cameras`). The worker
+/// polls this so admin zone/threshold edits apply without a restart.
+#[derive(Debug, Clone, Serialize)]
+pub struct CameraLprConfig {
+    pub camera_id: uuid::Uuid,
+    /// Whether the worker should read this camera at all.
+    pub enabled: bool,
+    /// `frigate` | `crumb-alpr` | `both` — which engine feeds this camera.
+    pub engine: String,
+    /// Per-camera OCR-confidence floor for stored reads.
+    pub min_confidence: f32,
+    /// `{"include":[poly...],"exclude":[poly...]}` normalized-0..1 polygons, or
+    /// `null` for "whole frame, nothing masked".
+    pub zones: Option<serde_json::Value>,
+}
+
 /// One license-plate read (`plate_reads`, migration 0051), as served to clients
 /// by `GET /plates`. Omits the heavy `crop`/`raw`/`vehicle` columns from the
 /// list shape; a crop is fetched separately.

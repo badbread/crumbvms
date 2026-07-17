@@ -7,7 +7,7 @@
 //! automatically.
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -196,6 +196,16 @@ struct Inner {
     /// concurrent callers on a stale cache collapse to one HA `/api/states`
     /// request (the others wait on the lock, then read the fresh snapshot).
     ha_states: tokio::sync::Mutex<Option<HaStatesCache>>,
+
+    /// Sender half of the detection-event channel consumed by the
+    /// `detection_ingester` task. Set once at startup (in `main.rs`, right after
+    /// the channel is created) via [`AppState::set_event_tx`]. The `POST
+    /// /lpr/reads` external-ingest handler clones it to push a `crumb-alpr`
+    /// `NormalizedEvent` into the SAME pipeline Frigate uses, so all downstream
+    /// plate logic (dedup, ignore-list, watchlist, alerts, timeline mirror) is
+    /// reused verbatim. `OnceLock` avoids an `AppState::new` signature change
+    /// (and the constructor runs before the channel exists).
+    event_tx: OnceLock<tokio::sync::mpsc::Sender<crumb_common::NormalizedEvent>>,
 }
 
 /// Cheaply-cloneable handle to shared API state.
@@ -256,7 +266,25 @@ impl AppState {
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
             ha_states: tokio::sync::Mutex::new(None),
+            event_tx: OnceLock::new(),
         }))
+    }
+
+    /// Install the detection-event channel sender (once, at startup). Called from
+    /// `main.rs` immediately after the channel is created and before the router
+    /// starts serving, so the `POST /lpr/reads` handler always sees it set.
+    /// A second call is ignored (returns the sender back) — the channel is
+    /// created exactly once.
+    pub fn set_event_tx(&self, tx: tokio::sync::mpsc::Sender<crumb_common::NormalizedEvent>) {
+        let _ = self.0.event_tx.set(tx);
+    }
+
+    /// Borrow the detection-event channel sender, if installed. `None` only in
+    /// the window before `main.rs` wires it (or in tests that never do), in which
+    /// case the ingest handler returns `503`.
+    #[inline]
+    pub fn event_tx(&self) -> Option<&tokio::sync::mpsc::Sender<crumb_common::NormalizedEvent>> {
+        self.0.event_tx.get()
     }
 
     /// Borrow the demand-driven HA `/api/states` cache (issue #170). The

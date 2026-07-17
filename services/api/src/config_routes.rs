@@ -221,6 +221,7 @@ pub fn routes() -> Router<AppState> {
         .route("/clip-sources", get(get_clip_sources))
         .route("/clip-source-default", put(set_clip_source_default))
         .route("/cameras/:id/clip-source", put(set_camera_clip_source))
+        .route("/cameras/:id/lpr", put(set_camera_lpr).get(get_camera_lpr))
         .route("/clip-preroll", get(get_clip_preroll).put(set_clip_preroll))
         .route(
             "/clip-overview",
@@ -351,6 +352,139 @@ async fn set_camera_clip_source(
         .await
         .map_err(ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── per-camera LPR settings (migration 0069: engine + zones + min-confidence) ──
+
+/// `PUT /config/cameras/:id/lpr` body — per-camera settings for the crumb-alpr
+/// worker. `engine` selects which plate source feeds this camera; `zones` is the
+/// `{include,exclude}` detection-polygon config (or null to clear).
+#[derive(serde::Deserialize)]
+struct CameraLprRequest {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_lpr_engine")]
+    engine: String,
+    #[serde(default = "default_lpr_min_conf")]
+    min_confidence: f32,
+    zones: Option<serde_json::Value>,
+}
+
+fn default_lpr_engine() -> String {
+    "frigate".to_owned()
+}
+
+fn default_lpr_min_conf() -> f32 {
+    0.80
+}
+
+/// Validate the per-camera LPR `zones` JSON shape so a malformed value can never
+/// crash the worker (which trusts the shape) or silently disable all reads: an
+/// object with optional `include`/`exclude` arrays, each a polygon of at least
+/// 3 `[x, y]` vertices with normalized `0..=1` coords. Bounded so a pathological
+/// payload stays small.
+fn validate_lpr_zones(z: &serde_json::Value) -> Result<(), String> {
+    const MAX_POLYS: usize = 32;
+    const MAX_VERTS: usize = 512;
+    let obj = z
+        .as_object()
+        .ok_or_else(|| "zones must be a JSON object".to_owned())?;
+    for key in obj.keys() {
+        if key != "include" && key != "exclude" {
+            return Err(format!(
+                "zones has unknown key '{key}' (only 'include'/'exclude')"
+            ));
+        }
+    }
+    for key in ["include", "exclude"] {
+        let Some(v) = obj.get(key) else { continue };
+        let polys = v
+            .as_array()
+            .ok_or_else(|| format!("zones.{key} must be an array of polygons"))?;
+        if polys.len() > MAX_POLYS {
+            return Err(format!(
+                "zones.{key} has too many polygons (max {MAX_POLYS})"
+            ));
+        }
+        for (pi, poly) in polys.iter().enumerate() {
+            let verts = poly
+                .as_array()
+                .ok_or_else(|| format!("zones.{key}[{pi}] must be an array of [x,y] points"))?;
+            if verts.len() < 3 {
+                return Err(format!("zones.{key}[{pi}] needs at least 3 points"));
+            }
+            if verts.len() > MAX_VERTS {
+                return Err(format!(
+                    "zones.{key}[{pi}] has too many points (max {MAX_VERTS})"
+                ));
+            }
+            for pt in verts {
+                let xy = pt
+                    .as_array()
+                    .filter(|a| a.len() == 2)
+                    .ok_or_else(|| format!("zones.{key}[{pi}] points must be [x, y] pairs"))?;
+                for c in xy {
+                    let f = c
+                        .as_f64()
+                        .ok_or_else(|| format!("zones.{key}[{pi}] coordinates must be numbers"))?;
+                    if !(0.0..=1.0).contains(&f) {
+                        return Err(format!(
+                            "zones.{key}[{pi}] coordinates must be normalized 0..1"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `PUT /config/cameras/:id/lpr` — set a camera's LPR engine, min-confidence, and
+/// detection zones (admin-only). The crumb-alpr worker picks these up via its
+/// `GET /lpr/worker-config` poll, so edits apply without a worker restart.
+async fn set_camera_lpr(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CameraLprRequest>,
+) -> Result<StatusCode, ApiError> {
+    let engine = match body.engine.as_str() {
+        "frigate" | "crumb-alpr" | "both" => body.engine,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "engine must be 'frigate', 'crumb-alpr', or 'both', got '{other}'"
+            )))
+        }
+    };
+    if let Some(z) = &body.zones {
+        validate_lpr_zones(z).map_err(ApiError::BadRequest)?;
+    }
+    let min_conf = body.min_confidence.clamp(0.0, 1.0);
+    db::update_camera_lpr(
+        state.pool(),
+        id,
+        body.enabled,
+        &engine,
+        min_conf,
+        body.zones,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /config/cameras/:id/lpr` — current per-camera LPR settings, for
+/// pre-populating the admin camera-edit form (admin-only).
+async fn get_camera_lpr(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crumb_common::types::CameraLprConfig>, ApiError> {
+    let cfg = db::get_camera_lpr_config(state.pool(), id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("camera {id} not found")))?;
+    Ok(Json(cfg))
 }
 
 // ─── clip pre-roll (Clips feature: seconds before the event a clip starts) ──────

@@ -903,6 +903,8 @@ fn process_mqtt_payload(
                 .or_else(|| plate_box_from_attributes(&after.current_attributes)),
             detect_dims.get(&after.camera).copied(),
         ),
+        // Frigate hands Crumb a snapshot URL to proxy, not raw crop bytes.
+        plate_crop: None,
         raw: raw_value,
     }))
 }
@@ -1119,6 +1121,7 @@ async fn http_backfill(
             recognized_plate,
             plate_confidence,
             plate_box,
+            plate_crop: None,
             raw: serde_json::json!({
                 "id": ev.id,
                 "camera": ev.camera,

@@ -384,6 +384,10 @@ async fn main() -> anyhow::Result<()> {
             detection_ingester::run(event_rx, ingester_pool).await;
         });
 
+        // Expose the sender to HTTP handlers (the `POST /lpr/reads` external-ingest
+        // path) so the crumb-alpr worker feeds the SAME ingester as Frigate.
+        state.set_event_tx(event_tx.clone());
+
         let sup_pool = state.pool().clone();
         tokio::spawn(async move {
             let mut current: Option<std::sync::Arc<FrigateProvider>> = None;

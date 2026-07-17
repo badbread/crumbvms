@@ -206,6 +206,33 @@ services:
     environment:
       - TZ=${TZ:-UTC}
 
+  # crumb-alpr — Crumb-native LPR worker (fast-alpr), OPT-IN via the `alpr` profile (a plain
+  # `up -d` never starts it). Gives Crumb its own local plate OCR: it pulls the go2rtc restream,
+  # motion-gates, runs fast-alpr, and POSTs reads to the api's POST /lpr/reads. Enable LPR + mint an
+  # ingest token in Admin → LPR first, then set the LPR_* vars. Built from source (no published
+  # image yet). One instance per camera. docs/LPR-NATIVE-ENGINE-PLAN.md, services/alpr-worker/README.md
+  #   docker compose --profile alpr up -d --build crumb-alpr
+  crumb-alpr:
+    profiles: ["alpr"]
+    build: ./services/alpr-worker
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - api
+    environment:
+      # NOTE: no `${VAR:?required}` here — Compose interpolates the WHOLE file
+      # before profile filtering, so a `:?` would break a plain `docker compose
+      # up -d` (alpr profile inactive) on every install. The worker's own _req()
+      # gives a clear error at start if these are unset when the profile IS run.
+      CRUMB_API_BASE: ${LPR_API_BASE:-http://api:8080}
+      LPR_INGEST_TOKEN: ${LPR_INGEST_TOKEN:-}
+      LPR_CAMERA_ID: ${LPR_CAMERA_ID:-}
+      LPR_RTSP_URL: ${LPR_RTSP_URL:-}
+      LPR_MIN_CONFIDENCE: ${LPR_MIN_CONFIDENCE:-0.80}
+      LPR_SAMPLE_FPS: ${LPR_SAMPLE_FPS:-5}
+      LPR_LOG_LEVEL: ${LPR_LOG_LEVEL:-info}
+      TZ: ${TZ:-UTC}
+
   # Off-host backup sync — OPTIONAL, opt-in via the `offsite` profile. Pushes DB_BACKUP_HOST_PATH to
   # an rclone remote (SFTP/S3/B2/NAS) so one disk failure can't take out footage AND backups. Simpler
   # alternative: point DB_BACKUP_HOST_PATH itself at a NAS mount and skip this service. docs/BACKUP.md
