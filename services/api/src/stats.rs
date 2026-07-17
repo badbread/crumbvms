@@ -264,13 +264,11 @@ async fn policy_stats(
             continue;
         }
 
-        let label = p.name.clone().unwrap_or_else(|| {
-            // Anonymous fork = single-owner (require_assignable_policy guarantees it).
-            match names.first() {
-                Some(cam) => format!("Custom — {cam}"),
-                None => "Custom".to_owned(),
-            }
-        });
+        // Phase 3: every policy is named (0068 made recording_policies.name NOT
+        // NULL, and no anonymous per-camera forks are minted anymore), so the old
+        // "Custom — <camera>" fallback is dead. Keep a neutral guard that cannot
+        // appear in practice.
+        let label = p.name.clone().unwrap_or_else(|| "Policy".to_owned());
         let gb_h = gb_per_hour(recent_bytes, recent_span);
         let forecast = policy_forecast(live_used, p.live_max_bytes, p.live_retention_hours, gb_h);
 
@@ -408,14 +406,10 @@ async fn policy_verify(
     let rollup = db::policy_usage_rollup(pool).await?;
     let policies = db::list_policies(pool).await?;
 
-    // Labels + camera→policy map for attribution.
-    let mut cams_by_policy: HashMap<Uuid, Vec<String>> = HashMap::new();
+    // Camera→policy map for attribution. (Phase 3 dropped the per-camera "Custom
+    // — <name>" label fallback, so the name-collecting map is no longer needed.)
     let mut cam_to_policy: HashMap<Uuid, Uuid> = HashMap::new();
-    for (policy_id, camera_id, name) in &cam_rows {
-        cams_by_policy
-            .entry(*policy_id)
-            .or_default()
-            .push(name.clone());
+    for (policy_id, camera_id, _name) in &cam_rows {
         cam_to_policy.insert(*camera_id, *policy_id);
     }
     let label_for = |pid: &Uuid| -> String {
@@ -423,10 +417,8 @@ async fn policy_verify(
             .iter()
             .find(|p| &p.id == pid)
             .and_then(|p| p.name.clone());
-        named.unwrap_or_else(|| match cams_by_policy.get(pid).and_then(|v| v.first()) {
-            Some(c) => format!("Custom — {c}"),
-            None => "Custom".to_owned(),
-        })
+        // Phase 3: policies are always named now; neutral guard that can't appear.
+        named.unwrap_or_else(|| "Policy".to_owned())
     };
 
     // DB bytes per policy (live + archive).

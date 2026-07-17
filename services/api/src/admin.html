@@ -901,6 +901,56 @@ function toast(msg, type = 'ok', duration = 3500) {
   $('toast-container').appendChild(el);
   setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, duration);
 }
+
+/* Phase 3 deviation feedback: a Motion-tab (or tuner) save either made the camera
+   JOIN an existing policy (its tuned settings matched one) or MINTED a new named
+   deviation policy. Toast which, with Rename (mint) + Undo (repoint to the policy
+   it left). Longer-lived than a plain toast so the actions are clickable. */
+function showDeviationToast(info) {
+  const { camId, prevId, resultPol } = info;
+  const name = resultPol.name || 'Default';
+  const minted = resultPol.origin === 'deviation';
+  const el = document.createElement('div');
+  el.className = 'toast ok';
+  el.style.display = 'flex'; el.style.alignItems = 'center'; el.style.gap = '10px'; el.style.flexWrap = 'wrap';
+  const txt = document.createElement('span');
+  txt.textContent = minted
+    ? `New policy “${name}” created for this camera.`
+    : `Settings match “${name}” — this camera now uses it.`;
+  el.appendChild(txt);
+  const dismiss = () => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); };
+  if (minted) {
+    const rn = document.createElement('button');
+    rn.className = 'ghost xs'; rn.textContent = 'Rename'; rn.style.fontSize = '11px';
+    rn.onclick = async () => {
+      const nn = (prompt('Name for this policy:', name) || '').trim();
+      if (!nn || nn === name) return;
+      try {
+        await api('/config/policies/' + resultPol.id, { method: 'PUT', body: JSON.stringify({ name: nn }) });
+        await ensurePolicies();
+        toast(`Renamed to “${nn}”.`);
+        if (selKind === 'profile' || location.hash.indexOf('recording') >= 0) renderRecordingRoot();
+      } catch (e) { toast('Rename failed: ' + (e.message || e), 'err'); }
+    };
+    el.appendChild(rn);
+  }
+  if (prevId) {
+    const un = document.createElement('button');
+    un.className = 'ghost xs'; un.textContent = 'Undo'; un.style.fontSize = '11px';
+    un.onclick = async () => {
+      try {
+        await api('/config/cameras/' + camId, { method: 'PUT', body: JSON.stringify({ policy_id: prevId }) });
+        await ensureCams(); await ensurePolicies();
+        if (selId === camId) renderCamera(camId);
+        toast('Reverted.');
+        dismiss();
+      } catch (e) { toast('Undo failed: ' + (e.message || e), 'err'); }
+    };
+    el.appendChild(un);
+  }
+  $('toast-container').appendChild(el);
+  setTimeout(dismiss, 9000);
+}
 /* Copy a string to the clipboard with a toast (used by the Restream URLs list). */
 function copyText(text) {
   if (!text) return;
@@ -3981,27 +4031,17 @@ function renderCamerasRoot() {
   const groupCount = (GROUPS||[]).length;
   const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).length;
   const camBody = CAMS.slice().sort(byName).map(c => {
-    const g = groupOfCamera(c.id);
+    const pol = profileById(c.policy_id);
     const model = (c.model || c.make) ? esc(c.model || c.make) : '<span style="color:var(--dim2)">—</span>';
     const type = esc(c.camera_type || 'other');
     const status = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
     return `<tr onclick="select('camera','${c.id}')">
       <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div></td>
-      <td>${g ? esc(g.name) : '<span style="color:var(--dim2)">Ungrouped</span>'}</td>
+      <td>${pol ? esc(pol.name || 'Default') : '<span style="color:var(--dim2)">—</span>'}</td>
       <td>${model}</td>
       <td>${status}</td>
     </tr>`;
   }).join('') || `<tr><td colspan="4" style="color:var(--dim2);padding:20px;text-align:center">No cameras yet — click “Add camera” to get started.</td></tr>`;
-
-  const groupBody = (GROUPS||[]).slice().sort(byName).map(g => {
-    const gp = g.policy_id ? profileById(g.policy_id) : null;
-    const n = (g.camera_ids||[]).length;
-    return `<tr onclick="select('group','${g.id}')">
-      <td><div class="lt-name"><span class="lt-ico">${icon('group',18)}</span><div class="lt-main">${esc(g.name)}</div></div></td>
-      <td>${gp ? esc(gp.name) : 'Default'}</td>
-      <td>${n} camera${n!==1?'s':''}</td>
-    </tr>`;
-  }).join('');
 
   const tile = (ic, k, v) => `<div class="stat-tile"><div class="st-k">${icon(ic,14)} ${k}</div><div class="st-v">${v}</div></div>`;
 
@@ -4022,46 +4062,114 @@ function renderCamerasRoot() {
     <div class="stat-tiles">
       ${tile('cameras','Cameras',total)}
       ${tile('profiles','Recording',`${rec}<small> / ${total}</small>`)}
-      ${tile('group','Groups',groupCount)}
-      ${tile('cameras','Ungrouped',ungrouped)}
+      ${tile('profiles','Policies',(allProfiles()||[]).length)}
     </div>
     <div class="card" style="padding:0">
       <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)">
         <div class="card-title">All cameras</div>
       </div>
       <div class="table-wrap">
-        <table class="list-tbl"><thead><tr><th>Camera</th><th>Group</th><th>Model</th><th>Recording</th></tr></thead>
+        <table class="list-tbl"><thead><tr><th>Camera</th><th>Policy</th><th>Model</th><th>Recording</th></tr></thead>
         <tbody>${camBody}</tbody></table>
       </div>
-    </div>
-    <div class="card" style="padding:0">
-      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-        <div class="card-title">Camera groups</div>
-        <button class="ghost sm" onclick="newGroup()">+ New group</button>
-      </div>
-      ${groupCount ? `<div class="table-wrap"><table class="list-tbl"><thead><tr><th>Group</th><th>Recording profile</th><th>Cameras</th></tr></thead><tbody>${groupBody}</tbody></table></div>`
-        : `<div class="card-hint" style="padding:14px 16px">No groups yet. Create one to assign a shared recording profile to several cameras at once.</div>`}
     </div>`;
 }
 /* Recording section list: the reusable profiles cameras/groups inherit. */
+/* Retention summary for a policy-manager row: "Live 2d · Archive 30d · max 60d". */
+function fmtRetHours(h) {
+  if (h == null) return '—';
+  return (h % 24 === 0) ? (h / 24) + 'd' : h + 'h';
+}
+function retentionSummary(p) {
+  let s = 'Live ' + fmtRetHours(p.live_retention_hours);
+  if (p.archive_enabled && p.archive_retention_hours != null) s += ' · Archive ' + fmtRetHours(p.archive_retention_hours);
+  else if (p.archive_enabled) s += ' · Archive on';
+  if (p.max_retention_days != null) s += ' · max ' + p.max_retention_days + 'd';
+  return s;
+}
+
+/* Recording section = the policy manager: one row per profile with its mode,
+   the cameras that belong to it, where it records, and its retention. A
+   deviation profile (auto-created when a camera's Motion-tab edit diverged) gets
+   a subtle "auto-created when <camera> deviated" hint. Name is inline-renamed in
+   place; the row opens the full editor. Every camera belongs to exactly one
+   profile now (Phase 2), so member counts are exact. */
 function renderRecordingRoot() {
   const profs = allProfiles();
   const body = profs.map(p => {
-    const def = p.is_default ? '<span style="margin-left:auto"><span class="pill accent">Default</span></span>' : '';
-    return `<tr onclick="select('profile','${p.id}')">
-      <td><div class="lt-name"><span class="lt-ico">${icon(p.is_default?'star':'profiles',18)}</span><div class="lt-main">${esc(p.name||'Default')}</div>${def}</div></td>
+    const members = directCamsForProfile(p.id).slice()
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    const memNames = members.map(c => c.name || '(unnamed)');
+    const modeTxt = (p.mode || '').charAt(0).toUpperCase() + (p.mode || '').slice(1);
+    const st = policyStorageNames(p);
+    const stTxt = st.archive ? esc(st.live) + ' → ' + esc(st.archive) : esc(st.live);
+    const defPill = p.is_default ? '<span class="pill accent" style="margin-left:6px">Default</span>' : '';
+    const devHint = (p.origin === 'deviation' && memNames.length)
+      ? `<div style="color:var(--dim2);font-size:11px;margin-top:2px">Auto-created when ${esc(memNames[0])} deviated from its policy</div>`
+      : '';
+    const memCell = members.length
+      ? `<span title="${esc(memNames.join(', '))}">${members.length} camera${members.length === 1 ? '' : 's'}</span>`
+      : '<span style="color:var(--dim2)">No cameras</span>';
+    return `<tr onclick="select('profile','${p.id}')" style="cursor:pointer">
+      <td>
+        <div class="lt-name" style="align-items:flex-start">
+          <span class="lt-ico">${icon(p.is_default ? 'star' : 'profiles', 18)}</span>
+          <div class="lt-main" style="display:block">
+            <span style="display:inline-flex;align-items:center;gap:6px">
+              <span id="polname-${p.id}">${esc(p.name || 'Default')}</span>${defPill}
+              <button class="ghost xs" title="Rename" onclick="event.stopPropagation();startPolicyRename('${p.id}')" style="padding:1px 7px;font-size:11px">Rename</button>
+            </span>
+            ${devHint}
+          </div>
+        </div>
+      </td>
+      <td><span class="pill">${esc(modeTxt)}</span></td>
+      <td>${memCell}</td>
+      <td style="color:var(--dim)">${stTxt}</td>
+      <td style="color:var(--dim)">${esc(retentionSummary(p))}</td>
     </tr>`;
-  }).join('') || `<tr><td style="color:var(--dim2);padding:20px;text-align:center">No recording profiles.</td></tr>`;
+  }).join('') || `<tr><td colspan="5" style="color:var(--dim2);padding:20px;text-align:center">No recording profiles.</td></tr>`;
   $('right-pane').innerHTML = `
     <div class="rp-head">
       <div class="rp-head-left"><span class="rp-head-icon">${icon('profiles',22)}</span>
-        <div class="rp-head-titles"><div class="rp-head-title">Recording</div><div class="rp-head-sub">Reusable recording profiles that cameras and groups inherit</div></div></div>
+        <div class="rp-head-titles"><div class="rp-head-title">Recording</div><div class="rp-head-sub">Reusable recording profiles — every camera belongs to exactly one</div></div></div>
       <div class="rp-head-actions"><button class="primary sm" onclick="newProfile()">+ New profile</button></div>
     </div>
     <div class="card" style="padding:0">
       <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)"><div class="card-title">Recording profiles</div></div>
-      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Profile</th></tr></thead><tbody>${body}</tbody></table></div>
+      <div class="table-wrap"><table class="list-tbl"><thead><tr><th>Profile</th><th>Mode</th><th>Cameras</th><th>Records to</th><th>Retention</th></tr></thead><tbody>${body}</tbody></table></div>
     </div>`;
+}
+
+/* Inline rename from the policy-manager list. Swaps the name to an input;
+   Enter/blur commits a name-only PUT (the backend keeps every other field —
+   resolve_policy_fields falls back to existing), Escape cancels. A rename of a
+   deviation profile promotes it to an operator template server-side. */
+function startPolicyRename(id) {
+  const span = document.getElementById('polname-' + id);
+  if (!span || span.dataset.editing === '1') return;
+  const cur = span.textContent;
+  span.dataset.editing = '1';
+  span.innerHTML = `<input value="${esc(cur)}" style="width:170px;font-size:13px"
+     onclick="event.stopPropagation()"
+     onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}else if(event.key==='Escape'){event.stopPropagation();this.dataset.cancel='1';this.blur();}"
+     onblur="commitPolicyRename('${id}', this.dataset.cancel==='1' ? null : this.value)" />`;
+  const inp = span.querySelector('input');
+  if (inp) { inp.focus(); inp.select(); }
+}
+async function commitPolicyRename(id, val) {
+  const span = document.getElementById('polname-' + id);
+  if (span) { if (span.dataset.editing !== '1') return; span.dataset.editing = ''; }
+  const p = profileById(id);
+  if (val === null || !p) { renderRecordingRoot(); return; }        // cancelled
+  const name = (val || '').trim();
+  if (!name || name === (p.name || '')) { renderRecordingRoot(); return; }
+  try {
+    await api('/config/policies/' + id, { method: 'PUT', body: JSON.stringify({ name }) });
+    await ensurePolicies();
+    toast('Renamed to "' + name + '".');
+  } catch (e) { toast('Rename failed: ' + (e.message || e)); }
+  renderRecordingRoot();
 }
 /* Users & security section list: roles (capabilities) + users (sign-in accounts). */
 function renderSecurityRoot() {
@@ -6710,111 +6818,43 @@ async function saveScrubPregenTtl(daysStr) {
   }
 }
 
-/* ── Camera tab 3: Storage & group ──
-   Phase 3, camera GROUPS are AUTHORITATIVE. A camera in a group ALWAYS uses
-   the group's assigned profile; it cannot hold a per-camera policy/storage
-   override while grouped. So the tab branches:
-     • GROUPED   → read-only "Controlled by the <group> group → <profile> profile"
-                   summary + Edit-group + Ungroup-to-customize. NO override path.
-     • UNGROUPED → the inherit / named-profile / custom radios (per-camera
-                   overrides are allowed only when ungrouped). */
+/* ── Camera tab 3: Recording policy ──
+   Phase 3: camera GROUPS are retired and every camera belongs to exactly one
+   NAMED policy (Phase 2 made cameras.policy_id NOT NULL). The tab collapses to a
+   single control — pick the policy — plus the effective-settings banner and the
+   deliberate "Save current settings as a new policy…" template-create path. The
+   assignment persists on the camera's Save button (saveCamEdit). */
 function renderCamStorageTab(c) {
-  const grp = groupOfCamera(c.id);
-  if (grp) return renderCamStorageGrouped(c, grp);
-  return renderCamStorageUngrouped(c);
-}
-
-/* GROUPED: authoritative, read-only. The group's profile governs; the only ways
-   to differ are editing the group's profile or ungrouping the camera. */
-function renderCamStorageGrouped(c, grp) {
-  // Resolve the group's effective profile exactly as effectivePolicy's group leg:
-  // the group's assigned policy, else the global Default.
-  const gp = grp.policy_id
-    ? profileById(grp.policy_id)
-    : (DEFAULT_POLICY || allProfiles().find(p => p.is_default) || null);
-  const profName = gp ? (gp.name || 'Default') : 'Default';
-  const summary = gp ? bannerHTMLForGroup(gp, !grp.policy_id) : '';
-  $('cam-tab-body').innerHTML = `
-    <div class="policy-section" style="margin-top:0">
-      <div class="policy-section-title">Controlled by group</div>
-      <div class="opt-sub" style="margin-bottom:10px">
-        This camera is in the <strong>${esc(grp.name)}</strong> group, so it always uses the
-        <strong>${esc(profName)}</strong> policy. A direct per-camera policy is only available for
-        ungrouped cameras, edit the group's policy to change all its cameras at once, or
-        ungroup this camera to give it its own.
-      </div>
-      ${summary}
-      <div class="inherit-banner-actions" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="ghost sm" onclick="select('group','${grp.id}')">Edit group "${esc(grp.name)}"</button>
-        <button class="ghost sm" onclick="ceUngroup('${c.id}')">Ungroup to customize</button>
-      </div>
-    </div>`;
-}
-
-/* UNGROUPED: ONE assignment model (group → policy), with the direct camera→policy
-   pin tucked inside a collapsed "exception" section. The old 3-way radio (inherit
-   / named-profile directly / custom copy-on-write fork) is GONE (S1): there is no
-   "custom" mode any more, and the anonymous fork is no longer creatable from the
-   UI, its replacement is "Save current settings as a new policy…", which POSTs a
-   NAMED policy (pre-filled from the effective one) and pins it, so every policy
-   stays visible in Recording (§5c / §6).
-
-   `assignMode` is now just 'inherit' (follow group / Default) or 'profile' (a
-   direct pin), used only to seed which control is shown, not a radio group. */
-function renderCamStorageUngrouped(c) {
-  const grp = groupOfCamera(c.id); // null on this path, kept for parity with banner code
-  const pinned = !!c.policy_id;    // a direct camera→policy pin is in force
-
-  const groupOpts = `<option value="">Ungrouped (uses Default policy)</option>` +
-    (GROUPS||[]).map(g => {
-      const gp = g.policy_id ? profileById(g.policy_id) : null;
-      const lbl = gp ? `${g.name} → ${gp.name}` : `${g.name} → Default`;
-      return `<option value="${g.id}" ${grp && grp.id===g.id ? 'selected':''}>${esc(lbl)}</option>`;
-    }).join('') +
-    `<option value="__new__">+ New group…</option>`;
-
   const profileOpts = allProfiles().map(p =>
     `<option value="${p.id}" ${c.policy_id===p.id?'selected':''}>${esc(profileSelectLabel(p))}</option>`).join('');
-
-  // The exception section starts OPEN when a direct pin is already in force (so the
-  // operator can see/change it); otherwise collapsed (the recommended path).
   $('cam-tab-body').innerHTML = `
     <div id="ce-inherit-banner"></div>
 
     <div class="policy-section" style="margin-top:0">
       <div class="policy-section-title">Recording policy</div>
-      <div class="card-hint" style="margin:-2px 0 12px 2px">A <b>camera group</b> is the usual way to choose how a camera records, put it in a group, the group picks the policy. Ungrouped cameras follow the <b>Default</b> policy.</div>
+      <div class="card-hint" style="margin:-2px 0 12px 2px">Every camera records under one named policy. Pick which policy governs this camera; edit the policy itself to change how it records (and every camera on it).</div>
       <div class="form-grid">
-        <label class="fg-label" for="ce-group">Group ${infoHint('When a camera joins a group, the group\'s policy takes over, any direct per-camera pin is cleared.')}</label>
-        <div class="fg-ctl"><select id="ce-group" onchange="ceGroupChanged()" style="font-size:13px;max-width:420px">${groupOpts}</select></div>
-        <div class="fg-full"><div class="opt-sub" id="ce-inherit-sub"></div></div>
+        <label class="fg-label" for="ce-profile">Policy</label>
+        <div class="fg-ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="ce-profile" onchange="ceAssignPreview()" style="font-size:13px;max-width:420px">${profileOpts}</select>
+          <button class="ghost sm" onclick="ceEditSelectedPolicy()">Edit policy…</button>
+        </div>
       </div>
 
-      <details class="detail-section" id="ce-exception" ${pinned?'open':''} style="margin-top:14px">
-        <summary>
-          <span class="ds-chev">&#x25B6;</span>
-          <span class="ds-title">This camera doesn't follow its group</span>
-          <span class="ds-glance">${pinned?'A specific policy is pinned':'Advanced, pin a specific policy'}</span>
-        </summary>
-        <div class="ds-body">
-          <div class="card-hint" style="margin:0 0 10px 2px">The exception: pin one specific policy to <b>this camera only</b>, or capture the effective settings as a new named policy. Prefer a group for anything you might configure in bulk later.</div>
-          <label class="chk" style="margin-bottom:10px"><input type="checkbox" id="ce-pin-enable" ${pinned?'checked':''} onchange="cePinToggle()" /> Pin a specific policy to this camera</label>
-          <div id="ce-pin-wrap" class="${pinned?'':'hidden'}">
-            <div class="form-grid">
-              <label class="fg-label" for="ce-profile">Policy</label>
-              <div class="fg-ctl"><select id="ce-profile" onchange="ceAssignPreview()" style="font-size:13px;max-width:420px">${profileOpts}</select></div>
-            </div>
-          </div>
-          <div style="margin-top:12px">
-            <button class="ghost sm" onclick="ceSaveAsNewPolicy()">Save current settings as a new policy…</button>
-            <div class="card-hint" style="margin-top:4px">Creates a named copy of this camera's effective policy in <b>Recording</b> and pins it here.</div>
-          </div>
-          <div id="ce-assign-msg" class="form-msg"></div>
-        </div>
-      </details>
+      <div style="margin-top:14px">
+        <button class="ghost sm" onclick="ceSaveAsNewPolicy()">Save current settings as a new policy…</button>
+        <div class="card-hint" style="margin-top:4px">Creates a named copy of this camera's current policy in <b>Recording</b> and assigns it here.</div>
+      </div>
+      <div id="ce-assign-msg" class="form-msg"></div>
     </div>`;
 
   ceAssignChanged();
+}
+
+/* Open the policy editor for whatever policy is currently selected in the tab. */
+function ceEditSelectedPolicy() {
+  const sel = $('ce-profile');
+  if (sel && sel.value) select('profile', sel.value);
 }
 
 /* Human label + one-line description for each pixel motion algorithm. */
@@ -6874,48 +6914,17 @@ function ceGroupChanged() {
   ceAssignChanged();
 }
 
-/* Assignment "mode" is derived, not radio-selected: a pinned policy (the
-   exception) → 'profile'; otherwise 'inherit' (follow group / Default). */
-function ceCurrentMode() {
-  const pin = $('ce-pin-enable');
-  return (pin && pin.checked) ? 'profile' : 'inherit';
-}
-function ceAssignChanged() {
-  const mode = ceCurrentMode();
-  const gsel = $('ce-group');
-  const gid = gsel ? gsel.value : '';
-  const grp = gid && gid !== '__new__' ? (GROUPS||[]).find(g => g.id === gid) : null;
-  const gp = grp && grp.policy_id ? profileById(grp.policy_id) : null;
-  if ($('ce-inherit-sub')) $('ce-inherit-sub').textContent = grp
-    ? `Currently: ${grp.name} (would use the ${gp ? gp.name : 'Default'} policy)`
-    : 'Currently: Ungrouped (would follow the Default policy)';
-  renderCeBanner(mode);
-}
-function ceAssignPreview() { renderCeBanner('profile'); }
-/* Show/hide the direct-pin policy picker as its checkbox toggles. */
-function cePinToggle() {
-  const on = $('ce-pin-enable') && $('ce-pin-enable').checked;
-  if ($('ce-pin-wrap')) $('ce-pin-wrap').classList.toggle('hidden', !on);
-  ceAssignChanged();
-}
+/* Phase 3: one control — the policy select. The banner previews whatever policy
+   is currently selected; the assignment persists on the camera's Save button. */
+function ceAssignChanged() { renderCeBanner(); }
+function ceAssignPreview() { renderCeBanner(); }
 
-function renderCeBanner(mode) {
+function renderCeBanner() {
   const c = CAMS.find(x => x.id === selId); if (!c) return;
   const bannerEl = $('ce-inherit-banner'); if (!bannerEl) return;
-  let p, via, srcText, borderCls;
-  if (mode === 'profile') {
-    p = profileById($('ce-profile') ? $('ce-profile').value : c.policy_id) || c.policy;
-    via = 'own'; borderCls = 'own';
-    srcText = 'directly assigned to this camera';
-  } else {
-    const gsel = $('ce-group');
-    const gid = gsel ? gsel.value : '';
-    const grp = gid && gid !== '__new__' ? (GROUPS||[]).find(g => g.id === gid) : null;
-    if (grp && grp.policy_id) { p = profileById(grp.policy_id); via='group'; borderCls=''; srcText = `via the ${grp.name} group`; }
-    else { p = DEFAULT_POLICY || profileById((c.policy||{}).id); via='default'; borderCls='default-profile'; srcText = grp ? `via the ${grp.name} group (which uses the Default policy)` : 'using the Default policy (no group assigned)'; }
-  }
+  const p = profileById($('ce-profile') ? $('ce-profile').value : c.policy_id) || c.policy;
   if (!p) { bannerEl.innerHTML = ''; return; }
-  bannerEl.innerHTML = bannerHTML(p, borderCls, srcText, c.id);
+  bannerEl.innerHTML = bannerHTML(p, 'own', 'directly assigned to this camera', c.id);
   renderRetentionHint();
 }
 
@@ -7049,45 +7058,26 @@ async function saveCamEdit() {
     if ($('ce-motion-ha')) camBody.motion_ha_enabled = $('ce-motion-ha').checked;
     if ($('ce-motion-algorithm')) camBody.motion_algorithm = $('ce-motion-algorithm').value;
 
-    // Phase 3: a grouped camera is AUTHORITATIVELY governed by its group's
-    // profile and may NOT acquire a direct per-camera policy/override. The
-    // GROUPED Storage tab renders no override controls, but the Storage- and
-    // Motion-tab override writes below also live in this save path, so gate them
-    // all on !isGrouped, belt-and-suspenders independent of the rendered DOM.
-    // (The backend rejects these too; this keeps the UI from issuing a 4xx.)
+    // Groups are retired (Phase 3), so a camera is never "grouped" now. The flag
+    // is kept because the Motion-tab override write below still reads it (it stays
+    // false, so that path is simply always allowed for an ungrouped camera).
     const isGrouped = !!groupOfCamera(id);
 
-    // Recording assignment (Recording tab, ungrouped only, a grouped camera's tab
-    // is read-only). ONE model now (S1): pick a GROUP (→ inherit its policy), or,
-    // as the collapsed exception, PIN a specific policy directly. The old 3-way
-    // radio and the anonymous "custom" copy-on-write fork are gone.
-    //   • group chosen (non-empty)  → join it; group authority clears any pin.
-    //   • else pin enabled          → set a direct policy_id.
-    //   • else                      → clear (follow the Default policy).
-    const chosenGroup = (!isGrouped && $('ce-group')) ? $('ce-group').value : '';
-    const joiningGroup = !!(chosenGroup && chosenGroup !== '__new__');
-    const pinEnabled = !isGrouped && $('ce-pin-enable') && $('ce-pin-enable').checked;
-    // mode is null when the Recording tab isn't mounted (saving from another tab).
+    // Recording assignment (Recording tab): ONE control now — a single policy
+    // select. Every camera belongs to exactly one named policy (Phase 2), so the
+    // save just pins the chosen policy_id. `mode` stays null when the Recording
+    // tab isn't mounted (saving from another tab), leaving the assignment as-is.
     let mode = null;
-    if (!isGrouped && ($('ce-group') || $('ce-pin-enable'))) {
-      if (joiningGroup) { mode = 'inherit'; camBody.policy_id = null; }
-      else if (pinEnabled && $('ce-profile')) { mode = 'profile'; camBody.policy_id = $('ce-profile').value; }
-      else { mode = 'inherit'; camBody.policy_id = null; }
+    if ($('ce-profile')) {
+      mode = 'profile';
+      camBody.policy_id = $('ce-profile').value;
     }
 
     // Phase 4: if this reassignment changes the camera's EFFECTIVE storage disk,
     // warn (footage-safe, no per-camera move) before persisting.
     if (mode) {
       const fromPol = effectivePolicy(c).policy;
-      let toPol = fromPol;
-      if (mode === 'profile') {
-        toPol = profileById($('ce-profile').value) || fromPol;
-      } else {
-        // inherit resolves through the chosen group: group policy → else Default.
-        const grp = joiningGroup ? (GROUPS || []).find(g => g.id === chosenGroup) : null;
-        const gp = grp && grp.policy_id ? profileById(grp.policy_id) : null;
-        toPol = gp || DEFAULT_POLICY || (POLICIES || []).find(p => p.is_default) || fromPol;
-      }
+      const toPol = profileById($('ce-profile').value) || fromPol;
       if (!confirmStorageReassign(fromPol, toPol, 'this camera')) {
         setMsg('ce-msg', 'No changes saved.');
         return;
@@ -7095,10 +7085,6 @@ async function saveCamEdit() {
     }
 
     await api('/config/cameras/' + id, { method: 'PUT', body: JSON.stringify(camBody) });
-
-    if (mode === 'inherit') {
-      await applyGroupMembership(id, chosenGroup);
-    }
     // Motion tab: persist per-camera motion sensitivity/buffers as a custom policy
     // override (copy-on-write), only when those fields were edited on the tab.
     // motion_sensitivity is sent ALONGSIDE motion_threshold so the threshold is
@@ -7106,6 +7092,7 @@ async function saveCamEdit() {
     // so we must flip the mode to 'manual' for the operator's value to take effect.
     // Phase 3: skip entirely for a grouped camera, a motion fork would re-create
     // the very per-camera override grouping forbids (the backend rejects it too).
+    let devTransition = null;
     if (!isGrouped && activeCamTab === 'motion' && $('cm-sensitivity')) {
       const mb = {};
       const sens = $('cm-sensitivity').value;
@@ -7116,12 +7103,21 @@ async function saveCamEdit() {
       }
       if ($('cm-pre') && $('cm-pre').value !== '') mb.motion_pre_seconds = Number($('cm-pre').value);
       if ($('cm-post') && $('cm-post').value !== '') mb.motion_post_seconds = Number($('cm-post').value);
-      await api('/config/cameras/' + id + '/policy', { method: 'PUT', body: JSON.stringify(mb) });
+      // Phase 3 deviation feedback: capture the camera's policy BEFORE the edit so
+      // we can tell the operator whether their tuning kept it, joined an existing
+      // policy, or minted a new named one (and offer Undo → the policy it left).
+      const prevPol = effectivePolicy(c).policy || {};
+      const prevId = prevPol.id;
+      const resultPol = await api('/config/cameras/' + id + '/policy', { method: 'PUT', body: JSON.stringify(mb) });
+      if (resultPol && resultPol.id && resultPol.id !== prevId) {
+        devTransition = { camId: id, prevId, resultPol };
+      }
     }
-    toast('Camera saved.');
     await ensureCams(); await ensureGroups();
     renderTree();
     renderCamera(id);
+    if (devTransition) showDeviationToast(devTransition);
+    else toast('Camera saved.');
   } catch (e) { setMsg('ce-msg', e.message, 'err'); }
 }
 
@@ -8000,18 +7996,12 @@ function renderProfile(id) {
     </div>
 
     <div class="policy-section" style="margin-top:14px">
-      <div class="policy-section-title">Cameras using this profile</div>
-      <div style="font-size:12px;color:var(--dim);margin-bottom:4px">Direct assignment (${direct.length})</div>
+      <div class="policy-section-title">Cameras on this policy (${direct.length})</div>
+      <div class="card-hint" style="margin:-2px 0 8px 2px">The cameras this policy governs. Add or remove cameras here to move them onto (or off) this policy in bulk.</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         ${direct.length ? direct.map(c => `<span style="font-size:12px;color:var(--text)">${esc(c.name)}</span>`).join('<span style="color:var(--border2)">·</span>') : '<span style="color:var(--dim2);font-size:12px">None</span>'}
         <button class="ghost sm" style="margin-left:4px" onclick="openAssignPanel('${p.id}')">+ Assign cameras</button>
       </div>
-      <div style="font-size:12px;color:var(--dim);margin:10px 0 4px;display:flex;align-items:center;gap:8px">
-        <span>Via group (${viaGroups.reduce((a,g)=>a+(g.camera_ids||[]).length,0)})</span>
-        <button class="ghost sm" onclick="openAssignGroupPanel('${p.id}')">+ Assign group</button>
-      </div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">${viaGroups.length ? viaGroups.map(g=>`<span style="font-size:12px;color:var(--accent2)">${esc(g.name)}</span>`).join('<span style="color:var(--border2)">·</span>') : '<span style="color:var(--dim2);font-size:12px">None</span>'}</div>
-      <div id="assign-group-panel-${p.id}"></div>
       <div id="assign-panel-${p.id}"></div>
     </div>
 
