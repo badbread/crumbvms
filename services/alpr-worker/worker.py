@@ -72,6 +72,13 @@ CONFIG_POLL_S = float(os.environ.get("LPR_CONFIG_POLL_SECONDS", "30"))
 # once per pass. Lower = quicker to treat a brief disappearance as a new arrival;
 # higher = stricter about re-reads.
 REAPPEAR_GAP_S = float(os.environ.get("LPR_REAPPEAR_GAP_SECONDS", "45"))
+# The read's stored image is the WHOLE frame (a Frigate-style context snapshot),
+# not a pre-cropped plate: the clients derive the tight plate crop themselves from
+# the normalized bbox, so shipping the full frame lets crumb-alpr reads render the
+# same "context photo + derived crop" as Frigate reads. Downscale it to keep the
+# payload under the server's crop-byte cap.
+FRAME_MAX_W = int(os.environ.get("LPR_FRAME_MAX_WIDTH", "1280"))
+FRAME_JPEG_Q = int(os.environ.get("LPR_FRAME_JPEG_QUALITY", "82"))
 
 
 # ── per-pass vote accumulator ────────────────────────────────────────────────
@@ -81,7 +88,9 @@ class PassVote:
 
     votes: dict[str, float] = field(default_factory=dict)  # plate -> summed conf
     count: dict[str, int] = field(default_factory=dict)  # plate -> frame count
-    # Best single frame's artefacts, kept for the emitted read's crop + bbox.
+    # Best single frame's artefacts, kept for the emitted read. `best_crop` is a
+    # misnomer for API compatibility: it now holds the whole context frame JPEG
+    # (the client derives the plate crop from `best_bbox`), sent as crop_jpeg_b64.
     best_conf: float = 0.0
     best_crop: bytes | None = None
     best_bbox: list[float] | None = None  # [x, y, w, h] normalized
@@ -116,9 +125,27 @@ class PassVote:
 
 
 # ── plate extraction from one frame ──────────────────────────────────────────
+def _encode_context_jpeg(frame: np.ndarray) -> bytes | None:
+    """Downscale + JPEG-encode the WHOLE frame as the read's context snapshot.
+    The clients render this as the full photo and derive the tight plate crop
+    from the normalized bbox — so we ship the frame, never a pre-crop."""
+    h, w = frame.shape[:2]
+    if w > FRAME_MAX_W:
+        img = cv2.resize(
+            frame,
+            (FRAME_MAX_W, max(1, round(h * FRAME_MAX_W / w))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        img = frame
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, FRAME_JPEG_Q])
+    return buf.tobytes() if ok else None
+
+
 def read_frame(alpr: ALPR, frame: np.ndarray):
-    """Return the highest-confidence (plate, conf, crop_jpeg, bbox_norm, region)
-    read in this frame, or None. Confidence is the mean per-character OCR score."""
+    """Return the highest-confidence (plate, conf, frame_jpeg, bbox_norm, region)
+    read in this frame, or None. `frame_jpeg` is the whole (downscaled) frame, not
+    a plate crop. Confidence is the mean per-character OCR score."""
     h, w = frame.shape[:2]
     best = None
     for r in alpr.predict(frame):
@@ -128,18 +155,19 @@ def read_frame(alpr: ALPR, frame: np.ndarray):
         if best is not None and conf <= best[1]:
             continue
         b = r.detection.bounding_box
-        # Clamp to the frame and encode a tight JPEG crop of the plate.
+        # Clamp the plate box to the frame; store it normalized for the client crop.
         x1, y1 = max(0, b.x1), max(0, b.y1)
         x2, y2 = min(w, b.x2), min(h, b.y2)
-        crop_jpeg = None
-        if x2 > x1 and y2 > y1:
-            ok, buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2])
-            if ok:
-                crop_jpeg = buf.tobytes()
+        if x2 <= x1 or y2 <= y1:
+            continue
         bbox_norm = [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h]
         region = getattr(r.ocr, "region", None) or None
-        best = (r.ocr.text, conf, crop_jpeg, bbox_norm, region)
-    return best
+        best = (r.ocr.text, conf, bbox_norm, region)
+    if best is None:
+        return None
+    # Encode the context frame once, for the winning detection only.
+    text, conf, bbox_norm, region = best
+    return (text, conf, _encode_context_jpeg(frame), bbox_norm, region)
 
 
 # ── detection zones (from GET /lpr/worker-config) ────────────────────────────
