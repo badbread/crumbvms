@@ -5036,7 +5036,10 @@ const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','wind
 
 /* Per-camera LPR settings (engine / min-confidence / detection zones), fetched
    on camera-edit open (GET /config/cameras/:id/lpr) and saved on its own button
-   (PUT /config/cameras/:id/lpr). Self-contained, like the HA-links section. */
+   (PUT /config/cameras/:id/lpr). The zones editor is a canvas polygon drawer over
+   the camera snapshot (include = green, exclude = red). State in `LZ`. */
+let LZ = null; // {camId, include:[[[x,y]…]], exclude:[…], cur:[], mode:'include'|'exclude'}
+
 async function loadCameraLpr(camId) {
   const el = $('ce-lpr'); if (!el) return;
   let cfg;
@@ -5044,7 +5047,14 @@ async function loadCameraLpr(camId) {
   catch (e) { el.innerHTML = `<div class="form-msg err" style="margin:0">${esc((e && e.message) || 'Failed to load LPR settings')}</div>`; return; }
   const eng = cfg.engine || 'frigate';
   const opt = (v, label) => `<option value="${v}" ${eng===v?'selected':''}>${label}</option>`;
-  const zonesStr = cfg.zones ? JSON.stringify(cfg.zones, null, 2) : '';
+  const z = (cfg.zones && typeof cfg.zones === 'object') ? cfg.zones : {};
+  LZ = {
+    camId,
+    include: Array.isArray(z.include) ? z.include.filter(Array.isArray).map(p => p.map(pt => pt.slice())) : [],
+    exclude: Array.isArray(z.exclude) ? z.exclude.filter(Array.isArray).map(p => p.map(pt => pt.slice())) : [],
+    cur: [],
+    mode: 'include',
+  };
   el.innerHTML = `
     <div class="card-hint" style="margin:0 0 10px 0">Which engine reads plates on this camera. The Crumb-native <b>crumb-alpr</b> worker (fast-alpr) reads only the include zones (or the whole frame if none) and ignores the exclude zones.</div>
     <div class="grid2">
@@ -5054,19 +5064,110 @@ async function loadCameraLpr(camId) {
         <input id="ce-lpr-minconf" type="number" min="0" max="1" step="0.05" value="${esc(String(cfg.min_confidence ?? 0.8))}" /></div>
     </div>
     <label class="chk" style="margin-top:10px"><input type="checkbox" id="ce-lpr-enabled" ${cfg.enabled?'checked':''}/> crumb-alpr worker should read this camera</label>
-    <label class="field-label">Detection zones (JSON) ${infoHint('{"include":[[[x,y],…]], "exclude":[[[x,y],…]]} with normalized 0–1 coordinates. include = only read plates whose box centroid is inside one of these; exclude = ignore plates inside these. Blank = whole frame. A visual zone editor is planned; for now paste polygon JSON.')}</label>
-    <textarea id="ce-lpr-zones" class="mono" style="width:100%;min-height:76px;font-size:12px" placeholder='{"include":[],"exclude":[]}'>${esc(zonesStr)}</textarea>
-    <div style="margin-top:8px"><button class="primary sm" onclick="saveCameraLpr('${camId}')">Save LPR settings</button></div>
+
+    <label class="field-label">Detection zones ${infoHint('Draw regions on the snapshot. Include (green) = only read plates whose box centre is inside one of them; Exclude (red) = ignore plates inside them. No include zones = the whole frame is read. Click to place points; double-click or Finish to close a shape.')}</label>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 8px">
+      <button type="button" id="lz-mode-include" class="sm" onclick="lzSetMode('include')">Include</button>
+      <button type="button" id="lz-mode-exclude" class="sm ghost" onclick="lzSetMode('exclude')">Exclude</button>
+      <span style="flex:0 0 8px"></span>
+      <button type="button" class="ghost sm" onclick="lzFinish()">Finish shape</button>
+      <button type="button" class="ghost sm" onclick="lzUndo()">Undo</button>
+      <button type="button" class="ghost sm" onclick="lzClear()">Clear all</button>
+    </div>
+    <div class="cm-stage" id="lz-stage" style="max-height:40vh">
+      <img id="lz-img" alt="" />
+      <canvas id="lz-canvas"></canvas>
+    </div>
+    <div class="card-hint" id="lz-hint" style="margin-top:6px"></div>
+
+    <div style="margin-top:10px"><button class="primary sm" onclick="saveCameraLpr('${camId}')">Save LPR settings</button></div>
     <div id="ce-lpr-msg" class="form-msg"></div>`;
+
+  const img = $('lz-img'), cv = $('lz-canvas');
+  try { img.src = await snapshotUrl(camId); } catch { /* no snapshot — draw on the empty stage */ }
+  const sizeCanvas = () => {
+    const st = $('lz-stage'); if (!st || !cv) return;
+    cv.width = st.clientWidth || 640; cv.height = st.clientHeight || 360; lzRedraw();
+  };
+  img.onload = sizeCanvas;
+  img.onerror = sizeCanvas;
+  setTimeout(sizeCanvas, 80);
+  cv.onclick = lzCanvasClick;
+  cv.ondblclick = (e) => { e.preventDefault(); lzFinish(); };
+  lzSetMode('include');
+}
+
+function lzSetMode(m) {
+  if (!LZ) return;
+  LZ.mode = m;
+  const inc = $('lz-mode-include'), exc = $('lz-mode-exclude');
+  if (inc) inc.className = 'sm' + (m === 'include' ? '' : ' ghost');
+  if (exc) exc.className = 'sm' + (m === 'exclude' ? '' : ' ghost');
+  const h = $('lz-hint');
+  if (h) h.innerHTML = `Drawing <b style="color:${m==='exclude'?'var(--danger)':'var(--ok)'}">${m==='exclude'?'Exclude':'Include'}</b> — click the snapshot to place points, double-click to close the shape.`;
+  lzRedraw();
+}
+
+function lzCanvasClick(e) {
+  if (!LZ) return;
+  const cv = $('lz-canvas'); if (!cv) return;
+  const r = cv.getBoundingClientRect();
+  const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+  LZ.cur.push([+x.toFixed(4), +y.toFixed(4)]);
+  lzRedraw();
+}
+
+function lzFinish() {
+  if (!LZ) return;
+  if (LZ.cur.length >= 3) (LZ.mode === 'exclude' ? LZ.exclude : LZ.include).push(LZ.cur);
+  LZ.cur = [];
+  lzRedraw();
+}
+
+function lzUndo() {
+  if (!LZ) return;
+  if (LZ.cur.length) LZ.cur.pop();
+  else if (LZ.mode === 'exclude' && LZ.exclude.length) LZ.exclude.pop();
+  else if (LZ.include.length) LZ.include.pop();
+  lzRedraw();
+}
+
+function lzClear() {
+  if (!LZ) return;
+  LZ.include = []; LZ.exclude = []; LZ.cur = [];
+  lzRedraw();
+}
+
+function lzPoly(ctx, poly, w, h, stroke, fill, closed) {
+  if (!poly.length) return;
+  ctx.beginPath();
+  poly.forEach((p, i) => { const x = p[0]*w, y = p[1]*h; i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); });
+  if (closed) ctx.closePath();
+  ctx.lineWidth = 2; ctx.strokeStyle = stroke;
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  ctx.stroke();
+  ctx.fillStyle = stroke;
+  poly.forEach(p => { ctx.beginPath(); ctx.arc(p[0]*w, p[1]*h, 3, 0, 6.2832); ctx.fill(); });
+}
+
+function lzRedraw() {
+  const cv = $('lz-canvas'); if (!cv || !LZ) return;
+  const ctx = cv.getContext('2d'); const w = cv.width, h = cv.height;
+  ctx.clearRect(0, 0, w, h);
+  LZ.include.forEach(p => lzPoly(ctx, p, w, h, '#3ddc84', 'rgba(61,220,132,0.18)', true));
+  LZ.exclude.forEach(p => lzPoly(ctx, p, w, h, '#ff5c6c', 'rgba(255,92,108,0.18)', true));
+  lzPoly(ctx, LZ.cur, w, h, LZ.mode === 'exclude' ? '#ff5c6c' : '#3ddc84', null, false);
 }
 
 async function saveCameraLpr(camId) {
   setMsg('ce-lpr-msg', '');
+  if (LZ && LZ.cur.length >= 3) lzFinish(); // auto-close a dangling shape
   let zones = null;
-  const raw = ($('ce-lpr-zones') || {}).value;
-  if (raw && raw.trim()) {
-    try { zones = JSON.parse(raw); }
-    catch { setMsg('ce-lpr-msg', 'Zones must be valid JSON (or left blank).', 'err'); return; }
+  if (LZ && (LZ.include.length || LZ.exclude.length)) {
+    zones = {};
+    if (LZ.include.length) zones.include = LZ.include;
+    if (LZ.exclude.length) zones.exclude = LZ.exclude;
   }
   const body = {
     enabled: $('ce-lpr-enabled').checked,
