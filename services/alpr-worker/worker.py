@@ -65,6 +65,13 @@ HTTP_TIMEOUT = float(os.environ.get("LPR_HTTP_TIMEOUT", "10"))
 # How often to re-poll GET /lpr/worker-config (zones + min-confidence) so admin
 # edits apply without restarting the worker.
 CONFIG_POLL_S = float(os.environ.get("LPR_CONFIG_POLL_SECONDS", "30"))
+# Presence-based dedup ("parked-car detection"): a plate is emitted ONCE when it
+# appears, then suppressed for as long as it stays continuously visible. It is
+# re-emitted only after it has been ABSENT (unseen) for this long — i.e. the
+# vehicle actually left and (re)appeared. So a car parked in view reads once, not
+# once per pass. Lower = quicker to treat a brief disappearance as a new arrival;
+# higher = stricter about re-reads.
+REAPPEAR_GAP_S = float(os.environ.get("LPR_REAPPEAR_GAP_SECONDS", "45"))
 
 
 # ── per-pass vote accumulator ────────────────────────────────────────────────
@@ -229,6 +236,8 @@ def run():
     last_motion = 0.0
     cfg: dict = {}
     last_cfg = 0.0
+    last_read: dict = {}     # plate -> monotonic time last seen (presence tracking)
+    pass_new: set = set()    # plates that NEWLY appeared during the current pass
 
     while True:
         cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
@@ -283,17 +292,32 @@ def run():
                             # in the allowed region (include ∧ ¬exclude).
                             cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
                             if in_zones(cx, cy, zones):
+                                # Presence-based dedup: a plate is a NEW sighting
+                                # only if it hasn't been seen for REAPPEAR_GAP_S
+                                # (the vehicle left and came back). A parked /
+                                # persistently-visible plate keeps refreshing
+                                # last_read, so it is emitted only on arrival.
+                                if now - last_read.get(plate, -1e9) > REAPPEAR_GAP_S:
+                                    pass_new.add(plate)
+                                last_read[plate] = now
                                 vote.add(plate, conf, crop, bbox, region)
 
-                    # End-of-pass: motion settled or safety cap → emit the vote.
+                    # End-of-pass: emit the winner ONLY if it newly appeared this
+                    # pass (a parked plate still sitting in view is not re-emitted).
                     if vote.active() and (
                         now - last_motion >= PASS_GAP_S
                         or now - vote.started >= PASS_MAX_S
                     ):
                         w = vote.winner()
-                        if w:
+                        if w and w[0] in pass_new:
                             post_read(session, w[0], w[1], vote)
                         vote.reset()
+                        pass_new = set()
+                        # Drop plates unseen longer than the gap (vehicle left), so
+                        # last_read stays small and a true re-arrival re-emits.
+                        last_read = {
+                            p: t for p, t in last_read.items() if now - t <= REAPPEAR_GAP_S
+                        }
                 except Exception:
                     log.exception("frame processing error — skipping this frame")
         finally:

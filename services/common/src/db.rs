@@ -8496,6 +8496,29 @@ pub async fn update_camera_lpr(
     Ok(())
 }
 
+/// Fetch the stored crop JPEG for the plate read linked to `event_id` (newest
+/// with a crop), for the `GET /events/:id/snapshot` fallback: crumb-alpr reads
+/// store crop bytes instead of a proxied Frigate `snapshot_url`, so the existing
+/// clients (which render a plate image via that endpoint) can show them with no
+/// client change. `None` if no linked read has a crop.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_plate_crop_by_event(pool: &Pool, event_id: Uuid) -> Result<Option<Vec<u8>>> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT crop FROM plate_reads
+             WHERE event_id = $1 AND crop IS NOT NULL
+             ORDER BY ts DESC LIMIT 1",
+            &[&event_id],
+        )
+        .await
+        .context("get_plate_crop_by_event")?;
+    Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>("crop")))
+}
+
 // ─── plate watchlist (lpr_watchlist, migration 0052) ────────────────────────
 
 /// Columns selected into a [`PlateWatchlistEntry`] (kept in one place so the

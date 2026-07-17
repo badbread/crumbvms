@@ -22,6 +22,7 @@ few % of one core for a single entry camera).
 | `LPR_MIN_CONFIDENCE` | | `0.80` | Drop reads below this mean OCR confidence |
 | `LPR_SAMPLE_FPS` | | `5` | Analysis rate while a pass is active |
 | `LPR_MOTION_MIN_FRAC` | | `0.0008` | Changed-pixel fraction that counts as motion |
+| `LPR_REAPPEAR_GAP_SECONDS` | | `45` | Parked-car dedup: a plate re-emits only after being unseen this long (so a car parked in view reads once, not repeatedly) |
 | `LPR_PASS_GAP_SECONDS` | | `2.0` | Motion-quiet gap that ends a pass |
 | `LPR_PASS_MAX_SECONDS` | | `15.0` | Hard cap before a pass is emitted anyway |
 | `LPR_DETECTOR` / `LPR_OCR` | | fast-alpr defaults | Override the ONNX models |
