@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 import requests
 from fast_alpr import ALPR
 
@@ -65,6 +66,50 @@ HTTP_TIMEOUT = float(os.environ.get("LPR_HTTP_TIMEOUT", "10"))
 # How often to re-poll GET /lpr/worker-config (zones + min-confidence) so admin
 # edits apply without restarting the worker.
 CONFIG_POLL_S = float(os.environ.get("LPR_CONFIG_POLL_SECONDS", "30"))
+# Presence-based dedup ("parked-car detection"): a plate is emitted ONCE when it
+# appears, then suppressed for as long as it stays continuously visible. It is
+# re-emitted only after it has been ABSENT (unseen) for this long — i.e. the
+# vehicle actually left and (re)appeared. So a car parked in view reads once, not
+# once per pass. Lower = quicker to treat a brief disappearance as a new arrival;
+# higher = stricter about re-reads.
+REAPPEAR_GAP_S = float(os.environ.get("LPR_REAPPEAR_GAP_SECONDS", "45"))
+# The read's stored image is the WHOLE frame (a Frigate-style context snapshot),
+# not a pre-cropped plate: the clients derive the tight plate crop themselves from
+# the normalized bbox, so shipping the full frame lets crumb-alpr reads render the
+# same "context photo + derived crop" as Frigate reads. Downscale it to keep the
+# payload under the server's crop-byte cap.
+FRAME_MAX_W = int(os.environ.get("LPR_FRAME_MAX_WIDTH", "1280"))
+FRAME_JPEG_Q = int(os.environ.get("LPR_FRAME_JPEG_QUALITY", "82"))
+# ONNX Runtime intra-op threads per session. The models are tiny (7 MB detector,
+# 3 MB OCR); ORT's default of one thread per core makes every inference a
+# 16-way coordination exercise whose spin-waiting pegs EVERY core between
+# frames. One thread is both cheaper AND (for these models) not measurably
+# slower. Raise only on very weak CPUs where single-core inference can't hold
+# LPR_SAMPLE_FPS.
+ORT_THREADS = int(os.environ.get("LPR_ORT_THREADS", "1"))
+# OpenCV's internal parallel_for pool, same story as ORT_THREADS: fanning a
+# ~10 ms MOG2/medianBlur call out across every core costs more in coordination
+# than it saves, and keeps otherwise-idle cores awake.
+CV_THREADS = int(os.environ.get("LPR_CV_THREADS", "1"))
+cv2.setNumThreads(CV_THREADS)
+# Emit a one-line pipeline stats summary every N seconds (0 disables).
+STATS_S = float(os.environ.get("LPR_STATS_SECONDS", "60"))
+
+
+def _ort_session_options() -> ort.SessionOptions:
+    """Session options that keep tiny-model inference off the all-core path:
+    a small fixed thread count, sequential execution, and no spin-waiting
+    (spinning burns whole idle cores between 5 fps inferences)."""
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = ORT_THREADS
+    so.inter_op_num_threads = 1
+    so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    try:
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        so.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    except Exception:  # older onnxruntime without these keys — thread cap still applies
+        pass
+    return so
 
 
 # ── per-pass vote accumulator ────────────────────────────────────────────────
@@ -74,7 +119,9 @@ class PassVote:
 
     votes: dict[str, float] = field(default_factory=dict)  # plate -> summed conf
     count: dict[str, int] = field(default_factory=dict)  # plate -> frame count
-    # Best single frame's artefacts, kept for the emitted read's crop + bbox.
+    # Best single frame's artefacts, kept for the emitted read. `best_crop` is a
+    # misnomer for API compatibility: it now holds the whole context frame JPEG
+    # (the client derives the plate crop from `best_bbox`), sent as crop_jpeg_b64.
     best_conf: float = 0.0
     best_crop: bytes | None = None
     best_bbox: list[float] | None = None  # [x, y, w, h] normalized
@@ -109,9 +156,27 @@ class PassVote:
 
 
 # ── plate extraction from one frame ──────────────────────────────────────────
+def _encode_context_jpeg(frame: np.ndarray) -> bytes | None:
+    """Downscale + JPEG-encode the WHOLE frame as the read's context snapshot.
+    The clients render this as the full photo and derive the tight plate crop
+    from the normalized bbox — so we ship the frame, never a pre-crop."""
+    h, w = frame.shape[:2]
+    if w > FRAME_MAX_W:
+        img = cv2.resize(
+            frame,
+            (FRAME_MAX_W, max(1, round(h * FRAME_MAX_W / w))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        img = frame
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, FRAME_JPEG_Q])
+    return buf.tobytes() if ok else None
+
+
 def read_frame(alpr: ALPR, frame: np.ndarray):
-    """Return the highest-confidence (plate, conf, crop_jpeg, bbox_norm, region)
-    read in this frame, or None. Confidence is the mean per-character OCR score."""
+    """Return the highest-confidence (plate, conf, frame_jpeg, bbox_norm, region)
+    read in this frame, or None. `frame_jpeg` is the whole (downscaled) frame, not
+    a plate crop. Confidence is the mean per-character OCR score."""
     h, w = frame.shape[:2]
     best = None
     for r in alpr.predict(frame):
@@ -121,18 +186,19 @@ def read_frame(alpr: ALPR, frame: np.ndarray):
         if best is not None and conf <= best[1]:
             continue
         b = r.detection.bounding_box
-        # Clamp to the frame and encode a tight JPEG crop of the plate.
+        # Clamp the plate box to the frame; store it normalized for the client crop.
         x1, y1 = max(0, b.x1), max(0, b.y1)
         x2, y2 = min(w, b.x2), min(h, b.y2)
-        crop_jpeg = None
-        if x2 > x1 and y2 > y1:
-            ok, buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2])
-            if ok:
-                crop_jpeg = buf.tobytes()
+        if x2 <= x1 or y2 <= y1:
+            continue
         bbox_norm = [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h]
         region = getattr(r.ocr, "region", None) or None
-        best = (r.ocr.text, conf, crop_jpeg, bbox_norm, region)
-    return best
+        best = (r.ocr.text, conf, bbox_norm, region)
+    if best is None:
+        return None
+    # Encode the context frame once, for the winning detection only.
+    text, conf, bbox_norm, region = best
+    return (text, conf, _encode_context_jpeg(frame), bbox_norm, region)
 
 
 # ── detection zones (from GET /lpr/worker-config) ────────────────────────────
@@ -165,6 +231,34 @@ def in_zones(cx: float, cy: float, zones: dict | None) -> bool:
     if any(_point_in_poly(cx, cy, p) for p in exclude):
         return False
     return True
+
+
+def zone_mask_for(zones: dict | None, shape: tuple[int, int]) -> np.ndarray | None:
+    """Rasterize the include/exclude zones to a binary mask at frame size, for
+    clipping the MOTION mask. Rationale: the zone filter already rejects any
+    read outside the include region AFTER inference — so motion outside it
+    (canonically: trees swaying at the top of the frame, all day, every day)
+    can never yield an accepted read and must not be allowed to trigger
+    inference either. Returns None when no zones are set (whole frame active).
+    """
+    if not zones:
+        return None
+    include = zones.get("include") or []
+    exclude = zones.get("exclude") or []
+    if not include and not exclude:
+        return None
+    h, w = shape
+    if include:
+        m = np.zeros((h, w), dtype=np.uint8)
+        for poly in include:
+            pts = np.array([[round(x * w), round(y * h)] for x, y in poly], np.int32)
+            cv2.fillPoly(m, [pts], 255)
+    else:
+        m = np.full((h, w), 255, dtype=np.uint8)
+    for poly in exclude:
+        pts = np.array([[round(x * w), round(y * h)] for x, y in poly], np.int32)
+        cv2.fillPoly(m, [pts], 0)
+    return m
 
 
 def fetch_config(session: requests.Session) -> dict:
@@ -220,8 +314,20 @@ def post_read(session: requests.Session, plate: str, conf: float, vote: PassVote
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 def run():
-    log.info("loading fast-alpr (detector=%s ocr=%s)…", DETECTOR, OCR)
-    alpr = ALPR(detector_model=DETECTOR, ocr_model=OCR)
+    log.info(
+        "loading fast-alpr (detector=%s ocr=%s ort_threads=%d)…",
+        DETECTOR,
+        OCR,
+        ORT_THREADS,
+    )
+    alpr = ALPR(
+        detector_model=DETECTOR,
+        detector_providers=["CPUExecutionProvider"],
+        detector_sess_options=_ort_session_options(),
+        ocr_model=OCR,
+        ocr_providers=["CPUExecutionProvider"],
+        ocr_sess_options=_ort_session_options(),
+    )
     session = requests.Session()
     bg = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=32, detectShadows=False)
     vote = PassVote()
@@ -229,6 +335,15 @@ def run():
     last_motion = 0.0
     cfg: dict = {}
     last_cfg = 0.0
+    last_read: dict = {}     # plate -> monotonic time last seen (presence tracking)
+    pass_new: set = set()    # plates that NEWLY appeared during the current pass
+    # Pipeline stats (logged every STATS_S so gating efficacy is observable).
+    st_grab = st_proc = st_motion = st_infer = 0
+    st_frac_max = 0.0
+    last_stats = time.monotonic()
+    # Cached zone raster for motion-mask clipping (rebuilt when zones/shape change).
+    zmask: np.ndarray | None = None
+    zmask_key: tuple | None = None
 
     while True:
         cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
@@ -240,14 +355,32 @@ def run():
         last_process = 0.0
         try:
             while True:
-                # Read (and thus DRAIN) EVERY frame so the FFmpeg buffer never
+                # grab() (and thus DRAIN) EVERY frame so the FFmpeg buffer never
                 # grows — a sleep-per-frame would let latency and timestamp drift
-                # accumulate on a live stream.
-                ok, frame = cap.read()
-                if not ok:
+                # accumulate on a live stream. grab() decodes but skips the
+                # YUV→BGR conversion + copy; we retrieve() only the frames we
+                # actually analyze (SAMPLE_FPS of them per second).
+                if not cap.grab():
                     log.warning("stream read failed — reconnecting")
                     break
                 now = time.monotonic()
+                st_grab += 1
+
+                if STATS_S > 0 and now - last_stats >= STATS_S:
+                    log.info(
+                        "stats: %ds — frames=%d analyzed=%d motion=%d infer=%d "
+                        "frac_max=%.5f (gate=%.5f)",
+                        round(now - last_stats),
+                        st_grab,
+                        st_proc,
+                        st_motion,
+                        st_infer,
+                        st_frac_max,
+                        MOTION_MIN_FRAC,
+                    )
+                    st_grab = st_proc = st_motion = st_infer = 0
+                    st_frac_max = 0.0
+                    last_stats = now
 
                 # Refresh per-camera config periodically.
                 if now - last_cfg >= CONFIG_POLL_S:
@@ -265,6 +398,10 @@ def run():
                 if now - last_process < period:
                     continue
                 last_process = now
+                ok, frame = cap.retrieve()
+                if not ok or frame is None:
+                    continue
+                st_proc += 1
 
                 # A malformed zone shape / bad frame must never crash the loop
                 # (which would crash-restart-crash forever under `restart:
@@ -273,9 +410,27 @@ def run():
                     min_conf = float(cfg.get("min_confidence", MIN_CONF))
                     zones = cfg.get("zones")
                     mask = bg.apply(frame)
+                    # Despeckle before counting: raw MOG2 flags scattered single
+                    # pixels (sensor/IR/compression noise) that at 1080p easily
+                    # exceed MOTION_MIN_FRAC, defeating the gate entirely. A 3x3
+                    # median wipes isolated pixels but preserves the contiguous
+                    # blob of anything vehicle-sized.
+                    mask = cv2.medianBlur(mask, 3)
+                    # Clip motion to the detection zones (see zone_mask_for) so
+                    # perpetual out-of-zone motion (swaying trees…) can't hold
+                    # the inference gate open around the clock.
+                    key = (repr(zones), mask.shape)
+                    if key != zmask_key:
+                        zmask = zone_mask_for(zones, mask.shape)
+                        zmask_key = key
+                    if zmask is not None:
+                        mask = cv2.bitwise_and(mask, zmask)
                     frac = float(np.count_nonzero(mask)) / mask.size
+                    st_frac_max = max(st_frac_max, frac)
                     if frac >= MOTION_MIN_FRAC:
                         last_motion = now
+                        st_motion += 1
+                        st_infer += 1
                         got = read_frame(alpr, frame)
                         if got and got[1] >= min_conf:
                             plate, conf, crop, bbox, region = got
@@ -283,17 +438,32 @@ def run():
                             # in the allowed region (include ∧ ¬exclude).
                             cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
                             if in_zones(cx, cy, zones):
+                                # Presence-based dedup: a plate is a NEW sighting
+                                # only if it hasn't been seen for REAPPEAR_GAP_S
+                                # (the vehicle left and came back). A parked /
+                                # persistently-visible plate keeps refreshing
+                                # last_read, so it is emitted only on arrival.
+                                if now - last_read.get(plate, -1e9) > REAPPEAR_GAP_S:
+                                    pass_new.add(plate)
+                                last_read[plate] = now
                                 vote.add(plate, conf, crop, bbox, region)
 
-                    # End-of-pass: motion settled or safety cap → emit the vote.
+                    # End-of-pass: emit the winner ONLY if it newly appeared this
+                    # pass (a parked plate still sitting in view is not re-emitted).
                     if vote.active() and (
                         now - last_motion >= PASS_GAP_S
                         or now - vote.started >= PASS_MAX_S
                     ):
                         w = vote.winner()
-                        if w:
+                        if w and w[0] in pass_new:
                             post_read(session, w[0], w[1], vote)
                         vote.reset()
+                        pass_new = set()
+                        # Drop plates unseen longer than the gap (vehicle left), so
+                        # last_read stays small and a true re-arrival re-emits.
+                        last_read = {
+                            p: t for p, t in last_read.items() if now - t <= REAPPEAR_GAP_S
+                        }
                 except Exception:
                     log.exception("frame processing error — skipping this frame")
         finally:

@@ -252,11 +252,26 @@ async fn get_event_snapshot(
         user.assert_camera_access(camera_id)?;
     }
 
-    // Look up the stored snapshot URL.
-    let provider_url = db::get_event_snapshot_url(state.pool(), event_id)
+    // Look up the stored snapshot URL. When there is none, fall back to the
+    // linked plate_read's stored crop (the crumb-alpr external-engine path stores
+    // crop bytes instead of a proxied Frigate URL). This lets the existing
+    // clients — which render a plate image via GET /events/{id}/snapshot — show
+    // crumb-alpr crops with no client change.
+    let provider_url = if let Some(u) = db::get_event_snapshot_url(state.pool(), event_id)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or_else(|| ApiError::NotFound(format!("event {event_id} has no snapshot")))?;
+    {
+        u
+    } else if let Some(crop) = db::get_plate_crop_by_event(state.pool(), event_id)
+        .await
+        .map_err(ApiError::Internal)?
+    {
+        return Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], crop).into_response());
+    } else {
+        return Err(ApiError::NotFound(format!(
+            "event {event_id} has no snapshot"
+        )));
+    };
 
     // Resolve against the Frigate HTTP API base when the stored path is relative.
     //

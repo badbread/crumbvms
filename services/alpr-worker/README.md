@@ -22,12 +22,24 @@ few % of one core for a single entry camera).
 | `LPR_MIN_CONFIDENCE` | | `0.80` | Drop reads below this mean OCR confidence |
 | `LPR_SAMPLE_FPS` | | `5` | Analysis rate while a pass is active |
 | `LPR_MOTION_MIN_FRAC` | | `0.0008` | Changed-pixel fraction that counts as motion |
+| `LPR_REAPPEAR_GAP_SECONDS` | | `45` | Parked-car dedup: a plate re-emits only after being unseen this long (so a car parked in view reads once, not repeatedly) |
 | `LPR_PASS_GAP_SECONDS` | | `2.0` | Motion-quiet gap that ends a pass |
 | `LPR_PASS_MAX_SECONDS` | | `15.0` | Hard cap before a pass is emitted anyway |
+| `LPR_ORT_THREADS` | | `1` | ONNX Runtime intra-op threads per model. **Keep at 1** — the models are tiny (7 MB + 3 MB) and ORT's default (one thread per core) makes each inference a many-way coordination exercise whose spin-waiting pegs *every* core between frames. One thread is cheaper and, for these models, no slower. Raise only on very weak CPUs that can't hold `LPR_SAMPLE_FPS` single-threaded. |
+| `LPR_CV_THREADS` | | `1` | OpenCV `parallel_for` threads — same all-core-fan-out story as `LPR_ORT_THREADS` for the millisecond motion-mask ops. |
+| `LPR_FRAME_MAX_WIDTH` | | `1280` | Downscale width for the stored context-frame JPEG |
+| `LPR_FRAME_JPEG_QUALITY` | | `82` | JPEG quality for the stored context frame |
+| `LPR_STATS_SECONDS` | | `60` | Emit a one-line pipeline stats summary every N s (`0` disables) |
 | `LPR_DETECTOR` / `LPR_OCR` | | fast-alpr defaults | Override the ONNX models |
 | `LPR_LOG_LEVEL` | | `INFO` | |
 
 One worker instance = one camera. Run several instances for several cameras.
+
+**Power note:** with the thread caps above, a single 1080p30 entry camera costs
+~a third of one CPU core at idle and ~half a core during a plate pass — single-digit
+watts. If you leave `LPR_ORT_THREADS`/`LPR_CV_THREADS` unset on a many-core host and
+they somehow default high, ONNX will spin-wait across every core and burn 15–40 W
+for the same result — so keep them at 1 unless you have measured a reason not to.
 
 ## Run (opt-in compose profile)
 
