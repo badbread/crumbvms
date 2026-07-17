@@ -1493,7 +1493,7 @@ change is exactly the failure mode a floating toolchain + `-D warnings` invites.
 
 **Chosen.** Pin the toolchain to an explicit version in two coordinated,
 cross-referenced places: `rust-toolchain.toml` at the repo root (governs local
-builds, so `cargo clippy` on dev1 matches CI and "run the gate before pushing"
+builds, so `cargo clippy` on a Linux build host matches CI and "run the gate before pushing"
 actually catches what CI catches) and the `toolchain:` input on the CI
 `dtolnay/rust-toolchain` steps (governs CI). Rust is now bumped deliberately by
 editing both, not surprise-upgraded. First pin: `1.97.0`.

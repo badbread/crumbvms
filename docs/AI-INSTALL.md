@@ -376,17 +376,17 @@ All wizard steps have API equivalents. Do them in order:
 
    ```jsonc
    // POST /config/discover
-   { "range": "192.168.1.0/24", "username": "admin", "password": "•••" }
+   { "range": "198.51.100.0/24", "username": "admin", "password": "•••" }
 
    // 200 response (abridged)
    {
      "scanned": 254,
      "truncated": false,
      "cameras": [
-       { "ip": "192.168.1.50", "is_onvif": true,
+       { "ip": "198.51.100.50", "is_onvif": true,
          "manufacturer": "Hikvision", "model": "DS-2CD2043",
-         "rtsp_main": "rtsp://admin:•••@192.168.1.50:554/Streaming/Channels/101",
-         "rtsp_sub":  "rtsp://admin:•••@192.168.1.50:554/Streaming/Channels/102",
+         "rtsp_main": "rtsp://admin:•••@198.51.100.50:554/Streaming/Channels/101",
+         "rtsp_sub":  "rtsp://admin:•••@198.51.100.50:554/Streaming/Channels/102",
          "note": "ONVIF, 2 profiles" }
      ]
    }
@@ -394,7 +394,7 @@ All wizard steps have API equivalents. Do them in order:
 
    Big ranges hit a 60 s wall-clock cap (`truncated: true`), split into
    `/26`-sized chunks and call once per chunk (the web wizard does exactly this to
-   drive its progress bar). A single IP (`"range": "192.168.1.50"`) works for a
+   drive its progress bar). A single IP (`"range": "198.51.100.50"`) works for a
    per-device credential retry; pass `"timeout_ms"` (500–8000) to stretch the
    per-host budget for a single known-slow responder (e.g. Reolink).
 
@@ -417,9 +417,9 @@ All wizard steps have API equivalents. Do them in order:
    // POST /config/cameras
    {
      "name": "Front Door",
-     "source_url":     "rtsp://admin:•••@192.168.1.50:554/Streaming/Channels/101",
-     "source_sub_url": "rtsp://admin:•••@192.168.1.50:554/Streaming/Channels/102",
-     "onvif_host": "192.168.1.50", "onvif_port": 80,
+     "source_url":     "rtsp://admin:•••@198.51.100.50:554/Streaming/Channels/101",
+     "source_sub_url": "rtsp://admin:•••@198.51.100.50:554/Streaming/Channels/102",
+     "onvif_host": "198.51.100.50", "onvif_port": 80,
      "onvif_user": "admin", "onvif_password": "•••"
      // "camera_type": "ptz"  // only if discovery flagged PTZ
    }

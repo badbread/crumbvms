@@ -421,7 +421,7 @@ reference `refs #7`; the PR that completes the last in-scope client carries
 - **C4 macOS + iOS (shared).** `UpdateChecker` in
   `apps/ios/Crumb/Networking/` + `Models/` mirror, Settings row + banner in
   both targets, compare against `CFBundleShortVersionString`, iOS flagged
-  lowest-priority per D5. Acceptance: both targets build on the macmini
+  lowest-priority per D5. Acceptance: both targets build on the macOS build host
   (`scripts/release/ios.sh` path); banner verified on macOS against a
   stubbed-newer dev server. Sonnet, medium.
 

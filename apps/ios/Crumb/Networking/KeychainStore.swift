@@ -8,7 +8,7 @@ final class KeychainStore: ObservableObject {
     @Published private(set) var token: String?
 
     var serverUrl: String {
-        get { UserDefaults.standard.string(forKey: Keys.serverUrl) ?? "http://192.168.1.100:8080" }
+        get { UserDefaults.standard.string(forKey: Keys.serverUrl) ?? "http://198.51.100.100:8080" }
         set { UserDefaults.standard.set(Self.normalizeUrl(newValue), forKey: Keys.serverUrl) }
     }
 

@@ -246,7 +246,7 @@ private fun LoginContent(
                             value = uiState.discoverRange,
                             onValueChange = onDiscoverRangeChange,
                             label = "Subnet to scan",
-                            placeholder = "192.168.1.0/24",
+                            placeholder = "198.51.100.0/24",
                             modifier = Modifier.weight(1f),
                             enabled = !uiState.loading,
                             keyboardOptions = KeyboardOptions(

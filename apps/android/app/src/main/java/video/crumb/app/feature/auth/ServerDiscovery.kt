@@ -173,7 +173,7 @@ private fun selfIpv4(context: Context): Inet4Address? {
 }
 
 /**
- * The device's own /24 as a CIDR string (e.g. `192.168.1.0/24`), for prefilling the
+ * The device's own /24 as a CIDR string (e.g. `198.51.100.0/24`), for prefilling the
  * "scan a specific subnet" field so the user only has to change the third octet to
  * reach a server on a neighbouring VLAN. Null when offline.
  */

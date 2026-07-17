@@ -2058,12 +2058,12 @@ async fn resolve_rtsp_bases(pool: &Pool, config: &Config) -> (String, String) {
 ///
 /// ```ignore
 /// assert_eq!(
-///     redact_rtsp_credentials("rtsp://admin:secret@10.0.0.1/stream"),
-///     "rtsp://***:***@10.0.0.1/stream"
+///     redact_rtsp_credentials("rtsp://admin:secret@192.0.2.1/stream"),
+///     "rtsp://***:***@192.0.2.1/stream"
 /// );
 /// assert_eq!(
-///     redact_rtsp_credentials("rtsp://10.0.0.1/noauth"),
-///     "rtsp://10.0.0.1/noauth"
+///     redact_rtsp_credentials("rtsp://192.0.2.1/noauth"),
+///     "rtsp://192.0.2.1/noauth"
 /// );
 /// ```
 pub(crate) fn redact_rtsp_credentials(url: &str) -> String {
@@ -5392,8 +5392,8 @@ mod tests {
     #[test]
     fn redact_strips_user_pass() {
         assert_eq!(
-            redact_rtsp_credentials("rtsp://admin:s3cr3t@10.0.0.1/stream1"),
-            "rtsp://***:***@10.0.0.1/stream1"
+            redact_rtsp_credentials("rtsp://admin:s3cr3t@192.0.2.1/stream1"),
+            "rtsp://***:***@192.0.2.1/stream1"
         );
     }
 
@@ -5401,20 +5401,20 @@ mod tests {
     fn redact_strips_user_only_no_colon() {
         // Some cameras omit the colon when there is no password.
         assert_eq!(
-            redact_rtsp_credentials("rtsp://admin@10.0.0.1/stream"),
-            "rtsp://***:***@10.0.0.1/stream"
+            redact_rtsp_credentials("rtsp://admin@192.0.2.1/stream"),
+            "rtsp://***:***@192.0.2.1/stream"
         );
     }
 
     #[test]
     fn redact_leaves_url_without_creds_unchanged() {
-        let url = "rtsp://10.0.0.1:8554/driveway";
+        let url = "rtsp://192.0.2.1:8554/driveway";
         assert_eq!(redact_rtsp_credentials(url), url);
     }
 
     #[test]
     fn redact_leaves_non_rtsp_url_unchanged() {
-        let url = "http://10.0.0.1:8080/api";
+        let url = "http://192.0.2.1:8080/api";
         assert_eq!(redact_rtsp_credentials(url), url);
     }
 
@@ -5429,7 +5429,7 @@ mod tests {
     fn redact_preserves_path_at_sign() {
         // An `@` in the path component (after the first `/`) must NOT be
         // treated as a credential delimiter.
-        let url = "rtsp://10.0.0.1/stream@1";
+        let url = "rtsp://192.0.2.1/stream@1";
         assert_eq!(redact_rtsp_credentials(url), url);
     }
 }

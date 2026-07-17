@@ -852,9 +852,9 @@ Accept: §10 rows + parity row present; §11 entry verbatim in spirit
 snapshot-restore revert rejection note).
 
 **T13. Android actuator bar** (Sonnet, L, DEFERRED): Compose actuator row by
-the PTZ controls, `actuator()` API method, `/status` fields; build on dev1,
+the PTZ controls, `actuator()` API method, `/status` fields; build on a Linux build host,
 verify via wireless ADB. **T14. iOS/macOS** (Sonnet, L, DEFERRED): SwiftUI
-equivalent in `apps/ios/Crumb/` (NOT apps/desktop), build on macmini.
+equivalent in `apps/ios/Crumb/` (NOT apps/desktop), build on a macOS build host.
 
 Effort: backend 3-5 focused days (Phases 1-3; roughly one day lighter than
 the neolink plan — no MQTT client, no supervisor, no broker), web + desktop

@@ -1724,7 +1724,7 @@ fn local_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
-/// The device's own /24 as a CIDR string (e.g. `192.168.1.0/24`), for prefilling the
+/// The device's own /24 as a CIDR string (e.g. `198.51.100.0/24`), for prefilling the
 /// "scan a specific subnet" field.
 #[tauri::command]
 fn local_subnet_cidr() -> Option<String> {

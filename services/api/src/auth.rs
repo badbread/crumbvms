@@ -867,8 +867,8 @@ mod tests {
     #[test]
     fn scan_range_from_ipv4_widens_to_slash_24() {
         assert_eq!(
-            suggested_scan_range("192.168.1.50"),
-            Some("192.168.1.0/24".to_owned())
+            suggested_scan_range("198.51.100.50"),
+            Some("198.51.100.0/24".to_owned())
         );
         assert_eq!(
             suggested_scan_range("192.0.2.6"),
@@ -876,8 +876,8 @@ mod tests {
         );
         // Zeroes the last octet even when the source host is already `.0`.
         assert_eq!(
-            suggested_scan_range("192.168.4.0"),
-            Some("192.168.4.0/24".to_owned())
+            suggested_scan_range("203.0.113.0"),
+            Some("203.0.113.0/24".to_owned())
         );
     }
 
@@ -893,6 +893,6 @@ mod tests {
         assert_eq!(suggested_scan_range("fe80::1"), None);
         // Malformed / out-of-range dotted quads are rejected by the parser.
         assert_eq!(suggested_scan_range("999.1.1.1"), None);
-        assert_eq!(suggested_scan_range("192.168.1"), None);
+        assert_eq!(suggested_scan_range("198.51.100"), None);
     }
 }
