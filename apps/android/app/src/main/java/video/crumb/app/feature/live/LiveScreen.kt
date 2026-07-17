@@ -136,7 +136,7 @@ fun LiveScreen(
     // any wedged pooled socket first. Fires only on the offline→online transition
     // (LaunchedEffect keyed on the online flag), so a persistent server-unreachable
     // error while already online doesn't hammer — that path keeps the manual Retry.
-    val isOnline = rememberIsOnline()
+    val isOnline by rememberIsOnline()
     LaunchedEffect(isOnline) {
         if (isOnline && state.error != null) vm.retry()
     }
