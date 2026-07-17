@@ -901,6 +901,56 @@ function toast(msg, type = 'ok', duration = 3500) {
   $('toast-container').appendChild(el);
   setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, duration);
 }
+
+/* Phase 3 deviation feedback: a Motion-tab (or tuner) save either made the camera
+   JOIN an existing policy (its tuned settings matched one) or MINTED a new named
+   deviation policy. Toast which, with Rename (mint) + Undo (repoint to the policy
+   it left). Longer-lived than a plain toast so the actions are clickable. */
+function showDeviationToast(info) {
+  const { camId, prevId, resultPol } = info;
+  const name = resultPol.name || 'Default';
+  const minted = resultPol.origin === 'deviation';
+  const el = document.createElement('div');
+  el.className = 'toast ok';
+  el.style.display = 'flex'; el.style.alignItems = 'center'; el.style.gap = '10px'; el.style.flexWrap = 'wrap';
+  const txt = document.createElement('span');
+  txt.textContent = minted
+    ? `New policy “${name}” created for this camera.`
+    : `Settings match “${name}” — this camera now uses it.`;
+  el.appendChild(txt);
+  const dismiss = () => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); };
+  if (minted) {
+    const rn = document.createElement('button');
+    rn.className = 'ghost xs'; rn.textContent = 'Rename'; rn.style.fontSize = '11px';
+    rn.onclick = async () => {
+      const nn = (prompt('Name for this policy:', name) || '').trim();
+      if (!nn || nn === name) return;
+      try {
+        await api('/config/policies/' + resultPol.id, { method: 'PUT', body: JSON.stringify({ name: nn }) });
+        await ensurePolicies();
+        toast(`Renamed to “${nn}”.`);
+        if (selKind === 'profile' || location.hash.indexOf('recording') >= 0) renderRecordingRoot();
+      } catch (e) { toast('Rename failed: ' + (e.message || e), 'err'); }
+    };
+    el.appendChild(rn);
+  }
+  if (prevId) {
+    const un = document.createElement('button');
+    un.className = 'ghost xs'; un.textContent = 'Undo'; un.style.fontSize = '11px';
+    un.onclick = async () => {
+      try {
+        await api('/config/cameras/' + camId, { method: 'PUT', body: JSON.stringify({ policy_id: prevId }) });
+        await ensureCams(); await ensurePolicies();
+        if (selId === camId) renderCamera(camId);
+        toast('Reverted.');
+        dismiss();
+      } catch (e) { toast('Undo failed: ' + (e.message || e), 'err'); }
+    };
+    el.appendChild(un);
+  }
+  $('toast-container').appendChild(el);
+  setTimeout(dismiss, 9000);
+}
 /* Copy a string to the clipboard with a toast (used by the Restream URLs list). */
 function copyText(text) {
   if (!text) return;
@@ -3981,27 +4031,17 @@ function renderCamerasRoot() {
   const groupCount = (GROUPS||[]).length;
   const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).length;
   const camBody = CAMS.slice().sort(byName).map(c => {
-    const g = groupOfCamera(c.id);
+    const pol = profileById(c.policy_id);
     const model = (c.model || c.make) ? esc(c.model || c.make) : '<span style="color:var(--dim2)">—</span>';
     const type = esc(c.camera_type || 'other');
     const status = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
     return `<tr onclick="select('camera','${c.id}')">
       <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div></td>
-      <td>${g ? esc(g.name) : '<span style="color:var(--dim2)">Ungrouped</span>'}</td>
+      <td>${pol ? esc(pol.name || 'Default') : '<span style="color:var(--dim2)">—</span>'}</td>
       <td>${model}</td>
       <td>${status}</td>
     </tr>`;
   }).join('') || `<tr><td colspan="4" style="color:var(--dim2);padding:20px;text-align:center">No cameras yet — click “Add camera” to get started.</td></tr>`;
-
-  const groupBody = (GROUPS||[]).slice().sort(byName).map(g => {
-    const gp = g.policy_id ? profileById(g.policy_id) : null;
-    const n = (g.camera_ids||[]).length;
-    return `<tr onclick="select('group','${g.id}')">
-      <td><div class="lt-name"><span class="lt-ico">${icon('group',18)}</span><div class="lt-main">${esc(g.name)}</div></div></td>
-      <td>${gp ? esc(gp.name) : 'Default'}</td>
-      <td>${n} camera${n!==1?'s':''}</td>
-    </tr>`;
-  }).join('');
 
   const tile = (ic, k, v) => `<div class="stat-tile"><div class="st-k">${icon(ic,14)} ${k}</div><div class="st-v">${v}</div></div>`;
 
@@ -4022,25 +4062,16 @@ function renderCamerasRoot() {
     <div class="stat-tiles">
       ${tile('cameras','Cameras',total)}
       ${tile('profiles','Recording',`${rec}<small> / ${total}</small>`)}
-      ${tile('group','Groups',groupCount)}
-      ${tile('cameras','Ungrouped',ungrouped)}
+      ${tile('profiles','Policies',(allProfiles()||[]).length)}
     </div>
     <div class="card" style="padding:0">
       <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)">
         <div class="card-title">All cameras</div>
       </div>
       <div class="table-wrap">
-        <table class="list-tbl"><thead><tr><th>Camera</th><th>Group</th><th>Model</th><th>Recording</th></tr></thead>
+        <table class="list-tbl"><thead><tr><th>Camera</th><th>Policy</th><th>Model</th><th>Recording</th></tr></thead>
         <tbody>${camBody}</tbody></table>
       </div>
-    </div>
-    <div class="card" style="padding:0">
-      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-        <div class="card-title">Camera groups</div>
-        <button class="ghost sm" onclick="newGroup()">+ New group</button>
-      </div>
-      ${groupCount ? `<div class="table-wrap"><table class="list-tbl"><thead><tr><th>Group</th><th>Recording profile</th><th>Cameras</th></tr></thead><tbody>${groupBody}</tbody></table></div>`
-        : `<div class="card-hint" style="padding:14px 16px">No groups yet. Create one to assign a shared recording profile to several cameras at once.</div>`}
     </div>`;
 }
 /* Recording section list: the reusable profiles cameras/groups inherit. */
@@ -7061,6 +7092,7 @@ async function saveCamEdit() {
     // so we must flip the mode to 'manual' for the operator's value to take effect.
     // Phase 3: skip entirely for a grouped camera, a motion fork would re-create
     // the very per-camera override grouping forbids (the backend rejects it too).
+    let devTransition = null;
     if (!isGrouped && activeCamTab === 'motion' && $('cm-sensitivity')) {
       const mb = {};
       const sens = $('cm-sensitivity').value;
@@ -7071,12 +7103,21 @@ async function saveCamEdit() {
       }
       if ($('cm-pre') && $('cm-pre').value !== '') mb.motion_pre_seconds = Number($('cm-pre').value);
       if ($('cm-post') && $('cm-post').value !== '') mb.motion_post_seconds = Number($('cm-post').value);
-      await api('/config/cameras/' + id + '/policy', { method: 'PUT', body: JSON.stringify(mb) });
+      // Phase 3 deviation feedback: capture the camera's policy BEFORE the edit so
+      // we can tell the operator whether their tuning kept it, joined an existing
+      // policy, or minted a new named one (and offer Undo → the policy it left).
+      const prevPol = effectivePolicy(c).policy || {};
+      const prevId = prevPol.id;
+      const resultPol = await api('/config/cameras/' + id + '/policy', { method: 'PUT', body: JSON.stringify(mb) });
+      if (resultPol && resultPol.id && resultPol.id !== prevId) {
+        devTransition = { camId: id, prevId, resultPol };
+      }
     }
-    toast('Camera saved.');
     await ensureCams(); await ensureGroups();
     renderTree();
     renderCamera(id);
+    if (devTransition) showDeviationToast(devTransition);
+    else toast('Camera saved.');
   } catch (e) { setMsg('ce-msg', e.message, 'err'); }
 }
 
@@ -7955,18 +7996,12 @@ function renderProfile(id) {
     </div>
 
     <div class="policy-section" style="margin-top:14px">
-      <div class="policy-section-title">Cameras using this profile</div>
-      <div style="font-size:12px;color:var(--dim);margin-bottom:4px">Direct assignment (${direct.length})</div>
+      <div class="policy-section-title">Cameras on this policy (${direct.length})</div>
+      <div class="card-hint" style="margin:-2px 0 8px 2px">The cameras this policy governs. Add or remove cameras here to move them onto (or off) this policy in bulk.</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         ${direct.length ? direct.map(c => `<span style="font-size:12px;color:var(--text)">${esc(c.name)}</span>`).join('<span style="color:var(--border2)">·</span>') : '<span style="color:var(--dim2);font-size:12px">None</span>'}
         <button class="ghost sm" style="margin-left:4px" onclick="openAssignPanel('${p.id}')">+ Assign cameras</button>
       </div>
-      <div style="font-size:12px;color:var(--dim);margin:10px 0 4px;display:flex;align-items:center;gap:8px">
-        <span>Via group (${viaGroups.reduce((a,g)=>a+(g.camera_ids||[]).length,0)})</span>
-        <button class="ghost sm" onclick="openAssignGroupPanel('${p.id}')">+ Assign group</button>
-      </div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">${viaGroups.length ? viaGroups.map(g=>`<span style="font-size:12px;color:var(--accent2)">${esc(g.name)}</span>`).join('<span style="color:var(--border2)">·</span>') : '<span style="color:var(--dim2);font-size:12px">None</span>'}</div>
-      <div id="assign-group-panel-${p.id}"></div>
       <div id="assign-panel-${p.id}"></div>
     </div>
 
