@@ -473,7 +473,7 @@ pub struct CameraGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
     /// Operator-visible reachable host, informational + future use.
-    /// e.g. `"http://192.168.1.50:8080"`.  Does not affect stream resolution.
+    /// e.g. `"http://198.51.100.50:8080"`.  Does not affect stream resolution.
     pub server_address: String,
     /// Base RTSP URL for Crumb's own restreamer (port :18554 by default).
     /// e.g. `"rtsp://crumb-host:18554"`.

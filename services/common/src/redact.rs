@@ -60,16 +60,16 @@ mod tests {
     #[test]
     fn plain_userinfo_redacted() {
         assert_eq!(
-            redact_url_credentials("rtsp://admin:secret@10.0.0.1/stream"),
-            "rtsp://***@10.0.0.1/stream"
+            redact_url_credentials("rtsp://admin:secret@192.0.2.1/stream"),
+            "rtsp://***@192.0.2.1/stream"
         );
     }
 
     #[test]
     fn plain_no_credentials_unchanged() {
         assert_eq!(
-            redact_url_credentials("rtsp://10.0.0.1:554/noauth"),
-            "rtsp://10.0.0.1:554/noauth"
+            redact_url_credentials("rtsp://192.0.2.1:554/noauth"),
+            "rtsp://192.0.2.1:554/noauth"
         );
     }
 

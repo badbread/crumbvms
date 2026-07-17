@@ -27,8 +27,8 @@ Reach it at:
 https://<this-host>:8443
 ```
 
-e.g. `https://192.168.1.50:8443`, same admin console / API as
-`http://192.168.1.50:8080`, just encrypted.
+e.g. `https://198.51.100.50:8443`, same admin console / API as
+`http://198.51.100.50:8080`, just encrypted.
 
 ## The self-signed-cert browser warning
 

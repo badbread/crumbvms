@@ -10,8 +10,8 @@ Type=oneshot
 # Run as the deploy user (in the docker group; can write the NFS backup dir).
 User=crumb
 WorkingDirectory=/opt/crumb/app
-# Off-host target: NFS mount from the NAS (192.0.2.21:/volume1/backups), so a
+# Off-host target: NFS mount from the NAS (192.0.2.21:/mnt/nas/backups), so a
 # server-host disk/host failure does not take the backups with it.
-Environment=BACKUP_DIR=/volume1/backups/crumb-db
+Environment=BACKUP_DIR=/mnt/nas/backups/crumb-db
 Environment=RETENTION_DAYS=30
 ExecStart=/usr/bin/bash /opt/crumb/app/scripts/backup-db.sh

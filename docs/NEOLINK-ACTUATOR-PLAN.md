@@ -445,7 +445,7 @@ COMPONENT-MAP parity row so no session "forgets" them.
 
 ## 8. Deployment (golden rule 5: install guide must not drift)
 
-### 8.1 Compose (`docker-compose.yml`, validated with `docker compose config` on dev1, real docker)
+### 8.1 Compose (`docker-compose.yml`, validated with `docker compose config` on a Linux build host, real docker)
 
 ```yaml
   neolink:
@@ -710,7 +710,7 @@ against a dev server via CDP.
 mosquitto-neolink auth wrapper + a broker-isolation threat-model check**)
 Files: `docker-compose.yml`, `scripts/setup-env.sh`, `.env.example`,
 `.gitignore`, `neolink/neolink.example.toml`.
-Accept: `docker compose config` clean on dev1 (real docker, not a YAML
+Accept: `docker compose config` clean on a Linux build host (real docker, not a YAML
 parser); plain `up -d` starts neither new service; `--profile neolink` starts
 both; broker rejects anonymous; no published ports on either new service; no
 secret printed or logged.
@@ -731,9 +731,9 @@ Accept: §10 rows + parity row present; §11 entry verbatim in spirit.
 ### Phase 6 (deferred, tracked): mobile parity
 
 **T14. Android actuator bar** (Sonnet, L): Compose actuator row by the PTZ
-controls, `actuator()` API method, `/status` fields; build on dev1, verify via
+controls, `actuator()` API method, `/status` fields; build on a Linux build host, verify via
 wireless ADB. **T15. iOS/macOS** (Sonnet, L): SwiftUI equivalent in
-`apps/ios/Crumb/` (NOT apps/desktop), build on macmini.
+`apps/ios/Crumb/` (NOT apps/desktop), build on a macOS build host.
 
 Effort roughly matches #25's estimate: backend 4-6 focused days (Phases 1-3),
 web+desktop 3-4, deploy/docs 1, mobile 2-3 each when scheduled.

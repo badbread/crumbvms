@@ -747,8 +747,8 @@ mod tests {
             ("host".into(), 1883)
         );
         assert_eq!(
-            parse_mqtt_url("10.0.0.1:1884").unwrap(),
-            ("10.0.0.1".into(), 1884)
+            parse_mqtt_url("192.0.2.1:1884").unwrap(),
+            ("192.0.2.1".into(), 1884)
         );
     }
 }

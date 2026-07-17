@@ -12,7 +12,7 @@
 //! # Request body
 //!
 //! ```json
-//! { "range": "192.168.1.0/24", "username": "admin", "password": "secret" }
+//! { "range": "198.51.100.0/24", "username": "admin", "password": "secret" }
 //! ```
 //!
 //! | Field        | Required | Default            | Notes                              |
@@ -23,9 +23,9 @@
 //! | `timeout_ms` | no       | [`PROBE_TIMEOUT`]  | per-host budget override, 500–8000  |
 //!
 //! `range` accepts three forms:
-//!  * **CIDR**: `192.168.1.0/24`
-//!  * **dash range**: `192.168.1.1-254` (last octet) or `192.168.1.1-192.168.1.254`
-//!  * **single IP**: `192.168.1.50`
+//!  * **CIDR**: `198.51.100.0/24`
+//!  * **dash range**: `198.51.100.1-254` (last octet) or `198.51.100.1-198.51.100.254`
+//!  * **single IP**: `198.51.100.50`
 //!
 //! `username` / `password` are optional ONVIF credentials. They are NOT required
 //! to *detect* a camera (ONVIF mandates that `GetSystemDateAndTime` answer
@@ -76,7 +76,7 @@
 //! admin UI's "try harder on just this one IP" action:
 //!
 //! ```json
-//! { "ip": "192.168.1.50", "username": "admin", "password": "secret", "brand": "reolink" }
+//! { "ip": "198.51.100.50", "username": "admin", "password": "secret", "brand": "reolink" }
 //! ```
 //!
 //! It tries, in order: (a) single-IP ONVIF discovery with a generous budget
@@ -315,8 +315,8 @@ fn render_candidate(ip: &str, port: u16, path: &str, user: &str, password: &str)
 /// `POST /config/discover` request body.
 #[derive(Debug, Deserialize)]
 pub struct DiscoverRequest {
-    /// IP range: CIDR (`192.168.1.0/24`), dash range (`192.168.1.1-254`), or a
-    /// single IP (`192.168.1.50`).
+    /// IP range: CIDR (`198.51.100.0/24`), dash range (`198.51.100.1-254`), or a
+    /// single IP (`198.51.100.50`).
     pub range: String,
     /// Optional ONVIF username — needed to auto-fill the stream URL.
     #[serde(default)]
@@ -341,7 +341,7 @@ pub struct DiscoveredCamera {
     /// Whether the host answered an unauthenticated ONVIF probe.
     pub is_onvif: bool,
     /// The ONVIF device-service URL that answered (e.g.
-    /// `http://192.168.1.5/onvif/device_service`), when `is_onvif`.
+    /// `http://198.51.100.5/onvif/device_service`), when `is_onvif`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onvif_service_url: Option<String>,
     /// Manufacturer (from authenticated `GetDeviceInformation`).
@@ -784,7 +784,7 @@ fn parse_range(input: &str) -> Result<Vec<Ipv4Addr>, ApiError> {
     if input.contains('/') {
         let net: Ipv4Net = input.parse().map_err(|_| {
             ApiError::BadRequest(format!(
-                "'{input}' is not a valid CIDR (e.g. 192.168.1.0/24)"
+                "'{input}' is not a valid CIDR (e.g. 198.51.100.0/24)"
             ))
         })?;
         // Reject an oversize prefix BEFORE materializing the host list (a /16
@@ -810,7 +810,7 @@ fn parse_range(input: &str) -> Result<Vec<Ipv4Addr>, ApiError> {
             .parse()
             .map_err(|_| ApiError::BadRequest(format!("'{lo_str}' is not a valid IPv4 address")))?;
 
-        // The high side is either a full IP (`192.168.1.254`) or a bare last octet
+        // The high side is either a full IP (`198.51.100.254`) or a bare last octet
         // (`254`), in which case it inherits the low IP's first three octets.
         let hi: Ipv4Addr = if let Ok(full) = hi_str.parse::<Ipv4Addr>() {
             full
@@ -819,7 +819,7 @@ fn parse_range(input: &str) -> Result<Vec<Ipv4Addr>, ApiError> {
             Ipv4Addr::new(o[0], o[1], o[2], last)
         } else {
             return Err(ApiError::BadRequest(format!(
-                "'{hi_str}' is not a valid range end (use 254 or 192.168.1.254)"
+                "'{hi_str}' is not a valid range end (use 254 or 198.51.100.254)"
             )));
         };
 
@@ -841,8 +841,8 @@ fn parse_range(input: &str) -> Result<Vec<Ipv4Addr>, ApiError> {
     }
 
     Err(ApiError::BadRequest(format!(
-        "'{input}' is not a valid range — use CIDR (192.168.1.0/24), \
-         a dash range (192.168.1.1-254), or a single IP"
+        "'{input}' is not a valid range — use CIDR (198.51.100.0/24), \
+         a dash range (198.51.100.1-254), or a single IP"
     )))
 }
 
@@ -1201,7 +1201,7 @@ pub(crate) struct RedetectResult {
 /// # Credential injection (#6)
 ///
 /// ONVIF `GetStreamUri` returns the raw camera RTSP URL, which many firmware
-/// builds emit WITHOUT embedded credentials (e.g. `rtsp://10.0.0.1:554/h264`).
+/// builds emit WITHOUT embedded credentials (e.g. `rtsp://192.0.2.1:554/h264`).
 /// When go2rtc tries to open that URL as a producer it will fail auth, silently
 /// stopping recording for the camera.  We inject the stored ONVIF username and
 /// password into both `source_url` and `source_sub_url` via
@@ -1372,54 +1372,54 @@ mod tests {
 
     #[test]
     fn single_ip() {
-        let v = parse_range("192.168.1.50").unwrap();
-        assert_eq!(v, vec![Ipv4Addr::new(192, 168, 1, 50)]);
+        let v = parse_range("198.51.100.50").unwrap();
+        assert_eq!(v, vec![Ipv4Addr::new(198, 51, 100, 50)]);
     }
 
     #[test]
     fn cidr_24_excludes_network_and_broadcast() {
-        let v = parse_range("192.168.1.0/24").unwrap();
+        let v = parse_range("198.51.100.0/24").unwrap();
         assert_eq!(v.len(), 254);
-        assert_eq!(v[0], Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(v[253], Ipv4Addr::new(192, 168, 1, 254));
+        assert_eq!(v[0], Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(v[253], Ipv4Addr::new(198, 51, 100, 254));
     }
 
     #[test]
     fn cidr_32_single_host() {
-        let v = parse_range("192.168.1.7/32").unwrap();
-        assert_eq!(v, vec![Ipv4Addr::new(192, 168, 1, 7)]);
+        let v = parse_range("198.51.100.7/32").unwrap();
+        assert_eq!(v, vec![Ipv4Addr::new(198, 51, 100, 7)]);
     }
 
     #[test]
     fn dash_range_last_octet() {
-        let v = parse_range("192.168.1.1-254").unwrap();
+        let v = parse_range("198.51.100.1-254").unwrap();
         assert_eq!(v.len(), 254);
-        assert_eq!(v[0], Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(v[253], Ipv4Addr::new(192, 168, 1, 254));
+        assert_eq!(v[0], Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(v[253], Ipv4Addr::new(198, 51, 100, 254));
     }
 
     #[test]
     fn dash_range_full_ip() {
-        let v = parse_range("192.168.1.10-192.168.1.20").unwrap();
+        let v = parse_range("198.51.100.10-198.51.100.20").unwrap();
         assert_eq!(v.len(), 11);
-        assert_eq!(v[0], Ipv4Addr::new(192, 168, 1, 10));
-        assert_eq!(v[10], Ipv4Addr::new(192, 168, 1, 20));
+        assert_eq!(v[0], Ipv4Addr::new(198, 51, 100, 10));
+        assert_eq!(v[10], Ipv4Addr::new(198, 51, 100, 20));
     }
 
     #[test]
     fn dash_range_inverted_rejected() {
-        assert!(parse_range("192.168.1.20-10").is_err());
+        assert!(parse_range("198.51.100.20-10").is_err());
     }
 
     #[test]
     fn oversize_cidr_rejected() {
         // /16 = 65534 hosts > MAX_HOSTS
-        assert!(parse_range("192.168.0.0/16").is_err());
+        assert!(parse_range("198.51.100.0/16").is_err());
     }
 
     #[test]
     fn oversize_dash_rejected() {
-        assert!(parse_range("192.168.0.0-192.168.255.255").is_err());
+        assert!(parse_range("198.51.100.0-198.51.255.255").is_err());
     }
 
     #[test]
@@ -1433,11 +1433,11 @@ mod tests {
     #[test]
     fn inject_creds_no_existing_userinfo() {
         // Bare URL: credentials should be injected.
-        let result = inject_rtsp_credentials("rtsp://10.0.0.1:554/h264", "admin", "secret");
+        let result = inject_rtsp_credentials("rtsp://192.0.2.1:554/h264", "admin", "secret");
         let u = Url::parse(&result).unwrap();
         assert_eq!(u.username(), "admin");
         assert_eq!(u.password(), Some("secret"));
-        assert_eq!(u.host_str(), Some("10.0.0.1"));
+        assert_eq!(u.host_str(), Some("192.0.2.1"));
         assert_eq!(u.port(), Some(554));
         assert!(u.path().contains("h264"));
     }
@@ -1445,7 +1445,7 @@ mod tests {
     #[test]
     fn inject_creds_empty_user_is_noop() {
         // When user is empty, return the original URL unchanged.
-        let url = "rtsp://10.0.0.1:554/h264";
+        let url = "rtsp://192.0.2.1:554/h264";
         let result = inject_rtsp_credentials(url, "", "ignored");
         assert_eq!(result, url);
     }
@@ -1457,13 +1457,13 @@ mod tests {
         // would split user:pass). go2rtc/ffmpeg percent-decode the userinfo before
         // dialing the camera, so the encoded form is the correct thing to store.
         let result =
-            inject_rtsp_credentials("rtsp://10.0.0.2:554/stream1", "cam_user", "p@ss:w0rd!");
+            inject_rtsp_credentials("rtsp://192.0.2.2:554/stream1", "cam_user", "p@ss:w0rd!");
         let u = Url::parse(&result).unwrap();
         assert_eq!(u.username(), "cam_user");
         // url::Url::password() returns the value AS STORED in the URL — percent-encoded.
         assert_eq!(u.password(), Some("p%40ss%3Aw0rd!"));
         // The URL structure is intact despite the special chars.
-        assert_eq!(u.host_str(), Some("10.0.0.2"));
+        assert_eq!(u.host_str(), Some("192.0.2.2"));
         assert_eq!(u.port(), Some(554));
     }
 
@@ -1472,7 +1472,7 @@ mod tests {
         // If the camera's GetStreamUri already returned a URL with creds, they
         // should be overwritten with the stored ONVIF creds (the DB is authoritative).
         let result = inject_rtsp_credentials(
-            "rtsp://old_user:old_pass@10.0.0.3:554/cam",
+            "rtsp://old_user:old_pass@192.0.2.3:554/cam",
             "new_user",
             "new_pass",
         );
@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn inject_creds_empty_password_sets_no_password() {
         // A non-empty user but empty password → no password component.
-        let result = inject_rtsp_credentials("rtsp://10.0.0.4:554/live", "admin", "");
+        let result = inject_rtsp_credentials("rtsp://192.0.2.4:554/live", "admin", "");
         let u = Url::parse(&result).unwrap();
         assert_eq!(u.username(), "admin");
         assert_eq!(u.password(), None);
@@ -1661,14 +1661,14 @@ mod tests {
 
     #[test]
     fn render_candidate_no_creds() {
-        let url = render_candidate("192.168.1.50", 554, "/h264Preview_01_main", "", "");
-        assert_eq!(url, "rtsp://192.168.1.50:554/h264Preview_01_main");
+        let url = render_candidate("198.51.100.50", 554, "/h264Preview_01_main", "", "");
+        assert_eq!(url, "rtsp://198.51.100.50:554/h264Preview_01_main");
     }
 
     #[test]
     fn render_candidate_with_creds_are_injected_and_encoded() {
         let url = render_candidate(
-            "192.168.1.50",
+            "198.51.100.50",
             554,
             "/h264Preview_01_main",
             "admin",
@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn render_candidate_custom_port() {
-        let url = render_candidate("10.0.0.5", 8554, "/media/video1", "user", "pass");
+        let url = render_candidate("192.0.2.5", 8554, "/media/video1", "user", "pass");
         let parsed = Url::parse(&url).unwrap();
         assert_eq!(parsed.port(), Some(8554));
     }
@@ -1693,7 +1693,7 @@ mod tests {
         // Dahua/Amcrest paths carry a query string — make sure it survives
         // both the no-creds and creds-injected render.
         let bare = render_candidate(
-            "10.0.0.6",
+            "192.0.2.6",
             554,
             "/cam/realmonitor?channel=1&subtype=0",
             "",
@@ -1701,11 +1701,11 @@ mod tests {
         );
         assert_eq!(
             bare,
-            "rtsp://10.0.0.6:554/cam/realmonitor?channel=1&subtype=0"
+            "rtsp://192.0.2.6:554/cam/realmonitor?channel=1&subtype=0"
         );
 
         let with_creds = render_candidate(
-            "10.0.0.6",
+            "192.0.2.6",
             554,
             "/cam/realmonitor?channel=1&subtype=0",
             "admin",

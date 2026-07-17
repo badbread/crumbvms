@@ -32,8 +32,14 @@ tags = ["homelab", "path"]
 
 [[rules]]
 id = "homelab-internal-domain"
-description = "Internal DNS suffix (private ARPA zone or mDNS)"
-regex = '''\b[a-z0-9][a-z0-9-]*\.(home\.arpa|local)\b'''
+description = "Internal DNS suffix (private homenet ARPA zone)"
+# Only .home.arpa (RFC8375 homenet) — a strong signal of a real internal host.
+# `.local` was dropped: mDNS is a public standard that pervades framework files
+# (`.env.local`, `settings.local`, `*.local` gitignore patterns) and legitimate
+# example hostnames (`homeassistant.local`, `crumb.local`), so it only produced
+# false positives. Any specific real `.local` host stays covered by the private
+# denylist injected at CI time.
+regex = '''\b[a-z0-9][a-z0-9-]*\.home\.arpa\b'''
 tags = ["homelab", "network"]
 
 [allowlist]
@@ -48,4 +54,7 @@ paths = [
   '''(^|/)VERSION$''',
   '''\.env\.example$''',
   '''(^|/)\.gitleaks\.toml$''',
+  # Binary assets: scanning raw bytes for TEXT identifiers only false-positives
+  # on incidental byte runs in compressed media. Media carries no secrets.
+  '''\.(png|jpe?g|gif|webp|ico|pdf|woff2?|ttf|mp4|zip)$''',
 ]

@@ -234,25 +234,25 @@ mod tests {
 
     #[test]
     fn supported_schemes() {
-        assert!(is_supported_scheme("rtsp://10.0.0.1/x"));
-        assert!(is_supported_scheme("RTSP://10.0.0.1/x"));
-        assert!(is_supported_scheme("rtsps://10.0.0.1/x"));
-        assert!(is_supported_scheme("http://10.0.0.1/x"));
-        assert!(is_supported_scheme("https://10.0.0.1/x"));
+        assert!(is_supported_scheme("rtsp://192.0.2.1/x"));
+        assert!(is_supported_scheme("RTSP://192.0.2.1/x"));
+        assert!(is_supported_scheme("rtsps://192.0.2.1/x"));
+        assert!(is_supported_scheme("http://192.0.2.1/x"));
+        assert!(is_supported_scheme("https://192.0.2.1/x"));
         assert!(!is_supported_scheme("file:///etc/passwd"));
-        assert!(!is_supported_scheme("ftp://10.0.0.1/x"));
+        assert!(!is_supported_scheme("ftp://192.0.2.1/x"));
         assert!(!is_supported_scheme(""));
     }
 
     #[test]
     fn rtsp_uses_dash_timeout_not_rw_timeout() {
-        let opts = input_opts("rtsp://10.0.0.1/x", "5000000");
+        let opts = input_opts("rtsp://192.0.2.1/x", "5000000");
         assert_eq!(opts, vec!["-rtsp_transport", "tcp", "-timeout", "5000000"]);
     }
 
     #[test]
     fn http_uses_rw_timeout() {
-        let opts = input_opts("http://10.0.0.1/x", "5000000");
+        let opts = input_opts("http://192.0.2.1/x", "5000000");
         assert_eq!(opts, vec!["-rw_timeout", "5000000"]);
     }
 

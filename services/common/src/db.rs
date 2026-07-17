@@ -8912,8 +8912,8 @@ pub async fn ensure_camera_ownership_columns(pool: &Pool) -> Result<()> {
 ///
 /// // Legacy absolute URL: passed through unchanged.
 /// assert_eq!(
-///     resolve_stream_url("crumb", "rtsp://10.0.0.1:18554/cam1", "rtsp://crumb:18554", "rtsp://frigate:8554"),
-///     "rtsp://10.0.0.1:18554/cam1"
+///     resolve_stream_url("crumb", "rtsp://192.0.2.1:18554/cam1", "rtsp://crumb:18554", "rtsp://frigate:8554"),
+///     "rtsp://192.0.2.1:18554/cam1"
 /// );
 ///
 /// // New relative name, Crumb-managed:

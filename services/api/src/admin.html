@@ -1386,9 +1386,9 @@ function wizardBody(key) {
     const addr = sv.server_address || WZ.suggested.suggested_address || '';
     const rtsp = sv.crumb_rtsp_base || WZ.suggested.suggested_rtsp_base || '';
     return `<label class="field-label" style="margin-top:0">Server address <span style="color:var(--dim2);font-weight:400">(how clients reach this console)</span></label>
-      <input id="wz-addr" class="mono" value="${esc(addr)}" placeholder="http://192.168.1.50:8080" style="font-size:13px" />
+      <input id="wz-addr" class="mono" value="${esc(addr)}" placeholder="http://198.51.100.50:8080" style="font-size:13px" />
       <label class="field-label" style="margin-top:12px">Camera streaming base, RTSP <span style="color:var(--dim2);font-weight:400">(native desktop / phone apps use this)</span></label>
-      <input id="wz-rtsp" class="mono" value="${esc(rtsp)}" placeholder="rtsp://192.168.1.50:18554" style="font-size:13px" />
+      <input id="wz-rtsp" class="mono" value="${esc(rtsp)}" placeholder="rtsp://198.51.100.50:18554" style="font-size:13px" />
       <div class="login-sub" style="margin-top:8px">For encrypted access, use <code>https://&lt;this-host&gt;:8443</code> instead (a Caddy sidecar terminates TLS in front of the console, self-signed by default on a LAN install). See <b>Server</b> → TLS, or docs/TLS.md, to trust the certificate or switch to a real domain.</div>`;
   }
   if (key === 'storage')    return wizardStorageBody();
@@ -1814,7 +1814,7 @@ function wizardFindBody() {
   const range = sc.range || WZ.suggested.suggested_scan_range || '';
   return `
     <label class="field-label" style="margin-top:0">IP range</label>
-    <input id="wz-scan-range" class="mono" value="${esc(range)}" placeholder="192.168.1.0/24   or   192.168.1.1-254" style="font-size:13px" oninput="WZ.scan.range=this.value" />
+    <input id="wz-scan-range" class="mono" value="${esc(range)}" placeholder="198.51.100.0/24   or   198.51.100.1-254" style="font-size:13px" oninput="WZ.scan.range=this.value" />
     <label class="field-label" style="margin-top:10px">Camera credentials <span style="color:var(--dim2);font-weight:400">(optional, add every login your cameras use)</span></label>
     ${wizardCredListHtml()}
     <div class="login-sub" style="margin-top:6px">Detection works without credentials; reading each camera's stream URLs needs them. Each set is tried against each camera until one works, the working login is saved on that camera. Different brands usually mean different logins: add one set per brand.</div>
@@ -2088,7 +2088,7 @@ async function wizardRunScan() {
   const range = (WZ.scan.range || '').trim();
   if (!range) { sc.error = 'Enter an IP range first.'; wizardScanRefresh(); return; }
   const ips = wizardExpandRange(range);
-  if (!ips.length) { sc.error = 'That range didn\'t parse. Use 192.168.1.0/24 or 192.168.1.1-254.'; wizardScanRefresh(); return; }
+  if (!ips.length) { sc.error = 'That range didn\'t parse. Use 198.51.100.0/24 or 198.51.100.1-254.'; wizardScanRefresh(); return; }
   const creds = wizardCredsClean();
   const first = creds[0] || null;
   // MERGE, don't reset: previously-found cameras stay. Ones that respond again are
@@ -2427,7 +2427,7 @@ function wizardManualRowHtml(m, k, fieldLbl) {
     </details>` : '';
   const discoverRow = `
     <div style="display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:8px;margin-bottom:6px">
-      <div>${fieldLbl('Camera IP / host')}<input value="${esc(m.ip || '')}" placeholder="192.168.1.50" class="mono" oninput="WZ.manualRows[${k}].ip=this.value" style="width:100%;font-size:12px" /></div>
+      <div>${fieldLbl('Camera IP / host')}<input value="${esc(m.ip || '')}" placeholder="198.51.100.50" class="mono" oninput="WZ.manualRows[${k}].ip=this.value" style="width:100%;font-size:12px" /></div>
       <div>${fieldLbl('Username (optional)')}<input value="${esc(m.user || '')}" placeholder="admin" autocomplete="off" oninput="WZ.manualRows[${k}].user=this.value" style="width:100%" /></div>
       <div>${fieldLbl('Password (optional)')}<input type="password" value="${esc(m.pass || '')}" autocomplete="new-password" oninput="WZ.manualRows[${k}].pass=this.value" style="width:100%" /></div>
     </div>
@@ -4801,7 +4801,7 @@ function renderCamInfoTab(c) {
       </div>
       <div class="form-grid">
         <label class="fg-label" for="ce-onvif-host">ONVIF host / IP</label>
-        <div class="fg-ctl"><input id="ce-onvif-host" class="mono" value="${esc(c.onvif_host||'')}" placeholder="10.0.0.50" style="max-width:220px" title="ONVIF lets Crumb read this camera's real stream URLs and PTZ controls directly from the device." /></div>
+        <div class="fg-ctl"><input id="ce-onvif-host" class="mono" value="${esc(c.onvif_host||'')}" placeholder="192.0.2.50" style="max-width:220px" title="ONVIF lets Crumb read this camera's real stream URLs and PTZ controls directly from the device." /></div>
         <label class="fg-label" for="ce-onvif-port">ONVIF port</label>
         <div class="fg-ctl"><input id="ce-onvif-port" type="number" min="1" max="65535" value="${c.onvif_port!=null?c.onvif_port:''}" placeholder="80" style="max-width:110px" /></div>
         <label class="fg-label" for="ce-onvif-user">ONVIF username</label>
@@ -6408,7 +6408,7 @@ async function renderServerSettings() {
       <div class="policy-section-title">This server</div>
       <div class="form-grid">
         <label class="fg-label" for="srv-address">Server address ${infoHint('How clients reach this console. Informational, the operator-facing URL for this management console.')}</label>
-        <div class="fg-ctl"><input id="srv-address" class="mono" value="${esc(s.server_address||'')}" placeholder="http://192.168.1.50:8080" style="max-width:420px" title="Informational, the operator-facing URL for this management console." /></div>
+        <div class="fg-ctl"><input id="srv-address" class="mono" value="${esc(s.server_address||'')}" placeholder="http://198.51.100.50:8080" style="max-width:420px" title="Informational, the operator-facing URL for this management console." /></div>
         <div class="fg-full card-hint">For encrypted access, use <code>https://&lt;this-host&gt;:8443</code>, a Caddy sidecar in front of this console terminates TLS (self-signed by default on a LAN install). See <code>docs/TLS.md</code> for trusting the certificate or switching to a real domain with automatic Let's Encrypt.</div>
       </div>
     </div>

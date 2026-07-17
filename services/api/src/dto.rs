@@ -351,7 +351,7 @@ pub struct CreateCameraRequest {
     /// Frigate detection event camera name mapping. Set when wiring a BYO-Frigate
     /// camera so detection events can be matched back to this camera.
     pub source_camera_name: Option<String>,
-    /// ONVIF host address (e.g. `"192.168.1.50"`). Required for PTZ + re-detect.
+    /// ONVIF host address (e.g. `"198.51.100.50"`). Required for PTZ + re-detect.
     pub onvif_host: Option<String>,
     /// ONVIF service port. Omitted/`null` defaults to `80`.
     pub onvif_port: Option<i32>,
@@ -878,11 +878,11 @@ pub struct FrigateHttpTestResult {
 #[derive(Debug, Serialize)]
 pub struct ServerSettingsDto {
     /// Human-facing reachable address of this Crumb server
-    /// (e.g. `"http://192.168.1.50:8080"`). Informational; not used for
+    /// (e.g. `"http://198.51.100.50:8080"`). Informational; not used for
     /// internal URL construction.
     pub server_address: String,
     /// RTSP base for Crumb's own go2rtc restreamer
-    /// (e.g. `"rtsp://192.168.1.50:18554"`). Used by desktop/Android native
+    /// (e.g. `"rtsp://198.51.100.50:18554"`). Used by desktop/Android native
     /// clients to build live RTSP URLs for cameras served by Crumb.
     pub crumb_rtsp_base: String,
     /// HTTP API base for Crumb's own embedded go2rtc
