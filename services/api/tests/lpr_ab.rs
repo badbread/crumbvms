@@ -198,10 +198,34 @@ async fn ab_report_pairs_and_scores_confirmed_truth() {
     // Pass 1: Frigate self-duplicates (refinement 5 s later, one char off,
     // higher confidence); crumb-alpr reads once. One physical vehicle.
     seed_read(pool, cam, "frigate", "9GXVL98", 0.70, t0).await;
-    seed_read(pool, cam, "frigate", "9GXV498", 0.87, t0 + Duration::seconds(5)).await;
-    seed_read(pool, cam, "crumb-alpr", "9GXVL98", 0.99, t0 + Duration::seconds(1)).await;
+    seed_read(
+        pool,
+        cam,
+        "frigate",
+        "9GXV498",
+        0.87,
+        t0 + Duration::seconds(5),
+    )
+    .await;
+    seed_read(
+        pool,
+        cam,
+        "crumb-alpr",
+        "9GXVL98",
+        0.99,
+        t0 + Duration::seconds(1),
+    )
+    .await;
     // Pass 2 (4 min later): Frigate only — a crumb-alpr miss.
-    seed_read(pool, cam, "frigate", "ZZTOP01", 0.91, t0 + Duration::seconds(240)).await;
+    seed_read(
+        pool,
+        cam,
+        "frigate",
+        "ZZTOP01",
+        0.91,
+        t0 + Duration::seconds(240),
+    )
+    .await;
 
     let admin = seed_admin(pool).await;
     let token = login(&app, &admin.username, &admin.password).await;

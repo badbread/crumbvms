@@ -675,7 +675,7 @@ async fn get_ab_report(
         .collect();
 
     let passes = lpr_ab::pair_passes(&reads, window_secs, fuzz);
-    let stats = lpr_ab::compute_stats(&reads, &passes, &truths);
+    let agg = lpr_ab::compute_stats(&reads, &passes, &truths);
     let pass_total = passes.len();
 
     let page: Vec<AbPassDto> = passes
@@ -704,11 +704,11 @@ async fn get_ab_report(
         start,
         end,
         cameras,
-        total_passes: stats.total_passes,
-        both_seen: stats.both_seen,
-        agreement_rate: stats.agreement_rate,
-        frigate: stats.frigate.into(),
-        crumb_alpr: stats.crumb_alpr.into(),
+        total_passes: agg.total_passes,
+        both_seen: agg.both_seen,
+        agreement_rate: agg.agreement_rate,
+        frigate: agg.frigate.into(),
+        crumb_alpr: agg.crumb_alpr.into(),
         passes: page,
         pass_total,
         has_more,

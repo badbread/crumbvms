@@ -8943,10 +8943,7 @@ pub async fn list_lpr_ab_cameras(pool: &Pool) -> Result<Vec<(Uuid, String)>> {
         )
         .await
         .context("list_lpr_ab_cameras")?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get("id"), r.get("name")))
-        .collect())
+    Ok(rows.iter().map(|r| (r.get("id"), r.get("name"))).collect())
 }
 
 fn pass_truth_from_row(row: &tokio_postgres::Row) -> crate::types::LprPassTruth {

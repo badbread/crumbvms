@@ -240,11 +240,16 @@ pub fn pair_passes(reads: &[PlateRead], window_secs: i64, fuzz: f32) -> Vec<Pass
     }
 
     // Phase 2: cross-engine pairing per camera.
-    let mut per_camera: HashMap<Uuid, (Vec<(DateTime<Utc>, EngineBest)>, Vec<(DateTime<Utc>, EngineBest)>)> =
-        HashMap::new();
+    // One engine's surviving cluster-bests, each with its cluster start ts.
+    type Bests = Vec<(DateTime<Utc>, EngineBest)>;
+    let mut per_camera: HashMap<Uuid, (Bests, Bests)> = HashMap::new();
     for ((camera_id, is_frigate), bucket) in clusters {
         let entry = per_camera.entry(camera_id).or_default();
-        let side = if is_frigate { &mut entry.0 } else { &mut entry.1 };
+        let side = if is_frigate {
+            &mut entry.0
+        } else {
+            &mut entry.1
+        };
         side.extend(bucket.into_iter().map(Cluster::into_best));
     }
 
@@ -350,7 +355,10 @@ pub fn compute_stats(
         total_passes: passes.len(),
         ..AbStats::default()
     };
-    stats.frigate.total_reads = reads.iter().filter(|r| r.source_id == ENGINE_FRIGATE).count();
+    stats.frigate.total_reads = reads
+        .iter()
+        .filter(|r| r.source_id == ENGINE_FRIGATE)
+        .count();
     stats.crumb_alpr.total_reads = reads.iter().filter(|r| r.source_id == ENGINE_CRUMB).count();
 
     let mut f_conf: (f64, usize) = (0.0, 0);
@@ -385,9 +393,8 @@ pub fn compute_stats(
         }
     }
 
-    let ratio = |num: usize, den: usize| -> Option<f32> {
-        (den > 0).then(|| num as f32 / den as f32)
-    };
+    let ratio =
+        |num: usize, den: usize| -> Option<f32> { (den > 0).then(|| num as f32 / den as f32) };
     stats.frigate.hit_rate = ratio(stats.frigate.passes_seen, stats.total_passes);
     stats.crumb_alpr.hit_rate = ratio(stats.crumb_alpr.passes_seen, stats.total_passes);
     stats.agreement_rate = ratio(stats.agree, stats.both_seen);

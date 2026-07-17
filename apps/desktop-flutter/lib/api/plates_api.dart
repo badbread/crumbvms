@@ -302,22 +302,6 @@ class AbPass {
     frigateCorrect: j['frigate_correct'] as bool?,
     crumbAlprCorrect: j['crumb_alpr_correct'] as bool?,
   );
-
-  AbPass copyWith({
-    String? truePlate,
-    bool? frigateCorrect,
-    bool? crumbAlprCorrect,
-  }) => AbPass(
-    cameraId: cameraId,
-    bucketTs: bucketTs,
-    bucketTsRaw: bucketTsRaw,
-    frigate: frigate,
-    crumbAlpr: crumbAlpr,
-    agree: agree,
-    truePlate: truePlate ?? this.truePlate,
-    frigateCorrect: frigateCorrect ?? this.frigateCorrect,
-    crumbAlprCorrect: crumbAlprCorrect ?? this.crumbAlprCorrect,
-  );
 }
 
 /// `GET /lpr/ab-report` response: the covered cameras, both engines' stat
