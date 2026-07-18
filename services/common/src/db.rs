@@ -8657,6 +8657,29 @@ pub async fn delete_watchlist_entry(pool: &Pool, id: Uuid) -> Result<bool> {
 /// matcher: how many single-character insert/delete/substitute edits separate a
 /// read from a watch/ignore plate.
 #[must_use]
+/// Visually-confusable character pairs that plate OCR routinely flips —
+/// especially at night / low resolution: `O↔0`, `I↔1`, `B↔8`, `S↔5`, `Z↔2`,
+/// `D↔0`, `G↔6`. Treated as a ZERO-cost substitution in [`levenshtein`] so a
+/// watchlisted or ignored plate still matches when the reader confused one of
+/// them (we'd rather never miss an alert). The position-based disambiguation a
+/// per-region plate grammar gives isn't modelled yet, so this is the standalone
+/// mitigation. Inputs are already `normalize_plate`-d (uppercase `[A-Z0-9]`).
+/// Symmetric via a shared canonical bucket.
+fn confusable(a: char, b: char) -> bool {
+    fn canon(c: char) -> char {
+        match c {
+            'O' | '0' | 'D' => '0',
+            'I' | '1' => '1',
+            'B' | '8' => '8',
+            'S' | '5' => '5',
+            'Z' | '2' => '2',
+            'G' | '6' => '6',
+            other => other,
+        }
+    }
+    a != b && canon(a) == canon(b)
+}
+
 pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -8672,7 +8695,9 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     for (i, &ca) in a.iter().enumerate() {
         curr[0] = i + 1;
         for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
+            // Confusable pairs (O/0, I/1, …) cost nothing — an OCR flip on one
+            // must not push a real watchlist plate over the fuzz budget.
+            let cost = usize::from(ca != cb && !confusable(ca, cb));
             // deletion, insertion, substitution.
             curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
@@ -11977,6 +12002,37 @@ pub async fn system_events_since(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn levenshtein_treats_confusable_chars_as_free() {
+        // An OCR O/0, I/1, B/8, S/5, Z/2, D/0, G/6 flip costs nothing, so a
+        // watchlisted plate still matches through the fuzz budget.
+        assert_eq!(levenshtein("8ABC123", "BABC123"), 0, "8<->B");
+        assert_eq!(levenshtein("O123456", "0123456"), 0, "O<->0");
+        assert_eq!(levenshtein("1AB2345", "IAB2345"), 0, "I<->1");
+        assert_eq!(levenshtein("5XY9876", "SXY9876"), 0, "S<->5");
+        assert_eq!(
+            levenshtein("2GHZ678", "ZGH2678"),
+            0,
+            "Z<->2 (both positions)"
+        );
+        assert_eq!(levenshtein("D0G6", "00G6"), 0, "D<->0");
+        // Non-confusable substitutions still cost 1, and confusables combine
+        // with real edits.
+        assert_eq!(levenshtein("ABC", "ABX"), 1, "C<->X is a real edit");
+        assert_eq!(levenshtein("8XC", "BXY"), 1, "8<->B free, C<->Y costs 1");
+        // A confusable at every position collapses the distance to zero even
+        // though the strings differ char-for-char.
+        assert_eq!(levenshtein("OIB", "01B"), 0);
+    }
+
+    #[test]
+    fn confusable_is_symmetric_and_bucketed() {
+        assert!(confusable('O', '0') && confusable('0', 'O'));
+        assert!(confusable('D', '0') && confusable('O', 'D')); // shared 0-bucket
+        assert!(!confusable('A', '4')); // not in the confusable set
+        assert!(!confusable('O', 'O')); // identical is not "confusable"
+    }
 
     /// R2: `run_migrations`'s advisory lock key must be distinct from
     /// `ensure_named_policies_and_groups`'s — each serialized startup path
