@@ -8507,9 +8507,31 @@ pub async fn update_camera_lpr(
     Ok(())
 }
 
-/// Aggregate storage footprint of the `plate_reads` table, for the retention
-/// hint under the admin console's plate-read-retention field: total stored
-/// reads, total bytes of stored crop JPEGs, and the oldest read's timestamp.
+/// Total on-disk size of the Crumb Postgres database (`pg_database_size`), in
+/// bytes. This is the whole database — events, the segment index, config,
+/// bookmarks, and the LPR `plate_reads` table (whose `crop` bytea images
+/// dominate when LPR is on). The storage advisor subtracts the LPR crop bytes
+/// (via [`lpr_storage_stats`]) to attribute the two separately.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn database_size_bytes(pool: &Pool) -> Result<i64> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            "SELECT pg_database_size(current_database())::bigint AS bytes",
+            &[],
+        )
+        .await
+        .context("database_size_bytes")?;
+    Ok(row.get("bytes"))
+}
+
+/// Aggregate storage footprint of the `plate_reads` table: total stored reads,
+/// total bytes of stored crop JPEGs, and the oldest read's timestamp. Feeds both
+/// the admin console's plate-read-retention hint and the storage advisor's LPR
+/// footprint line.
 ///
 /// # Errors
 ///

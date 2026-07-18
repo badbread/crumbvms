@@ -633,10 +633,41 @@ pub struct StorageAdvisorDto {
     pub suggestions: Vec<String>,
 }
 
+/// One Crumb-managed data store in the server-wide "Crumb data footprint"
+/// breakdown — everything Crumb keeps on disk (or in Postgres), not just the
+/// recordings shown in the per-location bars. Answers "what is Crumb storing,
+/// where, and how much" across every volume.
+#[derive(Debug, Serialize)]
+pub struct CrumbDataStoreDto {
+    /// Stable key for colour-keying in the UI: `recordings` | `lpr` | `clips` |
+    /// `playback_cache` | `thumbnails` | `exports` | `database`.
+    pub key: String,
+    /// Human label (e.g. `"LPR plate images"`, `"Clips cache"`).
+    pub label: String,
+    /// Bytes this store occupies right now.
+    pub bytes: i64,
+    /// Where it physically lives — a filesystem path, `"Postgres"`, or a summary
+    /// like `"3 recording locations"`.
+    pub location: String,
+    /// Optional one-line detail (e.g. `"1,240 reads · oldest 12d"` for LPR, or a
+    /// cache's TTL note). `null` when there's nothing useful to add.
+    pub detail: Option<String>,
+    /// Optional soft budget (max bytes) for stores that are capped caches, so the
+    /// UI can show "X of Y". `null` for uncapped stores (recordings, exports, DB).
+    pub budget_bytes: Option<i64>,
+}
+
 /// `GET /stats/storage` response.
 #[derive(Debug, Serialize)]
 pub struct StorageAdvisorResponse {
     pub storages: Vec<StorageAdvisorDto>,
+    /// Server-wide breakdown of every Crumb data store (recordings, LPR images,
+    /// clip/playback/thumbnail caches, exports, database), largest first. Empty
+    /// entries (0 bytes) are omitted except recordings and the database, which
+    /// always appear.
+    pub crumb_data: Vec<CrumbDataStoreDto>,
+    /// Sum of `crumb_data[].bytes` — the total Crumb footprint across all volumes.
+    pub crumb_data_total_bytes: i64,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -965,10 +996,180 @@ async fn storage_advisor(
         });
     }
 
+    // ── server-wide "Crumb data footprint" ──────────────────────────────────
+    // Everything Crumb stores, across every volume — not just the recordings in
+    // the per-location bars above. Recordings live on the configured storage
+    // devices; the caches + exports live under `export_dir`; the LPR plate images
+    // + all other metadata live in Postgres. Measured on demand (admin-only
+    // endpoint): a directory walk for the on-disk caches, two aggregate queries
+    // for Postgres. Failures degrade to 0 rather than failing the whole advisor.
+    let recordings_bytes: i64 = out
+        .iter()
+        .flat_map(|s| s.usage_by_policy.iter())
+        .map(|u| u.bytes)
+        .sum();
+    let export_dir = state.config().export_dir.clone();
+    let (dir_sizes, lpr_stats, db_size) = tokio::join!(
+        tokio::task::spawn_blocking(move || measure_export_dirs(&export_dir)),
+        db::lpr_storage_stats(pool),
+        db::database_size_bytes(pool),
+    );
+    let (clips_bytes, segcache_bytes, thumbs_bytes, export_total_bytes) =
+        dir_sizes.unwrap_or((0, 0, 0, 0));
+    let (lpr_reads, lpr_crop_bytes, lpr_oldest) = lpr_stats.unwrap_or((0, 0, None));
+    let db_total_bytes = db_size.unwrap_or(0);
+    // User exports = everything under export_dir that isn't one of the three
+    // managed caches. Clamp against races (a cache growing mid-walk).
+    let exports_bytes = (export_total_bytes - clips_bytes - segcache_bytes - thumbs_bytes).max(0);
+    // The database minus the LPR crop images, so the two read as distinct lines
+    // (the crops dominate DB size when LPR is on; the remainder is the event /
+    // segment index + config + bookmarks + everything else).
+    let db_meta_bytes = (db_total_bytes - lpr_crop_bytes).max(0);
+    let cfg = state.config();
+
+    let loc_count = out.len();
+    let recordings_location = match loc_count {
+        0 => "no recording location".to_owned(),
+        1 => out[0].name.clone(),
+        n => format!("{n} recording locations"),
+    };
+    let now = Utc::now();
+
+    let mut crumb_data = vec![CrumbDataStoreDto {
+        key: "recordings".to_owned(),
+        label: "Recordings".to_owned(),
+        bytes: recordings_bytes,
+        location: recordings_location,
+        detail: None,
+        budget_bytes: None,
+    }];
+    // LPR plate images — only when there are any reads (LPR may be off).
+    if lpr_reads > 0 || lpr_crop_bytes > 0 {
+        let oldest_detail = lpr_oldest.map(|ts| {
+            let days = (now - ts).num_days().max(0);
+            format!("{} reads · oldest {days}d", fmt_count(lpr_reads))
+        });
+        crumb_data.push(CrumbDataStoreDto {
+            key: "lpr".to_owned(),
+            label: "LPR plate images".to_owned(),
+            bytes: lpr_crop_bytes,
+            location: "Postgres".to_owned(),
+            detail: oldest_detail,
+            budget_bytes: None,
+        });
+    }
+    // On-disk caches — omit when empty (they self-populate on demand).
+    if clips_bytes > 0 {
+        crumb_data.push(CrumbDataStoreDto {
+            key: "clips".to_owned(),
+            label: "Clips cache".to_owned(),
+            bytes: clips_bytes,
+            location: format!("{}/clips", cfg.export_dir),
+            detail: Some("on-demand renders, auto-evicted".to_owned()),
+            budget_bytes: i64::try_from(cfg.clip_cache_max_bytes).ok(),
+        });
+    }
+    if segcache_bytes > 0 {
+        crumb_data.push(CrumbDataStoreDto {
+            key: "playback_cache".to_owned(),
+            label: "Playback cache".to_owned(),
+            bytes: segcache_bytes,
+            location: format!("{}/segcache", cfg.export_dir),
+            detail: Some("low-bitrate scrub transcodes".to_owned()),
+            budget_bytes: i64::try_from(cfg.segment_low_cache_max_bytes).ok(),
+        });
+    }
+    if thumbs_bytes > 0 {
+        crumb_data.push(CrumbDataStoreDto {
+            key: "thumbnails".to_owned(),
+            label: "Thumbnail cache".to_owned(),
+            bytes: thumbs_bytes,
+            location: format!("{}/.thumbs", cfg.export_dir),
+            detail: Some("filmstrip scrub frames".to_owned()),
+            budget_bytes: i64::try_from(cfg.thumb_cache_max_bytes).ok(),
+        });
+    }
+    if exports_bytes > 0 {
+        crumb_data.push(CrumbDataStoreDto {
+            key: "exports".to_owned(),
+            label: "Exports".to_owned(),
+            bytes: exports_bytes,
+            location: cfg.export_dir.clone(),
+            detail: Some("saved video exports".to_owned()),
+            budget_bytes: None,
+        });
+    }
+    crumb_data.push(CrumbDataStoreDto {
+        key: "database".to_owned(),
+        label: "Database".to_owned(),
+        bytes: db_meta_bytes,
+        location: "Postgres".to_owned(),
+        detail: Some("events, segment index, config".to_owned()),
+        budget_bytes: None,
+    });
+    crumb_data.sort_by_key(|d| std::cmp::Reverse(d.bytes));
+    let crumb_data_total_bytes: i64 = crumb_data.iter().map(|d| d.bytes).sum();
+
     Ok(Json(StorageAdvisorResponse {
         storages: out,
-        generated_at: Utc::now(),
+        crumb_data,
+        crumb_data_total_bytes,
+        generated_at: now,
     }))
+}
+
+/// Recursively sum the size of every regular file under `path`. Symlinks are not
+/// followed (metadata via `DirEntry::metadata`, which does not traverse). Any
+/// unreadable entry is skipped rather than propagated — the footprint is
+/// best-effort informational data, never worth failing the advisor over. Runs
+/// inside `spawn_blocking` (synchronous `std::fs`).
+fn dir_size(path: &std::path::Path) -> i64 {
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total: i64 = 0;
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if ft.is_file() {
+            if let Ok(meta) = entry.metadata() {
+                total = total.saturating_add(i64::try_from(meta.len()).unwrap_or(i64::MAX));
+            }
+        }
+    }
+    total
+}
+
+/// Measure the Crumb-managed subtrees under `export_dir`, returning
+/// `(clips, segcache, thumbs, export_total)` in bytes. `export_total` is the
+/// whole `export_dir` (so user-export bytes = total − the three caches). Missing
+/// dirs read as 0.
+fn measure_export_dirs(export_dir: &str) -> (i64, i64, i64, i64) {
+    let root = std::path::Path::new(export_dir);
+    let clips = dir_size(&root.join("clips"));
+    let segcache = dir_size(&root.join("segcache"));
+    let thumbs = dir_size(&root.join(".thumbs"));
+    let total = dir_size(root);
+    (clips, segcache, thumbs, total)
+}
+
+/// Format a non-negative integer with thousands separators (e.g. `1240` →
+/// `"1,240"`) for count details, independent of locale crates.
+fn fmt_count(n: i64) -> String {
+    let s = n.abs().to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, ch) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*ch as char);
+    }
+    out
 }
 
 /// Query `(total_bytes, free_bytes)` for the filesystem containing `path` via
