@@ -5,6 +5,7 @@ package video.crumb.app.feature.live
 import android.content.res.Configuration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -168,9 +169,6 @@ fun LiveScreen(
     var showSettings by remember { mutableStateOf(false) }
     var showViewsManager by remember { mutableStateOf(false) }
     var wallFullscreen by remember { mutableStateOf(false) }
-    // Snapshot (#163): when more than one camera is shown, tapping the snapshot
-    // action opens this menu to pick WHICH camera's live frame to grab.
-    var snapshotMenuOpen by remember { mutableStateOf(false) }
     // Actionable "Snapshot saved to …" / "Saved to …" confirmations (#164 offers a
     // Share action on them). Activity context (not applicationContext) so the share
     // chooser launches without needing FLAG_ACTIVITY_NEW_TASK.
@@ -467,36 +465,17 @@ fun LiveScreen(
                             store.liveGridLayout = next.ordinal
                         }
 
-                        // Take snapshot (#163). One shown camera → grab it directly;
-                        // several → a small menu to pick which camera's frame to grab.
-                        Box {
+                        // Take snapshot (#163) — only in a SINGLE-camera view. On a
+                        // tiled/multi-cam wall a snapshot is ambiguous (which camera?),
+                        // so the button is hidden in any tiled view. Snapshot still lives
+                        // on the single-camera Playback and Clips screens, where the
+                        // captured frame is unambiguous.
+                        if (shownCameras.size == 1) {
                             HintTooltip("Take snapshot") {
-                                IconButton(onClick = {
-                                    when (shownCameras.size) {
-                                        0 -> viewScope.launch {
-                                            snackbarHostState.showSnackbar("No camera to snapshot")
-                                        }
-                                        1 -> takeSnapshot(shownCameras.first())
-                                        else -> snapshotMenuOpen = true
-                                    }
-                                }) {
+                                IconButton(onClick = { takeSnapshot(shownCameras.first()) }) {
                                     Icon(
                                         imageVector = Icons.Default.AddAPhoto,
                                         contentDescription = "Take snapshot",
-                                    )
-                                }
-                            }
-                            DropdownMenu(
-                                expanded = snapshotMenuOpen,
-                                onDismissRequest = { snapshotMenuOpen = false },
-                            ) {
-                                shownCameras.forEach { cam ->
-                                    DropdownMenuItem(
-                                        text = { Text(cam.name) },
-                                        onClick = {
-                                            snapshotMenuOpen = false
-                                            takeSnapshot(cam)
-                                        },
                                     )
                                 }
                             }
@@ -654,7 +633,10 @@ fun LiveScreen(
 
                     // Floating exit button shown only in wall fullscreen mode.
                     // Positioned top-end with status-bar padding so it doesn't hide
-                    // under the system bar when the user edge-swipes it back.
+                    // under the system bar when the user edge-swipes it back. It sits
+                    // on a dark circular scrim with a white glyph so it stays legible
+                    // over ANY frame behind it (a bare tinted icon washed out against
+                    // bright/busy camera images).
                     if (wallFullscreen) {
                         HintTooltip("Exit fullscreen") {
                             IconButton(
@@ -662,12 +644,16 @@ fun LiveScreen(
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)
                                     .statusBarsPadding()
-                                    .padding(4.dp),
+                                    .padding(10.dp)
+                                    .background(
+                                        Color.Black.copy(alpha = 0.55f),
+                                        CircleShape,
+                                    ),
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.FullscreenExit,
                                     contentDescription = "Exit fullscreen",
-                                    tint = TealAccent,
+                                    tint = Color.White,
                                 )
                             }
                         }
