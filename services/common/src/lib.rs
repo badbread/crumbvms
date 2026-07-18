@@ -26,6 +26,7 @@ pub mod detection;
 pub mod ha;
 pub mod icons;
 pub mod logging;
+pub mod lpr_ab;
 pub mod redact;
 pub mod types;
 

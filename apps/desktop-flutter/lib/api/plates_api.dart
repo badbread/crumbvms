@@ -190,6 +190,175 @@ class LprConfig {
   );
 }
 
+/// One camera covered by the A/B benchmark (`lpr_engine == 'both'`).
+class AbCamera {
+  AbCamera({required this.id, required this.name});
+  final String id;
+  final String name;
+
+  factory AbCamera.fromJson(Map<String, dynamic> j) => AbCamera(
+    id: j['id'] as String,
+    name: (j['name'] as String?) ?? '',
+  );
+}
+
+/// One engine's aggregate stats block from `GET /lpr/ab-report`.
+class AbEngineStats {
+  AbEngineStats({
+    required this.totalReads,
+    required this.passesSeen,
+    required this.avgConfidence,
+    required this.hitRate,
+    required this.confirmed,
+    required this.correct,
+    required this.accuracy,
+  });
+
+  final int totalReads;
+  final int passesSeen;
+  final double? avgConfidence; // null when nothing to average
+  final double? hitRate; // null when no passes
+  final int confirmed;
+  final int correct;
+  final double? accuracy; // null when nothing confirmed
+
+  factory AbEngineStats.fromJson(Map<String, dynamic> j) => AbEngineStats(
+    totalReads: (j['total_reads'] as num?)?.toInt() ?? 0,
+    passesSeen: (j['passes_seen'] as num?)?.toInt() ?? 0,
+    avgConfidence: (j['avg_confidence'] as num?)?.toDouble(),
+    hitRate: (j['hit_rate'] as num?)?.toDouble(),
+    confirmed: (j['confirmed'] as num?)?.toInt() ?? 0,
+    correct: (j['correct'] as num?)?.toInt() ?? 0,
+    accuracy: (j['accuracy'] as num?)?.toDouble(),
+  );
+}
+
+/// One engine's best read inside a paired pass.
+class AbPassRead {
+  AbPassRead({
+    required this.readId,
+    required this.plate,
+    required this.confidence,
+    required this.eventId,
+    required this.ts,
+    required this.readCount,
+  });
+
+  final String readId;
+  final String plate; // normalized uppercase alphanumeric
+  final double? confidence;
+  final String? eventId; // sibling detection event (snapshot source), or null
+  final DateTime ts;
+  final int readCount; // raw reads collapsed into this entry
+
+  factory AbPassRead.fromJson(Map<String, dynamic> j) => AbPassRead(
+    readId: j['read_id'] as String,
+    plate: (j['plate'] as String?) ?? '',
+    confidence: (j['confidence'] as num?)?.toDouble(),
+    eventId: j['event_id'] as String?,
+    ts: DateTime.parse(j['ts'] as String),
+    readCount: (j['read_count'] as num?)?.toInt() ?? 1,
+  );
+}
+
+/// One derived vehicle pass from `GET /lpr/ab-report`. `(cameraId, bucketTs)`
+/// is the stable pass key `POST /lpr/ab-confirm` takes back — echo
+/// [bucketTsRaw] verbatim so no client-side reformatting can shift the key.
+class AbPass {
+  AbPass({
+    required this.cameraId,
+    required this.bucketTs,
+    required this.bucketTsRaw,
+    required this.frigate,
+    required this.crumbAlpr,
+    required this.agree,
+    required this.truePlate,
+    required this.frigateCorrect,
+    required this.crumbAlprCorrect,
+  });
+
+  final String cameraId;
+  final DateTime bucketTs;
+  final String bucketTsRaw; // server's exact key string, echoed on confirm
+  final AbPassRead? frigate; // null = frigate missed this pass
+  final AbPassRead? crumbAlpr; // null = crumb-alpr missed this pass
+  final bool? agree; // null when either engine missed
+  final String? truePlate; // operator-confirmed truth, or null
+  final bool? frigateCorrect;
+  final bool? crumbAlprCorrect;
+
+  factory AbPass.fromJson(Map<String, dynamic> j) => AbPass(
+    cameraId: j['camera_id'] as String,
+    bucketTs: DateTime.parse(j['bucket_ts'] as String),
+    bucketTsRaw: j['bucket_ts'] as String,
+    frigate: j['frigate'] == null
+        ? null
+        : AbPassRead.fromJson(j['frigate'] as Map<String, dynamic>),
+    crumbAlpr: j['crumb_alpr'] == null
+        ? null
+        : AbPassRead.fromJson(j['crumb_alpr'] as Map<String, dynamic>),
+    agree: j['agree'] as bool?,
+    truePlate: j['true_plate'] as String?,
+    frigateCorrect: j['frigate_correct'] as bool?,
+    crumbAlprCorrect: j['crumb_alpr_correct'] as bool?,
+  );
+}
+
+/// `GET /lpr/ab-report` response: the covered cameras, both engines' stat
+/// blocks, and one newest-first page of paired passes.
+class AbReport {
+  AbReport({
+    required this.windowSecs,
+    required this.fuzz,
+    required this.cameras,
+    required this.totalPasses,
+    required this.bothSeen,
+    required this.agreementRate,
+    required this.frigate,
+    required this.crumbAlpr,
+    required this.passes,
+    required this.passTotal,
+    required this.hasMore,
+    required this.truncated,
+  });
+
+  final int windowSecs;
+  final double fuzz;
+  final List<AbCamera> cameras; // empty ⇒ benchmark not applicable
+  final int totalPasses;
+  final int bothSeen;
+  final double? agreementRate;
+  final AbEngineStats frigate;
+  final AbEngineStats crumbAlpr;
+  final List<AbPass> passes;
+  final int passTotal;
+  final bool hasMore;
+  final bool truncated; // range held more reads than the server's ceiling
+
+  factory AbReport.fromJson(Map<String, dynamic> j) => AbReport(
+    windowSecs: (j['window_secs'] as num?)?.toInt() ?? 8,
+    fuzz: (j['fuzz'] as num?)?.toDouble() ?? 0.25,
+    cameras: (j['cameras'] as List<dynamic>? ?? const [])
+        .map((e) => AbCamera.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false),
+    totalPasses: (j['total_passes'] as num?)?.toInt() ?? 0,
+    bothSeen: (j['both_seen'] as num?)?.toInt() ?? 0,
+    agreementRate: (j['agreement_rate'] as num?)?.toDouble(),
+    frigate: AbEngineStats.fromJson(
+      (j['frigate'] as Map<String, dynamic>?) ?? const {},
+    ),
+    crumbAlpr: AbEngineStats.fromJson(
+      (j['crumb_alpr'] as Map<String, dynamic>?) ?? const {},
+    ),
+    passes: (j['passes'] as List<dynamic>? ?? const [])
+        .map((e) => AbPass.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false),
+    passTotal: (j['pass_total'] as num?)?.toInt() ?? 0,
+    hasMore: (j['has_more'] as bool?) ?? false,
+    truncated: (j['truncated'] as bool?) ?? false,
+  );
+}
+
 // [CrumbApi]'s http.Client is file-private (Dart library privacy is
 // file-scoped), so this extension keeps its own module-level client for its
 // stateless GETs — same construction as CrumbApi's default, just not shared.
@@ -321,6 +490,83 @@ extension PlatesApi on CrumbApi {
         resp.statusCode == 403
             ? 'Only admins can manage the watchlist.'
             : 'Failed to remove plate from watchlist (HTTP ${resp.statusCode}).',
+        statusCode: resp.statusCode,
+      );
+    }
+  }
+
+  /// `GET /lpr/ab-report` → the dual-engine LPR benchmark: paired passes plus
+  /// per-engine aggregates for every `lpr_engine == 'both'` camera the caller
+  /// may see (or just [cameraId] when given). Gated by the same `view_plates`
+  /// capability as [listPlates]; a server with no dual-engine cameras returns
+  /// an empty report (`cameras: []`) rather than an error, so callers can use
+  /// this both as the report fetch and as the "is the benchmark applicable?"
+  /// probe (pass a small [limit] for the probe).
+  Future<AbReport> getAbReport(
+    Session s, {
+    String? cameraId,
+    int windowSecs = 8,
+    double fuzz = 0.25,
+    DateTime? start,
+    DateTime? end,
+    int limit = 100,
+    int offset = 0,
+  }) async {
+    final params = <String, String>{
+      'window': '$windowSecs',
+      'fuzz': '$fuzz',
+      'limit': '$limit',
+      'offset': '$offset',
+    };
+    if (cameraId != null && cameraId.isNotEmpty) params['camera_id'] = cameraId;
+    if (start != null) params['start'] = start.toUtc().toIso8601String();
+    if (end != null) params['end'] = end.toUtc().toIso8601String();
+    final uri = Uri.parse(
+      '${s.base}/lpr/ab-report',
+    ).replace(queryParameters: params);
+    final resp = await _client.get(
+      uri,
+      headers: {'authorization': 'Bearer ${s.token}'},
+    );
+    if (resp.statusCode != 200) {
+      throw CrumbApiException(
+        'Failed to load LPR benchmark (HTTP ${resp.statusCode}).',
+        statusCode: resp.statusCode,
+      );
+    }
+    return AbReport.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// `POST /lpr/ab-confirm` → record the operator-verified true plate for one
+  /// pass. [bucketTs] must be the server's `bucket_ts` string echoed verbatim
+  /// (see [AbPass.bucketTsRaw]); [truePlate] is sent raw and normalized
+  /// server-side. Upserts, so re-confirming corrects a typo.
+  ///
+  /// **Admin-only.** A non-admin gets HTTP 403, surfaced as a
+  /// [CrumbApiException] with `statusCode == 403` and a friendly message.
+  Future<void> confirmAbPass(
+    Session s, {
+    required String cameraId,
+    required String bucketTs,
+    required String truePlate,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${s.base}/lpr/ab-confirm'),
+      headers: {
+        'authorization': 'Bearer ${s.token}',
+        'content-type': 'application/json',
+      },
+      body: jsonEncode({
+        'camera_id': cameraId,
+        'bucket_ts': bucketTs,
+        'true_plate': truePlate,
+      }),
+    );
+    if (resp.statusCode != 200) {
+      throw CrumbApiException(
+        resp.statusCode == 403
+            ? 'Only admins can confirm plates.'
+            : 'Failed to confirm plate (HTTP ${resp.statusCode}).',
         statusCode: resp.statusCode,
       );
     }

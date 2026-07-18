@@ -8621,7 +8621,7 @@ pub async fn delete_watchlist_entry(pool: &Pool, id: Uuid) -> Result<bool> {
 /// matcher: how many single-character insert/delete/substitute edits separate a
 /// read from a watch/ignore plate.
 #[must_use]
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     if a.is_empty() {
@@ -8658,7 +8658,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn allowed_edits(reference: &str, fuzz: f32) -> usize {
+pub(crate) fn allowed_edits(reference: &str, fuzz: f32) -> usize {
     let len = normalize_plate(reference).chars().count() as f32;
     (fuzz.clamp(0.0, 0.5) * len).floor() as usize
 }
@@ -8923,6 +8923,101 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
         .await
         .context("list_plate_reads")?;
     Ok((rows.iter().map(plate_read_from_row).collect(), total))
+}
+
+// ─── LPR A/B benchmark (lpr_pass_truth, migration 0070) ─────────────────────
+
+/// Cameras configured for dual-engine LPR (`lpr_engine = 'both'`) — the only
+/// cameras the A/B benchmark report considers. Returns `(id, name)` pairs,
+/// name-ordered. The route intersects these with the caller's camera scope.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_lpr_ab_cameras(pool: &Pool) -> Result<Vec<(Uuid, String)>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, name FROM cameras WHERE lpr_engine = 'both' ORDER BY name",
+            &[],
+        )
+        .await
+        .context("list_lpr_ab_cameras")?;
+    Ok(rows.iter().map(|r| (r.get("id"), r.get("name"))).collect())
+}
+
+fn pass_truth_from_row(row: &tokio_postgres::Row) -> crate::types::LprPassTruth {
+    crate::types::LprPassTruth {
+        id: row.get("id"),
+        camera_id: row.get("camera_id"),
+        bucket_ts: row.get("bucket_ts"),
+        true_plate: row.get("true_plate"),
+        confirmed_by: row.get("confirmed_by"),
+        confirmed_at: row.get("confirmed_at"),
+    }
+}
+
+/// Confirmed pass truths for the given cameras inside `[start, end)` — fetched
+/// alongside the reads so the report can attach each truth to its derived pass
+/// by exact `(camera_id, bucket_ts)` equality.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_lpr_pass_truth(
+    pool: &Pool,
+    camera_ids: &[Uuid],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<crate::types::LprPassTruth>> {
+    if camera_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let ids = camera_ids.to_vec();
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, camera_id, bucket_ts, true_plate, confirmed_by, confirmed_at
+             FROM lpr_pass_truth
+             WHERE camera_id = ANY($1) AND bucket_ts >= $2 AND bucket_ts < $3",
+            &[&ids, &start, &end],
+        )
+        .await
+        .context("list_lpr_pass_truth")?;
+    Ok(rows.iter().map(pass_truth_from_row).collect())
+}
+
+/// Upsert the operator-confirmed true plate for one pass, keyed on
+/// `(camera_id, bucket_ts)` — re-confirming the same pass overwrites (typo
+/// correction). `true_plate` must already be normalized (see
+/// [`normalize_plate`]); the confirming user is recorded for audit.
+///
+/// # Errors
+///
+/// Returns an error if the query fails (e.g. unknown `camera_id` violates the
+/// FK — the route 404s that before calling).
+pub async fn upsert_lpr_pass_truth(
+    pool: &Pool,
+    camera_id: Uuid,
+    bucket_ts: DateTime<Utc>,
+    true_plate: &str,
+    confirmed_by: Uuid,
+) -> Result<crate::types::LprPassTruth> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            "INSERT INTO lpr_pass_truth (camera_id, bucket_ts, true_plate, confirmed_by)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (camera_id, bucket_ts) DO UPDATE SET
+                 true_plate   = EXCLUDED.true_plate,
+                 confirmed_by = EXCLUDED.confirmed_by,
+                 confirmed_at = now()
+             RETURNING id, camera_id, bucket_ts, true_plate, confirmed_by, confirmed_at",
+            &[&camera_id, &bucket_ts, &true_plate, &confirmed_by],
+        )
+        .await
+        .context("upsert_lpr_pass_truth")?;
+    Ok(pass_truth_from_row(&row))
 }
 
 /// Ensure the `UNIQUE(name)` constraint exists on `storages`.
@@ -10049,6 +10144,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0069_camera_lpr.sql",
         include_str!("../../../db/migrations/0069_camera_lpr.sql"),
+    ),
+    (
+        "0070_lpr_pass_truth.sql",
+        include_str!("../../../db/migrations/0070_lpr_pass_truth.sql"),
     ),
 ];
 
