@@ -143,14 +143,17 @@ pub struct LprSettings {
 }
 
 /// Effective per-camera LPR config for the `crumb-alpr` worker, served by
-/// `GET /lpr/worker-config` (migration 0069 columns on `cameras`). The worker
-/// polls this so admin zone/threshold edits apply without a restart.
+/// `GET /lpr/worker-config` (migration 0069/0071 columns on `cameras`). The
+/// worker polls this so admin zone/threshold edits apply without a restart.
 #[derive(Debug, Clone, Serialize)]
 pub struct CameraLprConfig {
     pub camera_id: uuid::Uuid,
-    /// Whether the worker should read this camera at all.
+    /// Whether the crumb-alpr worker should read this camera. DERIVED from the
+    /// engine (`engine ∈ {crumb-alpr, both}`) since migration 0071 — kept in
+    /// the payload for worker back-compat, never independently settable.
     pub enabled: bool,
-    /// `frigate` | `crumb-alpr` | `both` — which engine feeds this camera.
+    /// `none` | `frigate` | `crumb-alpr` | `both` — which engine feeds this
+    /// camera (`none` = LPR off for this camera).
     pub engine: String,
     /// Per-camera OCR-confidence floor for stored reads.
     pub min_confidence: f32,

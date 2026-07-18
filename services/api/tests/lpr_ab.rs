@@ -92,7 +92,7 @@ async fn seed_read(
 
 /// Flip a seeded camera to dual-engine LPR so the benchmark covers it.
 async fn make_both(pool: &Pool, camera_id: Uuid) {
-    db::update_camera_lpr(pool, camera_id, true, "both", 0.0, None)
+    db::update_camera_lpr(pool, camera_id, "both", 0.0, None)
         .await
         .expect("update_camera_lpr");
 }

@@ -23,9 +23,10 @@ use tracing::{info, warn};
 
 use crumb_common::{
     db::{
-        get_lpr_settings, insert_system_event_with_snapshot, is_plate_ignored, mark_plate_alerted,
-        match_watchlist, normalize_plate, upsert_detection_event, upsert_plate_read,
-        UpsertDetectionEventParams, UpsertPlateReadParams,
+        get_camera_lpr_config, get_lpr_settings, insert_system_event_with_snapshot,
+        is_plate_ignored, mark_plate_alerted, match_watchlist, normalize_plate,
+        upsert_detection_event, upsert_plate_read, UpsertDetectionEventParams,
+        UpsertPlateReadParams,
     },
     detection::NormalizedEvent,
 };
@@ -115,7 +116,8 @@ fn ignore_decision(check: &anyhow::Result<bool>) -> IgnoreDecision {
 }
 
 /// Record a plate read for an event that carried one, but only when LPR capture
-/// is enabled (`lpr_config.enabled`). Off by default, so enabling Frigate
+/// is enabled (`lpr_config.enabled`) AND the camera's engine accepts the read's
+/// source (per-camera gate, migration 0071). Off by default, so enabling Frigate
 /// detections alone never silently builds a plate database. The read is deduped
 /// on `(source_id, provider_event_id)` and linked to its sibling `events` row
 /// via `event_id`. Best-effort: failures are logged, never fatal to ingestion.
@@ -131,6 +133,42 @@ async fn maybe_record_plate(
     }
     match get_lpr_settings(pool).await {
         Ok(Some(cfg)) if cfg.enabled => {
+            // Per-camera engine gate (migration 0071: the engine dropdown is
+            // the single per-camera LPR control). A read is stored only when
+            // its source matches the camera's engine: 'none' drops everything,
+            // 'frigate' accepts only Frigate-sourced reads (crumb-alpr reads
+            // are additionally rejected at POST /lpr/reads), 'crumb-alpr'
+            // accepts only worker reads, 'both' accepts either. Fail CLOSED
+            // like the ignore-list below: the engine choice is an operator
+            // privacy control, so a transient DB error must not let a read
+            // through — the sibling `events` row is already stored, and the
+            // next read of the same plate re-attempts the check.
+            let from_worker = ev.source_id == "crumb-alpr";
+            match get_camera_lpr_config(pool, ev.camera_id).await {
+                Ok(Some(cam)) => {
+                    let engine_accepts = match cam.engine.as_str() {
+                        "both" => true,
+                        "crumb-alpr" => from_worker,
+                        "frigate" => !from_worker,
+                        _ => false, // 'none' (or anything unexpected): LPR off
+                    };
+                    if !engine_accepts {
+                        tracing::debug!(
+                            plate = %plate_raw,
+                            camera = %ev.camera_id,
+                            engine = %cam.engine,
+                            source = %ev.source_id,
+                            "detection ingester: plate read dropped (camera engine does not accept this source)"
+                        );
+                        return;
+                    }
+                }
+                Ok(None) => return, // unknown camera — the FK insert would fail anyway
+                Err(e) => {
+                    warn!(error = %e, camera = %ev.camera_id, "detection ingester: get_camera_lpr_config failed — skipping plate read (fail-closed)");
+                    return;
+                }
+            }
             // Ignore-list (migration 0054): a plate on an `ignore` entry is
             // dropped entirely — not stored, never alerted. The pragmatic
             // backstop for a nuisance plate (e.g. a parked car Frigate keeps

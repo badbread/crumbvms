@@ -8439,8 +8439,14 @@ pub async fn get_plate_read_crop(pool: &Pool, id: Uuid) -> Result<Option<(Uuid, 
     Ok(row.map(|r| (r.get("camera_id"), r.get("crop"))))
 }
 
-/// Effective per-camera LPR config (migration 0069) for the `crumb-alpr` worker's
-/// `GET /lpr/worker-config` poll. Returns `None` if the camera id is unknown.
+/// Effective per-camera LPR config (migrations 0069/0071) for the `crumb-alpr`
+/// worker's `GET /lpr/worker-config` poll. Returns `None` if the camera id is
+/// unknown.
+///
+/// `enabled` is DERIVED from the engine (`lpr_engine IN ('crumb-alpr','both')`),
+/// never read from the legacy `lpr_enabled` column: the engine dropdown is the
+/// single control (migration 0071), so the worker keys off the engine even if
+/// the stored back-compat column were ever stale.
 ///
 /// # Errors
 ///
@@ -8452,7 +8458,8 @@ pub async fn get_camera_lpr_config(
     let client = get_conn(pool).await?;
     let row = client
         .query_opt(
-            "SELECT id, lpr_enabled, lpr_engine, lpr_min_confidence, lpr_zones
+            "SELECT id, (lpr_engine IN ('crumb-alpr', 'both')) AS lpr_enabled,
+                    lpr_engine, lpr_min_confidence, lpr_zones
              FROM cameras WHERE id = $1",
             &[&camera_id],
         )
@@ -8467,9 +8474,12 @@ pub async fn get_camera_lpr_config(
     }))
 }
 
-/// Update a camera's per-camera LPR settings (migration 0069) from the admin
-/// console. `engine` is validated by the caller (and the `cameras_lpr_engine_chk`
-/// constraint); `zones` is `{include,exclude}` JSON or `None` to clear.
+/// Update a camera's per-camera LPR settings (migrations 0069/0071) from the
+/// admin console. `engine` is validated by the caller (and the
+/// `cameras_lpr_engine_chk` constraint); `zones` is `{include,exclude}` JSON or
+/// `None` to clear. The legacy `lpr_enabled` column is not a caller input any
+/// more — it is DERIVED from the engine (`IN ('crumb-alpr','both')`) so the
+/// stored back-compat mirror can never contradict the engine dropdown.
 ///
 /// # Errors
 ///
@@ -8478,7 +8488,6 @@ pub async fn get_camera_lpr_config(
 pub async fn update_camera_lpr(
     pool: &Pool,
     id: Uuid,
-    enabled: bool,
     engine: &str,
     min_confidence: f32,
     zones: Option<serde_json::Value>,
@@ -8487,13 +8496,40 @@ pub async fn update_camera_lpr(
     client
         .execute(
             "UPDATE cameras
-             SET lpr_enabled = $2, lpr_engine = $3, lpr_min_confidence = $4, lpr_zones = $5
+             SET lpr_enabled = ($2::text IN ('crumb-alpr', 'both')),
+                 lpr_engine = $2, lpr_min_confidence = $3, lpr_zones = $4
              WHERE id = $1",
-            &[&id, &enabled, &engine, &min_confidence, &zones],
+            &[&id, &engine, &min_confidence, &zones],
         )
         .await
         .context("update_camera_lpr")?;
     Ok(())
+}
+
+/// Aggregate storage footprint of the `plate_reads` table, for the retention
+/// hint under the admin console's plate-read-retention field: total stored
+/// reads, total bytes of stored crop JPEGs, and the oldest read's timestamp.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn lpr_storage_stats(pool: &Pool) -> Result<(i64, i64, Option<DateTime<Utc>>)> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            "SELECT count(*)::bigint AS reads,
+                    coalesce(sum(octet_length(crop)), 0)::bigint AS crop_bytes,
+                    min(ts) AS oldest_ts
+             FROM plate_reads",
+            &[],
+        )
+        .await
+        .context("lpr_storage_stats")?;
+    Ok((
+        row.get("reads"),
+        row.get("crop_bytes"),
+        row.get("oldest_ts"),
+    ))
 }
 
 /// Fetch the stored crop JPEG for the plate read linked to `event_id` (newest
@@ -10148,6 +10184,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0070_lpr_pass_truth.sql",
         include_str!("../../../db/migrations/0070_lpr_pass_truth.sql"),
+    ),
+    (
+        "0071_lpr_engine_none.sql",
+        include_str!("../../../db/migrations/0071_lpr_engine_none.sql"),
     ),
 ];
 

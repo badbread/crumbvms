@@ -8,6 +8,68 @@ revisit.
 
 ---
 
+## 2026-07-17, Per-camera LPR: the engine dropdown is the single control (`none` added, `lpr_enabled` derived, source gate enforced at ingest)
+
+**Status.** Built on `feat/lpr-admin-console`. Migration 0071 widens
+`cameras_lpr_engine_chk` to `('none','frigate','crumb-alpr','both')` and
+re-derives the stored `lpr_enabled`; `update_camera_lpr` /
+`get_camera_lpr_config` derive `enabled` from the engine; the detection
+ingester gates each plate read on the camera's engine accepting the read's
+source; the admin console gained a dedicated LPR section (global knobs +
+per-camera engine table + zone editor + watchlist/reads) and lost the
+per-camera "worker should read this camera" checkbox.
+
+**Context.** Migration 0069 gave each camera TWO LPR controls: `lpr_engine`
+("which plate source feeds this camera") and `lpr_enabled` ("should the
+crumb-alpr worker read this camera"). They overlapped and could contradict
+(engine `crumb-alpr` with the checkbox off, engine `frigate` with it on), the
+UI needed a paragraph to explain the difference, and there was no way to say
+"LPR off for this camera" at all — the engine semantic was also only half
+enforced (the crumb-alpr side at `POST /lpr/reads`, nothing on the Frigate
+ingest side, so a `crumb-alpr`-only camera still silently stored Frigate
+reads).
+
+**Decision.** The engine dropdown is the SINGLE per-camera control, with
+`none` as a first-class value meaning LPR off for that camera. `lpr_enabled`
+survives only as a derived back-compat mirror (`engine IN
+('crumb-alpr','both')`): the DB write derives it, the read path computes it in
+SQL (so the worker's `GET /lpr/worker-config` poll keys off the engine even
+against a stale column), and 0071 backfills it. The engine semantic is now
+enforced symmetrically at the single choke point every read passes through
+(the detection ingester): a read is stored only when the camera's engine
+accepts its source, fail-closed on DB errors like the ignore-list, because the
+per-camera setting is an operator privacy control.
+
+**Rejected.**
+
+- *Keeping two independent controls (checkbox + engine).* Redundant state
+  that can contradict itself; every contradiction is a support question and
+  the checkbox's only non-redundant state (worker-engine camera the worker
+  should skip) is better expressed by switching the engine.
+- *Dropping the `lpr_enabled` column outright.* Breaks the deployed worker's
+  `cfg.enabled` check for zero benefit; a derived column costs one SQL
+  expression and keeps old workers correct.
+- *A separate per-camera on/off toggle beside the engine (`none` not in the
+  enum).* Same two-control contradiction with new paint.
+- *Gating Frigate-sourced reads in `detection/frigate.rs` instead of the
+  ingester.* Leaves `POST /lpr/reads` and any future provider to re-implement
+  the same rule; the ingester is the one path every read already crosses.
+
+**Trade-offs accepted.** One extra `cameras` lookup per plate-carrying event
+in the ingester (plates are low-rate; acceptable). Existing `crumb-alpr`-only
+cameras stop storing Frigate reads — that is the documented 0069 semantic
+finally enforced, but it IS a behavior change for anyone relying on the leak.
+A camera whose engine was `both`/`crumb-alpr` with the old checkbox off
+becomes worker-readable after the 0071 backfill (the engine now wins).
+
+**Revisit triggers.** A third engine source appears (the accept-rule match in
+the ingester grows; consider a source→engine capability table). Operators ask
+for "store reads but never worker-scan" (would need the two-control split
+back, as an explicit worker toggle). Per-camera LPR config grows past what a
+table row holds comfortably (dedicated per-camera LPR detail pane).
+
+---
+
 ## 2026-07-17, LPR A/B benchmark: passes derived at report time (two-phase clustering), truth keyed on (camera_id, bucket_ts)
 
 **Status.** Built on `feat/lpr-ab-benchmark`. Backend: `GET /lpr/ab-report` +
