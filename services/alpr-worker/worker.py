@@ -74,6 +74,14 @@ CONFIG_POLL_S = float(os.environ.get("LPR_CONFIG_POLL_SECONDS", "30"))
 # once per pass. Lower = quicker to treat a brief disappearance as a new arrival;
 # higher = stricter about re-reads.
 REAPPEAR_GAP_S = float(os.environ.get("LPR_REAPPEAR_GAP_SECONDS", "45"))
+# The frame the worker timestamps was captured EARLIER in the real world than
+# when we process it: the go2rtc restream + network buffer the stream, so
+# `time.time()` at the best frame overshoots the real capture moment by ~1-2s.
+# The recorder's segments are closer to real-time, so a clip centred on our
+# raw timestamp lands a second or two AFTER the car. Subtract this offset to
+# pull the read time back onto the car. Biased slightly generous (a hair early
+# shows the approach, which beats cutting the car off). Tune per-deployment.
+TS_OFFSET_S = float(os.environ.get("LPR_TS_OFFSET_SECONDS", "2.0"))
 # The read's stored image is the WHOLE frame (a Frigate-style context snapshot),
 # not a pre-cropped plate: the clients derive the tight plate crop themselves from
 # the normalized bbox, so shipping the full frame lets crumb-alpr reads render the
@@ -300,7 +308,9 @@ def post_read(session: requests.Session, plate: str, conf: float, vote: PassVote
         # in frame), not emit time — so the plate-clip pop-up centres on the car.
         # RFC3339 UTC (chrono parses it). Falls back to server now() if unset.
         "ts": (
-            datetime.fromtimestamp(vote.best_epoch, tz=timezone.utc).isoformat()
+            datetime.fromtimestamp(
+                vote.best_epoch - TS_OFFSET_S, tz=timezone.utc
+            ).isoformat()
             if vote.best_epoch
             else None
         ),
