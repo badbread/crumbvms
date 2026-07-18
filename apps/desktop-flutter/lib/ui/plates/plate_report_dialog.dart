@@ -113,7 +113,7 @@ class _PlateReportDialogState extends State<_PlateReportDialog> {
       if (fullSnapshot != null && read.bbox != null) {
         final cropped = await cropPlateToBbox(fullSnapshot, read.bbox!);
         if (cropped != null) {
-          plateCrop = cropped;
+          plateCrop = cropped.$1;
           cropIsFallback = false;
         }
       }
