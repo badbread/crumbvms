@@ -424,6 +424,34 @@ fn overview_window(
     (win_start, win_end)
 }
 
+/// A license-plate read is a **point in time**, not a bounded activity: the
+/// detection ingester stamps `start_ts == end_ts` at the moment the plate was
+/// voted (Frigate) or at the worker's best-frame capture (`crumb-alpr`). Running
+/// that zero-length event through [`overview_window`] yields a tight
+/// `[ts − pre, ts + post]` sliver (~10 s, the read barely 2 s in), so even a
+/// couple of seconds of pipeline skew — the OCR engine's decode/restream buffer
+/// runs behind the recorder's own segment clock — pushes the car right out of
+/// the frame the operator opens ("the car's already gone"). Chasing an exact
+/// per-deployment offset is fragile; instead a plate clip gets a generous,
+/// **backward-weighted** window centered on the read. It leans back further than
+/// forward because the read timestamp structurally *lags* the moment the car was
+/// actually in front of the lens (voting/decoding latency only ever accrues
+/// after the plate appears), so looking back reliably brackets the pass. The
+/// window is symmetric-ish around the true pass and comfortably absorbs a lag
+/// difference anywhere in `[−LPR_CLIP_TRAIL, +LPR_CLIP_LEAD]`. Still bounded by
+/// the compiled hard ceiling ([`MAX_CLIP_MEDIA_SECS`]).
+const LPR_CLIP_LEAD_SECS: i64 = 8;
+const LPR_CLIP_TRAIL_SECS: i64 = 4;
+
+fn plate_window(read_ts: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let win_start = read_ts - Duration::seconds(LPR_CLIP_LEAD_SECS);
+    let hard_cap = win_start + Duration::seconds(MAX_CLIP_MEDIA_SECS);
+    let win_end = (read_ts + Duration::seconds(LPR_CLIP_TRAIL_SECS))
+        .min(hard_cap)
+        .max(win_start);
+    (win_start, win_end)
+}
+
 /// A resolved clip window plus the metadata the media handlers need: the tunable
 /// window parameters (part of the cache key/ETag, so a settings change never
 /// serves a stale rendition), whether the underlying event is still open, and the
@@ -470,11 +498,18 @@ async fn resolve_clip(state: &AppState, id: &str) -> Result<ResolvedClip, ApiErr
         let ev = ev
             .parse::<Uuid>()
             .map_err(|_| ApiError::BadRequest("malformed clip id".to_owned()))?;
-        let (cam, ev_start, ev_end) = db::get_clip_event_window(state.pool(), ev)
+        let (cam, ev_start, ev_end, label) = db::get_clip_event_window(state.pool(), ev)
             .await
             .map_err(ApiError::Internal)?
             .ok_or_else(|| ApiError::NotFound(format!("clip {id} not found")))?;
-        let (start, end) = overview_window(ev_start, ev_end, pre_secs, overview_secs);
+        // Plate reads are a point in time — a generous backward-weighted window
+        // (see `plate_window`) brackets the car far more reliably than the tight
+        // overview a zero-length event would otherwise produce.
+        let (start, end) = if label == "license_plate" {
+            plate_window(ev_start)
+        } else {
+            overview_window(ev_start, ev_end, pre_secs, overview_secs)
+        };
         Ok(ResolvedClip {
             camera_id: cam,
             start,
@@ -664,12 +699,21 @@ fn clip_etag(id: &str, kind: &str) -> String {
     format!("\"{}-{}\"", sanitize_id(id), kind)
 }
 
+/// Bumped whenever the clip **windowing scheme** changes in a way the tunable
+/// `(overview, pre)` params alone don't capture — so old cached renditions (and
+/// pinned client `ETag`s) fall out of the keyspace and re-render under the new
+/// logic instead of being served stale. `v2` introduced the dedicated
+/// backward-weighted window for license-plate reads (see [`plate_window`]),
+/// whose bounds no longer derive from `(overview, pre)` at all.
+const CLIP_WINDOW_SCHEME: u32 = 2;
+
 /// The window-parameter suffix that makes a clip rendition's cache identity
-/// depend on the (now tunable) overview length + pre-roll. Without it, a 30-day
-/// immutable `ETag` would pin a stale rendition client-side after a settings
-/// change (§2.5.3). E.g. `30s2s` for a 30 s overview with 2 s pre-roll.
+/// depend on the (now tunable) overview length + pre-roll, plus the windowing
+/// scheme version. Without it, a 30-day immutable `ETag` would pin a stale
+/// rendition client-side after a settings or scheme change (§2.5.3). E.g.
+/// `v2-30s2s` for scheme 2 with a 30 s overview and 2 s pre-roll.
 fn clip_window_tag(overview_secs: i64, pre_secs: i64) -> String {
-    format!("{overview_secs}s{pre_secs}s")
+    format!("v{CLIP_WINDOW_SCHEME}-{overview_secs}s{pre_secs}s")
 }
 
 /// Cache filename for a clip rendition: `{sanitized_id}.{len}s{pre}s.{quality}.mp4`.
@@ -1253,6 +1297,21 @@ mod tests {
         let start = t(50_000);
         let (s, e) = overview_window(start, Some(t(0)), 0, 30);
         assert_eq!(e, s);
+    }
+
+    #[test]
+    fn plate_window_is_backward_weighted_and_brackets_the_read() {
+        // A plate read is a point in time; the window leans back further than
+        // forward so the (structurally lagging) read ts still lands the car.
+        let read = t(60_000);
+        let (s, e) = plate_window(read);
+        assert_eq!(read - s, Duration::seconds(LPR_CLIP_LEAD_SECS));
+        assert_eq!(e - read, Duration::seconds(LPR_CLIP_TRAIL_SECS));
+        // The read sits comfortably inside, with more footage before than after.
+        assert!(s < read && read < e);
+        assert!((read - s) > (e - read));
+        // Total length is well under the compiled ceiling (no truncation).
+        assert!((e - s).num_seconds() <= MAX_CLIP_MEDIA_SECS);
     }
 
     #[test]

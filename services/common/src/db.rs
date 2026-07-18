@@ -7828,11 +7828,11 @@ pub async fn frigate_http_base(pool: &Pool) -> Result<Option<String>> {
 pub async fn get_clip_event_window(
     pool: &Pool,
     event_id: Uuid,
-) -> Result<Option<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>> {
+) -> Result<Option<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String)>> {
     let client = get_conn(pool).await?;
     let row = client
         .query_opt(
-            "SELECT camera_id, ts, end_ts FROM events WHERE id = $1",
+            "SELECT camera_id, ts, end_ts, label FROM events WHERE id = $1",
             &[&event_id],
         )
         .await
@@ -7841,7 +7841,8 @@ pub async fn get_clip_event_window(
         let cam: Uuid = r.get("camera_id");
         let start: DateTime<Utc> = r.get("ts");
         let end: Option<DateTime<Utc>> = r.get("end_ts");
-        (cam, start, end)
+        let label: String = r.get("label");
+        (cam, start, end, label)
     }))
 }
 
