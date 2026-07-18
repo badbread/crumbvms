@@ -4,14 +4,19 @@
 // reports at least one dual-engine camera). Two side-by-side stat cards
 // (reads, passes seen, hit rate, avg confidence, accuracy) around a shared
 // agreement summary, over a newest-first list of paired vehicle passes: each
-// row shows the pass image, both engines' plate + confidence, a
-// match/differ/miss verdict, and — for admins — a confirm-true-plate control
-// that anchors the accuracy stats (`POST /lpr/ab-confirm`).
+// row shows the pass images (full-frame context + tight plate crop, both
+// click-to-enlarge), both engines' plate + confidence, a match/differ/miss
+// verdict, and — for admins — a confirm-true-plate control that anchors the
+// accuracy stats (`POST /lpr/ab-confirm`); the confirm prompt repeats both
+// images so the operator can read the plate before typing.
 //
 // Data: `GET /lpr/ab-report` (see plates_api.dart). Pass images ride the
 // existing authed sources only — the sibling detection-event snapshot
 // (`GET /events/{id}/snapshot`) or the stored crumb-alpr crop
-// (`GET /plates/{id}/crop`) — never an unauthenticated provider URL.
+// (`GET /plates/{id}/crop`) — never an unauthenticated provider URL. The
+// report itself carries no bbox, so the client-side plate crop (Frigate-only
+// passes) finds the read's bbox via one narrow `GET /plates` query and crops
+// with the shared plate_crop.dart helper, exactly like the Plates screen.
 
 import 'dart:typed_data';
 
@@ -21,6 +26,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 
 // Palette shared with the Plates screen (kept literal — those consts are
 // library-private to plates_screen.dart).
@@ -148,7 +154,12 @@ class _AbBenchmarkViewState extends State<_AbBenchmarkView> {
             : (f?.plate ?? c?.plate ?? ''));
     final plate = await showDialog<String>(
       context: context,
-      builder: (ctx) => _ConfirmPlateDialog(initial: prefill),
+      builder: (ctx) => _ConfirmPlateDialog(
+        initial: prefill,
+        pass: pass,
+        api: widget.api,
+        session: widget.session,
+      ),
     );
     if (plate == null || plate.trim().isEmpty || !mounted) return;
     try {
@@ -361,6 +372,7 @@ class _AbBenchmarkViewState extends State<_AbBenchmarkView> {
                 key: ValueKey('${p.cameraId}/${p.bucketTsRaw}'),
                 pass: p,
                 cameraName: camName[p.cameraId] ?? '(unknown camera)',
+                api: widget.api,
                 session: widget.session,
                 canConfirm: widget.canConfirm,
                 onConfirm: () => _confirm(p),
@@ -532,6 +544,7 @@ class _PassRow extends StatelessWidget {
     super.key,
     required this.pass,
     required this.cameraName,
+    required this.api,
     required this.session,
     required this.canConfirm,
     required this.onConfirm,
@@ -539,6 +552,7 @@ class _PassRow extends StatelessWidget {
 
   final AbPass pass;
   final String cameraName;
+  final CrumbApi api;
   final Session session;
   final bool canConfirm;
   final VoidCallback onConfirm;
@@ -549,7 +563,7 @@ class _PassRow extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       child: Row(
         children: [
-          _AbThumb(pass: pass, session: session),
+          _AbThumb(pass: pass, api: api, session: session),
           const SizedBox(width: 12),
           SizedBox(
             width: 150,
@@ -745,20 +759,174 @@ Widget _chip(String text, Color color) {
   );
 }
 
-// ─── pass image ────────────────────────────────────────────────────────────
+// ─── pass images ───────────────────────────────────────────────────────────
 
-/// Bounded cache of pass images (same pattern as the Plates thumbnails, local
-/// to the benchmark so its lifetime is the dialog's session).
-final Map<String, Uint8List> _abImageCache = {};
-const _abImageCacheMax = 300;
+/// The two images that describe one pass: the full-frame detection snapshot
+/// (scene context) and the tight plate crop (readable plate). Either may be
+/// null when no source exists or a fetch failed.
+class _AbPassImages {
+  const _AbPassImages({this.full, this.crop});
 
-/// The pass image: the sibling detection-event snapshot of whichever engine
-/// has one (Frigate first), else the crumb-alpr stored crop
-/// (`GET /plates/{id}/crop`). Placeholder when neither source exists.
+  final Uint8List? full;
+  final Uint8List? crop;
+
+  bool get isEmpty => full == null && crop == null;
+}
+
+String _abPassKey(AbPass p) => '${p.cameraId}/${p.bucketTsRaw}';
+
+/// Bounded cache of resolved pass images (same pattern as the Plates
+/// thumbnails), keyed by the stable pass key. Only resolutions that produced
+/// at least one image are cached, so a transient fetch failure retries on the
+/// next mount — parity with the previous single-image cache.
+final Map<String, _AbPassImages> _abImagesCache = {};
+const _abImagesCacheMax = 200;
+
+/// In-flight resolutions, deduped by pass key so a row thumb and the confirm
+/// dialog racing for the same pass share one set of fetches.
+final Map<String, Future<_AbPassImages>> _abImagesInFlight = {};
+
+/// Bbox lookup memo (read id → bbox or null-for-none). The ab-report carries
+/// no bbox, so the crop path re-finds the read via `GET /plates`; memoized so
+/// scrolling back over rows doesn't re-query.
+final Map<String, List<double>?> _abBboxCache = {};
+const _abBboxCacheMax = 400;
+
+/// Resolve (and cache) both images for [p]. Shared by the row thumbnails and
+/// the confirm-true-plate dialog so both hit the same cache.
+Future<_AbPassImages> _resolvePassImages(CrumbApi api, Session s, AbPass p) {
+  final key = _abPassKey(p);
+  final cached = _abImagesCache[key];
+  if (cached != null) return Future.value(cached);
+  final inFlight = _abImagesInFlight[key];
+  if (inFlight != null) return inFlight;
+  final future = _resolvePassImagesUncached(api, s, p).then((images) {
+    if (!images.isEmpty) {
+      if (_abImagesCache.length >= _abImagesCacheMax) {
+        _abImagesCache.remove(_abImagesCache.keys.first);
+      }
+      _abImagesCache[key] = images;
+    }
+    return images;
+  }).whenComplete(() => _abImagesInFlight.remove(key));
+  _abImagesInFlight[key] = future;
+  return future;
+}
+
+Future<_AbPassImages> _resolvePassImagesUncached(
+  CrumbApi api,
+  Session s,
+  AbPass p,
+) async {
+  // Full frame: the sibling detection-event snapshot of whichever engine has
+  // one (Frigate first). That read also "owns" the frame for bbox-crop
+  // purposes — a bbox is only valid against the exact frame its read was made
+  // on, so never mix one engine's bbox with the other engine's snapshot.
+  AbPassRead? owner;
+  String? ownerEventId;
+  for (final r in [p.frigate, p.crumbAlpr]) {
+    final eid = r?.eventId;
+    if (r != null && eid != null && eid.isNotEmpty) {
+      owner = r;
+      ownerEventId = eid;
+      break;
+    }
+  }
+  Uint8List? full;
+  if (ownerEventId != null) {
+    full = await _fetchAbBytes(
+      s,
+      '${s.base}/events/${Uri.encodeComponent(ownerEventId)}/snapshot',
+    );
+  }
+
+  // Tight plate crop: prefer the stored crumb-alpr crop (already plate-tight,
+  // no client work); else derive one from the full frame + the owner read's
+  // bbox, exactly like the Plates screen does.
+  Uint8List? crop;
+  final c = p.crumbAlpr;
+  if (c != null) {
+    crop = await _fetchAbBytes(
+      s,
+      '${s.base}/plates/${Uri.encodeComponent(c.readId)}/crop',
+    );
+  }
+  if (crop == null && full != null && owner != null) {
+    final bbox = await _lookupAbBbox(api, s, p.cameraId, owner);
+    if (bbox != null && bbox.length >= 4) {
+      try {
+        crop = await cachedPlateCrop(owner.readId, full, bbox);
+      } catch (_) {
+        crop = null; // undecodable frame — the full frame still shows
+      }
+    }
+  }
+  return _AbPassImages(full: full, crop: crop);
+}
+
+/// One Bearer-authed GET returning body bytes, or null on any non-200/error
+/// (callers fall back to a placeholder).
+Future<Uint8List?> _fetchAbBytes(Session s, String url) async {
+  try {
+    final resp = await sharedHttpClient.get(
+      Uri.parse(url),
+      headers: {'authorization': 'Bearer ${s.token}'},
+    );
+    if (resp.statusCode == 200 && resp.bodyBytes.isNotEmpty) {
+      return resp.bodyBytes;
+    }
+  } catch (_) {
+    // fall through
+  }
+  return null;
+}
+
+/// Find [read]'s bbox: one narrow `GET /plates` query (same camera, ±2 s
+/// around the read's timestamp) and match the row by read id. A read with no
+/// bbox memoizes null (no point re-querying); a failed query is not memoized.
+Future<List<double>?> _lookupAbBbox(
+  CrumbApi api,
+  Session s,
+  String cameraId,
+  AbPassRead read,
+) async {
+  if (_abBboxCache.containsKey(read.readId)) return _abBboxCache[read.readId];
+  List<double>? bbox;
+  try {
+    final page = await api.listPlates(
+      s,
+      cameraIds: [cameraId],
+      start: read.ts.subtract(const Duration(seconds: 2)),
+      end: read.ts.add(const Duration(seconds: 2)),
+      limit: 50,
+    );
+    for (final r in page.plates) {
+      if (r.id == read.readId) {
+        bbox = r.bbox;
+        break;
+      }
+    }
+  } catch (_) {
+    return null; // transient — retry on the next mount
+  }
+  if (_abBboxCache.length >= _abBboxCacheMax) {
+    _abBboxCache.remove(_abBboxCache.keys.first);
+  }
+  _abBboxCache[read.readId] = bbox;
+  return bbox;
+}
+
+/// The pass images cell: full-frame context thumb + tight plate crop side by
+/// side (crop slot reserved so columns stay aligned), each click-to-enlarge.
 class _AbThumb extends StatefulWidget {
-  const _AbThumb({required this.pass, required this.session});
+  const _AbThumb({
+    required this.pass,
+    required this.api,
+    required this.session,
+  });
 
   final AbPass pass;
+  final CrumbApi api;
   final Session session;
 
   @override
@@ -766,98 +934,192 @@ class _AbThumb extends StatefulWidget {
 }
 
 class _AbThumbState extends State<_AbThumb> {
-  Uint8List? _bytes;
-  bool _disposed = false;
-
-  String get _cacheKey =>
-      '${widget.pass.cameraId}/${widget.pass.bucketTsRaw}';
+  _AbPassImages? _images;
 
   @override
   void initState() {
     super.initState();
-    final cached = _abImageCache[_cacheKey];
-    if (cached != null) {
-      _bytes = cached;
-    } else {
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(_AbThumb oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A refresh can hand a reused element a different pass — reload then.
+    if (_abPassKey(oldWidget.pass) != _abPassKey(widget.pass)) {
+      _images = null;
       _load();
     }
   }
 
-  @override
-  void dispose() {
-    _disposed = true;
-    super.dispose();
-  }
-
   Future<void> _load() async {
-    final p = widget.pass;
-    final s = widget.session;
-    final eventId = p.frigate?.eventId ?? p.crumbAlpr?.eventId;
-    final urls = <String>[
-      if (eventId != null && eventId.isNotEmpty)
-        '${s.base}/events/${Uri.encodeComponent(eventId)}/snapshot',
-      if (p.crumbAlpr != null)
-        '${s.base}/plates/${Uri.encodeComponent(p.crumbAlpr!.readId)}/crop',
-    ];
-    for (final url in urls) {
-      try {
-        final resp = await sharedHttpClient.get(
-          Uri.parse(url),
-          headers: {'authorization': 'Bearer ${s.token}'},
-        );
-        if (_disposed) return;
-        if (resp.statusCode == 200 && resp.bodyBytes.isNotEmpty) {
-          if (_abImageCache.length >= _abImageCacheMax) {
-            _abImageCache.remove(_abImageCache.keys.first);
-          }
-          _abImageCache[_cacheKey] = resp.bodyBytes;
-          if (mounted) setState(() => _bytes = resp.bodyBytes);
-          return;
-        }
-      } catch (_) {
-        // Try the next source; fall through to the placeholder.
-      }
+    final pass = widget.pass;
+    final images = await _resolvePassImages(widget.api, widget.session, pass);
+    // Drop a stale resolution if the widget moved on to another pass.
+    if (mounted && _abPassKey(widget.pass) == _abPassKey(pass)) {
+      setState(() => _images = images);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final bytes = _bytes;
     final dpr = MediaQuery.devicePixelRatioOf(context);
-    return ClipRRect(
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _AbTappableImage(
+          bytes: _images?.full,
+          width: 132,
+          height: 74,
+          fit: BoxFit.cover,
+          cacheWidth: (132 * dpr).round(),
+          placeholderIcon: Icons.directions_car_outlined,
+          lightboxLabel: 'Full frame',
+        ),
+        const SizedBox(width: 6),
+        _AbTappableImage(
+          bytes: _images?.crop,
+          width: 110,
+          height: 74,
+          fit: BoxFit.contain,
+          cacheWidth: (110 * dpr).round(),
+          placeholderIcon: Icons.no_photography_outlined,
+          lightboxLabel: 'Plate crop',
+        ),
+      ],
+    );
+  }
+}
+
+/// One clickable benchmark image cell: rounded, black-backed, opens the
+/// lightbox on click when it has bytes; a dim placeholder icon otherwise.
+class _AbTappableImage extends StatelessWidget {
+  const _AbTappableImage({
+    required this.bytes,
+    required this.width,
+    required this.height,
+    required this.fit,
+    required this.cacheWidth,
+    required this.placeholderIcon,
+    required this.lightboxLabel,
+  });
+
+  final Uint8List? bytes;
+  final double width;
+  final double height;
+  final BoxFit fit;
+  final int cacheWidth;
+  final IconData placeholderIcon;
+  final String lightboxLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final b = bytes;
+    final cell = ClipRRect(
       borderRadius: BorderRadius.circular(6),
-      child: SizedBox(
-        width: 132,
-        height: 74,
-        child: bytes == null
-            ? Container(
-                color: Colors.black,
-                alignment: Alignment.center,
-                child: const Icon(
-                  Icons.directions_car_outlined,
-                  color: Colors.white24,
-                  size: 22,
-                ),
-              )
-            : Container(
-                color: Colors.black,
-                child: Image.memory(
-                  bytes,
-                  fit: BoxFit.cover,
-                  gaplessPlayback: true,
-                  cacheWidth: (132 * dpr).round(),
-                ),
+      child: Container(
+        width: width,
+        height: height,
+        color: Colors.black,
+        alignment: Alignment.center,
+        child: b == null
+            ? Icon(placeholderIcon, color: Colors.white24, size: 22)
+            : Image.memory(
+                b,
+                fit: fit,
+                gaplessPlayback: true,
+                cacheWidth: cacheWidth,
               ),
+      ),
+    );
+    if (b == null) return cell;
+    return MouseRegion(
+      cursor: SystemMouseCursors.zoomIn,
+      child: GestureDetector(
+        onTap: () => _showAbLightbox(context, b, label: lightboxLabel),
+        child: Tooltip(
+          message: 'Click to enlarge',
+          waitDuration: const Duration(milliseconds: 600),
+          child: cell,
+        ),
       ),
     );
   }
 }
 
+/// Full-size dismissible viewer: dark backdrop, wheel-zoom + drag-pan via
+/// [InteractiveViewer], click anywhere or Esc to close.
+Future<void> _showAbLightbox(
+  BuildContext context,
+  Uint8List bytes, {
+  String? label,
+}) {
+  return showDialog<void>(
+    context: context,
+    barrierColor: Colors.black.withValues(alpha: 0.88),
+    builder: (ctx) => Material(
+      type: MaterialType.transparency,
+      child: Stack(
+        children: [
+          // Click-anywhere-to-close, the image included (zoom rides the wheel
+          // and pan rides drags, neither of which registers as a tap).
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => Navigator.of(ctx).pop(),
+              child: InteractiveViewer(
+                maxScale: 8,
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Image.memory(
+                      bytes,
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (label != null)
+            Positioned(
+              left: 16,
+              top: 12,
+              child: Text(
+                label,
+                style: const TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ),
+          Positioned(
+            right: 8,
+            top: 8,
+            child: IconButton(
+              tooltip: 'Close (Esc)',
+              onPressed: () => Navigator.of(ctx).pop(),
+              icon: const Icon(Icons.close, color: Colors.white70, size: 22),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 // ─── confirm dialog ────────────────────────────────────────────────────────
 
 class _ConfirmPlateDialog extends StatefulWidget {
-  const _ConfirmPlateDialog({required this.initial});
+  const _ConfirmPlateDialog({
+    required this.initial,
+    required this.pass,
+    required this.api,
+    required this.session,
+  });
+
   final String initial;
+  final AbPass pass;
+  final CrumbApi api;
+  final Session session;
 
   @override
   State<_ConfirmPlateDialog> createState() => _ConfirmPlateDialogState();
@@ -865,11 +1127,20 @@ class _ConfirmPlateDialog extends StatefulWidget {
 
 class _ConfirmPlateDialogState extends State<_ConfirmPlateDialog> {
   late final TextEditingController _controller;
+  _AbPassImages? _images;
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.initial);
+    _loadImages();
+  }
+
+  /// Usually instant — the row thumbnail already resolved and cached these.
+  Future<void> _loadImages() async {
+    final images =
+        await _resolvePassImages(widget.api, widget.session, widget.pass);
+    if (mounted) setState(() => _images = images);
   }
 
   @override
@@ -886,6 +1157,8 @@ class _ConfirmPlateDialogState extends State<_ConfirmPlateDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final images = _images;
+    final dpr = MediaQuery.devicePixelRatioOf(context);
     return AlertDialog(
       backgroundColor: _panel,
       title: const Text(
@@ -893,16 +1166,43 @@ class _ConfirmPlateDialogState extends State<_ConfirmPlateDialog> {
         style: TextStyle(color: Colors.white, fontSize: 15),
       ),
       content: SizedBox(
-        width: 300,
+        width: 340,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
               'Read the plate off the image and correct the guess if needed. '
-              'Both engines are scored against this.',
+              'Both engines are scored against this. Click an image to '
+              'enlarge.',
               style: TextStyle(color: Colors.white54, fontSize: 12),
             ),
+            // Both pass images (full frame + tight plate crop) so the plate is
+            // readable right here before typing. Absent sources are skipped.
+            if (images != null && images.full != null) ...[
+              const SizedBox(height: 10),
+              _AbTappableImage(
+                bytes: images.full,
+                width: 340,
+                height: 191,
+                fit: BoxFit.contain,
+                cacheWidth: (340 * dpr).round(),
+                placeholderIcon: Icons.directions_car_outlined,
+                lightboxLabel: 'Full frame',
+              ),
+            ],
+            if (images != null && images.crop != null) ...[
+              const SizedBox(height: 8),
+              _AbTappableImage(
+                bytes: images.crop,
+                width: 340,
+                height: 64,
+                fit: BoxFit.contain,
+                cacheWidth: (340 * dpr).round(),
+                placeholderIcon: Icons.no_photography_outlined,
+                lightboxLabel: 'Plate crop',
+              ),
+            ],
             const SizedBox(height: 12),
             TextField(
               controller: _controller,
