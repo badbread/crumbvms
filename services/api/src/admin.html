@@ -302,6 +302,18 @@ details.detail-section .ds-body>.policy-section>.policy-section-title{position:s
 .adv-suggest{margin-top:9px;display:flex;flex-direction:column;gap:4px;}
 .adv-suggest-item{display:flex;gap:7px;align-items:flex-start;font-size:12px;color:var(--dim);line-height:1.5;padding:3px 0;}
 .adv-suggest-item .asi-ico{flex:0 0 auto;color:var(--accent);margin-top:1px;}
+/* ── Crumb data footprint (server-wide breakdown card) ── */
+.cf-list{margin-top:10px;display:flex;flex-direction:column;gap:2px;}
+.cf-row{display:grid;grid-template-columns:12px minmax(0,1.5fr) minmax(48px,1.1fr) 118px minmax(0,1.5fr);gap:10px;align-items:center;font-size:12px;padding:3px 0;}
+.cf-dot{width:10px;height:10px;border-radius:2px;flex:0 0 auto;}
+.cf-label{color:var(--text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+.cf-label .cf-loc{color:var(--dim2);font-weight:400;font-size:11px;margin-left:7px;font-family:ui-monospace,monospace;}
+.cf-bar{height:6px;background:var(--surface3);border-radius:3px;overflow:hidden;min-width:28px;}
+.cf-fill{display:block;height:100%;min-width:3px;border-radius:3px;}
+.cf-size{color:var(--text);white-space:nowrap;text-align:right;font-weight:600;}
+.cf-size small{color:var(--dim2);font-weight:400;margin-left:3px;}
+.cf-meta{color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+@media (max-width:720px){.cf-row{grid-template-columns:12px minmax(0,1.4fr) 100px;}.cf-row .cf-bar,.cf-row .cf-meta{display:none;}}
 /* ── Cards → raised group panels (fill + hairline + soft shadow) ── */
 .card{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:var(--sp-5);box-shadow:var(--shadow);}
 .card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px;}
@@ -4287,6 +4299,8 @@ async function loadStorageAdvisor() {
   // while the fetch was in flight.
   if (!$('storage-advisor')) return;
   ADV_STORAGES = list;
+  ADV_CRUMB = (data && Array.isArray(data.crumb_data)) ? data.crumb_data : [];
+  ADV_CRUMB_TOTAL = Number(data && data.crumb_data_total_bytes) || 0;
   advRenderCards();
 }
 
@@ -4294,11 +4308,74 @@ async function loadStorageAdvisor() {
    so a sort click can re-render the cards without re-fetching. Keyed by storage
    id → {key, dir}; default is footprint (bytes) descending. */
 let ADV_STORAGES = [];
+/* Server-wide "Crumb data footprint" breakdown (every store across all volumes)
+   + its total, from the same /stats/storage fetch. */
+let ADV_CRUMB = [];
+let ADV_CRUMB_TOTAL = 0;
 const ADV_CAM_SORT = {};
 
 function advRenderCards() {
   const host = $('storage-advisor'); if (!host) return;
-  host.innerHTML = ADV_STORAGES.map(advStorageCard).join('');
+  host.innerHTML = ADV_STORAGES.map(advStorageCard).join('') + advFootprintPanel();
+}
+
+/* Stable colour per Crumb data-store key, so the stacked bar and legend read as
+   one picture and the palette is meaningful (recordings = the Default blue). */
+const CRUMB_DATA_COLORS = {
+  recordings: '#38BDD6', lpr: '#E8A33D', clips: '#A78BFA',
+  playback_cache: '#2DD4BF', thumbnails: '#34C759', exports: '#F472B6', database: '#94A3B8',
+};
+
+/* Server-wide "Crumb data footprint" card: one stacked bar + a row per store
+   (recordings, LPR plate images, clip/playback/thumbnail caches, exports, DB),
+   with size, share of the total, physical location, and a budget meter for the
+   capped caches. Rendered once below the per-device cards. All values esc()'d. */
+function advFootprintPanel() {
+  const stores = Array.isArray(ADV_CRUMB) ? ADV_CRUMB.filter(d => Number(d.bytes) > 0) : [];
+  if (!stores.length) return '';
+  const total = ADV_CRUMB_TOTAL > 0 ? ADV_CRUMB_TOTAL : stores.reduce((a, d) => a + Number(d.bytes), 0);
+  const colorFor = d => CRUMB_DATA_COLORS[d.key] || 'var(--surface3)';
+
+  const segs = stores.map(d => {
+    const w = total ? Math.max(0, Number(d.bytes) / total * 100) : 0;
+    if (w <= 0) return '';
+    return `<span class="stk-seg" style="width:${w}%;background:${colorFor(d)}" title="${esc(d.label)} — ${esc(fmtBytes(d.bytes))}"></span>`;
+  }).join('');
+
+  const rows = stores.map(d => {
+    const bytes = Number(d.bytes);
+    const share = total ? bytes / total * 100 : 0;
+    const w = Math.max(0, share);
+    // Budget meter for capped caches; otherwise the store's detail line.
+    let meta;
+    if (d.budget_bytes != null && Number(d.budget_bytes) > 0) {
+      const bpct = Math.min(100, Math.round(bytes / Number(d.budget_bytes) * 100));
+      meta = `<span class="cf-meta">${bpct}% of ${esc(fmtBytes(Number(d.budget_bytes)))} budget</span>`;
+    } else if (d.detail) {
+      meta = `<span class="cf-meta">${esc(d.detail)}</span>`;
+    } else {
+      meta = `<span class="cf-meta"></span>`;
+    }
+    return `<div class="cf-row">
+      <span class="cf-dot" style="background:${colorFor(d)}"></span>
+      <span class="cf-label">${esc(d.label)}<span class="cf-loc">${esc(d.location || '')}</span></span>
+      <span class="cf-bar"><span class="cf-fill" style="width:${w}%;background:${colorFor(d)}"></span></span>
+      <span class="cf-size">${esc(fmtBytes(bytes))}<small> ${advPct(share)}</small></span>
+      ${meta}
+    </div>`;
+  }).join('');
+
+  return `<div class="adv-card cf-card">
+    <div class="adv-card-head">
+      <div style="min-width:0">
+        <div class="adv-card-title"><span class="ac-ico">${icon('database', 18)}</span><span class="ac-name">Crumb data footprint</span></div>
+        <div class="adv-card-path" style="font-family:inherit;color:var(--dim)">Everything Crumb stores, across every volume — not just recordings.</div>
+      </div>
+      <span class="adv-badge">${esc(fmtBytes(total))} total</span>
+    </div>
+    <div class="stk-track">${segs}</div>
+    <div class="cf-list">${rows}</div>
+  </div>`;
 }
 
 /* Sort the per-camera table for one storage card (toggles direction on repeat).
