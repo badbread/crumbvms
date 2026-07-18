@@ -840,18 +840,13 @@ Future<_AbPassImages> _resolvePassImagesUncached(
     );
   }
 
-  // Tight plate crop: prefer the stored crumb-alpr crop (already plate-tight,
-  // no client work); else derive one from the full frame + the owner read's
-  // bbox, exactly like the Plates screen does.
+  // Tight plate crop: ALWAYS derive it from the full frame + the owner read's
+  // bbox, exactly like the Plates screen. NB: do NOT use GET /plates/:id/crop —
+  // for crumb-alpr reads the stored "crop" column now holds the WHOLE context
+  // frame (clients derive the tight crop themselves), so fetching it would just
+  // show the same image as `full`.
   Uint8List? crop;
-  final c = p.crumbAlpr;
-  if (c != null) {
-    crop = await _fetchAbBytes(
-      s,
-      '${s.base}/plates/${Uri.encodeComponent(c.readId)}/crop',
-    );
-  }
-  if (crop == null && full != null && owner != null) {
+  if (full != null && owner != null) {
     final bbox = await _lookupAbBbox(api, s, p.cameraId, owner);
     if (bbox != null && bbox.length >= 4) {
       try {
