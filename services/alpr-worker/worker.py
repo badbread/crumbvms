@@ -14,6 +14,7 @@ constants below and ``services/alpr-worker/README.md``.
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import logging
 import os
 import sys
@@ -73,6 +74,14 @@ CONFIG_POLL_S = float(os.environ.get("LPR_CONFIG_POLL_SECONDS", "30"))
 # once per pass. Lower = quicker to treat a brief disappearance as a new arrival;
 # higher = stricter about re-reads.
 REAPPEAR_GAP_S = float(os.environ.get("LPR_REAPPEAR_GAP_SECONDS", "45"))
+# The frame the worker timestamps was captured EARLIER in the real world than
+# when we process it: the go2rtc restream + network buffer the stream, so
+# `time.time()` at the best frame overshoots the real capture moment by ~1-2s.
+# The recorder's segments are closer to real-time, so a clip centred on our
+# raw timestamp lands a second or two AFTER the car. Subtract this offset to
+# pull the read time back onto the car. Biased slightly generous (a hair early
+# shows the approach, which beats cutting the car off). Tune per-deployment.
+TS_OFFSET_S = float(os.environ.get("LPR_TS_OFFSET_SECONDS", "2.0"))
 # The read's stored image is the WHOLE frame (a Frigate-style context snapshot),
 # not a pre-cropped plate: the clients derive the tight plate crop themselves from
 # the normalized bbox, so shipping the full frame lets crumb-alpr reads render the
@@ -126,6 +135,11 @@ class PassVote:
     best_crop: bytes | None = None
     best_bbox: list[float] | None = None  # [x, y, w, h] normalized
     best_region: str | None = None
+    # Wall-clock (epoch seconds) of the best frame — sent as the read's `ts` so
+    # the clip player centres on when the plate was actually IN FRAME. Without
+    # it the server stamps now() at INGEST, which is at pass-emit (after voting,
+    # after the car has left), and the plate-clip pop-up lands seconds too late.
+    best_epoch: float = 0.0
     started: float = 0.0
 
     def active(self) -> bool:
@@ -143,6 +157,7 @@ class PassVote:
                 bbox,
                 region,
             )
+            self.best_epoch = time.time()
 
     def winner(self) -> tuple[str, float] | None:
         """Plate with the most summed confidence; its mean confidence."""
@@ -289,7 +304,16 @@ def post_read(session: requests.Session, plate: str, conf: float, vote: PassVote
         "region": vote.best_region,
         "bbox": vote.best_bbox,
         "provider_event_id": uuid.uuid4().hex,
-        "ts": None,  # server stamps now() when omitted
+        # Timestamp of the BEST frame (when the plate was clearest / the car was
+        # in frame), not emit time — so the plate-clip pop-up centres on the car.
+        # RFC3339 UTC (chrono parses it). Falls back to server now() if unset.
+        "ts": (
+            datetime.fromtimestamp(
+                vote.best_epoch - TS_OFFSET_S, tz=timezone.utc
+            ).isoformat()
+            if vote.best_epoch
+            else None
+        ),
     }
     if vote.best_crop:
         body["crop_jpeg_b64"] = base64.standard_b64encode(vote.best_crop).decode()
