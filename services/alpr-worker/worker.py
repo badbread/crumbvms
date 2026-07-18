@@ -14,6 +14,7 @@ constants below and ``services/alpr-worker/README.md``.
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import logging
 import os
 import sys
@@ -126,6 +127,11 @@ class PassVote:
     best_crop: bytes | None = None
     best_bbox: list[float] | None = None  # [x, y, w, h] normalized
     best_region: str | None = None
+    # Wall-clock (epoch seconds) of the best frame — sent as the read's `ts` so
+    # the clip player centres on when the plate was actually IN FRAME. Without
+    # it the server stamps now() at INGEST, which is at pass-emit (after voting,
+    # after the car has left), and the plate-clip pop-up lands seconds too late.
+    best_epoch: float = 0.0
     started: float = 0.0
 
     def active(self) -> bool:
@@ -143,6 +149,7 @@ class PassVote:
                 bbox,
                 region,
             )
+            self.best_epoch = time.time()
 
     def winner(self) -> tuple[str, float] | None:
         """Plate with the most summed confidence; its mean confidence."""
@@ -289,7 +296,14 @@ def post_read(session: requests.Session, plate: str, conf: float, vote: PassVote
         "region": vote.best_region,
         "bbox": vote.best_bbox,
         "provider_event_id": uuid.uuid4().hex,
-        "ts": None,  # server stamps now() when omitted
+        # Timestamp of the BEST frame (when the plate was clearest / the car was
+        # in frame), not emit time — so the plate-clip pop-up centres on the car.
+        # RFC3339 UTC (chrono parses it). Falls back to server now() if unset.
+        "ts": (
+            datetime.fromtimestamp(vote.best_epoch, tz=timezone.utc).isoformat()
+            if vote.best_epoch
+            else None
+        ),
     }
     if vote.best_crop:
         body["crop_jpeg_b64"] = base64.standard_b64encode(vote.best_crop).decode()
