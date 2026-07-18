@@ -67,6 +67,7 @@ class ClipPlayerShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
     return Material(
       color: Colors.black.withValues(alpha: 0.92),
       child: GestureDetector(
@@ -110,16 +111,39 @@ class ClipPlayerShell extends StatelessWidget {
                 if (actions.isNotEmpty)
                   _absorb(
                     Padding(
-                      padding: const EdgeInsets.only(top: 8),
+                      padding: const EdgeInsets.only(top: 10),
                       // Full-width so the tap-absorbing strip spans the row —
                       // a near-miss beside a button must not dismiss.
                       child: SizedBox(
                         width: double.infinity,
-                        child: Wrap(
-                          alignment: WrapAlignment.center,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          spacing: 8,
-                          children: actions,
+                        // Give every action a consistent accent-tinted pill
+                        // (colour + a bordered background = clear separation)
+                        // so the buttons read as distinct controls, not a run
+                        // of plain white text.
+                        child: TextButtonTheme(
+                          data: TextButtonThemeData(
+                            style: TextButton.styleFrom(
+                              foregroundColor: accent,
+                              backgroundColor: accent.withValues(alpha: 0.15),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 9,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                side: BorderSide(
+                                  color: accent.withValues(alpha: 0.38),
+                                ),
+                              ),
+                            ),
+                          ),
+                          child: Wrap(
+                            alignment: WrapAlignment.center,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            spacing: 12,
+                            runSpacing: 8,
+                            children: actions,
+                          ),
                         ),
                       ),
                     ),
