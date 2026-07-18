@@ -43,6 +43,7 @@ class PlatesPrefs {
   static const String _kCropCorner = 'crumb_plates_crop_corner';
   static const String _kCropSize = 'crumb_plates_crop_size';
   static const String _kCollapse = 'crumb_plates_collapse_dupes';
+  static const String _kShowWatchlist = 'crumb_plates_show_watchlist';
 
   /// The last-used view mode, or [PlatesViewMode.list] when the operator has
   /// never changed it (or persistence is unavailable).
@@ -155,6 +156,29 @@ class PlatesPrefs {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_kCollapse, on);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Whether the watchlist side panel is open. Defaults to true (open) the
+  /// first time, matching the panel's original default; thereafter it remembers
+  /// the operator's last choice, so closing it and switching tabs (which rebuilds
+  /// the Plates screen from scratch — there is no keep-alive) no longer springs
+  /// the panel back open. Purely local UI state, like the other plate prefs.
+  static Future<bool> getShowWatchlist() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_kShowWatchlist) ?? true;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  static Future<void> setShowWatchlist(bool show) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kShowWatchlist, show);
     } catch (_) {
       /* best-effort persistence */
     }

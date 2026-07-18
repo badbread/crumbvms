@@ -179,6 +179,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final corner = await PlatesPrefs.getCropCorner();
     final size = await PlatesPrefs.getCropSize();
     final collapse = await PlatesPrefs.getCollapseDuplicates();
+    final showWatchlist = await PlatesPrefs.getShowWatchlist();
     if (!mounted) return;
     setState(() {
       _viewMode = mode;
@@ -186,6 +187,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
       _cropCorner = corner;
       _cropSize = size;
       _collapse = collapse;
+      _showWatchlist = showWatchlist;
     });
   }
 
@@ -518,8 +520,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
                           onAdd: _addToWatchlist,
                           onRemove: _removeFromWatchlist,
                           onRefresh: _loadWatchlist,
-                          onClose: () =>
-                              setState(() => _showWatchlist = false),
+                          onClose: () => setState(() {
+                            _showWatchlist = false;
+                            PlatesPrefs.setShowWatchlist(false);
+                          }),
                         ),
                     ],
                   ),
@@ -688,8 +692,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
               ),
             ),
           TextButton.icon(
-            onPressed: () =>
-                setState(() => _showWatchlist = !_showWatchlist),
+            onPressed: () => setState(() {
+              _showWatchlist = !_showWatchlist;
+              PlatesPrefs.setShowWatchlist(_showWatchlist);
+            }),
             icon: Icon(
               _showWatchlist
                   ? Icons.playlist_add_check
@@ -1461,18 +1467,18 @@ class _PlateThumbState extends State<_PlateThumb> {
     return Container(color: Colors.black, child: image);
   }
 
-  /// Display aspect (w/h) of the plate crop, derived from the read's
-  /// normalized bbox. The bbox is in frame FRACTIONS, so its w/h must be
-  /// scaled by the frame's own aspect (snapshots are 16:9 — the same
-  /// assumption [_sideBySide] makes for the full frame) to get the crop's
-  /// pixel aspect. Clamped to a sane band so a degenerate box can't produce
-  /// an absurd slot. Null when the read has no usable bbox.
+  /// Display aspect (w/h) of the plate crop, taken from the crop image's OWN
+  /// decoded pixels (surfaced by the crop cache via [peekPlateCropAspect]) — not
+  /// re-derived from the bbox. The bbox is in frame FRACTIONS, so turning it
+  /// into a pixel aspect needs the snapshot's real dimensions, which vary by
+  /// camera; a hard-coded 16:9 assumption there mis-shaped the slot on any
+  /// non-16:9 camera (that was the bug). Clamped to a sane band so a degenerate
+  /// crop can't produce an absurd slot. Null until the crop is computed (the
+  /// caller then falls back to a plain letterboxed render).
   double? get _cropAspect {
-    final bb = widget.read.bbox;
-    if (bb == null || bb.length < 4) return null;
-    final bw = bb[2], bh = bb[3];
-    if (bw <= 0 || bh <= 0) return null;
-    return ((bw / bh) * (16 / 9)).clamp(1.0, 8.0).toDouble();
+    final a = peekPlateCropAspect(widget.read.id);
+    if (a == null || a <= 0) return null;
+    return a.clamp(1.0, 8.0).toDouble();
   }
 
   /// The crop centered in its (fixed) slot with the black backing sized to

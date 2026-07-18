@@ -12,21 +12,34 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 
 /// Crop [fullBytes] to the normalized `[x, y, w, h]` [bbox] (fractions 0..1 of
-/// the snapshot). Returns re-encoded JPEG bytes, or null if the image can't be
-/// decoded (callers then fall back to the full frame).
+/// the snapshot). Returns a `(jpegBytes, width, height)` record — the re-encoded
+/// crop plus its true pixel dimensions — or null if the image can't be decoded
+/// (callers then fall back to the full frame).
+///
+/// The width/height are the crop's ACTUAL pixels (`bbox.w · frameW` by
+/// `bbox.h · frameH`), so `width / height` is the crop's real display aspect.
+/// This is the authoritative aspect: the bbox fractions alone can't give it
+/// without the snapshot's real dimensions (which vary by camera — never assume
+/// 16:9), and callers must not re-derive it from a hard-coded frame aspect.
 ///
 /// The decode/crop/encode (all `package:image`, which is isolate-safe) runs on
 /// a background isolate via [Isolate.run] so a full-frame JPEG doesn't freeze
 /// the UI isolate. The closure captures only sendable data (the byte list + the
 /// bbox doubles) and calls a top-level function.
-Future<Uint8List?> cropPlateToBbox(Uint8List fullBytes, List<double> bbox) {
+Future<(Uint8List, int, int)?> cropPlateToBbox(
+  Uint8List fullBytes,
+  List<double> bbox,
+) {
   return Isolate.run(() => cropPlateToBboxSync(fullBytes, bbox));
 }
 
 /// The synchronous crop, safe to run inside a background isolate. The rect is
 /// clamped into the image so an out-of-range or degenerate box still yields a
-/// crop.
-Uint8List? cropPlateToBboxSync(Uint8List fullBytes, List<double> bbox) {
+/// crop. Returns `(jpegBytes, width, height)` — see [cropPlateToBbox].
+(Uint8List, int, int)? cropPlateToBboxSync(
+  Uint8List fullBytes,
+  List<double> bbox,
+) {
   final decoded = img.decodeImage(fullBytes);
   if (decoded == null) return null;
   final w = decoded.width;
@@ -43,7 +56,7 @@ Uint8List? cropPlateToBboxSync(Uint8List fullBytes, List<double> bbox) {
   // primary guard; this catches any residual bad box. Non-destructive — the
   // full frame still contains the plate somewhere.
   if (_isNearlyBlack(cropped)) return null;
-  return img.encodeJpg(cropped, quality: 90);
+  return (img.encodeJpg(cropped, quality: 90), cropped.width, cropped.height);
 }
 
 /// True when [im] is almost entirely black — the signature of a crop box that
@@ -76,6 +89,12 @@ final Map<String, Uint8List> _plateCropCache = {};
 final List<String> _plateCropOrder = []; // oldest first
 const _plateCropCacheMax = 256;
 
+/// The crop's true display aspect (`width / height`), keyed by the same read id
+/// as [_plateCropCache] and evicted in lockstep with it. Populated by
+/// [cachedPlateCrop] from the crop's real pixel dimensions so display code can
+/// size the crop's slot to its OWN aspect without guessing the frame aspect.
+final Map<String, double> _plateCropAspect = {};
+
 /// Sentinel cached against a key when a crop was attempted but failed (bad
 /// bytes / undecodable), so a doomed decode isn't retried on every rebuild.
 /// Distinct from "not computed yet" (absent from the map).
@@ -91,9 +110,15 @@ Future<Uint8List?> cachedPlateCrop(
 ) async {
   final hit = _plateCropCache[key];
   if (hit != null) return identical(hit, _cropFailed) ? null : hit;
-  final cropped = await cropPlateToBbox(fullBytes, bbox);
-  _cachePut(key, cropped ?? _cropFailed);
-  return cropped;
+  final result = await cropPlateToBbox(fullBytes, bbox);
+  if (result == null) {
+    _cachePut(key, _cropFailed);
+    return null;
+  }
+  final (bytes, cw, ch) = result;
+  _cachePut(key, bytes);
+  if (ch > 0) _plateCropAspect[key] = cw / ch;
+  return bytes;
 }
 
 /// Read a previously computed crop synchronously, without computing one.
@@ -104,6 +129,11 @@ Uint8List? peekPlateCrop(String key) {
   return hit;
 }
 
+/// The crop's real display aspect (`width / height`) for [key], or null if the
+/// crop hasn't been computed yet or failed. Frame-aspect-independent — derived
+/// from the crop's own pixels, so it is correct for any camera resolution.
+double? peekPlateCropAspect(String key) => _plateCropAspect[key];
+
 void _cachePut(String key, Uint8List bytes) {
   if (_plateCropCache.containsKey(key)) {
     _plateCropOrder.remove(key);
@@ -113,5 +143,6 @@ void _cachePut(String key, Uint8List bytes) {
   while (_plateCropOrder.length > _plateCropCacheMax) {
     final evicted = _plateCropOrder.removeAt(0);
     _plateCropCache.remove(evicted);
+    _plateCropAspect.remove(evicted);
   }
 }
