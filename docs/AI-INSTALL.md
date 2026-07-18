@@ -317,12 +317,14 @@ You're finished; they take it from here. (Skipping the camera steps adds nothing
 secure by default; steps 7–10 are all optional and skippable.)
 
 **After the wizard — License-plate recognition (optional).** Not a wizard step;
-it lives in the console under **Settings → Detection & clips**. OFF by default.
-If the user runs their cameras through Frigate with Frigate's native LPR enabled,
-plate reads arrive on the event stream Crumb already ingests — flip
-**License-plate recognition** on there (and set a **retention** window; older
-plate reads are pruned automatically) to start capturing them into the
-searchable **LPR** tab. No new services or env keys; it reuses the Frigate
+everything LPR lives in the console's dedicated **LPR** section (left nav). OFF
+by default. If the user runs their cameras through Frigate with Frigate's
+native LPR enabled, plate reads arrive on the event stream Crumb already
+ingests — flip **Enable license-plate capture** on there (and set a
+**retention** window; older plate reads are pruned automatically) to start
+capturing them into the searchable **LPR** tab. Each camera's **Engine**
+dropdown in the same section's per-camera table controls which source feeds it
+(**None** = LPR off for that camera; new cameras default to Frigate). No new services or env keys; it reuses the Frigate
 integration. A plate database is privacy-sensitive, so it stays opt-in, and
 viewing it needs the **View license plates** role capability (Settings → Users &
 Security). Plate-read retention is independent of footage/storage retention.
@@ -332,7 +334,9 @@ Alternatively — or for better accuracy than Frigate's native LPR — run Crumb
 **own** local OCR engine, the opt-in **`crumb-alpr`** worker (fast-alpr; no cloud,
 no third-party agent). It pulls a camera's go2rtc restream, motion-gates, reads
 plates, and POSTs them to the same LPR store. Enable LPR (above), then in
-**Admin → LPR** mint an **ingest token** (rotate token), set the `LPR_*` vars in
+**Admin → LPR** mint an **ingest token** (rotate token), set the camera's
+**Engine** to **Crumb (fast-alpr)** or **Both** in the per-camera table (the
+server only accepts worker reads for those engines), set the `LPR_*` vars in
 `.env` (`LPR_INGEST_TOKEN`, `LPR_CAMERA_ID`, `LPR_RTSP_URL`; see `.env.example`),
 and start it: `docker compose --profile alpr up -d --build crumb-alpr`. It's
 CPU-only and profile-gated (a plain `up -d` never starts it); one instance per
