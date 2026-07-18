@@ -55,6 +55,9 @@ pub fn json_routes() -> Router<AppState> {
         .route("/lpr/ab-confirm", post(post_ab_confirm))
         .route("/config/lpr", get(get_lpr_config).put(put_lpr_config))
         .route("/config/lpr/rotate-token", post(rotate_lpr_token))
+        // Storage-footprint hint for the retention field (admin-only, like the
+        // /config/lpr card it decorates).
+        .route("/lpr/storage", get(get_lpr_storage))
         .route(
             "/lpr/watchlist",
             get(get_watchlist).post(post_watchlist_entry),
@@ -838,6 +841,38 @@ async fn put_lpr_config(
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(s.into()))
+}
+
+/// `GET /lpr/storage` response — the storage footprint of stored plate reads,
+/// rendered by the admin console as a hint under the retention-days field
+/// ("12,431 reads · ~1.8 GB of images · oldest 61 days").
+#[derive(Debug, Serialize)]
+pub struct LprStorageDto {
+    /// Total stored plate reads.
+    pub reads: i64,
+    /// Total bytes of stored crop JPEGs (external-engine reads; Frigate reads
+    /// carry a snapshot URL instead and contribute 0 here).
+    pub crop_bytes: i64,
+    /// Timestamp of the oldest stored read (`null` when there are none).
+    pub oldest_ts: Option<DateTime<Utc>>,
+}
+
+/// `GET /lpr/storage` — admin. Aggregate `plate_reads` storage usage, so the
+/// retention setting shows what it is actually pruning. Admin-only like the
+/// `/config/lpr` card it decorates (it aggregates across ALL cameras, so it is
+/// not camera-scoped like `/plates`).
+async fn get_lpr_storage(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<LprStorageDto>, ApiError> {
+    let (reads, crop_bytes, oldest_ts) = db::lpr_storage_stats(state.pool())
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(LprStorageDto {
+        reads,
+        crop_bytes,
+        oldest_ts,
+    }))
 }
 
 /// Query parameters for `GET /plates`.

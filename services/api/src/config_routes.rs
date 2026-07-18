@@ -356,13 +356,14 @@ async fn set_camera_clip_source(
 
 // ─── per-camera LPR settings (migration 0069: engine + zones + min-confidence) ──
 
-/// `PUT /config/cameras/:id/lpr` body — per-camera settings for the crumb-alpr
-/// worker. `engine` selects which plate source feeds this camera; `zones` is the
-/// `{include,exclude}` detection-polygon config (or null to clear).
+/// `PUT /config/cameras/:id/lpr` body — per-camera LPR settings. `engine`
+/// selects which plate source feeds this camera (`none` = LPR off for it) and
+/// is the SINGLE control since migration 0071: the legacy `enabled` flag is
+/// derived server-side (`engine ∈ {crumb-alpr, both}`), so an `enabled` field
+/// in the body is ignored. `zones` is the `{include,exclude}`
+/// detection-polygon config (or null to clear).
 #[derive(serde::Deserialize)]
 struct CameraLprRequest {
-    #[serde(default)]
-    enabled: bool,
     #[serde(default = "default_lpr_engine")]
     engine: String,
     #[serde(default = "default_lpr_min_conf")]
@@ -449,10 +450,10 @@ async fn set_camera_lpr(
     Json(body): Json<CameraLprRequest>,
 ) -> Result<StatusCode, ApiError> {
     let engine = match body.engine.as_str() {
-        "frigate" | "crumb-alpr" | "both" => body.engine,
+        "none" | "frigate" | "crumb-alpr" | "both" => body.engine,
         other => {
             return Err(ApiError::BadRequest(format!(
-                "engine must be 'frigate', 'crumb-alpr', or 'both', got '{other}'"
+                "engine must be 'none', 'frigate', 'crumb-alpr', or 'both', got '{other}'"
             )))
         }
     };
@@ -460,16 +461,9 @@ async fn set_camera_lpr(
         validate_lpr_zones(z).map_err(ApiError::BadRequest)?;
     }
     let min_conf = body.min_confidence.clamp(0.0, 1.0);
-    db::update_camera_lpr(
-        state.pool(),
-        id,
-        body.enabled,
-        &engine,
-        min_conf,
-        body.zones,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
+    db::update_camera_lpr(state.pool(), id, &engine, min_conf, body.zones)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

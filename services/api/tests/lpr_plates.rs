@@ -672,3 +672,125 @@ async fn lpr_config_partial_update_preserves_other_fields() {
     );
     assert!((v["watchlist_fuzz"].as_f64().unwrap() - 0.1).abs() < 1e-6);
 }
+
+/// Migration 0071: `none` is a first-class per-camera engine value, and the
+/// legacy `enabled` flag is DERIVED from the engine (`∈ {crumb-alpr, both}`) —
+/// a legacy body's `enabled` field must be ignored, and `GET` (the same DB fn
+/// the crumb-alpr worker's `GET /lpr/worker-config` poll uses) must report the
+/// derived value.
+#[tokio::test]
+async fn camera_lpr_engine_none_and_derived_enabled() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+    let uri = format!("/config/cameras/{cam}/lpr");
+
+    // 'none' = LPR off for this camera.
+    let resp = app
+        .send(put_auth_json(
+            &uri,
+            &token,
+            &serde_json::json!({ "engine": "none", "min_confidence": 0.7, "zones": null }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "'none' is accepted");
+    let v = body_json(app.send(get_auth(&uri, &token)).await).await;
+    assert_eq!(v["engine"], "none");
+    assert_eq!(v["enabled"], false, "'none' derives enabled=false");
+
+    // A legacy client still sending `enabled: false` with a worker engine must
+    // NOT override the derivation: the engine is the single control.
+    let resp = app
+        .send(put_auth_json(
+            &uri,
+            &token,
+            &serde_json::json!({ "engine": "crumb-alpr", "enabled": false, "zones": null }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let v = body_json(app.send(get_auth(&uri, &token)).await).await;
+    assert_eq!(v["engine"], "crumb-alpr");
+    assert_eq!(
+        v["enabled"], true,
+        "worker engines derive enabled=true regardless of a legacy enabled field"
+    );
+
+    // Frigate-only means the worker must not read the camera.
+    let resp = app
+        .send(put_auth_json(
+            &uri,
+            &token,
+            &serde_json::json!({ "engine": "frigate", "enabled": true, "zones": null }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let v = body_json(app.send(get_auth(&uri, &token)).await).await;
+    assert_eq!(v["enabled"], false, "frigate-only derives enabled=false");
+
+    // Unknown engine values still 400.
+    let resp = app
+        .send(put_auth_json(
+            &uri,
+            &token,
+            &serde_json::json!({ "engine": "openalpr", "zones": null }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `GET /lpr/storage` — the retention hint's data source: admin-only, and its
+/// aggregates move when a read (with a crop) is stored. The test DB is shared
+/// across parallel tests, so assertions are monotone (`>=`), never exact.
+#[tokio::test]
+async fn lpr_storage_stats_admin_only_and_counts() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    // A viewer WITH view_plates still must not read the cross-camera aggregate.
+    let user = seed_viewer(app.pool(), &[cam]).await;
+    let vtoken = login(&app, &user.username, &user.password).await;
+    let resp = app.send(get_auth("/lpr/storage", &vtoken)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "GET /lpr/storage is admin-only"
+    );
+
+    // Seed one read carrying a 1000-byte crop, then check the aggregates.
+    let crop_len = 1000usize;
+    db::upsert_plate_read(
+        app.pool(),
+        &db::UpsertPlateReadParams {
+            camera_id: cam,
+            ts: chrono::Utc::now(),
+            plate: "STOR4GE".to_owned(),
+            plate_raw: Some("STOR4GE".to_owned()),
+            confidence: Some(0.9),
+            source_id: "crumb-alpr".to_owned(),
+            provider_event_id: Some(unique("pid")),
+            event_id: None,
+            snapshot_url: None,
+            bbox: None,
+            crop: Some(vec![0u8; crop_len]),
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .expect("seed plate_read with crop");
+
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+    let resp = app.send(get_auth("/lpr/storage", &token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert!(
+        v["reads"].as_i64().unwrap() >= 1,
+        "at least the seeded read"
+    );
+    assert!(
+        v["crop_bytes"].as_i64().unwrap() >= crop_len as i64,
+        "crop bytes cover the seeded crop, got {v}"
+    );
+    assert!(v["oldest_ts"].is_string(), "oldest_ts present, got {v}");
+}

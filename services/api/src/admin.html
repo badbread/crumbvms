@@ -688,6 +688,18 @@ code{background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:12px
   </div>
 </div><!-- /app -->
 
+<!-- ══ LPR DETECTION-ZONES MODAL (opened from the LPR section's camera table;
+     body is rendered by openLprZones so the canvas editor mounts fresh) ══ -->
+<div id="lpr-zones-modal" class="modal-overlay hidden">
+  <div class="modal-box" style="width:760px;max-width:100%">
+    <div class="modal-header">
+      <div class="modal-title" id="lz-modal-title">Detection zones</div>
+      <button class="modal-close" onclick="closeLprZones()">&times;</button>
+    </div>
+    <div id="lz-modal-body"></div>
+  </div>
+</div>
+
 <!-- ══ STREAM TEST MODAL (kept, focused video-frame context) ══ -->
 <div id="stest-modal" class="modal-overlay hidden">
   <div class="modal-box">
@@ -3872,8 +3884,9 @@ function routeApply(r) {
       return select('security-root');
     }
     if (sec === 'detection')     return select('detection-root');
-    // Plates deep-link only resolves while LPR is enabled; otherwise fall through.
-    if (sec === 'plates' && LPR_CONFIG && LPR_CONFIG.enabled) return select('plates-root');
+    // LPR deep-link resolves whenever the admin LPR config loaded (the section
+    // hosts the enable toggle itself now); otherwise fall through.
+    if (sec === 'plates' && LPR_CONFIG) return select('plates-root');
     if (sec === 'notifications') return select('notifications-root');
     if (sec === 'server')        return select('server-root');
     return selectNone();
@@ -3992,8 +4005,10 @@ function renderTree() {
     item("select('storage-root')",  icon('storage',17),     'Storage',            stoActive, STORAGES.length) +
     `<div class="rail-eyebrow">Intelligence</div>` +
     item("select('detection-root')",     icon('integration',17), 'Detection &amp; clips', detActive, null) +
-    // Plates: only when LPR capture is enabled (privacy-sensitive, off by default).
-    ((LPR_CONFIG && LPR_CONFIG.enabled)
+    // LPR: shown whenever the admin LPR config loaded (the section now hosts
+    // the enable toggle + all LPR settings, so it must be reachable while
+    // capture is still off). Watchlist/reads inside it stay gated on enabled.
+    (LPR_CONFIG
       ? item("select('plates-root')", icon('cam_lpr',17), 'LPR', selKind==='plates-root', null)
       : '') +
     item("select('notifications-root')",  icon('bell',17),        'Notifications',        notActive, null) +
@@ -4830,7 +4845,13 @@ function renderCamInfoTab(c) {
 
     <div class="policy-section">
       <div class="policy-section-title">License-plate recognition (this camera)</div>
-      <div id="ce-lpr"><div class="card-hint" style="margin:0">Loading LPR settings&hellip;</div></div>
+      <!-- LPR moved to the dedicated LPR section (item #2): engine, confidence
+           and zones for EVERY camera are managed side by side there, so this
+           card is just a signpost, not a second (drift-prone) editor. -->
+      <div class="card-hint" style="margin:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span>Engine, confidence, and detection zones for every camera are managed together in the <b>LPR</b> section.</span>
+        <button class="ghost sm" type="button" onclick="select('plates-root')">Open LPR settings</button>
+      </div>
     </div>
 
     <details class="detail-section" id="ce-probe-details">
@@ -4875,7 +4896,6 @@ function renderCamInfoTab(c) {
   loadCameraCompat(c.id);
   loadCameraAudioStatus(c.id);
   loadCameraHaLinks(c.id);
-  loadCameraLpr(c.id);
 }
 
 /* ── Camera compatibility (issue #48) ──
@@ -5034,19 +5054,29 @@ let HA_PICKER_SHOWALL = false;
 // device_classes worth linking to a camera; the rest hide under "Other sensors".
 const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
 
-/* Per-camera LPR settings (engine / min-confidence / detection zones), fetched
-   on camera-edit open (GET /config/cameras/:id/lpr) and saved on its own button
-   (PUT /config/cameras/:id/lpr). The zones editor is a canvas polygon drawer over
-   the camera snapshot (include = green, exclude = red). State in `LZ`. */
-let LZ = null; // {camId, include:[[[x,y]…]], exclude:[…], cur:[], mode:'include'|'exclude'}
+/* ── Per-camera LPR zone editor (modal, opened from the LPR section's camera
+   table — see loadLprCamTable). A canvas polygon editor over the camera
+   snapshot: include = green, exclude = red. Draws AND edits (item #13):
+     * click to place points, double-click / Finish to close a shape;
+     * drag a vertex of a closed shape to reshape it;
+     * click an edge to insert a vertex there (and drag it in one motion);
+     * right-click a vertex to delete it (a 3-point shape is removed whole);
+     * right-click inside a shape to delete the shape;
+     * drag inside a shape to move the whole polygon (clamped to the frame).
+   Normalized 0..1 coords throughout, saved via the same
+   PUT /config/cameras/:id/lpr zones payload. State in `LZ`. */
+let LZ = null; // {camId, include:[[[x,y]…]], exclude:[…], cur:[], mode, drag, suppressClick}
 
-async function loadCameraLpr(camId) {
-  const el = $('ce-lpr'); if (!el) return;
-  let cfg;
-  try { cfg = await api('/config/cameras/' + camId + '/lpr'); }
-  catch (e) { el.innerHTML = `<div class="form-msg err" style="margin:0">${esc((e && e.message) || 'Failed to load LPR settings')}</div>`; return; }
-  const eng = cfg.engine || 'frigate';
-  const opt = (v, label) => `<option value="${v}" ${eng===v?'selected':''}>${label}</option>`;
+const LZ_VTX_PX = 8;  // vertex grab tolerance (px)
+const LZ_EDGE_PX = 6; // edge-insert tolerance (px)
+
+async function openLprZones(camId) {
+  const cam = CAMS.find(c => c.id === camId);
+  let cfg = LPR_CAMS[camId];
+  if (!cfg) {
+    try { cfg = await api('/config/cameras/' + camId + '/lpr'); LPR_CAMS[camId] = cfg; }
+    catch (e) { toast((e && e.message) || 'Failed to load LPR settings'); return; }
+  }
   const z = (cfg.zones && typeof cfg.zones === 'object') ? cfg.zones : {};
   LZ = {
     camId,
@@ -5054,19 +5084,13 @@ async function loadCameraLpr(camId) {
     exclude: Array.isArray(z.exclude) ? z.exclude.filter(Array.isArray).map(p => p.map(pt => pt.slice())) : [],
     cur: [],
     mode: 'include',
+    drag: null,
+    suppressClick: false,
   };
-  el.innerHTML = `
-    <div class="card-hint" style="margin:0 0 10px 0">Which engine reads plates on this camera. The Crumb-native <b>crumb-alpr</b> worker (fast-alpr) reads only the include zones (or the whole frame if none) and ignores the exclude zones.</div>
-    <div class="grid2">
-      <div><label class="field-label" style="margin-top:0">Engine ${infoHint('Frigate = plates from Frigate&#39;s native LPR on the event stream. crumb-alpr = Crumb&#39;s own local fast-alpr worker (POST /lpr/reads). Both = accept reads from either engine.')}</label>
-        <select id="ce-lpr-engine" style="font-size:13px">${opt('frigate','Frigate native LPR')}${opt('crumb-alpr','Crumb-native (fast-alpr worker)')}${opt('both','Both')}</select></div>
-      <div><label class="field-label" style="margin-top:0">Min OCR confidence ${infoHint('crumb-alpr drops reads below this mean character confidence (0–1). 0.8 is a good default.')}</label>
-        <input id="ce-lpr-minconf" type="number" min="0" max="1" step="0.05" value="${esc(String(cfg.min_confidence ?? 0.8))}" /></div>
-    </div>
-    <label class="chk" style="margin-top:10px"><input type="checkbox" id="ce-lpr-enabled" ${cfg.enabled?'checked':''}/> crumb-alpr worker should read this camera</label>
-
-    <label class="field-label">Detection zones ${infoHint('Draw regions on the snapshot. Include (green) = only read plates whose box centre is inside one of them; Exclude (red) = ignore plates inside them. No include zones = the whole frame is read. Click to place points; double-click or Finish to close a shape.')}</label>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 8px">
+  $('lz-modal-title').textContent = 'Detection zones — ' + ((cam && cam.name) || 'camera');
+  $('lz-modal-body').innerHTML = `
+    <div class="card-hint" style="margin:0 0 8px 0">Include (green) = only read plates whose box centre is inside one; Exclude (red) = ignore plates inside. No include zones = the whole frame is read.</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 8px">
       <button type="button" id="lz-mode-include" class="sm" onclick="lzSetMode('include')">Include</button>
       <button type="button" id="lz-mode-exclude" class="sm ghost" onclick="lzSetMode('exclude')">Exclude</button>
       <span style="flex:0 0 8px"></span>
@@ -5074,14 +5098,17 @@ async function loadCameraLpr(camId) {
       <button type="button" class="ghost sm" onclick="lzUndo()">Undo</button>
       <button type="button" class="ghost sm" onclick="lzClear()">Clear all</button>
     </div>
-    <div class="cm-stage" id="lz-stage" style="max-height:40vh">
+    <div class="cm-stage" id="lz-stage" style="max-height:52vh">
       <img id="lz-img" alt="" />
       <canvas id="lz-canvas"></canvas>
     </div>
     <div class="card-hint" id="lz-hint" style="margin-top:6px"></div>
-
-    <div style="margin-top:10px"><button class="primary sm" onclick="saveCameraLpr('${camId}')">Save LPR settings</button></div>
-    <div id="ce-lpr-msg" class="form-msg"></div>`;
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <button class="primary sm" onclick="saveLprZones()">Save zones</button>
+      <button class="ghost sm" onclick="closeLprZones()">Cancel</button>
+    </div>
+    <div id="lz-msg" class="form-msg"></div>`;
+  $('lpr-zones-modal').classList.remove('hidden');
 
   const img = $('lz-img'), cv = $('lz-canvas');
   try { img.src = await snapshotUrl(camId); } catch { /* no snapshot — draw on the empty stage */ }
@@ -5092,9 +5119,20 @@ async function loadCameraLpr(camId) {
   img.onload = sizeCanvas;
   img.onerror = sizeCanvas;
   setTimeout(sizeCanvas, 80);
+  cv.onmousedown = lzMouseDown;
+  cv.onmousemove = lzMouseMove;
+  cv.onmouseup = lzMouseUp;
+  cv.onmouseleave = lzMouseUp;
   cv.onclick = lzCanvasClick;
   cv.ondblclick = (e) => { e.preventDefault(); lzFinish(); };
+  cv.oncontextmenu = lzContextMenu;
   lzSetMode('include');
+}
+
+function closeLprZones() {
+  const m = $('lpr-zones-modal');
+  if (m) m.classList.add('hidden');
+  LZ = null;
 }
 
 function lzSetMode(m) {
@@ -5104,17 +5142,130 @@ function lzSetMode(m) {
   if (inc) inc.className = 'sm' + (m === 'include' ? '' : ' ghost');
   if (exc) exc.className = 'sm' + (m === 'exclude' ? '' : ' ghost');
   const h = $('lz-hint');
-  if (h) h.innerHTML = `Drawing <b style="color:${m==='exclude'?'var(--danger)':'var(--ok)'}">${m==='exclude'?'Exclude':'Include'}</b> — click the snapshot to place points, double-click to close the shape.`;
+  if (h) h.innerHTML = `Drawing <b style="color:${m==='exclude'?'var(--danger)':'var(--ok)'}">${m==='exclude'?'Exclude':'Include'}</b> — click to place points, double-click to close. On a closed shape: drag a point to reshape, click an edge to add a point, right-click a point to delete it, right-click inside to delete the shape, drag inside to move it.`;
   lzRedraw();
 }
 
+/* Pointer position in normalized 0..1 coords + the canvas' CSS pixel size
+   (tolerances are in screen px, geometry is stored normalized). */
+function lzEventNorm(e) {
+  const cv = $('lz-canvas');
+  const r = cv.getBoundingClientRect();
+  return {
+    x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+    y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+    w: r.width || 1, h: r.height || 1,
+  };
+}
+/* Every CLOSED polygon with its list name + index, exclude first so the
+   shapes drawn on top win hit-testing ties. */
+function lzAllPolys() {
+  return LZ.exclude.map((poly, pi) => ({ list: 'exclude', pi, poly }))
+    .concat(LZ.include.map((poly, pi) => ({ list: 'include', pi, poly })));
+}
+function lzHitVertex(pt) {
+  for (const e of lzAllPolys()) {
+    for (let vi = 0; vi < e.poly.length; vi++) {
+      const dx = (e.poly[vi][0] - pt.x) * pt.w, dy = (e.poly[vi][1] - pt.y) * pt.h;
+      if (dx*dx + dy*dy <= LZ_VTX_PX*LZ_VTX_PX) return { list: e.list, pi: e.pi, vi };
+    }
+  }
+  return null;
+}
+function lzHitEdge(pt) {
+  const px = pt.x * pt.w, py = pt.y * pt.h;
+  for (const e of lzAllPolys()) {
+    const n = e.poly.length;
+    for (let i = 0; i < n; i++) {
+      const a = e.poly[i], b = e.poly[(i + 1) % n];
+      const ax = a[0]*pt.w, ay = a[1]*pt.h, bx = b[0]*pt.w, by = b[1]*pt.h;
+      const dx = bx - ax, dy = by - ay, len2 = dx*dx + dy*dy;
+      if (!len2) continue;
+      let t = ((px - ax)*dx + (py - ay)*dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      const qx = ax + t*dx, qy = ay + t*dy;
+      if ((px-qx)*(px-qx) + (py-qy)*(py-qy) <= LZ_EDGE_PX*LZ_EDGE_PX) {
+        return { list: e.list, pi: e.pi, insertAt: i + 1, x: qx / pt.w, y: qy / pt.h };
+      }
+    }
+  }
+  return null;
+}
+function lzPointInPoly(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function lzHitPoly(pt) {
+  for (const e of lzAllPolys()) if (lzPointInPoly(pt.x, pt.y, e.poly)) return { list: e.list, pi: e.pi };
+  return null;
+}
+
+function lzMouseDown(e) {
+  if (!LZ || e.button !== 0) return;
+  if (LZ.cur.length) return; // mid-draw: clicks place points, no editing
+  const pt = lzEventNorm(e);
+  const v = lzHitVertex(pt);
+  if (v) { LZ.drag = { kind: 'vertex', list: v.list, pi: v.pi, vi: v.vi }; LZ.suppressClick = true; return; }
+  const ed = lzHitEdge(pt);
+  if (ed) {
+    LZ[ed.list][ed.pi].splice(ed.insertAt, 0, [+ed.x.toFixed(4), +ed.y.toFixed(4)]);
+    LZ.drag = { kind: 'vertex', list: ed.list, pi: ed.pi, vi: ed.insertAt };
+    LZ.suppressClick = true;
+    lzRedraw();
+    return;
+  }
+  const ph = lzHitPoly(pt);
+  if (ph) {
+    LZ.drag = { kind: 'poly', list: ph.list, pi: ph.pi, start: [pt.x, pt.y], orig: LZ[ph.list][ph.pi].map(p => p.slice()) };
+    LZ.suppressClick = true;
+  }
+}
+function lzMouseMove(e) {
+  if (!LZ) return;
+  const pt = lzEventNorm(e);
+  if (LZ.drag) {
+    if (LZ.drag.kind === 'vertex') {
+      LZ[LZ.drag.list][LZ.drag.pi][LZ.drag.vi] = [+pt.x.toFixed(4), +pt.y.toFixed(4)];
+    } else {
+      // Whole-polygon drag: clamp the delta so the shape never leaves 0..1.
+      let dx = pt.x - LZ.drag.start[0], dy = pt.y - LZ.drag.start[1];
+      const xs = LZ.drag.orig.map(p => p[0]), ys = LZ.drag.orig.map(p => p[1]);
+      dx = Math.max(-Math.min(...xs), Math.min(1 - Math.max(...xs), dx));
+      dy = Math.max(-Math.min(...ys), Math.min(1 - Math.max(...ys), dy));
+      LZ[LZ.drag.list][LZ.drag.pi] = LZ.drag.orig.map(p => [+(p[0] + dx).toFixed(4), +(p[1] + dy).toFixed(4)]);
+    }
+    lzRedraw();
+    return;
+  }
+  const cv = $('lz-canvas'); if (!cv) return;
+  cv.style.cursor = LZ.cur.length ? 'crosshair'
+    : (lzHitVertex(pt) ? 'grab' : (lzHitEdge(pt) ? 'copy' : (lzHitPoly(pt) ? 'move' : 'crosshair')));
+}
+function lzMouseUp() { if (LZ) LZ.drag = null; }
+function lzContextMenu(e) {
+  e.preventDefault();
+  if (!LZ || LZ.cur.length) return;
+  const pt = lzEventNorm(e);
+  const v = lzHitVertex(pt);
+  if (v) {
+    const poly = LZ[v.list][v.pi];
+    if (poly.length <= 3) LZ[v.list].splice(v.pi, 1); // below 3 points is no shape
+    else poly.splice(v.vi, 1);
+    lzRedraw();
+    return;
+  }
+  const ph = lzHitPoly(pt);
+  if (ph) { LZ[ph.list].splice(ph.pi, 1); lzRedraw(); }
+}
 function lzCanvasClick(e) {
   if (!LZ) return;
-  const cv = $('lz-canvas'); if (!cv) return;
-  const r = cv.getBoundingClientRect();
-  const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
-  const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
-  LZ.cur.push([+x.toFixed(4), +y.toFixed(4)]);
+  if (LZ.suppressClick) { LZ.suppressClick = false; return; } // this click started an edit
+  const pt = lzEventNorm(e);
+  LZ.cur.push([+pt.x.toFixed(4), +pt.y.toFixed(4)]);
   lzRedraw();
 }
 
@@ -5148,7 +5299,7 @@ function lzPoly(ctx, poly, w, h, stroke, fill, closed) {
   if (fill) { ctx.fillStyle = fill; ctx.fill(); }
   ctx.stroke();
   ctx.fillStyle = stroke;
-  poly.forEach(p => { ctx.beginPath(); ctx.arc(p[0]*w, p[1]*h, 3, 0, 6.2832); ctx.fill(); });
+  poly.forEach(p => { ctx.beginPath(); ctx.arc(p[0]*w, p[1]*h, 4, 0, 6.2832); ctx.fill(); });
 }
 
 function lzRedraw() {
@@ -5160,25 +5311,32 @@ function lzRedraw() {
   lzPoly(ctx, LZ.cur, w, h, LZ.mode === 'exclude' ? '#ff5c6c' : '#3ddc84', null, false);
 }
 
-async function saveCameraLpr(camId) {
-  setMsg('ce-lpr-msg', '');
-  if (LZ && LZ.cur.length >= 3) lzFinish(); // auto-close a dangling shape
+async function saveLprZones() {
+  if (!LZ) return;
+  setMsg('lz-msg', '');
+  if (LZ.cur.length >= 3) lzFinish(); // auto-close a dangling shape
+  LZ.cur = [];
   let zones = null;
-  if (LZ && (LZ.include.length || LZ.exclude.length)) {
+  if (LZ.include.length || LZ.exclude.length) {
     zones = {};
     if (LZ.include.length) zones.include = LZ.include;
     if (LZ.exclude.length) zones.exclude = LZ.exclude;
   }
+  const camId = LZ.camId;
+  const cfg = LPR_CAMS[camId] || {};
   const body = {
-    enabled: $('ce-lpr-enabled').checked,
-    engine: $('ce-lpr-engine').value,
-    min_confidence: Math.max(0, Math.min(1, parseFloat(($('ce-lpr-minconf')||{}).value) || 0.8)),
+    engine: cfg.engine || 'frigate',
+    min_confidence: cfg.min_confidence ?? 0.8,
     zones: zones,
   };
   try {
     await api('/config/cameras/' + camId + '/lpr', { method: 'PUT', body: JSON.stringify(body) });
-    toast('LPR settings saved for this camera.');
-  } catch (e) { setMsg('ce-lpr-msg', (e && e.message) || 'Save failed', 'err'); }
+    cfg.zones = zones; LPR_CAMS[camId] = cfg;
+    const sum = $('lpr-zsum-' + camId);
+    if (sum) sum.textContent = lprZoneSummary(zones);
+    toast('Zones saved.');
+    closeLprZones();
+  } catch (e) { setMsg('lz-msg', (e && e.message) || 'Save failed', 'err'); }
 }
 
 async function loadCameraHaLinks(camId) {
@@ -6192,12 +6350,9 @@ async function loadMotionCacheGauge() {
 async function renderDetectionClips() {
   selKind = 'detection-root'; selId = null;
   $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('integration',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Detection &amp; clips</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
-  let c, s, ha, lpr;
-  try { [c, s, ha, lpr] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha'), api('/config/lpr')]); }
+  let c, s, ha;
+  try { [c, s, ha] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha')]); }
   catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
-  // Keep the cached LPR flag in step with what this pane just fetched, so the
-  // left-nav Plates entry appears/disappears the moment LPR is toggled here.
-  LPR_CONFIG = lpr;
   // Stash the full server settings so saveDetectionServer() can send a COMPLETE
   // /config/server body, that PUT is a whole-row replace with required Crumb
   // fields, so a partial body would 400 (missing fields) or blank the Crumb bases
@@ -6272,30 +6427,9 @@ async function renderDetectionClips() {
       <div id="ha-msg" class="form-msg"></div>
     </div>
 
-    <!-- License-plate recognition (lpr_config): privacy-sensitive, off by default. -->
-    <div class="rp-section-head" style="margin-top:22px">
-      <div class="policy-section-title" style="margin-bottom:0">License-plate recognition</div>
-      <button class="primary sm" onclick="saveLpr()">Save</button>
-    </div>
-    <div class="policy-section" style="margin-top:10px">
-      <div class="card-hint" style="margin:-2px 0 10px 2px">Building a database of recognised license plates is <b>privacy-sensitive</b>, so plate capture is <b>off by default</b>. When enabled, plate reads are retained for the window below and are visible only to roles granted the <b>View license plates</b> capability.</div>
-      <label class="chk"><input type="checkbox" id="lpr-enabled" ${lpr.enabled?'checked':''}/> Enable license-plate capture</label>
-      <div class="grid2" style="margin-top:10px">
-        <div><label class="field-label" style="margin-top:0">Plate-read retention (days) ${infoHint('How long recognised plate reads are kept before automatic deletion. 1–3650 days. Independent of footage/storage retention — plate reads are small database records pruned on their own schedule, so deleting video never deletes plate reads and vice-versa.')}</label><input id="lpr-retention" type="number" min="1" max="3650" value="${esc(String(lpr.retention_days))}" /></div>
-        <div><label class="field-label" style="margin-top:0">Match fuzziness (tolerated misreads) ${infoHint('How many characters may differ when matching a read to a watch or ignore plate. Scales with plate length: 20% is about 1 wrong character on a 6-7 char plate; 0% = exact. Frigate ALPR sometimes misreads a character, and this catches those. Applies to both watch (alert) and ignore (drop) entries. Max 50%.')}</label><input id="lpr-fuzz" type="number" min="0" max="50" step="5" value="${esc(String(Math.round((lpr.watchlist_fuzz||0)*100)))}" /></div>
-      </div>
-      <div class="card-hint" style="margin-top:4px">Saving applies immediately, no restart.</div>
-      <!-- Ingest token for the opt-in crumb-alpr worker (Crumb-native fast-alpr engine). -->
-      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
-        <label class="field-label" style="margin-top:0">Crumb-native LPR worker ${infoHint('The optional crumb-alpr worker (fast-alpr) is Crumb&#39;s own local plate OCR — no cloud, no third-party agent, better than Frigate on hard angles. It authenticates to POST /lpr/reads with the ingest token below. Rotate to mint a new one; the old token stops working immediately. Run the worker with: docker compose --profile alpr up -d --build crumb-alpr')}</label>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <span id="lpr-token-status" class="card-hint" style="margin:0">${lpr.has_ingest_token ? 'An ingest token is set.' : 'No ingest token yet — rotate to create one.'}</span>
-          <button class="sm" type="button" onclick="rotateLprToken()">Rotate ingest token</button>
-        </div>
-        <div id="lpr-token-reveal" class="form-msg" style="display:none;margin-top:8px"></div>
-      </div>
-      <div id="lpr-msg" class="form-msg"></div>
-    </div>
+    <!-- License-plate recognition moved to the dedicated LPR section (item #2):
+         the global capture/retention/token knobs now live beside the per-camera
+         engine table and the watchlist, not in this pane. -->
 
     <!-- Frigate stream address bases (external go2rtc), writes server_settings. -->
     <div class="rp-section-head" style="margin-top:22px">
@@ -6472,20 +6606,22 @@ async function testHa() {
 }
 /* ── License-plate recognition config (lpr_config) ──
    Toggles plate CAPTURE (privacy-sensitive, off by default) and the plate-read
-   retention window. On save we refresh the left nav so the Plates entry
-   appears/disappears with the enabled flag. */
+   retention window, from the LPR section's Settings card. PARTIAL body: the
+   watchlist fuzziness is owned by the slider next to the watchlist (same PUT,
+   omitted fields keep their stored values). Toggling `enabled` re-renders the
+   LPR page so the watchlist/reads sections appear/disappear with it. */
 async function saveLpr() {
   setMsg('lpr-msg', '');
   const days = parseInt(($('lpr-retention') || {}).value, 10);
   if (!Number.isFinite(days) || days < 1 || days > 3650) {
     setMsg('lpr-msg', 'Retention must be between 1 and 3650 days.', 'err'); return;
   }
-  const fuzzPct = Math.max(0, Math.min(50, parseInt(($('lpr-fuzz') || {}).value, 10) || 0));
-  const body = { enabled: $('lpr-enabled').checked, retention_days: days, watchlist_fuzz: fuzzPct / 100 };
+  const wasEnabled = !!(LPR_CONFIG && LPR_CONFIG.enabled);
+  const body = { enabled: $('lpr-enabled').checked, retention_days: days };
   try {
     LPR_CONFIG = await api('/config/lpr', { method: 'PUT', body: JSON.stringify(body) });
-    renderTree();               // show/hide the Plates nav entry to match
     toast('License-plate settings saved.');
+    if (LPR_CONFIG.enabled !== wasEnabled && selKind === 'plates-root') renderPlates();
   } catch (e) { setMsg('lpr-msg', e.message, 'err'); }
 }
 /* Mint a new crumb-alpr ingest token (POST /config/lpr/rotate-token). The token
@@ -9025,29 +9161,36 @@ const NOTIF_KIND_LABEL = {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   PLATES, license-plate reads (GET /plates)
-   Only reachable while LPR capture is enabled (the nav entry is gated on
-   LPR_CONFIG.enabled). Camera-scoped + view_plates-gated server-side; we simply
-   scope the query to every camera the console holds and let the API filter.
+   LPR SECTION — ALL license-plate recognition config in one place (item #2):
+   the global capture/retention/token knobs up top (moved out of Detection &
+   clips), then the per-camera engine/confidence/zones table (moved out of the
+   camera editor), then the watchlist + recent reads (shown only while capture
+   is enabled). The nav entry appears whenever the admin LPR config loaded, so
+   the enable toggle itself is reachable while capture is still off.
+   Reads stay camera-scoped + view_plates-gated server-side.
 ═══════════════════════════════════════════════════════════════════════════ */
 const PLATE_MATCH_MODES = ['contains', 'prefix', 'exact', 'fuzzy'];
 const PLATES_LIMIT = 200;
 
-function renderPlates() {
+async function renderPlates() {
   selKind = 'plates-root'; selId = null;
+  // Re-fetch the global config so the card reflects reality, not a stale cache.
+  try { LPR_CONFIG = await api('/config/lpr'); }
+  catch (e) {
+    $('right-pane').innerHTML = `<div class="policy-section"><div class="form-msg err">${esc((e && e.message) || 'Failed to load LPR settings')}</div></div>`;
+    return;
+  }
+  if (selKind !== 'plates-root') return; // navigated away mid-fetch
+  const lpr = LPR_CONFIG;
   const modeOpts = PLATE_MATCH_MODES
     .map(m => `<option value="${m}" ${m==='contains'?'selected':''}>${esc(m)}</option>`).join('');
-  $('right-pane').innerHTML = `
-    <div class="rp-head">
-      <div class="rp-head-left">
-        <span class="rp-head-icon">${icon('cam_lpr',22)}</span>
-        <div class="rp-head-titles">
-          <div class="rp-head-title">LPR</div>
-          <div class="rp-head-sub">Recognised license-plate reads, most recent first</div>
-        </div>
-      </div>
-    </div>
-    <div class="policy-section" style="margin-top:0">
+
+  // Watchlist + recent reads only render while capture is on: with capture off
+  // there are no NEW reads, and surfacing the stored ones behind an off switch
+  // would look like capture is still running.
+  const gated = !lpr.enabled ? `
+    <div class="info-note" style="margin-top:12px">License-plate capture is <b>off</b>. Enable it above to configure the watchlist and see recognised reads. Already-stored reads are kept (and pruned by retention) while capture is off.</div>` : `
+    <div class="policy-section" style="margin-top:12px">
       <div class="rp-section-head" style="margin-top:0">
         <div class="policy-section-title" style="margin-bottom:0">Watchlist</div>
       </div>
@@ -9084,9 +9227,163 @@ function renderPlates() {
       <div class="card-hint" style="margin-top:6px">Showing up to ${PLATES_LIMIT} reads across your cameras. Match mode applies to the search text.</div>
       <div id="plate-results" style="margin-top:12px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
     </div>`;
-  loadWatchlist();
-  loadPlates();
-  onWlFuzzInput();
+
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left">
+        <span class="rp-head-icon">${icon('cam_lpr',22)}</span>
+        <div class="rp-head-titles">
+          <div class="rp-head-title">LPR</div>
+          <div class="rp-head-sub">License-plate recognition — capture, engines, zones, watchlist &amp; reads</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Global capture settings (lpr_config): privacy-sensitive, off by default. -->
+    <div class="rp-section-head" style="margin-top:0">
+      <div class="policy-section-title" style="margin-bottom:0">Settings</div>
+      <button class="primary sm" onclick="saveLpr()">Save</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Building a database of recognised license plates is <b>privacy-sensitive</b>, so plate capture is <b>off by default</b>. When enabled, plate reads are retained for the window below and are visible only to roles granted the <b>View license plates</b> capability.</div>
+      <label class="chk"><input type="checkbox" id="lpr-enabled" ${lpr.enabled?'checked':''}/> Enable license-plate capture</label>
+      <div class="grid2" style="margin-top:10px">
+        <div>
+          <label class="field-label" style="margin-top:0">Plate-read retention (days) ${infoHint('How long recognised plate reads are kept before automatic deletion. 1–3650 days. Independent of footage/storage retention — plate reads are small database records pruned on their own schedule, so deleting video never deletes plate reads and vice-versa.')}</label>
+          <input id="lpr-retention" type="number" min="1" max="3650" value="${esc(String(lpr.retention_days))}" />
+          <div id="lpr-storage-hint" class="card-hint" style="margin-top:4px">Loading storage usage&hellip;</div>
+        </div>
+        <div>
+          <label class="field-label" style="margin-top:0">Crumb-native LPR worker ${infoHint('The optional crumb-alpr worker (fast-alpr) is Crumb&#39;s own local plate OCR — no cloud, no third-party agent, better than Frigate on hard angles. It authenticates to POST /lpr/reads with the ingest token below. Rotate to mint a new one; the old token stops working immediately. Run the worker with: docker compose --profile alpr up -d --build crumb-alpr')}</label>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <span id="lpr-token-status" class="card-hint" style="margin:0">${lpr.has_ingest_token ? 'An ingest token is set.' : 'No ingest token yet — rotate to create one.'}</span>
+            <button class="sm" type="button" onclick="rotateLprToken()">Rotate ingest token</button>
+          </div>
+        </div>
+      </div>
+      <div id="lpr-token-reveal" class="form-msg" style="display:none;margin-top:8px"></div>
+      <div class="card-hint" style="margin-top:8px">Saving applies immediately, no restart.</div>
+      <div id="lpr-msg" class="form-msg"></div>
+    </div>
+
+    <!-- Per-camera engine / confidence / zones (items #3 + #13): the engine
+         dropdown is the SINGLE per-camera control — None turns LPR off for
+         that camera; crumb-alpr/Both make the worker read it. -->
+    <div class="rp-section-head" style="margin-top:22px">
+      <div class="policy-section-title" style="margin-bottom:0">Cameras</div>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 8px 2px">Which engine reads plates on each camera. <b>None</b> = LPR off for that camera. <b>Frigate</b> = Frigate&#39;s native LPR on the event stream. <b>Crumb</b> = the local crumb-alpr (fast-alpr) worker — it reads only the include zones (or the whole frame if none) and ignores exclude zones. <b>Both</b> = accept reads from either engine. Changes save immediately.</div>
+      <div id="lpr-cam-table"><div class="card-hint" style="padding:6px 2px">Loading cameras&hellip;</div></div>
+    </div>
+    ${gated}`;
+
+  loadLprStorage();
+  loadLprCamTable();
+  if (lpr.enabled) {
+    loadWatchlist();
+    loadPlates();
+    onWlFuzzInput();
+  }
+}
+
+/* ── LPR storage-usage hint (item #1): GET /lpr/storage under the retention
+   field, so the operator sees what the retention window is actually holding. */
+async function loadLprStorage() {
+  const el = $('lpr-storage-hint'); if (!el) return;
+  let s;
+  try { s = await api('/lpr/storage'); }
+  catch { el.textContent = 'Storage usage unavailable.'; return; }
+  if (!$('lpr-storage-hint')) return; // navigated away
+  if (!s.reads) { el.textContent = 'No plate reads stored yet.'; return; }
+  const parts = [Number(s.reads).toLocaleString() + ' read' + (s.reads === 1 ? '' : 's')];
+  parts.push(s.crop_bytes > 0 ? '~' + fmtBytes(s.crop_bytes) + ' of images' : 'no stored images');
+  if (s.oldest_ts) {
+    const days = Math.floor((Date.now() - new Date(s.oldest_ts).getTime()) / 86400000);
+    parts.push(days < 1 ? 'oldest today' : 'oldest ' + days + ' day' + (days === 1 ? '' : 's'));
+  }
+  el.textContent = 'Currently stored: ' + parts.join(' · ');
+}
+
+/* ── LPR per-camera table (item #3) ──
+   One row per camera: engine dropdown (None / Frigate / Crumb / Both), min
+   OCR confidence, zones summary + editor. The engine replaces the old
+   "worker should read this camera" checkbox — the server derives that from
+   engine ∈ {crumb-alpr, both}. Config cache in LPR_CAMS feeds the zone modal. */
+let LPR_CAMS = {}; // camId → CameraLprConfig
+
+function lprZoneSummary(z) {
+  const inc = (z && Array.isArray(z.include)) ? z.include.length : 0;
+  const exc = (z && Array.isArray(z.exclude)) ? z.exclude.length : 0;
+  if (!inc && !exc) return 'Whole frame';
+  const parts = [];
+  if (inc) parts.push(inc + ' include');
+  if (exc) parts.push(exc + ' exclude');
+  return parts.join(' · ');
+}
+
+function lprStatusPill(engine) {
+  return (engine && engine !== 'none')
+    ? '<span class="pill ok">On</span>'
+    : '<span class="pill">Off</span>';
+}
+
+async function loadLprCamTable() {
+  const host = $('lpr-cam-table'); if (!host) return;
+  const byName = (a,b) => (a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
+  const cams = CAMS.slice().sort(byName);
+  if (!cams.length) {
+    host.innerHTML = `<div class="card-hint" style="padding:6px 2px">No cameras yet — add one under Cameras first.</div>`;
+    return;
+  }
+  let cfgs;
+  try { cfgs = await Promise.all(cams.map(c => api('/config/cameras/' + c.id + '/lpr'))); }
+  catch (e) { host.innerHTML = `<div class="form-msg err">${esc((e && e.message) || 'Failed to load per-camera LPR settings')}</div>`; return; }
+  if (!$('lpr-cam-table')) return; // navigated away
+  LPR_CAMS = {};
+  cams.forEach((c, i) => { LPR_CAMS[c.id] = cfgs[i]; });
+  const engOpt = (cfg, v, label) => `<option value="${v}" ${(cfg.engine||'frigate')===v?'selected':''}>${label}</option>`;
+  const rows = cams.map(c => {
+    const cfg = LPR_CAMS[c.id] || {};
+    return `<tr>
+      <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div class="lt-main">${esc(c.name)}</div></div></td>
+      <td><select id="lpr-eng-${c.id}" style="font-size:13px;min-width:150px" onchange="lprCamSave('${c.id}')">
+        ${engOpt(cfg,'none','None (LPR off)')}${engOpt(cfg,'frigate','Frigate native')}${engOpt(cfg,'crumb-alpr','Crumb (fast-alpr)')}${engOpt(cfg,'both','Both')}
+      </select></td>
+      <td><input id="lpr-conf-${c.id}" type="number" min="0" max="1" step="0.05" value="${esc(String(cfg.min_confidence ?? 0.8))}" style="width:74px" title="Min OCR confidence (crumb-alpr drops reads below this)" onchange="lprCamSave('${c.id}')" /></td>
+      <td><span id="lpr-zsum-${c.id}">${esc(lprZoneSummary(cfg.zones))}</span></td>
+      <td class="td-right">
+        <span id="lpr-stat-${c.id}">${lprStatusPill(cfg.engine)}</span>
+        <button class="ghost sm" style="margin-left:8px" onclick="openLprZones('${c.id}')">Edit zones</button>
+      </td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>Camera</th><th>Engine ${infoHint('The single per-camera LPR control. None = LPR off for this camera. The crumb-alpr worker reads a camera exactly when its engine is Crumb or Both.')}</th><th>Min conf. ${infoHint('crumb-alpr drops reads below this mean character confidence (0–1). 0.8 is a good default.')}</th><th>Zones</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+/* Save one row (engine and/or min-conf changed): merge over the cached config
+   so zones survive, PUT, then refresh the row's status pill. On failure,
+   reload the table so the controls snap back to stored reality. */
+async function lprCamSave(camId) {
+  const cfg = LPR_CAMS[camId] || {};
+  const engine = ($('lpr-eng-' + camId) || {}).value || cfg.engine || 'frigate';
+  const rawConf = parseFloat(($('lpr-conf-' + camId) || {}).value);
+  const minConf = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : (cfg.min_confidence ?? 0.8);
+  const body = { engine, min_confidence: minConf, zones: cfg.zones || null };
+  try {
+    await api('/config/cameras/' + camId + '/lpr', { method: 'PUT', body: JSON.stringify(body) });
+    cfg.engine = engine; cfg.min_confidence = minConf;
+    cfg.enabled = (engine === 'crumb-alpr' || engine === 'both');
+    LPR_CAMS[camId] = cfg;
+    const stat = $('lpr-stat-' + camId);
+    if (stat) stat.innerHTML = lprStatusPill(engine);
+    toast('LPR settings saved.');
+  } catch (e) {
+    toast((e && e.message) || 'Save failed');
+    loadLprCamTable();
+  }
 }
 
 /* ── watchlist match-fuzziness control (issue #141) ──
@@ -10093,6 +10390,16 @@ function renderSnapshot(c) {
 // the credential never lingers in the address bar or history. embed=1 also drops
 // our own topbar/sign-out (the host owns that chrome).
 (function bootSSO() {
+  // Chrome-less embed via query param (item #4): the desktop client's webview
+  // loads /admin?embedded=1 so the console drops its own topbar (brand, back /
+  // sign-out chrome) — the host draws that chrome, and doubling it up gave two
+  // back arrows. Same body.embedded class the #embed=1 hash handshake sets; a
+  // real browser (no param) keeps the full header.
+  try {
+    if (new URLSearchParams(location.search).get('embedded') === '1') {
+      document.body.classList.add('embedded');
+    }
+  } catch { /* malformed query string — keep the full chrome */ }
   const h = location.hash || '';
   // Route hashes (#/section/…) belong to the in-app router, leave them alone.
   // Only a key=value fragment (the host's #token=…&embed=1 handshake) is parsed
