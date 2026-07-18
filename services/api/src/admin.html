@@ -5324,8 +5324,17 @@ async function saveLprZones() {
   }
   const camId = LZ.camId;
   const cfg = LPR_CAMS[camId] || {};
+  // Never let a zone save rewrite the engine to a guessed value: preserve the
+  // camera's stored engine, and abort if it's unknown rather than downgrading
+  // it to 'frigate' (which would silently turn off a 'both' camera's crumb-alpr
+  // half). Editing zones must not change which engine reads the camera.
+  const engine = lprResolveEngine(cfg.engine, cfg);
+  if (engine === null) {
+    setMsg('lz-msg', 'Engine unknown for this camera — reopen the LPR table before saving zones.', 'err');
+    return;
+  }
   const body = {
-    engine: cfg.engine || 'frigate',
+    engine: engine,
     min_confidence: cfg.min_confidence ?? 0.8,
     zones: zones,
   };
@@ -9342,7 +9351,7 @@ async function loadLprCamTable() {
   if (!$('lpr-cam-table')) return; // navigated away
   LPR_CAMS = {};
   cams.forEach((c, i) => { LPR_CAMS[c.id] = cfgs[i]; });
-  const engOpt = (cfg, v, label) => `<option value="${v}" ${(cfg.engine||'frigate')===v?'selected':''}>${label}</option>`;
+  const engOpt = (cfg, v, label) => `<option value="${v}" ${cfg.engine===v?'selected':''}>${label}</option>`;
   const rows = cams.map(c => {
     const cfg = LPR_CAMS[c.id] || {};
     return `<tr>
@@ -9363,12 +9372,34 @@ async function loadLprCamTable() {
     <tbody>${rows}</tbody></table></div>`;
 }
 
+/* The four valid per-camera LPR engines. A save must NEVER invent one the
+   operator didn't choose: silently defaulting a missing/unknown value to
+   'frigate' would downgrade a 'both' camera — turning off half its LPR and
+   dropping it from the dual-engine A/B benchmark (the Benchmark button then
+   vanishes). Callers use [lprResolveEngine] to get a known engine or null. */
+const LPR_ENGINES = ['none', 'frigate', 'crumb-alpr', 'both'];
+/* Resolve the engine to persist: the operator's explicit choice [preferred] if
+   it is a known engine, else the camera's stored engine, else null (→ the
+   caller aborts and reloads rather than writing a guessed engine). */
+function lprResolveEngine(preferred, cfg) {
+  if (LPR_ENGINES.includes(preferred)) return preferred;
+  if (cfg && LPR_ENGINES.includes(cfg.engine)) return cfg.engine;
+  return null;
+}
+
 /* Save one row (engine and/or min-conf changed): merge over the cached config
    so zones survive, PUT, then refresh the row's status pill. On failure,
    reload the table so the controls snap back to stored reality. */
 async function lprCamSave(camId) {
   const cfg = LPR_CAMS[camId] || {};
-  const engine = ($('lpr-eng-' + camId) || {}).value || cfg.engine || 'frigate';
+  const engine = lprResolveEngine(($('lpr-eng-' + camId) || {}).value, cfg);
+  if (engine === null) {
+    // Stored engine unknown (config didn't load) — reload rather than write a
+    // guessed value that could downgrade the camera.
+    toast('Engine unknown for this camera — reloaded; try again.');
+    loadLprCamTable();
+    return;
+  }
   const rawConf = parseFloat(($('lpr-conf-' + camId) || {}).value);
   const minConf = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : (cfg.min_confidence ?? 0.8);
   const body = { engine, min_confidence: minConf, zones: cfg.zones || null };
