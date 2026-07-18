@@ -27,7 +27,9 @@ import 'package:webview_windows/webview_windows.dart';
 import 'package:crumb_desktop/api/admin_console_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 
-/// Embeds `{server}/admin#token=<jwt>&embed=1` in a native WebView2 pane.
+/// Embeds `{server}/admin?embedded=1#token=<jwt>&embed=1` in a native
+/// WebView2 pane (`?embedded=1` hides admin.html's own header chrome so it
+/// doesn't double up with this shell's header).
 ///
 /// Give this widget a STABLE key across rebuilds of the surrounding nav (e.g.
 /// `const ValueKey('admin-console')`) so Flutter doesn't tear down and
@@ -107,7 +109,9 @@ class _AdminConsoleScreenState extends State<AdminConsoleScreen> {
   }
 
   Future<void> _openInBrowser() async {
-    final uri = Uri.parse(adminConsoleUrl(widget.session));
+    // A real browser tab has no Flutter shell header, so let the console keep
+    // its own chrome there.
+    final uri = Uri.parse(adminConsoleUrl(widget.session, embedded: false));
     try {
       final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
       if (!ok && mounted) _showLaunchFailure();

@@ -31,6 +31,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
 import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_crop.dart';
@@ -1433,8 +1434,10 @@ class _PlateThumbState extends State<_PlateThumb> {
     } else if (showCrop && showFull && full != null) {
       content = _overlay(full, crop, cacheW);
     } else if (showCrop) {
-      // Crop only: letterbox (a plate is wide/short) on black.
-      content = _img(crop, BoxFit.contain, cacheW, background: true);
+      // Crop only: box the crop at its OWN aspect (from the read's bbox) so
+      // `contain` fills it edge-to-edge — a wide/short plate no longer floats
+      // between big black letterbox bars in a near-square slot.
+      content = _fittedCrop(crop, cacheW);
     } else if (full != null) {
       content = _img(full, BoxFit.cover, cacheW);
     } else {
@@ -1456,6 +1459,41 @@ class _PlateThumbState extends State<_PlateThumb> {
     );
     if (!background) return image;
     return Container(color: Colors.black, child: image);
+  }
+
+  /// Display aspect (w/h) of the plate crop, derived from the read's
+  /// normalized bbox. The bbox is in frame FRACTIONS, so its w/h must be
+  /// scaled by the frame's own aspect (snapshots are 16:9 — the same
+  /// assumption [_sideBySide] makes for the full frame) to get the crop's
+  /// pixel aspect. Clamped to a sane band so a degenerate box can't produce
+  /// an absurd slot. Null when the read has no usable bbox.
+  double? get _cropAspect {
+    final bb = widget.read.bbox;
+    if (bb == null || bb.length < 4) return null;
+    final bw = bb[2], bh = bb[3];
+    if (bw <= 0 || bh <= 0) return null;
+    return ((bw / bh) * (16 / 9)).clamp(1.0, 8.0).toDouble();
+  }
+
+  /// The crop centered in its (fixed) slot with the black backing sized to
+  /// the crop's OWN aspect instead of the whole slot — `contain` then fills
+  /// the backing edge-to-edge, so a wide/short plate shows no letterbox bars.
+  /// Falls back to the old letterboxed render when the bbox is unusable.
+  Widget _fittedCrop(Uint8List crop, int cacheW) {
+    final aspect = _cropAspect;
+    final image = _img(crop, BoxFit.contain, cacheW, background: true);
+    if (aspect == null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(widget.radius),
+        child: image,
+      );
+    }
+    return Center(
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(widget.radius),
+        child: AspectRatio(aspectRatio: aspect, child: image),
+      ),
+    );
   }
 
   Widget _placeholder() {
@@ -1548,18 +1586,24 @@ class _PlateThumbState extends State<_PlateThumb> {
             ),
           ),
           const SizedBox(width: 6),
-          ClipRRect(
-            borderRadius: r,
-            child: Container(
-              width: cropW,
-              height: h,
-              color: Colors.black,
-              alignment: Alignment.center,
-              child: crop != null
-                  ? Image.memory(crop, fit: BoxFit.contain, gaplessPlayback: true)
-                  : Icon(Icons.no_photography_outlined,
-                      color: Colors.white24, size: widget.iconSize),
-            ),
+          // Crop slot: fixed OUTER width so the plate text stays aligned
+          // across rows, but the black backing inside is sized to the crop's
+          // own aspect (via [_fittedCrop]) so the plate fills it edge-to-edge
+          // instead of floating between black letterbox bars.
+          SizedBox(
+            width: cropW,
+            height: h,
+            child: crop != null
+                ? _fittedCrop(crop, cacheW)
+                : ClipRRect(
+                    borderRadius: r,
+                    child: Container(
+                      color: Colors.black,
+                      alignment: Alignment.center,
+                      child: Icon(Icons.no_photography_outlined,
+                          color: Colors.white24, size: widget.iconSize),
+                    ),
+                  ),
           ),
         ],
       ),
@@ -2072,9 +2116,11 @@ class _PlateTimeline extends StatelessWidget {
 // ─── pop-up plate-hit clip player ──────────────────────────────────────────
 
 /// Dismissible overlay that plays a plate read's short detection clip — the
-/// same style/behavior as the Clips tab's clip player (Positioned.fill overlay
-/// over the tab, closes on Esc and a close button), trimmed to what a plate hit
-/// needs: no zoom/snapshot/bookmark, plus a "View on timeline" hand-off.
+/// same style/behavior as the Clips tab's clip player (both render through the
+/// shared [ClipPlayerShell]: Positioned.fill overlay over the tab, closes on
+/// Esc / the close X / a tap on the dark backdrop, actions under the video),
+/// trimmed to what a plate hit needs: no zoom/snapshot/bookmark, plus a "View
+/// on timeline" hand-off.
 ///
 /// The clip is resolved exactly like a Clips detection clip: the read's
 /// [PlateRead.eventId] is the `d:<event-uuid>` clip id, played from
@@ -2120,6 +2166,8 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   int _loadAttempt = 0;
   Timer? _watchdog;
   StreamSubscription<bool>? _playingSub;
+  StreamSubscription<int?>? _widthSub;
+  StreamSubscription<int?>? _heightSub;
   String? _error;
   // Clip rendition: 'preview' (SD, fast on-demand transcode) or 'full' (HD, the
   // original segment quality). Mirrors the Clips player's quality toggle — a
@@ -2242,6 +2290,16 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
         }
         if (mounted) setState(() => _playing = playing);
       });
+      // Rebuild once the video's dimensions are known so the pane can
+      // shrink-wrap the video's aspect — the dark space around it is then
+      // genuine backdrop (tap = close) rather than letterbox inside an
+      // oversized video box.
+      _widthSub = player.stream.width.listen((w) {
+        if (w != null && w > 0 && mounted) setState(() {});
+      });
+      _heightSub = player.stream.height.listen((h) {
+        if (h != null && h > 0 && mounted) setState(() {});
+      });
       final controller = VideoController(player);
       setState(() {
         _player = player;
@@ -2294,6 +2352,8 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
     HardwareKeyboard.instance.removeHandler(_onKeyEvent);
     _watchdog?.cancel();
     _playingSub?.cancel();
+    _widthSub?.cancel();
+    _heightSub?.cancel();
     _player?.dispose();
     super.dispose();
   }
@@ -2303,95 +2363,81 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
     final read = widget.read;
     final plate = read.plate.isEmpty ? '—' : read.plate;
     return Positioned.fill(
-      child: Material(
-        color: Colors.black.withValues(alpha: 0.92),
-        child: Column(
-          children: [
-            // Title bar.
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '$plate — ${widget.cameraName}',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 1.2,
-                        fontFamily: 'monospace',
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  _QualityToggle(
-                    quality: _quality,
-                    busy: _qualityBusy,
-                    onChanged: _setQuality,
-                  ),
-                  const SizedBox(width: 4),
-                  TextButton.icon(
-                    onPressed: widget.onReport,
-                    icon: const Icon(Icons.description_outlined,
-                        size: 16, color: Colors.white70),
-                    label: const Text(
-                      'Report',
-                      style: TextStyle(fontSize: 12, color: Colors.white70),
-                    ),
-                  ),
-                  TextButton.icon(
-                    onPressed: widget.onViewOnTimeline,
-                    icon: const Icon(Icons.timeline, size: 16, color: Colors.white70),
-                    label: const Text(
-                      'View on timeline',
-                      style: TextStyle(fontSize: 12, color: Colors.white70),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Close (Esc)',
-                    onPressed: widget.onClose,
-                    icon: const Icon(Icons.close, color: Colors.white70, size: 22),
-                  ),
-                ],
-              ),
-            ),
-            // Prominent plate crop (bbox region of the snapshot) pinned above
-            // the clip. Fetches the snapshot itself if a tile hasn't cached it,
-            // so it shows reliably. Renders nothing when the read has no bbox;
-            // hidden entirely when the operator chose full-frame-only.
-            if (widget.imageMode != PlateImageDisplay.fullOnly)
-              _PlateDetailCrop(
+      child: ClipPlayerShell(
+        title: '$plate — ${widget.cameraName}',
+        titleStyle: const TextStyle(
+          color: Colors.white,
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 1.2,
+          fontFamily: 'monospace',
+        ),
+        onClose: widget.onClose,
+        // Prominent plate crop (bbox region of the snapshot) pinned above
+        // the clip. Fetches the snapshot itself if a tile hasn't cached it,
+        // so it shows reliably. Renders nothing when the read has no bbox;
+        // hidden entirely when the operator chose full-frame-only.
+        header: widget.imageMode != PlateImageDisplay.fullOnly
+            ? _PlateDetailCrop(
                 read: read,
                 session: widget.session,
                 cropSize: widget.cropSize,
-              ),
-            // Video pane.
-            Expanded(
-              child: Center(
-                child: _error != null
-                    ? Text(
-                        _error!,
-                        style: const TextStyle(color: Colors.redAccent),
-                      )
-                    : _controller == null
-                        ? const CircularProgressIndicator()
-                        : Video(
-                            controller: _controller!,
-                            controls: NoVideoControls,
-                            fit: BoxFit.contain,
-                          ),
-              ),
+              )
+            : null,
+        video: _buildVideoPane(),
+        // Our own minimal transport (issue #143): restart + frame-step +
+        // play/pause, directly under the video. Native media_kit controls are
+        // suppressed via NoVideoControls.
+        transport: (_error == null && _controller != null) ? _buildTransport() : null,
+        // Primary actions live in a row under the transport (the shell lays
+        // them out); the title bar keeps just the plate label and the X.
+        actions: [
+          _QualityToggle(
+            quality: _quality,
+            busy: _qualityBusy,
+            onChanged: _setQuality,
+          ),
+          TextButton.icon(
+            onPressed: widget.onReport,
+            icon: const Icon(Icons.description_outlined,
+                size: 16, color: Colors.white70),
+            label: const Text(
+              'Report',
+              style: TextStyle(fontSize: 12, color: Colors.white70),
             ),
-            // Our own minimal transport (issue #143): restart + play/pause,
-            // styled like the rest of the pop-up. Native media_kit controls are
-            // suppressed above via NoVideoControls.
-            if (_error == null && _controller != null) _buildTransport(),
-            const SizedBox(height: 16),
-          ],
-        ),
+          ),
+          TextButton.icon(
+            onPressed: widget.onViewOnTimeline,
+            icon: const Icon(Icons.timeline, size: 16, color: Colors.white70),
+            label: const Text(
+              'View on timeline',
+              style: TextStyle(fontSize: 12, color: Colors.white70),
+            ),
+          ),
+        ],
       ),
     );
+  }
+
+  /// The video pane, shrink-wrapped to the video's aspect once known so the
+  /// dark space around it is genuine backdrop (tap = close) rather than
+  /// letterbox inside an oversized video box.
+  Widget _buildVideoPane() {
+    if (_error != null) {
+      return Text(_error!, style: const TextStyle(color: Colors.redAccent));
+    }
+    if (_controller == null) return const CircularProgressIndicator();
+    final video = Video(
+      controller: _controller!,
+      controls: NoVideoControls,
+      fit: BoxFit.contain,
+    );
+    final vw = (_player?.state.width ?? 0).toDouble();
+    final vh = (_player?.state.height ?? 0).toDouble();
+    if (vw > 0 && vh > 0) {
+      return AspectRatio(aspectRatio: vw / vh, child: video);
+    }
+    return video;
   }
 
   /// Minimal control bar: back-to-start and play/pause, driven by the player.

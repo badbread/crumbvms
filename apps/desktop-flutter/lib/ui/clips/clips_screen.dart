@@ -33,6 +33,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
+import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart'
     show FullscreenController;
 import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
@@ -814,6 +815,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
   Timer? _watchdog;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<int?>? _widthSub;
+  StreamSubscription<int?>? _heightSub;
   bool _highlighted = false;
 
   double _scale = 1.0;
@@ -922,10 +924,18 @@ class _ClipPlayerState extends State<_ClipPlayer> {
         if (playing) _watchdog?.cancel();
       });
       _widthSub = player.stream.width.listen((w) {
-        if (w != null && w > 0 && !_highlighted) {
+        if (w == null || w <= 0) return;
+        // Rebuild so the pane can shrink-wrap the now-known video aspect —
+        // the fitted pane is what makes the dark area around the picture
+        // genuine tappable backdrop (tap = close) rather than letterbox.
+        if (mounted) setState(() {});
+        if (!_highlighted) {
           _highlighted = true;
           _maybeHighlight();
         }
+      });
+      _heightSub = player.stream.height.listen((h) {
+        if (h != null && h > 0 && mounted) setState(() {});
       });
       final controller = VideoController(player);
       setState(() {
@@ -1141,6 +1151,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     _toastTimer?.cancel();
     _playingSub?.cancel();
     _widthSub?.cancel();
+    _heightSub?.cancel();
     _player?.dispose();
     super.dispose();
   }
@@ -1169,19 +1180,38 @@ class _ClipPlayerState extends State<_ClipPlayer> {
           }
           return KeyEventResult.ignored;
         },
-        child: Material(
-          color: Colors.black.withValues(alpha: 0.92),
         child: LayoutBuilder(
           builder: (context, constraints) {
-            _paneSize = Size(constraints.maxWidth, constraints.maxHeight * 0.82);
-            return Stack(
-              children: [
-                Positioned.fill(child: _buildPlayerColumn(context, c, label)),
+            // Fit the pane to the video's aspect once dimensions are known:
+            // the pane then hugs the picture, so the dark space around it is
+            // genuine backdrop (tap = close) instead of letterbox inside an
+            // oversized pane. Falls back to the full-width pane while the
+            // dimensions are still unknown (loading). 0.78 (not the old 0.82)
+            // leaves room for the actions row now living under the video.
+            var paneW = constraints.maxWidth;
+            var paneH = constraints.maxHeight * 0.78;
+            final vw = (_player?.state.width ?? 0).toDouble();
+            final vh = (_player?.state.height ?? 0).toDouble();
+            if (vw > 0 && vh > 0 && paneW > 0 && paneH > 0) {
+              final va = vw / vh;
+              if (paneW / paneH > va) {
+                paneW = paneH * va;
+              } else {
+                paneH = paneW / va;
+              }
+            }
+            _paneSize = Size(paneW, paneH);
+            return ClipPlayerShell(
+              title: '$label — ${c.cameraName}',
+              onClose: widget.onClose,
+              video: _buildVideoPane(context),
+              actions: _buildActions(context),
+              overlays: [
                 if (_toastMsg != null)
                   Positioned(
                     left: 0,
                     right: 0,
-                    bottom: 48,
+                    bottom: 96,
                     child: Center(
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -1201,147 +1231,123 @@ class _ClipPlayerState extends State<_ClipPlayer> {
           },
         ),
       ),
-      ),
     );
   }
 
-  Widget _buildPlayerColumn(BuildContext context, ClipDescriptor c, String label) {
-    return Column(
-              children: [
-                // Title bar.
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          '$label — ${c.cameraName}',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600,
-                          ),
-                          overflow: TextOverflow.ellipsis,
+  /// Primary actions, in a row under the video (the shell lays them out):
+  /// quality toggle, snapshot, bookmark, view-on-timeline. The close X stays
+  /// in the shell's title bar.
+  List<Widget> _buildActions(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
+    return [
+      TextButton.icon(
+        onPressed: _qualityBusy ? null : _toggleQuality,
+        icon: Icon(
+          Icons.high_quality,
+          size: 16,
+          color: _quality == 'full' ? accent : Colors.white70,
+        ),
+        label: Text(
+          _quality == 'full' ? 'Full' : 'Preview',
+          style: TextStyle(
+            fontSize: 12,
+            color: _quality == 'full' ? accent : Colors.white70,
+          ),
+        ),
+      ),
+      TextButton.icon(
+        onPressed: _snapshot,
+        icon: const Icon(Icons.camera_alt_outlined, color: Colors.white70, size: 16),
+        label: const Text(
+          'Snapshot',
+          style: TextStyle(fontSize: 12, color: Colors.white70),
+        ),
+      ),
+      TextButton.icon(
+        onPressed: _bookmark,
+        icon: const Icon(Icons.bookmark_add_outlined, color: Colors.white70, size: 16),
+        label: const Text(
+          'Bookmark',
+          style: TextStyle(fontSize: 12, color: Colors.white70),
+        ),
+      ),
+      if (widget.onViewOnTimeline != null)
+        TextButton.icon(
+          onPressed: widget.onViewOnTimeline,
+          icon: const Icon(Icons.timeline, color: Colors.white70, size: 16),
+          label: const Text(
+            'View on timeline',
+            style: TextStyle(fontSize: 12, color: Colors.white70),
+          ),
+        ),
+    ];
+  }
+
+  /// The zoom/pan-enabled video pane, sized to [_paneSize] (already fitted to
+  /// the video's aspect by [build] when the dimensions are known).
+  Widget _buildVideoPane(BuildContext context) {
+    return SizedBox(
+      key: _paneKey,
+      width: _paneSize.width,
+      height: _paneSize.height,
+      child: _error != null
+          ? Center(
+              child: Text(_error!, style: const TextStyle(color: Colors.redAccent)),
+            )
+          : _controller == null
+              ? const Center(child: CircularProgressIndicator())
+              : Listener(
+                  onPointerSignal: (e) {
+                    if (e is PointerScrollEvent) {
+                      _takeOverZoom();
+                      final factor = e.scrollDelta.dy < 0 ? 1.15 : 1 / 1.15;
+                      final ns = (_scale * factor).clamp(1.0, _clipZoomMax);
+                      if (ns == 1.0) {
+                        _resetZoom();
+                        return;
+                      }
+                      final box =
+                          _paneKey.currentContext?.findRenderObject() as RenderBox?;
+                      final local = box?.globalToLocal(e.position) ??
+                          Offset(_paneSize.width / 2, _paneSize.height / 2);
+                      final px = local.dx - _paneSize.width / 2;
+                      final py = local.dy - _paneSize.height / 2;
+                      final k = ns / _scale;
+                      _applyZoom(
+                        ns,
+                        Offset(px - (px - _offset.dx) * k, py - (py - _offset.dy) * k),
+                      );
+                    }
+                  },
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onDoubleTap: _resetZoom,
+                    onPanStart: (d) {
+                      if (_scale <= 1.0) return;
+                      _dragStart = d.globalPosition;
+                      _dragStartOffset = _offset;
+                    },
+                    onPanUpdate: (d) {
+                      if (_scale <= 1.0 || _dragStart == null) return;
+                      _takeOverZoom();
+                      final delta = d.globalPosition - _dragStart!;
+                      _applyZoom(_scale, _dragStartOffset! + delta);
+                    },
+                    child: ClipRect(
+                      child: Transform(
+                        transform: Matrix4.identity()
+                          ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
+                          ..scaleByDouble(_scale, _scale, 1, 1),
+                        alignment: Alignment.center,
+                        child: Video(
+                          controller: _controller!,
+                          controls: NoVideoControls,
+                          fit: BoxFit.contain,
                         ),
                       ),
-                      TextButton.icon(
-                        onPressed: _qualityBusy ? null : _toggleQuality,
-                        icon: Icon(
-                          Icons.high_quality,
-                          size: 16,
-                          color: _quality == 'full'
-                              ? Theme.of(context).colorScheme.primary
-                              : Colors.white70,
-                        ),
-                        label: Text(
-                          _quality == 'full' ? 'Full' : 'Preview',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _quality == 'full'
-                                ? Theme.of(context).colorScheme.primary
-                                : Colors.white70,
-                          ),
-                        ),
-                      ),
-                      // (accent follows the active tab colour)
-                      IconButton(
-                        tooltip: 'Snapshot',
-                        onPressed: _snapshot,
-                        icon: const Icon(Icons.camera_alt_outlined, color: Colors.white70, size: 20),
-                      ),
-                      IconButton(
-                        tooltip: 'Bookmark',
-                        onPressed: _bookmark,
-                        icon: const Icon(Icons.bookmark_add_outlined, color: Colors.white70, size: 20),
-                      ),
-                      if (widget.onViewOnTimeline != null)
-                        IconButton(
-                          tooltip: 'View on timeline',
-                          onPressed: widget.onViewOnTimeline,
-                          icon: const Icon(
-                            Icons.timeline,
-                            color: Colors.white70,
-                            size: 20,
-                          ),
-                        ),
-                      IconButton(
-                        tooltip: 'Close (Esc)',
-                        onPressed: widget.onClose,
-                        icon: const Icon(Icons.close, color: Colors.white70, size: 22),
-                      ),
-                    ],
-                  ),
-                ),
-                // Video pane with zoom/pan gestures.
-                Expanded(
-                  child: Center(
-                    child: SizedBox(
-                      key: _paneKey,
-                      width: _paneSize.width,
-                      height: _paneSize.height,
-                      child: _error != null
-                          ? Center(
-                              child: Text(_error!, style: const TextStyle(color: Colors.redAccent)),
-                            )
-                          : _controller == null
-                              ? const Center(child: CircularProgressIndicator())
-                              : Listener(
-                                  onPointerSignal: (e) {
-                                    if (e is PointerScrollEvent) {
-                                      _takeOverZoom();
-                                      final factor = e.scrollDelta.dy < 0 ? 1.15 : 1 / 1.15;
-                                      final ns = (_scale * factor).clamp(1.0, _clipZoomMax);
-                                      if (ns == 1.0) {
-                                        _resetZoom();
-                                        return;
-                                      }
-                                      final box =
-                                          _paneKey.currentContext?.findRenderObject() as RenderBox?;
-                                      final local = box?.globalToLocal(e.position) ??
-                                          Offset(_paneSize.width / 2, _paneSize.height / 2);
-                                      final px = local.dx - _paneSize.width / 2;
-                                      final py = local.dy - _paneSize.height / 2;
-                                      final k = ns / _scale;
-                                      _applyZoom(
-                                        ns,
-                                        Offset(px - (px - _offset.dx) * k, py - (py - _offset.dy) * k),
-                                      );
-                                    }
-                                  },
-                                  child: GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onDoubleTap: _resetZoom,
-                                    onPanStart: (d) {
-                                      if (_scale <= 1.0) return;
-                                      _dragStart = d.globalPosition;
-                                      _dragStartOffset = _offset;
-                                    },
-                                    onPanUpdate: (d) {
-                                      if (_scale <= 1.0 || _dragStart == null) return;
-                                      _takeOverZoom();
-                                      final delta = d.globalPosition - _dragStart!;
-                                      _applyZoom(_scale, _dragStartOffset! + delta);
-                                    },
-                                    child: ClipRect(
-                                      child: Transform(
-                                        transform: Matrix4.identity()
-                                          ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
-                                          ..scaleByDouble(_scale, _scale, 1, 1),
-                                        alignment: Alignment.center,
-                                        child: Video(
-                                          controller: _controller!,
-                                          controls: NoVideoControls,
-                                          fit: BoxFit.contain,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
-              ],
     );
   }
 }
