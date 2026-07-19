@@ -93,6 +93,7 @@ struct LiveWallView: View {
     private var visibleTabs: [Mode] {
         var t: [Mode] = [.live]
         if container.isAdmin || container.capabilities.playback { t.append(.playback) }
+        if container.platesEnabled { t.append(.plates) }
         if container.isAdmin || container.capabilities.clips { t.append(.clips) }
         return t
     }
@@ -323,6 +324,7 @@ struct LiveWallView: View {
             t.append(.playback)
             t.append(.exports)
         }
+        if container.platesEnabled { t.append(.plates) }
         if container.isAdmin || container.capabilities.clips { t.append(.clips) }
         t.append(.settings)
         return t
@@ -432,6 +434,12 @@ struct LiveWallView: View {
                     mode = .playback
                 })
             }
+        case .plates:
+            PlatesView(container: container, cameras: vm.cameras, onOpenPlayback: { id, date in
+                playbackStartTime = date
+                playbackCameraId = id
+                mode = .playback
+            })
         case .settings:
             SettingsView(container: container)
         }
@@ -638,6 +646,11 @@ struct LiveWallView: View {
                 )
             case .clips:
                 ClipsView(container: container, viewCameraIds: activeViewCameraIds, gridColumns: gridLayout.columns, onOpenPlayback: { id, date in
+                    playbackStartTime = date
+                    playbackCameraId = id
+                })
+            case .plates:
+                PlatesView(container: container, cameras: vm.cameras, onOpenPlayback: { id, date in
                     playbackStartTime = date
                     playbackCameraId = id
                 })

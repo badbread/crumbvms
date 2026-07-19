@@ -86,6 +86,12 @@ struct UserDto: Decodable {
     let isAdminFlag: Bool?
     /// Fine-grained capability set (absent on older servers → all-false).
     let capabilities: Capabilities
+    /// Whether the Plates (LPR) surface should be shown: LPR is enabled
+    /// server-side AND this caller holds `view_plates`. The single flag the
+    /// client gates the Plates tab on — do NOT re-derive it from `capabilities`.
+    /// Absent on servers without LPR → false. Can change, so it's re-fetched at
+    /// every login (see `AppContainer.applyUser`).
+    let platesEnabled: Bool
 
     /// Checks the explicit `is_admin` flag first (RBAC servers), falling back to
     /// the role string for backward-compat.
@@ -99,6 +105,7 @@ struct UserDto: Decodable {
         case id, username, role, capabilities
         case cameraIds = "camera_ids"
         case isAdminFlag = "is_admin"
+        case platesEnabled = "plates_enabled"
     }
 
     init(from decoder: Decoder) throws {
@@ -109,6 +116,7 @@ struct UserDto: Decodable {
         cameraIds = try c.decodeIfPresent([String].self, forKey: .cameraIds) ?? []
         isAdminFlag = try c.decodeIfPresent(Bool.self, forKey: .isAdminFlag)
         capabilities = try c.decodeIfPresent(Capabilities.self, forKey: .capabilities) ?? Capabilities()
+        platesEnabled = try c.decodeIfPresent(Bool.self, forKey: .platesEnabled) ?? false
     }
 }
 
@@ -319,6 +327,74 @@ struct LiveStreamsResponse: Decodable {
         case rtspSubUrl = "rtsp_sub_url"
         case rtspMobileUrl = "rtsp_mobile_url"
     }
+}
+
+// MARK: - License Plates (LPR)
+
+/// One license-plate read (`GET /plates`). `plate` is the normalized uppercase
+/// alphanumeric form; `confidence` is the plate-OCR score (0…1), NOT the vehicle
+/// detection score.
+struct PlateRead: Decodable, Identifiable {
+    let id: String
+    let cameraId: String
+    /// ISO 8601 read timestamp.
+    let ts: String
+    let plate: String
+    let plateRaw: String?
+    let confidence: Double?
+    let region: String?
+    let sourceId: String
+    /// Sibling detection event, when present — drives the "open playback" jump.
+    let eventId: String?
+    let snapshotUrl: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, ts, plate, confidence, region
+        case cameraId = "camera_id"
+        case plateRaw = "plate_raw"
+        case sourceId = "source_id"
+        case eventId = "event_id"
+        case snapshotUrl = "snapshot_url"
+    }
+}
+
+/// `GET /plates` response page.
+struct PlatesResponse: Decodable {
+    let plates: [PlateRead]
+    let total: Int
+    let hasMore: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case plates, total
+        case hasMore = "has_more"
+    }
+}
+
+/// One watchlist entry (`GET /lpr/watchlist`). Keyed server-side on the
+/// normalized plate, so re-adding the same plate edits rather than duplicates.
+struct WatchlistEntry: Decodable, Identifiable {
+    let id: String
+    let plate: String
+    let label: String?
+    let note: String?
+    let color: String?
+    let notify: Bool
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, plate, label, note, color, notify
+        case createdAt = "created_at"
+    }
+}
+
+/// `POST /lpr/watchlist` body. `plate` is normalized server-side; `notify`
+/// defaults to true server-side when omitted.
+struct WatchlistAddRequest: Encodable {
+    let plate: String
+    var label: String?
+    var note: String?
+    var color: String?
+    var notify: Bool?
 }
 
 // MARK: - Export

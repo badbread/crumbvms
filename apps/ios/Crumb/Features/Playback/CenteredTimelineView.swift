@@ -161,6 +161,11 @@ struct CenteredTimelineView: View {
     private func dragGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
+                // A pinch owns the touch sequence → zoom only, never scrub. The
+                // two-finger centroid drifts as you pinch, and letting that drive
+                // `onScrub` is the "time slides while I zoom" bug: while ≥2 fingers
+                // are down (pinchBaseSpan set) we skip the pan→scrub entirely.
+                if pinchBaseSpan != nil { return }
                 if dragBaseMs == nil {
                     dragBaseMs = playheadMs
                     onScrubStart()
@@ -172,7 +177,12 @@ struct CenteredTimelineView: View {
                 onScrub(min(max(base + deltaMs, 0), now))
             }
             .onEnded { value in
-                guard let base = dragBaseMs, width > 0 else { return }
+                // Don't commit a scrub the pinch cancelled (dragBaseMs cleared in
+                // pinchGesture) or that a pinch is still owning.
+                guard pinchBaseSpan == nil, let base = dragBaseMs, width > 0 else {
+                    dragBaseMs = nil
+                    return
+                }
                 let deltaMs = Int64(-value.translation.width / width * CGFloat(spanMs))
                 let now = Int64(Date().timeIntervalSince1970 * 1000)
                 let final = min(max(base + deltaMs, 0), now)
@@ -184,7 +194,18 @@ struct CenteredTimelineView: View {
     private func pinchGesture() -> some Gesture {
         MagnificationGesture()
             .onChanged { value in
-                if pinchBaseSpan == nil { pinchBaseSpan = spanMs }
+                if pinchBaseSpan == nil {
+                    pinchBaseSpan = spanMs
+                    // If a one-finger scrub started a frame or two before the
+                    // pinch was recognized, cancel it: snap the playhead back to
+                    // where the gesture began and end the scrub cleanly, so the
+                    // pinch keeps the current time pinned on the time it started
+                    // on (Android's fix).
+                    if let anchor = dragBaseMs {
+                        dragBaseMs = nil
+                        onScrubEnd(anchor)
+                    }
+                }
                 guard let base = pinchBaseSpan, value > 0 else { return }
                 let next = Int64(Double(base) / value)
                 onSpanChange(min(max(next, minSpanMs), maxSpanMs))

@@ -27,6 +27,10 @@ final class AppContainer: ObservableObject {
     /// Seeded from persistence at launch, refreshed by `GET /auth/me`.
     @Published private(set) var capabilities: Capabilities
     @Published private(set) var isAdmin: Bool
+    /// Whether the Plates (LPR) surface is available to this user (LPR enabled
+    /// server-side AND the `view_plates` capability). Re-fetched at every login
+    /// via `applyUser` since it can change. Gates the Plates tab.
+    @Published private(set) var platesEnabled: Bool = false
 
     private var cancellable: AnyCancellable?
 
@@ -51,6 +55,7 @@ final class AppContainer: ObservableObject {
                 if !loggedIn {
                     self?.capabilities = Capabilities()
                     self?.isAdmin = false
+                    self?.platesEnabled = false
                     // A logged-out session's cached scoped media tokens must
                     // never survive into the next login (different user,
                     // possibly different camera scope).
@@ -74,6 +79,7 @@ final class AppContainer: ObservableObject {
         let caps = me.effectiveCapabilities
         capabilities = caps
         isAdmin = me.isAdmin
+        platesEnabled = me.platesEnabled
         store.capabilities = caps
         store.role = me.role
         // `applyUser` runs on every successful login and on every launch-time
