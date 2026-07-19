@@ -520,9 +520,9 @@ mod tests {
     use super::parse_env;
 
     /// #249: compose forwards keys as `${VAR:-}`, so an unset key arrives as an
-    /// empty string. The api's parse_env must treat that as "use the default",
+    /// empty string. The api's `parse_env` must treat that as "use the default",
     /// not a fatal error, or a fresh install crash-loops at boot (the exact
-    /// regression: DB_POOL_SIZE = "" from the stock docker-compose.yml).
+    /// regression: `DB_POOL_SIZE` = "" from the stock `docker-compose.yml`).
     #[test]
     fn parse_env_treats_empty_as_default() {
         std::env::set_var("CRUMB_API_TEST_EMPTY_NUM", "");
