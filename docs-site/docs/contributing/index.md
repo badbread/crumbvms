@@ -28,7 +28,7 @@ The codebase is a Rust workspace plus native clients and a web console:
 
 ```
 services/   # Rust workspace: common, api, recorder (api also serves /admin)
-apps/       # desktop (Tauri + native video), Android (Kotlin/Compose), iOS
+apps/       # desktop-flutter (Flutter + Rust core, media_kit/libmpv), Android (Kotlin/Compose), iOS/macOS (SwiftUI)
 db/         # numbered SQL migrations, applied automatically on boot
 docs/       # design specs and runbooks
 ```

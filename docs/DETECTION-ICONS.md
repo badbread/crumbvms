@@ -28,8 +28,10 @@ Each client keeps a map `icon_key -> { glyph, colour }`. The lookup is:
 
 Per-client maps (keep in sync with the table below):
 
-- **Desktop** (Tauri): `apps/desktop/src/app.js`, `const DETECTION_ICONS` (raw
-  inline SVG, `currentColor` swapped to the hex for the canvas timeline).
+- **Desktop** (Flutter): `apps/desktop-flutter/lib/ui/live_status/detection_icons.dart`,
+  `kDetectionIcons`, a curated Material-Icons mapping (icon + colour per
+  `icon_key`) with a `kGenericDetectionIcon` fallback, rather than the raw
+  inline-SVG set the retired Tauri client carried.
 - **Web admin console**: `services/api/src/admin.html`, the inline timeline
   renderer's icon map (colour + shape per semantic group).
 - **Android** (Compose): `apps/android/.../data/Models.kt` —

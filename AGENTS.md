@@ -11,7 +11,7 @@ the code is.
 CrumbVMS is a **self-hosted, operator-grade** network video recorder: a Rust
 backend (`services/`) + Postgres + a Crumb-managed go2rtc restreamer (embedded
 in the recorder container, supervised by the recorder process), native
-desktop (Tauri/libmpv) and Android (Kotlin/Compose) clients, and a web admin
+desktop (Flutter/libmpv) and Android (Kotlin/Compose) clients, and a web admin
 console served by the API at `/admin`. The UX bar is a leading commercial VMS,
 not a hobby dashboard.
 
@@ -104,9 +104,12 @@ not a hobby dashboard.
   exist), `esc()` for interpolation, `api()` helper for authed fetches,
   semantic colors `var(--ok)`/`var(--warn)`/`var(--danger)`. Sanity-check with
   `node --check` on the extracted script block.
-- `apps/desktop`, Tauri + WebView2 over native libmpv. Windows note:
-  `libmpv-2.dll` must sit next to the built exe or video panes render black.
-- `apps/android`, Kotlin/Compose/Media3, Gradle (JDK 21, SDK 34).
+- `apps/desktop-flutter`, the live desktop client: Flutter over a Rust core
+  via `flutter_rust_bridge`, video through `media_kit`/libmpv. Windows note:
+  `libmpv-2.dll` must sit next to the built exe or video panes render black
+  (media_kit bundles it into the Release folder). `apps/desktop` is the
+  retired Tauri client, kept for reference; not built by CI or releases.
+- `apps/android`, Kotlin/Compose/Media3, Gradle (JDK 17, SDK 34).
 - `db/migrations/`, numbered SQL (see golden rule 4).
 - `docs/`, design docs and runbooks; `docs/ROADMAP.md` for larger initiatives.
 

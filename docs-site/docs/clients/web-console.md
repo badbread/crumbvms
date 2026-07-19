@@ -7,8 +7,10 @@ slug: /clients/web-console
 # Web console
 
 No install needed. Open `http://<server-host>:8080/admin` in any modern
-browser. On first server run, this is where you create the administrator
-account (see [First-run wizard](/getting-started/first-run-wizard)).
+browser. On first server run you sign in with the seeded admin credentials
+`setup-env.sh` printed (they're also saved in `.env`); the browser
+create-admin bootstrap only appears if you deliberately blanked the seed
+before first boot (see [First-run wizard](/getting-started/first-run-wizard)).
 
 The web console is Crumb's administration surface, and it's the most
 production-ready piece Crumb has today. It's where you add and configure

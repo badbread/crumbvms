@@ -31,7 +31,7 @@ When you report, please include as much of the following as you can:
 
 - The **server API** (`services/api`).
 - The **recorder** (`services/recorder`) and shared backend (`services/common`).
-- The **clients**: desktop (`apps/desktop`), Android (`apps/android`), iOS
+- The **clients**: desktop (`apps/desktop-flutter`), Android (`apps/android`), iOS
   (`apps/ios`), and the web admin console (served by the API at `/admin`).
 - The Docker Compose deployment, first-run setup flow, and the auth/token model.
 

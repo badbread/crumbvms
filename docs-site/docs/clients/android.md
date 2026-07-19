@@ -30,9 +30,10 @@ compares to the other clients.
 
 ## Verifying the download (optional but recommended)
 
-Since the alpha APK isn't distributed through a code-signing or Play Store
-channel, each release also publishes an `app-release.apk.sha256` checksum file
-next to the APK. Download both into the same folder and confirm they match
+The APK is signed with the project's release keystore in CI, but it isn't
+distributed through the Play Store, so no store vouches for the download
+itself. Each release therefore also publishes an `app-release.apk.sha256`
+checksum file next to the APK. Download both into the same folder and confirm they match
 before installing:
 
 ```bash

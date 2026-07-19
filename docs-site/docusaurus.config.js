@@ -1,5 +1,5 @@
 // @ts-check
-// CrumbVMS documentation site — docs.crumbvms.com
+// CrumbVMS documentation site, docs.crumbvms.com
 // No trackers: no gtag, no googleAnalytics, no external fonts/CDNs, no Algolia.
 // Search is local (offline lunr index) via @easyops-cn/docusaurus-search-local.
 
