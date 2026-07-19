@@ -55,6 +55,8 @@ pub mod clips;
 pub mod config;
 #[path = "../../src/config_routes.rs"]
 pub mod config_routes;
+#[path = "../../src/db_backup.rs"]
+pub mod db_backup;
 #[path = "../../src/discover.rs"]
 pub mod discover;
 #[path = "../../src/dto.rs"]
