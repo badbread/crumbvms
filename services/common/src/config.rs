@@ -416,7 +416,10 @@ impl Config {
             // non-US operator's archive/retention cron matches their wall clock
             // instead of always running in LA. America/Los_Angeles only if
             // neither is set (bare-metal with no TZ at all). (#228)
-            archive_cron_tz: parse_tz_env("RECORDER_TZ", &optional_env("TZ", "America/Los_Angeles")),
+            archive_cron_tz: parse_tz_env(
+                "RECORDER_TZ",
+                &optional_env("TZ", "America/Los_Angeles"),
+            ),
             motion_hwaccel,
             motion_vaapi_device: optional_env("MOTION_VAAPI_DEVICE", "/dev/dri/renderD128"),
             max_gpu_decode_sessions: parse_env("MAX_GPU_DECODE_SESSIONS", 4)?,
