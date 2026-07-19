@@ -294,6 +294,13 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = crumb_common::db::ensure_segments_storage_index(&pool).await {
         tracing::warn!(error = %e, "ensure_segments_storage_index failed (Change-storage drain SELECT may full-scan until recorder runs)");
     }
+    // Default recording policy row (#251): no migration seeds it, and without it
+    // the first-run wizard's storage step, PUT /config/policy/default, and
+    // camera creation all 500 on a fresh database. Idempotent; the recorder
+    // ensures it too right after seeding the storage rows.
+    if let Err(e) = crumb_common::db::ensure_default_policy(&pool, &cfg.live_storage_path).await {
+        tracing::warn!(error = %e, "ensure_default_policy failed (first-run setup will fail until the default policy exists)");
+    }
     // Frigate/MQTT settings singleton (seeded from env on first create) — backs
     // the admin Integrations page + the hot-reloadable detection provider.
     if let Err(e) = crumb_common::db::ensure_frigate_config_table(&pool).await {

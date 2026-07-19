@@ -1089,6 +1089,14 @@ impl RecorderSupervisor {
             archive = %self.config.archive_storage_name,
             "storage rows seeded"
         );
+
+        // Default recording policy row (#251): no migration seeds it, and
+        // camera creation / the wizard's storage step 500 without it. Runs
+        // right after the storage upsert so live_storage_id wires correctly
+        // on the very first boot; the api ensures it too (idempotent).
+        db::ensure_default_policy(&self.pool, &self.config.live_storage_path)
+            .await
+            .context("ensuring default recording policy")?;
         Ok(())
     }
 }
