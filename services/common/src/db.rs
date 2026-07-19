@@ -12746,9 +12746,13 @@ mod tests {
     /// non-default policy sidesteps the `one_default_policy` partial-unique
     /// constraint entirely (this test never needs the global default), and the
     /// explicit column set mirrors `services/api/tests/support/mod.rs`'s seed so
-    /// it stays valid as the schema grows.
+    /// it stays valid as the schema grows. The name carries a UUID suffix: the
+    /// shared CI database runs the whole suite in parallel, and `name` is
+    /// globally unique (`recording_policies_name_uidx`), so a fixed name would
+    /// collide the moment two tests seed a policy at once.
     async fn insert_nondefault_policy(pool: &Pool) -> Uuid {
         let client = get_conn(pool).await.expect("get_conn (insert_policy)");
+        let name = format!("Test Non-Default Policy {}", Uuid::new_v4().simple());
         let row = client
             .query_one(
                 r"
@@ -12759,14 +12763,14 @@ mod tests {
                     motion_keyframes_only, record_stream
                 )
                 VALUES (
-                    'Test Non-Default Policy', false, 'continuous', NULL, 48,
+                    $1, false, 'continuous', NULL, 48,
                     false, NULL, NULL, NULL,
                     5, 10, 'dynamic',
                     false, 'main'
                 )
                 RETURNING id
                 ",
-                &[],
+                &[&name],
             )
             .await
             .expect("insert non-default recording_policies row");
