@@ -92,6 +92,16 @@ class MotionTimelineController extends ChangeNotifier {
 
   int _seq = 0;
 
+  // Loop-hygiene state (#256): the playback screen re-fires refresh() every 5s
+  // on an idle timer, and the scrubber fires it on every move. Without these
+  // guards, a slow fetch (e.g. under recording load) lets identical-window
+  // fetches stack into dozens of concurrent server scans. `_fetchingSig` is the
+  // signature of the in-flight fetch (null when idle); `_loadedSig` is the
+  // signature of the last COMPLETED fetch. A signature is (fetchStart, fetchEnd,
+  // sorted-camera-ids) — the actual data range on screen.
+  String? _fetchingSig;
+  String? _loadedSig;
+
   /// Update window/selection/camera-set; caller still must call [refresh].
   void configure({
     int? windowStartMs,
@@ -115,7 +125,11 @@ class MotionTimelineController extends ChangeNotifier {
   /// Fetch the intensity histogram for every camera in the wall grid (fanned
   /// out, latest-wins) plus object-detection events for the loaded window.
   /// Ported from pbReloadTimeline -> pbFetchIntensity / pbFetchDetections.
-  Future<void> refresh() async {
+  ///
+  /// Pass [force] to bypass the "same window already loaded / in flight" guards
+  /// (the playback screen uses it for the periodic full re-fetch that picks up
+  /// footage evicted by retention).
+  Future<void> refresh({bool force = false}) async {
     final winDur = (windowEndMs - windowStartMs) > 0
         ? (windowEndMs - windowStartMs)
         : 3600000;
@@ -132,14 +146,30 @@ class MotionTimelineController extends ChangeNotifier {
     if (camIds.isEmpty) {
       intensityByCam.clear();
       detections = const [];
+      _fetchingSig = null;
+      _loadedSig = null;
       notifyListeners();
       return;
+    }
+
+    // Loop hygiene (#256): the data range currently requested. The epoch-snapped
+    // fetch bounds already keep small pans within one loaded range, so an
+    // unchanged sig means "the bars on screen already cover this".
+    final sig = '$fetchStart|$fetchEnd|${(camIds.toList()..sort()).join(',')}';
+    if (!force) {
+      // An identical fetch is already running — coalesce (the idle timer
+      // re-firing the same window is what stacks concurrent server scans).
+      if (_fetchingSig == sig) return;
+      // This exact range is already loaded and nothing is in flight — nothing
+      // to do. Scrubbing to a new window changes `sig` and proceeds normally.
+      if (_fetchingSig == null && _loadedSig == sig) return;
     }
 
     // Drop cached intensity for cameras no longer in the grid.
     intensityByCam.removeWhere((id, _) => !camIds.contains(id));
 
     final mySeq = ++_seq;
+    _fetchingSig = sig;
     loading = true;
     error = null;
     notifyListeners();
@@ -179,10 +209,17 @@ class MotionTimelineController extends ChangeNotifier {
       // each as a glyph too would flood the row. Object detections only.
       detections = events.where((e) => e.iconKey.isNotEmpty && e.iconKey != 'motion').toList();
 
+      // Record what's now loaded and clear the in-flight marker. Superseded
+      // fetches returned above without touching these, so the newest fetch owns
+      // them (single isolate — no race).
+      _loadedSig = sig;
+      _fetchingSig = null;
       loading = false;
       notifyListeners();
     } catch (e) {
       if (mySeq != _seq) return;
+      // Failed: clear in-flight (but not _loadedSig) so a retry can proceed.
+      _fetchingSig = null;
       loading = false;
       error = '$e';
       notifyListeners();
