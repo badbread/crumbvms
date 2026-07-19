@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use crumb_common::{
     config::{Config, HwAccel},
     db::MotionBaselineState,

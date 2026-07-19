@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// CONTRACT PHASE — stub modules contain todo!() bodies and not-yet-used
-// imports / functions.  Remove these allows once all stubs are implemented.
-#![allow(dead_code, unused_imports, unused_variables)]
+// Dead-code allowance only: a handful of superseded motion-detector helpers
+// are still in-tree pending a post-0.1.0 cleanup (issue #244). The
+// unused_imports / unused_variables halves of the old contract-phase blanket
+// allow are back on; the todo!() stubs that allow covered are long gone.
+#![allow(dead_code)]
 
 //! Crumb NVR — recorder process entry point.
 //!
