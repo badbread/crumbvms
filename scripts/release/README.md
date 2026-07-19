@@ -43,6 +43,9 @@ API is live before the clients ship. A failed gate aborts the deploy.
 - `ios.sh`, `xcodebuild` over SSH (unsigned compile check).
 - `desktop-linux.sh` / `desktop-windows.sh`, **retired** Tauri builds; each
   prints a pointer to `windows-release-flutter.yml` and exits.
+- `pr-changelog.sh`, one bullet per merged PR in a range (default: since the
+  last tag). Standalone, no SSH/hosts; feeds the release notes (see
+  `docs/RELEASE.md`).
 - `lib.sh`, shared host/path config (set hosts via `CRUMB_BUILD_HOST`/`CRUMB_PROD_HOST`/`CRUMB_MAC_HOST`).
 
 ## Prerequisites
