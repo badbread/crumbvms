@@ -414,6 +414,11 @@ pub enum MotionAlgorithm {
 
 impl MotionAlgorithm {
     /// Canonical lower-case identifier (DB column / API / tuner).
+    ///
+    /// Test-only today: production writes the identifier at its source (admin
+    /// console / tuner) and the recorder only ever parses; the round-trip
+    /// parity test keeps this in lockstep with [`Self::from_str_lenient`].
+    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             MotionAlgorithm::Census => "census",
@@ -436,14 +441,6 @@ impl MotionAlgorithm {
             _ => MotionAlgorithm::Census,
         }
     }
-}
-
-/// Where a camera's motion comes from. `LocalCv` runs the frame pipeline with a
-/// [`MotionDetector`]; `Frigate` (a later stage) consumes Frigate MQTT object
-/// events and bypasses the frame pipeline entirely.
-pub enum MotionSource {
-    LocalCv(Box<dyn MotionDetector>),
-    // Frigate(..) — added in the Frigate-as-source stage.
 }
 
 /// Shared per-frame state the detector needs when folding a frame into its model.
@@ -485,11 +482,15 @@ pub trait MotionDetector: Send {
     /// be updated — the pixel is masked out and its model state is frozen.
     fn commit(&mut self, frame: &[u8], ctx: FrameContext, active: &[u8]);
 
-    /// Drop all model state (called when the sub-stream reconnects so a stale
-    /// background can't read as motion on resume).
+    /// Drop all model state. Test-only: production never resets in place (a
+    /// reconnect rebuilds the detector via `build_detector`); the unit tests
+    /// use it to verify a cleared model re-seeds correctly.
+    #[cfg(test)]
     fn reset(&mut self);
 
-    /// Which algorithm this is (diagnostics / tuner).
+    /// Which algorithm this is. Test-only: the identity tests assert
+    /// `build_detector` wires each config value to the right detector.
+    #[cfg(test)]
     fn algorithm_id(&self) -> MotionAlgorithm;
 }
 
@@ -543,6 +544,7 @@ impl MotionDetector for CensusDetector {
         update_background_active(&mut self.bg, frame, alpha, active);
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.bg_init = false;
         for b in self.bg.iter_mut() {
@@ -550,6 +552,7 @@ impl MotionDetector for CensusDetector {
         }
     }
 
+    #[cfg(test)]
     fn algorithm_id(&self) -> MotionAlgorithm {
         MotionAlgorithm::Census
     }
@@ -618,11 +621,13 @@ impl MotionDetector for FrameDiffDetector {
         }
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.prev_init = false;
         self.prev.iter_mut().for_each(|p| *p = 0);
     }
 
+    #[cfg(test)]
     fn algorithm_id(&self) -> MotionAlgorithm {
         MotionAlgorithm::FrameDiff
     }
@@ -836,6 +841,7 @@ impl MotionDetector for Mog2Detector {
         }
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.init = false;
         self.means.iter_mut().for_each(|v| *v = 0.0);
@@ -843,6 +849,7 @@ impl MotionDetector for Mog2Detector {
         self.weights.iter_mut().for_each(|v| *v = 0.0);
     }
 
+    #[cfg(test)]
     fn algorithm_id(&self) -> MotionAlgorithm {
         MotionAlgorithm::Mog2
     }
@@ -995,11 +1002,13 @@ impl MotionDetector for OpticalFlowDetector {
         }
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.prev_init = false;
         self.prev.iter_mut().for_each(|p| *p = 0);
     }
 
+    #[cfg(test)]
     fn algorithm_id(&self) -> MotionAlgorithm {
         MotionAlgorithm::OpticalFlow
     }
@@ -1099,11 +1108,13 @@ impl MotionDetector for EnsembleDetector {
         self.mog2.commit(frame, ctx, active);
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.census.reset();
         self.mog2.reset();
     }
 
+    #[cfg(test)]
     fn algorithm_id(&self) -> MotionAlgorithm {
         MotionAlgorithm::Ensemble
     }
@@ -3232,6 +3243,7 @@ async fn emit_pixel_signal(tx: &MotionTx, pool: &Pool, signal: MotionSignal) {
 /// frame_absdiff(&prev, &curr, &mut dst);
 /// assert_eq!(dst, vec![50, 50, 50, 50]);
 /// ```
+#[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 pub fn frame_absdiff(prev: &[u8], curr: &[u8], dst: &mut [u8]) {
     let n = prev.len().min(curr.len()).min(dst.len());
     for i in 0..n {
@@ -3247,6 +3259,7 @@ pub fn frame_absdiff(prev: &[u8], curr: &[u8], dst: &mut [u8]) {
 /// let diff = vec![0u8, 50, 100, 200];
 /// assert_eq!(count_above_threshold(&diff, 75), 2);
 /// ```
+#[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 pub fn count_above_threshold(diff: &[u8], threshold: u8) -> usize {
     diff.iter().filter(|&&p| p > threshold).count()
 }
@@ -3277,6 +3290,7 @@ const MIN_NEIGHBOURS_ON: u32 = 4;
 ///
 /// Border pixels (no full 3×3 neighbourhood) are never counted; on tiny frames it
 /// falls back to the un-denoised count.
+#[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 pub fn count_eroded_above_threshold(diff: &[u8], width: u32, height: u32, threshold: u8) -> usize {
     let w = width as usize;
     let h = height as usize;
@@ -3328,6 +3342,7 @@ fn manual_floor(motion_threshold: Option<f32>) -> f32 {
 }
 
 /// EMA-update the background model in place: `bg = bg·(1−α) + curr·α`.
+#[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 fn update_background(bg: &mut [f32], curr: &[u8], alpha: f32) {
     let keep = 1.0 - alpha;
     for (b, &c) in bg.iter_mut().zip(curr.iter()) {
@@ -3352,6 +3367,7 @@ fn update_background_active(bg: &mut [f32], curr: &[u8], alpha: f32, active: &[u
 /// Threshold `|curr − bg|` into a binary foreground mask (0 or 255). Every output
 /// byte is assigned, so the caller may reuse `mask` across frames. Retained for
 /// the census dark-region fallback's semantics and the unit tests.
+#[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 fn threshold_mask_vs_bg(curr: &[u8], bg: &[f32], thr: f32, mask: &mut [u8]) {
     for ((m, &c), &b) in mask.iter_mut().zip(curr.iter()).zip(bg.iter()) {
         *m = if (c as f32 - b).abs() > thr { 255 } else { 0 };
@@ -4117,6 +4133,7 @@ pub(crate) fn should_process_frame(
 ///
 /// Mirrors the condition in the frame loop so boundary behavior is testable
 /// without spawning ffmpeg or touching real timers.
+#[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 pub(crate) fn frame_receipt_deadline_exceeded(elapsed_secs: u64) -> bool {
     elapsed_secs >= FRAME_RECEIPT_TIMEOUT_SECS
 }

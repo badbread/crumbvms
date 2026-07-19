@@ -22,12 +22,11 @@
 //! [`CameraTracker`]) are pure and unit-tested; only the thin MQTT plumbing
 //! needs a live broker.
 //!
-//! ## Selection (Stage 2 vs Stage 4)
+//! ## Selection
 //!
-//! Which cameras use Frigate motion is chosen here by the `FRIGATE_MOTION_CAMERAS`
-//! env allow-list ("all", or a comma list of go2rtc / camera names) so the
-//! feature is deployable and verifiable now. Stage 4 replaces
-//! [`camera_uses_frigate_motion`] with a per-camera `motion_source` DB column.
+//! Which cameras use Frigate motion is chosen by the per-camera `motion_source`
+//! DB column (Stage 4). The interim `FRIGATE_MOTION_CAMERAS` env allow-list and
+//! its `camera_uses_frigate_motion` helper were retired once the column landed.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -137,34 +136,6 @@ impl FrigateMotionConfig {
             min_score: s.min_score,
         })
     }
-}
-
-/// Whether `camera` should be driven by Frigate motion rather than pixel-diff.
-///
-/// Authoritative source is the per-camera `motion_source` column
-/// (`"frigate"`); the `FRIGATE_MOTION_CAMERAS` env allow-list (`"all"`, or a
-/// comma list matched against the camera's `go2rtc_name` / display `name`)
-/// remains as a global override for fleet-wide testing and pre-column rollout.
-/// Either being set selects Frigate motion.
-#[must_use]
-pub fn camera_uses_frigate_motion(camera: &Camera) -> bool {
-    if camera.motion_source.eq_ignore_ascii_case("frigate") {
-        return true;
-    }
-    let Ok(list) = std::env::var("FRIGATE_MOTION_CAMERAS") else {
-        return false;
-    };
-    let list = list.trim();
-    if list.is_empty() {
-        return false;
-    }
-    if list.eq_ignore_ascii_case("all") {
-        return true;
-    }
-    list.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .any(|name| name == camera.go2rtc_name || name == camera.name)
 }
 
 // ── pure event classification ─────────────────────────────────────────────────
