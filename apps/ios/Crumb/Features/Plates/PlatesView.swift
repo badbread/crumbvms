@@ -40,6 +40,10 @@ final class PlatesViewModel: ObservableObject {
     // Watchlist
     @Published var watchlist: [WatchlistEntry] = []
     @Published var watchlistError: String?
+    /// Watchlist fuzziness (0…0.5) from `GET /config/lpr`; nil until loaded /
+    /// when the caller isn't an admin (403). Drives the add-form slider + preview.
+    @Published var watchlistFuzz: Double?
+    private var lprConfig: LprConfigDto?
 
     let container: AppContainer
     let cameras: [CameraDto]
@@ -185,6 +189,33 @@ final class PlatesViewModel: ObservableObject {
                 watchlistError = nil
             } catch {
                 watchlistError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+            }
+        }
+    }
+
+    /// Load the LPR config for the fuzziness control (admin only; a 403 for a
+    /// non-admin just leaves the slider hidden).
+    func loadLprConfig() {
+        guard isAdmin else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            if let cfg = try? await container.api.lprConfig() {
+                lprConfig = cfg
+                watchlistFuzz = cfg.watchlistFuzz
+            }
+        }
+    }
+
+    /// Persist a new fuzziness (admin), round-tripping enabled/retention.
+    func saveFuzz(_ fuzz: Double) {
+        guard let cfg = lprConfig else { return }
+        watchlistFuzz = fuzz
+        Task { [weak self] in
+            guard let self else { return }
+            if let updated = try? await container.api.putLprConfig(
+                enabled: cfg.enabled, retentionDays: cfg.retentionDays, watchlistFuzz: fuzz) {
+                lprConfig = updated
+                watchlistFuzz = updated.watchlistFuzz
             }
         }
     }
@@ -654,6 +685,7 @@ private struct WatchlistSheet: View {
                         TextField("Label (optional)", text: $newLabel)
                         Toggle("Notify when seen", isOn: $newNotify)
                             .tint(CrumbColors.teal)
+                        if vm.watchlistFuzz != nil { fuzzControl }
                         if let formError {
                             Text(formError).font(.caption).foregroundColor(CrumbColors.error)
                         }
@@ -700,10 +732,33 @@ private struct WatchlistSheet: View {
                 }
             }
         }
-        .task { vm.loadWatchlist() }
+        .task { vm.loadWatchlist(); vm.loadLprConfig() }
         .sheet(item: $editing) { entry in
             WatchlistEditSheet(vm: vm, entry: entry)
                 .macModalSize(width: 420, height: 420)
+        }
+    }
+
+    /// Admin fuzziness slider + live "up to N edits" preview. The edit budget is
+    /// computed by the same `Lpr` matcher the server uses, off the plate being
+    /// typed (or a sample when empty).
+    private var fuzzControl: some View {
+        let fuzz = vm.watchlistFuzz ?? 0
+        let basis = newPlate.trimmingCharacters(in: .whitespaces).isEmpty ? "7ABC123" : newPlate
+        let edits = Lpr.allowedEdits(reference: basis, fuzz: fuzz)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Fuzziness").font(.caption).foregroundColor(CrumbColors.textSecondary)
+                Spacer()
+                Text(edits == 0 ? "Exact" : "\(Int((fuzz * 100).rounded()))% · up to \(edits) char\(edits == 1 ? "" : "s")")
+                    .font(.caption.monospacedDigit()).foregroundColor(CrumbColors.tealAccent)
+            }
+            Slider(
+                value: Binding(get: { vm.watchlistFuzz ?? 0 }, set: { vm.watchlistFuzz = $0 }),
+                in: 0...0.5, step: 0.01,
+                onEditingChanged: { editing in if !editing { vm.saveFuzz(vm.watchlistFuzz ?? 0) } }
+            )
+            .tint(CrumbColors.teal)
         }
     }
 

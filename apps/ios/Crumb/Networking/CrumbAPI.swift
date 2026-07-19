@@ -225,6 +225,18 @@ final class CrumbAPI {
         try await get("config/lpr")
     }
 
+    /// `PUT /config/lpr` — admin. Set the watchlist fuzziness; round-trips
+    /// `enabled`/`retention_days` unchanged (server clamps fuzz to 0…0.5).
+    @discardableResult
+    func putLprConfig(enabled: Bool, retentionDays: Int, watchlistFuzz: Double) async throws -> LprConfigDto {
+        struct Body: Encodable {
+            let enabled: Bool
+            let retention_days: Int
+            let watchlist_fuzz: Double
+        }
+        return try await put("config/lpr", body: Body(enabled: enabled, retention_days: retentionDays, watchlist_fuzz: watchlistFuzz))
+    }
+
     /// `GET /events/{event_id}/snapshot` — the full detection frame for a plate
     /// read, Bearer-authed + `view_plates`-gated. Returns raw JPEG bytes; the
     /// client derives the tight plate crop from the read's `bbox`.
