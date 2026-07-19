@@ -3,8 +3,14 @@
 # follows). Kept OUT of ci.yml because it builds both Rust images from source and
 # boots the full 6-service stack (~10 min), which shouldn't tax every push.
 #
-# Runs: nightly, on manual dispatch, and on pushes to main that touch the
-# install surface (compose / migrations / services / setup script).
+# Runs: nightly, on manual dispatch, on pushes to main, AND on pull requests
+# that touch the install surface (compose / migrations / services / setup
+# script). The PR trigger was added after #249: a compose+config change merged
+# green through ci.yml and crash-looped the api on every fresh install; this
+# smoke caught it, but only post-merge where nobody was watching. ~10 min on
+# the few PRs that touch these paths is the right price for gating that class.
+# (The path lists are duplicated because GitHub Actions does not support YAML
+# anchors; keep them in sync.)
 name: fresh-install-smoke
 
 on:
@@ -13,6 +19,18 @@ on:
   workflow_dispatch: {}
   push:
     branches: [main]
+    paths:
+      - "docker-compose*.yml"
+      - "db/migrations/**"
+      - "services/**"
+      - "scripts/setup-env.sh"
+      - "scripts/test/fresh-install-smoke.sh"
+      - "scripts/test/smoke-testsrc-go2rtc.yaml"
+      - "caddy/**"
+      - "go2rtc/**"
+      - "mosquitto/**"
+      - "VERSION"
+  pull_request:
     paths:
       - "docker-compose*.yml"
       - "db/migrations/**"
