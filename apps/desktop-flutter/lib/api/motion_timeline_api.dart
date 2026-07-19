@@ -156,6 +156,59 @@ extension MotionTimelineApi on CrumbApi {
     );
   }
 
+  /// GET /timeline/intensity/batch?camera_ids=<csv>&start=<iso>&end=<iso>&buckets=<n>
+  ///
+  /// The batched form of [fetchIntensity]: one request for the whole wall
+  /// instead of one per camera (#256). Returns a map keyed by camera id; every
+  /// requested camera is present (all-zero buckets for one with no footage or
+  /// outside the caller's scope), so the caller can rely on a complete map.
+  Future<Map<String, IntensityBuckets>> fetchIntensityBatch(
+    Session s,
+    List<String> cameraIds,
+    DateTime start,
+    DateTime end, {
+    int buckets = 240,
+  }) async {
+    final uri = Uri.parse('${s.base}/timeline/intensity/batch').replace(
+      queryParameters: {
+        'camera_ids': cameraIds.join(','),
+        'start': start.toUtc().toIso8601String(),
+        'end': end.toUtc().toIso8601String(),
+        'buckets': '$buckets',
+      },
+    );
+    final resp = await _client.get(
+      uri,
+      headers: {'authorization': 'Bearer ${s.token}'},
+    );
+    if (resp.statusCode != 200) {
+      throw CrumbApiException(
+        'Failed to load motion intensity (HTTP ${resp.statusCode}).',
+        statusCode: resp.statusCode,
+      );
+    }
+    final j = jsonDecode(resp.body) as Map<String, dynamic>;
+    final cameras = (j['cameras'] as Map<String, dynamic>? ?? const {});
+    final startMs = start.toUtc().millisecondsSinceEpoch;
+    final endMs = end.toUtc().millisecondsSinceEpoch;
+    final out = <String, IntensityBuckets>{};
+    cameras.forEach((cameraId, v) {
+      final list = (v as List<dynamic>? ?? const [])
+          .map((e) => (e as num).toDouble())
+          .toList(growable: false);
+      final n = list.isEmpty ? 1 : list.length;
+      final bucketMs = ((endMs - startMs) / n).round();
+      out[cameraId] = IntensityBuckets(
+        cameraId: cameraId,
+        startMs: startMs,
+        endMs: endMs,
+        bucketMs: bucketMs,
+        buckets: list,
+      );
+    });
+    return out;
+  }
+
   /// GET /timeline/motion?camera_id=<id>&from=<iso>&dir=next|prev
   ///
   /// The start of the next/previous motion EVENT relative to `from`, searched
