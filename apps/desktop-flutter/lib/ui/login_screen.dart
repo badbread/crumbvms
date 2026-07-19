@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/ui/discovery/server_discovery_panel.dart';
 
 /// Optional prefill for the server field, e.g.
 /// `--dart-define=SERVER_URL=http://host:port`. Never committed with a real
@@ -27,6 +28,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final _server = TextEditingController(text: _prefillServer);
   final _user = TextEditingController();
   final _pass = TextEditingController();
+  final _userFocus = FocusNode();
   bool _busy = false;
   String? _error;
 
@@ -61,6 +63,7 @@ class _LoginScreenState extends State<LoginScreen> {
     _server.dispose();
     _user.dispose();
     _pass.dispose();
+    _userFocus.dispose();
     super.dispose();
   }
 
@@ -96,9 +99,20 @@ class _LoginScreenState extends State<LoginScreen> {
                 keyboardType: TextInputType.url,
                 enabled: !_busy,
               ),
+              const SizedBox(height: 8),
+              // "Find my server": scans the LAN and fills the field above. The
+              // panel is self-contained and reports the chosen URL back here.
+              ServerDiscoveryPanel(
+                api: widget.api,
+                onServerSelected: (url) {
+                  setState(() => _server.text = url);
+                  _userFocus.requestFocus();
+                },
+              ),
               const SizedBox(height: 12),
               TextField(
                 controller: _user,
+                focusNode: _userFocus,
                 decoration: const InputDecoration(
                   labelText: 'Username',
                   border: OutlineInputBorder(),
