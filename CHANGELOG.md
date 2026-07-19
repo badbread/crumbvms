@@ -9,7 +9,7 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
-## [Unreleased] (heading toward v0.1.0)
+## [0.1.0] - 2026-07-18
 
 The week after the first public cut. The theme: turn a working recorder into a
 seat you'd actually want to sit in: a native desktop rewrite, license-plate
@@ -123,6 +123,23 @@ sheet for a saved snapshot or export.
 - Timeline shows the date when scrubbed off "today"; wall scrub tiles show
   "no footage" instead of freezing; thumbnail extraction forced to MJPEG (fixed a
   100%-scrub 404); Android Edit-view layout; and a long tail of client polish.
+- **Timezones actually work now.** The recorder's archive/retention cron
+  inherits the container `TZ` instead of hardcoding America/Los_Angeles, and the
+  admin console shows schedule times in the server's real timezone instead of a
+  hardcoded "Pacific" label (#228, #237).
+- **`.env` keys stopped being silent no-ops.** Compose now forwards the
+  code-read keys it previously dropped (`RECORDER_TZ`, `HA_BASE_URL`/`HA_TOKEN`/
+  `HA_TOKEN_FILE`, `DB_POOL_SIZE`, `MAINTENANCE_UNTIL`,
+  `CAMERA_OFFLINE_BOOT_GRACE_SECS`, the `THUMB_*` set), and the env parsers
+  treat an empty value as unset instead of failing boot (#229).
+- **First-run wizard storage cap.** On a nearly-full disk the prefilled
+  keep-at-most cap could invert to *unlimited*; it now floors at 80% of free
+  space (#227).
+- **The Windows desktop release ships the Flutter client.** The `v*` tag
+  workflow was still building the retired Tauri app; it now builds
+  `apps/desktop-flutter` and attaches an unzip-and-run
+  `CrumbVMS-windows-<tag>.zip` to the Release, with a real Crumb app icon
+  instead of the Flutter placeholder.
 
 ### Hardened (recorder correctness)
 
@@ -147,5 +164,5 @@ wizard with generated secrets, LAN-only by default; and native desktop
 (then Tauri), Android, and web-admin clients. Runs entirely on your own hardware,
 no cloud, no account, no telemetry.
 
-[Unreleased]: https://github.com/badbread/crumbvms/compare/v0.0.1...HEAD
+[0.1.0]: https://github.com/badbread/crumbvms/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/badbread/crumbvms/releases/tag/v0.0.1
