@@ -26,20 +26,32 @@ production-ready of Crumb's clients today.
   encrypted archive.
 - **Cameras.** Discovery, adding, editing, grouping, and stream testing.
   See [Cameras & Streams](/cameras/).
-- **Recording and storage.** Policies, groups, size caps, and storage
-  tiers. See [Recording & Storage](/recording/).
+- **Recording and storage.** Recording profiles (each camera is pinned to a
+  named profile), size caps, storage tiers, and the storage advisor's
+  per-profile fill-rate and retention cards. See
+  [Recording & Storage](/recording/).
 - **Motion tuning.** Per-camera detector choice, exclusion zones drawn
   directly on the live image. See [Motion & Detection](/motion/).
-- **Users and security.** Custom roles with per-camera and per-group
-  access grants, so a limited account can be restricted to specific
-  cameras, or to live view only.
-- **Server and streaming settings.** The address native clients use to
-  reach live video, hardware decode selection, and other console-side
-  settings that override environment defaults. See
+- **Detection and clips.** The Frigate detection integration, Home Assistant
+  connection settings (link a camera's HA motion, sensor, and actuator
+  entities, and use HA sensors as a recording trigger), and clip options.
+  See [Integrations](/integrations/).
+- **LPR.** License-plate recognition: per-camera engine (none, Frigate,
+  crumb-alpr, or both), an OCR-confidence floor, detection zones, and a plate
+  watchlist (watch or ignore entries, with adjustable match fuzziness). The
+  optional crumb-alpr worker is Crumb's own local plate OCR.
+- **Users and security.** Custom roles carrying both a capability set and a
+  base set of cameras, plus optional extra per-camera grants on top for an
+  individual user, so a limited account can be restricted to specific
+  cameras, or to live view only. See
+  [Users & access](/admin-console/users-and-access).
+- **Server.** The streaming address native clients use to reach live video,
+  hardware decode selection, update checks, scrub previews, and other
+  console-side settings that override environment defaults. See
   [Server settings](/configuration/server-settings).
 - **Notifications.** Channels, rules, and quiet hours. See
   [Notifications](/notifications/).
-- **Health panels.** Per-policy storage usage, decode status
+- **Health panels.** Per-profile storage usage, decode status
   (requested versus actually active hardware backend per camera), and
   system alerts for conditions like a disconnected camera, low disk, or a
   stale backup.

@@ -19,13 +19,47 @@ platforms:
 | Apple mobile | iOS 16+ | not yet distributable, see [iOS](/clients/ios) |
 | Android | Android 8.0+ | `.apk` from Releases |
 
-**Honest status.** The web console is production-ready. The Windows
-desktop and Android clients are the daily-driver, most-tested paths.
-macOS and iOS both work and are ready to try, but are rougher. None of the
-native clients have a signed installer or app-store listing yet, so
-installing one means sideloading and getting past your OS's warning about
-an unrecognized app. That's expected for a self-hosted project without a
-release budget behind it yet, not a sign of anything wrong with the build.
+**Honest status.** The web console is production-ready for administration. The
+Windows desktop and Android clients are the daily-driver, most-tested paths for
+actually watching video, and they carry the newest features. macOS and iOS both
+work and are ready to try, but are rougher and lag on features. None of the
+native clients have a signed installer or app-store listing yet, so installing
+one means sideloading and getting past your OS's warning about an unrecognized
+app. That's expected for a self-hosted project without a release budget behind
+it yet, not a sign of anything wrong with the build.
+
+## What each client can do
+
+The clients don't all do the same things yet. The Windows desktop and Android
+clients are where I build first, so they're the most complete. The macOS and
+iOS apps share one SwiftUI codebase and cover the core watch-and-review path but
+don't have the newer surfaces. The web console administers the server but plays
+no video.
+
+| Feature | Web console | Windows desktop | Android | macOS / iOS |
+|---|---|---|---|---|
+| Camera & server administration | yes | partial (embedded console pane) | no | no |
+| Live view | no | yes | yes | yes |
+| Timeline playback | no | yes | yes | yes |
+| Clips & export | no | yes | yes | yes |
+| PTZ controls | no | yes | yes | no |
+| Data-saver / adaptive quality | n/a | yes (Data-saver tier, "SD" chip) | yes (Auto / Full / Data-saver) | no |
+| LPR (license-plate) reads tab | configures LPR | yes | yes | no |
+| Home Assistant | configures & links | entity overlay on live video | read-only entity sheet | no |
+| Snapshot button | no | yes | yes (single-camera views) | no |
+
+Notes:
+
+- **Data-saver / adaptive quality** plays a low-bitrate transcode to save
+  bandwidth. On desktop it's a per-camera stream tier marked with an "SD" chip;
+  on Android the quality control is Auto / Full / Data-saver, where Auto uses
+  full quality on Wi-Fi and Data-saver on a metered connection.
+- **LPR** reads are browsed in the desktop and Android LPR tab (plate crops,
+  watchlist search, fuzzy preview). The web console is where LPR is configured
+  (engine, detection zones, watchlist).
+- **Home Assistant** is configured and linked in the web console. The desktop
+  client paints linked entity states as an overlay on live video; Android shows
+  a read-only per-camera entity sheet.
 
 ## Before installing any native client
 

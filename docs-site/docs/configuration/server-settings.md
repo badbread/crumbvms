@@ -33,17 +33,26 @@ console value falls back to the environment. This means:
 
 The most common settings an operator changes after first-run setup:
 
-- **Server & streaming**, the address native clients use to reach live
-  RTSP and WebRTC.
-- **Storage**, recording policies, size and time caps, storage tiers (see
+- **Server**, under this section: the streaming addresses native clients use
+  to reach live RTSP and WebRTC, update checks (the same toggle that
+  overrides `UPDATE_CHECK_ENABLED`, DB wins), and scrub previews (the
+  live-editable `THUMB_PREGEN_*` / `THUMB_CACHE_*` knobs).
+- **Storage**, recording profiles, size and time caps, storage tiers, plus
+  the storage advisor's per-profile fill-rate and retention cards (see
   [Recording & Storage](/recording/)).
 - **Motion decoding**, the requested hardware-decode backend (see
   [Hardware decode](/configuration/hardware-decode)).
+- **Detection & clips**, the Frigate detection integration's stream and API
+  bases, Home Assistant connection settings, and clip generation options
+  (see [Integrations](/integrations/)).
+- **LPR**, license-plate recognition: the per-camera engine selection
+  (none / Frigate / crumb-alpr / both), OCR-confidence floor, detection
+  zones, the plate watchlist with match fuzziness, and the crumb-alpr ingest
+  token.
 - **Notifications**, channels, per-camera rules, quiet hours (see
   [Notifications](/notifications/)).
-- **Users & security**, accounts, roles, per-camera access grants.
-- **Frigate**, the detection integration's stream and API bases (see
-  [Integrations](/integrations/frigate)).
+- **Users & security**, accounts, roles, per-camera access grants (see
+  [Users & access](/admin-console/users-and-access)).
 
 Each of these is covered in more depth in its own section; this page is
 just the rule for how console settings and environment defaults interact.

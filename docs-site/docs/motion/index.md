@@ -12,10 +12,12 @@ indicator, and notification rules. It runs entirely on your own hardware,
 on a downscaled grayscale frame from each camera's sub-stream, and doesn't
 require an object detector to be useful on its own.
 
-Object-level detection, telling a person apart from a car apart from a
-package, is a separate, deliberately out-of-scope concern for Crumb
-itself: if you already run (or want to run) a dedicated object detector,
-Crumb can show its results as icons on the same timeline. See
+General object-level detection, telling a person apart from a car apart
+from a package, is deliberately not something Crumb's own motion pipeline
+does: if you already run (or want to run) a dedicated object detector,
+Crumb can show its results as icons on the same timeline. The one kind of
+recognition Crumb does ship is an optional, opt-in, fully local
+license-plate reader, off unless you turn it on. See
 [Integrations](/integrations/).
 
 ## In this section
@@ -23,5 +25,6 @@ Crumb can show its results as icons on the same timeline. See
 - [Detectors](/motion/detectors), the detector choices and how they
   differ.
 - [Tuning](/motion/tuning), exclusion zones and per-camera sensitivity.
-- [Frigate as a detection source](/motion/frigate-as-source), showing
-  object-level detections alongside pixel motion.
+- [Motion sources](/motion/frigate-as-source), how pixel analysis, Frigate
+  detections, and Home Assistant sensors can each trigger recording, together
+  or on their own.

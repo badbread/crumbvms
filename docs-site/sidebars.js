@@ -114,6 +114,8 @@ const sidebars = {
       items: [
         'integrations/index',
         'integrations/frigate',
+        'integrations/license-plate-recognition',
+        'integrations/home-assistant',
       ],
     },
     {

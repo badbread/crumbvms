@@ -51,9 +51,28 @@ if [[ -f "${ENV_FILE}" && "${FORCE}" -ne 1 ]]; then
 fi
 
 gen_secret() { openssl rand -hex 32; }
-# Admin password: a URL/shell-safe random token (base64 with +,/,= stripped),
-# long enough to be strong. Avoids characters that could trip .env parsing.
-gen_password() { openssl rand -base64 24 | tr -d '+/=' | cut -c1-24; }
+# Admin password: a memorable two-word passphrase (Adjective + Noun) plus a
+# three-digit number, e.g. "IcyApples473". It is printed once below so you can
+# read it straight into the first-run sign-in, and it avoids characters that
+# trip .env parsing. This is a STARTER credential for the LAN-only first login
+# (~21 bits of entropy, fine behind the login rate-limiter on a trusted LAN);
+# change it in the console, or set your own with --prompt, before exposing the
+# console anywhere. The seeded admin also closes the unauthenticated
+# /auth/bootstrap window that a blank seed would leave open on first run.
+gen_password() {
+  local adjectives=(Amber Brave Brisk Calm Clever Cozy Crimson Dapper Eager \
+    Fuzzy Gentle Golden Happy Icy Jolly Keen Lively Lucky Mellow Nimble Noble \
+    Olive Plucky Quiet Rapid Rosy Rustic Sandy Shiny Silver Snowy Solar Spry \
+    Sunny Swift Teal Tidy Vivid Witty Woolly Zesty)
+  local nouns=(Acorn Apples Badger Beacon Cactus Cedar Comet Cove Dune Ember \
+    Falcon Fern Fjord Grove Harbor Heron Isle Kettle Lantern Lark Maple Meadow \
+    Nectar Otter Panda Pebble Pine Quartz Raven Reef Ridge River Robin Sparrow \
+    Spruce Thistle Tiger Timber Valley Willow Yarrow)
+  printf '%s%s%03d' \
+    "${adjectives[RANDOM % ${#adjectives[@]}]}" \
+    "${nouns[RANDOM % ${#nouns[@]}]}" \
+    "$(( RANDOM % 1000 ))"
+}
 
 POSTGRES_PASSWORD="$(gen_secret)"
 JWT_SECRET="$(gen_secret)"
@@ -280,10 +299,14 @@ ALERT_WEBHOOK_URL=
 UPDATE_CHECK_ENABLED=false
 
 # --- Seed (admin bootstrap user) ---
-# Easiest: leave SEED_ADMIN_PASSWORD blank and create the admin in the browser at
-# /admin on first run. For a HEADLESS install, the API hashes SEED_ADMIN_PASSWORD
-# at startup (argon2) and creates the admin if none exists (idempotent). The
-# recorder seed path reads SEED_ADMIN_PASSWORD_HASH (a PHC argon2id string) instead.
+# The default: this .env ships with a generated SEED_ADMIN_PASSWORD (the memorable
+# passphrase setup-env.sh printed). The API hashes it at startup (argon2) and
+# creates the admin if none exists, so you just open /admin and SIGN IN as this
+# user. Seeding the admin also closes the unauthenticated /auth/bootstrap window.
+# To use the browser "create admin" wizard instead, blank SEED_ADMIN_PASSWORD
+# below (that reopens the bootstrap window until you create the admin). For a
+# pre-hashed headless seed, the recorder path reads SEED_ADMIN_PASSWORD_HASH
+# (a PHC argon2id string) instead.
 SEED_ADMIN_USERNAME=${SEED_ADMIN_USERNAME}
 SEED_ADMIN_PASSWORD=${SEED_ADMIN_PASSWORD}
 SEED_ADMIN_PASSWORD_HASH=
@@ -297,9 +320,10 @@ SEED_DEFAULT_CAMERAS=false
 ONVIF_CONFIG_B64=
 
 # --- Versioned image deploy (optional; see docs/RELEASE.md) ---
-# Set these to pull tagged images from a registry instead of building locally:
-# CRUMB_IMAGE_PREFIX=ghcr.io/youraccount/crumb
-# CRUMB_VERSION=v1.0.0
+# Images pull from the public default prefix (ghcr.io/badbread/crumbvms) with no
+# login. Pin a release with CRUMB_VERSION; only override CRUMB_IMAGE_PREFIX when
+# running a fork's own registry (form: ghcr.io/<owner>/<repo>).
+# CRUMB_VERSION=v0.1.0
 EOF
 
 chmod 600 "${TMP}"
@@ -350,11 +374,10 @@ else
 fi
 
 log "wrote ${ENV_FILE} (mode 600) with freshly generated secrets"
-log "admin username: ${SEED_ADMIN_USERNAME}"
-if [[ "${PRINT}" -eq 1 ]]; then
-  log "admin password: ${SEED_ADMIN_PASSWORD}"
-else
-  log "admin password generated (not printed). Re-run with --print to show it, or set it with --prompt."
-fi
-log "NEXT: 'docker compose up -d', then open /admin to create your admin (first-run wizard)."
-log "(SEED_ADMIN_PASSWORD above is a headless fallback; the browser wizard is the easy path.)"
+log ""
+log "  Console sign-in (write these down, you will not be shown the password again):"
+log "    username: ${SEED_ADMIN_USERNAME}"
+log "    password: ${SEED_ADMIN_PASSWORD}"
+log ""
+log "  (also stored as SEED_ADMIN_PASSWORD in ${ENV_FILE}; change it in the console after first login)"
+log "NEXT: 'docker compose up -d', then open http://<host>:8080/admin and sign in with the above."

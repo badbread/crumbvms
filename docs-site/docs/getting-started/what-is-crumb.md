@@ -48,20 +48,25 @@ experience did not exist yet at this price point.
 - **Shows a live wall** of multiple cameras at once, with saveable per-device
   layouts, carousels, PTZ tiles, and on-video ONVIF pan/tilt/zoom control.
 - **Retains footage** according to named policies (continuous or
-  motion-triggered, size caps, time caps, storage tiers) applied per camera
-  or per camera group.
+  motion-triggered, size caps, time caps, storage tiers). Every camera
+  belongs to exactly one named policy; pointing several cameras at the same
+  policy is how they share retention settings.
 - **Exports** a selected span, or a batch list built up across a review
   session, to MP4 or an encrypted archive.
-- **Controls access** with custom roles and per-camera or per-group grants,
-  so a limited account can be restricted to specific cameras or to live-only.
+- **Controls access** with custom roles and per-camera grants, so a limited
+  account can be restricted to specific cameras or to live-only.
 
 ## What Crumb deliberately does not do
 
-- **It does not run its own object, face, or license-plate detection.**
-  Detection is left to a dedicated detector you already run (or could run)
-  independently. If you point Crumb at your own instance of one, Crumb will
-  show its detections as icons on the timeline. See
-  [Integrations](/integrations/) for how that works.
+- **It does not run its own object or face detection.** That is left to a
+  dedicated detector you already run (or could run) independently. If you
+  point Crumb at your own instance of one, Crumb will show its detections as
+  icons on the timeline. See [Integrations](/integrations/) for how that works.
+- **License-plate reading is the one exception.** Crumb ships an opt-in,
+  fully local plate reader (fast-alpr) that runs on your own hardware, no
+  cloud and no third-party account, and you can also feed plate reads in from
+  your own Frigate instead. Both are off by default and stay on your box. See
+  [Integrations](/integrations/) for how to turn it on.
 - **It does not require an account, a subscription, or any connection to a
   vendor's servers.** Setup happens entirely on your own network.
 - **It does not send footage, thumbnails, metadata, or usage statistics

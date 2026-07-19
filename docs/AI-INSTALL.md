@@ -58,12 +58,13 @@ CrumbVMS records **security cameras**. A misconfiguration is a privacy hazard, s
 - **GPU (optional):** not required. CrumbVMS runs motion detection on CPU by default
   (`MOTION_HWACCEL=auto`). NVIDIA GPU support is an opt-in overlay (Step 4).
 - **Images, pull vs. build:** the base compose file *pulls* prebuilt `api`/
-  `recorder` images from GHCR (no Rust toolchain needed), but that only works
-  once the upstream owner has enabled GHCR publishing (see `docs/IMAGES.md`
-  "Owner seam"). If you're working from a fresh clone of this repo and haven't
-  confirmed images are published, plan on the **build-from-source** path in
-  Step 5 instead (needs the Rust build to run inside Docker, no local Rust
-  toolchain required, but expect the first `up` to take several minutes).
+  `recorder` images from GHCR (no Rust toolchain needed). The upstream
+  `ghcr.io/badbread/crumbvms/{api,recorder}` images are **published and public**,
+  so the pull path is the default and works on a fresh clone. The
+  **build-from-source** path in Step 5 is still there for developers, air-gapped
+  hosts, or a private fork that hasn't published its own images (see
+  `docs/IMAGES.md`); it needs the Rust build to run inside Docker, no local Rust
+  toolchain required, but expect the first `up` to take several minutes.
 
 **Verify:** `docker compose version` prints v2.x; the target disk has > (estimate
 from camera count × resolution × retention) free.
@@ -119,9 +120,19 @@ scripts/setup-env.sh            # generates .env with strong random secrets
 ```
 
 This writes a gitignored `.env` with a strong `POSTGRES_PASSWORD`, `JWT_SECRET`,
-and `SEED_ADMIN_PASSWORD`. **Do not** edit those secret values by hand or echo them
-into the chat; if the user needs the admin password, re-run with `--print` or read
-it back to them privately.
+and a **seeded admin account**. By default `setup-env.sh` generates a *memorable*
+admin passphrase (e.g. `IcyApples473`), **prints it once**, and stores it as
+`SEED_ADMIN_PASSWORD` in `.env`; the api hashes it at startup and creates the
+`admin` user before the console is first reachable. This is the secure default:
+it closes the brief unauthenticated `/auth/bootstrap` window a blank seed would
+leave open. Capture that passphrase from the script output (or read the
+`SEED_ADMIN_PASSWORD` line out of `.env`) and hand it to the user privately, they
+sign in with it in Step 6. **Do not** edit the generated secret values by hand or
+echo any secret other than the user's own admin password into the chat. It's a
+LAN-only starter credential, tell the user to change it in the console after
+first login. (Advanced: `--prompt` sets your own admin password instead; blanking
+`SEED_ADMIN_PASSWORD` before first boot opts out of seeding and hands admin
+creation to the wizard's create-admin step, Step 6a.)
 
 It also detects two host facts and writes them (neither is a secret):
 
@@ -205,14 +216,13 @@ that error by inventing a value; re-run `scripts/setup-env.sh`.
 **Pick pull or build** (see Step 1's note and `docs/IMAGES.md`):
 
 ```sh
-# Default path, pulls prebuilt images (works once the owner has published to
-# GHCR; confirm with `docker compose pull` and check for a "not found"/403):
+# Default path, pulls the published (public) prebuilt images from GHCR:
 docker compose pull
 docker compose up -d
 
-# Build-from-source override, use this if `docker compose pull` fails to find
-# the images (common on a fresh clone before publishing is enabled), or if
-# you're developing against local code changes:
+# Build-from-source override, use this if you're developing against local code
+# changes, running air-gapped, or on a private fork that hasn't published its
+# own images (a plain `docker compose pull` would 404 there):
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
@@ -250,7 +260,10 @@ start with a stock `up -d` (Step 8).
 - `docker compose ps`: all services `running`/`healthy`.
 - `curl -fsS http://localhost:8080/health` → `200 OK` (it probes DB + recorder;
   503 means a component is still coming up. Wait and retry a few times).
-- `docker compose logs recorder | grep -i "migration"` shows migrations applied.
+- `docker compose logs api recorder | grep -i migration` shows migrations
+  applied. (Grep **both** services: whichever of api/recorder wins the startup
+  advisory lock runs and logs the migrations; the other logs nothing, so
+  grepping only one can miss them on a perfectly healthy boot.)
 
 ---
 
@@ -259,13 +272,19 @@ start with a stock `up -d` (Step 8).
 Pick ONE with the user.
 
 ### 6a. Hand off to the web Setup wizard (simplest)
-Tell the user to open **`http://<host-lan-ip>:8080/admin`**. On a fresh install it
-launches a guided wizard. It opens with a one-time **tester-terms gate**, an
-AS-IS / no-warranty / not-your-only-security / lawful-use acknowledgement the
-operator reads and checks to continue (recorded server-side once an admin exists,
+Tell the user to open **`http://<host-lan-ip>:8080/admin`** and **sign in as
+`admin`** with the passphrase `setup-env.sh` printed in Step 2 (the
+`SEED_ADMIN_PASSWORD` line in `.env`). On a fresh seeded install the admin
+already exists, so this is a normal sign-in, not an account-creation step.
+Signing in launches a guided wizard. It opens with a one-time **tester-terms
+gate**, an AS-IS / no-warranty / not-your-only-security / lawful-use
+acknowledgement the operator reads and checks to continue (recorded server-side,
 via `PUT /config/beta-terms`). Then:
 
-1. **Create admin**, the account they'll sign in with.
+1. **Create admin** (**skipped on the default seeded install**, the admin already
+   exists and you just signed in as it, so the wizard resumes at the tester-terms
+   gate). This step only appears if `SEED_ADMIN_PASSWORD` was blanked before first
+   boot.
 2. **Server address**, pre-filled from the connection; only change if wrong.
 3. **Storage**, confirm the recording disk (path + a live capacity bar), set
    **"Keep at most"** (GB) and **"Keep at least"** (days). These write the default
@@ -367,11 +386,20 @@ wins when both are set, and the integration stays dormant until enabled.
 ### 6b. Drive it yourself via the REST API (full hands-off)
 All wizard steps have API equivalents. Do them in order:
 
-1. **Create the admin.** `POST /auth/bootstrap` `{username, password}` (use the
-   `SEED_ADMIN_PASSWORD` from Step 2, or ask the user). Returns a bearer token; use
-   it for every call below. Then record the operator's acceptance of the tester
-   terms, `PUT /config/beta-terms` `{accept: true}` (the web wizard's opening
-   AS-IS gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
+1. **Get an admin token.** First probe `GET /auth/needs-bootstrap`.
+   - **Default (admin pre-seeded):** `needs_bootstrap` is `false`. `setup-env.sh`
+     already created the `admin` user from `SEED_ADMIN_PASSWORD`, so
+     `POST /auth/login` `{"username":"admin","password":"<SEED_ADMIN_PASSWORD from
+     .env>"}` returns the bearer token; use it for every call below. (`POST
+     /auth/bootstrap` would return **409 Conflict** on this path.)
+   - **Blanked-seed opt-in:** if the operator deliberately blanked
+     `SEED_ADMIN_PASSWORD` before first boot, `needs_bootstrap` is `true` and no
+     admin exists yet. Create it with `POST /auth/bootstrap` `{username, password}`
+     (pick a strong password, or ask the user; ≥ 8 chars); it returns the token.
+
+   Then record the operator's acceptance of the tester terms,
+   `PUT /config/beta-terms` `{accept: true}` (the web wizard's opening AS-IS
+   gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
 2. **Server address.** `PUT /config/server` with the host's **LAN** address
    (`server_address`, `crumb_rtsp_base`, …). Use the LAN IP, never a public one.
    (`GET /auth/setup-status` returns a suggested address derived from the request,
@@ -651,10 +679,11 @@ Default = LAN-only, do nothing. If the user wants to reach CrumbVMS away from ho
   `GO2RTC_PASS` "is required" → `.env` is missing those keys (hand-edited or
   copied from `.env.example` verbatim); re-run `scripts/setup-env.sh`.
 - `docker compose pull` errors with "not found" / "denied" / 403 on
-  `ghcr.io/badbread/crumbvms/...` → images aren't published yet for this
-  repo/fork (see `docs/IMAGES.md` "Owner seam"). Use the build override
-  instead: `docker compose -f docker-compose.yml -f docker-compose.build.yml
-  up -d --build`.
+  `ghcr.io/badbread/crumbvms/...` → the upstream images are public, so this
+  should be rare; it means you're on a **private fork** whose own images aren't
+  published (or `CRUMB_IMAGE_PREFIX` points somewhere unpublished). Build from
+  source instead: `docker compose -f docker-compose.yml -f
+  docker-compose.build.yml up -d --build` (see `docs/IMAGES.md`).
 - `/health` stays 503 → give Postgres a moment; check `docker compose logs postgres`.
 - Port 8080 (or 8443/18554/8556) in use → another service on the host; remap
   the conflicting port in `docker-compose.yml` (or override `CRUMB_HTTPS_PORT`
@@ -681,8 +710,8 @@ Default = LAN-only, do nothing. If the user wants to reach CrumbVMS away from ho
 This doc encodes real endpoints, ports, and scripts, so it can drift from the code.
 Unlike prose docs, an agent-runnable runbook is **testable**: add a CI job that, on
 a clean VM, runs these steps end-to-end (`setup-env.sh` → `docker compose up -d` →
-wait for `/health` → bootstrap + add a synthetic RTSP camera via the API →
-assert it records) and fails if any Verify check fails. That turns "the install
+wait for `/health` → log in as the seeded admin + add a synthetic RTSP camera via
+the API → assert it records) and fails if any Verify check fails. That turns "the install
 works" into a green check and stops this file from rotting against the compose /
 API surface.
 
@@ -695,9 +724,10 @@ leave it for a follow-up:
   (`:?`-guarded) env vars, volumes, healthchecks, or profile gating.
 - `.env.example` / `scripts/setup-env.sh`, new/renamed/removed config keys, or
   a change to what's generated vs. left blank.
-- Image publishing/pull-vs-build story (`docs/IMAGES.md`), e.g. once GHCR
-  publishing is enabled by default, the "pull may not work yet" caveats in
-  Step 1/5/Troubleshooting here should be softened or removed.
+- Image publishing/pull-vs-build story (`docs/IMAGES.md`). The GHCR images are
+  public now, so pull is the documented default; if publishing ever changes
+  (registry move, a fork going private), re-check the pull-vs-build wording in
+  Step 1/5/Troubleshooting.
 - First-run flow, wizard steps (`admin.html` `WIZARD_ALL_STEPS`) or the
   underlying REST endpoints (`auth.rs`, `config_routes.rs`).
 - Backup/monitoring/remote-access defaults, the api's built-in DB backup job

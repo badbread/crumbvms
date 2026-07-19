@@ -55,9 +55,9 @@ self-hosted registry, with no compose edits.
 
 ## Building from source instead
 
-Use this if you're developing CrumbVMS, running air-gapped, or the images
-described above aren't published yet (see "Owner seam" below). Layer the build
-override on top of the base file:
+Use this if you're developing CrumbVMS, running air-gapped, or on a private
+fork whose own images aren't published (the upstream ones are, see "Owner seam"
+below). Layer the build override on top of the base file:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
@@ -85,14 +85,15 @@ Tip: copy `docker-compose.build.yml` to `docker-compose.build.local.yml`
 
 ## Owner seam: enabling GHCR publishing
 
-**Until this is done, the default `docker-compose.yml` has nothing to pull** —
-anyone running from this repo today must use the build override above. This is
-the one manual step that flips the default over to "pull, don't compile" for
-everyone downstream.
+**This is done for the upstream repo.** The
+`ghcr.io/badbread/crumbvms/{api,recorder}` packages are published and **public**,
+so a fresh `docker compose pull` finds them with zero config, no build needed.
+This section is kept as the record of how that was set up, and as the recipe a
+**private fork** follows to publish its own images.
 
-CI (`.github/workflows/ci.yml`, the `images` job) already builds `api` and
-`recorder` on every push/PR and is *capable* of pushing them to GHCR, it just
-doesn't push until told where. To enable it:
+CI (`.github/workflows/ci.yml`, the `images` job) builds `api` and
+`recorder` on every push/PR and pushes them to GHCR when a registry is
+configured. To enable it on a fork:
 
 1. **Set the `REGISTRY` repository (or org) variable** to
    `ghcr.io/badbread/crumbvms`, GitHub repo → Settings → Secrets and variables →
@@ -110,15 +111,15 @@ doesn't push until told where. To enable it:
    *private* repo are created **private**, an anonymous `docker pull` will
    403. Go to the package page (github.com/badbread?tab=packages, or the
    package's own page after the first push → Package settings) for both
-   `crumb/api` and `crumb/recorder`, and change visibility to **Public**. Do
-   this for each image the first time it's created; it doesn't need repeating
+   `crumbvms/api` and `crumbvms/recorder`, and change visibility to **Public**.
+   Do this for each image the first time it's created; it doesn't need repeating
    on later pushes to the same package.
 4. **Optional but recommended:** link the packages to the repo (Package
    settings → "Connect Repository") so they show up on the repo's sidebar and
    inherit repo-level access notes.
 
-Until steps 1–3 are done, CI still builds and validates the images every run
-(so nothing is untested), it just keeps them local to the runner
+On a fork where steps 1–3 aren't done, CI still builds and validates the images
+every run (so nothing is untested), it just keeps them local to the runner
 (`docker/build-push-action`'s `load: true` path) instead of publishing them.
 See the "Resolve registry + push policy" step in `ci.yml` for the exact
 fallback logic.

@@ -26,11 +26,16 @@ docker compose up -d
 docker compose ps                      # postgres healthy, recorder (embeds go2rtc) + api up
 ```
 
-Then open **`http://<host>:8080/admin`** and **create your administrator** in the
-first-run wizard. After logging in, set the reachable address under **Server &
-streaming** (e.g. `rtsp://<host>:18554`) and add cameras in the **Cameras** page.
+Then open **`http://<host>:8080/admin`** and **sign in as `admin`** with the
+memorable passphrase `scripts/setup-env.sh` printed (stored as
+`SEED_ADMIN_PASSWORD` in `.env`); the first-run wizard resumes at the
+tester-terms step (the admin is already seeded, so there's no create-admin step).
+After logging in, set the reachable address under **Server & streaming** (e.g.
+`rtsp://<host>:18554`) and add cameras in the **Cameras** page. Change the starter
+admin password in the console after first login.
 
-- **Headless/CI:** set `SEED_ADMIN_PASSWORD` in `.env` to skip the browser wizard.
+- **Create the admin in the browser instead:** blank `SEED_ADMIN_PASSWORD` in
+  `.env` before first boot; the wizard then shows its create-admin step.
 - **GPU (optional):** add the overlay to enable NVDEC motion decode —
   `docker compose -f docker-compose.yml -f docker-compose.gpu.example.yml up -d`.
 - **Storage:** one broad media root (`MEDIA_HOST_PATH` → `/data`) is bind-mounted
@@ -56,13 +61,17 @@ hook that blocks committing it.**
 `scripts/setup-env.sh` writes a `.env` (mode 600) with:
 - `POSTGRES_PASSWORD`, `openssl rand -hex 32`
 - `JWT_SECRET`, `openssl rand -hex 32` (the API requires ≥ 32 bytes)
-- `SEED_ADMIN_PASSWORD`, generated (or `--prompt` to type your own); the API
-  hashes it with argon2 at startup and creates the admin if none exists.
+- `SEED_ADMIN_PASSWORD`, a **memorable passphrase generated and seeded by
+  default** (e.g. `IcyApples473`). `setup-env.sh` prints it and stores it here,
+  and the API hashes it with argon2 at startup to create the `admin` user. This
+  is the secure default: it closes the unauthenticated `/auth/bootstrap` window a
+  blank seed would leave open. Use `--prompt` to set your own, or blank the value
+  to hand admin creation to the browser wizard.
 
 ```bash
-scripts/setup-env.sh                  # generate everything, don't print the pw
-scripts/setup-env.sh --prompt         # type the admin password yourself
-scripts/setup-env.sh --print          # generate + print the admin password once
+scripts/setup-env.sh                  # generate secrets + seed an admin; prints the passphrase
+scripts/setup-env.sh --prompt         # set your own admin password interactively
+scripts/setup-env.sh --print          # also echo the passphrase to stdout after writing
 scripts/setup-env.sh --force          # ROTATE: overwrite an existing .env
 ```
 
@@ -85,11 +94,12 @@ a fresh init or an explicit `ALTER ROLE`.
 
 ### The DB_POOL_SIZE knob
 
-`api` and `recorder` read `DB_POOL_SIZE` (an integer; default **10** in code).
-It's left **unset** in `docker-compose.yml` so the code default applies. For real
-camera counts, set it for concurrent load, roughly **2 × cameras + 10** (e.g.
-42 for 16 cameras, 74 for 32), by uncommenting the line in `.env` /
-`docker-compose.yml`. Undersizing it causes pool-saturation hangs under load.
+`api` and `recorder` read `DB_POOL_SIZE` (an integer; default **32** in code).
+It's left **unset** in `docker-compose.yml` so the code default applies (note:
+there's no ready-made line to uncomment, so add `DB_POOL_SIZE` to `.env` and wire
+it into the api/recorder `environment:` blocks to override). For real camera
+counts, size it for concurrent load, roughly **2 × cameras + 10** (e.g. 42 for
+16 cameras, 74 for 32). Undersizing it causes pool-saturation hangs under load.
 
 ---
 

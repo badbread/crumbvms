@@ -79,15 +79,16 @@ CI does **not** hard-fail when no registry is configured, it still builds and
 validates the images, it just doesn't push. To enable pushing:
 
 - **GHCR (simplest)**, set a repository/org **variable** `REGISTRY` to
-  `ghcr.io/<owner>/crumb`. CI logs in with the built-in `GITHUB_TOKEN`
+  `ghcr.io/<owner>/crumbvms`. CI logs in with the built-in `GITHUB_TOKEN`
   (needs `packages: write`, already granted in the workflow) and pushes.
 - **Other registry (ECR, Docker Hub, Artifactory)**, set:
-  - variable `REGISTRY` = `<registry-host>/<namespace>/crumb`
+  - variable `REGISTRY` = `<registry-host>/<namespace>/crumbvms`
   - variable `REGISTRY_HOST` = the login host (e.g. `registry-1.docker.io`)
   - secrets `REGISTRY_USERNAME` / `REGISTRY_PASSWORD`
 
 Until then, releases are reproducible from source: any tagged commit can be
-checked out and built with `docker compose build`.
+checked out and built with `docker compose -f docker-compose.yml -f
+docker-compose.build.yml build`.
 
 ---
 
@@ -123,8 +124,11 @@ Notes:
   runner then misfired its first-run baseline and failed to re-apply the view
   migrations, a broken 18/44 schema on a fresh boot.) Still back up the DB before
   deploying, and call out breaking/non-additive migrations in release notes.
-- If you deploy by building from source instead of pulling, leave
-  `CRUMB_VERSION` unset (`local`) and run `docker compose up -d --build`.
+- If you deploy by building from source instead of pulling, add the build
+  override (the base file has no `build:` stanza, so a plain `up -d --build`
+  compiles nothing): `docker compose -f docker-compose.yml -f
+  docker-compose.build.yml up -d --build`. That override tags the result
+  `crumbvms/<svc>:local` regardless of `CRUMB_VERSION`.
 
 ---
 

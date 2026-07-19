@@ -6,7 +6,7 @@ cameras through a **client**. There are five:
 | Client | Platform | Tech | How you get it |
 |---|---|---|---|
 | **Web admin** | any browser | served by the API at `/admin` | nothing to install |
-| **Desktop** | Windows 10/11 | Flutter + native libmpv | installer (.exe/.msi) from Releases |
+| **Desktop** | Windows 10/11 | Flutter + native libmpv | installer from Releases |
 | **Desktop** | Linux | Flutter + libmpv | build from source |
 | **Apple** | macOS 13+ | native SwiftUI | zip from Releases |
 | **Apple / mobile** | iOS 16+ | native SwiftUI | *TestFlight, not set up yet* |
@@ -54,7 +54,7 @@ before installing anything native.
 
 **Requires:** Android 8.0 or newer.
 
-1. On the **Releases** page, download the latest `crumb-<version>.apk`.
+1. On the **Releases** page, download the latest `app-release.apk`.
 2. Your browser/Files app will ask to allow installing unknown apps, allow it
    for that app (Settings → Apps → *that app* → Install unknown apps). This is
    normal for any app not from the Play Store.
@@ -64,14 +64,14 @@ before installing anything native.
 
 **Verify the download (optional but recommended).** Because the alpha APK isn't
 distributed through a paid code-signing / Play Store channel, each release also
-publishes a `crumb-<version>.apk.sha256` checksum file next to the APK. Download
+publishes an `app-release.apk.sha256` checksum file next to the APK. Download
 both into the same folder and confirm they match before installing:
 
 ```bash
-sha256sum -c crumb-<version>.apk.sha256   # Linux/macOS; prints "OK"
+sha256sum -c app-release.apk.sha256   # Linux/macOS; prints "OK"
 # Windows PowerShell:
-(Get-FileHash crumb-<version>.apk -Algorithm SHA256).Hash -eq `
-  (Get-Content crumb-<version>.apk.sha256).Split(' ')[0].Trim()
+(Get-FileHash app-release.apk -Algorithm SHA256).Hash -eq `
+  (Get-Content app-release.apk.sha256).Split(' ')[0].Trim()
 ```
 
 CrumbVMS is not on the Play Store during the alpha; sideloading the APK is the
@@ -82,14 +82,13 @@ keeps your saved views and settings).
 
 ## Windows desktop
 
-**Requires:** Windows 10 or 11 (64-bit). The
-[WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/) is
-preinstalled on Windows 11; on Windows 10 the app will prompt to install it if
-missing.
+**Requires:** Windows 10 or 11 (64-bit). The desktop client is a native
+**Flutter** app (video renders through `media_kit`/libmpv), no WebView2 or other
+runtime to install.
 
-1. On the **Releases** page, download **`CrumbVMS_<version>_x64-setup.exe`**, the
-   installer. `libmpv-2.dll` is bundled inside it, so there's no separate file to
-   manage. (An `.msi` is also provided if you prefer that format.)
+1. On the **Releases** page, download the Windows installer for CrumbVMS.
+   `libmpv-2.dll` is bundled with it, so there's no separate file to manage and
+   nothing to copy next to the exe by hand.
 2. Run the installer. Windows **SmartScreen** will warn about an unrecognized app
    (it's unsigned during the alpha): click **More info → Run anyway**, then install.
 3. Launch **CrumbVMS** from the Start Menu.

@@ -20,3 +20,13 @@ Once TestFlight is set up, this becomes: install the TestFlight app from
 the App Store, open your invite, tap Install, then point the app at your
 server (Find my server, or enter `http://<server-host>:8080`). TestFlight
 handles updates automatically from there.
+
+## What it can do
+
+Because it shares the macOS SwiftUI codebase, the feature set matches the Apple
+desktop app: live view, timeline playback, clips, export, bookmarks, and motion
+tuning. The newer surfaces I've built on the Windows desktop and Android clients
+are not in the Apple app yet: no LPR license-plate tab, no Home Assistant
+overlay, and no Data-saver quality tier. See
+[the client feature rundown](/clients/#what-each-client-can-do) for the full
+comparison.

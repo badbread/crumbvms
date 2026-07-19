@@ -37,23 +37,28 @@ allowed, with real exceptions:
 
 ## Audio: stricter than video
 
-Crumb can record audio per camera. Audio is regulated more heavily than
-video. Many US states are all-party-consent, meaning everyone recorded
-must consent, and recording a conversation without that consent can be
-both a crime and a civil wrong. If you're unsure, leave audio off, or
-confine it to spaces where no one has a reasonable expectation of a
-private conversation. The admin console warns you at the point you enable
-audio, for exactly this reason.
+Crumb can record audio per camera, and the default recording policy has
+audio turned on, so a new camera records audio unless you turn it off.
+Audio is regulated more heavily than video. Many US states are
+all-party-consent, meaning everyone recorded must consent, and recording a
+conversation without that consent can be both a crime and a civil wrong. If
+you're unsure, turn audio off on the recording policy (or per camera), or
+confine it to spaces where no one has a reasonable expectation of a private
+conversation. The admin console warns you next to the audio setting, for
+exactly this reason.
 
-## Face or plate recognition, via your own detector
+## Face or plate recognition
 
-Crumb runs no recognition itself. If you connect your own object detector
-and configure it to identify named people or license plates, Crumb will
-store and display those labels, and named biometric data is regulated in
-some places (Illinois' BIPA, for example, imposes consent, notice, and
-retention rules with real penalties). If you enable named recognition
-through an integration, that's on you to do lawfully. See
-[Integrations](/integrations/) for how the integration itself works.
+Crumb ships an optional, opt-in license-plate reader that runs entirely on
+your own hardware (the `crumb-alpr` worker; it does no face recognition).
+It's off unless you turn it on, and even then it never sends plates or
+footage anywhere. You can also connect your own object detector. Either
+way, the moment Crumb is storing and displaying named people or license
+plates, named biometric data is regulated in some places (Illinois' BIPA,
+for example, imposes consent, notice, and retention rules with real
+penalties). Whether you use Crumb's own plate reader or an outside
+detector, doing named recognition lawfully is on you. See
+[Integrations](/integrations/) for how these pieces work.
 
 ## If you're in the EU or UK
 

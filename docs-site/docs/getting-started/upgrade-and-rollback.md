@@ -19,9 +19,10 @@ cd /opt/crumb/app   # or wherever your docker-compose.yml lives
 # Back up first: migrations may run as part of the upgrade.
 scripts/backup-db.sh
 
-# In .env, set:
-#   CRUMB_IMAGE_PREFIX=ghcr.io/<owner>/crumb
-#   CRUMB_VERSION=v1.2.0
+# In .env, pin the version you want (the image prefix already defaults to
+# the public ghcr.io/badbread/crumbvms, so leave CRUMB_IMAGE_PREFIX alone
+# unless you run a fork on a different registry):
+#   CRUMB_VERSION=v0.1.0
 
 docker compose pull
 docker compose up -d
@@ -39,8 +40,11 @@ treat any release that calls out a non-additive migration with extra
 care (see Rollback below).
 
 If you're building from source rather than pulling images, leave
-`CRUMB_VERSION` unset and use
-`docker compose up -d --build` instead.
+`CRUMB_VERSION` unset and layer in the build override:
+`docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`.
+(The base `docker-compose.yml` has no `build:` stanza, so a plain
+`docker compose up -d --build` rebuilds nothing and just runs the pulled
+images.)
 
 ## Rollback
 
@@ -49,7 +53,7 @@ Versioned images make rollback symmetrical with upgrade:
 ```bash
 cd /opt/crumb/app
 
-# In .env, set CRUMB_VERSION back to the previous tag, e.g. v1.1.0
+# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.1.0
 
 docker compose pull
 docker compose up -d
@@ -82,7 +86,9 @@ release notes when a migration isn't backward compatible.
 
 ## Local and development builds
 
-None of the above is required for day-to-day development. With
-`CRUMB_VERSION` left unset, `docker compose up -d --build` builds and runs
-local images from source, which is also the default before you've pinned a
-published version at all.
+None of the above is required for day-to-day development. Layering in the
+build override,
+`docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`,
+builds and runs local images from source. With `CRUMB_VERSION` left unset
+and no override, a plain `docker compose up -d` pulls the published `:latest`
+images instead.

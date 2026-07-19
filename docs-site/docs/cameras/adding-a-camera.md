@@ -15,15 +15,17 @@ through once:
 2. **Validate** the stream before adding it: the console shows a live
    thumbnail plus the detected resolution, codec, and frame rate, so you
    catch a wrong URL or bad credentials before committing.
-3. **Add**, choosing a name and, if you use them, a camera group. Each
-   camera clones its group's (or the default) recording policy at the
-   moment it's created, see [Policies and groups](/recording/policies-and-groups).
+3. **Add**, choosing a name and, if you use them, a camera group. A new
+   camera joins the Default recording policy (or its group's policy); it
+   doesn't get a private copy. If you later change a setting just for that
+   camera, Crumb splits it onto its own named policy at that point, see
+   [Policies and groups](/recording/policies-and-groups).
 
-An ONVIF-discovered camera keeps its ONVIF identity attached, which is
-what makes PTZ control and later credential re-detection work without
-re-entering anything. A camera added purely by RTSP URL, without ONVIF,
-still records and plays back normally, it just won't have PTZ or focus/iris
-control available.
+An ONVIF-discovered camera keeps its ONVIF identity attached, which is what
+lets you turn on PTZ control (off by default, see [ONVIF PTZ](/cameras/onvif-ptz))
+and re-detect credentials later without re-entering anything. A camera added
+purely by RTSP URL, without ONVIF, still records and plays back normally, it
+just won't have PTZ or focus/iris control available.
 
 Re-running discovery is safe: any IP already present as a camera is
 skipped rather than duplicated.
