@@ -3835,6 +3835,10 @@ fn server_settings_to_dto(s: ServerSettings) -> ServerSettingsDto {
         motion_hwaccel: s.motion_hwaccel,
         motion_vaapi_device: s.motion_vaapi_device,
         version: s.version,
+        // Derived from the TZ env (not the DB row), so the console can show
+        // schedule times in the server's real zone instead of a hardcoded
+        // one (#237). A PUT to /config/server never changes it.
+        tz: crate::db_backup::schedule_tz().name().to_string(),
     }
 }
 
