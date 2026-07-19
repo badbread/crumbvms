@@ -6654,6 +6654,16 @@ pub async fn motion_intensity_buckets(
     }
     let span_ms = (end - start).num_milliseconds().max(1) as f64;
 
+    // Sargable lower bound on the indexed `start_ts` (audit P2 #11 — the same fix
+    // `timeline_spans` already carries). The overlap predicate is
+    // `start_ts < end AND end_ts > start`; `end_ts > start` alone is non-sargable,
+    // so without a `start_ts` lower bound Postgres index-scans from the camera's
+    // OLDEST retained segment forward (O(retention), disk-bound under recording
+    // load — the primary cause of the slow motion strip, issue #256). A segment
+    // overlapping `[start, end)` cannot start earlier than `start - MAX_SEGMENT_LEN`
+    // (its duration is <= MAX_SEGMENT_LEN), so this drops zero rows and makes the
+    // scan O(window).
+    let lower_bound = start - MAX_SEGMENT_LEN;
     let client = get_conn(pool).await?;
     let rows = client
         .query(
@@ -6661,10 +6671,11 @@ pub async fn motion_intensity_buckets(
             SELECT start_ts, end_ts, COALESCE(motion_score, 0.0) AS motion_score
             FROM segments
             WHERE camera_id = $1
+              AND start_ts >= $4
               AND start_ts < $3
               AND end_ts   > $2
             ",
-            &[&camera_id, &start, &end],
+            &[&camera_id, &start, &end, &lower_bound],
         )
         .await
         .context("motion_intensity_buckets")?;
@@ -13144,6 +13155,101 @@ mod tests {
                 .expect("backfill again"),
             0,
             "backfill must not touch already-populated hosts"
+        );
+    }
+
+    /// Like [`insert_test_segment`] but sets `motion_score`, so the
+    /// intensity-bucket test can observe non-zero values.
+    async fn insert_scored_segment(
+        pool: &Pool,
+        camera_id: Uuid,
+        storage_id: Uuid,
+        start_ts: DateTime<Utc>,
+        end_ts: DateTime<Utc>,
+        motion_score: f32,
+    ) {
+        let client = get_conn(pool)
+            .await
+            .expect("get_conn (insert_scored_segment)");
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_ms = (end_ts - start_ts).num_milliseconds() as i32;
+        client
+            .execute(
+                r"
+                INSERT INTO segments
+                    (camera_id, storage_id, stage, path, stream, start_ts, end_ts,
+                     duration_ms, has_motion, size_bytes, motion_score)
+                VALUES ($1, $2, 'live', 'seg.mp4', 'main', $3, $4, $5, true, 64, $6)
+                ",
+                &[
+                    &camera_id,
+                    &storage_id,
+                    &start_ts,
+                    &end_ts,
+                    &duration_ms,
+                    &motion_score,
+                ],
+            )
+            .await
+            .expect("insert scored segment");
+    }
+
+    /// The sargable `start_ts >= start - MAX_SEGMENT_LEN` lower bound added to
+    /// `motion_intensity_buckets` (issue #256) is a performance optimization
+    /// that must NOT change results: a segment that begins *before* the window
+    /// but overlaps into it must still be bucketed. This is exactly the case a
+    /// naive `start_ts >= start` bound would wrongly drop, so this test also
+    /// guards the MAX_SEGMENT_LEN margin against a future over-tightening.
+    #[tokio::test]
+    async fn motion_intensity_keeps_boundary_overlapping_segment() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let camera_id = seed_camera_for_test(&pool, policy_id).await;
+        let storage_name = format!("test-storage-{}", Uuid::new_v4().simple());
+        let storage_id = create_storage(&pool, &storage_name, "/does/not/matter", None, None)
+            .await
+            .expect("create_storage")
+            .id;
+
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let sec = |n: i64| base + chrono::Duration::seconds(n);
+        // Window [base, base+100s); n=100 → one bucket per second.
+        let (start, end) = (sec(0), sec(100));
+
+        // A: starts 5s BEFORE the window and overlaps into it ([-5s, +5s), 0.8).
+        //    5s < MAX_SEGMENT_LEN (12s), so the lower bound must keep it.
+        insert_scored_segment(&pool, camera_id, storage_id, sec(-5), sec(5), 0.8).await;
+        // B: fully inside, mid-window ([50s, 56s), 0.5).
+        insert_scored_segment(&pool, camera_id, storage_id, sec(50), sec(56), 0.5).await;
+        // C: an hour before the window, no overlap — must never leak in.
+        insert_scored_segment(&pool, camera_id, storage_id, sec(-3600), sec(-3595), 0.9).await;
+
+        let buckets = motion_intensity_buckets(&pool, camera_id, start, end, 100)
+            .await
+            .expect("motion_intensity_buckets");
+        assert_eq!(buckets.len(), 100);
+        // A's in-window part [0,5s) → buckets 0..5 carry its 0.8.
+        assert!(
+            (buckets[0] - 0.8).abs() < 1e-6,
+            "boundary-overlapping segment must land in bucket 0 (got {})",
+            buckets[0]
+        );
+        assert!(
+            (buckets[4] - 0.8).abs() < 1e-6,
+            "segment A spans through bucket 4"
+        );
+        assert_eq!(buckets[10], 0.0, "gap after A carries no score");
+        assert!(
+            (buckets[50] - 0.5).abs() < 1e-6,
+            "mid-window segment must land in bucket 50 (got {})",
+            buckets[50]
         );
     }
 }
