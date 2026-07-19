@@ -1795,11 +1795,18 @@ function wizardStorageBody() {
       <div style="height:100%;width:${usedPct}%;background:var(--accent)"></div>
     </div>
     <div class="login-sub" style="margin-top:6px">${fmtBytes(free)} free of ${fmtBytes(total)}${total ? ` · ${usedPct}% used` : ''}</div>` : '';
-  // Cap prefill: min(80% of fs_total, free − 50 GiB) so a novice disk can't fill.
+  // Cap prefill: leave 50 GiB headroom (free − 50 GiB), but never below 80% of
+  // free and never above 80% of total, so a novice disk can't fill. The floor
+  // matters most on a nearly-full disk: when free < 50 GiB the headroom term
+  // goes negative, and without the 80%-of-free floor it clamped to 0, which
+  // renders as a blank field = UNLIMITED, the least-safe cap exactly when the
+  // disk is smallest (#227).
   const dp = WZ.defaultPolicy || {};
   const HEADROOM = 50 * 1024 * 1024 * 1024;
   const capDefaultBytes = total
-    ? Math.max(0, Math.min(Math.floor(total * 0.8), (free != null ? free - HEADROOM : Math.floor(total * 0.8))))
+    ? (free != null
+        ? Math.min(Math.floor(total * 0.8), Math.max(free - HEADROOM, Math.floor(free * 0.8)))
+        : Math.floor(total * 0.8))
     : 0;
   const capBytes = (dp.live_max_bytes != null) ? dp.live_max_bytes : capDefaultBytes;
   const capGb = capBytes ? Math.round(capBytes / 1e9) : '';
