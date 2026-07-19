@@ -1852,6 +1852,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// `AnimatedBuilder` for that).
   bool _haEditing = false;
 
+  /// Top-left position of the draggable HA edit panel (#255). Null = its default
+  /// top-right anchor; a drag pins an explicit offset for the rest of the edit
+  /// session so the operator can move it off a spot they want to place a badge
+  /// on. Clamped to the pane in `build`; reset when the session ends.
+  Offset? _haPanelOffset;
+
   void _onHaOverlayChanged() {
     if (!mounted) return;
     final editing = widget.haOverlay?.editor.editMode ?? false;
@@ -1860,7 +1866,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     // style lives in the right-side panel now), so a badge drag can't hide
     // under it (issue #13).
     widget.haOverlay?.editor.setEditBottomInset(editing ? 78 : 0);
-    setState(() => _haEditing = editing);
+    setState(() {
+      _haEditing = editing;
+      // Fresh session starts at the default anchor (a stale drag position from a
+      // previous camera's edit could land off-pane after a resize).
+      if (!editing) _haPanelOffset = null;
+    });
     // NOTE (issue #3): this pane deliberately does NOT re-fetch links when the
     // edit session ends. `editor.endEdit()` flips editMode false SYNCHRONOUSLY
     // — before `endEditAndSave` has awaited its placement PUTs — so a reload
@@ -2702,11 +2713,35 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                 // generic multi-select geometry ops (align/group/match/undo).
                 // Mutually exclusive with the PTZ chrome above by construction.
                 if (widget.haOverlay != null && _haEditing) ...[
-                  Positioned(
-                    right: 14,
-                    top: 64,
-                    child: HaOverlayEditPanel(host: widget.haOverlay!),
-                  ),
+                  () {
+                    // Draggable (#255): default to the top-right anchor, but once
+                    // the operator drags the panel's header, honor that offset —
+                    // clamped so the header can never leave the pane.
+                    const panelW = 300.0;
+                    final defaultLeft =
+                        (pane.width - panelW - 14).clamp(0.0, pane.width);
+                    final maxLeft = (pane.width - panelW).clamp(0.0, pane.width);
+                    final maxTop = (pane.height - 44).clamp(0.0, pane.height);
+                    final pos = _haPanelOffset ?? Offset(defaultLeft, 64);
+                    return Positioned(
+                      left: pos.dx.clamp(0.0, maxLeft),
+                      top: pos.dy.clamp(0.0, maxTop),
+                      child: HaOverlayEditPanel(
+                        host: widget.haOverlay!,
+                        onDragHeader: (delta) {
+                          setState(() {
+                            final base = _haPanelOffset ?? Offset(defaultLeft, 64);
+                            // Clamp here (not just at render) so dragging past an
+                            // edge can't bank up phantom offset to unwind later.
+                            _haPanelOffset = Offset(
+                              (base.dx + delta.dx).clamp(0.0, maxLeft),
+                              (base.dy + delta.dy).clamp(0.0, maxTop),
+                            );
+                          });
+                        },
+                      ),
+                    );
+                  }(),
                   Positioned(
                     left: 0,
                     right: 0,

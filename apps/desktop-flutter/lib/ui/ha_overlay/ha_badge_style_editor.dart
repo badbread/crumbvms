@@ -48,9 +48,14 @@ String overlayColorToHex(Color c) =>
 /// form (bottom). Rendered by the maximized pane while an HA overlay edit
 /// session is active.
 class HaOverlayEditPanel extends StatelessWidget {
-  const HaOverlayEditPanel({super.key, required this.host});
+  const HaOverlayEditPanel({super.key, required this.host, this.onDragHeader});
 
   final HaOverlayController host;
+
+  /// Drag delta from the panel's header strip — the host repositions the panel
+  /// (#255) so it can be moved off a spot the operator wants to place a badge
+  /// on. Null leaves the panel fixed.
+  final void Function(Offset delta)? onDragHeader;
 
   @override
   Widget build(BuildContext context) {
@@ -74,6 +79,35 @@ class HaOverlayEditPanel extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Drag handle: grab this strip to move the panel out of the way.
+              MouseRegion(
+                cursor: onDragHeader == null
+                    ? MouseCursor.defer
+                    : SystemMouseCursors.move,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onPanUpdate: onDragHeader == null
+                      ? null
+                      : (d) => onDragHeader!(d.delta),
+                  child: const Padding(
+                    padding: EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      children: [
+                        Icon(Icons.drag_indicator, color: Colors.white38, size: 16),
+                        SizedBox(width: 4),
+                        Text(
+                          'Home Assistant',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
               const Text(
                 'Entities',
                 style: TextStyle(
