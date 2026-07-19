@@ -4,6 +4,19 @@ import SwiftUI
 
 /// Plate-match mode. `contains` is the default; the server also supports
 /// `prefix`, `exact`, and `fuzzy` (similarity-ordered).
+/// Which plate image(s) a row shows. Raw values persist in UserDefaults.
+enum PlateImageDisplay: String, CaseIterable, Identifiable {
+    case both, full = "full", crop = "crop"
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .both: return "Full frame + crop"
+        case .full: return "Full frame only"
+        case .crop: return "Plate crop only"
+        }
+    }
+}
+
 enum PlateMatch: String, CaseIterable, Identifiable {
     case contains, prefix, exact, fuzzy
     var id: String { rawValue }
@@ -92,18 +105,27 @@ final class PlatesViewModel: ObservableObject {
 
     // MARK: plate-crop thumbnails
 
-    /// Decoded plate-crop thumbnails by event id — cached so re-scrolls don't
-    /// refetch or re-decode. Main-actor (the whole class is `@MainActor`).
-    private var thumbCache: [String: PlatformImage] = [:]
+    /// Which plate image(s) to show in each row — full frame, tight crop, or both
+    /// (matches the desktop client). Persisted per device.
+    @Published var imageDisplay: PlateImageDisplay =
+        PlateImageDisplay(rawValue: UserDefaults.standard.string(forKey: "plates_image_display") ?? "") ?? .both {
+        didSet { UserDefaults.standard.set(imageDisplay.rawValue, forKey: "plates_image_display") }
+    }
 
-    /// Fetch the snapshot for `eventId` and crop it to the plate `bbox`
-    /// (cached). Returns nil on any failure — the row keeps its placeholder.
-    func thumb(for eventId: String, bbox: [Double]?) async -> PlatformImage? {
-        if let cached = thumbCache[eventId] { return cached }
-        guard let data = try? await container.api.plateSnapshot(eventId: eventId),
-              let img = PlateCrop.crop(data, bbox: bbox) else { return nil }
-        thumbCache[eventId] = img
-        return img
+    /// Decoded (full, crop) images by event id — the snapshot is fetched once and
+    /// both derived from it, cached so re-scrolls don't refetch/re-decode.
+    private var imageCache: [String: (full: PlatformImage?, crop: PlatformImage?)] = [:]
+
+    /// Fetch the snapshot for `eventId` and derive the full frame + the tight
+    /// plate crop (from `bbox`), cached. Either may be nil on failure.
+    func images(for eventId: String, bbox: [Double]?) async -> (full: PlatformImage?, crop: PlatformImage?) {
+        if let cached = imageCache[eventId] { return cached }
+        guard let data = try? await container.api.plateSnapshot(eventId: eventId) else { return (nil, nil) }
+        let full = PlateCrop.crop(data, bbox: nil)
+        let crop = bbox != nil ? PlateCrop.crop(data, bbox: bbox) : full
+        let pair = (full, crop)
+        imageCache[eventId] = pair
+        return pair
     }
 
     // MARK: reads
@@ -357,6 +379,18 @@ struct PlatesView: View {
                 .buttonStyle(.plain)
                 .help(vm.collapse ? "Collapsing duplicate reads" : "Showing every read")
 
+                Menu {
+                    ForEach(PlateImageDisplay.allCases) { mode in
+                        Button { vm.imageDisplay = mode } label: {
+                            Text(mode.label)
+                            if vm.imageDisplay == mode { Image(systemName: "checkmark") }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "photo.on.rectangle").foregroundColor(CrumbColors.tealAccent)
+                }
+                .help("Image display")
+
                 Button { showWatchlist = true } label: {
                     Image(systemName: "list.star").foregroundColor(CrumbColors.tealAccent)
                 }
@@ -453,7 +487,8 @@ struct PlatesView: View {
                                 cameraName: vm.cameraName(read.cameraId),
                                 canWatch: vm.isAdmin,
                                 watched: vm.isWatched(read.plate),
-                                fetchThumb: thumbFetcher(for: read),
+                                display: vm.imageDisplay,
+                                fetchImages: imagesFetcher(for: read),
                                 onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
                                 onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
                             )
@@ -471,10 +506,10 @@ struct PlatesView: View {
 
     /// Async thumbnail loader for a row, or nil when the read has no event
     /// (⇒ no snapshot to fetch, the row keeps its placeholder).
-    private func thumbFetcher(for read: PlateRead) -> (() async -> PlatformImage?)? {
+    private func imagesFetcher(for read: PlateRead) -> (() async -> (PlatformImage?, PlatformImage?))? {
         guard let eventId = read.eventId else { return nil }
         let vm = vm
-        return { await vm.thumb(for: eventId, bbox: read.bbox) }
+        return { await vm.images(for: eventId, bbox: read.bbox) }
     }
 
     private func addToWatchlist(_ plate: String) {
@@ -530,12 +565,14 @@ private struct PlateRow: View {
     let cameraName: String
     let canWatch: Bool
     let watched: Bool
-    /// Loads the plate-crop thumbnail (nil when the read has no event).
-    let fetchThumb: (() async -> PlatformImage?)?
+    let display: PlateImageDisplay
+    /// Loads (full, crop) images (nil when the read has no event).
+    let fetchImages: (() async -> (PlatformImage?, PlatformImage?))?
     let onOpenPlayback: (() -> Void)?
     let onAddToWatchlist: (() -> Void)?
 
-    @State private var thumb: PlatformImage?
+    @State private var full: PlatformImage?
+    @State private var crop: PlatformImage?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -584,29 +621,38 @@ private struct PlateRow: View {
         .task(id: read.id) {
             // Off the row's critical path; the VM caches by event id so
             // re-scrolls resolve instantly without a refetch.
-            guard thumb == nil, let fetchThumb else { return }
-            thumb = await fetchThumb()
+            guard full == nil, crop == nil, let fetchImages else { return }
+            let pair = await fetchImages()
+            full = pair.0; crop = pair.1
         }
     }
 
-    /// Plate-crop thumbnail; a neutral car placeholder while loading or when
-    /// the read has no event/snapshot.
+    /// Full frame (~16:9), tight crop, or both side-by-side per the display mode;
+    /// a neutral car placeholder while loading or when there's no event/snapshot.
     @ViewBuilder private var thumbnail: some View {
+        HStack(spacing: 4) {
+            if display != .crop {
+                imageBox(full, width: 72) // full frame, 16:9-ish
+            }
+            if display != .full {
+                imageBox(crop, width: 56) // tight plate crop
+            }
+        }
+    }
+
+    private func imageBox(_ image: PlatformImage?, width: CGFloat) -> some View {
         Group {
-            if let thumb {
-                Image(platformImage: thumb)
-                    .resizable()
-                    .scaledToFill()
+            if let image {
+                Image(platformImage: image).resizable().scaledToFill()
             } else {
                 ZStack {
                     CrumbColors.surfaceVariant
-                    Image(systemName: "car.fill")
-                        .font(.system(size: 15))
-                        .foregroundColor(CrumbColors.textTertiary)
+                    Image(systemName: "car.fill").font(.system(size: 15)).foregroundColor(CrumbColors.textTertiary)
                 }
             }
         }
-        .frame(width: 56, height: 40)
+        .frame(width: width, height: 40)
+        .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
