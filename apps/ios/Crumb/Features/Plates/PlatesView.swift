@@ -4,6 +4,15 @@ import SwiftUI
 
 /// Plate-match mode. `contains` is the default; the server also supports
 /// `prefix`, `exact`, and `fuzzy` (similarity-ordered).
+/// Overall layout of the plate hits. (list + gallery for now; grouped/timeline
+/// on desktop are follow-ups.) Raw values persist in UserDefaults.
+enum PlatesLayout: String, CaseIterable, Identifiable {
+    case list, gallery
+    var id: String { rawValue }
+    var label: String { self == .list ? "List" : "Gallery" }
+    var icon: String { self == .list ? "list.bullet" : "square.grid.2x2" }
+}
+
 /// Which plate image(s) a row shows. Raw values persist in UserDefaults.
 enum PlateImageDisplay: String, CaseIterable, Identifiable {
     case both, full = "full", crop = "crop"
@@ -46,6 +55,12 @@ final class PlatesViewModel: ObservableObject {
     @Published var rangeHours: Double = 24
     /// Collapse near-duplicate reads (same camera, ≤15 s, similar plate) into
     /// one row. Device-local preference, persisted like `playbackQuality`.
+    /// Hit layout (list / gallery), persisted per device.
+    @Published var layout: PlatesLayout =
+        PlatesLayout(rawValue: UserDefaults.standard.string(forKey: "plates_layout") ?? "") ?? .list {
+        didSet { UserDefaults.standard.set(layout.rawValue, forKey: "plates_layout") }
+    }
+
     @Published var collapse: Bool = UserDefaults.standard.object(forKey: "plates_collapse") as? Bool ?? true {
         didSet { UserDefaults.standard.set(collapse, forKey: "plates_collapse") }
     }
@@ -379,6 +394,12 @@ struct PlatesView: View {
                 .buttonStyle(.plain)
                 .help(vm.collapse ? "Collapsing duplicate reads" : "Showing every read")
 
+                Button { vm.layout = vm.layout == .list ? .gallery : .list } label: {
+                    Image(systemName: vm.layout.icon).foregroundColor(CrumbColors.tealAccent)
+                }
+                .buttonStyle(.plain)
+                .help("Layout: \(vm.layout.label)")
+
                 Menu {
                     ForEach(PlateImageDisplay.allCases) { mode in
                         Button { vm.imageDisplay = mode } label: {
@@ -478,26 +499,53 @@ struct PlatesView: View {
             }
         } else {
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(vm.groups) { group in
-                        if let read = vm.plateRead(byId: group.representative.id) {
-                            PlateRow(
-                                read: read,
-                                count: group.count,
-                                cameraName: vm.cameraName(read.cameraId),
-                                canWatch: vm.isAdmin,
-                                watched: vm.isWatched(read.plate),
-                                display: vm.imageDisplay,
-                                fetchImages: imagesFetcher(for: read),
-                                onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
-                                onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
-                            )
-                            Divider().overlay(CrumbColors.surface)
-                        }
-                    }
+                switch vm.layout {
+                case .gallery: galleryLayout
+                case .list: listLayout
                 }
             }
         }
+    }
+
+    @ViewBuilder private var listLayout: some View {
+        LazyVStack(spacing: 0) {
+            ForEach(vm.groups) { group in
+                if let read = vm.plateRead(byId: group.representative.id) {
+                    PlateRow(
+                        read: read,
+                        count: group.count,
+                        cameraName: vm.cameraName(read.cameraId),
+                        canWatch: vm.isAdmin,
+                        watched: vm.isWatched(read.plate),
+                        display: vm.imageDisplay,
+                        fetchImages: imagesFetcher(for: read),
+                        onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
+                        onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
+                    )
+                    Divider().overlay(CrumbColors.surface)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var galleryLayout: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10)], spacing: 10) {
+            ForEach(vm.groups) { group in
+                if let read = vm.plateRead(byId: group.representative.id) {
+                    PlateCard(
+                        read: read,
+                        count: group.count,
+                        cameraName: vm.cameraName(read.cameraId),
+                        canWatch: vm.isAdmin,
+                        watched: vm.isWatched(read.plate),
+                        fetchImages: imagesFetcher(for: read),
+                        onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
+                        onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
+                    )
+                }
+            }
+        }
+        .padding(12)
     }
 
     private func centered<V: View>(@ViewBuilder _ v: () -> V) -> some View {
@@ -662,6 +710,83 @@ private struct PlateRow: View {
         let f = DateFormatter()
         f.dateFormat = "MMM d, h:mm:ss a"
         return f.string(from: date)
+    }
+}
+
+// MARK: - Plate card (gallery layout)
+
+private struct PlateCard: View {
+    let read: PlateRead
+    let count: Int
+    let cameraName: String
+    let canWatch: Bool
+    let watched: Bool
+    let fetchImages: (() async -> (PlatformImage?, PlatformImage?))?
+    let onOpenPlayback: (() -> Void)?
+    let onAddToWatchlist: (() -> Void)?
+
+    @State private var full: PlatformImage?
+    @State private var crop: PlatformImage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .topTrailing) {
+                image
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 110)
+                    .clipped()
+                if count > 1 {
+                    Text("×\(count)")
+                        .font(.caption2.weight(.bold).monospacedDigit()).foregroundColor(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(.black.opacity(0.65), in: Capsule())
+                        .padding(6)
+                }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(read.plate.isEmpty ? "—" : read.plate)
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .foregroundColor(CrumbColors.textPrimary).lineLimit(1)
+                    Spacer()
+                    ConfidenceChip(confidence: read.confidence)
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: "video").font(.system(size: 10)).foregroundColor(CrumbColors.textTertiary)
+                    Text(cameraName).font(.caption2).foregroundColor(CrumbColors.textSecondary).lineLimit(1)
+                    Spacer()
+                    if canWatch, let onAddToWatchlist {
+                        Button(action: onAddToWatchlist) {
+                            Image(systemName: watched ? "star.fill" : "star")
+                                .font(.system(size: 13))
+                                .foregroundColor(watched ? CrumbColors.bookmarkGold : CrumbColors.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(8)
+        }
+        .background(CrumbColors.surface, in: RoundedRectangle(cornerRadius: 10))
+        .contentShape(Rectangle())
+        .onTapGesture { onOpenPlayback?() }
+        .task(id: read.id) {
+            guard full == nil, crop == nil, let fetchImages else { return }
+            let pair = await fetchImages()
+            full = pair.0; crop = pair.1
+        }
+    }
+
+    /// Prefer the full frame for context; fall back to the crop, then a placeholder.
+    @ViewBuilder private var image: some View {
+        if let img = full ?? crop {
+            Image(platformImage: img).resizable().scaledToFill()
+        } else {
+            ZStack {
+                CrumbColors.surfaceVariant
+                Image(systemName: "car.fill").font(.system(size: 22)).foregroundColor(CrumbColors.textTertiary)
+            }
+        }
     }
 }
 
