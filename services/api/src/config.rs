@@ -460,6 +460,11 @@ where
     T::Err: std::fmt::Display,
 {
     match env::var(key) {
+        // Empty (or whitespace-only) means "not configured": compose forwards
+        // keys as `${VAR:-}`, so an unset key still arrives as "". Treat it as
+        // the default rather than a fatal parse error that would crash-loop the
+        // api on a fresh install (#249; mirrors crumb-common's parse_env).
+        Ok(val) if val.trim().is_empty() => Ok(default),
         Ok(val) => val
             .parse::<T>()
             .map_err(|e| anyhow::anyhow!("env var '{key}' = '{val}' could not be parsed: {e}")),
@@ -505,5 +510,31 @@ fn parse_onvif_config() -> Result<HashMap<String, OnvifCameraConfig>> {
                 "ONVIF config is not valid JSON; expected an object keyed by go2rtc_name, \
                  e.g. {\"lpr\":{\"host\":\"198.51.100.6\",\"port\":80,\"user\":\"admin\",\"password\":\"...\"}}"
             }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env;
+
+    /// #249: compose forwards keys as `${VAR:-}`, so an unset key arrives as an
+    /// empty string. The api's `parse_env` must treat that as "use the default",
+    /// not a fatal error, or a fresh install crash-loops at boot (the exact
+    /// regression: `DB_POOL_SIZE` = "" from the stock `docker-compose.yml`).
+    #[test]
+    fn parse_env_treats_empty_as_default() {
+        std::env::set_var("CRUMB_API_TEST_EMPTY_NUM", "");
+        assert_eq!(
+            parse_env::<u32>("CRUMB_API_TEST_EMPTY_NUM", 32).unwrap(),
+            32,
+            "an empty env value must fall back to the default, not error"
+        );
+        std::env::set_var("CRUMB_API_TEST_WS_NUM", "   ");
+        assert_eq!(parse_env::<u32>("CRUMB_API_TEST_WS_NUM", 32).unwrap(), 32);
+        std::env::set_var("CRUMB_API_TEST_SET_NUM", "8");
+        assert_eq!(parse_env::<u32>("CRUMB_API_TEST_SET_NUM", 32).unwrap(), 8);
+        std::env::remove_var("CRUMB_API_TEST_EMPTY_NUM");
+        std::env::remove_var("CRUMB_API_TEST_WS_NUM");
+        std::env::remove_var("CRUMB_API_TEST_SET_NUM");
     }
 }
