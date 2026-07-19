@@ -1,0 +1,90 @@
+# Crumb — Windows desktop (Flutter / media_kit) — DRAFT, validate before wiring to tags
+#
+# Repoints the Windows desktop release from the retired Tauri app (apps/desktop)
+# to the current Flutter client (apps/desktop-flutter). See docs/DECISIONS.md,
+# "2026-07-18, Desktop release ships the Flutter client, not the retired Tauri app".
+#
+# STATUS: workflow_dispatch ONLY. The existing windows-release.yml still owns the
+# `v*` tag trigger (Tauri) so nothing breaks. Before tagging v0.1.0: run this via
+# "Run workflow", confirm it produces a working bundle on the runner, then move
+# the `tags: ["v*"]` trigger here and retire windows-release.yml.
+#
+# The Flutter build compiles the Rust core through flutter_rust_bridge/cargokit,
+# so the runner needs Rust + LLVM (libclang, for bindgen) alongside Flutter.
+# media_kit bundles libmpv-2.dll into the Release folder, so there is no separate
+# libmpv fetch (unlike the Tauri workflow).
+#
+# Verified locally: `flutter build windows --release` on the winbuild box
+# (Flutter 3.44.6) produces build/windows/x64/runner/Release/crumb_desktop.exe
+# with libmpv-2.dll + the data/ bundle next to it.
+
+name: windows-release-flutter
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build Windows (Flutter)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop-flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up LLVM (flutter_rust_bridge / bindgen needs libclang)
+        run: choco install llvm --no-progress -y
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.6"
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: Build Windows (release)
+        run: flutter build windows --release
+
+      - name: Verify the bundle (exe + bundled libmpv + assets)
+        shell: pwsh
+        run: |
+          $rel = "build/windows/x64/runner/Release"
+          if (-not (Test-Path "$rel/crumb_desktop.exe"))   { throw "crumb_desktop.exe not built" }
+          if (-not (Test-Path "$rel/libmpv-2.dll"))         { throw "libmpv-2.dll not bundled (media_kit)" }
+          if (-not (Test-Path "$rel/data/flutter_assets"))  { throw "flutter_assets missing" }
+          Write-Host "OK: $((Get-ChildItem -Recurse $rel | Measure-Object).Count) files in $rel"
+
+      - name: Package as a zip
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $out = "CrumbVMS-windows-$ref.zip"
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath $out -Force
+          Write-Host "wrote $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crumbvms-windows-flutter
+          path: apps/desktop-flutter/CrumbVMS-windows-*.zip
+
+      # TODO before cutover (tracked in DECISIONS.md):
+      #  - ship an installer instead of a raw zip (Inno Setup or MSIX) to match
+      #    the Tauri NSIS UX, or document "unzip and run crumb_desktop.exe".
+      #  - code signing (Windows SmartScreen shows "unknown publisher" otherwise).
+      #  - attach the artifact to the GitHub Release on a `v*` tag
+      #    (softprops/action-gh-release), and move the `tags: ["v*"]` trigger here
+      #    from windows-release.yml, then retire that file.
