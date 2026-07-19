@@ -8,6 +8,50 @@ revisit.
 
 ---
 
+## 2026-07-19, iOS/macOS v0.1.0 parity: HA overlays + LPR are read-only on mobile; client-side logic ported verbatim from the server
+
+**Context.** The iOS/macOS SwiftUI client was catching up to a large batch of
+shipped server/Android/desktop features (Home Assistant on-video overlays, the
+expanded LPR client, live/playback UX). Two cross-cutting decisions were made.
+
+**Decision — HA and LPR mobile surfaces are read-only; the admin/editor halves
+stay off-device.** iOS renders HA entity badges on live video + a per-camera
+entity sheet, and the LPR Plates tab (reads, collapse, crops, watchlist
+add/edit/remove). It does NOT ship the HA connection config, the drag-to-place
+badge editor, the per-camera LPR engine/zone editor, or the A/B benchmark.
+Rejected: porting those admin editors to mobile — they are large, admin-only,
+and fully served by the web console (embedded in desktop). This matches Android,
+which made the same read-only cut. Watchlist writes remain admin-gated
+server-side (403) with the client hiding the controls for non-admins.
+
+**Decision — badge positioning uses the decoded video pixel size, plumbed up
+from the fMP4 demuxer.** HA badges anchor to the letterboxed video frame, so the
+demuxer now emits the video dimensions (`CMVideoFormatDescriptionGetDimensions`)
+up through `Fmp4StreamController` → `Fmp4VideoView.onVideoSize` → the overlay's
+`fieldRect` math. Rejected: assuming 16:9 (misplaces badges on other aspect
+ratios) and reading the AVSampleBufferDisplayLayer's rect (not exposed).
+
+**Decision — plate-matching logic is a verbatim Swift port of the server, unit
+tested.** `normalizePlate`, confusable-aware `levenshtein`, `allowedEdits`, and
+the duplicate-read `collapse` window live in `LprMatching.swift`, ported exactly
+from `services/common/src/db.rs` so the client's fuzzy preview / dedup agree with
+the server's matching (divergent reimplementations are how parity silently
+breaks). Same state-honesty rail as the recorder's `edge_on`: an
+`unavailable`/`unknown`/stale HA state is rendered grey, never "off"/"closed".
+
+**Trades accepted.** HA live-state and badge placement can't be fully validated
+without an HA-configured server + device; the logic is unit-tested and matches
+the desktop/Android contracts. Live-audio-style A/V or PTZ-zoom badge tracking
+(hiding badges during digital zoom) is deferred (badges position for the
+unzoomed frame).
+
+**Revisit triggers.** Demand for on-device HA/LPR admin editing → build the
+editors gated on `is_admin`. Badge drift complaints during digital zoom → hide
+badges while `zoomScale > 1`. A non-AAC/again-diverging server matcher → re-sync
+`LprMatching.swift`.
+
+---
+
 ## 2026-07-18, Compose forwards code-read env keys explicitly; helpers treat empty as unset
 
 **Status.** Implemented. `docker-compose.yml` now forwards the previously
