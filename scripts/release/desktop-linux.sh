@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+echo "RETIRED: the desktop release is the Flutter client, built by .github/workflows/windows-release-flutter.yml" >&2
+exit 1
+
 # Build the Linux desktop client (Tauri, gtk/mpv pane backend) on the build host.
 #
 # the build host doesn't mount the repo, so the sources are tar'd over; the GTK/WebKitGTK

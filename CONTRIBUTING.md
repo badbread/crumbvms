@@ -30,24 +30,26 @@ CrumbVMS is a Rust workspace plus native clients and a web console:
 
 ```
 services/   # Rust workspace: common, api, recorder (api also serves /admin)
-apps/       # desktop (Tauri + libmpv), android (Kotlin/Compose), ios
+apps/       # desktop-flutter (Flutter + libmpv; apps/desktop is the retired Tauri client), android (Kotlin/Compose), ios
 db/         # numbered SQL migrations, applied on boot
 docs/       # design specs and runbooks
 ```
 
 To stand up a working instance, follow **[docs/AI-INSTALL.md](docs/AI-INSTALL.md)**
 (the agent-runnable, secure-by-default install runbook) or the manual path in
-the [README](README.md#run): `scripts/setup-env.sh` → `docker compose up -d` →
+the [README](README.md#install): `scripts/setup-env.sh` → `docker compose up -d` →
 `http://<host>:8080/admin`. We don't duplicate install steps here, that
 runbook is the single source of truth.
 
 ### Client build notes (high level)
 
-- **Desktop** (`apps/desktop`): Tauri + WebView2 shell over native libmpv. On
-  Windows, `libmpv-2.dll` must sit next to the built exe or the video panes
-  render black.
+- **Desktop** (`apps/desktop-flutter`): Flutter over a Rust core via
+  `flutter_rust_bridge`, video through `media_kit`/libmpv. Needs the Flutter
+  3.44+ toolchain plus Rust and LLVM/libclang (for the bridge codegen); build
+  with `flutter build windows --release`. libmpv is bundled by media_kit.
+  (`apps/desktop` is the retired Tauri client, kept for reference.)
 - **Android** (`apps/android`): Kotlin / Jetpack Compose / Media3, built with
-  Gradle (JDK 21, SDK 34).
+  Gradle (JDK 17, SDK 34).
 - **iOS** (`apps/ios`): Swift; still partial and gated on further work.
 
 Each client's manifests (`Cargo.toml`, `build.gradle.kts`, Swift package files)

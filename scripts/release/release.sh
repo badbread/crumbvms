@@ -17,7 +17,10 @@ HERE="$(dirname "${BASH_SOURCE[0]}")"
 USAGE="usage: release.sh <backend|android|ios|desktop-windows|desktop-linux|desktop|all> [target...] [--api-only|--gate-only|--no-gate]"
 [ $# -gt 0 ] || die "$USAGE"
 
-ALL=(backend android ios desktop-linux desktop-windows)
+# desktop-linux/desktop-windows removed from ALL: the Windows desktop ships via
+# .github/workflows/windows-release-flutter.yml on the v* tag; the Tauri scripts
+# are retired (they exit immediately if invoked directly).
+ALL=(backend android ios)
 TARGETS=(); FLAGS=()
 for a in "$@"; do
   case "$a" in

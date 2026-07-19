@@ -53,7 +53,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 curl -fsS http://localhost:8080/health
 ```
 
-Should return `200 OK`. A `503` for the first few seconds is normal while the database finishes migrations.
+Should print the health response and exit 0 (`curl -fsS` prints the body, not a status line). A `503` for the first few seconds is normal while the database finishes migrations.
 
 ## 5. Open the browser
 

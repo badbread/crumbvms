@@ -46,12 +46,10 @@ If you missed the printout, read it straight out of the file:
 grep SEED_ADMIN_PASSWORD .env
 ```
 
-You can also re-print it at generation time with `--print`, but only in the
-**same** run that writes `.env`. `--print` shows what that run generated; it
-does not, and cannot, recover a value from an `.env` that already exists
-(re-running the script without `--force` just refuses to touch the existing
-file). Once `.env` exists, the `grep` above is the way to read the password
-back.
+There is no script flag that recovers it later: the password prints on the
+run that generates it, and re-running the script without `--force` just
+refuses to touch the existing file. Once `.env` exists, the `grep` above is
+the way to read the password back.
 
 **Prefer the browser create-admin wizard instead?** Blank out
 `SEED_ADMIN_PASSWORD` in `.env` (and leave `SEED_ADMIN_PASSWORD_HASH` empty)

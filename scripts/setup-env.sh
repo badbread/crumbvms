@@ -17,7 +17,6 @@
 #   scripts/setup-env.sh                # generate all secrets, write .env
 #   scripts/setup-env.sh --prompt       # prompt for the admin password instead
 #   scripts/setup-env.sh --force        # overwrite an existing .env
-#   scripts/setup-env.sh --print        # print the admin password after writing
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -29,12 +28,10 @@ ENV_FILE="${ENV_FILE:-${REPO_ROOT}/.env}"
 
 FORCE=0
 PROMPT=0
-PRINT=0
 for arg in "$@"; do
   case "${arg}" in
     --force)  FORCE=1 ;;
     --prompt) PROMPT=1 ;;
-    --print)  PRINT=1 ;;
     -h|--help)
       grep -E '^#' "$0" | sed 's/^# \{0,1\}//' ; exit 0 ;;
     *) echo "unknown flag: ${arg}" >&2; exit 1 ;;

@@ -1,7 +1,8 @@
-# Tauri + Vanilla
+# RETIRED: Tauri desktop client
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Javascript.
+This Tauri client is **retired**. It is not built by CI or releases, and it is
+not the desktop app users get from the Releases page.
 
-## Recommended IDE Setup
-
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+The live desktop client is **`apps/desktop-flutter`** (Flutter, Rust core over
+`flutter_rust_bridge`, video via `media_kit`/libmpv). This tree is kept for
+reference only.

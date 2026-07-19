@@ -112,7 +112,7 @@ draw them in the LPR section's per-camera zone editor over a live snapshot.
 
 ## Watchlist, ignore list, and fuzzy matching
 
-- **Watchlist:** add plates you care about (`GET`/`POST`/`DELETE /lpr/watchlist`;
+- **Watchlist:** add plates you care about (`GET`/`POST /lpr/watchlist`, `DELETE /lpr/watchlist/:id`;
   reads are `view_plates`-gated, writes are admin). A watchlist hit fans out as a
   `plate_watchlist_hit` alert with the crop attached.
 - **Ignore list:** plates Crumb drops entirely at ingest: an ignored plate is

@@ -132,6 +132,12 @@ grants.
 The recorder **healthcheck** verifies the recorder is PID 1 (it has no HTTP
 server; it exec's to become PID 1, so a dead recorder = a dead container).
 
+Forwarded env knobs on this service: `RECORDER_TZ` overrides the recorder's
+timezone independently (it inherits `TZ` when unset);
+`HA_BASE_URL`/`HA_TOKEN`/`HA_TOKEN_FILE` wire the optional Home Assistant
+integration (token inline, or read from a mounted file); `DB_POOL_SIZE` sizes
+the sqlx connection pool (empty = the code default).
+
 ## api
 
 Serves the HTTP API and the web admin console at `/admin` on `:8080`. Every
@@ -154,6 +160,14 @@ page itself, `/auth/login`, and the first-run
   at the broker your own Frigate already publishes to and set each camera's
   Frigate name in the admin UI. Empty `FRIGATE_MQTT_URL` ⇒ the whole detection
   subsystem stays disabled.
+- Other forwarded knobs: the same `HA_BASE_URL`/`HA_TOKEN`/`HA_TOKEN_FILE`
+  (Home Assistant) and `DB_POOL_SIZE` as the recorder; `MAINTENANCE_UNTIL`
+  (unix seconds) suppresses low-disk/camera-offline alerts during planned
+  maintenance; `CAMERA_OFFLINE_BOOT_GRACE_SECS` is the grace period before
+  offline alerts fire after boot (empty = default 180); and the `THUMB_*` set
+  tunes the timeline thumbnail cache and pre-generation (cache dir, size cap,
+  TTL, extract concurrency and timeout, widths, pre-gen toggle and lookback).
+  All default sensibly when unset; see [`.env.example`](../.env.example).
 
 ### Built-in nightly DB backup (P0-BACKUP)
 
@@ -194,6 +208,21 @@ one to the LAN (the localhost bind is deliberate; don't widen it by default).
 ```bash
 docker compose --profile frigate up -d            # stack + bundled broker
 docker compose --profile frigate up -d mosquitto  # just the broker, later
+```
+
+## crumb-alpr (opt-in `alpr` profile)
+
+Crumb's own local license-plate OCR worker (fast-alpr), **profile-gated** so a
+plain `up -d` never starts it. One instance per camera: it pulls that camera's
+go2rtc restream, motion-gates, runs plate recognition, and POSTs reads to the
+api's `POST /lpr/reads`. Enable LPR and mint an ingest token in Admin → LPR
+first, then set the env knobs: `CRUMB_API_BASE` (defaults to the internal
+`http://api:8080`), `LPR_INGEST_TOKEN`, `LPR_CAMERA_ID`, and `LPR_RTSP_URL`.
+Built from source (no published image yet); the full knob table is in
+[services/alpr-worker/README.md](../services/alpr-worker/README.md).
+
+```bash
+docker compose --profile alpr up -d --build crumb-alpr
 ```
 
 ## backup-offsite (opt-in `offsite` profile)

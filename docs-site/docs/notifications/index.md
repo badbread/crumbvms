@@ -12,8 +12,8 @@ Notifications panel.
 
 ## Channels
 
-A channel is a destination: ntfy, Pushover, a generic webhook, or one of
-several chat integrations. Add a channel, then send a test notification to
+A channel is a destination: Discord, Slack, Telegram, ntfy, Pushover, or a
+plain webhook. Add a channel, then send a test notification to
 confirm it delivers before relying on it.
 
 ## Rules

@@ -6,22 +6,25 @@ slug: /configuration/environment-reference
 
 # Environment reference
 
-Every key Crumb reads from `.env`, grouped by area. The authoritative copy
+The keys Crumb reads from `.env`, grouped by area (a few generic ones like
+`RUST_LOG` and `LOG_FORMAT` are omitted). The authoritative copy
 lives in `.env.example` in the repository; this page mirrors it for
 browsing. Most installs never need to touch most of these, `setup-env.sh`
 fills in the values that matter for a first boot.
 
-A few keys further down are read by the code but are **not** wired into
-`docker-compose.yml`. Those are flagged inline as "compose override needed",
-meaning setting them in `.env` alone does nothing, you have to pass them into
-the container yourself with a `docker-compose.override.yml`. I'd rather call
-that out honestly than let you set a key that silently never takes effect.
+Every key below is wired into the stock `docker-compose.yml` (the GPU keys
+ride in via their opt-in overlay files), so the workflow is uniform: set the
+key in `.env`, restart the affected container, done. No
+`docker-compose.override.yml` is needed. Where a value is also editable in
+the admin console, the console value (stored in the database) wins over the
+env default; that's flagged in the notes.
 
 ## Time zone
 
 | Key | Default | Notes |
 |---|---|---|
 | `TZ` | `UTC` | Local wall-clock for the whole stack: quiet hours, the nightly DB backup schedule (`DB_BACKUP_SCHEDULE`), the offsite-sync cron, and every log timestamp. Set an IANA name like `America/Los_Angeles` or `Europe/Berlin`. `setup-env.sh` detects the host's zone and writes it; if it can't, the compose default is `UTC` (not any local zone), so the clock is at least predictable. |
+| `RECORDER_TZ` | inherits `TZ` | IANA zone the recorder's per-camera archive-schedule cron runs in. Unset or empty means it inherits `TZ` above, which is what you want; set it only to run archive schedules in a different zone than the rest of the stack. A value that fails to parse is logged loudly and falls back rather than stopping the recorder. |
 
 ## PostgreSQL
 
@@ -31,7 +34,7 @@ that out honestly than let you set a key that silently never takes effect.
 | `POSTGRES_PASSWORD` | generated | strong random value from `setup-env.sh` |
 | `POSTGRES_DB` | `crumb` | |
 | `DATABASE_URL` | derived | full connection string used by api + recorder |
-| `DB_POOL_SIZE` | `32` | connection pool size. Fixed default of 32, not a per-camera formula. Raise it past ~16 cameras (rule of thumb `2 * cameras + 10`), and raise Postgres `max_connections` to match. **Compose override needed:** the base compose file doesn't forward this, so set it in a `docker-compose.override.yml`, not just `.env`. |
+| `DB_POOL_SIZE` | `32` | connection pool size. Fixed default of 32, not a per-camera formula. Raise it past ~16 cameras (rule of thumb `2 * cameras + 10`), and raise Postgres `max_connections` to match. Forwarded by the stock `docker-compose.yml` to both api and recorder; set it in `.env` and restart both containers. |
 
 ## WebRTC live (iOS / browser)
 
@@ -60,6 +63,18 @@ console's Server & streaming settings, that value wins.
 |---|---|---|
 | `SEGMENT_SECONDS` | `4` | 2 to 6 seconds; short segments mean near-instant seek |
 
+## Recorder internals
+
+Tuning knobs for the recorder's supervision loops. The defaults are right
+for almost everyone; `RECONCILE_PAUSED` is the only one an operator normally
+touches, and only during a deliberate storage migration.
+
+| Key | Default | Notes |
+|---|---|---|
+| `CONFIG_POLL_SECONDS` | `30` | how often the recorder diffs the database camera list against its running workers to pick up config changes |
+| `RECONCILE_INTERVAL_SECONDS` | `900` | how often the reconcile pass re-runs (adopt orphan files on disk, repair size drift, prune dangling index rows); floored to 60 |
+| `RECONCILE_PAUSED` | `false` | maintenance switch: `true` runs no reconcile passes at all. Set it while deliberately moving footage files out-of-band (storage migration, disk swap), since reconcile would race the move. Recording, motion, and retention continue normally. |
+
 ## Motion-mode RAM cache
 
 See [Motion & Detection](/motion/) for the mechanism this configures.
@@ -78,17 +93,21 @@ Five of these are also editable live from the admin console (**Server →
 Scrub previews**): the env value below is only the *default* until an
 operator sets it in the console, at which point the console value wins (no
 restart needed, takes effect within one scan interval / cache-sweep tick).
-The other two (`THUMB_CACHE_DIR`, `THUMB_PREGEN_WIDTH`) are env/compose-only,
-see the Notes column.
+The other three (`THUMB_CACHE_DIR`, `THUMB_PREGEN_WIDTH`,
+`THUMB_EXTRACT_MAX_CONCURRENCY`) are env-only, see the Notes column.
 
-**Compose override needed for the env side.** The base `docker-compose.yml`
-doesn't forward any `THUMB_*` key into the api container, so the env
-*defaults* below only change if you pass them in via a
-`docker-compose.override.yml`. The five console-editable knobs are the
-exception: those take effect through the database regardless, because the
-console writes them to `server_settings` (which the api reads at runtime),
-not to the environment. In short: edit these in the console, not `.env`,
-unless you're comfortable wiring a compose override for the two env-only ones.
+All of these are forwarded by the stock `docker-compose.yml` into the api
+container: set them in `.env` and restart the api. For the five
+console-editable knobs, prefer the console anyway; once an operator sets a
+value there, the database copy wins and the env value is just the default.
+
+One honest footnote: the compose file also forwards a few more `THUMB_*`
+names (`THUMB_INTERVAL_SECS`, `THUMB_MAX_ATTEMPTS`, `THUMB_MAX_WIDTH`,
+`THUMB_MIN_WIDTH`, `THUMB_NEAR_BLACK_LUMA`, `THUMB_EXTRACT_TIMEOUT_SECS`)
+that the current release treats as fixed built-in constants (a 4-second
+preview grid, widths clamped 48-640, a 12-second extract timeout, and the
+black-frame retry logic). Setting those in `.env` today has no effect;
+they're plumbed through for a future release, so they don't get rows here.
 
 | Key | Default | Console-editable? | Notes |
 |---|---|---|---|
@@ -114,7 +133,10 @@ unless you're comfortable wiring a compose override for the two env-only ones.
 
 | Key | Default | Notes |
 |---|---|---|
-| `MOTION_HWACCEL` | `auto` | `auto` probes for NVDEC and falls back to CPU; `cuda` forces NVDEC, `cpu` forces software decode |
+| `MOTION_HWACCEL` | `auto` | `auto` probes for NVDEC and falls back to CPU; `cuda` forces NVDEC, `vaapi` forces an Intel/AMD iGPU, `cpu` forces software decode |
+| `MAX_GPU_DECODE_SESSIONS` | `4` | global cap on concurrent NVDEC decode sessions; a camera past the cap decodes on CPU instead of failing |
+| `MOTION_VAAPI_DEVICE` | `/dev/dri/renderD128` | DRI render node used when `MOTION_HWACCEL=vaapi`; wired in by the `docker-compose.vaapi.example.yml` overlay, ignored otherwise |
+| `RENDER_GID` | `993` | host `render` group GID, read by the VAAPI overlay's `group_add` (not by Crumb itself) so the uid-1001 container user can open the render node; find yours with `getent group render` |
 
 See [Hardware decode](/configuration/hardware-decode) for enabling this.
 
@@ -164,8 +186,9 @@ See [Backups](/configuration/backups) for the full picture.
 | Key | Default | Notes |
 |---|---|---|
 | `ALERT_WEBHOOK_URL` | empty | a generic JSON webhook (Discord/Slack-compatible) for recorder-death paging; empty means silent |
-| `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart. **Compose override needed:** not forwarded by the base compose file, set it in a `docker-compose.override.yml`. |
-| `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot. **Compose override needed:** not forwarded by the base compose file, set it in a `docker-compose.override.yml`. |
+| `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
+| `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
+| `MOTION_UNHEALTHY_ALERT_SECS` | `180` | how long a camera's motion detector must stay *continuously* unhealthy before the recorder raises a system alert. This is alert hysteresis for flaky cameras that blip and self-heal; it delays only the alert, never the fail-open recording safety rail. |
 
 ## Update-available check (issue #7)
 
@@ -240,8 +263,7 @@ token from a dedicated **non-admin** HA user.
 | `HA_TOKEN` | empty | a long-lived access token; a secret. Prefer `HA_TOKEN_FILE` in production. |
 | `HA_TOKEN_FILE` | empty | path to a Docker-secret file holding the token, e.g. `/run/secrets/ha_token`; read in preference to `HA_TOKEN` |
 
-**Compose override needed.** The base `docker-compose.yml` doesn't forward
-`HA_BASE_URL` / `HA_TOKEN` / `HA_TOKEN_FILE` into the api container, so these
-env fallbacks only take effect through a `docker-compose.override.yml`. The
-console path (which writes to the database) is the supported way to configure
-Home Assistant and needs no compose changes.
+All three are forwarded by the stock `docker-compose.yml` into both the api
+and recorder containers: set them in `.env` and restart both. The console
+path (which writes to the database) is still the supported way to configure
+Home Assistant, and the DB value wins whenever both are set.

@@ -1,6 +1,6 @@
 # CrumbVMS Roadmap
 
-This is a living roadmap of "eventually" work for CrumbVMS, the free, open-source (AGPL-3.0-or-later) self-hosted NVR (Rust recorder/API + Tauri/libmpv desktop + Kotlin/Compose Android + go2rtc + optional Frigate). It is not a sprint plan or a commitment; it is the place where larger initiatives are scoped, grounded in the current code, and broken into phases so any future session can pick up an item with full context.
+This is a living roadmap of "eventually" work for CrumbVMS, the free, open-source (AGPL-3.0-or-later) self-hosted NVR (Rust recorder/API + Flutter/libmpv desktop + Kotlin/Compose Android + go2rtc + optional Frigate). It is not a sprint plan or a commitment; it is the place where larger initiatives are scoped, grounded in the current code, and broken into phases so any future session can pick up an item with full context.
 
 Each headline initiative below is written to be actionable cold: it cites the actual files involved, states where the code is today versus where it's going, and carries a phased checklist with effort tags, explicit dependencies, and the open decisions that are the maintainer's to make. The short backlog at the end is tracked elsewhere and listed here only for completeness.
 
@@ -61,7 +61,7 @@ Phase B, In-app Crumb push (Android, no FCM) (M)
 - [ ] `GET /notifications?since=<ts>` (viewer-scoped via `AuthUser.filter_camera_ids`, like `/events`) + optional `GET /notifications/stream` (SSE/long-poll) (M)
 - [ ] Android: foreground service OR WorkManager periodic poll → local notification via the declared `POST_NOTIFICATIONS`; tap deep-links to live/playback at the event time (M)
 - [ ] Android device/subscriber registry table so the server can target/scope (and later carry an ntfy/UnifiedPush endpoint) (S)
-- [ ] Desktop (Tauri): toast on new notification via the same `/notifications` endpoint (S)
+- [ ] Desktop (Flutter): toast on new notification via the same `/notifications` endpoint (S)
 
 Phase C, More channels + richer rules (M)
 
@@ -164,6 +164,11 @@ Phase 3, Snapshots + polish (stretch) (M)
 - Default broker when enabled: bundled mosquitto vs the user's existing HA/Mosquitto add-on broker (most HA users already run one). Default to bundled but document pointing at HA's broker.
 
 ### 3. Prebuilt distribution & signed releases
+
+> **Superseded 2026-07-18:** the Windows desktop release now builds
+> `apps/desktop-flutter` via `windows-release-flutter.yml` (media_kit already
+> bundles `libmpv-2.dll`); see `docs/DECISIONS.md`. The Tauri packaging steps
+> below are historical.
 
 Ship Crumb as prebuilt public Docker images (deploy-by-pull + an offline tarball for air-gapped installs), a code-signed Windows desktop installer, and a signed sideload APK, so nobody has to compile a Rust workspace to run it. Crumb is free and open source (AGPL-3.0-or-later); prebuilt artifacts are about convenience and trust (signatures, provenance, SmartScreen reputation), not secrecy. Building from source stays a first-class path.
 
@@ -610,7 +615,7 @@ Rewrite the Windows/Linux desktop client from Tauri/WebView2 to native Flutter, 
 
 #### Where we are today
 
-**P0 (de-risk spike) is done.** `apps/desktop-flutter/` proves media_kit live video + FRB → the real Windows-native Rust core + native overlay compositing (incl. Flutter-native digital zoom/pan) hold together on real hardware. Two things it settled: FRB bridges the *client/util* core (not the mpv engine, which media_kit replaces), and digital zoom/pan belongs in Flutter, not mpv. The Tauri `apps/desktop` is untouched and still ships.
+**P0 (de-risk spike) is done.** `apps/desktop-flutter/` proves media_kit live video + FRB → the real Windows-native Rust core + native overlay compositing (incl. Flutter-native digital zoom/pan) hold together on real hardware. Two things it settled: FRB bridges the *client/util* core (not the mpv engine, which media_kit replaces), and digital zoom/pan belongs in Flutter, not mpv. The Tauri `apps/desktop` is now retired and no longer ships; the Flutter client is the desktop release.
 
 #### What's next
 

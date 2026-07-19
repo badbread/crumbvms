@@ -32,8 +32,8 @@
 
 It is a side project. One maintainer, built on my own time, running at home in production
 today: eleven cameras, multiple storage volumes, recording day in and day out for months.
-**It is about 90% of where I want v1 to be, and the next milestone is the first tagged release,
-v0.1.0.** The recorder, the Windows desktop client, and the Android app are the polished daily
+**It is about 90% of where I want v1 to be, and the next milestone is v0.1.0, the first minor
+release.** The recorder, the Windows desktop client, and the Android app are the polished daily
 drivers. The macOS app works but sits behind Android and Windows until demand says otherwise,
 and the iOS app is built and actively developed but not yet distributable (Apple wants a paid
 developer account, see [License](#license)). Both macOS and iOS get kept up to date, they just
@@ -55,7 +55,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 - **A customizable on-video PTZ panel**: build your own control layout over the live feed, drag on a pan/tilt wheel, zoom, focus, iris, and your camera's presets, then size and place them how you like, per camera. Full ONVIF control
 - A per-camera **Data saver** stream (on-demand low-res transcode) for cheap remote or bandwidth-limited viewing
 - **Home Assistant entities on the live video, with live status.** Link a camera to its HA entities and drag each badge onto the frame where the thing actually is: the contact sensor on the front door, the light badge on the porch, the motion sensor over the driveway. Every badge shows live state right on the wall, updating as HA does
-- **Real native clients, not a browser in a wrapper.** A Windows/macOS desktop app on libmpv and a native Android app, both purpose-built, which is what makes the live wall and frame-accurate H.265 scrubbing feel instant instead of a laggy web tab. The web admin console is there for when you just want a browser
+- **Real native clients, not a browser in a wrapper.** A Windows desktop app on libmpv, a native SwiftUI macOS app, and a native Android app, all purpose-built, which is what makes the live wall and frame-accurate H.265 scrubbing feel instant instead of a laggy web tab. The web admin console is there for when you just want a browser
 
 **Keep**
 - Rust recorder. The Postgres segment index is the single source of truth
@@ -68,7 +68,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 - First-run wizard, generated secrets, LAN-only by default
 - Custom roles with per-camera and per-group access
 - Batch export list to MP4 or AES-256 encrypted ZIP, optional timestamp burn-in
-- Clients: Windows/macOS desktop (Flutter/libmpv), Android (Compose/Media3), web admin console. macOS and iOS are built and kept current, less battle-tested for now
+- Clients: Windows desktop (Flutter/libmpv), macOS (native SwiftUI), Android (Compose/Media3), web admin console. macOS and iOS are built and kept current, less battle-tested for now
 
 > Crumb records and lets you investigate. Frigate detects. They compose over MQTT.
 
@@ -231,7 +231,7 @@ so if you have thoughts on how it should work,
 | Primary focus | Operator/timeline layer + recording | Object-detection NVR | Integration hub + NVR | All-in-one NVR | Classic NVR |
 | Object detection | **BYO Frigate** (composes) | ✅ built-in | ✅ plugins | ✅ (DeepStack / CodeProject) | Basic / add-ons |
 | Scrubbable timeline | ✅ frame-level, native (libmpv) | ✅ web-based | ✅ web-based | ✅ native | Basic |
-| Native desktop client | ✅ Flutter/libmpv | ❌ (web) | ❌ (web) | ✅ Windows | ❌ (web) |
+| Native desktop client | ✅ Windows (Flutter/libmpv), macOS (SwiftUI) | ❌ (web) | ❌ (web) | ✅ Windows | ❌ (web) |
 | Mobile app | ✅ Android (iOS in progress) | via HA / 3rd-party | ✅ | ✅ | 3rd-party |
 | Multi-cam saveable wall | ✅ | ✅ camera groups | limited | ✅ | limited |
 | Batch export | ✅ list → MP4 / AES-256 zip | manual | limited | ✅ | limited |
@@ -398,7 +398,7 @@ For contributors working in this repo:
 
 ```
 services/   # Rust backend: common (types, DB, migrations), api (axum + web admin at /admin), recorder
-apps/       # desktop (Flutter + libmpv), android (Kotlin/Compose), ios
+apps/       # desktop-flutter (Flutter + libmpv), android (Kotlin/Compose), ios; desktop = retired Tauri client
 db/         # PostgreSQL migrations; the segment index is the single source of truth
 site/       # crumbvms.com source (static, zero-dep build)
 ```

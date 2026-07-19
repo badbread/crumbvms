@@ -8,11 +8,15 @@ workstation (Git Bash). Or just ask the Claude session to "update all clients" /
 > versioning, registries, and rollback, see [../../docs/RELEASE.md](../../docs/RELEASE.md).
 
 ```bash
-bash scripts/release/release.sh all                 # backend + android + ios + both desktops
+bash scripts/release/release.sh all                 # backend + android + ios
 bash scripts/release/release.sh backend android     # pick targets
-bash scripts/release/release.sh desktop             # both desktop builds
 bash scripts/release/release.sh backend --api-only  # api only (no recorder blip)
 ```
+
+> **Desktop is not a target here anymore.** The Windows desktop ships via
+> `.github/workflows/windows-release-flutter.yml` on the `v*` tag; the Tauri
+> `desktop-windows.sh` / `desktop-linux.sh` scripts are retired and exit
+> immediately if invoked.
 
 ## Build hosts
 
@@ -27,12 +31,9 @@ needed:
 | Backend gate | build host | `CRUMB_BUILD_HOST` | tar over SSH → `~/crumb-gate` | `cargo fmt --check` + `clippy -D warnings` + `test` |
 | Android | build host | `CRUMB_BUILD_HOST` | tar over SSH → `~/projects/crumb-android` | `./gradlew assembleDebug` → publish `~/apk-serve/crumb.apk` (http :8088) |
 | iOS | Mac host | `CRUMB_MAC_HOST` | repo at `$CRUMB_MAC_REPO` (mount or checkout on the Mac) | `xcodebuild -scheme Crumb` (unsigned compile) |
-| Desktop (Linux) | build host | `CRUMB_BUILD_HOST` | tar over SSH → `~/projects/crumb-desktop` | `cargo build` in `src-tauri` (gtk/mpv pane backend) |
-| Desktop (Windows) | local workstation |, (local) | synced repo → local run-dir (`CRUMB_DESKTOP_RUN_DIR`) | `cargo build` in the run-dir + libmpv-2.dll next to the exe |
 
 Order is fixed: **backend is gated then deployed first**, so a freshly-deployed
-API is live before the clients ship. A failed gate aborts the deploy. Desktop
-(Windows) is the one target that builds **locally** (it's Windows-native).
+API is live before the clients ship. A failed gate aborts the deploy.
 
 ## Scripts
 
@@ -40,8 +41,8 @@ API is live before the clients ship. A failed gate aborts the deploy. Desktop
 - `backend.sh`, `--gate-only` / `--no-gate` / `--api-only`.
 - `android.sh`, sync + `assembleDebug` + publish APK.
 - `ios.sh`, `xcodebuild` over SSH (unsigned compile check).
-- `desktop-linux.sh`, sync + `cargo build` on the build host.
-- `desktop-windows.sh`, local `cargo build` + place libmpv-2.dll (path via `CRUMB_LIBMPV_DLL`).
+- `desktop-linux.sh` / `desktop-windows.sh`, **retired** Tauri builds; each
+  prints a pointer to `windows-release-flutter.yml` and exits.
 - `lib.sh`, shared host/path config (set hosts via `CRUMB_BUILD_HOST`/`CRUMB_PROD_HOST`/`CRUMB_MAC_HOST`).
 
 ## Prerequisites
@@ -61,10 +62,6 @@ into artifacts others install is separate work:
   needs a signing identity + provisioning (free Apple ID = 7-day on-device; the
   $99 Apple Developer Program = TestFlight/App Store). Add an `--archive`/`--device`
   path once that's set up.
-- **Desktop (Linux) .deb**, `desktop-linux.sh` does `cargo build`; a `.deb` needs
-  `cargo tauri build` (the bundle config already declares the deb deps). Add once
-  tauri-cli is set up on the build host.
-- **Desktop (Windows) installer**, `cargo tauri build` produces an MSI/NSIS, but
-  the bundle config doesn't yet ship `libmpv-2.dll` as a resource, so a packaged
-  installer would be missing it. Add the DLL to bundle resources first.
+- **Desktop**, distributed separately: the Windows Flutter client is built and
+  zipped by `.github/workflows/windows-release-flutter.yml` on the `v*` tag.
 - **Web**, secondary console; no prod deploy target wired.

@@ -63,7 +63,7 @@ When you drag across the timeline you want a thumbnail under the cursor the whol
 way. You can't get that by decoding the full-resolution H.265 stream on every
 scrub tick: that's hundreds of full-frame decodes a second, and 4K H.265 is
 exactly what browsers already choke on. So Crumb pre-generates a low-res JPEG
-preview proxy (a small frame roughly every 10 seconds), lands the drag on the
+preview proxy (a small frame every few seconds, 4 s by default), lands the drag on the
 nearest proxy frame instantly, and only decodes the real frame from the actual
 video when you let go (see [Timeline scrubbing](/playback/scrubbing)). That proxy
 is derived from Crumb's own segment index by a background worker. Reading

@@ -78,8 +78,9 @@ controller under GDPR or UK GDPR, with real obligations. A few highlights:
   (how long live and archive footage are each kept) and an optional
   maximum retention cap that deletes everything older than N days across
   both tiers at once. The cap is off by default. One caveat: footage you
-  explicitly protect (a protected bookmark) is never auto-deleted, so it
-  can outlive the cap, unpin it once it's no longer needed. Crumb enforces
+  explicitly protect (a protected bookmark) is held past the cap for the
+  protection window you chose (1 to 30 days), then the protection expires
+  on its own; delete the bookmark to end it early. Crumb enforces
   whatever period you choose but can't tell you what the right period is,
   that's your call against your purpose and local law.
 - **Signage:** you generally must tell people they're being recorded,

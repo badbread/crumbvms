@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+echo "RETIRED: the desktop release is the Flutter client, built by .github/workflows/windows-release-flutter.yml" >&2
+exit 1
+
 # Build the Windows desktop client (Tauri) NATIVELY on this workstation.
 #
 # This is the one target that builds locally, not over SSH: the desktop crate is

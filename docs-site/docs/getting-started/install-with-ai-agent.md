@@ -38,8 +38,8 @@ worth knowing either way:
 - **Never invents or prints secrets.** Secrets come from
   `scripts/setup-env.sh`, which generates strong random values. An agent
   should never hardcode a password or secret, and should avoid echoing
-  them into chat history if you ask for the admin password back; the
-  script's `--print` flag is the intended path for that.
+  them into chat history; if you need the seeded admin password back
+  later, read it on the server yourself with `grep SEED_ADMIN_PASSWORD .env`.
 - **Confirms before privileged or destructive actions.** Installing system
   packages, changing firewall rules, deleting data, or overwriting an
   existing `.env` are all things the runbook asks the agent to show you and

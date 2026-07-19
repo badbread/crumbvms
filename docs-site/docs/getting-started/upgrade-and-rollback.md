@@ -53,7 +53,7 @@ Versioned images make rollback symmetrical with upgrade:
 ```bash
 cd /opt/crumb/app
 
-# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.1.0
+# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.0.1
 
 docker compose pull
 docker compose up -d

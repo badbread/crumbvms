@@ -49,9 +49,17 @@ licenses govern those components; this NOTICE is informational.
 The Rust backend (axum, tokio, tower-http, sqlx/tokio-postgres, jsonwebtoken,
 argon2, and others), the Android client (AndroidX, Jetpack Compose, Media3,
 Retrofit, OkHttp, Coil), the iOS client (Apple frameworks; WebRTC under BSD-3),
-and the desktop shell (Tauri) are all licensed under permissive terms
-(MIT / Apache-2.0 / BSD). See each project's Cargo.toml, build.gradle.kts, and
-Swift package manifests for the authoritative dependency lists.
+and the desktop client (Flutter under BSD-3-Clause; media_kit and
+flutter_rust_bridge under MIT/Apache-2.0) are all licensed under permissive
+terms (MIT / Apache-2.0 / BSD). See each project's Cargo.toml,
+build.gradle.kts, pubspec.yaml, and Swift package manifests for the
+authoritative dependency lists.
+
+The optional crumb-alpr worker (services/alpr-worker, opt-in `alpr` compose
+profile) builds on the fast-alpr wrappers (MIT) and ONNX Runtime (MIT). Its
+default detector weights are YOLOv9-derived models licensed GPL-3.0-or-later
+(compatible with AGPL-3.0); they are downloaded by the worker at first run and
+are never redistributed by CrumbVMS.
 
 ================================================================================
 Trademarks

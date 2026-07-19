@@ -6,7 +6,7 @@ cameras through a **client**. There are five:
 | Client | Platform | Tech | How you get it |
 |---|---|---|---|
 | **Web admin** | any browser | served by the API at `/admin` | nothing to install |
-| **Desktop** | Windows 10/11 | Flutter + native libmpv | installer from Releases |
+| **Desktop** | Windows 10/11 | Flutter + native libmpv | zip from Releases |
 | **Desktop** | Linux | Flutter + libmpv | build from source |
 | **Apple** | macOS 13+ | native SwiftUI | zip from Releases |
 | **Apple / mobile** | iOS 16+ | native SwiftUI | *TestFlight, not set up yet* |
@@ -26,7 +26,7 @@ cameras through a **client**. There are five:
 You need three things:
 
 1. **A running CrumbVMS server** on your LAN (or reachable over your own VPN /
-   Tailscale). See the [README](../README.md) "Run" section or
+   Tailscale). See the [README](../README.md) "Install" section or
    [docs/AI-INSTALL.md](AI-INSTALL.md).
 2. **An account**, your admin login, or a user the admin created for you.
 3. **The server reachable** on port **8080** (HTTP) or **8443** (HTTPS). Native
@@ -43,8 +43,11 @@ You need three things:
 
 ## Web console (no install)
 
-Open **`http://<server-host>:8080/admin`** in any browser. On first server run
-you create the administrator here. The web console covers admin, live view,
+Open **`http://<server-host>:8080/admin`** in any browser. Sign in with the
+seeded admin account: username `admin` and the `SEED_ADMIN_PASSWORD` that
+`scripts/setup-env.sh` printed once when it generated your `.env`. (A
+create-admin step only appears if you deliberately blanked the seed to use the
+browser wizard instead.) The web console covers admin, live view,
 playback, clips, and export, it's the fastest way to confirm your server works
 before installing anything native.
 
@@ -86,15 +89,17 @@ keeps your saved views and settings).
 **Flutter** app (video renders through `media_kit`/libmpv), no WebView2 or other
 runtime to install.
 
-1. On the **Releases** page, download the Windows installer for CrumbVMS.
-   `libmpv-2.dll` is bundled with it, so there's no separate file to manage and
-   nothing to copy next to the exe by hand.
-2. Run the installer. Windows **SmartScreen** will warn about an unrecognized app
-   (it's unsigned during the alpha): click **More info → Run anyway**, then install.
-3. Launch **CrumbVMS** from the Start Menu.
-4. Use **Find my server** or enter `http://<server-host>:8080`, then log in.
+1. On the **Releases** page, download `CrumbVMS-windows-<version>.zip`.
+2. Unzip it anywhere you like, keeping the extracted files together:
+   `crumb_desktop.exe` needs the bundled `libmpv-2.dll` and the `data/` folder
+   next to it. There is no installer to run.
+3. Run `crumb_desktop.exe`. Windows **SmartScreen** will warn about an
+   unrecognized app (it's unsigned during the alpha): click
+   **More info → Run anyway**.
+4. Optional: right-click the exe to pin it to Start or the taskbar.
+5. Use **Find my server** or enter `http://<server-host>:8080`, then log in.
 
-Updates = run the newer installer over the top.
+Updates = download the newer release zip and unzip it over the top.
 
 ---
 
@@ -166,7 +171,7 @@ at the top).
 |---|---|
 | "Find my server" finds nothing | Wi-Fi **client isolation** (common on guest networks) blocks device-to-device traffic, enter the address manually, or join the same LAN segment as the server. |
 | Connects, lists cameras, live panes black | Server RTSP address not set (**Server & streaming**), or the client can't reach port **18554**. |
-| Windows: video panes black | The bundled `libmpv-2.dll` isn't next to `CrumbVMS.exe`, reinstall with the installer rather than copying the exe out by hand. |
+| Windows: video panes black | The bundled `libmpv-2.dll` isn't next to `crumb_desktop.exe`, re-unzip the release zip rather than copying the exe out on its own. |
 | Windows: "Windows protected your PC" | SmartScreen on the unsigned alpha build, **More info → Run anyway**. |
 | macOS: "CrumbVMS can't be opened" | Gatekeeper on the un-notarized alpha build, **right-click → Open** the first time. |
 | Android: "app not installed" | You already have a build signed with a *different* key, uninstall the old one first (this won't happen for updates of the same alpha build). |

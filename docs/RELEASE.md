@@ -7,6 +7,11 @@ How Crumb goes from a git commit to a known, versioned, deployable, and
 > configured build hosts) is handled by the orchestrator in
 > [../scripts/release/](../scripts/release/README.md): `bash scripts/release/release.sh all`.
 
+> **Windows desktop:** the desktop release is built by
+> `.github/workflows/windows-release-flutter.yml` on the `v*` tag, which
+> attaches `CrumbVMS-windows-<tag>.zip` to the GitHub Release. The
+> `scripts/release/` desktop targets (the old Tauri builds) are retired.
+
 ---
 
 ## TL;DR

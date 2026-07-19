@@ -85,7 +85,8 @@ values.
 curl -fsS http://localhost:8080/health
 ```
 
-returns `200 OK`. A `503` for the first few seconds is normal while
+prints the health response and exits 0 (`curl -fsS` prints the body, not
+a status line). A `503` for the first few seconds is normal while
 Postgres and migrations finish; retry.
 
 ## What's running
