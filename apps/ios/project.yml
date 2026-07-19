@@ -13,8 +13,8 @@ settings:
     SWIFT_VERSION: "5.9"
     # Keep in lockstep with the rest of the project (android version.properties,
     # tauri.conf.json) — the first public tag must mean one version everywhere.
-    MARKETING_VERSION: "0.0.1"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "2"
     # Swift-6 readiness for the macOS port. `targeted` checks concurrency-adopting
     # code for Sendable / actor-isolation violations (warnings, not errors).
     SWIFT_STRICT_CONCURRENCY: targeted

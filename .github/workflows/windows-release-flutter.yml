@@ -109,4 +109,3 @@ jobs:
       #    the old Tauri NSIS UX. For the 0.1.0 alpha the docs say "unzip and run
       #    crumb_desktop.exe", which is honest.
       #  - code signing (Windows SmartScreen shows "unknown publisher" otherwise).
-      #    from windows-release.yml, then retire that file.
