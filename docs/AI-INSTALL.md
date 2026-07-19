@@ -58,12 +58,13 @@ CrumbVMS records **security cameras**. A misconfiguration is a privacy hazard, s
 - **GPU (optional):** not required. CrumbVMS runs motion detection on CPU by default
   (`MOTION_HWACCEL=auto`). NVIDIA GPU support is an opt-in overlay (Step 4).
 - **Images, pull vs. build:** the base compose file *pulls* prebuilt `api`/
-  `recorder` images from GHCR (no Rust toolchain needed), but that only works
-  once the upstream owner has enabled GHCR publishing (see `docs/IMAGES.md`
-  "Owner seam"). If you're working from a fresh clone of this repo and haven't
-  confirmed images are published, plan on the **build-from-source** path in
-  Step 5 instead (needs the Rust build to run inside Docker, no local Rust
-  toolchain required, but expect the first `up` to take several minutes).
+  `recorder` images from GHCR (no Rust toolchain needed). The upstream
+  `ghcr.io/badbread/crumbvms/{api,recorder}` images are **published and public**,
+  so the pull path is the default and works on a fresh clone. The
+  **build-from-source** path in Step 5 is still there for developers, air-gapped
+  hosts, or a private fork that hasn't published its own images (see
+  `docs/IMAGES.md`); it needs the Rust build to run inside Docker, no local Rust
+  toolchain required, but expect the first `up` to take several minutes.
 
 **Verify:** `docker compose version` prints v2.x; the target disk has > (estimate
 from camera count × resolution × retention) free.
@@ -119,21 +120,31 @@ scripts/setup-env.sh            # generates .env with strong random secrets
 ```
 
 This writes a gitignored `.env` with a strong `POSTGRES_PASSWORD`, `JWT_SECRET`,
-and `SEED_ADMIN_PASSWORD`. **Do not** edit those secret values by hand or echo them
-into the chat; if the user needs the admin password, re-run with `--print` or read
-it back to them privately.
+and a **seeded admin account**. By default `setup-env.sh` generates a *memorable*
+admin passphrase (e.g. `IcyApples473`), **prints it once**, and stores it as
+`SEED_ADMIN_PASSWORD` in `.env`; the api hashes it at startup and creates the
+`admin` user before the console is first reachable. This is the secure default:
+it closes the brief unauthenticated `/auth/bootstrap` window a blank seed would
+leave open. Capture that passphrase from the script output (or read the
+`SEED_ADMIN_PASSWORD` line out of `.env`) and hand it to the user privately, they
+sign in with it in Step 6. **Do not** edit the generated secret values by hand or
+echo any secret other than the user's own admin password into the chat. It's a
+LAN-only starter credential, tell the user to change it in the console after
+first login. (Advanced: `--prompt` sets your own admin password instead; blanking
+`SEED_ADMIN_PASSWORD` before first boot opts out of seeding and hands admin
+creation to the wizard's create-admin step, Step 6a.)
 
 It also detects two host facts and writes them (neither is a secret):
 
-- **`TZ`** — the host's IANA timezone (e.g. `Europe/Berlin`). It drives quiet
+- **`TZ`**: the host's IANA timezone (e.g. `Europe/Berlin`). It drives quiet
   hours, the nightly DB-backup schedule, and every log timestamp. If detection
-  fails it falls back to **`UTC`** (printed as a NOTE) — **not** a local zone;
+  fails it falls back to **`UTC`** (printed as a NOTE), **not** a local zone;
   confirm it looks right and set it by hand if the host clock is unusual. The
   compose default when `.env` has no `TZ` is also `UTC`.
-- **`WEBRTC_CANDIDATE`** — the host's LAN IP as `<lan-ip>:8556`. **Required for
+- **`WEBRTC_CANDIDATE`**: the host's LAN IP as `<lan-ip>:8556`. **Required for
   iOS/WebRTC live view**: go2rtc advertises it as an ICE candidate so LAN clients
   can connect; without it live silently degrades to ~1fps snapshots
-  (`docs/IOS-LIVE-VIDEO.md`). If detection fails it's left blank with a NOTE —
+  (`docs/IOS-LIVE-VIDEO.md`). If detection fails it's left blank with a NOTE:
   set it to the server's LAN IP + `:8556` before relying on iOS/WebRTC live.
 
 **Verify:** `.env` exists; `JWT_SECRET` is **not** the `change-me…` placeholder;
@@ -163,7 +174,7 @@ in the recorder container automatically, no compose edit needed) and only
 persists to disk on an actual motion trigger (pre-roll + event + post-roll);
 idle time between events is never written to disk at all. See
 `docs/MOTION-RECORDING.md` for the full mechanism and safety rails
-(fail-open on an unhealthy detector, spill-to-disk under cache pressure —
+(fail-open on an unhealthy detector, spill-to-disk under cache pressure:
 footage is never silently dropped by the mechanism itself, only by an
 under-tuned detector missing a real event).
 
@@ -205,14 +216,13 @@ that error by inventing a value; re-run `scripts/setup-env.sh`.
 **Pick pull or build** (see Step 1's note and `docs/IMAGES.md`):
 
 ```sh
-# Default path, pulls prebuilt images (works once the owner has published to
-# GHCR; confirm with `docker compose pull` and check for a "not found"/403):
+# Default path, pulls the published (public) prebuilt images from GHCR:
 docker compose pull
 docker compose up -d
 
-# Build-from-source override, use this if `docker compose pull` fails to find
-# the images (common on a fresh clone before publishing is enabled), or if
-# you're developing against local code changes:
+# Build-from-source override, use this if you're developing against local code
+# changes, running air-gapped, or on a private fork that hasn't published its
+# own images (a plain `docker compose pull` would 404 there):
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
@@ -236,7 +246,7 @@ authenticated with `GO2RTC_USER`/`GO2RTC_PASS`. Don't add a host port for it.
 (Upgrading an install that predates the embedding? `docker compose up -d
 --remove-orphans` removes the old standalone go2rtc container.)
 
-The `recorder` service sets `stop_grace_period: 90s` — its clean shutdown
+The `recorder` service sets `stop_grace_period: 90s`: its clean shutdown
 finalizes in-flight segments and storage-migration batches, and Docker's
 default 10 s grace would SIGKILL it mid-teardown. Don't remove or shorten it.
 
@@ -250,7 +260,10 @@ start with a stock `up -d` (Step 8).
 - `docker compose ps`: all services `running`/`healthy`.
 - `curl -fsS http://localhost:8080/health` → `200 OK` (it probes DB + recorder;
   503 means a component is still coming up. Wait and retry a few times).
-- `docker compose logs recorder | grep -i "migration"` shows migrations applied.
+- `docker compose logs api recorder | grep -i migration` shows migrations
+  applied. (Grep **both** services: whichever of api/recorder wins the startup
+  advisory lock runs and logs the migrations; the other logs nothing, so
+  grepping only one can miss them on a perfectly healthy boot.)
 
 ---
 
@@ -259,13 +272,19 @@ start with a stock `up -d` (Step 8).
 Pick ONE with the user.
 
 ### 6a. Hand off to the web Setup wizard (simplest)
-Tell the user to open **`http://<host-lan-ip>:8080/admin`**. On a fresh install it
-launches a guided wizard. It opens with a one-time **tester-terms gate**, an
-AS-IS / no-warranty / not-your-only-security / lawful-use acknowledgement the
-operator reads and checks to continue (recorded server-side once an admin exists,
+Tell the user to open **`http://<host-lan-ip>:8080/admin`** and **sign in as
+`admin`** with the passphrase `setup-env.sh` printed in Step 2 (the
+`SEED_ADMIN_PASSWORD` line in `.env`). On a fresh seeded install the admin
+already exists, so this is a normal sign-in, not an account-creation step.
+Signing in launches a guided wizard. It opens with a one-time **tester-terms
+gate**, an AS-IS / no-warranty / not-your-only-security / lawful-use
+acknowledgement the operator reads and checks to continue (recorded server-side,
 via `PUT /config/beta-terms`). Then:
 
-1. **Create admin**, the account they'll sign in with.
+1. **Create admin** (**skipped on the default seeded install**, the admin already
+   exists and you just signed in as it, so the wizard resumes at the tester-terms
+   gate). This step only appears if `SEED_ADMIN_PASSWORD` was blanked before first
+   boot.
 2. **Server address**, pre-filled from the connection; only change if wrong.
 3. **Storage**, confirm the recording disk (path + a live capacity bar), set
    **"Keep at most"** (GB) and **"Keep at least"** (days). These write the default
@@ -313,14 +332,14 @@ via `PUT /config/beta-terms`). Then:
     capabilities; fine-grained control is Settings → Users & Security.
 11. **Done.**
 
-You're finished; they take it from here. (Skipping the camera steps adds nothing —
+You're finished; they take it from here. (Skipping the camera steps adds nothing:
 secure by default; steps 7–10 are all optional and skippable.)
 
-**After the wizard — License-plate recognition (optional).** Not a wizard step;
+**After the wizard: License-plate recognition (optional).** Not a wizard step;
 everything LPR lives in the console's dedicated **LPR** section (left nav). OFF
 by default. If the user runs their cameras through Frigate with Frigate's
 native LPR enabled, plate reads arrive on the event stream Crumb already
-ingests — flip **Enable license-plate capture** on there (and set a
+ingests: flip **Enable license-plate capture** on there (and set a
 **retention** window; older plate reads are pruned automatically) to start
 capturing them into the searchable **LPR** tab. Each camera's **Engine**
 dropdown in the same section's per-camera table controls which source feeds it
@@ -330,7 +349,7 @@ viewing it needs the **View license plates** role capability (Settings → Users
 Security). Plate-read retention is independent of footage/storage retention.
 REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
-Alternatively — or for better accuracy than Frigate's native LPR — run Crumb's
+Alternatively (or for better accuracy than Frigate's native LPR) run Crumb's
 **own** local OCR engine, the opt-in **`crumb-alpr`** worker (fast-alpr; no cloud,
 no third-party agent). It pulls a camera's go2rtc restream, motion-gates, reads
 plates, and POSTs them to the same LPR store. Enable LPR (above), then in
@@ -340,16 +359,16 @@ server only accepts worker reads for those engines), set the `LPR_*` vars in
 `.env` (`LPR_INGEST_TOKEN`, `LPR_CAMERA_ID`, `LPR_RTSP_URL`; see `.env.example`),
 and start it: `docker compose --profile alpr up -d --build crumb-alpr`. It's
 CPU-only and profile-gated (a plain `up -d` never starts it); one instance per
-camera. Model weights download at first run (not vendored — see
+camera. Model weights download at first run (not vendored, see
 `docs/LPR-NATIVE-ENGINE-PLAN.md` for the licensing note and air-gapped pre-fetch).
 
 To be **alerted** when a specific plate is seen, add it to the **watchlist** in
 the **LPR** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
 admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert
-routed over the same notification channels as every other alert — enable/tune it
+routed over the same notification channels as every other alert: enable/tune it
 under Settings → Notifications → System alerts. No extra services or env keys.
 
-**After the wizard — Home Assistant (optional).** Also not a wizard step; it
+**After the wizard: Home Assistant (optional).** Also not a wizard step; it
 lives in the console under **Settings → Detection & clips → Home Assistant**
 (same panel as Frigate). OFF by default, fully self-hosted, footage never leaves
 Crumb. If the user runs Home
@@ -359,7 +378,7 @@ cameras can be linked to HA entities and entity **badges** (door/lock/sensor
 state) dropped onto the live video. Configure it in the console
 (`PUT /config/ha {"base_url":"http://<ha-host>:8123","token":"…","enabled":true}`;
 the token is write-only, never returned, and travels only in the `Authorization`
-header). No new services, ports, or generated secrets — it reuses the existing
+header). No new services, ports, or generated secrets: it reuses the existing
 stack. A headless env fallback exists (`HA_BASE_URL` + `HA_TOKEN` or, preferred,
 `HA_TOKEN_FILE` a Docker-secret path; see `.env.example`), but the console value
 wins when both are set, and the integration stays dormant until enabled.
@@ -367,11 +386,20 @@ wins when both are set, and the integration stays dormant until enabled.
 ### 6b. Drive it yourself via the REST API (full hands-off)
 All wizard steps have API equivalents. Do them in order:
 
-1. **Create the admin.** `POST /auth/bootstrap` `{username, password}` (use the
-   `SEED_ADMIN_PASSWORD` from Step 2, or ask the user). Returns a bearer token; use
-   it for every call below. Then record the operator's acceptance of the tester
-   terms, `PUT /config/beta-terms` `{accept: true}` (the web wizard's opening
-   AS-IS gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
+1. **Get an admin token.** First probe `GET /auth/needs-bootstrap`.
+   - **Default (admin pre-seeded):** `needs_bootstrap` is `false`. `setup-env.sh`
+     already created the `admin` user from `SEED_ADMIN_PASSWORD`, so
+     `POST /auth/login` `{"username":"admin","password":"<SEED_ADMIN_PASSWORD from
+     .env>"}` returns the bearer token; use it for every call below. (`POST
+     /auth/bootstrap` would return **409 Conflict** on this path.)
+   - **Blanked-seed opt-in:** if the operator deliberately blanked
+     `SEED_ADMIN_PASSWORD` before first boot, `needs_bootstrap` is `true` and no
+     admin exists yet. Create it with `POST /auth/bootstrap` `{username, password}`
+     (pick a strong password, or ask the user; ≥ 8 chars); it returns the token.
+
+   Then record the operator's acceptance of the tester terms,
+   `PUT /config/beta-terms` `{accept: true}` (the web wizard's opening AS-IS
+   gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
 2. **Server address.** `PUT /config/server` with the host's **LAN** address
    (`server_address`, `crumb_rtsp_base`, …). Use the LAN IP, never a public one.
    (`GET /auth/setup-status` returns a suggested address derived from the request,
@@ -459,7 +487,7 @@ All wizard steps have API equivalents. Do them in order:
    per camera it reports `requested` vs `active` plus a human `fallback_reason`
    when they differ (e.g. the render node isn't mapped into the recorder
    container, see "Hardware-accelerated motion decode" below). `capabilities:
-   null` means the recorder hasn't reported yet (older image / not booted) —
+   null` means the recorder hasn't reported yet (older image / not booted),
    not "no devices". Skipping this step entirely is fine: `auto` is the default.
 8. **Notifications (optional).** `POST /notifications/channels`
    `{kind, name, config, camera_ids: [], include_snapshot: true, enabled: true,
@@ -556,7 +584,7 @@ its camera and time, lose it and the footage on disk becomes un-seekable,
 un-exportable data. The **api service itself runs a nightly `pg_dump`**
 (03:15 local, default ON, plus an immediate catch-up dump on boot when no
 fresh backup exists) with rotation into `DB_BACKUP_HOST_PATH` (default
-`./backups`), so a stock `docker compose up -d` is already taking backups —
+`./backups`), so a stock `docker compose up -d` is already taking backups,
 **as long as that directory is writable by uid 1001** (the api's user).
 `scripts/setup-env.sh` prepares the default dir; if backups were disabled
 with a permissions warning in `docker compose logs api`, run
@@ -564,7 +592,7 @@ with a permissions warning in `docker compose logs api`, run
 api`. (A failed/unwritable backup never takes the api down, it logs, raises
 the `backup_failed` alert, and carries on serving.)
 
-- **Single-box home install:** on-host nightly dumps are an accepted posture —
+- **Single-box home install:** on-host nightly dumps are an accepted posture,
   just confirm they land: `ls -lh <DB_BACKUP_HOST_PATH>/daily/` shows a recent
   `.sql.gz` (the boot catch-up means this appears within a minute of first
   start, no need to wait for 03:15).
@@ -651,10 +679,11 @@ Default = LAN-only, do nothing. If the user wants to reach CrumbVMS away from ho
   `GO2RTC_PASS` "is required" → `.env` is missing those keys (hand-edited or
   copied from `.env.example` verbatim); re-run `scripts/setup-env.sh`.
 - `docker compose pull` errors with "not found" / "denied" / 403 on
-  `ghcr.io/badbread/crumbvms/...` → images aren't published yet for this
-  repo/fork (see `docs/IMAGES.md` "Owner seam"). Use the build override
-  instead: `docker compose -f docker-compose.yml -f docker-compose.build.yml
-  up -d --build`.
+  `ghcr.io/badbread/crumbvms/...` → the upstream images are public, so this
+  should be rare; it means you're on a **private fork** whose own images aren't
+  published (or `CRUMB_IMAGE_PREFIX` points somewhere unpublished). Build from
+  source instead: `docker compose -f docker-compose.yml -f
+  docker-compose.build.yml up -d --build` (see `docs/IMAGES.md`).
 - `/health` stays 503 → give Postgres a moment; check `docker compose logs postgres`.
 - Port 8080 (or 8443/18554/8556) in use → another service on the host; remap
   the conflicting port in `docker-compose.yml` (or override `CRUMB_HTTPS_PORT`
@@ -681,8 +710,8 @@ Default = LAN-only, do nothing. If the user wants to reach CrumbVMS away from ho
 This doc encodes real endpoints, ports, and scripts, so it can drift from the code.
 Unlike prose docs, an agent-runnable runbook is **testable**: add a CI job that, on
 a clean VM, runs these steps end-to-end (`setup-env.sh` → `docker compose up -d` →
-wait for `/health` → bootstrap + add a synthetic RTSP camera via the API →
-assert it records) and fails if any Verify check fails. That turns "the install
+wait for `/health` → log in as the seeded admin + add a synthetic RTSP camera via
+the API → assert it records) and fails if any Verify check fails. That turns "the install
 works" into a green check and stops this file from rotting against the compose /
 API surface.
 
@@ -695,9 +724,10 @@ leave it for a follow-up:
   (`:?`-guarded) env vars, volumes, healthchecks, or profile gating.
 - `.env.example` / `scripts/setup-env.sh`, new/renamed/removed config keys, or
   a change to what's generated vs. left blank.
-- Image publishing/pull-vs-build story (`docs/IMAGES.md`), e.g. once GHCR
-  publishing is enabled by default, the "pull may not work yet" caveats in
-  Step 1/5/Troubleshooting here should be softened or removed.
+- Image publishing/pull-vs-build story (`docs/IMAGES.md`). The GHCR images are
+  public now, so pull is the documented default; if publishing ever changes
+  (registry move, a fork going private), re-check the pull-vs-build wording in
+  Step 1/5/Troubleshooting.
 - First-run flow, wizard steps (`admin.html` `WIZARD_ALL_STEPS`) or the
   underlying REST endpoints (`auth.rs`, `config_routes.rs`).
 - Backup/monitoring/remote-access defaults, the api's built-in DB backup job

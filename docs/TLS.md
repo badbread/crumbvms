@@ -140,9 +140,9 @@ the base compose file does for you.
   for their server-address/streaming config, this task only adds the HTTPS
   *option* at the infrastructure layer (Caddy in front of the API). Wiring
   each client to prefer/require HTTPS, and to trust (or pin) Caddy's
-  internal CA so they don't need a manual per-device import, is future work
-  (tracked alongside related hardening like revocable sessions / scoped media
-  tokens, which matter more once the transport is encrypted).
+  internal CA so they don't need a manual per-device import, is future work.
+  (The related auth hardening that pairs with encrypted transport, revocable
+  sessions and scoped short-lived media `?token=` claims, already ships.)
 - **RTSP (`:18554`) and the WebRTC media plane (`:8556`) are unaffected by
   this change**, they're go2rtc's own listeners, not proxied through Caddy,
   and continue to run unencrypted (with go2rtc's own Basic-auth/RTSP-auth on

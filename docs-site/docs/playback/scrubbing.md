@@ -8,8 +8,8 @@ slug: /playback/scrubbing
 
 When you drag along the timeline to find a moment in recorded footage, Crumb
 shows a small preview image that updates as you move, so you can spot the right
-frame without playing through everything. It works the same in the desktop app,
-the mobile apps, and the web console.
+frame without playing through everything. It works the same in the desktop app
+and the mobile apps.
 
 ## It just works, and gets faster as you go
 
@@ -62,8 +62,9 @@ Then apply it:
 docker compose up -d api
 ```
 
-Whichever knob you set last wins: once you change a setting from the admin
-console, that value takes over from the `.env` default for good. The
+The admin console wins over `.env`: once you set a value from the console,
+that value takes over from the `.env` default for good, and `.env` only
+applies to settings you've never touched in the console. The
 [environment reference](/configuration/environment-reference) lists every
 knob (the fine-tuning ones and the console-editable ones) with its default and
 whether it's console-editable.

@@ -8,6 +8,66 @@ revisit.
 
 ---
 
+## 2026-07-18, Desktop release ships the Flutter client, not the retired Tauri app
+
+**Status.** Decided during the v0.1.0 readiness audit; NOT yet implemented. The
+tag-triggered `windows-release.yml` workflow and the ci.yml `desktop-lint` /
+`desktop-linux` jobs still build `apps/desktop/src-tauri`, and must be repointed
+to `apps/desktop-flutter` before v0.1.0 is tagged. (`macos-release.yml` builds
+the native SwiftUI app via XcodeGen and is unaffected by this repoint.)
+
+**Context.** The desktop client was rewritten in Flutter (libmpv over
+`flutter_rust_bridge`; see the 2026-07-10 entry). Every desktop feature since,
+the LPR Plates tab, the Home Assistant on-video overlay, the Data-saver tier,
+the PTZ panel, and the A/B benchmark, lives only in `apps/desktop-flutter`. The
+release path still builds the old Tauri crate, so tagging v0.1.0 today would
+publish a Windows installer with none of the release's headline features.
+
+**Chosen.** Repoint `windows-release.yml` and the CI desktop jobs to build
+`apps/desktop-flutter` (the SwiftUI macOS app has its own workflow and is
+separate; Linux as per-platform packaging lands), and drop the Tauri crate from
+the release path.
+**Rejected.** Ship the Tauri installer for v0.1.0 (advertises features the
+shipped app does not have). Hold the desktop client out of v0.1.0 entirely (web
+console + Android only, a worse story than shipping the real client).
+**Trade-offs accepted.** Flutter Windows packaging and code signing must be
+wired up. macOS packaging/notarization needs a Mac and the paid Apple Developer
+account (the same blocker as the iOS app), so the macOS desktop release may lag
+Windows. The Flutter Linux runner is unproven.
+**Revisit.** If Flutter desktop packaging proves impractical on a platform, or
+if the Tauri app is ever revived.
+
+## 2026-07-18, First-run admin: seed by default with a memorable passphrase, keep the bootstrap window closed
+
+**Status.** Implemented in `scripts/setup-env.sh`. It generates a memorable
+two-word-plus-digits passphrase (e.g. `IcyApples473`) as `SEED_ADMIN_PASSWORD`,
+prints it once at the end of the run, and the api seeds the `admin` user with it
+at first boot. The browser create-admin wizard is now the opt-in path (blank the
+seed to use it). Docs updated to "sign in with the printed password."
+
+**Context.** `POST /auth/bootstrap` is unauthenticated, gated only by "refuse if
+an admin already exists" (`auth.rs`). A blank seed leaves an unauthenticated
+window on first run where anyone who can reach `:8080` on the LAN can claim the
+admin account; the seed exists specifically to close that window (per the
+`auth.rs` comment). But the previous `setup-env.sh` generated a random base64
+password and deliberately did NOT print it, so the docs' "create your admin in
+the browser" story was false, an operator hit a login screen for a password they
+were never shown.
+
+**Chosen.** Keep seeding by default (window stays closed) AND make the password
+memorable and visible, so the documented "sign in with this password" flow is
+true.
+**Rejected.** Stop seeding by default (reopens the unauthenticated bootstrap
+window, a secure-by-default regression). Keep seeding but leave the password a
+random string (usable, but a worse first-run UX and no better on recovery).
+**Trade-offs accepted.** A two-word + three-digit passphrase is roughly 21 bits
+of entropy, weak for a password. It is acceptable only as a LAN-only STARTER
+credential behind the login rate-limiter, meant to be changed after first login,
+and is documented as such.
+**Revisit.** If the console becomes internet-exposed by default, if login
+rate-limiting is removed, or if a real first-run pairing/token mechanism replaces
+the seed.
+
 ## 2026-07-17, Per-camera LPR: the engine dropdown is the single control (`none` added, `lpr_enabled` derived, source gate enforced at ingest)
 
 **Status.** Built on `feat/lpr-admin-console`. Migration 0071 widens

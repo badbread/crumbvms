@@ -18,10 +18,13 @@ git clone https://github.com/badbread/crumbvms.git crumb && cd crumb
 `scripts/setup-env.sh` writes a gitignored `.env` with strong, randomly
 generated secrets (a Postgres password, a JWT signing secret, and the
 go2rtc restreamer's Basic-auth credentials). It refuses to overwrite an
-existing `.env` unless you pass `--force`. You do not need to set an admin
-password here; you'll create the admin account in the browser during
-first run. If you want to set one anyway for a headless/scripted install,
-run `./scripts/setup-env.sh --prompt`.
+existing `.env` unless you pass `--force`. At the end it also prints your
+admin username (`admin`) and a memorable password like `IcyApples473`, saved
+as `SEED_ADMIN_PASSWORD` in `.env`. The admin account is created on first
+boot, and you sign in with those at `/admin` (step 4), then change the
+password in the console. (Prefer to create the admin in the browser instead?
+Blank out `SEED_ADMIN_PASSWORD` in `.env` before bringing the stack up and
+first run gives you the create-admin wizard instead, opt-in.)
 
 Don't hand-edit the generated secrets, and don't commit `.env`, it stays
 gitignored by design.
@@ -35,9 +38,21 @@ For anything beyond a quick trial, point it at a disk with real headroom:
 MEDIA_HOST_PATH=/mnt/your-disk/crumb-data
 ```
 
-Make sure the directory exists and is writable. You can add more disks
-later without touching the compose file: mount them under this same host
-path (or a subdirectory) and add the storage path in the admin console.
+Make sure the directory exists and is writable by the recorder's container
+user (uid 1001) before you bring the stack up:
+
+```bash
+sudo mkdir -p /mnt/your-disk/crumb-data
+sudo chown -R 1001:1001 /mnt/your-disk/crumb-data
+```
+
+`setup-env.sh` does this automatically for the default `./_data`, but a
+custom path that Docker auto-creates on first `up` ends up root-owned. The
+recorder then can't write to it and footage is silently lost, while live
+view (which touches no disk) still works and the setup wizard still shows
+green, so this is worth getting right up front. You can add more disks later
+without touching the compose file: mount them under this same host path (or a
+subdirectory) and add the storage path in the admin console.
 
 ## 3. Bring up the stack
 
@@ -47,9 +62,9 @@ docker compose up -d
 docker compose ps
 ```
 
-`docker compose pull` fetches prebuilt `api` and `recorder` images. If that
-fails with "not found" or a permission-denied error, the images aren't
-published for the repository or fork you're running yet, use the
+`docker compose pull` fetches the prebuilt `api` and `recorder` images from
+`ghcr.io/badbread/crumbvms` (public, no login needed). If you're running a
+fork whose images aren't published, or `pull` reports "not found," use the
 build-from-source override instead:
 
 ```bash
@@ -94,10 +109,13 @@ that bring a fresh Postgres up to the current schema.
 
 ## 4. Finish setup in the browser
 
-Open `http://<host-lan-ip>:8080/admin`. A first-run wizard walks you
-through accepting the tester terms, creating your administrator account,
-confirming the server's address, choosing storage and retention, and
-finding cameras on your network. See
+Open `http://<host-lan-ip>:8080/admin` and sign in with the admin username
+and the memorable password `setup-env.sh` printed (also in `.env`), then
+change it in the console. A first-run wizard then walks you through accepting
+the tester terms, confirming the server's address, choosing storage and
+retention, and finding cameras on your network. (If you blanked
+`SEED_ADMIN_PASSWORD` in step 1, the wizard opens with a create-admin step
+instead of a sign-in.) See
 [First-run wizard](/getting-started/first-run-wizard) for the full
 walkthrough.
 

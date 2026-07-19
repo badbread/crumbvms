@@ -187,6 +187,13 @@ nothing to a stock install unless you turn it on:
 docker compose --profile frigate up -d
 ```
 
+Frigate's license-plate reads are the exception to "whatever labels Frigate
+emits": they only land in Crumb's plate database if you've turned on license
+plates. That's gated twice, globally (LPR is off by default) and per camera (the
+camera's engine must be **Frigate** or **Both**). If Frigate is reading plates
+but nothing shows up in Crumb's Plates tab, that's the first thing to check. See
+[License plates (LPR)](/integrations/lpr).
+
 ## Setup
 
 1. Point Crumb at the MQTT broker your detector publishes to (the
@@ -207,7 +214,8 @@ everything else is completely unaffected either way.
 ## What you're responsible for
 
 If you enable named recognition (identifying specific people or license
-plates) through your own detector, that data is regulated in some places,
-Illinois' BIPA is a commonly cited example for named biometric
-identifiers. Using it lawfully is on you as the operator; see
-[Responsible use](/responsible-use).
+plates), whether through Frigate or through Crumb's own LPR engine, that data
+is regulated in some places, Illinois' BIPA is a commonly cited example for
+named biometric identifiers. Using it lawfully is on you as the operator; see
+[Responsible use](/responsible-use) and, for plates specifically,
+[License plates (LPR)](/integrations/lpr).

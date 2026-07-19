@@ -135,8 +135,10 @@ server; it exec's to become PID 1, so a dead recorder = a dead container).
 ## api
 
 Serves the HTTP API and the web admin console at `/admin` on `:8080`. Every
-protected endpoint requires a JWT; only `/health`, `/auth/login`, and the
-first-run `/auth/needs-bootstrap` + `/auth/bootstrap` are open.
+protected endpoint requires a JWT; the open (unauthenticated) endpoints are
+`/health`, `/version`, `/metrics` (Prometheus scrape, no secrets), the `/admin`
+page itself, `/auth/login`, and the first-run
+`/auth/needs-bootstrap` + `/auth/setup-status` + `/auth/bootstrap`.
 
 - Mounts the **same media root read-only** (`/data:ro`) — the api only reads
   recorded files; the recorder owns writes. Storage paths added in the UI must

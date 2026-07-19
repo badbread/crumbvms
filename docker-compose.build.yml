@@ -9,10 +9,10 @@
 # When to use this instead of the default:
 #   - You're developing Crumb (editing services/api or services/recorder).
 #   - Air-gapped / no-registry-access environment.
-#   - The owner hasn't published GHCR images yet (private repo, packages not
-#     public) — see docs/IMAGES.md "owner seam". Until publishing is enabled,
-#     the default docker-compose.yml has nothing to pull, so THIS override is
-#     required for anyone running from this repo today.
+#   - You're on a fork that hasn't published its own images. (The upstream
+#     images are public at ghcr.io/badbread/crumbvms, see docs/IMAGES.md, so
+#     a normal install just pulls; this override is only for building from
+#     source.)
 #   - You want to pin/test an unreleased local change instead of a tagged image.
 #
 # This override re-adds `build:` and re-tags the image `crumbvms/<service>:local`

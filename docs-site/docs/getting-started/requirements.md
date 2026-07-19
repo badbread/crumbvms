@@ -44,9 +44,9 @@ Hardware-accelerated motion decode is an opt-in overlay for Intel/AMD iGPUs
 ## Images: pull or build
 
 The default install path pulls prebuilt `api` and `recorder` container
-images, so no Rust toolchain is needed on the host. That depends on the
-project owner having published images for the repository or fork you are
-running; if `docker compose pull` reports the images can't be found, the
+images from `ghcr.io/badbread/crumbvms` (public, no login needed), so no Rust
+toolchain is needed on the host. If you're running a fork whose images aren't
+published, or `docker compose pull` reports the images can't be found, the
 build-from-source override handles it instead, still with no local Rust
 toolchain required (the compile happens inside the build container). See
 [Install with Docker Compose](/getting-started/install-docker-compose) for
