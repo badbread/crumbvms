@@ -86,6 +86,12 @@ warning above only applies if you point a **browser** at the HTTPS port.
   autosaved config. If you don't want it, delete the `caddy:` block (and the
   two volumes) from `docker-compose.yml`, the rest of the stack is
   unaffected.
+- **Rate limiting behind the proxy:** with clients coming through Caddy, the
+  API sees every request from Caddy's container IP, so the login rate limiter
+  shares one bucket across all HTTPS users. Set `TRUST_PROXY=1` in `.env` and
+  the limiter keys on the client IP from `X-Forwarded-For` (which Caddy sets)
+  instead. Leave it unset when clients hit `:8080` directly, trusting a header
+  that any direct client can forge would let an attacker dodge the limiter.
 
 ## Going HTTPS-only
 
