@@ -30,6 +30,22 @@ final class ClipsViewModel: ObservableObject {
     /// Hours before now to load clips from (default last 24 h). Changing it reloads.
     @Published var windowHours: Double = 24
 
+    // MARK: - Paging (server orders newest-first with offset 0, so "load more"
+    // grows the limit rather than paging by offset).
+    /// Total clips available in the window (from the server) — drives the count
+    /// label + whether more can be loaded.
+    @Published var total = 0
+    /// How many clips to request; grows on "Load more" up to the server cap.
+    @Published var loadLimit = 500
+    private let maxLimit = 2000
+    var canLoadMore: Bool { clips.count < total && loadLimit < maxLimit }
+
+    func loadMore() {
+        guard canLoadMore else { return }
+        loadLimit = min(loadLimit + 500, maxLimit)
+        Task { await load() }
+    }
+
     // MARK: - Dependencies
 
     private let container: AppContainer
@@ -90,9 +106,11 @@ final class ClipsViewModel: ObservableObject {
             let response = try await container.api.clips(
                 cameraIds: ids,
                 start: iso8601String(start),
-                end: iso8601String(end)
+                end: iso8601String(end),
+                limit: loadLimit
             )
             clips = response.clips
+            total = response.total
             motionHighlightSeconds = response.motionHighlightSeconds
         } catch {
             self.error = error.userMessage
@@ -130,6 +148,7 @@ final class ClipsViewModel: ObservableObject {
     func setWindowHours(_ hours: Double) {
         guard hours != windowHours else { return }
         windowHours = hours
+        loadLimit = 500 // new window → reset paging
         Task { await load() }
     }
 

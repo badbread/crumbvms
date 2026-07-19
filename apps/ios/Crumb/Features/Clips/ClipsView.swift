@@ -53,7 +53,15 @@ struct ClipsView: View {
                     kindChip("All", nil)
                     kindChip("Motion", "motion")
                     kindChip("Detections", "detection")
+                    if !vm.filteredClips.isEmpty {
+                        Text("\(vm.filteredClips.count) clip\(vm.filteredClips.count == 1 ? "" : "s")")
+                            .font(.caption2).foregroundColor(CrumbColors.textTertiary)
+                    }
                     Spacer()
+                    Button { Task { await vm.refresh() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain).foregroundColor(CrumbColors.tealAccent).help("Refresh")
                     #if os(macOS)
                     Picker("", selection: $clipTileSize) {
                         Image(systemName: "square.grid.3x3").tag(0)
@@ -134,7 +142,7 @@ struct ClipsView: View {
 
     private var rangeMenu: some View {
         Menu {
-            ForEach([6.0, 24.0, 72.0, 168.0], id: \.self) { hrs in
+            ForEach([6.0, 24.0, 72.0, 168.0, 336.0, 720.0], id: \.self) { hrs in
                 Button { vm.setWindowHours(hrs) } label: {
                     Text(rangeLabel(hrs))
                     if vm.windowHours == hrs { Image(systemName: "checkmark") }
@@ -171,6 +179,15 @@ struct ClipsView: View {
                 }
             }
             .padding(12)
+            if vm.canLoadMore {
+                Button { vm.loadMore() } label: {
+                    if vm.isLoading { ProgressView().controlSize(.small) }
+                    else { Text("Load more (\(vm.clips.count) of \(vm.total))") }
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(CrumbColors.tealAccent)
+                .padding(.bottom, 16)
+            }
         }
     }
 
