@@ -255,7 +255,7 @@ API_BIND=0.0.0.0:8080
 # Exports live at a TOP-LEVEL /exports (own named volume), NOT under the API's
 # read-only /data mount — a nested mountpoint under a read-only bind can't be
 # created on a fresh install and stalls the api container. Must match the compose
-# `crumb_exports:/exports` mount + its ${EXPORT_DIR:-/exports} default.
+# \`crumb_exports:/exports\` mount + its \${EXPORT_DIR:-/exports} default.
 EXPORT_DIR=/exports
 EXPORT_TTL_SECONDS=86400
 
