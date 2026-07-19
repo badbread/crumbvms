@@ -591,6 +591,19 @@ private struct WatchlistSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                #if os(macOS)
+                // macOS sheets don't reliably render the nav-bar toolbar, so give
+                // the watchlist an explicit, visible close row (Esc also works).
+                HStack {
+                    Text("Watchlist").font(.headline).foregroundColor(CrumbColors.textPrimary)
+                    Spacer()
+                    Button("Done") { dismiss() }
+                        .buttonStyle(.plain)
+                        .foregroundColor(CrumbColors.tealAccent)
+                        .keyboardShortcut(.cancelAction)
+                }
+                .listRowSeparator(.hidden)
+                #endif
                 if vm.isAdmin {
                     Section("Add plate") {
                         TextField("Plate (e.g. ABC123)", text: $newPlate)

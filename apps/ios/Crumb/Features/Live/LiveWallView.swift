@@ -178,6 +178,14 @@ struct LiveWallView: View {
         }
         .task {
             await vm.loadViews()
+            // If "All cameras" is hidden and nothing (or a stale view) is active,
+            // fall back to the first saved view so the wall never silently shows
+            // the aggregate the operator chose to hide.
+            if !settings.showAllCamerasView,
+               settings.activeViewId == nil
+                || !vm.views.contains(where: { $0.id == settings.activeViewId }) {
+                settings.activeViewId = vm.views.first?.id
+            }
         }
         .onDisappear {
             vm.stopStatusPolling()
@@ -472,6 +480,7 @@ struct LiveWallView: View {
                     get: { settings.activeViewId },
                     set: { settings.activeViewId = $0 }
                 ),
+                showAll: settings.showAllCamerasView,
                 onCreate: { showNewView = true },
                 onEdit: { v in editingView = v }
             )
@@ -625,6 +634,7 @@ struct LiveWallView: View {
                     get: { settings.activeViewId },
                     set: { settings.activeViewId = $0 }
                 ),
+                showAll: settings.showAllCamerasView,
                 onCreate: { showNewView = true },
                 onEdit: { v in editingView = v }
             )

@@ -254,6 +254,7 @@ struct PlaybackView: View {
         let playSize: CGFloat = compact ? 33 : 50
         VStack(spacing: compact ? 0 : 6) {
             HStack(spacing: 2) {
+                ctl("backward.to.line", "Jump to oldest", ctlSize, ctlIcon) { vm.gotoFirst() }
                 ctl("backward.frame.fill", "Step back one frame", ctlSize, ctlIcon) { player.stepFrame(forward: false); vm.setPlaying(false) }
                 motionJump(forward: false, size: ctlSize, icon: ctlIcon) { vm.jumpToPrevMotion() }
                 Button { vm.setPlaying(!vm.playing) } label: {
@@ -439,6 +440,7 @@ struct PlaybackView: View {
                 Spacer()
 
                 HStack(spacing: 6) {
+                    ctl("backward.to.line", "Jump to oldest", 34, 17) { vm.gotoFirst() }
                     ctl("backward.frame.fill", "Step back one frame", 34, 17) { player.stepFrame(forward: false); vm.setPlaying(false) }
                     motionJump(forward: false, size: 34, icon: 17) { vm.jumpToPrevMotion() }
                     Button { vm.setPlaying(!vm.playing) } label: {

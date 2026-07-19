@@ -154,6 +154,12 @@ struct SettingsView: View {
                 "Show the bookmark button in the live wall's top bar.",
                 $settings.bookmarksButtonEnabled
             )
+            rowDivider
+            settingToggle(
+                "Show \"All cameras\" view",
+                "Show the built-in all-cameras quick view. Turn off to work only from your saved Views.",
+                $settings.showAllCamerasView
+            )
         }
     }
 

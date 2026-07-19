@@ -42,7 +42,7 @@ extension Mode {
         switch self {
         case .live: return "Live"
         case .playback: return "Playback"
-        case .plates: return "Plates"
+        case .plates: return "LPR"
         case .exports: return "Exports"
         case .clips: return "Clips"
         case .settings: return "Settings"

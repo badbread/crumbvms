@@ -15,6 +15,9 @@ import SwiftUI
 struct ViewChipsView: View {
     let views: [CameraView]
     @Binding var activeId: String?
+    /// Whether to show the built-in "All cameras" chip (a per-device setting —
+    /// operators who work from saved Views can hide the aggregate).
+    var showAll: Bool = true
     let onCreate: () -> Void
     let onEdit: (CameraView) -> Void
 
@@ -22,11 +25,13 @@ struct ViewChipsView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 // "All" chip
-                chip(
-                    label: "All",
-                    isActive: activeId == nil
-                ) {
-                    activeId = nil
+                if showAll {
+                    chip(
+                        label: "All",
+                        isActive: activeId == nil
+                    ) {
+                        activeId = nil
+                    }
                 }
 
                 // One chip per saved view; long-press opens editor.

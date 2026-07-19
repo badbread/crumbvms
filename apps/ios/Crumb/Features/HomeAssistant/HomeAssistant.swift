@@ -283,7 +283,10 @@ struct HAOverlayLayer: View {
             age: link.overlayShowAge ? HA.relativeAgo(controller.state(for: link.entityId)?.lastChanged) : nil
         )
         .opacity(link.overlayOpacity ?? 1)
-        .offset(x: min(max(x, field.minX), field.maxX), y: min(max(y, field.minY), field.maxY))
+        // Clamp the top-left origin so the badge box stays fully inside the video
+        // frame (desktop clamps to max - boxSize, not just max).
+        .offset(x: min(max(x, field.minX), max(field.minX, field.maxX - side)),
+                y: min(max(y, field.minY), max(field.minY, field.maxY - side)))
         .onTapGesture { tapped = link }
     }
 
@@ -319,9 +322,9 @@ private struct HABadge: View {
             if link.overlayShowState || age != nil {
                 VStack(spacing: 0) {
                     if link.overlayShowState {
-                        Text(visual.stateText).font(.system(size: max(8, side * 0.3)))
+                        Text(visual.stateText).font(.system(size: min(max(8, side * 0.3), 13)))
                     }
-                    if let age { Text(age).font(.system(size: max(7, side * 0.26))) }
+                    if let age { Text(age).font(.system(size: min(max(7, side * 0.26), 11))) }
                 }
                 .foregroundColor(.white)
                 .padding(.horizontal, 4).padding(.vertical, 1)
@@ -333,8 +336,8 @@ private struct HABadge: View {
     @ViewBuilder private var content: some View {
         if isPill {
             HStack(spacing: side * 0.2) {
-                Image(systemName: visual.symbol).font(.system(size: side * 0.56))
-                Text(link.displayName).font(.system(size: side * 0.4, weight: .semibold)).lineLimit(1)
+                Image(systemName: visual.symbol).font(.system(size: min(side * 0.56, 40)))
+                Text(link.displayName).font(.system(size: min(side * 0.4, 26), weight: .semibold)).lineLimit(1)
             }
             .foregroundColor(.white)
             .padding(.horizontal, side * 0.4).frame(height: side)
@@ -345,7 +348,7 @@ private struct HABadge: View {
             }
         } else {
             Image(systemName: visual.symbol)
-                .font(.system(size: side * 0.58))
+                .font(.system(size: min(side * 0.58, 40)))
                 .foregroundColor(visual.color)
                 .frame(width: side, height: side)
                 .background(Circle().fill(bgColor))
