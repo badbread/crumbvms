@@ -249,9 +249,10 @@ private fun HaTile(link: HaLinkDto, state: String?, onClick: () -> Unit) {
     }
 }
 
-/** HA "more-info"-style detail dialog (read-only). */
+/** HA "more-info"-style detail dialog (read-only). Also opened by tapping an
+ *  on-video badge in [HaBadgeOverlayLayer]. */
 @Composable
-private fun HaMoreInfoDialog(
+internal fun HaMoreInfoDialog(
     link: HaLinkDto,
     state: String?,
     lastChanged: String?,
