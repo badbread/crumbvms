@@ -56,6 +56,15 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows (release)
+        # GitHub's windows-latest runner ships VS 2026 / MSVC 14.51, whose STL
+        # turns the deprecated <experimental/coroutine> header into a hard error
+        # (STL1011). The webview_windows plugin still uses experimental coroutines,
+        # so define the macro Microsoft's own error points at, via the CL env var
+        # (MSVC prepends CL to every cl.exe invocation) so it reaches the plugin's
+        # vcxproj without patching plugin source. Drop this once webview_windows
+        # migrates to the C++20 <coroutine> header.
+        env:
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: flutter build windows --release
 
       - name: Verify the bundle (exe + bundled libmpv + assets)
