@@ -411,7 +411,15 @@ impl Config {
             live_storage_name: optional_env("LIVE_STORAGE_NAME", "NVMe-Live"),
             archive_storage_path: optional_env("ARCHIVE_STORAGE_PATH", "/data/archive"),
             archive_storage_name: optional_env("ARCHIVE_STORAGE_NAME", "Bulk-Archive"),
-            archive_cron_tz: parse_tz_env("RECORDER_TZ", "America/Los_Angeles"),
+            // RECORDER_TZ wins; otherwise inherit the container's TZ (compose
+            // forwards it, and setup-env.sh sets it to the host zone) so a
+            // non-US operator's archive/retention cron matches their wall clock
+            // instead of always running in LA. America/Los_Angeles only if
+            // neither is set (bare-metal with no TZ at all). (#228)
+            archive_cron_tz: parse_tz_env(
+                "RECORDER_TZ",
+                &optional_env("TZ", "America/Los_Angeles"),
+            ),
             motion_hwaccel,
             motion_vaapi_device: optional_env("MOTION_VAAPI_DEVICE", "/dev/dri/renderD128"),
             max_gpu_decode_sessions: parse_env("MAX_GPU_DECODE_SESSIONS", 4)?,
@@ -460,7 +468,15 @@ fn require_secret(key: &str) -> Result<String> {
 /// it runs the archive cron in the wrong timezone with no clue why (audit
 /// #84).
 fn parse_tz_env(key: &str, default: &str) -> chrono_tz::Tz {
+    // An env var set to an empty string (compose forwards keys as `${VAR:-}`, so
+    // an unset key still materializes as "") means "not configured": use the
+    // default, don't treat "" as an invalid-zone error. (#228/#229)
     let raw = optional_env(key, default);
+    let raw = if raw.trim().is_empty() {
+        default.to_owned()
+    } else {
+        raw
+    };
     match raw.parse::<chrono_tz::Tz>() {
         Ok(tz) => tz,
         Err(_) => {
@@ -487,6 +503,11 @@ where
     T::Err: std::fmt::Display,
 {
     match env::var(key) {
+        // Empty (or whitespace-only) means "not configured": compose forwards
+        // keys as `${VAR:-}`, so an unset key still arrives as "". Treat it as
+        // the default rather than a fatal parse error that would fail boot.
+        // (#229; mirrors parse_bool_env's empty handling.)
+        Ok(val) if val.trim().is_empty() => Ok(default),
         Ok(val) => val
             .parse::<T>()
             .map_err(|e| anyhow::anyhow!("env var '{key}' = '{val}' could not be parsed: {e}")),
@@ -523,7 +544,7 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tz_env;
+    use super::{optional_env, parse_env, parse_tz_env};
 
     /// Audit #84: an invalid TZ value must fall back (non-fatal, now loudly
     /// logged) to the caller's default when that parses — never panic, never
@@ -553,5 +574,58 @@ mod tests {
             parse_tz_env("CRUMB_TEST_TZ_UNSET", "America/Los_Angeles"),
             chrono_tz::Tz::America__Los_Angeles
         );
+    }
+
+    /// #229: compose forwards keys as `${VAR:-}`, so an unset key arrives as an
+    /// empty string. parse_env must treat that as "use the default", not a fatal
+    /// parse error that would fail boot.
+    #[test]
+    fn parse_env_treats_empty_as_default() {
+        std::env::set_var("CRUMB_TEST_EMPTY_NUM", "");
+        assert_eq!(
+            parse_env::<u32>("CRUMB_TEST_EMPTY_NUM", 32).unwrap(),
+            32,
+            "an empty env value must fall back to the default, not error"
+        );
+        std::env::set_var("CRUMB_TEST_WS_NUM", "   ");
+        assert_eq!(
+            parse_env::<u32>("CRUMB_TEST_WS_NUM", 32).unwrap(),
+            32,
+            "a whitespace-only env value must fall back to the default"
+        );
+        std::env::set_var("CRUMB_TEST_SET_NUM", "8");
+        assert_eq!(parse_env::<u32>("CRUMB_TEST_SET_NUM", 32).unwrap(), 8);
+        std::env::remove_var("CRUMB_TEST_EMPTY_NUM");
+        std::env::remove_var("CRUMB_TEST_WS_NUM");
+        std::env::remove_var("CRUMB_TEST_SET_NUM");
+    }
+
+    /// #228: with RECORDER_TZ unset, the archive cron inherits TZ (this is how
+    /// the recorder resolves it: `parse_tz_env("RECORDER_TZ", optional_env("TZ", …))`),
+    /// and an empty RECORDER_TZ (the `${VAR:-}` case) is treated as unset.
+    #[test]
+    fn archive_tz_inherits_tz_when_recorder_tz_absent() {
+        // RECORDER_TZ unset -> inherit TZ.
+        std::env::set_var("CRUMB_TEST_TZ_INHERIT", "Europe/Berlin");
+        assert_eq!(
+            parse_tz_env(
+                "CRUMB_TEST_RECORDER_TZ_UNSET",
+                &optional_env("CRUMB_TEST_TZ_INHERIT", "America/Los_Angeles")
+            ),
+            chrono_tz::Tz::Europe__Berlin,
+            "an unset RECORDER_TZ must inherit TZ"
+        );
+        // RECORDER_TZ present but empty -> still treated as unset, inherit TZ.
+        std::env::set_var("CRUMB_TEST_RECORDER_TZ_EMPTY", "");
+        assert_eq!(
+            parse_tz_env(
+                "CRUMB_TEST_RECORDER_TZ_EMPTY",
+                &optional_env("CRUMB_TEST_TZ_INHERIT", "America/Los_Angeles")
+            ),
+            chrono_tz::Tz::Europe__Berlin,
+            "an empty RECORDER_TZ must be treated as unset and inherit TZ"
+        );
+        std::env::remove_var("CRUMB_TEST_TZ_INHERIT");
+        std::env::remove_var("CRUMB_TEST_RECORDER_TZ_EMPTY");
     }
 }
