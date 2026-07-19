@@ -20,6 +20,9 @@ final class AppSettings: ObservableObject {
     @Published var lowBandwidthMode: Bool { didSet { defaults.set(lowBandwidthMode, forKey: Keys.lowBandwidthMode) } }
     @Published var motionTunerEnabled: Bool { didSet { defaults.set(motionTunerEnabled, forKey: Keys.motionTunerEnabled) } }
     @Published var bookmarksButtonEnabled: Bool { didSet { defaults.set(bookmarksButtonEnabled, forKey: Keys.bookmarksButtonEnabled) } }
+    /// Whether the built-in "All cameras" quick-view chip is shown. Off lets an
+    /// operator work purely from saved Views (matches the desktop client option).
+    @Published var showAllCamerasView: Bool { didSet { defaults.set(showAllCamerasView, forKey: Keys.showAllCamerasView) } }
     /// The id of the currently-active named view, or `nil` for "All cameras".
     /// (The views themselves are server-backed as of M1 — see
     /// `LiveViewModel.views`/`loadViews()` — but which one is "active" stays a
@@ -39,16 +42,36 @@ final class AppSettings: ObservableObject {
         lowBandwidthMode = defaults.object(forKey: Keys.lowBandwidthMode) as? Bool ?? false
         motionTunerEnabled = defaults.object(forKey: Keys.motionTunerEnabled) as? Bool ?? true
         bookmarksButtonEnabled = defaults.object(forKey: Keys.bookmarksButtonEnabled) as? Bool ?? true
+        showAllCamerasView = defaults.object(forKey: Keys.showAllCamerasView) as? Bool ?? true
         activeViewId = defaults.string(forKey: Keys.activeViewId)
         biometricLockEnabled = defaults.object(forKey: Keys.biometricLockEnabled) as? Bool ?? false
     }
 
+    // MARK: - Per-camera audio preference
+
+    /// Whether the operator last chose to hear audio for `cameraId`. Persisted
+    /// per camera (default off) so a security viewer never surprises a room with
+    /// sound, but a camera you deliberately listen to comes back unmuted. Shared
+    /// by both live (`Fmp4VideoView`) and recorded playback so the choice is
+    /// consistent across the two surfaces for the same camera.
+    func audioEnabled(for cameraId: String) -> Bool {
+        defaults.object(forKey: Keys.audioEnabledPrefix + cameraId) as? Bool ?? false
+    }
+
+    /// Persist the audio on/off choice for `cameraId`.
+    func setAudioEnabled(_ enabled: Bool, for cameraId: String) {
+        defaults.set(enabled, forKey: Keys.audioEnabledPrefix + cameraId)
+    }
+
     private enum Keys {
         static let liveGridLayout = "live_grid_layout"
+        /// Prefix for the per-camera audio-enabled flag (`audio_enabled_<cameraId>`).
+        static let audioEnabledPrefix = "audio_enabled_"
         static let ptzStyle = "ptz_style"
         static let lowBandwidthMode = "low_bandwidth_mode"
         static let motionTunerEnabled = "motion_tuner_enabled"
         static let bookmarksButtonEnabled = "bookmarks_button_enabled"
+        static let showAllCamerasView = "show_all_cameras_view"
         static let activeViewId = "active_view_id"
         static let biometricLockEnabled = "biometric_lock_enabled"
     }

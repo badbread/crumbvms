@@ -27,6 +27,12 @@ struct PlaybackView: View {
     @State private var showSpeedMenu = false
     @State private var savedToast: String?
     @State private var audioOn = false
+    /// Balances `CrumbAudioSession` acquire/release for recorded-playback audio.
+    @State private var audioSessionHeld = false
+    // Jog/shuttle reverse state.
+    @State private var reverseTask: Task<Void, Never>?
+    @State private var reverseRate: Double = 0
+    @State private var reversePos: Int64 = 0
     // Export-range selection (macOS right-click "mark for export").
     @State private var exportSelStart: Int64?
     @State private var exportSelEnd: Int64?
@@ -34,9 +40,16 @@ struct PlaybackView: View {
     @State private var jumpDraft = Date()
     @State private var showBookmarksList = false
     @Environment(\.verticalSizeClass) private var vSize
+    /// Selected media quality (Full/Data-saver/Auto), loaded from the secure
+    /// store on appear; the chip cycles + persists it.
+    @State private var quality: PlaybackQuality = .fallback
+    /// App-wide metered signal, observed so `.auto` re-resolves live when the
+    /// link flips metered mid-session.
+    @ObservedObject private var connectivity: ConnectivityMonitor
 
     init(camera: CameraDto, cameras: [CameraDto], container: AppContainer, startTime: Date? = nil, onBack: @escaping () -> Void) {
-        _vm = StateObject(wrappedValue: PlaybackViewModel(cameraId: camera.id, container: container, startTime: startTime))
+        _vm = StateObject(wrappedValue: PlaybackViewModel(cameraId: camera.id, container: container, startTime: startTime, cameras: cameras))
+        _connectivity = ObservedObject(wrappedValue: container.connectivity)
         self.cameras = cameras
         self.onBack = onBack
     }
@@ -88,7 +101,7 @@ struct PlaybackView: View {
             }
         }
         .task { await loadBookmarks() }
-        .onChange(of: vm.cameraId) { _ in Task { await loadBookmarks() } }
+        .onChange(of: vm.cameraId) { _ in Task { await loadBookmarks() }; restoreAudio() }
         // Feed the player whenever the resolved segment changes. `segmentPath`/
         // `cameraId`/`mediaUrls` let the HEVC-retag range-proxy re-mint a fresh
         // scoped media token if this segment plays longer than the token's
@@ -109,12 +122,18 @@ struct PlaybackView: View {
         .onChange(of: vm.playing) { p in player.setPlaying(p && !vm.scrubbing) }
         .onChange(of: vm.speed) { s in player.setSpeed(s) }
         .onChange(of: vm.scrubbing) { s in player.setPlaying(!s && vm.playing) }
+        // `.auto`: re-resolve playback when the link flips metered/unmetered.
+        .onChange(of: connectivity.isMetered) { _ in applyQuality() }
         .onAppear {
             player.onEnded = { vm.onSegmentEnded() }
             player.onError = { vm.onPlayerError() }
             player.onTick = { ms in vm.onPlaybackTick(ms) }
             player.onAdvanced = { vm.commitAdvance() }
+            restoreAudio()
+            quality = PlaybackQuality(persisted: vm.container.store.playbackQuality)
+            applyQuality()
         }
+        .onDisappear { releaseAudioSession() }
         .sheet(isPresented: $showAddBookmark) {
             AddBookmarkDialog(atDate: vm.playheadDate) { desc, days, pre, post in
                 Task {
@@ -196,10 +215,13 @@ struct PlaybackView: View {
             PlayerLayerView(player: player.player, onLayer: { pip.attach(to: $0) })
                 .zoomable()
 
-            // M6: Picture-in-Picture toggle — only rendered once PiP is
-            // actually possible for the current player (system convention).
-            PictureInPictureButton(pip: pip)
-                .padding(8)
+            // Top-right controls: audio toggle (always shown) + PiP (shown once
+            // PiP is actually possible for the current player).
+            HStack(spacing: 6) {
+                audioToggleButton
+                PictureInPictureButton(pip: pip)
+            }
+            .padding(8)
 
             if vm.scrubbing, let f = vm.scrubFrameURL {
                 Color.black.opacity(0.55)
@@ -236,6 +258,7 @@ struct PlaybackView: View {
         let playSize: CGFloat = compact ? 33 : 50
         VStack(spacing: compact ? 0 : 6) {
             HStack(spacing: 2) {
+                ctl("backward.to.line", "Jump to oldest", ctlSize, ctlIcon) { vm.gotoFirst() }
                 ctl("backward.frame.fill", "Step back one frame", ctlSize, ctlIcon) { player.stepFrame(forward: false); vm.setPlaying(false) }
                 motionJump(forward: false, size: ctlSize, icon: ctlIcon) { vm.jumpToPrevMotion() }
                 Button { vm.setPlaying(!vm.playing) } label: {
@@ -248,14 +271,6 @@ struct PlaybackView: View {
                 motionJump(forward: true, size: ctlSize, icon: ctlIcon) { vm.jumpToNextMotion() }
                 ctl("forward.frame.fill", "Step forward one frame", ctlSize, ctlIcon) { player.stepFrame(forward: true); vm.setPlaying(false) }
                 ctl("forward.to.line", "Jump to latest", ctlSize, ctlIcon) { vm.gotoLast() }
-                Button {
-                    audioOn.toggle(); player.setMuted(!audioOn)
-                } label: {
-                    Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                        .font(.system(size: ctlIcon)).foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
-                        .frame(width: ctlSize, height: ctlSize)
-                }
-                .accessibilityLabel(audioOn ? "Mute audio" : "Unmute audio")
                 Menu {
                     ForEach([8.0, 4.0, 2.0, 1.0, 0.5], id: \.self) { s in
                         Button { vm.setSpeed(Float(s)) } label: {
@@ -267,6 +282,7 @@ struct PlaybackView: View {
                     Text(speedLabel(vm.speed)).font(.caption.bold()).foregroundColor(CrumbColors.tealAccent)
                         .frame(minWidth: ctlSize, minHeight: ctlSize)
                 }
+                qualityChip(minSize: ctlSize)
             }
             .padding(.top, compact ? 1 : 6)
 
@@ -285,6 +301,7 @@ struct PlaybackView: View {
     @ViewBuilder private var timeline: some View {
         CenteredTimelineView(
             spans: vm.spans, motionBuckets: vm.motionBuckets,
+            motionByCamera: vm.motionByCamera, selectedCameraId: vm.cameraId,
             motionStartMs: vm.motionStartMs, motionEndMs: vm.motionEndMs,
             detectionEvents: vm.detectionEvents, bookmarks: bookmarks,
             playheadMs: vm.playheadMs, spanMs: vm.visibleSpanMs,
@@ -326,6 +343,126 @@ struct PlaybackView: View {
         s == 0.5 ? "0.5×" : "\(Int(s))×"
     }
 
+    // MARK: - audio
+
+    /// The top-right audio toggle, pinned over the video so it's reachable in
+    /// both orientations (the header is hidden in landscape). Enables/disables
+    /// sound for the recorded footage of the current camera; remembered per
+    /// camera. Audio only exists in segments the recorder captured with the
+    /// camera's `record_audio` policy on.
+    private var audioToggleButton: some View {
+        Button { setAudio(!audioOn) } label: {
+            Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                .font(.title3)
+                .foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
+                .padding(8)
+                .background(.black.opacity(0.45))
+                .clipShape(Circle())
+        }
+        .accessibilityLabel(audioOn ? "Mute audio" : "Unmute audio")
+        #if os(macOS)
+        .buttonStyle(.plain)
+        #endif
+    }
+
+    // MARK: - quality
+
+    /// One-tap quality chip (Auto → Full → Data saver → Auto), mirroring
+    /// Android's playback-bar chip: `HD`/`SD`/`AUTO`, teal when a non-Auto
+    /// override is active. Persists the choice and re-resolves playback.
+    private func qualityChip(minSize: CGFloat) -> some View {
+        Button {
+            quality = quality.next
+            vm.container.store.playbackQuality = quality.rawValue
+            applyQuality()
+        } label: {
+            Text(quality.short)
+                .font(.caption2.bold())
+                .foregroundColor(quality == .auto ? .white : CrumbColors.tealAccent)
+                .frame(minWidth: minSize, minHeight: minSize)
+        }
+        .accessibilityLabel("Quality: \(quality.label)")
+        #if os(macOS)
+        .buttonStyle(.plain)
+        #endif
+    }
+
+    /// Apply an audio on/off choice: mute the player, persist it for this camera,
+    /// and acquire/release the shared `.playback` session so unmuted sound
+    /// actually plays (through the speaker, ignoring the ring switch).
+    private func setAudio(_ on: Bool) {
+        audioOn = on
+        player.setMuted(!on)
+        vm.container.settings.setAudioEnabled(on, for: vm.cameraId)
+        if on {
+            if !audioSessionHeld { CrumbAudioSession.acquire(); audioSessionHeld = true }
+        } else if audioSessionHeld {
+            CrumbAudioSession.release(); audioSessionHeld = false
+        }
+    }
+
+    /// Restore the remembered audio choice for the current camera (called on
+    /// appear and camera switch).
+    private func restoreAudio() {
+        setAudio(vm.container.settings.audioEnabled(for: vm.cameraId))
+    }
+
+    /// Drop the audio session if we hold it (leaving the view).
+    private func releaseAudioSession() {
+        if audioSessionHeld { CrumbAudioSession.release(); audioSessionHeld = false }
+    }
+
+    /// Resolve the current quality preference + metered state into the low/full
+    /// decision and hand it to the view-model (which drives `/low.mp4` vs the raw
+    /// segment). Called on appear, on chip change, and whenever the link's
+    /// metered state flips (so `.auto` reacts live).
+    private func applyQuality() {
+        vm.setLowQuality(quality.useLow(metered: connectivity.isMetered))
+    }
+
+    // MARK: - jog / shuttle
+
+    /// Apply a signed shuttle rate: forward → variable-speed playback; reverse →
+    /// walk the playhead backward via the scrub path; ~0 → pause.
+    private func applyShuttle(_ rate: Double) {
+        if rate > 0 {
+            stopReverse()
+            vm.setSpeed(Float(rate)); vm.setPlaying(true)
+        } else if rate < 0 {
+            reverseRate = -rate
+            startReverse()
+        } else {
+            stopReverse()
+            vm.setPlaying(false); vm.setSpeed(1)
+        }
+    }
+
+    private func startReverse() {
+        guard reverseTask == nil else { return }
+        vm.setPlaying(false)
+        reversePos = vm.playheadMs
+        vm.onScrubStart()
+        reverseTask = Task { @MainActor in
+            while !Task.isCancelled {
+                reversePos = max(0, reversePos - Int64(reverseRate * (1000.0 / 15.0)))
+                vm.onScrub(reversePos)
+                try? await Task.sleep(nanoseconds: 66_000_000) // ~15 fps rewind
+            }
+        }
+    }
+
+    private func stopReverse() {
+        guard reverseTask != nil else { return }
+        reverseTask?.cancel(); reverseTask = nil
+        vm.onScrubEnd(reversePos)
+    }
+
+    /// Shuttle released → recenter to paused 1×.
+    private func endShuttle() {
+        stopReverse()
+        vm.setSpeed(1); vm.setPlaying(false)
+    }
+
     // MARK: - macOS desktop transport
 
     #if os(macOS)
@@ -351,6 +488,7 @@ struct PlaybackView: View {
                 Spacer()
 
                 HStack(spacing: 6) {
+                    ctl("backward.to.line", "Jump to oldest", 34, 17) { vm.gotoFirst() }
                     ctl("backward.frame.fill", "Step back one frame", 34, 17) { player.stepFrame(forward: false); vm.setPlaying(false) }
                     motionJump(forward: false, size: 34, icon: 17) { vm.jumpToPrevMotion() }
                     Button { vm.setPlaying(!vm.playing) } label: {
@@ -379,12 +517,7 @@ struct PlaybackView: View {
                             .foregroundColor(CrumbColors.tealAccent).frame(minWidth: 38)
                     }
                     .menuStyle(.borderlessButton).fixedSize()
-                    Button { audioOn.toggle(); player.setMuted(!audioOn) } label: {
-                        Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                            .font(.system(size: 17)).foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
-                            .frame(width: 34, height: 34)
-                    }
-                    .buttonStyle(.plain)
+                    qualityChip(minSize: 34)
                 }
                 .frame(minWidth: 150, alignment: .trailing)
             }
@@ -403,6 +536,9 @@ struct PlaybackView: View {
                     .labelsHidden().datePickerStyle(.compact).fixedSize()
                 Button("Go") { vm.jumpToTime(Int64(jumpDraft.timeIntervalSince1970 * 1000)) }
                     .buttonStyle(.plain).font(.callout.weight(.medium)).foregroundColor(CrumbColors.tealAccent)
+
+                macDivider
+                ShuttleControl(onRate: { applyShuttle($0) }, onRelease: { endShuttle() })
 
                 Spacer()
 
@@ -898,3 +1034,54 @@ final class SegmentPlayer: ObservableObject {
     }
 }
 
+
+// MARK: - Jog / shuttle control
+
+/// A spring-return shuttle: drag right to fast-forward (0.5×…8×), left to rewind;
+/// releasing snaps back to center. Reports a signed rate (0 inside the dead zone).
+private struct ShuttleControl: View {
+    let onRate: (Double) -> Void
+    let onRelease: () -> Void
+
+    @State private var offset: CGFloat = 0 // -1…1
+    private let trackW: CGFloat = 150
+    private let thumb: CGFloat = 22
+
+    var body: some View {
+        let half = trackW / 2 - thumb / 2
+        ZStack {
+            Capsule().fill(CrumbColors.surfaceVariant).frame(height: 22)
+            Rectangle().fill(CrumbColors.textTertiary.opacity(0.5)).frame(width: 1, height: 12)
+            ZStack {
+                Circle().fill(CrumbColors.teal).frame(width: thumb, height: thumb)
+                Image(systemName: "chevron.left.chevron.right")
+                    .font(.system(size: 10)).foregroundColor(.black.opacity(0.6))
+            }
+            .offset(x: offset * half)
+        }
+        .frame(width: trackW, height: 26)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    offset = max(-1, min(1, v.translation.width / half))
+                    onRate(rate(for: offset))
+                }
+                .onEnded { _ in
+                    withAnimation(.spring(response: 0.25)) { offset = 0 }
+                    onRelease()
+                }
+        )
+        .help("Shuttle — drag right to fast-forward, left to rewind")
+    }
+
+    /// Signed exponential rate with a 12% dead zone: ±0.5× … ±8×.
+    private func rate(for d: CGFloat) -> Double {
+        let dead: CGFloat = 0.12
+        let m = abs(d)
+        guard m > dead else { return 0 }
+        let t = Double((m - dead) / (1 - dead))
+        let mag = 0.5 * pow(16, t)
+        return d < 0 ? -mag : mag
+    }
+}

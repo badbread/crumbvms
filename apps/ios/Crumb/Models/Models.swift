@@ -86,6 +86,12 @@ struct UserDto: Decodable {
     let isAdminFlag: Bool?
     /// Fine-grained capability set (absent on older servers → all-false).
     let capabilities: Capabilities
+    /// Whether the Plates (LPR) surface should be shown: LPR is enabled
+    /// server-side AND this caller holds `view_plates`. The single flag the
+    /// client gates the Plates tab on — do NOT re-derive it from `capabilities`.
+    /// Absent on servers without LPR → false. Can change, so it's re-fetched at
+    /// every login (see `AppContainer.applyUser`).
+    let platesEnabled: Bool
 
     /// Checks the explicit `is_admin` flag first (RBAC servers), falling back to
     /// the role string for backward-compat.
@@ -99,6 +105,7 @@ struct UserDto: Decodable {
         case id, username, role, capabilities
         case cameraIds = "camera_ids"
         case isAdminFlag = "is_admin"
+        case platesEnabled = "plates_enabled"
     }
 
     init(from decoder: Decoder) throws {
@@ -109,6 +116,7 @@ struct UserDto: Decodable {
         cameraIds = try c.decodeIfPresent([String].self, forKey: .cameraIds) ?? []
         isAdminFlag = try c.decodeIfPresent(Bool.self, forKey: .isAdminFlag)
         capabilities = try c.decodeIfPresent(Capabilities.self, forKey: .capabilities) ?? Capabilities()
+        platesEnabled = try c.decodeIfPresent(Bool.self, forKey: .platesEnabled) ?? false
     }
 }
 
@@ -302,6 +310,14 @@ struct LiveStreamsResponse: Decodable {
     let webrtcSubUrl: String?
     let rtspMainUrl: String
     let rtspSubUrl: String?
+    /// On-demand low-res H.264 go2rtc transcode (`<name>_mobile`), present only
+    /// when the server has `MOBILE_STREAM_ENABLED` and the camera resolves.
+    /// NOTE: iOS live plays fMP4/WebRTC via the API's `/live/{id}/stream.mp4`
+    /// proxy, which only maps `main`/`sub` — it has no path to the go2rtc
+    /// `_mobile` src, and iOS has no RTSP player. So on a metered link iOS falls
+    /// back to the native `sub` stream (already low, no transcode); this raw
+    /// RTSP URL is not directly consumable here (see the live quality wiring).
+    let rtspMobileUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case cameraId = "camera_id"
@@ -309,6 +325,220 @@ struct LiveStreamsResponse: Decodable {
         case webrtcSubUrl = "webrtc_sub_url"
         case rtspMainUrl = "rtsp_main_url"
         case rtspSubUrl = "rtsp_sub_url"
+        case rtspMobileUrl = "rtsp_mobile_url"
+    }
+}
+
+// MARK: - License Plates (LPR)
+
+/// One license-plate read (`GET /plates`). `plate` is the normalized uppercase
+/// alphanumeric form; `confidence` is the plate-OCR score (0…1), NOT the vehicle
+/// detection score.
+struct PlateRead: Decodable, Identifiable {
+    let id: String
+    let cameraId: String
+    /// ISO 8601 read timestamp.
+    let ts: String
+    let plate: String
+    let plateRaw: String?
+    let confidence: Double?
+    let region: String?
+    let sourceId: String
+    /// Sibling detection event, when present — drives the "open playback" jump.
+    let eventId: String?
+    let snapshotUrl: String?
+    /// Plate bounding box `[x, y, w, h]` as fractions (0…1) of the snapshot
+    /// frame — used to derive a tight plate crop client-side.
+    let bbox: [Double]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, ts, plate, confidence, region, bbox
+        case cameraId = "camera_id"
+        case plateRaw = "plate_raw"
+        case sourceId = "source_id"
+        case eventId = "event_id"
+        case snapshotUrl = "snapshot_url"
+    }
+}
+
+/// `GET /plates` response page.
+struct PlatesResponse: Decodable {
+    let plates: [PlateRead]
+    let total: Int
+    let hasMore: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case plates, total
+        case hasMore = "has_more"
+    }
+}
+
+/// One watchlist entry (`GET /lpr/watchlist`). Keyed server-side on the
+/// normalized plate, so re-adding the same plate edits rather than duplicates.
+struct WatchlistEntry: Decodable, Identifiable {
+    let id: String
+    let plate: String
+    let label: String?
+    let note: String?
+    let color: String?
+    let notify: Bool
+    /// `"watch"` (alert on sighting) or `"ignore"` (suppress). Default watch.
+    let kind: String
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, plate, label, note, color, notify, kind
+        case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        plate = try c.decode(String.self, forKey: .plate)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        note = try c.decodeIfPresent(String.self, forKey: .note)
+        color = try c.decodeIfPresent(String.self, forKey: .color)
+        notify = try c.decodeIfPresent(Bool.self, forKey: .notify) ?? true
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "watch"
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+}
+
+/// `POST /lpr/watchlist` body. `plate` is normalized server-side; `notify`
+/// defaults to true server-side when omitted.
+struct WatchlistAddRequest: Encodable {
+    let plate: String
+    var label: String?
+    var note: String?
+    var color: String?
+    var notify: Bool?
+    /// `"watch"` | `"ignore"`; omitted ⇒ server default "watch".
+    var kind: String?
+}
+
+/// `GET /config/lpr` (admin) — carries `watchlist_fuzz` for the live match
+/// preview. Other clients swallow a 403 and hide the preview.
+struct LprConfigDto: Decodable {
+    let enabled: Bool
+    let retentionDays: Int
+    let watchlistFuzz: Double
+    let hasIngestToken: Bool
+    let version: Int
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, version
+        case retentionDays = "retention_days"
+        case watchlistFuzz = "watchlist_fuzz"
+        case hasIngestToken = "has_ingest_token"
+    }
+}
+
+// MARK: - Home Assistant overlay
+
+/// One camera↔entity link (`GET /cameras/:id/ha/links`). Carries the on-video
+/// overlay placement/style; the read-only entity sheet ignores the `overlay*`
+/// fields. Mirrors the server `HaLinkDto`.
+struct HaLink: Decodable, Identifiable {
+    let id: String
+    let entityId: String
+    let role: String
+    let deviceClass: String?
+    let label: String?
+    let sortOrder: Int
+    // Overlay placement/style (nil placement ⇒ no on-video badge).
+    let overlayX: Double?
+    let overlayY: Double?
+    let overlaySize: Double?
+    let overlayColor: String?
+    let overlayIcon: String?
+    let overlayShowState: Bool
+    let overlayShowAge: Bool
+    let overlayOpacity: Double?
+    let overlayShape: String?
+    let overlayBgColor: String?
+    let overlayOutline: Bool
+
+    /// A badge renders iff both placement coords are set.
+    var hasPlacement: Bool { overlayX != nil && overlayY != nil }
+    /// Display caption: operator label, else the entity id minus its domain.
+    var displayName: String {
+        if let label, !label.isEmpty { return label }
+        if let dot = entityId.firstIndex(of: ".") { return String(entityId[entityId.index(after: dot)...]) }
+        return entityId
+    }
+    /// HA domain (prefix before the first `.`).
+    var domain: String {
+        entityId.firstIndex(of: ".").map { String(entityId[..<$0]) } ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, role, label
+        case entityId = "entity_id"
+        case deviceClass = "device_class"
+        case sortOrder = "sort_order"
+        case overlayX = "overlay_x"
+        case overlayY = "overlay_y"
+        case overlaySize = "overlay_size"
+        case overlayColor = "overlay_color"
+        case overlayIcon = "overlay_icon"
+        case overlayShowState = "overlay_show_state"
+        case overlayShowAge = "overlay_show_age"
+        case overlayOpacity = "overlay_opacity"
+        case overlayShape = "overlay_shape"
+        case overlayBgColor = "overlay_bg_color"
+        case overlayOutline = "overlay_outline"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        entityId = try c.decode(String.self, forKey: .entityId)
+        role = try c.decodeIfPresent(String.self, forKey: .role) ?? "sensor"
+        deviceClass = try c.decodeIfPresent(String.self, forKey: .deviceClass)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        sortOrder = try c.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0
+        overlayX = try c.decodeIfPresent(Double.self, forKey: .overlayX)
+        overlayY = try c.decodeIfPresent(Double.self, forKey: .overlayY)
+        overlaySize = try c.decodeIfPresent(Double.self, forKey: .overlaySize)
+        overlayColor = try c.decodeIfPresent(String.self, forKey: .overlayColor)
+        overlayIcon = try c.decodeIfPresent(String.self, forKey: .overlayIcon)
+        overlayShowState = try c.decodeIfPresent(Bool.self, forKey: .overlayShowState) ?? false
+        overlayShowAge = try c.decodeIfPresent(Bool.self, forKey: .overlayShowAge) ?? false
+        overlayOpacity = try c.decodeIfPresent(Double.self, forKey: .overlayOpacity)
+        overlayShape = try c.decodeIfPresent(String.self, forKey: .overlayShape)
+        overlayBgColor = try c.decodeIfPresent(String.self, forKey: .overlayBgColor)
+        overlayOutline = try c.decodeIfPresent(Bool.self, forKey: .overlayOutline) ?? false
+    }
+}
+
+/// One entity's live state (`GET /ha/states`).
+struct HaEntityState: Decodable {
+    let entityId: String
+    let state: String
+    let lastChanged: String?
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case entityId = "entity_id"
+        case lastChanged = "last_changed"
+    }
+}
+
+/// `GET /ha/states` response. `stale` ⇒ HA was unreachable and this is the
+/// last-known snapshot (grey the badges). Never treat a stale snapshot as
+/// authoritative.
+struct HaStatesResponse: Decodable {
+    let fetchedAtMsAgo: Int
+    let stale: Bool
+    let states: [HaEntityState]
+
+    enum CodingKeys: String, CodingKey {
+        case stale, states
+        case fetchedAtMsAgo = "fetched_at_ms_ago"
+    }
+
+    func state(for entityId: String) -> HaEntityState? {
+        states.first { $0.entityId == entityId }
     }
 }
 

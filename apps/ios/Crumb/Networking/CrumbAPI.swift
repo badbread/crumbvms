@@ -190,6 +190,95 @@ final class CrumbAPI {
         ])
     }
 
+    // MARK: - License Plates (LPR)
+
+    /// `GET /plates` — license-plate reads for the given cameras (viewer-scoped;
+    /// out-of-scope cameras are dropped server-side). Needs `view_plates`.
+    /// Newest-first, except `match == "fuzzy"` which the server orders by
+    /// similarity — the caller must preserve that order (do not re-sort by time).
+    func plates(cameraIds: [String], start: String? = nil, end: String? = nil,
+                q: String? = nil, match: String? = nil,
+                limit: Int = 200, offset: Int = 0) async throws -> PlatesResponse {
+        var query: [String: String] = [
+            "camera_ids": cameraIds.joined(separator: ","),
+            "limit": "\(limit)",
+            "offset": "\(offset)",
+        ]
+        if let start { query["start"] = start }
+        if let end { query["end"] = end }
+        // `q`/`match` are only meaningful together and only when `q` is non-empty.
+        if let q, !q.isEmpty {
+            query["q"] = q
+            if let match { query["match"] = match }
+        }
+        return try await get("plates", query: query)
+    }
+
+    /// `GET /lpr/watchlist` — the plate watchlist. Needs `view_plates`.
+    func watchlist() async throws -> [WatchlistEntry] {
+        try await get("lpr/watchlist")
+    }
+
+    /// `GET /config/lpr` — admin-only LPR config (carries `watchlist_fuzz` for
+    /// the live match preview). Callers swallow a 403 (non-admin) and hide it.
+    func lprConfig() async throws -> LprConfigDto {
+        try await get("config/lpr")
+    }
+
+    /// `PUT /config/lpr` — admin. Set the watchlist fuzziness; round-trips
+    /// `enabled`/`retention_days` unchanged (server clamps fuzz to 0…0.5).
+    @discardableResult
+    func putLprConfig(enabled: Bool, retentionDays: Int, watchlistFuzz: Double) async throws -> LprConfigDto {
+        struct Body: Encodable {
+            let enabled: Bool
+            let retention_days: Int
+            let watchlist_fuzz: Double
+        }
+        return try await put("config/lpr", body: Body(enabled: enabled, retention_days: retentionDays, watchlist_fuzz: watchlistFuzz))
+    }
+
+    /// `GET /events/{event_id}/snapshot` — the full detection frame for a plate
+    /// read, Bearer-authed + `view_plates`-gated. Returns raw JPEG bytes; the
+    /// client derives the tight plate crop from the read's `bbox`.
+    func plateSnapshot(eventId: String) async throws -> Data {
+        try await imageData("events/\(eventId)/snapshot")
+    }
+
+    /// `POST /lpr/watchlist` — add or edit (keyed on the normalized plate) a
+    /// watchlist entry. ADMIN ONLY (server returns 403 otherwise).
+    @discardableResult
+    func addWatchlist(_ body: WatchlistAddRequest) async throws -> WatchlistEntry {
+        try await post("lpr/watchlist", body: body)
+    }
+
+    /// `DELETE /lpr/watchlist/{id}` — remove a watchlist entry. ADMIN ONLY.
+    /// Verifies the HTTP status rather than assuming success: a `404` means the
+    /// entry was already gone (treated as success); any other non-2xx (notably a
+    /// `403` for a non-admin) propagates as an `APIError` so the UI never falsely
+    /// reports "removed".
+    func deleteWatchlist(id: String) async throws {
+        do {
+            let _: EmptyResponse = try await delete("lpr/watchlist/\(id)")
+        } catch let error as APIError where error.isNotFound {
+            // Already gone — the desired end state, treat as success.
+        }
+    }
+
+    // MARK: - Home Assistant overlay
+
+    /// `GET /cameras/:id/ha/links` — the camera's linked HA entities (+ overlay
+    /// placement). Viewer-accessible (camera-scoped). Empty ⇒ no HA for this cam.
+    func haLinks(cameraId: String) async throws -> [HaLink] {
+        try await get("cameras/\(cameraId)/ha/links")
+    }
+
+    /// `GET /ha/states` — live states for entities the caller can see (RBAC
+    /// projected). `stale`/`fetched_at_ms_ago` drive badge greying. Returns 400
+    /// when HA is disabled — callers treat that as "no states", not a hard error.
+    func haStates() async throws -> HaStatesResponse {
+        try await get("ha/states")
+    }
+
     // MARK: - Saved Views (server-backed, per-user; shared with desktop/android/web)
 
     /// All views visible to the caller (own + legacy global + shared-with-me).
@@ -234,6 +323,22 @@ final class CrumbAPI {
     }
 
     // MARK: - Transport
+
+    /// Fetch raw bytes (e.g. a JPEG) from a Bearer-authed endpoint. Non-media
+    /// image endpoints (plate snapshots) use the login JWT, not a media token.
+    private func imageData(_ path: String) async throws -> Data {
+        let url = try buildURL(path)
+        var request = URLRequest(url: url)
+        addAuth(&request)
+        request.timeoutInterval = 20
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard (200...299).contains(http.statusCode) else {
+            if http.statusCode == 401 { store.clearSession() }
+            throw APIError.http(statusCode: http.statusCode, data: data)
+        }
+        return data
+    }
 
     private func get<T: Decodable>(_ path: String, query: [String: String] = [:], authenticated: Bool = true) async throws -> T {
         let url = try buildURL(path, query: query)
@@ -328,6 +433,12 @@ enum APIError: Error, LocalizedError {
 
     var isNotFound: Bool {
         if case .http(let code, _) = self { return code == 404 }
+        return false
+    }
+
+    /// A capability/role denial (e.g. a non-admin attempting a watchlist write).
+    var isForbidden: Bool {
+        if case .http(let code, _) = self { return code == 403 }
         return false
     }
 

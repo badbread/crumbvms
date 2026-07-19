@@ -13,6 +13,11 @@ struct CenteredTimelineView: View {
 
     let spans: [RecordedSpan]
     let motionBuckets: [Float]
+    /// Per-camera motion histograms (each in the camera's own color). When
+    /// non-empty this drives the ribbons instead of the single-tone
+    /// `motionBuckets`; `selectedCameraId` is drawn prominent, others faint.
+    var motionByCamera: [(id: String, buckets: [Float])] = []
+    var selectedCameraId: String? = nil
     let motionStartMs: Int64
     let motionEndMs: Int64
     let detectionEvents: [DetectionEvent]
@@ -36,6 +41,9 @@ struct CenteredTimelineView: View {
     // Gesture bases captured at gesture start.
     @State private var dragBaseMs: Int64?
     @State private var pinchBaseSpan: Int64?
+    /// The scrub/hover probe (time + x) driving the detail chip; nil when idle.
+    @State private var probeMs: Int64?
+    @State private var probeX: CGFloat = 0
 
     private let minSpanMs: Int64 = 60_000
     private let maxSpanMs: Int64 = 6 * 3_600_000
@@ -58,6 +66,9 @@ struct CenteredTimelineView: View {
     // ever mutate in place without changing count) and cache the result.
     @State private var parsedSpans: [(Int64, Int64)] = []
     @State private var parsedDetections: [(Int64, DetectionEvent)] = []
+    /// Detection events with a resolved `[start, end]` span (only those with an
+    /// `end_ts`) — drives the active-event highlight band under the playhead.
+    @State private var parsedEventSpans: [(Int64, Int64, DetectionEvent)] = []
     @State private var distinctIconKeys: [String] = []
 
     /// Cheap (O(1), no full-array scan) change key for `spans` — count plus
@@ -85,6 +96,12 @@ struct CenteredTimelineView: View {
             guard let d = parseISO8601(e.ts) else { return nil }
             return (Int64(d.timeIntervalSince1970 * 1000), e)
         }.sorted { $0.0 < $1.0 }
+        parsedEventSpans = detectionEvents.compactMap { e in
+            guard let end = e.endTs, let s = parseISO8601(e.ts), let en = parseISO8601(end) else { return nil }
+            let sMs = Int64(s.timeIntervalSince1970 * 1000), eMs = Int64(en.timeIntervalSince1970 * 1000)
+            guard eMs > sMs else { return nil }
+            return (sMs, eMs, e)
+        }
         distinctIconKeys = Array(Set(detectionEvents.map(\.iconKey))).sorted()
     }
 
@@ -98,6 +115,15 @@ struct CenteredTimelineView: View {
                         .font(.system(size: 10))
                         .foregroundColor(.white)
                         .tag(key)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if let ms = probeMs {
+                    detailChip(ms)
+                        .fixedSize()
+                        .position(x: min(max(probeX, 80), max(80, geo.size.width - 80)), y: 12)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
                 }
             }
             // M5: parse spans/detections once per data change, not once per
@@ -147,7 +173,11 @@ struct CenteredTimelineView: View {
         let deltaMs = Int64(-dx / width * CGFloat(spanMs))
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let v = min(max(base + deltaMs, 0), now)
-        if commit { dragBaseMs = nil; onScrubEnd(v) } else { onScrub(v) }
+        if commit {
+            dragBaseMs = nil; probeMs = nil; onScrubEnd(v)
+        } else {
+            onScrub(v); probeMs = v; probeX = width / 2 // playhead stays centered
+        }
     }
 
     /// Scroll-wheel zoom: scroll up/away → zoom in (smaller span), clamped.
@@ -158,9 +188,57 @@ struct CenteredTimelineView: View {
         onSpanChange(min(max(next, minSpanMs), maxSpanMs))
     }
 
+    // MARK: - scrub/hover detail chip
+
+    /// A floating readout at the scrub/hover time: the nearest detection (icon,
+    /// label, confidence) if any, plus the clock time.
+    @ViewBuilder private func detailChip(_ ms: Int64) -> some View {
+        let ev = nearestDetection(ms)
+        HStack(spacing: 6) {
+            if let ev {
+                Image(systemName: DetectionIcons.sfSymbol(for: ev.iconKey))
+                    .font(.system(size: 11)).foregroundColor(DetectionIcons.color(for: ev.iconKey))
+                Text(ev.label.isEmpty ? ev.iconKey : ev.label)
+                    .font(.caption2.weight(.semibold)).foregroundColor(.white).lineLimit(1)
+                if ev.score > 0 {
+                    Text("\(Int(ev.score * 100))%")
+                        .font(.caption2.monospacedDigit()).foregroundColor(CrumbColors.textSecondary)
+                }
+            }
+            Text(Self.clockLabel(ms))
+                .font(.caption2.monospacedDigit())
+                .foregroundColor(ev == nil ? .white : CrumbColors.textTertiary)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(.black.opacity(0.8), in: Capsule())
+    }
+
+    /// Nearest detection to `ms` within ~1/30 of the visible span, else nil.
+    private func nearestDetection(_ ms: Int64) -> DetectionEvent? {
+        let threshold = max(Int64(Double(spanMs) / 30), 1000)
+        var best: (Int64, DetectionEvent)?
+        for (ts, ev) in parsedDetections {
+            let d = abs(ts - ms)
+            guard d <= threshold else { continue }
+            if best == nil || d < abs(best!.0 - ms) { best = (ts, ev) }
+        }
+        return best?.1
+    }
+
+    private static func clockLabel(_ ms: Int64) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm:ss a"
+        return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
+
     private func dragGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
+                // A pinch owns the touch sequence → zoom only, never scrub. The
+                // two-finger centroid drifts as you pinch, and letting that drive
+                // `onScrub` is the "time slides while I zoom" bug: while ≥2 fingers
+                // are down (pinchBaseSpan set) we skip the pan→scrub entirely.
+                if pinchBaseSpan != nil { return }
                 if dragBaseMs == nil {
                     dragBaseMs = playheadMs
                     onScrubStart()
@@ -169,10 +247,21 @@ struct CenteredTimelineView: View {
                 // Drag right → earlier in time (content follows the finger).
                 let deltaMs = Int64(-value.translation.width / width * CGFloat(spanMs))
                 let now = Int64(Date().timeIntervalSince1970 * 1000)
-                onScrub(min(max(base + deltaMs, 0), now))
+                let target = min(max(base + deltaMs, 0), now)
+                onScrub(target)
+                // The playhead stays centered while scrubbing → anchor the detail
+                // chip at center over the scrubbed time.
+                probeMs = target
+                probeX = width / 2
             }
             .onEnded { value in
-                guard let base = dragBaseMs, width > 0 else { return }
+                probeMs = nil
+                // Don't commit a scrub the pinch cancelled (dragBaseMs cleared in
+                // pinchGesture) or that a pinch is still owning.
+                guard pinchBaseSpan == nil, let base = dragBaseMs, width > 0 else {
+                    dragBaseMs = nil
+                    return
+                }
                 let deltaMs = Int64(-value.translation.width / width * CGFloat(spanMs))
                 let now = Int64(Date().timeIntervalSince1970 * 1000)
                 let final = min(max(base + deltaMs, 0), now)
@@ -184,7 +273,18 @@ struct CenteredTimelineView: View {
     private func pinchGesture() -> some Gesture {
         MagnificationGesture()
             .onChanged { value in
-                if pinchBaseSpan == nil { pinchBaseSpan = spanMs }
+                if pinchBaseSpan == nil {
+                    pinchBaseSpan = spanMs
+                    // If a one-finger scrub started a frame or two before the
+                    // pinch was recognized, cancel it: snap the playhead back to
+                    // where the gesture began and end the scrub cleanly, so the
+                    // pinch keeps the current time pinned on the time it started
+                    // on (Android's fix).
+                    if let anchor = dragBaseMs {
+                        dragBaseMs = nil
+                        onScrubEnd(anchor)
+                    }
+                }
                 guard let base = pinchBaseSpan, value > 0 else { return }
                 let next = Int64(Double(base) / value)
                 onSpanChange(min(max(next, minSpanMs), maxSpanMs))
@@ -219,13 +319,14 @@ struct CenteredTimelineView: View {
             ctx.fill(Path(CGRect(x: x1, y: bandTop + bandH - baseH, width: bw, height: baseH)), with: .color(TLColors.recording))
         }
 
-        // 2b. motion density bars (two-tone blue)
-        if !motionBuckets.isEmpty, motionEndMs > motionStartMs {
-            let n = motionBuckets.count
+        // 2b. motion density bars.
+        let motionMaxH = bandH - baseH
+        func drawMotion(_ buckets: [Float], color: (Float) -> Color, heightScale: CGFloat) {
+            guard !buckets.isEmpty, motionEndMs > motionStartMs else { return }
+            let n = buckets.count
             let bucketDur = Double(motionEndMs - motionStartMs) / Double(n)
-            let motionMaxH = bandH - baseH
             for i in 0..<n {
-                let v = motionBuckets[i]
+                let v = buckets[i]
                 if v < motionFloor { continue }
                 let bt0 = motionStartMs + Int64(Double(i) * bucketDur)
                 let bt1 = bt0 + Int64(bucketDur)
@@ -235,10 +336,41 @@ struct CenteredTimelineView: View {
                 let bw = max(x2 - x1, 1)
                 let frac = min(max((v - motionFloor) / (motionCeil - motionFloor), 0), 1)
                 let norm = 0.12 + 0.88 * frac
-                let mh = motionMaxH * CGFloat(norm)
-                let color = lerpColor(TLColors.motionLow, TLColors.motion, Double(frac))
-                ctx.fill(Path(CGRect(x: x1, y: bandTop + bandH - baseH - mh, width: bw, height: mh)), with: .color(color))
+                let mh = motionMaxH * CGFloat(norm) * heightScale
+                ctx.fill(Path(CGRect(x: x1, y: bandTop + bandH - baseH - mh, width: bw, height: mh)),
+                         with: .color(color(frac)))
             }
+        }
+        if !motionByCamera.isEmpty {
+            // Per-camera colored ribbons (desktop parity): non-selected first,
+            // sorted by ascending peak + faint/short; the selected camera on top,
+            // prominent — each in its deterministic per-camera color.
+            let ordered = motionByCamera.sorted { a, b in
+                let aSel = a.id == selectedCameraId, bSel = b.id == selectedCameraId
+                if aSel != bSel { return !aSel }
+                return (a.buckets.max() ?? 0) < (b.buckets.max() ?? 0)
+            }
+            for (id, buckets) in ordered {
+                let isSel = id == selectedCameraId
+                let base = CameraColors.motionColor(id)
+                drawMotion(buckets, color: { _ in base.opacity(isSel ? 0.95 : 0.35) },
+                           heightScale: isSel ? 0.95 : 0.6)
+            }
+        } else {
+            // Single-tone fallback (playback wall) — two-tone blue by intensity.
+            drawMotion(motionBuckets,
+                       color: { frac in lerpColor(TLColors.motionLow, TLColors.motion, Double(frac)) },
+                       heightScale: 1)
+        }
+
+        // 2b.5 now-line: dim the future + a green line at the current wall time.
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if nowMs >= visStart && nowMs <= visEnd {
+            let nx = xOf(nowMs)
+            if nx < w {
+                ctx.fill(Path(CGRect(x: nx, y: bandTop, width: w - nx, height: bandH)), with: .color(.black.opacity(0.28)))
+            }
+            ctx.fill(Path(CGRect(x: nx - 0.5, y: bandTop, width: 1, height: bandH)), with: .color(Color(hex: 0x4FB477).opacity(0.9)))
         }
 
         // 2c. bookmarks → gold downward triangles
@@ -252,6 +384,26 @@ struct CenteredTimelineView: View {
             tri.closeSubpath()
             ctx.stroke(tri, with: .color(TLColors.iconHalo), lineWidth: 2.5)
             ctx.fill(tri, with: .color(CrumbColors.bookmarkGold))
+        }
+
+        // 2c.5 active-event highlight — for any detection event whose [start,end]
+        // span contains the playhead, draw a faint colour band + edge lines (the
+        // "what event am I inside" readout, desktop parity, #57). Drawn under the
+        // glyphs so the badge stays crisp on top.
+        for (s0, s1, ev) in parsedEventSpans {
+            guard playheadMs >= s0, playheadMs <= s1 else { continue }
+            if s1 < visStart || s0 > visEnd { continue }
+            let x1 = min(max(xOf(s0), 0), w)
+            let x2 = min(max(xOf(s1), 0), w)
+            let color = DetectionIcons.color(for: ev.iconKey)
+            ctx.fill(Path(CGRect(x: x1, y: bandTop, width: max(x2 - x1, 1), height: bandH)),
+                     with: .color(color.opacity(0.16)))
+            if xOf(s0) >= 0, xOf(s0) <= w {
+                ctx.fill(Path(CGRect(x: x1, y: bandTop, width: 1.2, height: bandH)), with: .color(color.opacity(0.7)))
+            }
+            if xOf(s1) >= 0, xOf(s1) <= w {
+                ctx.fill(Path(CGRect(x: x2 - 1.2, y: bandTop, width: 1.2, height: bandH)), with: .color(color.opacity(0.4)))
+            }
         }
 
         // 2d. detection glyphs (collision-thinned badges)

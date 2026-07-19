@@ -15,6 +15,9 @@ struct LiveFullscreenView: View {
 
     @State private var isPtz = false
     @State private var ptzPresets: [PtzPresetDto] = []
+    /// Live audio on/off for the current camera, restored from the per-camera
+    /// preference and threaded into `Fmp4VideoView` as `muted: !audioOn`.
+    @State private var audioOn = false
     /// Scoped (~15 min-token) snapshot-backdrop URL, resolved async — see
     /// `.task(id: camera.id)` below. `cameraFrameUrl` used to be a synchronous
     /// full-JWT URL built inline in `body`; minting the scoped token requires
@@ -29,6 +32,26 @@ struct LiveFullscreenView: View {
 
     // Motion tuner sheet
     @State private var showTuner = false
+
+    /// Selected media quality (Full/Data-saver/Auto), loaded from the secure
+    /// store; the chip cycles + persists it. On a metered link (or Data-saver)
+    /// the fullscreen feed switches to the native sub stream.
+    @State private var quality: PlaybackQuality = .fallback
+    /// App-wide metered signal, observed so `.auto` re-selects the stream live
+    /// when the link flips metered mid-session.
+    @ObservedObject private var connectivity: ConnectivityMonitor
+
+    /// Home Assistant entity links + live states for on-video badges + sheet.
+    @StateObject private var ha: HAController
+    @State private var haVideoSize: CGSize?
+    @State private var showHASheet = false
+    /// Live digital-zoom scale (1 = not zoomed). HA badges are composited outside
+    /// the zoom transform, so they can't track a pinch+pan — hide them while
+    /// zoomed (matches the desktop client).
+    @State private var videoZoom: CGFloat = 1
+    #if os(iOS)
+    @State private var shareItem: ShareImageItem?
+    #endif
 
     /// M6: Picture-in-Picture for the live feed (iOS only — see
     /// `PictureInPicture.swift`; macOS has no PiP concept here, matching the
@@ -47,6 +70,8 @@ struct LiveFullscreenView: View {
         self.onBack = onBack
         self.onSwipeCamera = onSwipeCamera
         self.onOpenPlayback = onOpenPlayback
+        _connectivity = ObservedObject(wrappedValue: vm.container.connectivity)
+        _ha = StateObject(wrappedValue: HAController(container: vm.container))
     }
 
     var body: some View {
@@ -67,7 +92,16 @@ struct LiveFullscreenView: View {
                     .ignoresSafeArea()
                 // Digital zoom (scroll/pinch) for fixed cameras; PTZ cameras zoom
                 // physically via their own drag controls, so don't fight them.
-                .zoomable(enabled: !isPtz)
+                .zoomable(enabled: !isPtz, onZoomChange: { videoZoom = $0 })
+
+                // Home Assistant entity badges over the video (empty areas pass
+                // taps through to the video/zoom below; badges tap → detail card).
+                // Hidden while digitally zoomed — the overlay lives outside the
+                // zoom transform and would otherwise sit on the wrong pixels.
+                if videoZoom <= 1.01 {
+                    HAOverlayLayer(controller: ha, videoSize: haVideoSize)
+                        .ignoresSafeArea()
+                }
 
                 if isPtz {
                     ptzLayer
@@ -99,6 +133,12 @@ struct LiveFullscreenView: View {
         }
         .statusBarHiddenCompat(true)
         .task(id: camera.id) {
+            // Restore this camera's remembered audio choice (default off) + quality.
+            audioOn = vm.container.settings.audioEnabled(for: camera.id)
+            quality = PlaybackQuality(persisted: vm.container.store.playbackQuality)
+            haVideoSize = nil
+            videoZoom = 1
+            ha.activate(cameraId: camera.id)
             frameUrl = nil
             frameUrl = await vm.mediaUrls().cameraFrameUrl(camera.id)
         }
@@ -124,28 +164,60 @@ struct LiveFullscreenView: View {
                 onClose: { showTuner = false }
             )
         }
+        .sheet(isPresented: $showHASheet) {
+            HAEntitySheet(controller: ha, cameraName: camera.name)
+                .macModalSize(width: 420, height: 560)
+        }
+        #if os(iOS)
+        .sheet(item: $shareItem) { item in
+            ShareSheet(activityItems: [item.image])
+        }
+        #endif
+        .onDisappear { ha.stop() }
     }
+
+    /// Whether to serve the low-bitrate variant for this camera right now —
+    /// the resolved Full/Data-saver/Auto choice against the metered signal.
+    private var useLow: Bool {
+        quality.useLow(metered: connectivity.isMetered)
+    }
+
+    /// On a metered link (or explicit Data-saver) prefer the camera's native
+    /// **sub** stream — already low-res H.264 and, unlike the go2rtc `_mobile`
+    /// transcode, reachable through the fMP4 proxy (`stream=sub`). This mirrors
+    /// the first half of Android's `rtsp_sub_url ?? rtsp_mobile_url`. A camera
+    /// with NO sub stays on main: the `_mobile` transcode (Android's fallback)
+    /// is NOT reachable from iOS's fMP4/WebRTC live path — see `rtspMobileUrl`
+    /// in `LiveStreamsResponse` and the task note.
+    private var useSubStream: Bool { useLow && camera.hasSubStream }
 
     /// `Fmp4VideoView` construction, split out because its `pip:` parameter
     /// only exists on iOS (`#if os(iOS)` in `Fmp4Player.swift`) — a single
     /// call site can't straddle that with a mid-argument-list `#if`.
     @ViewBuilder
     private func fmp4View(urls: MediaUrls, frameUrl: URL?) -> some View {
-        // Fullscreen shows the MAIN (full-res) stream; the URL is minted per
-        // connect through the authenticated /live proxy.
+        // Fullscreen shows MAIN (full-res) on an unmetered link / Full quality,
+        // and the native SUB (low-res) on a metered link / Data-saver. The
+        // stream key encodes the choice so flipping quality restarts the stream.
         let cameraId = camera.id
+        let sub = useSubStream
+        let key = "\(cameraId):\(sub ? "sub" : "main")"
         #if os(iOS)
         Fmp4VideoView(
-            streamKey: cameraId,
-            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: false) },
+            streamKey: key,
+            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: sub) },
             snapshotURL: frameUrl,
+            muted: !audioOn,
+            onVideoSize: { haVideoSize = $0 },
             pip: pip
         )
         #else
         Fmp4VideoView(
-            streamKey: cameraId,
-            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: false) },
-            snapshotURL: frameUrl
+            streamKey: key,
+            streamProvider: { await urls.liveFmp4URL(cameraId: cameraId, sub: sub) },
+            snapshotURL: frameUrl,
+            muted: !audioOn,
+            onVideoSize: { haVideoSize = $0 }
         )
         #endif
     }
@@ -233,6 +305,19 @@ struct LiveFullscreenView: View {
 
                 Spacer(minLength: 4)
 
+                // Quality chip (Auto → Full → Data saver): on a metered link /
+                // Data-saver the fullscreen feed uses the native sub stream.
+                Button {
+                    quality = quality.next
+                    vm.container.store.playbackQuality = quality.rawValue
+                } label: {
+                    Text(quality.short)
+                        .font(.caption.bold())
+                        .foregroundColor(quality == .auto ? .white : CrumbColors.tealAccent)
+                        .frame(minWidth: 34, minHeight: 30)
+                }
+                .accessibilityLabel("Quality: \(quality.label)")
+
                 // M6: Picture-in-Picture toggle (iOS only) — lets the operator
                 // keep watching this camera while backgrounding the app or
                 // navigating elsewhere.
@@ -263,6 +348,30 @@ struct LiveFullscreenView: View {
                     }
                 }
 
+                // Audio toggle (top-right): enable/disable live sound for THIS
+                // camera. Remembered per camera; plays only if the stream carries
+                // an audio track (see `Fmp4Demuxer`/go2rtc transcode).
+                Button {
+                    audioOn.toggle()
+                    vm.container.settings.setAudioEnabled(audioOn, for: camera.id)
+                } label: {
+                    Image(systemName: audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                        .font(.title3)
+                        .foregroundColor(audioOn ? CrumbColors.tealAccent : .white)
+                }
+                .accessibilityLabel(audioOn ? "Mute audio" : "Unmute audio")
+
+                // Home Assistant entity sheet — shown only when this camera has
+                // linked entities (read-only list of states).
+                if ha.hasLinks {
+                    Button { showHASheet = true } label: {
+                        Image(systemName: "house.fill")
+                            .font(.title3)
+                            .foregroundColor(.white)
+                    }
+                    .accessibilityLabel("Home Assistant entities")
+                }
+
                 // Secondary actions in a menu — keeps the bar uncluttered
                 Menu {
                     Button {
@@ -270,6 +379,13 @@ struct LiveFullscreenView: View {
                     } label: {
                         Label("Snapshot", systemImage: "camera.fill")
                     }
+                    #if os(iOS)
+                    Button {
+                        Task { await shareSnapshot() }
+                    } label: {
+                        Label("Share snapshot", systemImage: "square.and.arrow.up")
+                    }
+                    #endif
 
                     if vm.container.isAdmin || vm.container.capabilities.playback {
                         Button {
@@ -347,15 +463,8 @@ struct LiveFullscreenView: View {
     /// codec-agnostic) and saves it to Photos. Simpler + more reliable than tapping
     /// the WebRTC pixel pipeline.
     private func takeSnapshot() async {
-        let urls = vm.mediaUrls()
-        guard let frameUrl = await urls.cameraFrameUrl(camera.id) else { return }
+        guard let image = await fetchFrameImage() else { return }
         do {
-            var req = URLRequest(url: frameUrl)
-            req.cachePolicy = .reloadIgnoringLocalCacheData
-            req.timeoutInterval = 8
-            let (data, response) = try await URLSession.crumbMedia.data(for: req)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-                  let image = PlatformImage(data: data) else { return }
             try await saveToPhotos(image)
             withAnimation { showSavedToast = true }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -364,6 +473,29 @@ struct LiveFullscreenView: View {
             // Silently ignore denied / already-shown system alert
         }
     }
+
+    /// Fetch the current frame from the server's codec-agnostic `/frame.jpg`
+    /// proxy (works regardless of the live decode path).
+    private func fetchFrameImage() async -> PlatformImage? {
+        let urls = vm.mediaUrls()
+        guard let frameUrl = await urls.cameraFrameUrl(camera.id) else { return nil }
+        var req = URLRequest(url: frameUrl)
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.timeoutInterval = 8
+        guard let (data, response) = try? await URLSession.crumbMedia.data(for: req),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let image = PlatformImage(data: data) else { return nil }
+        return image
+    }
+
+    #if os(iOS)
+    /// Capture the current frame and hand it to the system share sheet
+    /// (Android #166 parity — share via any installed target).
+    private func shareSnapshot() async {
+        guard let image = await fetchFrameImage() else { return }
+        shareItem = ShareImageItem(image: image)
+    }
+    #endif
 
     // MARK: - Camera navigation
 
@@ -376,3 +508,12 @@ struct LiveFullscreenView: View {
     }
 }
 
+
+#if os(iOS)
+/// Identifiable wrapper so a captured snapshot can drive `.sheet(item:)` for the
+/// system share sheet.
+struct ShareImageItem: Identifiable {
+    let id = UUID()
+    let image: PlatformImage
+}
+#endif

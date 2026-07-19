@@ -10,6 +10,7 @@ import SwiftUI
 enum Mode: String, CaseIterable {
     case live
     case playback
+    case plates
     case exports
     case clips
     case settings
@@ -41,6 +42,7 @@ extension Mode {
         switch self {
         case .live: return "Live"
         case .playback: return "Playback"
+        case .plates: return "LPR"
         case .exports: return "Exports"
         case .clips: return "Clips"
         case .settings: return "Settings"
@@ -52,6 +54,7 @@ extension Mode {
         switch self {
         case .live: return "dot.radiowaves.left.and.right"
         case .playback: return "clock.arrow.circlepath"
+        case .plates: return "car.fill"
         case .exports: return "square.and.arrow.up"
         case .clips: return "film.stack"
         case .settings: return "gearshape"
@@ -64,6 +67,7 @@ extension Mode {
         switch self {
         case .live: return Color(hex: 0x5E9BD6)      // blue (Android TealAccent)
         case .playback: return Color(hex: 0xE8A33D)  // amber (timeline playhead)
+        case .plates: return Color(hex: 0x46B3B0)    // teal-cyan (LPR)
         case .exports: return Color(hex: 0x4FB477)   // green
         case .clips: return Color(hex: 0xB07CD8)     // purple (Android Clips)
         case .settings: return Color(hex: 0x9AA7B5)  // slate
