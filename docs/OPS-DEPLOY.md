@@ -36,7 +36,7 @@ admin password in the console after first login.
 
 - **Create the admin in the browser instead:** blank `SEED_ADMIN_PASSWORD` in
   `.env` before first boot; the wizard then shows its create-admin step.
-- **GPU (optional):** add the overlay to enable NVDEC motion decode —
+- **GPU (optional):** add the overlay to enable NVDEC motion decode:
   `docker compose -f docker-compose.yml -f docker-compose.gpu.example.yml up -d`.
 - **Storage:** one broad media root (`MEDIA_HOST_PATH` → `/data`) is bind-mounted
   RW into the recorder and RO into the API. Add a disk by mounting it under that
@@ -107,8 +107,8 @@ counts, size it for concurrent load, roughly **2 × cameras + 10** (e.g. 42 for
 
 By default Postgres runs **inside** the stack (bundled `postgres` service, data
 in the `crumb_pgdata` volume). That makes the recording host a single point of
-failure for the index. To remove that SPOF, run Postgres on a **separate host** —
-**no code change required, only `DATABASE_URL`.**
+failure for the index. To remove that SPOF, run Postgres on a **separate host**
+(**no code change required, only `DATABASE_URL`**).
 
 Mechanism: `docker-compose.override.example.yml`.
 

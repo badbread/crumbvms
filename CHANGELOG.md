@@ -85,6 +85,11 @@ sheet for a saved snapshot or export.
 
 ### Changed
 
+- **The install seeds the admin by default.** `scripts/setup-env.sh` now
+  generates a memorable passphrase as `SEED_ADMIN_PASSWORD` and prints it once,
+  so the admin account exists at first boot and the unauthenticated bootstrap
+  window stays closed. The browser create-admin wizard is now the opt-in path
+  (blank the seed to use it).
 - **Recording policies replaced group inheritance.** Every camera now belongs to
   one explicitly named recording policy instead of inheriting through camera
   groups, so what a camera records by is never a guess. The old NULL-inherit /
@@ -105,7 +110,7 @@ sheet for a saved snapshot or export.
   and, once flowing, live reads stored no plate crop box because 0.18 sends the
   box as pixel corners on a different frame than the recognized text. Both fixed
   and covered by fixtures built from the real wire payloads.
-- **Audio.** Recorded segments now capture audio (`-copyinkf:a`) and normalize it
+- **Audio.** Recorded segments now capture audio and normalize it
   to gap-filled 48 kHz AAC so it plays on Android; a mid-playback volume glitch
   on Android was fixed.
 - **Gapless playback** across recorded segment boundaries on desktop and macOS

@@ -136,15 +136,15 @@ creation to the wizard's create-admin step, Step 6a.)
 
 It also detects two host facts and writes them (neither is a secret):
 
-- **`TZ`** — the host's IANA timezone (e.g. `Europe/Berlin`). It drives quiet
+- **`TZ`**: the host's IANA timezone (e.g. `Europe/Berlin`). It drives quiet
   hours, the nightly DB-backup schedule, and every log timestamp. If detection
-  fails it falls back to **`UTC`** (printed as a NOTE) — **not** a local zone;
+  fails it falls back to **`UTC`** (printed as a NOTE), **not** a local zone;
   confirm it looks right and set it by hand if the host clock is unusual. The
   compose default when `.env` has no `TZ` is also `UTC`.
-- **`WEBRTC_CANDIDATE`** — the host's LAN IP as `<lan-ip>:8556`. **Required for
+- **`WEBRTC_CANDIDATE`**: the host's LAN IP as `<lan-ip>:8556`. **Required for
   iOS/WebRTC live view**: go2rtc advertises it as an ICE candidate so LAN clients
   can connect; without it live silently degrades to ~1fps snapshots
-  (`docs/IOS-LIVE-VIDEO.md`). If detection fails it's left blank with a NOTE —
+  (`docs/IOS-LIVE-VIDEO.md`). If detection fails it's left blank with a NOTE:
   set it to the server's LAN IP + `:8556` before relying on iOS/WebRTC live.
 
 **Verify:** `.env` exists; `JWT_SECRET` is **not** the `change-me…` placeholder;
@@ -174,7 +174,7 @@ in the recorder container automatically, no compose edit needed) and only
 persists to disk on an actual motion trigger (pre-roll + event + post-roll);
 idle time between events is never written to disk at all. See
 `docs/MOTION-RECORDING.md` for the full mechanism and safety rails
-(fail-open on an unhealthy detector, spill-to-disk under cache pressure —
+(fail-open on an unhealthy detector, spill-to-disk under cache pressure:
 footage is never silently dropped by the mechanism itself, only by an
 under-tuned detector missing a real event).
 
@@ -246,7 +246,7 @@ authenticated with `GO2RTC_USER`/`GO2RTC_PASS`. Don't add a host port for it.
 (Upgrading an install that predates the embedding? `docker compose up -d
 --remove-orphans` removes the old standalone go2rtc container.)
 
-The `recorder` service sets `stop_grace_period: 90s` — its clean shutdown
+The `recorder` service sets `stop_grace_period: 90s`: its clean shutdown
 finalizes in-flight segments and storage-migration batches, and Docker's
 default 10 s grace would SIGKILL it mid-teardown. Don't remove or shorten it.
 
@@ -332,14 +332,14 @@ via `PUT /config/beta-terms`). Then:
     capabilities; fine-grained control is Settings → Users & Security.
 11. **Done.**
 
-You're finished; they take it from here. (Skipping the camera steps adds nothing —
+You're finished; they take it from here. (Skipping the camera steps adds nothing:
 secure by default; steps 7–10 are all optional and skippable.)
 
-**After the wizard — License-plate recognition (optional).** Not a wizard step;
+**After the wizard: License-plate recognition (optional).** Not a wizard step;
 everything LPR lives in the console's dedicated **LPR** section (left nav). OFF
 by default. If the user runs their cameras through Frigate with Frigate's
 native LPR enabled, plate reads arrive on the event stream Crumb already
-ingests — flip **Enable license-plate capture** on there (and set a
+ingests: flip **Enable license-plate capture** on there (and set a
 **retention** window; older plate reads are pruned automatically) to start
 capturing them into the searchable **LPR** tab. Each camera's **Engine**
 dropdown in the same section's per-camera table controls which source feeds it
@@ -349,7 +349,7 @@ viewing it needs the **View license plates** role capability (Settings → Users
 Security). Plate-read retention is independent of footage/storage retention.
 REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
-Alternatively — or for better accuracy than Frigate's native LPR — run Crumb's
+Alternatively (or for better accuracy than Frigate's native LPR) run Crumb's
 **own** local OCR engine, the opt-in **`crumb-alpr`** worker (fast-alpr; no cloud,
 no third-party agent). It pulls a camera's go2rtc restream, motion-gates, reads
 plates, and POSTs them to the same LPR store. Enable LPR (above), then in
@@ -359,16 +359,16 @@ server only accepts worker reads for those engines), set the `LPR_*` vars in
 `.env` (`LPR_INGEST_TOKEN`, `LPR_CAMERA_ID`, `LPR_RTSP_URL`; see `.env.example`),
 and start it: `docker compose --profile alpr up -d --build crumb-alpr`. It's
 CPU-only and profile-gated (a plain `up -d` never starts it); one instance per
-camera. Model weights download at first run (not vendored — see
+camera. Model weights download at first run (not vendored, see
 `docs/LPR-NATIVE-ENGINE-PLAN.md` for the licensing note and air-gapped pre-fetch).
 
 To be **alerted** when a specific plate is seen, add it to the **watchlist** in
 the **LPR** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
 admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert
-routed over the same notification channels as every other alert — enable/tune it
+routed over the same notification channels as every other alert: enable/tune it
 under Settings → Notifications → System alerts. No extra services or env keys.
 
-**After the wizard — Home Assistant (optional).** Also not a wizard step; it
+**After the wizard: Home Assistant (optional).** Also not a wizard step; it
 lives in the console under **Settings → Detection & clips → Home Assistant**
 (same panel as Frigate). OFF by default, fully self-hosted, footage never leaves
 Crumb. If the user runs Home
@@ -378,7 +378,7 @@ cameras can be linked to HA entities and entity **badges** (door/lock/sensor
 state) dropped onto the live video. Configure it in the console
 (`PUT /config/ha {"base_url":"http://<ha-host>:8123","token":"…","enabled":true}`;
 the token is write-only, never returned, and travels only in the `Authorization`
-header). No new services, ports, or generated secrets — it reuses the existing
+header). No new services, ports, or generated secrets: it reuses the existing
 stack. A headless env fallback exists (`HA_BASE_URL` + `HA_TOKEN` or, preferred,
 `HA_TOKEN_FILE` a Docker-secret path; see `.env.example`), but the console value
 wins when both are set, and the integration stays dormant until enabled.
@@ -487,7 +487,7 @@ All wizard steps have API equivalents. Do them in order:
    per camera it reports `requested` vs `active` plus a human `fallback_reason`
    when they differ (e.g. the render node isn't mapped into the recorder
    container, see "Hardware-accelerated motion decode" below). `capabilities:
-   null` means the recorder hasn't reported yet (older image / not booted) —
+   null` means the recorder hasn't reported yet (older image / not booted),
    not "no devices". Skipping this step entirely is fine: `auto` is the default.
 8. **Notifications (optional).** `POST /notifications/channels`
    `{kind, name, config, camera_ids: [], include_snapshot: true, enabled: true,
@@ -584,7 +584,7 @@ its camera and time, lose it and the footage on disk becomes un-seekable,
 un-exportable data. The **api service itself runs a nightly `pg_dump`**
 (03:15 local, default ON, plus an immediate catch-up dump on boot when no
 fresh backup exists) with rotation into `DB_BACKUP_HOST_PATH` (default
-`./backups`), so a stock `docker compose up -d` is already taking backups —
+`./backups`), so a stock `docker compose up -d` is already taking backups,
 **as long as that directory is writable by uid 1001** (the api's user).
 `scripts/setup-env.sh` prepares the default dir; if backups were disabled
 with a permissions warning in `docker compose logs api`, run
@@ -592,7 +592,7 @@ with a permissions warning in `docker compose logs api`, run
 api`. (A failed/unwritable backup never takes the api down, it logs, raises
 the `backup_failed` alert, and carries on serving.)
 
-- **Single-box home install:** on-host nightly dumps are an accepted posture —
+- **Single-box home install:** on-host nightly dumps are an accepted posture,
   just confirm they land: `ls -lh <DB_BACKUP_HOST_PATH>/daily/` shows a recent
   `.sql.gz` (the boot catch-up means this appears within a minute of first
   start, no need to wait for 03:15).

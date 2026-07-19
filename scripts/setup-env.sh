@@ -166,8 +166,8 @@ cat > "${TMP}" <<EOF
 # Secrets are strong and gitignored. Do NOT commit this file. Re-run setup-env.sh
 # --force to rotate the generated secrets.
 #
-# After 'docker compose up -d', create your admin in the browser at /admin
-# (first-run wizard). No admin password needs to be set here.
+# After 'docker compose up -d', open /admin and sign in as 'admin' with the
+# SEED_ADMIN_PASSWORD below (setup-env printed it once at generation).
 
 # --- Time zone ---
 # Detected from this host. Drives quiet hours, the nightly DB backup schedule,

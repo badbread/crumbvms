@@ -115,7 +115,9 @@ draw them in the LPR section's per-camera zone editor over a live snapshot.
 - **Watchlist:** add plates you care about (`GET`/`POST`/`DELETE /lpr/watchlist`;
   reads are `view_plates`-gated, writes are admin). A watchlist hit fans out as a
   `plate_watchlist_hit` alert with the crop attached.
-- **Ignore list:** plates to never alert on. It fails closed.
+- **Ignore list:** plates Crumb drops entirely at ingest: an ignored plate is
+  never stored and never shows up in search, not merely muted from alerts. It
+  fails closed.
 - **Fuzzy matching:** matching is length-scaled character tolerance, not trigram
   similarity. The fuzz value (0 to 0.5, set alongside the enable toggle) means
   "up to this fraction of the plate's characters may differ" and works out to

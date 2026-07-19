@@ -11,9 +11,10 @@ revisit.
 ## 2026-07-18, Desktop release ships the Flutter client, not the retired Tauri app
 
 **Status.** Decided during the v0.1.0 readiness audit; NOT yet implemented. The
-tag-triggered release workflows (`windows-release.yml`, `macos-release.yml`, and
-the Linux desktop CI job) still build `apps/desktop/src-tauri`, and must be
-repointed to `apps/desktop-flutter` before v0.1.0 is tagged.
+tag-triggered `windows-release.yml` workflow and the ci.yml `desktop-lint` /
+`desktop-linux` jobs still build `apps/desktop/src-tauri`, and must be repointed
+to `apps/desktop-flutter` before v0.1.0 is tagged. (`macos-release.yml` builds
+the native SwiftUI app via XcodeGen and is unaffected by this repoint.)
 
 **Context.** The desktop client was rewritten in Flutter (libmpv over
 `flutter_rust_bridge`; see the 2026-07-10 entry). Every desktop feature since,
@@ -22,8 +23,9 @@ the PTZ panel, and the A/B benchmark, lives only in `apps/desktop-flutter`. The
 release path still builds the old Tauri crate, so tagging v0.1.0 today would
 publish a Windows installer with none of the release's headline features.
 
-**Chosen.** Repoint the release to build `apps/desktop-flutter` (Windows first,
-macOS and Linux as per-platform packaging lands), and drop the Tauri crate from
+**Chosen.** Repoint `windows-release.yml` and the CI desktop jobs to build
+`apps/desktop-flutter` (the SwiftUI macOS app has its own workflow and is
+separate; Linux as per-platform packaging lands), and drop the Tauri crate from
 the release path.
 **Rejected.** Ship the Tauri installer for v0.1.0 (advertises features the
 shipped app does not have). Hold the desktop client out of v0.1.0 entirely (web

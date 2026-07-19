@@ -18,10 +18,11 @@ with no archive tier at all is equally valid.
 Adding storage doesn't require a compose file edit or a restart of the
 stack's shape. Mount the new disk (or a subdirectory of an existing mount)
 under the same host media path, then add the corresponding path in the
-admin console. The path you add must **already exist and be writable** on
-the recording server; Crumb validates that when you add it and refuses a
-path that isn't there yet. Once the location exists, the recorder creates
-the per-camera subdirectories under it on its first write.
+admin console. The path you add must live **under the media root**; if it
+already exists it has to be a directory, and a path that doesn't exist yet
+is accepted as long as its parent is a reachable directory. The recorder
+creates the directory (and the per-camera subdirectories under it) on its
+first write.
 
 ## How footage moves between tiers
 
@@ -42,13 +43,14 @@ Eviction does not have to wait for a disk to be completely full. Two things
 keep headroom in reserve:
 
 - **A server-wide floor that is always on.** Crumb keeps a minimum amount of
-  free space on the live disk no matter what, 5% of the disk or 50 GB,
+  free space on the live disk no matter what, 5% of the disk or 50 GiB,
   whichever is stricter (both overridable with the `MIN_FREE_FRACTION` and
   `MIN_FREE_BYTES` environment variables). A full disk means ffmpeg records
   nothing, and losing footage is the one failure I refuse to allow, so this
   backstop fires even on a policy with no size cap and no archive tier.
-- **Per-policy headroom overrides.** A policy can set a stricter free-space
-  floor (a percentage, a byte amount, or both) on its own live disk. When
+- **Per-policy headroom overrides.** A policy can set its own free-space
+  floor, typically stricter (a percentage, a byte amount, or both), on its
+  own live disk. When
   free space drops below that floor, eviction kicks in early: the oldest
   footage is moved to archive if the policy has an archive tier, or deleted
   if it doesn't, until the headroom is back.
