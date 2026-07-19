@@ -85,10 +85,14 @@ struct ClipPlayerView: View {
         HStack(spacing: 14) {
             Button { player.restart() } label: { Image(systemName: "gobackward") }
                 .buttonStyle(.plain)
+            Button { player.stepFrame(false) } label: { Image(systemName: "backward.frame.fill") }
+                .buttonStyle(.plain)
             Button { player.togglePlay() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").frame(width: 22)
             }
             .buttonStyle(.plain)
+            Button { player.stepFrame(true) } label: { Image(systemName: "forward.frame.fill") }
+                .buttonStyle(.plain)
             Text(Self.timeLabel(scrubbing ? scrubValue : player.position))
                 .font(.caption2.monospacedDigit())
             Slider(
@@ -316,6 +320,13 @@ final class ClipPlayer: ObservableObject {
     func restart() {
         pausedByUser = false
         player.seek(to: .zero) { [weak self] _ in self?.player.play() }
+    }
+
+    /// Step one frame forward/back (pauses first; matches the desktop plate-clip
+    /// transport's frame-advance buttons).
+    func stepFrame(_ forward: Bool) {
+        player.pause(); pausedByUser = true; isPlaying = false
+        player.currentItem?.step(byCount: forward ? 1 : -1)
     }
     func stop() {
         if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
