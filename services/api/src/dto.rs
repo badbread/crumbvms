@@ -916,6 +916,12 @@ pub struct ServerSettingsDto {
     /// Monotonically increasing version counter; bumped on every PUT. Clients
     /// poll this (via `/status`) to detect changes and reload stream URLs.
     pub version: i64,
+    /// Resolved IANA timezone the server evaluates its schedules in (from the
+    /// `TZ` env; `America/Los_Angeles` if unset/invalid). Read-only, derived from
+    /// the environment (not the `server_settings` row, so a PUT never changes
+    /// it). The console shows schedule "next run" times in this zone instead of a
+    /// hardcoded one (#237).
+    pub tz: String,
 }
 
 /// `PUT /config/server` request body.

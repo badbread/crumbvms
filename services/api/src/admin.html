@@ -3452,26 +3452,44 @@ function fmtClock(h24, m) {
 /* Plain-English schedule summary (for the schedule control preview note). */
 function describeSchedule(s) {
   if (s.type === 'none')   return 'No automatic archiving. Footage still moves to archive when the live storage size cap is reached, set a size cap to control this.';
-  if (s.type === 'hourly') return 'Archive runs every hour, at the top of the hour, Pacific.';
+  if (s.type === 'hourly') return `Archive runs every hour, at the top of the hour, ${serverTzLabel()}.`;
   if (s.type === 'every-n') {
-    if (s.n === 1) return 'Archive runs every hour, at the top of the hour, Pacific.';
+    if (s.n === 1) return `Archive runs every hour, at the top of the hour, ${serverTzLabel()}.`;
     const hrs = []; for (let h = 0; h < 24; h += s.n) hrs.push(fmtClock(h, 0));
-    return `Archive runs every ${s.n} hours (${hrs.join(', ')}) Pacific.`;
+    return `Archive runs every ${s.n} hours (${hrs.join(', ')}) ${serverTzLabel()}.`;
   }
-  if (s.type === 'daily')  return `Archive runs daily at ${fmtClock(s.hour24, s.minute)} Pacific.`;
+  if (s.type === 'daily')  return `Archive runs daily at ${fmtClock(s.hour24, s.minute)} ${serverTzLabel()}.`;
   if (s.type === 'weekly') {
     const full = s.days.map(d => ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d]);
-    return `Archive runs every ${full.join(' and ')} at ${fmtClock(s.hour24, s.minute)} Pacific.`;
+    return `Archive runs every ${full.join(' and ')} at ${fmtClock(s.hour24, s.minute)} ${serverTzLabel()}.`;
   }
   return 'Custom schedule.';
 }
 
-/* "Next run" preview computed in America/Los_Angeles wall-clock time. */
+/* The IANA zone the SERVER evaluates schedules in, reported by GET /config/server
+   (#237). Falls back to America/Los_Angeles for an old backend that doesn't send
+   it, matching the server's own default. */
+function serverTz() {
+  const tz = WZ.server && WZ.server.tz;
+  return (typeof tz === 'string' && tz) ? tz : 'America/Los_Angeles';
+}
+/* Short human label for the server's zone (e.g. "PST", "CET", "GMT+9") for
+   inline schedule copy; falls back to the IANA name if the browser can't. */
+function serverTzLabel() {
+  const tz = serverTz();
+  try {
+    const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
+      .formatToParts(new Date());
+    return p.find(x => x.type === 'timeZoneName')?.value || tz;
+  } catch { return tz; }
+}
+
+/* "Next run" preview computed in the server's schedule timezone. */
 function nextRunPreview(s) {
   if (!s || s.type === 'none' || s.type === 'custom') return '';
-  // Current Pacific wall-clock components.
+  // Current wall-clock components in the server's zone.
   const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Los_Angeles', hour12: false,
+    timeZone: serverTz(), hour12: false,
     weekday: 'short', hour: '2-digit', minute: '2-digit'
   }).formatToParts(new Date());
   const get = t => parts.find(p => p.type === t)?.value;
@@ -3507,7 +3525,7 @@ function nextRunPreview(s) {
   if (best.offset === 0) when = 'today';
   else if (best.offset === 1) when = 'tomorrow';
   else { const d = (dow + best.offset) % 7; when = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d]; }
-  return `Next run: ${when} at ${fmtClock(best.h, best.m)} Pacific.`;
+  return `Next run: ${when} at ${fmtClock(best.h, best.m)} ${serverTzLabel()}.`;
 }
 
 /* ── Schedule control: render + wire + read ───────────────────────────────── */
@@ -3591,7 +3609,7 @@ function renderSchedControl(pfx, cron) {
       ${customRow}
     </div>
     <div class="sched-preview" id="${pfx}-sched-preview"></div>
-    <div class="sched-tz">Schedules run in America/Los_Angeles time.</div>`;
+    <div class="sched-tz">Schedules run in ${esc(serverTz())} time (set by the server's TZ).</div>`;
 
   schedChanged(pfx);
 }
@@ -7340,7 +7358,7 @@ function bannerHTML(p, borderCls, srcText, camId) {
   const liveStHl  = hl(esc(liveName), 'accent2');
   const capHl     = p.live_max_bytes ? `, up to ${hl(fmtBytes(p.live_max_bytes), 'warn')}` : '';
   const archiveLine = p.archive_enabled
-    ? `Archive to ${hl(esc(archName), 'accent2')} for ${hl(fmtDur(p.archive_retention_hours), 'warn')}, <span style="color:var(--dim)">${esc(fmtSchedule(p.archive_schedule).toLowerCase())} Pacific</span>.`
+    ? `Archive to ${hl(esc(archName), 'accent2')} for ${hl(fmtDur(p.archive_retention_hours), 'warn')}, <span style="color:var(--dim)">${esc(fmtSchedule(p.archive_schedule).toLowerCase())} ${esc(serverTzLabel())}</span>.`
     : `<span style="color:var(--dim2)">No archiving configured.</span>`;
   return `<div class="inherit-banner ${borderCls}">
     <div class="inherit-banner-title">Using "${esc(p.name || 'Default')}" policy</div>
@@ -8193,7 +8211,7 @@ function bannerHTMLForGroup(p, inheriting) {
   const modeHl   = p.mode === 'motion' ? hl('Motion-triggered', 'danger') : hl('Continuous', 'ok');
   const streamHl = hl(p.record_stream === 'sub' ? 'sub' : 'main', 'accent2');
   const archiveLine = p.archive_enabled
-    ? `Archive to ${hl(archName, 'accent2')} for ${hl(fmtDur(p.archive_retention_hours), 'warn')}, <span style="color:var(--dim)">${esc(fmtSchedule(p.archive_schedule).toLowerCase())} Pacific</span>.`
+    ? `Archive to ${hl(archName, 'accent2')} for ${hl(fmtDur(p.archive_retention_hours), 'warn')}, <span style="color:var(--dim)">${esc(fmtSchedule(p.archive_schedule).toLowerCase())} ${esc(serverTzLabel())}</span>.`
     : `<span style="color:var(--dim2)">No archiving configured.</span>`;
   return `<div class="inherit-banner ${inheriting?'default-profile':''}">
     <div class="inherit-banner-title">Using "${esc(p.name || 'Default')}" profile</div>
@@ -8385,7 +8403,7 @@ function renderProfile(id) {
           ${capForStorage(p.archive_storage_id)}
           <div class="tier-field"><div class="tier-field-name">Keep for</div><div class="tier-field-value">${p.archive_retention_hours==null?'No expiry':fmtDur(p.archive_retention_hours)}</div></div>
           <div class="tier-field"><div class="tier-field-name">Size cap</div><div class="tier-field-value">${p.archive_max_bytes?fmtBytes(p.archive_max_bytes):'No cap'}</div></div>
-          <div class="tier-field"><div class="tier-field-name">Schedule</div><div class="tier-field-value">${esc(fmtSchedule(p.archive_schedule))} Pacific</div></div>`
+          <div class="tier-field"><div class="tier-field-name">Schedule</div><div class="tier-field-value">${esc(fmtSchedule(p.archive_schedule))} ${esc(serverTzLabel())}</div></div>`
           : '<div style="font-size:13px;color:var(--dim);padding:8px 0">Archiving is disabled for this profile.</div>'}
         </div>
       </div>

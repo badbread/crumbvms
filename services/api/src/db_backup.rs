@@ -98,7 +98,11 @@ fn env_keep(key: &str, default: usize) -> usize {
 /// Timezone the schedule is evaluated in: `TZ` env (IANA name), default
 /// `America/Los_Angeles`. `chrono-tz` embeds the IANA db, so no system tzdata
 /// is needed in the image.
-fn schedule_tz() -> Tz {
+///
+/// `pub(crate)` so `/config/server` can report the same resolved zone to the
+/// console (#237), keeping the displayed schedule TZ in lockstep with the zone
+/// the backup scheduler actually uses.
+pub(crate) fn schedule_tz() -> Tz {
     let Ok(v) = std::env::var("TZ") else {
         return Tz::America__Los_Angeles;
     };
