@@ -29,6 +29,10 @@ struct PlaybackView: View {
     @State private var audioOn = false
     /// Balances `CrumbAudioSession` acquire/release for recorded-playback audio.
     @State private var audioSessionHeld = false
+    // Jog/shuttle reverse state.
+    @State private var reverseTask: Task<Void, Never>?
+    @State private var reverseRate: Double = 0
+    @State private var reversePos: Int64 = 0
     // Export-range selection (macOS right-click "mark for export").
     @State private var exportSelStart: Int64?
     @State private var exportSelEnd: Int64?
@@ -416,6 +420,49 @@ struct PlaybackView: View {
         vm.setLowQuality(quality.useLow(metered: connectivity.isMetered))
     }
 
+    // MARK: - jog / shuttle
+
+    /// Apply a signed shuttle rate: forward → variable-speed playback; reverse →
+    /// walk the playhead backward via the scrub path; ~0 → pause.
+    private func applyShuttle(_ rate: Double) {
+        if rate > 0 {
+            stopReverse()
+            vm.setSpeed(Float(rate)); vm.setPlaying(true)
+        } else if rate < 0 {
+            reverseRate = -rate
+            startReverse()
+        } else {
+            stopReverse()
+            vm.setPlaying(false); vm.setSpeed(1)
+        }
+    }
+
+    private func startReverse() {
+        guard reverseTask == nil else { return }
+        vm.setPlaying(false)
+        reversePos = vm.playheadMs
+        vm.onScrubStart()
+        reverseTask = Task { @MainActor in
+            while !Task.isCancelled {
+                reversePos = max(0, reversePos - Int64(reverseRate * (1000.0 / 15.0)))
+                vm.onScrub(reversePos)
+                try? await Task.sleep(nanoseconds: 66_000_000) // ~15 fps rewind
+            }
+        }
+    }
+
+    private func stopReverse() {
+        guard reverseTask != nil else { return }
+        reverseTask?.cancel(); reverseTask = nil
+        vm.onScrubEnd(reversePos)
+    }
+
+    /// Shuttle released → recenter to paused 1×.
+    private func endShuttle() {
+        stopReverse()
+        vm.setSpeed(1); vm.setPlaying(false)
+    }
+
     // MARK: - macOS desktop transport
 
     #if os(macOS)
@@ -489,6 +536,9 @@ struct PlaybackView: View {
                     .labelsHidden().datePickerStyle(.compact).fixedSize()
                 Button("Go") { vm.jumpToTime(Int64(jumpDraft.timeIntervalSince1970 * 1000)) }
                     .buttonStyle(.plain).font(.callout.weight(.medium)).foregroundColor(CrumbColors.tealAccent)
+
+                macDivider
+                ShuttleControl(onRate: { applyShuttle($0) }, onRelease: { endShuttle() })
 
                 Spacer()
 
@@ -984,3 +1034,54 @@ final class SegmentPlayer: ObservableObject {
     }
 }
 
+
+// MARK: - Jog / shuttle control
+
+/// A spring-return shuttle: drag right to fast-forward (0.5×…8×), left to rewind;
+/// releasing snaps back to center. Reports a signed rate (0 inside the dead zone).
+private struct ShuttleControl: View {
+    let onRate: (Double) -> Void
+    let onRelease: () -> Void
+
+    @State private var offset: CGFloat = 0 // -1…1
+    private let trackW: CGFloat = 150
+    private let thumb: CGFloat = 22
+
+    var body: some View {
+        let half = trackW / 2 - thumb / 2
+        ZStack {
+            Capsule().fill(CrumbColors.surfaceVariant).frame(height: 22)
+            Rectangle().fill(CrumbColors.textTertiary.opacity(0.5)).frame(width: 1, height: 12)
+            ZStack {
+                Circle().fill(CrumbColors.teal).frame(width: thumb, height: thumb)
+                Image(systemName: "chevron.left.chevron.right")
+                    .font(.system(size: 10)).foregroundColor(.black.opacity(0.6))
+            }
+            .offset(x: offset * half)
+        }
+        .frame(width: trackW, height: 26)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    offset = max(-1, min(1, v.translation.width / half))
+                    onRate(rate(for: offset))
+                }
+                .onEnded { _ in
+                    withAnimation(.spring(response: 0.25)) { offset = 0 }
+                    onRelease()
+                }
+        )
+        .help("Shuttle — drag right to fast-forward, left to rewind")
+    }
+
+    /// Signed exponential rate with a 12% dead zone: ±0.5× … ±8×.
+    private func rate(for d: CGFloat) -> Double {
+        let dead: CGFloat = 0.12
+        let m = abs(d)
+        guard m > dead else { return 0 }
+        let t = Double((m - dead) / (1 - dead))
+        let mag = 0.5 * pow(16, t)
+        return d < 0 ? -mag : mag
+    }
+}
