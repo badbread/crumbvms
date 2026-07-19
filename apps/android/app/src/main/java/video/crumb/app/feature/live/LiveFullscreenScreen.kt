@@ -42,11 +42,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import video.crumb.app.LocalPipController
@@ -122,25 +124,35 @@ fun LiveFullscreenScreen(
         }
     }
 
-    // Home Assistant: the entities linked to the current camera (drives whether
-    // the HA button shows). Read-only status sheet — no on-video badges on the
-    // small screen; a button opens the list instead.
+    // Home Assistant: the entities linked to the current camera. Drives BOTH the
+    // read-only list sheet (HA button) and the on-video badges the operator
+    // placed on the desktop overlay editor (issue #263) — placed links render as
+    // badges pinned to the video frame; tapping one opens the same detail dialog.
     var haLinks by remember { mutableStateOf<List<HaLinkDto>>(emptyList()) }
     var haStates by remember { mutableStateOf<HaStatesResponse?>(null) }
     var haSheetOpen by remember { mutableStateOf(false) }
+    var haBadgeSelected by remember { mutableStateOf<HaLinkDto?>(null) }
     LaunchedEffect(currentCameraId) {
         haLinks = emptyList()
         haSheetOpen = false
+        haBadgeSelected = null
         repo.haLinks(currentCameraId).onSuccess { haLinks = it }
     }
-    // Poll HA states only while the sheet is open (server demand-cache, ~2s TTL).
-    LaunchedEffect(haSheetOpen, currentCameraId) {
-        if (!haSheetOpen) return@LaunchedEffect
+    // Poll HA states while this camera has linked entities (to keep the on-video
+    // badges live) or the sheet is open. Server demand-caches with a ~2s TTL.
+    val haHasPlaced = haLinks.any { it.hasPlacement }
+    LaunchedEffect(currentCameraId, haHasPlaced, haSheetOpen) {
+        if (!haHasPlaced && !haSheetOpen) return@LaunchedEffect
         while (true) {
             repo.haStates().onSuccess { haStates = it }
             kotlinx.coroutines.delay(2000)
         }
     }
+    // Decoded video pixel size (for contain-fit badge placement) and the current
+    // digital-zoom scale (badges hide while zoomed — they'd misalign, matching
+    // the desktop `hideBadges: scale > 1.01` rule). Both feed HaBadgeOverlayLayer.
+    var videoSize by remember { mutableStateOf(IntSize.Zero) }
+    var zoomScale by remember { mutableStateOf(1f) }
 
     // Picture-in-Picture: while this full-screen camera is up, let the Activity
     // auto-enter PiP when the user leaves the app so the video keeps playing in a
@@ -403,8 +415,17 @@ fun LiveFullscreenScreen(
                 // Try to reconnect before showing the hard error.
                 scheduleReconnect()
             }
+
+            override fun onVideoSizeChanged(vs: VideoSize) {
+                // Decoded frame size — drives the contain-fit rect the on-video HA
+                // badges are placed against (issue #263).
+                if (vs.width > 0 && vs.height > 0) videoSize = IntSize(vs.width, vs.height)
+            }
         }
         player?.addListener(listener)
+        // Seed from the current size in case the first frame arrived before this
+        // listener attached (stream swap / recomposition).
+        player?.videoSize?.let { if (it.width > 0 && it.height > 0) videoSize = IntSize(it.width, it.height) }
 
         // ── Stall watchdog ──────────────────────────────────────────────────────
         // RTSP-over-TCP can stall WITHOUT firing onPlayerError, so the error-only
@@ -559,6 +580,7 @@ fun LiveFullscreenScreen(
                         }
                     }
                 },
+                onTransformChange = { zoomScale = it.scale },
             ) {
                 PlayerSurface(
                     player = player,
@@ -567,6 +589,21 @@ fun LiveFullscreenScreen(
                     textureView = true,
                 )
             }
+        }
+
+        // On-video Home Assistant badges (issue #263) — the entities the operator
+        // placed on the desktop overlay, pinned to the video frame. A sibling of
+        // the zoom surface (not inside it), so it is hidden while digitally zoomed
+        // (badges would misalign) and in PiP (video only). Only badge hit-boxes
+        // are interactive; the rest passes touches through to the video/PTZ.
+        if (player != null && !playerError && !inPip && zoomScale <= 1.01f) {
+            HaBadgeOverlayLayer(
+                links = haLinks,
+                states = haStates,
+                videoWidth = videoSize.width,
+                videoHeight = videoSize.height,
+                onBadgeTap = { haBadgeSelected = it },
+            )
         }
 
         // Spinner while resolving URL or buffering. Suppressed during reconnect
@@ -840,6 +877,13 @@ fun LiveFullscreenScreen(
                 states = haStates,
                 onDismiss = { haSheetOpen = false },
             )
+        }
+
+        // Tapping an on-video HA badge opens the same read-only detail dialog the
+        // list sheet uses (issue #263).
+        haBadgeSelected?.let { link ->
+            val st = haStates?.stateFor(link.entityId)
+            HaMoreInfoDialog(link, st?.state, st?.lastChanged, onDismiss = { haBadgeSelected = null })
         }
 
         // ── In-view PTZ controls — wheel (joystick ring) OR edge-pinned arrows ──
