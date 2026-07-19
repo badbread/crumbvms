@@ -85,6 +85,16 @@ services:
       SEED_DEFAULT_CAMERAS: ${SEED_DEFAULT_CAMERAS:-false}   # dev-only prototype cameras; keep false in real deploys
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # Timezone for the archive/retention cron. Unset = inherit TZ above so the
+      # schedule matches the container wall clock; set only to run it in a
+      # different zone. (#228)
+      RECORDER_TZ: ${RECORDER_TZ:-}
+      # Home Assistant as a motion source (optional; per-camera links live in the
+      # DB, these are the env fallback). Empty = use DB settings / disabled. (#229)
+      HA_BASE_URL: ${HA_BASE_URL:-}
+      HA_TOKEN: ${HA_TOKEN:-}
+      HA_TOKEN_FILE: ${HA_TOKEN_FILE:-}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-}                   # sqlx pool size (empty = default 32)
     volumes:
       - ${MEDIA_HOST_PATH:-./_data}:/data              # one broad media root, RW (recorder owns all writes)
       - /proc:/host/proc:ro                            # NSpid translation for per-camera GPU% (optional)
@@ -158,6 +168,29 @@ services:
       DB_BACKUP_KEEP_WEEKS: ${DB_BACKUP_KEEP_WEEKS:-4}
       DB_BACKUP_KEEP_MONTHS: ${DB_BACKUP_KEEP_MONTHS:-0}
       DB_BACKUP_ENABLED: ${DB_BACKUP_ENABLED:-true}
+      # Home Assistant entity overlay / control (optional; DB settings win, these
+      # are the env fallback). Empty = use DB settings / disabled. (#229)
+      HA_BASE_URL: ${HA_BASE_URL:-}
+      HA_TOKEN: ${HA_TOKEN:-}
+      HA_TOKEN_FILE: ${HA_TOKEN_FILE:-}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-}                   # sqlx pool size (empty = default 32)
+      MAINTENANCE_UNTIL: ${MAINTENANCE_UNTIL:-}         # unix seconds; suppress low-disk/offline alerts during planned maintenance
+      CAMERA_OFFLINE_BOOT_GRACE_SECS: ${CAMERA_OFFLINE_BOOT_GRACE_SECS:-}   # grace before offline alerts after boot (empty = default 180)
+      # Thumbnail cache + pregen tuning (all optional; empty = built-in default). (#229)
+      THUMB_CACHE_DIR: ${THUMB_CACHE_DIR:-}
+      THUMB_CACHE_MAX_BYTES: ${THUMB_CACHE_MAX_BYTES:-}
+      THUMB_CACHE_TTL_SECONDS: ${THUMB_CACHE_TTL_SECONDS:-}
+      THUMB_EXTRACT_MAX_CONCURRENCY: ${THUMB_EXTRACT_MAX_CONCURRENCY:-}
+      THUMB_EXTRACT_TIMEOUT_SECS: ${THUMB_EXTRACT_TIMEOUT_SECS:-}
+      THUMB_INTERVAL_SECS: ${THUMB_INTERVAL_SECS:-}
+      THUMB_MAX_ATTEMPTS: ${THUMB_MAX_ATTEMPTS:-}
+      THUMB_MAX_WIDTH: ${THUMB_MAX_WIDTH:-}
+      THUMB_MIN_WIDTH: ${THUMB_MIN_WIDTH:-}
+      THUMB_NEAR_BLACK_LUMA: ${THUMB_NEAR_BLACK_LUMA:-}
+      THUMB_PREGEN_ENABLED: ${THUMB_PREGEN_ENABLED:-}
+      THUMB_PREGEN_LOOKBACK_HOURS: ${THUMB_PREGEN_LOOKBACK_HOURS:-}
+      THUMB_PREGEN_SCAN_SECS: ${THUMB_PREGEN_SCAN_SECS:-}
+      THUMB_PREGEN_WIDTH: ${THUMB_PREGEN_WIDTH:-}
     volumes:
       - ${MEDIA_HOST_PATH:-./_data}:/data:ro            # same media root as recorder, READ-ONLY (api never writes footage)
       - crumb_exports:/exports

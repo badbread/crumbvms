@@ -8,6 +8,41 @@ revisit.
 
 ---
 
+## 2026-07-18, Compose forwards code-read env keys explicitly; helpers treat empty as unset
+
+**Status.** Implemented. `docker-compose.yml` now forwards the previously
+silently-dropped keys (`RECORDER_TZ`, `HA_BASE_URL`/`HA_TOKEN`/`HA_TOKEN_FILE`,
+`DB_POOL_SIZE`, `MAINTENANCE_UNTIL`, `CAMERA_OFFLINE_BOOT_GRACE_SECS`, the
+`THUMB_*` set) into the api and recorder as `${VAR:-}`, and `parse_env` /
+`parse_tz_env` treat an empty-or-whitespace value as "unset → default" (fixes
+#228, #229).
+
+**Context.** These keys are read via `std::env` but the stock compose never
+forwarded them, so setting them in `.env` was a silent no-op. Compose
+materializes a forwarded key even when unset (`${VAR:-}` → `""`), and
+`parse_env` previously treated `""` as a fatal parse error, so a naive
+passthrough would have failed boot. Separately, `RECORDER_TZ` hard-defaulted to
+`America/Los_Angeles` for every operator regardless of `TZ`.
+
+**Chosen.** Explicit per-service passthrough of the documented keys, plus making
+the numeric/timezone env helpers empty-safe (mirroring the existing
+`parse_bool_env`). `RECORDER_TZ` now inherits `TZ` when unset. This keeps the
+env contract explicit and secure-by-default while making every documented key
+actually work from `.env`.
+**Rejected.** `env_file: .env` on the api/recorder services (would pull the
+*entire* `.env`, including secrets meant only for other services, into every
+container, widening exposure, against golden rule 1). Per-key compose defaults
+duplicating each code default (e.g. `${DB_POOL_SIZE:-32}`) drift from the code
+defaults over time; the empty-as-unset helper fix removes the need. Leaving the
+docs to say "add a compose override" (the keys are meant to work from `.env`).
+**Trade-offs accepted.** The api env block grew by the `THUMB_*` tuning set,
+which most operators never touch, in exchange for no silent no-ops. An operator
+who explicitly sets a key to an empty string now gets the default rather than an
+empty value; for these keys that is the intended reading of "blank = unset".
+**Revisit.** If the forwarded-key list grows unwieldy, reconsider a scoped
+`env_file` split (a non-secret `.env.app` forwarded wholesale, secrets kept
+per-service).
+
 ## 2026-07-18, Desktop release ships the Flutter client, not the retired Tauri app
 
 **Status.** Decided during the v0.1.0 readiness audit; NOT yet implemented. The
