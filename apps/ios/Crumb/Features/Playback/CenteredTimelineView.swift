@@ -13,6 +13,11 @@ struct CenteredTimelineView: View {
 
     let spans: [RecordedSpan]
     let motionBuckets: [Float]
+    /// Per-camera motion histograms (each in the camera's own color). When
+    /// non-empty this drives the ribbons instead of the single-tone
+    /// `motionBuckets`; `selectedCameraId` is drawn prominent, others faint.
+    var motionByCamera: [(id: String, buckets: [Float])] = []
+    var selectedCameraId: String? = nil
     let motionStartMs: Int64
     let motionEndMs: Int64
     let detectionEvents: [DetectionEvent]
@@ -249,13 +254,14 @@ struct CenteredTimelineView: View {
             ctx.fill(Path(CGRect(x: x1, y: bandTop + bandH - baseH, width: bw, height: baseH)), with: .color(TLColors.recording))
         }
 
-        // 2b. motion density bars (two-tone blue)
-        if !motionBuckets.isEmpty, motionEndMs > motionStartMs {
-            let n = motionBuckets.count
+        // 2b. motion density bars.
+        let motionMaxH = bandH - baseH
+        func drawMotion(_ buckets: [Float], color: (Float) -> Color, heightScale: CGFloat) {
+            guard !buckets.isEmpty, motionEndMs > motionStartMs else { return }
+            let n = buckets.count
             let bucketDur = Double(motionEndMs - motionStartMs) / Double(n)
-            let motionMaxH = bandH - baseH
             for i in 0..<n {
-                let v = motionBuckets[i]
+                let v = buckets[i]
                 if v < motionFloor { continue }
                 let bt0 = motionStartMs + Int64(Double(i) * bucketDur)
                 let bt1 = bt0 + Int64(bucketDur)
@@ -265,10 +271,41 @@ struct CenteredTimelineView: View {
                 let bw = max(x2 - x1, 1)
                 let frac = min(max((v - motionFloor) / (motionCeil - motionFloor), 0), 1)
                 let norm = 0.12 + 0.88 * frac
-                let mh = motionMaxH * CGFloat(norm)
-                let color = lerpColor(TLColors.motionLow, TLColors.motion, Double(frac))
-                ctx.fill(Path(CGRect(x: x1, y: bandTop + bandH - baseH - mh, width: bw, height: mh)), with: .color(color))
+                let mh = motionMaxH * CGFloat(norm) * heightScale
+                ctx.fill(Path(CGRect(x: x1, y: bandTop + bandH - baseH - mh, width: bw, height: mh)),
+                         with: .color(color(frac)))
             }
+        }
+        if !motionByCamera.isEmpty {
+            // Per-camera colored ribbons (desktop parity): non-selected first,
+            // sorted by ascending peak + faint/short; the selected camera on top,
+            // prominent — each in its deterministic per-camera color.
+            let ordered = motionByCamera.sorted { a, b in
+                let aSel = a.id == selectedCameraId, bSel = b.id == selectedCameraId
+                if aSel != bSel { return !aSel }
+                return (a.buckets.max() ?? 0) < (b.buckets.max() ?? 0)
+            }
+            for (id, buckets) in ordered {
+                let isSel = id == selectedCameraId
+                let base = CameraColors.motionColor(id)
+                drawMotion(buckets, color: { _ in base.opacity(isSel ? 0.95 : 0.35) },
+                           heightScale: isSel ? 0.95 : 0.6)
+            }
+        } else {
+            // Single-tone fallback (playback wall) — two-tone blue by intensity.
+            drawMotion(motionBuckets,
+                       color: { frac in lerpColor(TLColors.motionLow, TLColors.motion, Double(frac)) },
+                       heightScale: 1)
+        }
+
+        // 2b.5 now-line: dim the future + a green line at the current wall time.
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if nowMs >= visStart && nowMs <= visEnd {
+            let nx = xOf(nowMs)
+            if nx < w {
+                ctx.fill(Path(CGRect(x: nx, y: bandTop, width: w - nx, height: bandH)), with: .color(.black.opacity(0.28)))
+            }
+            ctx.fill(Path(CGRect(x: nx - 0.5, y: bandTop, width: 1, height: bandH)), with: .color(Color(hex: 0x4FB477).opacity(0.9)))
         }
 
         // 2c. bookmarks → gold downward triangles

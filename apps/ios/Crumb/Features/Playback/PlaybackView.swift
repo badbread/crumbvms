@@ -44,7 +44,7 @@ struct PlaybackView: View {
     @ObservedObject private var connectivity: ConnectivityMonitor
 
     init(camera: CameraDto, cameras: [CameraDto], container: AppContainer, startTime: Date? = nil, onBack: @escaping () -> Void) {
-        _vm = StateObject(wrappedValue: PlaybackViewModel(cameraId: camera.id, container: container, startTime: startTime))
+        _vm = StateObject(wrappedValue: PlaybackViewModel(cameraId: camera.id, container: container, startTime: startTime, cameras: cameras))
         _connectivity = ObservedObject(wrappedValue: container.connectivity)
         self.cameras = cameras
         self.onBack = onBack
@@ -297,6 +297,7 @@ struct PlaybackView: View {
     @ViewBuilder private var timeline: some View {
         CenteredTimelineView(
             spans: vm.spans, motionBuckets: vm.motionBuckets,
+            motionByCamera: vm.motionByCamera, selectedCameraId: vm.cameraId,
             motionStartMs: vm.motionStartMs, motionEndMs: vm.motionEndMs,
             detectionEvents: vm.detectionEvents, bookmarks: bookmarks,
             playheadMs: vm.playheadMs, spanMs: vm.visibleSpanMs,

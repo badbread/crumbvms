@@ -32,8 +32,14 @@ final class PlaybackViewModel: ObservableObject {
     @Published var noFootageAtPlayhead = false
     @Published var visibleSpanMs: Int64 = 60 * 60_000
     @Published var motionBuckets: [Float] = []
+    /// Per-camera motion histograms for the whole camera set — the timeline draws
+    /// every camera's bars in its own color, the selected one prominent. Empty
+    /// falls back to the single-tone `motionBuckets`.
+    @Published var motionByCamera: [(id: String, buckets: [Float])] = []
     @Published var motionStartMs: Int64 = 0
     @Published var motionEndMs: Int64 = 0
+    /// Cameras whose motion the timeline shows (defaults to just the current one).
+    private var timelineCameraIds: [String] = []
     @Published var detectionEvents: [DetectionEvent] = []
 
     let container: AppContainer
@@ -100,10 +106,11 @@ final class PlaybackViewModel: ObservableObject {
     /// to probe + buffer before the boundary while staying inside the segment.
     private let prefetchLeadMs: Int64 = 2_500
 
-    init(cameraId: String, container: AppContainer, startTime: Date? = nil) {
+    init(cameraId: String, container: AppContainer, startTime: Date? = nil, cameras: [CameraDto] = []) {
         self.cameraId = cameraId
         self.container = container
         self.pendingSeedMs = startTime.map { Int64($0.timeIntervalSince1970 * 1000) } ?? 0
+        self.timelineCameraIds = cameras.isEmpty ? [cameraId] : cameras.map(\.id)
         startCamera(cameraId, preserveTime: false)
     }
 
@@ -199,12 +206,26 @@ final class PlaybackViewModel: ObservableObject {
     }
 
     private func loadIntensity(_ startMs: Int64, _ endMs: Int64) async {
-        if let resp = try? await container.api.timelineIntensity(cameraId: cameraId, start: iso(startMs), end: iso(endMs), buckets: motionBucketsCount) {
-            guard !Task.isCancelled else { return }
-            motionBuckets = resp.buckets
-            motionStartMs = startMs
-            motionEndMs = endMs
+        let ids = timelineCameraIds.isEmpty ? [cameraId] : timelineCameraIds
+        let startISO = iso(startMs), endISO = iso(endMs)
+        // Fan out one per-camera intensity request (the endpoint is single-camera),
+        // in parallel: each Task inherits the main actor, and its await frees the
+        // actor so the requests overlap — no off-actor / Sendable captures.
+        let handles: [(String, Task<[Float]?, Never>)] = ids.map { id in
+            (id, Task {
+                (try? await self.container.api.timelineIntensity(
+                    cameraId: id, start: startISO, end: endISO, buckets: self.motionBucketsCount))?.buckets
+            })
         }
+        var result: [(id: String, buckets: [Float])] = []
+        for (id, handle) in handles {
+            if let buckets = await handle.value { result.append((id: id, buckets: buckets)) }
+        }
+        guard !Task.isCancelled else { return }
+        motionByCamera = result
+        motionBuckets = result.first(where: { $0.id == cameraId })?.buckets ?? result.first?.buckets ?? []
+        motionStartMs = startMs
+        motionEndMs = endMs
     }
 
     private func loadEvents(_ startMs: Int64, _ endMs: Int64) async {
