@@ -105,6 +105,7 @@ const String _kPtzStyle = 'crumb.ptzStyle';
 const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
 const String _kZoomSwitchesToMain = 'crumb.zoomSwitchesToMain';
 const String _kOpenClipsInHd = 'crumb.openClipsInHd';
+const String _kSeamlessTileSwitch = 'crumb.seamlessTileSwitch';
 
 /// Loads/holds/persists the client options this file owns. Construct once
 /// (e.g. in `CrumbClientApp` state) via [ClientOptionsStore.load] and pass
@@ -127,6 +128,7 @@ class ClientOptionsStore extends ChangeNotifier {
     required PtzWheelCorner ptzWheelCorner,
     required bool zoomSwitchesToMain,
     required bool openClipsInHd,
+    required bool seamlessTileSwitching,
   }) : _showInfoBar = showInfoBar,
        _showAllCamerasView = showAllCamerasView,
        _hotkeysEnabled = hotkeysEnabled,
@@ -135,7 +137,8 @@ class ClientOptionsStore extends ChangeNotifier {
        _ptzStyle = ptzStyle,
        _ptzWheelCorner = ptzWheelCorner,
        _zoomSwitchesToMain = zoomSwitchesToMain,
-       _openClipsInHd = openClipsInHd;
+       _openClipsInHd = openClipsInHd,
+       _seamlessTileSwitching = seamlessTileSwitching;
 
   final SharedPreferences? _prefs;
 
@@ -148,6 +151,7 @@ class ClientOptionsStore extends ChangeNotifier {
   PtzWheelCorner _ptzWheelCorner;
   bool _zoomSwitchesToMain;
   bool _openClipsInHd;
+  bool _seamlessTileSwitching;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -169,6 +173,7 @@ class ClientOptionsStore extends ChangeNotifier {
       ),
       zoomSwitchesToMain: prefs?.getBool(_kZoomSwitchesToMain) ?? false,
       openClipsInHd: prefs?.getBool(_kOpenClipsInHd) ?? false,
+      seamlessTileSwitching: prefs?.getBool(_kSeamlessTileSwitch) ?? true,
     );
   }
 
@@ -250,6 +255,17 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _openClipsInHd) return;
     _openClipsInHd = v;
     unawaited(_prefs?.setBool(_kOpenClipsInHd, v));
+    notifyListeners();
+  }
+
+  // ── carousel/hotspot tiles pre-warm the incoming camera and swap only on
+  //    its first decoded frame, so a switch never blanks to black (#254). Off
+  //    = the old cold-remount behavior (one decode at a time), for weak boxes ──
+  bool get seamlessTileSwitching => _seamlessTileSwitching;
+  set seamlessTileSwitching(bool v) {
+    if (v == _seamlessTileSwitching) return;
+    _seamlessTileSwitching = v;
+    unawaited(_prefs?.setBool(_kSeamlessTileSwitch, v));
     notifyListeners();
   }
 }

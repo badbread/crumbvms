@@ -733,18 +733,33 @@ class _WallScreenState extends State<WallScreen> {
             final cam = camId == null ? null : camById[camId];
             // Plain camera slots key by camera (per-camera GlobalKey) so a
             // camera shared between the outgoing and incoming view keeps its
-            // decoding player across the switch. Carousel/hotspot slots keep
-            // the old slot-scoped key — their camera changes over time, and
-            // stealing a static slot's key would just move the teardown.
+            // decoding player across the switch.
+            //
+            // Carousel/hotspot slots (`spec != null` here — the non-video specials
+            // were handled above): with seamless switching ON, key by SLOT (drop
+            // the camera id) so the tile SURVIVES a camera flip and re-opens in
+            // place — the incoming camera decodes in the background and the tile
+            // swaps to it only on its first frame (#254), instead of remounting
+            // and cold-opening (the ~1-2s black gap). Its pane id is made
+            // slot-stable too, so snapshot/audio registration doesn't churn (or
+            // collide with a plain slot showing the same camera) on every switch.
+            // OFF = the old cam-keyed remount, byte-identical to before.
+            final seamless =
+                widget.clientOptions?.seamlessTileSwitching ?? true;
+            final specialSeamless = spec != null && seamless;
             final Key? tileKey = cam == null
                 ? null
                 : (spec == null && usedCamKeys.add(cam.id))
                 ? _tileKeyFor(cam.id)
+                : specialSeamless
+                ? ValueKey('${view.id}:$i:special')
                 : ValueKey('${view.id}:$i:${cam.id}');
             child = cam == null
                 ? const _EmptySlot()
                 : _WallTile(
                     key: tileKey,
+                    paneIdOverride:
+                        specialSeamless ? 'wall:${view.id}:$i' : null,
                     api: widget.api,
                     session: widget.session,
                     camera: cam,
@@ -909,11 +924,18 @@ class _WallTile extends StatefulWidget {
     this.onEditHaOverlay,
     this.onHaLinksLoaded,
     this.isAdmin = false,
+    this.paneIdOverride,
   });
 
   final CrumbApi api;
   final Session session;
   final Camera camera;
+
+  /// Slot-stable pane id for carousel/hotspot tiles under seamless switching
+  /// (#254). Null → the pane id is derived from the camera id (plain tiles).
+  /// A stable id lets the snapshot/audio registration survive an in-place
+  /// camera flip (see [_WallTileState._paneId]) instead of churning per switch.
+  final String? paneIdOverride;
   final LiveStatusController liveStatus;
   final bool showInfoBar;
   final VoidCallback onTap;
@@ -957,6 +979,20 @@ class _WallTile extends StatefulWidget {
 class _WallTileState extends State<_WallTile> {
   Player? _player;
   VideoController? _controller;
+
+  /// The camera whose video is currently PAINTING. Under seamless switching
+  /// (#254) `widget.camera` flips to the incoming camera the instant the slot
+  /// re-targets, but the old feed keeps painting until the replacement's first
+  /// frame — so the name label follows THIS (promoted in [_onFirstFrame]) to
+  /// stay in step with the picture, not the pending switch.
+  late Camera _shown;
+
+  /// Monotonic load generation. Every [_load] captures the current value; a
+  /// newer [_load] (a rapid re-target while the previous open is still in
+  /// flight — reachable because mpv's 10s network-timeout exceeds the 8s min
+  /// carousel interval) bumps it, so the stale open disposes its player and
+  /// bails instead of clobbering [_pending] with the wrong camera.
+  int _loadGen = 0;
 
   /// A replacement player mid stream-swap (main/sub change): it decodes in
   /// the background while the old player keeps rendering, and [_onFirstFrame]
@@ -1061,7 +1097,37 @@ class _WallTileState extends State<_WallTile> {
   @override
   void initState() {
     super.initState();
+    _shown = widget.camera;
     _load();
+    unawaited(_loadHaLinks());
+  }
+
+  @override
+  void didUpdateWidget(covariant _WallTile old) {
+    super.didUpdateWidget(old);
+    // Only fires for a SEAMLESS carousel/hotspot slot (its key is slot-stable,
+    // so the State survives a camera flip). Plain tiles key by camera, so their
+    // camera never changes under a live State — this early-returns for them.
+    if (old.camera.id == widget.camera.id) return;
+    // The slot re-targeted. Drop the old camera's HA bookkeeping from the wall's
+    // has-a-placement set (mirrors dispose), clear per-camera view state so no
+    // stale badge/SD-badge/zoom carries onto the new feed, then re-open in place.
+    // `_load()` with `_player != null` parks the new player in `_pending` and
+    // keeps the old one painting until `_onFirstFrame` swaps — no black gap.
+    // `_shown`/`_firstFrame` are deliberately NOT reset: the old feed stays the
+    // painted, "live" one until the replacement decodes.
+    widget.onHaLinksLoaded?.call(old.camera.id, const []);
+    setState(() {
+      _haLinks = const [];
+      _streams = null;
+      _error = null;
+      _scale = 1.0;
+      _offset = Offset.zero;
+      _zoomedToMain = false;
+      _videoW = null;
+      _videoH = null;
+    });
+    unawaited(_load());
     unawaited(_loadHaLinks());
   }
 
@@ -1070,12 +1136,17 @@ class _WallTileState extends State<_WallTile> {
     // before the pane adopts it — otherwise a failed initial load leaks the
     // player and its native mpv handle (#132). Cleared once ownership passes to
     // the pane (_adopt) or the pending swap slot.
+    final gen = ++_loadGen;
     Player? spawned;
     try {
       final streams = await widget.api.cameraStreams(
         widget.session,
         widget.camera.id,
       );
+      // A newer _load (a rapid slot re-target) superseded this one while the
+      // fetch was in flight — drop it before it can overwrite _streams or park a
+      // now-wrong camera in _pending (#254).
+      if (gen != _loadGen || !mounted) return;
       _streams = streams; // gate the Data-saver menu item + drive the SD badge
       // Per-camera main/sub/data-saver override (right-click menu) wins over
       // the wall default; falls back to the plain wall preference if no store.
@@ -1128,7 +1199,9 @@ class _WallTileState extends State<_WallTile> {
         if (h != null && h > 0) _videoH = h;
       });
       await player.open(Media(url));
-      if (!mounted) {
+      if (gen != _loadGen || !mounted) {
+        // Superseded (or unmounted) during open — retire this player detached
+        // (#105) rather than promoting a camera the slot has moved past.
         _disposePlayerDetached(player);
         return;
       }
@@ -1252,11 +1325,18 @@ class _WallTileState extends State<_WallTile> {
     final old = _player;
     _pending = null;
     _firstFrame = true;
+    // The incoming feed is now the painted one — promote the name label to it
+    // (it lagged the pending switch on purpose, #254); _adopt's setState repaints.
+    _shown = widget.camera;
     _adopt(player, controller);
-    old?.dispose();
+    // Retire the outgoing player OFF the UI isolate — libmpv dispose() can block
+    // for seconds (#105), and under a carousel this now fires on every switch.
+    // Safe: warmController is null whenever _pending != null, so nothing external
+    // was painting `old` at promote time.
+    _disposePlayerDetached(old);
   }
 
-  String get _paneId => 'wall:${widget.camera.id}';
+  String get _paneId => widget.paneIdOverride ?? 'wall:${widget.camera.id}';
 
   /// Swap to the currently-preferred stream (after a main/sub override change
   /// from the right-click menu, or a zoom-to-main toggle). Re-fetches the URLs
@@ -1496,7 +1576,7 @@ class _WallTileState extends State<_WallTile> {
       builder: (context, _) {
         final status = widget.liveStatus.cameraFor(widget.camera.id);
         return TileInfoBar(
-          name: widget.camera.name,
+          name: _shown.name,
           connected: _firstFrame && _error == null,
           hasError: _error != null,
           recording: status?.recording ?? false,
@@ -1646,7 +1726,7 @@ class _WallTileState extends State<_WallTile> {
                           ),
                           const SizedBox(width: 6),
                           Text(
-                            widget.camera.name,
+                            _shown.name,
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 12,
