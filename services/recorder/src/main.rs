@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// CONTRACT PHASE — stub modules contain todo!() bodies and not-yet-used
-// imports / functions.  Remove these allows once all stubs are implemented.
-#![allow(dead_code, unused_imports, unused_variables)]
-
 //! Crumb NVR — recorder process entry point.
 //!
 //! # Responsibility

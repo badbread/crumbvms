@@ -222,6 +222,8 @@ fn fs_free_and_total(path: &str) -> Option<(i64, i64)> {
 ///     exceed the whole disk and perma-trigger eviction), so we fall back to the
 ///     fractional floor alone. This keeps the default 50GB headroom meaningful on
 ///     real multi-TB live tiers while never wedging a small/test filesystem.
+#[cfg(test)] // production always goes through the per-policy variant; the tests
+             // exercise the env-default floor path through this thin wrapper
 fn below_free_floor(path: &str) -> Option<(bool, i64)> {
     below_free_floor_for_policy(path, None, None)
 }
