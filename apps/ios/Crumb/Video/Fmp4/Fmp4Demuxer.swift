@@ -26,6 +26,9 @@ final class Fmp4Demuxer {
 
     /// Video access units, flagged display-immediately (invalid timing).
     var onSample: ((CMSampleBuffer) -> Void)?
+    /// The decoded video's pixel dimensions, emitted once the `moov` yields a
+    /// video format description — used to letterbox-position HA overlay badges.
+    var onVideoSize: ((CGSize) -> Void)?
     /// Audio access units, carrying valid PTS/duration. Left `nil` while muted so
     /// the audio path is skipped entirely (the moov is still scanned cheaply).
     var onAudioSample: ((CMSampleBuffer) -> Void)?
@@ -260,6 +263,12 @@ final class Fmp4Demuxer {
         } else if etype == "avc1" || etype == "avc3" {
             if let avcc = firstBox(children, "avcC") {
                 formatDesc = makeAVCFormat(children.subdata(in: avcc))
+            }
+        }
+        if let fd = formatDesc {
+            let dim = CMVideoFormatDescriptionGetDimensions(fd)
+            if dim.width > 0, dim.height > 0 {
+                onVideoSize?(CGSize(width: Int(dim.width), height: Int(dim.height)))
             }
         }
     }

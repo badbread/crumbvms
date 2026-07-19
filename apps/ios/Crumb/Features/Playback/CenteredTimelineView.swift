@@ -58,6 +58,9 @@ struct CenteredTimelineView: View {
     // ever mutate in place without changing count) and cache the result.
     @State private var parsedSpans: [(Int64, Int64)] = []
     @State private var parsedDetections: [(Int64, DetectionEvent)] = []
+    /// Detection events with a resolved `[start, end]` span (only those with an
+    /// `end_ts`) — drives the active-event highlight band under the playhead.
+    @State private var parsedEventSpans: [(Int64, Int64, DetectionEvent)] = []
     @State private var distinctIconKeys: [String] = []
 
     /// Cheap (O(1), no full-array scan) change key for `spans` — count plus
@@ -85,6 +88,12 @@ struct CenteredTimelineView: View {
             guard let d = parseISO8601(e.ts) else { return nil }
             return (Int64(d.timeIntervalSince1970 * 1000), e)
         }.sorted { $0.0 < $1.0 }
+        parsedEventSpans = detectionEvents.compactMap { e in
+            guard let end = e.endTs, let s = parseISO8601(e.ts), let en = parseISO8601(end) else { return nil }
+            let sMs = Int64(s.timeIntervalSince1970 * 1000), eMs = Int64(en.timeIntervalSince1970 * 1000)
+            guard eMs > sMs else { return nil }
+            return (sMs, eMs, e)
+        }
         distinctIconKeys = Array(Set(detectionEvents.map(\.iconKey))).sorted()
     }
 
@@ -273,6 +282,26 @@ struct CenteredTimelineView: View {
             tri.closeSubpath()
             ctx.stroke(tri, with: .color(TLColors.iconHalo), lineWidth: 2.5)
             ctx.fill(tri, with: .color(CrumbColors.bookmarkGold))
+        }
+
+        // 2c.5 active-event highlight — for any detection event whose [start,end]
+        // span contains the playhead, draw a faint colour band + edge lines (the
+        // "what event am I inside" readout, desktop parity, #57). Drawn under the
+        // glyphs so the badge stays crisp on top.
+        for (s0, s1, ev) in parsedEventSpans {
+            guard playheadMs >= s0, playheadMs <= s1 else { continue }
+            if s1 < visStart || s0 > visEnd { continue }
+            let x1 = min(max(xOf(s0), 0), w)
+            let x2 = min(max(xOf(s1), 0), w)
+            let color = DetectionIcons.color(for: ev.iconKey)
+            ctx.fill(Path(CGRect(x: x1, y: bandTop, width: max(x2 - x1, 1), height: bandH)),
+                     with: .color(color.opacity(0.16)))
+            if xOf(s0) >= 0, xOf(s0) <= w {
+                ctx.fill(Path(CGRect(x: x1, y: bandTop, width: 1.2, height: bandH)), with: .color(color.opacity(0.7)))
+            }
+            if xOf(s1) >= 0, xOf(s1) <= w {
+                ctx.fill(Path(CGRect(x: x2 - 1.2, y: bandTop, width: 1.2, height: bandH)), with: .color(color.opacity(0.4)))
+            }
         }
 
         // 2d. detection glyphs (collision-thinned badges)

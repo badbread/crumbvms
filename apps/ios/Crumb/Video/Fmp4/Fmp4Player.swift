@@ -25,6 +25,9 @@ struct Fmp4VideoView: View {
     /// taps "listen") the audio path is skipped entirely. Only the fullscreen
     /// single-camera view ever passes `false`.
     var muted: Bool = true
+    /// Emitted once the decoded video pixel size is known — lets the fullscreen
+    /// view letterbox-position HA overlay badges over the displayed frame.
+    var onVideoSize: ((CGSize) -> Void)? = nil
     /// M6 (iOS only — see `PictureInPicture.swift`): when supplied, this
     /// view attaches `controller.displayLayer` to it on appear so the caller
     /// can drive Picture-in-Picture for the live stream. `nil` (the default)
@@ -63,6 +66,7 @@ struct Fmp4VideoView: View {
             pip?.attach(to: controller.displayLayer)
             #endif
         }
+        .onChange(of: controller.videoSize) { if let s = $0 { onVideoSize?(s) } }
         .onChange(of: muted) { controller.setMuted($0) }
         #if os(iOS)
         .onDisappear {
@@ -125,6 +129,9 @@ final class Fmp4StreamController: NSObject, ObservableObject {
     @Published private(set) var displaying = false
     /// True while the connection is down / retrying (drives the reconnect hint).
     @Published private(set) var failed = false
+    /// Decoded video pixel size, once known — lets overlays (HA badges)
+    /// letterbox-position against the displayed frame.
+    @Published private(set) var videoSize: CGSize?
 
     let displayLayer = AVSampleBufferDisplayLayer()
 
@@ -161,6 +168,12 @@ final class Fmp4StreamController: NSObject, ObservableObject {
         demuxer.onSample = { [weak self] sample in
             // Demux runs on the demux queue; UI + layer touch the main actor.
             DispatchQueue.main.async { self?.enqueue(sample) }
+        }
+        demuxer.onVideoSize = { [weak self] size in
+            DispatchQueue.main.async {
+                guard let self, self.videoSize != size else { return }
+                self.videoSize = size
+            }
         }
         // `onAudioSample` is wired only while unmuted (see `setMuted`), so a muted
         // feed pays nothing for audio beyond the near-free moov scan.

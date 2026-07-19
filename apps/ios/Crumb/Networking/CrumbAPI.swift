@@ -219,6 +219,19 @@ final class CrumbAPI {
         try await get("lpr/watchlist")
     }
 
+    /// `GET /config/lpr` — admin-only LPR config (carries `watchlist_fuzz` for
+    /// the live match preview). Callers swallow a 403 (non-admin) and hide it.
+    func lprConfig() async throws -> LprConfigDto {
+        try await get("config/lpr")
+    }
+
+    /// `GET /events/{event_id}/snapshot` — the full detection frame for a plate
+    /// read, Bearer-authed + `view_plates`-gated. Returns raw JPEG bytes; the
+    /// client derives the tight plate crop from the read's `bbox`.
+    func plateSnapshot(eventId: String) async throws -> Data {
+        try await imageData("events/\(eventId)/snapshot")
+    }
+
     /// `POST /lpr/watchlist` — add or edit (keyed on the normalized plate) a
     /// watchlist entry. ADMIN ONLY (server returns 403 otherwise).
     @discardableResult
@@ -237,6 +250,21 @@ final class CrumbAPI {
         } catch let error as APIError where error.isNotFound {
             // Already gone — the desired end state, treat as success.
         }
+    }
+
+    // MARK: - Home Assistant overlay
+
+    /// `GET /cameras/:id/ha/links` — the camera's linked HA entities (+ overlay
+    /// placement). Viewer-accessible (camera-scoped). Empty ⇒ no HA for this cam.
+    func haLinks(cameraId: String) async throws -> [HaLink] {
+        try await get("cameras/\(cameraId)/ha/links")
+    }
+
+    /// `GET /ha/states` — live states for entities the caller can see (RBAC
+    /// projected). `stale`/`fetched_at_ms_ago` drive badge greying. Returns 400
+    /// when HA is disabled — callers treat that as "no states", not a hard error.
+    func haStates() async throws -> HaStatesResponse {
+        try await get("ha/states")
     }
 
     // MARK: - Saved Views (server-backed, per-user; shared with desktop/android/web)
@@ -283,6 +311,22 @@ final class CrumbAPI {
     }
 
     // MARK: - Transport
+
+    /// Fetch raw bytes (e.g. a JPEG) from a Bearer-authed endpoint. Non-media
+    /// image endpoints (plate snapshots) use the login JWT, not a media token.
+    private func imageData(_ path: String) async throws -> Data {
+        let url = try buildURL(path)
+        var request = URLRequest(url: url)
+        addAuth(&request)
+        request.timeoutInterval = 20
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard (200...299).contains(http.statusCode) else {
+            if http.statusCode == 401 { store.clearSession() }
+            throw APIError.http(statusCode: http.statusCode, data: data)
+        }
+        return data
+    }
 
     private func get<T: Decodable>(_ path: String, query: [String: String] = [:], authenticated: Bool = true) async throws -> T {
         let url = try buildURL(path, query: query)

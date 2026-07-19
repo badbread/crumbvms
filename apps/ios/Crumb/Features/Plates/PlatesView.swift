@@ -31,6 +31,11 @@ final class PlatesViewModel: ObservableObject {
     @Published var match: PlateMatch = .contains
     /// Lookback window in hours; 0 = all time. Matches the desktop options.
     @Published var rangeHours: Double = 24
+    /// Collapse near-duplicate reads (same camera, ≤15 s, similar plate) into
+    /// one row. Device-local preference, persisted like `playbackQuality`.
+    @Published var collapse: Bool = UserDefaults.standard.object(forKey: "plates_collapse") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(collapse, forKey: "plates_collapse") }
+    }
 
     // Watchlist
     @Published var watchlist: [WatchlistEntry] = []
@@ -60,6 +65,41 @@ final class PlatesViewModel: ObservableObject {
     func isWatched(_ plate: String) -> Bool {
         let norm = plate.uppercased()
         return watchlist.contains { $0.plate.uppercased() == norm }
+    }
+
+    /// The rendered list: `plates` collapsed into duplicate groups. Collapse
+    /// operates over the reads in server order (which for fuzzy IS the result,
+    /// see `load()`), so ordering is preserved — no re-sort here either.
+    var groups: [Lpr.PlateGroup] {
+        let lites = plates.map {
+            Lpr.PlateReadLite(
+                id: $0.id, cameraId: $0.cameraId,
+                tsMs: Int64(parseISO8601($0.ts)?.timeIntervalSince1970 ?? 0) * 1000,
+                plate: $0.plate, confidence: $0.confidence
+            )
+        }
+        return Lpr.collapse(lites, enabled: collapse)
+    }
+
+    /// Look a full `PlateRead` back up by id (group representatives are lites).
+    func plateRead(byId id: String) -> PlateRead? {
+        plates.first { $0.id == id }
+    }
+
+    // MARK: plate-crop thumbnails
+
+    /// Decoded plate-crop thumbnails by event id — cached so re-scrolls don't
+    /// refetch or re-decode. Main-actor (the whole class is `@MainActor`).
+    private var thumbCache: [String: PlatformImage] = [:]
+
+    /// Fetch the snapshot for `eventId` and crop it to the plate `bbox`
+    /// (cached). Returns nil on any failure — the row keeps its placeholder.
+    func thumb(for eventId: String, bbox: [Double]?) async -> PlatformImage? {
+        if let cached = thumbCache[eventId] { return cached }
+        guard let data = try? await container.api.plateSnapshot(eventId: eventId),
+              let img = PlateCrop.crop(data, bbox: bbox) else { return nil }
+        thumbCache[eventId] = img
+        return img
     }
 
     // MARK: reads
@@ -149,9 +189,14 @@ final class PlatesViewModel: ObservableObject {
         }
     }
 
-    /// Add/edit a watchlist entry (admin only). Returns nil on success or an
-    /// error message to surface. Refreshes the list on success.
-    func addToWatchlist(plate: String, label: String?, notify: Bool) async -> String? {
+    /// Add/edit a watchlist entry (admin only; POST is an upsert keyed on the
+    /// normalized plate). Callers editing an existing entry must round-trip its
+    /// `note`/`color` so the upsert doesn't wipe them. Returns nil on success
+    /// or an error message to surface. Refreshes the list on success.
+    func addToWatchlist(
+        plate: String, label: String?, notify: Bool,
+        note: String? = nil, color: String? = nil, kind: String? = nil
+    ) async -> String? {
         let trimmed = plate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "Enter a plate." }
         do {
@@ -159,7 +204,7 @@ final class PlatesViewModel: ObservableObject {
                 WatchlistAddRequest(
                     plate: trimmed,
                     label: label?.isEmpty == true ? nil : label,
-                    note: nil, color: nil, notify: notify
+                    note: note, color: color, notify: notify, kind: kind
                 )
             )
             loadWatchlist()
@@ -260,6 +305,13 @@ struct PlatesView: View {
                 matchMenu
                 rangeMenu
 
+                Button { vm.collapse.toggle() } label: {
+                    Image(systemName: vm.collapse ? "square.stack.3d.up" : "square.stack.3d.up.slash")
+                        .foregroundColor(vm.collapse ? CrumbColors.tealAccent : CrumbColors.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .help(vm.collapse ? "Collapsing duplicate reads" : "Showing every read")
+
                 Button { showWatchlist = true } label: {
                     Image(systemName: "list.star").foregroundColor(CrumbColors.tealAccent)
                 }
@@ -348,18 +400,22 @@ struct PlatesView: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(vm.plates) { read in
-                        PlateRow(
-                            read: read,
-                            cameraName: vm.cameraName(read.cameraId),
-                            canWatch: vm.isAdmin,
-                            watched: vm.isWatched(read.plate),
-                            onOpenPlayback: read.eventId != nil ? {
-                                if let d = parseISO8601(read.ts) { onOpenPlayback(read.cameraId, d) }
-                            } : nil,
-                            onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
-                        )
-                        Divider().overlay(CrumbColors.surface)
+                    ForEach(vm.groups) { group in
+                        if let read = vm.plateRead(byId: group.representative.id) {
+                            PlateRow(
+                                read: read,
+                                count: group.count,
+                                cameraName: vm.cameraName(read.cameraId),
+                                canWatch: vm.isAdmin,
+                                watched: vm.isWatched(read.plate),
+                                fetchThumb: thumbFetcher(for: read),
+                                onOpenPlayback: read.eventId != nil ? {
+                                    if let d = parseISO8601(read.ts) { onOpenPlayback(read.cameraId, d) }
+                                } : nil,
+                                onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
+                            )
+                            Divider().overlay(CrumbColors.surface)
+                        }
                     }
                 }
             }
@@ -368,6 +424,14 @@ struct PlatesView: View {
 
     private func centered<V: View>(@ViewBuilder _ v: () -> V) -> some View {
         VStack { Spacer(); v(); Spacer() }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Async thumbnail loader for a row, or nil when the read has no event
+    /// (⇒ no snapshot to fetch, the row keeps its placeholder).
+    private func thumbFetcher(for read: PlateRead) -> (() async -> PlatformImage?)? {
+        guard let eventId = read.eventId else { return nil }
+        let vm = vm
+        return { await vm.thumb(for: eventId, bbox: read.bbox) }
     }
 
     private func addToWatchlist(_ plate: String) {
@@ -390,18 +454,34 @@ struct PlatesView: View {
 
 private struct PlateRow: View {
     let read: PlateRead
+    /// Collapsed-group size; > 1 renders the "×N" badge.
+    let count: Int
     let cameraName: String
     let canWatch: Bool
     let watched: Bool
+    /// Loads the plate-crop thumbnail (nil when the read has no event).
+    let fetchThumb: (() async -> PlatformImage?)?
     let onOpenPlayback: (() -> Void)?
     let onAddToWatchlist: (() -> Void)?
 
+    @State private var thumb: PlatformImage?
+
     var body: some View {
         HStack(spacing: 12) {
+            thumbnail
             VStack(alignment: .leading, spacing: 3) {
-                Text(read.plate.isEmpty ? "—" : read.plate)
-                    .font(.system(size: 17, weight: .bold, design: .monospaced))
-                    .foregroundColor(CrumbColors.textPrimary)
+                HStack(spacing: 6) {
+                    Text(read.plate.isEmpty ? "—" : read.plate)
+                        .font(.system(size: 17, weight: .bold, design: .monospaced))
+                        .foregroundColor(CrumbColors.textPrimary)
+                    if count > 1 {
+                        Text("×\(count)")
+                            .font(.caption2.weight(.bold).monospacedDigit())
+                            .foregroundColor(CrumbColors.tealAccent)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(CrumbColors.tealAccent.opacity(0.18), in: Capsule())
+                    }
+                }
                 HStack(spacing: 5) {
                     Image(systemName: "video").font(.system(size: 11)).foregroundColor(CrumbColors.textTertiary)
                     Text(cameraName).font(.caption).foregroundColor(CrumbColors.textSecondary)
@@ -430,6 +510,33 @@ private struct PlateRow: View {
         .padding(.horizontal, 16).padding(.vertical, 10)
         .contentShape(Rectangle())
         .onTapGesture { onOpenPlayback?() }
+        .task(id: read.id) {
+            // Off the row's critical path; the VM caches by event id so
+            // re-scrolls resolve instantly without a refetch.
+            guard thumb == nil, let fetchThumb else { return }
+            thumb = await fetchThumb()
+        }
+    }
+
+    /// Plate-crop thumbnail; a neutral car placeholder while loading or when
+    /// the read has no event/snapshot.
+    @ViewBuilder private var thumbnail: some View {
+        Group {
+            if let thumb {
+                Image(platformImage: thumb)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                ZStack {
+                    CrumbColors.surfaceVariant
+                    Image(systemName: "car.fill")
+                        .font(.system(size: 15))
+                        .foregroundColor(CrumbColors.textTertiary)
+                }
+            }
+        }
+        .frame(width: 56, height: 40)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     /// Local time, 12-hour with seconds — e.g. "Jul 13, 3:07:09 PM".
@@ -478,6 +585,8 @@ private struct WatchlistSheet: View {
     @State private var newNotify = true
     @State private var formError: String?
     @State private var busy = false
+    /// Entry being edited (admin taps a row); drives the edit sheet.
+    @State private var editing: WatchlistEntry?
 
     var body: some View {
         NavigationStack {
@@ -525,6 +634,8 @@ private struct WatchlistSheet: View {
                         WatchlistRow(entry: entry, canRemove: vm.isAdmin) {
                             Task { await remove(entry) }
                         }
+                        .contentShape(Rectangle())
+                        .onTapGesture { if vm.isAdmin { editing = entry } }
                     }
                 }
             }
@@ -537,11 +648,17 @@ private struct WatchlistSheet: View {
             }
         }
         .task { vm.loadWatchlist() }
+        .sheet(item: $editing) { entry in
+            WatchlistEditSheet(vm: vm, entry: entry)
+                .macModalSize(width: 420, height: 420)
+        }
     }
 
     private func add() async {
         busy = true
-        formError = await vm.addToWatchlist(plate: newPlate, label: newLabel, notify: newNotify)
+        formError = await vm.addToWatchlist(
+            plate: newPlate, label: newLabel, notify: newNotify, kind: "watch"
+        )
         busy = false
         if formError == nil { newPlate = ""; newLabel = ""; newNotify = true }
     }
@@ -572,6 +689,12 @@ private struct WatchlistRow: View {
                 }
             }
             Spacer()
+            if entry.kind == "ignore" {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 13))
+                    .foregroundColor(CrumbColors.textTertiary)
+                    .help("Ignored plate")
+            }
             Image(systemName: entry.notify ? "bell.fill" : "bell.slash")
                 .font(.system(size: 13))
                 .foregroundColor(entry.notify ? CrumbColors.tealAccent : CrumbColors.textTertiary)
@@ -592,5 +715,89 @@ private struct WatchlistRow: View {
         if s.hasPrefix("#") { s.removeFirst() }
         guard s.count == 6, let value = UInt(s, radix: 16) else { return nil }
         return Color(hex: value)
+    }
+}
+
+// MARK: - Watchlist edit sheet
+
+/// Edit an existing watchlist entry (admin only). The plate is the server's
+/// upsert key so it's shown read-only; saving re-POSTs through
+/// `addToWatchlist`, round-tripping the entry's `note`/`color` so an edit
+/// doesn't wipe fields this sheet doesn't expose.
+private struct WatchlistEditSheet: View {
+    @ObservedObject var vm: PlatesViewModel
+    let entry: WatchlistEntry
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var label: String
+    @State private var kind: String
+    @State private var notify: Bool
+    @State private var formError: String?
+    @State private var busy = false
+
+    init(vm: PlatesViewModel, entry: WatchlistEntry) {
+        self.vm = vm
+        self.entry = entry
+        _label = State(initialValue: entry.label ?? "")
+        _kind = State(initialValue: entry.kind == "ignore" ? "ignore" : "watch")
+        _notify = State(initialValue: entry.notify)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Plate") {
+                    Text(entry.plate)
+                        .font(.system(.body, design: .monospaced).weight(.semibold))
+                        .foregroundColor(CrumbColors.textSecondary)
+                }
+                Section("Details") {
+                    TextField("Label (optional)", text: $label)
+                    Picker("Kind", selection: $kind) {
+                        Text("Watch").tag("watch")
+                        Text("Ignore").tag("ignore")
+                    }
+                    .pickerStyle(.segmented)
+                    if kind == "watch" {
+                        Toggle("Notify when seen", isOn: $notify)
+                            .tint(CrumbColors.teal)
+                    }
+                    if let formError {
+                        Text(formError).font(.caption).foregroundColor(CrumbColors.error)
+                    }
+                }
+            }
+            .navigationTitle("Edit plate")
+            .navBarInline()
+            .toolbar {
+                ToolbarItem(placement: .barLeading) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundColor(CrumbColors.textSecondary)
+                }
+                ToolbarItem(placement: .barTrailing) {
+                    Button {
+                        Task { await save() }
+                    } label: {
+                        if busy { ProgressView().controlSize(.small) } else { Text("Save") }
+                    }
+                    .disabled(busy)
+                    .foregroundColor(CrumbColors.tealAccent)
+                }
+            }
+        }
+    }
+
+    private func save() async {
+        busy = true
+        let err = await vm.addToWatchlist(
+            plate: entry.plate, label: label, notify: notify,
+            note: entry.note, color: entry.color, kind: kind
+        )
+        busy = false
+        if let err {
+            formError = err
+        } else {
+            dismiss()
+        }
     }
 }
