@@ -61,6 +61,109 @@
         "https://github.com/androidx/media/issues/1008",
         "https://github.com/google/ExoPlayer/issues/11089"
       ]
+    },
+    {
+      "make": "Reolink",
+      "model": "CX410",
+      "category": "Fixed bullet (ColorX low-light)",
+      "match": {
+        "make": "reolink",
+        "make_aliases": [
+          "reolink"
+        ],
+        "models": [
+          "cx410"
+        ],
+        "model_globs": []
+      },
+      "firmware_observed": [
+        "v3.1.0.3429_2404181313"
+      ],
+      "streams": {
+        "main": {
+          "codec": "H265",
+          "notes": "Model default; the reporter ran the stock encoding and saw recording, live, and playback all work (exact codec not separately recorded)."
+        },
+        "sub": {
+          "codec": "H264"
+        }
+      },
+      "support": {
+        "recording": "yes",
+        "desktop_live": "yes",
+        "web_live": "yes",
+        "android_live": "yes",
+        "ios_live": "yes",
+        "playback": "yes",
+        "onvif": "partial"
+      },
+      "quirks": [
+        {
+          "summary": "Fixed camera (no PTZ); ONVIF add and identify work",
+          "affects": [],
+          "detail": "No PTZ hardware, so there is nothing to pan/tilt/zoom. ONVIF add and identify work; the only ONVIF caveat is that there is no PTZ to discover. Otherwise the reporter saw no issues across recording, desktop, web, Android, iOS/macOS live, and playback."
+        }
+      ],
+      "tested": {
+        "by": "badbread",
+        "date": "2026-07-15",
+        "method": "Home install, reported working across recording, live (desktop/web/Android/iOS-macOS), and playback (GitHub issue #181)."
+      },
+      "references": [
+        "https://github.com/badbread/crumbvms/issues/181"
+      ]
+    },
+    {
+      "make": "EmpireTech",
+      "model": "IPC-B54IR-ASE-2.8MM-S3",
+      "aka": [
+        "Dahua OEM (rebranded Dahua)"
+      ],
+      "category": "Fixed bullet (5MP IR)",
+      "match": {
+        "make": "empiretech",
+        "make_aliases": [
+          "dahua"
+        ],
+        "models": [
+          "ipcb54irase28mms3"
+        ],
+        "model_globs": [
+          "ipcb54ir*"
+        ]
+      },
+      "firmware_observed": [
+        "3.142.15OG003.0.R"
+      ],
+      "streams": {
+        "main": {
+          "codec": "H265",
+          "notes": "Keep the camera's encoding strategy on Normal, not the Smart/AI codec option, for clean interop. Recording, live, and playback all worked."
+        },
+        "sub": {
+          "codec": "H264"
+        }
+      },
+      "support": {
+        "recording": "yes",
+        "desktop_live": "yes",
+        "web_live": "yes",
+        "android_live": "yes",
+        "ios_live": "yes",
+        "playback": "yes",
+        "onvif": "yes"
+      },
+      "recommended_settings": [
+        "Set the encoding strategy to Normal, not the AI / Smart-codec option, to avoid interop quirks."
+      ],
+      "tested": {
+        "by": "badbread",
+        "date": "2026-07-15",
+        "method": "Home install, reported working across recording, live (desktop/web/Android/iOS-macOS), playback, and ONVIF (GitHub issue #182)."
+      },
+      "references": [
+        "https://github.com/badbread/crumbvms/issues/182"
+      ]
     }
   ]
 }
