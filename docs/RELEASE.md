@@ -63,12 +63,21 @@ between releases.
 ## Cutting a release
 
 1. Land changes on `main` (CI green: fmt, clippy, build, test, images build).
-2. Tag and push:
+2. Generate the change list for the release notes, one bullet per merged PR
+   since the last tag:
+   ```bash
+   scripts/release/pr-changelog.sh              # since the most recent tag
+   # or an explicit range: scripts/release/pr-changelog.sh v1.1.0 v1.2.0
+   ```
+   The repo squash-merges, so this is every merged PR (each subject ends in
+   `(#N)`); drop it into the GitHub Release notes / `CHANGELOG.md` alongside the
+   curated Added/Changed/Fixed prose.
+3. Tag and push:
    ```bash
    git tag -a v1.2.0 -m "Crumb v1.2.0"
    git push origin v1.2.0
    ```
-3. CI builds `recorder` and `api` and tags them `v1.2.0` (+ short SHA). If a
+4. CI builds `recorder` and `api` and tags them `v1.2.0` (+ short SHA). If a
    registry is configured (below), they're pushed; otherwise they're built and
    validated but not pushed.
 
