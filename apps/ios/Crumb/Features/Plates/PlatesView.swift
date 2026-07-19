@@ -242,6 +242,9 @@ struct PlatesView: View {
 
     @State private var showWatchlist = false
     @State private var toast: String?
+    /// The plate-hit clip to play (tapping a read with an event opens the
+    /// server-windowed clip, which lands on the car — see `openReadClip`).
+    @State private var playingClip: ClipDescriptor?
 
     init(container: AppContainer, cameras: [CameraDto], onOpenPlayback: @escaping (String, Date) -> Void) {
         _vm = StateObject(wrappedValue: PlatesViewModel(container: container, cameras: cameras))
@@ -262,6 +265,17 @@ struct PlatesView: View {
         .sheet(isPresented: $showWatchlist) {
             WatchlistSheet(vm: vm)
                 .macModalSize(width: 460, height: 560)
+        }
+        .fullScreenCoverCompat(item: $playingClip) { clip in
+            ClipPlayerView(
+                clip: clip,
+                mediaUrls: vm.container.mediaUrls(),
+                highlightSeconds: 0,
+                onViewInTimeline: { cameraId, date in
+                    playingClip = nil
+                    onOpenPlayback(cameraId, date)
+                }
+            )
         }
         .overlay(alignment: .bottom) {
             if let toast {
@@ -409,9 +423,7 @@ struct PlatesView: View {
                                 canWatch: vm.isAdmin,
                                 watched: vm.isWatched(read.plate),
                                 fetchThumb: thumbFetcher(for: read),
-                                onOpenPlayback: read.eventId != nil ? {
-                                    if let d = parseISO8601(read.ts) { onOpenPlayback(read.cameraId, d) }
-                                } : nil,
+                                onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
                                 onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
                             )
                             Divider().overlay(CrumbColors.surface)
@@ -439,6 +451,34 @@ struct PlatesView: View {
             let err = await vm.addToWatchlist(plate: plate, label: nil, notify: true)
             flash(err ?? "Added \(plate) to watchlist")
         }
+    }
+
+    /// Play the plate-hit clip for a read. The clip id `d:<eventId>` resolves to
+    /// `/clip/d:<eventId>/clip.mp4?q=preview`, which the server windows with the
+    /// backward-weighted `plate_window` (ts-8s … ts+4s) so playback lands ON the
+    /// car — unlike seeking the timeline at the raw read ts (which is after the
+    /// pass, when the car has already left frame).
+    private func openReadClip(_ read: PlateRead) {
+        guard let eventId = read.eventId else {
+            if let d = parseISO8601(read.ts) { onOpenPlayback(read.cameraId, d) }
+            return
+        }
+        let ts = parseISO8601(read.ts) ?? Date()
+        let iso = ISO8601DateFormatter()
+        playingClip = ClipDescriptor(
+            id: "d:\(eventId)",
+            cameraId: read.cameraId,
+            cameraName: vm.cameraName(read.cameraId),
+            kind: "detection",
+            label: read.plate.isEmpty ? "license_plate" : read.plate,
+            iconKey: "car",
+            score: read.confidence.map(Float.init),
+            startTs: iso.string(from: ts.addingTimeInterval(-8)),
+            endTs: iso.string(from: ts.addingTimeInterval(4)),
+            durationMs: 12000,
+            thumbnailUrl: "", clipUrl: "", downloadUrl: "",
+            source: "crumb", viewed: true, motionBbox: nil
+        )
     }
 
     private func flash(_ msg: String) {

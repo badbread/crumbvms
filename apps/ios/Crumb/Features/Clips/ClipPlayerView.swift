@@ -25,6 +25,8 @@ struct ClipPlayerView: View {
     /// so a failed mint doesn't flash "Video unavailable" during the brief resolve.
     @State private var videoURL: URL?
     @State private var resolving = true
+    @State private var scrubbing = false
+    @State private var scrubValue: Double = 0
 
     var body: some View {
         ZStack {
@@ -62,6 +64,61 @@ struct ClipPlayerView: View {
             }
         }
         .overlay(alignment: .bottom) {
+            VStack(spacing: 10) {
+                if videoURL != nil && player.duration > 0 { transportBar }
+                bottomBar
+            }
+            .padding(.bottom, 28)
+        }
+        .task(id: clip.id) {
+            resolving = true
+            videoURL = await mediaUrls.clipVideoUrl(clip.id, cameraId: clip.cameraId)
+            resolving = false
+            player.start(url: videoURL)
+        }
+        .onDisappear { player.stop() }
+        .macModalSize(width: 1024, height: 680)
+    }
+
+    /// Play/pause · restart · scrub · time, matching the desktop clip player.
+    private var transportBar: some View {
+        HStack(spacing: 14) {
+            Button { player.restart() } label: { Image(systemName: "gobackward") }
+                .buttonStyle(.plain)
+            Button { player.togglePlay() } label: {
+                Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").frame(width: 22)
+            }
+            .buttonStyle(.plain)
+            Text(Self.timeLabel(scrubbing ? scrubValue : player.position))
+                .font(.caption2.monospacedDigit())
+            Slider(
+                value: Binding(
+                    get: { scrubbing ? scrubValue : min(player.position, player.duration) },
+                    set: { scrubValue = $0 }
+                ),
+                in: 0...max(player.duration, 0.1),
+                onEditingChanged: { editing in
+                    if editing { scrubbing = true; scrubValue = player.position }
+                    else { player.seek(scrubValue); scrubbing = false }
+                }
+            )
+            .tint(CrumbColors.tealAccent)
+            Text(Self.timeLabel(player.duration)).font(.caption2.monospacedDigit())
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 16).padding(.vertical, 8)
+        .background(Capsule().fill(.black.opacity(0.6)))
+        .frame(maxWidth: 520)
+        .padding(.horizontal, 24)
+    }
+
+    private static func timeLabel(_ s: Double) -> String {
+        guard s.isFinite, s >= 0 else { return "0:00" }
+        let t = Int(s.rounded())
+        return String(format: "%d:%02d", t / 60, t % 60)
+    }
+
+    private var bottomBar: some View {
             HStack(spacing: 10) {
                 HStack(spacing: 6) {
                     Image(systemName: clip.kind == "motion" ? "waveform.path.ecg" : DetectionIcons.sfSymbol(for: clip.iconKey))
@@ -88,16 +145,6 @@ struct ClipPlayerView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.bottom, 28)
-        }
-        .task(id: clip.id) {
-            resolving = true
-            videoURL = await mediaUrls.clipVideoUrl(clip.id, cameraId: clip.cameraId)
-            resolving = false
-            player.start(url: videoURL)
-        }
-        .onDisappear { player.stop() }
-        .macModalSize(width: 1024, height: 680)
     }
 }
 
@@ -212,16 +259,24 @@ final class ClipPlayer: ObservableObject {
     /// surface sizes itself to this so the motion-bbox (normalized to the VIDEO
     /// frame) maps correctly — not to the letterboxed full screen.
     @Published private(set) var videoAspect: CGFloat?
+    /// Transport state for the on-screen controls.
+    @Published private(set) var isPlaying = false
+    @Published private(set) var position: Double = 0
+    @Published private(set) var duration: Double = 0
 
     private var loopObserver: NSObjectProtocol?
     private var timeObserver: Any?
+    /// True while the user has explicitly paused — suppresses the end-of-clip
+    /// auto-loop so a paused clip stays paused instead of restarting.
+    private var pausedByUser = false
 
     func start(url: URL?) {
         guard let url else { return }
+        pausedByUser = false
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
         loopObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            guard let self else { return }
+            guard let self, !self.pausedByUser else { return }
             self.displaying = false
             self.player.seek(to: .zero) { _ in self.player.play() }
         }
@@ -230,11 +285,37 @@ final class ClipPlayer: ObservableObject {
             if self.videoAspect == nil, let ps = self.player.currentItem?.presentationSize, ps.width > 0, ps.height > 0 {
                 self.videoAspect = ps.width / ps.height
             }
+            if self.duration == 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
+                self.duration = d
+            }
+            self.position = time.seconds
+            self.isPlaying = self.player.timeControlStatus == .playing
             if !self.displaying, self.player.timeControlStatus == .playing, time.seconds > 0.03 {
                 self.displaying = true
             }
         }
         player.play()
+    }
+
+    /// Toggle play/pause; a manual pause sticks (no auto-loop restart).
+    func togglePlay() {
+        if player.timeControlStatus == .playing {
+            player.pause(); pausedByUser = true; isPlaying = false
+        } else {
+            pausedByUser = false; player.play(); isPlaying = true
+        }
+    }
+
+    /// Seek to an absolute time (seconds).
+    func seek(_ seconds: Double) {
+        player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// Restart from the beginning and play.
+    func restart() {
+        pausedByUser = false
+        player.seek(to: .zero) { [weak self] _ in self?.player.play() }
     }
     func stop() {
         if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
