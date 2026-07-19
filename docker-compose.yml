@@ -95,6 +95,10 @@ services:
       HA_TOKEN: ${HA_TOKEN:-}
       HA_TOKEN_FILE: ${HA_TOKEN_FILE:-}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-}                   # sqlx pool size (empty = default 32)
+      # Retention low-disk safety floor: eviction keeps at least this much free
+      # on the physical disk. Empty = defaults (5% / 50 GiB). (#241)
+      MIN_FREE_FRACTION: ${MIN_FREE_FRACTION:-}
+      MIN_FREE_BYTES: ${MIN_FREE_BYTES:-}
     volumes:
       - ${MEDIA_HOST_PATH:-./_data}:/data              # one broad media root, RW (recorder owns all writes)
       - /proc:/host/proc:ro                            # NSpid translation for per-camera GPU% (optional)
@@ -191,6 +195,11 @@ services:
       THUMB_PREGEN_LOOKBACK_HOURS: ${THUMB_PREGEN_LOOKBACK_HOURS:-}
       THUMB_PREGEN_SCAN_SECS: ${THUMB_PREGEN_SCAN_SECS:-}
       THUMB_PREGEN_WIDTH: ${THUMB_PREGEN_WIDTH:-}
+      # Behind the bundled Caddy (or any reverse proxy), set TRUST_PROXY=1 so the
+      # rate limiter keys on the client IP from X-Forwarded-For instead of the
+      # proxy's own address (one bucket for ALL HTTPS users otherwise). Leave
+      # empty when clients hit :8080 directly. (#241, docs/TLS.md)
+      TRUST_PROXY: ${TRUST_PROXY:-}
     volumes:
       - ${MEDIA_HOST_PATH:-./_data}:/data:ro            # same media root as recorder, READ-ONLY (api never writes footage)
       - crumb_exports:/exports
@@ -235,7 +244,7 @@ services:
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     ports:
-      - "127.0.0.1:1883:1883"   # LAN-local only; not forwarded to WAN
+      - "127.0.0.1:1883:1883"   # host-local only (a Frigate on ANOTHER host can't reach it; widen the bind deliberately if needed, docs/COMPOSE.md)
     environment:
       - TZ=${TZ:-UTC}
 
