@@ -41,6 +41,9 @@ struct CenteredTimelineView: View {
     // Gesture bases captured at gesture start.
     @State private var dragBaseMs: Int64?
     @State private var pinchBaseSpan: Int64?
+    /// The scrub/hover probe (time + x) driving the detail chip; nil when idle.
+    @State private var probeMs: Int64?
+    @State private var probeX: CGFloat = 0
 
     private let minSpanMs: Int64 = 60_000
     private let maxSpanMs: Int64 = 6 * 3_600_000
@@ -114,6 +117,15 @@ struct CenteredTimelineView: View {
                         .tag(key)
                 }
             }
+            .overlay(alignment: .topLeading) {
+                if let ms = probeMs {
+                    detailChip(ms)
+                        .fixedSize()
+                        .position(x: min(max(probeX, 80), max(80, geo.size.width - 80)), y: 12)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
             // M5: parse spans/detections once per data change, not once per
             // draw. `.task(id:)` cancels+reruns only when the id changes. Keyed
             // on count + first/last raw timestamp (cheap — O(1), no full-array
@@ -161,7 +173,11 @@ struct CenteredTimelineView: View {
         let deltaMs = Int64(-dx / width * CGFloat(spanMs))
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let v = min(max(base + deltaMs, 0), now)
-        if commit { dragBaseMs = nil; onScrubEnd(v) } else { onScrub(v) }
+        if commit {
+            dragBaseMs = nil; probeMs = nil; onScrubEnd(v)
+        } else {
+            onScrub(v); probeMs = v; probeX = width / 2 // playhead stays centered
+        }
     }
 
     /// Scroll-wheel zoom: scroll up/away → zoom in (smaller span), clamped.
@@ -170,6 +186,49 @@ struct CenteredTimelineView: View {
         let factor = delta > 0 ? 0.9 : (1.0 / 0.9)
         let next = Int64((Double(spanMs) * factor).rounded())
         onSpanChange(min(max(next, minSpanMs), maxSpanMs))
+    }
+
+    // MARK: - scrub/hover detail chip
+
+    /// A floating readout at the scrub/hover time: the nearest detection (icon,
+    /// label, confidence) if any, plus the clock time.
+    @ViewBuilder private func detailChip(_ ms: Int64) -> some View {
+        let ev = nearestDetection(ms)
+        HStack(spacing: 6) {
+            if let ev {
+                Image(systemName: DetectionIcons.sfSymbol(for: ev.iconKey))
+                    .font(.system(size: 11)).foregroundColor(DetectionIcons.color(for: ev.iconKey))
+                Text(ev.label.isEmpty ? ev.iconKey : ev.label)
+                    .font(.caption2.weight(.semibold)).foregroundColor(.white).lineLimit(1)
+                if ev.score > 0 {
+                    Text("\(Int(ev.score * 100))%")
+                        .font(.caption2.monospacedDigit()).foregroundColor(CrumbColors.textSecondary)
+                }
+            }
+            Text(Self.clockLabel(ms))
+                .font(.caption2.monospacedDigit())
+                .foregroundColor(ev == nil ? .white : CrumbColors.textTertiary)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(.black.opacity(0.8), in: Capsule())
+    }
+
+    /// Nearest detection to `ms` within ~1/30 of the visible span, else nil.
+    private func nearestDetection(_ ms: Int64) -> DetectionEvent? {
+        let threshold = max(Int64(Double(spanMs) / 30), 1000)
+        var best: (Int64, DetectionEvent)?
+        for (ts, ev) in parsedDetections {
+            let d = abs(ts - ms)
+            guard d <= threshold else { continue }
+            if best == nil || d < abs(best!.0 - ms) { best = (ts, ev) }
+        }
+        return best?.1
+    }
+
+    private static func clockLabel(_ ms: Int64) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm:ss a"
+        return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 
     private func dragGesture(width: CGFloat) -> some Gesture {
@@ -188,9 +247,15 @@ struct CenteredTimelineView: View {
                 // Drag right → earlier in time (content follows the finger).
                 let deltaMs = Int64(-value.translation.width / width * CGFloat(spanMs))
                 let now = Int64(Date().timeIntervalSince1970 * 1000)
-                onScrub(min(max(base + deltaMs, 0), now))
+                let target = min(max(base + deltaMs, 0), now)
+                onScrub(target)
+                // The playhead stays centered while scrubbing → anchor the detail
+                // chip at center over the scrubbed time.
+                probeMs = target
+                probeX = width / 2
             }
             .onEnded { value in
+                probeMs = nil
                 // Don't commit a scrub the pinch cancelled (dragBaseMs cleared in
                 // pinchGesture) or that a pinch is still owning.
                 guard pinchBaseSpan == nil, let base = dragBaseMs, width > 0 else {
