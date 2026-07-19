@@ -151,6 +151,29 @@ if [ -n "${TOKEN}" ]; then
 
   CAMS="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "${API_URL}/config/cameras" 2>/dev/null || true)"
   [ "${CAMS}" = "200" ] && pass "/config/cameras = 200 (admin API responds)" || fail "/config/cameras = ${CAMS} (expected 200)"
+
+  # ── 4c1. first-run setup actually works (#251 regression) ──────────────────
+  # A fresh DB has no default recording policy unless boot seeds it; without
+  # the row, the wizard's storage step, PUT /config/policy/default, and camera
+  # creation ALL 500. Exercise the real first-run sequence, not just reads.
+  info "first-run setup path (default policy + camera add)"
+  DP="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "${API_URL}/config/policy/default" 2>/dev/null || true)"
+  [ "${DP}" = "200" ] && pass "GET /config/policy/default = 200 (default policy seeded)" || fail "GET /config/policy/default = ${DP} (expected 200 — default policy row missing?)"
+
+  DPUT="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+    -d '{"live_max_bytes":10000000000,"live_retention_hours":168}' \
+    "${API_URL}/config/policy/default" 2>/dev/null || true)"
+  [ "${DPUT}" = "200" ] && pass "PUT /config/policy/default = 200 (wizard storage step works)" || fail "PUT /config/policy/default = ${DPUT} (expected 200)"
+
+  # Camera add clones the default policy; the RTSP URL points at the smoke's
+  # go2rtc testsrc so the recorder can actually ingest it.
+  CADD="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+    -d '{"name":"Smoke Cam","source_url":"rtsp://localhost:8554/testsrc"}' \
+    "${API_URL}/config/cameras" 2>/dev/null || true)"
+  case "${CADD}" in
+    200|201) pass "POST /config/cameras = ${CADD} (camera add works on a fresh install)" ;;
+    *) fail "POST /config/cameras = ${CADD} (expected 200/201 — default-policy clone broken?)" ;;
+  esac
 fi
 
 # ── 4c2. built-in DB backup: boot catch-up dump landed ───────────────────────

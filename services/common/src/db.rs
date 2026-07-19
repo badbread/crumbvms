@@ -2599,6 +2599,61 @@ pub async fn config_version(pool: &Pool) -> Result<String> {
     Ok(row.get("version"))
 }
 
+/// Ensure the single default recording policy row exists (idempotent).
+///
+/// No migration seeds this row (#251): on a truly fresh database
+/// `recording_policies` is empty, and everything that assumes the default row
+/// (the wizard's storage step, `PUT /config/policy/default`, camera creation's
+/// policy clone) got a 500 from [`get_default_policy`]. Called at api boot
+/// (beside the other ensures) and by the recorder right after it seeds the
+/// storage rows, so whichever service boots first creates it.
+///
+/// Two idempotent statements:
+/// 1. Insert a `Default` (`is_default = true`) row only when no default row
+///    exists. Every other column takes its schema default (continuous mode,
+///    48 h live retention, audio on) — the same baseline a fresh wizard run
+///    starts from. `ON CONFLICT DO NOTHING` guards both the partial-unique
+///    `is_default` index and the unique `name` index, so a legacy DB with a
+///    non-default policy literally named `Default` degrades to a no-op rather
+///    than an error (the operator's row wins; the loud failure then stays
+///    [`get_default_policy`]'s, exactly as before).
+/// 2. Backfill `live_storage_id` from the configured live-storage path when it
+///    is NULL, so the row points at real storage as soon as the recorder has
+///    seeded the storages table (first-boot ordering is race-free: whichever
+///    service runs this last wires it).
+pub async fn ensure_default_policy(pool: &Pool, live_storage_path: &str) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            INSERT INTO recording_policies (is_default, name)
+            SELECT true, 'Default'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM recording_policies WHERE is_default
+            )
+            ON CONFLICT DO NOTHING
+            ",
+            &[],
+        )
+        .await
+        .context("ensure_default_policy: insert")?;
+    client
+        .execute(
+            r"
+            UPDATE recording_policies
+            SET live_storage_id = s.id
+            FROM storages s
+            WHERE recording_policies.is_default
+              AND recording_policies.live_storage_id IS NULL
+              AND s.path = $1
+            ",
+            &[&live_storage_path],
+        )
+        .await
+        .context("ensure_default_policy: backfill live_storage_id")?;
+    Ok(())
+}
+
 /// Return the single default recording policy row (`is_default = true`).
 ///
 /// There is exactly one such row (enforced by a partial unique index in the

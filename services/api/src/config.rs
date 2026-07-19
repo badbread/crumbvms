@@ -63,10 +63,8 @@ pub struct ApiConfig {
     ///
     /// No longer read by request handlers: a segment's file is now resolved SOLELY
     /// by its `storage_id` (→ `storages.path`), never by a stage→mount guess (A1).
-    /// Retained as the documented operational mount contract (the compose bind
-    /// still mounts this path read-only); kept in the struct so the env var stays
-    /// part of the config surface.
-    #[allow(dead_code)]
+    /// Read at boot by `ensure_default_policy` (#251) to wire the default
+    /// policy's `live_storage_id` to the storage row matching this path.
     pub live_storage_path: String,
 
     /// `ARCHIVE_STORAGE_PATH` -- in-container mount point for archive footage.
