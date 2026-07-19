@@ -79,7 +79,9 @@ jobs:
       - name: Package as a zip
         shell: pwsh
         run: |
-          $ref = "${{ github.ref_name }}"
+          # Sanitize: a branch ref like fix/foo has a '/' that Compress-Archive
+          # reads as a path separator. Tags (v0.1.0) are already clean.
+          $ref = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
           $out = "CrumbVMS-windows-$ref.zip"
           Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath $out -Force
           Write-Host "wrote $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
