@@ -8,6 +8,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -738,16 +739,24 @@ fun PlaybackScreen(
                 actions = {
                     // Quality selector (Auto / Full / Data saver) — always visible so
                     // the operator can pick a cellular-friendly stream before playing.
+                    // A TextButton (sizes to its content), NOT an IconButton: the
+                    // latter is a fixed ~48dp single-glyph box, so a 4-char label
+                    // like "AUTO" wrapped to two lines ("AUT"/"O"). maxLines/softWrap
+                    // are a belt-and-suspenders guard against wrap when the bar is
+                    // crowded. (#262)
                     HintTooltip(PlaybackQuality.label(quality)) {
-                        IconButton(
+                        TextButton(
                             onClick = {
                                 quality = PlaybackQuality.next(quality)
                                 store.playbackQuality = quality
                             },
+                            contentPadding = PaddingValues(horizontal = 12.dp),
                         ) {
                             Text(
                                 text = PlaybackQuality.short(quality),
                                 color = if (quality == PlaybackQuality.AUTO) Color.White else TealAccent,
+                                maxLines = 1,
+                                softWrap = false,
                             )
                         }
                     }
