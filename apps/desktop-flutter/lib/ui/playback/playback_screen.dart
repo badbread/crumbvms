@@ -286,9 +286,13 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       if (!mounted) return;
       _idleTicks++;
       // Live-edge top-up most ticks; a full re-fetch every ~5 min so coverage
-      // evicted by retention eventually drops off the line.
-      unawaited(_syncCoverage(force: _idleTicks % 60 == 0));
-      _scheduleMotionRefresh();
+      // evicted by retention eventually drops off the line. The motion refresh
+      // is forced on the same cadence: on the other ticks an unchanged window
+      // is a no-op (the controller skips it), which is what stops idle ticks
+      // from stacking concurrent server scans (#256).
+      final full = _idleTicks % 60 == 0;
+      unawaited(_syncCoverage(force: full));
+      _scheduleMotionRefresh(force: full);
     });
   }
 
@@ -315,8 +319,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   /// Keep the motion controller's window/selection in step with the scrubber,
-  /// then (debounced) refetch intensity + detections.
-  void _scheduleMotionRefresh() {
+  /// then (debounced) refetch intensity + detections. [force] bypasses the
+  /// controller's "same window already loaded" skip (used by the periodic
+  /// full re-fetch).
+  void _scheduleMotionRefresh({bool force = false}) {
     _motion.configure(
       windowStartMs: _timeline.windowStart.millisecondsSinceEpoch,
       windowEndMs: _timeline.windowEnd.millisecondsSinceEpoch,
@@ -326,7 +332,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _motionDebounce?.cancel();
     _motionDebounce = Timer(
       const Duration(milliseconds: 350),
-      () => _motion.refresh(),
+      () => _motion.refresh(force: force),
     );
   }
 

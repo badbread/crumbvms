@@ -14,12 +14,15 @@ your control. If you want to help the next person, add your camera and open a PR
 
 1. Edit `camera-compatibility.json` (add an entry to the `cameras` array, or
    improve an existing one).
-2. Regenerate the docs page:
+2. Optionally preview the rendered page locally:
    ```bash
-   node scripts/gen-camera-compat.mjs
+   node scripts/gen-camera-compat.mjs   # writes docs-site/docs/cameras/compatibility.md
    ```
-3. Commit both the JSON and the regenerated
-   `docs-site/docs/cameras/compatibility.md`.
+   Running it also validates your entry (a malformed JSON entry fails here).
+3. Commit **only the JSON**. The generated
+   `docs-site/docs/cameras/compatibility.md` is gitignored and regenerated at
+   build time (the docs Dockerfile and `docs.yml` CI both run the generator), so
+   you do not commit it.
 4. Open a PR. Keep it factual and first-hand; note how you tested.
 
 The generator is zero-dependency (Node built-ins only), so step 2 needs nothing
