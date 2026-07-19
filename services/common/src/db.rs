@@ -6701,6 +6701,81 @@ pub async fn motion_intensity_buckets(
     Ok(buckets)
 }
 
+/// Batched [`motion_intensity_buckets`] for many cameras in ONE query (#256).
+///
+/// The playback timeline needs the intensity histogram for every camera on the
+/// wall at once. Doing that as one request/pool-checkout per camera multiplies
+/// load; this fetches all of them with a single `camera_id = ANY(...)` scan and
+/// buckets each camera's segments in Rust with the identical math as the
+/// single-camera function (asserted equal by a test).
+///
+/// Returns a bucket array (length `n`, clamped 1..=4096) for EVERY requested
+/// camera — an all-zero array for a camera with no segments in the window, so
+/// callers can rely on a complete map.
+pub async fn motion_intensity_buckets_multi(
+    pool: &Pool,
+    camera_ids: &[Uuid],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    n: usize,
+) -> Result<std::collections::HashMap<Uuid, Vec<f32>>> {
+    let n = n.clamp(1, 4096);
+    // Every requested camera gets an entry up front (all-zeros), so a camera
+    // with no footage still returns a bucket array — same as the per-camera
+    // endpoint, which returns zeros rather than omitting the camera.
+    let mut out: std::collections::HashMap<Uuid, Vec<f32>> = camera_ids
+        .iter()
+        .map(|id| (*id, vec![0.0_f32; n]))
+        .collect();
+    if end <= start || camera_ids.is_empty() {
+        return Ok(out);
+    }
+    let span_ms = (end - start).num_milliseconds().max(1) as f64;
+    // Same sargable lower bound as the single-camera query (audit P2 #11) —
+    // O(window) not O(retention). See `motion_intensity_buckets`.
+    let lower_bound = start - MAX_SEGMENT_LEN;
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT camera_id, start_ts, end_ts, COALESCE(motion_score, 0.0) AS motion_score
+            FROM segments
+            WHERE camera_id = ANY($1)
+              AND start_ts >= $4
+              AND start_ts < $3
+              AND end_ts   > $2
+            ",
+            &[&camera_ids, &start, &end, &lower_bound],
+        )
+        .await
+        .context("motion_intensity_buckets_multi")?;
+
+    for row in &rows {
+        let cam: Uuid = row.get("camera_id");
+        let Some(buckets) = out.get_mut(&cam) else {
+            continue;
+        };
+        let s: DateTime<Utc> = row.get("start_ts");
+        let e: DateTime<Utc> = row.get("end_ts");
+        let score: f32 = row.get("motion_score");
+        // Identical bucketing to `motion_intensity_buckets`: map the segment's
+        // overlap with [start,end) onto bucket indices and keep the MAX score.
+        let s_off = ((s - start).num_milliseconds() as f64).max(0.0);
+        let e_off = ((e - start).num_milliseconds() as f64).min(span_ms);
+        if e_off <= s_off {
+            continue;
+        }
+        let b0 = ((s_off / span_ms) * n as f64).floor() as usize;
+        let b1 = (((e_off / span_ms) * n as f64).ceil() as usize).min(n);
+        for bucket in &mut buckets[b0..b1] {
+            if score > *bucket {
+                *bucket = score;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Ensure the `motion_grid` table exists (idempotent — the recorder calls this
 /// at startup so the tuner works without a manual migration).
 pub async fn ensure_motion_grid_table(pool: &Pool) -> Result<()> {
@@ -13254,6 +13329,65 @@ mod tests {
             (buckets[50] - 0.5).abs() < 1e-6,
             "mid-window segment must land in bucket 50 (got {})",
             buckets[50]
+        );
+    }
+
+    /// The batched `motion_intensity_buckets_multi` must return, for every
+    /// camera, EXACTLY what the per-camera `motion_intensity_buckets` returns —
+    /// that equality is what lets the client replace the N-request fan-out with
+    /// one request without changing the rendered bars (#256).
+    #[tokio::test]
+    async fn motion_intensity_multi_matches_per_camera() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let cam_a = seed_camera_for_test(&pool, policy_id).await;
+        let cam_b = seed_camera_for_test(&pool, policy_id).await;
+        let cam_empty = seed_camera_for_test(&pool, policy_id).await; // no segments
+        let storage_name = format!("test-storage-{}", Uuid::new_v4().simple());
+        let storage_id = create_storage(&pool, &storage_name, "/does/not/matter", None, None)
+            .await
+            .expect("create_storage")
+            .id;
+
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let sec = |n: i64| base + chrono::Duration::seconds(n);
+        let (start, end) = (sec(0), sec(120));
+
+        // cam A: one segment overlapping the window start from before, one mid.
+        insert_scored_segment(&pool, cam_a, storage_id, sec(-5), sec(5), 0.8).await;
+        insert_scored_segment(&pool, cam_a, storage_id, sec(60), sec(66), 0.5).await;
+        // cam B: one segment.
+        insert_scored_segment(&pool, cam_b, storage_id, sec(30), sec(36), 0.3).await;
+
+        let n = 120;
+        let batch =
+            motion_intensity_buckets_multi(&pool, &[cam_a, cam_b, cam_empty], start, end, n)
+                .await
+                .expect("motion_intensity_buckets_multi");
+
+        for cam in [cam_a, cam_b, cam_empty] {
+            let single = motion_intensity_buckets(&pool, cam, start, end, n)
+                .await
+                .expect("motion_intensity_buckets");
+            assert_eq!(
+                batch.get(&cam).cloned().unwrap_or_default(),
+                single,
+                "batched buckets must equal the per-camera buckets for {cam}"
+            );
+        }
+        // A camera with no footage still gets a full-length zero array (so the
+        // client can rely on a complete map).
+        assert_eq!(
+            batch.get(&cam_empty).map(Vec::len),
+            Some(n),
+            "no-footage camera must still return an n-length array"
         );
     }
 }

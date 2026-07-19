@@ -70,6 +70,10 @@ const MAX_SPAN_LIMIT: usize = 10_000;
 /// windowing or future SQL-side bucketing.
 const SCAN_WARN_SEGMENTS: usize = 100_000;
 
+/// Max cameras accepted by `GET /timeline/intensity/batch`. A wall is a handful
+/// of cameras; this just bounds a pathological request.
+const MAX_INTENSITY_BATCH: usize = 64;
+
 /// Mount timeline routes.
 ///
 /// Caller (`main.rs`) merges this at the router root.
@@ -77,6 +81,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/timeline", get(get_timeline))
         .route("/timeline/intensity", get(get_intensity))
+        .route("/timeline/intensity/batch", get(get_intensity_batch))
         .route("/timeline/motion", get(get_motion_edge))
 }
 
@@ -163,6 +168,75 @@ async fn get_intensity(
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(IntensityResponse { buckets }))
+}
+
+/// Query for `GET /timeline/intensity/batch` — the multi-camera form.
+#[derive(Debug, Deserialize)]
+struct IntensityBatchQuery {
+    /// Comma-separated camera UUIDs.
+    camera_ids: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    /// Number of time buckets across the window (default 240, clamped 1..4096).
+    buckets: Option<usize>,
+}
+
+/// Response for `GET /timeline/intensity/batch` — a bucket array per requested
+/// camera (keyed by UUID string). Every requested camera is present; a camera
+/// with no footage (or outside the caller's scope) gets an all-zero array, so
+/// the client gets a complete map in one request instead of N.
+#[derive(Debug, Serialize)]
+struct IntensityBatchResponse {
+    cameras: std::collections::HashMap<String, Vec<f32>>,
+}
+
+/// `GET /timeline/intensity/batch?camera_ids=<csv>&start=<iso>&end=<iso>&buckets=<n>`
+///
+/// The batched form of [`get_intensity`]: one request + one DB scan for the
+/// whole wall instead of one per camera (#256). Scope is enforced like the
+/// per-camera endpoint — a camera the caller can't access gets all-zeros rather
+/// than a 403.
+async fn get_intensity_batch(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<IntensityBatchQuery>,
+) -> Result<Json<IntensityBatchResponse>, ApiError> {
+    user.require_playback()?;
+    if q.start >= q.end {
+        return Err(ApiError::BadRequest(
+            "start must be strictly before end".to_owned(),
+        ));
+    }
+    let requested = parse_uuid_csv(&q.camera_ids)?;
+    if requested.is_empty() {
+        return Err(ApiError::BadRequest(
+            "camera_ids must contain at least one UUID".to_owned(),
+        ));
+    }
+    // Bound the fan-in — a wall is a handful of cameras, not hundreds.
+    if requested.len() > MAX_INTENSITY_BATCH {
+        return Err(ApiError::BadRequest(format!(
+            "camera_ids: at most {MAX_INTENSITY_BATCH} cameras per request"
+        )));
+    }
+    let n = q.buckets.unwrap_or(240).clamp(1, 4096);
+
+    // Fetch only the accessible cameras; inaccessible ones fall through to the
+    // all-zeros default below (matching the per-camera endpoint's behaviour).
+    let accessible = user.filter_camera_ids(&requested);
+    let mut data = db::motion_intensity_buckets_multi(state.pool(), &accessible, q.start, q.end, n)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // Build the response over EVERY requested camera so the client always gets a
+    // complete map (accessible-with-data, accessible-empty, and inaccessible all
+    // resolve to an array; only inaccessible are silently zeroed).
+    let mut cameras = std::collections::HashMap::with_capacity(requested.len());
+    for id in &requested {
+        let buckets = data.remove(id).unwrap_or_else(|| vec![0.0; n]);
+        cameras.insert(id.to_string(), buckets);
+    }
+    Ok(Json(IntensityBatchResponse { cameras }))
 }
 
 // ─── handler ──────────────────────────────────────────────────────────────────

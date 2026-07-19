@@ -175,27 +175,20 @@ class MotionTimelineController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final results = await Future.wait(
-        camIds.map((id) async {
-          try {
-            final r = await api.fetchIntensity(
-              session,
-              id,
-              DateTime.fromMillisecondsSinceEpoch(fetchStart, isUtc: true),
-              DateTime.fromMillisecondsSinceEpoch(fetchEnd, isUtc: true),
-              buckets: bucketCount,
-            );
-            return MapEntry(id, r);
-          } catch (_) {
-            return null; // per-camera failure shouldn't sink the whole fetch
-          }
-        }),
+      // One batched request for the whole wall (#256) instead of a per-camera
+      // fan-out: one HTTP round-trip, one server DB scan, one rate-limit token.
+      // The server returns a complete map (all-zero buckets for a camera with no
+      // footage or outside scope), so every requested camera is covered.
+      final intensity = await api.fetchIntensityBatch(
+        session,
+        camIds,
+        DateTime.fromMillisecondsSinceEpoch(fetchStart, isUtc: true),
+        DateTime.fromMillisecondsSinceEpoch(fetchEnd, isUtc: true),
+        buckets: bucketCount,
       );
       if (mySeq != _seq) return; // superseded by a newer refresh
 
-      for (final e in results) {
-        if (e != null) intensityByCam[e.key] = e.value;
-      }
+      intensityByCam.addAll(intensity);
 
       final events = await api.fetchEvents(
         session,
