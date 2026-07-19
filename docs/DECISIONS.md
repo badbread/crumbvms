@@ -45,11 +45,20 @@ per-service).
 
 ## 2026-07-18, Desktop release ships the Flutter client, not the retired Tauri app
 
-**Status.** Decided during the v0.1.0 readiness audit; NOT yet implemented. The
-tag-triggered `windows-release.yml` workflow and the ci.yml `desktop-lint` /
-`desktop-linux` jobs still build `apps/desktop/src-tauri`, and must be repointed
-to `apps/desktop-flutter` before v0.1.0 is tagged. (`macos-release.yml` builds
-the native SwiftUI app via XcodeGen and is unaffected by this repoint.)
+**Status.** Implemented. `windows-release-flutter.yml` builds
+`apps/desktop-flutter` and, on a `v*` tag, attaches the zip to the GitHub
+Release; the old Tauri `windows-release.yml` is deleted and the ci.yml
+`desktop-lint` / `desktop-linux` Tauri jobs are removed. Validated green on
+`windows-latest` via `workflow_dispatch` before the tag trigger was wired.
+(`macos-release.yml` builds the native SwiftUI app via XcodeGen and was
+unaffected.) Two runner-specific fixes were needed and are in the workflow:
+(1) GitHub's `windows-latest` moved to VS 2026 / MSVC 14.51, whose STL makes
+`<experimental/coroutine>` a hard error (STL1011) that the `webview_windows`
+plugin tripped; fixed by defining
+`_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS` via the `CL` env var.
+The local winbuild box has an older MSVC and never hit it, the CI runner did.
+(2) `github.ref_name` is sanitized before use as the zip filename so a `/` in a
+branch ref can't break packaging on dispatch runs.
 
 **Context.** The desktop client was rewritten in Flutter (libmpv over
 `flutter_rust_bridge`; see the 2026-07-10 entry). Every desktop feature since,
@@ -58,19 +67,26 @@ the PTZ panel, and the A/B benchmark, lives only in `apps/desktop-flutter`. The
 release path still builds the old Tauri crate, so tagging v0.1.0 today would
 publish a Windows installer with none of the release's headline features.
 
-**Chosen.** Repoint `windows-release.yml` and the CI desktop jobs to build
-`apps/desktop-flutter` (the SwiftUI macOS app has its own workflow and is
-separate; Linux as per-platform packaging lands), and drop the Tauri crate from
-the release path.
+**Chosen.** Repoint the Windows release and drop the Tauri crate from the
+release path and CI. For the 0.1.0 alpha the Windows artifact is a **zip**
+("unzip and run `crumb_desktop.exe`"), matching how the macOS release already
+ships a zip; the docs-site Windows client pages were updated to that flow in
+the same change.
 **Rejected.** Ship the Tauri installer for v0.1.0 (advertises features the
 shipped app does not have). Hold the desktop client out of v0.1.0 entirely (web
-console + Android only, a worse story than shipping the real client).
-**Trade-offs accepted.** Flutter Windows packaging and code signing must be
-wired up. macOS packaging/notarization needs a Mac and the paid Apple Developer
-account (the same blocker as the iOS app), so the macOS desktop release may lag
-Windows. The Flutter Linux runner is unproven.
-**Revisit.** If Flutter desktop packaging proves impractical on a platform, or
-if the Tauri app is ever revived.
+console + Android only, a worse story than shipping the real client). Block
+0.1.0 on a proper NSIS/MSIX installer (needless delay when a zip is honest for
+an alpha).
+**Trade-offs accepted.** The Windows artifact is an unsigned zip, not an
+installer: SmartScreen shows "unknown publisher" and updating means unzipping
+over the top. An installer (Inno Setup or MSIX) and code signing are deferred
+post-0.1.0 polish, tracked in the workflow's trailing comment. macOS
+packaging/notarization needs a Mac and the paid Apple Developer account (the
+same blocker as the iOS app), so the macOS desktop release may lag Windows. The
+Flutter Linux desktop path is unproven and is not part of the release yet.
+**Revisit.** If Flutter desktop packaging proves impractical on a platform, if
+the zip UX proves too rough and an installer is needed sooner, or if the Tauri
+app is ever revived.
 
 ## 2026-07-18, First-run admin: seed by default with a memorable passphrase, keep the bootstrap window closed
 

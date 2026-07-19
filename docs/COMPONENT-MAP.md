@@ -66,7 +66,8 @@ All paths below are repo-relative and verified to exist as of 2026-07-06.
 
 | Surface | Path(s) | Notes |
 |---|---|---|
-| CI gate | `.github/workflows/ci.yml` (jobs: `rust` fmt/clippy/test, `desktop-lint`, `desktop-linux`, `images` recorder+api) | Golden rule 3: fmt, clippy `-D warnings`, workspace tests green before push/PR |
+| CI gate | `.github/workflows/ci.yml` (jobs: `rust` fmt/clippy/test, `android` debug build, `images` recorder+api) | Golden rule 3: fmt, clippy `-D warnings`, workspace tests green before push/PR. The Flutter desktop is not lint/built per-PR (the retired Tauri `desktop-lint`/`desktop-linux` jobs were removed with the Tauri release); it is compiled by the Windows release workflow, and a per-PR `flutter analyze` job is a tracked follow-up |
+| Windows desktop release | `.github/workflows/windows-release-flutter.yml` | `v*` tag builds `apps/desktop-flutter` on `windows-latest` and attaches `CrumbVMS-windows-<tag>.zip` to the Release; `workflow_dispatch` builds an artifact only. Replaced the retired Tauri `windows-release.yml`. See `docs/DECISIONS.md` 2026-07-18 |
 | Fresh-install smoke | `.github/workflows/smoke.yml` + `docker-compose.smoke.yml` | Boots the stack from scratch; install-surface changes must keep it green |
 | Android release | `.github/workflows/android-release.yml` | `v*` tag, signed APK + sha256 on the GitHub Release. Keystore is a CI secret. Also `workflow_dispatch` (input: `release_tag`) to re-ship an Android-only fix onto an existing release without a new tag — bump `apps/android/version.properties` `VERSION_CODE` first |
 | CLA bot | `.github/workflows/cla.yml`, `CLA.md`, `CCLA.md`, `DCO` | |

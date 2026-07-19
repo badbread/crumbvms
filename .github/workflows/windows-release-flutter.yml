@@ -1,13 +1,13 @@
-# Crumb — Windows desktop (Flutter / media_kit) — DRAFT, validate before wiring to tags
+# Crumb — Windows desktop (Flutter / media_kit)
 #
-# Repoints the Windows desktop release from the retired Tauri app (apps/desktop)
-# to the current Flutter client (apps/desktop-flutter). See docs/DECISIONS.md,
-# "2026-07-18, Desktop release ships the Flutter client, not the retired Tauri app".
+# The Windows desktop release. Builds the current Flutter client
+# (apps/desktop-flutter); the retired Tauri app (apps/desktop) and its old
+# windows-release.yml are gone. See docs/DECISIONS.md, "2026-07-18, Desktop
+# release ships the Flutter client, not the retired Tauri app".
 #
-# STATUS: workflow_dispatch ONLY. The existing windows-release.yml still owns the
-# `v*` tag trigger (Tauri) so nothing breaks. Before tagging v0.1.0: run this via
-# "Run workflow", confirm it produces a working bundle on the runner, then move
-# the `tags: ["v*"]` trigger here and retire windows-release.yml.
+# Triggers: a `v*` tag builds and attaches the zip to that GitHub Release;
+# workflow_dispatch builds and leaves the zip as an artifact (iteration).
+# Validated green on windows-latest via workflow_dispatch before wiring the tag.
 #
 # The Flutter build compiles the Rust core through flutter_rust_bridge/cargokit,
 # so the runner needs Rust + LLVM (libclang, for bindgen) alongside Flutter.
@@ -22,9 +22,11 @@ name: windows-release-flutter
 
 on:
   workflow_dispatch: {}
+  push:
+    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: write   # attach the zip to the GitHub Release on tag builds
 
 jobs:
   build:
@@ -56,6 +58,15 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows (release)
+        # GitHub's windows-latest runner ships VS 2026 / MSVC 14.51, whose STL
+        # turns the deprecated <experimental/coroutine> header into a hard error
+        # (STL1011). The webview_windows plugin still uses experimental coroutines,
+        # so define the macro Microsoft's own error points at, via the CL env var
+        # (MSVC prepends CL to every cl.exe invocation) so it reaches the plugin's
+        # vcxproj without patching plugin source. Drop this once webview_windows
+        # migrates to the C++20 <coroutine> header.
+        env:
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: flutter build windows --release
 
       - name: Verify the bundle (exe + bundled libmpv + assets)
@@ -70,7 +81,9 @@ jobs:
       - name: Package as a zip
         shell: pwsh
         run: |
-          $ref = "${{ github.ref_name }}"
+          # Sanitize: a branch ref like fix/foo has a '/' that Compress-Archive
+          # reads as a path separator. Tags (v0.1.0) are already clean.
+          $ref = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
           $out = "CrumbVMS-windows-$ref.zip"
           Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath $out -Force
           Write-Host "wrote $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
@@ -81,10 +94,19 @@ jobs:
           name: crumbvms-windows-flutter
           path: apps/desktop-flutter/CrumbVMS-windows-*.zip
 
-      # TODO before cutover (tracked in DECISIONS.md):
+      - name: Attach zip to the GitHub Release (tag builds only)
+        # Only fires on a v* tag push; workflow_dispatch runs skip this and just
+        # leave the artifact above for iteration. Glob is repo-root-relative
+        # (defaults.run working-directory does not apply to action inputs).
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apps/desktop-flutter/CrumbVMS-windows-*.zip
+          fail_on_unmatched_files: true
+
+      # Remaining polish (post-0.1.0, tracked in DECISIONS.md):
       #  - ship an installer instead of a raw zip (Inno Setup or MSIX) to match
-      #    the Tauri NSIS UX, or document "unzip and run crumb_desktop.exe".
+      #    the old Tauri NSIS UX. For the 0.1.0 alpha the docs say "unzip and run
+      #    crumb_desktop.exe", which is honest.
       #  - code signing (Windows SmartScreen shows "unknown publisher" otherwise).
-      #  - attach the artifact to the GitHub Release on a `v*` tag
-      #    (softprops/action-gh-release), and move the `tags: ["v*"]` trigger here
       #    from windows-release.yml, then retire that file.

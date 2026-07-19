@@ -69,12 +69,12 @@ guest networks, blocks device-to-device discovery traffic. Enter the
 server address manually instead, or join the same network segment as the
 server.
 
-**Windows: video panes black even though the app connects.** The bundled
-video library isn't sitting next to the installed executable; reinstall
-rather than moving files by hand. See [Windows desktop](/clients/windows-desktop).
+**Windows: video panes black even though the app connects.** `libmpv-2.dll`
+isn't sitting next to `crumb_desktop.exe`; re-unzip the release rather than
+moving files by hand. See [Windows desktop](/clients/windows-desktop).
 
 **Windows: "Windows protected your PC."** SmartScreen flagging the
-unsigned alpha installer; "More info" then "Run anyway."
+unsigned alpha build; "More info" then "Run anyway."
 
 **macOS: "CrumbVMS can't be opened."** Gatekeeper on the un-notarized alpha
 build; right-click the app, choose Open, then Open again, just the first

@@ -13,7 +13,7 @@ platforms:
 | Client | Platform | How you get it |
 |---|---|---|
 | Web admin | any browser | nothing to install, served by the server itself |
-| Desktop | Windows 10/11 | installer from Releases |
+| Desktop | Windows 10/11 | zip from Releases |
 | Desktop | Linux | build from source |
 | Apple desktop | macOS 13+ | zip from Releases |
 | Apple mobile | iOS 16+ | not yet distributable, see [iOS](/clients/ios) |
