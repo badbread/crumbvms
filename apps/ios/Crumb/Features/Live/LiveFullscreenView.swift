@@ -45,6 +45,10 @@ struct LiveFullscreenView: View {
     @StateObject private var ha: HAController
     @State private var haVideoSize: CGSize?
     @State private var showHASheet = false
+    /// Live digital-zoom scale (1 = not zoomed). HA badges are composited outside
+    /// the zoom transform, so they can't track a pinch+pan — hide them while
+    /// zoomed (matches the desktop client).
+    @State private var videoZoom: CGFloat = 1
     #if os(iOS)
     @State private var shareItem: ShareImageItem?
     #endif
@@ -88,12 +92,16 @@ struct LiveFullscreenView: View {
                     .ignoresSafeArea()
                 // Digital zoom (scroll/pinch) for fixed cameras; PTZ cameras zoom
                 // physically via their own drag controls, so don't fight them.
-                .zoomable(enabled: !isPtz)
+                .zoomable(enabled: !isPtz, onZoomChange: { videoZoom = $0 })
 
                 // Home Assistant entity badges over the video (empty areas pass
                 // taps through to the video/zoom below; badges tap → detail card).
-                HAOverlayLayer(controller: ha, videoSize: haVideoSize)
-                    .ignoresSafeArea()
+                // Hidden while digitally zoomed — the overlay lives outside the
+                // zoom transform and would otherwise sit on the wrong pixels.
+                if videoZoom <= 1.01 {
+                    HAOverlayLayer(controller: ha, videoSize: haVideoSize)
+                        .ignoresSafeArea()
+                }
 
                 if isPtz {
                     ptzLayer
@@ -129,6 +137,7 @@ struct LiveFullscreenView: View {
             audioOn = vm.container.settings.audioEnabled(for: camera.id)
             quality = PlaybackQuality(persisted: vm.container.store.playbackQuality)
             haVideoSize = nil
+            videoZoom = 1
             ha.activate(cameraId: camera.id)
             frameUrl = nil
             frameUrl = await vm.mediaUrls().cameraFrameUrl(camera.id)

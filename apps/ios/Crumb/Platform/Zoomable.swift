@@ -6,20 +6,25 @@ extension View {
     /// Makes a view zoomable/pannable. iOS: pinch to zoom, drag to pan, double-tap
     /// to reset. macOS: scroll-wheel to zoom, drag to pan, double-click to reset
     /// (a mouse can't pinch). Pan is clamped to the content edges.
-    func zoomable(minZoom: CGFloat = 1, maxZoom: CGFloat = 6) -> some View {
-        modifier(Zoomable(minZoom: minZoom, maxZoom: maxZoom))
+    func zoomable(minZoom: CGFloat = 1, maxZoom: CGFloat = 6,
+                  onZoomChange: ((CGFloat) -> Void)? = nil) -> some View {
+        modifier(Zoomable(minZoom: minZoom, maxZoom: maxZoom, onZoomChange: onZoomChange))
     }
 
     /// Conditional variant — used where zoom must yield to another gesture (e.g.
-    /// PTZ drag controls on PTZ cameras).
-    @ViewBuilder func zoomable(enabled: Bool, minZoom: CGFloat = 1, maxZoom: CGFloat = 6) -> some View {
-        if enabled { zoomable(minZoom: minZoom, maxZoom: maxZoom) } else { self }
+    /// PTZ drag controls on PTZ cameras). `onZoomChange` reports the live scale
+    /// (1 = not zoomed) so callers can, e.g., hide overlays that can't track a
+    /// digital zoom.
+    @ViewBuilder func zoomable(enabled: Bool, minZoom: CGFloat = 1, maxZoom: CGFloat = 6,
+                               onZoomChange: ((CGFloat) -> Void)? = nil) -> some View {
+        if enabled { zoomable(minZoom: minZoom, maxZoom: maxZoom, onZoomChange: onZoomChange) } else { self }
     }
 }
 
 private struct Zoomable: ViewModifier {
     let minZoom: CGFloat
     let maxZoom: CGFloat
+    var onZoomChange: ((CGFloat) -> Void)? = nil
 
     @State private var zoom: CGFloat = 1
     @State private var lastZoom: CGFloat = 1
@@ -33,6 +38,7 @@ private struct Zoomable: ViewModifier {
                 content
                     .scaleEffect(zoom)
                     .offset(offset)
+                    .onChange(of: zoom) { onZoomChange?($0) }
                 #if os(macOS)
                 ScrollPanCatcher(
                     onZoom: { delta in applyZoom(delta, size: geo.size) },
