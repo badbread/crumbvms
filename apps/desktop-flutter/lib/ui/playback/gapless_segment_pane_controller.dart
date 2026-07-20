@@ -957,7 +957,17 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     // touch a disposed Player from [_onPlaylistChanged].
     unawaited(_playlistSub?.cancel());
     _playlistSub = null;
-    _player.dispose();
+    // Detach the (potentially seconds-long) libmpv teardown from the calling
+    // isolate — media_kit/libmpv's Player.dispose() can block for seconds
+    // while the native mpv handle winds down, and PlaybackScreen.dispose()
+    // tears down every pane's controller in a tight synchronous loop. On a
+    // 9-16 camera playback wall that reproduces the same multi-second UI
+    // freeze the live wall already worked around (its
+    // `_disposePlayerDetached` helper, wall_screen.dart — issue #105).
+    // Nothing reads `_player` after this ChangeNotifier is disposed, so it's
+    // safe to let the native teardown finish on its own after this returns.
+    final player = _player;
+    unawaited(Future(() => player.dispose()));
     super.dispose();
   }
 }
