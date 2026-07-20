@@ -210,3 +210,17 @@ recorder, and later the API) must satisfy these *by construction*.
     re-check `pg_stat_progress_create_index` for that index — skip a real manual
     `CREATE INDEX CONCURRENTLY`, but RETRY transient/foreign contention rather than
     permanently skipping (which would silently leave a broken catalog entry).
+
+## quarantine (review-then-purge)
+29. **The quarantine prune ages by quarantine-ENTRY time, and only ever deletes
+    inside `_quarantine/`.** `quarantine_file` stamps mtime to NOW on arrival
+    (a same-fs rename would otherwise preserve the RECORDING-time mtime,
+    silently shrinking the review window to `retention − age-at-entry`,
+    clamped at zero — issue #277: a deleted camera's history was orphaned,
+    quarantined, and purged within one reconcile pass). The prune deletes only
+    regular files, inside the canonicalized `_quarantine/` subtree, strictly
+    older than `quarantine_retention_days` counted from entry; `0` disables it;
+    `walk_storage` never descends `_quarantine/`. **`-rN` collision-loser
+    files are exempt at any age** — they are real footage ratified "never
+    deleted" (2026-07-14 decision); quarantine is their terminal parking spot
+    and deleting them stays a manual operator action.

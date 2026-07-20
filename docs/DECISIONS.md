@@ -735,6 +735,15 @@ confirmed absent immediately beforehand, so it can never delete good footage.
 cameras (would justify the monotonic-counter filename scheme), or a decision to
 support sub-second segment resolution (would change the collision surface).
 
+**Addendum (2026-07-20, issue #277):** the "stays an on-disk orphan (never
+deleted)" promise was silently broken when the quarantine-retention prune
+(#203) landed: an unparseable `-rN` name is exactly the orphan pass's
+`NotIndexable` → quarantine path, and the prune then deleted the file after
+the retention window. Restored: `prune_quarantine` now exempts `-rN`
+disambiguated files at any age (`is_collision_disambiguated`), so quarantine
+is their terminal parking spot and deletion remains a manual operator action —
+the ratified outcome above holds again. See RECORDER-CORRECTNESS item 29.
+
 ---
 
 ## 2026-07-13, Fuzzy plate matching: length-scaled character tolerance (edit distance), superseding pg_trgm trigram similarity
