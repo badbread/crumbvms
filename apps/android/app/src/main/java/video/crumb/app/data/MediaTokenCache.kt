@@ -140,8 +140,11 @@ class MediaTokenCache(
         /** Refresh a cached token once it's within this long of expiring. */
         const val REFRESH_SKEW_MS = 10_000L
 
-        /** Fallback assumed lifetime if `expires_at` fails to parse — matches the
-         *  server's documented ~15 min scoped-token validity. */
+        /** Fallback assumed lifetime if `expires_at` fails to parse: a conservative
+         *  60 s, deliberately well under the server's actual ~15 min scoped-token
+         *  validity (`MEDIA_TOKEN_EXPIRY_SECONDS` in `services/api/src/auth.rs`) —
+         *  if we couldn't determine the real expiry, refresh sooner rather than
+         *  risk serving a URL built from an already-expired token. */
         const val DEFAULT_TTL_MS = 60_000L
     }
 }

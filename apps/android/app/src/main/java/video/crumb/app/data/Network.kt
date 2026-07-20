@@ -91,8 +91,9 @@ object Network {
             // connection before send is transparently retried on a fresh socket.
             .retryOnConnectionFailure(true)
         if (callTimeoutSeconds != null) builder.callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
-        // Log ONLY in debug builds: BASIC logs request URLs, and media URLs carry the
-        // JWT as ?token= — never write that to logcat in a release build.
+        // Log ONLY in debug builds: BASIC logs request URLs, and media URLs carry a
+        // short-lived scoped media token (see MediaTokenCache) as ?token= — never
+        // write that to logcat in a release build.
         if (BuildConfig.DEBUG) {
             builder.addInterceptor(
                 HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC },
