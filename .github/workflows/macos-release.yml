@@ -74,7 +74,15 @@ jobs:
           if-no-files-found: error
 
       - name: Attach app + sha256 to the Release (tag builds only)
+        # softprops/action-gh-release CREATES the Release if it doesn't exist
+        # yet — same action the Windows/Android workflows use. The previous
+        # `gh release upload` failed with "release not found" whenever this
+        # build finished before any sibling workflow had created the Release
+        # for the tag (bit v0.1.0; fixed by hand). Issue #253.
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" CrumbVMS-macos-*.zip CrumbVMS-macos-*.zip.sha256 --clobber --repo "${GITHUB_REPOSITORY}"
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apps/ios/CrumbVMS-macos-*.zip
+            apps/ios/CrumbVMS-macos-*.zip.sha256
+          fail_on_unmatched_files: true
