@@ -108,6 +108,12 @@ class DetectionEvent {
 // `http.Client()` construction, just not shared with it.
 final http.Client _client = TimeoutClient();
 
+/// Server bases whose API 404'd `/timeline/intensity/batch` — i.e. servers
+/// older than the batch endpoint (#270). Keyed by base (not a lone bool) so a
+/// same-process switch to a different, newer server isn't wrongly demoted to
+/// the per-camera fallback.
+final Set<String> _batchUnsupportedBases = <String>{};
+
 extension MotionTimelineApi on CrumbApi {
   /// GET /timeline/intensity?camera_id=<id>&start=<iso>&end=<iso>&buckets=<n>
   ///
@@ -162,6 +168,14 @@ extension MotionTimelineApi on CrumbApi {
   /// instead of one per camera (#256). Returns a map keyed by camera id; every
   /// requested camera is present (all-zero buckets for one with no footage or
   /// outside the caller's scope), so the caller can rely on a complete map.
+  ///
+  /// Version tolerance (#270): a server older than the batch endpoint 404s the
+  /// route. Client/server skew is normal for a self-hosted VMS, so on a 404
+  /// this falls back to the per-camera [fetchIntensity] fan-out every older
+  /// server supports — same complete-map result, just N requests — and
+  /// remembers batch-unsupported for that server so later refreshes skip the
+  /// doomed batch attempt. (A server upgraded mid-session picks the batch path
+  /// back up on next app start; skew in that direction is rare and harmless.)
   Future<Map<String, IntensityBuckets>> fetchIntensityBatch(
     Session s,
     List<String> cameraIds,
@@ -169,6 +183,43 @@ extension MotionTimelineApi on CrumbApi {
     DateTime end, {
     int buckets = 240,
   }) async {
+    if (_batchUnsupportedBases.contains(s.base)) {
+      return _fetchIntensityPerCamera(s, cameraIds, start, end, buckets);
+    }
+    try {
+      return await _fetchIntensityBatchRaw(s, cameraIds, start, end, buckets);
+    } on CrumbApiException catch (e) {
+      if (e.statusCode != 404) rethrow;
+      _batchUnsupportedBases.add(s.base);
+      return _fetchIntensityPerCamera(s, cameraIds, start, end, buckets);
+    }
+  }
+
+  /// The pre-batch per-camera fan-out (the #270 fallback path). Mirrors the
+  /// batch guarantee: one entry per requested camera ([fetchIntensity] returns
+  /// all-zero buckets rather than erroring for scope/no-footage cameras).
+  Future<Map<String, IntensityBuckets>> _fetchIntensityPerCamera(
+    Session s,
+    List<String> cameraIds,
+    DateTime start,
+    DateTime end,
+    int buckets,
+  ) async {
+    final results = await Future.wait(
+      cameraIds.map(
+        (id) => fetchIntensity(s, id, start, end, buckets: buckets),
+      ),
+    );
+    return {for (final r in results) r.cameraId: r};
+  }
+
+  Future<Map<String, IntensityBuckets>> _fetchIntensityBatchRaw(
+    Session s,
+    List<String> cameraIds,
+    DateTime start,
+    DateTime end,
+    int buckets,
+  ) async {
     final uri = Uri.parse('${s.base}/timeline/intensity/batch').replace(
       queryParameters: {
         'camera_ids': cameraIds.join(','),
