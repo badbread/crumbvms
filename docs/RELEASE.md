@@ -9,8 +9,12 @@ How Crumb goes from a git commit to a known, versioned, deployable, and
 
 > **Windows desktop:** the desktop release is built by
 > `.github/workflows/windows-release-flutter.yml` on the `v*` tag, which
-> attaches `CrumbVMS-windows-<tag>.zip` to the GitHub Release. The
-> `scripts/release/` desktop targets (the old Tauri builds) are retired.
+> attaches `CrumbVMS-windows-<tag>.zip` **and its `.sha256` companion** to the
+> GitHub Release (every published binary — Windows, macOS, Android — ships a
+> checksum). The `scripts/release/` desktop targets (the old Tauri builds) are
+> retired. All three release workflows attach via `softprops/action-gh-release`,
+> which creates the Release if it doesn't exist yet — no workflow depends on
+> another having run first (#253).
 
 ---
 

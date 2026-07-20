@@ -87,21 +87,31 @@ jobs:
           $out = "CrumbVMS-windows-$ref.zip"
           Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath $out -Force
           Write-Host "wrote $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
+          # SHA-256 companion, same `<hash>  <file>` format as the macOS and
+          # Android assets, so every published binary is verifiable with
+          # `sha256sum -c` / `Get-FileHash`. Issue #253.
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          "$hash  $out" | Out-File -Encoding ascii -NoNewline "$out.sha256"
+          Get-Content "$out.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: crumbvms-windows-flutter
-          path: apps/desktop-flutter/CrumbVMS-windows-*.zip
+          path: |
+            apps/desktop-flutter/CrumbVMS-windows-*.zip
+            apps/desktop-flutter/CrumbVMS-windows-*.zip.sha256
 
-      - name: Attach zip to the GitHub Release (tag builds only)
+      - name: Attach zip + sha256 to the GitHub Release (tag builds only)
         # Only fires on a v* tag push; workflow_dispatch runs skip this and just
         # leave the artifact above for iteration. Glob is repo-root-relative
         # (defaults.run working-directory does not apply to action inputs).
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: apps/desktop-flutter/CrumbVMS-windows-*.zip
+          files: |
+            apps/desktop-flutter/CrumbVMS-windows-*.zip
+            apps/desktop-flutter/CrumbVMS-windows-*.zip.sha256
           fail_on_unmatched_files: true
 
       # Remaining polish (post-0.1.0, tracked in DECISIONS.md):
