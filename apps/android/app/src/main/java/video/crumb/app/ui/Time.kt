@@ -3,6 +3,7 @@
 package video.crumb.app.ui
 
 import java.time.Instant
+import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -25,7 +26,20 @@ object Time {
     /** Parse an RFC-3339 string (handles fractional seconds + 'Z'). */
     fun parse(iso: String): Instant = Instant.parse(iso)
 
-    fun parseToMillis(iso: String): Long = Instant.parse(iso).toEpochMilli()
+    /**
+     * Parse an RFC-3339 string to epoch-millis, leniently: recorded-span and
+     * segment timestamps come straight from the server and are trusted
+     * unconditionally by many hot paths (playback resolve, the centered
+     * timeline), so a single malformed/oddly-formatted value (e.g. an explicit
+     * offset like `+00:00` instead of a `Z` suffix) must not crash composition
+     * or a ViewModel coroutine. Falls back to [OffsetDateTime.parse] for
+     * offset-style timestamps [Instant.parse] rejects, and to `0L` (epoch) if
+     * neither parses.
+     */
+    fun parseToMillis(iso: String): Long =
+        runCatching { Instant.parse(iso).toEpochMilli() }
+            .recoverCatching { OffsetDateTime.parse(iso).toInstant().toEpochMilli() }
+            .getOrDefault(0L)
 
     fun clock(instant: Instant): String = clockFmt.format(instant.atZone(zone))
     fun clock(iso: String): String = clock(parse(iso))
