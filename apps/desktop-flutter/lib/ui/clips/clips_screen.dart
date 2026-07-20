@@ -920,6 +920,15 @@ class _ClipPlayerState extends State<_ClipPlayer> {
           }
         }
       }
+      // The property loop above awaits; the overlay can be closed (this State
+      // disposed) during that gap. Bail BEFORE wiring listeners / calling
+      // setState on a dead State — and dispose the just-created, never-adopted
+      // player so its native mpv handle doesn't leak (#323). The later
+      // `if (!mounted) return` couldn't help — it sat after the setState.
+      if (!mounted) {
+        player.dispose();
+        return;
+      }
       _playingSub = player.stream.playing.listen((playing) {
         if (playing) _watchdog?.cancel();
       });

@@ -206,9 +206,26 @@ extension MotionTimelineApi on CrumbApi {
     int buckets,
   ) async {
     final results = await Future.wait(
-      cameraIds.map(
-        (id) => fetchIntensity(s, id, start, end, buckets: buckets),
-      ),
+      cameraIds.map((id) async {
+        try {
+          return await fetchIntensity(s, id, start, end, buckets: buckets);
+        } catch (_) {
+          // Per-camera failure tolerance (restored — the #271 fallback used a
+          // bare Future.wait, so one transient per-camera error sank the WHOLE
+          // refresh into the error state). Degrade that one camera to a zero
+          // bucket and keep the rest; self-heals on the next idle tick. Only the
+          // old-server (no batch endpoint) path reaches here.
+          final startMs = start.millisecondsSinceEpoch;
+          final endMs = end.millisecondsSinceEpoch;
+          return IntensityBuckets(
+            cameraId: id,
+            startMs: startMs,
+            endMs: endMs,
+            bucketMs: buckets > 0 ? ((endMs - startMs) / buckets).round() : 0,
+            buckets: List<double>.filled(buckets > 0 ? buckets : 0, 0.0),
+          );
+        }
+      }),
     );
     return {for (final r in results) r.cameraId: r};
   }
