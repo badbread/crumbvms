@@ -2123,16 +2123,37 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         setState(() {}); // affects PTZ affordances/menu gating
       case 'main':
         prefs?.setOverride(widget.camera.id, StreamQuality.main);
+        await _load();
       case 'sub':
         prefs?.setOverride(widget.camera.id, StreamQuality.sub);
+        await _load();
       case 'data-saver':
         prefs?.setOverride(widget.camera.id, StreamQuality.dataSaver);
+        await _load();
       case 'reset':
         prefs?.setOverride(widget.camera.id, null);
+        await _load();
     }
   }
 
   Future<void> _load() async {
+    // A reload (the right-click stream-override menu now calls _load() again
+    // after setOverride — issue #322) must retire any already-playing player
+    // + watchdog first: this method originally only ran once from initState,
+    // so a second call would otherwise leak the outgoing player and run two
+    // decoders/watchdogs at once. Resetting _firstFrame re-arms the width
+    // listener below and briefly shows the warm-start stand-in (if any) /
+    // loading spinner while the new tier buffers — expected for an explicit
+    // quality change. No-op on the very first call (_player is still null).
+    final previous = _player;
+    if (previous != null) {
+      _watchdog?.dispose();
+      _watchdog = null;
+      _player = null;
+      _controller = null;
+      if (mounted) setState(() => _firstFrame = false);
+      _disposePlayerDetached(previous);
+    }
     // Track a Player created below so the catch can dispose it if open() throws
     // before this pane adopts it — a failed initial load otherwise leaks the
     // player and its native mpv handle (#132). Cleared once ownership passes to
@@ -2144,8 +2165,17 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         widget.camera.id,
       );
       _streams = streams; // gate the right-click Data-saver item
-      // Prefer MAIN for the maximized view; fall back to sub.
-      final url = streams.rtspMain ?? streams.preferredForWall;
+      // Honor an explicit per-camera stream override from the right-click
+      // menu (Main/Sub/Data saver) — issue #322, this pane used to ignore
+      // `streamPrefs` entirely. `isMaximized: false` here means "don't force
+      // main the way a wall-tile zoom-to-main does" — an override is a
+      // deliberate, persistent choice for this camera, not a transient zoom.
+      // With no override, keep today's default: prefer MAIN for the
+      // maximized view, falling back to sub.
+      final prefs = widget.streamPrefs;
+      final url = (prefs != null && prefs.hasOverride(widget.camera.id))
+          ? prefs.liveStreamUrl(widget.camera.id, streams, isMaximized: false)
+          : (streams.rtspMain ?? streams.preferredForWall);
       if (url == null) {
         setState(() => _error = 'no stream');
         return;
