@@ -276,6 +276,20 @@ class _WallScreenState extends State<WallScreen> {
     if (idsChanged) {
       _liveStatus.cameraIds = _shown.map((c) => c.id).toList();
     }
+    // A config-driven refresh can remove OR disable the currently-maximized
+    // camera — disabling alone doesn't flip `idsChanged` above (the raw id
+    // list is unchanged; only that camera's `enabled` flag is), but it does
+    // drop the camera from `_shown`, which unmounts its wall tile. That tile
+    // detach-disposes its player while `_maximizeWarmCtrl` may still
+    // reference the now-invalid `VideoController` — and the maximized pane
+    // paints it as its warm-start stand-in whenever its own main-stream
+    // player hasn't decoded a first frame yet (issue #319: black pane, or a
+    // media_kit texture exception). Leave the maximized view — which also
+    // clears `_maximizeWarmCtrl` — before that stale controller can be painted.
+    final maxCam = _maximized;
+    if (maxCam != null && !_shown.any((c) => c.id == maxCam.id)) {
+      _restore();
+    }
   }
 
   /// The wall's config-change signal: re-fetch the camera list via the host.
