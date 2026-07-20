@@ -27,6 +27,7 @@ import 'package:crumb_desktop/ui/client_options/client_options_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_remap_screen.dart';
 import 'package:crumb_desktop/ui/hotkeys/keyboard_shortcuts_screen.dart';
 import 'package:crumb_desktop/ui/server/server_dashboard_screen.dart';
+import 'package:crumb_desktop/ui/settings/diagnostics_pane.dart';
 import 'package:crumb_desktop/ui/settings/ha_settings_screen.dart';
 import 'package:crumb_desktop/ui/updates/about_panel.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
@@ -43,6 +44,7 @@ enum SettingsSection {
   // entry entirely for non-admins (see `_leftNav`); `PUT/POST /config/ha*`
   // are admin-enforced server-side regardless.
   homeAssistant(Icons.home_outlined, 'Home Assistant', pane: true),
+  diagnostics(Icons.bug_report_outlined, 'Diagnostics', pane: true),
   about(Icons.info_outline, 'About', pane: true),
   serverConsole(Icons.admin_panel_settings_outlined, 'Server console',
       pane: false),
@@ -335,6 +337,8 @@ class _SettingsWindowState extends State<SettingsWindow> {
         // this value some other way.
         if (!widget.isAdmin) return const _Unavailable('Home Assistant');
         return HaSettingsScreen(api: widget.api, session: widget.session);
+      case SettingsSection.diagnostics:
+        return const DiagnosticsPane();
       case SettingsSection.about:
         return AboutPanel(controller: widget.updateCheck);
       case SettingsSection.serverConsole:
