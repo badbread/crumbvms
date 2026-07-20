@@ -202,13 +202,23 @@ class _WallScreenState extends State<WallScreen> {
   );
   String? _haEditCameraId;
 
-  /// Per-camera "has ≥1 placed HA badge" flag, reported by each tile/pane as
-  /// it (re)loads its own links (mirrors how each pane self-fetches
+  /// "Has ≥1 placed HA badge" flag, reported by each tile/pane as it
+  /// (re)loads its own links (mirrors how each pane self-fetches
   /// `cameraStreams` — desktop P0 plan §4.4). Drives `_liveStatus.wantHaStates`
   /// so `/ha/states` is polled only while at least one VISIBLE camera has a
   /// placement — the client half of the server's demand-driven-cache
   /// contract (services/api/src/ha.rs `HA_STATES_TTL`).
-  final Set<String> _camerasWithHaPlacements = {};
+  ///
+  /// Keyed by SURFACE (a wall tile's `_paneId`, or `max:<cameraId>` for the
+  /// maximized pane), not by camera id alone: a camera's wall tile stays
+  /// mounted (and still polling its own placement) underneath the maximized
+  /// overlay, so both surfaces can independently hold a report for the same
+  /// camera at once. Keying by camera id let whichever surface unmounted
+  /// LAST (e.g. the maximized pane on restore) blindly wipe the other's
+  /// still-current "yes, this camera has a badge" report — freezing
+  /// `/ha/states` polling for a camera whose tile badge was never gone
+  /// (issue #317).
+  final Map<String, bool> _haPlacementsBySurface = {};
 
   /// Fresh per-maximize `GlobalKey` for the maximized pane (mirrors
   /// `_tileKeyFor`'s per-camera keys, but this pane only ever shows ONE
@@ -541,17 +551,22 @@ class _WallScreenState extends State<WallScreen> {
     }
   }
 
-  /// Reported by every tile/pane as it (re)loads its own HA links — recomputes
-  /// `_liveStatus.wantHaStates` so `/ha/states` is polled only while at least
-  /// one VISIBLE camera has a placed badge (desktop P0 plan §4.4's
-  /// energy-lean "poll on demand" contract, client half).
-  void _onHaLinksLoaded(String cameraId, List<HaLink> links) {
+  /// Reported by every tile/pane (keyed by its own surface id — see
+  /// [_haPlacementsBySurface]'s doc) as it (re)loads its own HA links —
+  /// recomputes `_liveStatus.wantHaStates` so `/ha/states` is polled only
+  /// while at least one VISIBLE camera has a placed badge (desktop P0 plan
+  /// §4.4's energy-lean "poll on demand" contract, client half).
+  void _onHaLinksLoaded(String surfaceKey, List<HaLink> links) {
     final hasPlacement = links.any((l) => l.hasPlacement);
-    final changed = hasPlacement
-        ? _camerasWithHaPlacements.add(cameraId)
-        : _camerasWithHaPlacements.remove(cameraId);
-    if (changed) {
-      _liveStatus.wantHaStates = _camerasWithHaPlacements.isNotEmpty;
+    final before = _haPlacementsBySurface.isNotEmpty;
+    if (hasPlacement) {
+      _haPlacementsBySurface[surfaceKey] = true;
+    } else {
+      _haPlacementsBySurface.remove(surfaceKey);
+    }
+    final after = _haPlacementsBySurface.isNotEmpty;
+    if (before != after) {
+      _liveStatus.wantHaStates = after;
     }
   }
 
@@ -967,8 +982,10 @@ class _WallTile extends StatefulWidget {
 
   /// Reported every time this tile (re)loads its own HA links, so the wall
   /// can track which visible cameras have a placed badge and drive
-  /// `LiveStatusController.wantHaStates` (desktop P0 plan §4.4).
-  final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
+  /// `LiveStatusController.wantHaStates` (desktop P0 plan §4.4). Called with
+  /// this tile's own surface key (`_WallTileState._paneId`), NOT bare camera
+  /// id — see `WallScreen._haPlacementsBySurface`'s doc for why.
+  final void Function(String surfaceKey, List<HaLink> links)? onHaLinksLoaded;
 
   /// Gates the right-click menu's "Link HA entities…" item (issue #52
   /// desktop port) — `PUT /cameras/:id/ha/links` is admin-enforced
@@ -1130,7 +1147,10 @@ class _WallTileState extends State<_WallTile> {
     // keeps the old one painting until `_onFirstFrame` swaps — no black gap.
     // `_shown`/`_firstFrame` are deliberately NOT reset: the old feed stays the
     // painted, "live" one until the replacement decodes.
-    widget.onHaLinksLoaded?.call(old.camera.id, const []);
+    // `_paneId` is slot-stable (paneIdOverride), so it's unchanged by the
+    // camera swap — this and the re-load below report under the SAME
+    // surface key, just like a plain report/re-report cycle.
+    widget.onHaLinksLoaded?.call(_paneId, const []);
     setState(() {
       _haLinks = const [];
       _streams = null;
@@ -1396,7 +1416,7 @@ class _WallTileState extends State<_WallTile> {
 
   void _applyHaLinks(List<HaLink> links) {
     if (mounted) setState(() => _haLinks = links);
-    widget.onHaLinksLoaded?.call(widget.camera.id, links);
+    widget.onHaLinksLoaded?.call(_paneId, links);
   }
 
   /// Right-click menu: per-camera PTZ-controls toggle + stream main/sub
@@ -1530,10 +1550,12 @@ class _WallTileState extends State<_WallTile> {
     _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
-    // Report "no links" so the wall drops this camera from its
-    // has-a-placement set (_camerasWithHaPlacements) — otherwise a removed
-    // tile's last-known placement would keep /ha/states polling forever.
-    widget.onHaLinksLoaded?.call(widget.camera.id, const []);
+    // Report "no links" so the wall drops THIS TILE's contribution from
+    // `_haPlacementsBySurface` — otherwise a removed tile's last-known
+    // placement would keep /ha/states polling forever. Keyed by `_paneId`
+    // (not bare camera id) so this can't clobber a maximized pane's separate
+    // report for the same camera (issue #317).
+    widget.onHaLinksLoaded?.call(_paneId, const []);
     // Detach the (potentially seconds-long) libmpv teardown from the teardown
     // path so restore/close doesn't freeze the UI (#105). Null first.
     final pending = _pending;
@@ -1872,8 +1894,9 @@ class _MaximizedPane extends StatefulWidget {
   final VoidCallback? onLinkHaEntities;
 
   /// Reported every time this pane (re)loads its own HA links — see
-  /// `_WallTile.onHaLinksLoaded`'s doc; same contract.
-  final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
+  /// `_WallTile.onHaLinksLoaded`'s doc; same contract. Called with this
+  /// pane's own surface key (`'max:<cameraId>'`), NOT bare camera id.
+  final void Function(String surfaceKey, List<HaLink> links)? onHaLinksLoaded;
 
   @override
   State<_MaximizedPane> createState() => _MaximizedPaneState();
@@ -2022,7 +2045,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   void _applyHaLinks(List<HaLink> links) {
     if (mounted) setState(() => _haLinks = links);
-    widget.onHaLinksLoaded?.call(widget.camera.id, links);
+    widget.onHaLinksLoaded?.call('max:${widget.camera.id}', links);
   }
 
   /// Right-click menu for the maximized pane (issue #7): the same actions the
@@ -2419,10 +2442,13 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     _watchdog?.dispose();
     widget.ptzPanel?.removeListener(_onPtzPanelChanged);
     widget.haOverlay?.editor.removeListener(_onHaOverlayChanged);
-    // Mirrors `_WallTileState.dispose`'s report — drops this camera from the
-    // wall's has-a-placement set so a closed maximized pane can't keep
-    // /ha/states polling forever.
-    widget.onHaLinksLoaded?.call(widget.camera.id, const []);
+    // Mirrors `_WallTileState.dispose`'s report — drops THIS PANE's
+    // contribution to `_haPlacementsBySurface` so a closed maximized pane
+    // can't keep /ha/states polling forever. Keyed by `'max:<cameraId>'`
+    // (not bare camera id) so restoring never clobbers the underlying wall
+    // tile's own still-current placement report for the same camera — that
+    // tile stays mounted (and still polling) the whole time (issue #317).
+    widget.onHaLinksLoaded?.call('max:${widget.camera.id}', const []);
     SnapshotRegistry.instance.unregister('maximized');
     widget.audio?.unregisterPane('max:${widget.camera.id}');
     // Guaranteed stop: if any PTZ motion could still be in flight (an active
