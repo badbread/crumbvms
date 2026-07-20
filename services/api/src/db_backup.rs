@@ -33,7 +33,7 @@
 //! ## Schedule
 //!
 //! Daily at `DB_BACKUP_SCHEDULE` (a local wall-clock `HH:MM`, default
-//! `03:15`) in the `TZ` timezone (IANA name, default `America/Los_Angeles`).
+//! `03:15`) in the `TZ` timezone (IANA name, default `UTC` when unset).
 //! Legacy sidecar values are tolerated: `@daily` maps to the default, and a
 //! simple 5-field daily cron (`M H * * *`) is read as `H:M`. On boot, if the
 //! newest dump is missing or older than ~25 h, a catch-up dump runs
@@ -95,20 +95,25 @@ fn env_keep(key: &str, default: usize) -> usize {
     })
 }
 
-/// Timezone the schedule is evaluated in: `TZ` env (IANA name), default
-/// `America/Los_Angeles`. `chrono-tz` embeds the IANA db, so no system tzdata
-/// is needed in the image.
+/// Timezone the schedule is evaluated in: `TZ` env (IANA name), default `UTC`
+/// when unset or unparseable. `chrono-tz` embeds the IANA db, so no system
+/// tzdata is needed in the image.
 ///
 /// `pub(crate)` so `/config/server` can report the same resolved zone to the
 /// console (#237), keeping the displayed schedule TZ in lockstep with the zone
 /// the backup scheduler actually uses.
 pub(crate) fn schedule_tz() -> Tz {
+    // UTC when TZ is unset or unparseable — matches the documented contract in
+    // .env.example ("if unset the default is UTC, NOT any local zone"). In Docker,
+    // compose always injects TZ (default UTC); this fallback only matters on a
+    // bare-metal/systemd deployment with no TZ at all, where a hidden local-zone
+    // default would silently run the nightly backup on the wrong wall clock.
     let Ok(v) = std::env::var("TZ") else {
-        return Tz::America__Los_Angeles;
+        return Tz::UTC;
     };
     v.trim().parse::<Tz>().unwrap_or_else(|_| {
-        tracing::warn!("TZ='{v}' is not a recognized IANA timezone — using America/Los_Angeles");
-        Tz::America__Los_Angeles
+        tracing::warn!("TZ='{v}' is not a recognized IANA timezone — using UTC");
+        Tz::UTC
     })
 }
 

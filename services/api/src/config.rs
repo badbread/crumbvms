@@ -374,6 +374,18 @@ impl ApiConfig {
              (openssl rand -hex 32) or let setup-env.sh / the auto-secret bootstrap create it"
         );
 
+        // Same backstop for the go2rtc password. Unlike Postgres (unpublished),
+        // go2rtc's RTSP is LAN-published (0.0.0.0:18554), so the documented
+        // `change-me` placeholder would let any host on the LAN open live camera
+        // streams with a guessable credential. setup-env.sh generates a strong
+        // one; this only fires if someone hand-wrote the placeholder into .env.
+        let go2rtc_pass = require_secret("GO2RTC_PASS")?;
+        anyhow::ensure!(
+            go2rtc_pass != "change-me",
+            "GO2RTC_PASS is the known placeholder value ('change-me'); generate a \
+             real one or let setup-env.sh create it — go2rtc RTSP is LAN-exposed"
+        );
+
         let bind_str = optional_env("API_BIND", "0.0.0.0:8080");
         let bind_addr: SocketAddr = bind_str
             .parse()
@@ -395,7 +407,7 @@ impl ApiConfig {
             crumb_go2rtc_api_base: optional_env("CRUMB_GO2RTC_API_BASE", "http://recorder:1984"),
             crumb_go2rtc_rtsp_base: optional_env("CRUMB_GO2RTC_RTSP_BASE", ""),
             go2rtc_user: require_secret("GO2RTC_USER")?,
-            go2rtc_pass: require_secret("GO2RTC_PASS")?,
+            go2rtc_pass,
             export_dir: optional_env("EXPORT_DIR", "/data/exports"),
             export_ttl_seconds: parse_env("EXPORT_TTL_SECONDS", 86_400_u64)?,
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),

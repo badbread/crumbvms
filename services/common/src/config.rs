@@ -107,7 +107,8 @@ pub struct Config {
 
     /// `RECORDER_TZ` — IANA timezone the per-camera archive-schedule cron is
     /// evaluated in, so a "Daily at 02:00" schedule fires at **local** 02:00
-    /// (DST-correct), not 02:00 UTC. Default: `America/Los_Angeles` (never UTC).
+    /// (DST-correct), not 02:00 UTC. Falls back to `TZ`, else `UTC` when neither
+    /// is set (matching the documented .env.example contract).
     pub archive_cron_tz: chrono_tz::Tz,
 
     // ── motion ─────────────────────────────────────────────────────────────
@@ -413,13 +414,11 @@ impl Config {
             archive_storage_name: optional_env("ARCHIVE_STORAGE_NAME", "Bulk-Archive"),
             // RECORDER_TZ wins; otherwise inherit the container's TZ (compose
             // forwards it, and setup-env.sh sets it to the host zone) so a
-            // non-US operator's archive/retention cron matches their wall clock
-            // instead of always running in LA. America/Los_Angeles only if
-            // neither is set (bare-metal with no TZ at all). (#228)
-            archive_cron_tz: parse_tz_env(
-                "RECORDER_TZ",
-                &optional_env("TZ", "America/Los_Angeles"),
-            ),
+            // non-US operator's archive/retention cron matches their wall clock.
+            // UTC only if neither is set (bare-metal with no TZ at all) — matches
+            // the documented .env.example contract ("if unset the default is UTC,
+            // NOT any local zone"). (#228)
+            archive_cron_tz: parse_tz_env("RECORDER_TZ", &optional_env("TZ", "UTC")),
             motion_hwaccel,
             motion_vaapi_device: optional_env("MOTION_VAAPI_DEVICE", "/dev/dri/renderD128"),
             max_gpu_decode_sessions: parse_env("MAX_GPU_DECODE_SESSIONS", 4)?,
@@ -461,7 +460,7 @@ fn require_secret(key: &str) -> Result<String> {
 }
 
 /// Parse an IANA timezone from `key`, falling back to `default` (and to
-/// `America/Los_Angeles` if even that fails to parse).
+/// `UTC` if even that fails to parse).
 ///
 /// The fallback is deliberately non-fatal — a typo'd `RECORDER_TZ` must not
 /// stop the recorder from booting — but it must be LOUD: silently swallowing
@@ -482,7 +481,7 @@ fn parse_tz_env(key: &str, default: &str) -> chrono_tz::Tz {
         Err(_) => {
             let fallback = default
                 .parse::<chrono_tz::Tz>()
-                .unwrap_or(chrono_tz::Tz::America__Los_Angeles);
+                .unwrap_or(chrono_tz::Tz::UTC);
             tracing::error!(
                 "env var '{key}' = '{raw}' is not a valid IANA timezone \
                  (e.g. 'America/Los_Angeles'); falling back to '{fallback}' — \
