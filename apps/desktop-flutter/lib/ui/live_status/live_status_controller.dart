@@ -66,9 +66,19 @@ class LiveStatusController extends ChangeNotifier {
     this.detectionLookback = const Duration(seconds: 25),
     this.detectionLookahead = const Duration(seconds: 5),
     this.configReloadDebounce = const Duration(milliseconds: 1500),
+    this.onUnauthorized,
   });
 
   final CrumbApi api;
+
+  /// Called when `/status` comes back 401/403 (the bearer JWT expired or was
+  /// revoked mid-wall) — the Live tab never mints a media token, so without
+  /// this hook a 401 here was invisible to `SessionController.handleUnauthorized`
+  /// and just accumulated as ordinary poll failures, eventually showing a
+  /// permanently-false "Connection lost" banner with no recovery (issue #316).
+  /// The caller is expected to surface a re-auth prompt (mirrors
+  /// `MediaTokenCache.onUnauthorized`); this controller does not know how.
+  final VoidCallback? onUnauthorized;
 
   /// The session whose bearer token authenticates every poll. NOT final: an
   /// in-place re-auth (see `main.dart`'s session-change handler) mints a fresh
@@ -235,6 +245,16 @@ class LiveStatusController extends ChangeNotifier {
       if (_disposed) return;
 
       if (statusError != null || status == null) {
+        // An auth rejection is not a network/server problem — don't lie with
+        // a "connection lost" banner (issue #316); hand it to the re-auth
+        // hook instead so the same in-place re-auth prompt a Playback/Clips
+        // 401 already triggers also covers the Live tab.
+        final err = statusError;
+        if (err is CrumbApiException &&
+            (err.statusCode == 401 || err.statusCode == 403)) {
+          onUnauthorized?.call();
+          return;
+        }
         _failStreak += 1;
         if (_failStreak >= failuresBeforeConnLost && !_connectionLost) {
           _connectionLost = true;

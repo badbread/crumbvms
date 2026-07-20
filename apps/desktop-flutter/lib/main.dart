@@ -296,9 +296,18 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
       session: session,
       onUnauthorized: controller.handleUnauthorized,
     );
-    _recordingAlerts = RecordingAlertsController(api: _api, session: session)
-      ..start();
-    _updateCheck = UpdateCheckController(api: _api, session: session)..start();
+    _recordingAlerts =
+        RecordingAlertsController(
+          api: _api,
+          session: session,
+          onUnauthorized: controller.handleUnauthorized,
+        )..start();
+    _updateCheck =
+        UpdateCheckController(
+          api: _api,
+          session: session,
+          onUnauthorized: controller.handleUnauthorized,
+        )..start();
     _session = session;
     _cameras = cameras;
     // Diagnostics breadcrumb (#180): record host:port only, never creds.
@@ -1352,6 +1361,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
           // The wall's /status poller detects config_version bumps; bubble that
           // up so an admin/config edit reloads the camera list live (#146).
           onConfigChanged: widget.onRefreshCameras,
+          // A bearer JWT expiring/being revoked while the user stays on Live
+          // never reached re-auth otherwise — the Live tab never mints a
+          // media token, the only other thing wired to this (issue #316).
+          onUnauthorized: widget.sessionController.handleUnauthorized,
         );
     }
   }
