@@ -26,7 +26,7 @@ import javax.net.ssl.SSLHandshakeException
  * structured concurrency works and no error is shown. Every repository call
  * below wraps a cancellable suspend call, so this is a drop-in replacement.
  */
-private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> =
+internal inline fun <T> runCatchingCancellable(block: () -> T): Result<T> =
     try {
         Result.success(block())
     } catch (e: CancellationException) {
