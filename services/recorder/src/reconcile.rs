@@ -1190,6 +1190,7 @@ pub async fn quarantine_file(file_path: &Path, storage_root: &Path) -> Result<()
                 dst = %dst.display(),
                 "quarantined file via rename"
             );
+            stamp_quarantine_entry_time(&dst);
             Ok(())
         }
         Err(e) if e.raw_os_error() == Some(libc_cross_device_error()) => {
@@ -1208,6 +1209,7 @@ pub async fn quarantine_file(file_path: &Path, storage_root: &Path) -> Result<()
                 dst = %dst.display(),
                 "quarantined file via copy+delete (cross-device)"
             );
+            stamp_quarantine_entry_time(&dst);
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!(
@@ -1215,6 +1217,49 @@ pub async fn quarantine_file(file_path: &Path, storage_root: &Path) -> Result<()
             file_path.display(),
             dst.display()
         )),
+    }
+}
+
+/// Stamp a just-quarantined file's mtime to NOW — the quarantine-ENTRY time.
+///
+/// The prune's age gate reads mtime, and a same-filesystem `rename` preserves
+/// the original RECORDING-time mtime — which silently turned the
+/// "review-then-purge grace window" into `retention − (age at quarantine)`,
+/// clamped at zero (issue #277): a file already older than the window at entry
+/// was deleted by the very next prune, possibly in the SAME reconcile pass
+/// (e.g. a deleted camera's entire history, orphaned → quarantined → purged
+/// within ~15 minutes, no review window at all). Touching mtime on arrival
+/// gives every quarantined file the FULL window from the moment an operator
+/// could first see it in `_quarantine/`.
+///
+/// Best-effort: on a filesystem where this fails, the old mtime remains and
+/// that file falls back to recording-age pruning — logged loudly so the
+/// degradation is visible, and never a reason to fail the quarantine itself
+/// (parking the file safely still comes first).
+fn stamp_quarantine_entry_time(path: &Path) {
+    let touch = || -> std::io::Result<()> {
+        let f = std::fs::File::options().append(true).open(path)?;
+        f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+    };
+    if let Err(e) = touch() {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "quarantine: could not stamp entry-time mtime; prune will age this file by its RECORDING time"
+        );
+    }
+}
+
+/// True when `filename` carries the backward-clock `-rN` disambiguator
+/// (`recording.rs::disambiguated_name`, issue #144 item 2): stem ends in
+/// `-r<digits>`. Those files are the losers of a wall-clock collision — real
+/// footage ratified as "never deleted" (DECISIONS 2026-07-14) — and the
+/// quarantine prune exempts them (issue #277). Pure + unit-tested.
+fn is_collision_disambiguated(filename: &str) -> bool {
+    let stem = filename.rsplit_once('.').map_or(filename, |(s, _)| s);
+    match stem.rsplit_once("-r") {
+        Some((_, digits)) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
     }
 }
 
@@ -1328,8 +1373,27 @@ async fn prune_quarantine(storage_root: &Path, retention_days: i64) -> (u64, u64
                 continue;
             }
 
+            // COLLISION-LOSER EXEMPTION (issue #277): `-rN` disambiguated
+            // files are the losers of a backward wall-clock collision — real
+            // footage the 2026-07-14 decision promises is "never deleted".
+            // Their stems deliberately don't parse, so the orphan pass parks
+            // them here; quarantine is their TERMINAL home, and deleting them
+            // stays a manual operator action.
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_collision_disambiguated)
+            {
+                debug!(path = %path.display(),
+                    "prune_quarantine: -rN collision-loser footage; never auto-deleted");
+                continue;
+            }
+
             // AGE GATE: only files strictly older than the retention cutoff. A
             // missing/unreadable mtime fails SAFE toward keeping the file.
+            // NOTE the epoch: `quarantine_file` stamps mtime to the
+            // quarantine-ENTRY time on arrival, so this window counts from
+            // when the file became reviewable — not from when it was recorded.
             let mtime = match meta.modified() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1653,6 +1717,104 @@ mod tests {
             aged2.exists(),
             "retention 0 must keep even a 30-day-old file"
         );
+    }
+
+    /// Issue #277 part (a): the prune's grace window must count from
+    /// quarantine ENTRY, not from recording time. A file 30 days old at the
+    /// moment it is quarantined must still get the FULL review window —
+    /// pre-fix, `rename` preserved the recording mtime and the very next
+    /// prune (same reconcile pass) deleted it, so e.g. deleting a camera
+    /// silently destroyed its whole history with zero review window.
+    #[tokio::test]
+    async fn quarantine_entry_restarts_the_prune_clock() {
+        const DAY: u64 = 86_400;
+        let root = tempfile::Builder::new()
+            .prefix("crumb-qclock")
+            .tempdir()
+            .expect("tempdir");
+        let root_path = root.path();
+
+        // An "orphaned segment" already 30 days old at quarantine time.
+        let cam = Uuid::new_v4().to_string();
+        let rec_dir = root_path.join(&cam).join("2026").join("06");
+        tokio::fs::create_dir_all(&rec_dir).await.expect("mkdir");
+        let old_file = rec_dir.join("20260620T000000Z.mp4");
+        tokio::fs::write(&old_file, vec![0u8; 4096])
+            .await
+            .expect("write");
+        backdate(&old_file, 30 * DAY).await;
+
+        quarantine_file(&old_file, root_path)
+            .await
+            .expect("quarantine");
+        // Layout: `_quarantine/<camera_id>/<filename>` (camera dir preserved,
+        // date tree flattened — see quarantine_file's doc).
+        let quarantined = root_path
+            .join("_quarantine")
+            .join(&cam)
+            .join("20260620T000000Z.mp4");
+        assert!(quarantined.exists(), "file parked under _quarantine");
+
+        // Entry stamp: mtime is ~now, not the 30-day-old recording time.
+        let mtime: DateTime<Utc> = tokio::fs::metadata(&quarantined)
+            .await
+            .expect("meta")
+            .modified()
+            .expect("mtime")
+            .into();
+        assert!(
+            Utc::now() - mtime < Duration::minutes(5),
+            "quarantine entry must stamp mtime to NOW (got {mtime})"
+        );
+
+        // The very next prune (14d window) must KEEP it — the full review
+        // window starts at entry.
+        let (files, _) = prune_quarantine(root_path, 14).await;
+        assert_eq!(files, 0, "freshly quarantined file must survive the prune");
+        assert!(quarantined.exists());
+    }
+
+    /// Issue #277 part (b): `-rN` collision-loser files are ratified "never
+    /// deleted" (DECISIONS 2026-07-14) — the prune must exempt them at ANY
+    /// age, while a plain aged neighbor is still pruned.
+    #[tokio::test]
+    async fn prune_quarantine_exempts_collision_losers() {
+        const DAY: u64 = 86_400;
+        let root = tempfile::Builder::new()
+            .prefix("crumb-qrn")
+            .tempdir()
+            .expect("tempdir");
+        let q = root.path().join("_quarantine").join("cam");
+        tokio::fs::create_dir_all(&q).await.expect("mkdir");
+
+        let loser = q.join("20260101T000000Z-r1.mp4");
+        tokio::fs::write(&loser, vec![0u8; 1024]).await.expect("w");
+        backdate(&loser, 90 * DAY).await;
+
+        let plain = q.join("20260101T000000Z.mp4");
+        tokio::fs::write(&plain, vec![0u8; 2048]).await.expect("w");
+        backdate(&plain, 90 * DAY).await;
+
+        let (files, bytes) = prune_quarantine(root.path(), 14).await;
+        assert_eq!(files, 1, "only the plain aged file is pruned");
+        assert_eq!(bytes, 2048);
+        assert!(
+            loser.exists(),
+            "-rN collision-loser footage must NEVER be auto-deleted"
+        );
+        assert!(!plain.exists());
+    }
+
+    /// The `-rN` detector: exact suffix shape only (stem ends `-r<digits>`).
+    #[test]
+    fn collision_disambiguated_detector() {
+        assert!(is_collision_disambiguated("20260101T000000Z-r1.mp4"));
+        assert!(is_collision_disambiguated("20260101T000000Z-r64.mp4"));
+        assert!(is_collision_disambiguated("seg-r7")); // no extension
+        assert!(!is_collision_disambiguated("20260101T000000Z.mp4"));
+        assert!(!is_collision_disambiguated("clip-r.mp4")); // no digits
+        assert!(!is_collision_disambiguated("clip-r1x.mp4")); // trailing junk
+        assert!(!is_collision_disambiguated("rear-video.mp4"));
     }
 
     /// Prefers `CRUMB_TEST_DATABASE_URL`, falling back to the workspace-wide
