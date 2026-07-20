@@ -120,7 +120,10 @@ errors; `docker compose logs postgres` shows corruption / WAL errors.
 ```bash
 cd /opt/crumb/app
 docker compose stop recorder api
-docker compose stop postgres
+# Stop AND REMOVE the postgres container. A merely-stopped container still holds a
+# reference to its data volume, which makes the `docker volume rm` in the fallback
+# below fail with "volume is in use". `up -d postgres` recreates the container.
+docker compose rm -sf postgres
 
 # Resolve the ACTUAL Postgres data volume name. On a stock install the Compose
 # project is `crumbvms`, so the volume is `crumbvms_crumb_pgdata` — but resolve
