@@ -492,6 +492,8 @@ fun PlaybackWallScreen(
                     bookmarks = emptyList(),
                     playheadMs = cursorMs,
                     spanMs = visibleSpanMs,
+                    minSpanMs = WALL_MIN_SPAN_MS,
+                    maxSpanMs = WALL_MAX_SPAN_MS,
                     onScrubStart = {},
                     onScrub = { ts -> cursorMs = ts; atLatest = false; previewMs = ts },
                     onScrubEnd = { ts ->
