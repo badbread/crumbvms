@@ -95,6 +95,9 @@ class SpecialTileController extends ChangeNotifier {
   /// — they carry no resolved camera. Starts/stops carousel timers as needed.
   void applySpecs(Map<int, SpecialTileSpec> specs) {
     _specs = specs;
+    // Slot indices mean something else in the incoming view — a stale frozen
+    // index could freeze an arbitrary slot of the new layout (#269).
+    frozenSlot = null;
 
     // Stop + drop carousels for slots no longer carrying a carousel spec.
     for (final slot in _carousels.keys.toList()) {
