@@ -334,7 +334,12 @@ final class CrumbAPI {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {
-            if http.statusCode == 401 { store.clearSession() }
+            // `imageData` is nonisolated and resumes off the main actor after the
+            // `await` above — `store.clearSession()` synchronously writes
+            // `KeychainStore`'s `@Published var token` (see KeychainStore.swift),
+            // which SwiftUI expects to only ever change on the main thread. Hop
+            // over rather than call it directly from here.
+            if http.statusCode == 401 { Task { @MainActor in self.store.clearSession() } }
             throw APIError.http(statusCode: http.statusCode, data: data)
         }
         return data
@@ -407,8 +412,14 @@ final class CrumbAPI {
             // A runtime 401 means the token expired/was revoked. Drop the session
             // so the app returns to login instead of silently failing every call.
             // (403 is a capability denial, not a session problem — left untouched.)
+            //
+            // `execute` is nonisolated and resumes off the main actor after the
+            // `await` above — `store.clearSession()` synchronously writes
+            // `KeychainStore`'s `@Published var token`, which SwiftUI expects to
+            // only ever change on the main thread (an unsynchronized read/write
+            // race otherwise). Hop over rather than call it directly from here.
             if http.statusCode == 401 {
-                store.clearSession()
+                Task { @MainActor in store.clearSession() }
             }
             throw APIError.http(statusCode: http.statusCode, data: data)
         }
