@@ -151,7 +151,7 @@ fun LiveFullscreenScreen(
                 val res = repo.haStates().onSuccess { haStates = it }
                 failStreak = if (res.isSuccess) 0 else failStreak + 1
                 kotlinx.coroutines.delay(
-                    if (failStreak == 0) 2000L else (2000L shl (failStreak - 1)).coerceAtMost(30000L),
+                    if (failStreak == 0) 2000L else (2000L shl (failStreak - 1).coerceAtMost(4)).coerceAtMost(30000L),
                 )
             }
         }
@@ -263,7 +263,7 @@ fun LiveFullscreenScreen(
                     motionNow = st.cameras.firstOrNull { it.id == currentCameraId }?.recentMotion == true
                 }
                 failStreak = if (res.isSuccess) 0 else failStreak + 1
-                delay(if (failStreak == 0) 2000L else (2000L shl (failStreak - 1)).coerceAtMost(30000L))
+                delay(if (failStreak == 0) 2000L else (2000L shl (failStreak - 1).coerceAtMost(4)).coerceAtMost(30000L))
             }
         }
     }

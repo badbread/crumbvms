@@ -10,6 +10,7 @@ import video.crumb.app.data.RecordedSpan
 import video.crumb.app.data.ResolvedSegment
 import video.crumb.app.data.CrumbRepository
 import video.crumb.app.data.isNotFound
+import video.crumb.app.data.runCatchingCancellable
 import video.crumb.app.data.toUserMessage
 import video.crumb.app.ui.Time
 import kotlinx.coroutines.Job
@@ -505,7 +506,7 @@ class PlaybackViewModel(
                 // failure (MediaTokenCache) — guard it like every other consumer
                 // (e.g. PlaybackWallScreen, ClipsScreen) so a token error can't
                 // crash the app; treat it as a genuine failure, same as below.
-                runCatching {
+                runCatchingCancellable {
                     repo.mediaUrls().scopedUrl(cameraId, qualityUrl(segment.url))
                 }.onSuccess { authedUrl ->
                     _state.update {
@@ -605,7 +606,7 @@ class PlaybackViewModel(
                 // guard it so a token hiccup during a background prefetch can't
                 // crash the app; dropped silently like every other prefetch
                 // failure below (the STATE_ENDED fallback still covers it).
-                val authedUrl = runCatching {
+                val authedUrl = runCatchingCancellable {
                     repo.mediaUrls().scopedUrl(cameraId, qualityUrl(next.url))
                 }.getOrNull() ?: return@onSuccess
                 _state.update { it.copy(nextSegment = next, nextSegmentUrl = authedUrl) }
@@ -978,7 +979,7 @@ class PlaybackViewModel(
             viewModelScope.launch {
                 // scopedUrl() throws on a media-token fetch failure — guard it like
                 // every other consumer and just drop the frame on failure.
-                val frameUrl = runCatching {
+                val frameUrl = runCatchingCancellable {
                     repo.mediaUrls().scopedUrl(cameraId, nearestFrame.url)
                 }.getOrNull()
                 if (frameUrl != null && _state.value.scrubbing) {
@@ -1043,7 +1044,7 @@ class PlaybackViewModel(
                     // like every other consumer; the scrubber still works without
                     // a filmstrip frame.
                     val frameUrl = nearestFrame?.let {
-                        runCatching { repo.mediaUrls().scopedUrl(cameraId, it.url) }.getOrNull()
+                        runCatchingCancellable { repo.mediaUrls().scopedUrl(cameraId, it.url) }.getOrNull()
                     }
                     _state.update { s ->
                         s.copy(filmstrip = frames, scrubFrameUrl = if (s.scrubbing) frameUrl else s.scrubFrameUrl)
