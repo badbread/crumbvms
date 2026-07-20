@@ -100,6 +100,16 @@ pub struct MediaClaims {
     /// The single camera UUID this token authorises. Media handlers assert the
     /// requested resource belongs to this camera.
     pub cam: String,
+    /// The minting user's `export` capability, carried so the media principal
+    /// grants no more than the caller actually held. These cap fields are NOT
+    /// `#[serde(default)]`: a pre-upgrade token that lacks them must fail to
+    /// decode (→ a clean 401 and automatic re-mint) rather than silently
+    /// deserialize as something with the wrong caps.
+    pub export: bool,
+    /// The minting user's `playback` (recorded-footage) capability.
+    pub playback: bool,
+    /// The minting user's `clips` capability.
+    pub clips: bool,
     /// Expiry — Unix timestamp (seconds). Short (~15 min; see auth.rs).
     pub exp: u64,
     /// Issued-at — Unix timestamp.

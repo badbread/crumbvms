@@ -489,11 +489,15 @@ impl FromRequestParts<AppState> for AdminUser {
 /// which case the caller falls through to the full-JWT path.
 ///
 /// The returned principal is deliberately scoped to exactly the token's one
-/// camera (`camera_ids = [cam]`) with a `Viewer` role and full media
-/// capabilities: the capability gate was already enforced when the token was
-/// minted (the minting user proved camera access), and confining the principal
-/// to a single camera means even a granted capability can only ever touch that
-/// one camera's media. `user_id` is carried through for audit/log correlation.
+/// camera (`camera_ids = [cam]`) with a `Viewer` role. Its media capabilities
+/// (`export`/`playback`/`clips`) are reconstructed from the token, which
+/// carries the MINTING USER'S actual capabilities — the token amplifies
+/// nothing. (Minting proves camera *access*, not the export/clips/playback
+/// capability, so hardcoding a full set here would let a viewer whose role
+/// withholds one of these regain it just by minting a token.) Confining the
+/// principal to a single camera additionally means even a carried capability
+/// can only ever touch that one camera's media. `user_id` is carried through
+/// for audit/log correlation.
 fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
@@ -513,20 +517,31 @@ fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
         user_id,
         role: UserRole::Viewer,
         camera_ids: vec![cam],
-        // Full media caps, but hard-scoped to the single camera above.
-        capabilities: Capabilities {
-            export: true,
-            playback: true,
-            clips: true,
-            ptz: false,
-            bookmarks: BookmarkScope::None,
-            manage_views: false,
-            view_plates: false,
-        },
+        // Carried from the token (the minting user's real caps), hard-scoped to
+        // the single camera above. See `media_capabilities_from_claims`.
+        capabilities: media_capabilities_from_claims(&claims),
         role_id: None,
         // A media token is not a revocable session; it self-expires in ~15 min.
         jti: None,
     })
+}
+
+/// Reconstruct a media principal's [`Capabilities`] from a decoded
+/// [`MediaClaims`]. `export`/`playback`/`clips` come straight from the token
+/// (the minting user's real capabilities — never widened); every other
+/// capability is denied, because a media token never grants ptz, bookmark,
+/// view-management, or plate access. Pure, so the "no amplification" property
+/// is directly unit-testable.
+fn media_capabilities_from_claims(claims: &MediaClaims) -> Capabilities {
+    Capabilities {
+        export: claims.export,
+        playback: claims.playback,
+        clips: claims.clips,
+        ptz: false,
+        bookmarks: BookmarkScope::None,
+        manage_views: false,
+        view_plates: false,
+    }
 }
 
 /// Extract a `token` value from a URL query string (e.g. `w=320&token=xyz`).
@@ -544,4 +559,47 @@ fn token_from_query(query: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod media_cap_tests {
+    use super::media_capabilities_from_claims;
+    use crate::dto::MediaClaims;
+
+    fn claims(export: bool, playback: bool, clips: bool) -> MediaClaims {
+        MediaClaims {
+            sub: "00000000-0000-0000-0000-000000000000".to_owned(),
+            typ: super::MEDIA_TOKEN_TYP.to_owned(),
+            cam: "00000000-0000-0000-0000-000000000001".to_owned(),
+            export,
+            playback,
+            clips,
+            exp: 0,
+            iat: 0,
+        }
+    }
+
+    #[test]
+    fn media_token_never_amplifies_capabilities() {
+        // Regression guard for the media-token capability-escalation advisory: a
+        // token minted by a viewer WITHOUT export/playback/clips must reconstruct
+        // a principal without them — the token must not restore a capability the
+        // caller's role withheld.
+        let caps = media_capabilities_from_claims(&claims(false, false, false));
+        assert!(!caps.export, "no-export token must not grant export");
+        assert!(!caps.playback, "no-playback token must not grant playback");
+        assert!(!caps.clips, "no-clips token must not grant clips");
+        // A media token never carries these regardless of the claim.
+        assert!(!caps.ptz);
+        assert!(!caps.manage_views);
+        assert!(!caps.view_plates);
+    }
+
+    #[test]
+    fn media_token_preserves_held_capabilities() {
+        // A caller who legitimately holds these still gets a working token,
+        // hard-scoped to its one camera by the caller.
+        let caps = media_capabilities_from_claims(&claims(true, true, true));
+        assert!(caps.export && caps.playback && caps.clips);
+    }
 }
