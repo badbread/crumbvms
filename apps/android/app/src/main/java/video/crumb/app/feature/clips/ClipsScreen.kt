@@ -80,6 +80,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -412,6 +415,25 @@ private fun ClipPlayerDialog(
     var playerView by remember { mutableStateOf<PlayerView?>(null) }
     val exo = remember { ExoPlayer.Builder(context).build() }
     DisposableEffect(Unit) { onDispose { exo.release() } }
+
+    // Pause when backgrounded (matches PlaybackScreen) — otherwise this dialog's
+    // audio/video keeps playing after the user leaves the app.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, exo) {
+        var wasPlaying = false
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> {
+                    wasPlaying = exo.playWhenReady
+                    exo.pause()
+                }
+                Lifecycle.Event.ON_RESUME -> if (wasPlaying) exo.play()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // The clip URL carries a per-camera scoped token (see MediaTokenCache), so
     // resolving it is a suspend call — prepare the player once the FIRST
