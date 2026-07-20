@@ -111,6 +111,16 @@ final class LivePictureInPicture: NSObject, ObservableObject {
     private var controller: AVPictureInPictureController?
     private let renderingQueue = DispatchQueue(label: "video.crumb.pip.rendering")
 
+    /// Set by `Fmp4VideoView.onDisappear` when its view left the SwiftUI
+    /// hierarchy while PiP was still active (deliberately skipping
+    /// `controller.stop()` so PiP could keep showing the feed). Invoked once,
+    /// when PiP actually stops, so the now-orphaned `Fmp4StreamController` —
+    /// which nothing else can reach to tear down, since it retains itself
+    /// strongly via its own `URLSession(delegate: self)` — finally gets a
+    /// `stop()` call instead of leaking its HTTP stream + demux pipeline for
+    /// the rest of the process's life.
+    var onStoppedWhileDetached: (() -> Void)?
+
     /// Attach to the display layer that's already rendering the live stream
     /// (the same one `Fmp4StreamController.displayLayer` feeds — no separate
     /// decode/pipeline is created for PiP).
@@ -149,7 +159,11 @@ extension LivePictureInPicture: AVPictureInPictureControllerDelegate {
         Task { @MainActor in self.isActive = true }
     }
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        Task { @MainActor in self.isActive = false }
+        Task { @MainActor in
+            self.isActive = false
+            self.onStoppedWhileDetached?()
+            self.onStoppedWhileDetached = nil
+        }
     }
 }
 
