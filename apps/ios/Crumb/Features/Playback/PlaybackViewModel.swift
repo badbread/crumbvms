@@ -429,9 +429,13 @@ final class PlaybackViewModel: ObservableObject {
         playheadMs = startMs
         error = nil
         noFootageAtPlayhead = false
-        // Setting this re-fires the view's feed(url); the player recognises the
-        // just-advanced URL and no-ops (SegmentPlayer.justAdvanced).
         currentSegmentURL = signal.url
+        // The view now keys the feed on `seekGeneration`, not the URL, so bump it
+        // here so `feed(url)` re-fires: the player recognises the just-advanced URL
+        // and no-ops it, which is what CLEARS `SegmentPlayer.justAdvanced`. Without
+        // this bump the latch stays set, and the first within-segment seek after a
+        // gapless advance is silently swallowed during playback.
+        seekGeneration += 1
         resetPrefetch() // let the NEW current segment queue its own next
     }
 
