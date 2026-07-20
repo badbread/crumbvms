@@ -383,6 +383,20 @@ const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
 /// Post-roll padding after a clip's event window (pre-roll is an admin setting).
 const POST_ROLL_MS: i64 = 8_000;
 
+/// Wall-clock ceiling on a single clip/preview transcode. `kill_on_drop` reaps
+/// the child when the request future is dropped (client disconnect); this
+/// timeout reaps a *wedged* ffmpeg that neither exits nor gets its future
+/// dropped. A ≤30 s clip transcodes in a few seconds — this is a generous
+/// backstop, not a tight budget.
+const CLIP_TRANSCODE_TIMEOUT_SECS: u64 = 120;
+/// Ceiling on a single-frame thumbnail grab / luma probe (each is one frame).
+const THUMB_FRAME_TIMEOUT_SECS: u64 = 20;
+/// Cap on bytes buffered from a proxied Frigate clip/thumbnail. A thumbnail is a
+/// small JPEG; the clip proxy only runs for overview-eligible (≈≤30 s) events,
+/// so 64 MiB is a generous bound that still stops an oversized or misbehaving
+/// upstream from exhausting api memory (every other proxy caps its read too).
+const FRIGATE_MEDIA_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Compiled hard ceiling on a rendered clip's length (seconds), and the
 /// permanent safety floor of the clip-overview model. A clip is an **overview**
 /// of an event — a short, representative snippet — NOT the full event: to watch a
@@ -813,8 +827,17 @@ async fn get_clip_thumbnail(
     let cache_dir = PathBuf::from(&state.config().export_dir).join("clips");
     tokio::fs::create_dir_all(&cache_dir).await.ok();
     let out = cache_dir.join(format!("{}.jpg", sanitize_id(&id)));
-    if !out.exists() {
-        generate_thumbnail(&state, cam, start, end, &out).await?;
+    // Per-clip singleflight: concurrent misses on the same thumbnail serialize on
+    // the cache path so they render exactly once — the same guard the clip.mp4
+    // path uses. Without it, a cold grid re-fetch spawns one ffmpeg per request
+    // for the same frame. `generate_thumbnail` additionally holds the shared
+    // clip-gen semaphore, bounding total concurrent ffmpeg fan-out.
+    if tokio::fs::metadata(&out).await.is_err() {
+        let lock = state.clip_inflight_lock(&out);
+        let _guard = lock.lock().await;
+        if tokio::fs::metadata(&out).await.is_err() {
+            generate_thumbnail(&state, cam, start, end, &out).await?;
+        }
     }
     let bytes = tokio::fs::read(&out)
         .await
@@ -927,21 +950,27 @@ async fn generate_clip_file(
     }
     args.extend(["-movflags".to_owned(), "+faststart".to_owned()]);
     args.push(tmp.to_string_lossy().into_owned());
-    let status = Command::new(FFMPEG_BIN)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+    // kill_on_drop reaps ffmpeg if the client disconnects (future dropped); the
+    // timeout reaps a wedged encode that neither exits nor gets dropped.
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(CLIP_TRANSCODE_TIMEOUT_SECS),
+        Command::new(FFMPEG_BIN)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
     let _ = tokio::fs::remove_file(&concat_path).await;
     match status {
-        Ok(s) if s.success() => tokio::fs::rename(&tmp, out)
+        Ok(Ok(s)) if s.success() => tokio::fs::rename(&tmp, out)
             .await
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("cache clip rename: {e}"))),
         other => {
             let _ = tokio::fs::remove_file(&tmp).await;
             Err(ApiError::Internal(anyhow::anyhow!(
-                "ffmpeg clip transcode failed: {other:?}"
+                "ffmpeg clip transcode failed or timed out: {other:?}"
             )))
         }
     }
@@ -1012,6 +1041,13 @@ async fn generate_thumbnail(
     end: DateTime<Utc>,
     out: &FsPath,
 ) -> Result<(), ApiError> {
+    // Bound total concurrent ffmpeg fan-out with the same permit the clip.mp4 and
+    // low-stream transcodes use, so a cold thumbnail grid can't spawn-storm.
+    let _permit = state
+        .clip_gen_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("clip-gen semaphore closed: {e}")))?;
     let pool = state.pool();
     let storage_paths = db::storage_path_map(pool)
         .await
@@ -1119,13 +1155,18 @@ async fn grab_frame(
         .map(str::to_owned),
     );
     args.push(out_s);
-    let status = Command::new(FFMPEG_BIN)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn ffmpeg: {e}")))?;
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(THUMB_FRAME_TIMEOUT_SECS),
+        Command::new(FFMPEG_BIN)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| ApiError::Internal(anyhow::anyhow!("ffmpeg thumbnail grab timed out")))?
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn ffmpeg: {e}")))?;
     if !status.success() {
         return Err(ApiError::Internal(anyhow::anyhow!(
             "ffmpeg failed for thumbnail ({status})"
@@ -1143,23 +1184,28 @@ async fn mean_luma(path: &FsPath) -> Option<f64> {
     // log level, unlike plain `metadata=print` which logs at info and is hidden by
     // `-v error`). Scaling to 1x1 first makes YAVG a whole-frame average, computed
     // near-instantly.
-    let out = Command::new(FFMPEG_BIN)
-        .args([
-            "-v",
-            "error",
-            "-i",
-            &path.to_string_lossy(),
-            "-vf",
-            "scale=1:1,signalstats,metadata=print:file=-",
-            "-f",
-            "null",
-            "-",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(THUMB_FRAME_TIMEOUT_SECS),
+        Command::new(FFMPEG_BIN)
+            .args([
+                "-v",
+                "error",
+                "-i",
+                &path.to_string_lossy(),
+                "-vf",
+                "scale=1:1,signalstats,metadata=print:file=-",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()? // timeout → None; caller accepts the frame rather than retry blindly
+    .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
         .filter_map(|l| l.trim().strip_prefix("lavfi.signalstats.YAVG="))
@@ -1224,7 +1270,12 @@ async fn try_frigate_event_media(
     if !resp.status().is_success() {
         return None;
     }
-    resp.bytes().await.ok().map(|b| b.to_vec())
+    // Cap the read: a misbehaving or oversized upstream must not buffer an
+    // unbounded body into memory and OOM the api. `None` on overflow falls back
+    // to own-footage generation, same as any other Frigate miss.
+    crate::channel_notify::read_body_capped(resp, FRIGATE_MEDIA_MAX_BYTES)
+        .await
+        .ok()
 }
 
 #[cfg(test)]

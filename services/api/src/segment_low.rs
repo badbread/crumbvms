@@ -51,6 +51,13 @@ use crate::{auth_mw::AuthUser, error::ApiError, playback::guard_path_traversal, 
 /// Same ffmpeg the clip machinery uses (bundled jellyfin-ffmpeg in the API image).
 const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
 
+/// Wall-clock ceiling on a single low-stream transcode. `kill_on_drop` reaps
+/// the child when the request future is dropped (client disconnect); this
+/// timeout reaps a wedged encode that neither exits nor gets dropped. One
+/// segment (a few seconds of footage) transcodes quickly — this is a generous
+/// backstop, not a tight budget.
+const LOW_TRANSCODE_TIMEOUT_SECS: u64 = 120;
+
 /// Long, immutable cache lifetime (30 days) — a segment's footage never changes.
 const CACHE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
@@ -146,20 +153,26 @@ async fn generate_low_file(state: &AppState, src: &FsPath, out: &FsPath) -> Resu
     }
     let tmp = out.with_file_name(format!("{}.partial.mp4", Uuid::new_v4()));
     let args = low_transcode_args(&src.to_string_lossy(), &tmp.to_string_lossy());
-    let status = Command::new(FFMPEG_BIN)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+    // kill_on_drop reaps ffmpeg if the client disconnects (future dropped); the
+    // timeout reaps a wedged encode that neither exits nor gets dropped.
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(LOW_TRANSCODE_TIMEOUT_SECS),
+        Command::new(FFMPEG_BIN)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
     match status {
-        Ok(s) if s.success() => tokio::fs::rename(&tmp, out)
+        Ok(Ok(s)) if s.success() => tokio::fs::rename(&tmp, out)
             .await
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("cache low.mp4 rename: {e}"))),
         other => {
             let _ = tokio::fs::remove_file(&tmp).await;
             Err(ApiError::Internal(anyhow::anyhow!(
-                "ffmpeg low transcode failed: {other:?}"
+                "ffmpeg low transcode failed or timed out: {other:?}"
             )))
         }
     }
