@@ -11,6 +11,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import retrofit2.HttpException
 import java.io.IOException
+import javax.net.ssl.SSLHandshakeException
 
 /**
  * Like [runCatching] but re-throws [CancellationException] instead of capturing
@@ -524,6 +525,13 @@ fun Throwable.toUserMessage(): String = when (this) {
         404 -> "Not found."
         else -> "Server error (${code()})."
     }
+    // Checked before the generic IOException branch below (SSLHandshakeException
+    // is an IOException) — server discovery can surface an https:// candidate
+    // whose self-signed cert the real (validating) client then refuses; without
+    // this the failure fell through to the generic "can't reach" message with no
+    // hint that the actual problem is an untrusted certificate.
+    is SSLHandshakeException ->
+        "Certificate isn't trusted. Try the http:// address instead, or install the server's CA."
     is IOException -> "Can't reach the server. Check the address and your connection."
     else -> message ?: "Unexpected error."
 }
