@@ -501,19 +501,36 @@ class PlaybackViewModel(
             repo.resolveSegment(cameraId, tsIso).onSuccess { segment ->
                 val startMs = Time.parseToMillis(segment.start)
                 val offsetMs = (tsMs - startMs).coerceAtLeast(0L)
-                val authedUrl = repo.mediaUrls().scopedUrl(cameraId, qualityUrl(segment.url))
-                _state.update {
-                    it.copy(
-                        // Belt-and-braces re-assertion (spec 5.): whatever else
-                        // touched playheadMs during the round-trip, the landed
-                        // segment's own resolve target wins.
-                        playheadMs = tsMs,
-                        currentSegment = segment,
-                        currentSegmentUrl = authedUrl,
-                        segmentOffsetMs = offsetMs,
-                        error = null,
-                        noFootageAtPlayhead = false,
-                    )
+                // The media-token fetch behind scopedUrl() throws by design on
+                // failure (MediaTokenCache) — guard it like every other consumer
+                // (e.g. PlaybackWallScreen, ClipsScreen) so a token error can't
+                // crash the app; treat it as a genuine failure, same as below.
+                runCatching {
+                    repo.mediaUrls().scopedUrl(cameraId, qualityUrl(segment.url))
+                }.onSuccess { authedUrl ->
+                    _state.update {
+                        it.copy(
+                            // Belt-and-braces re-assertion (spec 5.): whatever else
+                            // touched playheadMs during the round-trip, the landed
+                            // segment's own resolve target wins.
+                            playheadMs = tsMs,
+                            currentSegment = segment,
+                            currentSegmentUrl = authedUrl,
+                            segmentOffsetMs = offsetMs,
+                            error = null,
+                            noFootageAtPlayhead = false,
+                        )
+                    }
+                }.onFailure { err ->
+                    _state.update {
+                        it.copy(
+                            currentSegment = null,
+                            currentSegmentUrl = null,
+                            segmentOffsetMs = 0L,
+                            error = err.toUserMessage(),
+                            noFootageAtPlayhead = false,
+                        )
+                    }
                 }
             }.onFailure { err ->
                 if (err.isNotFound() && retryAtMs != null && retryAtMs != tsMs) {
@@ -584,7 +601,13 @@ class PlaybackViewModel(
                 // segment this prefetch was FOR while the network call was in
                 // flight, don't attach a stale "next" to the new current segment.
                 if (_state.value.currentSegment?.segmentId != targetSegmentId) return@onSuccess
-                val authedUrl = repo.mediaUrls().scopedUrl(cameraId, qualityUrl(next.url))
+                // scopedUrl() throws on a media-token fetch failure (by design) —
+                // guard it so a token hiccup during a background prefetch can't
+                // crash the app; dropped silently like every other prefetch
+                // failure below (the STATE_ENDED fallback still covers it).
+                val authedUrl = runCatching {
+                    repo.mediaUrls().scopedUrl(cameraId, qualityUrl(next.url))
+                }.getOrNull() ?: return@onSuccess
                 _state.update { it.copy(nextSegment = next, nextSegmentUrl = authedUrl) }
             }
             // Failures (including 404 at a span boundary edge case) are silently
@@ -953,8 +976,14 @@ class PlaybackViewModel(
             // per-camera scoped token — resolve it off the main update, then apply
             // it only if the scrub hasn't already moved past this frame.
             viewModelScope.launch {
-                val frameUrl = repo.mediaUrls().scopedUrl(cameraId, nearestFrame.url)
-                if (_state.value.scrubbing) _state.update { it.copy(scrubFrameUrl = frameUrl) }
+                // scopedUrl() throws on a media-token fetch failure — guard it like
+                // every other consumer and just drop the frame on failure.
+                val frameUrl = runCatching {
+                    repo.mediaUrls().scopedUrl(cameraId, nearestFrame.url)
+                }.getOrNull()
+                if (frameUrl != null && _state.value.scrubbing) {
+                    _state.update { it.copy(scrubFrameUrl = frameUrl) }
+                }
             }
         } else {
             _state.update { it.copy(scrubFrameUrl = null) }
@@ -1010,7 +1039,12 @@ class PlaybackViewModel(
                     val nearestFrame = frames.minByOrNull {
                         kotlin.math.abs(Time.parseToMillis(it.ts) - _state.value.playheadMs)
                     }
-                    val frameUrl = nearestFrame?.let { repo.mediaUrls().scopedUrl(cameraId, it.url) }
+                    // scopedUrl() throws on a media-token fetch failure — guard it
+                    // like every other consumer; the scrubber still works without
+                    // a filmstrip frame.
+                    val frameUrl = nearestFrame?.let {
+                        runCatching { repo.mediaUrls().scopedUrl(cameraId, it.url) }.getOrNull()
+                    }
                     _state.update { s ->
                         s.copy(filmstrip = frames, scrubFrameUrl = if (s.scrubbing) frameUrl else s.scrubFrameUrl)
                     }
