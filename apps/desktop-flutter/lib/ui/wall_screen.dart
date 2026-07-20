@@ -1056,6 +1056,14 @@ class _WallTileState extends State<_WallTile> {
   Timer? _pendingTimeout;
   static const _pendingSwapTimeout = Duration(seconds: 15);
 
+  /// The camera [_pending] was actually opened for, captured at the same time
+  /// as [_pending] itself. Under seamless carousel/hotspot switching a rapid
+  /// double flip (A -> B -> C) can retarget `widget.camera` to C while B's
+  /// player is still the one parked in [_pending] — [_onFirstFrame] must
+  /// promote `_shown` from THIS captured identity, not from `widget.camera`,
+  /// or the tile paints B's footage labelled as C (issue #321).
+  Camera? _pendingCamera;
+
   String? _error;
   bool _firstFrame = false;
 
@@ -1278,6 +1286,15 @@ class _WallTileState extends State<_WallTile> {
         // so the native mpv wind-down never stalls the swap (#105 contract).
         final superseded = _pending;
         _pending = player;
+        // Capture the camera THIS player was actually opened for, right now —
+        // the `gen == _loadGen` check just above guarantees no newer _load()
+        // has started (and thus `widget.camera` hasn't moved on) since this
+        // call began. Under seamless double-flip retargeting (A -> B -> C),
+        // `widget.camera` can already read C by the time B's player is the
+        // one promoted in [_onFirstFrame] — that promotion must label the
+        // pane from THIS captured identity, not from `widget.camera` at
+        // promote time (issue #321).
+        _pendingCamera = widget.camera;
         // Arm the wedged-swap recovery timeout (#318) — cancels+re-arms if a
         // second swap starts before the first ever resolved.
         _pendingTimeout?.cancel();
@@ -1403,10 +1420,16 @@ class _WallTileState extends State<_WallTile> {
     _pending = null;
     _pendingTimeout?.cancel();
     _pendingTimeout = null;
+    // The camera THIS player was opened for (captured alongside _pending) —
+    // NOT widget.camera, which can already have moved on under a rapid
+    // double flip (issue #321: promoting B's player while widget.camera
+    // reads C must still label the tile "B", not "C").
+    final promotedCamera = _pendingCamera ?? widget.camera;
+    _pendingCamera = null;
     _firstFrame = true;
     // The incoming feed is now the painted one — promote the name label to it
     // (it lagged the pending switch on purpose, #254); _adopt's setState repaints.
-    _shown = widget.camera;
+    _shown = promotedCamera;
     _adopt(player, controller);
     // Retire the outgoing player OFF the UI isolate — libmpv dispose() can block
     // for seconds (#105), and under a carousel this now fires on every switch.
@@ -1425,6 +1448,7 @@ class _WallTileState extends State<_WallTile> {
     final pending = _pending;
     if (pending == null) return;
     _pending = null;
+    _pendingCamera = null;
     _disposePlayerDetached(pending);
   }
 
@@ -1616,6 +1640,7 @@ class _WallTileState extends State<_WallTile> {
     final pending = _pending;
     final player = _player;
     _pending = null;
+    _pendingCamera = null;
     _player = null;
     _disposePlayerDetached(pending);
     _disposePlayerDetached(player);
