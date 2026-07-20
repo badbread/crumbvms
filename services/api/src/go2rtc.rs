@@ -317,6 +317,14 @@ fn is_patch_alias_collision(src: &str, managed_names: &HashSet<String>) -> bool 
 /// [`patch_stream`]. To force a real producer re-dial after a source change, use
 /// [`reconnect`] (DELETE + `PUT`), not this pass.
 pub async fn reconcile(state: &AppState) -> Result<()> {
+    // Hold the reconcile/teardown lock for the whole read-then-apply pass. This
+    // pass is additive (PUT every DB stream, never prune), so without this a
+    // camera delete's stream teardown could land *between* our stream-list read
+    // and our PUTs and be undone — resurrecting the deleted camera's stream
+    // permanently (#294). `remove()` takes the same lock.
+    let lock = state.go2rtc_reconcile_lock();
+    let _guard = lock.lock().await;
+
     let api_base = &state.config().crumb_go2rtc_api_base;
     let auth = (
         state.config().go2rtc_user.as_str(),
@@ -438,6 +446,14 @@ async fn apply_stream(
 
 /// Remove a camera's go2rtc streams (main + sub) — call after deleting a camera.
 pub async fn remove(state: &AppState, go2rtc_name: &str) -> Result<()> {
+    // Serialize teardown against a reconcile pass (#294): a pass that snapshotted
+    // this camera before the delete must not re-PUT its stream after we tear it
+    // down. Holding the same lock reconcile() takes means the two never
+    // interleave — the pass either finishes before we delete, or reads the
+    // post-delete camera set and never re-adds us.
+    let lock = state.go2rtc_reconcile_lock();
+    let _guard = lock.lock().await;
+
     let api_base = &state.config().crumb_go2rtc_api_base;
     let auth = (
         state.config().go2rtc_user.as_str(),
