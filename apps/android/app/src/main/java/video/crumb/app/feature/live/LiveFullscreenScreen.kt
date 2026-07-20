@@ -140,12 +140,20 @@ fun LiveFullscreenScreen(
     }
     // Poll HA states while this camera has linked entities (to keep the on-video
     // badges live) or the sheet is open. Server demand-caches with a ~2s TTL.
+    // Gate on lifecycle so it doesn't poll while backgrounded, and back off under
+    // failure (matches the motion poll below).
     val haHasPlaced = haLinks.any { it.hasPlacement }
     LaunchedEffect(currentCameraId, haHasPlaced, haSheetOpen) {
         if (!haHasPlaced && !haSheetOpen) return@LaunchedEffect
-        while (true) {
-            repo.haStates().onSuccess { haStates = it }
-            kotlinx.coroutines.delay(2000)
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var failStreak = 0
+            while (true) {
+                val res = repo.haStates().onSuccess { haStates = it }
+                failStreak = if (res.isSuccess) 0 else failStreak + 1
+                kotlinx.coroutines.delay(
+                    if (failStreak == 0) 2000L else (2000L shl (failStreak - 1)).coerceAtMost(30000L),
+                )
+            }
         }
     }
     // Decoded video pixel size (for contain-fit badge placement) and the current
