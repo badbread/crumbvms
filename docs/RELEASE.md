@@ -76,12 +76,22 @@ between releases.
    The repo squash-merges, so this is every merged PR (each subject ends in
    `(#N)`); drop it into the GitHub Release notes / `CHANGELOG.md` alongside the
    curated Added/Changed/Fixed prose.
-3. Tag and push:
+3. **Bump `VERSION` and finalize the `CHANGELOG`** (a small release PR landed on
+   `main` before the tag):
+   - Set the `VERSION` file to the new version. The api `include_str!`s it,
+     reports it as the server version, **and compares it against the latest
+     GitHub release for the update-available check** — skip this and the shipped
+     server self-reports the *previous* version and flags its own release as an
+     available update.
+   - Add a dated `## [X.Y.Z] - <date>` section to `CHANGELOG.md` from the bullets
+     in step 2 (curated), and add/point the `[Unreleased]` compare-link in the
+     footer (`compare/vX.Y.Z...HEAD`).
+4. Tag and push (only after step 3 is on `main`):
    ```bash
    git tag -a v1.2.0 -m "Crumb v1.2.0"
    git push origin v1.2.0
    ```
-4. CI builds `recorder` and `api` and tags them `v1.2.0` (+ short SHA). If a
+5. CI builds `recorder` and `api` and tags them `v1.2.0` (+ short SHA). If a
    registry is configured (below), they're pushed; otherwise they're built and
    validated but not pushed.
 

@@ -50,7 +50,8 @@ runbook is the single source of truth.
   (`apps/desktop` is the retired Tauri client, kept for reference.)
 - **Android** (`apps/android`): Kotlin / Jetpack Compose / Media3, built with
   Gradle (JDK 17, SDK 34).
-- **iOS** (`apps/ios`): Swift; still partial and gated on further work.
+- **iOS** (`apps/ios`): Swift / SwiftUI; built to near-parity, not yet
+  distributable (pre-TestFlight — needs a paid Apple account, see README § License).
 
 Each client's manifests (`Cargo.toml`, `build.gradle.kts`, Swift package files)
 are the authoritative source for toolchain versions and dependencies.
