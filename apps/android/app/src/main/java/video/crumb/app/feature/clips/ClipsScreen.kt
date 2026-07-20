@@ -442,9 +442,16 @@ private fun ClipPlayerDialog(
     LaunchedEffect(clip.id) {
         val url = runCatching { mediaUrls.clipVideoUrl(clip.cameraId, clip.id, "preview") }.getOrNull()
             ?: return@LaunchedEffect
-        exo.setMediaItem(MediaItem.fromUri(url))
-        exo.prepare()
-        exo.playWhenReady = true
+        // The token resolve above is a network round-trip; if the dialog was
+        // dismissed (and exo released) while it was in flight, there's no further
+        // suspension point before touching exo below for Compose's cooperative
+        // cancellation to catch — guard against IllegalStateException from an
+        // already-released player instead of crashing.
+        runCatching {
+            exo.setMediaItem(MediaItem.fromUri(url))
+            exo.prepare()
+            exo.playWhenReady = true
+        }
     }
 
     // Gate the motion auto-zoom on the FIRST rendered frame. Without this, the
@@ -514,10 +521,13 @@ private fun ClipPlayerDialog(
                     scope.launch {
                         val url = runCatching { mediaUrls.clipVideoUrl(clip.cameraId, clip.id, quality) }.getOrNull()
                             ?: return@launch
-                        exo.setMediaItem(MediaItem.fromUri(url))
-                        exo.prepare()
-                        exo.seekTo(at)
-                        exo.playWhenReady = true
+                        // Same disposed-mid-load guard as the initial load above.
+                        runCatching {
+                            exo.setMediaItem(MediaItem.fromUri(url))
+                            exo.prepare()
+                            exo.seekTo(at)
+                            exo.playWhenReady = true
+                        }
                     }
                 }) {
                     Icon(
