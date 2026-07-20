@@ -147,6 +147,16 @@ struct Inner {
     /// pattern and lifecycle as `thumb_inflight`.
     clip_inflight: DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
 
+    /// Serializes go2rtc reconcile passes against camera-stream teardown. A
+    /// reconcile pass is additive (it PUTs every DB stream but never prunes), so
+    /// a periodic pass that snapshots the camera list *before* a camera delete
+    /// but applies its PUTs *after* the delete tore the stream down would
+    /// resurrect the deleted camera's go2rtc stream permanently. `reconcile()`
+    /// and `remove()` both hold this for their duration so the teardown can
+    /// never interleave with a pass's read-then-apply. Low-frequency operations,
+    /// so a single global lock is fine.
+    go2rtc_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -258,6 +268,7 @@ impl AppState {
             play_semaphore,
             clip_gen_semaphore,
             clip_inflight: DashMap::new(),
+            go2rtc_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             thumb_semaphore,
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
@@ -448,6 +459,15 @@ impl AppState {
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Clone the shared go2rtc reconcile/teardown lock. A go2rtc `reconcile()`
+    /// pass and a stream `remove()` both hold this for their duration so a
+    /// camera delete can never interleave with a pass's read-then-apply and
+    /// resurrect the deleted camera's stream. See the field docs on
+    /// [`go2rtc_reconcile_lock`](Inner::go2rtc_reconcile_lock).
+    pub fn go2rtc_reconcile_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.0.go2rtc_reconcile_lock)
     }
 
     // ── health-alert maintenance window (issue #46) ───────────────────────────
