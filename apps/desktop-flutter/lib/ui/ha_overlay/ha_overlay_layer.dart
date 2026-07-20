@@ -353,7 +353,16 @@ class HaBadgeCaptions extends StatelessWidget {
 
     final showState = item.showState || hovered;
     final showAge = (item.showAge || hovered) && state?.lastChanged != null;
-    if (!showState && !showAge && !hovered) return null;
+    // A Dot renders icon-only (unlike a Pill, which shows its label inline), so
+    // when the operator has given a Dot an explicit label, surface it as a
+    // caption line — the compact-Dot analogue of the Pill's inline label
+    // (#255). Gated on a non-empty operator label so unlabeled Dots stay
+    // icon-only, and suppressed while hovering (the hover line already shows the
+    // name). Rides the link's existing `label` — no new persisted field.
+    final showLabel = !item.isPill &&
+        !hovered &&
+        (item.labelText?.trim().isNotEmpty ?? false);
+    if (!showState && !showAge && !hovered && !showLabel) return null;
 
     // Scale text with the badge so captions stay proportional on small tiles.
     final fState = (h * 0.42).clamp(8.0, 13.0).toDouble();
@@ -364,6 +373,17 @@ class HaBadgeCaptions extends StatelessWidget {
       if (hovered)
         Text(
           item.displayLabel,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: fState,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      if (showLabel)
+        Text(
+          item.pillLabel,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(
