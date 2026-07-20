@@ -1031,6 +1031,17 @@ class _WallTileState extends State<_WallTile> {
   /// the pane while the fresh player waits ~a GOP for its first keyframe.
   Player? _pending;
 
+  /// Bounded-timeout recovery for [_pending] (issue #318): if the replacement
+  /// never reaches its first keyframe (e.g. the newly-selected stream's URL
+  /// is dead), the swap must not wedge the tile on the stale outgoing feed
+  /// forever — and, since [_reconnectStalled] refuses to run at all while
+  /// [_pending] is non-null (a real swap is assumed to be resolving on its
+  /// own), a wedged swap would also permanently disable this tile's stall
+  /// watchdog. Armed whenever a player is parked in [_pending]; cancelled
+  /// the moment it clears (promoted or disposed).
+  Timer? _pendingTimeout;
+  static const _pendingSwapTimeout = Duration(seconds: 15);
+
   String? _error;
   bool _firstFrame = false;
 
@@ -1253,7 +1264,18 @@ class _WallTileState extends State<_WallTile> {
         // so the native mpv wind-down never stalls the swap (#105 contract).
         final superseded = _pending;
         _pending = player;
+        // Arm the wedged-swap recovery timeout (#318) — cancels+re-arms if a
+        // second swap starts before the first ever resolved.
+        _pendingTimeout?.cancel();
+        _pendingTimeout = Timer(_pendingSwapTimeout, _onPendingSwapTimedOut);
         _disposePlayerDetached(superseded);
+        // The width event can fire during the `await player.open()` above,
+        // before `_pending` was assigned — the stream listener's
+        // `identical(player, _pending)` check would have silently dropped
+        // that signal (#318). Re-check once now that `_pending` is set so an
+        // already-arrived first frame isn't lost.
+        final w = player.state.width;
+        if (w != null && w > 0) _onFirstFrame(player, controller);
       }
       spawned = null; // ownership handed off — the catch must not dispose it
     } catch (_) {
@@ -1363,6 +1385,8 @@ class _WallTileState extends State<_WallTile> {
     if (!identical(player, _pending)) return; // superseded swap — ignore
     final old = _player;
     _pending = null;
+    _pendingTimeout?.cancel();
+    _pendingTimeout = null;
     _firstFrame = true;
     // The incoming feed is now the painted one — promote the name label to it
     // (it lagged the pending switch on purpose, #254); _adopt's setState repaints.
@@ -1373,6 +1397,19 @@ class _WallTileState extends State<_WallTile> {
     // Safe: warmController is null whenever _pending != null, so nothing external
     // was painting `old` at promote time.
     _disposePlayerDetached(old);
+  }
+
+  /// [_pendingTimeout] fired: the pending swap never reached a first frame.
+  /// Retire the wedged player (detached, #105) and clear [_pending] so
+  /// [_reconnectStalled] — which refuses to run at all while a swap looks
+  /// "in flight" — resumes normal stall recovery on the still-painting
+  /// outgoing player (issue #318).
+  void _onPendingSwapTimedOut() {
+    _pendingTimeout = null;
+    final pending = _pending;
+    if (pending == null) return;
+    _pending = null;
+    _disposePlayerDetached(pending);
   }
 
   String get _paneId => widget.paneIdOverride ?? 'wall:${widget.camera.id}';
@@ -1558,6 +1595,8 @@ class _WallTileState extends State<_WallTile> {
     widget.onHaLinksLoaded?.call(_paneId, const []);
     // Detach the (potentially seconds-long) libmpv teardown from the teardown
     // path so restore/close doesn't freeze the UI (#105). Null first.
+    _pendingTimeout?.cancel();
+    _pendingTimeout = null;
     final pending = _pending;
     final player = _player;
     _pending = null;
