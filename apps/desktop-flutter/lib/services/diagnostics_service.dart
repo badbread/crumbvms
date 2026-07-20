@@ -123,16 +123,25 @@ class DiagnosticsService extends ChangeNotifier {
   /// Wire a media_kit [player]'s error/log streams into the buffer. Errors
   /// always; mpv's own log lines only in verbose (they're chatty). The
   /// subscriptions die with the player's streams on dispose — fire-and-forget.
+  ///
+  /// mpv/ffmpeg error and log text routinely echoes back the full URL it was
+  /// opening (a go2rtc/RTSP restream, possibly `user:pass@`-embedded) — [log]
+  /// already runs every message through [scrub], but these two call sites
+  /// pre-scrub the raw text too, belt-and-suspenders, since it's the one place
+  /// credential-bearing URLs are most likely to appear verbatim.
   void attachPlayer(String tag, Player player) {
     player.stream.error.listen(
-      (e) => log('player:$tag', e, level: 'warn'),
+      (e) => log('player:$tag', scrub(e), level: 'warn'),
       onError: (_) {},
     );
     player.stream.log.listen(
       (l) {
         if (!_verbose) return;
-        log('player:$tag', '[${l.level}] ${l.prefix}: ${l.text}',
-            level: 'debug');
+        log(
+          'player:$tag',
+          scrub('[${l.level}] ${l.prefix}: ${l.text}'),
+          level: 'debug',
+        );
       },
       onError: (_) {},
     );
@@ -167,6 +176,15 @@ class DiagnosticsService extends ChangeNotifier {
         caseSensitive: false,
       ),
       (m) => '"${m[1]}":"[REDACTED]"',
+    );
+    // URL userinfo (`scheme://user:pass@host`) — go2rtc/RTSP restream URLs can
+    // embed basic-auth-style credentials, and mpv/ffmpeg error + log lines
+    // routinely echo back the full URL being opened. Strip the userinfo
+    // regardless of scheme so a restream credential never survives into an
+    // exported diagnostics file.
+    out = out.replaceAllMapped(
+      RegExp(r'([a-z][a-z0-9+.-]*://)[^/@\s]+@'),
+      (m) => '${m[1]}[REDACTED]@',
     );
     return out;
   }
