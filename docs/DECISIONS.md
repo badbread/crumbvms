@@ -8,6 +8,41 @@ revisit.
 
 ---
 
+## 2026-07-20, Admin-only outbound probes (stream-test / ONVIF discovery) are not SSRF-guarded; risk accepted under the LAN-only, single-operator trust model
+
+**Context.** An API reliability/security audit flagged that `POST
+/config/test-stream`, `/config/test-frame`, `/config/discover`, and
+`/config/discover/probe` let the caller point Crumb's outbound request at an
+arbitrary host — including `169.254.169.254` (cloud metadata), `localhost:<port>`,
+or other internal hosts — a classic SSRF surface. Error text can echo a snippet
+of the upstream response.
+
+**Decision — accept the risk; do not add a URL allowlist or private-IP denylist
+right now.** Every one of these endpoints is `AdminUser`-gated, and in Crumb's
+ratified posture the admin **is** the trust root and owns the LAN. Crumb's whole
+job is to reach arbitrary RTSP/ONVIF hosts on the operator's own network that the
+admin types in — a private-IP denylist would break the primary use case (LAN
+cameras live on exactly the private ranges an SSRF guard blocks). There is **no
+viewer-reachable outbound path**: the audit confirmed the only non-admin outbound
+(PTZ) targets a DB/admin-set host the viewer cannot influence. So this is admin
+self-targeting, not a privilege-boundary break.
+
+**Rejected:** an allowlist/denylist on these outbound targets — it fights the LAN
+camera use case and adds config surface for a threat the trust model already
+covers. Also rejected: suppressing upstream error snippets — they are genuinely
+useful for diagnosing why a camera URL failed, and the reader is the admin.
+
+**Revisit triggers (any one):**
+- Crumb grows a **hosted / multi-tenant** deployment mode, or any path where a
+  non-admin (or a lower-trust admin) can influence these outbound targets — then a
+  metadata-endpoint / link-local (`169.254.0.0/16`) denylist and error-snippet
+  suppression become warranted.
+- These probe endpoints are ever exposed to an untrusted network or moved off the
+  `AdminUser` gate.
+- A credible report of admin-context SSRF being chained with another finding.
+
+Tracked privately as advisory GHSA-v7q8-gj2q-gffw.
+
 ## 2026-07-19, iOS/macOS v0.1.0 parity: HA overlays + LPR are read-only on mobile; client-side logic ported verbatim from the server
 
 **Context.** The iOS/macOS SwiftUI client was catching up to a large batch of

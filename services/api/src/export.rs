@@ -259,6 +259,18 @@ async fn get_export_status(
         ));
     }
 
+    // Return only what the caller can see: strip out-of-scope camera UUIDs and
+    // their per-camera download URLs, so polling a job you have only partial
+    // access to doesn't disclose cameras outside your scope. The job's creator
+    // and admins hold every camera in the job, so they see it unchanged. The
+    // single nil-camera ZIP-archive entry names no specific camera, so it is
+    // left in place (the archive download handler enforces its own scope).
+    let visible_set: std::collections::HashSet<Uuid> = visible.iter().copied().collect();
+    let mut job = job;
+    job.camera_ids.retain(|c| visible_set.contains(c));
+    job.output_files
+        .retain(|f| f.camera_id.is_nil() || visible_set.contains(&f.camera_id));
+
     Ok(Json(job))
 }
 
@@ -278,16 +290,20 @@ async fn cancel_export(
     State(state): State<AppState>,
     Path(job_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Same gate as get_export_status: export capability + access to ≥1 job camera.
     user.require_export()?;
     let job = state
         .export_jobs()
         .get(&job_id)
         .map(|r| r.clone())
         .ok_or_else(|| ApiError::NotFound(format!("export job {job_id} not found")))?;
-    if user.filter_camera_ids(&job.camera_ids).is_empty() {
+    // Cancelling aborts the WHOLE job, so require access to EVERY camera in it —
+    // not just one. The creator and admins hold them all; a viewer with partial
+    // access must not be able to kill someone else's multi-camera export.
+    // filter_camera_ids drops only out-of-scope cameras, so an equal length
+    // means every camera is in the caller's scope.
+    if user.filter_camera_ids(&job.camera_ids).len() != job.camera_ids.len() {
         return Err(ApiError::Forbidden(
-            "you do not have access to this export job".to_owned(),
+            "you do not have access to all cameras in this export job".to_owned(),
         ));
     }
 

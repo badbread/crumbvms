@@ -1291,8 +1291,12 @@ pub(crate) async fn redetect_camera_streams(
     .is_ok_and(|r| r.is_ok());
 
     if !reachable {
+        // Redact the RTSP userinfo before logging — the URL embeds the camera's
+        // `user:pass@`, and percent-encoding is not redaction. Same treatment
+        // the go2rtc apply path gives this class of URL.
+        let redacted_url = crumb_common::redact::redact_url_credentials(&source_url);
         tracing::warn!(
-            rtsp_url = %source_url,
+            rtsp_url = %redacted_url,
             onvif_host = %host,
             probe_host = %probe_host_str,
             probe_port,
