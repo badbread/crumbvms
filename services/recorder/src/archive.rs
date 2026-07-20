@@ -350,7 +350,15 @@ async fn tick(
     }
 
     // ── 2. Per-camera archive jobs ────────────────────────────────────────────
-    let cameras = match db::list_enabled_cameras(pool).await {
+    // ALL cameras, not just enabled ones (#279): footage LIFECYCLE (archive
+    // moves, retention, size caps, and above all the max_retention_days legal
+    // ceiling — correctness item 22's hard limit) is a property of the footage
+    // and its policy, not of whether the camera is currently recording.
+    // Driving the tick from enabled cameras only meant disabling a camera
+    // silently froze its footage outside every sweep — indefinite retention,
+    // in violation of the operator's stated ceiling. Only the RECORDING
+    // supervisor (main.rs) keys off enabled.
+    let cameras = match db::list_cameras_all(pool).await {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "failed to list cameras for archive tick; skipping");
@@ -431,10 +439,11 @@ async fn tick(
         }
     }
 
-    // Prune CronTracker entries for cameras that are no longer enabled so the
-    // map does not grow unbounded.
-    let enabled_ids: std::collections::HashSet<Uuid> = cameras.iter().map(|c| c.id).collect();
-    cron_trackers.retain(|id, _| enabled_ids.contains(id));
+    // Prune CronTracker entries for cameras that no longer exist so the map
+    // does not grow unbounded (the tick now iterates ALL cameras, so only a
+    // deleted camera drops out — #279).
+    let known_ids: std::collections::HashSet<Uuid> = cameras.iter().map(|c| c.id).collect();
+    cron_trackers.retain(|id, _| known_ids.contains(id));
 }
 
 /// Run the cron-driven time-based archive move + archive-retention sweep for one
@@ -1670,10 +1679,13 @@ fn archive_relative_path(
 pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
     let now = Utc::now();
 
-    // Load all enabled cameras to build the per-camera retention map.
-    let cameras = db::list_enabled_cameras(pool)
+    // Load ALL cameras (enabled and disabled) to build the per-camera
+    // retention map (#279): retention applies to the footage regardless of
+    // whether its camera is currently recording — enabled-only meant a
+    // disabled camera's live footage was retained forever.
+    let cameras = db::list_cameras_all(pool)
         .await
-        .context("list_enabled_cameras for retention sweep")?;
+        .context("list_cameras_all for retention sweep")?;
 
     // Build map: camera_id -> live_retention_hours for non-archive cameras.
     // Also determine the minimum retention across non-archive cameras so we
@@ -1750,13 +1762,15 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
                 continue;
             }
         } else {
-            // The segment belongs to a camera not in our retention map.
-            // This means the camera is archive-enabled or disabled — skip it.
-            // (Correctness item 7 defence-in-depth.)
+            // The segment belongs to a camera not in our retention map. Since
+            // the map now covers disabled cameras too (#279), this means the
+            // camera is archive-enabled (its live footage is the cron move's
+            // to handle) or was deleted since the list. (Correctness item 7
+            // defence-in-depth.)
             warn!(
                 segment_id = %seg.id,
                 camera_id  = %seg.camera_id,
-                "live_retention_sweep: camera not in retention map (archive-enabled or disabled); skipping"
+                "live_retention_sweep: camera not in retention map (archive-enabled or deleted); skipping"
             );
             continue;
         }
@@ -5361,6 +5375,74 @@ mod tests {
                 )
                 .await
                 .expect("set max_retention_days");
+        }
+
+        /// #279 / correctness item 22: footage LIFECYCLE covers DISABLED
+        /// cameras. The tick previously sourced its camera/policy sets from
+        /// enabled cameras only, so disabling a camera froze its footage
+        /// outside every sweep — indefinite retention, violating the
+        /// operator's stated `max_retention_days` legal ceiling. A full tick
+        /// with the camera disabled must still delete its over-ceiling
+        /// footage (file AND row).
+        #[tokio::test]
+        async fn disabled_camera_footage_still_ages_out() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup_policy(&url, None, None, false).await; // archive OFF
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            set_max_retention_days(&fx, Some(7)).await;
+
+            let live_path = fx._live_dir.path().to_path_buf();
+            add_segment_for(
+                &fx.pool,
+                fx.camera_a_id,
+                fx.live_storage_id,
+                &live_path,
+                SegmentStage::Live,
+                "disabled_old.mp4",
+                Utc::now() - Duration::days(10), // past the 7-day ceiling
+                100,
+            )
+            .await;
+
+            // Disable the camera BEFORE any sweep runs.
+            {
+                let client = fx.pool.get().await.expect("conn");
+                client
+                    .execute(
+                        // BOTH cameras: the sweeps are policy-wide, so a single
+                        // still-enabled sibling would keep the policy in the
+                        // tick's set and mask the hole. The audited failure is
+                        // a policy whose members are ALL disabled.
+                        "UPDATE cameras SET enabled = false WHERE id = $1 OR id = $2",
+                        &[&fx.camera_a_id, &fx.camera_b_id],
+                    )
+                    .await
+                    .expect("disable cameras");
+            }
+
+            // A FULL tick (live sweep + cron jobs + size/max sweeps), exactly
+            // as the scheduler drives it.
+            let mut trackers = std::collections::HashMap::new();
+            tick(&fx.pool, &config, &mut trackers).await;
+
+            assert!(
+                !live_path.join("disabled_old.mp4").exists(),
+                "a disabled camera's over-ceiling footage must still be swept"
+            );
+            let client = fx.pool.get().await.expect("conn");
+            let rows: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM segments WHERE camera_id = $1",
+                    &[&fx.camera_a_id],
+                )
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(rows, 0, "the segment row must be deleted with the file");
         }
 
         /// OFF by default: with `max_retention_days` unset, even ancient footage on
