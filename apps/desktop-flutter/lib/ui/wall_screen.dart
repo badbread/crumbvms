@@ -18,6 +18,7 @@ import 'package:crumb_desktop/api/ha_models.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/ptz_panel_store.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
+import 'package:crumb_desktop/services/diagnostics_service.dart';
 import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/client_options.dart';
@@ -1178,6 +1179,11 @@ class _WallTileState extends State<_WallTile> {
       final player = Player();
       final controller = VideoController(player);
       spawned = player;
+      // Diagnostics (#180): player errors always captured; mpv log in verbose.
+      DiagnosticsService.instance.attachPlayer(
+        'live:${widget.camera.name}',
+        player,
+      );
       final p = player.platform;
       if (p is NativePlayer) {
         for (final kv in const [
@@ -2146,6 +2152,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       }
       final player = Player();
       final controller = VideoController(player);
+      // Diagnostics (#180): player errors always captured; mpv log in verbose.
+      DiagnosticsService.instance.attachPlayer(
+        'max:${widget.camera.name}',
+        player,
+      );
       spawned = player;
       final p = player.platform;
       if (p is NativePlayer) {

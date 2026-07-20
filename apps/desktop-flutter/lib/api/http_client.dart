@@ -14,6 +14,8 @@ import 'dart:async';
 
 import 'package:http/http.dart' as http;
 
+import '../services/diagnostics_service.dart';
+
 /// Per-request budget for every desktop API call. Long enough to ride out a
 /// briefly slow LAN server, short enough that a wedged request fails fast
 /// instead of freezing the UI.
@@ -31,14 +33,37 @@ class TimeoutClient extends http.BaseClient {
   final Duration timeout;
 
   @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) {
-    return _inner.send(request).timeout(
-      timeout,
-      onTimeout: () => throw TimeoutException(
-        'Request to ${request.url} timed out',
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    // Diagnostics (#180): every API call funnels through this one method, so
+    // it's the single choke point for the HTTP trace. ONLY method + bare path
+    // + status + duration are ever recorded — never the query string (media
+    // URLs carry `?token=`), never headers (`authorization: Bearer`), never
+    // bodies (login credentials).
+    final sw = Stopwatch()..start();
+    try {
+      final resp = await _inner.send(request).timeout(
         timeout,
-      ),
-    );
+        onTimeout: () => throw TimeoutException(
+          'Request to ${request.url} timed out',
+          timeout,
+        ),
+      );
+      DiagnosticsService.instance.httpTrace(
+        request.method,
+        request.url.path,
+        resp.statusCode,
+        sw.elapsedMilliseconds,
+      );
+      return resp;
+    } catch (e) {
+      DiagnosticsService.instance.httpTrace(
+        request.method,
+        request.url.path,
+        null,
+        sw.elapsedMilliseconds,
+      );
+      rethrow;
+    }
   }
 
   @override

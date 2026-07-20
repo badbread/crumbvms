@@ -92,6 +92,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../../api/crumb_api.dart';
 import '../../api/models.dart';
 import '../../api/playback_api.dart';
+import '../../services/diagnostics_service.dart';
 
 /// How long before a segment's end to kick off the prefetch of the next one.
 /// Mirrors app.js's `seg.segEndMs - 1000` check in `pbTick`.
@@ -136,6 +137,8 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   }) : _session = session {
     _player = Player();
     _videoController = VideoController(_player);
+    // Diagnostics (#180): player errors always captured; mpv log in verbose.
+    DiagnosticsService.instance.attachPlayer('playback:$cameraId', _player);
     // Watch mpv's playlist pointer: with `prefetch-playlist=yes` and the next
     // segment appended, mpv auto-advances the playlist at the REAL end of the
     // current file. In the single-pane mpv-driven mode that auto-advance IS

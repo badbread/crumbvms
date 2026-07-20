@@ -10,6 +10,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -27,6 +28,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/playback_api.dart' show PlaybackApi;
 import 'package:crumb_desktop/api/views_api.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
+import 'package:crumb_desktop/services/diagnostics_service.dart';
 import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/session/session_controller.dart';
@@ -108,6 +110,24 @@ ThemeData _desktopTheme() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Diagnostics (#180): stand up the bounded log capture and funnel every
+  // framework/platform error into it — before anything else can fail. The
+  // handlers CHAIN to Flutter's defaults so console behavior is unchanged;
+  // the buffer is just an additional, exportable witness.
+  await DiagnosticsService.instance.init();
+  final prevFlutterError = FlutterError.onError;
+  FlutterError.onError = (details) {
+    DiagnosticsService.instance.log(
+      'flutter',
+      details.exceptionAsString(),
+      level: 'error',
+    );
+    prevFlutterError?.call(details);
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    DiagnosticsService.instance.log('uncaught', '$error', level: 'error');
+    return false; // not handled — keep the default crash/log behavior
+  };
   // media_kit native surface + libmpv init.
   MediaKit.ensureInitialized();
   // flutter_rust_bridge — loads the cargokit-built rust_lib_crumb_desktop dylib.
@@ -281,6 +301,8 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     _updateCheck = UpdateCheckController(api: _api, session: session)..start();
     _session = session;
     _cameras = cameras;
+    // Diagnostics breadcrumb (#180): record host:port only, never creds.
+    DiagnosticsService.instance.setServerBase(session.base);
     // Apply "launch into fullscreen wall" only after the initial camera load —
     // same ordering as the old client's applyLaunchPreferences().
     unawaited(applyLaunchFullscreenPreference(_fullscreen));
