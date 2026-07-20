@@ -170,6 +170,14 @@ pub struct ApiConfig {
     /// Default: `2 GiB`.
     pub segment_low_cache_max_bytes: u64,
 
+    /// `EXPORT_CACHE_MAX_BYTES` -- soft byte budget for finished export job
+    /// output under `{export_dir}/<job-id>`. The TTL sweeper evicts the
+    /// oldest-by-`created_at` finished jobs (Done/Failed/Cancelled — never a
+    /// Running job) past this budget, in addition to the `EXPORT_TTL_SECONDS`
+    /// age rule, so a burst of large exports can't fill the disk within a
+    /// single TTL window. Default: `20 GiB`.
+    pub export_cache_max_bytes: u64,
+
     /// `MOBILE_STREAM_ENABLED` -- register a per-camera `<name>_mobile` go2rtc
     /// stream: an on-demand H.264 transcode of the camera's sub stream (or main,
     /// when there is no sub), capped to [`Self::mobile_stream_width`]. Exposed to
@@ -397,6 +405,7 @@ impl ApiConfig {
                 "SEGMENT_LOW_CACHE_MAX_BYTES",
                 2_147_483_648_u64,
             )?,
+            export_cache_max_bytes: parse_env("EXPORT_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
             mobile_stream_enabled: parse_env("MOBILE_STREAM_ENABLED", true)?,
             mobile_stream_width: parse_env("MOBILE_STREAM_WIDTH", 640_u32)?.max(160),
             thumb_extract_max_concurrency: parse_env(
