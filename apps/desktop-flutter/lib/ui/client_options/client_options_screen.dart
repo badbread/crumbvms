@@ -75,6 +75,8 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setZoomSwitchesToMain(bool v) =>
       setState(() => _o.zoomSwitchesToMain = v);
   void _setOpenClipsInHd(bool v) => setState(() => _o.openClipsInHd = v);
+  void _setSeamlessTileSwitching(bool v) =>
+      setState(() => _o.seamlessTileSwitching = v);
 
   StreamQuality get _wallDefaultQuality =>
       widget.streamPrefs?.wallDefaultQuality ?? StreamQuality.sub;
@@ -251,6 +253,13 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Zoom switches to main stream',
             subtitle:
                 'Digitally zooming a wall tile past 100% temporarily loads its full-res main stream; back at 100% it reverts to sub.',
+          ),
+          _switchRow(
+            value: _o.seamlessTileSwitching,
+            onChanged: _setSeamlessTileSwitching,
+            title: 'Seamless carousel/hotspot switching',
+            subtitle:
+                'Pre-warm the incoming camera and swap only once it has a frame, so a carousel or auto-hotspot tile never blanks to black on a switch. Turn off on low-powered machines to avoid the brief second decode.',
           ),
 
           const Divider(height: 24),
