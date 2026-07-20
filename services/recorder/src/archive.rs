@@ -1059,6 +1059,12 @@ struct CopiedSeg {
     src_abs: PathBuf,
     dst_abs: PathBuf,
     size_bytes: i64,
+    /// True when src and dst resolved to the SAME file (duplicate storage rows
+    /// for one path, symlinked/bind-mounted roots — issue #276): the bytes are
+    /// already durable at the destination path, no copy was performed, and the
+    /// cleanup phase must not delete ANYTHING for this segment in either arm
+    /// (the "source" and the "destination" are one inode).
+    in_place: bool,
 }
 
 /// Result of the (unguarded, parallelizable) copy phase for one segment.
@@ -1101,13 +1107,39 @@ async fn copy_segment_for_migration(
         return MigrationOutcome::Skipped;
     }
 
+    // The from/to roots can resolve to the SAME file: `storages` has no
+    // UNIQUE(path), so two rows can point at one directory (the consolidation
+    // case), and symlinked/bind-mounted roots alias too. The bytes are already
+    // durable at the destination path, so the correct move is a bare DB flip
+    // with NO file I/O — mirroring `move_segment_to_archive`'s in-place flip.
+    // Without this pre-guard the same-file bail inside `copy_with_crc32` routes
+    // into the failure arm below, whose dst cleanup would UNLINK THE ONLY COPY
+    // (dst IS src) — issue #276, the #70 failure class resurrected.
+    if same_file(&src_abs, &dst_abs).await {
+        return MigrationOutcome::Copied(CopiedSeg {
+            id: seg.id,
+            src_abs,
+            dst_abs,
+            size_bytes: seg.size_bytes,
+            in_place: true,
+        });
+    }
+
     // copy + streaming hash of the source (one pass)
     let bytes_copied = match copy_with_crc32(&src_abs, &dst_abs).await {
         Ok((n, _src_crc)) => n,
         Err(e) => {
             warn!(segment = %seg.id, error = %e,
                   "migration: copy {} -> {} failed", src_abs.display(), dst_abs.display());
-            let _ = tokio::fs::remove_file(&dst_abs).await;
+            // Defense in depth for the phase invariant "the unguarded copy
+            // phase never deletes a file it did not itself create": even
+            // though the same-file case was pre-guarded above, re-verify
+            // before removing the partial dst (a rename/symlink swap between
+            // the pre-guard and the copy must not turn this cleanup into a
+            // source unlink).
+            if !same_file(&src_abs, &dst_abs).await {
+                let _ = tokio::fs::remove_file(&dst_abs).await;
+            }
             return MigrationOutcome::Failed;
         }
     };
@@ -1142,6 +1174,7 @@ async fn copy_segment_for_migration(
         src_abs,
         dst_abs,
         size_bytes: seg.size_bytes,
+        in_place: false,
     })
 }
 
@@ -1316,6 +1349,17 @@ pub async fn run_storage_migration(pool: &Pool, mig: &StorageMigration) -> Resul
         //    concurrent mover/eviction → its dst copy is a duplicate; remove it.
         let (mut moved, mut bytes) = (0i64, 0i64);
         for c in &copied {
+            // In-place (same-file) segment: the "source" and the "destination"
+            // are one inode (#276). Nothing may be deleted in EITHER arm —
+            // flipped: the row now points at the same bytes under the new
+            // root; lost-the-race: the file is still the live source.
+            if c.in_place {
+                if flipped.contains(&c.id) {
+                    moved += 1;
+                    bytes += c.size_bytes;
+                }
+                continue;
+            }
             if flipped.contains(&c.id) {
                 match tokio::fs::remove_file(&c.src_abs).await {
                     Ok(()) => {}
@@ -3758,6 +3802,112 @@ mod tests {
             assert_eq!(after.moved_bytes, 4096 + 8192);
 
             // Idempotent: re-running drains nothing (all already on target) → Ok.
+            run_storage_migration(&fx.pool, &mig)
+                .await
+                .expect("second drain is a clean no-op");
+        }
+
+        /// Issue #276: `storages` has no UNIQUE(path), so two rows can point at
+        /// ONE directory (the operator-consolidation case; symlinked roots alias
+        /// the same way). Draining a policy between such rows must flip the DB
+        /// rows in place and touch NO files. Pre-fix, the same-file bail inside
+        /// `copy_with_crc32` routed into the failure arm whose dst cleanup
+        /// unlinked the ONLY copy — destroying the policy's oldest
+        /// MIGRATION_BATCH segments per attempt.
+        #[tokio::test]
+        async fn change_storage_drain_same_path_flips_in_place() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup(&url, None, None, false).await;
+            db::ensure_storage_migrations_table(&fx.pool)
+                .await
+                .expect("ensure migrations table");
+
+            // A DUPLICATE storage row for the SAME directory the live storage
+            // already points at.
+            let dup_storage = db::create_storage(
+                &fx.pool,
+                "live-duplicate-row",
+                fx._live_dir.path().to_str().expect("utf8 tmpdir"),
+                None,
+                None,
+            )
+            .await
+            .expect("duplicate storage row")
+            .id;
+
+            let start = Utc::now() - Duration::hours(2);
+            let rel1 = format!("{}/2026/06/21/same-a.mp4", fx.camera_id);
+            let rel2 = format!("{}/2026/06/21/same-b.mp4", fx.camera_id);
+            add_segment(
+                &fx,
+                fx.live_storage_id,
+                fx._live_dir.path(),
+                SegmentStage::Live,
+                &rel1,
+                start,
+                4096,
+            )
+            .await;
+            add_segment(
+                &fx,
+                fx.live_storage_id,
+                fx._live_dir.path(),
+                SegmentStage::Live,
+                &rel2,
+                start + Duration::seconds(10),
+                8192,
+            )
+            .await;
+
+            let policy_id = default_policy_id(&fx).await;
+            let mig = db::create_storage_migration(
+                &fx.pool,
+                policy_id,
+                fx.live_storage_id,
+                dup_storage,
+                2,
+            )
+            .await
+            .expect("create migration");
+            db::set_migration_status(&fx.pool, mig.id, "running", None)
+                .await
+                .expect("set running");
+
+            run_storage_migration(&fx.pool, &mig)
+                .await
+                .expect("same-path drain completes");
+
+            // THE invariant: every file is still there — nothing was unlinked.
+            for rel in [&rel1, &rel2] {
+                assert!(
+                    fx._live_dir.path().join(rel).exists(),
+                    "same-path migration must never touch the file: {rel}"
+                );
+            }
+
+            // Rows flipped to the duplicate storage id; stage + path unchanged.
+            let segs = db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+                .await
+                .unwrap();
+            assert_eq!(segs.len(), 2);
+            for s in &segs {
+                assert_eq!(s.storage_id, dup_storage, "row flipped in place");
+                assert_eq!(s.stage, SegmentStage::Live, "stage preserved");
+            }
+
+            // Progress recorded as moved (the drain made real forward progress —
+            // without this the batch reads moved==0 and bails "stalled").
+            let after = db::get_storage_migration(&fx.pool, mig.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.moved_segments, 2);
+            assert_eq!(after.moved_bytes, 4096 + 8192);
+
+            // Idempotent: nothing left on the from-storage → clean no-op.
             run_storage_migration(&fx.pool, &mig)
                 .await
                 .expect("second drain is a clean no-op");
