@@ -44,6 +44,30 @@ void main() {
     expect(out, contains('"username":"admin"'), reason: 'non-secrets survive');
   });
 
+  test('RTSP/URL userinfo credentials are redacted (any case, @ in password)', () {
+    // The load-bearing case: mpv/ffmpeg echo the full go2rtc restream URL, which
+    // embeds user:pass@ — it must never reach the exported log.
+    // ignore: this is a fabricated test credential, not a real one
+    final lower = scrub('Playing: rtsp://cam:s3cret@192.0.2.6:554/stream1'); // gitleaks:allow
+    expect(lower, isNot(contains('s3cret')));
+    expect(lower, contains('rtsp://[REDACTED]@192.0.2.6:554/stream1'));
+
+    // Uppercase scheme is still caught (regex is case-insensitive).
+    final upper = scrub('RTSP://user:pass@host:8554/cam failed'); // gitleaks:allow
+    expect(upper, isNot(contains('pass')));
+    expect(upper, contains('[REDACTED]@host:8554'));
+
+    // A password containing '@' is fully redacted (greedy to the LAST @).
+    final atPw = scrub('open rtsp://user:p@ss@host/stream refused'); // gitleaks:allow
+    expect(atPw, isNot(contains('p@ss')));
+    expect(atPw, isNot(contains('ss@host')));
+    expect(atPw, contains('rtsp://[REDACTED]@host/stream'));
+
+    // No userinfo → nothing redacted; a later '@' in the path/query is not swallowed.
+    const clean = 'GET http://host:8080/media/x.mp4?to=a@b done';
+    expect(scrub(clean), clean);
+  });
+
   test('ordinary log lines pass through untouched', () {
     const line = 'GET /cameras → 200 (41ms)';
     expect(scrub(line), line);

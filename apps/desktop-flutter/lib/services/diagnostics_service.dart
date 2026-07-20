@@ -182,8 +182,13 @@ class DiagnosticsService extends ChangeNotifier {
     // routinely echo back the full URL being opened. Strip the userinfo
     // regardless of scheme so a restream credential never survives into an
     // exported diagnostics file.
+    // Case-insensitive so `RTSP://`/`HTTP://` are covered, and the userinfo is
+    // matched GREEDILY up to the LAST `@` before the path — so a password that
+    // itself contains `@` (e.g. `user:p@ss@host`) is fully redacted rather than
+    // leaving the trailing `ss@` exposed. `[^/\s]+` stops at the first `/`, so a
+    // later `@` in the path/query (`?email=a@b`) is never mis-swallowed.
     out = out.replaceAllMapped(
-      RegExp(r'([a-z][a-z0-9+.-]*://)[^/@\s]+@'),
+      RegExp(r'([a-z][a-z0-9+.-]*://)[^/\s]+@', caseSensitive: false),
       (m) => '${m[1]}[REDACTED]@',
     );
     return out;

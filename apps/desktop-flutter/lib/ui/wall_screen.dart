@@ -1363,7 +1363,13 @@ class _WallTileState extends State<_WallTile> {
     // The first pane to come up becomes the default capture target.
     SnapshotRegistry.instance.register(
       _paneId,
-      SnapshotTarget(player: player, cameraName: widget.camera.name),
+      // Label the snapshot from `_shown` (the just-promoted camera), NOT
+      // `widget.camera` — under a rapid carousel double-flip A->B->C, promoting
+      // B's player while `widget.camera` already reads C would otherwise file a
+      // snapshot of B's footage under C's name (the #321/#330 mislabel class,
+      // via the snapshot path). `_shown` is set to the promoted camera
+      // immediately before this call, and equals `widget.camera` on first load.
+      SnapshotTarget(player: player, cameraName: _shown.name),
     );
     // Register as an audio pane (muted until it becomes the audible pane).
     widget.audio?.registerPane(
@@ -2032,6 +2038,14 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   VideoController? _controller;
   String? _error;
 
+  /// Generation guard for [_load]. Since #322 the right-click stream-override
+  /// menu can call [_load] again while a prior load is still awaiting
+  /// `cameraStreams`/`open()`; without this, both loads adopt their own
+  /// player+watchdog and the later one overwrites `_player`/`_watchdog`, leaking
+  /// the earlier player's live decoder until app exit. Same pattern as
+  /// `_WallTileState._loadGen`.
+  int _loadGen = 0;
+
   /// True once this pane's own (main-stream) player has decoded a frame —
   /// until then the warm-start controller (if any) covers the wait.
   bool _firstFrame = false;
@@ -2293,6 +2307,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     // listener below and briefly shows the warm-start stand-in (if any) /
     // loading spinner while the new tier buffers — expected for an explicit
     // quality change. No-op on the very first call (_player is still null).
+    //
+    // Supersede any in-flight load (the #322 reload race): a later _load() bumps
+    // this generation, and the earlier call bails after its awaits instead of
+    // adopting a second player + watchdog (which would leak the first).
+    final gen = ++_loadGen;
     final previous = _player;
     if (previous != null) {
       _watchdog?.dispose();
@@ -2313,6 +2332,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         widget.camera.id,
       );
       _streams = streams; // gate the right-click Data-saver item
+      if (gen != _loadGen || !mounted) return; // superseded by a newer _load()
       // Honor an explicit per-camera stream override from the right-click
       // menu (Main/Sub/Data saver) — issue #322, this pane used to ignore
       // `streamPrefs` entirely. `isMaximized: false` here means "don't force
@@ -2373,7 +2393,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         if (h != null && h > 0) _videoH = h;
       });
       await player.open(Media(url));
-      if (!mounted) {
+      if (gen != _loadGen || !mounted) {
+        // A newer _load() superseded us (or the pane unmounted) while opening —
+        // don't adopt, and dispose the player we spawned so it doesn't leak.
         _disposePlayerDetached(player);
         return;
       }
@@ -2430,7 +2452,13 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         widget.session,
         widget.camera.id,
       );
-      final url = streams.rtspMain ?? streams.preferredForWall;
+      // Honor the same per-camera override _load() uses (issue #322) — otherwise
+      // a stall recovery (camera reboot / go2rtc restart) silently reverts an
+      // explicit Sub/Data-saver choice back to Main until the pane is re-maximized.
+      final prefs = widget.streamPrefs;
+      final url = (prefs != null && prefs.hasOverride(widget.camera.id))
+          ? prefs.liveStreamUrl(widget.camera.id, streams, isMaximized: false)
+          : (streams.rtspMain ?? streams.preferredForWall);
       if (url == null) return;
       await player.open(Media(url));
       _watchdog?.resetBaseline();
