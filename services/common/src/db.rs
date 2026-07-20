@@ -4727,6 +4727,19 @@ pub fn thumbnail_grid_slots(
     if end_ms <= start_ms {
         return vec![];
     }
+    // Defense-in-depth allocation bound. Without this, a caller that fails to
+    // bound its `[start, end)` window (or passes a far-past/future range) would
+    // have us allocate a Vec of `count` timestamps — and callers a second Vec
+    // of the same size — which for a multi-millennium span is tens of billions
+    // of entries and OOM-kills the process. This is the single choke point for
+    // both the synthetic filmstrip grid and the coverage-filtered
+    // `list_thumbnail_times` (which calls us first), so bounding it here caps
+    // every path. No legitimate scrub/filmstrip grid is anywhere near this
+    // ceiling; past it we return nothing rather than allocate.
+    const MAX_GRID_SLOTS: i64 = 250_000; // at 4 s spacing, ~11.5 days
+    if (end_ms - start_ms) / step_ms >= MAX_GRID_SLOTS {
+        return vec![];
+    }
     // start_ms < end_ms and step_ms > 0 here; the quotient fits usize on all
     // targets we care about (Linux x86_64 with 48-bit virtual address space).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -12782,6 +12795,24 @@ mod tests {
             .unwrap();
         assert!(thumbnail_grid_slots(t, t, 5).is_empty());
         assert!(thumbnail_grid_slots(t + chrono::Duration::seconds(5), t, 5).is_empty());
+    }
+
+    #[test]
+    fn thumbnail_grid_slots_caps_absurd_range_instead_of_allocating() {
+        // Regression guard for the filmstrip OOM (issue #288): an unbounded
+        // window (here ~9000 years) at 4 s spacing would ask for ~7e10 slots and
+        // OOM the process. The allocation bound must return empty rather than
+        // build the Vec. A just-under-the-cap range must still produce slots.
+        let start = Utc.timestamp_millis_opt(0).single().unwrap();
+        let far_future = Utc.with_ymd_and_hms(9999, 1, 1, 0, 0, 0).single().unwrap();
+        assert!(
+            thumbnail_grid_slots(start, far_future, 4).is_empty(),
+            "an absurd range must be refused, not allocated"
+        );
+
+        // Sanity: a modest range still returns the expected grid.
+        let end = start + chrono::Duration::seconds(40);
+        assert_eq!(thumbnail_grid_slots(start, end, 4).len(), 10);
     }
 
     // ── list_thumbnail_times — coverage-aware grid, throwaway-DB integration test ──

@@ -81,6 +81,13 @@ pub(crate) const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
 const THUMB_MIN_WIDTH: u32 = 48;
 const THUMB_MAX_WIDTH: u32 = 640;
 
+/// Hard ceiling on a single filmstrip window. The endpoint builds one grid
+/// entry per `DEFAULT_THUMB_INTERVAL_SECS`, so an unbounded range would
+/// allocate an enormous Vec (and OOM the process — filmstrip lives on the
+/// no-timeout, no-rate-limit media router). No real scrub window is anywhere
+/// near a week; past this we reject with 400 rather than allocate.
+const FILMSTRIP_MAX_RANGE_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// Monotonic counter for unique temp-file suffixes during atomic thumbnail
 /// writes (ffmpeg renders to `<final>.tmpN`, then we rename into place).
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -132,6 +139,17 @@ async fn list_filmstrip(
         return Err(ApiError::BadRequest(
             "start must be strictly before end".to_owned(),
         ));
+    }
+
+    // Bound the window before it reaches the grid builder. An unbounded range
+    // (e.g. year 1000 → 9999) would synthesise tens of billions of slots and
+    // OOM the api on this no-timeout router; reject it up front with a clear
+    // 400 instead. `thumbnail_grid_slots` also caps the allocation as a
+    // defense-in-depth backstop for any other caller.
+    if (q.end - q.start).num_seconds() > FILMSTRIP_MAX_RANGE_SECS {
+        return Err(ApiError::BadRequest(format!(
+            "filmstrip window too large: max {FILMSTRIP_MAX_RANGE_SECS} seconds"
+        )));
     }
 
     // Query coverage-filtered thumbnail slot timestamps from the DB.
