@@ -396,11 +396,28 @@ final class Fmp4Demuxer {
             let hasFlags = flags & 0x400 != 0
             let hasCTS = flags & 0x800 != 0
 
+            // `sampleCount` is a raw 32-bit field from the box (up to ~4.29B) with
+            // nothing to validate it against the box's actual size — the per-sample
+            // read guards below (`t.count >= p + 4`) only skip OUT-OF-RANGE READS,
+            // they don't stop the loop, so a malformed/hostile 16-byte `trun`
+            // claiming billions of samples would still `reserveCapacity`/`append`
+            // that many entries (~4.29B × 8 bytes ≈ 48 GB) and OOM. Clamp to what
+            // the box could plausibly hold given its declared per-sample fields,
+            // plus an absolute sanity cap — real fragments carry at most a few
+            // hundred samples.
+            let bytesPerSample = (hasDuration ? 4 : 0) + (hasSize ? 4 : 0) + (hasFlags ? 4 : 0) + (hasCTS ? 4 : 0)
+            let maxSamplesPerFragment = 10_000
+            var boundedSampleCount = min(sampleCount, maxSamplesPerFragment)
+            if bytesPerSample > 0 {
+                let availableBytes = max(0, t.count - p)
+                boundedSampleCount = min(boundedSampleCount, availableBytes / bytesPerSample)
+            }
+
             var sizes: [Int] = []
             var durations: [UInt32] = []
-            sizes.reserveCapacity(sampleCount)
-            durations.reserveCapacity(sampleCount)
-            for _ in 0..<sampleCount {
+            sizes.reserveCapacity(boundedSampleCount)
+            durations.reserveCapacity(boundedSampleCount)
+            for _ in 0..<boundedSampleCount {
                 var duration = defaultSampleDuration
                 if hasDuration { if t.count >= p + 4 { duration = beU32(t, p) }; p += 4 }
                 var size = defaultSampleSize
