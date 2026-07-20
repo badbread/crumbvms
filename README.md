@@ -32,8 +32,8 @@
 
 It is a side project. One maintainer, built on my own time, running at home in production
 today: eleven cameras, multiple storage volumes, recording day in and day out for months.
-**It is about 90% of where I want v1 to be, and the next milestone is v0.1.0, the first minor
-release.** The recorder, the Windows desktop client, and the Android app are the polished daily
+**It is about 90% of where I want v1 to be. The first minor release (v0.1.0) shipped in July
+2026, and the work continues toward v1.** The recorder, the Windows desktop client, and the Android app are the polished daily
 drivers. The macOS app works but sits behind Android and Windows until demand says otherwise,
 and the iOS app is built and actively developed but not yet distributable (Apple wants a paid
 developer account, see [License](#license)). Both macOS and iOS get kept up to date, they just
@@ -204,7 +204,7 @@ so if you have thoughts on how it should work,
 
 > [!IMPORTANT]
 > ## Looking for testers
-> **This is the first public release and I genuinely need help testing it.** CrumbVMS runs
+> **Crumb is early public software and I genuinely need help testing it.** CrumbVMS runs
 > clean on my hardware, but that is the whole problem: one person, one set of cameras, one GPU,
 > one disk layout. The only way to learn how it holds up in the real world is to get it onto
 > hardware that is not mine. If you run cameras at home (bonus points for an existing Frigate
@@ -400,7 +400,7 @@ For contributors working in this repo:
 services/   # Rust backend: common (types, DB, migrations), api (axum + web admin at /admin), recorder
 apps/       # desktop-flutter (Flutter + libmpv), android (Kotlin/Compose), ios; desktop = retired Tauri client
 db/         # PostgreSQL migrations; the segment index is the single source of truth
-site/       # crumbvms.com source (static, zero-dep build)
+# (crumbvms.com lives in its own separate repo, not included here — see .gitignore)
 ```
 
 ## The itch this scratches

@@ -1,7 +1,7 @@
 # CrumbVMS clients, install & connect
 
 CrumbVMS's server is the recorder. You watch live, scrub the timeline, and manage
-cameras through a **client**. There are five:
+cameras through a **client**. There are six:
 
 | Client | Platform | Tech | How you get it |
 |---|---|---|---|

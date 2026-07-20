@@ -14,10 +14,6 @@ Instead, **use GitHub private vulnerability reporting**: on the repository, go
 to **Security → Report a vulnerability** and file a private advisory. This keeps
 the report visible only to the maintainer until it's resolved.
 
-> **Maintainer setup:** enable **private vulnerability reporting** in the
-> repository's **Settings → Security** before the first invite goes out, the
-> GitHub advisory path above depends on it.
-
 When you report, please include as much of the following as you can:
 
 - the affected component (server API, recorder, or a specific client);
