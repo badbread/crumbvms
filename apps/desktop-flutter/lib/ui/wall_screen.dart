@@ -378,7 +378,13 @@ class _WallScreenState extends State<WallScreen> {
   }
 
   /// Maximize a camera + make it the audio-active pane.
-  void _maximize(Camera cam) {
+  ///
+  /// [specialSlot]: when the maximize originated from a carousel/hotspot slot,
+  /// its slot index — the controller freezes that slot so the rotation doesn't
+  /// keep advancing (and, with seamless switching, warm-swapping streams)
+  /// underneath the maximized overlay (#269). Null for plain-camera maximizes,
+  /// which also UNfreezes any previously frozen slot.
+  void _maximize(Camera cam, {int? specialSlot}) {
     // Maximizing a different camera mid panel-edit ends (and persists) the
     // edit — the editor chrome must not follow the wrong camera. The session
     // teardown is synchronous inside endEditAndSave (only the store write is
@@ -400,6 +406,9 @@ class _WallScreenState extends State<WallScreen> {
       // it shows live video (upscaled sub stream) instead of black while its
       // own main-stream player waits ~a GOP for its first keyframe.
       _maximizeWarmCtrl = _tileKeys[cam.id]?.currentState?.warmController;
+      // Freeze the originating carousel/hotspot slot (or unfreeze on a
+      // plain-camera maximize) — see the doc above (#269).
+      _special.frozenSlot = specialSlot;
       _maximized = cam;
       // Fresh key per maximize — lets the wall reach this pane's State later
       // (e.g. to push refreshed HA links after an edit saves) while keeping
@@ -419,6 +428,8 @@ class _WallScreenState extends State<WallScreen> {
     setState(() {
       _maximizeWarmCtrl = null;
       _maximized = null;
+      // Let a frozen carousel/hotspot slot resume rotating (#269).
+      _special.frozenSlot = null;
     });
   }
 
@@ -773,7 +784,9 @@ class _WallScreenState extends State<WallScreen> {
                     onTap: () {
                       // Clicking a camera retargets classic (click) hotspots.
                       _special.routeHotspotClick(i, cam.id);
-                      _maximize(cam);
+                      // A maximize FROM a carousel/hotspot slot freezes that
+                      // slot's rotation until restore (#269).
+                      _maximize(cam, specialSlot: spec == null ? null : i);
                     },
                     onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(cam)),
                     onEditHaOverlay: () =>
