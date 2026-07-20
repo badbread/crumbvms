@@ -468,7 +468,13 @@ final class HEVCRetagLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate {
                 }
                 if self.totalSize == nil, let cr = http.value(forHTTPHeaderField: "Content-Range"),
                    let slash = cr.firstIndex(of: "/"), let total = Int(cr[cr.index(after: slash)...]) {
-                    self.totalSize = total
+                    // `totalSize` isn't isolated (this class isn't `@MainActor`),
+                    // and `serveRangeStreamed`'s read of it runs on whatever
+                    // executor the resource-loader delegate callback landed on.
+                    // Hop through `MainActor.run` for the write, same as every
+                    // other mutation of this delegate's state in this file
+                    // (`fetchHeader` above, `proxyTasks[key] = nil` below).
+                    await MainActor.run { self.totalSize = total }
                 }
 
                 var chunk = Data()
