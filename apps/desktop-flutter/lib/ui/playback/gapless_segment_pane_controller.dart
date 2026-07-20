@@ -595,6 +595,15 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         } catch (_) {
           /* non-fatal — the transport owner reasserts speed on its next change */
         }
+        // The offset seek below MUST wait for the file to finish loading:
+        // media_kit's open() returns before mpv's file-loaded, and mpv
+        // silently REJECTS seeks issued mid-load (media_kit logs, never
+        // throws). Without this gate the pane lands on the segment's FIRST
+        // frame while the playhead shows the clicked time — invisible on a
+        // static scene, then "exposed" by the first frame-step truthfully
+        // mapping mpv's real position and snapping the playhead a whole
+        // segment (the #186 no-motion ~4s jump).
+        await _awaitFileLoaded();
       }
       final offsetMs = (ts.millisecondsSinceEpoch - seg.startMs)
           .clamp(0, seg.durationMs)
@@ -625,6 +634,26 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     } finally {
       _resolving = false;
       _replayPendingResolve();
+    }
+  }
+
+  /// Wait (bounded) for a just-`open()`ed file to actually finish loading
+  /// before issuing its offset seek. mpv rejects seeks while a file is still
+  /// loading, and media_kit's `open()` returns as soon as the load *begins* —
+  /// so an immediate seek is silently dropped (media_kit only logs the mpv
+  /// error) and the pane sits on the file's first frame while the app thinks
+  /// it seeked (#186). mpv's `duration` flips 0 → real exactly at
+  /// file-loaded (`open()` resets it to 0 first), so that's the gate.
+  /// Timeout → proceed and seek anyway: the worst case is today's behavior,
+  /// never a new hang.
+  Future<void> _awaitFileLoaded() async {
+    if (_player.state.duration > Duration.zero) return;
+    try {
+      await _player.stream.duration
+          .firstWhere((d) => d > Duration.zero)
+          .timeout(const Duration(seconds: 3));
+    } catch (_) {
+      /* best-effort — see doc */
     }
   }
 
@@ -854,6 +883,12 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       } catch (_) {
         /* non-fatal — the transport owner reasserts speed on its next change */
       }
+      // Same dropped-seek gate as resolveAt (#186): without it the backward
+      // cross's `durationMs - 200` seek is rejected mid-load and the pane
+      // lands on the previous segment's FIRST frame — whose position ≈ 0 the
+      // next back-press reads as "at the file start" and crosses ANOTHER
+      // segment (the repeated whole-segment back-jump #192 only softened).
+      await _awaitFileLoaded();
       // Landing offset: first frame going forward. Going backward, aim a few
       // frames shy of the end (200 ms) rather than the exact last frame —
       // the indexed duration can slightly overshoot the real file, and a
