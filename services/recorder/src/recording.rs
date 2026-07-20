@@ -66,7 +66,7 @@ use chrono::{DateTime, Utc};
 use crumb_common::{
     config::Config,
     db::{self, InsertSegmentParams},
-    types::{Camera, RecordingMode, SegmentStage, SegmentStream},
+    types::{Camera, RecordingMode, SegmentStage, SegmentStream, Storage},
     MotionSignal,
 };
 use deadpool_postgres::Pool;
@@ -440,6 +440,11 @@ pub async fn run(
     // re-tries the cache once the operator has freed RAM.
     let cache_disabled = Arc::new(AtomicBool::new(false));
 
+    // #280: worker-lifetime cache of the last successfully resolved live
+    // storage row — lets a mid-outage RECONNECT keep recording to the known
+    // disk instead of failing setup until the DB returns.
+    let mut cached_live_storage: Option<Storage> = None;
+
     loop {
         // Check for shutdown before attempting to start ffmpeg.
         if cancel.is_cancelled() {
@@ -480,6 +485,7 @@ pub async fn run(
             &watchdog_secs,
             &mut gop_probe_spawned,
             &cache_disabled,
+            &mut cached_live_storage,
         )
         .await;
 
@@ -617,6 +623,105 @@ pub async fn run(
         camera_name = %camera.name,
         "recording task stopped"
     );
+}
+
+/// Resolve this worker's live storage row, with a worker-lifetime cache so a
+/// RECONNECT survives a DB outage (#280).
+///
+/// While ffmpeg runs, a DB outage is fully fail-open (indexing skipped, files
+/// adopted later) — but every reconnect used to re-resolve the storage row
+/// with `?`, so "DB down, then a stream blip / watchdog fire" left the camera
+/// dark for the whole outage even though the storage path hadn't changed.
+///
+/// Fallback rules, deliberately narrow:
+/// * A **query error** (DB unreachable) falls back to the cached row — but on
+///   the policy-pinned path ONLY when the cached row's id still matches the
+///   policy's `live_storage_id`. A policy repointed since the cache must not
+///   silently record to the old disk; it keeps erroring until the DB answers.
+/// * `Ok(None)` / an empty name lookup is the DB **answering** that the row is
+///   gone — a genuine config error the cache must never mask. Bails as before.
+/// * Every successful resolution refreshes the cache.
+async fn resolve_live_storage(
+    pool: &Pool,
+    config: &Config,
+    policy_storage_id: Option<uuid::Uuid>,
+    cache: &mut Option<Storage>,
+) -> Result<Storage> {
+    let resolved = if let Some(sid) = policy_storage_id {
+        match db::get_storage(pool, sid).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Authoritative answer: the row is gone. Never cache-mask.
+                anyhow::bail!("live_storage_id {} from policy not found in storages", sid);
+            }
+            Err(e) => match cache {
+                Some(prev) if prev.id == sid => {
+                    warn!(
+                        storage_id = %sid,
+                        path = %prev.path,
+                        error = %e,
+                        "DB unreachable resolving live storage on reconnect; \
+                         using the worker's cached row (#280)"
+                    );
+                    prev.clone()
+                }
+                _ => return Err(e).context("get_storage by policy id"),
+            },
+        }
+    } else {
+        // NULL-policy fallback: prefer resolving the configured default storage ROW
+        // (and thereafter use its id) rather than carrying the name around. Defend
+        // against an ambiguous config where the name maps to >1 row — though
+        // `storages.name` is UNIQUE so this should be impossible, a loud warning
+        // beats silently picking one if that invariant is ever weakened.
+        match db::find_storages_by_name(pool, &config.live_storage_name).await {
+            Ok(candidates) => {
+                // Panic-free by construction (audit 2026-07-05): consume the vec via
+                // its iterator instead of `.len()`-match + `.next().expect()`, so
+                // there is no unreachable-panic path in this footage-start path even
+                // if the length invariant is ever weakened.
+                let count = candidates.len();
+                let mut it = candidates.into_iter();
+                match it.next() {
+                    None => {
+                        anyhow::bail!(
+                            "live storage '{}' not found; run the seed first",
+                            config.live_storage_name
+                        );
+                    }
+                    Some(first) => {
+                        if count > 1 {
+                            warn!(
+                                name = %config.live_storage_name,
+                                count,
+                                "AMBIGUOUS default live storage: NAME maps to >1 storage row; using the first. \
+                                 Set the policy's live_storage_id explicitly to disambiguate."
+                            );
+                        }
+                        first
+                    }
+                }
+            }
+            Err(e) => match cache {
+                // The name comes from process-constant config and the policy
+                // had a NULL id both times, so the cached row is the same
+                // resolution this call would have made.
+                Some(prev) => {
+                    warn!(
+                        name = %config.live_storage_name,
+                        path = %prev.path,
+                        error = %e,
+                        "DB unreachable resolving default live storage on reconnect; \
+                         using the worker's cached row (#280)"
+                    );
+                    prev.clone()
+                }
+                None => return Err(e).context("find_storages_by_name (live default)"),
+            },
+        }
+    };
+    *cache = Some(resolved.clone());
+    Ok(resolved)
 }
 
 /// Inner loop: resolve storage, spawn ffmpeg, read the segment list pipe.
@@ -776,52 +881,26 @@ async fn run_ffmpeg_loop(
     // cache, so a wedged cache never silently stalls recording. Reset only by a
     // worker respawn (config change / process restart).
     cache_disabled: &Arc<AtomicBool>,
+    // #280: worker-lifetime cache of the last successfully resolved live
+    // storage row, so a RECONNECT (stream blip / watchdog fire) during a DB
+    // outage keeps recording to the known disk instead of failing setup and
+    // backing off until the DB returns. Owned by [`run`], like the motion
+    // state; see [`resolve_live_storage`] for the exact fallback rules.
+    cached_live_storage: &mut Option<Storage>,
 ) -> Result<()> {
     // ── 1. Resolve live storage ────────────────────────────────────────────────
 
     // A segment's physical location is owned by its storage_id. Resolve this
     // worker's live disk by the policy's live_storage_id when set (authoritative);
     // only when it is NULL fall back to the configured default storage NAME (A1c).
-    let live_storage = if let Some(sid) = camera.policy.live_storage_id {
-        db::get_storage(pool, sid)
-            .await
-            .context("get_storage by policy id")?
-            .with_context(|| format!("live_storage_id {} from policy not found in storages", sid))?
-    } else {
-        // NULL-policy fallback: prefer resolving the configured default storage ROW
-        // (and thereafter use its id) rather than carrying the name around. Defend
-        // against an ambiguous config where the name maps to >1 row — though
-        // `storages.name` is UNIQUE so this should be impossible, a loud warning
-        // beats silently picking one if that invariant is ever weakened.
-        let candidates = db::find_storages_by_name(pool, &config.live_storage_name)
-            .await
-            .context("find_storages_by_name (live default)")?;
-        // Panic-free by construction (audit 2026-07-05): consume the vec via its
-        // iterator instead of `.len()`-match + `.next().expect()`, so there is no
-        // unreachable-panic path in this footage-start path even if the length
-        // invariant is ever weakened.
-        let count = candidates.len();
-        let mut it = candidates.into_iter();
-        match it.next() {
-            None => {
-                anyhow::bail!(
-                    "live storage '{}' not found; run the seed first",
-                    config.live_storage_name
-                );
-            }
-            Some(first) => {
-                if count > 1 {
-                    warn!(
-                        name = %config.live_storage_name,
-                        count,
-                        "AMBIGUOUS default live storage: NAME maps to >1 storage row; using the first. \
-                         Set the policy's live_storage_id explicitly to disambiguate."
-                    );
-                }
-                first
-            }
-        }
-    };
+    // The worker-lifetime cache makes a RECONNECT survive a DB outage (#280).
+    let live_storage = resolve_live_storage(
+        pool,
+        config,
+        camera.policy.live_storage_id,
+        cached_live_storage,
+    )
+    .await?;
 
     // ── 2. Build output path and ensure directory exists ───────────────────────
 
@@ -3808,10 +3887,90 @@ impl MotionUnion {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use uuid::Uuid;
 
     // Helper to build a UTC DateTime quickly.
     fn utc(y: i32, mo: u32, d: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, m, s).unwrap()
+    }
+
+    // ── #280: reconnect storage-cache fallback ──────────────────────────────────
+
+    fn test_storage(id: Uuid) -> Storage {
+        Storage {
+            id,
+            name: "test-live".into(),
+            path: "/data/live".into(),
+            total_bytes: None,
+            icon: None,
+            created_at: utc(2026, 1, 1, 0, 0, 0),
+        }
+    }
+
+    /// A pool whose every connection attempt fails fast (connection refused on
+    /// the discard port) — the "DB unreachable" state, without any container.
+    fn dead_pool() -> Pool {
+        db::build_pool("postgres://crumb:x@127.0.0.1:9/crumb", 1).expect("pool builds lazily")
+    }
+
+    fn test_config() -> Config {
+        std::env::set_var("DATABASE_URL", "unused://");
+        Config::from_env().expect("config")
+    }
+
+    /// With the DB unreachable and a matching cached row, a reconnect resolves
+    /// from the cache (recording continues); the cache survives.
+    #[tokio::test]
+    async fn reconnect_uses_cached_storage_when_db_unreachable() {
+        let pool = dead_pool();
+        let config = test_config();
+        let sid = Uuid::new_v4();
+        let mut cache = Some(test_storage(sid));
+
+        let got = resolve_live_storage(&pool, &config, Some(sid), &mut cache)
+            .await
+            .expect("must resolve from the worker cache during a DB outage");
+        assert_eq!(got.id, sid);
+        assert_eq!(got.path, "/data/live");
+        assert!(cache.is_some(), "cache survives the fallback");
+
+        // NULL-policy (name-resolved) path: same fallback.
+        let mut cache2 = Some(test_storage(Uuid::new_v4()));
+        let got2 = resolve_live_storage(&pool, &config, None, &mut cache2)
+            .await
+            .expect("name path must also fall back to the cache");
+        assert_eq!(got2.path, "/data/live");
+    }
+
+    /// No cache (first-ever resolution) → the DB outage still fails setup —
+    /// there is nothing safe to record to yet.
+    #[tokio::test]
+    async fn reconnect_without_cache_still_errors_on_db_outage() {
+        let pool = dead_pool();
+        let config = test_config();
+        let mut cache: Option<Storage> = None;
+        assert!(
+            resolve_live_storage(&pool, &config, Some(Uuid::new_v4()), &mut cache)
+                .await
+                .is_err(),
+            "no cached row → a DB outage must still fail setup"
+        );
+        assert!(cache.is_none());
+    }
+
+    /// A cached row whose id no longer matches the policy's pin must NOT be
+    /// used — a repointed policy may not silently record to the old disk.
+    #[tokio::test]
+    async fn reconnect_rejects_stale_cache_after_policy_repoint() {
+        let pool = dead_pool();
+        let config = test_config();
+        let mut cache = Some(test_storage(Uuid::new_v4())); // old pin
+        assert!(
+            resolve_live_storage(&pool, &config, Some(Uuid::new_v4()), &mut cache)
+                .await
+                .is_err(),
+            "mismatched cache id → keep erroring until the DB answers"
+        );
     }
 
     // ── audio segmenter args (declared-track-must-carry-packets invariant) ──────
