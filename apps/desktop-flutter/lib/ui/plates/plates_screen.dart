@@ -2312,6 +2312,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
         _controller = controller;
       });
     }
+    // The property-setting loop above awaits — the overlay can be closed
+    // (dispose() synchronously disposes _player) during that gap. Calling
+    // open()/play() on the now-disposed player would throw an uncaught async
+    // error (issue #323).
+    if (!mounted) return;
     await player.open(Media(url));
     await player.play();
     _armWatchdog();
