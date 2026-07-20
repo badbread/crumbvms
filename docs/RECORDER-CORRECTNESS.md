@@ -19,7 +19,10 @@ recorder, and later the API) must satisfy these *by construction*.
 2. **Segments start on keyframes and are independently seekable:** `-c copy` (zero
    re-encode), `-segment_atclocktime 1`, `-reset_timestamps 1`.
 3. **Precise timestamps:** derive `start_ts` from the strftime-encoded filename
-   (clock-aligned; container runs in UTC), set `end_ts` = next segment's `start_ts`
+   (clock-aligned; the filename==UTC contract is enforced by the **`TZ=UTC` pin on
+   the ffmpeg child process itself** — the container may legitimately run an
+   operator timezone, so never rely on container-level UTC; see the 2026-07-03
+   TZ incident), set `end_ts` = next segment's `start_ts`
    (contiguous), `duration = end - start`. Do **not** use wall-clock at the moment a log
    line is observed. Final segment at shutdown: use file mtime (or start + segment_seconds).
 4. **Don't depend on log verbosity for segment detection.** Prefer `-segment_list pipe:`
@@ -224,3 +227,29 @@ recorder, and later the API) must satisfy these *by construction*.
     files are exempt at any age** — they are real footage ratified "never
     deleted" (2026-07-14 decision); quarantine is their terminal parking spot
     and deleting them stays a manual operator action.
+
+## policy model & seeding (2026-07-19 audit)
+30. **Policy membership is TOTAL.** Every camera holds a `NOT NULL`, FK'd
+    `policy_id` (RESTRICT — a referenced policy cannot be deleted); the boot
+    shim may only ever *re-add* the NOT NULL constraint, never drop it; the
+    deviation-reaper deletes only unreferenced non-default rows; exactly one
+    `is_default` policy row exists while cameras exist.
+31. **The default-policy seed is idempotent under concurrency.** `ensure_default_policy`
+    must stay safe for simultaneous api + recorder boots (`WHERE NOT EXISTS` +
+    bare `ON CONFLICT DO NOTHING` spanning both unique indexes); a name
+    collision degrades to a loud no-op, never a second default.
+
+## storage migration ("Change storage" drain)
+32. **Phase discipline: the unguarded copy phase never mutates the DB and never
+    deletes or modifies any file it did not itself create.** Only the guarded
+    flip (+ post-flip source delete) touches existing state, and the flip is
+    conditional on the expected from-storage. When from/to resolve to the SAME
+    file (duplicate rows for one path, symlinked roots), the drain flips the
+    row in place and touches no files (issue #276 — the failure-arm cleanup
+    once unlinked the only copy).
+
+## shared reconcile gates
+33. **The sub-floor (512 B) and in-flight (2× segment-length mtime) gates
+    precede every reconcile mutation and every live-path index insert**, and
+    live as shared constants — never two drifting copies. Any new
+    reconcile/adoption path must route through the same gates.

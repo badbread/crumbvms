@@ -1696,6 +1696,19 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
     for cam in &cameras {
         if !cam.policy.archive_enabled {
             let h = cam.policy.live_retention_hours;
+            // Defensive `h > 0` filter (#281), mirroring the archive drain's
+            // `*h > 0` and `max_retention_sweep`'s `d > 0` guards: the API
+            // rejects non-positive values, but a hand-edited DB row of 0 would
+            // otherwise delete ALL live footage of archive-off cameras within
+            // one tick. Skip = retain (the safe direction), loudly.
+            if h <= 0 {
+                warn!(
+                    camera_id = %cam.id,
+                    live_retention_hours = h,
+                    "live retention sweep: non-positive retention (hand-edited DB?); skipping camera"
+                );
+                continue;
+            }
             retention_map.insert(cam.id, h);
             if h < min_retention_hours {
                 min_retention_hours = h;
