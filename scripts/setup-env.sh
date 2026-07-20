@@ -84,6 +84,16 @@ if [[ "${PROMPT}" -eq 1 ]]; then
   printf 'Admin password (leave blank to auto-generate): '
   read -rs ADMIN_INPUT; echo
   if [[ -n "${ADMIN_INPUT}" ]]; then
+    # This value is written verbatim into .env, and Docker Compose's dotenv
+    # loader interpolates `$` (it wants `$$`) and treats `#` as an inline comment
+    # — so a password containing these would be silently corrupted before it
+    # reaches the api, and first login would fail with no diagnostic anywhere.
+    # Reject the .env-breaking characters up front; the operator can change the
+    # password to anything in the app after first sign-in.
+    case "${ADMIN_INPUT}" in
+      *'$'*|*'`'*|*'#'*|*'"'*|*"'"*|*'\'*)
+        die "admin password can't contain \$ \` # \" ' or backslash (they corrupt .env parsing). Use other symbols, or set it in the app after first login." ;;
+    esac
     printf 'Confirm admin password: '
     read -rs ADMIN_CONFIRM; echo
     [[ "${ADMIN_INPUT}" == "${ADMIN_CONFIRM}" ]] || die "passwords did not match"

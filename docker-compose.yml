@@ -20,6 +20,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -181,20 +182,25 @@ services:
       MAINTENANCE_UNTIL: ${MAINTENANCE_UNTIL:-}         # unix seconds; suppress low-disk/offline alerts during planned maintenance
       CAMERA_OFFLINE_BOOT_GRACE_SECS: ${CAMERA_OFFLINE_BOOT_GRACE_SECS:-}   # grace before offline alerts after boot (empty = default 180)
       # Thumbnail cache + pregen tuning (all optional; empty = built-in default). (#229)
+      # NB: THUMB_EXTRACT_TIMEOUT_SECS / _INTERVAL_SECS / _MAX_ATTEMPTS / _MAX_WIDTH
+      # / _MIN_WIDTH / _NEAR_BLACK_LUMA are compile-time consts, NOT env-read — they
+      # are deliberately not forwarded here (forwarding them implied a tunability
+      # that does not exist).
       THUMB_CACHE_DIR: ${THUMB_CACHE_DIR:-}
       THUMB_CACHE_MAX_BYTES: ${THUMB_CACHE_MAX_BYTES:-}
       THUMB_CACHE_TTL_SECONDS: ${THUMB_CACHE_TTL_SECONDS:-}
       THUMB_EXTRACT_MAX_CONCURRENCY: ${THUMB_EXTRACT_MAX_CONCURRENCY:-}
-      THUMB_EXTRACT_TIMEOUT_SECS: ${THUMB_EXTRACT_TIMEOUT_SECS:-}
-      THUMB_INTERVAL_SECS: ${THUMB_INTERVAL_SECS:-}
-      THUMB_MAX_ATTEMPTS: ${THUMB_MAX_ATTEMPTS:-}
-      THUMB_MAX_WIDTH: ${THUMB_MAX_WIDTH:-}
-      THUMB_MIN_WIDTH: ${THUMB_MIN_WIDTH:-}
-      THUMB_NEAR_BLACK_LUMA: ${THUMB_NEAR_BLACK_LUMA:-}
       THUMB_PREGEN_ENABLED: ${THUMB_PREGEN_ENABLED:-}
       THUMB_PREGEN_LOOKBACK_HOURS: ${THUMB_PREGEN_LOOKBACK_HOURS:-}
       THUMB_PREGEN_SCAN_SECS: ${THUMB_PREGEN_SCAN_SECS:-}
       THUMB_PREGEN_WIDTH: ${THUMB_PREGEN_WIDTH:-}
+      # On-demand media caches + mobile/data-saver tuning (all optional; empty =
+      # default). Documented in docs/MOBILE-PERFORMANCE.md — forwarded here so a
+      # value set in .env actually reaches the api (compose only passes listed keys).
+      MOBILE_STREAM_ENABLED: ${MOBILE_STREAM_ENABLED:-}
+      MOBILE_STREAM_WIDTH: ${MOBILE_STREAM_WIDTH:-}
+      SEGMENT_LOW_CACHE_MAX_BYTES: ${SEGMENT_LOW_CACHE_MAX_BYTES:-}
+      EXPORT_CACHE_MAX_BYTES: ${EXPORT_CACHE_MAX_BYTES:-}
       # Behind the bundled Caddy (or any reverse proxy), set TRUST_PROXY=1 so the
       # rate limiter keys on the client IP from X-Forwarded-For instead of the
       # proxy's own address (one bucket for ALL HTTPS users otherwise). Leave
@@ -220,6 +226,7 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - api
     volumes:
@@ -241,6 +248,7 @@ services:
     profiles: ["frigate"]
     image: eclipse-mosquitto:2
     restart: unless-stopped
+    logging: *default-logging
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     ports:

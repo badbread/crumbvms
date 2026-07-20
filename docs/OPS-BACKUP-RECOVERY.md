@@ -122,13 +122,21 @@ cd /opt/crumb/app
 docker compose stop recorder api
 docker compose stop postgres
 
-# Move the corrupt data volume aside (don't delete until recovery is confirmed).
-docker volume ls | grep crumb_pgdata
-docker volume rename crumb_crumb_pgdata crumb_pgdata_corrupt_$(date +%Y%m%d) 2>/dev/null \
-  || { docker run --rm -v crumb_crumb_pgdata:/from -v crumb_pgdata_corrupt:/to alpine \
-         sh -c 'cp -a /from/. /to/' ; }   # if your docker can't rename volumes, copy then prune
+# Resolve the ACTUAL Postgres data volume name. On a stock install the Compose
+# project is `crumbvms`, so the volume is `crumbvms_crumb_pgdata` — but resolve
+# it rather than hardcode, in case your project name differs.
+PGVOL=$(docker volume ls -q | grep crumb_pgdata | head -1)
+echo "Postgres data volume: $PGVOL"
 
-docker compose up -d postgres             # fresh empty volume → applies db/migrations on init
+# Move the corrupt data volume aside (don't delete until recovery is confirmed).
+docker volume rename "$PGVOL" "${PGVOL}_corrupt_$(date +%Y%m%d)" \
+  || { docker run --rm -v "$PGVOL":/from -v "${PGVOL}_corrupt":/to alpine \
+         sh -c 'cp -a /from/. /to/' && docker volume rm "$PGVOL" ; }
+         # ^ if your Docker can't rename volumes: copy the data aside, then remove
+         #   the original so the next `up -d` recreates it empty.
+
+docker compose up -d postgres             # recreates an empty data volume; api/recorder
+                                          # apply db/migrations on their next boot (NOT postgres initdb)
 scripts/restore-db.sh --yes backups/<most-recent>.sql.gz
 docker compose up -d recorder api         # reconcile re-indexes on-disk segments
 ```
