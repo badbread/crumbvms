@@ -466,8 +466,13 @@ final class ExportViewModel: ObservableObject {
         }
         var req = URLRequest(url: remote)
         req.timeoutInterval = 300   // exports can be large; give the download room
-        let (data, response) = try await URLSession.crumbMedia.data(for: req)
+        // `.download(for:)` streams the response straight to a temp file instead
+        // of buffering it in memory like `.data(for:)` did — a batch export is
+        // routinely hundreds of MB to multi-GB, and holding the whole file as an
+        // in-memory `Data` mid-download was a jetsam risk.
+        let (downloadedURL, response) = try await URLSession.crumbMedia.download(for: req)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            try? FileManager.default.removeItem(at: downloadedURL)
             throw URLError(.badServerResponse)
         }
 
@@ -475,7 +480,7 @@ final class ExportViewModel: ObservableObject {
             .appendingPathComponent("crumb-export-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let localURL = dir.appendingPathComponent(suggestedFilename(for: file))
-        try data.write(to: localURL, options: .atomic)
+        try FileManager.default.moveItem(at: downloadedURL, to: localURL)
         return localURL
     }
 
