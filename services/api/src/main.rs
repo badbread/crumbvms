@@ -908,6 +908,13 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
             }
         }
 
+        // Export byte budget: the loop above caps how LONG finished export
+        // output lingers; this caps how MUCH accumulates within a TTL window, so
+        // a burst of large exports can't fill the disk. The export dir often
+        // shares a volume with /data, and a full disk stalls the recorder's
+        // writes — the one unforgivable failure. Never evicts a Running job.
+        sweep_export_budget(&state, state.config().export_cache_max_bytes).await;
+
         // Clip cache: clips are generated on demand and cached under
         // {export_dir}/clips; evict files older than the TTL, then evict
         // oldest-by-mtime past the byte budget so a burst of plays can't grow
@@ -951,6 +958,106 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
         )
         .await;
     }
+}
+
+/// Evict finished export job output (`{export_dir}/<job-id>`) oldest-first once
+/// the total exceeds `max_bytes`. Complements the age-based TTL sweep in
+/// [`export_ttl_sweeper`]: age caps how long output lingers, this caps how much
+/// accumulates within a TTL window so a burst of large exports can't fill the
+/// disk. A `Running` job is never touched.
+async fn sweep_export_budget(state: &AppState, max_bytes: u64) {
+    let export_root = state.config().export_dir.clone();
+    // Snapshot finished jobs with their creation time and on-disk size.
+    let mut finished: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>, u64)> = Vec::new();
+    for entry in state.export_jobs() {
+        let job = entry.value();
+        if !matches!(
+            job.status,
+            dto::ExportStatus::Done | dto::ExportStatus::Failed | dto::ExportStatus::Cancelled
+        ) {
+            continue; // never evict a running job
+        }
+        let dir = std::path::Path::new(&export_root).join(entry.key().to_string());
+        let size = dir_size_bytes(&dir).await;
+        finished.push((*entry.key(), job.created_at, size));
+    }
+
+    for job_id in plan_export_evictions(finished, max_bytes) {
+        let dir = std::path::Path::new(&export_root).join(job_id.to_string());
+        let removed = match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => true,
+            Err(_) if !dir.exists() => true, // already gone
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    path = %dir.display(),
+                    error = %e,
+                    "export budget sweep: failed to remove export directory"
+                );
+                false
+            }
+        };
+        if removed {
+            state.export_jobs().remove(&job_id);
+            if let Err(e) = export_store::delete_export_job(state.pool(), job_id).await {
+                tracing::warn!(
+                    job_id = %job_id,
+                    error = %e,
+                    "export budget sweep: failed to delete persisted export job"
+                );
+            }
+            tracing::info!(job_id = %job_id, "export job byte-budget-evicted");
+        }
+    }
+}
+
+/// Pure planner for [`sweep_export_budget`]: given finished jobs as
+/// `(id, created_at, size)` and a byte budget, return the ids to evict —
+/// oldest-`created_at` first — until the running total is at or under budget.
+/// Returns empty when already within budget. Kept pure so the eviction order
+/// and stop condition are unit-testable without a DB or filesystem.
+fn plan_export_evictions(
+    mut finished: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>, u64)>,
+    max_bytes: u64,
+) -> Vec<uuid::Uuid> {
+    let mut total: u64 = finished.iter().map(|(_, _, s)| *s).sum();
+    if total <= max_bytes {
+        return Vec::new();
+    }
+    finished.sort_by_key(|(_, created, _)| *created); // oldest first
+    let mut victims = Vec::new();
+    for (id, _, size) in finished {
+        if total <= max_bytes {
+            break;
+        }
+        victims.push(id);
+        total = total.saturating_sub(size);
+    }
+    victims
+}
+
+/// Total size in bytes of all regular files under `dir` (best-effort; a walk
+/// error just under-counts). Iterative to avoid async recursion.
+async fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&d).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 /// Evict cached clip media (under `{export_dir}/clips`): first anything older
@@ -1101,5 +1208,44 @@ mod thumb_sweep_tests {
         assert!(keep.exists(), "non-jpg file must never be removed");
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+}
+
+#[cfg(test)]
+mod export_budget_tests {
+    use super::plan_export_evictions;
+    use chrono::{TimeZone, Utc};
+    use uuid::Uuid;
+
+    #[test]
+    fn no_eviction_when_within_budget() {
+        let a = Uuid::new_v4();
+        let jobs = vec![(a, Utc.timestamp_opt(1_000, 0).unwrap(), 500_u64)];
+        assert!(
+            plan_export_evictions(jobs, 1_000).is_empty(),
+            "under budget → nothing evicted"
+        );
+    }
+
+    #[test]
+    fn evicts_oldest_first_until_under_budget() {
+        // Regression guard for issue #290: finished export output must be
+        // byte-budget-capped, oldest-first, so a burst can't fill the disk.
+        let oldest = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let newest = Uuid::new_v4();
+        let gib = 1024 * 1024 * 1024_u64;
+        // Deliberately unsorted input; total 12 GiB, budget 5 GiB.
+        let jobs = vec![
+            (newest, Utc.timestamp_opt(3_000, 0).unwrap(), 4 * gib),
+            (oldest, Utc.timestamp_opt(1_000, 0).unwrap(), 4 * gib),
+            (middle, Utc.timestamp_opt(2_000, 0).unwrap(), 4 * gib),
+        ];
+        // Dropping the two oldest (8 GiB) brings the total to 4 GiB ≤ 5 GiB.
+        assert_eq!(
+            plan_export_evictions(jobs, 5 * gib),
+            vec![oldest, middle],
+            "evict oldest-first, and stop as soon as the total is within budget"
+        );
     }
 }
