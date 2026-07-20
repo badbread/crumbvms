@@ -511,10 +511,17 @@ async fn media_token(
     let exp = now
         .checked_add_signed(chrono::Duration::seconds(MEDIA_TOKEN_EXPIRY_SECONDS))
         .unwrap_or(now);
+    // Carry the caller's ACTUAL media capabilities into the token rather than
+    // hardcoding a full set downstream. Minting proves camera access, not the
+    // export/clips/playback capability, so a viewer whose role withholds one of
+    // these must not have it silently restored when the token is presented.
     let claims = MediaClaims {
         sub: user.user_id.to_string(),
         typ: MEDIA_TOKEN_TYP.to_owned(),
         cam: q.camera.to_string(),
+        export: user.capabilities.export,
+        playback: user.capabilities.playback,
+        clips: user.capabilities.clips,
         exp: u64::try_from(exp.timestamp()).unwrap_or(0),
         iat: u64::try_from(now.timestamp()).unwrap_or(0),
     };
