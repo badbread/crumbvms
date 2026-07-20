@@ -19,6 +19,13 @@ final class PlaybackViewModel: ObservableObject {
     @Published var playheadMs: Int64 = 0
     @Published var currentSegment: ResolvedSegment?
     @Published var currentSegmentURL: URL?
+    /// Bumped on every `seekTo` resolution (success or failure), even when
+    /// `currentSegmentURL` lands on the SAME URL as before (a scrub that stays
+    /// within the current ~4s segment reuses its cached token/URL). The view's
+    /// `.onChange` keys off this instead of `currentSegmentURL` so a within-
+    /// segment reseek isn't silently dropped — `Equatable`'s `onChange` never
+    /// fires for a value that didn't change.
+    @Published var seekGeneration = 0
     @Published var segmentOffsetMs: Int64 = 0
     @Published var playing = false
     @Published var speed: Float = 1
@@ -246,12 +253,29 @@ final class PlaybackViewModel: ObservableObject {
                 let segment = try await container.api.play(cameraId: cameraId, ts: iso(tsMs))
                 guard !Task.isCancelled else { return }
                 let startMs = parseMs(segment.start)
-                currentSegment = segment
-                currentSegmentURL = await container.mediaUrls().scopedURL(cameraId: cameraId, qualityPath(segment.url))
+                let url = await container.mediaUrls().scopedURL(cameraId: cameraId, qualityPath(segment.url))
                 guard !Task.isCancelled else { return }
+                guard let url else {
+                    // Media-token mint failed (transient — offline blip, session
+                    // hiccup). Treat it like any other seek failure instead of
+                    // leaving `currentSegment` set with a nil URL: that combination
+                    // left playback silently black with no error and no retry,
+                    // because the error/Retry UI below only shows when
+                    // `currentSegment == nil`.
+                    currentSegment = nil
+                    currentSegmentURL = nil
+                    segmentOffsetMs = 0
+                    self.error = "Couldn't load this clip. Check your connection and retry."
+                    noFootageAtPlayhead = false
+                    seekGeneration += 1
+                    return
+                }
+                currentSegment = segment
+                currentSegmentURL = url
                 segmentOffsetMs = max(tsMs - startMs, 0)
                 error = nil
                 noFootageAtPlayhead = false
+                seekGeneration += 1
             } catch {
                 guard !Task.isCancelled else { return }
                 currentSegment = nil
@@ -264,6 +288,7 @@ final class PlaybackViewModel: ObservableObject {
                     self.error = error.userMessage
                     noFootageAtPlayhead = false
                 }
+                seekGeneration += 1
             }
         }
     }

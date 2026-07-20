@@ -106,7 +106,15 @@ struct PlaybackView: View {
         // `cameraId`/`mediaUrls` let the HEVC-retag range-proxy re-mint a fresh
         // scoped media token if this segment plays longer than the token's
         // ~15 min TTL (P0-SESSIONS) — see `SegmentPlayer.feed`.
-        .onChange(of: vm.currentSegmentURL) { url in
+        //
+        // Keyed on `seekGeneration`, not `currentSegmentURL` directly: a scrub
+        // that lands back in the SAME ~4s segment resolves to a byte-identical
+        // (cached-token) URL, and SwiftUI's `onChange` never fires for a value
+        // that didn't change — that made within-segment seeks a silent no-op.
+        // `seekGeneration` bumps on every resolution regardless, so this always
+        // fires; `SegmentPlayer.feed`'s same-URL branch still does the reseek.
+        .onChange(of: vm.seekGeneration) { _ in
+            let url = vm.currentSegmentURL
             player.feed(url: url, offsetMs: vm.segmentOffsetMs, playing: vm.playing && !vm.scrubbing,
                         segmentStartMs: vm.currentSegment.map { Int64((parseISO8601($0.start)?.timeIntervalSince1970 ?? 0) * 1000) } ?? 0,
                         segmentPath: vm.currentSegment?.url, cameraId: vm.cameraId, mediaUrls: vm.mediaUrls())
