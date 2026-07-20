@@ -244,12 +244,21 @@ async fn get_event_snapshot(
     State(state): State<AppState>,
     Path(event_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    // Enforce camera scope when the event's camera is known.
-    if let Some(camera_id) = db::get_event_camera_id(state.pool(), event_id)
+    // Enforce camera scope, failing CLOSED. A NULL-camera event has no scope to
+    // check, so previously it was served to any authenticated user; treat "no
+    // owning camera" as a denial instead — event media must always be behind a
+    // camera the caller can access. (No current path inserts a NULL-camera event
+    // with media, so this denies nothing legitimate.)
+    match db::get_event_camera_id(state.pool(), event_id)
         .await
         .map_err(ApiError::Internal)?
     {
-        user.assert_camera_access(camera_id)?;
+        Some(camera_id) => user.assert_camera_access(camera_id)?,
+        None => {
+            return Err(ApiError::Forbidden(
+                "event has no accessible camera scope".to_owned(),
+            ));
+        }
     }
 
     // Look up the stored snapshot URL. When there is none, fall back to the
@@ -266,6 +275,11 @@ async fn get_event_snapshot(
         .await
         .map_err(ApiError::Internal)?
     {
+        // This fallback serves a license-plate crop — plate data. Gate it behind
+        // the same `view_plates` capability the dedicated GET /plates/{id}/crop
+        // enforces, so a viewer without it can't reach the crop bytes through the
+        // snapshot path.
+        user.require_view_plates()?;
         return Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], crop).into_response());
     } else {
         return Err(ApiError::NotFound(format!(

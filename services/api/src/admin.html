@@ -8935,7 +8935,7 @@ function renderUser(id) {
   const roleObj = ROLES.find(r => r.id === u.role_id);
   const roleSub = u.role === 'admin'
     ? 'Administrator · Full access including this console'
-    : (roleObj ? `Role: ${roleObj.name}` : 'No role assigned');
+    : (roleObj ? `Role: ${esc(roleObj.name)}` : 'No role assigned');
   $('right-pane').innerHTML = `
     <div class="rp-head">
       <div class="rp-head-left">
