@@ -272,6 +272,21 @@ fn free_floor_decision(free: i64, total: i64, frac: f64, abs: i64) -> (bool, i64
     }
 }
 
+/// Pure deficit-credit decision for a successful ARCHIVE MOVE during a
+/// free-space-floor deficit (#278): the move may be credited against the
+/// deficit ONLY when the source bytes lived on the floor (deficit)
+/// filesystem — a move whose source sits on another disk (repointed
+/// storage; or one sharing the archive fs while the floor fs is elsewhere)
+/// frees nothing on the deficit disk, and crediting it would clear the
+/// deficit on paper while the real disk keeps filling toward the ffmpeg
+/// ENOSPC halt the floor exists to prevent.
+fn credit_move_against_deficit(deficit: i64, seg_bytes: i64, src_on_floor_fs: bool) -> i64 {
+    if deficit <= 0 || !src_on_floor_fs {
+        return deficit.max(0);
+    }
+    (deficit - seg_bytes).max(0)
+}
+
 // ─── scheduler entry point ────────────────────────────────────────────────────
 
 /// Run the archive scheduler loop until `cancel` is triggered.
@@ -2323,12 +2338,42 @@ pub async fn policy_size_eviction_sweep(
                         {
                             Ok(()) => {
                                 used -= seg.size_bytes;
-                                // Moving frees the source bytes from the live FS.
-                                // A floor-deficit move only reaches here when the
-                                // archive is a DIFFERENT filesystem (the same-fs
-                                // case is deleted by the ENOSPC rescue above), so
-                                // decrementing the deficit is accurate.
-                                deficit = (deficit - seg.size_bytes).max(0);
+                                // Deficit accounting (#278): a move helps the floor
+                                // ONLY when the source bytes lived on the floor
+                                // (deficit) filesystem. The old comment claimed a
+                                // floor-deficit move "only reaches here when the
+                                // archive is a DIFFERENT filesystem" — untrue for a
+                                // repointed storage: the policy's oldest footage can
+                                // sit on another disk entirely (or share the archive
+                                // fs while the floor fs is elsewhere), in which case
+                                // the move frees ZERO bytes on the deficit disk.
+                                // Crediting it anyway "cleared" the deficit on paper
+                                // each tick while the real disk kept filling toward
+                                // the ffmpeg ENOSPC halt the floor exists to prevent.
+                                if deficit > 0 {
+                                    let src_on_floor_fs = match floor_root {
+                                        Some(fr) => {
+                                            match same_fs_floor_cache.get(&src_storage.id).copied()
+                                            {
+                                                Some(v) => v,
+                                                None => {
+                                                    let v = same_filesystem(src_root, fr).await;
+                                                    same_fs_floor_cache.insert(src_storage.id, v);
+                                                    v
+                                                }
+                                            }
+                                        }
+                                        // No floor storage resolved → nothing to
+                                        // credit against (deficit only arises with
+                                        // a known floor fs).
+                                        None => false,
+                                    };
+                                    deficit = credit_move_against_deficit(
+                                        deficit,
+                                        seg.size_bytes,
+                                        src_on_floor_fs,
+                                    );
+                                }
                                 debug!(
                                     policy_id  = %policy.id,
                                     segment_id = %seg.id,
@@ -2931,6 +2976,23 @@ mod tests {
             below,
             "small disk truly below 5% must still trigger eviction"
         );
+    }
+
+    /// #278: an archive move may be credited against the floor deficit ONLY
+    /// when its source bytes lived on the floor (deficit) filesystem. A move
+    /// from any other disk frees nothing on the deficit disk and must leave
+    /// the deficit untouched — the pre-fix unconditional credit "cleared" the
+    /// deficit on paper each tick while the real disk filled toward ENOSPC.
+    #[test]
+    fn deficit_credited_only_for_floor_fs_moves() {
+        // On the floor fs → credited, clamped at zero.
+        assert_eq!(credit_move_against_deficit(1000, 400, true), 600);
+        assert_eq!(credit_move_against_deficit(300, 400, true), 0);
+        // NOT on the floor fs → deficit untouched (the fix).
+        assert_eq!(credit_move_against_deficit(1000, 400, false), 1000);
+        // No deficit → nothing to credit either way; negatives clamp.
+        assert_eq!(credit_move_against_deficit(0, 400, true), 0);
+        assert_eq!(credit_move_against_deficit(-5, 400, false), 0);
     }
 
     #[test]
