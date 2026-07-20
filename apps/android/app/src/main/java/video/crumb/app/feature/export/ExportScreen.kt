@@ -161,7 +161,7 @@ fun ExportScreen(onBack: () -> Unit) {
                 endMs = state.endMs,
                 onStartChange = vm::setStart,
                 onEndChange = vm::setEnd,
-                disabled = state.polling,
+                disabled = state.polling || state.submitting,
             )
 
             HorizontalDivider(color = NavySurfaceVariant)
@@ -171,19 +171,22 @@ fun ExportScreen(onBack: () -> Unit) {
             BurnTimestampRow(
                 enabled = state.burn,
                 onChange = vm::setBurn,
-                disabled = state.polling,
+                disabled = state.polling || state.submitting,
             )
 
             HorizontalDivider(color = NavySurfaceVariant)
 
             // ─── submit button ───────────────────────────────────────────────
-            val canSubmit = state.selectedCameraIds.isNotEmpty() && !state.polling
+            // state.submitting covers the gap between tapping Create and the POST
+            // round-trip resolving (before state.polling itself flips true) — closes
+            // a fast-double-tap window that could otherwise submit two export jobs.
+            val canSubmit = state.selectedCameraIds.isNotEmpty() && !state.polling && !state.submitting
             Button(
                 onClick = vm::createExport,
                 enabled = canSubmit,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (state.polling) "Exporting..." else "Create Export")
+                Text(if (state.polling || state.submitting) "Exporting..." else "Create Export")
             }
 
             // ─── job progress + results ──────────────────────────────────────

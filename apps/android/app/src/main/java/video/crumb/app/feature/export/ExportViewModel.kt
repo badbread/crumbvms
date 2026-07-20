@@ -33,6 +33,12 @@ import java.time.Instant
  * @property job The most recent [ExportJob] returned by the server (null until created).
  * @property jobError Human-readable error string when the job itself fails.
  * @property polling True while we are actively polling exportStatus.
+ * @property submitting True from the moment [ExportViewModel.createExport] is called
+ *   until its `POST /export` round-trip resolves (success or failure). Distinct from
+ *   [polling], which only flips true AFTER that round-trip completes — without this,
+ *   a fast double-tap on Create before the first response lands could submit two
+ *   export jobs (the guard in [ExportViewModel.createExport] checked [polling] too
+ *   late to catch it).
  */
 data class ExportUiState(
     val loadingCameras: Boolean = true,
@@ -45,6 +51,7 @@ data class ExportUiState(
     val job: ExportJob? = null,
     val jobError: String? = null,
     val polling: Boolean = false,
+    val submitting: Boolean = false,
 )
 
 /**
@@ -123,7 +130,11 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
     fun createExport() {
         val s = _state.value
         if (s.selectedCameraIds.isEmpty()) return
-        if (s.polling) return // already running
+        if (s.polling || s.submitting) return // already running or already in flight
+        // Set synchronously, BEFORE the coroutine launch, so a fast double-tap on
+        // Create can't slip a second submit in during the POST round-trip (polling
+        // alone doesn't flip true until that round-trip completes).
+        _state.update { it.copy(submitting = true) }
 
         val startIso = Time.iso(Instant.ofEpochMilli(s.startMs))
         val endIso = Time.iso(Instant.ofEpochMilli(s.endMs))
@@ -138,10 +149,10 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
                 endIso = endIso,
                 burn = s.burn,
             ).onSuccess { response ->
-                _state.update { it.copy(polling = true) }
+                _state.update { it.copy(polling = true, submitting = false) }
                 startPolling(response.jobId)
             }.onFailure { t ->
-                _state.update { it.copy(jobError = t.toUserMessage()) }
+                _state.update { it.copy(jobError = t.toUserMessage(), submitting = false) }
             }
         }
     }
