@@ -1297,8 +1297,10 @@ class _WallTileState extends State<_WallTile> {
       // native mpv handle isn't leaked on a failed initial load (#132). On the
       // success path spawned is nulled above once the pane adopts the player
       // (or hands it to _pending), so the stall-watchdog/reconnect handling is
-      // untouched and a live player is never disposed here.
-      spawned?.dispose();
+      // untouched and a live player is never disposed here. Detached (#105,
+      // issue #323) — same discipline as every other player teardown in this
+      // file, rather than a synchronous dispose on this error path.
+      _disposePlayerDetached(spawned);
       if (mounted) {
         setState(() => _error = 'load failed');
       }
@@ -2332,8 +2334,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       // A Player created before open() failed is orphaned; dispose it so its
       // native mpv handle isn't leaked on a failed initial load (#132). On the
       // success path spawned is nulled above (after _player/_controller adopt
-      // it), so a live/reconnecting player is never disposed here.
-      spawned?.dispose();
+      // it), so a live/reconnecting player is never disposed here. Detached
+      // (#105, issue #323) rather than a synchronous dispose on this error path.
+      _disposePlayerDetached(spawned);
       if (mounted) setState(() => _error = 'load failed');
     }
   }
