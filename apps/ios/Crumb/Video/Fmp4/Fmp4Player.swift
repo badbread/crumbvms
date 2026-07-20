@@ -64,6 +64,10 @@ struct Fmp4VideoView: View {
             controller.start(provider: streamProvider)
             #if os(iOS)
             pip?.attach(to: controller.displayLayer)
+            // Clear any teardown registered by a PREVIOUS disappear of this
+            // same `pip` — we're attached and visible again now, so the normal
+            // `onDisappear` logic below governs this session fresh.
+            pip?.onStoppedWhileDetached = nil
             #endif
         }
         .onChange(of: controller.videoSize) { if let s = $0 { onVideoSize?(s) } }
@@ -75,8 +79,20 @@ struct Fmp4VideoView: View {
             // whether PiP should keep the feed alive. `detach()` here just
             // releases OUR reference; if PiP is genuinely still active the
             // system keeps its own strong reference until the user closes it.
-            if pip?.isActive != true { pip?.detach() }
-            if pip?.isActive != true { controller.stop() }
+            if pip?.isActive != true {
+                pip?.detach()
+                controller.stop()
+            } else {
+                // PiP is keeping the stream alive without this view. Once PiP
+                // itself eventually stops (system-closed, or the user swipes it
+                // away) nothing else will ever call `stop()` on `controller` —
+                // `Fmp4StreamController`'s own `URLSession(delegate: self)`
+                // retains it strongly, so it would otherwise leak its HTTP
+                // stream + demux pipeline for the rest of the process's life.
+                // Register a teardown PiP invokes once it actually stops (see
+                // `LivePictureInPicture.onStoppedWhileDetached`).
+                pip?.onStoppedWhileDetached = { [weak controller] in controller?.stop() }
+            }
         }
         #else
         .onDisappear { controller.stop() }
