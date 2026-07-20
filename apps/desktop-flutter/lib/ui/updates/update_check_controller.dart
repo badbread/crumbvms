@@ -61,7 +61,11 @@ bool isNewerVersion(String? latest, String? own) {
 /// shell) and call [start] once a session is established; call [stop] on
 /// sign-out and [dispose] on teardown.
 class UpdateCheckController extends ChangeNotifier {
-  UpdateCheckController({required this.api, required this.session});
+  UpdateCheckController({
+    required this.api,
+    required this.session,
+    this.onUnauthorized,
+  });
 
   /// Adopt a refreshed session (in-place re-auth) so the next poll uses the live
   /// token instead of the dead one captured at construction. See #131.
@@ -69,6 +73,12 @@ class UpdateCheckController extends ChangeNotifier {
 
   final CrumbApi api;
   Session session;
+
+  /// Called when a check comes back 401/403 (the bearer JWT expired or was
+  /// revoked) — mirrors `MediaTokenCache.onUnauthorized` so this poller's
+  /// 401s reach `SessionController.handleUnauthorized` too instead of just
+  /// silently keeping the last-known state forever (issue #316).
+  final VoidCallback? onUnauthorized;
 
   Timer? _timer;
   UpdateCheckResponse? _data;
@@ -153,7 +163,12 @@ class UpdateCheckController extends ChangeNotifier {
       final res = await api.getLatestUpdate(session, refresh: refresh);
       // enabled:false or a 404 (null) both clear the state — nothing shows.
       _data = (res != null && res.enabled) ? res : null;
-    } catch (_) {
+    } catch (e) {
+      if (e is CrumbApiException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        onUnauthorized?.call();
+        return;
+      }
       // Transient failure — keep the last known state, matching app.js's
       // empty catch in updCheck.
     } finally {

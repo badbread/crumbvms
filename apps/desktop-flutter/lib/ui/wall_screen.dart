@@ -83,6 +83,7 @@ class WallScreen extends StatefulWidget {
     this.onMaximizedCameraChanged,
     this.statsSink,
     this.onConfigChanged,
+    this.onUnauthorized,
   });
 
   final CrumbApi api;
@@ -137,6 +138,14 @@ class WallScreen extends StatefulWidget {
   /// The relevant option here is `showInfoBar` (per-tile header strip vs
   /// floating overlays). Null → defaults (header bar on).
   final ClientOptionsStore? clientOptions;
+
+  /// Called on a 401/403 from anything the wall itself polls or fetches
+  /// directly — `/status`+`/events` (via [LiveStatusController]) and each
+  /// tile/pane's own `cameraStreams` fetch. The Live tab never mints a media
+  /// token, so without this hook a session expiring while the user stays on
+  /// Live never reached the re-auth prompt (issue #316); wire this to
+  /// `SessionController.handleUnauthorized`.
+  final VoidCallback? onUnauthorized;
 
   @override
   State<WallScreen> createState() => _WallScreenState();
@@ -229,7 +238,13 @@ class _WallScreenState extends State<WallScreen> {
       const Duration(seconds: 2),
       (_) => _pollStats(),
     );
-    _liveStatus = LiveStatusController(api: widget.api, session: widget.session)
+    _liveStatus = LiveStatusController(
+      api: widget.api,
+      session: widget.session,
+      // Live-tab 401s (a bearer JWT that expires/is revoked while the user
+      // never leaves Live) otherwise never reached re-auth — issue #316.
+      onUnauthorized: widget.onUnauthorized,
+    )
       ..cameraIds = _shown.map((c) => c.id).toList()
       // A config_version bump means cameras/streams may have changed — ask the
       // host to re-fetch the camera list so the wall picks it up live (#146).
@@ -621,6 +636,7 @@ class _WallScreenState extends State<WallScreen> {
               onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(_maximized!)),
               onLinkHaEntities: () => unawaited(_refreshHaLinksFor(_maximized!.id)),
               onHaLinksLoaded: _onHaLinksLoaded,
+              onUnauthorized: widget.onUnauthorized,
               onClose: _restore,
             ),
         ],
@@ -793,6 +809,7 @@ class _WallScreenState extends State<WallScreen> {
                     onEditHaOverlay: () =>
                         unawaited(_beginHaOverlayEdit(cam)),
                     onHaLinksLoaded: _onHaLinksLoaded,
+                    onUnauthorized: widget.onUnauthorized,
                     isAdmin: widget.isAdmin,
                   );
           }
@@ -862,6 +879,7 @@ class _WallScreenState extends State<WallScreen> {
                 onEditHaOverlay: () =>
                     unawaited(_beginHaOverlayEdit(cam)),
                 onHaLinksLoaded: _onHaLinksLoaded,
+                onUnauthorized: widget.onUnauthorized,
                 isAdmin: widget.isAdmin,
               ),
             ),
@@ -937,6 +955,7 @@ class _WallTile extends StatefulWidget {
     this.onEditPtzPanel,
     this.onEditHaOverlay,
     this.onHaLinksLoaded,
+    this.onUnauthorized,
     this.isAdmin = false,
     this.paneIdOverride,
   });
@@ -969,6 +988,11 @@ class _WallTile extends StatefulWidget {
   /// can track which visible cameras have a placed badge and drive
   /// `LiveStatusController.wantHaStates` (desktop P0 plan §4.4).
   final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
+
+  /// Called on a 401/403 from this tile's own `cameraStreams` fetch (in
+  /// `_load`/`_reconnectStalled`) — a bearer JWT expiring/being revoked while
+  /// the user stays on Live never reached re-auth otherwise (issue #316).
+  final VoidCallback? onUnauthorized;
 
   /// Gates the right-click menu's "Link HA entities…" item (issue #52
   /// desktop port) — `PUT /cameras/:id/ha/links` is admin-enforced
@@ -1236,7 +1260,14 @@ class _WallTileState extends State<_WallTile> {
         _disposePlayerDetached(superseded);
       }
       spawned = null; // ownership handed off — the catch must not dispose it
-    } catch (_) {
+    } catch (e) {
+      // cameraStreams's own 401/403 never reached SessionController — a
+      // bearer JWT expiring/being revoked while the user stays on Live never
+      // triggered re-auth otherwise (issue #316).
+      if (e is CrumbApiException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        widget.onUnauthorized?.call();
+      }
       // A Player created before open() failed is orphaned; dispose it so its
       // native mpv handle isn't leaked on a failed initial load (#132). On the
       // success path spawned is nulled above once the pane adopts the player
@@ -1325,7 +1356,15 @@ class _WallTileState extends State<_WallTile> {
       if (mounted) setState(() => _firstFrame = false);
       await player.open(Media(url));
       _watchdog?.resetBaseline();
-    } catch (_) {
+    } catch (e) {
+      // cameraStreams's own 401/403 never reached SessionController — surface
+      // it the same way _load's does (issue #316) rather than silently
+      // retrying a stall reconnect against a dead token forever.
+      if (e is CrumbApiException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        widget.onUnauthorized?.call();
+        return;
+      }
       // Left for the next backoff tick — the watchdog never gives up.
     }
   }
@@ -1805,6 +1844,7 @@ class _MaximizedPane extends StatefulWidget {
     this.onEditPtzPanel,
     this.onLinkHaEntities,
     this.onHaLinksLoaded,
+    this.onUnauthorized,
   });
 
   final CrumbApi api;
@@ -1874,6 +1914,11 @@ class _MaximizedPane extends StatefulWidget {
   /// Reported every time this pane (re)loads its own HA links — see
   /// `_WallTile.onHaLinksLoaded`'s doc; same contract.
   final void Function(String cameraId, List<HaLink> links)? onHaLinksLoaded;
+
+  /// Called on a 401/403 from this pane's own `cameraStreams` fetch (in
+  /// `_load`/`_reconnectStalled`) — see `_WallTile.onUnauthorized`'s doc;
+  /// same contract (issue #316).
+  final VoidCallback? onUnauthorized;
 
   @override
   State<_MaximizedPane> createState() => _MaximizedPaneState();
@@ -2222,7 +2267,14 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         _controller = controller;
       });
       spawned = null; // ownership handed off — the catch must not dispose it
-    } catch (_) {
+    } catch (e) {
+      // cameraStreams's own 401/403 never reached SessionController — a
+      // bearer JWT expiring/being revoked while the user stays on Live never
+      // triggered re-auth otherwise (issue #316).
+      if (e is CrumbApiException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        widget.onUnauthorized?.call();
+      }
       // A Player created before open() failed is orphaned; dispose it so its
       // native mpv handle isn't leaked on a failed initial load (#132). On the
       // success path spawned is nulled above (after _player/_controller adopt
@@ -2248,7 +2300,15 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       if (url == null) return;
       await player.open(Media(url));
       _watchdog?.resetBaseline();
-    } catch (_) {
+    } catch (e) {
+      // cameraStreams's own 401/403 never reached SessionController — surface
+      // it the same way _load's does (issue #316) rather than silently
+      // retrying a stall reconnect against a dead token forever.
+      if (e is CrumbApiException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        widget.onUnauthorized?.call();
+        return;
+      }
       // Left for the next backoff tick — the watchdog never gives up.
     }
   }

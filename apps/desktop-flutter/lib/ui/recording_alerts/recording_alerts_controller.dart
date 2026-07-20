@@ -48,7 +48,11 @@ const double _heartbeatStaleSecs = 60;
 /// (e.g. the wall screen) and call [start] once the session is established;
 /// call [dispose] on sign-out / screen teardown.
 class RecordingAlertsController extends ChangeNotifier {
-  RecordingAlertsController({required this.api, required this.session});
+  RecordingAlertsController({
+    required this.api,
+    required this.session,
+    this.onUnauthorized,
+  });
 
   /// Adopt a refreshed session (in-place re-auth) so the next poll uses the live
   /// token instead of the dead one captured at construction. See #131.
@@ -56,6 +60,12 @@ class RecordingAlertsController extends ChangeNotifier {
 
   final CrumbApi api;
   Session session;
+
+  /// Called when a poll comes back 401/403 (the bearer JWT expired or was
+  /// revoked) — mirrors `MediaTokenCache.onUnauthorized` so this poller's
+  /// 401s reach `SessionController.handleUnauthorized` too instead of just
+  /// silently keeping the last-known warnings forever (issue #316).
+  final VoidCallback? onUnauthorized;
 
   Timer? _timer;
   List<RecordingWarning> _warnings = const [];
@@ -99,7 +109,12 @@ class RecordingAlertsController extends ChangeNotifier {
       );
       _warnings = next;
       notifyListeners();
-    } catch (_) {
+    } catch (e) {
+      if (e is CrumbApiException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        onUnauthorized?.call();
+        return;
+      }
       // Transient network error — keep showing the last computed state,
       // exactly like pollRecordingAlerts' empty catch block.
     }
