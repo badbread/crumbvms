@@ -90,6 +90,12 @@ private val ICON_DISC = Color(0xF21A1C22)   // near-opaque dark disc directly be
  *   rendering is identical to having no events. Additive and non-fatal.
  * @param playheadMs Current playback position (rendered at the center).
  * @param spanMs Visible time span across the full width (pinch-to-zoom).
+ * @param minSpanMs Minimum pinch-zoomed-in span (max zoom-in), clamped inside the
+ *   gesture itself so [onSpanChange] never sees a value outside the host's range.
+ * @param maxSpanMs Maximum pinch-zoomed-out span (max zoom-out) — must match the
+ *   host's own data-window width (e.g. the playback wall's 12 h vs. single-camera
+ *   playback's 6 h), or pinch-out silently stops working before the host's actual
+ *   range is reached.
  * @param onScrubStart Called once when a gesture begins.
  * @param onScrub Called continuously with the new playhead time.
  * @param onScrubEnd Called once on release with the final playhead time.
@@ -105,6 +111,8 @@ fun CenteredTimeline(
     bookmarks: List<Long>,
     playheadMs: Long,
     spanMs: Long,
+    minSpanMs: Long = 60_000L,
+    maxSpanMs: Long = 6L * 3600_000L,
     onScrubStart: () -> Unit,
     onScrub: (Long) -> Unit,
     onScrubEnd: (Long) -> Unit,
@@ -173,7 +181,7 @@ fun CenteredTimeline(
                             val zoom = event.calculateZoom()
                             if (zoom != 1f && zoom > 0f) {
                                 sp = (sp / zoom).roundToLong()
-                                    .coerceIn(60_000L, 6L * 3600_000L)
+                                    .coerceIn(minSpanMs, maxSpanMs)
                                 onSpanChange(sp)
                             }
                             // Only a single-finger drag scrubs. While PINCHING (two
