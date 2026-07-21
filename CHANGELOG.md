@@ -9,6 +9,138 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
+## [0.1.1] - 2026-07-20
+
+A hardening release. Where 0.1.0 was about building the seat, 0.1.1 is about
+making it trustworthy. This cycle was driven by an intensive, multi-model audit
+program run with **Fable**: instead of a single review pass it ran repeated
+adversarial sweeps over the whole system, the recorder, the API, all four
+clients, install and upgrade, and the seams between server and client, each one
+finding an issue, then independently trying to *refute* it, and only then fixing
+it. That program produced the 60-plus changes below. Almost none of them change
+what Crumb does; they change how much you can rely on it not to drop footage,
+leak a credential, or lie to you on screen.
+
+### The audit program
+
+- **Recorder correctness got the most scrutiny**, because losing footage is the
+  one unforgivable bug. The storage-migration copy now refuses to unlink the only
+  copy of a segment (#282), quarantine pruning ages from entry time and spares
+  collision losers (#283), the retention ceiling is truly absolute even for
+  disabled cameras (#285), and a per-worker live-storage cache lets a reconnect
+  survive a database outage (#286).
+- **API security and reliability**: media tokens now carry the minter's real
+  capabilities instead of a hardcoded full set (#326), a security batch tightened
+  log redaction, XSS, and export/events authorization (#333), export bytes and
+  the filmstrip window are bounded so one request cannot fill the disk or OOM the
+  api (#314, #295), and the go2rtc reconcile loop is serialized against stream
+  teardown (#315).
+- **A final cross-boundary pass** hunted for cases where a server change diverged
+  from how a client actually calls it, the class that produced the black license
+  plate crops, and fixed the survivors: media tokens now carry `view_plates` so
+  crops load (#365), plus honest clips paging totals, live and plate-clip
+  capability gating, and a false motion-strip gap on long-GOP cameras (#374).
+- **Every client was audited on its own.** iOS and macOS reached 0.1.0 feature
+  parity (#261) and then took a batch of correctness, security, and memory fixes
+  (#345 through #353, #377). Android hardened its coroutine and lifecycle handling
+  and stopped rendering stale Home Assistant state as live (#306 through #313,
+  #362, #376). The desktop client landed a long stability and UX pass (#324
+  through #334, #361, #375).
+
+### Added
+
+- In-app desktop **Diagnostics**: bounded log capture, a verbose toggle, and a
+  scrubbed export (#274).
+- Seamless carousel and hotspot camera switching with no black gap (#268), and a
+  draggable Home Assistant edit panel with labelled dot badges (#267).
+- On-video Home Assistant badges on Android live (#266).
+- **iOS and macOS reached feature parity with 0.1.0**: HA overlays, the LPR
+  client, audio, data-saver, and the live and playback UX (#261).
+- Camera compatibility: Reolink CX410 and EmpireTech IPC-B54IR-ASE-2.8MM-S3
+  (#258).
+
+### Changed
+
+- The playback motion strip fetches intensity in one batched request instead of
+  one per camera, backed by a sargable query bound that turns an O(retention)
+  scan into O(window) (#259, #264); the clients chunk that batch to stay within
+  the server cap (#375, #377).
+
+### Known issues
+
+- After upgrading, a running desktop, Android, or iOS client may show blank
+  thumbnails or stalled media for up to about 15 minutes while its cached media
+  tokens expire. Restart the client to clear it immediately. This is fixed
+  permanently in the next release (#366).
+
+### All merged changes
+
+Every pull request merged since 0.1.0, newest first:
+
+- fix(api): v0.1.1 cross-boundary audit batch (clips total, live cap, plate-clip cap, long-GOP intensity) (#374)
+- fix(ios): use batched timeline-intensity endpoint instead of per-camera fan-out (#377)
+- fix(android): grey HA badges after 2 missed polls (client-side staleness) (#376)
+- fix(desktop): chunk motion-intensity batch into <=64-camera requests (#375)
+- fix(ios): shield content on .inactive so the app-switcher snapshot can't leak it (#353)
+- fix(ios): don't discard a successful login on a transient /auth/me failure (#352)
+- fix(ios): hop HEVC-retag totalSize write to the main actor (#351)
+- fix(ios): stream export downloads to disk instead of buffering in memory (#350)
+- fix(ios): downsample plate images before caching (#349)
+- fix(ios): within-segment seeks and failed media-token mints during playback (#348)
+- fix(api): carry view_plates in media tokens so plate crops load (regression) (#365)
+- fix(desktop): v0.1.1 verification-pass polish (6 fixes) (#361)
+- fix(android): rethrow CancellationException at scopedUrl sites; clamp HA/motion poll backoff (#362)
+- docs(ops): remove the postgres container before volume swap in DR recovery (#360)
+- docs: v0.1.1 presentation hygiene + release-process bump step (#359)
+- fix(install): secrets-overlay project name, password escaping, env/TZ/DR hygiene (#357)
+- fix(ios): stop the live stream controller when PiP closes after detaching (#347)
+- fix(ios): hop session-token clear to the main actor on a 401 (#346)
+- fix(ios): clamp trun sample_count to prevent OOM on malformed fMP4 (#345)
+- fix(desktop): carry camera identity with the pending player, not widget.camera (#330)
+- fix(desktop): funnel live-wall 401s into the re-auth prompt (#334)
+- fix(api): security hardening batch — log redaction, XSS, and export/events authz (#333)
+- fix(desktop): guard disposed-mid-load players, detach error-path dispose (#332)
+- fix(desktop): honor stream-override menu on the maximized live pane (#331)
+- fix(desktop): detach playback pane player disposal from the UI isolate (#329)
+- fix(desktop): restore from maximize when the maximized camera drops out of _shown (#328)
+- fix(desktop): bound wedged stream-swaps with a timeout + recover a missed first-frame race (#327)
+- fix(api): media tokens carry the minter's real caps, not a hardcoded full set (#326)
+- fix(desktop): key HA-placement tracking by surface, not camera id (#325)
+- fix(desktop): harden diagnostics log scrubbing to redact URL credentials (#324)
+- fix(api): serialize go2rtc reconcile against stream teardown (delete race) (#315)
+- fix(api): cap total finished-export bytes so a burst can't fill the disk (#314)
+- fix(android): minor correctness cleanups (clip-player guard, stale comments) (#313)
+- fix(android): map SSLHandshakeException to a specific message instead of the generic one (#312)
+- fix(android): close export Create button's double-submit window (#311)
+- fix(android): let CenteredTimeline's pinch-zoom span clamp match the host's own range (#310)
+- fix(android): make Time.parseToMillis lenient instead of crashing on parse failure (#309)
+- fix(android): move snapshot JPEG compress + MediaStore I/O off the main thread (#308)
+- fix(android): lifecycle-gate HA-states poll and pause clip player on background (#307)
+- fix(android): guard scopedUrl() at 4 unguarded call sites in PlaybackViewModel (#306)
+- fix(api): harden clip-media ffmpeg spawns and the Frigate proxy read (#296)
+- fix(api): bound the filmstrip window so one request can't OOM the api (#295)
+- chore(recorder): hygiene batch — live-sweep h>0 guard, TZ invariant wording, audit invariants 30-33 (#287)
+- fix(recorder): cache the resolved live storage per worker — a reconnect survives a DB outage (#286)
+- fix(recorder): footage lifecycle covers disabled cameras — the retention ceiling is truly absolute (#285)
+- fix(recorder): credit the floor deficit only for moves off the floor filesystem (#284)
+- fix(recorder): quarantine prune ages from ENTRY time and exempts -rN collision losers (#283)
+- fix(recorder): same-file guard in the storage-migration copy — never unlink the only copy (#282)
+- ci(release): macOS attach creates the Release if missing; Windows zip ships a sha256 (#275)
+- feat(desktop): in-app Diagnostics — bounded log capture, verbose toggle, scrubbed export (#180) (#274)
+- fix(desktop): actually freeze a maximized carousel/hotspot slot (#273)
+- fix(desktop): gate post-open seeks on file-loaded — frame-step no longer jumps a segment on quiet footage (#272)
+- fix(desktop): fall back to per-camera intensity when the server lacks the batch endpoint (#271)
+- feat(desktop): seamless carousel/hotspot camera switching (no black gap) (#254) (#268)
+- feat(desktop): draggable HA edit panel + Dot badges show their label (#255) (#267)
+- feat(android): render on-video Home Assistant badges on live (#263) (#266)
+- fix(android): quality label no longer wraps 'AUTO' to two lines (#265)
+- iOS/macOS: v0.1.0 parity — Home Assistant overlays, LPR client, audio, data-saver, live/playback UX (#261)
+- perf(timeline): batch the per-camera intensity fan-out into one request (#256) (#264)
+- perf(timeline): stop the motion-strip refresh from stacking under load (#256) (#260)
+- perf(timeline): sargable start_ts bound on the intensity query — O(retention) → O(window) (#256) (#259)
+- chore(release): add pr-changelog.sh (per-PR bulleted change list) + document it (#257)
+- data(cameras): add Reolink CX410 + EmpireTech IPC-B54IR-ASE-2.8MM-S3 (closes #181, #182) (#258)
+
 ## [0.1.0] - 2026-07-18
 
 The week after the first public cut. The theme: turn a working recorder into a
@@ -164,5 +296,7 @@ wizard with generated secrets, LAN-only by default; and native desktop
 (then Tauri), Android, and web-admin clients. Runs entirely on your own hardware,
 no cloud, no account, no telemetry.
 
+[Unreleased]: https://github.com/badbread/crumbvms/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/badbread/crumbvms/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/badbread/crumbvms/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/badbread/crumbvms/releases/tag/v0.0.1
