@@ -266,6 +266,10 @@ fun HaBadgeOverlayLayer(
     videoWidth: Int,
     videoHeight: Int,
     modifier: Modifier = Modifier,
+    // Client-observed staleness (>= 2 missed `/ha/states` polls). ORed with the
+    // server's own `stale` flag so a badge greys when EITHER Crumb->HA or
+    // phone->Crumb has gone quiet. (#371)
+    clientStale: Boolean = false,
     onBadgeTap: (HaLinkDto) -> Unit,
 ) {
     if (videoWidth <= 0 || videoHeight <= 0) return
@@ -290,7 +294,7 @@ fun HaBadgeOverlayLayer(
             val (bw, bh) = badgeSize(link, ps)
             val x = (fx + (link.overlayX ?: 0.0).toFloat() * fw).coerceIn(fx, (fx + fw - bw).coerceAtLeast(fx))
             val y = (fy + (link.overlayY ?: 0.0).toFloat() * fh).coerceIn(fy, (fy + fh - bh).coerceAtLeast(fy))
-            HaBadge(link, states, x, y, bw, bh, onBadgeTap)
+            HaBadge(link, states, clientStale, x, y, bw, bh, onBadgeTap)
         }
     }
 }
@@ -299,6 +303,7 @@ fun HaBadgeOverlayLayer(
 private fun HaBadge(
     link: HaLinkDto,
     states: HaStatesResponse?,
+    clientStale: Boolean,
     xDp: Float,
     yDp: Float,
     wDp: Float,
@@ -306,7 +311,8 @@ private fun HaBadge(
     onTap: (HaLinkDto) -> Unit,
 ) {
     val st = states?.stateFor(link.entityId)
-    val stale = states?.stale == true
+    // Stale when the server says so OR this client has missed >= 2 polls (#371).
+    val stale = states?.stale == true || clientStale
     val visual = badgeVisual(link, st?.state, stale)
     val bg = parseHexColor(link.overlayBgColor) ?: BadgeDefaultBg
     val opacity = (link.overlayOpacity?.toFloat() ?: 1f).coerceIn(0.05f, 1f)
