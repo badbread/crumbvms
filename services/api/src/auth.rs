@@ -522,6 +522,7 @@ async fn media_token(
         export: user.capabilities.export,
         playback: user.capabilities.playback,
         clips: user.capabilities.clips,
+        view_plates: user.capabilities.view_plates,
         exp: u64::try_from(exp.timestamp()).unwrap_or(0),
         iat: u64::try_from(now.timestamp()).unwrap_or(0),
     };

@@ -110,6 +110,12 @@ pub struct MediaClaims {
     pub playback: bool,
     /// The minting user's `clips` capability.
     pub clips: bool,
+    /// The minting user's `view_plates` capability. Carried because the plate
+    /// crop served by `GET /events/{id}/snapshot` (the crumb-alpr stored-crop
+    /// fallback) and `GET /plates/{id}/crop` both require it, and clients fetch
+    /// those with a scoped media token; without carrying it, an authorized
+    /// user's token gets 403 and plate crops render blank.
+    pub view_plates: bool,
     /// Expiry — Unix timestamp (seconds). Short (~15 min; see auth.rs).
     pub exp: u64,
     /// Issued-at — Unix timestamp.

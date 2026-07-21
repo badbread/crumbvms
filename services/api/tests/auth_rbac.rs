@@ -962,6 +962,139 @@ async fn camera_frame_route_rejects_full_jwt_but_accepts_scoped_token() {
     assert_ne!(scoped.status(), StatusCode::FORBIDDEN);
 }
 
+// ─── crumb-alpr plate crop via scoped media token (regression: #364) ──────────
+//
+// The Android / desktop / iOS clients render a license-plate crop with an
+// `<img>`-style request to GET /events/{id}/snapshot carrying a *scoped media
+// token* (`?token=`), never the bearer JWT — an image request can't set an
+// Authorization header. That snapshot route falls back to the linked
+// plate_read's stored `crop` bytes (the crumb-alpr external-engine path) and
+// gates that fallback behind the `view_plates` capability.
+//
+// Regression #364 (media tokens hard-coded `view_plates=false`): every
+// crumb-alpr crop came back 403 through the media-token path and rendered as a
+// black tile on the clients — even for a viewer who DID hold `view_plates`.
+// iPhone was unaffected only because it happened to still hold a pre-regression
+// token. These two tests pin the contract end to end: mint a REAL media token
+// and prove the crop is served (200) when the minter holds `view_plates`, and
+// refused (403) when it does not — so the capability can never again be dropped
+// silently on the mint→reconstruct round-trip.
+
+/// Insert a crumb-alpr event with a NULL `snapshot_url` (so `get_event_snapshot`
+/// takes the crop-fallback branch, not the Frigate proxy path) linked to a
+/// `plate_reads` row carrying `crop` bytes. Returns the event id.
+async fn seed_alpr_crop_event(app: &TestApp, camera_id: Uuid, crop: &[u8]) -> Uuid {
+    let now = Utc::now();
+    let event_id: Uuid = {
+        let client = app.pool().get().await.expect("pool.get (alpr event)");
+        client
+            .query_one(
+                "INSERT INTO events (camera_id, ts, label, score, thumb_path, snapshot_url)
+                 VALUES ($1, $2, 'car', 0.9, NULL, NULL) RETURNING id",
+                &[&camera_id, &now],
+            )
+            .await
+            .expect("insert crumb-alpr event")
+            .get("id")
+    };
+
+    crumb_common::db::upsert_plate_read(
+        app.pool(),
+        &crumb_common::db::UpsertPlateReadParams {
+            camera_id,
+            ts: now,
+            plate: crumb_common::db::normalize_plate("ALPR123"),
+            plate_raw: Some("ALPR123".to_owned()),
+            confidence: Some(0.95),
+            source_id: "crumb-alpr".to_owned(),
+            provider_event_id: Some(format!("alpr-{event_id}")),
+            event_id: Some(event_id),
+            snapshot_url: None,
+            bbox: None,
+            crop: Some(crop.to_vec()),
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .expect("seed crumb-alpr plate_read");
+
+    event_id
+}
+
+/// Seed a viewer whose role lacks `view_plates` (but is otherwise a normal
+/// playback viewer) granted the given cameras.
+async fn seed_viewer_no_plates(pool: &deadpool_postgres::Pool, cameras: &[Uuid]) -> SeededUser {
+    use crumb_common::types::{BookmarkScope, Capabilities};
+    let caps = Capabilities {
+        export: false,
+        playback: true,
+        clips: true,
+        ptz: false,
+        bookmarks: BookmarkScope::Own,
+        manage_views: true,
+        view_plates: false,
+    };
+    let role = crumb_common::db::create_role(pool, &unique("noplates-role"), &caps, cameras)
+        .await
+        .expect("create_role (no view_plates)");
+    seed_viewer_user(pool, role.id).await
+}
+
+#[tokio::test]
+async fn crumb_alpr_crop_served_via_media_token_when_view_plates_held() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    // JPEG SOI + APP0 marker bytes; the handler serves these verbatim.
+    let crop = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    let event_id = seed_alpr_crop_event(&app, cam, &crop).await;
+
+    // seed_viewer grants view_plates, so the minted media token must carry it.
+    let viewer = seed_viewer(app.pool(), &[cam]).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+    let media = mint_media_token(&app, &token, cam).await;
+
+    let resp = app
+        .send(get(&format!("/events/{event_id}/snapshot?token={media}")))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a media token minted by a view_plates holder must serve the crumb-alpr crop \
+         (regression #364: it used to 403 because the token dropped view_plates)"
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        crop.as_slice(),
+        "the served body must be the stored crop bytes, unmodified"
+    );
+}
+
+#[tokio::test]
+async fn crumb_alpr_crop_refused_via_media_token_without_view_plates() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    let crop = vec![0xFFu8, 0xD8, 0xFF, 0xE0];
+    let event_id = seed_alpr_crop_event(&app, cam, &crop).await;
+
+    // Viewer WITHOUT view_plates → the media token must not carry it, so the
+    // crop fallback stays gated (the token can't amplify past its minter).
+    let viewer = seed_viewer_no_plates(app.pool(), &[cam]).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+    let media = mint_media_token(&app, &token, cam).await;
+
+    let resp = app
+        .send(get(&format!("/events/{event_id}/snapshot?token={media}")))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a media token minted without view_plates must NOT unlock the crumb-alpr crop"
+    );
+}
+
 // ─── revocable sessions (P0-SESSIONS) ──────────────────────────────────────────
 
 /// Read the caller's session list and return the jti flagged `is_current`.
