@@ -182,6 +182,17 @@ impl AuthUser {
     pub fn require_clips(&self) -> Result<(), ApiError> {
         Self::require(self.can_clips(), "viewing clips")
     }
+    /// Authorize a detection/plate (`d:`) clip. Those clips are played from the
+    /// Plates tab, which is revealed by `view_plates`, so either capability is
+    /// sufficient — otherwise a `{view_plates, clips:false}` role sees a working
+    /// Plates tab whose every Play 403s. Motion (`m:`) clips still require
+    /// `clips`. (#370)
+    pub fn require_clips_or_view_plates(&self) -> Result<(), ApiError> {
+        Self::require(
+            self.can_clips() || self.can_view_plates(),
+            "viewing clips",
+        )
+    }
     pub fn require_ptz(&self) -> Result<(), ApiError> {
         Self::require(self.can_ptz(), "PTZ control")
     }

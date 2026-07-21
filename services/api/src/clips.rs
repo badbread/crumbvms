@@ -192,6 +192,10 @@ async fn get_clips(
         .collect();
 
     let mut clips: Vec<ClipDescriptor> = Vec::new();
+    // Full-window count of detection events (the DB COUNT, independent of the
+    // page `limit`), so the response `total` is the honest window total rather
+    // than the returned page size. (#368)
+    let mut det_total: usize = 0;
 
     // ── Detections (events table; source = per-camera resolved) ──
     if want_det {
@@ -203,9 +207,10 @@ async fn get_clips(
             limit,
             offset: 0,
         };
-        let (rows, _total) = db::list_detection_events(state.pool(), &dq)
+        let (rows, total_det) = db::list_detection_events(state.pool(), &dq)
             .await
             .map_err(ApiError::Internal)?;
+        det_total = total_det.max(0) as usize;
         for r in rows {
             // Motion-labelled detection events duplicate the segment-derived motion
             // clips below — skip them so the feed isn't double-counted.
@@ -244,6 +249,11 @@ async fn get_clips(
             });
         }
     }
+
+    // Detection clips actually pushed (page-limited, minus the motion-labelled
+    // duplicates skipped above); the gap between this and `det_total` is what the
+    // clients page toward by growing their limit.
+    let det_pushed = clips.len();
 
     // ── Motion (contiguous has_motion segment runs; always Crumb own-footage) ──
     if want_mot {
@@ -287,7 +297,19 @@ async fn get_clips(
         }
     }
 
-    // Newest first, capped.
+    // Motion runs are gathered unbounded, so their count is exact.
+    let motion_count = clips.len() - det_pushed;
+
+    // Honest full-window total, so a client gating a "Load more (N of M)"
+    // affordance on `returned < total` (growing its `limit`, offset 0) knows more
+    // exist. Previously `total` was computed AFTER the truncate below and so
+    // always equalled the returned page size, making "Load more" dead. `det_total`
+    // is the DB COUNT of detection events; it includes the motion-labelled events
+    // skipped above as motion-clip duplicates, so `total` can read a hair high
+    // when a source emits them — never low, so it never hides clips. (#368)
+    let total = det_total + motion_count;
+
+    // Newest first, then cap to the requested page.
     clips.sort_by_key(|c| std::cmp::Reverse(c.start_ts));
     clips.truncate(limit as usize);
 
@@ -307,7 +329,6 @@ async fn get_clips(
         .await
         .map_err(ApiError::Internal)?;
 
-    let total = clips.len();
     Ok(Json(ClipsResponse {
         clips,
         total,
@@ -608,7 +629,14 @@ async fn get_clip_media(
     Query(mq): Query<MediaQuery>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    user.require_clips()?;
+    // `d:` = detection/plate clips (played from the Plates tab, gated on
+    // view_plates); authorize by clips OR view_plates. `m:` motion clips still
+    // require clips. (#370)
+    if id.starts_with("d:") {
+        user.require_clips_or_view_plates()?;
+    } else {
+        user.require_clips()?;
+    }
     let rc = resolve_clip(&state, &id).await?;
     // Camera-access denial is 403 (Forbidden), matching playback.rs / events.rs —
     // NOT 404. `resolve_clip` above already 404s a genuinely missing clip; once it
@@ -796,7 +824,13 @@ async fn get_clip_thumbnail(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    user.require_clips()?;
+    // See get_clip_media: `d:` plate/detection clips accept clips OR
+    // view_plates; `m:` motion clips require clips. (#370)
+    if id.starts_with("d:") {
+        user.require_clips_or_view_plates()?;
+    } else {
+        user.require_clips()?;
+    }
     let rc = resolve_clip(&state, &id).await?;
     let (cam, start, end) = (rc.camera_id, rc.start, rc.end);
     // Camera-access denial is 403 (Forbidden), matching playback.rs / events.rs —

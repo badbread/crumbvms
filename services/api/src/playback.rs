@@ -141,7 +141,12 @@ async fn live_stream_mp4(
     AxumPath(camera_id): AxumPath<Uuid>,
     Query(q): Query<LiveStreamQuery>,
 ) -> Result<Response, ApiError> {
-    user.require_playback()?;
+    // Live viewing is an any-viewer surface, camera-scope only — it is NOT the
+    // recorded-`playback` capability (which gates `play`/`serve_segment`/etc).
+    // The sibling live route `live_webrtc` is likewise camera-scope only; this
+    // MSE path must match it, or a role with `playback:false` (a supported
+    // "recorded-footage-only" config) 403s on iOS/macOS live while the WebRTC
+    // and RTSP clients keep working. (#369)
     user.assert_camera_access(camera_id)?;
 
     let cam = db::get_camera(state.pool(), camera_id)
