@@ -188,10 +188,7 @@ impl AuthUser {
     /// Plates tab whose every Play 403s. Motion (`m:`) clips still require
     /// `clips`. (#370)
     pub fn require_clips_or_view_plates(&self) -> Result<(), ApiError> {
-        Self::require(
-            self.can_clips() || self.can_view_plates(),
-            "viewing clips",
-        )
+        Self::require(self.can_clips() || self.can_view_plates(), "viewing clips")
     }
     pub fn require_ptz(&self) -> Result<(), ApiError> {
         Self::require(self.can_ptz(), "PTZ control")
