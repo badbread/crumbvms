@@ -143,19 +143,29 @@ fun LiveFullscreenScreen(
     // Gate on lifecycle so it doesn't poll while backgrounded, and back off under
     // failure (matches the motion poll below).
     val haHasPlaced = haLinks.any { it.hasPlacement }
+    // Client-side staleness. The server `stale` flag only reflects Crumb->HA
+    // reachability; it says nothing about whether THIS phone is still reaching
+    // Crumb. If the phone loses the Crumb API (Wi-Fi drop, server restart) while
+    // go2rtc video keeps playing, the last-known HA states would otherwise keep
+    // rendering as live security state (e.g. a door "Closed") indefinitely. Count
+    // consecutive `/ha/states` misses and, at >= 2, treat the badges as stale --
+    // matching desktop (`live_status_controller.haStale`) and iOS
+    // (`HomeAssistant` missStreak >= 2). (#371)
+    var haMissStreak by remember { mutableStateOf(0) }
     LaunchedEffect(currentCameraId, haHasPlaced, haSheetOpen) {
         if (!haHasPlaced && !haSheetOpen) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            var failStreak = 0
             while (true) {
                 val res = repo.haStates().onSuccess { haStates = it }
-                failStreak = if (res.isSuccess) 0 else failStreak + 1
+                haMissStreak = if (res.isSuccess) 0 else haMissStreak + 1
                 kotlinx.coroutines.delay(
-                    if (failStreak == 0) 2000L else (2000L shl (failStreak - 1).coerceAtMost(4)).coerceAtMost(30000L),
+                    if (haMissStreak == 0) 2000L else (2000L shl (haMissStreak - 1).coerceAtMost(4)).coerceAtMost(30000L),
                 )
             }
         }
     }
+    // Server-reported OR client-observed staleness (>= 2 missed polls).
+    val haStale = haStates?.stale == true || haMissStreak >= 2
     // Decoded video pixel size (for contain-fit badge placement) and the current
     // digital-zoom scale (badges hide while zoomed — they'd misalign, matching
     // the desktop `hideBadges: scale > 1.01` rule). Both feed HaBadgeOverlayLayer.
@@ -608,6 +618,7 @@ fun LiveFullscreenScreen(
             HaBadgeOverlayLayer(
                 links = haLinks,
                 states = haStates,
+                clientStale = haStale,
                 videoWidth = videoSize.width,
                 videoHeight = videoSize.height,
                 onBadgeTap = { haBadgeSelected = it },
