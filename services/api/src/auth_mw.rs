@@ -527,20 +527,22 @@ fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
 }
 
 /// Reconstruct a media principal's [`Capabilities`] from a decoded
-/// [`MediaClaims`]. `export`/`playback`/`clips` come straight from the token
-/// (the minting user's real capabilities — never widened); every other
-/// capability is denied, because a media token never grants ptz, bookmark,
-/// view-management, or plate access. Pure, so the "no amplification" property
-/// is directly unit-testable.
+/// [`MediaClaims`]. `export`/`playback`/`clips`/`view_plates` come straight from
+/// the token (the minting user's real capabilities — never widened); the rest
+/// (ptz, bookmark, view-management) are always denied, since a media token is
+/// only ever used to fetch media. `view_plates` is carried because plate crops
+/// (`GET /events/{id}/snapshot` crumb-alpr fallback and `GET /plates/{id}/crop`)
+/// require it and clients fetch them with a media token. Pure, so the
+/// "no amplification" property is directly unit-testable.
 fn media_capabilities_from_claims(claims: &MediaClaims) -> Capabilities {
     Capabilities {
         export: claims.export,
         playback: claims.playback,
         clips: claims.clips,
+        view_plates: claims.view_plates,
         ptz: false,
         bookmarks: BookmarkScope::None,
         manage_views: false,
-        view_plates: false,
     }
 }
 
@@ -566,7 +568,8 @@ mod media_cap_tests {
     use super::media_capabilities_from_claims;
     use crate::dto::MediaClaims;
 
-    fn claims(export: bool, playback: bool, clips: bool) -> MediaClaims {
+    #[allow(clippy::fn_params_excessive_bools)] // test helper mirroring the cap flags
+    fn claims(export: bool, playback: bool, clips: bool, view_plates: bool) -> MediaClaims {
         MediaClaims {
             sub: "00000000-0000-0000-0000-000000000000".to_owned(),
             typ: super::MEDIA_TOKEN_TYP.to_owned(),
@@ -574,6 +577,7 @@ mod media_cap_tests {
             export,
             playback,
             clips,
+            view_plates,
             exp: 0,
             iat: 0,
         }
@@ -582,24 +586,25 @@ mod media_cap_tests {
     #[test]
     fn media_token_never_amplifies_capabilities() {
         // Regression guard for the media-token capability-escalation advisory: a
-        // token minted by a viewer WITHOUT export/playback/clips must reconstruct
-        // a principal without them — the token must not restore a capability the
-        // caller's role withheld.
-        let caps = media_capabilities_from_claims(&claims(false, false, false));
+        // token minted by a viewer WITHOUT export/playback/clips/view_plates must
+        // reconstruct a principal without them — the token must not restore a
+        // capability the caller's role withheld.
+        let caps = media_capabilities_from_claims(&claims(false, false, false, false));
         assert!(!caps.export, "no-export token must not grant export");
         assert!(!caps.playback, "no-playback token must not grant playback");
         assert!(!caps.clips, "no-clips token must not grant clips");
+        assert!(!caps.view_plates, "no-view_plates token must not grant it");
         // A media token never carries these regardless of the claim.
         assert!(!caps.ptz);
         assert!(!caps.manage_views);
-        assert!(!caps.view_plates);
     }
 
     #[test]
     fn media_token_preserves_held_capabilities() {
         // A caller who legitimately holds these still gets a working token,
-        // hard-scoped to its one camera by the caller.
-        let caps = media_capabilities_from_claims(&claims(true, true, true));
-        assert!(caps.export && caps.playback && caps.clips);
+        // hard-scoped to its one camera by the caller. view_plates in particular
+        // must survive, or plate crops fetched with the token render blank.
+        let caps = media_capabilities_from_claims(&claims(true, true, true, true));
+        assert!(caps.export && caps.playback && caps.clips && caps.view_plates);
     }
 }
