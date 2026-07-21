@@ -80,11 +80,27 @@ final class AuthViewModel: ObservableObject {
                 remember: rememberMe
             ))
             container.store.setToken(resp.token)
+        } catch {
+            // Only a failure of `login` itself means there's no valid session —
+            // clear the (nonexistent) token so the form stays on the login screen.
+            container.store.setToken(nil)
+            self.error = error.userMessage
+            isLoading = false
+            return
+        }
+
+        do {
+            // A separate `do` block: `login` above already succeeded and the
+            // token is stored, so a failure here must NOT discard that session
+            // (mirrors `AppContainer.validateSession`'s "401 clears, anything
+            // else keeps the user signed in" split). A network blip on this
+            // second call used to log the user right back out immediately
+            // after a successful login. A real 401 here still clears the
+            // session on its own via `CrumbAPI.execute`'s `clearSession()`.
             let me = try await container.api.me()
             container.applyUser(me)
             container.store.username = me.username
         } catch {
-            container.store.setToken(nil)
             self.error = error.userMessage
         }
 
