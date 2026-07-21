@@ -64,12 +64,45 @@ enum PlateCrop {
         return mean < 12
     }
 
-    /// Wrap a CGImage in the platform image type (UIImage / NSImage).
+    /// Cap on the longer side of any image we hand back for caching. Plate rows
+    /// render this at ~72×40pt / ~56×40pt and the gallery card at ~110pt tall —
+    /// well under 200pt (≈600px at 3x) even generously. A raw detection frame
+    /// can be 2560×1440 (~14 MB decoded); `PlatesView.imageCache` keeps one
+    /// entry per event id with no eviction, so caching full-res bitmaps there
+    /// is an unbounded-growth OOM risk. Downsampling here — the single choke
+    /// point every returned image passes through — caps each cached entry to
+    /// well under 1 MB regardless of the source frame's resolution.
+    private static let maxCachedPixelSize: CGFloat = 640
+
+    /// Downsample `image` so its longer side is at most `maxPixelSize`,
+    /// preserving aspect ratio. Returns `image` unchanged if it's already
+    /// smaller (never upscales).
+    private static func downsample(_ image: CGImage, maxPixelSize: CGFloat) -> CGImage {
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        guard max(w, h) > maxPixelSize, w > 0, h > 0 else { return image }
+        let scale = maxPixelSize / max(w, h)
+        let newWidth = max(1, Int((w * scale).rounded()))
+        let newHeight = max(1, Int((h * scale).rounded()))
+        guard let ctx = CGContext(
+            data: nil, width: newWidth, height: newHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+        return ctx.makeImage() ?? image
+    }
+
+    /// Wrap a CGImage in the platform image type (UIImage / NSImage), downsampled
+    /// to `maxCachedPixelSize` first (see above) so callers that cache the result
+    /// (`PlatesView.imageCache`) never retain a full-resolution detection frame.
     private static func platformImage(_ cg: CGImage) -> PlatformImage {
+        let sized = downsample(cg, maxPixelSize: maxCachedPixelSize)
         #if os(macOS)
-        return PlatformImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return PlatformImage(cgImage: sized, size: NSSize(width: sized.width, height: sized.height))
         #else
-        return PlatformImage(cgImage: cg)
+        return PlatformImage(cgImage: sized)
         #endif
     }
 }
