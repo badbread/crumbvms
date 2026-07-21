@@ -76,13 +76,24 @@ between releases.
    The repo squash-merges, so this is every merged PR (each subject ends in
    `(#N)`); drop it into the GitHub Release notes / `CHANGELOG.md` alongside the
    curated Added/Changed/Fixed prose.
-3. **Bump `VERSION` and finalize the `CHANGELOG`** (a small release PR landed on
-   `main` before the tag):
+3. **Bump `VERSION` + every client version, and finalize the `CHANGELOG`** (a
+   small release PR landed on `main` before the tag):
    - Set the `VERSION` file to the new version. The api `include_str!`s it,
      reports it as the server version, **and compares it against the latest
      GitHub release for the update-available check** — skip this and the shipped
      server self-reports the *previous* version and flags its own release as an
      available update.
+   - **Bump the client versions in lockstep with `VERSION`** (they are separate
+     files, and each client self-reports its own version — the server bump does
+     NOT cover them; missing this ships clients that report the *previous*
+     version, so the in-app update banner never clears and, on Android, the
+     update is not a clean monotonic upgrade):
+     - `apps/android/version.properties` — `VERSION_NAME` = the release version,
+       and **increment `VERSION_CODE`** (Android refuses an update whose code is
+       not strictly higher).
+     - `apps/ios/project.yml` — `MARKETING_VERSION` = the release version, and
+       bump `CURRENT_PROJECT_VERSION` (the build number).
+     - `apps/desktop-flutter/pubspec.yaml` — `version: X.Y.Z+<build>` (bump both).
    - Add a dated `## [X.Y.Z] - <date>` section to `CHANGELOG.md` from the bullets
      in step 2 (curated), and add/point the `[Unreleased]` compare-link in the
      footer (`compare/vX.Y.Z...HEAD`).
