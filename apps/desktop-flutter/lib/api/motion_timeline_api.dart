@@ -9,6 +9,7 @@
 // no ?token= media claim is involved.
 
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -114,6 +115,11 @@ final http.Client _client = TimeoutClient();
 /// the per-camera fallback.
 final Set<String> _batchUnsupportedBases = <String>{};
 
+/// The server rejects `/timeline/intensity/batch` with a 400 above this many
+/// camera ids (`MAX_INTENSITY_BATCH` in services/api/src/timeline.rs). Keep in
+/// sync: the client splits a larger wall into chunks of this size. (#367)
+const int _maxIntensityBatch = 64;
+
 extension MotionTimelineApi on CrumbApi {
   /// GET /timeline/intensity?camera_id=<id>&start=<iso>&end=<iso>&buckets=<n>
   ///
@@ -187,10 +193,30 @@ extension MotionTimelineApi on CrumbApi {
       return _fetchIntensityPerCamera(s, cameraIds, start, end, buckets);
     }
     try {
-      return await _fetchIntensityBatchRaw(s, cameraIds, start, end, buckets);
+      // The server caps the batch route at `_maxIntensityBatch` camera ids (400
+      // above that), and the default "All Cameras" wall can exceed it. Split into
+      // <=cap chunks and merge; a single uncapped request 400'd and took the whole
+      // motion/detection strip down with it. (#367)
+      final merged = <String, IntensityBuckets>{};
+      for (var i = 0; i < cameraIds.length; i += _maxIntensityBatch) {
+        final chunk = cameraIds.sublist(
+          i,
+          min(i + _maxIntensityBatch, cameraIds.length),
+        );
+        merged.addAll(
+          await _fetchIntensityBatchRaw(s, chunk, start, end, buckets),
+        );
+      }
+      return merged;
     } on CrumbApiException catch (e) {
-      if (e.statusCode != 404) rethrow;
-      _batchUnsupportedBases.add(s.base);
+      // 404: the server predates the batch route -> per-camera fan-out, and
+      // remember so later refreshes skip the doomed batch attempt.
+      // 400: an unexpectedly-rejected batch (a server with a smaller/differing
+      // cap, or future validation) -> degrade to the per-camera path rather than
+      // surfacing a broken strip. Don't mark the base unsupported for a 400 --
+      // it may be transient/request-specific, unlike the permanent 404.
+      if (e.statusCode != 404 && e.statusCode != 400) rethrow;
+      if (e.statusCode == 404) _batchUnsupportedBases.add(s.base);
       return _fetchIntensityPerCamera(s, cameraIds, start, end, buckets);
     }
   }
