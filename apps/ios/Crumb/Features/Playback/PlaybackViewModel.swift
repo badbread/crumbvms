@@ -205,23 +205,58 @@ final class PlaybackViewModel: ObservableObject {
         }
     }
 
+    /// Must match the server's `MAX_INTENSITY_BATCH` (services/api/src/timeline.rs):
+    /// the batch route 400s above this many camera ids, so we chunk. (#373)
+    private static let maxIntensityBatch = 64
+
     private func loadIntensity(_ startMs: Int64, _ endMs: Int64) async {
         let ids = timelineCameraIds.isEmpty ? [cameraId] : timelineCameraIds
         let startISO = iso(startMs), endISO = iso(endMs)
-        // Fan out one per-camera intensity request (the endpoint is single-camera),
-        // in parallel: each Task inherits the main actor, and its await frees the
-        // actor so the requests overlap — no off-actor / Sendable captures.
-        let handles: [(String, Task<[Float]?, Never>)] = ids.map { id in
-            (id, Task {
-                (try? await self.container.api.timelineIntensity(
-                    cameraId: id, start: startISO, end: endISO, buckets: self.motionBucketsCount))?.buckets
-            })
+
+        // Use the batch endpoint: one request per <=64-camera chunk instead of one
+        // request per camera. The old per-camera fan-out issued N requests into the
+        // shared rate limiter on every scrub re-center, so a large wall 429'd and
+        // dropped motion bars. Falls back to the per-camera route on 404 (a server
+        // predating the batch endpoint) or 400. (#373)
+        var byId: [String: [Float]] = [:]
+        var batchUnsupported = false
+        var i = 0
+        while i < ids.count {
+            let chunk = Array(ids[i ..< min(i + Self.maxIntensityBatch, ids.count)])
+            i += Self.maxIntensityBatch
+            do {
+                let resp = try await container.api.timelineIntensityBatch(
+                    cameraIds: chunk, start: startISO, end: endISO, buckets: motionBucketsCount)
+                for (id, buckets) in resp.cameras { byId[id] = buckets }
+            } catch APIError.http(let statusCode, _) where statusCode == 404 || statusCode == 400 {
+                batchUnsupported = true
+                break
+            } catch {
+                // Transient failure for this chunk: leave its cameras zeroed (matches
+                // the old per-camera `try?` behavior); the next scrub retries.
+            }
         }
-        var result: [(id: String, buckets: [Float])] = []
-        for (id, handle) in handles {
-            if let buckets = await handle.value { result.append((id: id, buckets: buckets)) }
+
+        if batchUnsupported {
+            // Pre-batch server: fall back to the per-camera fan-out. Each Task
+            // inherits the main actor and frees it on await, so requests overlap.
+            let handles: [(String, Task<[Float]?, Never>)] = ids.map { id in
+                (id, Task {
+                    (try? await self.container.api.timelineIntensity(
+                        cameraId: id, start: startISO, end: endISO, buckets: self.motionBucketsCount))?.buckets
+                })
+            }
+            byId = [:]
+            for (id, handle) in handles {
+                if let buckets = await handle.value { byId[id] = buckets }
+            }
         }
+
         guard !Task.isCancelled else { return }
+        // Preserve the requested order (the server's map is unordered).
+        let result: [(id: String, buckets: [Float])] = ids.compactMap { id in
+            byId[id].map { (id: id, buckets: $0) }
+        }
         motionByCamera = result
         motionBuckets = result.first(where: { $0.id == cameraId })?.buckets ?? result.first?.buckets ?? []
         motionStartMs = startMs

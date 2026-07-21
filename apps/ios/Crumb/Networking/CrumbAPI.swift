@@ -71,6 +71,19 @@ final class CrumbAPI {
         ])
     }
 
+    /// Batched form of `timelineIntensity`: one request for up to
+    /// `MAX_INTENSITY_BATCH` (64) cameras instead of one per camera. The server
+    /// 400s above that cap, so callers must chunk. Returns a map keyed by camera
+    /// id (all-zeros for cameras with no footage or outside scope).
+    func timelineIntensityBatch(cameraIds: [String], start: String, end: String, buckets: Int = 240) async throws -> IntensityBatchResponse {
+        try await get("timeline/intensity/batch", query: [
+            "camera_ids": cameraIds.joined(separator: ","),
+            "start": start,
+            "end": end,
+            "buckets": "\(buckets)",
+        ])
+    }
+
     // MARK: - Playback
 
     func play(cameraId: String, ts: String, stream: String = "main") async throws -> ResolvedSegment {

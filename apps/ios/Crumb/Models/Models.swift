@@ -282,6 +282,20 @@ struct IntensityResponse: Decodable {
     enum CodingKeys: String, CodingKey { case buckets }
 }
 
+/// Batched motion intensity: `GET /timeline/intensity/batch` returns one bucket
+/// array per requested camera, keyed by camera id. Every requested camera is
+/// present (all-zeros for one with no footage or outside the caller's scope).
+struct IntensityBatchResponse: Decodable {
+    let cameras: [String: [Float]]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cameras = try c.decodeIfPresent([String: [Float]].self, forKey: .cameras) ?? [:]
+    }
+
+    enum CodingKeys: String, CodingKey { case cameras }
+}
+
 // MARK: - Playback
 
 struct ResolvedSegment: Decodable {
