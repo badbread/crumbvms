@@ -515,12 +515,22 @@ fn camera_from_row(row: &tokio_postgres::Row) -> Result<Camera> {
 /// Upper bound on a single segment's wall-clock duration, used as the sargable
 /// lower-bound offset in time-window queries (`start_ts >= start - MAX_SEGMENT_LEN`).
 ///
-/// The recorder caps `SEGMENT_SECONDS` at 6s; we use 2× that (12s) so even a
-/// boundary-straddling segment (or a slightly long final segment recovered at
-/// shutdown) is always captured. Over-estimating only widens the index range
-/// scan slightly; under-estimating would drop a real overlapping segment, so we
-/// err generous.
-pub const MAX_SEGMENT_LEN: chrono::Duration = chrono::Duration::seconds(12);
+/// `SEGMENT_SECONDS` (2..=6s) is only the *timer target*. Because the recorder
+/// muxes with `-c copy -f segment`, a segment can only be cut on a keyframe, so
+/// its real wall-clock length tracks the camera's GOP, not the timer. On a
+/// smart-codec / long-GOP camera (Hikvision/Dahua "H.264+/H.265+") a segment can
+/// legitimately run far longer than a few seconds; the recorder tolerates up to
+/// `MAX_SEGMENT_RECEIPT_TIMEOUT_SECS` (3600s, in `recorder::recording`) before it
+/// treats the stream as stalled. This bound MUST match that ceiling: at 12s (the
+/// old 2×`SEGMENT_SECONDS` value) a long segment that starts more than 12s before
+/// a query window but overlaps into it was silently dropped, so the motion-
+/// intensity ribbon and the playback timeline showed a false gap at the window's
+/// left edge on exactly the long-GOP cameras the recorder engineers for. Over-
+/// estimating only widens the index range-scan (still sargable, still an index
+/// range on `start_ts`, just up to an hour of lookback); under-estimating drops a
+/// real overlapping segment, so we pin it to the recorder's own tolerance. Keep
+/// in sync with `MAX_SEGMENT_RECEIPT_TIMEOUT_SECS`. (#372)
+pub const MAX_SEGMENT_LEN: chrono::Duration = chrono::Duration::seconds(3600);
 
 /// Default page size for the keyset-paginated reconcile boot load
 /// ([`list_segments_after`]). Each page is one round-trip; 10k rows is a few MB
@@ -13334,12 +13344,13 @@ mod tests {
         let (start, end) = (sec(0), sec(100));
 
         // A: starts 5s BEFORE the window and overlaps into it ([-5s, +5s), 0.8).
-        //    5s < MAX_SEGMENT_LEN (12s), so the lower bound must keep it.
+        //    5s < MAX_SEGMENT_LEN, so the lower bound must keep it.
         insert_scored_segment(&pool, camera_id, storage_id, sec(-5), sec(5), 0.8).await;
         // B: fully inside, mid-window ([50s, 56s), 0.5).
         insert_scored_segment(&pool, camera_id, storage_id, sec(50), sec(56), 0.5).await;
-        // C: an hour before the window, no overlap — must never leak in.
-        insert_scored_segment(&pool, camera_id, storage_id, sec(-3600), sec(-3595), 0.9).await;
+        // C: two hours before the window (outside even the 3600s bound), no
+        //    overlap — must never leak in.
+        insert_scored_segment(&pool, camera_id, storage_id, sec(-7200), sec(-7195), 0.9).await;
 
         let buckets = motion_intensity_buckets(&pool, camera_id, start, end, 100)
             .await
@@ -13361,6 +13372,56 @@ mod tests {
             "mid-window segment must land in bucket 50 (got {})",
             buckets[50]
         );
+    }
+
+    /// Regression (#372): a long-GOP camera legitimately persists segments far
+    /// longer than the old 12s bound (the recorder tolerates up to 3600s with
+    /// `-c copy`). A segment that starts well before the window but overlaps into
+    /// it MUST still be bucketed; the old `start - 12s` lower bound dropped it,
+    /// showing a false gap at the window's left edge. This pins the widened bound.
+    #[tokio::test]
+    async fn motion_intensity_keeps_long_gop_overhang_segment() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let camera_id = seed_camera_for_test(&pool, policy_id).await;
+        let storage_name = format!("test-storage-{}", Uuid::new_v4().simple());
+        let storage_id = create_storage(&pool, &storage_name, "/does/not/matter", None, None)
+            .await
+            .expect("create_storage")
+            .id;
+
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let sec = |n: i64| base + chrono::Duration::seconds(n);
+        // Window [base, base+100s); n=100 → one bucket per second.
+        let (start, end) = (sec(0), sec(100));
+
+        // A long-GOP segment: starts 300s before the window (>> the old 12s
+        // bound) and runs to +10s, overlapping the window start. The old bound
+        // would drop it; the widened bound must keep it so bucket 0 carries 0.7.
+        insert_scored_segment(&pool, camera_id, storage_id, sec(-300), sec(10), 0.7).await;
+
+        let buckets = motion_intensity_buckets(&pool, camera_id, start, end, 100)
+            .await
+            .expect("motion_intensity_buckets");
+        assert_eq!(buckets.len(), 100);
+        assert!(
+            (buckets[0] - 0.7).abs() < 1e-6,
+            "long-GOP overhang segment must land in bucket 0 (got {})",
+            buckets[0]
+        );
+        assert!(
+            (buckets[9] - 0.7).abs() < 1e-6,
+            "long-GOP overhang segment spans through bucket 9 (got {})",
+            buckets[9]
+        );
+        assert_eq!(buckets[20], 0.0, "no score after the overhang segment ends");
     }
 
     /// The batched `motion_intensity_buckets_multi` must return, for every

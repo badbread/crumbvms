@@ -1847,3 +1847,136 @@ async fn bookmark_viewall_sees_all_but_manages_only_own() {
     let resp = app.send(delete(&viewers_bookmark, &viewer_token)).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
+
+// ─── capability unmasking after #326/#365 (media tokens carry real caps) ──────
+//
+// Once media tokens carry the minter's REAL capabilities (not a hardcoded full
+// set), two routes revealed latent over-gating:
+//   #369: live is an any-viewer surface — a role with playback:false must still
+//         reach live fMP4, matching its WebRTC/RTSP siblings, even though the
+//         recorded-playback routes are correctly gated.
+//   #370: plate/detection (`d:`) clips are played from the Plates tab, which is
+//         revealed by view_plates, so view_plates alone must authorize them.
+
+fn mk_caps(playback: bool, clips: bool, view_plates: bool) -> crumb_common::types::Capabilities {
+    crumb_common::types::Capabilities {
+        export: false,
+        playback,
+        clips,
+        ptz: false,
+        bookmarks: crumb_common::types::BookmarkScope::Own,
+        manage_views: false,
+        view_plates,
+    }
+}
+
+async fn seed_viewer_caps(
+    app: &TestApp,
+    cams: &[Uuid],
+    capabilities: crumb_common::types::Capabilities,
+) -> SeededUser {
+    let role = crumb_common::db::create_role(app.pool(), &unique("caps-role"), &capabilities, cams)
+        .await
+        .expect("create_role (caps)");
+    seed_viewer_user(app.pool(), role.id).await
+}
+
+#[tokio::test]
+async fn live_fmp4_allows_role_without_playback_capability() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    // A "recorded-footage-only" role: playback:false. Live must still work.
+    let user = seed_viewer_caps(&app, &[cam], mk_caps(false, false, false)).await;
+    let token = login(&app, &user.username, &user.password).await;
+
+    // Live fMP4: the cap gate must NOT 403. (go2rtc is unreachable in tests, so
+    // any non-403/401 status proves the capability gate let the request through.)
+    let resp = app
+        .send(get_auth(&format!("/live/{cam}/stream.mp4"), &token))
+        .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "live fMP4 must not require the recorded-playback capability (#369)"
+    );
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Contrast: a RECORDED route still requires playback → 403.
+    let resp = app
+        .send(get_auth(&format!("/cameras/{cam}/motion-grid"), &token))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "recorded playback routes must still enforce the playback capability"
+    );
+}
+
+#[tokio::test]
+async fn plate_clip_authorized_by_view_plates_without_clips_capability() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let event = seed_event(app.pool(), cam).await;
+    let clip_id = format!("d:{event}");
+
+    // {view_plates:true, clips:false} — the Plates-tab role. Must pass the clip
+    // cap gate (media serving then fails on absent footage, but never with 403).
+    let vp = seed_viewer_caps(&app, &[cam], mk_caps(false, false, true)).await;
+    let vp_token = login(&app, &vp.username, &vp.password).await;
+    let resp = app
+        .send(get_auth(&format!("/clip/{clip_id}/clip.mp4"), &vp_token))
+        .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "view_plates must authorize a `d:` clip even without the clips capability (#370)"
+    );
+
+    // {clips:false, view_plates:false} — neither → the cap gate 403s.
+    let none = seed_viewer_caps(&app, &[cam], mk_caps(false, false, false)).await;
+    let none_token = login(&app, &none.username, &none.password).await;
+    let resp = app
+        .send(get_auth(&format!("/clip/{clip_id}/clip.mp4"), &none_token))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a role with neither clips nor view_plates must be refused the clip"
+    );
+}
+
+#[tokio::test]
+async fn clips_total_reflects_window_not_page_size() {
+    // #368: `total` must be the full-window count so a client's "Load more"
+    // (grow-the-limit) affordance knows more exist. Before the fix it was
+    // computed after truncation and always equalled the returned page size.
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    for _ in 0..3 {
+        seed_event(app.pool(), cam).await; // label 'person' → 3 detection clips
+    }
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+
+    let now = Utc::now();
+    let start = (now - chrono::Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ");
+    let end = (now + chrono::Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ");
+    let resp = app
+        .send(get_auth(
+            &format!("/clips?camera_ids={cam}&start={start}&end={end}&type=detection&limit=1"),
+            &token,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(
+        v["clips"].as_array().unwrap().len(),
+        1,
+        "the page must honor limit=1"
+    );
+    assert_eq!(
+        v["total"].as_i64().unwrap(),
+        3,
+        "total must reflect the full window (3), not the returned page size (#368)"
+    );
+}
