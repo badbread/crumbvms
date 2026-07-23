@@ -57,6 +57,8 @@ pub mod config;
 pub mod config_routes;
 #[path = "../../src/db_backup.rs"]
 pub mod db_backup;
+#[path = "../../src/diagnostics.rs"]
+pub mod diagnostics;
 #[path = "../../src/discover.rs"]
 pub mod discover;
 #[path = "../../src/dto.rs"]
@@ -375,6 +377,7 @@ pub fn test_router() -> Router<AppState> {
         .merge(bookmarks::routes())
         .merge(timeline::routes())
         .merge(status::routes())
+        .merge(diagnostics::routes())
         .merge(stats::routes())
         .merge(stats::heavy_routes())
         .merge(ptz::routes())

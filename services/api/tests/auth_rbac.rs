@@ -1980,3 +1980,43 @@ async fn clips_total_reflects_window_not_page_size() {
         "total must reflect the full window (3), not the returned page size (#368)"
     );
 }
+
+// ─── diagnostics bundle (#180): admin-only, downloadable, scrubbed ────────────
+
+#[tokio::test]
+async fn diagnostics_bundle_is_admin_only_and_downloads() {
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+    let admin_token = login(&app, &admin.username, &admin.password).await;
+
+    // Admin: 200, downloads as an attachment, parseable JSON with a version block.
+    let resp = app
+        .send(get_auth("/diagnostics/bundle", &admin_token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cd = resp
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        cd.contains("attachment") && cd.contains("crumb-diagnostics"),
+        "diagnostics bundle must download as an attachment (got {cd:?})"
+    );
+    let v = body_json(resp).await;
+    assert_eq!(v["version"]["service"], "crumb-api");
+    assert!(
+        v["database"].is_object(),
+        "bundle carries a database section"
+    );
+
+    // Viewer (authenticated non-admin): 403.
+    let cam = seed_camera(app.pool()).await;
+    let viewer = seed_viewer(app.pool(), &[cam]).await;
+    let viewer_token = login(&app, &viewer.username, &viewer.password).await;
+    let resp = app
+        .send(get_auth("/diagnostics/bundle", &viewer_token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

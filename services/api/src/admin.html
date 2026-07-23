@@ -1034,6 +1034,34 @@ async function api(path, opts = {}) {
   return res.status === 204 ? null : res.json();
 }
 
+/* Download the admin-only scrubbed diagnostics bundle (GET /diagnostics/bundle).
+   A file download, so it can't use api() (which parses JSON); fetch the blob and
+   click a synthetic <a download>. The server has already redacted secrets. */
+async function downloadDiagnostics() {
+  setMsg('diag-msg', 'Preparing…');
+  try {
+    const res = await fetch('/diagnostics/bundle', { headers: { Authorization: 'Bearer ' + TOKEN } });
+    if (res.status === 401) { logout(); return; }
+    if (!res.ok) {
+      let m = res.statusText;
+      try { const j = await res.json(); m = j.message || j.error || m; } catch {}
+      throw new Error(m);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="?([^"]+)"?/);
+    const name = (match && match[1]) || 'crumb-diagnostics.json';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    setMsg('diag-msg', 'Downloaded ' + name);
+  } catch (e) {
+    setMsg('diag-msg', 'Failed: ' + e.message);
+  }
+}
+
 /* ── Scoped media tokens for camera snapshots (audit 2026-07-05 #2) ──
    A per-camera short-lived (~15 min) token from GET /media-token, cached here
    and used as ?token= on /cameras/{id}/frame.jpg, instead of putting the full
@@ -6570,6 +6598,16 @@ async function renderDetectionClips() {
         <span id="srv-frigate-test" style="margin-left:8px;font-size:12px;line-height:1.6"></span>
       </div>
       <div id="srv-frigate-msg" class="form-msg"></div>
+    </div>
+
+    <!-- Support diagnostics: admin-only scrubbed snapshot download (issue #180). -->
+    <div class="rp-section-head" style="margin-top:22px">
+      <div class="policy-section-title" style="margin-bottom:0">Diagnostics <span style="font-weight:400;color:var(--dim2);text-transform:none;letter-spacing:0">— support bundle</span></div>
+      <button class="primary sm" onclick="downloadDiagnostics()">Download bundle</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">A scrubbed snapshot of this server's version, effective config, key environment, and schema state — for handing to the maintainer when something is wrong server-side. Secrets (tokens, passwords, URL credentials) are redacted before download; footage and live logs are never included.</div>
+      <div id="diag-msg" class="form-msg"></div>
     </div>
 
     <!-- ── MOTION DECODING (hwaccel), detection compute, not networking (S4) ── -->
