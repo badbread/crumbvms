@@ -83,6 +83,7 @@ mod db_backup;
 mod detection;
 #[cfg(feature = "detection")]
 mod detection_ingester;
+mod diagnostics;
 mod discover;
 mod dto;
 mod error;
@@ -477,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(bookmarks::routes())
         .merge(timeline::routes())
         .merge(status::routes())
+        .merge(diagnostics::routes())
         .merge(stats::routes())
         .merge(ptz::routes())
         // Detection events list (authenticated, subject to rate-limit + gzip).

@@ -9856,6 +9856,33 @@ pub async fn set_system_alert_quiet_hours(
     Ok(())
 }
 
+/// List the migrations recorded as applied in `schema_migrations`, oldest first.
+/// Read-only; used by the admin diagnostics bundle to report schema state.
+///
+/// # Errors
+///
+/// Returns an error if the query fails (e.g. the table does not exist on a
+/// pre-migration boot — callers should treat that as "unknown", not fatal).
+pub async fn list_applied_migrations(pool: &Pool) -> Result<Vec<(String, DateTime<Utc>)>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT filename, applied_at FROM schema_migrations ORDER BY applied_at",
+            &[],
+        )
+        .await
+        .context("list_applied_migrations")?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, String>("filename"),
+                r.get::<_, DateTime<Utc>>("applied_at"),
+            )
+        })
+        .collect())
+}
+
 // ─── schema migration runner (C4) ────────────────────────────────────────────
 
 /// Apply embedded `db/migrations/*.sql` files in filename order, idempotently,
