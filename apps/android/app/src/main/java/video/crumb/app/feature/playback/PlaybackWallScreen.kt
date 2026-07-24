@@ -24,8 +24,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmarks
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -356,7 +356,7 @@ fun PlaybackWallScreen(
                     if (caps.export || store.isAdmin) {
                         HintTooltip("Export footage") {
                             IconButton(onClick = onOpenExport) {
-                                Icon(Icons.Default.Share, contentDescription = "Export footage")
+                                Icon(Icons.Default.Download, contentDescription = "Export footage")
                             }
                         }
                     }
