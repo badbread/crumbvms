@@ -15,6 +15,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -46,6 +47,31 @@ data class ViewTransform(
     val offsetX: Float,
     val offsetY: Float,
 )
+
+/**
+ * Hoistable zoom/pan state for [ZoomableVideoSurface]. By default the surface
+ * owns an internal one (so it resets whenever the surface leaves the
+ * composition, e.g. Live camera switches). A caller that wants the zoom to
+ * SURVIVE the surface unmounting/remounting, e.g. playback scrubbing across a
+ * quiet gap on a motion camera, where `currentSegment` briefly nulls and flips
+ * the video off-screen, hoists this above that boundary and passes it in, then
+ * [reset]s it on an actual camera change. (#386)
+ */
+@Stable
+class ZoomableSurfaceState {
+    var zoom by mutableFloatStateOf(1f)
+    var offset by mutableStateOf(Offset.Zero)
+
+    /** Return to fully zoomed out (1x, no pan). */
+    fun reset() {
+        zoom = 1f
+        offset = Offset.Zero
+    }
+}
+
+/** Remember a [ZoomableSurfaceState] across recomposition. */
+@Composable
+fun rememberZoomableSurfaceState(): ZoomableSurfaceState = remember { ZoomableSurfaceState() }
 
 /**
  * Wraps a video composable (a [PlayerSurface] using TextureView) and adds
@@ -84,15 +110,24 @@ fun ZoomableVideoSurface(
     suppressPan: Boolean = false,
     onSwipeCamera: ((Int) -> Unit)? = null,
     onTransformChange: ((ViewTransform) -> Unit)? = null,
+    state: ZoomableSurfaceState = rememberZoomableSurfaceState(),
     content: @Composable () -> Unit,
 ) {
-    var zoom by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }   // content-space pan
+    // Local working copies seeded from the hoisted [state]. On (re)mount the seed
+    // re-reads `state`, so a preserved zoom survives the surface briefly leaving
+    // the composition (e.g. playback scrubbing across a motion-camera gap).
+    // report() writes changes back so `state` stays authoritative. (#386)
+    var zoom by remember { mutableFloatStateOf(state.zoom) }
+    var offset by remember { mutableStateOf(state.offset) }   // content-space pan
     var size by remember { mutableStateOf(IntSize.Zero) }
 
     // Report transform changes (zoom/pan/reset) to the parent for snapshot cropping.
     val transformCb = rememberUpdatedState(onTransformChange)
     fun report() {
+        // Keep the hoisted state authoritative so a preserved zoom survives the
+        // surface remounting on a segment transition. (#386)
+        state.zoom = zoom
+        state.offset = offset
         transformCb.value?.invoke(
             ViewTransform(scale = zoom, offsetX = offset.x, offsetY = offset.y),
         )

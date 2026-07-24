@@ -109,6 +109,7 @@ import video.crumb.app.ui.player.MediaFactory
 import video.crumb.app.ui.player.PlayerSurface
 import video.crumb.app.ui.player.ViewTransform
 import video.crumb.app.ui.player.ZoomableVideoSurface
+import video.crumb.app.ui.player.rememberZoomableSurfaceState
 import video.crumb.app.feature.live.rememberIsMetered
 import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.NavySurface
@@ -217,6 +218,14 @@ fun PlaybackScreen(
 
     // The camera currently shown (owned by the VM; updated on switch/swipe).
     val cameraId = state.cameraId
+
+    // Digital-zoom state hoisted ABOVE the video `when` below, so a zoomed view
+    // survives the surface briefly leaving the composition when scrubbing or
+    // jumping across a quiet gap on a motion camera (there `currentSegment` nulls
+    // and the video branch flips off-screen, unmounting the surface). Reset only
+    // on an actual camera change, so scrubbing the same camera keeps the zoom. (#386)
+    val zoomState = rememberZoomableSurfaceState()
+    LaunchedEffect(cameraId) { zoomState.reset() }
 
     // Ordered enabled-camera ids (live-wall order) for the picker + swipe nav.
     var cameraIds by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -855,6 +864,8 @@ fun PlaybackScreen(
                             // Track zoom/pan so a "Current view" snapshot can crop to
                             // exactly what's on screen.
                             onTransformChange = { viewTransform = it },
+                            // Hoisted so the zoom survives segment gaps (#386).
+                            state = zoomState,
                         ) {
                             PlayerSurface(
                                 player = player,
