@@ -380,6 +380,38 @@ else
   log "NOTE: could not create ${BACKUP_DIR_HOST} — create it and chown 1001:1001 before 'docker compose up'."
 fi
 
+# ── Required bind-mounted FILES ──────────────────────────────────────────────
+# Same failure class as the backup directory above, but worse. The compose file
+# bind-mounts two config FILES from the repo. If either is missing, Docker does
+# not error usefully: it silently creates a DIRECTORY at that path, and the
+# container then dies with
+#
+#   error mounting ".../caddy/Caddyfile" to rootfs at "/etc/caddy/Caddyfile":
+#   not a directory: Are you trying to mount a directory onto a file
+#
+# which says nothing about the real problem (the file is missing) and leaves a
+# bogus directory behind that has to be removed by hand before a retry works.
+# Fail here instead, where we can name the file and the fix.
+#
+# This bites deployments that keep a partial copy of the repo rather than a full
+# checkout, which is a normal thing to do when running from prebuilt images.
+for required_file in "caddy/Caddyfile" "go2rtc/go2rtc.yaml"; do
+  path="${REPO_ROOT}/${required_file}"
+  if [[ -d "${path}" ]]; then
+    die "${path} is a DIRECTORY but must be a file.
+      Docker creates an empty directory here when the file is missing and a
+      container has already tried to start. Remove it and restore the file:
+        rmdir '${path}'
+        git checkout -- '${required_file}'"
+  elif [[ ! -f "${path}" ]]; then
+    die "missing required file: ${path}
+      docker-compose.yml bind-mounts this into a container. Without it the
+      container fails to start with a confusing 'not a directory' mount error.
+      Restore it with:
+        git checkout -- '${required_file}'"
+  fi
+done
+
 log "wrote ${ENV_FILE} (mode 600) with freshly generated secrets"
 log ""
 log "  Console sign-in (write these down, you will not be shown the password again):"
