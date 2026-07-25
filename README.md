@@ -152,6 +152,14 @@ desktop client, a batch export list, and roles with per-camera access, with Frig
 detections drawn right on the timeline over MQTT. Run both. **Frigate detects, Crumb is the
 room you sit in.**
 
+**Crumb is built to sit next to Home Assistant too, and the rule is the same.** HA stays your
+automation brain; Crumb puts it on the glass. Its sensors can act as an extra recording trigger,
+so a real door or motion contact arms recording alongside pixel motion and Frigate's detections
+rather than pixels alone, and you can pin a camera's HA entities onto the live frame where they
+physically are, live state and all. Connect it and link entities from inside the desktop app, no
+YAML. Leave Home Assistant unconfigured and none of it runs, exactly like the Frigate
+integration. Neither is required, and neither is replaced.
+
 **"Why not just read Frigate's recordings?"** Because a smooth, frame-accurate, multi-camera
 scrubbable timeline is a property of how footage is *recorded*, not how it is played back.
 Frigate's files play fine, but the things that make scrubbing feel instant (short
