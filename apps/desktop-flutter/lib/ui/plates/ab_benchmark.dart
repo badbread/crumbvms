@@ -14,9 +14,11 @@
 // existing authed sources only — the sibling detection-event snapshot
 // (`GET /events/{id}/snapshot`) or the stored crumb-alpr crop
 // (`GET /plates/{id}/crop`) — never an unauthenticated provider URL. The
-// report itself carries no bbox, so the client-side plate crop (Frigate-only
-// passes) finds the read's bbox via one narrow `GET /plates` query and crops
-// with the shared plate_crop.dart helper, exactly like the Plates screen.
+// report carries each best read's bbox, so the client-side plate crop is
+// derived from the fetched frame with the shared plate_crop.dart helper
+// (exactly like the Plates screen) with NO extra round-trip: a row used to
+// spend a whole `GET /plates` range query just to re-find a box the server
+// already had in hand.
 
 import 'dart:typed_data';
 
@@ -786,12 +788,6 @@ const _abImagesCacheMax = 200;
 /// dialog racing for the same pass share one set of fetches.
 final Map<String, Future<_AbPassImages>> _abImagesInFlight = {};
 
-/// Bbox lookup memo (read id → bbox or null-for-none). The ab-report carries
-/// no bbox, so the crop path re-finds the read via `GET /plates`; memoized so
-/// scrolling back over rows doesn't re-query.
-final Map<String, List<double>?> _abBboxCache = {};
-const _abBboxCacheMax = 400;
-
 /// Resolve (and cache) both images for [p]. Shared by the row thumbnails and
 /// the confirm-true-plate dialog so both hit the same cache.
 Future<_AbPassImages> _resolvePassImages(CrumbApi api, Session s, AbPass p) {
@@ -847,7 +843,9 @@ Future<_AbPassImages> _resolvePassImagesUncached(
   // show the same image as `full`.
   Uint8List? crop;
   if (full != null && owner != null) {
-    final bbox = await _lookupAbBbox(api, s, p.cameraId, owner);
+    // The box comes with the report (see AbPassRead.bbox) — no per-row
+    // `GET /plates` round-trip to re-find a box the server already had.
+    final bbox = owner.bbox;
     if (bbox != null && bbox.length >= 4) {
       try {
         crop = await cachedPlateCrop(owner.readId, full, bbox);
@@ -874,41 +872,6 @@ Future<Uint8List?> _fetchAbBytes(Session s, String url) async {
     // fall through
   }
   return null;
-}
-
-/// Find [read]'s bbox: one narrow `GET /plates` query (same camera, ±2 s
-/// around the read's timestamp) and match the row by read id. A read with no
-/// bbox memoizes null (no point re-querying); a failed query is not memoized.
-Future<List<double>?> _lookupAbBbox(
-  CrumbApi api,
-  Session s,
-  String cameraId,
-  AbPassRead read,
-) async {
-  if (_abBboxCache.containsKey(read.readId)) return _abBboxCache[read.readId];
-  List<double>? bbox;
-  try {
-    final page = await api.listPlates(
-      s,
-      cameraIds: [cameraId],
-      start: read.ts.subtract(const Duration(seconds: 2)),
-      end: read.ts.add(const Duration(seconds: 2)),
-      limit: 50,
-    );
-    for (final r in page.plates) {
-      if (r.id == read.readId) {
-        bbox = r.bbox;
-        break;
-      }
-    }
-  } catch (_) {
-    return null; // transient — retry on the next mount
-  }
-  if (_abBboxCache.length >= _abBboxCacheMax) {
-    _abBboxCache.remove(_abBboxCache.keys.first);
-  }
-  _abBboxCache[read.readId] = bbox;
-  return bbox;
 }
 
 /// The pass images cell: full-frame context thumb + tight plate crop side by

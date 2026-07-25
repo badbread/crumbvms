@@ -512,6 +512,11 @@ pub struct AbReadDto {
     /// Sibling detection event — the client fetches the pass image via the
     /// existing `GET /events/:id/snapshot` (or `GET /plates/:id/crop`).
     pub event_id: Option<Uuid>,
+    /// Plate box `[x, y, w, h]` (0..1 fractions of the snapshot frame), when
+    /// one was captured. Lets a client crop the pass image to the plate from
+    /// the report alone — without a per-row `GET /plates` round-trip to look
+    /// up a box the server already had.
+    pub bbox: Option<[f32; 4]>,
     pub ts: DateTime<Utc>,
     /// Raw reads collapsed into this engine's entry (dup-refinement count).
     pub read_count: usize,
@@ -523,6 +528,7 @@ fn ab_read_dto(b: &crumb_common::lpr_ab::EngineBest) -> AbReadDto {
         plate: b.plate.clone(),
         confidence: b.confidence,
         event_id: b.event_id,
+        bbox: b.bbox,
         ts: b.ts,
         read_count: b.read_count,
     }

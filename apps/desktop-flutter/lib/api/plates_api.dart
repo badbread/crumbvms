@@ -240,6 +240,7 @@ class AbPassRead {
     required this.plate,
     required this.confidence,
     required this.eventId,
+    required this.bbox,
     required this.ts,
     required this.readCount,
   });
@@ -248,6 +249,11 @@ class AbPassRead {
   final String plate; // normalized uppercase alphanumeric
   final double? confidence;
   final String? eventId; // sibling detection event (snapshot source), or null
+  /// Plate box `[x, y, w, h]` (0..1 fractions of the snapshot frame), or null.
+  /// Served by the report itself so the benchmark can crop a pass image to the
+  /// plate without a per-row `GET /plates` round-trip. Null on a server older
+  /// than this field — callers fall back to the uncropped frame.
+  final List<double>? bbox;
   final DateTime ts;
   final int readCount; // raw reads collapsed into this entry
 
@@ -256,6 +262,7 @@ class AbPassRead {
     plate: (j['plate'] as String?) ?? '',
     confidence: (j['confidence'] as num?)?.toDouble(),
     eventId: j['event_id'] as String?,
+    bbox: _parseBbox(j['bbox']),
     ts: DateTime.parse(j['ts'] as String),
     readCount: (j['read_count'] as num?)?.toInt() ?? 1,
   );
