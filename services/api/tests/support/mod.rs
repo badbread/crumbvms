@@ -77,6 +77,8 @@ pub mod ffprobe;
 pub mod filmstrip;
 #[path = "../../src/go2rtc.rs"]
 pub mod go2rtc;
+#[path = "../../src/imgcache.rs"]
+pub mod imgcache;
 #[path = "../../src/plates.rs"]
 pub mod plates;
 #[path = "../../src/playback.rs"]

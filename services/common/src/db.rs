@@ -8604,6 +8604,40 @@ pub async fn get_plate_read_crop(pool: &Pool, id: Uuid) -> Result<Option<(Uuid, 
     Ok(row.map(|r| (r.get("camera_id"), r.get("crop"))))
 }
 
+/// Like [`get_plate_read_crop`] but also returns the read's plate box as
+/// `[x, y, w, h]` fractions, so a caller can crop the stored frame down to just
+/// the plate. Assembled from the `bbox_x1..bbox_y2` corner columns exactly like
+/// [`plate_read_from_row`]; `None` when no box was captured.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_plate_read_crop_with_bbox(
+    pool: &Pool,
+    id: Uuid,
+) -> Result<Option<(Uuid, Option<Vec<u8>>, Option<[f32; 4]>)>> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT camera_id, crop, bbox_x1, bbox_y1, bbox_x2, bbox_y2 \
+             FROM plate_reads WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .context("get_plate_read_crop_with_bbox")?;
+    Ok(row.map(|r| {
+        let x1: Option<f32> = r.get("bbox_x1");
+        let y1: Option<f32> = r.get("bbox_y1");
+        let x2: Option<f32> = r.get("bbox_x2");
+        let y2: Option<f32> = r.get("bbox_y2");
+        let bbox = match (x1, y1, x2, y2) {
+            (Some(x1), Some(y1), Some(x2), Some(y2)) => Some([x1, y1, x2 - x1, y2 - y1]),
+            _ => None,
+        };
+        (r.get("camera_id"), r.get("crop"), bbox)
+    }))
+}
+
 /// Effective per-camera LPR config (migrations 0069/0071) for the `crumb-alpr`
 /// worker's `GET /lpr/worker-config` poll. Returns `None` if the camera id is
 /// unknown.

@@ -271,10 +271,31 @@ async fn post_lpr_read(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Query parameters for `GET /plates/:id/crop`.
+#[derive(Debug, Deserialize)]
+pub struct PlateCropQuery {
+    /// When true, crop the stored frame down to just this read's plate box
+    /// (server-side) instead of returning the whole stored frame.
+    #[serde(default)]
+    pub tight: bool,
+}
+
 /// `GET /plates/:id/crop` — serve a stored plate crop JPEG (external-engine reads
 /// only; Frigate reads carry `snapshot_url` instead). `view_plates`-gated and
 /// camera-scoped: an out-of-scope or unknown read 404s (never revealing
 /// existence), and a read with no stored crop 404s.
+///
+/// ## `?tight=1` (optional)
+///
+/// The `crop` column stores the whole CONTEXT frame for `crumb-alpr` reads, not
+/// a tight plate crop, so clients historically downloaded the full frame
+/// (~174 KB) and cropped it themselves — a full-frame decode per row. With
+/// `tight=1` the server crops to the read's own box and returns just the plate
+/// (a few KB).
+///
+/// The crop is deliberately NOT downscaled: a plate box is only ~5 % of frame
+/// width, so a plate cropped out of a shrunken frame is unreadable, and reading
+/// the plate is the entire point of this image.
 ///
 /// # Errors
 ///
@@ -284,9 +305,10 @@ async fn get_plate_crop(
     user: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<PlateCropQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     user.require_view_plates()?;
-    let (camera_id, crop) = db::get_plate_read_crop(state.pool(), id)
+    let (camera_id, crop, bbox) = db::get_plate_read_crop_with_bbox(state.pool(), id)
         .await
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("plate read {id} not found")))?;
@@ -294,6 +316,21 @@ async fn get_plate_crop(
         return Err(ApiError::NotFound(format!("plate read {id} not found")));
     }
     let bytes = crop.ok_or_else(|| ApiError::NotFound(format!("plate read {id} has no crop")))?;
+
+    // Tight crop when asked for AND a box exists. No box → serve the stored
+    // frame; cropping to a guessed region would hide the plate entirely.
+    // A transform failure likewise degrades to the stored frame rather than
+    // failing the request.
+    let bytes = match (q.tight, bbox) {
+        (true, Some(bb)) => match crate::imgcache::cropped(&state, id, bb, &bytes).await {
+            Ok(cropped) => cropped,
+            Err(e) => {
+                tracing::warn!(error = %e, read_id = %id, "plate crop failed; serving full frame");
+                bytes
+            }
+        },
+        _ => bytes,
+    };
     Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response())
 }
 

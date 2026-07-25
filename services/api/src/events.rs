@@ -57,6 +57,15 @@ pub fn media_routes() -> Router<AppState> {
 
 // ── /events query params & response ──────────────────────────────────────────
 
+/// Query parameters for `GET /events/{id}/snapshot`.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotQuery {
+    /// Optional target width in pixels. Absent → the original frame, byte for
+    /// byte. Present → downscaled (and snapped to an allowed width; see
+    /// `imgcache::snap_width`).
+    pub w: Option<u32>,
+}
+
 /// Query parameters for `GET /events`.
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
@@ -234,6 +243,19 @@ async fn get_events(
 /// editable in the admin camera editor — no code change needed here; the DB
 /// column is writable and `db::load_camera_name_map` already uses it.
 ///
+/// ## `?w=<width>` (optional)
+///
+/// Serve the frame downscaled to roughly `width` px wide instead of at full
+/// resolution. Clients render these frames into ~130 px thumbnails, so the full
+/// frame (~174 KB in a live sample) is two orders of magnitude more bytes than
+/// they draw; a list view that asks for `?w=320` ships ~12 KB per row instead.
+/// Omit the parameter for the original bytes — the default is unchanged, so
+/// existing callers and the click-to-enlarge path are untouched.
+///
+/// The width is SNAPPED to an allowed set (see `imgcache::snap_width`) rather
+/// than honored verbatim: an open range would let one caller mint unbounded
+/// distinct cache entries (and ffmpeg runs) for a single image.
+///
 /// Returns:
 /// - `200 image/jpeg` — JPEG bytes proxied from the provider.
 /// - `401` / `403` — auth / scope failure.
@@ -243,6 +265,7 @@ async fn get_event_snapshot(
     user: AuthUser,
     State(state): State<AppState>,
     Path(event_id): Path<Uuid>,
+    Query(q): Query<SnapshotQuery>,
 ) -> Result<Response, ApiError> {
     // Enforce camera scope, failing CLOSED. A NULL-camera event has no scope to
     // check, so previously it was served to any authenticated user; treat "no
@@ -280,7 +303,8 @@ async fn get_event_snapshot(
         // enforces, so a viewer without it can't reach the crop bytes through the
         // snapshot path.
         user.require_view_plates()?;
-        return Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], crop).into_response());
+        let bytes = maybe_scale(&state, event_id, q.w, crop).await;
+        return Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response());
     } else {
         return Err(ApiError::NotFound(format!(
             "event {event_id} has no snapshot"
@@ -374,12 +398,36 @@ async fn get_event_snapshot(
     .await
     .map_err(|e| ApiError::BadGateway(format!("snapshot body: {e}")))?;
 
+    let bytes = maybe_scale(&state, event_id, q.w, bytes).await;
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "image/jpeg")],
         Body::from(bytes),
     )
         .into_response())
+}
+
+/// Apply `?w=` when present. A transform failure is NOT fatal — the caller
+/// still gets the original frame, so a missing/wedged ffmpeg degrades the
+/// response size rather than breaking the image.
+async fn maybe_scale(
+    state: &AppState,
+    event_id: Uuid,
+    width: Option<u32>,
+    bytes: Vec<u8>,
+) -> Vec<u8> {
+    let Some(requested) = width else {
+        return bytes;
+    };
+    let w = crate::imgcache::snap_width(requested);
+    match crate::imgcache::scaled(state, event_id, w, &bytes).await {
+        Ok(scaled) => scaled,
+        Err(e) => {
+            tracing::warn!(error = %e, %event_id, "snapshot downscale failed; serving full frame");
+            bytes
+        }
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

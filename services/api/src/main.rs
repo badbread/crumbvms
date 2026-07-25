@@ -94,6 +94,7 @@ mod ffprobe;
 mod filmstrip;
 mod go2rtc;
 mod ha;
+mod imgcache;
 mod metrics;
 mod notifications;
 mod plates;
