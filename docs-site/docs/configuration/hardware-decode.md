@@ -72,3 +72,59 @@ that no devices exist.
 
 A wrong pick is always safe: the recorder falls back to CPU automatically
 rather than failing to decode at all.
+
+## Keeping an NVIDIA host stable
+
+This section only matters if you gave the recorder an NVIDIA GPU. VAAPI
+and CPU installs can skip it.
+
+Upgrading the host's NVIDIA driver replaces the userspace libraries, but
+the kernel module already loaded in memory stays at the old version until
+the machine reboots. Until then the two disagree, `nvidia-smi` reports
+`Driver/library version mismatch`, and Docker can no longer start a
+container that asks for the GPU.
+
+The dangerous part is the delay. Containers that are already running keep
+working, because their GPU mounts were established before the upgrade. The
+stack looks healthy, possibly for days. The breakage only surfaces the next
+time a container is **recreated**, so a machine can silently lose the
+ability to restart its own recorder and only reveal it during an update, or
+after a power cut. For a recorder that is supposed to be running
+unattended, that is a bad way to find out.
+
+Two things make this much less likely to catch you:
+
+**Reboot after a driver upgrade.** Not eventually, as part of the upgrade.
+Then confirm with `nvidia-smi` before assuming you are back.
+
+**Don't let driver upgrades happen unattended.** Ubuntu and Debian enable
+`unattended-upgrades` out of the box, so this can happen without anyone
+running `apt` at all, and it will not reboot for you. On those systems you
+can hold the driver and kernel back while still receiving ordinary security
+patches, by dropping a file into `/etc/apt/apt.conf.d/`:
+
+```
+Unattended-Upgrade::Package-Blacklist {
+        "^nvidia-";
+        "^libnvidia-";
+        "^xserver-xorg-video-nvidia";
+        "^linux-image";
+        "^linux-headers";
+        "^linux-generic";
+        "^linux-modules";
+};
+```
+
+Driver and kernel updates then happen when *you* choose, paired with the
+reboot they need. Check it took effect with:
+
+```bash
+sudo unattended-upgrade --dry-run --debug | grep -i blacklist
+```
+
+Kernel upgrades are worth holding for the same reason: a new kernel without
+a reboot leaves the running module and the installed modules out of step.
+
+If you hit this, [Troubleshooting](/troubleshooting/) covers recovery,
+including how to get the recorder running again without the GPU when a
+reboot has to wait.
