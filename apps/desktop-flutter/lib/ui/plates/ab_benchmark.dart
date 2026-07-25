@@ -12,14 +12,18 @@
 //
 // Data: `GET /lpr/ab-report` (see plates_api.dart). Pass images ride the
 // existing authed sources only — the sibling detection-event snapshot
-// (`GET /events/{id}/snapshot`) or the stored crumb-alpr crop
-// (`GET /plates/{id}/crop`) — never an unauthenticated provider URL. The
-// report carries each best read's bbox, so the client-side plate crop is
-// derived from the fetched frame with the shared plate_crop.dart helper
-// (exactly like the Plates screen) with NO extra round-trip: a row used to
-// spend a whole `GET /plates` range query just to re-find a box the server
-// already had in hand.
+// (`GET /events/{id}/snapshot`) and the stored crumb-alpr crop
+// (`GET /plates/{id}/crop`) — never an unauthenticated provider URL.
+//
+// Both row images are fetched as SERVER-SIDE DERIVATIVES, concurrently:
+// `?w=` downscales the context frame (a row draws it at 132 px; the stored
+// frame is ~174 KB) and `?tight=1` crops the plate server-side at native
+// resolution. The plate box cannot come from the downscaled frame — it is only
+// ~5 % of frame width — which is why the crop is its own request rather than a
+// client-side derivation. Enlarging an image fetches the full-resolution frame
+// on demand, so the list never pays for it.
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -28,7 +32,6 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
-import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 
 // Palette shared with the Plates screen (kept literal — those consts are
 // library-private to plates_screen.dart).
@@ -763,14 +766,25 @@ Widget _chip(String text, Color color) {
 
 // ─── pass images ───────────────────────────────────────────────────────────
 
-/// The two images that describe one pass: the full-frame detection snapshot
-/// (scene context) and the tight plate crop (readable plate). Either may be
-/// null when no source exists or a fetch failed.
+/// Width requested for the context thumb. The row draws it at 132 px and the
+/// confirm dialog at 340 px, so this covers both crisply on a HiDPI display
+/// while still being a fraction of the stored frame (~174 KB → ~25 KB). The
+/// server snaps this to its own allowed set; 480 is one of them.
+const _abThumbFetchWidth = 480;
+
+/// The two images that describe one pass: the downscaled context frame (scene
+/// context) and the tight plate crop (readable plate, cropped server-side at
+/// native resolution). Either may be null when no source exists or a fetch
+/// failed.
+///
+/// [fullResUrl] is the SAME frame without `?w=`, fetched only when the operator
+/// clicks to enlarge — the list never pays for full-resolution bytes.
 class _AbPassImages {
-  const _AbPassImages({this.full, this.crop});
+  const _AbPassImages({this.full, this.crop, this.fullResUrl});
 
   final Uint8List? full;
   final Uint8List? crop;
+  final String? fullResUrl;
 
   bool get isEmpty => full == null && crop == null;
 }
@@ -828,33 +842,43 @@ Future<_AbPassImages> _resolvePassImagesUncached(
       break;
     }
   }
-  Uint8List? full;
-  if (ownerEventId != null) {
-    full = await _fetchAbBytes(
-      s,
-      '${s.base}/events/${Uri.encodeComponent(ownerEventId)}/snapshot',
-    );
-  }
+  // Context thumb: ask the server to downscale. The row draws it at 132 px, so
+  // pulling the full-resolution frame (~174 KB) shipped ~15x the bytes drawn.
+  // The lightbox fetches the full frame separately, only when clicked.
+  // Both fetches below are independent — run them concurrently.
+  final fullFut = ownerEventId == null
+      ? Future<Uint8List?>.value()
+      : _fetchAbBytes(
+          s,
+          '${s.base}/events/${Uri.encodeComponent(ownerEventId)}'
+          '/snapshot?w=$_abThumbFetchWidth',
+        );
 
-  // Tight plate crop: ALWAYS derive it from the full frame + the owner read's
-  // bbox, exactly like the Plates screen. NB: do NOT use GET /plates/:id/crop —
-  // for crumb-alpr reads the stored "crop" column now holds the WHOLE context
-  // frame (clients derive the tight crop themselves), so fetching it would just
-  // show the same image as `full`.
-  Uint8List? crop;
-  if (full != null && owner != null) {
-    // The box comes with the report (see AbPassRead.bbox) — no per-row
-    // `GET /plates` round-trip to re-find a box the server already had.
-    final bbox = owner.bbox;
-    if (bbox != null && bbox.length >= 4) {
-      try {
-        crop = await cachedPlateCrop(owner.readId, full, bbox);
-      } catch (_) {
-        crop = null; // undecodable frame — the full frame still shows
-      }
-    }
-  }
-  return _AbPassImages(full: full, crop: crop);
+  // Tight plate crop: the SERVER crops to the owner read's box, at native
+  // resolution. Previously the client pulled the whole frame and cropped it in
+  // a freshly spawned isolate per row; the box is only ~5% of frame width, so
+  // it cannot be derived from the downscaled thumb above.
+  //
+  // A bbox on the report (see AbPassRead.bbox) tells us a crop is worth asking
+  // for at all — `?tight=1` serves the stored frame unchanged when the read has
+  // no box, which would just duplicate the context thumb.
+  final ownerRead = owner;
+  final cropFut = (ownerRead == null || ownerRead.bbox == null)
+      ? Future<Uint8List?>.value()
+      : _fetchAbBytes(
+          s,
+          '${s.base}/plates/${Uri.encodeComponent(ownerRead.readId)}'
+          '/crop?tight=1',
+        );
+
+  final results = await Future.wait([fullFut, cropFut]);
+  return _AbPassImages(
+    full: results[0],
+    crop: results[1],
+    fullResUrl: ownerEventId == null
+        ? null
+        : '${s.base}/events/${Uri.encodeComponent(ownerEventId)}/snapshot',
+  );
 }
 
 /// One Bearer-authed GET returning body bytes, or null on any non-200/error
@@ -933,6 +957,9 @@ class _AbThumbState extends State<_AbThumb> {
           cacheWidth: (132 * dpr).round(),
           placeholderIcon: Icons.directions_car_outlined,
           lightboxLabel: 'Full frame',
+          // Enlarging pulls the frame at full resolution; the list itself only
+          // ever fetched the downscaled thumb.
+          upgrade: _fullResFetcher(widget.session, _images),
         ),
         const SizedBox(width: 6),
         _AbTappableImage(
@@ -949,6 +976,14 @@ class _AbThumbState extends State<_AbThumb> {
   }
 }
 
+/// Build the lightbox's full-resolution fetch for [images], or null when there
+/// is no frame to upgrade to (the displayed thumb is then all there is).
+Future<Uint8List?> Function()? _fullResFetcher(Session s, _AbPassImages? images) {
+  final url = images?.fullResUrl;
+  if (url == null) return null;
+  return () => _fetchAbBytes(s, url);
+}
+
 /// One clickable benchmark image cell: rounded, black-backed, opens the
 /// lightbox on click when it has bytes; a dim placeholder icon otherwise.
 class _AbTappableImage extends StatelessWidget {
@@ -960,6 +995,7 @@ class _AbTappableImage extends StatelessWidget {
     required this.cacheWidth,
     required this.placeholderIcon,
     required this.lightboxLabel,
+    this.upgrade,
   });
 
   final Uint8List? bytes;
@@ -969,6 +1005,9 @@ class _AbTappableImage extends StatelessWidget {
   final int cacheWidth;
   final IconData placeholderIcon;
   final String lightboxLabel;
+
+  /// Optional higher-resolution fetch for the lightbox — see [_showAbLightbox].
+  final Future<Uint8List?> Function()? upgrade;
 
   @override
   Widget build(BuildContext context) {
@@ -994,7 +1033,12 @@ class _AbTappableImage extends StatelessWidget {
     return MouseRegion(
       cursor: SystemMouseCursors.zoomIn,
       child: GestureDetector(
-        onTap: () => _showAbLightbox(context, b, label: lightboxLabel),
+        onTap: () => _showAbLightbox(
+          context,
+          b,
+          label: lightboxLabel,
+          upgrade: upgrade,
+        ),
         child: Tooltip(
           message: 'Click to enlarge',
           waitDuration: const Duration(milliseconds: 600),
@@ -1007,15 +1051,60 @@ class _AbTappableImage extends StatelessWidget {
 
 /// Full-size dismissible viewer: dark backdrop, wheel-zoom + drag-pan via
 /// [InteractiveViewer], click anywhere or Esc to close.
+///
+/// [upgrade], when given, fetches a higher-resolution version of the same
+/// image. The already-loaded (downscaled) bytes render immediately so the
+/// viewer never opens blank, and the sharper frame swaps in when it arrives —
+/// this is what lets the LIST fetch only small derivatives while enlarging
+/// still shows real detail.
 Future<void> _showAbLightbox(
   BuildContext context,
   Uint8List bytes, {
   String? label,
+  Future<Uint8List?> Function()? upgrade,
 }) {
   return showDialog<void>(
     context: context,
     barrierColor: Colors.black.withValues(alpha: 0.88),
-    builder: (ctx) => Material(
+    builder: (ctx) => _AbLightbox(bytes: bytes, label: label, upgrade: upgrade),
+  );
+}
+
+class _AbLightbox extends StatefulWidget {
+  const _AbLightbox({required this.bytes, this.label, this.upgrade});
+
+  final Uint8List bytes;
+  final String? label;
+  final Future<Uint8List?> Function()? upgrade;
+
+  @override
+  State<_AbLightbox> createState() => _AbLightboxState();
+}
+
+class _AbLightboxState extends State<_AbLightbox> {
+  late Uint8List _bytes = widget.bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    final up = widget.upgrade;
+    if (up != null) {
+      unawaited(
+        up().then((better) {
+          if (better != null && better.isNotEmpty && mounted) {
+            setState(() => _bytes = better);
+          }
+        }),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ctx = context;
+    final bytes = _bytes;
+    final label = widget.label;
+    return Material(
       type: MaterialType.transparency,
       child: Stack(
         children: [
@@ -1060,8 +1149,8 @@ Future<void> _showAbLightbox(
           ),
         ],
       ),
-    ),
-  );
+    );
+  }
 }
 
 // ─── confirm dialog ────────────────────────────────────────────────────────
@@ -1147,6 +1236,7 @@ class _ConfirmPlateDialogState extends State<_ConfirmPlateDialog> {
                 cacheWidth: (340 * dpr).round(),
                 placeholderIcon: Icons.directions_car_outlined,
                 lightboxLabel: 'Full frame',
+                upgrade: _fullResFetcher(widget.session, images),
               ),
             ],
             if (images != null && images.crop != null) ...[
