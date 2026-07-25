@@ -2209,6 +2209,29 @@ guarantees Crumb treats as sacred.
 
 ---
 
+## 2026-07-25, Copy names other products as a comparison, not as an identity
+
+**Decision.** User-facing copy may name another product to describe how Crumb
+relates to it ("if you have used X, this will feel familiar"). It does not use
+another product's name as Crumb's own identity ("the open source X").
+
+**Context.** The previous rule was "generic references to other NVRs only".
+That left Crumb hard to find for someone looking for a self-hosted option with
+this style of review workflow, and it was inconsistent with the comparison
+table, which already names Blue Iris, Scrypted and ZoneMinder.
+
+**Rejected: "the open source \<product\>" as a tagline.** It anchors expectations
+to an enterprise product, so everything Crumb does not have reads as a
+shortfall. The comparison phrasing has room to state plainly what Crumb is not,
+which is more useful to someone evaluating it and more accurate.
+
+**Accepted trade-offs.** Copy carries a trademark attribution line, uses no
+other product's logo or visual style, and claims no compatibility that does not
+exist.
+
+**Revisit if:** the comparison stops being an honest description of what Crumb
+is for.
+
 ## 2026-07-05, Retention: a configurable time cap + a neutral over-retention nudge (no hardcoded jurisdictional number)
 
 **Context.** A pass over EU/UK data-minimization considerations flagged two things.

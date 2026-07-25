@@ -10,6 +10,10 @@
 </p>
 
 <p align="center">
+  <sub>If you have used Milestone XProtect or similar commercial VMS software, the investigate workflow will feel familiar.</sub>
+</p>
+
+<p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
   <img alt="Backend: Rust" src="https://img.shields.io/badge/backend-Rust-orange?logo=rust">
@@ -241,6 +245,18 @@ so if you have thoughts on how it should work,
 
 <sub>Comparisons are my best-effort read as of 2026, corrections welcome via an issue. Crumb is alpha. Blue Iris and ZoneMinder are mature, shipping products. And to be clear one more time, the Frigate column is not a knock. Frigate wins at detection, which is exactly why Crumb delegates detection to it.</sub>
 
+**Coming from a commercial VMS?** The investigate workflow is deliberately modelled on the
+professional layout that products like Milestone XProtect established: a timeline you drive
+from the keyboard, a live wall saved per workstation, export as a first-class action rather
+than an afterthought. That is the reference point I built against, because it is the one I
+spent years in.
+
+What Crumb does not have is the enterprise half of those products: recording-server failover,
+federated multi-site, hardware certification programmes, and a support contract. If you are
+running a licensed installation for a real site, this is not a replacement for it. If you have
+used one at work and want that way of working at home without a per-camera licence, that is
+exactly who this is for.
+
 ## What I have actually tested
 
 Being honest about this matters, because "works on my machine" is the entire risk with a
@@ -449,3 +465,10 @@ covered, iOS testing goes live for everyone.
 </p>
 
 > Follow the trail.
+
+---
+
+<sub>Milestone and XProtect are trademarks of Milestone Systems A/S. Frigate, Home Assistant,
+and any other product names are the property of their respective owners. CrumbVMS is an
+independent project and is not affiliated with, endorsed by, or sponsored by any of them.
+Comparisons are for description only.</sub>
