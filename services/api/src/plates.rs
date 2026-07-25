@@ -276,8 +276,33 @@ async fn post_lpr_read(
 pub struct PlateCropQuery {
     /// When true, crop the stored frame down to just this read's plate box
     /// (server-side) instead of returning the whole stored frame.
-    #[serde(default)]
+    ///
+    /// Accepts `1`/`0` as well as `true`/`false`. A plain `#[serde] bool`
+    /// rejects `?tight=1` with "provided string was not `true` or `false`",
+    /// which is a poor answer for a query parameter — `1` is the conventional
+    /// spelling in a URL, and the failure is a 400 with an opaque message
+    /// rather than the image the caller asked for.
+    #[serde(default, deserialize_with = "de_flexible_bool")]
     pub tight: bool,
+}
+
+/// Deserialize a query-string boolean permissively: `1`/`true`/`yes`/`on`
+/// (case-insensitive) are true, `0`/`false`/`no`/`off`/empty are false.
+/// Anything else is an error, so a typo still surfaces rather than silently
+/// reading as false.
+fn de_flexible_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let raw = String::deserialize(d)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(D::Error::custom(format!(
+            "expected a boolean (1/0, true/false), got '{other}'"
+        ))),
+    }
 }
 
 /// `GET /plates/:id/crop` — serve a stored plate crop JPEG (external-engine reads
@@ -1031,4 +1056,34 @@ fn parse_uuid_csv(csv: &str) -> Result<Vec<Uuid>, ApiError> {
             Uuid::parse_str(s).map_err(|_| ApiError::BadRequest(format!("invalid camera id: {s}")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `?tight=1` is the conventional URL spelling and must work; a plain
+    /// serde `bool` rejects it with an opaque 400 (found end-to-end against a
+    /// live instance, where every crop request failed this way).
+    #[test]
+    fn tight_accepts_both_1_and_true() {
+        // Exercised through serde_json (already a dependency) rather than
+        // serde_urlencoded — same `de_flexible_bool` code path, no new crate
+        // pulled in just for a test.
+        for raw in ["1", "true", "yes", "ON"] {
+            let json = format!(r#"{{"tight":"{raw}"}}"#);
+            let q: PlateCropQuery = serde_json::from_str(&json).expect(raw);
+            assert!(q.tight, "{raw} should parse as true");
+        }
+        for raw in ["0", "false", "no", ""] {
+            let json = format!(r#"{{"tight":"{raw}"}}"#);
+            let q: PlateCropQuery = serde_json::from_str(&json).expect(raw);
+            assert!(!q.tight, "{raw} should parse as false");
+        }
+        // Absent entirely -> false (the #[serde(default)]).
+        let q: PlateCropQuery = serde_json::from_str("{}").expect("empty");
+        assert!(!q.tight);
+        // A typo must still be an error, not a silent false.
+        assert!(serde_json::from_str::<PlateCropQuery>(r#"{"tight":"ture"}"#).is_err());
+    }
 }
