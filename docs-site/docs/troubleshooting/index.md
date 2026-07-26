@@ -34,6 +34,31 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 it. Remap the conflicting port in `docker-compose.yml`, or override
 `CRUMB_HTTPS_PORT` in `.env` for the Caddy HTTPS port.
 
+**A container dies with `not a directory: Are you trying to mount a
+directory onto a file`,** naming `caddy/Caddyfile` or
+`go2rtc/go2rtc.yaml`. That config file is missing from your copy of the
+repo. Compose bind-mounts it into the container, and when the source file
+doesn't exist Docker silently creates an empty **directory** in its place,
+then fails to mount it over a file. The error describes the symptom, not
+the cause.
+
+Remove the directory Docker left behind and restore the real file:
+
+```bash
+rmdir caddy/Caddyfile          # the empty directory Docker created
+git checkout -- caddy/Caddyfile
+docker compose up -d
+```
+
+Both the `rmdir` and the restore are needed: leaving the directory in
+place makes the next `up` fail exactly the same way. `scripts/setup-env.sh`
+now checks for this before you start the stack, so re-running it will also
+tell you which file is missing.
+
+This usually means the deployment directory holds a partial copy of the
+repo rather than a full checkout, which is easy to end up with when running
+from prebuilt images and only copying what looks necessary.
+
 ## After startup
 
 **`/health` stays `503`.** Give Postgres a moment to finish starting and
