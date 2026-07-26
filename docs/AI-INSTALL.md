@@ -203,6 +203,20 @@ is present, **stay on CPU.** Never block the install on a GPU.
 **Verify (if enabled):** `nvidia-smi` works (NVIDIA) or a `/dev/dri/renderD*`
 node exists (VAAPI); otherwise skip.
 
+**If NVIDIA was enabled, tell the user about the driver-upgrade trap** (and
+offer to mitigate it, do not change their update policy without asking):
+upgrading the host NVIDIA driver without rebooting leaves the loaded kernel
+module mismatched against the new libraries. Already-running containers keep
+working, so nothing looks wrong, but the next container **recreate** fails with
+`open /run/nvidia-persistenced/socket: no such file or directory` and the
+recorder will not start. On a recorder meant to run unattended this surfaces at
+the worst time, during an update or after a power cut. Fix is a host reboot;
+rolling Crumb's image back does not help. Debian/Ubuntu enable
+`unattended-upgrades` by default, so this can happen with no one running `apt`.
+Mitigation (hold driver + kernel back while still taking security patches) is in
+`docs-site/docs/configuration/hardware-decode.md`, "Keeping an NVIDIA host
+stable"; recovery is in `docs-site/docs/troubleshooting/index.md`.
+
 ---
 
 ## 5. Bring up the stack

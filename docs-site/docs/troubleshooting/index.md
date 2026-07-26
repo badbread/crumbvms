@@ -44,6 +44,42 @@ clear within a minute or two.
 (`MOTION_HWACCEL=auto`); recording itself never needed the GPU in the
 first place. See [Hardware decode](/configuration/hardware-decode).
 
+**The recorder won't start, and the error mentions
+`/run/nvidia-persistenced/socket: no such file or directory`.** The host's
+NVIDIA driver was upgraded, but the machine hasn't been rebooted since, so
+the kernel module still loaded in memory no longer matches the newly
+installed userspace libraries. Confirm it with `nvidia-smi` on the host, a
+mismatch reports:
+
+```
+Failed to initialize NVML: Driver/library version mismatch
+```
+
+**Fix: reboot the host.** Rolling Crumb back to an earlier image does not
+help, the fault is on the host, not in Crumb.
+
+This one is worth understanding because of *when* it bites. A container
+that is already running keeps working fine after the driver upgrade,
+because its GPU mounts were established before the upgrade happened. So
+the stack looks completely healthy, sometimes for hours or days. The
+failure only appears the next time a container is **recreated**, which
+might be a Crumb update, a `docker compose up -d`, or an unrelated
+restart. In other words the machine can quietly lose the ability to
+restart its own recorder, and you find out at the worst moment. If your
+host installs updates automatically (Ubuntu and Debian do by default),
+see [Hardware decode](/configuration/hardware-decode) for how to stop
+driver upgrades landing unattended.
+
+Only installs that hand the recorder an NVIDIA device are affected. The
+base stack boots GPU-free, and VAAPI installs are unaffected.
+
+If a reboot has to wait and you would rather be recording than have GPU
+stats, start the recorder without the GPU by dropping the GPU overlay from
+your `docker compose` command. Note that removing the device reservation
+alone is not enough, the NVIDIA container toolkit also activates on the
+`NVIDIA_VISIBLE_DEVICES` environment variable, so that must be set to
+`void` as well. Reboot at the next opportunity and put the overlay back.
+
 ## Cameras
 
 **A camera won't connect.** Usually a wrong RTSP URL or credentials.
