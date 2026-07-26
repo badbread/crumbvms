@@ -2276,10 +2276,9 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           ['demuxer-max-back-bytes', '1MiB'],
           ['network-timeout', '10'],
           ['demuxer-lavf-o', 'analyzeduration=500000,probesize=500000'],
-          // Frame-accurate seeking. Without exact seeks, a small backward seek
-          // snaps to the same keyframe (frame-back appears to do nothing) while
-          // forward crosses into the next frame — so the ± one-frame buttons in
-          // the transport only worked one direction. Force exact seeks.
+          // Frame-accurate seeking. Required by mpv's `frame-back-step` (see
+          // _stepFrame) and it keeps any absolute seek landing on the frame
+          // asked for rather than the preceding keyframe.
           ['hr-seek', 'yes'],
         ]) {
           try {
@@ -2461,17 +2460,38 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   }
 
   /// Minimal control bar: back-to-start and play/pause, driven by the player.
-  /// Nudge the clip by roughly one frame. media_kit has no frame-step API, so
-  /// pause and seek by ~1/30 s relative to the current position (clamped ≥ 0).
-  void _stepFrame(bool forward) {
+  ///
+  /// Step the clip by exactly one frame, using libmpv's native `frame-step` /
+  /// `frame-back-step` through the media_kit [NativePlayer] command channel —
+  /// the same commands the playback transport uses (see
+  /// `playback_transport_controller.dart`). Frame-exact in BOTH directions.
+  ///
+  /// Do NOT "simplify" this back to a `position ± 1000/fps` seek: mpv resolves
+  /// a backward seek to the nearest KEYFRAME, so a seek-based back-step keeps
+  /// snapping to the same keyframe and the button appears dead while forward
+  /// works. That was this popup's bug (#390) — the identical failure the
+  /// playback transport had already hit and fixed. The fps seek survives only
+  /// as the fallback for a non-native platform (never the case on desktop).
+  Future<void> _stepFrame(bool forward) async {
     final p = _player;
     if (p == null) return;
-    p.pause();
-    const frame = Duration(milliseconds: 33);
-    final pos = p.state.position;
-    var target = forward ? pos + frame : pos - frame;
-    if (target < Duration.zero) target = Duration.zero;
-    p.seek(target);
+    await p.pause();
+    try {
+      final platform = p.platform;
+      if (platform is NativePlayer) {
+        // Frame-exact native step (mpv pauses itself on step, matching the
+        // explicit pause above).
+        await platform.command([forward ? 'frame-step' : 'frame-back-step']);
+        return;
+      }
+      const frame = Duration(milliseconds: 33);
+      final pos = p.state.position;
+      var target = forward ? pos + frame : pos - frame;
+      if (target < Duration.zero) target = Duration.zero;
+      await p.seek(target);
+    } catch (_) {
+      // Non-fatal — a disposed player must not throw out of a tap handler.
+    }
   }
 
   Widget _buildTransport() {
@@ -2493,7 +2513,7 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           const SizedBox(width: 8),
           IconButton(
             tooltip: 'Back one frame',
-            onPressed: () => _stepFrame(false),
+            onPressed: () => unawaited(_stepFrame(false)),
             icon: const Icon(Icons.navigate_before,
                 color: Colors.white70, size: 26),
           ),
@@ -2516,7 +2536,7 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           ),
           IconButton(
             tooltip: 'Forward one frame',
-            onPressed: () => _stepFrame(true),
+            onPressed: () => unawaited(_stepFrame(true)),
             icon: const Icon(Icons.navigate_next,
                 color: Colors.white70, size: 26),
           ),
