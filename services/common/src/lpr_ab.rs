@@ -67,6 +67,11 @@ pub struct EngineBest {
     pub confidence: Option<f32>,
     /// Sibling detection event of the kept read, when one exists.
     pub event_id: Option<Uuid>,
+    /// Plate box `[x, y, w, h]` (0..1 fractions) of the kept read's snapshot
+    /// frame, when one was captured. Carried through so a client can crop the
+    /// pass image to the plate WITHOUT re-querying `/plates` per row just to
+    /// re-find a box the report already had in hand.
+    pub bbox: Option<[f32; 4]>,
     /// Timestamp of the kept read.
     pub ts: DateTime<Utc>,
     /// How many raw reads this engine contributed to the pass (collapsed
@@ -195,6 +200,7 @@ impl<'a> Cluster<'a> {
                 plate: self.best.plate.clone(),
                 confidence: self.best.confidence,
                 event_id: self.best.event_id,
+                bbox: self.best.bbox,
                 ts: self.best.ts,
                 read_count: self.count,
             },
@@ -460,6 +466,41 @@ mod tests {
         assert_eq!(f.read_count, 2, "both raw reads counted");
         assert!(passes[0].crumb_alpr.is_none());
         assert_eq!(passes[0].bucket_ts, t0(), "bucket = earliest read ts");
+    }
+
+    /// The kept read's bbox rides along into the pass, so a client can crop
+    /// the pass image to the plate straight from the report. Critically it is
+    /// the BEST read's box, never a collapsed duplicate's: a box is only valid
+    /// against the exact frame its own read was made on, so pairing the
+    /// survivor's frame with a discarded read's box would crop the wrong
+    /// region.
+    #[test]
+    fn kept_reads_bbox_rides_into_the_pass() {
+        let cam = Uuid::new_v4();
+        let mut low = mk_read(cam, ENGINE_FRIGATE, "9GXVL98", Some(0.70), t0());
+        low.bbox = Some([0.10, 0.10, 0.05, 0.05]);
+        let mut high = mk_read(cam, ENGINE_FRIGATE, "9GXV498", Some(0.87), t0() + secs(5));
+        high.bbox = Some([0.40, 0.60, 0.05, 0.05]);
+
+        let passes = pair_passes(&[low, high], 8, 0.25);
+        assert_eq!(passes.len(), 1, "one physical pass");
+        let f = passes[0].frigate.as_ref().expect("frigate best kept");
+        assert_eq!(
+            f.bbox,
+            Some([0.40, 0.60, 0.05, 0.05]),
+            "the surviving (higher-confidence) read's box, not the dropped duplicate's",
+        );
+    }
+
+    /// A read with no captured box stays `None` — the client falls back to the
+    /// uncropped frame rather than cropping to a bogus region.
+    #[test]
+    fn missing_bbox_stays_none() {
+        let cam = Uuid::new_v4();
+        let reads = vec![mk_read(cam, ENGINE_CRUMB, "8TKM204", Some(0.99), t0())];
+        let passes = pair_passes(&reads, 8, 0.25);
+        let c = passes[0].crumb_alpr.as_ref().expect("crumb best kept");
+        assert_eq!(c.bbox, None);
     }
 
     /// Both engines read the same car → one pass with both bests, agreement.
