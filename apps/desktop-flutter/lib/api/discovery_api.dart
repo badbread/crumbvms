@@ -23,7 +23,13 @@ import 'crumb_api.dart';
 
 /// One server found by [DiscoveryApi.discoverServers].
 class DiscoveredServer {
-  DiscoveredServer({required this.url, required this.ip, required this.port, this.version});
+  DiscoveredServer({
+    required this.url,
+    required this.ip,
+    required this.port,
+    this.version,
+    this.certTrusted = true,
+  });
 
   /// Full base URL, e.g. `http://<lan-ip>:8080` or `https://<lan-ip>:8443`.
   final String url;
@@ -31,7 +37,22 @@ class DiscoveredServer {
   final int port;
   final String? version;
 
+  /// Whether this host's TLS certificate validated against the system trust
+  /// store. Always true for plain http.
+  ///
+  /// This matters because the discovery probe deliberately accepts ANY
+  /// certificate so it can still *find* a TLS-fronted server, but the app's
+  /// normal API client does not. Handing back an https URL whose certificate
+  /// the app will later reject produces a server that "was found" and then
+  /// refuses to connect, which is exactly the wrong answer. The bundled Caddy
+  /// issues from its own internal CA, so an out-of-the-box stack lands here.
+  final bool certTrusted;
+
   bool get isHttps => url.startsWith('https://');
+
+  /// True when this entry is usable without the operator first trusting a
+  /// certificate. Ranked above [certTrusted] == false entries.
+  bool get usableAsIs => !isHttps || certTrusted;
 }
 
 /// LAN server discovery, added as an extension (not a method on [CrumbApi]
@@ -73,11 +94,22 @@ extension DiscoveryApi on CrumbApi {
 
     final httpClient = HttpClient()
       ..connectionTimeout = const Duration(milliseconds: 500);
+
+    // Hosts whose TLS certificate did NOT validate. badCertificateCallback
+    // fires only on a validation failure, so membership here is exactly "the
+    // app's normal client would refuse this URL". We still return true to keep
+    // probing (we want to FIND the server either way), but we remember, so the
+    // result can be ranked and labelled honestly instead of silently handing
+    // back a URL that will not connect.
+    final untrusted = <String>{};
     final httpsClient = HttpClient()
       ..connectionTimeout = const Duration(milliseconds: 500)
       // Discovery only reads the unauthenticated /health signature; a LAN
       // server's TLS cert is typically self-signed, so don't reject it here.
-      ..badCertificateCallback = (cert, host, port) => true;
+      ..badCertificateCallback = (cert, host, port) {
+        untrusted.add('$host:$port');
+        return true;
+      };
 
     try {
       final probes = <(String ip, bool isHttps, int port)>[
@@ -102,17 +134,40 @@ extension DiscoveryApi on CrumbApi {
       // 64-way concurrent, matching the Rust `buffer_unordered(64)`.
       await Future.wait(List.generate(64, (_) => worker()));
 
-      // Collapse the plain+TLS front doors of a *single* host into one
-      // entry: if the same IP answers on both http:8080 and https:8443, keep
-      // only the secure URL. Distinct hosts and genuinely different ports
-      // stay separate.
-      final dual = found
-          .where((s) => s.isHttps && s.port == 8443)
+      // Stamp each https hit with whether its certificate actually validated.
+      for (var i = 0; i < found.length; i++) {
+        final s = found[i];
+        if (!s.isHttps) continue;
+        found[i] = DiscoveredServer(
+          url: s.url,
+          ip: s.ip,
+          port: s.port,
+          version: s.version,
+          certTrusted: !untrusted.contains('${s.ip}:${s.port}'),
+        );
+      }
+
+      // Collapse the plain+TLS front doors of a *single* host into one entry.
+      // Prefer the TLS URL ONLY when its certificate validates, because that is
+      // the only case where the app's normal client can actually use it. With
+      // the bundled Caddy (its own internal CA) the cert does not validate, and
+      // dropping the working http URL in favour of it produced a "found" server
+      // that then refused to connect. In that case keep the plain URL, which
+      // always works, and leave the TLS one out rather than offering a choice
+      // that fails.
+      final trustedTls = found
+          .where((s) => s.isHttps && s.certTrusted)
           .map((s) => s.ip)
           .toSet();
-      found.removeWhere((s) => s.port == 8080 && !s.isHttps && dual.contains(s.ip));
+      final plainHosts = found.where((s) => !s.isHttps).map((s) => s.ip).toSet();
+      found.removeWhere((s) => !s.isHttps && trustedTls.contains(s.ip));
+      found.removeWhere((s) => s.isHttps && !s.certTrusted && plainHosts.contains(s.ip));
 
       found.sort((a, b) {
+        // Usable-as-is first: a self-signed TLS host with no plain-http sibling
+        // is still worth showing (it may be all the operator exposes), but it
+        // must never outrank one that just works.
+        if (a.usableAsIs != b.usableAsIs) return a.usableAsIs ? -1 : 1;
         int lastOctet(String ip) => int.tryParse(ip.split('.').last) ?? 0;
         final byIp = lastOctet(a.ip).compareTo(lastOctet(b.ip));
         if (byIp != 0) return byIp;

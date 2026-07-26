@@ -73,7 +73,15 @@ class _ServerDiscoveryPanelState extends State<ServerDiscoveryPanel> {
       } else if (found.length == 1) {
         widget.onServerSelected(found[0].url);
         setState(() {
-          _message = 'Found ${found[0].url}';
+          // Say so when the only hit is a TLS server whose certificate does not
+          // validate (e.g. the bundled Caddy's internal CA). It is filled in
+          // because it may be all that is exposed, but connecting will fail
+          // until that certificate is trusted, and "Found <url>" alone would
+          // make that look like a Crumb bug rather than a trust decision.
+          _message = found[0].usableAsIs
+              ? 'Found ${found[0].url}'
+              : 'Found ${found[0].url} (self-signed certificate, '
+                  'trust it on this machine or use the plain http port)';
           _found = const [];
         });
       } else {

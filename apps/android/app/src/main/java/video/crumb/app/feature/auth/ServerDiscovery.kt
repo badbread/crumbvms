@@ -26,7 +26,23 @@ data class DiscoveredServer(
     val ip: String,
     val port: Int,
     val version: String?,
-)
+    /**
+     * Whether this host's TLS certificate validated normally. Always true for
+     * plain http.
+     *
+     * The discovery probe deliberately trusts any certificate so it can still
+     * FIND a TLS-fronted server, but real API traffic does not. Returning an
+     * https URL whose certificate the app will later reject yields a server
+     * that "was found" and then refuses to connect. The bundled Caddy issues
+     * from its own internal CA, so a stock stack lands exactly here.
+     */
+    val certTrusted: Boolean = true,
+) {
+    val isHttps: Boolean get() = url.startsWith("https://")
+
+    /** Usable without the operator first trusting a certificate. */
+    val usableAsIs: Boolean get() = !isHttps || certTrusted
+}
 
 /**
  * Max probes in flight at once — bounds socket pressure so a /24 finishes in a
@@ -90,14 +106,41 @@ suspend fun discoverCrumbServers(
         }.awaitAll()
     }.filterNotNull()
 
-    collapseDualExposed(found)
+    // Re-probe each https hit with the VALIDATING client to learn whether its
+    // certificate would survive real API traffic. Cheap: a scan usually turns up
+    // at most one TLS host, and the answer decides whether preferring the TLS
+    // URL would hand back something that cannot actually connect.
+    val checked = found.map { s ->
+        if (!s.isHttps) s else s.copy(certTrusted = certValidates(plainClient, "${s.url}/health"))
+    }
+
+    collapseDualExposed(checked)
         .sortedWith(
             compareBy(
+                { !it.usableAsIs },
                 { it.ip.substringAfterLast('.').toIntOrNull() ?: 0 },
                 { it.port },
             ),
         )
 }
+
+/**
+ * Whether [url] completes over TLS using a client that performs NORMAL
+ * certificate validation. False for a self-signed or otherwise untrusted cert
+ * (what the bundled Caddy serves), which is exactly the case where handing the
+ * operator this URL would produce a connect failure after a successful "found".
+ *
+ * Any failure counts as untrusted: the point is "would real traffic work",
+ * and a probe that cannot complete is not a URL worth preferring.
+ */
+private suspend fun certValidates(validatingClient: OkHttpClient, url: String): Boolean =
+    withContext(Dispatchers.IO) {
+        runCatching {
+            validatingClient.newCall(
+                Request.Builder().url(url).get().build(),
+            ).execute().use { it.isSuccessful }
+        }.getOrDefault(false)
+    }
 
 /**
  * The (isHttps, port) probe candidates per host: plain :8080 + TLS :8443, plus an
@@ -119,13 +162,22 @@ internal fun candidatePorts(port: Int?): List<Pair<Boolean, Int>> {
  * separate entries.
  */
 internal fun collapseDualExposed(found: List<DiscoveredServer>): List<DiscoveredServer> {
-    val dual = found
-        .filter { it.port == 8443 && it.url.startsWith("https://") }
+    // Prefer the TLS URL ONLY when its certificate validates, because that is
+    // the only case where real API traffic can use it. With the bundled Caddy
+    // (its own internal CA) it does not, and dropping the working http URL in
+    // favour of it produced a "found" server that then refused to connect.
+    val trustedTls = found
+        .filter { it.isHttps && it.certTrusted }
         .map { it.ip }
         .toSet()
-    return found.filterNot {
-        it.port == 8080 && it.url.startsWith("http://") && it.ip in dual
-    }
+    val plainHosts = found.filterNot { it.isHttps }.map { it.ip }.toSet()
+    return found
+        .filterNot { !it.isHttps && it.ip in trustedTls }
+        // An untrusted TLS host with a working plain sibling is dropped rather
+        // than offered as a choice that fails. With no sibling it is kept: it
+        // may be all the operator exposes.
+        .filterNot { it.isHttps && !it.certTrusted && it.ip in plainHosts }
+        .sortedBy { !it.usableAsIs }
 }
 
 /**
