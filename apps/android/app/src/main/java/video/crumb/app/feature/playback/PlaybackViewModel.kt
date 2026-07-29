@@ -77,6 +77,30 @@ data class PlaybackUiState(
     val scrubFrameUrl: String? = null,
     val jumpInProgress: Boolean = false,
     /**
+     * True from the moment a USER-INITIATED seek starts until its segment
+     * resolve lands (success, 404, or failure).
+     *
+     * `scrubbing` only covers the drag itself and is cleared the instant the
+     * finger lifts, but [seekTo] then does a network round-trip. In that window
+     * the OLD segment is still loaded and the player still holds its media, so
+     * both playhead writers were unblocked and would move the cursor off the
+     * place the user just chose:
+     *
+     *  - [onSegmentEnded] ran against the stale segment and auto-advanced to the
+     *    next recorded span after *its* end. Landing in a recording gap, that
+     *    seeks FORWARD across the gap, which is the "scrub into a gap and it
+     *    jumps to a later time" bug (#402). Segments are short (4 s on a busy
+     *    camera), so a segment boundary very often falls inside the window.
+     *  - [onPlaybackTick] resumed its 250 ms poll and wrote
+     *    `segStart + player.position` from the stale segment.
+     *
+     * This is the same ownership `jumpInProgress` gives a motion jump; scrubbing
+     * simply never got it. Deliberately NOT set for seeks that [onSegmentEnded]
+     * itself issues for normal auto-advance, or that would suppress the very
+     * mechanism that plays continuously across segment boundaries.
+     */
+    val userSeekInProgress: Boolean = false,
+    /**
      * True when the resolve at [playheadMs] returned 404 — there is simply no
      * footage at this instant (a NORMAL recording gap for a motion-record camera,
      * which only records while motion is present). The UI shows a calm "No footage
@@ -482,8 +506,21 @@ class PlaybackViewModel(
         }
     }
 
-    fun seekTo(tsMs: Long, retryAtMs: Long? = null) {
-        _state.update { it.copy(playheadMs = tsMs) }
+    /**
+     * @param userInitiated true for a seek the operator asked for (scrub
+     *   release, jump-to-time). Takes ownership of the playhead until the
+     *   resolve lands, so the stale segment's tick/ended events cannot move the
+     *   cursor off the chosen instant (#402). Left false for internal seeks such
+     *   as [onSegmentEnded]'s auto-advance, which must keep working.
+     */
+    fun seekTo(tsMs: Long, retryAtMs: Long? = null, userInitiated: Boolean = false) {
+        _state.update {
+            if (userInitiated) {
+                it.copy(playheadMs = tsMs, userSeekInProgress = true)
+            } else {
+                it.copy(playheadMs = tsMs)
+            }
+        }
         // Cancel any in-flight resolve so a stale result can't override this seek
         // (e.g. an onSegmentEnded auto-advance racing a user scrub). NOTE: a
         // motion-jump's own seekTo is the ONLY writer active while
@@ -498,6 +535,15 @@ class PlaybackViewModel(
         // once we're playing again near the (new) segment's tail.
         _state.update { it.copy(nextSegment = null, nextSegmentUrl = null) }
         seekJob = viewModelScope.launch {
+            // Release playhead ownership once this resolve has landed, whatever
+            // the outcome. In a `finally` so a thrown/cancelled resolve cannot
+            // leave the guard stuck on, which would freeze the playhead clock.
+            // The 404 retry below re-enters seekTo, which starts its own job and
+            // sets its own guard. `handedOff` stops THIS job's finally from
+            // clearing a guard the retry now owns, which would otherwise release
+            // the playhead mid-retry.
+            var handedOff = false
+            try {
             val tsIso = Time.iso(Instant.ofEpochMilli(tsMs))
             repo.resolveSegment(cameraId, tsIso).onSuccess { segment ->
                 val startMs = Time.parseToMillis(segment.start)
@@ -536,8 +582,11 @@ class PlaybackViewModel(
             }.onFailure { err ->
                 if (err.isNotFound() && retryAtMs != null && retryAtMs != tsMs) {
                     // Pre-rolled landing fell in a gap (short pre-buffer) — retry
-                    // once at the event's exact start before giving up.
-                    seekTo(retryAtMs, retryAtMs = null)
+                    // once at the event's exact start before giving up. Carries
+                    // userInitiated through so the playhead guard spans BOTH
+                    // attempts rather than dropping between them.
+                    handedOff = true
+                    seekTo(retryAtMs, retryAtMs = null, userInitiated = userInitiated)
                     return@launch
                 }
                 _state.update {
@@ -562,6 +611,11 @@ class PlaybackViewModel(
                             noFootageAtPlayhead = false,
                         )
                     }
+                }
+            }
+            } finally {
+                if (userInitiated && !handedOff) {
+                    _state.update { it.copy(userSeekInProgress = false) }
                 }
             }
         }
@@ -660,6 +714,12 @@ class PlaybackViewModel(
         // user's press (RC2). The player is paused for the duration of a jump,
         // so STATE_ENDED firing here mid-jump would itself be stale.
         if (state.jumpInProgress) return
+        // A user seek is mid-resolve, so `currentSegment` here is the segment we
+        // are leaving, not the one the user asked for. Auto-advancing from it
+        // seeks to the next span after ITS end, which on a recording gap throws
+        // the playhead forward past the gap (#402). The user's own seekTo will
+        // land shortly; let it decide where the playhead belongs.
+        if (state.userSeekInProgress) return
         val seg = state.currentSegment ?: return
         val endMs = Time.parseToMillis(seg.end)
         val spans = state.spans
@@ -701,8 +761,17 @@ class PlaybackViewModel(
      */
     fun onPlaybackTick(tsMs: Long) {
         val s = _state.value
-        if (s.scrubbing || s.jumpInProgress) return
-        _state.update { if (it.scrubbing || it.jumpInProgress) it else it.copy(playheadMs = tsMs) }
+        // userSeekInProgress: the player still holds the PREVIOUS segment while a
+        // user seek resolves, so this tick would report that segment's position
+        // and overwrite the instant the user just chose (#402).
+        if (s.scrubbing || s.jumpInProgress || s.userSeekInProgress) return
+        _state.update {
+            if (it.scrubbing || it.jumpInProgress || it.userSeekInProgress) {
+                it
+            } else {
+                it.copy(playheadMs = tsMs)
+            }
+        }
     }
 
     // ─── Motion navigation ──────────────────────────────────────────────────────
@@ -952,7 +1021,7 @@ class PlaybackViewModel(
             )
         }
         loadTimeline(windowStart, windowEnd)
-        seekTo(epochMs)
+        seekTo(epochMs, userInitiated = true)
     }
 
     // ─── Scrubbing ───────────────────────────────────────────────────────────────
@@ -1011,7 +1080,7 @@ class PlaybackViewModel(
             _state.update { it.copy(windowStartMs = ws, windowEndMs = we) }
             loadTimeline(ws, we)
         }
-        seekTo(tsMs)
+        seekTo(tsMs, userInitiated = true)
     }
 
     /** Set the centered-timeline visible span (pinch-to-zoom), clamped. Persists the
