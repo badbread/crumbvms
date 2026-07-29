@@ -2020,3 +2020,88 @@ async fn diagnostics_bundle_is_admin_only_and_downloads() {
         .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+// ─── pre-upgrade media tokens (issue #366) ─────────────────────────────────────
+
+/// Forge a media token in the shape a PREVIOUS server version minted: valid
+/// signature, `typ: "media"`, scoped to `camera`, but **without** the capability
+/// claims that were added later.
+///
+/// Signed with the same `JWT_SECRET` the test harness sets, so this is exactly
+/// what a warm client's cached token looks like across an upgrade that adds a
+/// claim — not an invalid token.
+fn forge_old_shape_media_token(user_id: Uuid, camera: Uuid) -> String {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    let now = Utc::now().timestamp() as u64;
+    // Deliberately omits export/playback/clips/view_plates.
+    let claims = serde_json::json!({
+        "sub": user_id.to_string(),
+        "typ": "media",
+        "cam": camera.to_string(),
+        "exp": now + 900,
+        "iat": now,
+    });
+    let secret = std::env::var("JWT_SECRET").expect("harness sets JWT_SECRET");
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("forge media token")
+}
+
+/// A token minted before the capability claims existed must still DECODE, so an
+/// upgrade does not black out media on every warm client for the token's
+/// remaining TTL (#366).
+///
+/// Uses live fMP4 because it is gated on camera access alone, so a non-401 here
+/// isolates "the token authenticated" from any capability question. go2rtc is
+/// unreachable in tests, so the status will not be 200 — 401 is the failure this
+/// asserts against.
+#[tokio::test]
+async fn old_shape_media_token_still_authenticates() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let viewer = seed_viewer(app.pool(), &[cam]).await;
+
+    let old = forge_old_shape_media_token(viewer.user_id, cam);
+    let resp = app
+        .send(get(&format!("/live/{cam}/stream.mp4?token={old}")))
+        .await;
+
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a pre-upgrade media token must still decode: rejecting it took ALL media \
+         away from every warm client until its 15-minute TTL expired (#366)"
+    );
+}
+
+/// ...but it must carry NO capabilities, so capability-gated media is denied.
+/// This is the half that makes defaulting safe: the degradation is a loss of
+/// privilege, never a gain.
+#[tokio::test]
+async fn old_shape_media_token_carries_no_capabilities() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let crop = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    let event_id = seed_alpr_crop_event(&app, cam, &crop).await;
+
+    // seed_viewer HOLDS view_plates, so a current-shape token would be served
+    // (see crumb_alpr_crop_served_via_media_token_when_view_plates_held). The
+    // refusal below must therefore come from the token's defaulted claim, not
+    // from the user lacking the right.
+    let viewer = seed_viewer(app.pool(), &[cam]).await;
+    let old = forge_old_shape_media_token(viewer.user_id, cam);
+
+    let resp = app
+        .send(get(&format!("/events/{event_id}/snapshot?token={old}")))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an old-shape token must default view_plates to false and be refused the \
+         plate crop, even though the minting user holds the capability: the token \
+         must never grant more than it proves"
+    );
+}

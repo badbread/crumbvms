@@ -8,6 +8,47 @@ revisit.
 
 ---
 
+## 2026-07-29, Media-token capability claims default to false rather than failing to decode
+
+**Decision.** The capability claims on `MediaClaims` (`export`, `playback`,
+`clips`, `view_plates`) are `#[serde(default)]`. A media token minted by a server
+version that predates one of them still decodes, with that capability `false`.
+
+**Context.** They were deliberately NOT defaulted, on the reasoning that a
+pre-upgrade token lacking a claim should fail to decode and force a clean
+re-mint. The re-mint half does not exist: no client re-mints on a media-route
+401, they only react to a 401 on the mint call itself. So adding a required claim
+stopped every previously-minted token from decoding, and every warm client lost
+ALL media (live tiles, thumbnails, filmstrips, segments, clips, admin previews)
+until its cached token reached `exp`, up to the full 15-minute TTL. Bearer JSON
+calls kept working, so nothing prompted a re-auth that would have cleared the
+caches. Self-healing, but it read as a fleet-wide outage after a routine upgrade.
+
+**Why defaulting is the safe direction.** An old token still authenticates for
+basic media but carries no capabilities, so the capability-gated routes deny it
+exactly as they would for a user who never held those rights. The token is still
+signed, still `typ: "media"`, and still scoped to one camera by `cam`. This
+grants strictly LESS privilege than intended, never more. A short-lived loss of
+gated features beats a total media blackout.
+
+**Rejected: client-side re-mint on a media 401 as the immediate fix.** It is the
+better long-term answer and stays open, but media URLs are consumed by
+third-party loaders (Coil and ExoPlayer, media_kit, AVFoundation, plain `<img>`
+in the admin console), so catching a 401 means per-client interceptor plumbing
+across four surfaces. Worth doing, but not as the thing standing between an
+upgrade and a working deployment.
+
+**Accepted trade-offs.** For the TTL after an upgrade that adds a claim, a warm
+client silently lacks a capability it should have: exports, clips or plate crops
+may 403 until the token rotates. That is visible and recoverable, unlike the
+blackout. Covered by two tests: an old-shape token still authenticates on a
+capability-free media route, and is refused a plate crop even though the minting
+user holds `view_plates`.
+
+**Revisit if:** clients gain media-401 re-mint, at which point the strict
+behaviour could return without an outage, though there is little reason to want
+it back.
+
 ## 2026-07-20, Admin-only outbound probes (stream-test / ONVIF discovery) are not SSRF-guarded; risk accepted under the LAN-only, single-operator trust model
 
 **Context.** An API reliability/security audit flagged that `POST
