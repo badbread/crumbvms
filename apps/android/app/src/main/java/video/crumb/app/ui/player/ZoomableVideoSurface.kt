@@ -28,7 +28,24 @@ import androidx.compose.ui.unit.IntSize
 import kotlin.math.abs
 
 private const val MIN_SCALE = 1.0f
-private const val MAX_SCALE = 5.0f
+
+/** Digital-zoom ceiling, shared by live fullscreen, playback and clips.
+ *
+ *  Was 5x, which made Android the most restrictive client (iOS allows 6x,
+ *  desktop 8x) for no reason anyone could point at: the same pinch on the same
+ *  camera went further on a laptop. 10x now, so the phone is not the thing that
+ *  runs out first.
+ *
+ *  Past roughly 1:1 source pixels the extra zoom is interpolation rather than
+ *  new detail, and on a sub-stream that point arrives immediately. That is
+ *  deliberately not enforced here: magnifying an already-soft region is a normal
+ *  thing to do when identifying something, and where to stop is the operator's
+ *  judgement, not a constant's.
+ *
+ *  Nothing else needs to change with the ceiling: the pan clamp below is
+ *  scale-relative (`size * (1 - 1/scale)`), so the magnified image stays inside
+ *  its window at any scale. */
+private const val MAX_SCALE = 10.0f
 
 /** A horizontal swipe (at 1x) must travel at least this fraction of the view
  *  width to count as a camera switch, with a floor so tiny views still need a
