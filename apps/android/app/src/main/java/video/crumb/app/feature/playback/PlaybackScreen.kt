@@ -483,8 +483,21 @@ fun PlaybackScreen(
     // within PREFETCH_LEAD_MS_SCREEN of the segment's end, ask the VM to
     // pre-resolve the next segment so it can be queued on the ExoPlayer playlist
     // (see the addMediaSource effect above) well before STATE_ENDED would fire.
-    LaunchedEffect(state.playing, state.scrubbing, state.jumpInProgress, state.currentSegment?.start) {
-        if (!state.playing || state.scrubbing || state.jumpInProgress) return@LaunchedEffect
+    // userSeekInProgress is a key AND a guard: re-key so the loop restarts against
+    // the segment the user actually landed on, and bail so it does not poll the
+    // stale segment's position while the resolve is in flight (#402).
+    LaunchedEffect(
+        state.playing,
+        state.scrubbing,
+        state.jumpInProgress,
+        state.userSeekInProgress,
+        state.currentSegment?.start,
+    ) {
+        if (!state.playing || state.scrubbing || state.jumpInProgress ||
+            state.userSeekInProgress
+        ) {
+            return@LaunchedEffect
+        }
         val seg = state.currentSegment ?: return@LaunchedEffect
         val segStartMs = Time.parseToMillis(seg.start)
         while (isActive) {
