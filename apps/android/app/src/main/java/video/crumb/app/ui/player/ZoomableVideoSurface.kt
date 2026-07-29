@@ -28,7 +28,26 @@ import androidx.compose.ui.unit.IntSize
 import kotlin.math.abs
 
 private const val MIN_SCALE = 1.0f
-private const val MAX_SCALE = 5.0f
+
+/** Digital-zoom ceiling, shared by live fullscreen, playback and clips.
+ *
+ *  History: 5x originally, which made Android the most restrictive client (iOS
+ *  6x, desktop 8x) for no reason anyone could point at. Raised to 10x, then to
+ *  **30x** after operator testing: 10x still ran out while identifying something
+ *  small in a frame, which is the whole reason the gesture exists.
+ *
+ *  Well past 1:1 source pixels this is pure interpolation, not new detail, and on
+ *  a sub-stream that point arrives almost immediately. Deliberately not enforced:
+ *  magnifying an already-soft region is a normal thing to do when you are trying
+ *  to make out a face or a plate, and a blurry-but-large view genuinely reads
+ *  better than a sharp-but-tiny one. Where to stop is the operator's judgement,
+ *  not a constant's.
+ *
+ *  Nothing else needs to change with the ceiling: the pan clamp below is
+ *  scale-relative (`size * (1 - 1/scale)`), so the magnified image stays inside
+ *  its window at any scale, and the gesture math is multiplicative so reaching
+ *  30x is a couple of pinches rather than a marathon. */
+private const val MAX_SCALE = 30.0f
 
 /** A horizontal swipe (at 1x) must travel at least this fraction of the view
  *  width to count as a camera switch, with a floor so tiny views still need a
@@ -76,7 +95,7 @@ fun rememberZoomableSurfaceState(): ZoomableSurfaceState = remember { ZoomableSu
 /**
  * Wraps a video composable (a [PlayerSurface] using TextureView) and adds
  * client-side digital zoom + pan, plus an optional horizontal swipe-to-switch:
- *   - two-finger pinch to zoom (1x–5x), pivoting around the fingers
+ *   - two-finger pinch to zoom ([MIN_SCALE]–[MAX_SCALE]), pivoting around the fingers
  *   - one-finger drag to pan while zoomed, clamped so the video never reveals
  *     blank edges
  *   - double-tap to reset to 1x
