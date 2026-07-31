@@ -33,6 +33,7 @@ PlateRead _read(
     sourceId: source,
     eventId: null,
     snapshotUrl: null,
+    displayName: null,
     bbox: null,
   );
 }

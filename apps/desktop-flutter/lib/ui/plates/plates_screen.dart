@@ -1075,6 +1075,69 @@ class _CameraPickerDialogState extends State<_CameraPickerDialog> {
   }
 }
 
+// ─── plate headline (name + raw plate) ─────────────────────────────────────
+
+/// A plate read's headline. When the server resolved a human-readable name for
+/// the plate ([name], from `display_name`), it's the primary label with the raw
+/// [plate] shown small/mono beneath. With no name, renders just the plate in
+/// [plateStyle] exactly as before — so older servers (which omit the name) see
+/// no change. `—` stands in for an empty plate, matching the rest of this file.
+class _PlateHeadline extends StatelessWidget {
+  const _PlateHeadline({
+    required this.name,
+    required this.plate,
+    required this.plateStyle,
+  });
+
+  final String? name; // display_name, or null/empty
+  final String plate; // normalized plate (shown as-is when there's no name)
+  final TextStyle plateStyle; // the call site's existing plate text style
+
+  @override
+  Widget build(BuildContext context) {
+    final n = name?.trim() ?? '';
+    final plateText = plate.isEmpty ? '—' : plate;
+    if (n.isEmpty) {
+      return Text(
+        plateText,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: plateStyle,
+      );
+    }
+    // Raw plate demoted to a compact secondary line, keeping the call site's
+    // mono family/color so it still reads as a plate.
+    final secondaryStyle = plateStyle.copyWith(
+      fontSize: (plateStyle.fontSize ?? 14) * 0.62,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 1.0,
+      color: Colors.white54,
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          n,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: plateStyle.fontSize,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        Text(
+          plateText,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: secondaryStyle,
+        ),
+      ],
+    );
+  }
+}
+
 // ─── plate row + lazy snapshot ─────────────────────────────────────────────
 
 class _PlateRow extends StatelessWidget {
@@ -1204,9 +1267,10 @@ class _PlateRow extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    read.plate.isEmpty ? '—' : read.plate,
-                    style: const TextStyle(
+                  _PlateHeadline(
+                    name: read.displayName,
+                    plate: read.plate,
+                    plateStyle: const TextStyle(
                       color: Colors.white,
                       fontSize: 18,
                       fontWeight: FontWeight.w700,
@@ -1786,11 +1850,10 @@ class _PlateGalleryCard extends StatelessWidget {
                   Row(
                     children: [
                       Expanded(
-                        child: Text(
-                          read.plate.isEmpty ? '—' : read.plate,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                        child: _PlateHeadline(
+                          name: read.displayName,
+                          plate: read.plate,
+                          plateStyle: const TextStyle(
                             color: Colors.white,
                             fontSize: 16,
                             fontWeight: FontWeight.w700,
@@ -1939,9 +2002,12 @@ class _PlateGroupedList extends StatelessWidget {
               width: imageMode == PlateImageDisplay.both ? 200 : 110,
               height: 64,
             ),
-            title: Text(
-              g.plate,
-              style: const TextStyle(
+            title: _PlateHeadline(
+              // All reads in a group share the normalized plate, so they share
+              // the server-resolved name; the newest read is representative.
+              name: sorted.isNotEmpty ? sorted.first.displayName : null,
+              plate: g.plate,
+              plateStyle: const TextStyle(
                 color: Colors.white,
                 fontSize: 16,
                 fontWeight: FontWeight.w700,
@@ -2052,11 +2118,10 @@ class _PlateTimeline extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(
-                          p.plate.isEmpty ? '—' : p.plate,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                        _PlateHeadline(
+                          name: p.displayName,
+                          plate: p.plate,
+                          plateStyle: const TextStyle(
                             color: Colors.white,
                             fontSize: 24,
                             fontWeight: FontWeight.w700,
@@ -2381,9 +2446,13 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   Widget build(BuildContext context) {
     final read = widget.read;
     final plate = read.plate.isEmpty ? '—' : read.plate;
+    // Lead the title with the operator-given name when the server resolved one,
+    // keeping the raw plate alongside it; otherwise the plate stands alone.
+    final name = read.displayName?.trim() ?? '';
+    final heading = name.isEmpty ? plate : '$name ($plate)';
     return Positioned.fill(
       child: ClipPlayerShell(
-        title: '$plate — ${widget.cameraName}',
+        title: '$heading — ${widget.cameraName}',
         titleStyle: const TextStyle(
           color: Colors.white,
           fontSize: 15,
@@ -3643,11 +3712,10 @@ class _WatchlistTile extends StatelessWidget {
                 Row(
                   children: [
                     Flexible(
-                      child: Text(
-                        entry.plate.isEmpty ? '—' : entry.plate,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                      child: _PlateHeadline(
+                        name: entry.displayName,
+                        plate: entry.plate,
+                        plateStyle: const TextStyle(
                           color: Colors.white,
                           fontSize: 14,
                           fontWeight: FontWeight.w700,

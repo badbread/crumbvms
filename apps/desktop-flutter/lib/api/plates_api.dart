@@ -41,6 +41,7 @@ class PlateRead {
     required this.sourceId,
     required this.eventId,
     required this.snapshotUrl,
+    required this.displayName,
     required this.bbox,
   });
 
@@ -54,6 +55,7 @@ class PlateRead {
   final String? sourceId;
   final String? eventId; // sibling detection event, or null
   final String? snapshotUrl; // provider snapshot path, or null
+  final String? displayName; // operator-given plate name, or null (older servers omit)
   final List<double>? bbox; // [x,y,w,h] fractions 0..1 of snapshot, or null
 
   factory PlateRead.fromJson(Map<String, dynamic> j) => PlateRead(
@@ -67,6 +69,7 @@ class PlateRead {
     sourceId: j['source_id'] as String?,
     eventId: j['event_id'] as String?,
     snapshotUrl: j['snapshot_url'] as String?,
+    displayName: j['display_name'] as String?,
     bbox: _parseBbox(j['bbox']),
   );
 }
@@ -125,6 +128,7 @@ class PlateWatchlistEntry {
     required this.color,
     required this.notify,
     required this.kind,
+    required this.displayName,
     required this.createdAt,
   });
 
@@ -135,6 +139,7 @@ class PlateWatchlistEntry {
   final String? color; // "#rrggbb", or null
   final bool notify; // alert on sighting
   final String kind; // "watch" | "ignore"
+  final String? displayName; // server-resolved plate name, or null (older servers omit)
   final DateTime? createdAt;
 
   /// True when this entry drops matching reads rather than alerting on them.
@@ -149,6 +154,7 @@ class PlateWatchlistEntry {
         color: j['color'] as String?,
         notify: (j['notify'] as bool?) ?? true,
         kind: (j['kind'] as String?) == 'ignore' ? 'ignore' : 'watch',
+        displayName: j['display_name'] as String?,
         createdAt: DateTime.tryParse((j['created_at'] as String?) ?? ''),
       );
 }
