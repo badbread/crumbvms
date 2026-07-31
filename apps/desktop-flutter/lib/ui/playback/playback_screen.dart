@@ -2001,7 +2001,10 @@ class _PbTileState extends State<_PbTile> {
   // stream, so there is no sub→main swap like the live wall's zoomToMain.
   double _scale = 1.0;
   Offset _offset = Offset.zero;
-  static const double _maxZoom = 8.0;
+  // Digital-zoom ceiling. Keep in sync with the other _maxZoom constants, the
+  // clips ceiling, Android MAX_SCALE and the iOS zoomable() default: they drifted
+  // to 5/6/8 independently before, so the phone ran out first for no reason.
+  static const double _maxZoom = 30.0;
 
   void _zoomAt(Offset cursor, double factor, Size pane) {
     final newScale = (_scale * factor).clamp(1.0, _maxZoom);

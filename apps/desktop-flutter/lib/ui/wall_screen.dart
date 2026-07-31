@@ -1145,7 +1145,10 @@ class _WallTileState extends State<_WallTile> {
   // (the wall stays up); drag pans when zoomed. Double-click still maximizes.
   double _scale = 1.0;
   Offset _offset = Offset.zero;
-  static const double _maxZoom = 8.0;
+  // Digital-zoom ceiling. Keep in sync with the other _maxZoom constants, the
+  // clips ceiling, Android MAX_SCALE and the iOS zoomable() default: they drifted
+  // to 5/6/8 independently before, so the phone ran out first for no reason.
+  static const double _maxZoom = 30.0;
 
   /// True while a zoom-in has temporarily switched this tile to the main
   /// stream (see [WallScreen.onMaximizedCameraChanged]/zoomSwitchesToMain).
@@ -2070,7 +2073,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   double _scale = 1.0;
   Offset _offset = Offset.zero;
-  static const double _maxZoom = 8.0;
+  // Digital-zoom ceiling. Keep in sync with the other _maxZoom constants, the
+  // clips ceiling, Android MAX_SCALE and the iOS zoomable() default: they drifted
+  // to 5/6/8 independently before, so the phone ran out first for no reason.
+  static const double _maxZoom = 30.0;
 
   /// Mirror of the custom-panel controller state for THIS camera: whether a
   /// custom panel is active (saved layout or edit session) and whether it's

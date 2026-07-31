@@ -43,7 +43,9 @@ enum ClipsDensity { compact, normal, large }
 
 const _clipsPageSize = 200;
 const _thumbConcurrency = 6;
-const _clipZoomMax = 5.0;
+// Digital-zoom ceiling for clips. Keep in sync with the _maxZoom constants,
+// Android MAX_SCALE and the iOS zoomable() default (see #404).
+const _clipZoomMax = 30.0;
 const _clipLoadTimeout = Duration(milliseconds: 4500);
 const _clipMaxRetries = 2;
 
