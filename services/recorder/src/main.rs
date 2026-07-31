@@ -958,6 +958,13 @@ impl RecorderSupervisor {
                 if let Err(e) = db::delete_camera_motion_cache_status(&self.pool, id).await {
                     warn!(camera_id = %id, error = %e, "failed to delete motion-cache status row");
                 }
+                // Same for the motion-health current-state row (migration 0072):
+                // a stopped/disabled camera has no worker left to report health,
+                // so drop the stale row (absence renders as "no report", never
+                // as unhealthy). Camera DELETEs also cascade it via the FK.
+                if let Err(e) = db::delete_camera_motion_health(&self.pool, id).await {
+                    warn!(camera_id = %id, error = %e, "failed to delete motion-health row");
+                }
             }
         }
 

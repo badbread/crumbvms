@@ -1047,6 +1047,20 @@ pub struct CameraDecodeStatusDto {
     /// `true` when the recorder is re-encoding this camera's audio to 48 kHz AAC
     /// (source rate > 48 kHz), `false` when bit-exact copied, `null` when unknown.
     pub audio_transcoding: Option<bool>,
+    /// Current motion-detector health (migration 0072). `false` means the
+    /// camera's motion detection is DOWN and the recorder is failing OPEN
+    /// (recording continuously as a fallback) right now — footage is not being
+    /// lost, only the disk-saving benefit of Motion mode is suspended. `true`
+    /// when healthy. `null` when the recorder has never reported health for this
+    /// camera (older recorder image, not a Motion-mode camera, or not booted).
+    pub motion_healthy: Option<bool>,
+    /// When the current `motion_healthy` state began (advanced only on a flip),
+    /// so an unhealthy row reads as "recording continuously since <time>".
+    /// `null` when there is no health row.
+    pub motion_health_since: Option<DateTime<Utc>>,
+    /// Short human-readable cause when `motion_healthy == false` (which
+    /// source(s) stopped delivering frames); `null` when healthy or no row.
+    pub motion_health_reason: Option<String>,
 }
 
 /// `GET /config/decode-status` response — what the recorder is ACTUALLY using

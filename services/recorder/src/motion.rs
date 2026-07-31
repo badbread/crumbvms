@@ -1488,6 +1488,10 @@ pub async fn run(
             alert_after_secs,
         )
         .await;
+        // Persist the current-state row too (migration 0072) so the admin
+        // console shows this camera as failing open right now — this path never
+        // reaches the aggregator that would otherwise write it.
+        persist_motion_health(&pool, camera_id, false, Some("no motion source enabled")).await;
         cancel.cancelled().await;
         info!(camera_id = %camera_id, "motion task exiting");
         return;
@@ -1562,9 +1566,10 @@ pub async fn run(
     let aggregator = {
         let health_tx = health_tx.clone();
         let cancel = cancel.clone();
+        let pool = pool.clone();
         tokio::spawn(async move {
             aggregate_health(
-                enabled, pixel_rx, frigate_rx, ha_rx, health_tx, camera_id, cancel,
+                enabled, pixel_rx, frigate_rx, ha_rx, health_tx, camera_id, pool, cancel,
             )
             .await;
         })
@@ -1934,6 +1939,7 @@ async fn idle_before_recheck(cancel: &CancellationToken) {
 /// the recording task reads, applying the [`FailOpenGate`] rule. Re-evaluates on
 /// any per-source change AND every second (so the down-past-grace clause fires on
 /// time even with no new event). Publishes a final unhealthy on teardown.
+#[allow(clippy::too_many_arguments)]
 async fn aggregate_health(
     enabled: Vec<SourceKind>,
     mut pixel_rx: Option<tokio::sync::watch::Receiver<bool>>,
@@ -1941,6 +1947,7 @@ async fn aggregate_health(
     mut ha_rx: Option<tokio::sync::watch::Receiver<bool>>,
     health_tx: MotionHealthTx,
     camera_id: uuid::Uuid,
+    pool: Pool,
     cancel: CancellationToken,
 ) {
     let start = Utc::now();
@@ -1991,16 +1998,26 @@ async fn aggregate_health(
         }
         let camera_healthy = gate.healthy(now);
         if last_sent != Some(camera_healthy) {
-            if camera_healthy {
-                info!(camera_id = %camera_id, "motion health: RECOVERED (a source is healthy)");
-            } else {
-                warn!(
-                    camera_id = %camera_id,
-                    "motion health: FAIL-OPEN (no source healthy, or one down past grace)"
-                );
-            }
+            // Flip the in-memory fail-open signal FIRST and unconditionally —
+            // recording correctness must never wait on the telemetry DB write
+            // below (same rule as report_health).
             let _ = health_tx.send(camera_healthy);
             last_sent = Some(camera_healthy);
+            if camera_healthy {
+                info!(camera_id = %camera_id, "motion health: RECOVERED (a source is healthy)");
+                // Level signal for the admin console (migration 0072): current
+                // state is healthy again — clears the "recording continuously"
+                // badge. Best-effort; never blocks the fail-open flip above.
+                persist_motion_health(&pool, camera_id, true, None).await;
+            } else {
+                let reason = fail_open_reason(&last_healthy);
+                warn!(
+                    camera_id = %camera_id,
+                    reason = %reason,
+                    "motion health: FAIL-OPEN (no source healthy, or one down past grace)"
+                );
+                persist_motion_health(&pool, camera_id, false, Some(&reason)).await;
+            }
         }
 
         tokio::select! {
@@ -2013,8 +2030,59 @@ async fn aggregate_health(
     }
 
     // Teardown: the recording task must not trust a stale healthy reading.
+    // NOTE: we deliberately do NOT persist this teardown unhealthy to
+    // `camera_motion_health` — teardown is worker shutdown, not a detector
+    // fault. The last in-loop state stays until the worker restarts and the
+    // aggregator re-evaluates (conservative: an operator sees the last real
+    // state, and staleness is visible via `updated_at`), and the supervisor
+    // deletes the row outright for a disabled/removed camera.
     let _ = health_tx.send(false);
     info!(camera_id = %camera_id, "motion health aggregator exiting");
+}
+
+/// Best-effort upsert of a camera's CURRENT motion-detector health
+/// (`camera_motion_health`, migration 0072), surfaced by
+/// `GET /config/decode-status` so the admin console can show a camera that is
+/// failing open (recording continuously as a fallback) right now. Telemetry
+/// only — a failed write is logged at DEBUG and never affects the fail-open
+/// signal, which flips independently and instantly.
+async fn persist_motion_health(
+    pool: &Pool,
+    camera_id: uuid::Uuid,
+    healthy: bool,
+    reason: Option<&str>,
+) {
+    if let Err(e) =
+        crumb_common::db::upsert_camera_motion_health(pool, camera_id, healthy, reason).await
+    {
+        debug!(
+            camera_id = %camera_id,
+            error = %e,
+            "motion-health upsert failed (telemetry only)"
+        );
+    }
+}
+
+/// Build the short, operator-facing reason persisted when a camera goes
+/// fail-open: which enabled source(s) are currently not delivering frames.
+/// Pure (no I/O) and deterministic (down sources sorted) so it is unit-testable
+/// and the DTO/badge text is stable. `last_healthy` maps each enabled source to
+/// its last-observed health; a source reads as down when `false`.
+#[must_use]
+fn fail_open_reason(last_healthy: &std::collections::HashMap<SourceKind, bool>) -> String {
+    let mut down: Vec<&'static str> = last_healthy
+        .iter()
+        .filter(|&(_, &healthy)| !healthy)
+        .map(|(kind, _)| kind.as_str())
+        .collect();
+    down.sort_unstable();
+    match down.as_slice() {
+        // Empty only if every source reads healthy — the gate can still fail
+        // open transiently on the down-past-grace clause; give a generic cause.
+        [] => "motion detection unhealthy".to_string(),
+        [one] => format!("{one} motion detection not delivering frames"),
+        many => format!("{} motion sources not delivering frames", many.join(", ")),
+    }
 }
 
 /// Await the next change on an optional per-source health watch. A `None` slot
@@ -4353,6 +4421,56 @@ mod tests {
         assert!(should_emit_unhealthy_alert(0, 0, false));
     }
 
+    // ── fail-open reason string (persisted to camera_motion_health, mig 0072) ────
+
+    fn health_map(pairs: &[(SourceKind, bool)]) -> std::collections::HashMap<SourceKind, bool> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn fail_open_reason_names_the_single_down_source() {
+        // The #411 scenario: a single pixel detector producing zero frames.
+        let m = health_map(&[(SourceKind::Pixel, false)]);
+        assert_eq!(
+            fail_open_reason(&m),
+            "pixel motion detection not delivering frames"
+        );
+    }
+
+    #[test]
+    fn fail_open_reason_lists_multiple_down_sources_sorted() {
+        // Deterministic (sorted) despite HashMap iteration order, so the DTO /
+        // badge text is stable across reads.
+        let m = health_map(&[
+            (SourceKind::Ha, false),
+            (SourceKind::Pixel, false),
+            (SourceKind::Frigate, false),
+        ]);
+        assert_eq!(
+            fail_open_reason(&m),
+            "frigate, ha, pixel motion sources not delivering frames"
+        );
+    }
+
+    #[test]
+    fn fail_open_reason_reports_only_the_down_ones() {
+        // A healthy source is not named; only the source(s) that stopped.
+        let m = health_map(&[(SourceKind::Pixel, true), (SourceKind::Frigate, false)]);
+        assert_eq!(
+            fail_open_reason(&m),
+            "frigate motion detection not delivering frames"
+        );
+    }
+
+    #[test]
+    fn fail_open_reason_all_healthy_gives_generic_cause() {
+        // The down-past-grace clause can drive a transient fail-open even when
+        // every source's last reading is healthy — give a generic, non-empty
+        // cause rather than an empty string.
+        let m = health_map(&[(SourceKind::Pixel, true)]);
+        assert_eq!(fail_open_reason(&m), "motion detection unhealthy");
+    }
+
     #[test]
     fn alert_gate_generation_bumps_on_each_transition() {
         // Simulates the transition bookkeeping `report_health` performs,
@@ -5967,6 +6085,26 @@ mod tests {
 
     // ── health aggregator: dropped source sender ⇒ fail-open ────────────────────
 
+    /// A deadpool pool pointing at a port where nothing listens, so the
+    /// aggregator's best-effort `camera_motion_health` upsert fails fast and is
+    /// swallowed (telemetry-only). This test exercises health AGGREGATION and
+    /// the fail-open signal, not persistence — no database is required.
+    fn unreachable_pool() -> Pool {
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = Some("127.0.0.1".to_string());
+        cfg.port = Some(1); // nothing listens ⇒ connect refused immediately
+        cfg.dbname = Some("crumb_test_unreachable".to_string());
+        cfg.user = Some("nobody".to_string());
+        // Mirror the crate's real pool construction (services/common/src/db.rs):
+        // builder(NoTls) → Tokio1 runtime → build. Lazy — no connection is made
+        // until first checkout, which then fails fast and is swallowed.
+        cfg.builder(tokio_postgres::NoTls)
+            .expect("unreachable test pool builder")
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .build()
+            .expect("build unreachable test pool")
+    }
+
     /// Await the camera health watch reaching `want`, with a hard timeout so a
     /// broken aggregator fails the test instead of hanging it.
     async fn wait_for_camera_health(rx: &mut tokio::sync::watch::Receiver<bool>, want: bool) {
@@ -5996,6 +6134,7 @@ mod tests {
             None,
             cam_tx,
             uuid::Uuid::nil(),
+            unreachable_pool(),
             cancel.clone(),
         ));
 

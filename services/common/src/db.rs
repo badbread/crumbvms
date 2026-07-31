@@ -6151,10 +6151,14 @@ pub async fn list_camera_decode_status(pool: &Pool) -> Result<Vec<CameraDecodeSt
             SELECT s.camera_id, c.name AS camera_name,
                    s.requested, s.active, s.fallback_reason, s.updated_at,
                    a.sample_rate AS audio_sample_rate,
-                   a.transcoding AS audio_transcoding
+                   a.transcoding AS audio_transcoding,
+                   h.healthy    AS motion_healthy,
+                   h.changed_at AS motion_health_since,
+                   h.reason     AS motion_health_reason
             FROM camera_decode_status s
             JOIN cameras c ON c.id = s.camera_id
             LEFT JOIN camera_audio_status a ON a.camera_id = s.camera_id
+            LEFT JOIN camera_motion_health h ON h.camera_id = s.camera_id
             ORDER BY c.name, s.camera_id
             ",
             &[],
@@ -6172,8 +6176,75 @@ pub async fn list_camera_decode_status(pool: &Pool) -> Result<Vec<CameraDecodeSt
             updated_at: row.get("updated_at"),
             audio_sample_rate: row.get("audio_sample_rate"),
             audio_transcoding: row.get("audio_transcoding"),
+            motion_healthy: row.get("motion_healthy"),
+            motion_health_since: row.get("motion_health_since"),
+            motion_health_reason: row.get("motion_health_reason"),
         })
         .collect())
+}
+
+/// Upsert one camera's CURRENT motion-detector health (`camera_motion_health`,
+/// migration 0072). Written by the recorder's health aggregator
+/// (`services/recorder/src/motion.rs` `aggregate_health`) on every camera-level
+/// health TRANSITION, so the row is a LEVEL signal (current state), not the
+/// EDGE `motion_detector_unhealthy` system_events emit. `changed_at` advances
+/// only when `healthy` actually flips, so it reads as "unhealthy since <time>";
+/// `updated_at` always advances so staleness of the report is visible.
+///
+/// Best-effort at the call site (telemetry) — a failed write never affects the
+/// in-memory fail-open signal, which flips independently and instantly.
+///
+/// # Errors
+/// Returns an error if the database query fails.
+pub async fn upsert_camera_motion_health(
+    pool: &Pool,
+    camera_id: Uuid,
+    healthy: bool,
+    reason: Option<&str>,
+) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            INSERT INTO camera_motion_health (camera_id, healthy, reason, changed_at, updated_at)
+            VALUES ($1, $2, $3, now(), now())
+            ON CONFLICT (camera_id) DO UPDATE
+                SET healthy    = EXCLUDED.healthy,
+                    reason     = EXCLUDED.reason,
+                    -- Advance changed_at only on a real flip so it stays the
+                    -- 'since when' of the CURRENT state, not the last write.
+                    changed_at = CASE
+                        WHEN camera_motion_health.healthy <> EXCLUDED.healthy THEN now()
+                        ELSE camera_motion_health.changed_at
+                    END,
+                    updated_at = now()
+            ",
+            &[&camera_id, &healthy, &reason],
+        )
+        .await
+        .context("upsert_camera_motion_health")?;
+    Ok(())
+}
+
+/// Delete one camera's motion-health row.
+///
+/// Called by the supervisor when it stops the worker of a disabled/removed
+/// camera (mirrors `delete_camera_decode_status`), so the admin panel never
+/// shows a stale health badge for a camera that has no worker left to report.
+/// Camera deletion also cascades via the FK — this covers the disable case.
+///
+/// # Errors
+/// Returns an error if the database query fails.
+pub async fn delete_camera_motion_health(pool: &Pool, camera_id: Uuid) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            "DELETE FROM camera_motion_health WHERE camera_id = $1",
+            &[&camera_id],
+        )
+        .await
+        .context("delete_camera_motion_health")?;
+    Ok(())
 }
 
 // ─── motion RAM-cache telemetry (migration 0039) ──────────────────────────────
@@ -10427,6 +10498,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0071_lpr_engine_none.sql",
         include_str!("../../../db/migrations/0071_lpr_engine_none.sql"),
+    ),
+    (
+        "0072_camera_motion_health.sql",
+        include_str!("../../../db/migrations/0072_camera_motion_health.sql"),
     ),
 ];
 

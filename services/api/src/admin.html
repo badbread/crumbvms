@@ -6259,13 +6259,30 @@ function decodeCamBadgeHtml(c) {
   return badge + why;
 }
 
+/* Per-camera motion-detector health (migration 0072). A prominent danger badge
+   when the detector is DOWN and the recorder is failing OPEN (recording
+   continuously as a fallback) right now; nothing when healthy (motion_healthy
+   === true) or unreported (motion_healthy == null, e.g. Continuous-mode camera
+   or an older recorder). This is what makes an invisible fail-open fault (a
+   broken detector produces the same continuous segments as a busy scene)
+   visible in-app without needing a configured push channel. */
+function motionHealthBadgeHtml(c) {
+  if (c.motion_healthy !== false) return '';
+  const forStr = c.motion_health_since ? decodeAgo(c.motion_health_since).replace(' ago', '') : '';
+  const forSuffix = forStr ? ` (for ${esc(forStr)})` : '';
+  const sinceTitle = c.motion_health_since ? ` Recording continuously since ${esc(new Date(c.motion_health_since).toLocaleString())}.` : '';
+  const why = c.motion_health_reason ? ` Cause: ${esc(c.motion_health_reason)}.` : '';
+  return `<span title="Motion detection is DOWN for this camera, so the recorder is recording continuously as a fail-open fallback. Footage is NOT being lost, only the disk-saving benefit of Motion mode is suspended.${sinceTitle}${why}" style="display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;background:rgba(229,72,77,.15);color:var(--danger);white-space:nowrap">⚠ Motion detection DOWN, recording continuously as fallback${forSuffix}</span>`;
+}
+
 function decodeCamsHtml(st) {
   const cams = (st && st.cameras) || [];
   if (!cams.length) return '<div class="card-hint" style="margin-top:8px">No motion-decode workers reported yet, rows appear when the recorder (re)starts a camera\'s motion worker.</div>';
   return cams.map(c => `
-    <div style="display:flex;align-items:center;gap:10px;padding:4px 0;border-bottom:1px solid var(--border);min-width:0">
+    <div style="display:flex;align-items:center;gap:10px;padding:4px 0;border-bottom:1px solid var(--border);min-width:0;flex-wrap:wrap">
       <span style="flex:0 0 170px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.camera_name)}">${esc(c.camera_name)}</span>
       ${decodeCamBadgeHtml(c)}
+      ${motionHealthBadgeHtml(c)}
       <span style="flex:1"></span>
       <span style="font-size:11px;color:var(--dim2);white-space:nowrap">${decodeAgo(c.updated_at)}</span>
     </div>`).join('');

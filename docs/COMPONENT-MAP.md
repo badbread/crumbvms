@@ -180,6 +180,7 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Tuner UIs | `admin.html` motion tuner, desktop inline tuner in `app.js`, android `feature/tuner`, iOS `Features/Tuner` | Four tuner surfaces exist; a new knob must reach all four or be explicitly deferred |
 | Docs | `docs/MOTION-DETECTION-DESIGN.md`, `docs/MOTION-ADAPTIVE-THRESHOLD.md` | |
 | Schema | per-camera detector/threshold settings ride `cameras`/policies: rows B and C | |
+| Detector-health visibility | recorder `aggregate_health` upserts current per-camera health to `camera_motion_health` (migration `0072`) on every transition (LEVEL signal, not the EDGE `motion_detector_unhealthy` system_event); `GET /config/decode-status` LEFT JOINs it (`CameraDecodeStatus`/`CameraDecodeStatusDto` `motion_healthy`/`_since`/`_reason`); `admin.html` `motionHealthBadgeHtml` renders a `var(--danger)` "Motion detection DOWN, recording continuously as fallback" badge in the decode-status panel | Fail-open recording looks identical to a busy scene; without a LEVEL signal a broken detector is invisible in-app (issue #411). Push alert already ships via `0038` + `notifications.rs`. **Deferred:** desktop/android/iOS surfacing of the same field |
 
 ### G. Auth, RBAC, sessions, or security posture change
 
