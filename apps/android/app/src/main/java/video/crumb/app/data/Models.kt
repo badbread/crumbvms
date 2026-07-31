@@ -505,6 +505,12 @@ data class PlateRead(
     val ts: String,
     val plate: String = "",
     @SerialName("plate_raw") val plateRaw: String = "",
+    /**
+     * Operator-assigned human-readable name for this plate (e.g. "Mom's car"),
+     * resolved server-side. Null/absent on older servers or an unnamed plate; the
+     * client then falls back to displaying the raw plate text.
+     */
+    @SerialName("display_name") val displayName: String? = null,
     val confidence: Float? = null,
     val region: String? = null,
     @SerialName("source_id") val sourceId: String? = null,
@@ -548,6 +554,12 @@ data class PlatesResponse(
 data class PlateWatchlistEntry(
     val id: String,
     val plate: String,
+    /**
+     * Operator-assigned human-readable name for this plate, resolved server-side
+     * (same source as [PlateRead.displayName]). Null/absent on older servers or an
+     * unnamed plate; the client then falls back to displaying the raw plate text.
+     */
+    @SerialName("display_name") val displayName: String? = null,
     val label: String? = null,
     val note: String? = null,
     /** `#rrggbb` accent for the entry, or null. */

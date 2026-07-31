@@ -91,6 +91,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -513,13 +514,10 @@ private fun PlateGalleryCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        text = read.plate.ifEmpty { "—" },
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
+                    PlateLabel(
+                        displayName = read.displayName,
+                        plate = read.plate,
+                        nameStyle = MaterialTheme.typography.titleMedium,
                     )
                     Text(
                         text = cameraName,
@@ -589,12 +587,10 @@ private fun PlateGroupRow(
         ) {
             PlateThumb(read = group.latest, mediaUrls = mediaUrls, modifier = Modifier.size(width = 84.dp, height = 50.dp))
             Column(Modifier.weight(1f)) {
-                Text(
-                    text = group.plate.ifEmpty { "—" },
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                    style = MaterialTheme.typography.titleMedium,
+                PlateLabel(
+                    displayName = group.latest.displayName,
+                    plate = group.plate,
+                    nameStyle = MaterialTheme.typography.titleMedium,
                 )
                 Text(
                     text = "${group.count} sighting${if (group.count == 1) "" else "s"} · ${group.cameraNames(cameraName)}",
@@ -670,12 +666,10 @@ private fun PlatesTimelineView(
                 ) {
                     PlateThumb(read = p, mediaUrls = mediaUrls, modifier = Modifier.size(width = 132.dp, height = 78.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(
-                            text = p.plate.ifEmpty { "—" },
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                            style = MaterialTheme.typography.headlineSmall,
+                        PlateLabel(
+                            displayName = p.displayName,
+                            plate = p.plate,
+                            nameStyle = MaterialTheme.typography.headlineSmall,
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Filled.Videocam, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(15.dp))
@@ -896,6 +890,54 @@ private fun CameraPickerDialog(
     )
 }
 
+// ─── plate primary label (name over raw plate) ─────────────────────────────────
+
+/**
+ * The primary label for a plate. When the server resolved a human-readable
+ * [displayName] (e.g. "Mom's car") it becomes the prominent line, styled with
+ * [nameStyle], with the raw [plate] shown small and monospaced beneath it.
+ * When [displayName] is null/blank the raw [plate] is rendered exactly as before
+ * (bold monospace at [nameStyle]); the fallback is the plate text, never a dash
+ * in place of a name.
+ */
+@Composable
+private fun PlateLabel(
+    displayName: String?,
+    plate: String,
+    nameStyle: TextStyle,
+    modifier: Modifier = Modifier,
+) {
+    val name = displayName?.takeIf { it.isNotBlank() }
+    if (name == null) {
+        Text(
+            text = plate.ifEmpty { "—" },
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            style = nameStyle,
+            maxLines = 1,
+            modifier = modifier,
+        )
+    } else {
+        Column(modifier) {
+            Text(
+                text = name,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+                style = nameStyle,
+                maxLines = 1,
+            )
+            Text(
+                text = plate.ifEmpty { "—" },
+                color = TextSecondary,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
 // ─── plate row + lazy snapshot ─────────────────────────────────────────────────
 
 @Composable
@@ -918,12 +960,10 @@ private fun PlateRow(
     ) {
         PlateThumb(read = read, mediaUrls = mediaUrls, modifier = Modifier.size(width = 92.dp, height = 56.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = read.plate.ifEmpty { "—" },
-                color = MaterialTheme.colorScheme.onSurface,
-                fontWeight = FontWeight.Bold,
-                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                style = MaterialTheme.typography.titleMedium,
+            PlateLabel(
+                displayName = read.displayName,
+                plate = read.plate,
+                nameStyle = MaterialTheme.typography.titleMedium,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
@@ -1303,12 +1343,10 @@ private fun EditWatchlistEntryDialog(
         title = { Text("Edit watchlist entry") },
         text = {
             Column {
-                Text(
-                    text = entry.plate.ifEmpty { "—" },
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.titleLarge,
+                PlateLabel(
+                    displayName = entry.displayName,
+                    plate = entry.plate,
+                    nameStyle = MaterialTheme.typography.titleLarge,
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
@@ -1512,12 +1550,10 @@ private fun WatchlistRow(
             )
         }
         Column(Modifier.weight(1f)) {
-            Text(
-                text = entry.plate,
-                color = MaterialTheme.colorScheme.onSurface,
-                fontWeight = FontWeight.Bold,
-                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                style = MaterialTheme.typography.titleSmall,
+            PlateLabel(
+                displayName = entry.displayName,
+                plate = entry.plate,
+                nameStyle = MaterialTheme.typography.titleSmall,
             )
             val label = entry.label
             if (!label.isNullOrBlank()) {
@@ -1633,12 +1669,10 @@ private fun PlateReportDialog(
                     crop = true,
                     decodePx = PLATE_CROP_DECODE_PX,
                 )
-                Text(
-                    text = read.plate.ifEmpty { "—" },
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                    style = MaterialTheme.typography.titleLarge,
+                PlateLabel(
+                    displayName = read.displayName,
+                    plate = read.plate,
+                    nameStyle = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(top = 8.dp),
                 )
                 // Timezone picker.
