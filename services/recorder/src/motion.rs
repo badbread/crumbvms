@@ -1661,6 +1661,38 @@ async fn run_one_source(
     // One hysteresis gate for this source's lifetime — every report_health call
     // below shares it so a transition retires a stale alert timer.
     let alert_gate = UnhealthyAlertGate::new();
+
+    // Arm the STARTUP unhealthy episode explicitly (issue #411).
+    //
+    // The source health watch starts unhealthy (`false`), and `report_health`
+    // only arms the alert timer on a healthy→unhealthy TRANSITION. So a source
+    // that is broken from startup and NEVER becomes healthy produces no
+    // transition and would never alert — exactly what happened in prod when a
+    // GPU driver upgrade left VAAPI decode dead at boot: motion silently
+    // fail-open-recorded for 5 days with no alert. The fail-open rail itself
+    // worked (invariant #19); only the operator-facing alert was missing.
+    //
+    // Arming the initial (generation-0) episode here means: if this source has
+    // not become healthy within `alert_after_secs`, the alert fires. The first
+    // RECOVERED transition bumps the gate generation and retires this timer, and
+    // a later healthy→unhealthy flap arms its own — so this is purely additive
+    // to the existing transition-armed scheme. `alert_after_secs == 0` keeps its
+    // immediate-alert semantics via the timer's 0-second sleep.
+    spawn_unhealthy_alert_timer(
+        Arc::clone(&alert_gate),
+        alert_gate
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        health_tx.clone(),
+        pool.clone(),
+        camera.id,
+        format!(
+            "{} motion detector never became healthy after startup",
+            kind.as_str()
+        ),
+        alert_after_secs,
+    );
+
     let mut backoff_secs = BACKOFF_BASE_SECS;
 
     loop {
@@ -4218,6 +4250,49 @@ mod tests {
         // Exactly-once guard: even well past the threshold, an episode that
         // already alerted must not alert a second time.
         assert!(!should_emit_unhealthy_alert(999, 180, true));
+    }
+
+    // ── born-unhealthy startup arm (issue #411) ─────────────────────────────────
+
+    #[test]
+    fn born_unhealthy_source_that_never_recovers_alerts() {
+        // run_one_source arms a startup timer for the gate's INITIAL generation.
+        // A source that is broken from boot and never becomes healthy produces
+        // no health transition, so the generation never moves — the startup
+        // episode is not superseded and, past the threshold, the alert emits.
+        // Before #411 no timer was armed at all in this case, so the 5-day prod
+        // fail-open ran silent.
+        use std::sync::atomic::Ordering::SeqCst;
+        let gate = UnhealthyAlertGate::new();
+        let armed_generation = gate.generation.load(SeqCst); // captured at startup
+                                                             // ... source never becomes healthy: no report_health transition fires ...
+        let superseded = gate.generation.load(SeqCst) != armed_generation;
+        assert!(
+            !superseded,
+            "a never-recovering source's episode is never superseded"
+        );
+        let still_unhealthy = true;
+        assert!(
+            still_unhealthy && should_emit_unhealthy_alert(180, 180, superseded),
+            "born-unhealthy source that stays down must alert at the threshold"
+        );
+    }
+
+    #[test]
+    fn born_unhealthy_source_that_recovers_before_threshold_does_not_alert() {
+        // If the source comes up healthy before the startup timer matures, the
+        // healthy transition bumps the gate generation, superseding the startup
+        // episode so it never alerts (no false alarm for a slow-but-fine start).
+        use std::sync::atomic::Ordering::SeqCst;
+        let gate = UnhealthyAlertGate::new();
+        let armed_generation = gate.generation.load(SeqCst);
+        gate.generation.fetch_add(1, SeqCst); // healthy transition (report_health)
+        let superseded = gate.generation.load(SeqCst) != armed_generation;
+        assert!(superseded, "recovery must supersede the startup episode");
+        assert!(
+            !should_emit_unhealthy_alert(180, 180, superseded),
+            "a source that recovered must not emit the startup alert"
+        );
     }
 
     #[test]
