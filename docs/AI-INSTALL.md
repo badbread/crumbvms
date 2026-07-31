@@ -561,6 +561,17 @@ committed overlays at the repo root:
   the node, and `MOTION_VAAPI_DEVICE` if the iGPU's render node isn't
   `/dev/dri/renderD128` (check `ls -l /dev/dri/by-path`).
 
+  On a **multi-GPU host** (e.g. an iGPU plus a discrete NVIDIA card), set
+  `MOTION_VAAPI_DEVICE` to the iGPU's **stable by-path symlink** rather than a
+  bare `renderD128`, e.g. `/dev/dri/by-path/pci-0000:00:02.0-render` (use the
+  host's real PCI address). The `renderD*` numbers can reorder across a
+  GPU-driver upgrade + reboot; if that repoints VAAPI at the wrong card, motion
+  decode fails and the recorder falls open to continuous recording silently
+  (the recorder logs a distinct `VAAPI decode init FAILING` ERROR when this
+  happens). The by-path name is tied to the PCI address and does not move.
+  Immune-by-design alternative: `MOTION_HWACCEL=cpu`, software decode at the
+  ~320px/5fps analysis resolution is cheap and unaffected by GPU issues.
+
 - **NVIDIA (NVDEC)**, `docker-compose.gpu.example.yml` (host needs the NVIDIA
   driver + `nvidia-container-toolkit`):
 
