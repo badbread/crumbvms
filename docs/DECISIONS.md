@@ -49,6 +49,67 @@ mounting the Docker socket, a meaningful privilege for a default-path service.
 - A first-party, socket-free recovery mechanism becomes available (e.g. the
   recorder self-restarting a wedged internal subsystem, or a healthcheck-driven
   restart that does not need the Docker socket).
+## 2026-07-31, go2rtc restream auth opt-out is a first-class env choice (`GO2RTC_AUTH=off`), LAN-RTSP only, secure default preserved
+
+**Decision.** The LAN-facing go2rtc RTSP restream (`:8554`, published `:18554`)
+can be run without authentication via a single explicit env var, `GO2RTC_AUTH=off`
+(issue #398). It is secure by default: unset, empty, and any unrecognized value
+all keep auth ON, byte-for-byte unchanged from prior behavior. When set to `off`:
+the recorder renders an effective go2rtc config at startup that omits ONLY the
+`rtsp:` listener's `username`/`password` (the tracked `go2rtc/go2rtc.yaml` stays
+read-only and un-edited), the api hands out credential-free
+`rtsp://host:18554/<name>` URLs, and the posture is logged loudly by both
+containers and shown as a red badge on the admin console's Server page. The
+internal go2rtc REST API (`:1984`, never host-published) stays authenticated in
+BOTH postures.
+
+**Context.** Before this, the only way to run an open restream was to edit the
+tracked `go2rtc/go2rtc.yaml`, an invisible fork of a repo-managed file that no
+fresh checkout reproduces and that makes a deployment stop matching what users
+run. Turning auth on is a coordination cost paid at one instant by every consumer
+(a BYO Frigate/NVR pulling the restream, plus every client); on a segmented,
+trusted LAN an operator may reasonably decline it. The project should let them
+express that as configuration, not as a patch.
+
+**Why LAN-RTSP-only, internal REST always authed.** go2rtc auth is per-listener.
+The `:1984` REST API is the stream-management surface (enumerate/PUT/DELETE any
+camera) and is reachable only over the compose bridge as `recorder:1984`; the api
+and reconcile loop depend on its auth as free defense-in-depth. Only the LAN RTSP
+listener is what an operator wants open, so only its credentials are ever removed.
+
+**Why render, not empty-username magic.** go2rtc treats a listener with no
+`username`/`password` as open. We render that state explicitly (strip the two
+`rtsp:` keys) rather than passing an empty `${GO2RTC_USER}` and relying on
+substitution semantics, because an empty credential is ambiguous (it could break
+env substitution or silently disable auth in a way that drifts across go2rtc
+versions). Confidence that an omitted listener credential is go2rtc 1.9.x's "no
+auth" state: high, it is the documented model and matches the in-repo note that
+RTSP auth is purely listener-credential-driven with no separate toggle. The
+render path also fails safe: if reading the template or writing the effective
+config fails, the recorder falls back to the authenticated template, so a failure
+can never silently open the restream.
+
+**Rejected.** (1) Flipping the default to off, explicitly out of scope: a
+permissive default is paid silently by every operator who never read the docs,
+whereas the coordination cost is paid once, deliberately, by the operator who
+opts out. (2) Relying on an empty `GO2RTC_USER` to disable auth, ambiguous and
+version-fragile as above. (3) Editing the tracked `go2rtc.yaml` (the status quo),
+invisible drift, and the mount is read-only anyway. (4) Also opening the internal
+`:1984` REST listener, no benefit, loses free defense-in-depth on the
+stream-management surface.
+
+**Accepted trade-offs.** Opt-out is all-or-nothing across cameras (go2rtc auth is
+per-listener, not per-stream) and per-deployment, not per-user. The rendered
+effective config lives at a writable temp path (overridable via
+`GO2RTC_RENDERED_CONFIG`), regenerated each boot from the template so it cannot
+drift. `GO2RTC_AUTH` must be set on both the recorder (renders the config) and the
+api (URL construction); compose forwards it to both.
+
+**Revisit if:** go2rtc gains a per-stream or per-user auth model; go2rtc changes
+how an omitted listener credential is interpreted (retest the render path); or a
+demand emerges for a scoped RTSP credential (per-camera / short-lived) rather than
+the single shared one, which would change the calculus for both the default and
+the opt-out.
 
 ## 2026-07-29, Media-token capability claims default to false rather than failing to decode
 

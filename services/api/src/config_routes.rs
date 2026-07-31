@@ -3822,7 +3822,10 @@ async fn redetect_camera(
 
 // ─── server / streaming settings ─────────────────────────────────────────────
 
-fn server_settings_to_dto(s: ServerSettings) -> ServerSettingsDto {
+fn server_settings_to_dto(
+    s: ServerSettings,
+    restream_rtsp_authenticated: bool,
+) -> ServerSettingsDto {
     ServerSettingsDto {
         server_address: s.server_address,
         crumb_rtsp_base: s.crumb_rtsp_base,
@@ -3839,6 +3842,8 @@ fn server_settings_to_dto(s: ServerSettings) -> ServerSettingsDto {
         // schedule times in the server's real zone instead of a hardcoded
         // one (#237). A PUT to /config/server never changes it.
         tz: crate::db_backup::schedule_tz().name().to_string(),
+        // Issue #398: runtime posture from the GO2RTC_AUTH env, not the DB row.
+        restream_rtsp_authenticated,
     }
 }
 
@@ -3853,7 +3858,10 @@ async fn get_server_settings(
         .ok_or_else(|| {
             ApiError::Internal(anyhow::anyhow!("server_settings row missing; run ensure"))
         })?;
-    Ok(Json(server_settings_to_dto(s)))
+    Ok(Json(server_settings_to_dto(
+        s,
+        state.config().go2rtc_rtsp_auth,
+    )))
 }
 
 /// `PUT /config/server` — update server & streaming base-URL settings.
@@ -3907,7 +3915,10 @@ async fn update_server_settings(
     .await
     .context("update_server_settings")?;
     tracing::info!(version = s.version, "server settings updated");
-    Ok(Json(server_settings_to_dto(s)))
+    Ok(Json(server_settings_to_dto(
+        s,
+        state.config().go2rtc_rtsp_auth,
+    )))
 }
 
 // ─── health-alert maintenance window (issue #46) ────────────────────────────────

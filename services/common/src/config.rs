@@ -434,6 +434,49 @@ impl Config {
     }
 }
 
+// ── go2rtc RTSP restream auth posture (issue #398) ─────────────────────────────
+
+/// Explicit opt-out token for `GO2RTC_AUTH`. Only this exact value (case-
+/// insensitive, surrounding whitespace ignored) disables auth on the LAN-facing
+/// go2rtc RTSP restream listener. Every other value keeps auth ON.
+pub const GO2RTC_AUTH_OFF_TOKEN: &str = "off";
+
+/// Whether Crumb's own go2rtc RTSP restream listener (`:8554`, LAN-published as
+/// `:18554`) should require authentication.
+///
+/// **Secure by default.** Returns `true` for every input EXCEPT the explicit
+/// opt-out token [`GO2RTC_AUTH_OFF_TOKEN`] (`"off"`). Unset (`None`), empty, and
+/// any unrecognized value all keep auth ON, so a typo, a blank `${VAR:-}`
+/// expansion, or a stray value can never silently open the restream. Disabling
+/// auth is only ever the operator's explicit, documented choice.
+///
+/// This governs ONLY the LAN-facing RTSP listener. go2rtc's internal REST API
+/// (`:1984`, never host-published) stays authenticated in both postures as
+/// defense-in-depth; it is not affected by this function.
+///
+/// # Examples
+///
+/// ```
+/// use crumb_common::config::go2rtc_rtsp_auth_enabled;
+/// assert!(go2rtc_rtsp_auth_enabled(None));            // unset  → ON
+/// assert!(go2rtc_rtsp_auth_enabled(Some("")));        // empty  → ON
+/// assert!(go2rtc_rtsp_auth_enabled(Some("on")));      // on     → ON
+/// assert!(go2rtc_rtsp_auth_enabled(Some("nonsense"))); // typo  → ON (safe)
+/// assert!(!go2rtc_rtsp_auth_enabled(Some("off")));    // off    → OFF
+/// assert!(!go2rtc_rtsp_auth_enabled(Some("  OFF ")));  // trimmed/case → OFF
+/// ```
+#[must_use]
+pub fn go2rtc_rtsp_auth_enabled(raw: Option<&str>) -> bool {
+    !matches!(raw, Some(v) if v.trim().eq_ignore_ascii_case(GO2RTC_AUTH_OFF_TOKEN))
+}
+
+/// Read the [`go2rtc_rtsp_auth_enabled`] posture from the process environment
+/// (`GO2RTC_AUTH`). Convenience wrapper for the api/recorder startup paths.
+#[must_use]
+pub fn go2rtc_rtsp_auth_enabled_env() -> bool {
+    go2rtc_rtsp_auth_enabled(env::var("GO2RTC_AUTH").ok().as_deref())
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Read a secret from `{key}_FILE` (a file path — e.g. a Docker secret mounted
@@ -543,7 +586,40 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{optional_env, parse_env, parse_tz_env};
+    use super::{go2rtc_rtsp_auth_enabled, optional_env, parse_env, parse_tz_env};
+
+    /// Issue #398 — secure by default: auth is ON for every input except the
+    /// explicit `off` token. Unset, empty, and unrecognized values MUST all keep
+    /// auth ON so a typo or blank `${VAR:-}` expansion can never open the
+    /// LAN-facing restream. Only the documented off token disables it.
+    #[test]
+    fn go2rtc_auth_is_secure_by_default() {
+        // Auth stays ON:
+        assert!(go2rtc_rtsp_auth_enabled(None), "unset must keep auth ON");
+        assert!(
+            go2rtc_rtsp_auth_enabled(Some("")),
+            "empty must keep auth ON"
+        );
+        assert!(
+            go2rtc_rtsp_auth_enabled(Some("   ")),
+            "whitespace-only must keep auth ON"
+        );
+        assert!(go2rtc_rtsp_auth_enabled(Some("on")));
+        assert!(go2rtc_rtsp_auth_enabled(Some("true")));
+        assert!(go2rtc_rtsp_auth_enabled(Some("1")));
+        assert!(
+            go2rtc_rtsp_auth_enabled(Some("offf")),
+            "a near-miss token must NOT disable auth"
+        );
+        assert!(
+            go2rtc_rtsp_auth_enabled(Some("disabled")),
+            "an unrecognized value must fall back to the safe direction (ON)"
+        );
+        // Auth turns OFF only on the explicit token (case/whitespace tolerant):
+        assert!(!go2rtc_rtsp_auth_enabled(Some("off")));
+        assert!(!go2rtc_rtsp_auth_enabled(Some("OFF")));
+        assert!(!go2rtc_rtsp_auth_enabled(Some("  Off  ")));
+    }
 
     /// Audit #84: an invalid TZ value must fall back (non-fatal, now loudly
     /// logged) to the caller's default when that parses — never panic, never

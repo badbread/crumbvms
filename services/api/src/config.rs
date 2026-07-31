@@ -133,6 +133,23 @@ pub struct ApiConfig {
     pub go2rtc_user: String,
     pub go2rtc_pass: String,
 
+    /// `GO2RTC_AUTH` — whether Crumb's own go2rtc RTSP restream listener
+    /// (`:18554`, LAN-published) requires authentication (issue #398).
+    ///
+    /// **Secure by default: `true`.** Only the explicit opt-out token
+    /// `GO2RTC_AUTH=off` sets this to `false`; unset / empty / unrecognized all
+    /// keep it `true` (see [`crumb_common::config::go2rtc_rtsp_auth_enabled`]).
+    ///
+    /// When `true` (default), `GET /cameras/{id}/streams` embeds
+    /// `GO2RTC_USER:GO2RTC_PASS@` into the `rtsp://` URLs it hands clients, as
+    /// before. When `false`, the LAN restream is open and the API hands out
+    /// credential-free `rtsp://host:18554/<name>` URLs.
+    ///
+    /// This does NOT affect the internal go2rtc REST API (`:1984`), which stays
+    /// authenticated in both postures — the API always keeps `go2rtc_user` /
+    /// `go2rtc_pass` for its own internal REST calls regardless of this flag.
+    pub go2rtc_rtsp_auth: bool,
+
     // -- export -------------------------------------------------------------
     /// `EXPORT_DIR` -- directory where completed export MP4 files are written.
     ///
@@ -408,6 +425,8 @@ impl ApiConfig {
             crumb_go2rtc_rtsp_base: optional_env("CRUMB_GO2RTC_RTSP_BASE", ""),
             go2rtc_user: require_secret("GO2RTC_USER")?,
             go2rtc_pass,
+            // Issue #398: secure by default — auth ON unless GO2RTC_AUTH=off.
+            go2rtc_rtsp_auth: crumb_common::config::go2rtc_rtsp_auth_enabled_env(),
             export_dir: optional_env("EXPORT_DIR", "/data/exports"),
             export_ttl_seconds: parse_env("EXPORT_TTL_SECONDS", 86_400_u64)?,
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),

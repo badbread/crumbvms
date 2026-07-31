@@ -260,6 +260,15 @@ authenticated with `GO2RTC_USER`/`GO2RTC_PASS`. Don't add a host port for it.
 (Upgrading an install that predates the embedding? `docker compose up -d
 --remove-orphans` removes the old standalone go2rtc container.)
 
+The LAN RTSP restream (`18554`) is **authenticated by default**, and that is the
+recommended posture, do not disable it on your own initiative. An operator on a
+trusted, segmented LAN may explicitly opt out by setting `GO2RTC_AUTH=off` in
+`.env`, which opens ONLY that RTSP listener (any LAN client can then pull every
+camera with no password); the internal `:1984` REST API stays authenticated
+regardless. It is loud when set: startup `WARN` logs in both the recorder and
+api, plus a red badge on the admin console's Server page. Any value but `off`
+(including unset) keeps auth on. Full detail: `docs/COMPOSE.md` § go2rtc.
+
 The `recorder` service sets `stop_grace_period: 90s`: its clean shutdown
 finalizes in-flight segments and storage-migration batches, and Docker's
 default 10 s grace would SIGKILL it mid-teardown. Don't remove or shorten it.

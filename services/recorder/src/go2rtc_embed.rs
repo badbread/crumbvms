@@ -97,7 +97,119 @@ pub fn spawn(shutdown: CancellationToken) -> Option<tokio::task::JoinHandle<()>>
         return None;
     }
 
-    Some(tokio::spawn(supervise(bin, config, shutdown)))
+    // Issue #398: the LAN-facing RTSP restream (:8554, published as :18554) is
+    // authenticated by default. An operator may opt the LAN restream out of auth
+    // with the explicit, documented token `GO2RTC_AUTH=off`. Secure by default:
+    // anything else (unset / empty / unrecognized) keeps auth ON. The internal
+    // go2rtc REST API (:1984, never host-published) stays authenticated in BOTH
+    // postures — only the `rtsp:` listener's credentials are ever removed.
+    let effective_config = resolve_effective_config(&config);
+
+    Some(tokio::spawn(supervise(bin, effective_config, shutdown)))
+}
+
+/// Decide which go2rtc config file to launch, honoring the `GO2RTC_AUTH` posture
+/// (issue #398) and logging the posture LOUDLY at startup.
+///
+/// * Auth ON (default): returns `template_path` UNCHANGED — go2rtc reads the
+///   tracked, read-only-mounted config exactly as before, so the default path is
+///   byte-for-byte identical to prior behavior.
+/// * Auth OFF (`GO2RTC_AUTH=off`): renders an effective config with ONLY the
+///   `rtsp:` listener's `username`/`password` removed and returns that writable
+///   path. If rendering fails for any reason, falls back to `template_path`
+///   (auth stays ON) — a failure to open the restream must never silently open
+///   it, and must never open it by accident either.
+fn resolve_effective_config(template_path: &str) -> String {
+    if crumb_common::config::go2rtc_rtsp_auth_enabled_env() {
+        info!(
+            config = %template_path,
+            "go2rtc RTSP restream auth is ENABLED (default); off-container LAN clients must \
+             authenticate to pull streams"
+        );
+        return template_path.to_owned();
+    }
+
+    match render_auth_off(template_path) {
+        Ok(rendered) => {
+            warn!(
+                rendered = %rendered,
+                "go2rtc RTSP restream auth is DISABLED (GO2RTC_AUTH=off): any LAN client can pull \
+                 every camera from rtsp://<host>:18554/<name> WITHOUT credentials. This is the \
+                 operator's explicit opt-out; the internal go2rtc REST API (:1984) stays \
+                 authenticated"
+            );
+            rendered
+        }
+        Err(e) => {
+            // Secure fallback: keep the authenticated template so a rendering
+            // failure leaves the restream LOCKED rather than in an unknown state.
+            warn!(
+                error = %e,
+                config = %template_path,
+                "GO2RTC_AUTH=off was requested but rendering the auth-off go2rtc config failed; \
+                 falling back to the AUTHENTICATED config (restream stays locked, secure by default)"
+            );
+            template_path.to_owned()
+        }
+    }
+}
+
+/// Render an effective go2rtc config with the LAN `rtsp:` listener's auth
+/// removed, written to a recorder-writable path (the tracked template is mounted
+/// read-only, so it cannot be edited in place).
+///
+/// Only the `rtsp:` block's `username`/`password` keys are stripped; the `api:`
+/// block keeps its credentials so the internal REST API (:1984) stays
+/// authenticated. Returns the path go2rtc should be launched with.
+fn render_auth_off(template_path: &str) -> std::io::Result<String> {
+    let template = std::fs::read_to_string(template_path)?;
+    let rendered = strip_rtsp_auth(&template);
+    // A dedicated writable filename next to the OS temp dir. Regenerated on every
+    // boot from the current template, so it never drifts. `GO2RTC_RENDERED_CONFIG`
+    // overrides the location for hardened deployments with an unusual temp dir.
+    let out_path = std::env::var("GO2RTC_RENDERED_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("crumb-go2rtc.effective.yaml"));
+    std::fs::write(&out_path, rendered)?;
+    Ok(out_path.to_string_lossy().into_owned())
+}
+
+/// Remove the `username`/`password` keys from ONLY the top-level `rtsp:` block of
+/// a go2rtc YAML config, leaving every other block (notably `api:`) untouched.
+///
+/// go2rtc treats a listener with no `username`/`password` as open, so this is the
+/// clean "no auth" state for the LAN RTSP listener (issue #398). The transform is
+/// block-aware (it tracks the current top-level section by column-0 `key:` lines)
+/// and comment-safe, so it survives key reordering and never touches the
+/// identically-named keys under `api:`.
+fn strip_rtsp_auth(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    // The top-level section the current line belongs to (`api`, `rtsp`, …).
+    let mut section: Option<String> = None;
+
+    // `split_inclusive` keeps each line's trailing newline so the rewritten file
+    // preserves the original line endings exactly.
+    for line in template.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let is_top_level = !body.is_empty()
+            && !body.starts_with(char::is_whitespace)
+            && !body.starts_with('#')
+            && body.contains(':');
+        if is_top_level {
+            let key = body.split(':').next().unwrap_or("").trim();
+            section = Some(key.to_owned());
+        }
+
+        if section.as_deref() == Some("rtsp") {
+            let keyish = body.trim_start();
+            if keyish.starts_with("username:") || keyish.starts_with("password:") {
+                // Drop this credential line — opens ONLY the rtsp listener.
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Supervision loop: run the child, restart with exponential backoff, exit on
@@ -256,7 +368,99 @@ async fn terminate(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::drain_pipe;
+    use super::{drain_pipe, strip_rtsp_auth};
+
+    /// The shipped go2rtc config layout (issue #398). Mirrors
+    /// `go2rtc/go2rtc.yaml`: `api:` and `rtsp:` both carry
+    /// `username`/`password`, and `api:` additionally has `local_auth: true`.
+    const SAMPLE: &str = "\
+api:
+  listen: \":1984\"
+  username: \"${GO2RTC_USER}\"
+  password: \"${GO2RTC_PASS}\"
+  local_auth: true
+
+rtsp:
+  listen: \":8554\"
+  # credential lines follow; stripped when the operator opts out
+  username: \"${GO2RTC_USER}\"
+  password: \"${GO2RTC_PASS}\"
+
+webrtc:
+  listen: \":8556\"
+
+streams: {}
+";
+
+    /// Auth-off render: ONLY the rtsp block's credentials are removed. The api
+    /// block's credentials (defense-in-depth for the internal :1984 REST API)
+    /// MUST remain, and no other content may be lost.
+    #[test]
+    fn strip_rtsp_auth_removes_only_rtsp_credentials() {
+        let out = strip_rtsp_auth(SAMPLE);
+
+        // The rtsp listener is now open: its credential KEYS are gone.
+        let rtsp_block = out
+            .split_once("rtsp:")
+            .expect("rtsp block present")
+            .1
+            .split("webrtc:")
+            .next()
+            .expect("content before webrtc");
+        assert!(
+            !rtsp_block.contains("username:"),
+            "rtsp username must be stripped, got:\n{rtsp_block}"
+        );
+        assert!(
+            !rtsp_block.contains("password:"),
+            "rtsp password must be stripped, got:\n{rtsp_block}"
+        );
+        // Non-credential content in the rtsp block (comments, other keys) is
+        // preserved — only the two credential lines are removed.
+        assert!(rtsp_block.contains("# credential lines follow"));
+
+        // The api block KEEPS its credentials + local_auth (internal REST stays
+        // authenticated in both postures).
+        let api_block = out
+            .split_once("api:")
+            .expect("api block present")
+            .1
+            .split("rtsp:")
+            .next()
+            .expect("content before rtsp");
+        assert!(api_block.contains("username: \"${GO2RTC_USER}\""));
+        assert!(api_block.contains("password: \"${GO2RTC_PASS}\""));
+        assert!(api_block.contains("local_auth: true"));
+
+        // Unrelated blocks survive intact.
+        assert!(out.contains("webrtc:"));
+        assert!(out.contains("streams: {}"));
+        assert!(out.contains("listen: \":8554\""));
+    }
+
+    /// Byte-for-byte guard on the auth-ON path is enforced by
+    /// `resolve_effective_config` returning the template unchanged; here we
+    /// prove the transform itself only ever REMOVES the two rtsp credential
+    /// lines and changes nothing else (line count drops by exactly 2).
+    #[test]
+    fn strip_rtsp_auth_removes_exactly_two_lines() {
+        let before = SAMPLE.lines().count();
+        let out = strip_rtsp_auth(SAMPLE);
+        assert_eq!(
+            out.lines().count(),
+            before - 2,
+            "exactly the rtsp username + password lines are removed"
+        );
+    }
+
+    /// A config with no rtsp credentials (already open, or a hand-edited file)
+    /// is returned unchanged — the transform is idempotent and never errors.
+    #[test]
+    fn strip_rtsp_auth_is_idempotent() {
+        let once = strip_rtsp_auth(SAMPLE);
+        let twice = strip_rtsp_auth(&once);
+        assert_eq!(once, twice);
+    }
 
     /// Audit #76 regression: the old UTF-8-strict `next_line()` drain returned
     /// `InvalidData` on the first non-UTF-8 byte and silently exited, closing
