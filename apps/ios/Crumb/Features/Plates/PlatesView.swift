@@ -584,7 +584,7 @@ struct PlatesView: View {
             cameraId: read.cameraId,
             cameraName: vm.cameraName(read.cameraId),
             kind: "detection",
-            label: read.plate.isEmpty ? "license_plate" : read.plate,
+            label: read.resolvedName ?? (read.plate.isEmpty ? "license_plate" : read.plate),
             iconKey: "car",
             score: read.confidence.map(Float.init),
             startTs: iso.string(from: ts.addingTimeInterval(-8)),
@@ -601,6 +601,27 @@ struct PlatesView: View {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             withAnimation { toast = nil }
         }
+    }
+}
+
+// MARK: - Plate name
+
+private extension PlateRead {
+    /// The operator-assigned plate name, trimmed; nil when absent or blank so
+    /// the UI falls back to the raw plate exactly as before.
+    var resolvedName: String? {
+        guard let n = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !n.isEmpty else { return nil }
+        return n
+    }
+}
+
+private extension WatchlistEntry {
+    /// The operator-assigned plate name, trimmed; nil when absent or blank.
+    var resolvedName: String? {
+        guard let n = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !n.isEmpty else { return nil }
+        return n
     }
 }
 
@@ -627,9 +648,21 @@ private struct PlateRow: View {
             thumbnail
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(read.plate.isEmpty ? "—" : read.plate)
-                        .font(.system(size: 17, weight: .bold, design: .monospaced))
-                        .foregroundColor(CrumbColors.textPrimary)
+                    if let name = read.resolvedName {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(name)
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(CrumbColors.textPrimary)
+                                .lineLimit(1)
+                            Text(read.plate.isEmpty ? "—" : read.plate)
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundColor(CrumbColors.textSecondary)
+                        }
+                    } else {
+                        Text(read.plate.isEmpty ? "—" : read.plate)
+                            .font(.system(size: 17, weight: .bold, design: .monospaced))
+                            .foregroundColor(CrumbColors.textPrimary)
+                    }
                     if count > 1 {
                         Text("×\(count)")
                             .font(.caption2.weight(.bold).monospacedDigit())
@@ -745,9 +778,20 @@ private struct PlateCard: View {
             }
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text(read.plate.isEmpty ? "—" : read.plate)
-                        .font(.system(size: 15, weight: .bold, design: .monospaced))
-                        .foregroundColor(CrumbColors.textPrimary).lineLimit(1)
+                    if let name = read.resolvedName {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(name)
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(CrumbColors.textPrimary).lineLimit(1)
+                            Text(read.plate.isEmpty ? "—" : read.plate)
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(CrumbColors.textSecondary).lineLimit(1)
+                        }
+                    } else {
+                        Text(read.plate.isEmpty ? "—" : read.plate)
+                            .font(.system(size: 15, weight: .bold, design: .monospaced))
+                            .foregroundColor(CrumbColors.textPrimary).lineLimit(1)
+                    }
                     Spacer()
                     ConfidenceChip(confidence: read.confidence)
                 }
@@ -960,9 +1004,18 @@ private struct WatchlistRow: View {
                 Circle().fill(c).frame(width: 10, height: 10)
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(entry.plate)
-                    .font(.system(.body, design: .monospaced).weight(.semibold))
-                    .foregroundColor(CrumbColors.textPrimary)
+                if let name = entry.resolvedName {
+                    Text(name)
+                        .font(.body.weight(.semibold))
+                        .foregroundColor(CrumbColors.textPrimary)
+                    Text(entry.plate)
+                        .font(.system(.caption, design: .monospaced).weight(.semibold))
+                        .foregroundColor(CrumbColors.textSecondary)
+                } else {
+                    Text(entry.plate)
+                        .font(.system(.body, design: .monospaced).weight(.semibold))
+                        .foregroundColor(CrumbColors.textPrimary)
+                }
                 if let label = entry.label, !label.isEmpty {
                     Text(label).font(.caption).foregroundColor(CrumbColors.textSecondary)
                 }
@@ -1026,9 +1079,16 @@ private struct WatchlistEditSheet: View {
         NavigationStack {
             List {
                 Section("Plate") {
-                    Text(entry.plate)
-                        .font(.system(.body, design: .monospaced).weight(.semibold))
-                        .foregroundColor(CrumbColors.textSecondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let name = entry.resolvedName {
+                            Text(name)
+                                .font(.body.weight(.semibold))
+                                .foregroundColor(CrumbColors.textPrimary)
+                        }
+                        Text(entry.plate)
+                            .font(.system(.body, design: .monospaced).weight(.semibold))
+                            .foregroundColor(CrumbColors.textSecondary)
+                    }
                 }
                 Section("Details") {
                     TextField("Label (optional)", text: $label)
