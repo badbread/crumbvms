@@ -20,6 +20,34 @@
 #   - The host 'render' group GID: `getent group render | cut -d: -f3`. Put it in
 #     RENDER_GID so the non-root container user (uid 1001) can open the node.
 #
+# ── STABILITY ON MULTI-GPU HOSTS (renderD numbers are NOT stable) ────────────
+# The renderD128 / renderD129 NUMBERS are assigned at boot and can REORDER when
+# you have more than one GPU (e.g. an iGPU + a discrete NVIDIA card). A GPU-driver
+# upgrade + reboot can move the iGPU from renderD128 to renderD129 and hand
+# renderD128 to the OTHER card. If MOTION_VAAPI_DEVICE still points at renderD128,
+# VAAPI decode now targets a card with no VAAPI: every motion-decode ffmpeg child
+# exits instantly ("Failed to initialise VAAPI connection"), motion detection goes
+# DOWN, and the recorder fails OPEN to continuous recording, silently.
+#
+# Robust fix: map the iGPU by its STABLE by-path symlink instead of the volatile
+# renderD number. The by-path name is tied to the PCI address, which does not move
+# across reboots. Find it with `ls -l /dev/dri/by-path` (look for the *-render
+# entry whose target is your iGPU's renderD* node), then in .env set e.g.:
+#   MOTION_VAAPI_DEVICE=/dev/dri/by-path/pci-0000:00:02.0-render
+# (0000:00:02.0 is the classic Intel iGPU address; use YOURS.) ffmpeg follows the
+# symlink to whichever renderD* the iGPU currently owns, so a driver upgrade can
+# no longer repoint decode at the wrong card.
+#
+# NOTE: server_settings.motion_hwaccel / motion_vaapi_device in the DB (set via
+# the admin console) OVERRIDE these env vars. If you set the decode mode in the
+# console, changing MOTION_HWACCEL here does nothing: change it in the console
+# (or clear the DB value) too.
+#
+# Immune-by-design alternative: MOTION_HWACCEL=cpu. Motion analysis runs at ~320px
+# / 5 fps, so software decode is cheap and cannot be affected by any GPU render-
+# node reordering, driver mismatch, or device-mapping problem. If iGPU power
+# savings don't justify the operational fragility on YOUR host, cpu is a safe pick.
+#
 # NVDEC (discrete NVIDIA) is a SEPARATE overlay (docker-compose.gpu.example.yml).
 # Pick whichever matches your hardware; don't apply both for the same decode mode.
 #
@@ -30,10 +58,14 @@ services:
     environment:
       # Force VAAPI decode (overrides the base 'auto').
       MOTION_HWACCEL: ${MOTION_HWACCEL:-vaapi}
-      # DRI render node for the iGPU. Override if yours isn't renderD128.
+      # DRI render node for the iGPU. Override if yours isn't renderD128. On a
+      # multi-GPU host, prefer the stable by-path symlink over the renderD number
+      # (see the STABILITY note in the header), e.g.:
+      #   MOTION_VAAPI_DEVICE=/dev/dri/by-path/pci-0000:00:02.0-render
       MOTION_VAAPI_DEVICE: ${MOTION_VAAPI_DEVICE:-/dev/dri/renderD128}
     devices:
-      # Map the iGPU render node into the container.
+      # Map the iGPU render node into the container. A by-path value resolves to
+      # the correct renderD* even if the numbers reorder across a reboot.
       - ${MOTION_VAAPI_DEVICE:-/dev/dri/renderD128}:${MOTION_VAAPI_DEVICE:-/dev/dri/renderD128}
     group_add:
       # Host 'render' group GID — required for the uid-1001 container user to open

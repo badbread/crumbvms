@@ -105,6 +105,28 @@ alone is not enough, the NVIDIA container toolkit also activates on the
 `NVIDIA_VISIBLE_DEVICES` environment variable, so that must be set to
 `void` as well. Reboot at the next opportunity and put the overlay back.
 
+**Motion events stopped and storage is filling faster than usual, on a VAAPI
+(iGPU) install.** On a host with more than one GPU, the `/dev/dri/renderD*`
+node numbers can reorder across a driver upgrade + reboot, so a
+`MOTION_VAAPI_DEVICE` pinned to `renderD128` can end up pointing at a card
+with no VAAPI. Motion decode then fails to initialise and the recorder falls
+**open** to continuous recording, it keeps all footage, but silently. Confirm
+it in the recorder logs:
+
+```bash
+docker compose logs recorder | grep -i "VAAPI decode init FAILING"
+```
+
+A match (or a raw `Failed to initialise VAAPI connection` from ffmpeg)
+confirms the wrong render node. **Fix:** map the iGPU by its stable by-path
+symlink instead of the bare number (`MOTION_VAAPI_DEVICE=/dev/dri/by-path/pci-<addr>-render`),
+or switch motion decode to CPU, which is immune to this whole class of
+problem. Both are covered in
+[Hardware decode](/configuration/hardware-decode). If you set the decode mode
+in the admin console, remember the stored DB value **overrides** the
+`MOTION_HWACCEL` / `MOTION_VAAPI_DEVICE` env vars, change it in the console
+too, or an env-only fix will appear to do nothing.
+
 ## Cameras
 
 **A camera won't connect.** Usually a wrong RTSP URL or credentials.

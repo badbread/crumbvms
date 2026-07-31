@@ -2419,8 +2419,9 @@ async fn run_pixel_diff_loop(
     // NVDEC session + VRAM leak indefinitely).  We drain stderr line-by-line in
     // a background task, logging at DEBUG level.
     let camera_id_log = camera.id;
+    let vaapi_selected = use_vaapi;
     let stderr_handle = tokio::spawn(async move {
-        drain_motion_stderr(stderr, camera_id_log).await;
+        drain_motion_stderr(stderr, camera_id_log, vaapi_selected).await;
     });
 
     // ── 7. Initialise per-loop state ──────────────────────────────────────────
@@ -3145,6 +3146,27 @@ async fn read_exact_frame(
 /// teardown `stderr_handle.await`.
 const STDERR_DRAIN_MAX_CONSECUTIVE_ERRORS: u32 = 100;
 
+/// True when an ffmpeg stderr line signals VAAPI hardware-decode
+/// INITIALISATION failure — the render node was opened but there is no usable
+/// VAAPI driver behind it, so ffmpeg exits immediately having decoded nothing.
+///
+/// This is the render-node-reordering trap (issue #411): on a multi-GPU host
+/// the `/dev/dri/renderD*` node NUMBERS are not stable across a GPU-driver
+/// upgrade + reboot. A fixed `renderD128` mapping can silently land on a card
+/// with no VAAPI (e.g. an NVIDIA GPU that took `renderD128` when the iGPU moved
+/// to `renderD129`). The device path still EXISTS, so the pre-launch presence
+/// check in `run_one_source` passes, but ffmpeg fails at runtime with one of
+/// these lines and exits with no frames — motion then fails OPEN to continuous
+/// recording, silently, until an operator notices. Matched case-insensitively
+/// against the known ffmpeg/libva messages.
+fn is_vaapi_init_failure(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("failed to initialise vaapi")
+        || l.contains("failed to initialize vaapi")
+        || l.contains("no device available for decoder")
+        || (l.contains("device type vaapi") && l.contains("needed for"))
+}
+
 /// Drain the motion ffmpeg child's stderr to DEBUG logs until EOF, returning
 /// the number of lines drained (exercised by tests).
 ///
@@ -3158,14 +3180,25 @@ const STDERR_DRAIN_MAX_CONSECUTIVE_ERRORS: u32 = 100;
 /// a short pause, bounded by [`STDERR_DRAIN_MAX_CONSECUTIVE_ERRORS`]) rather
 /// than ending the drain, because only EOF (`Ok(0)` — the child exited) means
 /// there is nothing left to drain.
+///
+/// `vaapi_selected` = this child was launched with `-hwaccel vaapi`. When set,
+/// the FIRST stderr line matching [`is_vaapi_init_failure`] is re-logged at
+/// ERROR with an operator-actionable, greppable message (the render-node trap,
+/// issue #411). Escalated at most once per child so a back-off reconnect loop
+/// leaves a recurring-but-not-spammy trail. This only ADDS a log line; it does
+/// not change decode behavior or the fail-open path.
 async fn drain_motion_stderr(
     stderr: impl tokio::io::AsyncRead + Unpin,
     camera_id: uuid::Uuid,
+    vaapi_selected: bool,
 ) -> u64 {
     let mut reader = tokio::io::BufReader::new(stderr);
     let mut line: Vec<u8> = Vec::new();
     let mut drained: u64 = 0;
     let mut consecutive_errors: u32 = 0;
+    // Escalate the VAAPI-init-failure signature at most once per child, so a
+    // back-off reconnect loop doesn't flood the log with duplicate ERRORs.
+    let mut vaapi_failure_escalated = false;
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line).await {
@@ -3181,6 +3214,24 @@ async fn drain_motion_stderr(
                         ffmpeg_stderr = trimmed,
                         "motion ffmpeg"
                     );
+                    if vaapi_selected && !vaapi_failure_escalated && is_vaapi_init_failure(trimmed)
+                    {
+                        vaapi_failure_escalated = true;
+                        error!(
+                            camera_id     = %camera_id,
+                            ffmpeg_stderr = trimmed,
+                            "motion VAAPI decode init FAILING for this camera: the mapped \
+                             render node has no usable VAAPI driver, so the decoder exited \
+                             with no frames. Motion detection is DOWN for this camera and \
+                             recording has failed OPEN to continuous as a safety fallback. \
+                             Likely cause: the /dev/dri render-node NUMBER moved across a \
+                             GPU-driver upgrade + reboot (issue #411). Map the iGPU by its \
+                             STABLE by-path symlink (/dev/dri/by-path/pci-<addr>-render) \
+                             instead of a bare renderD128, or set motion decode to cpu \
+                             (note: server_settings.motion_hwaccel in the DB OVERRIDES the \
+                             MOTION_HWACCEL env var)."
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -4365,7 +4416,10 @@ mod tests {
         // stdout frame reader stalled (correctness item 5). The byte drain
         // must reach EOF having seen all three lines.
         let stderr: &[u8] = b"frame=1 fps=5\n\xff\xfe bad bytes\nframe=2 fps=5\n";
-        assert_eq!(drain_motion_stderr(stderr, uuid::Uuid::nil()).await, 3);
+        assert_eq!(
+            drain_motion_stderr(stderr, uuid::Uuid::nil(), false).await,
+            3
+        );
     }
 
     #[tokio::test]
@@ -4373,7 +4427,38 @@ mod tests {
         // A child that dies mid-line leaves a final chunk without '\n' — it is
         // still drained (read_until returns Ok(n>0) for it) before the Ok(0) EOF.
         let stderr: &[u8] = b"line one\ntruncated";
-        assert_eq!(drain_motion_stderr(stderr, uuid::Uuid::nil()).await, 2);
+        assert_eq!(
+            drain_motion_stderr(stderr, uuid::Uuid::nil(), true).await,
+            2
+        );
+    }
+
+    // ── VAAPI init-failure signature (render-node reorder trap, issue #411) ──────
+
+    #[test]
+    fn vaapi_init_failure_matches_known_ffmpeg_libva_messages() {
+        // The exact lines observed when a renderD* number moved onto a card with
+        // no VAAPI after a driver upgrade + reboot.
+        assert!(is_vaapi_init_failure(
+            "[AVHWDeviceContext @ 0x...] Failed to initialise VAAPI connection: unknown libva error."
+        ));
+        assert!(is_vaapi_init_failure(
+            "No device available for decoder: device type vaapi needed for codec h264."
+        ));
+        // Case-insensitive + the American spelling ffmpeg sometimes emits.
+        assert!(is_vaapi_init_failure("FAILED TO INITIALIZE VAAPI DEVICE"));
+    }
+
+    #[test]
+    fn vaapi_init_failure_ignores_ordinary_stderr() {
+        // Normal ffmpeg chatter must never trip the escalation.
+        assert!(!is_vaapi_init_failure("frame= 42 fps=5.0 q=-0.0 size=N/A"));
+        assert!(!is_vaapi_init_failure(
+            "[rtsp @ 0x...] method DESCRIBE failed: 401 Unauthorized"
+        ));
+        assert!(!is_vaapi_init_failure(
+            "Using VAAPI device /dev/dri/renderD128"
+        ));
     }
 
     // ── frame_absdiff ─────────────────────────────────────────────────────────
