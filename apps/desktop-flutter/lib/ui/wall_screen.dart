@@ -21,11 +21,13 @@ import 'package:crumb_desktop/services/audio_follow_controller.dart';
 import 'package:crumb_desktop/services/diagnostics_service.dart';
 import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
+import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/ha_link/ha_link_dialog.dart';
+import 'package:crumb_desktop/ui/live/adaptive_guardrail_dialog.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
@@ -76,6 +78,7 @@ class WallScreen extends StatefulWidget {
     required this.isAdmin,
     this.clientOptions,
     this.streamPrefs,
+    this.adaptive,
     this.view,
     this.audio,
     this.hotkeys,
@@ -112,6 +115,12 @@ class WallScreen extends StatefulWidget {
   /// Per-camera stream (main/sub) + PTZ-disable prefs. Drives the right-click
   /// menu on a tile and which stream each pane plays.
   final StreamPrefsStore? streamPrefs;
+
+  /// Adaptive live-wall quality brain (issue #382). The wall feeds it the
+  /// decode-util signal from its stats poll and a per-tile registry; it drives
+  /// the config-time guardrail nudge (Stage 1) and the runtime shed/restore of
+  /// peripheral tiles (Stage 2). Null → both stages inert (feature unavailable).
+  final AdaptiveWallController? adaptive;
 
   /// The applied saved view (its custom layout + slot→camera map). Null → the
   /// default auto-grid of every enabled camera (the "All Cameras" wall).
@@ -389,6 +398,15 @@ class _WallScreenState extends State<WallScreen> {
     }
     _lastCpuTime = s.cpuTimeSecs;
     _lastSample = now;
+    // Feed the adaptive-wall brain the same decode-util signal (issue #382).
+    // gpuDecUtil is null on software-decode / no-counter boxes; the controller
+    // falls back to CPU decode util, and to the count guardrail only if neither
+    // is measurable — never assuming free headroom.
+    widget.adaptive?.pushSample(
+      gpuDecUtil: s.gpuDecUtil,
+      cpuPercent: cpuPct,
+      at: now,
+    );
     // Perf/debug line for the bottom status bar (no wall rebuild needed).
     // GPU/Decode are vendor-neutral now (NVML on NVIDIA, else the Windows
     // "GPU Engine" perf counters — see rust/src/api/host.rs), so the label is
@@ -822,6 +840,8 @@ class _WallScreenState extends State<WallScreen> {
                     camera: cam,
                     liveStatus: _liveStatus,
                     streamPrefs: widget.streamPrefs,
+                    adaptive: widget.adaptive,
+                    wallOrder: i,
                     audio: widget.audio,
                     showInfoBar: showInfoBar,
                     zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
@@ -897,6 +917,8 @@ class _WallScreenState extends State<WallScreen> {
                 camera: cam,
                 liveStatus: _liveStatus,
                 streamPrefs: widget.streamPrefs,
+                adaptive: widget.adaptive,
+                wallOrder: i,
                 audio: widget.audio,
                 showInfoBar: showInfoBar,
                 zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
@@ -920,20 +942,30 @@ class _WallScreenState extends State<WallScreen> {
   }
 }
 
-/// Compact "SD" chip marking a pane that is playing the Data-saver (low-res
-/// `_mobile` transcode) tier — so it's visible at a glance which tiles are on
-/// the bandwidth-saving stream. Amber (the app's "warn" accent) on black text.
+/// Compact "SD" chip marking a pane that is playing a reduced-resolution
+/// stream. Two flavors, same glyph:
+///   * [adaptive] == false — the Data-saver (low-res `_mobile` transcode) tier,
+///     amber (the app's "warn" accent).
+///   * [adaptive] == true — the adaptive wall auto-shed this tile to sub to
+///     protect decode headroom (issue #382). Blue tint so it reads as "the
+///     system protected you", not a bug; it self-restores silently.
 class _SdBadge extends StatelessWidget {
-  const _SdBadge();
+  const _SdBadge({this.adaptive = false});
+
+  final bool adaptive;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: 'Data saver (low-res)',
+      message: adaptive
+          ? 'Auto-reduced to sub to protect decode headroom'
+          : 'Data saver (low-res)',
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
         decoration: BoxDecoration(
-          color: Colors.amber.shade600.withValues(alpha: 0.9),
+          color: adaptive
+              ? Colors.lightBlue.shade400.withValues(alpha: 0.92)
+              : Colors.amber.shade600.withValues(alpha: 0.9),
           borderRadius: BorderRadius.circular(4),
         ),
         child: const Text(
@@ -978,6 +1010,8 @@ class _WallTile extends StatefulWidget {
     required this.showInfoBar,
     required this.onTap,
     this.streamPrefs,
+    this.adaptive,
+    this.wallOrder = 0,
     this.audio,
     this.fit = BoxFit.cover,
     this.zoomToMain = false,
@@ -1002,6 +1036,16 @@ class _WallTile extends StatefulWidget {
   final bool showInfoBar;
   final VoidCallback onTap;
   final StreamPrefsStore? streamPrefs;
+
+  /// Adaptive live-wall quality brain (issue #382). When present, the tile
+  /// registers itself (order/visibility/focus/measured resolution), plays sub
+  /// while the controller has it shed, and shows the auto-reduced "SD" badge.
+  final AdaptiveWallController? adaptive;
+
+  /// This tile's position in the wall (slot / reading order), used by the
+  /// adaptive shedder to pick peripheral tiles first.
+  final int wallOrder;
+
   final AudioFollowController? audio;
 
   /// "Edit PTZ panel…" from the right-click menu (PTZ cameras only): the wall
@@ -1111,8 +1155,25 @@ class _WallTileState extends State<_WallTile> {
 
   /// The quality tier this pane is currently resolved to play (mirrors the URL
   /// [StreamPrefsStore.liveStreamUrl] picked), for the tile's "SD" badge. Null
-  /// until the first stream fetch completes.
+  /// until the first stream fetch completes. Reflects the adaptive backpressure
+  /// downgrade so the badge never disagrees with the pixels.
   StreamQuality? get _activeQuality {
+    final s = _streams;
+    if (s == null) return null;
+    return widget.streamPrefs?.resolvedQuality(
+      widget.camera.id,
+      s,
+      isMaximized: _zoomedToMain,
+      adaptiveDowngrade: _adaptiveShed,
+    );
+  }
+
+  /// True while the adaptive controller has this pane shed to sub (issue #382).
+  bool get _adaptiveShed => widget.adaptive?.isShed(_paneId) ?? false;
+
+  /// The tier this pane WOULD play absent any adaptive shed — used to tell an
+  /// auto-reduced main (blue "SD") apart from a genuine Data-saver tile (amber).
+  StreamQuality? get _configuredQuality {
     final s = _streams;
     if (s == null) return null;
     return widget.streamPrefs?.resolvedQuality(
@@ -1121,6 +1182,12 @@ class _WallTileState extends State<_WallTile> {
       isMaximized: _zoomedToMain,
     );
   }
+
+  /// The adaptive wall actually knocked this main tile down to sub right now.
+  bool get _autoReduced =>
+      _adaptiveShed &&
+      _configuredQuality == StreamQuality.main &&
+      _activeQuality == StreamQuality.sub;
 
   /// Per-pane stall watchdog: polls the ACTIVE player's frame/position
   /// progress and, on a confirmed freeze (camera reboot, go2rtc restart, PoE
@@ -1215,12 +1282,30 @@ class _WallTileState extends State<_WallTile> {
     setState(() => _offset = _clampOffset(_offset + delta, pane));
   }
 
+  /// Last-seen adaptive shed state for THIS pane, so the controller's
+  /// notifications (which fire for any tile) only trigger a stream swap here
+  /// when our own shed status actually flips.
+  bool _lastAdaptiveShed = false;
+
   @override
   void initState() {
     super.initState();
     _shown = widget.camera;
+    _lastAdaptiveShed = _adaptiveShed;
+    widget.adaptive?.addListener(_onAdaptiveChanged);
     _load();
     unawaited(_loadHaLinks());
+  }
+
+  /// The adaptive controller changed something. If OUR shed status flipped,
+  /// swap the stream (main<->sub); the old player keeps painting until the
+  /// replacement decodes, so there's no black flash.
+  void _onAdaptiveChanged() {
+    if (!mounted) return;
+    final shed = _adaptiveShed;
+    if (shed == _lastAdaptiveShed) return;
+    _lastAdaptiveShed = shed;
+    unawaited(_reloadStream());
   }
 
   @override
@@ -1272,6 +1357,7 @@ class _WallTileState extends State<_WallTile> {
       // now-wrong camera in _pending (#254).
       if (gen != _loadGen || !mounted) return;
       _streams = streams; // gate the Data-saver menu item + drive the SD badge
+      _reportAdaptive(); // refresh canDowngrade (sub availability) for the shedder
       // Per-camera main/sub/data-saver override (right-click menu) wins over
       // the wall default; falls back to the plain wall preference if no store.
       final url =
@@ -1280,6 +1366,8 @@ class _WallTileState extends State<_WallTile> {
             streams,
             // Zoomed-in tiles temporarily play main (full-res); otherwise sub.
             isMaximized: _zoomedToMain,
+            // Adaptive backpressure sheds this peripheral tile to sub (#382).
+            adaptiveDowngrade: _adaptiveShed,
           ) ??
           streams.preferredForWall;
       if (url == null) {
@@ -1325,7 +1413,12 @@ class _WallTileState extends State<_WallTile> {
         }
       });
       player.stream.height.listen((h) {
-        if (h != null && h > 0) _videoH = h;
+        if (h != null && h > 0) {
+          _videoH = h;
+          // Keep the adaptive controller's measured-resolution reading current
+          // for cold-start weighting (best-effort; no rebuild forced).
+          _reportAdaptive();
+        }
       });
       await player.open(Media(url));
       if (gen != _loadGen || !mounted) {
@@ -1462,6 +1555,7 @@ class _WallTileState extends State<_WallTile> {
             widget.camera.id,
             streams,
             isMaximized: _zoomedToMain,
+            adaptiveDowngrade: _adaptiveShed,
           ) ??
           streams.preferredForWall;
       if (url == null) return;
@@ -1686,6 +1780,10 @@ class _WallTileState extends State<_WallTile> {
       case 'ha-overlay':
         widget.onEditHaOverlay?.call();
       case 'main':
+        // Stage 1 guardrail (issue #382): warn before a per-camera -> main
+        // switch that would over-subscribe this machine's decoder. Advisory —
+        // "Proceed anyway" still applies it.
+        if (!await _confirmSwitchToMain()) break;
         prefs?.setOverride(widget.camera.id, StreamQuality.main);
         await _reloadStream();
       case 'sub':
@@ -1700,8 +1798,35 @@ class _WallTileState extends State<_WallTile> {
     }
   }
 
+  /// Stage 1 guardrail for switching THIS camera to its main stream from the
+  /// right-click menu. Returns true if the switch should proceed. Never blocks:
+  /// the nudge only appears when the projected load would over-subscribe the
+  /// decoder, and "Proceed anyway" / "Don't warn on this machine" both proceed.
+  Future<bool> _confirmSwitchToMain() async {
+    final adaptive = widget.adaptive;
+    if (adaptive == null) return true;
+    final opts = adaptive.options;
+    if (!opts.adaptiveWallGuardrail || opts.adaptiveWallGuardrailDontWarn) {
+      return true;
+    }
+    final assessment = adaptive.assessCameraMain(widget.camera.id);
+    if (!assessment.overSubscribed) return true;
+    if (!context.mounted) return true;
+    final choice = await showAdaptiveGuardrailDialog(
+      context,
+      assessment: assessment,
+    );
+    if (choice == null || choice == GuardrailChoice.keepSub) return false;
+    if (choice == GuardrailChoice.dontWarnOnThisMachine) {
+      opts.adaptiveWallGuardrailDontWarn = true;
+    }
+    return true;
+  }
+
   @override
   void dispose() {
+    widget.adaptive?.removeListener(_onAdaptiveChanged);
+    widget.adaptive?.dropTile(_paneId);
     _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
@@ -1744,6 +1869,7 @@ class _WallTileState extends State<_WallTile> {
       valueListenable: SnapshotRegistry.instance.activePaneId,
       builder: (context, activeId, _) {
         final selected = activeId == _paneId;
+        _reportAdaptive();
         return Stack(
           fit: StackFit.expand,
           children: [
@@ -1782,8 +1908,33 @@ class _WallTileState extends State<_WallTile> {
           recentMotion: status?.recentMotion ?? false,
           detectionKeys: widget.liveStatus.detectionKeysFor(widget.camera.id),
           dataSaver: _activeQuality == StreamQuality.dataSaver,
+          autoReduced: _autoReduced,
         );
       },
+    );
+  }
+
+  /// Push this tile's current state into the adaptive controller (issue #382).
+  /// Cheap map writes only — never notifies (the one focus-unshed exception is
+  /// deferred inside the controller), so it's safe to call from build or from a
+  /// stream/frame callback.
+  void _reportAdaptive() {
+    if (!mounted) return; // a late stream callback must not resurrect the tile
+    final adaptive = widget.adaptive;
+    if (adaptive == null) return;
+    final selected =
+        SnapshotRegistry.instance.activePaneId.value == _paneId;
+    adaptive.syncTile(
+      _paneId,
+      cameraId: widget.camera.id,
+      wallOrder: widget.wallOrder,
+      // The default grid and custom views lay every tile out at once (no
+      // scrolling), so a mounted tile is on-screen.
+      visible: true,
+      // Focused (selected), hovered/zoomed, or zoom-switched-to-main — never shed.
+      protectedTile: selected || _scale > 1.01 || _zoomedToMain,
+      canDowngrade: _streams?.rtspSub != null,
+      measuredHeight: _videoH ?? 0,
     );
   }
 
@@ -1937,6 +2088,9 @@ class _WallTileState extends State<_WallTile> {
                           if (_activeQuality == StreamQuality.dataSaver) ...[
                             const SizedBox(width: 6),
                             const _SdBadge(),
+                          ] else if (_autoReduced) ...[
+                            const SizedBox(width: 6),
+                            const _SdBadge(adaptive: true),
                           ],
                           if (_reconnecting) ...[
                             const SizedBox(width: 6),

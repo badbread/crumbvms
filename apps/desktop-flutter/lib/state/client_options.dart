@@ -106,6 +106,12 @@ const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
 const String _kZoomSwitchesToMain = 'crumb.zoomSwitchesToMain';
 const String _kOpenClipsInHd = 'crumb.openClipsInHd';
 const String _kSeamlessTileSwitch = 'crumb.seamlessTileSwitch';
+// Adaptive live-wall quality (issue #382) — client-local, both default ON.
+const String _kAdaptiveWallGuardrail = 'crumb.adaptiveWallGuardrail';
+const String _kAdaptiveWallBackpressure = 'crumb.adaptiveWallBackpressure';
+// "Don't warn on this machine" opt-out for the Stage 1 guardrail nudge.
+const String _kAdaptiveWallGuardrailDontWarn =
+    'crumb.adaptiveWallGuardrailDontWarn';
 
 /// Loads/holds/persists the client options this file owns. Construct once
 /// (e.g. in `CrumbClientApp` state) via [ClientOptionsStore.load] and pass
@@ -129,6 +135,9 @@ class ClientOptionsStore extends ChangeNotifier {
     required bool zoomSwitchesToMain,
     required bool openClipsInHd,
     required bool seamlessTileSwitching,
+    required bool adaptiveWallGuardrail,
+    required bool adaptiveWallBackpressure,
+    required bool adaptiveWallGuardrailDontWarn,
   }) : _showInfoBar = showInfoBar,
        _showAllCamerasView = showAllCamerasView,
        _hotkeysEnabled = hotkeysEnabled,
@@ -138,7 +147,10 @@ class ClientOptionsStore extends ChangeNotifier {
        _ptzWheelCorner = ptzWheelCorner,
        _zoomSwitchesToMain = zoomSwitchesToMain,
        _openClipsInHd = openClipsInHd,
-       _seamlessTileSwitching = seamlessTileSwitching;
+       _seamlessTileSwitching = seamlessTileSwitching,
+       _adaptiveWallGuardrail = adaptiveWallGuardrail,
+       _adaptiveWallBackpressure = adaptiveWallBackpressure,
+       _adaptiveWallGuardrailDontWarn = adaptiveWallGuardrailDontWarn;
 
   final SharedPreferences? _prefs;
 
@@ -152,6 +164,9 @@ class ClientOptionsStore extends ChangeNotifier {
   bool _zoomSwitchesToMain;
   bool _openClipsInHd;
   bool _seamlessTileSwitching;
+  bool _adaptiveWallGuardrail;
+  bool _adaptiveWallBackpressure;
+  bool _adaptiveWallGuardrailDontWarn;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -174,6 +189,11 @@ class ClientOptionsStore extends ChangeNotifier {
       zoomSwitchesToMain: prefs?.getBool(_kZoomSwitchesToMain) ?? false,
       openClipsInHd: prefs?.getBool(_kOpenClipsInHd) ?? false,
       seamlessTileSwitching: prefs?.getBool(_kSeamlessTileSwitch) ?? true,
+      adaptiveWallGuardrail: prefs?.getBool(_kAdaptiveWallGuardrail) ?? true,
+      adaptiveWallBackpressure:
+          prefs?.getBool(_kAdaptiveWallBackpressure) ?? true,
+      adaptiveWallGuardrailDontWarn:
+          prefs?.getBool(_kAdaptiveWallGuardrailDontWarn) ?? false,
     );
   }
 
@@ -266,6 +286,39 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _seamlessTileSwitching) return;
     _seamlessTileSwitching = v;
     unawaited(_prefs?.setBool(_kSeamlessTileSwitch, v));
+    notifyListeners();
+  }
+
+  // ── Adaptive live-wall quality (issue #382), both client-local, default ON ──
+
+  // Stage 1: warn at config time when a change (wall default -> main, a
+  // per-camera -> main) would over-subscribe this machine's decoder.
+  bool get adaptiveWallGuardrail => _adaptiveWallGuardrail;
+  set adaptiveWallGuardrail(bool v) {
+    if (v == _adaptiveWallGuardrail) return;
+    _adaptiveWallGuardrail = v;
+    unawaited(_prefs?.setBool(_kAdaptiveWallGuardrail, v));
+    notifyListeners();
+  }
+
+  // Stage 2: shed peripheral tiles to sub when smoothed decode util saturates,
+  // restore them when it recovers.
+  bool get adaptiveWallBackpressure => _adaptiveWallBackpressure;
+  set adaptiveWallBackpressure(bool v) {
+    if (v == _adaptiveWallBackpressure) return;
+    _adaptiveWallBackpressure = v;
+    unawaited(_prefs?.setBool(_kAdaptiveWallBackpressure, v));
+    notifyListeners();
+  }
+
+  // "Don't warn on this machine" — the guardrail nudge's permanent opt-out.
+  // Independent of [adaptiveWallGuardrail] so re-enabling the guardrail doesn't
+  // resurrect a warning the operator dismissed for good.
+  bool get adaptiveWallGuardrailDontWarn => _adaptiveWallGuardrailDontWarn;
+  set adaptiveWallGuardrailDontWarn(bool v) {
+    if (v == _adaptiveWallGuardrailDontWarn) return;
+    _adaptiveWallGuardrailDontWarn = v;
+    unawaited(_prefs?.setBool(_kAdaptiveWallGuardrailDontWarn, v));
     notifyListeners();
   }
 }

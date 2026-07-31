@@ -189,11 +189,18 @@ class StreamPrefsStore {
   /// (full quality) unless this camera's main is known-dead this session, in
   /// which case it downgrades to sub. [liveStreamUrl] is defined in terms of
   /// this, so the tile badge never disagrees with the pixels on screen.
+  ///
+  /// [adaptiveDowngrade] is the adaptive-wall backpressure hook (issue #382):
+  /// when true, a tile whose configured tier resolves to MAIN is knocked down
+  /// to sub to shed decode load. It NEVER touches the maximized path (the
+  /// focused pane is protected) and only downgrades when a sub actually exists,
+  /// so a shed can never blank a pane.
   StreamQuality resolvedQuality(
     String cameraId,
     StreamUrls streams, {
     required bool isMaximized,
     bool maximizeUsesMain = true,
+    bool adaptiveDowngrade = false,
   }) {
     if (isMaximized && maximizeUsesMain) {
       if (mainUnavailable.contains(cameraId) && streams.rtspSub != null) {
@@ -203,20 +210,24 @@ class StreamPrefsStore {
           ? StreamQuality.main
           : (streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main);
     }
-    switch (effectiveFor(cameraId)) {
-      case StreamQuality.dataSaver:
-        if (streams.rtspMobile != null) return StreamQuality.dataSaver;
-        if (streams.rtspSub != null) return StreamQuality.sub;
-        return StreamQuality.main;
-      case StreamQuality.sub:
-        return streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main;
-      case StreamQuality.main:
-        return streams.rtspMain != null
-            ? StreamQuality.main
-            : (streams.rtspSub != null
-                  ? StreamQuality.sub
-                  : StreamQuality.main);
+    final base = switch (effectiveFor(cameraId)) {
+      StreamQuality.dataSaver => streams.rtspMobile != null
+          ? StreamQuality.dataSaver
+          : (streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main),
+      StreamQuality.sub =>
+        streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main,
+      StreamQuality.main => streams.rtspMain != null
+          ? StreamQuality.main
+          : (streams.rtspSub != null ? StreamQuality.sub : StreamQuality.main),
+    };
+    // Adaptive backpressure only sheds the expensive MAIN tier, and only when a
+    // sub is available to fall back to.
+    if (adaptiveDowngrade &&
+        base == StreamQuality.main &&
+        streams.rtspSub != null) {
+      return StreamQuality.sub;
     }
+    return base;
   }
 
   /// The URL for a given resolved tier, with a final safety fallback so a pane
@@ -243,12 +254,14 @@ class StreamPrefsStore {
     StreamUrls streams, {
     required bool isMaximized,
     bool maximizeUsesMain = true,
+    bool adaptiveDowngrade = false,
   }) {
     final q = resolvedQuality(
       cameraId,
       streams,
       isMaximized: isMaximized,
       maximizeUsesMain: maximizeUsesMain,
+      adaptiveDowngrade: adaptiveDowngrade,
     );
     return _urlForQuality(q, streams);
   }

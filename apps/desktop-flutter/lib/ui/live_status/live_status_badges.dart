@@ -78,6 +78,7 @@ class TileInfoBar extends StatelessWidget {
     required this.recentMotion,
     required this.detectionKeys,
     this.dataSaver = false,
+    this.autoReduced = false,
     this.height = 18,
   });
 
@@ -87,6 +88,12 @@ class TileInfoBar extends StatelessWidget {
   /// The pane is playing the Data-saver (low-res `_mobile` transcode) tier —
   /// show a small "SD" chip so the active stream tier is visible on the strip.
   final bool dataSaver;
+
+  /// The adaptive wall auto-shed this tile to sub to protect decode headroom
+  /// (issue #382). Renders the same "SD" chip in a distinct (blue) tint so it
+  /// reads as "the system protected you", not a bug. [dataSaver] takes visual
+  /// precedence when both are somehow set.
+  final bool autoReduced;
 
   /// First frame decoded and no error — drives the green "live" dot. When
   /// false (and not [hasError]) the dot is amber ("connecting").
@@ -137,12 +144,15 @@ class TileInfoBar extends StatelessWidget {
             ),
           ),
           // Data-saver ("SD") chip, just after the name — marks the tile as on
-          // the low-res transcode tier.
-          if (dataSaver) ...[
+          // the low-res transcode tier. The adaptive auto-shed reuses the same
+          // "SD" chip in a blue tint (see [autoReduced]).
+          if (dataSaver || autoReduced) ...[
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
               decoration: BoxDecoration(
-                color: Colors.amber.shade600.withValues(alpha: 0.9),
+                color: dataSaver
+                    ? Colors.amber.shade600.withValues(alpha: 0.9)
+                    : Colors.lightBlue.shade400.withValues(alpha: 0.92),
                 borderRadius: BorderRadius.circular(3),
               ),
               child: const Text(

@@ -200,6 +200,34 @@ user holds `view_plates`.
 behaviour could return without an outage, though there is little reason to want
 it back.
 
+## 2026-07-20, Live-wall quality is managed by measured decode util: a preventive guardrail (75%) gates config, reactive backpressure (85%) sheds at runtime
+
+The desktop live wall lets a user set the whole wall (or per camera) to the
+main stream. On a large wall that over-subscribes the client's video decoder
+(the cameras are shielded by the go2rtc restream; the ceiling is purely local
+GPU/CPU decode). The client already samples whole-GPU decode util but only
+displayed it. Decision: manage wall quality from that measured signal with two
+interlocking stages. A preventive **guardrail** warns at config time when the
+projected main-tile load (learned per-main cost x projected count) would exceed
+**75%**; reactive **backpressure** sheds peripheral tiles to sub when smoothed
+util exceeds **85%** for 4s and restores below **60%** for 20s (hysteresis to
+prevent flapping). The 75 < 85 relationship guarantees the warning always fires
+before the shedder. The focused/hovered/zoomed tile is never shed. Both features
+and all thresholds are client-local (per-machine budgets); no server change.
+
+**Rejected:** a static tile cap (wrong unit: 4K vs 1080p main and 10x machine
+variance make a fixed count either over-restrict or under-protect); server-side
+enforcement (the constraint is the client GPU, invisible to the server, and
+differs per viewer); blocking the all-main action (paternalistic; warn + catch,
+do not forbid); per-tile cost modeling (the platform exposes only whole-GPU
+util; deriving avg cost from the global signal is simpler and sufficient).
+
+**Revisit triggers:** the platform exposes reliable per-tile decode cost (shed
+the most expensive tile, not by wall-order); multi-monitor / multiple walls make
+a single global util too coarse (per-window budgeting); operators want a
+server-persisted quality policy rather than per-machine (reconsider client-local);
+the 75/85 defaults misfire in practice under a new codec/hwdec path.
+
 ## 2026-07-20, Admin-only outbound probes (stream-test / ONVIF discovery) are not SSRF-guarded; risk accepted under the LAN-only, single-operator trust model
 
 **Context.** An API reliability/security audit flagged that `POST
