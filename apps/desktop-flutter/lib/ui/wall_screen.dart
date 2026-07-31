@@ -1151,6 +1151,29 @@ class _WallTileState extends State<_WallTile> {
   /// stream (see [WallScreen.onMaximizedCameraChanged]/zoomSwitchesToMain).
   bool _zoomedToMain = false;
 
+  // Trackpad pinch accumulator. Flutter delivers precision-trackpad gestures
+  // (pinch + two-finger scroll) as PointerPanZoom events, NOT
+  // PointerScrollEvent, so the mouse-wheel path never fires for them (#409).
+  // `scale` on the update event is CUMULATIVE from gesture start (no delta is
+  // provided), so we diff against the previous event; `panDelta` is already the
+  // per-event step and feeds _panBy directly.
+  double _panZoomLastScale = 1.0;
+
+  /// Feed a trackpad pan-zoom update into digital zoom (pinch) + pan
+  /// (two-finger drag). Shared by both wall Listeners.
+  void _onPanZoomUpdate(PointerPanZoomUpdateEvent e, Size pane) {
+    if (e.scale != _panZoomLastScale) {
+      final factor = e.scale / _panZoomLastScale;
+      _panZoomLastScale = e.scale;
+      _zoomAt(e.localPosition, factor, pane);
+    }
+    if (e.panDelta != Offset.zero) _panBy(e.panDelta, pane);
+  }
+
+  void _onPanZoomStart(PointerPanZoomStartEvent _) {
+    _panZoomLastScale = 1.0;
+  }
+
   void _zoomAt(Offset cursor, double factor, Size pane) {
     final newScale = (_scale * factor).clamp(1.0, _maxZoom);
     if (newScale == _scale) return;
@@ -1769,6 +1792,9 @@ class _WallTileState extends State<_WallTile> {
               _zoomAt(e.localPosition, factor, pane);
             }
           },
+          // Laptop trackpad: pinch → digital zoom, two-finger drag → pan (#409).
+          onPointerPanZoomStart: _onPanZoomStart,
+          onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, pane),
           child: GestureDetector(
             // Single click selects this pane (snapshot + audio target);
             // double-click maximizes; right-click opens the per-tile menu.
@@ -2499,6 +2525,26 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     setState(() => _offset = _clampOffset(_offset + delta, pane));
   }
 
+  // Trackpad pinch → DIGITAL zoom in the maximized view (#409). Mirrors the
+  // wheel branch's guards. PTZ optical zoom stays wheel-only: it fires discrete
+  // network pulses (see _ptzWheelZoom), which a continuous pinch would spam, so
+  // mapping a pinch onto it cleanly is a separate exercise.
+  double _panZoomLastScale = 1.0;
+
+  void _onPanZoomStart(PointerPanZoomStartEvent _) {
+    _panZoomLastScale = 1.0;
+  }
+
+  void _onPanZoomUpdate(PointerPanZoomUpdateEvent e, Size pane) {
+    if (_panelEditing || _haEditing || _ptzEnabled) return;
+    if (e.scale != _panZoomLastScale) {
+      final factor = e.scale / _panZoomLastScale;
+      _panZoomLastScale = e.scale;
+      _zoomAt(e.localPosition, factor, pane);
+    }
+    if (e.panDelta != Offset.zero) _panBy(e.panDelta, pane);
+  }
+
   /// PTZ usable here: camera supports it AND the operator hasn't disabled PTZ
   /// controls for this camera via the right-click menu.
   bool get _ptzEnabled =>
@@ -2727,6 +2773,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           },
                           onPointerUp: (_) => _ptzStopSteer(),
                           onPointerCancel: (_) => _ptzStopSteer(),
+                          // Laptop trackpad pinch → digital zoom (non-PTZ);
+                          // guards handled inside (#409).
+                          onPointerPanZoomStart: _onPanZoomStart,
+                          onPointerPanZoomUpdate: (e) =>
+                              _onPanZoomUpdate(e, pane),
                           onPointerSignal: (e) {
                             if (e is PointerScrollEvent) {
                               // Panel/HA-overlay editor open: the wheel must

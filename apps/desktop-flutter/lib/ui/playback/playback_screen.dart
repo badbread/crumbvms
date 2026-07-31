@@ -2027,6 +2027,25 @@ class _PbTileState extends State<_PbTile> {
     setState(() => _offset = _clampOffset(_offset + delta, pane));
   }
 
+  // Laptop trackpad: Flutter delivers pinch + two-finger scroll as PointerPanZoom
+  // events, not PointerScrollEvent, so the mouse-wheel path never fires for them
+  // (#409). `scale` is cumulative from gesture start (diff it for the factor);
+  // `panDelta` is already per-event and feeds _panBy directly.
+  double _panZoomLastScale = 1.0;
+
+  void _onPanZoomStart(PointerPanZoomStartEvent _) {
+    _panZoomLastScale = 1.0;
+  }
+
+  void _onPanZoomUpdate(PointerPanZoomUpdateEvent e, Size pane) {
+    if (e.scale != _panZoomLastScale) {
+      final factor = e.scale / _panZoomLastScale;
+      _panZoomLastScale = e.scale;
+      _zoomAt(e.localPosition, factor, pane);
+    }
+    if (e.panDelta != Offset.zero) _panBy(e.panDelta, pane);
+  }
+
   /// The overlay shown when a pane has no live segment: a load error, a spinner
   /// while resolving, or — once resolved with nothing here — a styled "no
   /// footage" placeholder that reads calmly for a motion gap but flags a camera
@@ -2189,6 +2208,10 @@ class _PbTileState extends State<_PbTile> {
                       _zoomAt(e.localPosition, factor, paneSize);
                     }
                   },
+                  // Laptop trackpad: pinch → digital zoom, two-finger drag →
+                  // pan (#409).
+                  onPointerPanZoomStart: _onPanZoomStart,
+                  onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, paneSize),
                   child: ClipRect(
                     child: Transform(
                       transform: _zoomTransform,
