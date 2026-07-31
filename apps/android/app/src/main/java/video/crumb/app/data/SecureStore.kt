@@ -317,6 +317,29 @@ class SecureStore(context: Context) {
         set(value) = safeWrite { it.putBoolean(KEY_LOW_BW_AUTOFIX, value) }
 
     /**
+     * Adaptive live-wall quality (issue #384). When on (the default), the wall
+     * protects the device's video decoder from over-subscription: a config-time
+     * guardrail warns before a heavy wall renders, and a runtime backpressure
+     * loop sheds peripheral tiles to still-frames when dropped-frame rate or
+     * thermal pressure climbs, restoring them when it recovers. Device-local
+     * (a phone and a tablet have very different decode budgets).
+     *
+     * Default true.
+     */
+    var adaptiveWallQuality: Boolean
+        get() = safeRead(true) { it.getBoolean(KEY_ADAPTIVE_WALL, true) }
+        set(value) = safeWrite { it.putBoolean(KEY_ADAPTIVE_WALL, value) }
+
+    /**
+     * "Don't warn on this device": suppresses the Stage-1 guardrail nudge for a
+     * heavy live wall on this device only. The runtime backpressure net still
+     * runs; only the advisory heads-up is silenced. Default false.
+     */
+    var wallGuardrailSilenced: Boolean
+        get() = safeRead(false) { it.getBoolean(KEY_WALL_GUARDRAIL_SILENCED, false) }
+        set(value) = safeWrite { it.putBoolean(KEY_WALL_GUARDRAIL_SILENCED, value) }
+
+    /**
      * How the Plates tab renders its reads: "list" (dense rows, default),
      * "gallery" (snapshot grid), "grouped" (collapsed by plate), or "timeline"
      * (big chronological feed). Per-account UI residue: CLEARED on logout
@@ -417,6 +440,8 @@ class SecureStore(context: Context) {
         private const val KEY_PLAYBACK_QUALITY = "playback_quality"
         private const val KEY_LIVE_LAYOUT = "live_grid_layout"
         private const val KEY_LOW_BW_AUTOFIX = "low_bw_autofix_applied"
+        private const val KEY_ADAPTIVE_WALL = "adaptive_wall_quality"
+        private const val KEY_WALL_GUARDRAIL_SILENCED = "wall_guardrail_silenced"
         private const val KEY_PTZ_STYLE = "ptz_style"
         private const val KEY_MOTION_TUNER = "motion_tuner_enabled"
         private const val KEY_SHOW_ALL_CAMERAS_VIEW = "show_all_cameras_view"
