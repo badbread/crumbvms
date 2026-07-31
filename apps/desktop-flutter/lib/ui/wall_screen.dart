@@ -1155,19 +1155,29 @@ class _WallTileState extends State<_WallTile> {
   // (pinch + two-finger scroll) as PointerPanZoom events, NOT
   // PointerScrollEvent, so the mouse-wheel path never fires for them (#409).
   // `scale` on the update event is CUMULATIVE from gesture start (no delta is
-  // provided), so we diff against the previous event; `panDelta` is already the
-  // per-event step and feeds _panBy directly.
+  // provided), so we diff against the previous event.
   double _panZoomLastScale = 1.0;
 
-  /// Feed a trackpad pan-zoom update into digital zoom (pinch) + pan
+  // Last mouse position over the video, tracked from onPointerHover. Used as the
+  // pinch zoom anchor: a PointerPanZoom event's own localPosition is NOT the
+  // cursor on Windows trackpads (it reads near the pane origin), which made the
+  // frame expand from the top-left and drift hard-right while pinching (#412).
+  Offset? _hoverCursor;
+
+  /// Feed a trackpad pan-zoom update into digital zoom (pinch) OR pan
   /// (two-finger drag). Shared by both wall Listeners.
   void _onPanZoomUpdate(PointerPanZoomUpdateEvent e, Size pane) {
     if (e.scale != _panZoomLastScale) {
+      // Pinch: zoom about the CURSOR, never translate — mixing a per-event pan
+      // into a scale step is what produced the sideways drift.
       final factor = e.scale / _panZoomLastScale;
       _panZoomLastScale = e.scale;
-      _zoomAt(e.localPosition, factor, pane);
+      final anchor = _hoverCursor ?? Offset(pane.width / 2, pane.height / 2);
+      _zoomAt(anchor, factor, pane);
+    } else if (e.panDelta != Offset.zero) {
+      // Two-finger drag with no pinch this frame → pan.
+      _panBy(e.panDelta, pane);
     }
-    if (e.panDelta != Offset.zero) _panBy(e.panDelta, pane);
   }
 
   void _onPanZoomStart(PointerPanZoomStartEvent _) {
@@ -1793,6 +1803,7 @@ class _WallTileState extends State<_WallTile> {
             }
           },
           // Laptop trackpad: pinch → digital zoom, two-finger drag → pan (#409).
+          onPointerHover: (e) => _hoverCursor = e.localPosition,
           onPointerPanZoomStart: _onPanZoomStart,
           onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, pane),
           child: GestureDetector(
@@ -2531,6 +2542,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   // mapping a pinch onto it cleanly is a separate exercise.
   double _panZoomLastScale = 1.0;
 
+  // Cursor for the pinch anchor — see the wall-tile equivalent (#412).
+  Offset? _hoverCursor;
+
   void _onPanZoomStart(PointerPanZoomStartEvent _) {
     _panZoomLastScale = 1.0;
   }
@@ -2540,9 +2554,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     if (e.scale != _panZoomLastScale) {
       final factor = e.scale / _panZoomLastScale;
       _panZoomLastScale = e.scale;
-      _zoomAt(e.localPosition, factor, pane);
+      final anchor = _hoverCursor ?? Offset(pane.width / 2, pane.height / 2);
+      _zoomAt(anchor, factor, pane);
+    } else if (e.panDelta != Offset.zero) {
+      _panBy(e.panDelta, pane);
     }
-    if (e.panDelta != Offset.zero) _panBy(e.panDelta, pane);
   }
 
   /// PTZ usable here: camera supports it AND the operator hasn't disabled PTZ
@@ -2774,7 +2790,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                           onPointerUp: (_) => _ptzStopSteer(),
                           onPointerCancel: (_) => _ptzStopSteer(),
                           // Laptop trackpad pinch → digital zoom (non-PTZ);
-                          // guards handled inside (#409).
+                          // guards handled inside (#409). Hover tracks the
+                          // pinch anchor (#412).
+                          onPointerHover: (e) => _hoverCursor = e.localPosition,
                           onPointerPanZoomStart: _onPanZoomStart,
                           onPointerPanZoomUpdate: (e) =>
                               _onPanZoomUpdate(e, pane),

@@ -2029,9 +2029,13 @@ class _PbTileState extends State<_PbTile> {
 
   // Laptop trackpad: Flutter delivers pinch + two-finger scroll as PointerPanZoom
   // events, not PointerScrollEvent, so the mouse-wheel path never fires for them
-  // (#409). `scale` is cumulative from gesture start (diff it for the factor);
-  // `panDelta` is already per-event and feeds _panBy directly.
+  // (#409). `scale` is cumulative from gesture start (diff it for the factor).
   double _panZoomLastScale = 1.0;
+
+  // Cursor for the pinch anchor. A pan-zoom event's own localPosition is not the
+  // mouse on Windows trackpads, which drifted the zoom hard-right; track the
+  // real cursor from onPointerHover instead (#412).
+  Offset? _hoverCursor;
 
   void _onPanZoomStart(PointerPanZoomStartEvent _) {
     _panZoomLastScale = 1.0;
@@ -2041,9 +2045,11 @@ class _PbTileState extends State<_PbTile> {
     if (e.scale != _panZoomLastScale) {
       final factor = e.scale / _panZoomLastScale;
       _panZoomLastScale = e.scale;
-      _zoomAt(e.localPosition, factor, pane);
+      final anchor = _hoverCursor ?? Offset(pane.width / 2, pane.height / 2);
+      _zoomAt(anchor, factor, pane);
+    } else if (e.panDelta != Offset.zero) {
+      _panBy(e.panDelta, pane);
     }
-    if (e.panDelta != Offset.zero) _panBy(e.panDelta, pane);
   }
 
   /// The overlay shown when a pane has no live segment: a load error, a spinner
@@ -2209,7 +2215,8 @@ class _PbTileState extends State<_PbTile> {
                     }
                   },
                   // Laptop trackpad: pinch → digital zoom, two-finger drag →
-                  // pan (#409).
+                  // pan (#409). Hover tracks the pinch anchor (#412).
+                  onPointerHover: (e) => _hoverCursor = e.localPosition,
                   onPointerPanZoomStart: _onPanZoomStart,
                   onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, paneSize),
                   child: ClipRect(
