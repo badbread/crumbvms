@@ -438,6 +438,7 @@ mod tests {
             event_id: Some(Uuid::new_v4()),
             snapshot_url: None,
             bbox: None,
+            display_name: None,
         }
     }
 

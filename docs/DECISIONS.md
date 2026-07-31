@@ -8,6 +8,54 @@ revisit.
 
 ---
 
+## 2026-07-31, Naming a license plate is a first-class `plate_labels` table, not an extension of the watchlist; resolved via COALESCE with exact-normalized keying
+
+**Context.** Issue #363 asks that an operator name a plate once ("Mom's car",
+"Delivery van") and have every client show the name instead of the raw plate
+wherever the plate appears: LPR reads, plate detail, the watchlist, and alert
+text. The plate watchlist (`lpr_watchlist`, migration 0052) already carries a
+`label` column, so the obvious shortcut is to make "naming a plate" just a
+watchlist entry with a label. The open question the issue raises is whether the
+name belongs on the watchlist or is its own thing.
+
+**Decision, a first-class `plate_labels` table (migration 0073), keyed on the
+normalized plate string (`plate text PRIMARY KEY`, `label text NOT NULL`).** A
+plate name is display metadata that applies to ALL reads of a plate; the
+watchlist is an alert / BOLO list, a different concern that a plate need not be
+on to have a name. Everywhere a plate read is shown, the display name resolves
+as `COALESCE(plate_labels.label, lpr_watchlist.label)` on the normalized plate,
+so a first-class name wins while an existing watchlist label keeps working as a
+fallback. The watchlist keeps its own `label` column unchanged (its own
+alert-list UI still uses it). Resolution is folded into the read path
+(`list_plate_reads` and the watchlist read in `db.rs`) as correlated scalar
+subqueries and surfaced as `display_name: Option<String>` on the `PlateRead` and
+`PlateWatchlistEntry` DTOs, so every client gets the name for free; the raw
+`plate` is always retained alongside it. Writes (`PUT`/`DELETE
+/lpr/plate-labels`) are admin-only, matching the watchlist write path. Keying is
+the EXACT normalized plate string (same `normalize_plate` the matcher uses); a
+name is not applied to fuzzy / confusable variants.
+
+**Rejected:**
+- **Watchlist-only extension (name = a watchlist label).** Conflates naming with
+  the BOLO list: you cannot name a plate without watchlisting it, and clearing a
+  watchlist entry would silently drop the name. Naming should be independent of
+  whether the plate is flagged.
+- **Naming fuzzy / confusable variants in v1.** The matcher already treats
+  `O/0`, `I/1`, etc. as zero-cost for alert matching, so one could argue a name
+  should cover the whole confusable group. Deferred: v1 names the exact
+  normalized string only. Applying a name across a variant group risks a name
+  bleeding onto a genuinely different plate, and there is no demand yet.
+
+**Deferred (follow-ups, not part of this change):** per-client rendering of the
+new `display_name` field, desktop (Flutter), Android, iOS, web, and the PDF
+export report, each renders the name as its own change.
+
+**Revisit triggers (any one):**
+- Demand to name a whole confusable-variant group at once (then key the name on
+  a canonicalized plate, or resolve through the same edit-distance matcher).
+- Demand for non-admin operators to name plates (then split a narrower
+  capability from the admin-only write path, like `view_plates` did for reads).
+
 ## 2026-07-31, No auto-restart watchdog (autoheal) in the default stack; surface unhealthy containers via the notification system instead
 
 **Context.** A long-running deployment was found carrying `willfarrell/autoheal`

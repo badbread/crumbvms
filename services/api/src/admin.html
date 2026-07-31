@@ -9717,13 +9717,19 @@ async function loadWatchlist() {
         ? `<span title="Alerts on hit" style="color:var(--ok)">●</span>`
         : `<span title="Silent (tracked, no alert)" style="color:var(--dim2)">○</span>`);
     const kindTag = ignore ? `<span class="pill" style="font-size:10px">ignore</span>` : '';
-    const label = w.label ? `<span style="font-size:12px;color:var(--dim)">${esc(w.label)}</span>` : '';
+    // Show the resolved name (issue #363): a first-class plate name wins over
+    // this entry's own watchlist label. `display_name` already carries that
+    // COALESCE. Record it so namePlate() can prefill from here too.
+    const named = w.display_name ? String(w.display_name) : '';
+    if (named) PLATE_NAMES[w.plate] = named;
+    const label = named ? `<span style="font-size:12px;color:var(--dim)">${esc(named)}</span>` : '';
     return `
     <div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border)">
       ${dot}
       <span style="flex:0 0 130px;font-weight:600;font-family:var(--mono,monospace)">${esc(w.plate)}</span>
       ${kindTag}
       <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</span>
+      <button class="ghost sm" title="Name this plate (shown wherever it appears)" onclick="namePlate('${esc(w.plate)}')">${named ? 'Rename' : 'Name'}</button>
       <button class="danger-ghost sm" onclick="delWatch('${esc(w.id)}','${esc(w.plate)}')">Remove</button>
     </div>`;
   }).join('');
@@ -9782,6 +9788,12 @@ async function loadPlates() {
   renderPlateTable(host, data);
 }
 
+/* Resolved plate names by normalized plate (issue #363), populated whenever the
+   plate table or watchlist paints, so namePlate() can prefill the prompt with
+   the current name without threading it through an inline onclick (a name may
+   contain a quote, which esc() would not make safe inside a JS string). */
+let PLATE_NAMES = {};
+
 function renderPlateTable(host, data) {
   const plates = (data && data.plates) || [];
   if (!plates.length) {
@@ -9794,24 +9806,60 @@ function renderPlateTable(host, data) {
     const conf = (p.confidence == null) ? '—' : Math.round(p.confidence * 100) + '%';
     const src  = p.source_id || '—';
     const rawNote = (p.plate_raw && p.plate_raw !== p.plate) ? ` title="raw: ${esc(p.plate_raw)}"` : '';
+    // Show the operator-assigned name (issue #363) over the raw plate when set;
+    // the raw plate always stays visible below it so the row is never ambiguous.
+    const named = p.display_name ? String(p.display_name) : '';
+    if (named) PLATE_NAMES[p.plate] = named;
+    const plateCell = named
+      ? `<span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(named)}</span>
+         <span style="font-size:11px;color:var(--dim);font-family:var(--mono,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(p.plate || '—')}</span>`
+      : `<span style="font-weight:600;font-family:var(--mono,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(p.plate || '—')}</span>`;
     return `
     <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);min-width:0">
-      <span style="flex:0 0 130px;font-weight:600;font-family:var(--mono,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"${rawNote}>${esc(p.plate || '—')}</span>
-      <span style="flex:0 0 170px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(camName(p.camera_id))}">${esc(camName(p.camera_id))}</span>
+      <span style="flex:0 0 150px;min-width:0;overflow:hidden"${rawNote}>${plateCell}</span>
+      <span style="flex:0 0 150px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(camName(p.camera_id))}">${esc(camName(p.camera_id))}</span>
       <span style="flex:1;font-size:12px;color:var(--dim);white-space:nowrap">${esc(when)}</span>
       <span style="flex:0 0 60px;font-size:12px;color:var(--dim)">${esc(conf)}</span>
-      <span style="flex:0 0 120px;font-size:12px;color:var(--dim2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(src)}">${esc(src)}</span>
+      <span style="flex:0 0 110px;font-size:12px;color:var(--dim2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(src)}">${esc(src)}</span>
+      <button class="ghost sm" title="Give this plate a human-readable name shown wherever it appears" onclick="namePlate('${esc(p.plate)}')">${named ? 'Rename' : 'Name'}</button>
     </div>`;
   }).join('');
   const more = (data && data.has_more)
     ? `<div class="card-hint" style="margin-top:8px">More reads exist, narrow your search to see them.</div>` : '';
   host.innerHTML = `
     <div style="display:flex;gap:10px;padding:2px 0 4px;font-size:11px;color:var(--dim2)">
-      <span style="flex:0 0 130px">Plate</span><span style="flex:0 0 170px">Camera</span><span style="flex:1">Time</span><span style="flex:0 0 60px">Conf.</span><span style="flex:0 0 120px">Source</span>
+      <span style="flex:0 0 150px">Plate</span><span style="flex:0 0 150px">Camera</span><span style="flex:1">Time</span><span style="flex:0 0 60px">Conf.</span><span style="flex:0 0 110px">Source</span><span style="flex:0 0 62px"></span>
     </div>
     ${rows}
     <div class="card-hint" style="margin-top:8px">${esc(String((data && data.total) != null ? data.total : plates.length))} total plate read${((data && data.total) === 1) ? '' : 's'}.</div>
     ${more}`;
+}
+
+/* Set, edit, or clear a plate's human-readable name (issue #363, admin-only
+   server-side). Prefills from PLATE_NAMES (the resolved name shown in the row);
+   a blank submission clears any first-class name. Keyed on the normalized plate,
+   so the name applies wherever that plate appears. */
+async function namePlate(plate) {
+  const cur = (PLATE_NAMES && PLATE_NAMES[plate]) || '';
+  const next = prompt('Name for plate ' + plate + ' (leave blank to clear):', cur);
+  if (next === null) return; // cancelled
+  const name = next.trim();
+  try {
+    if (name) {
+      await api('/lpr/plate-labels', { method: 'PUT', body: JSON.stringify({ plate, label: name }) });
+      PLATE_NAMES[plate] = name;
+      toast('Plate named.');
+    } else {
+      // Blank = clear. A 404 just means it had no first-class name (the shown
+      // name came from a watchlist label) — treat that as already-cleared.
+      try { await api('/lpr/plate-labels/' + encodeURIComponent(plate), { method: 'DELETE' }); }
+      catch (e) { if (!/no name set/i.test(e.message || '')) throw e; }
+      delete PLATE_NAMES[plate];
+      toast('Name cleared.');
+    }
+    loadPlates();
+    if (LPR_CONFIG && LPR_CONFIG.enabled) loadWatchlist();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function renderNotifications() {

@@ -273,8 +273,12 @@ async fn maybe_alert_watchlist(
         }
     };
 
+    // Prefer the resolved display name (issue #363): a first-class plate name
+    // (plate_labels) wins over this entry's own watchlist label; `display_name`
+    // already carries that COALESCE. Keep the raw plate in the text too, so the
+    // alert is never ambiguous — e.g. `watchlisted plate 7ABC123 ("Mom's car")`.
     let label = entry
-        .label
+        .display_name
         .as_deref()
         .filter(|l| !l.is_empty())
         .map(|l| format!(" (\"{l}\")"))
