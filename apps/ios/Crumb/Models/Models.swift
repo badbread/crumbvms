@@ -358,6 +358,10 @@ struct PlateRead: Decodable, Identifiable {
     let confidence: Double?
     let region: String?
     let sourceId: String
+    /// Operator-assigned, human-readable name for this plate (e.g. "Mom's car"),
+    /// resolved server-side. Optional: older servers omit the key, which decodes
+    /// as nil, and the UI then falls back to the raw plate.
+    let displayName: String?
     /// Sibling detection event, when present — drives the "open playback" jump.
     let eventId: String?
     let snapshotUrl: String?
@@ -370,6 +374,7 @@ struct PlateRead: Decodable, Identifiable {
         case cameraId = "camera_id"
         case plateRaw = "plate_raw"
         case sourceId = "source_id"
+        case displayName = "display_name"
         case eventId = "event_id"
         case snapshotUrl = "snapshot_url"
     }
@@ -398,10 +403,15 @@ struct WatchlistEntry: Decodable, Identifiable {
     let notify: Bool
     /// `"watch"` (alert on sighting) or `"ignore"` (suppress). Default watch.
     let kind: String
+    /// Operator-assigned, human-readable name for this plate, resolved
+    /// server-side. Optional: older servers omit the key (decodes as nil) and
+    /// the UI falls back to the raw plate.
+    let displayName: String?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
         case id, plate, label, note, color, notify, kind
+        case displayName = "display_name"
         case createdAt = "created_at"
     }
 
@@ -414,6 +424,7 @@ struct WatchlistEntry: Decodable, Identifiable {
         color = try c.decodeIfPresent(String.self, forKey: .color)
         notify = try c.decodeIfPresent(Bool.self, forKey: .notify) ?? true
         kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "watch"
+        displayName = try c.decodeIfPresent(String.self, forKey: .displayName)
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
     }
 }
