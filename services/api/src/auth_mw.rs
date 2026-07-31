@@ -506,6 +506,16 @@ impl FromRequestParts<AppState> for AdminUser {
 /// principal to a single camera additionally means even a carried capability
 /// can only ever touch that one camera's media. `user_id` is carried through
 /// for audit/log correlation.
+///
+/// # Tokens minted before a capability claim existed (issue #366)
+///
+/// The cap claims are `#[serde(default)]` (see [`MediaClaims`]), so a token from
+/// a server version that predates one of them still decodes here, with that
+/// capability `false`. That is intentional: the alternative (a decode failure)
+/// took ALL media away from every warm client for the token's remaining TTL
+/// after any upgrade that added a claim. Such a token authenticates for basic
+/// media but is denied by the capability-gated routes, which is strictly less
+/// privilege than the minting user held, never more.
 fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;

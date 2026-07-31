@@ -101,20 +101,46 @@ pub struct MediaClaims {
     /// requested resource belongs to this camera.
     pub cam: String,
     /// The minting user's `export` capability, carried so the media principal
-    /// grants no more than the caller actually held. These cap fields are NOT
-    /// `#[serde(default)]`: a pre-upgrade token that lacks them must fail to
-    /// decode (→ a clean 401 and automatic re-mint) rather than silently
-    /// deserialize as something with the wrong caps.
+    /// grants no more than the caller actually held.
+    ///
+    /// # Why these cap fields ARE `#[serde(default)]` (issue #366)
+    ///
+    /// They deliberately were not, on the reasoning that a pre-upgrade token
+    /// lacking them should fail to decode and force a clean re-mint. In practice
+    /// that produced a far worse failure. Adding a required claim means every
+    /// token minted by the previous version stops decoding, so **every warm
+    /// client loses ALL media** (live tiles, thumbnails, filmstrips, segments,
+    /// clips, admin previews) until its cached token reaches `exp` — up to the
+    /// full 15-minute TTL. Bearer JSON calls keep working, so nothing prompts a
+    /// re-auth that would clear the caches, and no client re-mints on a
+    /// media-route 401. It self-heals, but it reads as a fleet-wide outage after
+    /// every routine upgrade that touches this struct.
+    ///
+    /// Defaulting to `false` fails closed in the direction that actually matters:
+    /// an old token still authenticates for basic media, but carries **no**
+    /// capabilities, so the capability-gated routes (export, clips, plates) deny
+    /// it exactly as they would for a user who never had those rights. The token
+    /// is still signed, still `typ: "media"`, and still scoped to one camera by
+    /// `cam`, so this grants strictly LESS privilege than intended, never more.
+    /// A short-lived degradation of gated features beats a total media blackout.
+    ///
+    /// Clients re-minting on a media-route 401 is still the durable fix and is
+    /// tracked separately; this removes the outage without waiting on four
+    /// clients.
+    #[serde(default)]
     pub export: bool,
     /// The minting user's `playback` (recorded-footage) capability.
+    #[serde(default)]
     pub playback: bool,
     /// The minting user's `clips` capability.
+    #[serde(default)]
     pub clips: bool,
     /// The minting user's `view_plates` capability. Carried because the plate
     /// crop served by `GET /events/{id}/snapshot` (the crumb-alpr stored-crop
     /// fallback) and `GET /plates/{id}/crop` both require it, and clients fetch
     /// those with a scoped media token; without carrying it, an authorized
     /// user's token gets 403 and plate crops render blank.
+    #[serde(default)]
     pub view_plates: bool,
     /// Expiry — Unix timestamp (seconds). Short (~15 min; see auth.rs).
     pub exp: u64,
