@@ -145,8 +145,26 @@ struct SettingsView: View {
             rowDivider
             settingToggle(
                 "Low-bandwidth mode",
-                "Drop the live wall to still snapshots (~1 fps) instead of live video — for weak or metered connections.",
+                "Drop the live wall to still snapshots (~1 fps) instead of live video, for weak or metered connections.",
                 $settings.lowBandwidthMode
+            )
+            rowDivider
+            settingToggle(
+                "High-quality wall",
+                "Decode every tile at full resolution instead of the lighter sub stream. Uses much more decoding power on large walls.",
+                $settings.wallHighQuality
+            )
+            rowDivider
+            settingToggle(
+                "Adaptive quality",
+                "If this device gets too warm, automatically lighten the least-important tiles, then restore them when it cools.",
+                $settings.adaptiveWallQuality
+            )
+            rowDivider
+            settingToggle(
+                "Decode guardrail",
+                "Warn before a wall would run more full-resolution streams than this device can comfortably decode at once.",
+                $settings.wallDecodeGuardrail
             )
             rowDivider
             settingToggle(

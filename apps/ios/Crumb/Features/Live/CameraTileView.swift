@@ -12,8 +12,16 @@ struct CameraTileView: View {
     /// requires an async `GET /media-token` round trip (see
     /// `MediaUrls.cameraFrameUrl`). Re-resolved whenever `camera.id` changes.
     let mediaUrls: MediaUrls
-    /// When true, show ~1fps snapshots instead of live WebRTC (low-bandwidth mode).
-    let lowBandwidth: Bool
+    /// The stream rung this tile should decode, already folding low-bandwidth
+    /// mode, the high-quality-wall choice, and any reactive shed together (see
+    /// `WallLoadController.effectiveQuality`). `.snapshot` == the ~1 fps still
+    /// path; `.sub` / `.main` == live sub / main video.
+    var quality: TileQuality = .sub
+    /// True when the adaptive backpressure net downgraded this tile (as opposed
+    /// to a rung the operator chose). Drives the amber "SD" badge so an
+    /// auto-downgrade reads as "the app protected this device," not a fault; it
+    /// self-restores silently when the device cools.
+    var degraded: Bool = false
     /// When true (default) the tile locks to 16:9; when false it fills its
     /// container (used by custom layouts whose panes are arbitrary aspect ratios).
     var lockAspect: Bool = true
@@ -23,33 +31,42 @@ struct CameraTileView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            if lowBandwidth {
-                // Own long-lived poll loop (low-bandwidth mode) — re-resolves
-                // its own scoped URL every tick rather than reusing the
-                // `frameUrl` snapshot-backdrop state above, since a ~1.2s
+            switch quality {
+            case .snapshot:
+                // Still-frame path (low-bandwidth, or shed all the way down when
+                // there is no sub to fall back to). Own long-lived poll loop —
+                // re-resolves its own scoped URL every tick rather than reusing
+                // the `frameUrl` snapshot-backdrop state above, since a ~1.2s
                 // poll easily outlives the ~15 min scoped-token TTL.
                 SnapshotTile(cameraId: camera.id, mediaUrls: mediaUrls)
-            } else {
+            case .sub, .main:
+                let sub = (quality == .sub)
                 #if canImport(WebRTC)
-                // iOS: native WebRTC sub-stream (sub-second), snapshot backdrop until first frame.
-                // [iOS] C3 fix: `LiveViewModel.loadCameras()` publishes `cameras`
-                // before `resolveStreams` finishes, so this tile can first render
-                // with `whepURL == nil` (the `WebRTCManager` init falls back to the
-                // `http://invalid.local` placeholder) and never retry once the real
-                // URL resolves a moment later — the `@StateObject` manager is only
-                // built once, at this view's first construction. Keying identity on
-                // the URL forces SwiftUI to tear down and rebuild the view (and thus
-                // the manager) whenever whepURL changes from nil → real or between
-                // cameras, mirroring the macOS Fmp4VideoView's `.onChange(of:
-                // streamURL)` rebuild-on-change behavior.
-                WebRTCVideoView(cameraId: camera.id, mediaUrls: mediaUrls, hasSub: camera.hasSubStream, fill: true)
+                // iOS: native WebRTC (sub-second), snapshot backdrop until first
+                // frame. `hasSub: true` prefers the light sub stream (main
+                // fallback); `false` forces the full-res main.
+                //
+                // [iOS] C3 fix + adaptive rung: `LiveViewModel.loadCameras()`
+                // publishes `cameras` before `resolveStreams` finishes, so this
+                // tile can first render with `whepURL == nil` (the
+                // `WebRTCManager` init falls back to the `http://invalid.local`
+                // placeholder) and never retry once the real URL resolves a
+                // moment later — the `@StateObject` manager is built once, at
+                // construction. Keying identity on the chosen rung forces SwiftUI
+                // to tear down and rebuild the manager whenever the rung flips
+                // (nil → real, sub ⇄ main on a shed/restore, or between cameras),
+                // mirroring the macOS Fmp4VideoView's rebuild-on-change behavior.
+                WebRTCVideoView(cameraId: camera.id, mediaUrls: mediaUrls, hasSub: sub, fill: true)
+                    .id(sub)
                 #else
                 // macOS: the cross-platform fMP4 / VideoToolbox player (no WebRTC).
-                // Wall tiles pull the SUB stream when present (lighter); the stream
-                // URL is minted per connect through the authenticated /live proxy.
+                // The stream URL is minted per connect through the authenticated
+                // /live proxy; the `streamKey` carries the rung so a shed/restore
+                // reconnects onto the other stream (Fmp4VideoView reconnects on a
+                // `streamKey` change).
                 Fmp4VideoView(
-                    streamKey: "\(camera.id):\(camera.hasSubStream ? "sub" : "main")",
-                    streamProvider: { await mediaUrls.liveFmp4URL(cameraId: camera.id, sub: camera.hasSubStream) },
+                    streamKey: "\(camera.id):\(sub ? "sub" : "main")",
+                    streamProvider: { await mediaUrls.liveFmp4URL(cameraId: camera.id, sub: sub) },
                     snapshotURL: frameUrl
                 )
                 #endif
@@ -86,6 +103,23 @@ struct CameraTileView: View {
                     .frame(width: 6, height: 6)
                     .padding(6)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
+
+            // "SD" badge (bottom-right): only while the adaptive net has this
+            // tile shed. Amber (not error red) so it reads as "the app lightened
+            // this tile to protect the device," and clears itself on restore.
+            if degraded {
+                VStack {
+                    Spacer()
+                    Text("SD")
+                        .font(.caption2.bold())
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(CrumbColors.motionDot, in: Capsule())
+                        .padding(6)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
             }
 
             VStack {
