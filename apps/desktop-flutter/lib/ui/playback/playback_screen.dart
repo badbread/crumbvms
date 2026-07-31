@@ -2032,11 +2032,6 @@ class _PbTileState extends State<_PbTile> {
   // (#409). `scale` is cumulative from gesture start (diff it for the factor).
   double _panZoomLastScale = 1.0;
 
-  // Cursor for the pinch anchor. A pan-zoom event's own localPosition is not the
-  // mouse on Windows trackpads, which drifted the zoom hard-right; track the
-  // real cursor from onPointerHover instead (#412).
-  Offset? _hoverCursor;
-
   void _onPanZoomStart(PointerPanZoomStartEvent _) {
     _panZoomLastScale = 1.0;
   }
@@ -2045,8 +2040,10 @@ class _PbTileState extends State<_PbTile> {
     if (e.scale != _panZoomLastScale) {
       final factor = e.scale / _panZoomLastScale;
       _panZoomLastScale = e.scale;
-      final anchor = _hoverCursor ?? Offset(pane.width / 2, pane.height / 2);
-      _zoomAt(anchor, factor, pane);
+      // Trackpad pinch anchors at the VIEW CENTRE (no reliable cursor mid-
+      // gesture on Windows trackpads → cursor-anchoring drifted, #412). The
+      // mouse wheel path still zooms to the cursor.
+      _zoomAt(Offset(pane.width / 2, pane.height / 2), factor, pane);
     } else if (e.panDelta != Offset.zero) {
       _panBy(e.panDelta, pane);
     }
@@ -2216,7 +2213,6 @@ class _PbTileState extends State<_PbTile> {
                   },
                   // Laptop trackpad: pinch → digital zoom, two-finger drag →
                   // pan (#409). Hover tracks the pinch anchor (#412).
-                  onPointerHover: (e) => _hoverCursor = e.localPosition,
                   onPointerPanZoomStart: _onPanZoomStart,
                   onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, paneSize),
                   child: ClipRect(
