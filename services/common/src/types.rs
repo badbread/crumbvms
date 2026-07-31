@@ -996,6 +996,20 @@ pub struct CameraDecodeStatus {
     /// 48 kHz AAC (source rate > 48 kHz), `Some(false)` when bit-exact copied,
     /// `None` when unknown / no audio-status row.
     pub audio_transcoding: Option<bool>,
+    /// Current motion-detector health (migration 0072, LEFT JOINed from
+    /// `camera_motion_health`): `Some(true)` when the detector is healthy,
+    /// `Some(false)` when it is currently down and the recorder is failing OPEN
+    /// (recording continuously as a fallback) right now, `None` when the
+    /// recorder has never reported health for this camera (older image, not a
+    /// Motion-mode camera, or not booted yet).
+    pub motion_healthy: Option<bool>,
+    /// When the current `motion_healthy` state began (advanced only on a flip),
+    /// so an unhealthy row reads as "recording continuously since <time>".
+    /// `None` when there is no health row.
+    pub motion_health_since: Option<DateTime<Utc>>,
+    /// Short human-readable cause when `motion_healthy == Some(false)` (which
+    /// source(s) stopped delivering frames); `None` when healthy or no row.
+    pub motion_health_reason: Option<String>,
 }
 
 // ─── motion RAM-cache telemetry (migration 0039) ──────────────────────────────

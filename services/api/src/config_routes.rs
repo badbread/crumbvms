@@ -4021,6 +4021,9 @@ async fn get_decode_status(
             updated_at: s.updated_at,
             audio_sample_rate: s.audio_sample_rate,
             audio_transcoding: s.audio_transcoding,
+            motion_healthy: s.motion_healthy,
+            motion_health_since: s.motion_health_since,
+            motion_health_reason: s.motion_health_reason,
         })
         .collect();
 
