@@ -8,6 +8,48 @@ revisit.
 
 ---
 
+## 2026-07-31, No auto-restart watchdog (autoheal) in the default stack; surface unhealthy containers via the notification system instead
+
+**Context.** A long-running deployment was found carrying `willfarrell/autoheal`
+as a local addition to its compose stack (a leftover from before the stack
+consolidation). Moving that deployment back to the stock compose removed it,
+which raised the question of whether an auto-restart watchdog should be stock.
+`restart: unless-stopped` only handles a container that EXITS; it does nothing
+for a container that stays running but goes UNHEALTHY (a recorder wedged on a
+stalled decode, an api healthy-but-not-serving). Both `api` and `recorder`
+already define Docker healthchecks, so the signal exists. autoheal would watch
+that health status and restart anything reporting unhealthy. Tracked as issue
+#396, raised per golden rule 6 (new background services need discussion first).
+
+**Decision, do not ship autoheal, in any profile, for now. Rely on the alerting
+that already exists.** The notification system already emits `recorder_offline`
+(heartbeat stale) and `motion_detector_unhealthy`, and the health watchdogs in
+`services/api/src/alerts.rs` already turn unhealthy state into operator-facing
+alerts over the configured channels. For a project whose ethos is "hear about
+failures and fix the root cause," alert-and-investigate is a better fit than
+silently restarting. Auto-restart masks bugs (turns a hard failure into a
+restart loop that never gets reported), and autoheal specifically requires
+mounting the Docker socket, a meaningful privilege for a default-path service.
+
+**Rejected:**
+- Shipping autoheal default-on, the Docker-socket privilege on a service nobody
+  asked for is decisive against it.
+- Shipping autoheal as an opt-in profile (like `mosquitto`/`alpr`/`offsite`),
+  still adds a third-party image and a socket-mounting service to the supported
+  surface to solve a problem the alerting path already covers; not worth the
+  standing maintenance and privilege footprint until there is evidence the
+  alert-only path is insufficient.
+
+**Revisit triggers (any one):**
+- Field evidence that a container goes unhealthy-but-running and the existing
+  alerts are not enough (operator not watching, footage lost for hours) often
+  enough that manual restart is a real reliability gap. Then reconsider the
+  opt-in `watchdog` profile, with restart events logged AND notified so it heals
+  without hiding the underlying bug.
+- A first-party, socket-free recovery mechanism becomes available (e.g. the
+  recorder self-restarting a wedged internal subsystem, or a healthcheck-driven
+  restart that does not need the Docker socket).
+
 ## 2026-07-29, Media-token capability claims default to false rather than failing to decode
 
 **Decision.** The capability claims on `MediaClaims` (`export`, `playback`,
