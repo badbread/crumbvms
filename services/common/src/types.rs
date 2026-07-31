@@ -185,6 +185,12 @@ pub struct PlateRead {
     /// just the plate. `None` when no box was captured/normalizable. Assembled
     /// from the `bbox_x1..bbox_y2` corner columns.
     pub bbox: Option<[f32; 4]>,
+    /// Operator-assigned human-readable name for this plate ("Mom's car"),
+    /// resolved as `COALESCE(plate_labels.label, lpr_watchlist.label)` on the
+    /// normalized plate (issue #363, migration 0073). `None` when the plate has
+    /// neither a first-class name nor a watchlist label; clients then show the
+    /// raw `plate`. The raw plate is always retained alongside it.
+    pub display_name: Option<String>,
 }
 
 /// Operator-confirmed ground truth for one derived vehicle "pass"
@@ -228,6 +234,11 @@ pub struct PlateWatchlistEntry {
     /// not stored, never alerted). Migration 0054.
     pub kind: String,
     pub created_at: DateTime<Utc>,
+    /// Resolved human-readable name for this plate, `COALESCE(plate_labels.label,
+    /// label)` on the normalized plate (issue #363, migration 0073). A first-class
+    /// `plate_labels` name wins over this entry's own `label`; falls back to
+    /// `label` when no first-class name is set, and is `None` when neither exists.
+    pub display_name: Option<String>,
 }
 
 /// One camera ↔ HA entity link (`camera_ha_links`, migration 0048).

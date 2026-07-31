@@ -8817,7 +8817,15 @@ pub async fn get_plate_crop_by_event(pool: &Pool, event_id: Uuid) -> Result<Opti
 
 /// Columns selected into a [`PlateWatchlistEntry`] (kept in one place so the
 /// several queries below can't drift out of sync with `watchlist_from_row`).
-const WATCHLIST_COLS: &str = "id, plate, label, note, color, notify, kind, created_at";
+///
+/// `display_name` (issue #363) resolves the human-readable name shown for the
+/// plate: a first-class `plate_labels` name wins, falling back to this entry's
+/// own `label`. Computed as a correlated scalar subquery on the normalized
+/// plate so it works uniformly in every site (list, upsert `RETURNING`, and the
+/// matcher), including `RETURNING`, where a join is not available.
+const WATCHLIST_COLS: &str = "id, plate, label, note, color, notify, kind, created_at, \
+     COALESCE((SELECT pl.label FROM plate_labels pl WHERE pl.plate = lpr_watchlist.plate), label) \
+     AS display_name";
 
 fn watchlist_from_row(row: &tokio_postgres::Row) -> PlateWatchlistEntry {
     PlateWatchlistEntry {
@@ -8829,6 +8837,7 @@ fn watchlist_from_row(row: &tokio_postgres::Row) -> PlateWatchlistEntry {
         notify: row.get("notify"),
         kind: row.get("kind"),
         created_at: row.get("created_at"),
+        display_name: row.get("display_name"),
     }
 }
 
@@ -8906,6 +8915,63 @@ pub async fn delete_watchlist_entry(pool: &Pool, id: Uuid) -> Result<bool> {
         .execute("DELETE FROM lpr_watchlist WHERE id = $1", &[&id])
         .await
         .context("delete_watchlist_entry")?;
+    Ok(n > 0)
+}
+
+// ─── plate names (plate_labels, migration 0073) ─────────────────────────────
+
+/// Set (or update) the human-readable name for a plate (issue #363), keyed on
+/// the normalized plate. Normalizes `plate` here so callers can pass raw input;
+/// `label` is trimmed. Returns `Ok(false)` without writing when either the plate
+/// normalizes to empty or the trimmed label is empty (nothing to name) — the
+/// route surfaces that as a 400. A second name for the same plate edits the
+/// existing row (upsert on the `plate` primary key). Exact-normalized keying
+/// only: v1 does not name fuzzy / confusable variants.
+///
+/// # Errors
+///
+/// Returns an error if the upsert fails.
+pub async fn upsert_plate_label(pool: &Pool, plate: &str, label: &str) -> Result<bool> {
+    let plate = normalize_plate(plate);
+    let label = label.trim();
+    if plate.is_empty() || label.is_empty() {
+        return Ok(false);
+    }
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            INSERT INTO plate_labels (plate, label)
+            VALUES ($1, $2)
+            ON CONFLICT (plate) DO UPDATE SET
+                label      = EXCLUDED.label,
+                updated_at = now()
+            ",
+            &[&plate, &label],
+        )
+        .await
+        .context("upsert_plate_label")?;
+    Ok(true)
+}
+
+/// Clear the human-readable name for a plate (issue #363). Normalizes `plate`
+/// first so it matches how the name was stored. Returns `true` if a row was
+/// removed (the read path falls back to any watchlist label, else the raw
+/// plate).
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub async fn delete_plate_label(pool: &Pool, plate: &str) -> Result<bool> {
+    let plate = normalize_plate(plate);
+    if plate.is_empty() {
+        return Ok(false);
+    }
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute("DELETE FROM plate_labels WHERE plate = $1", &[&plate])
+        .await
+        .context("delete_plate_label")?;
     Ok(n > 0)
 }
 
@@ -9167,6 +9233,7 @@ fn plate_read_from_row(row: &tokio_postgres::Row) -> PlateRead {
         event_id: row.get("event_id"),
         snapshot_url: row.get("snapshot_url"),
         bbox,
+        display_name: row.get("display_name"),
     }
 }
 
@@ -9230,9 +9297,18 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
 
     let limit_idx = n + 1;
     let offset_idx = n + 2;
+    // display_name (issue #363): resolve a human-readable name for the plate as
+    // COALESCE(plate_labels.label, lpr_watchlist.label) on the normalized plate,
+    // via two correlated scalar subqueries. Both are unique on `plate`, so each
+    // yields at most one row and cannot fan out the result set.
     let list_sql = format!(
         "SELECT id, camera_id, ts, plate, plate_raw, confidence, region, source_id, event_id, \
-         snapshot_url, bbox_x1, bbox_y1, bbox_x2, bbox_y2 FROM plate_reads WHERE {where_clause} \
+         snapshot_url, bbox_x1, bbox_y1, bbox_x2, bbox_y2, \
+         COALESCE( \
+           (SELECT pl.label FROM plate_labels pl WHERE pl.plate = plate_reads.plate), \
+           (SELECT w.label FROM lpr_watchlist w WHERE w.plate = plate_reads.plate) \
+         ) AS display_name \
+         FROM plate_reads WHERE {where_clause} \
          ORDER BY {order} LIMIT ${limit_idx} OFFSET ${offset_idx}"
     );
     params.push(&q.limit);
@@ -10502,6 +10578,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0072_camera_motion_health.sql",
         include_str!("../../../db/migrations/0072_camera_motion_health.sql"),
+    ),
+    (
+        "0073_plate_labels.sql",
+        include_str!("../../../db/migrations/0073_plate_labels.sql"),
     ),
 ];
 
@@ -13582,6 +13662,190 @@ mod tests {
             batch.get(&cam_empty).map(Vec::len),
             Some(n),
             "no-footage camera must still return an n-length array"
+        );
+    }
+
+    // ── plate names (plate_labels, migration 0073, issue #363) ──────────────
+
+    /// Seed one plate read for `camera_id` at `ts` and return the stored id.
+    /// `plate` is normalized here so callers can pass raw text.
+    async fn seed_plate_read(pool: &Pool, camera_id: Uuid, plate: &str, ts: DateTime<Utc>) -> Uuid {
+        upsert_plate_read(
+            pool,
+            &UpsertPlateReadParams {
+                camera_id,
+                ts,
+                plate: normalize_plate(plate),
+                plate_raw: Some(plate.to_owned()),
+                confidence: Some(0.9),
+                source_id: "test".to_owned(),
+                provider_event_id: Some(Uuid::new_v4().simple().to_string()),
+                event_id: None,
+                snapshot_url: None,
+                bbox: None,
+                crop: None,
+                raw: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("upsert_plate_read")
+        .id
+    }
+
+    /// Read back the resolved `display_name` of the single seeded read for
+    /// `plate` on `cam` (exact match). Panics unless exactly one read exists.
+    async fn read_one_display_name(pool: &Pool, cam: Uuid, plate: &str) -> Option<String> {
+        let (reads, _) = list_plate_reads(
+            pool,
+            &PlateReadQuery {
+                camera_ids: vec![cam],
+                start: None,
+                end: None,
+                plate: Some(plate.to_owned()),
+                match_mode: PlateMatch::Exact,
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("list_plate_reads");
+        assert_eq!(reads.len(), 1, "exactly one seeded read for {plate}");
+        reads[0].display_name.clone()
+    }
+
+    /// `upsert_plate_label` normalizes the plate + trims the label, and rejects
+    /// (returns `Ok(false)`, no row written) an empty-after-normalize plate or a
+    /// blank label. A second name for the same plate edits the row in place.
+    #[tokio::test]
+    async fn plate_label_upsert_normalizes_and_rejects_empty() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        // Use a UUID-derived plate so parallel test binaries on the shared DB
+        // never collide on the plate_labels primary key.
+        let plate = normalize_plate(&Uuid::new_v4().simple().to_string());
+
+        // Empty-after-normalize plate is rejected, nothing written.
+        assert!(
+            !upsert_plate_label(&pool, "-- //", "Anything")
+                .await
+                .expect("upsert empty plate"),
+            "a plate with no alphanumerics must be rejected"
+        );
+        // Blank label is rejected.
+        assert!(
+            !upsert_plate_label(&pool, &plate, "   ")
+                .await
+                .expect("upsert blank label"),
+            "a blank label must be rejected"
+        );
+
+        // A raw/messy plate normalizes to the same key and stores the trimmed
+        // label. Pass lowercased + punctuated to prove normalization on write.
+        let lowered = plate.to_ascii_lowercase();
+        let messy = format!(" {lowered}-! ");
+        assert!(
+            upsert_plate_label(&pool, &messy, "  Mom's car  ")
+                .await
+                .expect("upsert name"),
+            "a valid name must be written"
+        );
+
+        // Re-upsert edits the same row (keyed on the normalized plate).
+        assert!(upsert_plate_label(&pool, &plate, "Delivery van")
+            .await
+            .expect("re-upsert name"));
+
+        // Resolution reads back the latest label on a read of that plate.
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let cam = seed_camera_for_test(&pool, policy_id).await;
+        let ts = Utc
+            .timestamp_millis_opt(1_700_000_100_000)
+            .single()
+            .unwrap();
+        seed_plate_read(&pool, cam, &plate, ts).await;
+        assert_eq!(
+            read_one_display_name(&pool, cam, &plate).await.as_deref(),
+            Some("Delivery van")
+        );
+
+        // delete_plate_label normalizes + removes the row.
+        assert!(delete_plate_label(&pool, &messy)
+            .await
+            .expect("delete via messy plate"));
+        // A second delete finds nothing.
+        assert!(!delete_plate_label(&pool, &plate)
+            .await
+            .expect("delete again"));
+    }
+
+    /// Display-name resolution precedence: a first-class `plate_labels` name wins
+    /// over a watchlist label; with only a watchlist label that label shows; with
+    /// neither, `display_name` is `None`. Verified on BOTH a plate read
+    /// (`list_plate_reads`) and the watchlist read (`list_watchlist`).
+    #[tokio::test]
+    async fn plate_display_name_resolution_precedence() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let cam = seed_camera_for_test(&pool, policy_id).await;
+        let plate = normalize_plate(&Uuid::new_v4().simple().to_string());
+        let ts = Utc
+            .timestamp_millis_opt(1_700_000_200_000)
+            .single()
+            .unwrap();
+        seed_plate_read(&pool, cam, &plate, ts).await;
+
+        // 1. Neither a first-class name nor a watchlist label -> None.
+        assert_eq!(read_one_display_name(&pool, cam, &plate).await, None);
+
+        // 2. Only a watchlist label -> that label shows.
+        upsert_watchlist_entry(
+            &pool,
+            &UpsertWatchlistParams {
+                plate: plate.clone(),
+                label: Some("Watchlist label".to_owned()),
+                note: None,
+                color: None,
+                notify: true,
+                kind: "watch".to_owned(),
+            },
+        )
+        .await
+        .expect("upsert_watchlist_entry");
+        assert_eq!(
+            read_one_display_name(&pool, cam, &plate).await.as_deref(),
+            Some("Watchlist label")
+        );
+        // The watchlist read carries the same resolved name.
+        let wl = list_watchlist(&pool).await.expect("list_watchlist");
+        let entry = wl.iter().find(|w| w.plate == plate).expect("entry present");
+        assert_eq!(entry.display_name.as_deref(), Some("Watchlist label"));
+
+        // 3. A first-class plate name wins over the watchlist label.
+        assert!(upsert_plate_label(&pool, &plate, "First-class name")
+            .await
+            .expect("upsert_plate_label"));
+        assert_eq!(
+            read_one_display_name(&pool, cam, &plate).await.as_deref(),
+            Some("First-class name")
+        );
+        let wl = list_watchlist(&pool).await.expect("list_watchlist");
+        let entry = wl.iter().find(|w| w.plate == plate).expect("entry present");
+        assert_eq!(entry.display_name.as_deref(), Some("First-class name"));
+
+        // 4. Clearing the first-class name falls back to the watchlist label.
+        assert!(delete_plate_label(&pool, &plate)
+            .await
+            .expect("delete_plate_label"));
+        assert_eq!(
+            read_one_display_name(&pool, cam, &plate).await.as_deref(),
+            Some("Watchlist label")
         );
     }
 }

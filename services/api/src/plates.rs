@@ -34,8 +34,9 @@ use crate::{
 };
 
 /// Mount the authenticated JSON routes: `GET /plates` (view_plates-gated), the
-/// admin `GET`/`PUT /config/lpr` enable toggle, and the plate-watchlist CRUD
-/// (reads gated on `view_plates`, writes admin-only).
+/// admin `GET`/`PUT /config/lpr` enable toggle, the plate-watchlist CRUD (reads
+/// gated on `view_plates`, writes admin-only), and the plate-name CRUD
+/// (`PUT`/`DELETE /lpr/plate-labels`, admin-only, issue #363).
 ///
 /// Mounted in `json_routes` (rate-limited, gzip, 30 s timeout).
 pub fn json_routes() -> Router<AppState> {
@@ -65,6 +66,14 @@ pub fn json_routes() -> Router<AppState> {
         .route(
             "/lpr/watchlist/:id",
             axum::routing::delete(delete_watchlist),
+        )
+        // Human-readable plate names (issue #363). Writes are admin-only, like
+        // the watchlist writes; the resolved name rides `GET /plates` and the
+        // watchlist read for every client via the `display_name` DTO field.
+        .route("/lpr/plate-labels", axum::routing::put(put_plate_label))
+        .route(
+            "/lpr/plate-labels/:plate",
+            axum::routing::delete(delete_plate_label),
         )
 }
 
@@ -442,6 +451,75 @@ async fn delete_watchlist(
         Err(ApiError::NotFound(format!(
             "watchlist entry {id} not found"
         )))
+    }
+}
+
+// ── plate names (`/lpr/plate-labels`) ────────────────────────────────────────
+
+/// `PUT /lpr/plate-labels` body. `plate` is normalized server-side; `label` is
+/// the human-readable name to show wherever the plate appears.
+#[derive(Debug, Deserialize)]
+pub struct PlateLabelUpsert {
+    pub plate: String,
+    pub label: String,
+}
+
+/// `PUT /lpr/plate-labels` — set or edit a plate's human-readable name (issue
+/// #363). Admin-only, matching the watchlist writes: naming a plate is an
+/// operator-curation action. Keyed on the normalized plate, so re-setting the
+/// same plate edits it. The name then wins over any watchlist label wherever a
+/// plate read is shown (see the `display_name` resolution in `list_plate_reads`
+/// and the watchlist read).
+///
+/// # Errors
+///
+/// * `400` — the plate normalizes to empty, or the label is blank.
+/// * `401` / `403` — auth failure / not an admin.
+async fn put_plate_label(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<PlateLabelUpsert>,
+) -> Result<StatusCode, ApiError> {
+    let wrote = db::upsert_plate_label(state.pool(), &body.plate, &body.label)
+        .await
+        .map_err(ApiError::Internal)?;
+    if wrote {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::BadRequest(
+            "plate must contain at least one alphanumeric character and label must not be blank"
+                .to_owned(),
+        ))
+    }
+}
+
+/// `DELETE /lpr/plate-labels/:plate` — clear a plate's human-readable name
+/// (admin-only). The `plate` path segment is normalized before lookup, so it
+/// matches how the name was stored. 404 when the plate has no name. After
+/// clearing, reads fall back to any watchlist label, else the raw plate.
+///
+/// # Errors
+///
+/// * `400` — the plate normalizes to empty.
+/// * `401` / `403` — auth failure / not an admin.
+/// * `404` — the plate has no name set.
+async fn delete_plate_label(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(plate): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if db::normalize_plate(&plate).is_empty() {
+        return Err(ApiError::BadRequest(
+            "plate must contain at least one alphanumeric character".to_owned(),
+        ));
+    }
+    let removed = db::delete_plate_label(state.pool(), &plate)
+        .await
+        .map_err(ApiError::Internal)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("plate {plate} has no name set")))
     }
 }
 

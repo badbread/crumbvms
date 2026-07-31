@@ -794,3 +794,120 @@ async fn lpr_storage_stats_admin_only_and_counts() {
     );
     assert!(v["oldest_ts"].is_string(), "oldest_ts present, got {v}");
 }
+
+// ── plate names (`/lpr/plate-labels`, issue #363) ────────────────────────────
+
+/// A viewer WITH `view_plates` can read plate reads, but naming a plate is a
+/// curation write and must be admin-only, exactly like the watchlist writes.
+#[tokio::test]
+async fn plate_label_write_requires_admin() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let user = seed_viewer(app.pool(), &[cam]).await;
+    let token = login(&app, &user.username, &user.password).await;
+
+    let resp = app
+        .send(put_auth_json(
+            "/lpr/plate-labels",
+            &token,
+            &serde_json::json!({ "plate": "ABC123", "label": "Mom's car" }),
+        ))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "PUT /lpr/plate-labels is admin-only"
+    );
+
+    let resp = app
+        .send(delete_auth("/lpr/plate-labels/ABC123", &token))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "DELETE /lpr/plate-labels is admin-only"
+    );
+}
+
+/// Admin set/clear round-trip: naming a plate makes `display_name` ride the read
+/// path (`GET /plates`), the name wins over the raw plate, clearing removes it,
+/// and a blank label / empty plate 400s (never stores a nameless row).
+#[tokio::test]
+async fn plate_label_admin_set_and_clear() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    // A distinctive plate so it can't collide with another test's reads on the
+    // shared Postgres.
+    let plate = format!("N{}", unique("").to_uppercase());
+    let plate: String = plate.chars().filter(char::is_ascii_alphanumeric).collect();
+    seed_plate(app.pool(), cam, &plate).await;
+
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+
+    // Before naming: display_name is null on the read.
+    let uri = format!("/plates?camera_ids={cam}&q={plate}&match=exact");
+    let v = body_json(app.send(get_auth(&uri, &token)).await).await;
+    assert_eq!(v["plates"].as_array().unwrap().len(), 1);
+    assert!(
+        v["plates"][0]["display_name"].is_null(),
+        "unnamed plate has null display_name, got {v}"
+    );
+
+    // Name it (plate normalized server-side; lowercase + punctuation in).
+    let messy = format!(" {}-! ", plate.to_lowercase());
+    let resp = app
+        .send(put_auth_json(
+            "/lpr/plate-labels",
+            &token,
+            &serde_json::json!({ "plate": messy, "label": "Mom's car" }),
+        ))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "admin PUT names a plate"
+    );
+
+    // The read now carries the name; the raw plate is retained too.
+    let v = body_json(app.send(get_auth(&uri, &token)).await).await;
+    assert_eq!(v["plates"][0]["display_name"], "Mom's car");
+    assert_eq!(v["plates"][0]["plate"], plate);
+
+    // Clear it.
+    let resp = app
+        .send(delete_auth(&format!("/lpr/plate-labels/{plate}"), &token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let v = body_json(app.send(get_auth(&uri, &token)).await).await;
+    assert!(
+        v["plates"][0]["display_name"].is_null(),
+        "cleared name is null again, got {v}"
+    );
+
+    // A second clear is a 404 (nothing to remove).
+    let resp = app
+        .send(delete_auth(&format!("/lpr/plate-labels/{plate}"), &token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A blank label 400s (never store a nameless row).
+    let resp = app
+        .send(put_auth_json(
+            "/lpr/plate-labels",
+            &token,
+            &serde_json::json!({ "plate": &plate, "label": "   " }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A plate that normalizes to empty 400s.
+    let resp = app
+        .send(put_auth_json(
+            "/lpr/plate-labels",
+            &token,
+            &serde_json::json!({ "plate": "---", "label": "Anything" }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
