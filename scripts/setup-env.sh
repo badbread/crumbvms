@@ -211,6 +211,12 @@ CRUMB_GO2RTC_RTSP_BASE=
 # restarting recorder + api.
 GO2RTC_USER=${GO2RTC_USER}
 GO2RTC_PASS=${GO2RTC_PASS}
+# OPTIONAL restream auth opt-out (issue #398). Left UNSET here on purpose: the
+# secure default is an AUTHENTICATED LAN RTSP restream. Set GO2RTC_AUTH=off ONLY
+# to deliberately run an open, credential-free restream on a trusted LAN (any LAN
+# client can then pull every camera at rtsp://<host>:18554/<name>). The internal
+# go2rtc REST API (:1984) stays authenticated regardless. docs/COMPOSE.md § go2rtc.
+# GO2RTC_AUTH=off
 # External (BRING-YOUR-OWN) Frigate's go2rtc — only for cameras served_by='frigate'.
 # This is a SEPARATE go2rtc instance with its own credentials (if any);
 # GO2RTC_USER/PASS above are never sent to it.

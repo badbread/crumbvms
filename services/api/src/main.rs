@@ -153,6 +153,18 @@ async fn main() -> anyhow::Result<()> {
     let cfg = ApiConfig::from_env()?;
     let bind_addr = cfg.bind_addr;
     info!(bind_addr = %bind_addr, "configuration loaded");
+    // Issue #398: surface the go2rtc RTSP restream auth posture at startup. The
+    // recorder owns + logs the actual listener config; the api logs it too so an
+    // "open restream" is visible in both containers' logs and never a surprise.
+    if cfg.go2rtc_rtsp_auth {
+        info!("go2rtc RTSP restream auth: ENABLED (default); client stream URLs carry credentials");
+    } else {
+        tracing::warn!(
+            "go2rtc RTSP restream auth is DISABLED (GO2RTC_AUTH=off): the LAN restream \
+             (rtsp://<host>:18554) is OPEN to any client and /cameras/*/streams URLs carry no \
+             credentials. Operator opt-out; the internal go2rtc REST API stays authenticated"
+        );
+    }
 
     // ── 3. database pool ──────────────────────────────────────────────────────
     let pool = build_pool(&cfg.database_url, cfg.db_pool_size)?;

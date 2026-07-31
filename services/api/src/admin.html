@@ -426,6 +426,9 @@ tbody tr.selected td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
 .warn-note{border-left:2px solid var(--warn);padding:6px 10px;font-size:12px;color:var(--dim);line-height:1.5;margin-top:10px;}
 .info-note b,.info-note strong{color:var(--text);}
 .warn-note b,.warn-note strong{color:var(--warn);}
+/* Danger variant: an OPEN/unauthenticated posture the operator must not miss. */
+.warn-note.danger{border-left-color:var(--danger);}
+.warn-note.danger b,.warn-note.danger strong{color:var(--danger);}
 /* ── Code ── */
 code{background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:12px;font-family:ui-monospace,monospace;}
 /* ── Inheritance banner, flattened: left accent rule, no filled box ── */
@@ -888,6 +891,17 @@ function infoHint(text) {
   // stopPropagation/preventDefault so clicking the icon inside a <label>
   // doesn't toggle the control it annotates.
   return `<span class="info-hint" tabindex="0" role="button" title="${t}" aria-label="${t}" data-info="${t}" onclick="event.preventDefault();event.stopPropagation();toast(this.getAttribute('data-info'),'info',7000)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toast(this.getAttribute('data-info'),'info',7000)}">${icon('info',13)}</span>`;
+}
+/* Restream auth posture badge (issue #398). `authed` is the DTO's
+   restream_rtsp_authenticated: true = secure default (green), false = the
+   operator set GO2RTC_AUTH=off and the LAN RTSP restream is OPEN (red). An
+   undefined value (older server) shows a neutral "unknown" chip. */
+function restreamAuthBadge(authed) {
+  if (authed === true)
+    return `<span class="pill" style="color:var(--ok);border:1px solid var(--ok)">Authenticated</span>`;
+  if (authed === false)
+    return `<span class="pill" style="color:var(--danger);border:1px solid var(--danger)">OPEN, no auth</span>`;
+  return `<span class="pill" style="color:var(--dim)">unknown</span>`;
 }
 /* Tooltip copy for the motion detection controls (shared by the camera Motion
    tab and the dedicated Motion-tuning view). */
@@ -6901,8 +6915,16 @@ async function renderServerSettings() {
         <div class="fg-ctl"><input id="srv-crumb-rtsp" class="mono" value="${esc(s.crumb_rtsp_base||'')}" placeholder="rtsp://&lt;this-host&gt;:18554" style="max-width:420px" title="Public RTSP address native clients pull from. Empty = the in-network container default." /></div>
         <label class="fg-label" for="srv-crumb-api">Crumb API base ${infoHint('go2rtc REST/WebRTC base for the web player. Empty = the container default.')}</label>
         <div class="fg-ctl"><input id="srv-crumb-api" class="mono" value="${esc(s.crumb_api_base||'')}" placeholder="http://go2rtc:1984" style="max-width:420px" title="go2rtc REST/WebRTC base for the web player. Empty = the container default." /></div>
+        <label class="fg-label">Restream auth ${infoHint('Whether the LAN RTSP restream (rtsp://<host>:18554) requires a username/password. Set by GO2RTC_AUTH; not editable here.')}</label>
+        <div class="fg-ctl">${restreamAuthBadge(s.restream_rtsp_authenticated)}</div>
         <div class="fg-full card-hint">Frigate stream addresses &amp; the motion-decode backend moved to <b>Detection &amp; clips</b>.</div>
       </div>
+      ${s.restream_rtsp_authenticated === false ? `<div class="warn-note danger" style="margin-top:10px">
+        <b>The RTSP restream is OPEN.</b> <code>GO2RTC_AUTH=off</code> is set, so any client on the LAN can pull
+        every camera from <code>rtsp://&lt;this-host&gt;:18554/&lt;name&gt;</code> with no credentials. This is an
+        explicit opt-out. To re-secure it, remove <code>GO2RTC_AUTH</code> (or set it to anything other than
+        <code>off</code>) and restart the stack. The internal go2rtc REST API (:1984) stays authenticated either way.
+      </div>` : ''}
     </div>
     <div class="policy-section">
       <div class="policy-section-title">Features</div>

@@ -614,11 +614,21 @@ async fn live_streams(
     let b = resolve_bases(&state).await;
     // P0-GO2RTC (lighter lockdown): embed Crumb's go2rtc RTSP credentials into
     // the CRUMB base only — never into frigate_rtsp (a separate BYO instance).
-    let crumb_rtsp_authed = crumb_common::db::inject_rtsp_credentials(
-        &b.crumb_rtsp,
-        &state.config().go2rtc_user,
-        &state.config().go2rtc_pass,
-    );
+    //
+    // Issue #398: when the operator has explicitly opted the LAN restream out of
+    // auth (`GO2RTC_AUTH=off`), go2rtc's RTSP listener is open, so hand clients
+    // credential-free `rtsp://host:18554/<name>` URLs (embedding a user:pass@
+    // that the listener no longer expects would be misleading, and there is no
+    // secret to embed). Default (auth ON) is unchanged: creds are embedded.
+    let crumb_rtsp_authed = if state.config().go2rtc_rtsp_auth {
+        crumb_common::db::inject_rtsp_credentials(
+            &b.crumb_rtsp,
+            &state.config().go2rtc_user,
+            &state.config().go2rtc_pass,
+        )
+    } else {
+        b.crumb_rtsp.clone()
+    };
 
     // ── 4. build stream URLs ──────────────────────────────────────────────────
     // RTSP URLs are resolved via the canonical helper so legacy rows (absolute
@@ -912,6 +922,37 @@ mod tests {
         assert_eq!(resolved.segment_id, seg.id);
         assert_eq!(resolved.duration_ms, seg.duration_ms);
         assert_eq!(resolved.has_motion, seg.has_motion);
+    }
+
+    // ── go2rtc RTSP restream auth posture (issue #398) ────────────────────────
+
+    /// The `live_streams` handler chooses the Crumb RTSP base by the auth
+    /// posture: auth ON embeds `user:pass@` into the base (the default), auth OFF
+    /// hands out the bare base with NO credentials. This mirrors that exact
+    /// branch so the contract is pinned: a credential-free URL when, and only
+    /// when, the operator opted out, and a fully qualified `rtsp://` in both.
+    fn crumb_rtsp_base_for(auth_on: bool, base: &str, user: &str, pass: &str) -> String {
+        if auth_on {
+            crumb_common::db::inject_rtsp_credentials(base, user, pass)
+        } else {
+            base.to_owned()
+        }
+    }
+
+    #[test]
+    fn rtsp_url_embeds_credentials_when_auth_on() {
+        let out = crumb_rtsp_base_for(true, "rtsp://host:18554", "u", "p");
+        assert_eq!(out, "rtsp://u:p@host:18554");
+        // A per-camera stream name resolves onto the credentialed base.
+        assert_eq!(format!("{out}/driveway"), "rtsp://u:p@host:18554/driveway");
+    }
+
+    #[test]
+    fn rtsp_url_omits_credentials_when_auth_off() {
+        let out = crumb_rtsp_base_for(false, "rtsp://host:18554", "u", "p");
+        assert_eq!(out, "rtsp://host:18554", "no user:pass@ when auth is off");
+        assert!(!out.contains('@'), "auth-off URL must carry no userinfo");
+        assert_eq!(format!("{out}/driveway"), "rtsp://host:18554/driveway");
     }
 
     // ── guard_path_traversal ──────────────────────────────────────────────────

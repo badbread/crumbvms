@@ -55,6 +55,7 @@ console's Server & streaming settings, that value wins.
 | `GO2RTC_USER` | `go2rtc` | a fixed, non-secret Basic-auth username label (not generated); required, compose fails fast if unset |
 | `GO2RTC_PASS` | generated | required; required to be strong, rotate with care (needs a recorder + api restart) |
 | `GO2RTC_EMBEDDED` | `true` | set `false` only if running an external restreamer |
+| `GO2RTC_AUTH` | empty (auth ON) | optional restream auth opt-out. Leave unset for the secure default (authenticated LAN RTSP restream). Set to `off` to run an OPEN, credential-free restream on a trusted LAN: any LAN client can then pull every camera at `rtsp://<host>:18554/<name>` with no password. Any value other than `off` (including empty) keeps auth ON. The internal go2rtc REST API (`:1984`) stays authenticated regardless, so `GO2RTC_USER`/`GO2RTC_PASS` are still required. |
 | `GO2RTC_RTSP_BASE` / `GO2RTC_API_BASE` | empty | a separate, external Frigate go2rtc instance, only used for cameras served by it |
 
 ## Recording

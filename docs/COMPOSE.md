@@ -105,6 +105,32 @@ grants.
 > LAN scanning, **not** a replacement for the api's per-user JWT/RBAC on the
 > MSE/WebRTC-signaling/JPEG planes.
 
+#### Opting the LAN RTSP restream out of auth (`GO2RTC_AUTH=off`)
+
+The RTSP restream is authenticated by default, and that is the recommended
+posture. Turning auth on is not a local change: every consumer (a Frigate or
+other NVR pulling `rtsp://host:18554/<stream>`, plus every client) needs the
+credential at the same instant. On a segmented, trusted LAN an operator may
+reasonably decide that coordination cost is not worth it, so the opt-out is a
+first-class, supported setting rather than a config-file fork.
+
+Set `GO2RTC_AUTH=off` in `.env` to open ONLY the LAN-facing RTSP listener
+(`:18554`). With it set:
+
+- the recorder renders an effective go2rtc config at startup that omits the
+  `rtsp:` listener's credentials (the tracked `go2rtc/go2rtc.yaml` is mounted
+  read-only and is never edited), so a deployment stays byte-identical to
+  upstream and only sets one env var;
+- the api hands out credential-free `rtsp://host:18554/<name>` URLs;
+- the recorder logs a startup `WARN`, the api logs one too, and the admin
+  console's **Server** page shows a red "OPEN, no auth" badge, so an open
+  restream is never a silent surprise.
+
+Any value other than exactly `off` (including empty or unset) keeps auth ON.
+The internal go2rtc REST API (`:1984`) stays authenticated in both postures, so
+`GO2RTC_USER`/`GO2RTC_PASS` remain required. To re-secure the restream, remove
+`GO2RTC_AUTH` (or set it to anything but `off`) and restart the stack.
+
 ### recorder volumes and the motion RAM cache
 
 - `${MEDIA_HOST_PATH}:/data` — one broad media root, **read-write** (the

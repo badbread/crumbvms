@@ -958,6 +958,13 @@ pub struct ServerSettingsDto {
     /// Monotonically increasing version counter; bumped on every PUT. Clients
     /// poll this (via `/status`) to detect changes and reload stream URLs.
     pub version: i64,
+    /// Whether Crumb's own go2rtc RTSP restream (LAN-published `:18554`)
+    /// requires authentication (issue #398). Read-only, derived from the
+    /// `GO2RTC_AUTH` env posture (not the `server_settings` row), so a PUT never
+    /// changes it. `true` = secure default (clients get credentialed URLs);
+    /// `false` = the operator set `GO2RTC_AUTH=off` and the restream is OPEN to
+    /// any LAN client. The console renders a loud warning when this is `false`.
+    pub restream_rtsp_authenticated: bool,
     /// Resolved IANA timezone the server evaluates its schedules in (from the
     /// `TZ` env; `America/Los_Angeles` if unset/invalid). Read-only, derived from
     /// the environment (not the `server_settings` row, so a PUT never changes
