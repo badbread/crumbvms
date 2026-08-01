@@ -2,6 +2,7 @@
 
 package video.crumb.app.feature.live
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -59,6 +60,9 @@ import video.crumb.app.ui.KeepScreenOn
 import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
 import video.crumb.app.data.PtzPresetDto
+import video.crumb.app.data.haNeedsSheet
+import video.crumb.app.data.haPrimaryAction
+import video.crumb.app.data.toUserMessage
 import video.crumb.app.di.appContainer
 import video.crumb.app.ui.player.MediaFactory
 import video.crumb.app.ui.player.PlayerSurface
@@ -132,11 +136,57 @@ fun LiveFullscreenScreen(
     var haStates by remember { mutableStateOf<HaStatesResponse?>(null) }
     var haSheetOpen by remember { mutableStateOf(false) }
     var haBadgeSelected by remember { mutableStateOf<HaLinkDto?>(null) }
+    // The cover/lock badge tapped for control (opens the confirm-guarded control
+    // dialog); distinct from [haBadgeSelected], which is the read-only detail. (#428)
+    var haControlSelected by remember { mutableStateOf<HaLinkDto?>(null) }
+    // actionLinkIds of HA actions currently posting — drives the in-flight spinner
+    // on the badge / control buttons. We never flip state locally (#428).
+    var haInFlight by remember { mutableStateOf<Set<String>>(emptySet()) }
     LaunchedEffect(currentCameraId) {
         haLinks = emptyList()
         haSheetOpen = false
         haBadgeSelected = null
+        haControlSelected = null
         repo.haLinks(currentCameraId).onSuccess { haLinks = it }
+    }
+    // May this user actuate linked HA devices? Physical-security privileged and
+    // default-off; admins imply it. Older servers omit the capability → false, so
+    // controls hide and every badge stays read-only (#187).
+    val actuatorCapable = store.isAdmin || store.capabilities.actuators
+    // Fire one HA service call. Optimistic ONLY in the spinner sense; the shown
+    // state converges via the `/ha/states` poll (never a local flip). A rejection
+    // (no capability / bad link / HA unreachable) shows a compact toast.
+    val fireHaAction: (HaLinkDto, String) -> Unit = { link, action ->
+        val id = link.actionLinkId
+        haInFlight = haInFlight + id
+        scope.launch {
+            val res = repo.haAction(currentCameraId, id, action)
+            haInFlight = haInFlight - id
+            res.onFailure {
+                Toast.makeText(
+                    context,
+                    "Couldn't control ${link.displayName}: ${it.toUserMessage()}",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }.onSuccess {
+                // Nudge an immediate refresh so the badge catches up fast; the
+                // periodic poll then keeps it converged.
+                repo.haStates().onSuccess { haStates = it }
+            }
+        }
+    }
+    // A single tap on a badge: fire the primary action directly for simple
+    // actuators, open the confirm-guarded control dialog for cover/lock, else
+    // fall back to the read-only detail (non-actuator, no capability, or a domain
+    // we can't actuate). Long-press always opens the read-only detail. (#428)
+    val onHaBadgeTap: (HaLinkDto) -> Unit = { link ->
+        val canActuate = actuatorCapable && link.isActuator
+        val primary = haPrimaryAction(link.domain)
+        when {
+            canActuate && primary != null -> fireHaAction(link, primary)
+            canActuate && haNeedsSheet(link.domain) -> haControlSelected = link
+            else -> haBadgeSelected = link
+        }
     }
     // Poll HA states while this camera has linked entities (to keep the on-video
     // badges live) or the sheet is open. Server demand-caches with a ~2s TTL.
@@ -152,8 +202,11 @@ fun LiveFullscreenScreen(
     // matching desktop (`live_status_controller.haStale`) and iOS
     // (`HomeAssistant` missStreak >= 2). (#371)
     var haMissStreak by remember { mutableStateOf(0) }
-    LaunchedEffect(currentCameraId, haHasPlaced, haSheetOpen) {
-        if (!haHasPlaced && !haSheetOpen) return@LaunchedEffect
+    // Keep polling while any detail/control dialog is open too, so a fired action
+    // converges the shown state even when no badge is placed on this camera (#428).
+    val haDialogOpen = haBadgeSelected != null || haControlSelected != null
+    LaunchedEffect(currentCameraId, haHasPlaced, haSheetOpen, haDialogOpen) {
+        if (!haHasPlaced && !haSheetOpen && !haDialogOpen) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 val res = repo.haStates().onSuccess { haStates = it }
@@ -619,9 +672,11 @@ fun LiveFullscreenScreen(
                 links = haLinks,
                 states = haStates,
                 clientStale = haStale,
+                inFlightLinkIds = haInFlight,
                 videoWidth = videoSize.width,
                 videoHeight = videoSize.height,
-                onBadgeTap = { haBadgeSelected = it },
+                onBadgeTap = onHaBadgeTap,
+                onBadgeLongPress = { haBadgeSelected = it },
             )
         }
 
@@ -894,15 +949,32 @@ fun LiveFullscreenScreen(
                 cameraName = cameraNames[currentCameraId] ?: "Camera",
                 links = haLinks,
                 states = haStates,
+                canActuate = actuatorCapable,
+                inFlightLinkIds = haInFlight,
+                onAction = { link, action -> fireHaAction(link, action) },
                 onDismiss = { haSheetOpen = false },
             )
         }
 
-        // Tapping an on-video HA badge opens the same read-only detail dialog the
-        // list sheet uses (issue #263).
+        // Long-pressing an on-video badge (or tapping a non-controllable one) opens
+        // the read-only detail dialog the list sheet uses (issue #263) — inspect
+        // without actuating (#428).
         haBadgeSelected?.let { link ->
             val st = haStates?.stateFor(link.entityId)
             HaMoreInfoDialog(link, st?.state, st?.lastChanged, onDismiss = { haBadgeSelected = null })
+        }
+
+        // Tapping a controllable cover/lock badge opens the confirm-guarded control
+        // dialog (multi-action, physical-security) (#428).
+        haControlSelected?.let { link ->
+            val st = haStates?.stateFor(link.entityId)
+            HaMoreInfoDialog(
+                link, st?.state, st?.lastChanged,
+                canActuate = true,
+                inFlight = link.actionLinkId in haInFlight,
+                onAction = { action -> fireHaAction(link, action) },
+                onDismiss = { haControlSelected = null },
+            )
         }
 
         // ── In-view PTZ controls — wheel (joystick ring) OR edge-pinned arrows ──

@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
+import video.crumb.app.data.haPrimaryAction
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -144,9 +145,12 @@ private fun changedAgo(iso: String?): String? {
 }
 
 /**
- * The Home Assistant entity sheet for one camera. Read-only (Phase 1): shows the
- * camera's linked HA entities as HA-style tile cards with live state; tapping a
- * tile opens an HA "more-info"-style detail. Control lands in Phase 2.
+ * The Home Assistant entity sheet for one camera. Shows the camera's linked HA
+ * entities as HA-style tile cards with live state; tapping a tile opens an HA
+ * "more-info"-style detail. Phase 2 (#187): when [canActuate] and the link is an
+ * actuator, that detail also carries controls (with a confirm on cover/lock);
+ * every other case stays read-only. [onAction] fires one service call for a link;
+ * [inFlightLinkIds] holds the [HaLinkDto.actionLinkId]s currently posting.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -155,6 +159,9 @@ fun HaEntitiesSheet(
     links: List<HaLinkDto>,
     states: HaStatesResponse?,
     onDismiss: () -> Unit,
+    canActuate: Boolean = false,
+    inFlightLinkIds: Set<String> = emptySet(),
+    onAction: (HaLinkDto, String) -> Unit = { _, _ -> },
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selected by remember { mutableStateOf<HaLinkDto?>(null) }
@@ -204,7 +211,13 @@ fun HaEntitiesSheet(
 
     selected?.let { link ->
         val st = states?.stateFor(link.entityId)
-        HaMoreInfoDialog(link, st?.state, st?.lastChanged, onDismiss = { selected = null })
+        HaMoreInfoDialog(
+            link, st?.state, st?.lastChanged,
+            canActuate = canActuate && link.isActuator,
+            inFlight = link.actionLinkId in inFlightLinkIds,
+            onAction = { action -> onAction(link, action) },
+            onDismiss = { selected = null },
+        )
     }
 }
 
@@ -249,16 +262,30 @@ private fun HaTile(link: HaLinkDto, state: String?, onClick: () -> Unit) {
     }
 }
 
-/** HA "more-info"-style detail dialog (read-only). Also opened by tapping an
- *  on-video badge in [HaBadgeOverlayLayer]. */
+/**
+ * HA "more-info"-style detail dialog. Read-only by default (also opened by
+ * long-pressing an on-video badge in [HaBadgeOverlayLayer], or tapping a
+ * non-controllable one). When [canActuate] is true and the link is an actuator it
+ * grows a control row: a single primary action for simple domains (fired
+ * directly), and confirm-guarded multi-action buttons for `cover`/`lock`. A
+ * future value-setting control (dimmer/position) will render here too; the
+ * backend is on/off/toggle-only today, so there is no such UI yet (#428).
+ */
 @Composable
 internal fun HaMoreInfoDialog(
     link: HaLinkDto,
     state: String?,
     lastChanged: String?,
     onDismiss: () -> Unit,
+    canActuate: Boolean = false,
+    inFlight: Boolean = false,
+    onAction: (String) -> Unit = {},
 ) {
     val v = haVisual(link, state)
+    // Pending confirm-guarded action (action verb -> human prompt), for cover/lock.
+    var pendingConfirm by remember { mutableStateOf<Pair<String, String>?>(null) }
+    val showControls = canActuate && link.isActuator
+
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -281,9 +308,120 @@ internal fun HaMoreInfoDialog(
                 Spacer(Modifier.height(4.dp))
                 Text(it, color = HaSecondaryText, fontSize = 12.5.sp)
             }
+
+            if (showControls) {
+                Spacer(Modifier.height(18.dp))
+                HaControlRow(
+                    domain = link.domain,
+                    inFlight = inFlight,
+                    // Simple domains fire directly; cover/lock route through the
+                    // confirm prompt (physical-security guard).
+                    onFire = { action -> onAction(action) },
+                    onConfirm = { action, prompt -> pendingConfirm = action to prompt },
+                    entityName = link.displayName,
+                )
+            }
+
             Spacer(Modifier.height(16.dp))
             HaAttrRow("Device class", link.deviceClass?.replace('_', ' ') ?: "—")
             HaAttrRow("Entity", link.entityId)
+        }
+    }
+
+    pendingConfirm?.let { (action, prompt) ->
+        HaConfirmDialog(
+            prompt = prompt,
+            onConfirm = {
+                pendingConfirm = null
+                onAction(action)
+            },
+            onCancel = { pendingConfirm = null },
+        )
+    }
+}
+
+/**
+ * The control row for an actuator detail: one button for simple domains (toggle/
+ * press/activate, fired directly via [onFire]), Open/Stop/Close for `cover` and
+ * Lock/Unlock for `lock` (routed through [onConfirm] with a human prompt). While
+ * [inFlight], buttons are disabled and a spinner shows.
+ */
+@Composable
+private fun HaControlRow(
+    domain: String,
+    inFlight: Boolean,
+    entityName: String,
+    onFire: (String) -> Unit,
+    onConfirm: (String, String) -> Unit,
+) {
+    if (inFlight) {
+        androidx.compose.material3.CircularProgressIndicator(
+            modifier = Modifier.size(26.dp),
+            color = HaBlue,
+            strokeWidth = 2.5.dp,
+        )
+        return
+    }
+    when (domain) {
+        "cover" -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            HaActionButton("Open", HaBlue) { onConfirm("open_cover", "Open $entityName?") }
+            HaActionButton("Stop", HaGrey) { onConfirm("stop_cover", "Stop $entityName?") }
+            HaActionButton("Close", HaAmber) { onConfirm("close_cover", "Close $entityName?") }
+        }
+        "lock" -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            HaActionButton("Lock", HaBlue) { onConfirm("lock", "Lock $entityName?") }
+            HaActionButton("Unlock", HaRed) { onConfirm("unlock", "Unlock $entityName?") }
+        }
+        else -> {
+            // Simple direct-fire actuators (light/switch/fan/siren/button/scene/...).
+            val primary = haPrimaryAction(domain) ?: return
+            val label = when (primary) {
+                "toggle" -> "Toggle"
+                "press" -> "Press"
+                "turn_on" -> "Activate"
+                else -> primary.replaceFirstChar { it.uppercase() }
+            }
+            HaActionButton(label, HaBlue) { onFire(primary) }
+        }
+    }
+}
+
+/** A rounded pill action button in the HA sheet's dark theme. */
+@Composable
+private fun HaActionButton(label: String, accent: Color, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(accent.copy(alpha = 0.18f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** Confirmation prompt shown before any cover/lock action fires (#428). */
+@Composable
+private fun HaConfirmDialog(prompt: String, onConfirm: () -> Unit, onCancel: () -> Unit) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onCancel) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(HaCard)
+                .padding(horizontal = 22.dp, vertical = 22.dp),
+        ) {
+            Text(prompt, color = HaPrimaryText, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(20.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                HaActionButton("Cancel", HaGrey, onClick = onCancel)
+                Spacer(Modifier.size(10.dp))
+                HaActionButton("Confirm", HaBlue, onClick = onConfirm)
+            }
         }
     }
 }
