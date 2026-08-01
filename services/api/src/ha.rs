@@ -107,6 +107,14 @@ fn allowed_service(domain: &str, action: &str) -> Option<&'static str> {
     actions.iter().copied().find(|s| *s == action)
 }
 
+/// Every entity domain Crumb can actuate, derived straight from
+/// [`HA_ACTION_ALLOWLIST`] so the "controls" entity-picker set can never drift
+/// from the domains the action endpoint will actually accept. Order follows the
+/// allowlist.
+fn control_domains() -> Vec<&'static str> {
+    HA_ACTION_ALLOWLIST.iter().map(|(d, _)| *d).collect()
+}
+
 // ─── HTTP: shared client + picker filter ──────────────────────────────────────
 
 /// Build the shared `crumb_common::ha` client from stored settings, mapping the
@@ -199,8 +207,12 @@ struct HaEntity {
 
 #[derive(Deserialize)]
 struct EntitiesQuery {
-    /// `binary_sensor`, `light`, `switch`, `scene`, or `controls`
-    /// (light+switch+scene). Omitted ⇒ all of the above.
+    /// A single HA domain (e.g. `binary_sensor`, `sensor`, `light`, `cover`), or
+    /// one of the role aliases: `controls` (every actuatable domain from
+    /// `HA_ACTION_ALLOWLIST`: light, switch, fan, siren, cover, lock, button,
+    /// `input_button`, scene, script) or `sensors` (numeric `sensor`). Omitted ⇒
+    /// the union of all of the above (motion binary sensors + numeric sensors +
+    /// every controllable domain).
     domain: Option<String>,
 }
 
@@ -440,9 +452,20 @@ async fn get_entities(
 ) -> Result<Json<Vec<HaEntity>>, ApiError> {
     let s = effective_settings(&state).await?;
     let domains: Vec<&str> = match q.domain.as_deref() {
-        Some("controls") => vec!["light", "switch", "scene"],
+        // Actuator role: every domain the action endpoint can drive (light,
+        // switch, fan, siren, cover, lock, button, input_button, scene, script),
+        // derived from the allowlist so the two can never diverge.
+        Some("controls") => control_domains(),
+        // Numeric-sensor role (temperature/humidity/... display links).
+        Some("sensors") => vec!["sensor"],
         Some(d) => vec![d],
-        None => vec!["binary_sensor", "light", "switch", "scene"],
+        // Omitted ⇒ the union of every pickable role: motion binary sensors,
+        // numeric sensors, and every controllable domain.
+        None => {
+            let mut all = vec!["binary_sensor", "sensor"];
+            all.extend(control_domains());
+            all
+        }
     };
     let states = ha_client(&s)?
         .get_states()
@@ -890,6 +913,60 @@ mod tests {
         let controls = entities_from_states(arr, &["light", "switch", "scene"]);
         assert_eq!(controls.len(), 1);
         assert_eq!(controls[0].entity_id, "light.kitchen");
+
+        // Numeric-sensor picker set surfaces `sensor.*` only.
+        let sensors = entities_from_states(arr, &["sensor"]);
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].entity_id, "sensor.temperature");
+    }
+
+    #[test]
+    fn control_domains_match_the_action_allowlist() {
+        // The picker's "controls" set is derived from HA_ACTION_ALLOWLIST, so
+        // every domain the action endpoint can drive is reachable through the
+        // picker, and nothing else leaks in. This guards against the two lists
+        // silently diverging.
+        let picker = control_domains();
+        let allow: Vec<&str> = HA_ACTION_ALLOWLIST.iter().map(|(d, _)| *d).collect();
+        assert_eq!(picker, allow);
+        for d in [
+            "light",
+            "switch",
+            "fan",
+            "siren",
+            "cover",
+            "lock",
+            "button",
+            "input_button",
+            "scene",
+            "script",
+        ] {
+            assert!(picker.contains(&d), "control picker missing {d}");
+        }
+        // Motion + numeric-sensor domains are NOT controls (separate roles).
+        assert!(!picker.contains(&"binary_sensor"));
+        assert!(!picker.contains(&"sensor"));
+    }
+
+    #[test]
+    fn control_domains_filter_covers_lock_and_cover() {
+        // A cover and a lock must both be pickable via the widened controls set
+        // (the flagship confirm-gated garage/lock control had buttons but no
+        // pick path before issue #433).
+        let states = json!([
+            {"entity_id": "cover.garage", "attributes": {"friendly_name": "Garage Door"}},
+            {"entity_id": "lock.front", "attributes": {"friendly_name": "Front Lock"}},
+            {"entity_id": "fan.attic", "attributes": {"friendly_name": "Attic Fan"}},
+            {"entity_id": "binary_sensor.motion", "attributes": {"friendly_name": "Motion"}}
+        ]);
+        let arr = states.as_array().unwrap();
+        let controls = entities_from_states(arr, &control_domains());
+        let ids: Vec<&str> = controls.iter().map(|e| e.entity_id.as_str()).collect();
+        assert!(ids.contains(&"cover.garage"));
+        assert!(ids.contains(&"lock.front"));
+        assert!(ids.contains(&"fan.attic"));
+        // binary_sensor is a motion entity, not a control.
+        assert!(!ids.contains(&"binary_sensor.motion"));
     }
 
     #[test]

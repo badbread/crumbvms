@@ -5145,8 +5145,10 @@ async function saveCameraDeviceInfo(id) {
 }
 
 /* ── Camera <-> Home Assistant entity links (issue #52, Phase 1) ──
-   Link this camera to HA motion/door sensors (role 'motion') and lights/switches
-   /scenes (role 'actuator'). Edited as a set and saved via PUT .../ha/links. */
+   Link this camera to HA motion/door sensors (role 'motion'), numeric value
+   sensors like temperature/humidity (role 'sensor'), and controllable entities
+   like lights, switches, fans, covers, locks, scenes and scripts (role
+   'actuator'). Edited as a set and saved via PUT .../ha/links. */
 let HA_LINKS = [];        // working set for the open camera
 let HA_CAM_ID = null;
 let HA_ENT_CACHE = {};    // domain -> [{entity_id, friendly_name, device_class}], per camera open
@@ -5490,6 +5492,7 @@ function renderHaLinks(configured) {
     <div>${rows}</div>
     <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
       <button class="ghost sm" onclick="haOpenPicker('motion')">+ Add sensor</button>
+      <button class="ghost sm" onclick="haOpenPicker('sensor')">+ Add value</button>
       <button class="ghost sm" onclick="haOpenPicker('actuator')">+ Add control</button>
       <button class="primary sm" onclick="saveHaLinks()" style="margin-left:auto">Save links</button>
     </div>
@@ -5499,11 +5502,22 @@ function renderHaLinks(configured) {
 }
 
 /* Reusable search + grouped entity picker (avoids a wall-of-entities select).
-   Sensors: whitelist device_classes grouped first, rest under a collapsed
-   "Other sensors" bucket + a Show-all toggle. Controls: grouped by domain. */
+   Motion sensors: whitelist device_classes grouped first, rest under a collapsed
+   "Other sensors" bucket + a Show-all toggle. Values (numeric sensors) and
+   controls: grouped by domain. The role maps to a server domain/alias via
+   haPickerDomain(); the server owns the actual domain list. */
+/* Server domain/alias behind each link role: motion binary sensors, numeric
+   value sensors, or the widened controls set (every actuatable domain). The
+   server owns the real domain list; the client just asks by role. */
+function haPickerDomain(role) {
+  if (role === 'motion') return 'binary_sensor';
+  if (role === 'sensor') return 'sensors';
+  return 'controls';
+}
+
 async function haOpenPicker(role) {
   HA_PICKER = role; HA_PICKER_SEARCH = ''; HA_PICKER_SHOWALL = false;
-  const domain = role === 'motion' ? 'binary_sensor' : 'controls';
+  const domain = haPickerDomain(role);
   if (!HA_ENT_CACHE[domain]) {
     const box = $('ce-ha-picker'); if (box) box.innerHTML = '<div class="card-hint" style="margin-top:8px">Loading entities from Home Assistant&hellip;</div>';
     try { HA_ENT_CACHE[domain] = await api('/ha/entities?domain=' + domain); }
@@ -5518,7 +5532,7 @@ function haToggleShowAll() { HA_PICKER_SHOWALL = !HA_PICKER_SHOWALL; renderHaRes
 
 function renderHaPicker() {
   const box = $('ce-ha-picker'); if (!box || !HA_PICKER) return;
-  const kind = HA_PICKER === 'motion' ? 'sensors' : 'controls';
+  const kind = HA_PICKER === 'motion' ? 'sensors' : (HA_PICKER === 'sensor' ? 'values' : 'controls');
   box.innerHTML = `
     <div class="policy-section" style="margin-top:8px">
       <div style="display:flex;gap:8px;align-items:center">
@@ -5536,7 +5550,7 @@ function renderHaResults() {
   const results = $('ha-pick-results'); const extra = $('ha-pick-extra');
   if (!results || !HA_PICKER) return;
   const role = HA_PICKER;
-  const domain = role === 'motion' ? 'binary_sensor' : 'controls';
+  const domain = haPickerDomain(role);
   const all = HA_ENT_CACHE[domain] || [];
   const q = HA_PICKER_SEARCH.trim().toLowerCase();
   const match = e => !q || e.entity_id.toLowerCase().includes(q) || (e.friendly_name || '').toLowerCase().includes(q);
@@ -5566,7 +5580,7 @@ function renderHaResults() {
 
 function haPick(entity_id) {
   const role = HA_PICKER; if (!role) return;
-  const domain = role === 'motion' ? 'binary_sensor' : 'controls';
+  const domain = haPickerDomain(role);
   const ent = (HA_ENT_CACHE[domain] || []).find(e => e.entity_id === entity_id);
   if (!ent) return;
   if (HA_LINKS.some(l => l.entity_id === entity_id && l.role === role)) return;
