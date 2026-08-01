@@ -8,6 +8,76 @@ revisit.
 
 ---
 
+## 2026-08-01, Home Assistant control is a strict per-domain action allowlist addressed by `link_id`, gated on a new default-off `actuators` capability
+
+**Context.** The HA integration has been read-only since Phase 1 (config
+singleton + `camera_ha_links` + an entity picker that proxies HA so the token
+never reaches a client). Issue #187 adds the control path: an operator watching
+the garage on camera should be able to close it from the same view. This is the
+only endpoint in Crumb that actuates PHYSICAL hardware, and the HA long-lived
+access token Crumb holds is unscoped, so anything a client can talk Crumb into
+asking HA for, it gets. The design question is how much of the HA service call a
+client is allowed to influence.
+
+**Decision, `POST /cameras/:id/ha/action` with a body of exactly
+`{link_id, action}`, and nothing else.** The client names a `camera_ha_links`
+row the operator authored and one action *word*. The server derives the HA
+domain from that row's stored `entity_id` (text before the first `.`), looks the
+word up in a static per-domain allowlist, and builds
+`POST <ha_base>/api/services/<domain>/<service>` with
+`{"entity_id": <the stored entity>}` itself. The allowlist is exhaustive:
+`light`/`switch`/`fan`/`siren` (`turn_on`, `turn_off`, `toggle`), `cover`
+(`open_cover`, `close_cover`, `stop_cover`), `lock` (`lock`, `unlock`),
+`button`/`input_button` (`press`), `scene`/`script` (`turn_on`). No domain,
+service, or entity id is ever accepted from a client. Verification runs in a
+fixed order and returns before HA is contacted at every step: the new
+`actuators` capability, then per-camera scope, then "this link exists on this
+camera and has `role = 'actuator'`", then the allowlist. Every attempt that
+resolves to an actuator link, including allowlist rejections and failed HA
+calls, writes a `system_events` row (`event_key = 'ha_actuation'`) naming the
+user, camera, link, entity, action and outcome, plus a tracing line.
+
+`actuators` is a role-level boolean, default FALSE in the DB (jsonb capability,
+migration 0074 makes the key explicit), in the Rust struct, and in serde (a role
+row that predates the capability deserializes to `false`, never an error, per
+the #407 lesson). Admin implies it. It is deliberately NOT a media-token claim:
+a `?token=` credential can end up in URLs and access logs, and it must never be
+able to work a lock. The same capability will gate the planned Reolink
+actuators, so an operator grants "may work the devices on their cameras" once.
+
+**Rejected:**
+- **Raw service / entity passthrough (client sends `domain`, `service`,
+  `entity_id`).** The obvious, most flexible design, and the reason this needed
+  a decision: it turns any viewer session that holds the capability into
+  arbitrary control of the operator's ENTIRE Home Assistant, `homeassistant.
+  restart`, `shell_command.*`, every alarm panel, whether or not the entity is
+  linked to any camera. Crumb's token cannot be scoped down to compensate.
+- **Per-camera actuator grants in v1.** Genuinely finer-grained, but it means a
+  new grant mechanism (a second table, new admin UI, new resolution path)
+  alongside the role's existing camera list, which already bounds which cameras,
+  and therefore which links, a role can reach. Deferred until someone actually
+  needs "can see 12 cameras, may only work the door on one".
+- **Returning the new entity state in the response.** Clients already poll
+  `GET /ha/states` every 3s and converge from it. Returning state here would
+  create a second source of truth that can disagree with the poll (HA applies a
+  service call asynchronously; the state at response time is often still the old
+  one), so the response is just `{"ok": true}`.
+- **A tracing-only audit.** Cheaper, but actuations are exactly the events an
+  operator will want to reconstruct later ("who opened the gate at 2am"), and
+  logs rotate. `system_events` is append-only, is not pruned, and has no
+  `system_alert_rules` row for this key, so the notification engine consumes and
+  skips it: a durable audit trail with no notification side effects.
+
+**Revisit triggers (any one):**
+- The Reolink actuators land: confirm they reuse `actuators` rather than
+  inventing a second capability, and that their action vocabulary gets the same
+  allowlist treatment.
+- Demand for per-camera (or per-link) actuator grants, then split a narrower
+  grant from the role-level boolean, the way `view_plates` was split from admin.
+- Home Assistant ships a scoped-token mechanism (per-entity or per-domain
+  tokens), which would let Crumb hold a credential that cannot do more than the
+  allowlist and would reopen how much of the allowlist has to live in Crumb.
+
 ## 2026-07-31, Naming a license plate is a first-class `plate_labels` table, not an extension of the watchlist; resolved via COALESCE with exact-normalized keying
 
 **Context.** Issue #363 asks that an operator name a plate once ("Mom's car",

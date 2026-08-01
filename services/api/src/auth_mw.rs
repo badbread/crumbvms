@@ -153,6 +153,14 @@ impl AuthUser {
     pub fn can_view_plates(&self) -> bool {
         self.is_admin() || self.capabilities.view_plates
     }
+    /// Operate a device linked to a camera (HA actuators today, Reolink
+    /// actuators later). Deny-by-default: a role must be granted `actuators`
+    /// explicitly, and a scoped media principal never carries it (see
+    /// [`media_capabilities_from_claims`]).
+    #[inline]
+    pub fn can_actuators(&self) -> bool {
+        self.is_admin() || self.capabilities.actuators
+    }
     /// Effective bookmark visibility (admins see all).
     #[inline]
     pub fn bookmarks_scope(&self) -> BookmarkScope {
@@ -196,6 +204,9 @@ impl AuthUser {
     pub fn require_view_plates(&self) -> Result<(), ApiError> {
         Self::require(self.can_view_plates(), "viewing license plates")
     }
+    pub fn require_actuators(&self) -> Result<(), ApiError> {
+        Self::require(self.can_actuators(), "controlling linked devices")
+    }
 }
 
 /// Conservative capabilities for a token that carries no resolvable role
@@ -212,6 +223,7 @@ fn fallback_caps(role: UserRole) -> Capabilities {
             bookmarks: BookmarkScope::Own,
             manage_views: true,
             view_plates: false,
+            actuators: false,
         },
     }
 }
@@ -547,11 +559,14 @@ fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
 /// Reconstruct a media principal's [`Capabilities`] from a decoded
 /// [`MediaClaims`]. `export`/`playback`/`clips`/`view_plates` come straight from
 /// the token (the minting user's real capabilities — never widened); the rest
-/// (ptz, bookmark, view-management) are always denied, since a media token is
-/// only ever used to fetch media. `view_plates` is carried because plate crops
-/// (`GET /events/{id}/snapshot` crumb-alpr fallback and `GET /plates/{id}/crop`)
-/// require it and clients fetch them with a media token. Pure, so the
-/// "no amplification" property is directly unit-testable.
+/// (ptz, actuators, bookmark, view-management) are always denied, since a media
+/// token is only ever used to fetch media. `view_plates` is carried because
+/// plate crops (`GET /events/{id}/snapshot` crumb-alpr fallback and
+/// `GET /plates/{id}/crop`) require it and clients fetch them with a media
+/// token. `actuators` is deliberately NOT a media claim and hardcoded `false`
+/// here: a `?token=` media credential can appear in URLs/logs, and it must never
+/// be able to operate a lock or a garage door. Pure, so the "no amplification"
+/// property is directly unit-testable.
 fn media_capabilities_from_claims(claims: &MediaClaims) -> Capabilities {
     Capabilities {
         export: claims.export,
@@ -559,6 +574,7 @@ fn media_capabilities_from_claims(claims: &MediaClaims) -> Capabilities {
         clips: claims.clips,
         view_plates: claims.view_plates,
         ptz: false,
+        actuators: false,
         bookmarks: BookmarkScope::None,
         manage_views: false,
     }
@@ -615,6 +631,10 @@ mod media_cap_tests {
         // A media token never carries these regardless of the claim.
         assert!(!caps.ptz);
         assert!(!caps.manage_views);
+        assert!(
+            !caps.actuators,
+            "a media token must never be able to operate a physical device"
+        );
     }
 
     #[test]
@@ -624,5 +644,7 @@ mod media_cap_tests {
         // must survive, or plate crops fetched with the token render blank.
         let caps = media_capabilities_from_claims(&claims(true, true, true, true));
         assert!(caps.export && caps.playback && caps.clips && caps.view_plates);
+        // ...but still never the device-control capability.
+        assert!(!caps.actuators);
     }
 }

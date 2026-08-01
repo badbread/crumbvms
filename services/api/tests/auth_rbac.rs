@@ -1033,6 +1033,7 @@ async fn seed_viewer_no_plates(pool: &deadpool_postgres::Pool, cameras: &[Uuid])
         bookmarks: BookmarkScope::Own,
         manage_views: true,
         view_plates: false,
+        actuators: false,
     };
     let role = crumb_common::db::create_role(pool, &unique("noplates-role"), &caps, cameras)
         .await
@@ -1481,6 +1482,17 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::GET, "/stats/storage".into()),
         (Method::POST, format!("/cameras/{u}/ptz")),
         (Method::POST, format!("/cameras/{u}/imaging")),
+        // -- Home Assistant integration (config admin-only, links/states/action
+        //    authenticated); the action route operates physical hardware. --
+        (Method::GET, "/config/ha".into()),
+        (Method::PUT, "/config/ha".into()),
+        (Method::POST, "/config/ha/test".into()),
+        (Method::GET, "/ha/entities".into()),
+        (Method::GET, "/ha/states".into()),
+        (Method::GET, format!("/cameras/{u}/ha/links")),
+        (Method::PUT, format!("/cameras/{u}/ha/links")),
+        (Method::PUT, format!("/cameras/{u}/ha/links/{u}/placement")),
+        (Method::POST, format!("/cameras/{u}/ha/action")),
         (Method::GET, "/events".into()),
         // Detection snapshot proxy: despite a stale "unauthenticated opaque-UUID"
         // comment in main.rs/events.rs, get_event_snapshot actually takes AuthUser,
@@ -1867,6 +1879,7 @@ fn mk_caps(playback: bool, clips: bool, view_plates: bool) -> crumb_common::type
         bookmarks: crumb_common::types::BookmarkScope::Own,
         manage_views: false,
         view_plates,
+        actuators: false,
     }
 }
 
