@@ -18,6 +18,22 @@ final class AppSettings: ObservableObject {
     @Published var liveGridLayout: Int { didSet { defaults.set(liveGridLayout, forKey: Keys.liveGridLayout) } }
     @Published var ptzStyle: String { didSet { defaults.set(ptzStyle, forKey: Keys.ptzStyle) } }
     @Published var lowBandwidthMode: Bool { didSet { defaults.set(lowBandwidthMode, forKey: Keys.lowBandwidthMode) } }
+    /// Opt-in "high quality" live wall: decode every tile's full-resolution main
+    /// stream instead of the lighter sub. Off by default (the wall stays
+    /// sub-preferring). This is the config-time knob the Stage-1 decode guardrail
+    /// warns about and the Stage-2 backpressure net manages (issue #383).
+    @Published var wallHighQuality: Bool { didSet { defaults.set(wallHighQuality, forKey: Keys.wallHighQuality) } }
+    /// Stage-2 reactive backpressure: when the device gets too warm (thermalState,
+    /// CPU fallback) automatically shed the least-important tiles to a lighter
+    /// stream and restore them when it cools. On by default.
+    @Published var adaptiveWallQuality: Bool { didSet { defaults.set(adaptiveWallQuality, forKey: Keys.adaptiveWallQuality) } }
+    /// Stage-1 preventive guardrail: warn before showing a wall that would run
+    /// more full-resolution streams than this device can comfortably decode. On
+    /// by default; advisory, never blocks.
+    @Published var wallDecodeGuardrail: Bool { didSet { defaults.set(wallDecodeGuardrail, forKey: Keys.wallDecodeGuardrail) } }
+    /// Per-device "Don't warn on this device" latch for the decode guardrail.
+    /// Off by default; set when the operator dismisses the nudge permanently.
+    @Published var guardrailSuppressed: Bool { didSet { defaults.set(guardrailSuppressed, forKey: Keys.guardrailSuppressed) } }
     @Published var motionTunerEnabled: Bool { didSet { defaults.set(motionTunerEnabled, forKey: Keys.motionTunerEnabled) } }
     @Published var bookmarksButtonEnabled: Bool { didSet { defaults.set(bookmarksButtonEnabled, forKey: Keys.bookmarksButtonEnabled) } }
     /// Whether the built-in "All cameras" quick-view chip is shown. Off lets an
@@ -40,6 +56,10 @@ final class AppSettings: ObservableObject {
         liveGridLayout = defaults.object(forKey: Keys.liveGridLayout) as? Int ?? 1
         ptzStyle = defaults.string(forKey: Keys.ptzStyle) ?? "wheel"
         lowBandwidthMode = defaults.object(forKey: Keys.lowBandwidthMode) as? Bool ?? false
+        wallHighQuality = defaults.object(forKey: Keys.wallHighQuality) as? Bool ?? false
+        adaptiveWallQuality = defaults.object(forKey: Keys.adaptiveWallQuality) as? Bool ?? true
+        wallDecodeGuardrail = defaults.object(forKey: Keys.wallDecodeGuardrail) as? Bool ?? true
+        guardrailSuppressed = defaults.object(forKey: Keys.guardrailSuppressed) as? Bool ?? false
         motionTunerEnabled = defaults.object(forKey: Keys.motionTunerEnabled) as? Bool ?? true
         bookmarksButtonEnabled = defaults.object(forKey: Keys.bookmarksButtonEnabled) as? Bool ?? true
         showAllCamerasView = defaults.object(forKey: Keys.showAllCamerasView) as? Bool ?? true
@@ -69,6 +89,10 @@ final class AppSettings: ObservableObject {
         static let audioEnabledPrefix = "audio_enabled_"
         static let ptzStyle = "ptz_style"
         static let lowBandwidthMode = "low_bandwidth_mode"
+        static let wallHighQuality = "wall_high_quality"
+        static let adaptiveWallQuality = "adaptive_wall_quality"
+        static let wallDecodeGuardrail = "wall_decode_guardrail"
+        static let guardrailSuppressed = "wall_guardrail_suppressed"
         static let motionTunerEnabled = "motion_tuner_enabled"
         static let bookmarksButtonEnabled = "bookmarks_button_enabled"
         static let showAllCamerasView = "show_all_cameras_view"

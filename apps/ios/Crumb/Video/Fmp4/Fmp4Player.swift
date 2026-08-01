@@ -312,6 +312,14 @@ final class Fmp4StreamController: NSObject, ObservableObject {
 
     private func enqueue(_ sample: CMSampleBuffer) {
         guard !stopped else { return }
+        // TODO(#383, follow-up): AVSampleBufferDisplayLayer frame-delivery-health
+        // refinement, deferred as the lower-priority Stage-2 signal. Sample
+        // `displayLayer.isReadyForMoreMediaData` stalls + enqueue backlog here
+        // (late/dropped access units under decoder over-subscription) and surface
+        // it to `WallLoadController` as a per-tile pressure input alongside the
+        // shipped thermalState/CPU signals. Intentionally NOT wired yet: it must
+        // not perturb the recorder-shielded decode path, and thermalState +
+        // guardrail already cover the failure mode.
         if displayLayer.status == .failed { displayLayer.flush() }
         displayLayer.enqueue(sample)
         if !displaying {

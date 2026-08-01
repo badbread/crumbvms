@@ -27,6 +27,9 @@ enum GridLayout: Int, CaseIterable {
 struct LiveWallView: View {
 
     @StateObject private var vm: LiveViewModel
+    /// Adaptive live-wall quality (issue #383): thermalState-driven backpressure
+    /// plus the config-time decode guardrail. Scoped to the wall's lifetime.
+    @StateObject private var wallLoad: WallLoadController
     @State private var selectedCameraId: String?
     @State private var playbackCameraId: String?
     @State private var playbackStartTime: Date?
@@ -59,6 +62,7 @@ struct LiveWallView: View {
         _updateChecker = ObservedObject(wrappedValue: container.updateChecker)
         let vm = LiveViewModel(container: container)
         _vm = StateObject(wrappedValue: vm)
+        _wallLoad = StateObject(wrappedValue: WallLoadController(settings: container.settings))
         _selectedCameraId = State(initialValue: container.store.lastLiveCameraId)
     }
 
@@ -189,12 +193,76 @@ struct LiveWallView: View {
         }
         .onDisappear {
             vm.stopStatusPolling()
+            wallLoad.stop()
         }
         // Proactive update-available notice, pinned above the wall content
         // (pushes content down rather than covering it). Renders nothing —
         // and reserves no space — unless there's an un-dismissed newer
         // version, so it stays out of the way the rest of the time.
         .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
+        // Feed the adaptive-quality controller the current wall composition. A
+        // single signature covers camera-set / view / focus / quality changes.
+        .onAppear { syncWallLoad() }
+        .onChange(of: wallSignature) { _ in syncWallLoad() }
+        // Stage-1 guardrail nudge (advisory; never blocks). Presented here so
+        // "Keep sub" can revert the wall-quality setting in place.
+        .alert(
+            "Heavy live wall",
+            isPresented: Binding(
+                get: { wallLoad.warning != nil },
+                set: { if !$0 { wallLoad.warning = nil } }
+            ),
+            presenting: wallLoad.warning
+        ) { warning in
+            if warning.revertable {
+                Button("Keep sub") {
+                    settings.wallHighQuality = false
+                    wallLoad.warning = nil
+                }
+                Button("Proceed anyway") { wallLoad.warning = nil }
+            } else {
+                Button("OK") { wallLoad.warning = nil }
+            }
+            Button("Don't warn on this device", role: .cancel) {
+                settings.guardrailSuppressed = true
+                wallLoad.warning = nil
+            }
+        } message: { warning in
+            Text(warning.message)
+        }
+    }
+
+    // MARK: - Adaptive wall quality (issue #383)
+
+    /// Compact signature of everything that changes the wall's decode load, so a
+    /// single `.onChange` re-feeds the controller.
+    private var wallSignature: String {
+        visibleCameras.map(\.id).joined(separator: ",")
+            + "|\(settings.wallHighQuality)|\(selectedCameraId ?? "")"
+    }
+
+    /// Push the current visible wall composition + focused tile to the controller.
+    private func syncWallLoad() {
+        wallLoad.configure(
+            cameras: visibleCameras.map { (id: $0.id, hasSub: $0.hasSubStream) },
+            focusedId: selectedCameraId
+        )
+    }
+
+    /// Effective stream rung for a tile, folding user prefs + any reactive shed.
+    private func tileQuality(_ camera: CameraDto) -> TileQuality {
+        WallLoadController.effectiveQuality(
+            hasSub: camera.hasSubStream,
+            highQuality: settings.wallHighQuality,
+            lowBandwidth: settings.lowBandwidthMode,
+            degraded: wallLoad.shedCameraIds.contains(camera.id)
+        )
+    }
+
+    /// Whether the tile carries the auto-downgrade "SD" badge (a reactive shed,
+    /// not a user-chosen low rung).
+    private func tileDegraded(_ camera: CameraDto) -> Bool {
+        !settings.lowBandwidthMode && wallLoad.shedCameraIds.contains(camera.id)
     }
 
     // MARK: - Update banner (issue #7 / task C4)
@@ -524,7 +592,8 @@ struct LiveWallView: View {
                     status: vm.cameraStatuses[cam.id],
                     detectionKeys: vm.activeDetections[cam.id] ?? [],
                     mediaUrls: urls,
-                    lowBandwidth: settings.lowBandwidthMode,
+                    quality: tileQuality(cam),
+                    degraded: tileDegraded(cam),
                     lockAspect: false,
                     onTap: {
                         selectedCameraId = cam.id
@@ -724,7 +793,8 @@ struct LiveWallView: View {
                         status: vm.cameraStatuses[camera.id],
                         detectionKeys: vm.activeDetections[camera.id] ?? [],
                         mediaUrls: urls,
-                        lowBandwidth: settings.lowBandwidthMode,
+                        quality: tileQuality(camera),
+                        degraded: tileDegraded(camera),
                         onTap: {
                             selectedCameraId = camera.id
                             vm.store.lastLiveCameraId = camera.id
