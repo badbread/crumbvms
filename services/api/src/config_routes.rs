@@ -965,7 +965,7 @@ async fn create_camera(
     let motion_source = match body.motion_source.as_deref() {
         Some(s) => normalize_motion_source(s).ok_or_else(|| {
             ApiError::BadRequest(format!(
-                "motion_source must be 'pixel' or 'frigate', got '{s}'"
+                "motion_source must be 'pixel', 'frigate', or 'ha', got '{s}'"
             ))
         })?,
         None => "pixel",
@@ -1231,7 +1231,7 @@ async fn update_camera(
         Some(s) => normalize_motion_source(s)
             .ok_or_else(|| {
                 ApiError::BadRequest(format!(
-                    "motion_source must be 'pixel' or 'frigate', got '{s}'"
+                    "motion_source must be 'pixel', 'frigate', or 'ha', got '{s}'"
                 ))
             })?
             .to_owned(),
