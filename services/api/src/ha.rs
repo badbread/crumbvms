@@ -115,6 +115,51 @@ fn control_domains() -> Vec<&'static str> {
     HA_ACTION_ALLOWLIST.iter().map(|(d, _)| *d).collect()
 }
 
+/// Validate a link's authored `role` against its entity's HA domain at write
+/// time (issue #434). A role that cannot possibly work on its entity's domain is
+/// a silent misconfiguration: an `actuator` on a `sensor` never fires, a `motion`
+/// link on a non-`binary_sensor` never produces recording edges. Rejecting at the
+/// PUT turns that into an immediate, explained 400 instead of a dead link.
+///
+/// Rules:
+/// - `actuator`: the entity's domain MUST be controllable, i.e. present in
+///   [`control_domains`] (derived from `HA_ACTION_ALLOWLIST`, never hand-copied,
+///   so this can never drift from what `POST .../ha/action` will accept).
+/// - `motion`: the entity MUST be a `binary_sensor` (only on/off domains yield
+///   the edges motion recording keys on).
+/// - `sensor` (status-only display): permissive, any domain is allowed.
+///
+/// Returns the 400 message on rejection. Pure, so every role-vs-domain pairing is
+/// unit-testable without HA or a DB.
+fn validate_link_role(entity_id: &str, role: &str) -> Result<(), String> {
+    let domain = domain_of(entity_id);
+    match role {
+        "actuator" => {
+            if control_domains().contains(&domain) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "an 'actuator' link needs a controllable entity, but '{entity_id}' is a \
+                     '{domain}' entity Crumb cannot control (controllable domains: {})",
+                    control_domains().join(", ")
+                ))
+            }
+        }
+        "motion" => {
+            if domain == "binary_sensor" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "a 'motion' link needs a 'binary_sensor' entity, but '{entity_id}' is a \
+                     '{domain}' entity (only binary sensors produce motion edges)"
+                ))
+            }
+        }
+        // 'sensor' is status-only display; permissive on any domain.
+        _ => Ok(()),
+    }
+}
+
 // ─── HTTP: shared client + picker filter ──────────────────────────────────────
 
 /// Build the shared `crumb_common::ha` client from stored settings, mapping the
@@ -358,6 +403,11 @@ struct HaEntityState {
     state: String,
     /// HA `last_changed` (RFC3339), passed through verbatim for "N ago" display.
     last_changed: Option<String>,
+    /// HA `attributes.unit_of_measurement`, passed through verbatim so clients
+    /// can render a numeric sensor as `<state> <unit>` (e.g. "72 degF"). `None`
+    /// when the entity reports no unit (issue #449). No server-side formatting:
+    /// the raw `state` string is left as-is; clients own display.
+    unit: Option<String>,
 }
 
 /// `GET /ha/states` response: the caller-visible entity states plus cache age so
@@ -506,6 +556,10 @@ async fn put_links(
                 "link entity_id must not be empty".to_owned(),
             ));
         }
+        // Role must be compatible with the entity's HA domain, else the link is
+        // a silent dead end (actuator that never fires, motion that never
+        // triggers). Issue #434.
+        validate_link_role(l.entity_id.trim(), &l.role).map_err(ApiError::BadRequest)?;
     }
     let tuples: Vec<db::HaLinkInsert> = body
         .links
@@ -870,6 +924,11 @@ fn project_states(
                     .get("last_changed")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
+                unit: v
+                    .get("attributes")
+                    .and_then(|a| a.get("unit_of_measurement"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
             })
         })
         .collect()
@@ -1173,6 +1232,76 @@ mod tests {
             json!({"link_id": "11111111-1111-1111-1111-111111111111"}),
         );
         assert!(no_action.is_err());
+    }
+
+    #[test]
+    fn link_role_validation_matches_role_to_domain() {
+        // actuator: every controllable domain is accepted...
+        for d in control_domains() {
+            assert!(
+                validate_link_role(&format!("{d}.thing"), "actuator").is_ok(),
+                "actuator on controllable '{d}' should be accepted"
+            );
+        }
+        // ...and non-controllable domains are rejected.
+        assert!(validate_link_role("sensor.temperature", "actuator").is_err());
+        assert!(validate_link_role("binary_sensor.motion", "actuator").is_err());
+        assert!(validate_link_role("climate.thermostat", "actuator").is_err());
+        assert!(validate_link_role("garage", "actuator").is_err()); // no domain
+
+        // motion: only binary_sensor is accepted.
+        assert!(validate_link_role("binary_sensor.motion", "motion").is_ok());
+        assert!(validate_link_role("sensor.temperature", "motion").is_err());
+        assert!(validate_link_role("light.kitchen", "motion").is_err());
+        assert!(validate_link_role("cover.garage", "motion").is_err());
+
+        // sensor (display): permissive on any domain, including numeric sensors,
+        // binary sensors, and even controllable domains.
+        assert!(validate_link_role("sensor.temperature", "sensor").is_ok());
+        assert!(validate_link_role("binary_sensor.motion", "sensor").is_ok());
+        assert!(validate_link_role("light.kitchen", "sensor").is_ok());
+
+        // The rejection message names the offending entity so an operator can
+        // see what to fix (and carries no em-dash per house style).
+        let msg = validate_link_role("sensor.temperature", "actuator").unwrap_err();
+        assert!(msg.contains("sensor.temperature"));
+        assert!(!msg.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn state_unit_is_parsed_from_attributes_when_present() {
+        let states = json!([
+            {"entity_id": "sensor.temperature", "state": "72",
+             "attributes": {"unit_of_measurement": "\u{00b0}F"}},
+            {"entity_id": "sensor.no_unit", "state": "42",
+             "attributes": {"friendly_name": "Plain"}},
+            {"entity_id": "binary_sensor.door", "state": "on"}
+        ]);
+        let arr = states.as_array().unwrap();
+        let wanted: std::collections::HashSet<&str> =
+            ["sensor.temperature", "sensor.no_unit", "binary_sensor.door"]
+                .into_iter()
+                .collect();
+        let out = project_states(arr, &wanted);
+
+        let temp = out
+            .iter()
+            .find(|e| e.entity_id == "sensor.temperature")
+            .unwrap();
+        assert_eq!(temp.state, "72"); // no server-side formatting
+        assert_eq!(temp.unit.as_deref(), Some("\u{00b0}F"));
+
+        // Unit is None when the attribute is missing, or attributes absent.
+        let no_unit = out
+            .iter()
+            .find(|e| e.entity_id == "sensor.no_unit")
+            .unwrap();
+        assert_eq!(no_unit.unit, None);
+        let door = out
+            .iter()
+            .find(|e| e.entity_id == "binary_sensor.door")
+            .unwrap();
+        assert_eq!(door.unit, None);
     }
 
     #[test]
