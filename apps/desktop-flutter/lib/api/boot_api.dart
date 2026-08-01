@@ -44,6 +44,14 @@ class MeResponse {
   /// clients must NOT re-derive it from [capabilities]. Absent → false.
   final bool platesEnabled;
 
+  /// Whether this account may actuate HA entities linked to a camera
+  /// (`POST /cameras/:id/ha/action`, issue #187). Server-side truth: the
+  /// `actuators` capability is deny-by-default and admin sessions get it set
+  /// by the server, so clients read the flag rather than re-deriving it from
+  /// [isAdmin]. Absent (older server) or non-boolean → false, which simply
+  /// means no control buttons render — identical to today's read-only badges.
+  bool get canActuate => capabilities['actuators'] == true;
+
   factory MeResponse.fromJson(Map<String, dynamic> j) => MeResponse(
     id: j['id'] as String,
     username: j['username'] as String,

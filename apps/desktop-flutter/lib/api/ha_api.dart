@@ -44,6 +44,15 @@
 //                                                       authenticated user;
 //                                                       RBAC-projected to the
 //                                                       caller's cameras)
+//   POST /cameras/{id}/ha/action  body {link_id,action} -> {ok:true}. Requires
+//                                                       the `actuators`
+//                                                       capability (issue
+//                                                       #187); 403 without
+//                                                       it, 400/404 on a
+//                                                       rejected action or
+//                                                       unknown link, 502
+//                                                       when HA is
+//                                                       unreachable.
 
 import 'dart:convert';
 
@@ -289,6 +298,49 @@ extension HaApi on CrumbApi {
     }
     return HaStatesSnapshot.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// POST /cameras/{id}/ha/action — actuate a linked HA entity (issue #187,
+  /// HA control Phase 2). The client sends the LINK id, never a raw HA
+  /// entity_id, and `action` must be one of the server's allowed strings for
+  /// that entity's domain (`ha_overlay/ha_actions.dart` mirrors the same
+  /// table, so the UI never offers a button the server would refuse).
+  ///
+  /// Requires the `actuators` capability — deny-by-default, so a viewer who
+  /// can see a camera cannot actuate its devices unless granted. Throws
+  /// [CrumbApiException] with `statusCode` on any non-200 and a message
+  /// already suitable for an operator-facing toast:
+  /// - `403` — not permitted for this account.
+  /// - `400`/`404` — the server rejected the action or the link is gone.
+  /// - `502` — Home Assistant is unreachable.
+  ///
+  /// Returns normally on success. Callers must NOT flip the badge locally:
+  /// the 3s `/ha/states` poll is what converges the displayed state.
+  Future<void> haAction(
+    Session s,
+    String cameraId, {
+    required String linkId,
+    required String action,
+  }) async {
+    final resp = await sharedHttpClient.post(
+      Uri.parse('${s.base}/cameras/$cameraId/ha/action'),
+      headers: {
+        'authorization': 'Bearer ${s.token}',
+        'content-type': 'application/json',
+      },
+      body: jsonEncode({'link_id': linkId, 'action': action}),
+    );
+    if (resp.statusCode == 200) return;
+    final detail = _errorDetail(resp).trim();
+    throw CrumbApiException(
+      switch (resp.statusCode) {
+        403 => 'Not permitted.',
+        502 => 'Home Assistant is unreachable.',
+        400 || 404 when detail.isNotEmpty => detail,
+        _ => 'HTTP ${resp.statusCode}.',
+      },
+      statusCode: resp.statusCode,
     );
   }
 }

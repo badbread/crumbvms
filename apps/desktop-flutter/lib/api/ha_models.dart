@@ -27,10 +27,15 @@ class HaLink {
     this.overlayOutline = false,
   });
 
-  final String id; // UUID
+  /// The link's own UUID — this is the `link_id` the control endpoint takes
+  /// (`POST /cameras/:id/ha/action`, issue #187). The client never sends a raw
+  /// HA entity_id anywhere.
+  final String id;
+
   final String entityId;
 
-  /// `"motion" | "sensor" | "actuator"` (see migration 0048).
+  /// `"motion" | "sensor" | "actuator"` (see migration 0048). Only
+  /// `"actuator"` links can be controlled.
   final String role;
 
   /// HA `device_class` (`door`, `motion`, ...), binary_sensor links only.
@@ -92,7 +97,10 @@ class HaLink {
       (label != null && label!.trim().isNotEmpty) ? label! : entityId;
 
   factory HaLink.fromJson(Map<String, dynamic> j) => HaLink(
-    id: j['id'] as String,
+    // `id` is what the links DTO has always emitted; `link_id` is tolerated
+    // as an alias so a server that spells it that way still parses. Still
+    // throws (loudly) if neither is present.
+    id: (j['id'] ?? j['link_id']) as String,
     entityId: j['entity_id'] as String,
     role: (j['role'] as String?) ?? 'sensor',
     deviceClass: j['device_class'] as String?,
