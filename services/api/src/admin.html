@@ -5512,9 +5512,19 @@ async function loadCameraHaLinks(camId) {
   }
 }
 
-function haRolePill(l) {
-  if (l.role === 'actuator') return 'control';
-  return l.device_class || 'sensor';   // show the class (door/motion/...) for sensors
+/* The three link roles an operator can pick per row. "Control" is the server's
+   `actuator` role (an entity you can operate); the parenthetical spells that out
+   so it reads as controllable, not just another sensor. */
+const HA_ROLE_OPTS = [
+  ['motion', 'Motion (triggers recording)'],
+  ['sensor', 'Sensor (status only)'],
+  ['actuator', 'Control (operate)'],
+];
+
+function haRoleSelect(i, role) {
+  const opts = HA_ROLE_OPTS.map(([v, t]) =>
+    `<option value="${v}"${v === role ? ' selected' : ''}>${esc(t)}</option>`).join('');
+  return `<select onchange="haSetRole(${i}, this.value)" title="How Crumb uses this entity" style="font-size:12px">${opts}</select>`;
 }
 
 function renderHaLinks(configured) {
@@ -5524,9 +5534,10 @@ function renderHaLinks(configured) {
     return;
   }
   const rows = HA_LINKS.map((l, i) => `
-    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
-      <span class="pill">${esc(haRolePill(l))}</span>
-      <span style="flex:1;font-size:13px">${esc(l.label || l.entity_id)}</span>
+    <div style="display:flex;align-items:center;gap:8px;margin:6px 0;flex-wrap:wrap">
+      ${haRoleSelect(i, l.role)}
+      <input value="${esc(l.label || '')}" placeholder="${esc(l.entity_id)}" oninput="haSetLabel(${i}, this.value)" title="Display label" style="flex:1;min-width:140px;font-size:13px" />
+      <input value="${esc(l.device_class || '')}" placeholder="device class" oninput="haSetDeviceClass(${i}, this.value)" title="Home Assistant device class" style="width:120px;font-size:12px" />
       <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
       <button class="ghost sm" onclick="removeHaLink(${i})">Remove</button>
     </div>`).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
@@ -5542,6 +5553,14 @@ function renderHaLinks(configured) {
     <div id="ce-ha-msg" class="form-msg"></div>`;
   if (HA_PICKER) renderHaPicker();
 }
+
+/* Row-edit handlers: mutate the working set in place WITHOUT re-rendering, so a
+   text input keeps focus while typing. The edited set is persisted by
+   saveHaLinks(). Empty text collapses to null (label falls back to entity_id,
+   device_class is genuinely unset). */
+function haSetRole(i, v) { if (HA_LINKS[i]) HA_LINKS[i].role = v; }
+function haSetLabel(i, v) { if (HA_LINKS[i]) HA_LINKS[i].label = v.trim() ? v : null; }
+function haSetDeviceClass(i, v) { if (HA_LINKS[i]) HA_LINKS[i].device_class = v.trim() ? v : null; }
 
 /* Reusable search + grouped entity picker (avoids a wall-of-entities select).
    Motion sensors: whitelist device_classes grouped first, rest under a collapsed
@@ -5643,7 +5662,14 @@ async function saveHaLinks() {
     HA_PICKER = null;
     toast('Home Assistant links saved.');
     renderHaLinks(true);
-  } catch (e) { setMsg('ce-ha-msg', (e && e.message) || 'Save failed', 'err'); }
+  } catch (e) {
+    // The server rejects a role that doesn't fit the entity's domain (e.g.
+    // marking a light as Motion) with a 400; surface that reason inline and as
+    // a toast rather than failing silently.
+    const msg = (e && e.message) || 'Save failed';
+    setMsg('ce-ha-msg', msg, 'err');
+    toast(msg, 'err');
+  }
 }
 
 /* At-a-glance summary line for the collapsed "Camera info (probed)" section: the
