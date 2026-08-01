@@ -2,9 +2,12 @@
 // console's camera-editor flow (services/api/src/admin.html ~4810-4960:
 // `loadCameraHaLinks`/`renderHaLinks`/`haOpenPicker`/`renderHaResults`/
 // `haPick`/`removeHaLink`/`saveHaLinks`, issue #52). Lets an admin link this
-// camera's HA motion/door sensors (role `motion`, domain `binary_sensor`)
-// and lights/switches/scenes (role `actuator`, domain `controls`) without
-// leaving the desktop app. The desktop's separate "Edit HA overlay…" editor
+// camera's HA motion/door sensors (role `motion`, domain `binary_sensor`),
+// numeric value sensors like temperature/humidity (role `sensor`, domain
+// `sensors`), and controllable entities — lights, switches, fans, sirens,
+// covers, locks, buttons, scenes, scripts (role `actuator`, domain `controls`,
+// the server's widened action-allowlist set) — without leaving the desktop
+// app. The desktop's separate "Edit HA overlay…" editor
 // (issue #170) then places any of these linked entities as an on-video
 // badge — this dialog only manages WHICH entities are linked, not where
 // they're drawn.
@@ -14,7 +17,7 @@
 //     `HA_SENSOR_CLASSES`) grouped first (sorted), the rest bucketed under
 //     "Other sensors" — hidden unless "Show all binary sensors" is checked
 //     or there's a search query.
-//   - Controls: grouped by entity_id domain (light/switch/scene), sorted.
+//   - Values / controls: grouped by entity_id domain, sorted.
 //   - A search box filters both by friendly_name/entity_id substring.
 //   - An already-linked-for-this-role entity is shown dimmed "(linked)" but
 //     stays tappable (a no-op re-pick, matching `haPick`'s guard).
@@ -105,7 +108,7 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
   String? _saveError;
 
   // ── picker state (mirrors HA_PICKER/HA_PICKER_SEARCH/HA_PICKER_SHOWALL) ──
-  String? _pickerRole; // 'motion' | 'actuator' | null (closed)
+  String? _pickerRole; // 'motion' | 'sensor' | 'actuator' | null (closed)
   final TextEditingController _searchCtrl = TextEditingController();
   String _pickerSearch = '';
   bool _pickerShowAll = false;
@@ -153,6 +156,16 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
     }
   }
 
+  /// Server domain/alias behind each link role: motion binary sensors, numeric
+  /// value sensors, or the widened controls set (every actuatable domain). The
+  /// server owns the real domain list; the client just asks by role. Mirrors
+  /// admin.html's `haPickerDomain`.
+  String _pickerDomain(String role) {
+    if (role == 'motion') return 'binary_sensor';
+    if (role == 'sensor') return 'sensors';
+    return 'controls';
+  }
+
   Future<void> _openPicker(String role) async {
     setState(() {
       _pickerRole = role;
@@ -161,7 +174,7 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
       _pickerError = null;
     });
     _searchCtrl.clear();
-    final domain = role == 'motion' ? 'binary_sensor' : 'controls';
+    final domain = _pickerDomain(role);
     if (_entityCache.containsKey(domain)) return;
     setState(() => _pickerLoading = true);
     try {
@@ -316,6 +329,11 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
             ),
             const SizedBox(width: 8),
             OutlinedButton(
+              onPressed: () => _openPicker('sensor'),
+              child: const Text('+ Add value'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
               onPressed: () => _openPicker('actuator'),
               child: const Text('+ Add control'),
             ),
@@ -378,7 +396,11 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
 
   Widget _pickerPanel(ColorScheme scheme) {
     final role = _pickerRole!;
-    final kind = role == 'motion' ? 'sensors' : 'controls';
+    final kind = role == 'motion'
+        ? 'sensors'
+        : role == 'sensor'
+        ? 'values'
+        : 'controls';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -418,7 +440,7 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
   }
 
   Widget _pickerResults(ColorScheme scheme, String role) {
-    final domain = role == 'motion' ? 'binary_sensor' : 'controls';
+    final domain = _pickerDomain(role);
     final all = _entityCache[domain] ?? const <HaEntity>[];
     final q = _pickerSearch.trim().toLowerCase();
     bool match(HaEntity e) =>
