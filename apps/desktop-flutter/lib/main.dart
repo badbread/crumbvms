@@ -555,6 +555,13 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// admin-only server-side); the server's 403 is still the authority.
   bool _isAdmin = false;
 
+  /// Server-side truth (`GET /auth/me` → `capabilities.actuators`) for whether
+  /// this account may control HA devices linked to a camera (issue #187).
+  /// Gates the on-video badge card's control buttons; false (including against
+  /// an older server that doesn't send the key) keeps the badges read-only.
+  /// The server's 403 is still the authority.
+  bool _canActuate = false;
+
   /// The applied saved view (null → the default "All Cameras" auto-grid wall),
   /// and the id used to highlight the active chip in the view-selector row.
   AppliedView? _appliedView;
@@ -627,18 +634,25 @@ class _MainShellState extends State<MainShell> with WindowListener {
     _loadCapabilities();
   }
 
-  /// Resolve the capability gate for the Plates tab. The app otherwise gates
-  /// nothing on capabilities, so this is the one `/auth/me` call the shell
-  /// makes; it stores only [MeResponse.platesEnabled]. Best-effort — a failure
-  /// leaves the tab hidden rather than surfacing an error.
+  /// Resolve the capability gates the shell owns: the Plates tab
+  /// ([MeResponse.platesEnabled]) and HA device control
+  /// ([MeResponse.canActuate], issue #187). This is the one `/auth/me` call
+  /// the shell makes. Best-effort — a failure leaves both false, so the tab
+  /// stays hidden and the HA badges stay read-only rather than surfacing an
+  /// error.
   Future<void> _loadCapabilities() async {
     try {
       final me = await widget.api.fetchMe(widget.sessionController.session);
       if (!mounted) return;
-      if (me.platesEnabled == _platesEnabled && me.isAdmin == _isAdmin) return;
+      if (me.platesEnabled == _platesEnabled &&
+          me.isAdmin == _isAdmin &&
+          me.canActuate == _canActuate) {
+        return;
+      }
       setState(() {
         _platesEnabled = me.platesEnabled;
         _isAdmin = me.isAdmin;
+        _canActuate = me.canActuate;
       });
     } catch (_) {
       // Leave _platesEnabled false — the Plates tab simply stays hidden.
@@ -1359,6 +1373,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
           // (issue #52 desktop port) — `PUT /cameras/:id/ha/links` is
           // admin-enforced server-side regardless.
           isAdmin: _isAdmin,
+          // Gates the on-video HA badge card's control buttons (issue #187);
+          // `POST /cameras/:id/ha/action` enforces the capability server-side
+          // regardless.
+          canActuate: _canActuate,
           // The wall listens to client options so the per-tile header bar
           // (showInfoBar) restyles live when toggled in the Settings panel.
           clientOptions: widget.clientOptions,
