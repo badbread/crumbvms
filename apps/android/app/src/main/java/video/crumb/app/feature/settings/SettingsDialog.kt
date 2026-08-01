@@ -59,6 +59,13 @@ fun SettingsDialog(
     lowBandwidthMode: Boolean,
     onLowBandwidthChange: (Boolean) -> Unit,
     /**
+     * Adaptive live-wall quality (#384). Mirrored from the caller (not read from
+     * [store] here) so the wall reacts the moment the switch flips. Governs both the
+     * config-time guardrail nudge and the runtime decode backpressure.
+     */
+    adaptiveWallQuality: Boolean,
+    onAdaptiveWallQualityChange: (Boolean) -> Unit,
+    /**
      * Whether the auto-built "All Cameras" quick-grid default view is offered on the
      * Live/Playback wall. Mirrored (not read straight from [store]) so the caller's
      * copy — which the wall itself reacts to live — stays in sync; see
@@ -180,6 +187,37 @@ fun SettingsDialog(
                     Switch(
                         checked = lowBandwidthMode,
                         onCheckedChange = onLowBandwidthChange,
+                        colors = crumbSwitchColors(),
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                    ) {
+                        Text(
+                            text = "Adaptive video quality",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary,
+                        )
+                        Text(
+                            text = "Protect this device's video decoder on big walls. " +
+                                "Warns before a heavy wall, and quietly steps busy tiles " +
+                                "down to snapshots if the decoder or the device gets hot, " +
+                                "restoring them once it recovers.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                    Switch(
+                        checked = adaptiveWallQuality,
+                        onCheckedChange = onAdaptiveWallQualityChange,
                         colors = crumbSwitchColors(),
                     )
                 }

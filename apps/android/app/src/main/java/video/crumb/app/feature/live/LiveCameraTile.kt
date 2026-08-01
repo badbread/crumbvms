@@ -57,6 +57,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.ui.AspectRatioFrameLayout
 import video.crumb.app.data.CameraDto
 import video.crumb.app.data.DetectionIcons
@@ -121,16 +122,32 @@ fun LiveCameraTile(
     detections: List<String> = emptyList(),
     /** When true the tile renders via snapshot polling instead of RTSP. */
     lowBandwidthMode: Boolean = false,
+    /**
+     * Adaptive backpressure (#384) has shed THIS tile to the still-frame path to
+     * relieve decoder/thermal pressure on the wall. Same render path as
+     * [lowBandwidthMode] but tile-scoped and system-driven, so it carries a
+     * distinct "SD" auto badge and self-restores silently when pressure eases.
+     */
+    autoShed: Boolean = false,
     /** Called when the stall watchdog fires; forwarded to the VM for auto-fallback. */
     onStall: () -> Unit = {},
+    /**
+     * Reports this tile's Media3 dropped-frame deltas (count, elapsedMs) up to the
+     * wall's [WallDecodeMonitor] so it can aggregate the reactive decode signal.
+     * Wired only on the live RTSP path; a no-op by default.
+     */
+    onDroppedFrames: (Int, Long) -> Unit = { _, _ -> },
 ) {
+    // Either the user-selected wall-wide low-bandwidth mode OR a system-shed tile
+    // renders the still-frame path instead of an RTSP decoder.
+    val stillFramePath = lowBandwidthMode || autoShed
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
             .background(Color.Black)
             .clickable(onClick = onClick),
     ) {
-        if (lowBandwidthMode) {
+        if (stillFramePath) {
             // ── Snapshot-polling path ────────────────────────────────────────────
             // Independent JPEG GETs on an adaptive interval. No RTSP connection,
             // no ExoPlayer, no buffering — just a new still every tick. A single
@@ -155,14 +172,16 @@ fun LiveCameraTile(
                 streams = streams,
                 mediaUrls = mediaUrls,
                 onStall = onStall,
+                onDroppedFrames = onDroppedFrames,
             )
         }
 
         // ── Overlays common to both paths ─────────────────────────────────────
 
         // Low-bandwidth mode indicator (bottom-center, subtle) so the user
-        // always knows which render path is active.
-        if (lowBandwidthMode && mediaUrls != null) {
+        // always knows which render path is active. Only for the user-selected
+        // wall-wide mode; a system-shed tile shows the "SD" auto badge instead.
+        if (lowBandwidthMode && !autoShed && mediaUrls != null) {
             Icon(
                 imageVector = Icons.Default.SignalWifiStatusbarConnectedNoInternet4,
                 contentDescription = "Low-bandwidth mode",
@@ -171,6 +190,25 @@ fun LiveCameraTile(
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 6.dp)
                     .size(14.dp),
+            )
+        }
+
+        // Adaptive-backpressure "SD" badge (#384): this tile was auto-shed to a
+        // still frame to protect the decoder. A distinct amber tint reads as
+        // "the system stepped this down", not a fault; it self-clears silently.
+        if (autoShed) {
+            Text(
+                text = "SD",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 6.dp)
+                    .background(
+                        color = AutoShedAmber.copy(alpha = 0.85f),
+                        shape = RoundedCornerShape(4.dp),
+                    )
+                    .padding(horizontal = 5.dp, vertical = 1.dp),
             )
         }
 
@@ -260,6 +298,7 @@ private fun LiveRtspContent(
     streams: LiveStreamsResponse?,
     mediaUrls: MediaUrls?,
     onStall: () -> Unit,
+    onDroppedFrames: (Int, Long) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -343,6 +382,28 @@ private fun LiveRtspContent(
             // (fullscreen) camera. Avoids a wall of overlapping audio tracks.
             exo.volume = 0f
         }
+    }
+
+    // Adaptive-wall decode signal (#384): forward this player's dropped-frame
+    // deltas to the wall's WallDecodeMonitor. Media3 calls onDroppedVideoFrames
+    // with the frames dropped since the last callback and the elapsed decode time,
+    // which is exactly the per-tile term the monitor aggregates across the wall.
+    // The listener is removed in onDispose (keyed on `player`), so it can't outlive
+    // the player instance or leak across the tile's many reconnects.
+    val onDroppedFramesState = rememberUpdatedState(onDroppedFrames)
+    DisposableEffect(player) {
+        val p = player
+        val analytics = object : AnalyticsListener {
+            override fun onDroppedVideoFrames(
+                eventTime: AnalyticsListener.EventTime,
+                droppedFrames: Int,
+                elapsedMs: Long,
+            ) {
+                onDroppedFramesState.value(droppedFrames, elapsedMs)
+            }
+        }
+        p?.addAnalyticsListener(analytics)
+        onDispose { p?.removeAnalyticsListener(analytics) }
     }
 
     // Attach a listener that updates buffering/error state and drives automatic
@@ -701,6 +762,11 @@ private fun LiveRtspContent(
         }
     }
 }
+
+/** Amber tint for the adaptive-backpressure "SD" auto badge (#384) — deliberately
+ *  distinct from the teal low-bandwidth glyph and the red motion/error accents, so
+ *  a system-shed tile reads as "stepped down to protect the device", not a fault. */
+private val AutoShedAmber = Color(0xFFFFB300)
 
 // ─── reconnect tuning ─────────────────────────────────────────────────────────
 

@@ -5,6 +5,8 @@ package video.crumb.app.feature.live
 import android.content.res.Configuration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddAPhoto
 import androidx.compose.material.icons.filled.Close
@@ -27,6 +30,7 @@ import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.SignalWifiStatusbarConnectedNoInternet4
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -45,11 +49,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
@@ -301,6 +308,81 @@ fun LiveScreen(
     // Low-bw mode: read from the VM state (which is seeded from SecureStore on init).
     val lowBandwidthMode = state.lowBandwidthMode
 
+    // ── Adaptive wall quality (#384) ──────────────────────────────────────────────
+    // Client-local decode protection: a config-time guardrail nudge (Stage 1) plus a
+    // runtime backpressure loop (Stage 2) that sheds peripheral tiles to still frames
+    // when the device's decoder/thermal headroom runs low. Both governed by one
+    // device-local toggle (default ON). Mirrored in state so the Settings switch and
+    // the guardrail's "Don't warn on this device" take effect without leaving here.
+    var adaptiveWallQuality by remember { mutableStateOf(store.adaptiveWallQuality) }
+    var wallGuardrailSilenced by remember { mutableStateOf(store.wallGuardrailSilenced) }
+    // Session-only ack of the guardrail nudge ("Proceed anyway"): quiet until the
+    // wall drops back under budget and climbs over it again.
+    var guardrailProceeded by remember { mutableStateOf(false) }
+
+    // The reactive monitor. Remembered for the wall's lifetime; its thermal listener
+    // is registered while foregrounded and always removed on dispose (see below).
+    val decodeMonitor = remember { WallDecodeMonitor(activityContext) }
+    val shedIds by decodeMonitor.shedIds.collectAsStateWithLifecycle()
+
+    // Grid scroll state, so the shedder can prefer off-screen tiles (shed order:
+    // off-screen first, then oldest wall-order, never the focused single tile).
+    val gridState = rememberLazyGridState()
+    val visibleCameraIds by remember {
+        derivedStateOf {
+            gridState.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? String }.toSet()
+        }
+    }
+
+    // Push topology (order / off-screen / focus) into the monitor on any change.
+    LaunchedEffect(shownCameras, visibleCameraIds) {
+        val ordered = shownCameras.map { it.id }
+        val offscreen = ordered.toSet() - visibleCameraIds
+        // A single-camera view is the Android analog of the focused/fullscreen tile
+        // and must never be shed.
+        val focused = shownCameras.singleOrNull()?.id
+        decodeMonitor.updateTopology(ordered, offscreen, focused)
+    }
+
+    // Stage-2 control loop: tick the monitor ~every 2s while the wall is at least
+    // STARTED and the feature is on and we're not already wall-wide low-bw (where
+    // every tile is a still anyway). Register/unregister the thermal listener around
+    // the foreground window; reset shed state whenever the loop is not running.
+    LaunchedEffect(adaptiveWallQuality, lowBandwidthMode) {
+        if (!adaptiveWallQuality || lowBandwidthMode) {
+            decodeMonitor.reset()
+            return@LaunchedEffect
+        }
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            decodeMonitor.start()
+            try {
+                var last = SystemClock.elapsedRealtime()
+                while (true) {
+                    delay(WallDecodeMonitor.WALL_TICK_MS)
+                    val now = SystemClock.elapsedRealtime()
+                    decodeMonitor.tick(now - last)
+                    last = now
+                }
+            } finally {
+                decodeMonitor.stop()
+            }
+        }
+    }
+    // Belt-and-suspenders: ensure the thermal listener is gone if the wall leaves
+    // composition outside the repeatOnLifecycle window.
+    DisposableEffect(Unit) {
+        onDispose { decodeMonitor.stop() }
+    }
+
+    // Stage-1 guardrail: warn when the live wall would render more video tiles than
+    // this device's conservative decode budget, before anything saturates. Advisory
+    // only. Suppressed in low-bw mode (no video tiles), once silenced on the device,
+    // or once acknowledged this session.
+    val liveTileCount = if (lowBandwidthMode) 0 else shownCameras.size
+    val showGuardrail = adaptiveWallQuality && !lowBandwidthMode &&
+        !wallGuardrailSilenced && !guardrailProceeded &&
+        liveTileCount > WallDecodeMonitor.GUARDRAIL_TILE_BUDGET
+
     // Snapshot (#163): grab a camera's current live frame → device gallery, then a
     // Share-able confirmation (#164). The wall tiles render on a SurfaceView (no
     // readable pixel buffer), so rather than a surface grab we fetch the camera's
@@ -434,6 +516,25 @@ fun LiveScreen(
                     LowBandwidthAutoFallbackBanner(
                         onRestore = { vm.setLowBandwidthMode(false) },
                         onDismiss = { vm.dismissAutoFallbackBadge() },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
+                // ── Adaptive-wall guardrail nudge (#384, Stage 1) ─────────────────
+                // Advisory heads-up that this wall has enough live tiles to risk
+                // over-subscribing the device's decoder. Never blocks; three actions.
+                if (showGuardrail) {
+                    WallGuardrailNudge(
+                        tileCount = liveTileCount,
+                        onUseSnapshots = {
+                            vm.setLowBandwidthMode(true)
+                            guardrailProceeded = true
+                        },
+                        onProceed = { guardrailProceeded = true },
+                        onDontWarn = {
+                            wallGuardrailSilenced = true
+                            store.wallGuardrailSilenced = true
+                        },
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
@@ -599,6 +700,7 @@ fun LiveScreen(
                         else -> {
                             LazyVerticalGrid(
                                 columns = GridCells.Fixed(minOf(layout.cols, maxCols)),
+                                state = gridState,
                                 contentPadding = PaddingValues(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -621,7 +723,14 @@ fun LiveScreen(
                                         recording = recordingCams.contains(cam.id),
                                         detections = detectionCams[cam.id] ?: emptyList(),
                                         lowBandwidthMode = lowBandwidthMode,
+                                        // Stage-2 backpressure: this tile has been
+                                        // shed to a still to relieve decode pressure.
+                                        autoShed = adaptiveWallQuality &&
+                                            !lowBandwidthMode && shedIds.contains(cam.id),
                                         onStall = { vm.reportTileStall(cam.id) },
+                                        onDroppedFrames = { dropped, elapsedMs ->
+                                            decodeMonitor.reportDroppedVideoFrames(dropped, elapsedMs)
+                                        },
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .aspectRatio(16f / 9f),
@@ -668,6 +777,11 @@ fun LiveScreen(
             store = store,
             lowBandwidthMode = lowBandwidthMode,
             onLowBandwidthChange = { vm.setLowBandwidthMode(it) },
+            adaptiveWallQuality = adaptiveWallQuality,
+            onAdaptiveWallQualityChange = {
+                adaptiveWallQuality = it
+                store.adaptiveWallQuality = it
+            },
             showAllCamerasView = showAllCamerasView,
             onShowAllCamerasViewChange = {
                 showAllCamerasView = it
@@ -827,6 +941,75 @@ private fun LowBandwidthAutoFallbackBanner(
                 tint = TextSecondary,
                 modifier = Modifier.size(14.dp),
             )
+        }
+    }
+}
+
+// ─── adaptive-wall guardrail nudge (#384, Stage 1) ────────────────────────────
+
+/**
+ * A dismissible, non-blocking nudge shown when the live wall would render more
+ * live video tiles than this device's conservative decode budget. Advisory only,
+ * matching the desktop guardrail (#382): it warns before the wall over-subscribes
+ * the decoder, but never forbids the heavy wall. Three actions:
+ * - "Use snapshots" — drop the wall to the low-bandwidth still-frame path.
+ * - "Proceed anyway" — keep full video; quiet for this session.
+ * - "Don't warn on this device" — silence the nudge on this device for good (the
+ *   runtime backpressure net still runs).
+ */
+@Composable
+private fun WallGuardrailNudge(
+    tileCount: Int,
+    onUseSnapshots: () -> Unit,
+    onProceed: () -> Unit,
+    onDontWarn: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .background(NavySurface)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Default.Speed,
+                contentDescription = null,
+                tint = TealAccent,
+                modifier = Modifier.size(16.dp),
+            )
+            Text(
+                text = "This wall runs $tileCount live streams, which may exceed this " +
+                    "device's video decode headroom. Use still snapshots instead?",
+                style = MaterialTheme.typography.labelMedium,
+                color = TextSecondary,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        // Horizontally scrollable so all three actions stay reachable even on a
+        // narrow phone (a >12-tile wall can appear in portrait too).
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+        ) {
+            TextButton(onClick = onDontWarn) {
+                Text(
+                    "Don't warn on this device",
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+            TextButton(onClick = onProceed) {
+                Text("Proceed anyway", color = TextSecondary, style = MaterialTheme.typography.labelMedium)
+            }
+            TextButton(onClick = onUseSnapshots) {
+                Text("Use snapshots", color = TealAccent, style = MaterialTheme.typography.labelMedium)
+            }
         }
     }
 }
