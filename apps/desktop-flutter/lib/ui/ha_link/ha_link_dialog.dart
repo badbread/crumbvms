@@ -214,6 +214,47 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
     setState(() => _links = [..._links]..removeAt(index));
   }
 
+  /// Replace one field on the working link at [index] without rebuilding the
+  /// whole list, so an in-row text field keeps focus while typing. The edited
+  /// set is persisted by [_save]. Empty text collapses to null (label falls
+  /// back to entityId, device_class is genuinely unset).
+  void _updateRole(int index, String role) {
+    final l = _links[index];
+    setState(() {
+      _links = [..._links]..[index] = HaLinkInput(
+        entityId: l.entityId,
+        role: role,
+        deviceClass: l.deviceClass,
+        label: l.label,
+        sortOrder: l.sortOrder,
+      );
+    });
+  }
+
+  void _updateLabel(int index, String label) {
+    final l = _links[index];
+    final trimmed = label.trim();
+    _links[index] = HaLinkInput(
+      entityId: l.entityId,
+      role: l.role,
+      deviceClass: l.deviceClass,
+      label: trimmed.isEmpty ? null : label,
+      sortOrder: l.sortOrder,
+    );
+  }
+
+  void _updateDeviceClass(int index, String deviceClass) {
+    final l = _links[index];
+    final trimmed = deviceClass.trim();
+    _links[index] = HaLinkInput(
+      entityId: l.entityId,
+      role: l.role,
+      deviceClass: trimmed.isEmpty ? null : deviceClass,
+      label: l.label,
+      sortOrder: l.sortOrder,
+    );
+  }
+
   Future<void> _save() async {
     setState(() {
       _saving = true;
@@ -245,14 +286,26 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
         const SnackBar(content: Text('Home Assistant links saved.')),
       );
     } catch (e) {
-      if (mounted) setState(() => _saveError = '$e');
+      // The server rejects a role that doesn't fit the entity's domain (e.g.
+      // marking a light as Motion) with a 400; surface that reason inline and
+      // as a snackbar rather than failing silently.
+      if (mounted) {
+        setState(() => _saveError = '$e');
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
     } finally {
       if (mounted) setState(() => _saving = false);
     }
   }
 
-  String _rolePill(HaLinkInput l) =>
-      l.role == 'actuator' ? 'control' : (l.deviceClass ?? 'sensor');
+  /// The three link roles an operator can pick per row. "Control" is the
+  /// server's `actuator` role (an entity you can operate); the parenthetical
+  /// spells that out so it reads as controllable, not just another sensor.
+  static const List<(String, String)> _roleOptions = [
+    ('motion', 'Motion (triggers recording)'),
+    ('sensor', 'Sensor (status only)'),
+    ('actuator', 'Control (operate)'),
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -354,40 +407,82 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
 
   Widget _linkRow(ColorScheme scheme, int index) {
     final l = _links[index];
+    // Key each editable field to the entity so Flutter reattaches field state
+    // to the right row after a remove shifts indexes.
+    final rowKey = '${l.entityId}:${l.role}';
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Text(_rolePill(l), style: const TextStyle(fontSize: 11)),
+          Row(
+            children: [
+              DropdownButton<String>(
+                value: l.role,
+                isDense: true,
+                style: TextStyle(fontSize: 12, color: scheme.onSurface),
+                items: [
+                  for (final (v, t) in _roleOptions)
+                    DropdownMenuItem(value: v, child: Text(t)),
+                ],
+                onChanged: (v) {
+                  if (v != null) _updateRole(index, v);
+                },
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextFormField(
+                  key: ValueKey('label:$rowKey'),
+                  initialValue: l.label ?? '',
+                  style: const TextStyle(fontSize: 13),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: l.entityId,
+                    labelText: 'Label',
+                    border: const OutlineInputBorder(),
+                  ),
+                  onChanged: (v) => _updateLabel(index, v),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Remove',
+                icon: const Icon(Icons.close, size: 16),
+                onPressed: () => _removeAt(index),
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              l.label ?? l.entityId,
-              style: const TextStyle(fontSize: 13),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            l.entityId,
-            style: TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 11,
-              color: scheme.onSurfaceVariant,
-            ),
-          ),
-          IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.close, size: 16),
-            onPressed: () => _removeAt(index),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              SizedBox(
+                width: 160,
+                child: TextFormField(
+                  key: ValueKey('dc:$rowKey'),
+                  initialValue: l.deviceClass ?? '',
+                  style: const TextStyle(fontSize: 12),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    hintText: 'device class',
+                    labelText: 'Device class',
+                    border: OutlineInputBorder(),
+                  ),
+                  onChanged: (v) => _updateDeviceClass(index, v),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  l.entityId,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
         ],
       ),
