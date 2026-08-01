@@ -163,6 +163,28 @@ internal fun badgeVisual(link: HaLinkDto, state: String?, stale: Boolean): Badge
     return BadgeVisual(color, overrideIcon ?: base.icon, base.label)
 }
 
+/**
+ * The state text to show on a badge caption / entity sheet (issue #449): the
+ * visual's friendly label ("Open"/"On"), with the entity's
+ * `unit_of_measurement` appended when the reading is a real value — a
+ * numeric/plain state (`edgeOn == null`) that is not an indeterminate
+ * placeholder — and a unit is known: "72" -> "72 °F", "48" -> "48 %". An
+ * on/off/open/closed label never takes a unit. Returns exactly today's label
+ * when [unit] is null, so an un-updated server renders unchanged. Mirrors the
+ * desktop `haStateDisplay`.
+ */
+internal fun haStateDisplay(visual: BadgeVisual, state: String?, unit: String?): String {
+    val base = visual.label
+    val u = unit?.trim()
+    if (u.isNullOrEmpty() || state == null) return base
+    val s = state.trim()
+    if (s.isEmpty() || edgeOn(s) != null) return base
+    when (s.lowercase(Locale.US)) {
+        "unavailable", "unknown", "none" -> return base
+    }
+    return "$base $u"
+}
+
 /** Parse `#RRGGBB` -> opaque [Color], or null if absent/malformed. */
 internal fun parseHexColor(hex: String?): Color? {
     val h = hex?.trim()?.removePrefix("#") ?: return null
