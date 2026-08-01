@@ -68,6 +68,20 @@ actuators, so an operator grants "may work the devices on their cameras" once.
   `system_alert_rules` row for this key, so the notification engine consumes and
   skips it: a durable audit trail with no notification side effects.
 
+**Client interaction model (issue #428).** The wire contract above is
+interaction-agnostic, but the clients settled on: single-click actuates the
+primary action directly for the one-tap "simple" domains (light/switch/fan/siren
+-> `toggle`, button/input_button -> `press`, scene/script -> `turn_on`), with an
+optimistic in-flight indicator and no local state flip (the 3s state poll
+converges); hover surfaces the entity's state/age (desktop has a mouse), so the
+detail card is no longer the way to read state. The card is reserved for the
+domains a single tap cannot express: `cover` (open/stop/close) and `lock` (which
+keeps its confirm dialog), plus any future value-setting control (a dimmer /
+position slider) once the allowlist grows past on/off/toggle. Read-only /
+non-controllable badges still open the read-only card on click. The
+simple-vs-card split is derived from the same per-domain table as the server
+allowlist so the two cannot drift.
+
 **Revisit triggers (any one):**
 - The Reolink actuators land: confirm they reuse `actuators` rather than
   inventing a second capability, and that their action vocabulary gets the same

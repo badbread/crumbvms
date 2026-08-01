@@ -13,12 +13,19 @@
 // * pinned captions — the live state text and/or relative last-changed age,
 //   per the link's `overlay_show_state`/`overlay_show_age` toggles;
 // * a hover reveal — mousing over a badge shows state + age even when not
-//   pinned (desktop has a mouse; `OverlayEditorLayer.onHoverItem`);
-// * the `HaStateCard` on tap, placed beside the badge and flipped/clamped away
-//   from the pane edges. Read-only by default; when the host passes the
-//   actuation plumbing (`api`/`session`/`cameraId`) AND this account holds the
-//   `actuators` capability, an `actuator`-role link's card also carries the
-//   control buttons for its domain (issue #187, HA control Phase 2).
+//   pinned (desktop has a mouse; `OverlayEditorLayer.onHoverItem`). This is the
+//   primary way to see an entity's state now that a click actuates (issue #428)
+//   and applies to every badge, actuator and read-only alike;
+// * click routing (issue #428, refining #187): for a badge this account can
+//   control (host passed the `api`/`session`/`cameraId` plumbing AND this
+//   account holds the `actuators` capability AND the link is `actuator`-role),
+//   a click on a one-tap "simple" domain (light/switch/fan/siren/button/scene/
+//   script — see `haPrimaryAction`) fires the primary action DIRECTLY with a
+//   brief on-badge spinner, no card. Only `cover`/`lock` (`haNeedsCard`, multi-
+//   action + confirm) still open the `HaStateCard` with its control buttons.
+//   Every read-only / non-controllable badge opens the read-only card on click
+//   exactly as before. The card is placed beside the badge, flipped/clamped
+//   away from the pane edges.
 //
 // Purely a display widget: everything comes via the constructor, no
 // controller/global lookups (it builds its own private, ephemeral
@@ -40,6 +47,8 @@
 //       hideBadges: _scale > 1.01,               // digital zoom, POC rule §4.2
 //     ),
 //   )
+
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
@@ -67,6 +76,7 @@ import 'ha_state_card.dart';
 OverlayItemBuilder haBadgeItemBuilder({
   required HaEntityState? Function(String entityId) stateFor,
   required bool stale,
+  Set<String> pendingLinkIds = const {},
 }) {
   return (item, {required bool editing, required bool selected}) {
     final badge = item as HaOverlayBadgeItem;
@@ -92,6 +102,9 @@ OverlayItemBuilder haBadgeItemBuilder({
       animate: !editing,
       // A change in this key (state string / staleness) drives the squish.
       stateKey: '${state?.state ?? ''}|$stale',
+      // Brief in-flight spinner for a direct-click actuation (issue #428) while
+      // the 3s /ha/states poll converges. Never set while editing.
+      pending: !editing && pendingLinkIds.contains(link.id),
     );
   };
 }
@@ -127,6 +140,7 @@ class HaBadgeChip extends StatefulWidget {
     this.outline = false,
     this.animate = false,
     this.stateKey,
+    this.pending = false,
   });
 
   final HaVisual visual;
@@ -149,6 +163,11 @@ class HaBadgeChip extends StatefulWidget {
 
   /// Opaque token; a change (state/staleness) triggers the squish.
   final Object? stateKey;
+
+  /// Overlay a brief spinner while a direct-click actuation is in flight /
+  /// settling (issue #428). Purely cosmetic; the badge's real state still
+  /// arrives via the state poll.
+  final bool pending;
 
   @override
   State<HaBadgeChip> createState() => _HaBadgeChipState();
@@ -194,16 +213,47 @@ class _HaBadgeChipState extends State<HaBadgeChip>
           ? _pill(constraints.biggest.height)
           : _dot(constraints.biggest.shortestSide),
     );
-    if (!widget.animate) return chip;
-    return AnimatedBuilder(
-      animation: _scale,
-      builder: (context, child) => Transform.scale(
-        scale: _scale.value <= 0 ? 0.0 : _scale.value,
-        child: child,
-      ),
-      child: chip,
-    );
+    final Widget content = !widget.animate
+        ? chip
+        : AnimatedBuilder(
+            animation: _scale,
+            builder: (context, child) => Transform.scale(
+              scale: _scale.value <= 0 ? 0.0 : _scale.value,
+              child: child,
+            ),
+            child: chip,
+          );
+    if (!widget.pending) return content;
+    return _withPendingOverlay(content);
   }
+
+  /// A centered spinner over the badge while a direct-click action is in flight
+  /// (issue #428). Sized to the badge so it stays proportional on a small tile.
+  Widget _withPendingOverlay(Widget child) => Stack(
+        clipBehavior: Clip.none,
+        children: [
+          child,
+          Positioned.fill(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final d = (constraints.biggest.shortestSide * 0.52)
+                    .clamp(10.0, 22.0)
+                    .toDouble();
+                return Center(
+                  child: SizedBox(
+                    width: d,
+                    height: d,
+                    child: const CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      );
 
   BoxDecoration _decoration(BoxShape shape, BorderRadius? radius) {
     final bg = widget.bgColor ?? _kBadgeDefaultBg;
@@ -524,6 +574,18 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
   /// Link id currently under the mouse (hover reveal of state + age).
   String? _hoverLinkId;
 
+  /// Link ids with a direct-click action in flight / settling (issue #428) —
+  /// each shows a brief spinner on its badge while the 3s `/ha/states` poll
+  /// converges the real state. Kept per-link so several badges can be mid-flight
+  /// at once.
+  final Set<String> _pendingLinkIds = {};
+  final Map<String, Timer> _settleTimers = {};
+
+  /// How long the badge keeps its spinner after the POST lands, matching the
+  /// card's settle window so the operator sees the request took before the next
+  /// state poll (3s) speaks for itself.
+  static const Duration _kBadgeSettle = Duration(milliseconds: 3200);
+
   static const double _cardWidth = 260;
 
   /// Rough height estimates for flip/clamp decisions (the real widgets
@@ -535,6 +597,9 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
 
   @override
   void dispose() {
+    for (final t in _settleTimers.values) {
+      t.cancel();
+    }
     _viewController.dispose();
     super.dispose();
   }
@@ -581,10 +646,10 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
                 buildItem: haBadgeItemBuilder(
                   stateFor: widget.stateFor,
                   stale: widget.stale,
+                  pendingLinkIds: _pendingLinkIds,
                 ),
-                onTapItem: (item) => setState(
-                  () => _openLinkId = _openLinkId == item.id ? null : item.id,
-                ),
+                onTapItem: (item) =>
+                    _handleTap((item as HaOverlayBadgeItem).link),
                 onHoverItem: (item, hovering) {
                   final next = hovering
                       ? item.id
@@ -638,18 +703,62 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
     return null;
   }
 
-  /// The control buttons to offer for [link] (issue #187), or empty for the
-  /// read-only card. Both gates must pass: the account holds the `actuators`
-  /// capability AND this link is an actuator (a motion/door sensor link is
-  /// never controllable, even for an admin). The domain table then decides
-  /// the button set, mirroring the server's allow-list.
-  List<HaControlAction> _actionsFor(HaLink link) {
-    if (!widget.canActuate || link.role != 'actuator') return const [];
-    if (widget.api == null ||
-        widget.session == null ||
-        widget.cameraId == null) {
-      return const [];
+  /// Whether this caller can actuate [link]: the account holds the `actuators`
+  /// capability, the link is an `actuator` role (a motion/door sensor is never
+  /// controllable, even for an admin), and the host wired the POST plumbing.
+  bool _canControl(HaLink link) {
+    if (!widget.canActuate || link.role != 'actuator') return false;
+    return widget.api != null &&
+        widget.session != null &&
+        widget.cameraId != null;
+  }
+
+  /// Route a badge tap (issue #428). For a controllable badge whose domain is a
+  /// one-tap "simple" domain (light/switch/fan/siren/button/scene/script) the
+  /// click fires the primary action DIRECTLY, no card. `cover`/`lock`
+  /// ([haNeedsCard]) and every read-only / non-controllable badge fall through
+  /// to toggling the detail card (which, for cover/lock, still carries the
+  /// multi-action buttons + confirm dialog).
+  void _handleTap(HaLink link) {
+    if (_canControl(link)) {
+      final primary = haPrimaryAction(link.domain);
+      if (primary != null) {
+        unawaited(_fireDirect(link, primary));
+        return;
+      }
     }
+    setState(() => _openLinkId = _openLinkId == link.id ? null : link.id);
+  }
+
+  /// POST a direct-click action and show a brief in-flight spinner on the badge
+  /// itself (issue #428). Reuses [_runAction]'s optimistic-never-flip-locally +
+  /// toast-on-failure behavior; the spinner rides the settle window, then the
+  /// 3s `/ha/states` poll converges the badge.
+  Future<void> _fireDirect(HaLink link, HaControlAction action) async {
+    if (_pendingLinkIds.contains(link.id)) return;
+    setState(() => _pendingLinkIds.add(link.id));
+    final ok = await _runAction(link, action.action);
+    if (!mounted) return;
+    if (!ok) {
+      // _runAction already toasted; drop the spinner so the operator can retry.
+      setState(() => _pendingLinkIds.remove(link.id));
+      return;
+    }
+    // Accepted: hold the spinner through the convergence window.
+    _settleTimers[link.id]?.cancel();
+    _settleTimers[link.id] = Timer(_kBadgeSettle, () {
+      if (!mounted) return;
+      setState(() => _pendingLinkIds.remove(link.id));
+    });
+  }
+
+  /// The control buttons to offer for [link] (issue #187), or empty for the
+  /// read-only card. Gated by [_canControl]; the domain table then decides the
+  /// button set, mirroring the server's allow-list. In practice only the card
+  /// domains (`cover`/`lock`) reach here controllable, since simple domains
+  /// actuate on a direct click (issue #428) and never open the card.
+  List<HaControlAction> _actionsFor(HaLink link) {
+    if (!_canControl(link)) return const [];
     return haActionsForDomain(link.domain);
   }
 
