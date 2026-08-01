@@ -206,6 +206,19 @@ interface CrumbApi {
     suspend fun haStates(): HaStatesResponse
 
     /**
+     * Fire a Home Assistant service call for a linked entity. Requires the
+     * `actuators` capability (admin implies it); the server enforces its own
+     * per-domain action allowlist and returns `{ "ok": true }` on success. A
+     * missing capability is 403, a rejected/unknown link 400/404, HA unreachable
+     * 502 — all surfaced to the caller as a [retrofit2.HttpException].
+     */
+    @POST("cameras/{camera_id}/ha/action")
+    suspend fun haAction(
+        @Path("camera_id") cameraId: String,
+        @Body body: HaActionRequest,
+    ): HaActionResponse
+
+    /**
      * License-plate reads (LPR) for the Plates tab — newest-first over
      * [cameraIds] (further viewer-scoped server-side; the route requires
      * `camera_ids`). [query]/[match] filter by plate text

@@ -78,6 +78,12 @@ data class CapabilitiesDto(
     val ptz: Boolean = false,
     /** May create/edit custom camera views. */
     @SerialName("manage_views") val manageViews: Boolean = false,
+    /**
+     * May actuate (control) linked Home Assistant devices — turn lights/switches
+     * on/off, open/close covers, lock/unlock, press buttons. Physical-security
+     * privileged, so default-off; absent on older servers → false (controls hide).
+     */
+    val actuators: Boolean = false,
     /** Bookmark access level: "none", "own", or "all". */
     val bookmarks: String = "none",
 )
@@ -122,6 +128,7 @@ data class UserDto(
             clips = true,
             ptz = true,
             manageViews = true,
+            actuators = true,
             bookmarks = "all",
         )
     } else {

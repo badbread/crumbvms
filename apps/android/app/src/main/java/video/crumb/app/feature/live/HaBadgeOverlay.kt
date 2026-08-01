@@ -2,9 +2,10 @@
 
 package video.crumb.app.feature.live
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.WaterDrop
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -258,6 +260,13 @@ private fun badgeSize(link: HaLinkDto, ps: Float): FloatArray {
  * gated by the caller on video-size-known and not-digitally-zoomed. Only the
  * badge hit-boxes are interactive — the rest of the layer passes touches through
  * to the video/PTZ beneath.
+ *
+ * Interaction (issue #428): [onBadgeTap] is the PRIMARY gesture (the caller
+ * decides direct-fire vs control sheet vs read-only detail from the link's
+ * domain/role/capability); [onBadgeLongPress] always opens the read-only detail
+ * so an actuator can be inspected without actuating. [inFlightLinkIds] holds the
+ * [HaLinkDto.actionLinkId]s of actions currently posting, shown as a brief
+ * in-flight spinner on the badge — state is never flipped locally.
  */
 @Composable
 fun HaBadgeOverlayLayer(
@@ -270,7 +279,9 @@ fun HaBadgeOverlayLayer(
     // server's own `stale` flag so a badge greys when EITHER Crumb->HA or
     // phone->Crumb has gone quiet. (#371)
     clientStale: Boolean = false,
+    inFlightLinkIds: Set<String> = emptySet(),
     onBadgeTap: (HaLinkDto) -> Unit,
+    onBadgeLongPress: (HaLinkDto) -> Unit = onBadgeTap,
 ) {
     if (videoWidth <= 0 || videoHeight <= 0) return
     val placed = remember(links) { links.filter { it.hasPlacement } }
@@ -294,21 +305,29 @@ fun HaBadgeOverlayLayer(
             val (bw, bh) = badgeSize(link, ps)
             val x = (fx + (link.overlayX ?: 0.0).toFloat() * fw).coerceIn(fx, (fx + fw - bw).coerceAtLeast(fx))
             val y = (fy + (link.overlayY ?: 0.0).toFloat() * fh).coerceIn(fy, (fy + fh - bh).coerceAtLeast(fy))
-            HaBadge(link, states, clientStale, x, y, bw, bh, onBadgeTap)
+            HaBadge(
+                link, states, clientStale,
+                inFlight = link.actionLinkId in inFlightLinkIds,
+                xDp = x, yDp = y, wDp = bw, hDp = bh,
+                onTap = onBadgeTap, onLongPress = onBadgeLongPress,
+            )
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HaBadge(
     link: HaLinkDto,
     states: HaStatesResponse?,
     clientStale: Boolean,
+    inFlight: Boolean,
     xDp: Float,
     yDp: Float,
     wDp: Float,
     hDp: Float,
     onTap: (HaLinkDto) -> Unit,
+    onLongPress: (HaLinkDto) -> Unit,
 ) {
     val st = states?.stateFor(link.entityId)
     // Stale when the server says so OR this client has missed >= 2 polls (#371).
@@ -316,6 +335,7 @@ private fun HaBadge(
     val visual = badgeVisual(link, st?.state, stale)
     val bg = parseHexColor(link.overlayBgColor) ?: BadgeDefaultBg
     val opacity = (link.overlayOpacity?.toFloat() ?: 1f).coerceIn(0.05f, 1f)
+    val isPill = link.overlayShape == "pill"
 
     Column(
         modifier = Modifier
@@ -326,17 +346,40 @@ private fun HaBadge(
         Box(
             modifier = Modifier
                 .size(width = wDp.dp, height = hDp.dp)
-                .clickable { onTap(link) },
+                // Tap = primary gesture (fire/sheet/detail, decided by the caller);
+                // long-press = read-only inspect. Both consumed here so the touch
+                // does not fall through to the video/PTZ beneath. (#428)
+                .combinedClickable(
+                    onClick = { onTap(link) },
+                    onLongClick = { onLongPress(link) },
+                ),
         ) {
             HaBadgeChip(
                 visual = visual,
-                isPill = link.overlayShape == "pill",
+                isPill = isPill,
                 pillLabel = link.displayName,
                 bgColor = bg,
                 outline = link.overlayOutline,
                 heightDp = hDp,
                 modifier = Modifier.fillMaxSize(),
             )
+            // Brief in-flight spinner while an action posts — we never flip the
+            // shown state locally; the `/ha/states` poll converges it. (#428)
+            if (inFlight) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(if (isPill) RoundedCornerShape(percent = 50) else CircleShape)
+                        .background(Color.Black.copy(alpha = 0.45f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.fillMaxSize(0.6f),
+                        color = Color.White,
+                        strokeWidth = 2.dp,
+                    )
+                }
+            }
         }
 
         val caption = buildString {
