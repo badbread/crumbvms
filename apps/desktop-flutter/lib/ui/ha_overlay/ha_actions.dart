@@ -47,9 +47,21 @@ class HaControlAction {
   final bool confirm;
 }
 
+/// light / switch / fan / siren, single-click (issue #428). A plain click on a
+/// controllable badge for these domains flips it in one gesture — the badge's
+/// live state tells the operator which way it went, so a lone `toggle` is the
+/// natural desktop action and skips the card entirely. `toggle` is in the
+/// server's allow-list for all four domains (see this file's header table).
+const HaControlAction _kToggleAction = HaControlAction(
+  action: 'toggle',
+  label: 'Toggle',
+  icon: Icons.power_settings_new,
+);
+
 /// light / switch / fan / siren. Two explicit intents rather than a single
 /// `toggle`: on a security console "make it on" beats "flip whatever it is",
-/// and the card already shows the live state right above these buttons.
+/// and the card already shows the live state right above these buttons. Still
+/// used for the (unreachable-for-simple-domains but generic) card path.
 const List<HaControlAction> _kOnOffActions = [
   HaControlAction(
     action: 'turn_on',
@@ -138,6 +150,48 @@ List<HaControlAction> haActionsForDomain(String domain) {
       return const [];
   }
 }
+
+/// The client interaction split for issue #428 — kept HERE (next to the
+/// server-mirroring action table) so every client and the state model agree on
+/// which domains a single click actuates directly vs which open the detail card.
+///
+/// The single action a plain click fires for a "simple", one-tap domain, or
+/// null when the domain either needs the multi-action card ([haNeedsCard]) or
+/// has no control path at all. Direct-click desktop actuation routes on this:
+/// a non-null result POSTs immediately (no card); null falls through to the
+/// card (or, for a read-only badge, the read-only card).
+///
+///   light / switch / fan / siren -> toggle
+///   button / input_button        -> press
+///   scene / script               -> turn_on (activate / run)
+///
+/// Unknown/read-only domains (binary_sensor, sensor, a newer HA domain) return
+/// null: no guessed actuation, the badge stays read-only.
+HaControlAction? haPrimaryAction(String domain) {
+  switch (domain) {
+    case 'light':
+    case 'switch':
+    case 'fan':
+    case 'siren':
+      return _kToggleAction;
+    case 'button':
+    case 'input_button':
+      return _kPressActions.first;
+    case 'scene':
+      return _kSceneActions.first;
+    case 'script':
+      return _kScriptActions.first;
+    default:
+      return null;
+  }
+}
+
+/// Domains whose control needs the detail CARD rather than a single click:
+/// `cover` (open / stop / close — three distinct actions) and `lock` (which
+/// also keeps its confirm dialog). A future value-setting control (a dimmer /
+/// position slider) would join this bucket once the backend action allow-list
+/// grows past on/off/toggle; today those two are the only card domains.
+bool haNeedsCard(String domain) => domain == 'cover' || domain == 'lock';
 
 /// The confirm-step prompt for a physical-security action, e.g.
 /// "Unlock Front Door?" / "Close Garage Door?".
