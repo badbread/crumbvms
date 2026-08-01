@@ -19,17 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bolt
-import androidx.compose.material.icons.filled.Garage
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Lightbulb
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.LockOpen
-import androidx.compose.material.icons.filled.MeetingRoom
-import androidx.compose.material.icons.filled.PowerSettingsNew
-import androidx.compose.material.icons.filled.Sensors
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Window
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -44,7 +34,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -54,7 +43,6 @@ import video.crumb.app.data.haPrimaryAction
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
-import java.util.Locale
 
 // Home Assistant default (dark) theme tokens — the sheet renders in HA's own
 // look regardless of the app theme, so it feels like an extension of the HA app.
@@ -64,69 +52,16 @@ private val HaCardActive = Color(0xFF232323)
 private val HaPrimaryText = Color(0xFFE1E1E1)
 private val HaSecondaryText = Color(0xFF9B9B9B)
 private val HaDivider = Color(0x1FE1E1E1)
-private val HaBlue = Color(0xFF18BCF2) // HA brand mark
-private val HaAmber = Color(0xFFFFC107) // active state
-private val HaRed = Color(0xFFF44336) // problem state
-private val HaGrey = Color(0xFF7A7A7A) // inactive icon
+private val HaBlue = Color(0xFF18BCF2) // HA brand mark / primary action accent
+private val HaAmber = Color(0xFFFFC107) // cover Close accent
+private val HaRed = Color(0xFFF44336) // lock Unlock accent
+private val HaGrey = Color(0xFF7A7A7A) // neutral Stop / Cancel accent
 
-/** Resolved visual for one entity: state color, icon, and a display state text. */
-private data class HaVisual(val color: Color, val icon: ImageVector, val stateText: String)
-
-private val PROBLEM_CLASSES =
-    setOf("smoke", "gas", "safety", "moisture", "problem", "co", "carbon_monoxide", "tamper")
-
-/** Is a binary/state value "active" (on/open/detected)? */
-private fun isActive(state: String): Boolean =
-    when (state.lowercase(Locale.US)) {
-        "on", "open", "opening", "detected", "unlocked", "home", "playing", "active" -> true
-        else -> false
-    }
-
-/**
- * Map (domain, device_class, state) to HA's state color + icon + a friendly
- * state label, matching Home Assistant's own conventions: amber when active,
- * grey when inactive, red for problem-type binary sensors.
- */
-private fun haVisual(link: HaLinkDto, state: String?): HaVisual {
-    val s = state?.lowercase(Locale.US) ?: "unknown"
-    val dc = link.deviceClass?.lowercase(Locale.US)
-    val active = isActive(s)
-    val problem = dc in PROBLEM_CLASSES && active
-
-    val color = when {
-        s == "unavailable" || s == "unknown" -> HaGrey
-        problem -> HaRed
-        active -> HaAmber
-        else -> HaGrey
-    }
-
-    val icon = when {
-        link.domain == "light" -> Icons.Filled.Lightbulb
-        link.domain == "switch" || link.domain == "input_boolean" -> Icons.Filled.PowerSettingsNew
-        link.domain == "lock" -> if (s == "unlocked") Icons.Filled.LockOpen else Icons.Filled.Lock
-        dc == "garage" || dc == "garage_door" -> Icons.Filled.Garage
-        dc == "motion" || dc == "occupancy" || dc == "presence" || dc == "moving" -> Icons.Filled.Sensors
-        dc == "window" -> Icons.Filled.Window
-        dc == "door" || dc == "opening" || link.domain == "cover" -> Icons.Filled.MeetingRoom
-        problem -> Icons.Filled.Warning
-        else -> Icons.Filled.Bolt
-    }
-
-    // HA's friendly state text per device class.
-    val text = when {
-        s == "unavailable" -> "Unavailable"
-        s == "unknown" -> "Unknown"
-        dc == "motion" || dc == "occupancy" || dc == "presence" -> if (active) "Detected" else "Clear"
-        dc in PROBLEM_CLASSES -> if (active) "Detected" else "OK"
-        dc == "door" || dc == "window" || dc == "garage" || dc == "garage_door" ||
-            dc == "opening" || link.domain == "cover" -> if (active) "Open" else "Closed"
-        link.domain == "lock" -> if (s == "unlocked") "Unlocked" else "Locked"
-        link.domain == "light" || link.domain == "switch" || link.domain == "input_boolean" ->
-            if (active) "On" else "Off"
-        else -> state.orEmpty().replaceFirstChar { it.uppercase() }.ifBlank { "Unknown" }
-    }
-    return HaVisual(color, icon, text)
-}
+// The entity look (icon + state color + label) comes from the ONE canonical
+// mapping in `HaVisual.kt` (`badgeVisual`), shared with the on-video badge
+// overlay so an entity reads identically in the badge and in this sheet (#437).
+// The HaAmber/HaRed/HaGrey tokens above are the actuator control-row button
+// accents (#428) — the state-color derivation itself lives in `HaVisual.kt`.
 
 /** "Changed N ago" from an RFC3339 timestamp, HA-style. */
 private fun changedAgo(iso: String?): String? {
@@ -166,6 +101,8 @@ fun HaEntitiesSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selected by remember { mutableStateOf<HaLinkDto?>(null) }
     val sorted = remember(links) { links.sortedBy { it.sortOrder } }
+    // Grey the icon honestly when HA is unreachable, exactly as the badge does.
+    val stale = states?.stale == true
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -204,7 +141,7 @@ fun HaEntitiesSheet(
         ) {
             items(sorted, key = { it.id }) { link ->
                 val st = states?.stateFor(link.entityId)
-                HaTile(link, st?.state, onClick = { selected = link })
+                HaTile(link, st?.state, stale, onClick = { selected = link })
             }
         }
     }
@@ -212,7 +149,7 @@ fun HaEntitiesSheet(
     selected?.let { link ->
         val st = states?.stateFor(link.entityId)
         HaMoreInfoDialog(
-            link, st?.state, st?.lastChanged,
+            link, st?.state, st?.lastChanged, stale,
             canActuate = canActuate && link.isActuator,
             inFlight = link.actionLinkId in inFlightLinkIds,
             onAction = { action -> onAction(link, action) },
@@ -230,8 +167,8 @@ private fun HaGrabber() {
 
 /** One HA tile card: state-colored icon in a tinted circle, name + state. */
 @Composable
-private fun HaTile(link: HaLinkDto, state: String?, onClick: () -> Unit) {
-    val v = haVisual(link, state)
+private fun HaTile(link: HaLinkDto, state: String?, stale: Boolean, onClick: () -> Unit) {
+    val v = badgeVisual(link, state, stale)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -256,7 +193,7 @@ private fun HaTile(link: HaLinkDto, state: String?, onClick: () -> Unit) {
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
             )
-            Text(v.stateText, color = if (v.color == HaGrey) HaSecondaryText else v.color, fontSize = 13.sp)
+            Text(v.label, color = v.color, fontSize = 13.sp)
         }
         Text("›", color = Color(0xFF4C4C4C), fontSize = 20.sp)
     }
@@ -276,12 +213,13 @@ internal fun HaMoreInfoDialog(
     link: HaLinkDto,
     state: String?,
     lastChanged: String?,
+    stale: Boolean,
     onDismiss: () -> Unit,
     canActuate: Boolean = false,
     inFlight: Boolean = false,
     onAction: (String) -> Unit = {},
 ) {
-    val v = haVisual(link, state)
+    val v = badgeVisual(link, state, stale)
     // Pending confirm-guarded action (action verb -> human prompt), for cover/lock.
     var pendingConfirm by remember { mutableStateOf<Pair<String, String>?>(null) }
     val showControls = canActuate && link.isActuator
@@ -303,7 +241,7 @@ internal fun HaMoreInfoDialog(
             }
             Spacer(Modifier.height(12.dp))
             Text(link.displayName, color = HaPrimaryText, fontSize = 19.sp, fontWeight = FontWeight.Medium)
-            Text(v.stateText, color = if (v.color == HaGrey) HaSecondaryText else v.color, fontSize = 15.sp)
+            Text(v.label, color = v.color, fontSize = 15.sp)
             changedAgo(lastChanged)?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(it, color = HaSecondaryText, fontSize = 12.5.sp)
