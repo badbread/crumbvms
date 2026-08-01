@@ -230,6 +230,45 @@ extension HA {
             return []
         }
     }
+
+    /// Domains whose control is genuinely multi-action or needs a safety confirm,
+    /// so a single tap cannot express it: the tap opens `HAStateCard` instead of
+    /// firing. Today only `cover` (open/stop/close) and `lock` (lock/unlock, which
+    /// keeps its confirm). A future value-setting control (a dimmer / position
+    /// slider) would also live on the card and belongs here; the backend action
+    /// allow-list is on/off/toggle only for now, so there is no brightness UI yet.
+    static func needsCard(_ domain: String) -> Bool {
+        domain == "cover" || domain == "lock"
+    }
+
+    /// The single service call a one-tap fires for a directly-controllable
+    /// (simple) actuator domain, mirroring the server allow-list: `toggle` for
+    /// on/off devices, `press` for buttons, `turn_on` (activate/run) for
+    /// scenes/scripts. Returns nil for card domains (cover/lock) and unknown
+    /// domains, which never direct-fire.
+    static func primaryAction(for domain: String) -> String? {
+        switch domain {
+        case "light", "switch", "fan", "siren": return "toggle"
+        case "button", "input_button": return "press"
+        case "scene", "script": return "turn_on"
+        default: return nil
+        }
+    }
+
+    /// Human phrasing for an action failure, shared by the direct-tap surfaces
+    /// (badge, entity-sheet row) and the detail card. 403 → permission denial,
+    /// 502 → "Crumb is up, HA isn't", 400/404 → rejected; else the app's shared
+    /// error text.
+    static func actionMessage(for error: Error) -> String {
+        if let api = error as? APIError {
+            if api.isForbidden { return "You are not permitted to control this device." }
+            if api.isBadGateway { return "Home Assistant did not respond. The device was not changed." }
+            if case .http(let code, _) = api, code == 400 || code == 404 {
+                return "Home Assistant rejected that action."
+            }
+        }
+        return error.userMessage
+    }
 }
 
 /// Client-side failure before an action ever reaches the server.
@@ -271,6 +310,16 @@ final class HAController: ObservableObject {
     var canActuate: Bool { container.isAdmin || container.capabilities.actuators }
 
     func state(for entityId: String) -> HaEntityState? { states?.state(for: entityId) }
+
+    /// The action a single tap should fire directly for `link`, or nil when a tap
+    /// should instead open the detail card. Direct-fire requires the actuate grant
+    /// AND an actuator-role link AND a simple (non-card) domain with a defined
+    /// primary action. Read-only links, cover/lock, and unknown domains return nil
+    /// (tap opens `HAStateCard`, exactly as the read-only Phase 1 UI did).
+    func directTapAction(for link: HaLink) -> String? {
+        guard canActuate, link.isActuator, !HA.needsCard(link.domain) else { return nil }
+        return HA.primaryAction(for: link.domain)
+    }
 
     /// Fire one HA service call for a link. Throws on any non-2xx so the caller
     /// can surface `403` as "not permitted" and `502` as "HA unreachable".
@@ -341,7 +390,13 @@ struct HAOverlayLayer: View {
     @ObservedObject var controller: HAController
     let videoSize: CGSize?
 
+    /// Presents the detail card (read-only links + cover/lock on tap; any link on
+    /// long-press).
     @State private var tapped: HaLink?
+    /// Link ids with a direct-tap action in flight (brief on-badge spinner).
+    @State private var firing: Set<String> = []
+    /// Direct-tap failure, surfaced as an alert since no card is open.
+    @State private var actionError: String?
 
     var body: some View {
         GeometryReader { geo in
@@ -360,6 +415,11 @@ struct HAOverlayLayer: View {
             HAStateCard(link: link, controller: controller)
                 .macModalSize(width: 360, height: 340)
         }
+        .alert("Control failed", isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })) {
+            Button("OK", role: .cancel) { actionError = nil }
+        } message: {
+            Text(actionError ?? "")
+        }
     }
 
     @ViewBuilder
@@ -371,14 +431,43 @@ struct HAOverlayLayer: View {
             link: link,
             visual: HA.visual(for: link, state: controller.state(for: link.entityId), stale: controller.stale),
             side: side,
-            age: link.overlayShowAge ? HA.relativeAgo(controller.state(for: link.entityId)?.lastChanged) : nil
+            age: link.overlayShowAge ? HA.relativeAgo(controller.state(for: link.entityId)?.lastChanged) : nil,
+            busy: firing.contains(link.id)
         )
         .opacity(link.overlayOpacity ?? 1)
         // Clamp the top-left origin so the badge box stays fully inside the video
         // frame (desktop clamps to max - boxSize, not just max).
         .offset(x: min(max(x, field.minX), max(field.minX, field.maxX - side)),
                 y: min(max(y, field.minY), max(field.minY, field.maxY - side)))
-        .onTapGesture { tapped = link }
+        // A single tap fires the primary action for a directly-controllable simple
+        // actuator (light/switch/fan/siren toggle, button press, scene/script run);
+        // for read-only links and cover/lock it opens the detail card instead. A
+        // long-press always opens the card, so a controllable simple actuator can
+        // still be inspected without actuating it.
+        .onTapGesture {
+            if let action = controller.directTapAction(for: link) {
+                fire(link, action)
+            } else {
+                tapped = link
+            }
+        }
+        .onLongPressGesture { tapped = link }
+    }
+
+    /// Fire one direct-tap action, showing a brief on-badge spinner and surfacing
+    /// any failure via the alert. The shown state is never flipped locally; the
+    /// controller's poll converges it (state-honesty invariant).
+    private func fire(_ link: HaLink, _ action: String) {
+        guard !firing.contains(link.id) else { return }
+        firing.insert(link.id)
+        Task { @MainActor in
+            do {
+                try await controller.perform(link: link, action: action)
+            } catch {
+                actionError = HA.actionMessage(for: error)
+            }
+            firing.remove(link.id)
+        }
     }
 
     /// Letterboxed (BoxFit.contain) frame of the video within the pane.
@@ -400,6 +489,8 @@ private struct HABadge: View {
     let visual: HAVisual
     let side: CGFloat
     let age: String?
+    /// A direct-tap action is in flight — dim the icon and overlay a spinner.
+    var busy: Bool = false
 
     private var bgColor: Color {
         if let hex = link.overlayBgColor, let c = HA.colorFromHex(hex) { return c }
@@ -410,6 +501,14 @@ private struct HABadge: View {
     var body: some View {
         VStack(spacing: 2) {
             content
+                .opacity(busy ? 0.55 : 1)
+                .overlay {
+                    if busy {
+                        ProgressView().controlSize(.small).tint(.white)
+                            .padding(4)
+                            .background(Circle().fill(.black.opacity(0.6)))
+                    }
+                }
             if link.overlayShowState || age != nil {
                 VStack(spacing: 0) {
                     if link.overlayShowState {
@@ -576,22 +675,9 @@ struct HAStateCard: View {
         do {
             try await controller.perform(link: link, action: action.action)
         } catch {
-            errorText = message(for: error)
+            errorText = HA.actionMessage(for: error)
         }
         inFlight = nil
-    }
-
-    /// 403 reads as a permission denial, 502 as "Crumb is up, HA isn't"; anything
-    /// else falls through to the app's shared error phrasing.
-    private func message(for error: Error) -> String {
-        if let api = error as? APIError {
-            if api.isForbidden { return "You are not permitted to control this device." }
-            if api.isBadGateway { return "Home Assistant did not respond. The device was not changed." }
-            if case .http(let code, _) = api, code == 400 || code == 404 {
-                return "Home Assistant rejected that action."
-            }
-        }
-        return error.userMessage
     }
 
     private func detailRow(_ label: String, _ value: String) -> some View {
@@ -604,12 +690,19 @@ struct HAStateCard: View {
     }
 }
 
-// MARK: - Read-only entity sheet (Android-parity; a "Home" button opens it)
+// MARK: - Per-camera entity sheet (Android-parity; a "Home" button opens it)
 
 struct HAEntitySheet: View {
     @ObservedObject var controller: HAController
     let cameraName: String
     @Environment(\.dismiss) private var dismiss
+
+    /// Detail card opened from a long-press (or a tap on a read-only / cover / lock
+    /// row); mirrors the on-video badge affordance.
+    @State private var detail: HaLink?
+    /// Link ids with a direct-tap action in flight (brief inline spinner).
+    @State private var firing: Set<String> = []
+    @State private var actionError: String?
 
     var body: some View {
         NavigationStack {
@@ -620,11 +713,7 @@ struct HAEntitySheet: View {
                         .font(.caption).foregroundColor(HA.amber)
                 }
                 ForEach(controller.links.sorted { $0.sortOrder < $1.sortOrder }) { link in
-                    NavigationLink {
-                        HAStateCard(link: link, controller: controller)
-                    } label: {
-                        entityRow(link)
-                    }
+                    row(link)
                 }
                 if controller.links.isEmpty {
                     Text("No linked entities.").font(.caption).foregroundColor(CrumbColors.textTertiary)
@@ -638,14 +727,64 @@ struct HAEntitySheet: View {
                 }
             }
         }
+        .sheet(item: $detail) { link in
+            HAStateCard(link: link, controller: controller)
+                .macModalSize(width: 360, height: 340)
+        }
+        .alert("Control failed", isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })) {
+            Button("OK", role: .cancel) { actionError = nil }
+        } message: {
+            Text(actionError ?? "")
+        }
         .task { controller.startPolling() }
     }
 
-    private func entityRow(_ link: HaLink) -> some View {
+    /// A directly-controllable simple actuator fires its primary action on tap and
+    /// opens the detail card on long-press; everything else (read-only links,
+    /// cover/lock) pushes the detail card on tap, exactly as before.
+    @ViewBuilder
+    private func row(_ link: HaLink) -> some View {
+        if let action = controller.directTapAction(for: link) {
+            Button {
+                fire(link, action)
+            } label: {
+                entityRow(link, busy: firing.contains(link.id))
+            }
+            .buttonStyle(.plain)
+            .onLongPressGesture { detail = link }
+        } else {
+            NavigationLink {
+                HAStateCard(link: link, controller: controller)
+            } label: {
+                entityRow(link)
+            }
+        }
+    }
+
+    /// Fire one direct-tap action, showing a brief inline spinner and surfacing any
+    /// failure via the alert. State is never flipped locally; the poll converges it.
+    private func fire(_ link: HaLink, _ action: String) {
+        guard !firing.contains(link.id) else { return }
+        firing.insert(link.id)
+        Task { @MainActor in
+            do {
+                try await controller.perform(link: link, action: action)
+            } catch {
+                actionError = HA.actionMessage(for: error)
+            }
+            firing.remove(link.id)
+        }
+    }
+
+    private func entityRow(_ link: HaLink, busy: Bool = false) -> some View {
         let v = HA.visual(for: link, state: controller.state(for: link.entityId), stale: controller.stale)
         return HStack(spacing: 12) {
-            Image(systemName: v.symbol).font(.system(size: 16)).foregroundColor(v.color)
-                .frame(width: 34, height: 34).background(v.color.opacity(0.16), in: Circle())
+            ZStack {
+                Image(systemName: v.symbol).font(.system(size: 16)).foregroundColor(v.color)
+                    .opacity(busy ? 0 : 1)
+                if busy { ProgressView().controlSize(.small) }
+            }
+            .frame(width: 34, height: 34).background(v.color.opacity(0.16), in: Circle())
             VStack(alignment: .leading, spacing: 2) {
                 Text(link.displayName).foregroundColor(CrumbColors.textPrimary)
                 Text(v.stateText).font(.caption).foregroundColor(CrumbColors.textSecondary)
