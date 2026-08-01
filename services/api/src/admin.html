@@ -9118,7 +9118,8 @@ async function delUser(id) {
    ROLES, list / create / edit / delete
    REST: GET/POST /config/roles  ·  GET/PUT/DELETE /config/roles/:id
    Role shape: { id, name, is_admin, capabilities:{export,playback,clips,ptz,
-                 manage_views,bookmarks}, camera_ids:[uuid], created_at }
+                 manage_views,bookmarks,view_plates,actuators},
+                 camera_ids:[uuid], created_at }
 ═══════════════════════════════════════════════════════════════════════════ */
 
 /* Capability checkboxes rendered in the role editor. */
@@ -9129,6 +9130,7 @@ const ROLE_CAP_FIELDS = [
   { key: 'ptz',          label: 'PTZ control',    hint: 'Operate pan / tilt / zoom on PTZ cameras.' },
   { key: 'manage_views', label: 'Manage views',   hint: 'Create, edit and delete saved live-wall views.' },
   { key: 'view_plates',  label: 'View license plates', hint: 'Sensitive: see recognised license-plate reads and search the plate database for this role’s cameras.' },
+  { key: 'actuators',    label: 'Control linked devices (locks, covers, switches) - default off', hint: 'Sensitive: operate PHYSICAL devices linked to this role’s cameras, garage doors, locks, lights, sirens. Off by default; seeing a camera never implies being able to work its devices.' },
 ];
 
 /** Build the capability checkboxes + bookmarks selector for a role form. pfx = field prefix. */

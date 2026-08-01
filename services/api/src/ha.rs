@@ -1,13 +1,23 @@
-//! Home Assistant integration — Phase 1: connection config + per-camera entity
-//! links + an entity picker. REST-only (HA's `/api`), no WebSocket yet; the
-//! inbound event path (Phase 2) will consume a transport-agnostic source so WS
-//! can drop in later. See `docs/DECISIONS.md` (2026-07-10) and issue #52.
+//! Home Assistant integration — connection config + per-camera entity links + an
+//! entity picker (Phase 1), the live state feed, and the outbound control path
+//! (Phase 2, issue #187). REST-only (HA's `/api`), no WebSocket yet; the inbound
+//! event path consumes a transport-agnostic source so WS can drop in later. See
+//! `docs/DECISIONS.md` (2026-07-10, 2026-08-01) and issues #52 / #187.
 //!
 //! Security: the token is write-only (never returned; the admin DTO exposes only
 //! `has_token`) and travels in the `Authorization: Bearer` header, never a URL.
 //! The entity picker proxies HA `/api/states` so the client never sees the token.
 //! Config + links edits are admin-only; reading a camera's links needs only
 //! access to that camera.
+//!
+//! `POST /cameras/:id/ha/action` is the most privileged surface in the product:
+//! it moves physical hardware (locks, garage doors, sirens). Its whole design is
+//! "the client picks from a set the server already decided": the client sends a
+//! `link_id` the operator authored plus an action *word*, and the server derives
+//! the HA domain from the stored entity, checks the word against a static
+//! per-domain allowlist, and constructs the service call itself. There is no
+//! raw-service passthrough, and no domain / service / `entity_id` is ever accepted
+//! from a client.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +58,52 @@ pub fn routes() -> Router<AppState> {
             "/cameras/:id/ha/links/:link_id/placement",
             put(put_placement),
         )
+        .route("/cameras/:id/ha/action", post(post_action))
+}
+
+// ─── outbound control: the action allowlist ───────────────────────────────────
+
+/// The EXHAUSTIVE set of HA services Crumb will ever call, keyed by the linked
+/// entity's own domain. A client sends an action *word*; the server looks it up
+/// here for the domain it derived from the stored `entity_id` and calls the
+/// matching HA service. Anything not in this table is rejected with a 400.
+///
+/// Deliberately narrow: only actions an operator would plausibly want from a
+/// camera view, and only ones whose effect is obvious from the button. Adding a
+/// domain here widens what any `actuators` role can do, so it is a security
+/// decision, not a convenience one (see `docs/DECISIONS.md`, 2026-08-01).
+///
+/// The action word and the HA service name are 1:1 within a domain, so the
+/// lookup returns a `&'static str` service that the URL is built from — the
+/// client's own string never reaches the HA request.
+const HA_ACTION_ALLOWLIST: &[(&str, &[&str])] = &[
+    ("light", &["turn_on", "turn_off", "toggle"]),
+    ("switch", &["turn_on", "turn_off", "toggle"]),
+    ("fan", &["turn_on", "turn_off", "toggle"]),
+    ("siren", &["turn_on", "turn_off", "toggle"]),
+    ("cover", &["open_cover", "close_cover", "stop_cover"]),
+    ("lock", &["lock", "unlock"]),
+    ("button", &["press"]),
+    ("input_button", &["press"]),
+    ("scene", &["turn_on"]),
+    ("script", &["turn_on"]),
+];
+
+/// HA domain of an entity id: the text before the first `.` (`cover.garage` ⇒
+/// `cover`). Always derived SERVER-SIDE from the stored link, never taken from
+/// the client. An entity id with no `.` yields `""`, which matches no allowlist
+/// row and is therefore rejected.
+fn domain_of(entity_id: &str) -> &str {
+    entity_id.split_once('.').map_or("", |(d, _)| d)
+}
+
+/// Resolve `(domain, action)` to the `&'static str` HA service to call, or
+/// `None` when the pair is not allowlisted (unknown domain, unknown action, or
+/// an action that belongs to a different domain). Pure, so the allowlist is
+/// exhaustively unit-testable without HA or a DB.
+fn allowed_service(domain: &str, action: &str) -> Option<&'static str> {
+    let (_, actions) = HA_ACTION_ALLOWLIST.iter().find(|(d, _)| *d == domain)?;
+    actions.iter().copied().find(|s| *s == action)
 }
 
 // ─── HTTP: shared client + picker filter ──────────────────────────────────────
@@ -150,6 +206,12 @@ struct EntitiesQuery {
 #[derive(Serialize)]
 struct HaLinkDto {
     id: Uuid,
+    /// The same value as `id`, under the name the control endpoint's request
+    /// body uses (`POST /cameras/:id/ha/action` takes `link_id`). Additive and
+    /// redundant on purpose: clients rendering controls from this payload send
+    /// the field back verbatim, and having the two names agree removes the one
+    /// place a client could plausibly send the wrong id.
+    link_id: Uuid,
     entity_id: String,
     role: String,
     device_class: Option<String>,
@@ -183,6 +245,7 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
     fn from(l: crumb_common::types::CameraHaLink) -> Self {
         Self {
             id: l.id,
+            link_id: l.id,
             entity_id: l.entity_id,
             role: l.role,
             device_class: l.device_class,
@@ -311,6 +374,19 @@ struct HaLinkInput {
 #[derive(Deserialize)]
 struct HaLinksUpdate {
     links: Vec<HaLinkInput>,
+}
+
+/// Body of `POST /cameras/:id/ha/action`.
+///
+/// Note what is NOT here: no domain, no service, no entity id. The link id
+/// addresses an operator-authored row on this camera, and `action` is a word
+/// looked up in [`HA_ACTION_ALLOWLIST`] for the domain the SERVER derives from
+/// that row's entity. Everything the HA request is built from comes from the
+/// server side of that lookup.
+#[derive(Deserialize)]
+struct HaActionRequest {
+    link_id: Uuid,
+    action: String,
 }
 
 // ─── handlers ────────────────────────────────────────────────────────────────
@@ -579,6 +655,171 @@ async fn get_states(
     }))
 }
 
+// ─── outbound control: the actuator endpoint ─────────────────────────────────
+
+/// `system_events.event_key` for the actuation audit trail. There is no
+/// `system_alert_rules` row for it, so the notification engine consumes and
+/// skips it (see `notifications.rs`): the row is an AUDIT record, not an alert.
+const HA_ACTUATION_EVENT_KEY: &str = "ha_actuation";
+
+/// Sanitize a client-supplied string for inclusion in an audit detail: keep it
+/// short and printable so a hostile `action` cannot smuggle newlines or control
+/// characters into the log / audit row.
+fn sanitize_for_audit(s: &str) -> String {
+    s.chars()
+        .take(64)
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .collect()
+}
+
+/// Record one actuation attempt: a durable `system_events` row plus a tracing
+/// line. Called for every attempt that got as far as a resolved actuator link,
+/// including allowlist rejections and failed HA calls.
+///
+/// Never fails the request: the tracing line is emitted unconditionally, so a
+/// DB hiccup degrades the audit to log-only rather than either losing the record
+/// silently or telling an operator their garage door did not move when it did.
+async fn audit_actuation(
+    state: &AppState,
+    user: &AuthUser,
+    camera_id: Uuid,
+    link: &crumb_common::types::CameraHaLink,
+    action: &str,
+    outcome: &str,
+) {
+    let username = db::get_user_by_id(state.pool(), user.user_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown".to_owned(), |u| u.username);
+    let action = sanitize_for_audit(action);
+    tracing::info!(
+        target: "crumb::audit",
+        user_id = %user.user_id,
+        username = %username,
+        camera_id = %camera_id,
+        link_id = %link.id,
+        entity_id = %link.entity_id,
+        action = %action,
+        outcome = %outcome,
+        "HA actuation"
+    );
+    let detail = format!(
+        "user={username} ({}) camera={camera_id} link={} entity={} \
+         action={action} outcome={outcome}",
+        user.user_id, link.id, link.entity_id
+    );
+    if let Err(e) = db::insert_system_event(
+        state.pool(),
+        HA_ACTUATION_EVENT_KEY,
+        Some(camera_id),
+        Some(&detail),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "ha actuation audit row insert failed (log-only audit for this attempt)");
+    }
+}
+
+/// `POST /cameras/:id/ha/action` — operate a device linked to this camera.
+///
+/// Bearer JWT only. A scoped media `?token=` principal authenticates for media
+/// but never carries the `actuators` capability (hardcoded `false` in
+/// `auth_mw::media_capabilities_from_claims`), so it is refused at the first
+/// check below.
+///
+/// Verification order, each step returning before HA is contacted:
+/// 1. `actuators` capability (admin implies) — else 403.
+/// 2. access to camera `:id` — else 403, matching every other per-camera route
+///    (`AuthUser::assert_camera_access`).
+/// 3. `link_id` exists on THIS camera and has `role = 'actuator'` — else 404.
+/// 4. the action is allowlisted for the domain of the link's stored entity —
+///    else 400.
+///
+/// Returns `{"ok": true}` on an HA 2xx. No state is returned: clients converge
+/// on the existing 3s `GET /ha/states` poll, so there is one source of truth for
+/// entity state and no chance of this response disagreeing with it.
+///
+/// # Errors
+///
+/// * `400` — action not allowlisted for the entity's domain, or HA not
+///   configured/enabled.
+/// * `403` — missing `actuators`, or the camera is outside the caller's grant.
+/// * `404` — no actuator link with that id on this camera.
+/// * `502` — Home Assistant unreachable or returned an error.
+async fn post_action(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(camera_id): Path<Uuid>,
+    Json(body): Json<HaActionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // 1. capability — the deny-by-default gate on moving physical hardware.
+    user.require_actuators()?;
+    // 2. camera scope.
+    user.assert_camera_access(camera_id)?;
+    // 3. the link must exist ON THIS CAMERA and be an actuator. A link id from
+    //    another camera, or a motion/sensor link, is indistinguishable from a
+    //    nonexistent one to the caller.
+    let link = db::get_camera_ha_link(state.pool(), camera_id, body.link_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .filter(|l| l.role == "actuator")
+        .ok_or_else(|| {
+            ApiError::NotFound("no actuator HA link with that id on this camera".to_owned())
+        })?;
+
+    // 4. allowlist, on the domain derived from the STORED entity id.
+    let domain = domain_of(&link.entity_id);
+    let action = body.action.trim();
+    let Some(service) = allowed_service(domain, action) else {
+        audit_actuation(
+            &state,
+            &user,
+            camera_id,
+            &link,
+            action,
+            "rejected: action not allowed for this domain",
+        )
+        .await;
+        let allowed = HA_ACTION_ALLOWLIST
+            .iter()
+            .find(|(d, _)| *d == domain)
+            .map(|(_, a)| a.join(", "));
+        return Err(ApiError::BadRequest(match allowed {
+            Some(list) => {
+                format!("that action is not allowed for a '{domain}' entity (allowed: {list})")
+            }
+            None => format!("Crumb does not control '{domain}' entities"),
+        }));
+    };
+
+    let settings = effective_settings(&state).await?;
+    if !settings.enabled {
+        return Err(ApiError::BadRequest(
+            "Home Assistant is not enabled".to_owned(),
+        ));
+    }
+    let client = ha_client(&settings)?;
+
+    // `domain` is the stored entity's own prefix and `service` is a &'static str
+    // straight out of the allowlist, so nothing client-controlled reaches the
+    // HA URL; the entity id travels in the request body.
+    match client.call_service(domain, service, &link.entity_id).await {
+        Ok(()) => {
+            audit_actuation(&state, &user, camera_id, &link, action, "ok").await;
+            Ok(Json(json!({ "ok": true })))
+        }
+        Err(e) => {
+            audit_actuation(&state, &user, camera_id, &link, action, "ha call failed").await;
+            // BadGateway logs the detail and returns a generic message to the
+            // client (see error.rs); the detail carries only a status code.
+            Err(ApiError::BadGateway(format!(
+                "Home Assistant service call failed: {e}"
+            )))
+        }
+    }
+}
+
 /// Project a raw HA `/api/states` array down to the `wanted` entity ids, keeping
 /// each entity's `state` and `last_changed`. Pure (no HA/DB), so the RBAC
 /// filtering it backs is unit-testable. Entities not in `wanted` are dropped —
@@ -740,6 +981,119 @@ mod tests {
         assert!(!valid_overlay_shape("square")); // not in the vocabulary
         assert!(!valid_overlay_shape("Dot")); // case-sensitive
         assert!(!valid_overlay_shape("")); // empty
+    }
+
+    #[test]
+    fn domain_is_derived_from_the_entity_id_prefix() {
+        assert_eq!(domain_of("cover.garage_door"), "cover");
+        assert_eq!(domain_of("lock.front_door"), "lock");
+        // Only the FIRST dot splits, so a dotted object id keeps its domain.
+        assert_eq!(domain_of("light.hall.left"), "light");
+        // No dot ⇒ no domain ⇒ matches no allowlist row.
+        assert_eq!(domain_of("garage"), "");
+        assert_eq!(domain_of(""), "");
+        assert!(allowed_service(domain_of("garage"), "turn_on").is_none());
+    }
+
+    #[test]
+    fn allowlist_accepts_every_documented_domain_action_pair() {
+        // The EXHAUSTIVE positive list. If this test needs editing, the set of
+        // things any `actuators` role can do to physical hardware changed.
+        let allowed: &[(&str, &[&str])] = &[
+            ("light", &["turn_on", "turn_off", "toggle"]),
+            ("switch", &["turn_on", "turn_off", "toggle"]),
+            ("fan", &["turn_on", "turn_off", "toggle"]),
+            ("siren", &["turn_on", "turn_off", "toggle"]),
+            ("cover", &["open_cover", "close_cover", "stop_cover"]),
+            ("lock", &["lock", "unlock"]),
+            ("button", &["press"]),
+            ("input_button", &["press"]),
+            ("scene", &["turn_on"]),
+            ("script", &["turn_on"]),
+        ];
+        for (domain, actions) in allowed {
+            for action in *actions {
+                assert_eq!(
+                    allowed_service(domain, action),
+                    Some(*action),
+                    "{domain}.{action} must be allowed and map 1:1 to its service"
+                );
+            }
+        }
+        // ...and the allowlist contains nothing beyond that set.
+        let expected: usize = allowed.iter().map(|(_, a)| a.len()).sum();
+        let actual: usize = HA_ACTION_ALLOWLIST.iter().map(|(_, a)| a.len()).sum();
+        assert_eq!(actual, expected, "allowlist grew or shrank unexpectedly");
+    }
+
+    #[test]
+    fn allowlist_rejects_wrong_domain_unknown_and_garbage_actions() {
+        // Right action word, wrong domain.
+        assert_eq!(allowed_service("lock", "turn_on"), None);
+        assert_eq!(allowed_service("light", "unlock"), None);
+        assert_eq!(allowed_service("cover", "toggle"), None);
+        assert_eq!(allowed_service("scene", "turn_off"), None);
+        assert_eq!(allowed_service("button", "turn_on"), None);
+        assert_eq!(allowed_service("script", "toggle"), None);
+        assert_eq!(allowed_service("lock", "open_cover"), None);
+
+        // Unknown domains, including HA domains Crumb deliberately won't drive.
+        assert_eq!(allowed_service("climate", "set_temperature"), None);
+        assert_eq!(allowed_service("alarm_control_panel", "alarm_disarm"), None);
+        assert_eq!(allowed_service("homeassistant", "turn_on"), None);
+        assert_eq!(allowed_service("shell_command", "turn_on"), None);
+        assert_eq!(allowed_service("", "turn_on"), None);
+
+        // Unknown / garbage actions.
+        assert_eq!(allowed_service("light", "explode"), None);
+        assert_eq!(allowed_service("light", ""), None);
+        assert_eq!(allowed_service("light", "TURN_ON"), None); // case-sensitive
+        assert_eq!(allowed_service("light", "turn_on "), None); // handler trims
+        assert_eq!(allowed_service("light", "turn_on;reboot"), None);
+        assert_eq!(
+            allowed_service("light", "../../homeassistant/restart"),
+            None
+        );
+        assert_eq!(allowed_service("light", "turn_on/../restart"), None);
+        assert_eq!(allowed_service("light/../x", "turn_on"), None);
+    }
+
+    #[test]
+    fn audit_detail_is_sanitized() {
+        assert_eq!(sanitize_for_audit("turn_on"), "turn_on");
+        // Newlines / control chars can't break out into a forged log line.
+        assert_eq!(sanitize_for_audit("turn_on\nFAKE"), "turn_on?FAKE");
+        assert_eq!(sanitize_for_audit("a\tb"), "a?b");
+        // Bounded length.
+        assert_eq!(sanitize_for_audit(&"x".repeat(300)).len(), 64);
+    }
+
+    #[test]
+    fn action_request_requires_link_id_and_action_only() {
+        let ok: HaActionRequest = serde_json::from_value(json!({
+            "link_id": "11111111-1111-1111-1111-111111111111",
+            "action": "open_cover"
+        }))
+        .unwrap();
+        assert_eq!(ok.action, "open_cover");
+        // A body trying to name a service/entity/domain is not a different
+        // request — the extra keys are simply ignored, never honoured.
+        let sneaky: HaActionRequest = serde_json::from_value(json!({
+            "link_id": "11111111-1111-1111-1111-111111111111",
+            "action": "turn_on",
+            "domain": "homeassistant",
+            "service": "restart",
+            "entity_id": "lock.front_door"
+        }))
+        .unwrap();
+        assert_eq!(sneaky.action, "turn_on");
+        // Missing fields are a deserialize failure (400), not a default.
+        let no_link = serde_json::from_value::<HaActionRequest>(json!({"action": "turn_on"}));
+        assert!(no_link.is_err());
+        let no_action = serde_json::from_value::<HaActionRequest>(
+            json!({"link_id": "11111111-1111-1111-1111-111111111111"}),
+        );
+        assert!(no_action.is_err());
     }
 
     #[test]

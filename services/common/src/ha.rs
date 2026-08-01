@@ -84,6 +84,44 @@ impl HaClient {
         resp.json().await.context("Home Assistant states parse")
     }
 
+    /// `POST /api/services/<domain>/<service>` with `{"entity_id": ...}` — the
+    /// outbound control path (Phase 2, issue #187).
+    ///
+    /// # Security contract (do NOT weaken)
+    ///
+    /// `domain` and `service` must be caller-chosen CONSTANTS, never strings
+    /// that came off the wire: this method builds a URL path from them. The API
+    /// obtains both from a static per-domain allowlist keyed by the linked
+    /// entity's own domain (`api/src/ha.rs::allowed_service`), so a client can
+    /// never reach an arbitrary HA service. `entity_id` is the stored link's
+    /// entity, never a client-supplied one, and travels in the JSON body.
+    ///
+    /// The token is a header (as everywhere in this client), so the error
+    /// strings below cannot leak it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HA is unreachable, rejects the token, or answers
+    /// non-2xx. The message carries only the HTTP status, no upstream body.
+    pub async fn call_service(&self, domain: &str, service: &str, entity_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/api/services/{domain}/{service}", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "entity_id": entity_id }))
+            .send()
+            .await
+            .context("Home Assistant service call failed")?;
+        let code = resp.status();
+        if code.is_success() {
+            Ok(())
+        } else if code.as_u16() == 401 {
+            anyhow::bail!("Home Assistant rejected the token (HTTP 401)")
+        } else {
+            anyhow::bail!("Home Assistant returned HTTP {}", code.as_u16())
+        }
+    }
+
     /// Current `(entity_id, state)` for the given entities. HA has no bulk
     /// get-by-id, so this filters the full `/api/states` read (cheap at homelab
     /// scale; the one bounded request doubles as the liveness check).
@@ -296,9 +334,13 @@ mod tests {
 
     /// Stand-in HA: serves `GET /api/` and `GET /api/states` for one sensor whose
     /// state the test can flip, and can be switched to fail (HTTP 500) mid-run.
+    /// Also accepts `POST /api/services/<domain>/<service>` and records the
+    /// request line so the control path's URL construction is assertable.
     struct MockHa {
         sensor_state: Mutex<String>,
         fail: AtomicBool,
+        /// `("<method> <path>", "<body>")` for every service call received.
+        service_calls: Mutex<Vec<(String, String)>>,
     }
 
     /// Bind a stand-in HA on a loopback port and return its base URL.
@@ -324,10 +366,36 @@ mod tests {
                             Err(_) => return,
                         }
                     }
-                    let req = String::from_utf8_lossy(&buf);
-                    let path = req.split_whitespace().nth(1).unwrap_or("/");
+                    // A POST carries a body after the head; read exactly
+                    // Content-Length more bytes so the assertion below sees it.
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let head_end = head.find("\r\n\r\n").map_or(head.len(), |i| i + 4);
+                    let want: usize = head
+                        .lines()
+                        .filter_map(|l| l.split_once(':'))
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + want {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).to_string();
+                    let method = req.split_whitespace().next().unwrap_or("GET").to_owned();
+                    let path_owned = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let path = path_owned.as_str();
+                    let req_body = req.get(head_end..).unwrap_or("").to_owned();
                     let (status, body) = if mock.fail.load(Ordering::SeqCst) {
                         ("500 Internal Server Error", String::new())
+                    } else if method == "POST" && path.starts_with("/api/services/") {
+                        mock.service_calls
+                            .lock()
+                            .unwrap()
+                            .push((format!("{method} {path}"), req_body));
+                        ("200 OK", "[]".to_owned())
                     } else if path == "/api/" {
                         ("200 OK", r#"{"message":"API running."}"#.to_owned())
                     } else if path == "/api/states" {
@@ -365,6 +433,7 @@ mod tests {
         let mock = Arc::new(MockHa {
             sensor_state: Mutex::new("off".to_owned()),
             fail: AtomicBool::new(false),
+            service_calls: Mutex::new(Vec::new()),
         });
         let base = spawn_mock_ha(Arc::clone(&mock)).await;
         let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
@@ -398,6 +467,41 @@ mod tests {
             failed.is_err(),
             "a failed poll MUST return Err to arm fail-open, got {failed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn call_service_posts_domain_service_and_entity_then_errors_on_failure() {
+        let mock = Arc::new(MockHa {
+            sensor_state: Mutex::new("off".to_owned()),
+            fail: AtomicBool::new(false),
+            service_calls: Mutex::new(Vec::new()),
+        });
+        let base = spawn_mock_ha(Arc::clone(&mock)).await;
+        let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
+
+        client
+            .call_service("cover", "close_cover", "cover.garage")
+            .await
+            .expect("service call ok");
+
+        let calls = mock.service_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "POST /api/services/cover/close_cover");
+        // The entity travels in the BODY, never the URL.
+        let body: serde_json::Value = serde_json::from_str(&calls[0].1).expect("json body");
+        assert_eq!(body["entity_id"], "cover.garage");
+        assert_eq!(
+            body.as_object().map(|o| o.len()),
+            Some(1),
+            "body carries exactly entity_id, nothing else"
+        );
+
+        // A failing HA surfaces as Err (the handler maps this to a 502).
+        mock.fail.store(true, Ordering::SeqCst);
+        assert!(client
+            .call_service("lock", "unlock", "lock.front")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

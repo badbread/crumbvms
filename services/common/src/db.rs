@@ -1700,6 +1700,37 @@ pub async fn get_camera_ha_links(
     Ok(rows.iter().map(ha_link_from_row).collect())
 }
 
+/// One HA link by id, scoped to the camera it must belong to.
+///
+/// The camera is part of the WHERE clause on purpose: the actuator endpoint
+/// (`POST /cameras/:id/ha/action`) has already authorized the caller for that
+/// camera, so a link id belonging to a different camera must read as "not
+/// found" rather than resolve. Returns `None` when no such link exists on that
+/// camera.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn get_camera_ha_link(
+    pool: &Pool,
+    camera_id: Uuid,
+    link_id: Uuid,
+) -> Result<Option<CameraHaLink>> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_opt(
+            "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
+                    overlay_x, overlay_y, overlay_size,
+                    overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
+                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline
+             FROM camera_ha_links WHERE camera_id = $1 AND id = $2",
+            &[&camera_id, &link_id],
+        )
+        .await
+        .context("get_camera_ha_link")?;
+    Ok(row.as_ref().map(ha_link_from_row))
+}
+
 /// One camera↔HA link to persist: `(entity_id, role, device_class, label,
 /// sort_order)`. `id` is server-assigned.
 pub type HaLinkInsert = (String, String, Option<String>, Option<String>, i32);
@@ -10582,6 +10613,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0073_plate_labels.sql",
         include_str!("../../../db/migrations/0073_plate_labels.sql"),
+    ),
+    (
+        "0074_role_actuators_capability.sql",
+        include_str!("../../../db/migrations/0074_role_actuators_capability.sql"),
     ),
 ];
 
