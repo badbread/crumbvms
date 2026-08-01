@@ -2,13 +2,14 @@
 
 import SwiftUI
 
-/// Home Assistant on-video overlays + read-only entity sheet, at parity with the
-/// desktop badge overlay and the Android per-camera entity sheet.
+/// Home Assistant on-video overlays + entity sheet, at parity with the desktop
+/// badge overlay and the Android per-camera entity sheet.
 ///
-/// Read-only by design (matches Android/desktop POC): the client renders linked
-/// entities and their live states; linking/placement/config is admin-only and
-/// lives in the web console / desktop editor. Both surfaces here use only the two
-/// viewer-accessible endpoints `GET /cameras/:id/ha/links` and `GET /ha/states`.
+/// Linking/placement/config stays admin-only (web console / desktop editor); the
+/// client only reads `GET /cameras/:id/ha/links` and `GET /ha/states`. Phase 2
+/// (issue #187) adds ONE write: `POST /cameras/:id/ha/action` on the detail
+/// card, gated on the `actuators` capability AND an `actuator`-role link, so a
+/// viewer without the grant sees exactly the read-only surface it saw before.
 ///
 /// State-honesty invariant (mirrors the recorder's `edge_on` rail): an
 /// `unavailable`/`unknown`/empty state, or a `stale` snapshot, is NEVER rendered
@@ -172,6 +173,76 @@ enum HA {
     }
 }
 
+// MARK: - Actions (Phase 2 controls, issue #187)
+
+/// One button on the detail card: the wire `action` the server accepts, its
+/// caption, an SF Symbol from the same vocabulary the badges use, and whether
+/// it needs a confirmation first.
+struct HAAction: Identifiable, Equatable {
+    let action: String
+    let title: String
+    let symbol: String
+    /// Physical-security domains (locks, covers) confirm before firing.
+    let confirms: Bool
+    /// Renders the confirm button in the destructive role (unlock / open).
+    let destructive: Bool
+
+    var id: String { action }
+
+    init(_ action: String, _ title: String, _ symbol: String, confirms: Bool = false, destructive: Bool = false) {
+        self.action = action
+        self.title = title
+        self.symbol = symbol
+        self.confirms = confirms
+        self.destructive = destructive
+    }
+}
+
+extension HA {
+    /// Allowed actions BY DOMAIN, mirroring the server's allow-list. An unknown
+    /// domain yields no buttons (the card stays read-only) rather than guessing
+    /// at a service call the server would reject.
+    static func actions(for domain: String) -> [HAAction] {
+        switch domain {
+        case "light", "switch", "fan", "siren":
+            return [
+                HAAction("turn_on", "On", "power"),
+                HAAction("turn_off", "Off", "power"),
+            ]
+        case "cover":
+            return [
+                HAAction("open_cover", "Open", "arrow.up.square", confirms: true, destructive: true),
+                HAAction("stop_cover", "Stop", "stop.fill", confirms: true),
+                HAAction("close_cover", "Close", "arrow.down.square", confirms: true),
+            ]
+        case "lock":
+            return [
+                HAAction("lock", "Lock", "lock.fill", confirms: true),
+                HAAction("unlock", "Unlock", "lock.open.fill", confirms: true, destructive: true),
+            ]
+        case "button", "input_button":
+            return [HAAction("press", "Press", "hand.tap.fill")]
+        case "scene":
+            return [HAAction("turn_on", "Activate", "film")]
+        case "script":
+            return [HAAction("turn_on", "Run", "play.fill")]
+        default:
+            return []
+        }
+    }
+}
+
+/// Client-side failure before an action ever reaches the server.
+enum HAActionError: LocalizedError {
+    case noCamera
+
+    var errorDescription: String? {
+        switch self {
+        case .noCamera: return "No camera selected."
+        }
+    }
+}
+
 // MARK: - Controller (per-camera links + polled states)
 
 @MainActor
@@ -193,7 +264,27 @@ final class HAController: ObservableObject {
     var placedLinks: [HaLink] { links.filter(\.hasPlacement) }
     var hasLinks: Bool { !links.isEmpty }
 
+    /// Whether this user may actuate linked devices (issue #187). Deny-by-default:
+    /// an older server omits the capability, `Capabilities` defaults it to false,
+    /// and the detail card renders byte-identically to the read-only Phase 1 UI.
+    /// Admins implicitly hold it (`Capabilities.admin`), same as every other cap.
+    var canActuate: Bool { container.isAdmin || container.capabilities.actuators }
+
     func state(for entityId: String) -> HaEntityState? { states?.state(for: entityId) }
+
+    /// Fire one HA service call for a link. Throws on any non-2xx so the caller
+    /// can surface `403` as "not permitted" and `502` as "HA unreachable".
+    /// Deliberately does NOT mutate the shown state: the `/ha/states` poll is the
+    /// only source of truth (state-honesty invariant above), so a call that HA
+    /// silently drops can never leave the badge lying about the device.
+    func perform(link: HaLink, action: String) async throws {
+        // Unreachable in practice (links only exist after `activate`), but a
+        // missing camera must read as a failure, never as a silent success.
+        guard let cameraId else { throw HAActionError.noCamera }
+        try await container.api.haAction(cameraId: cameraId, linkId: link.id, action: action)
+        // Nudge the poll so the real new state lands sooner than the next tick.
+        await pollOnce()
+    }
 
     /// Point at a camera: load its links, and (re)start state polling if it has
     /// any. Idempotent per camera id.
@@ -266,8 +357,8 @@ struct HAOverlayLayer: View {
             }
         }
         .sheet(item: $tapped) { link in
-            HAStateCard(link: link, state: controller.state(for: link.entityId), stale: controller.stale)
-                .macModalSize(width: 360, height: 300)
+            HAStateCard(link: link, controller: controller)
+                .macModalSize(width: 360, height: 340)
         }
     }
 
@@ -364,13 +455,31 @@ private struct HABadge: View {
     }
 }
 
-// MARK: - Read-only detail card (tap a badge)
+// MARK: - Detail card (tap a badge) — read-only, plus Phase 2 controls
 
 struct HAStateCard: View {
     let link: HaLink
-    let state: HaEntityState?
-    let stale: Bool
+    /// Observed (not snapshotted) so the 3s poll keeps the shown state current
+    /// while the card is open — the card never flips state locally after an
+    /// action, it waits for the poll to say so.
+    @ObservedObject var controller: HAController
     @Environment(\.dismiss) private var dismiss
+
+    /// The action currently in flight (its wire name), or nil.
+    @State private var inFlight: String?
+    /// Awaiting confirmation (lock/cover only).
+    @State private var pending: HAAction?
+    @State private var errorText: String?
+
+    private var state: HaEntityState? { controller.state(for: link.entityId) }
+    private var stale: Bool { controller.stale }
+
+    /// Controls render only for an `actuator`-role link when the user holds the
+    /// `actuators` capability. Both false ⇒ the exact Phase 1 card.
+    private var actions: [HAAction] {
+        guard controller.canActuate, link.isActuator else { return [] }
+        return HA.actions(for: link.domain)
+    }
 
     var body: some View {
         let v = HA.visual(for: link, state: state, stale: stale)
@@ -381,6 +490,13 @@ struct HAStateCard: View {
                 Text(v.stateText).font(.title3.weight(.semibold)).foregroundColor(v.color)
                 if let age = HA.relativeAgo(state?.lastChanged) {
                     Text("Changed \(age)").font(.caption).foregroundColor(CrumbColors.textSecondary)
+                }
+                if !actions.isEmpty {
+                    controlsRow
+                }
+                if let errorText {
+                    Text(errorText).font(.caption).foregroundColor(CrumbColors.error)
+                        .multilineTextAlignment(.center)
                 }
                 if let dc = link.deviceClass, !dc.isEmpty {
                     detailRow("Device class", dc)
@@ -404,6 +520,78 @@ struct HAStateCard: View {
                 }
             }
         }
+        .confirmationDialog(
+            pending.map { "\($0.title) \(link.displayName)?" } ?? "",
+            isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
+            titleVisibility: .visible
+        ) {
+            if let action = pending {
+                Button(action.title, role: action.destructive ? ButtonRole.destructive : nil) {
+                    pending = nil
+                    Task { await fire(action) }
+                }
+            }
+            Button("Cancel", role: .cancel) { pending = nil }
+        }
+    }
+
+    /// The per-domain button set. Buttons stay disabled while any action is in
+    /// flight so a double tap can't queue two service calls at a lock.
+    private var controlsRow: some View {
+        HStack(spacing: 10) {
+            ForEach(actions) { action in
+                Button {
+                    if action.confirms {
+                        pending = action
+                    } else {
+                        Task { await fire(action) }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        if inFlight == action.action {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: action.symbol).font(.system(size: 13))
+                        }
+                        Text(action.title).font(.subheadline.weight(.medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(CrumbColors.surfaceVariant, in: RoundedRectangle(cornerRadius: 9))
+                    .foregroundColor(CrumbColors.textPrimary)
+                }
+                .buttonStyle(.plain)
+                .disabled(inFlight != nil)
+                .opacity(inFlight != nil && inFlight != action.action ? 0.5 : 1)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    /// One service call, with the button disabled for its duration. The shown
+    /// state is left alone either way; the 3s poll converges it.
+    private func fire(_ action: HAAction) async {
+        errorText = nil
+        inFlight = action.action
+        do {
+            try await controller.perform(link: link, action: action.action)
+        } catch {
+            errorText = message(for: error)
+        }
+        inFlight = nil
+    }
+
+    /// 403 reads as a permission denial, 502 as "Crumb is up, HA isn't"; anything
+    /// else falls through to the app's shared error phrasing.
+    private func message(for error: Error) -> String {
+        if let api = error as? APIError {
+            if api.isForbidden { return "You are not permitted to control this device." }
+            if api.isBadGateway { return "Home Assistant did not respond. The device was not changed." }
+            if case .http(let code, _) = api, code == 400 || code == 404 {
+                return "Home Assistant rejected that action."
+            }
+        }
+        return error.userMessage
     }
 
     private func detailRow(_ label: String, _ value: String) -> some View {
@@ -433,7 +621,7 @@ struct HAEntitySheet: View {
                 }
                 ForEach(controller.links.sorted { $0.sortOrder < $1.sortOrder }) { link in
                     NavigationLink {
-                        HAStateCard(link: link, state: controller.state(for: link.entityId), stale: controller.stale)
+                        HAStateCard(link: link, controller: controller)
                     } label: {
                         entityRow(link)
                     }
