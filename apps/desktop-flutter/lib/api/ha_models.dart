@@ -215,7 +215,7 @@ class HaLinkInput {
 
 /// One entity's current reading from `GET /ha/states`.
 class HaEntityState {
-  HaEntityState({required this.state, this.lastChanged});
+  HaEntityState({required this.state, this.lastChanged, this.unit});
 
   /// Raw HA state string (e.g. `"on"`, `"open"`, `"unavailable"`). Never
   /// reinterpret this as a boolean directly — use `ha_overlay/ha_icons.dart`'s
@@ -226,9 +226,15 @@ class HaEntityState {
   /// HA `last_changed` (RFC3339), passed through verbatim for "N ago" display.
   final DateTime? lastChanged;
 
+  /// HA `attributes.unit_of_measurement` for numeric sensors ("°F", "%", "W",
+  /// ...), or null when the entity has no unit (issue #449). Parsed with a
+  /// null default so an older server that omits the field still decodes.
+  final String? unit;
+
   factory HaEntityState.fromJson(Map<String, dynamic> j) => HaEntityState(
     state: (j['state'] as String?) ?? '',
     lastChanged: DateTime.tryParse((j['last_changed'] as String?) ?? ''),
+    unit: j['unit'] as String?,
   );
 }
 

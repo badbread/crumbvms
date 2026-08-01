@@ -99,6 +99,10 @@ data class HaEntityState(
     @SerialName("entity_id") val entityId: String,
     val state: String,
     @SerialName("last_changed") val lastChanged: String? = null,
+    // HA `attributes.unit_of_measurement` for numeric sensors ("°F", "%", "W",
+    // ...); null when the entity has no unit (issue #449). Default null so an
+    // older server that omits the field still decodes.
+    @SerialName("unit") val unit: String? = null,
 )
 
 /** GET /ha/states response: the entity states plus cache freshness. */
