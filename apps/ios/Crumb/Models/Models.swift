@@ -46,23 +46,29 @@ struct Capabilities: Codable, Equatable {
     var clips: Bool
     var ptz: Bool
     var manageViews: Bool
+    /// Controlling physical devices (HA lights/locks/covers, and later the
+    /// Reolink actuators) — deny-by-default, issue #187. Absent on servers
+    /// before HA control Phase 2 ⇒ false ⇒ the controls stay hidden.
+    var actuators: Bool
     /// Bookmark access level: "none", "own", or "all".
     var bookmarks: String
 
     /// Admins implicitly hold every capability.
-    static let admin = Capabilities(export: true, playback: true, clips: true, ptz: true, manageViews: true, bookmarks: "all")
+    static let admin = Capabilities(export: true, playback: true, clips: true, ptz: true, manageViews: true, actuators: true, bookmarks: "all")
 
     /// True when the user may see/create any bookmarks at all.
     var canBookmark: Bool { bookmarks != "none" }
 
     init(export: Bool = false, playback: Bool = false, clips: Bool = false,
-         ptz: Bool = false, manageViews: Bool = false, bookmarks: String = "none") {
+         ptz: Bool = false, manageViews: Bool = false, actuators: Bool = false,
+         bookmarks: String = "none") {
         self.export = export; self.playback = playback; self.clips = clips
-        self.ptz = ptz; self.manageViews = manageViews; self.bookmarks = bookmarks
+        self.ptz = ptz; self.manageViews = manageViews; self.actuators = actuators
+        self.bookmarks = bookmarks
     }
 
     enum CodingKeys: String, CodingKey {
-        case export, playback, clips, ptz, bookmarks
+        case export, playback, clips, ptz, actuators, bookmarks
         case manageViews = "manage_views"
     }
 
@@ -73,6 +79,7 @@ struct Capabilities: Codable, Equatable {
         clips = try c.decodeIfPresent(Bool.self, forKey: .clips) ?? false
         ptz = try c.decodeIfPresent(Bool.self, forKey: .ptz) ?? false
         manageViews = try c.decodeIfPresent(Bool.self, forKey: .manageViews) ?? false
+        actuators = try c.decodeIfPresent(Bool.self, forKey: .actuators) ?? false
         bookmarks = try c.decodeIfPresent(String.self, forKey: .bookmarks) ?? "none"
     }
 }
@@ -464,8 +471,14 @@ struct LprConfigDto: Decodable {
 /// overlay placement/style; the read-only entity sheet ignores the `overlay*`
 /// fields. Mirrors the server `HaLinkDto`.
 struct HaLink: Decodable, Identifiable {
+    /// The link id. Sent back as `link_id` on `POST /cameras/:id/ha/action` —
+    /// the client never sends a raw HA entity id (issue #52 RBAC note). Decoded
+    /// from `id`, falling back to `link_id` if a server ever names it that way.
     let id: String
     let entityId: String
+    /// `"motion"`, `"sensor"`, or `"actuator"`. Only `actuator` links get
+    /// controls (issue #187); older servers that omit it fall back to `sensor`,
+    /// which renders read-only exactly as today.
     let role: String
     let deviceClass: String?
     let label: String?
@@ -495,9 +508,13 @@ struct HaLink: Decodable, Identifiable {
     var domain: String {
         entityId.firstIndex(of: ".").map { String(entityId[..<$0]) } ?? ""
     }
+    /// Controllable link (issue #187). Controls also require the `actuators`
+    /// capability — see `HAController.canActuate`.
+    var isActuator: Bool { role.caseInsensitiveCompare("actuator") == .orderedSame }
 
     enum CodingKeys: String, CodingKey {
         case id, role, label
+        case linkId = "link_id"
         case entityId = "entity_id"
         case deviceClass = "device_class"
         case sortOrder = "sort_order"
@@ -516,7 +533,11 @@ struct HaLink: Decodable, Identifiable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
+        if let plainId = try c.decodeIfPresent(String.self, forKey: .id) {
+            id = plainId
+        } else {
+            id = try c.decode(String.self, forKey: .linkId)
+        }
         entityId = try c.decode(String.self, forKey: .entityId)
         role = try c.decodeIfPresent(String.self, forKey: .role) ?? "sensor"
         deviceClass = try c.decodeIfPresent(String.self, forKey: .deviceClass)
@@ -564,6 +585,37 @@ struct HaStatesResponse: Decodable {
 
     func state(for entityId: String) -> HaEntityState? {
         states.first { $0.entityId == entityId }
+    }
+}
+
+/// Body of `POST /cameras/:id/ha/action` (issue #187). The client identifies the
+/// target by LINK id, never by raw HA entity id, so the server stays the only
+/// thing that can name an entity to Home Assistant.
+struct HaActionRequest: Encodable {
+    let linkId: String
+    /// One of the server's per-domain allow-list: `turn_on`/`turn_off`/`toggle`,
+    /// `open_cover`/`close_cover`/`stop_cover`, `lock`/`unlock`, `press`.
+    let action: String
+
+    enum CodingKeys: String, CodingKey {
+        case action
+        case linkId = "link_id"
+    }
+}
+
+/// `POST /cameras/:id/ha/action` response. Any 2xx is success; `ok` is decoded
+/// defensively (absent ⇒ true) so a leaner server response can't read as a
+/// failure after the service call already went through.
+struct HaActionResponse: Decodable {
+    let ok: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? true
     }
 }
 

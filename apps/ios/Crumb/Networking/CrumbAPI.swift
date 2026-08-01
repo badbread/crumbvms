@@ -292,6 +292,18 @@ final class CrumbAPI {
         try await get("ha/states")
     }
 
+    /// `POST /cameras/:id/ha/action` — actuate a linked HA entity (issue #187).
+    /// Requires the `actuators` capability plus access to the camera; the server
+    /// enforces a per-domain action allow-list and returns `403` (not permitted),
+    /// `400`/`404` (rejected link/action) or `502` (Home Assistant unreachable).
+    /// The caller does NOT flip local state on success: the `/ha/states` poll
+    /// stays the only source of truth for what the device is actually doing.
+    @discardableResult
+    func haAction(cameraId: String, linkId: String, action: String) async throws -> HaActionResponse {
+        try await post("cameras/\(cameraId)/ha/action",
+                       body: HaActionRequest(linkId: linkId, action: action))
+    }
+
     // MARK: - Saved Views (server-backed, per-user; shared with desktop/android/web)
 
     /// All views visible to the caller (own + legacy global + shared-with-me).
@@ -463,6 +475,13 @@ enum APIError: Error, LocalizedError {
     /// A capability/role denial (e.g. a non-admin attempting a watchlist write).
     var isForbidden: Bool {
         if case .http(let code, _) = self { return code == 403 }
+        return false
+    }
+
+    /// The server reached us but could not reach the thing behind it (an HA
+    /// service call with Home Assistant down). Distinct from a Crumb failure.
+    var isBadGateway: Bool {
+        if case .http(let code, _) = self { return code == 502 }
         return false
     }
 
