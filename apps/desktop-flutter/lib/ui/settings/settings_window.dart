@@ -19,6 +19,7 @@ import 'package:flutter/material.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
@@ -73,6 +74,7 @@ class SettingsWindow extends StatefulWidget {
     required this.isAdmin,
     this.clientOptions,
     this.streamPrefs,
+    this.adaptive,
     this.hotkeys,
     this.keyboardShortcuts,
   });
@@ -100,6 +102,11 @@ class SettingsWindow extends StatefulWidget {
 
   final ClientOptionsStore? clientOptions;
   final StreamPrefsStore? streamPrefs;
+
+  /// Adaptive live-wall quality brain (issue #382) — threaded to the Options
+  /// pane so the wall-default -> main guardrail can predict the load.
+  final AdaptiveWallController? adaptive;
+
   final HotkeyConfigStore? hotkeys;
   final KeyboardShortcutsStore? keyboardShortcuts;
 
@@ -315,6 +322,7 @@ class _SettingsWindowState extends State<SettingsWindow> {
         return ClientOptionsScreen(
           options: opts,
           streamPrefs: widget.streamPrefs,
+          adaptive: widget.adaptive,
         );
       case SettingsSection.keyboardShortcuts:
         final ks = widget.keyboardShortcuts;

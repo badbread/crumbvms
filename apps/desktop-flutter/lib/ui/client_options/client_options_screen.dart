@@ -31,15 +31,18 @@
 
 import 'package:flutter/material.dart';
 
+import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
+import 'package:crumb_desktop/ui/live/adaptive_guardrail_dialog.dart';
 
 class ClientOptionsScreen extends StatefulWidget {
   const ClientOptionsScreen({
     super.key,
     required this.options,
     this.streamPrefs,
+    this.adaptive,
     this.onMaybeLayoutAffectingChange,
   });
 
@@ -51,6 +54,12 @@ class ClientOptionsScreen extends StatefulWidget {
   /// caller. When present, toggling "wall tiles use sub streams" here updates
   /// it directly so an already-visible wall picks it up immediately.
   final StreamPrefsStore? streamPrefs;
+
+  /// Adaptive live-wall quality brain (issue #382). Drives the Stage 1
+  /// guardrail nudge when the wall default is switched to main, and backs the
+  /// two adaptive toggles below. Null → the toggles still persist, but no
+  /// config-time prediction runs (no live wall registered).
+  final AdaptiveWallController? adaptive;
 
   /// Called after a change that the old client's `optClose()` used to react
   /// to by rebuilding the tile grid (currently just `showInfoBar`, which
@@ -78,12 +87,42 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setSeamlessTileSwitching(bool v) =>
       setState(() => _o.seamlessTileSwitching = v);
 
+  void _setAdaptiveGuardrail(bool v) =>
+      setState(() => _o.adaptiveWallGuardrail = v);
+  void _setAdaptiveBackpressure(bool v) =>
+      setState(() => _o.adaptiveWallBackpressure = v);
+
   StreamQuality get _wallDefaultQuality =>
       widget.streamPrefs?.wallDefaultQuality ?? StreamQuality.sub;
-  void _setWallDefaultQuality(StreamQuality q) {
+  Future<void> _setWallDefaultQuality(StreamQuality q) async {
+    // Stage 1 guardrail (issue #382): before switching the WHOLE wall to main,
+    // warn if the projected load would over-subscribe this machine's decoder.
+    // Advisory only — "Proceed anyway" still applies it.
+    if (q == StreamQuality.main && !await _confirmWallDefaultMain()) return;
     setState(() {
       widget.streamPrefs?.wallDefaultQuality = q;
     });
+  }
+
+  /// Returns true if switching the wall default to main should proceed.
+  Future<bool> _confirmWallDefaultMain() async {
+    final adaptive = widget.adaptive;
+    if (adaptive == null) return true;
+    if (!_o.adaptiveWallGuardrail || _o.adaptiveWallGuardrailDontWarn) {
+      return true;
+    }
+    final assessment = adaptive.assessWallDefault(StreamQuality.main);
+    if (!assessment.overSubscribed) return true;
+    if (!context.mounted) return true;
+    final choice = await showAdaptiveGuardrailDialog(
+      context,
+      assessment: assessment,
+    );
+    if (choice == null || choice == GuardrailChoice.keepSub) return false;
+    if (choice == GuardrailChoice.dontWarnOnThisMachine) {
+      _o.adaptiveWallGuardrailDontWarn = true;
+    }
+    return true;
   }
 
   void _setPtzClickMode(PtzClickMode v) => setState(() => _o.ptzClickMode = v);
@@ -261,6 +300,55 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             subtitle:
                 'Pre-warm the incoming camera and swap only once it has a frame, so a carousel or auto-hotspot tile never blanks to black on a switch. Turn off on low-powered machines to avoid the brief second decode.',
           ),
+
+          const Divider(height: 24),
+          _SectionHeader('Adaptive wall quality'),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
+            child: Text(
+              'Manages how many full-res streams the wall runs against this '
+              'machine\'s video decoder. Per-machine, measured live.',
+              style: TextStyle(fontSize: 11),
+            ),
+          ),
+          _switchRow(
+            value: _o.adaptiveWallGuardrail,
+            onChanged: _setAdaptiveGuardrail,
+            title: 'Warn before over-subscribing the decoder',
+            subtitle:
+                'When switching the wall (or a camera) to main would run more full-res streams than this machine can likely decode, show an advisory nudge first. Never blocks the change.',
+          ),
+          _switchRow(
+            value: _o.adaptiveWallBackpressure,
+            onChanged: _setAdaptiveBackpressure,
+            title: 'Auto-reduce tiles under decode load',
+            subtitle:
+                'If decode load saturates, temporarily drop peripheral tiles to their sub stream (marked "SD" in blue), restoring them when it recovers. The tile you are focused on is never reduced.',
+          ),
+          if (_o.adaptiveWallGuardrailDontWarn)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 8, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'The over-subscription warning is currently dismissed on '
+                      'this machine.',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => setState(
+                      () => _o.adaptiveWallGuardrailDontWarn = false,
+                    ),
+                    child: const Text('Re-enable'),
+                  ),
+                ],
+              ),
+            ),
 
           const Divider(height: 24),
           _SectionHeader('Clips'),

@@ -35,6 +35,7 @@ import 'package:crumb_desktop/session/session_controller.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/src/rust/api/secret.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
+import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
@@ -177,6 +178,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   final StatusBarController _statusBar = StatusBarController();
   ClientOptionsStore? _clientOptions;
   StreamPrefsStore? _streamPrefs;
+  AdaptiveWallController? _adaptive;
   HotkeyConfigStore? _hotkeys;
   KeyboardShortcutsStore? _shortcuts;
 
@@ -211,10 +213,17 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     final streamPrefs = await StreamPrefsStore.load();
     final hotkeys = await HotkeyConfigStore.load();
     final shortcuts = await KeyboardShortcutsStore.load();
+    // App-scoped adaptive-wall brain (issue #382): fed the decode-util signal +
+    // tile registry by the live wall, and queried by the Settings guardrail.
+    final adaptive = AdaptiveWallController(
+      options: options,
+      streamPrefs: streamPrefs,
+    );
     if (mounted) {
       setState(() {
         _clientOptions = options;
         _streamPrefs = streamPrefs;
+        _adaptive = adaptive;
         _hotkeys = hotkeys;
         _shortcuts = shortcuts;
       });
@@ -411,6 +420,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     _teardownSession();
     _fullscreen.dispose();
     _statusBar.dispose();
+    _adaptive?.dispose();
     _api.close();
     super.dispose();
   }
@@ -445,6 +455,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
             statusBar: _statusBar,
             clientOptions: _clientOptions,
             streamPrefs: _streamPrefs,
+            adaptive: _adaptive,
             hotkeys: _hotkeys,
             shortcuts: _shortcuts,
           ),
@@ -481,6 +492,7 @@ class MainShell extends StatefulWidget {
     this.onRefreshCameras,
     this.clientOptions,
     this.streamPrefs,
+    this.adaptive,
     this.hotkeys,
     this.shortcuts,
   });
@@ -501,6 +513,11 @@ class MainShell extends StatefulWidget {
   final StatusBarController statusBar;
   final ClientOptionsStore? clientOptions;
   final StreamPrefsStore? streamPrefs;
+
+  /// Adaptive live-wall quality brain (issue #382), shared by the wall (feeds
+  /// it) and the Settings panel (queries it for the guardrail).
+  final AdaptiveWallController? adaptive;
+
   final HotkeyConfigStore? hotkeys;
   final KeyboardShortcutsStore? shortcuts;
 
@@ -1007,6 +1024,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
       isAdmin: _isAdmin,
       clientOptions: widget.clientOptions,
       streamPrefs: widget.streamPrefs,
+      adaptive: widget.adaptive,
       hotkeys: widget.hotkeys,
       keyboardShortcuts: widget.shortcuts,
       onClose: () => setState(() => _settingsOpen = false),
@@ -1346,6 +1364,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
           clientOptions: widget.clientOptions,
           // Per-camera stream (main/sub) + PTZ-disable prefs (right-click menu).
           streamPrefs: widget.streamPrefs,
+          // Adaptive live-wall quality (issue #382) — the wall feeds it the
+          // decode-util signal + a tile registry and honors its shed decisions.
+          adaptive: widget.adaptive,
           // The applied saved view (null → default auto-grid of all cameras).
           view: _appliedView,
           // Play-on-focus audio (global audio button governs it).
