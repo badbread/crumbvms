@@ -74,6 +74,7 @@ class WallScreen extends StatefulWidget {
     required this.cameras,
     required this.onLogout,
     required this.isAdmin,
+    this.canActuate = false,
     this.clientOptions,
     this.streamPrefs,
     this.view,
@@ -97,6 +98,14 @@ class WallScreen extends StatefulWidget {
   /// camera's HA links need only camera access, but writing them
   /// (`PUT /cameras/:id/ha/links`) is admin-enforced server-side regardless.
   final bool isAdmin;
+
+  /// Server-side truth (`GET /auth/me` → `capabilities.actuators`, see
+  /// `main.dart`'s `_canActuate`) for whether this account may control HA
+  /// devices (issue #187). Passed down to every tile/pane's HA badge layer:
+  /// false renders today's read-only badge card with no hint that controls
+  /// exist. `POST /cameras/:id/ha/action` enforces the capability server-side
+  /// regardless.
+  final bool canActuate;
 
   /// Play-on-focus audio controller (single audible pane). Tiles register
   /// their Player; selection/maximize pick the active pane.
@@ -660,6 +669,7 @@ class _WallScreenState extends State<WallScreen> {
                   PtzWheelCorner.bottomLeft,
               haOverlay: _haOverlay,
               isAdmin: widget.isAdmin,
+              canActuate: widget.canActuate,
               onEditHaOverlay: () => unawaited(_beginHaOverlayEdit(_maximized!)),
               onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
               onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(_maximized!)),
@@ -840,6 +850,7 @@ class _WallScreenState extends State<WallScreen> {
                     onHaLinksLoaded: _onHaLinksLoaded,
                     onUnauthorized: widget.onUnauthorized,
                     isAdmin: widget.isAdmin,
+                    canActuate: widget.canActuate,
                   );
           }
           children.add(
@@ -910,6 +921,7 @@ class _WallScreenState extends State<WallScreen> {
                 onHaLinksLoaded: _onHaLinksLoaded,
                 onUnauthorized: widget.onUnauthorized,
                 isAdmin: widget.isAdmin,
+                canActuate: widget.canActuate,
               ),
             ),
           );
@@ -986,6 +998,7 @@ class _WallTile extends StatefulWidget {
     this.onHaLinksLoaded,
     this.onUnauthorized,
     this.isAdmin = false,
+    this.canActuate = false,
     this.paneIdOverride,
   });
 
@@ -1030,6 +1043,11 @@ class _WallTile extends StatefulWidget {
   /// server-side regardless; this only avoids showing an item that would
   /// 403 for a non-admin.
   final bool isAdmin;
+
+  /// Whether this account holds the `actuators` capability (issue #187) —
+  /// handed to this tile's HA badge layer so an actuator link's tap card can
+  /// offer control buttons. False keeps the card read-only.
+  final bool canActuate;
 
   /// When true, digitally zooming this tile past 100% temporarily loads its
   /// main stream (reverting to sub at 100%). From the "Zoom switches to main
@@ -1828,6 +1846,12 @@ class _WallTileState extends State<_WallTile> {
                         videoW: _videoW,
                         videoH: _videoH,
                         hideBadges: _scale > 1.01,
+                        // Actuation plumbing for the badge tap card (#187) —
+                        // inert unless the account holds `actuators`.
+                        api: widget.api,
+                        session: widget.session,
+                        cameraId: widget.camera.id,
+                        canActuate: widget.canActuate,
                       ),
                     ),
                   ),
@@ -1947,6 +1971,7 @@ class _MaximizedPane extends StatefulWidget {
     this.ptzWheelCorner = PtzWheelCorner.bottomLeft,
     this.haOverlay,
     this.isAdmin = false,
+    this.canActuate = false,
     this.onEditHaOverlay,
     this.onHaOverlayDone,
     this.onEditPtzPanel,
@@ -1967,6 +1992,10 @@ class _MaximizedPane extends StatefulWidget {
   /// entities…" item (mirrors `_WallTile.isAdmin`; the PUT is admin-enforced
   /// server-side regardless).
   final bool isAdmin;
+
+  /// Whether this account holds the `actuators` capability (issue #187) —
+  /// see `_WallTile.canActuate`; same contract.
+  final bool canActuate;
 
   /// The wall tile's live controller for this camera, if it was already
   /// decoding when we maximized. Painted full-pane (sub stream, upscaled) as
@@ -2827,6 +2856,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                         videoW: _videoW,
                         videoH: _videoH,
                         hideBadges: _scale > 1.01,
+                        // Actuation plumbing for the badge tap card (#187) —
+                        // inert unless the account holds `actuators`.
+                        api: widget.api,
+                        session: widget.session,
+                        cameraId: widget.camera.id,
+                        canActuate: widget.canActuate,
                       ),
                     ),
                   ),

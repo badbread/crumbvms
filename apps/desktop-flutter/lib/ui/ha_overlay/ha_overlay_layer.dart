@@ -14,8 +14,11 @@
 //   per the link's `overlay_show_state`/`overlay_show_age` toggles;
 // * a hover reveal — mousing over a badge shows state + age even when not
 //   pinned (desktop has a mouse; `OverlayEditorLayer.onHoverItem`);
-// * the read-only `HaStateCard` on tap, placed beside the badge and flipped/
-//   clamped away from the pane edges.
+// * the `HaStateCard` on tap, placed beside the badge and flipped/clamped away
+//   from the pane edges. Read-only by default; when the host passes the
+//   actuation plumbing (`api`/`session`/`cameraId`) AND this account holds the
+//   `actuators` capability, an `actuator`-role link's card also carries the
+//   control buttons for its domain (issue #187, HA control Phase 2).
 //
 // Purely a display widget: everything comes via the constructor, no
 // controller/global lookups (it builds its own private, ephemeral
@@ -41,10 +44,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 
+import '../../api/crumb_api.dart';
+import '../../api/ha_api.dart';
 import '../../api/ha_models.dart';
+import '../../api/models.dart';
 import '../overlay_editor/overlay_editor_controller.dart';
 import '../overlay_editor/overlay_editor_layer.dart';
 import '../overlay_editor/overlay_geometry.dart';
+import 'ha_actions.dart';
 import 'ha_icons.dart';
 import 'ha_overlay_controller.dart' show HaOverlayBadgeItem;
 import 'ha_state_card.dart';
@@ -456,6 +463,10 @@ class HaOverlayLayer extends StatefulWidget {
     this.videoW,
     this.videoH,
     this.hideBadges = false,
+    this.api,
+    this.session,
+    this.cameraId,
+    this.canActuate = false,
   });
 
   /// The camera's linked entities (incl. placement) — only the PLACED ones
@@ -484,6 +495,19 @@ class HaOverlayLayer extends StatefulWidget {
   /// `_scale > 1.01`.
   final bool hideBadges;
 
+  /// Actuation plumbing (issue #187). All three must be non-null for the tap
+  /// card to offer controls; a host that hasn't wired them keeps today's
+  /// read-only card.
+  final CrumbApi? api;
+  final Session? session;
+  final String? cameraId;
+
+  /// Server-side truth (`GET /auth/me` → `capabilities.actuators`, see
+  /// `MeResponse.canActuate`) for whether this account may actuate. False —
+  /// including against an older server that doesn't send the key — renders
+  /// the card exactly as it is today, with no hint that controls exist.
+  final bool canActuate;
+
   @override
   State<HaOverlayLayer> createState() => _HaOverlayLayerState();
 }
@@ -505,6 +529,9 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
   /// Rough height estimates for flip/clamp decisions (the real widgets
   /// self-size; these only pick which side of the badge to render on).
   static const double _cardEstHeight = 150;
+
+  /// Extra estimated height once the card carries a control row (issue #187).
+  static const double _cardControlsEstHeight = 52;
 
   @override
   void dispose() {
@@ -611,6 +638,56 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
     return null;
   }
 
+  /// The control buttons to offer for [link] (issue #187), or empty for the
+  /// read-only card. Both gates must pass: the account holds the `actuators`
+  /// capability AND this link is an actuator (a motion/door sensor link is
+  /// never controllable, even for an admin). The domain table then decides
+  /// the button set, mirroring the server's allow-list.
+  List<HaControlAction> _actionsFor(HaLink link) {
+    if (!widget.canActuate || link.role != 'actuator') return const [];
+    if (widget.api == null ||
+        widget.session == null ||
+        widget.cameraId == null) {
+      return const [];
+    }
+    return haActionsForDomain(link.domain);
+  }
+
+  /// POST the action and surface any failure as a toast. Never throws; returns
+  /// whether the server accepted it, which is all the card needs to decide
+  /// between "settling" and "hand the buttons back". Deliberately does NOT
+  /// flip the badge locally: the 3s `/ha/states` poll converges the state.
+  Future<bool> _runAction(HaLink link, String action) async {
+    final api = widget.api;
+    final session = widget.session;
+    final cameraId = widget.cameraId;
+    if (api == null || session == null || cameraId == null) return false;
+    try {
+      await api.haAction(
+        session,
+        cameraId,
+        linkId: link.id,
+        action: action,
+      );
+      return true;
+    } on CrumbApiException catch (e) {
+      _toast(
+        e.statusCode == 403
+            ? 'Not permitted: this account cannot control devices.'
+            : 'Action failed. ${e.message}',
+      );
+    } catch (_) {
+      _toast('Action failed. The server could not be reached.');
+    }
+    return false;
+  }
+
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+    );
+  }
 
   /// The tap card, placed BESIDE the tapped badge (right by preference,
   /// flipped left near the right edge; vertically clamped into the pane) —
@@ -635,8 +712,11 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
     if (left + _cardWidth > paneW - 4) {
       left = (x - 8 - _cardWidth).clamp(4.0, double.infinity).toDouble();
     }
+    final actions = _actionsFor(open);
+    final estHeight =
+        _cardEstHeight + (actions.isEmpty ? 0.0 : _cardControlsEstHeight);
     final top = y
-        .clamp(4.0, (paneH - _cardEstHeight).clamp(4.0, double.infinity))
+        .clamp(4.0, (paneH - estHeight).clamp(4.0, double.infinity))
         .toDouble();
     return Positioned(
       left: left,
@@ -651,6 +731,10 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
         iconOverride: open.overlayIcon,
         colorOverride: parseOverlayColorHex(open.overlayColor),
         onDismiss: () => setState(() => _openLinkId = null),
+        actions: actions,
+        onAction: actions.isEmpty
+            ? null
+            : (action) => _runAction(open, action),
       ),
     );
   }
