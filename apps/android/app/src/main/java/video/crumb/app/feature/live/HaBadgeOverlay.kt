@@ -236,7 +236,7 @@ private fun HaBadge(
         }
 
         val caption = buildString {
-            if (link.overlayShowState) append(visual.label)
+            if (link.overlayShowState) append(haStateDisplay(visual, st?.state, st?.unit))
             if (link.overlayShowAge) {
                 relativeAgo(st?.lastChanged)?.let {
                     if (isNotEmpty()) append(" · ")

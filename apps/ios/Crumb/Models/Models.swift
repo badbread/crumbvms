@@ -551,9 +551,14 @@ struct HaEntityState: Decodable {
     let entityId: String
     let state: String
     let lastChanged: String?
+    /// HA `attributes.unit_of_measurement` for numeric sensors ("°F", "%", "W",
+    /// ...); nil when the entity has no unit (issue #449). The synthesized
+    /// decoder treats this optional as `decodeIfPresent`, so a payload from an
+    /// older server that omits `unit` still decodes.
+    let unit: String?
 
     enum CodingKeys: String, CodingKey {
-        case state
+        case state, unit
         case entityId = "entity_id"
         case lastChanged = "last_changed"
     }

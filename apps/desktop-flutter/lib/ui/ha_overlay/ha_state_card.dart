@@ -215,7 +215,11 @@ class _HaStateCardState extends State<HaStateCard> {
               ),
               const SizedBox(height: 6),
               Text(
-                visual.label ?? (state?.state ?? 'Unknown'),
+                haStateDisplay(
+                  visual: visual,
+                  state: state?.state,
+                  unit: state?.unit,
+                ),
                 style: TextStyle(
                   color: visual.color,
                   fontSize: 13,

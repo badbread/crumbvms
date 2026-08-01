@@ -78,9 +78,11 @@ enum HA {
         }
 
         // Indeterminate (unknown/unavailable/stale) → grey, honest state text.
+        // A numeric sensor ("72", "48") lands here too (its state is not an
+        // on/off edge), so this is where its unit_of_measurement is appended.
         if stale || state == nil || (on == nil && domain != "light" && domain != "switch") {
             let sym = baseSymbol(domain: domain, deviceClass: link.deviceClass, on: false)
-            let text = raw.isEmpty ? "Unknown" : raw.capitalized
+            let text = raw.isEmpty ? "Unknown" : stateTextWithUnit(raw, unit: state?.unit)
             return HAVisual(symbol: overrideSymbol(link) ?? sym, color: grey, stateText: text, indeterminate: true)
         }
 
@@ -98,6 +100,21 @@ enum HA {
             base = classVisual(HA.classForDeviceClass(link.deviceClass), on: isOn)
         }
         return applyOverrides(link, base: base, on: isOn)
+    }
+
+    /// Append the entity's `unit_of_measurement` to a real numeric/plain reading
+    /// (issue #449): "72" + "°F" -> "72 °F", "48" + "%" -> "48 %". Never appended
+    /// to an on/off/open/closed edge label (those never reach this path) nor to
+    /// an indeterminate placeholder. Falls back to today's capitalized text when
+    /// there is no unit, so a payload from an older server renders unchanged.
+    private static func stateTextWithUnit(_ raw: String, unit: String?) -> String {
+        let base = raw.capitalized
+        guard let u = unit?.trimmingCharacters(in: .whitespaces), !u.isEmpty else { return base }
+        if edgeOn(raw) != nil { return base }
+        switch raw.lowercased() {
+        case "unavailable", "unknown", "none": return base
+        default: return "\(raw) \(u)"
+        }
     }
 
     private static func classVisual(_ cls: String, on: Bool) -> HAVisual {

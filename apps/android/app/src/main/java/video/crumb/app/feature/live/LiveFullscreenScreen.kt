@@ -963,7 +963,7 @@ fun LiveFullscreenScreen(
             val st = haStates?.stateFor(link.entityId)
             // Same combined staleness the on-video badge uses (server OR client).
             val stale = haStates?.stale == true || haStale
-            HaMoreInfoDialog(link, st?.state, st?.lastChanged, stale, onDismiss = { haBadgeSelected = null })
+            HaMoreInfoDialog(link, st?.state, st?.lastChanged, stale, onDismiss = { haBadgeSelected = null }, unit = st?.unit)
         }
 
         // Tapping a controllable cover/lock badge opens the confirm-guarded control
@@ -974,6 +974,7 @@ fun LiveFullscreenScreen(
             val stale = haStates?.stale == true || haStale
             HaMoreInfoDialog(
                 link, st?.state, st?.lastChanged, stale,
+                unit = st?.unit,
                 canActuate = true,
                 inFlight = link.actionLinkId in haInFlight,
                 onAction = { action -> fireHaAction(link, action) },

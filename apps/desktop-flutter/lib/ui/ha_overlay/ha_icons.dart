@@ -178,6 +178,37 @@ Color? parseOverlayColorHex(String? hex) {
   return Color(0xFF000000 | v);
 }
 
+/// The text to show for an entity's current reading on a badge caption / state
+/// card (issue #449). The visual's semantic label ("Open"/"On"/"Closed") when
+/// there is one, else the raw state, with the entity's
+/// `unit_of_measurement` appended when the reading is a real value — i.e. a
+/// numeric/plain state (`edgeOn == null`) that is not an indeterminate
+/// placeholder — and a unit is known: "72" + "°F" -> "72 °F", "48" + "%" ->
+/// "48 %". An on/off/open/closed label never gets a unit appended. Falls back
+/// to exactly today's text ("Open", "Unknown", the bare value) when `unit` is
+/// null.
+String haStateDisplay({
+  required HaVisual visual,
+  required String? state,
+  String? unit,
+}) {
+  final base = visual.label ?? (state ?? 'Unknown');
+  final u = unit?.trim();
+  if (u == null || u.isEmpty || state == null) return base;
+  final s = state.trim();
+  if (s.isEmpty) return base;
+  // Only a real value takes a unit: skip on/off style states (edgeOn known)
+  // and the indeterminate placeholders, which are not measurements.
+  if (edgeOn(s) != null) return base;
+  switch (s.toLowerCase()) {
+    case 'unavailable':
+    case 'unknown':
+    case 'none':
+      return base;
+  }
+  return '$base $u';
+}
+
 /// Relative "N ago" for a badge caption / state card, from HA `last_changed`.
 String haRelativeAgo(DateTime t) {
   final d = DateTime.now().difference(t);

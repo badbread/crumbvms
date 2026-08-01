@@ -141,7 +141,7 @@ fun HaEntitiesSheet(
         ) {
             items(sorted, key = { it.id }) { link ->
                 val st = states?.stateFor(link.entityId)
-                HaTile(link, st?.state, stale, onClick = { selected = link })
+                HaTile(link, st?.state, st?.unit, stale, onClick = { selected = link })
             }
         }
     }
@@ -150,6 +150,7 @@ fun HaEntitiesSheet(
         val st = states?.stateFor(link.entityId)
         HaMoreInfoDialog(
             link, st?.state, st?.lastChanged, stale,
+            unit = st?.unit,
             canActuate = canActuate && link.isActuator,
             inFlight = link.actionLinkId in inFlightLinkIds,
             onAction = { action -> onAction(link, action) },
@@ -167,7 +168,7 @@ private fun HaGrabber() {
 
 /** One HA tile card: state-colored icon in a tinted circle, name + state. */
 @Composable
-private fun HaTile(link: HaLinkDto, state: String?, stale: Boolean, onClick: () -> Unit) {
+private fun HaTile(link: HaLinkDto, state: String?, unit: String?, stale: Boolean, onClick: () -> Unit) {
     val v = badgeVisual(link, state, stale)
     Row(
         modifier = Modifier
@@ -193,7 +194,7 @@ private fun HaTile(link: HaLinkDto, state: String?, stale: Boolean, onClick: () 
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
             )
-            Text(v.label, color = v.color, fontSize = 13.sp)
+            Text(haStateDisplay(v, state, unit), color = v.color, fontSize = 13.sp)
         }
         Text("›", color = Color(0xFF4C4C4C), fontSize = 20.sp)
     }
@@ -215,6 +216,7 @@ internal fun HaMoreInfoDialog(
     lastChanged: String?,
     stale: Boolean,
     onDismiss: () -> Unit,
+    unit: String? = null,
     canActuate: Boolean = false,
     inFlight: Boolean = false,
     onAction: (String) -> Unit = {},
@@ -241,7 +243,7 @@ internal fun HaMoreInfoDialog(
             }
             Spacer(Modifier.height(12.dp))
             Text(link.displayName, color = HaPrimaryText, fontSize = 19.sp, fontWeight = FontWeight.Medium)
-            Text(v.label, color = v.color, fontSize = 15.sp)
+            Text(haStateDisplay(v, state, unit), color = v.color, fontSize = 15.sp)
             changedAgo(lastChanged)?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(it, color = HaSecondaryText, fontSize = 12.5.sp)

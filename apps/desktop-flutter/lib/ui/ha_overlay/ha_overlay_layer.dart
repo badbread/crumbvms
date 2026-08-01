@@ -451,7 +451,7 @@ class HaBadgeCaptions extends StatelessWidget {
         ),
       if (showState)
         Text(
-          visual.label ?? (state?.state ?? 'Unknown'),
+          haStateDisplay(visual: visual, state: state?.state, unit: state?.unit),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(
