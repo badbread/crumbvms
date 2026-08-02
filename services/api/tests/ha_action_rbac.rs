@@ -92,6 +92,10 @@ fn action_body(link_id: Uuid, action: &str) -> serde_json::Value {
     serde_json::json!({ "link_id": link_id, "action": action })
 }
 
+fn action_body_value(link_id: Uuid, action: &str, value: f64) -> serde_json::Value {
+    serde_json::json!({ "link_id": link_id, "action": action, "value": value })
+}
+
 async fn body_text(resp: axum::http::Response<axum::body::Body>) -> String {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -436,6 +440,133 @@ async fn allowed_actions_forbids_a_domain_valid_but_unlisted_action() {
     assert!(
         !body.contains("not enabled"),
         "a forbidden action must be refused before the HA call, got: {body}"
+    );
+}
+
+// ─── value actions (#442, Slice 1): brightness / position / speed ────────────
+
+#[tokio::test]
+async fn a_value_action_with_a_valid_value_passes_every_gate_and_stops_at_ha() {
+    // A dimmable light with no allowed_actions restriction (null ⇒ every domain
+    // action, INCLUDING the new value words). set_brightness with an in-range
+    // value clears capability + scope + link + allowlist + allowed_actions +
+    // value validation and reaches the HA call site (distinct "not enabled" 400,
+    // HA being unconfigured here).
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let links = seed_links(app.pool(), cam, &[("light.kitchen", "actuator")]).await;
+
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[cam], caps_with_actuators()).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body_value(links[0].id, "set_brightness", 62.0),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("not enabled"),
+        "a valid value action must pass every gate and reach the HA call, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_range_value_is_rejected_before_ha() {
+    // 150 is outside 0..100. The request must be refused with a 400 BEFORE HA is
+    // contacted (so NOT the "not enabled" boundary marker).
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let links = seed_links(app.pool(), cam, &[("light.kitchen", "actuator")]).await;
+
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[cam], caps_with_actuators()).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body_value(links[0].id, "set_brightness", 150.0),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(resp).await;
+    assert!(
+        !body.contains("not enabled"),
+        "an out-of-range value must be refused before the HA call, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_value_action_missing_its_value_is_a_400_before_ha() {
+    // set_brightness with no value at all is a client bug: 400 before HA.
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let links = seed_links(app.pool(), cam, &[("light.kitchen", "actuator")]).await;
+
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[cam], caps_with_actuators()).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body(links[0].id, "set_brightness"),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(resp).await;
+    assert!(
+        !body.contains("not enabled"),
+        "a value action with no value must 400 before the HA call, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn allowed_actions_still_governs_the_new_value_word() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    // A light restricted to turn_on only. set_brightness is a valid LIGHT value
+    // action (passes the domain allowlist) but is NOT in allowed_actions, so it
+    // is refused with a 403 before HA, even with a perfectly valid value.
+    let restricted =
+        seed_link_with_allowed_actions(app.pool(), cam, "light.kitchen", &["turn_on"]).await;
+
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[cam], caps_with_actuators()).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body_value(restricted[0].id, "set_brightness", 50.0),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // A light that DOES permit set_brightness lets a valid value through to HA.
+    let permitted =
+        seed_link_with_allowed_actions(app.pool(), cam, "light.hall", &["set_brightness"]).await;
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body_value(permitted[0].id, "set_brightness", 50.0),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("not enabled"),
+        "a permitted value word must reach the HA call, got: {body}"
     );
 }
 

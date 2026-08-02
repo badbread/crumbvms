@@ -73,21 +73,103 @@ pub fn routes() -> Router<AppState> {
 /// domain here widens what any `actuators` role can do, so it is a security
 /// decision, not a convenience one (see `docs/DECISIONS.md`, 2026-08-01).
 ///
-/// The action word and the HA service name are 1:1 within a domain, so the
-/// lookup returns a `&'static str` service that the URL is built from — the
-/// client's own string never reaches the HA request.
-const HA_ACTION_ALLOWLIST: &[(&str, &[&str])] = &[
-    ("light", &["turn_on", "turn_off", "toggle"]),
-    ("switch", &["turn_on", "turn_off", "toggle"]),
-    ("fan", &["turn_on", "turn_off", "toggle"]),
-    ("siren", &["turn_on", "turn_off", "toggle"]),
-    ("cover", &["open_cover", "close_cover", "stop_cover"]),
-    ("lock", &["lock", "unlock"]),
-    ("button", &["press"]),
-    ("input_button", &["press"]),
-    ("scene", &["turn_on"]),
-    ("script", &["turn_on"]),
+/// Each row is a [`HaActionSpec`]: the action *word* a client may send, the
+/// `&'static` HA service Crumb calls for it, and whether it carries a numeric
+/// value. The action word is NO LONGER 1:1 with the service (a value word like
+/// `set_brightness` rides `turn_on`); the `service` and every value `param` are
+/// always `&'static str`s from this table, never the client's string, so the
+/// URL and the service-data keys are built entirely server-side.
+///
+/// Value words this slice adds (#442, Slice 1): `light.set_brightness` (rides
+/// `turn_on`, `brightness_pct`), `cover.set_position` (`set_cover_position`,
+/// `position`), `fan.set_speed` (`set_percentage`, `percentage`). All three are
+/// percent-kind (0..100). Climate `set_temperature` is Slice 2 and deliberately
+/// NOT here (see `docs/DECISIONS.md`, 2026-08-01).
+const HA_ACTION_ALLOWLIST: &[(&str, &[HaActionSpec])] = &[
+    (
+        "light",
+        &[
+            spec("turn_on"),
+            spec("turn_off"),
+            spec("toggle"),
+            pct("set_brightness", "turn_on", "brightness_pct"),
+        ],
+    ),
+    (
+        "switch",
+        &[spec("turn_on"), spec("turn_off"), spec("toggle")],
+    ),
+    (
+        "fan",
+        &[
+            spec("turn_on"),
+            spec("turn_off"),
+            spec("toggle"),
+            pct("set_speed", "set_percentage", "percentage"),
+        ],
+    ),
+    (
+        "siren",
+        &[spec("turn_on"), spec("turn_off"), spec("toggle")],
+    ),
+    (
+        "cover",
+        &[
+            spec("open_cover"),
+            spec("close_cover"),
+            spec("stop_cover"),
+            pct("set_position", "set_cover_position", "position"),
+        ],
+    ),
+    ("lock", &[spec("lock"), spec("unlock")]),
+    ("button", &[spec("press")]),
+    ("input_button", &[spec("press")]),
+    ("scene", &[spec("turn_on")]),
+    ("script", &[spec("turn_on")]),
 ];
+
+/// The kind of numeric value an action carries. Kept as an enum (not a bare
+/// range) so a non-percent kind slots in without reshaping the spec or the
+/// validation: Slice 2's climate `set_temperature` will add a `Temperature`
+/// variant here and one match arm in [`validate_value`] / the state descriptor,
+/// nothing else.
+enum ValueKind {
+    /// An integer percent, hardcoded `0..=100`. `param` is the HA service-data
+    /// key the rounded value is sent under (`brightness_pct`, `position`, ...).
+    Percent { param: &'static str },
+}
+
+/// One allowlisted action for a domain: the action *word* a client sends, the
+/// `&'static` HA service Crumb calls for it, and its value arity (`None` =
+/// discrete on/off/press; `Some(kind)` = requires a numeric value of that kind).
+struct HaActionSpec {
+    /// The action word a client sends, looked up per the entity's own domain.
+    action: &'static str,
+    /// The HA service Crumb calls for it. `&'static`, never client input.
+    service: &'static str,
+    /// `None` for a discrete action; `Some(kind)` for a value action.
+    value: Option<ValueKind>,
+}
+
+/// Build a discrete spec whose action word IS its HA service name (the common
+/// case: on/off/toggle/press).
+const fn spec(action: &'static str) -> HaActionSpec {
+    HaActionSpec {
+        action,
+        service: action,
+        value: None,
+    }
+}
+
+/// Build a percent-kind value spec: `action` word, the `service` it rides, and
+/// the service-data `param` the rounded 0..100 value is sent under.
+const fn pct(action: &'static str, service: &'static str, param: &'static str) -> HaActionSpec {
+    HaActionSpec {
+        action,
+        service,
+        value: Some(ValueKind::Percent { param }),
+    }
+}
 
 /// HA domain of an entity id: the text before the first `.` (`cover.garage` ⇒
 /// `cover`). Always derived SERVER-SIDE from the stored link, never taken from
@@ -97,13 +179,50 @@ fn domain_of(entity_id: &str) -> &str {
     entity_id.split_once('.').map_or("", |(d, _)| d)
 }
 
-/// Resolve `(domain, action)` to the `&'static str` HA service to call, or
-/// `None` when the pair is not allowlisted (unknown domain, unknown action, or
-/// an action that belongs to a different domain). Pure, so the allowlist is
-/// exhaustively unit-testable without HA or a DB.
-fn allowed_service(domain: &str, action: &str) -> Option<&'static str> {
-    let (_, actions) = HA_ACTION_ALLOWLIST.iter().find(|(d, _)| *d == domain)?;
-    actions.iter().copied().find(|s| *s == action)
+/// Resolve `(domain, action)` to its [`HaActionSpec`], or `None` when the pair
+/// is not allowlisted (unknown domain, unknown action, or an action that belongs
+/// to a different domain). Pure, so the allowlist is exhaustively unit-testable
+/// without HA or a DB.
+fn allowed_spec(domain: &str, action: &str) -> Option<&'static HaActionSpec> {
+    HA_ACTION_ALLOWLIST
+        .iter()
+        .find(|(d, _)| *d == domain)
+        .and_then(|(_, specs)| specs.iter().find(|s| s.action == action))
+}
+
+/// Validate a request's numeric `value` against an action's [`HaActionSpec`],
+/// returning the HA service-data extras to send (`&'static` key + JSON value) on
+/// success, or a 400 message on failure. Enforced in `post_action` AFTER the
+/// allowlist + `allowed_actions` checks and BEFORE HA is contacted, and pure so
+/// every arity/range/rounding edge is unit-testable without HA or a DB.
+///
+/// Rules (strict on purpose, to catch buggy clients):
+/// - discrete action (`spec.value == None`) with a value present ⇒ rejected;
+/// - value action with no value ⇒ rejected;
+/// - percent kind: `value` must be finite and in `0..=100` (the range is
+///   hardcoded, so a cold attribute cache can never block a control), then it is
+///   rounded to the nearest integer and sent as a JSON integer under the spec's
+///   `param`.
+fn validate_value(
+    spec: &HaActionSpec,
+    value: Option<f64>,
+) -> Result<Vec<(&'static str, serde_json::Value)>, String> {
+    match (&spec.value, value) {
+        (None, None) => Ok(Vec::new()),
+        (None, Some(_)) => Err(format!("action '{}' does not take a value", spec.action)),
+        (Some(_), None) => Err(format!("action '{}' requires a numeric value", spec.action)),
+        (Some(ValueKind::Percent { param }), Some(v)) => {
+            if !v.is_finite() || !(0.0..=100.0).contains(&v) {
+                return Err(format!(
+                    "value for '{}' must be a number between 0 and 100",
+                    spec.action
+                ));
+            }
+            // Round to nearest integer and send as a JSON integer.
+            let pct = v.round() as i64;
+            Ok(vec![(*param, serde_json::json!(pct))])
+        }
+    }
 }
 
 /// Every entity domain Crumb can actuate, derived straight from
@@ -172,7 +291,7 @@ fn validate_link_role(entity_id: &str, role: &str) -> Result<(), String> {
 fn validate_allowed_actions(entity_id: &str, allowed: &[String]) -> Result<(), String> {
     let domain = domain_of(entity_id);
     for action in allowed {
-        if allowed_service(domain, action).is_none() {
+        if allowed_spec(domain, action).is_none() {
             return Err(format!(
                 "allowed_actions entry '{action}' is not a valid action for a '{domain}' entity \
                  ('{entity_id}'); it must be one of that domain's actions"
@@ -554,6 +673,88 @@ fn canonical_icon(slug: &str) -> bool {
     CANONICAL_ICON_SLUGS.contains(&slug)
 }
 
+/// A value-control capability descriptor on a `GET /ha/states` entry (#442,
+/// Slice 1). Present only when the entity currently exposes a settable value
+/// (a dimmable light, a positionable cover, a speed-controllable fan); absent
+/// otherwise, which is how a client decides whether to draw a slider at all. An
+/// old client simply ignores the unknown field.
+///
+/// Deliberately KIND-AGNOSTIC (`min`/`max`/`step`/`unit`, numbers as JSON
+/// values) so Slice 2's temperature control reuses this shape unchanged: it only
+/// sets `kind` to something other than `"percent"` and a non-null `unit`.
+#[derive(Serialize)]
+struct ControlDescriptor {
+    /// The value action word a client sends to set this (`set_brightness`, ...).
+    action: &'static str,
+    /// The value kind. `"percent"` in this slice; a future kind reuses the rest.
+    kind: &'static str,
+    /// Current value, then the slider bounds/step, in the descriptor's own units
+    /// (integers for percent). JSON numbers so a client can render without a
+    /// second call and without guessing the type.
+    value: serde_json::Value,
+    min: serde_json::Value,
+    max: serde_json::Value,
+    step: serde_json::Value,
+    /// Unit label for non-percent kinds; `null` for percent.
+    unit: Option<String>,
+}
+
+/// Build a percent-kind [`ControlDescriptor`] (0..100, given current value and
+/// step; `unit` is null for percent).
+fn percent_descriptor(action: &'static str, value: i64, step: i64) -> ControlDescriptor {
+    ControlDescriptor {
+        action,
+        kind: "percent",
+        value: serde_json::json!(value),
+        min: serde_json::json!(0),
+        max: serde_json::json!(100),
+        step: serde_json::json!(step),
+        unit: None,
+    }
+}
+
+/// Project a value-control descriptor from an entity's HA `attributes`, using
+/// ONLY fields already in the cached raw snapshot (no extra HA round-trip). Kept
+/// in lockstep with the value rows of [`HA_ACTION_ALLOWLIST`]: the descriptor's
+/// `action` is exactly the value word the client sends back to `post_action`.
+///
+/// - light: present iff `attributes.brightness` (0..255) exists; value =
+///   `round(brightness * 100 / 255)`.
+/// - cover: iff `attributes.current_position` (0..100) exists; value = it.
+/// - fan: iff `attributes.percentage` (0..100) exists; step =
+///   `ceil(attributes.percentage_step)` min 1, else 1.
+///
+/// Returns `None` for any other domain, or when the keying attribute is absent
+/// (a non-dimmable light, a cover that does not report position): the client
+/// then shows the entity with no slider.
+fn control_descriptor(
+    domain: &str,
+    attrs: Option<&serde_json::Value>,
+) -> Option<ControlDescriptor> {
+    let attr = |k: &str| {
+        attrs
+            .and_then(|a| a.get(k))
+            .and_then(serde_json::Value::as_f64)
+    };
+    match domain {
+        "light" => {
+            let brightness = attr("brightness")?;
+            let pct = (brightness * 100.0 / 255.0).round() as i64;
+            Some(percent_descriptor("set_brightness", pct, 1))
+        }
+        "cover" => {
+            let pos = attr("current_position")?;
+            Some(percent_descriptor("set_position", pos.round() as i64, 1))
+        }
+        "fan" => {
+            let pct = attr("percentage")?;
+            let step = attr("percentage_step").map_or(1, |s| (s.ceil() as i64).max(1));
+            Some(percent_descriptor("set_speed", pct.round() as i64, step))
+        }
+        _ => None,
+    }
+}
+
 /// One entity's current state in the `GET /ha/states` feed.
 #[derive(Serialize)]
 struct HaEntityState {
@@ -566,6 +767,12 @@ struct HaEntityState {
     /// when the entity reports no unit (issue #449). No server-side formatting:
     /// the raw `state` string is left as-is; clients own display.
     unit: Option<String>,
+    /// Value-control capability (#442, Slice 1), projected from the entity's
+    /// current HA attributes. `None` ⇒ no settable value ⇒ the client shows no
+    /// slider. `#[serde(skip)]` when absent to keep the payload small and old
+    /// clients unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control: Option<ControlDescriptor>,
 }
 
 /// `GET /ha/states` response: the caller-visible entity states plus cache age so
@@ -614,10 +821,19 @@ struct HaLinksUpdate {
 /// looked up in [`HA_ACTION_ALLOWLIST`] for the domain the SERVER derives from
 /// that row's entity. Everything the HA request is built from comes from the
 /// server side of that lookup.
+///
+/// `value` is the ONE numeric a value action carries (a dimmer level, a cover
+/// position). It is optional so discrete actions omit it; serde `f64` rejects
+/// strings/objects and JSON has no NaN/Infinity, so a non-number never parses.
+/// The arity/range check lives in [`validate_value`], keyed off the action's
+/// spec, so a value on a discrete action (or a missing value on a value action)
+/// is a clean 400.
 #[derive(Deserialize)]
 struct HaActionRequest {
     link_id: Uuid,
     action: String,
+    #[serde(default)]
+    value: Option<f64>,
 }
 
 // ─── handlers ────────────────────────────────────────────────────────────────
@@ -958,6 +1174,7 @@ async fn audit_actuation(
     camera_id: Uuid,
     link: &crumb_common::types::CameraHaLink,
     action: &str,
+    value: Option<f64>,
     outcome: &str,
 ) {
     let username = db::get_user_by_id(state.pool(), user.user_id)
@@ -966,6 +1183,9 @@ async fn audit_actuation(
         .flatten()
         .map_or_else(|| "unknown".to_owned(), |u| u.username);
     let action = sanitize_for_audit(action);
+    // Formatted from the PARSED f64, never the raw client string. Empty for a
+    // discrete action so its audit line/detail read exactly as before.
+    let value_str = value.map(|v| format!(" value={v}")).unwrap_or_default();
     tracing::info!(
         target: "crumb::audit",
         user_id = %user.user_id,
@@ -974,12 +1194,13 @@ async fn audit_actuation(
         link_id = %link.id,
         entity_id = %link.entity_id,
         action = %action,
+        value = ?value,
         outcome = %outcome,
         "HA actuation"
     );
     let detail = format!(
         "user={username} ({}) camera={camera_id} link={} entity={} \
-         action={action} outcome={outcome}",
+         action={action}{value_str} outcome={outcome}",
         user.user_id, link.id, link.entity_id
     );
     if let Err(e) = db::insert_system_event(
@@ -1010,6 +1231,8 @@ async fn audit_actuation(
 ///    else 400.
 /// 5. the action is permitted by the link's own `allowed_actions` restriction
 ///    (migration 0075, issue #440) — else 403. `null` ⇒ unrestricted.
+/// 6. the request's numeric `value` matches the action's arity/range
+///    (`validate_value`, #442 Slice 1) — else 400, before HA is contacted.
 ///
 /// Returns `{"ok": true}` on an HA 2xx. No state is returned: clients converge
 /// on the existing 3s `GET /ha/states` poll, so there is one source of truth for
@@ -1047,20 +1270,21 @@ async fn post_action(
     // 4. allowlist, on the domain derived from the STORED entity id.
     let domain = domain_of(&link.entity_id);
     let action = body.action.trim();
-    let Some(service) = allowed_service(domain, action) else {
+    let Some(spec) = allowed_spec(domain, action) else {
         audit_actuation(
             &state,
             &user,
             camera_id,
             &link,
             action,
+            body.value,
             "rejected: action not allowed for this domain",
         )
         .await;
         let allowed = HA_ACTION_ALLOWLIST
             .iter()
             .find(|(d, _)| *d == domain)
-            .map(|(_, a)| a.join(", "));
+            .map(|(_, a)| a.iter().map(|s| s.action).collect::<Vec<_>>().join(", "));
         return Err(ApiError::BadRequest(match allowed {
             Some(list) => {
                 format!("that action is not allowed for a '{domain}' entity (allowed: {list})")
@@ -1081,6 +1305,7 @@ async fn post_action(
             camera_id,
             &link,
             action,
+            body.value,
             "rejected: action not in link's allowed_actions",
         )
         .await;
@@ -1094,6 +1319,27 @@ async fn post_action(
         )));
     }
 
+    // 6. value arity + range, driven by the action's spec. A discrete action
+    //    with a value, a value action with none, or an out-of-range value is a
+    //    400 audited as a rejection BEFORE HA is contacted. `extra` is the
+    //    (&'static key, JSON value) service data to send (empty for discrete).
+    let extra = match validate_value(spec, body.value) {
+        Ok(extra) => extra,
+        Err(msg) => {
+            audit_actuation(
+                &state,
+                &user,
+                camera_id,
+                &link,
+                action,
+                body.value,
+                "rejected: value failed validation",
+            )
+            .await;
+            return Err(ApiError::BadRequest(msg));
+        }
+    };
+
     let settings = effective_settings(&state).await?;
     if !settings.enabled {
         return Err(ApiError::BadRequest(
@@ -1102,16 +1348,29 @@ async fn post_action(
     }
     let client = ha_client(&settings)?;
 
-    // `domain` is the stored entity's own prefix and `service` is a &'static str
-    // straight out of the allowlist, so nothing client-controlled reaches the
-    // HA URL; the entity id travels in the request body.
-    match client.call_service(domain, service, &link.entity_id).await {
+    // `domain` is the stored entity's own prefix, `spec.service` is a &'static
+    // str, and every `extra` KEY is a &'static param from the spec, so nothing
+    // client-controlled reaches the HA URL or the service-data keys; the entity
+    // id and the validated numeric value travel in the request body.
+    match client
+        .call_service_with(domain, spec.service, &link.entity_id, &extra)
+        .await
+    {
         Ok(()) => {
-            audit_actuation(&state, &user, camera_id, &link, action, "ok").await;
+            audit_actuation(&state, &user, camera_id, &link, action, body.value, "ok").await;
             Ok(Json(json!({ "ok": true })))
         }
         Err(e) => {
-            audit_actuation(&state, &user, camera_id, &link, action, "ha call failed").await;
+            audit_actuation(
+                &state,
+                &user,
+                camera_id,
+                &link,
+                action,
+                body.value,
+                "ha call failed",
+            )
+            .await;
             // BadGateway logs the detail and returns a generic message to the
             // client (see error.rs); the detail carries only a status code.
             Err(ApiError::BadGateway(format!(
@@ -1136,6 +1395,7 @@ fn project_states(
             if !wanted.contains(eid) {
                 return None;
             }
+            let attrs = v.get("attributes");
             Some(HaEntityState {
                 entity_id: eid.to_owned(),
                 state: v
@@ -1147,11 +1407,11 @@ fn project_states(
                     .get("last_changed")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
-                unit: v
-                    .get("attributes")
+                unit: attrs
                     .and_then(|a| a.get("unit_of_measurement"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
+                control: control_descriptor(domain_of(eid), attrs),
             })
         })
         .collect()
@@ -1352,7 +1612,7 @@ mod tests {
         // No dot ⇒ no domain ⇒ matches no allowlist row.
         assert_eq!(domain_of("garage"), "");
         assert_eq!(domain_of(""), "");
-        assert!(allowed_service(domain_of("garage"), "turn_on").is_none());
+        assert!(allowed_spec(domain_of("garage"), "turn_on").is_none());
     }
 
     #[test]
@@ -1373,15 +1633,38 @@ mod tests {
         ];
         for (domain, actions) in allowed {
             for action in *actions {
+                let spec = allowed_spec(domain, action)
+                    .unwrap_or_else(|| panic!("{domain}.{action} must be allowlisted"));
                 assert_eq!(
-                    allowed_service(domain, action),
-                    Some(*action),
-                    "{domain}.{action} must be allowed and map 1:1 to its service"
+                    spec.service, *action,
+                    "{domain}.{action} must map 1:1 to its service (discrete action)"
+                );
+                assert!(
+                    spec.value.is_none(),
+                    "{domain}.{action} is a discrete action, not a value action"
                 );
             }
         }
-        // ...and the allowlist contains nothing beyond that set.
-        let expected: usize = allowed.iter().map(|(_, a)| a.len()).sum();
+
+        // The value actions (#442, Slice 1): action word != service, percent kind.
+        let value_words: &[(&str, &str, &str, &str)] = &[
+            ("light", "set_brightness", "turn_on", "brightness_pct"),
+            ("cover", "set_position", "set_cover_position", "position"),
+            ("fan", "set_speed", "set_percentage", "percentage"),
+        ];
+        for (domain, action, service, param) in value_words {
+            let spec = allowed_spec(domain, action)
+                .unwrap_or_else(|| panic!("{domain}.{action} must be allowlisted"));
+            assert_eq!(spec.service, *service, "{domain}.{action} rides {service}");
+            match &spec.value {
+                Some(ValueKind::Percent { param: p }) => assert_eq!(p, param),
+                None => panic!("{domain}.{action} must be a value action"),
+            }
+        }
+
+        // ...and the allowlist contains nothing beyond the discrete + value sets.
+        let expected: usize =
+            allowed.iter().map(|(_, a)| a.len()).sum::<usize>() + value_words.len();
         let actual: usize = HA_ACTION_ALLOWLIST.iter().map(|(_, a)| a.len()).sum();
         assert_eq!(actual, expected, "allowlist grew or shrank unexpectedly");
     }
@@ -1389,33 +1672,203 @@ mod tests {
     #[test]
     fn allowlist_rejects_wrong_domain_unknown_and_garbage_actions() {
         // Right action word, wrong domain.
-        assert_eq!(allowed_service("lock", "turn_on"), None);
-        assert_eq!(allowed_service("light", "unlock"), None);
-        assert_eq!(allowed_service("cover", "toggle"), None);
-        assert_eq!(allowed_service("scene", "turn_off"), None);
-        assert_eq!(allowed_service("button", "turn_on"), None);
-        assert_eq!(allowed_service("script", "toggle"), None);
-        assert_eq!(allowed_service("lock", "open_cover"), None);
+        assert!(allowed_spec("lock", "turn_on").is_none());
+        assert!(allowed_spec("light", "unlock").is_none());
+        assert!(allowed_spec("cover", "toggle").is_none());
+        assert!(allowed_spec("scene", "turn_off").is_none());
+        assert!(allowed_spec("button", "turn_on").is_none());
+        assert!(allowed_spec("script", "toggle").is_none());
+        assert!(allowed_spec("lock", "open_cover").is_none());
 
         // Unknown domains, including HA domains Crumb deliberately won't drive.
-        assert_eq!(allowed_service("climate", "set_temperature"), None);
-        assert_eq!(allowed_service("alarm_control_panel", "alarm_disarm"), None);
-        assert_eq!(allowed_service("homeassistant", "turn_on"), None);
-        assert_eq!(allowed_service("shell_command", "turn_on"), None);
-        assert_eq!(allowed_service("", "turn_on"), None);
+        assert!(allowed_spec("climate", "set_temperature").is_none());
+        assert!(allowed_spec("alarm_control_panel", "alarm_disarm").is_none());
+        assert!(allowed_spec("homeassistant", "turn_on").is_none());
+        assert!(allowed_spec("shell_command", "turn_on").is_none());
+        assert!(allowed_spec("", "turn_on").is_none());
 
         // Unknown / garbage actions.
-        assert_eq!(allowed_service("light", "explode"), None);
-        assert_eq!(allowed_service("light", ""), None);
-        assert_eq!(allowed_service("light", "TURN_ON"), None); // case-sensitive
-        assert_eq!(allowed_service("light", "turn_on "), None); // handler trims
-        assert_eq!(allowed_service("light", "turn_on;reboot"), None);
+        assert!(allowed_spec("light", "explode").is_none());
+        assert!(allowed_spec("light", "").is_none());
+        assert!(allowed_spec("light", "TURN_ON").is_none()); // case-sensitive
+        assert!(allowed_spec("light", "turn_on ").is_none()); // handler trims
+        assert!(allowed_spec("light", "turn_on;reboot").is_none());
+        assert!(allowed_spec("light", "../../homeassistant/restart").is_none());
+        assert!(allowed_spec("light", "turn_on/../restart").is_none());
+        assert!(allowed_spec("light/../x", "turn_on").is_none());
+    }
+
+    // ─── value actions (#442, Slice 1) ──────────────────────────────────────
+
+    #[test]
+    fn value_action_spec_lookup() {
+        // The three value words resolve to their ride-along service + percent kind.
+        for (domain, action, service, param) in [
+            ("light", "set_brightness", "turn_on", "brightness_pct"),
+            ("cover", "set_position", "set_cover_position", "position"),
+            ("fan", "set_speed", "set_percentage", "percentage"),
+        ] {
+            let spec = allowed_spec(domain, action).expect("value word allowlisted");
+            assert_eq!(spec.service, service);
+            match &spec.value {
+                Some(ValueKind::Percent { param: p }) => assert_eq!(*p, param),
+                None => panic!("{domain}.{action} must be a value action"),
+            }
+        }
+        // Climate is Slice 2: still not allowlisted in this slice.
+        assert!(allowed_spec("climate", "set_temperature").is_none());
+        // A value word on the wrong domain does not resolve.
+        assert!(allowed_spec("switch", "set_brightness").is_none());
+        assert!(allowed_spec("light", "set_position").is_none());
+    }
+
+    #[test]
+    fn validate_value_enforces_arity_range_and_rounding() {
+        let discrete = allowed_spec("light", "turn_on").unwrap();
+        let percent = allowed_spec("light", "set_brightness").unwrap();
+
+        // Discrete action: no value ⇒ ok with empty extras; a value ⇒ 400.
+        assert_eq!(validate_value(discrete, None).unwrap(), vec![]);
+        assert!(validate_value(discrete, Some(50.0)).is_err());
+
+        // Value action: absent value ⇒ 400.
+        assert!(validate_value(percent, None).is_err());
+
+        // Out of range (either side) and non-finite ⇒ 400.
+        assert!(validate_value(percent, Some(-1.0)).is_err());
+        assert!(validate_value(percent, Some(100.1)).is_err());
+        assert!(validate_value(percent, Some(f64::NAN)).is_err());
+        assert!(validate_value(percent, Some(f64::INFINITY)).is_err());
+
+        // Boundaries 0 and 100 are ok and map to their integer param values.
         assert_eq!(
-            allowed_service("light", "../../homeassistant/restart"),
-            None
+            validate_value(percent, Some(0.0)).unwrap(),
+            vec![("brightness_pct", serde_json::json!(0))]
         );
-        assert_eq!(allowed_service("light", "turn_on/../restart"), None);
-        assert_eq!(allowed_service("light/../x", "turn_on"), None);
+        assert_eq!(
+            validate_value(percent, Some(100.0)).unwrap(),
+            vec![("brightness_pct", serde_json::json!(100))]
+        );
+        // Rounds to the nearest integer and sends a JSON integer.
+        let extra = validate_value(percent, Some(61.6)).unwrap();
+        assert_eq!(extra, vec![("brightness_pct", serde_json::json!(62))]);
+        assert!(extra[0].1.is_i64() || extra[0].1.is_u64());
+
+        // The param name follows the entity's domain, not the action word.
+        assert_eq!(
+            validate_value(allowed_spec("cover", "set_position").unwrap(), Some(40.4)).unwrap(),
+            vec![("position", serde_json::json!(40))]
+        );
+        assert_eq!(
+            validate_value(allowed_spec("fan", "set_speed").unwrap(), Some(66.7)).unwrap(),
+            vec![("percentage", serde_json::json!(67))]
+        );
+    }
+
+    #[test]
+    fn action_request_parses_optional_value() {
+        // Omitted ⇒ None (discrete actions), present ⇒ carried through.
+        let no_value: HaActionRequest = serde_json::from_value(json!({
+            "link_id": "11111111-1111-1111-1111-111111111111", "action": "toggle"
+        }))
+        .unwrap();
+        assert_eq!(no_value.value, None);
+        let with_value: HaActionRequest = serde_json::from_value(json!({
+            "link_id": "11111111-1111-1111-1111-111111111111",
+            "action": "set_brightness", "value": 62
+        }))
+        .unwrap();
+        assert_eq!(with_value.value, Some(62.0));
+        // A non-number value is a parse failure (400), never silently coerced.
+        assert!(serde_json::from_value::<HaActionRequest>(json!({
+            "link_id": "11111111-1111-1111-1111-111111111111",
+            "action": "set_brightness", "value": "62"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn control_descriptor_projection_per_domain() {
+        // Dimmable light: brightness 191/255 ⇒ round(74.9) = 75, percent kind.
+        let d = control_descriptor("light", Some(&json!({"brightness": 191}))).expect("dimmable");
+        assert_eq!(d.action, "set_brightness");
+        assert_eq!(d.kind, "percent");
+        assert_eq!(d.value, json!(75));
+        assert_eq!(d.min, json!(0));
+        assert_eq!(d.max, json!(100));
+        assert_eq!(d.step, json!(1));
+        assert!(d.unit.is_none());
+
+        // Non-dimmable light (no brightness attr, or no attrs) ⇒ no descriptor.
+        assert!(control_descriptor("light", Some(&json!({"friendly_name": "Porch"}))).is_none());
+        assert!(control_descriptor("light", None).is_none());
+
+        // Cover reports current_position verbatim.
+        let c =
+            control_descriptor("cover", Some(&json!({"current_position": 40}))).expect("position");
+        assert_eq!(c.action, "set_position");
+        assert_eq!(c.value, json!(40));
+        assert!(control_descriptor("cover", Some(&json!({"state": "open"}))).is_none());
+
+        // Fan: percentage + step from ceil(percentage_step), min 1.
+        let f = control_descriptor(
+            "fan",
+            Some(&json!({"percentage": 66, "percentage_step": 33.3333})),
+        )
+        .expect("fan");
+        assert_eq!(f.action, "set_speed");
+        assert_eq!(f.value, json!(66));
+        assert_eq!(f.step, json!(34)); // ceil(33.3333)
+                                       // Missing percentage_step ⇒ step defaults to 1.
+        let f2 = control_descriptor("fan", Some(&json!({"percentage": 50}))).expect("fan");
+        assert_eq!(f2.step, json!(1));
+        assert!(control_descriptor("fan", Some(&json!({"state": "on"}))).is_none());
+
+        // A non-controllable domain never gets a descriptor.
+        assert!(control_descriptor("switch", Some(&json!({"brightness": 100}))).is_none());
+        assert!(control_descriptor("sensor", Some(&json!({"state": "72"}))).is_none());
+    }
+
+    #[test]
+    fn project_states_includes_control_only_for_settable_entities() {
+        let states = json!([
+            {"entity_id": "light.dimmable", "state": "on", "attributes": {"brightness": 255}},
+            {"entity_id": "light.plain", "state": "on", "attributes": {}},
+            {"entity_id": "switch.plug", "state": "on", "attributes": {}}
+        ]);
+        let arr = states.as_array().unwrap();
+        let wanted: std::collections::HashSet<&str> =
+            ["light.dimmable", "light.plain", "switch.plug"]
+                .into_iter()
+                .collect();
+        let out = project_states(arr, &wanted);
+        let v = serde_json::to_value(&out).unwrap();
+
+        // The dimmable light carries a control descriptor (100% at brightness 255).
+        let dimmable = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["entity_id"] == "light.dimmable")
+            .unwrap();
+        assert_eq!(dimmable["control"]["action"], "set_brightness");
+        assert_eq!(dimmable["control"]["value"], 100);
+        // A non-dimmable light and a switch omit the field entirely (skip-if-none),
+        // so an old client sees exactly today's payload.
+        let plain = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["entity_id"] == "light.plain")
+            .unwrap();
+        assert!(plain.get("control").is_none());
+        let plug = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["entity_id"] == "switch.plug")
+            .unwrap();
+        assert!(plug.get("control").is_none());
     }
 
     #[test]

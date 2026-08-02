@@ -188,8 +188,10 @@ What each domain supports, in plain terms:
 
 | Entity type | Actions |
 |---|---|
-| Lights, switches, fans, sirens | Turn on, turn off, toggle |
-| Covers (garage doors, blinds, shades) | Open, close, stop |
+| Lights | Turn on, turn off, toggle, set brightness |
+| Switches, sirens | Turn on, turn off, toggle |
+| Fans | Turn on, turn off, toggle, set speed |
+| Covers (garage doors, blinds, shades) | Open, close, stop, set position |
 | Locks | Lock, unlock |
 | Buttons | Press |
 | Scenes, scripts | Run |
@@ -200,6 +202,16 @@ Crumb only ever calls a fixed HA service matching the action word for a link
 you authored; a client can never send an arbitrary HA domain, service, or
 entity id, only a link id plus an action word the server looks up against the
 domain it derived from that link's own stored entity.
+
+**Value controls (brightness, position, speed).** A dimmable light, a cover that
+reports its position, and a fan with a speed all get a **slider** on the camera
+view, not just an on/off tap. Drag it and Crumb sets the level directly, for
+example a hallway light to 40 percent or a shade halfway down. The value is a
+plain percentage from 0 to 100 that Crumb checks before it ever reaches Home
+Assistant. A light that is not dimmable, or a cover that does not report a
+position, simply shows no slider. If you restrict which actions a control allows
+(above), "set brightness", "set position", and "set speed" are ordinary entries
+in that list, so you can offer the slider on some controls and not others.
 
 ## Controlling actuators from live video
 

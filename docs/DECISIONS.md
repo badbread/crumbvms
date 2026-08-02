@@ -8,6 +8,71 @@ revisit.
 
 ---
 
+## 2026-08-01, Home Assistant value controls (brightness / position / speed) carry one optional server-validated number, discovered via a states `control` descriptor
+
+**Context.** The action model above shipped on/off/toggle/press control. The
+obvious next step (#442) is value-setting: dim a light, set a cover to 40 percent,
+pick a fan speed, from the same camera view. That means an action needs to carry
+a number, and a client needs to know an entity is settable (and its current
+value) to draw a slider. This is Slice 1: the three already-trusted percent
+domains only (`light.set_brightness`, `cover.set_position`, `fan.set_speed`).
+Climate `set_temperature` is Slice 2, deliberately out of scope here so the
+non-percent path lands separately.
+
+**Decision.** `POST /cameras/:id/ha/action` gains one optional `value: f64`. The
+per-domain allowlist becomes a structured spec table (`HaActionSpec { action,
+service, value: Option<ValueKind> }`); every existing discrete row migrates in
+with `value: None`, and the three value rows carry `Some(ValueKind::Percent {
+param })`. The action word is no longer equal to the HA service (`set_brightness`
+rides `turn_on` with `brightness_pct`; `set_position` rides
+`set_cover_position`; `set_speed` rides `set_percentage`) — that invariant is
+retired, and `service` plus every value `param` stay `&'static` from the table so
+nothing client-controlled reaches the URL or the service-data keys. A new
+`validate_value` step runs AFTER the allowlist and `allowed_actions` checks and
+BEFORE HA is contacted: a value on a discrete action, or a missing value on a
+value action, is a 400; a percent value must be finite and in a HARDCODED
+`0..=100` (so a cold attribute cache can never block a control), then it is
+rounded to the nearest integer and sent as a JSON integer. Out-of-range is
+audited as a rejection like any other. `allowed_actions = null` still means every
+domain action INCLUDING the value words (uniform with on/off); a non-null list
+must name the value word explicitly.
+
+Client capability discovery is an OPTIONAL `control` descriptor on each
+`GET /ha/states` entry, projected from attributes ALREADY in the cached raw
+snapshot (no extra HA round-trip): `{action, kind:"percent", value, min, max,
+step, unit}`, present iff the entity currently exposes a settable value
+(`brightness` for a light, `current_position` for a cover, `percentage` for a
+fan). Absent descriptor ⇒ the client shows no slider; an old client ignores the
+field. The descriptor is kind-agnostic (min/max/step/unit) so Slice 2 temperature
+reuses it unchanged. `audit_actuation` records the parsed number (never the raw
+client string).
+
+**Rejected:**
+- **Overloading `turn_on` to also mean "set brightness".** Ambiguous on the wire
+  and impossible to gate distinctly in `allowed_actions`; a distinct
+  `set_brightness` word that happens to ride `turn_on` server-side keeps the
+  vocabulary explicit while reusing HA's actual service.
+- **A separate "value capability" or endpoint.** The value path is the same
+  privileged actuation surface with one more validated field; a second endpoint
+  or capability would duplicate every RBAC gate for no security gain.
+- **Persisting value ranges in Postgres.** Percent is hardcoded `0..=100`;
+  richer ranges (temperature) live on the HA entity and reach the client through
+  the `control` descriptor. No migration is needed: `allowed_actions text[]`
+  already stores arbitrary vocabulary and range metadata lives on the entity.
+- **Per-link value clamps in v1** (e.g. "this dimmer maxes at 60 percent"). Real,
+  but it is a new authoring surface; deferred until asked for. `allowed_actions`
+  already gates WHETHER the value word is offered at all.
+
+**Revisit triggers (any one):**
+- A non-percent, non-temperature value kind is needed (a raw 0..255, a named
+  enum): add a `ValueKind` variant + one `validate_value` arm + one descriptor
+  arm, and reconsider whether the range still belongs hardcoded in Crumb.
+- Demand for per-link value clamps: split a clamp field from the link config the
+  way `allowed_actions` was split from the domain allowlist.
+- Slider drag generating a call storm inflates the `ha_actuation` audit volume:
+  add client-side debounce or a commit-on-release contract before rate-limiting
+  server-side.
+
 ## 2026-08-01, Home Assistant control is a strict per-domain action allowlist addressed by `link_id`, gated on a new default-off `actuators` capability
 
 **Context.** The HA integration has been read-only since Phase 1 (config
