@@ -67,6 +67,25 @@ enum HA {
         }
     }
 
+    /// Human "Type" label for the detail card: the humanized `device_class` when
+    /// present, else the humanized entity domain — NEVER blank. Mirrors the
+    /// Android `haTypeLabel(domain, deviceClass)` and the desktop card exactly, so
+    /// a light with no device_class reads "Light", a cover with `garage_door`
+    /// reads "Garage door", `carbon_monoxide` reads "Carbon monoxide".
+    static func typeLabel(domain: String, deviceClass: String?) -> String {
+        let raw = (deviceClass?.isEmpty == false) ? deviceClass! : domain
+        return humanizeToken(raw)
+    }
+
+    /// underscores → spaces, and capitalize ONLY the first letter (interior words
+    /// untouched): `garage_door` → "Garage door". Not `.capitalized`, which would
+    /// title-case every word ("Garage Door").
+    private static func humanizeToken(_ token: String) -> String {
+        let spaced = token.replacingOccurrences(of: "_", with: " ")
+        guard let first = spaced.first else { return spaced }
+        return first.uppercased() + spaced.dropFirst()
+    }
+
     /// Relative age of a last-changed RFC3339 timestamp.
     static func relativeAgo(_ lastChanged: String?) -> String? {
         guard let s = lastChanged, let date = parseISO8601(s) else { return nil }
@@ -742,11 +761,10 @@ struct HAStateCard: View {
                     Text(errorText).font(.caption).foregroundColor(CrumbColors.error)
                         .multilineTextAlignment(.center)
                 }
-                if let dc = link.deviceClass, !dc.isEmpty {
-                    // Humanize the device-class token for display (`garage_door` →
-                    // `garage door`), matching the Android detail card's row.
-                    detailRow("Device class", dc.replacingOccurrences(of: "_", with: " "))
-                }
+                // Single "Type" row: humanized device_class when present, else the
+                // humanized domain (never blank), matching the Android
+                // `haTypeLabel` and the desktop card.
+                detailRow("Type", HA.typeLabel(domain: link.domain, deviceClass: link.deviceClass))
                 detailRow("Entity", link.entityId)
                 if stale {
                     Label("Stale — Home Assistant connection may be down",

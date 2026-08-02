@@ -63,4 +63,26 @@ final class HaBadgeVisualTests: XCTestCase {
         XCTAssertEqual(v.color, HA.grey)
         XCTAssertTrue(v.indeterminate)
     }
+
+    // MARK: - "Type" row label (parity with Android haTypeLabel)
+
+    /// device_class present ⇒ humanized device_class, first letter only.
+    func testTypeUsesHumanizedDeviceClass() {
+        XCTAssertEqual(HA.typeLabel(domain: "cover", deviceClass: "garage_door"), "Garage door")
+        XCTAssertEqual(HA.typeLabel(domain: "sensor", deviceClass: "carbon_monoxide"), "Carbon monoxide")
+    }
+
+    /// device_class absent/empty ⇒ humanized domain, never blank.
+    func testTypeFallsBackToDomainWhenDeviceClassMissing() {
+        XCTAssertEqual(HA.typeLabel(domain: "light", deviceClass: nil), "Light")
+        XCTAssertEqual(HA.typeLabel(domain: "light", deviceClass: ""), "Light")
+        XCTAssertEqual(HA.typeLabel(domain: "media_player", deviceClass: nil), "Media player")
+    }
+
+    /// Only the first letter is capitalized — interior words untouched (not
+    /// `.capitalized`, which would title-case every word).
+    func testTypeCapitalizesFirstLetterOnly() {
+        XCTAssertEqual(HA.typeLabel(domain: "binary_sensor", deviceClass: "garage_door"), "Garage door")
+        XCTAssertNotEqual(HA.typeLabel(domain: "cover", deviceClass: "garage_door"), "Garage Door")
+    }
 }
