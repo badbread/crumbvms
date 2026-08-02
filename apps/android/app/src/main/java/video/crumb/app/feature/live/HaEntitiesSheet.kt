@@ -255,15 +255,35 @@ internal fun HaMoreInfoDialog(
                 .padding(horizontal = 20.dp, vertical = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // An entity that is ON/active reads as a boldly filled colored disc with
+            // a dark glyph cut out of it (HA's "lit" look), so on-vs-off is
+            // unmistakable at icon size — a warm-yellow bulb on a faint 16% disc was
+            // too weak to read as lit. Off/unknown keep the faint tinted disc +
+            // state-colored glyph. The on/off signal is the canonical `v.active`
+            // from `badgeVisual` (no forked color logic).
+            val activeOn = v.active == true
             Box(
-                modifier = Modifier.size(76.dp).clip(CircleShape).background(v.color.copy(alpha = 0.16f)),
+                modifier = Modifier
+                    .size(76.dp)
+                    .clip(CircleShape)
+                    .background(v.color.copy(alpha = if (activeOn) 1f else 0.16f)),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(v.icon, contentDescription = null, tint = v.color, modifier = Modifier.size(40.dp))
+                Icon(
+                    v.icon,
+                    contentDescription = null,
+                    tint = if (activeOn) HaBg else v.color,
+                    modifier = Modifier.size(40.dp),
+                )
             }
             Spacer(Modifier.height(12.dp))
             Text(link.displayName, color = HaPrimaryText, fontSize = 19.sp, fontWeight = FontWeight.Medium)
-            Text(haStateDisplay(v, state, unit), color = v.color, fontSize = 15.sp)
+            Text(
+                haStateDisplay(v, state, unit),
+                color = v.color,
+                fontSize = 15.sp,
+                fontWeight = if (activeOn) FontWeight.SemiBold else FontWeight.Normal,
+            )
             changedAgo(lastChanged)?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(it, color = HaSecondaryText, fontSize = 12.5.sp)

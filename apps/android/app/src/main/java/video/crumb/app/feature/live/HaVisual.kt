@@ -102,8 +102,21 @@ internal val BadgeGreen = Color(0xFF2BA84A) // switch on
 internal val BadgeWarmYellow = Color(0xFFFFCC33) // light on
 internal val BadgeDanger = Color(0xFFE5484D) // smoke/gas alarm active — attention red
 
-/** Resolved look for one entity: state color, glyph, and a friendly state label. */
-internal data class BadgeVisual(val color: Color, val icon: ImageVector, val label: String)
+/**
+ * Resolved look for one entity: state color, glyph, and a friendly state label,
+ * plus [active] — the tri-state on/off derived once here (true = on/open/motion,
+ * false = off/closed/clear, null = unknown/stale/scene) so every surface can
+ * style "on vs off" from the SAME signal instead of re-deriving it or guessing
+ * from the color. The more-info dialog uses it to fill the icon disc boldly when
+ * an actuator is on (issue: popup icon didn't read as lit); the badge/tile ignore
+ * it and keep today's look.
+ */
+internal data class BadgeVisual(
+    val color: Color,
+    val icon: ImageVector,
+    val label: String,
+    val active: Boolean? = null,
+)
 
 /**
  * HA `state` -> on / off / indeterminate, mirroring desktop `edgeOn` (and the
@@ -256,33 +269,34 @@ private fun defaultVisual(
     state: String?,
     stale: Boolean,
 ): BadgeVisual {
-    if (domain == "scene") return BadgeVisual(BadgeNeutral, Icons.Filled.MovieFilter, "Scene")
+    if (domain == "scene") return BadgeVisual(BadgeNeutral, Icons.Filled.MovieFilter, "Scene", active = null)
     val on = if (state == null || stale) null else edgeOn(state)
     if (on == null) {
-        return BadgeVisual(BadgeGrey.copy(alpha = 0.6f), defaultIcon(domain, deviceClass), state ?: "Unknown")
+        return BadgeVisual(BadgeGrey.copy(alpha = 0.6f), defaultIcon(domain, deviceClass), state ?: "Unknown", active = null)
     }
     if (domain == "light") {
-        return BadgeVisual(if (on) BadgeWarmYellow else BadgeGrey, Icons.Filled.Lightbulb, if (on) "On" else "Off")
+        return BadgeVisual(if (on) BadgeWarmYellow else BadgeGrey, Icons.Filled.Lightbulb, if (on) "On" else "Off", active = on)
     }
     if (domain == "switch") {
         return BadgeVisual(
             if (on) BadgeGreen else BadgeGrey,
             if (on) Icons.Filled.Power else Icons.Filled.PowerOff,
             if (on) "On" else "Off",
+            active = on,
         )
     }
     return when (labelForDeviceClass(deviceClass)) {
-        "door" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.SensorDoor, if (on) "Open" else "Closed")
-        "window" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.SensorWindow, if (on) "Open" else "Closed")
-        "garage" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.Garage, if (on) "Open" else "Closed")
-        "motion" -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.DirectionsRun, if (on) "Motion" else "Clear")
-        "occupancy" -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.Person, if (on) "Occupied" else "Clear")
+        "door" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.SensorDoor, if (on) "Open" else "Closed", active = on)
+        "window" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.SensorWindow, if (on) "Open" else "Closed", active = on)
+        "garage" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.Garage, if (on) "Open" else "Closed", active = on)
+        "motion" -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.DirectionsRun, if (on) "Motion" else "Clear", active = on)
+        "occupancy" -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.Person, if (on) "Occupied" else "Clear", active = on)
         // A binary_sensor lock reads on = unsecured/unlocked, off = locked.
-        "lock" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, if (on) Icons.Filled.LockOpen else Icons.Filled.Lock, if (on) "Unlocked" else "Locked")
-        "smoke" -> BadgeVisual(if (on) BadgeDanger else BadgeNeutral, Icons.Filled.LocalFireDepartment, if (on) "Smoke" else "Clear")
-        "gas" -> BadgeVisual(if (on) BadgeDanger else BadgeNeutral, Icons.Filled.Co2, if (on) "Gas" else "Clear")
-        "leak" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.WaterDamage, if (on) "Leak" else "Dry")
-        else -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.Sensors, if (on) "Active" else "Clear")
+        "lock" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, if (on) Icons.Filled.LockOpen else Icons.Filled.Lock, if (on) "Unlocked" else "Locked", active = on)
+        "smoke" -> BadgeVisual(if (on) BadgeDanger else BadgeNeutral, Icons.Filled.LocalFireDepartment, if (on) "Smoke" else "Clear", active = on)
+        "gas" -> BadgeVisual(if (on) BadgeDanger else BadgeNeutral, Icons.Filled.Co2, if (on) "Gas" else "Clear", active = on)
+        "leak" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.WaterDamage, if (on) "Leak" else "Dry", active = on)
+        else -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.Sensors, if (on) "Active" else "Clear", active = on)
     }
 }
 
@@ -303,7 +317,9 @@ internal fun badgeVisual(link: HaLinkDto, state: String?, stale: Boolean): Badge
     } else {
         base.color
     }
-    return BadgeVisual(color, overrideIcon ?: base.icon, base.label)
+    // `on` here is the same tri-state `defaultVisual` used for `base.active`
+    // (both null out on unknown/stale/scene); keep them in lockstep.
+    return BadgeVisual(color, overrideIcon ?: base.icon, base.label, active = on)
 }
 
 /**
