@@ -588,12 +588,48 @@ struct HaEntityState: Decodable {
     /// decoder treats this optional as `decodeIfPresent`, so a payload from an
     /// older server that omits `unit` still decodes.
     let unit: String?
+    /// Value-control capability descriptor (issue #442 Slice 1, PR #460).
+    /// Present only when the entity currently exposes a settable value (a
+    /// dimmable light, a positionable cover, a speed-controllable fan); absent
+    /// otherwise, and absent entirely on an older server. The synthesized
+    /// decoder treats this optional as `decodeIfPresent`, so it decodes to nil
+    /// rather than failing when the key is missing — that absence is exactly
+    /// the client's cue to render no slider.
+    let control: HaControlDescriptor?
 
     enum CodingKeys: String, CodingKey {
-        case state, unit
+        case state, unit, control
         case entityId = "entity_id"
         case lastChanged = "last_changed"
     }
+}
+
+/// A value-setting control capability on an `HaEntityState` (issue #442 Slice
+/// 1, PR #460). Mirrors the server's `ControlDescriptor`: kept KIND-AGNOSTIC
+/// (`min`/`max`/`step`/`unit` rather than a hardcoded 0...100) so a future
+/// value kind (Slice 2's climate `set_temperature`) reuses this shape and the
+/// `HAValueSlider` view unchanged — only `kind`/`unit` would differ.
+///
+/// Every numeric field decodes via `decodeIfPresent` (the synthesized
+/// decoder's default for an Optional), so a leaner payload degrades to sane
+/// percent defaults at the call site rather than failing to decode the whole
+/// entity state.
+struct HaControlDescriptor: Decodable {
+    /// The value action word to send back on `POST /cameras/:id/ha/action`
+    /// (`set_brightness`, `set_position`, `set_speed`, ...).
+    let action: String
+    /// The value kind. `"percent"` for every Slice 1 word; a future kind (e.g.
+    /// `"temperature"`) would pair with a non-nil `unit`.
+    let kind: String
+    /// Current value in the descriptor's own units, or nil if HA hasn't
+    /// reported one yet.
+    let value: Double?
+    let min: Double?
+    let max: Double?
+    let step: Double?
+    /// Unit label for a non-percent kind; nil for percent (the client renders
+    /// a bare "%" for that case instead).
+    let unit: String?
 }
 
 /// `GET /ha/states` response. `stale` ⇒ HA was unreachable and this is the
@@ -620,12 +656,27 @@ struct HaStatesResponse: Decodable {
 struct HaActionRequest: Encodable {
     let linkId: String
     /// One of the server's per-domain allow-list: `turn_on`/`turn_off`/`toggle`,
-    /// `open_cover`/`close_cover`/`stop_cover`, `lock`/`unlock`, `press`.
+    /// `open_cover`/`close_cover`/`stop_cover`, `lock`/`unlock`, `press`, or a
+    /// value word (`set_brightness`/`set_position`/`set_speed`, issue #442
+    /// Slice 1) paired with `value`.
     let action: String
+    /// The single numeric value a value action carries (0...100 for every
+    /// Slice 1 word; the server rounds and validates the range). Nil for a
+    /// discrete action. The synthesized encoder treats an Optional as
+    /// `encodeIfPresent`, so the key is omitted entirely rather than sent as
+    /// `null` — required, since the server 400s a discrete action that
+    /// carries a `value` key at all.
+    let value: Double?
 
     enum CodingKeys: String, CodingKey {
-        case action
+        case action, value
         case linkId = "link_id"
+    }
+
+    init(linkId: String, action: String, value: Double? = nil) {
+        self.linkId = linkId
+        self.action = action
+        self.value = value
     }
 }
 
