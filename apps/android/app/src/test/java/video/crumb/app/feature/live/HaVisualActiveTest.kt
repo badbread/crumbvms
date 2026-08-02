@@ -12,11 +12,12 @@ import video.crumb.app.data.HaLinkDto
 
 /**
  * The tri-state [BadgeVisual.active] the canonical [badgeVisual] mapping derives
- * once (on / off / unknown), and which the more-info dialog uses to fill the icon
- * disc boldly for an ON actuator (the "popup icon didn't read as lit" polish).
- * Locks that on-vs-off is honestly signalled and that an ON light really carries
- * the warm-yellow accent — no forked color logic, no reliance on the color to
- * infer state.
+ * once (on / off / unknown), plus the state color the more-info dialog tints its
+ * icon glyph with — the same near-black-chip + full-strength-color-glyph look as
+ * the on-video badge (the "popup didn't match the badge" polish, #437). Locks that
+ * on-vs-off is honestly signalled and that an ON light really carries the
+ * warm-yellow accent the popup glyph shows — no forked color logic, no reliance on
+ * the color to infer state.
  */
 class HaVisualActiveTest {
 

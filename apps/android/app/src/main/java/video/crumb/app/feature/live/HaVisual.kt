@@ -101,6 +101,7 @@ internal val BadgeBlue = Color(0xFF33C3FF) // motion / occupancy active
 internal val BadgeGreen = Color(0xFF2BA84A) // switch on
 internal val BadgeWarmYellow = Color(0xFFFFCC33) // light on
 internal val BadgeDanger = Color(0xFFE5484D) // smoke/gas alarm active — attention red
+internal val BadgeDefaultBg = Color(0xFF17171B) // near-black opaque chip behind the glyph
 
 /**
  * Resolved look for one entity: state color, glyph, and a friendly state label,

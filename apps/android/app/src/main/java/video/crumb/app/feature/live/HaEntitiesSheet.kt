@@ -255,24 +255,27 @@ internal fun HaMoreInfoDialog(
                 .padding(horizontal = 20.dp, vertical = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // An entity that is ON/active reads as a boldly filled colored disc with
-            // a dark glyph cut out of it (HA's "lit" look), so on-vs-off is
-            // unmistakable at icon size — a warm-yellow bulb on a faint 16% disc was
-            // too weak to read as lit. Off/unknown keep the faint tinted disc +
-            // state-colored glyph. The on/off signal is the canonical `v.active`
-            // from `badgeVisual` (no forked color logic).
+            // The icon reads EXACTLY like the entity's on-video badge (#437): the
+            // full-strength state color as the glyph on the same near-black chip the
+            // badge uses ([BadgeDefaultBg]). So a lit light is unmistakably warm-yellow
+            // (not the washed 16% tint that read grey/white), and on-vs-off is carried
+            // by the color itself — warm-yellow vs grey, green vs grey, amber vs
+            // neutral — the same signal the badge and the desktop/iOS detail popups
+            // use. No forked palette, no inverted filled-disc/cut-out treatment that
+            // diverged from the badge. `v.active` (the canonical tri-state) only adds a
+            // little extra weight to the state text below when the entity is on.
             val activeOn = v.active == true
             Box(
                 modifier = Modifier
                     .size(76.dp)
                     .clip(CircleShape)
-                    .background(v.color.copy(alpha = if (activeOn) 1f else 0.16f)),
+                    .background(BadgeDefaultBg),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     v.icon,
                     contentDescription = null,
-                    tint = if (activeOn) HaBg else v.color,
+                    tint = v.color,
                     modifier = Modifier.size(40.dp),
                 )
             }
