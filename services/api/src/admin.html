@@ -5197,8 +5197,49 @@ let HA_ENT_CACHE = {};    // domain -> [{entity_id, friendly_name, device_class}
 let HA_PICKER = null;         // which picker is open: 'motion' | 'actuator' | null
 let HA_PICKER_SEARCH = '';
 let HA_PICKER_SHOWALL = false;
+let HA_STYLE_OPEN = null;     // index of the HA_LINKS row whose icon/style editor is expanded
+let HA_CTRL_OPEN = null;      // index of the HA_LINKS row whose control-config editor is expanded
 // device_classes worth linking to a camera; the rest hide under "Other sensors".
 const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
+
+/* The ONE canonical closed vocabulary of on-video badge icon slugs (issue
+   #438/#439, epic #445). Source of truth: `CANONICAL_ICON_SLUGS` in
+   services/api/src/ha.rs — the placement endpoint 400s on any slug not in
+   that list, so keep this array in exact lockstep (same members; order is
+   not significant) or a save here will fail server-side validation. */
+const HA_ICON_SLUGS = [
+  'door','window','gate','garage','cover','blinds','curtains','shade','lock','key',
+  'motion','occupancy','person','pet','vibration',
+  'lightbulb','floodlight','outdoor_light',
+  'switch','power','plug','outlet','energy','meter','battery','solar','ev',
+  'fan','ac','heatpump','hvac','thermostat','temperature','humidity','sun',
+  'smoke','gas','co','fire','leak','water','valve','siren','security','armed','warning','doorbell','bell',
+  'camera','tv','speaker',
+  'wifi','router',
+  'vehicle','package','mail',
+  'vacuum','lawn','fridge','laundry','pool','hottub',
+  'clock',
+  'scene','script','button',
+  'sensor',
+];
+
+/* Domain -> allowed action words for the "Control" role's control-config
+   editor (issue #440/#439). Source of truth: `HA_ACTION_ALLOWLIST` in
+   services/api/src/ha.rs — `PUT .../ha/links` 400s if `allowed_actions`
+   contains anything outside the entity's own domain here, so keep this
+   object in exact lockstep (same domains, same action words). */
+const HA_ACTION_ALLOWLIST_BY_DOMAIN = {
+  light: ['turn_on', 'turn_off', 'toggle'],
+  switch: ['turn_on', 'turn_off', 'toggle'],
+  fan: ['turn_on', 'turn_off', 'toggle'],
+  siren: ['turn_on', 'turn_off', 'toggle'],
+  cover: ['open_cover', 'close_cover', 'stop_cover'],
+  lock: ['lock', 'unlock'],
+  button: ['press'],
+  input_button: ['press'],
+  scene: ['turn_on'],
+  script: ['turn_on'],
+};
 
 /* ── Per-camera LPR zone editor (modal, opened from the LPR section's camera
    table — see loadLprCamTable). A canvas polygon editor over the camera
@@ -5494,6 +5535,36 @@ async function saveLprZones() {
   } catch (e) { setMsg('lz-msg', (e && e.message) || 'Save failed', 'err'); }
 }
 
+/* Map a server HaLinkDto (GET/PUT .../ha/links, PUT .../placement) onto the
+   console's working-set shape. Carries EVERY field the two write endpoints
+   can persist (role/entity/device_class/label/sort_order/require_confirm/
+   allowed_actions + all overlay_* placement/style fields) so a save from
+   either editor round-trips what the other one owns instead of wiping it
+   (see AGENTS.md config-precedence rule + issue #439). */
+function haMapLinkFromServer(l) {
+  return {
+    id: l.id,
+    entity_id: l.entity_id,
+    role: l.role,
+    device_class: l.device_class,
+    label: l.label,
+    sort_order: l.sort_order,
+    require_confirm: !!l.require_confirm,
+    allowed_actions: Array.isArray(l.allowed_actions) ? l.allowed_actions.slice() : null,
+    overlay_x: l.overlay_x ?? null,
+    overlay_y: l.overlay_y ?? null,
+    overlay_size: l.overlay_size ?? null,
+    overlay_color: l.overlay_color ?? null,
+    overlay_icon: l.overlay_icon ?? null,
+    overlay_show_state: !!l.overlay_show_state,
+    overlay_show_age: !!l.overlay_show_age,
+    overlay_opacity: l.overlay_opacity ?? null,
+    overlay_shape: l.overlay_shape ?? null,
+    overlay_bg_color: l.overlay_bg_color ?? null,
+    overlay_outline: !!l.overlay_outline,
+  };
+}
+
 async function loadCameraHaLinks(camId) {
   const el = $('ce-ha'); if (!el) return;
   HA_CAM_ID = camId;
@@ -5503,8 +5574,10 @@ async function loadCameraHaLinks(camId) {
       api('/cameras/' + camId + '/ha/links'),
       api('/config/ha').catch(() => ({ enabled: false, base_url: '', has_token: false })),
     ]);
-    HA_LINKS = links.map(l => ({ entity_id: l.entity_id, role: l.role, device_class: l.device_class, label: l.label, sort_order: l.sort_order }));
+    HA_LINKS = links.map(haMapLinkFromServer);
     HA_PICKER = null;
+    HA_STYLE_OPEN = null;
+    HA_CTRL_OPEN = null;
     const configured = !!(cfg && cfg.enabled && cfg.base_url && cfg.has_token);
     renderHaLinks(configured);
   } catch (e) {
@@ -5533,14 +5606,24 @@ function renderHaLinks(configured) {
     el.innerHTML = '<div class="card-hint" style="margin:0">Configure and enable Home Assistant on the <b>Detection &amp; clips</b> page first, then link this camera\'s sensors and controls here.</div>';
     return;
   }
-  const rows = HA_LINKS.map((l, i) => `
-    <div style="display:flex;align-items:center;gap:8px;margin:6px 0;flex-wrap:wrap">
-      ${haRoleSelect(i, l.role)}
-      <input value="${esc(l.label || '')}" placeholder="${esc(l.entity_id)}" oninput="haSetLabel(${i}, this.value)" title="Display label" style="flex:1;min-width:140px;font-size:13px" />
-      <input value="${esc(l.device_class || '')}" placeholder="device class" oninput="haSetDeviceClass(${i}, this.value)" title="Home Assistant device class" style="width:120px;font-size:12px" />
-      <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
-      <button class="ghost sm" onclick="removeHaLink(${i})">Remove</button>
-    </div>`).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
+  const rows = HA_LINKS.map((l, i) => {
+    const canStyle = l.id != null;
+    const isActuator = l.role === 'actuator';
+    return `
+    <div style="border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px;margin:6px 0">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        ${haRoleSelect(i, l.role)}
+        <input value="${esc(l.label || '')}" placeholder="${esc(l.entity_id)}" oninput="haSetLabel(${i}, this.value)" title="Display label" style="flex:1;min-width:140px;font-size:13px" />
+        <input value="${esc(l.device_class || '')}" placeholder="device class" oninput="haSetDeviceClass(${i}, this.value)" title="Home Assistant device class" style="width:120px;font-size:12px" />
+        <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
+        <button class="ghost sm" onclick="haToggleStyle(${i})" ${canStyle ? '' : 'disabled'} title="${canStyle ? 'Badge icon, shape and color for this entity on the video wall' : 'Save links first to customize this entity\'s badge'}">${HA_STYLE_OPEN === i ? 'Hide style' : 'Icon &amp; style'}</button>
+        ${isActuator ? `<button class="ghost sm" onclick="haToggleCtrl(${i})" title="Confirmation + which actions this control allows">${HA_CTRL_OPEN === i ? 'Hide controls' : 'Controls'}</button>` : ''}
+        <button class="ghost sm" onclick="removeHaLink(${i})">Remove</button>
+      </div>
+      ${HA_STYLE_OPEN === i ? haStylePanel(i, l) : ''}
+      ${HA_CTRL_OPEN === i ? haCtrlPanel(i, l) : ''}
+    </div>`;
+  }).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
   el.innerHTML = `
     <div>${rows}</div>
     <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
@@ -5552,6 +5635,178 @@ function renderHaLinks(configured) {
     <div id="ce-ha-picker"></div>
     <div id="ce-ha-msg" class="form-msg"></div>`;
   if (HA_PICKER) renderHaPicker();
+}
+
+function haToggleStyle(i) {
+  if (!HA_LINKS[i] || HA_LINKS[i].id == null) return;
+  HA_STYLE_OPEN = HA_STYLE_OPEN === i ? null : i;
+  renderHaLinks(true);
+}
+function haToggleCtrl(i) {
+  if (!HA_LINKS[i]) return;
+  HA_CTRL_OPEN = HA_CTRL_OPEN === i ? null : i;
+  renderHaLinks(true);
+}
+
+/* Small badge mockup mirroring the on-video overlay's shape/color/bg/opacity
+   so an icon/style edit gets SOME immediate visual feedback without pulling
+   in a live video canvas here (issue #439 — "a clean functional editor beats
+   a fancy broken one"). Shows the icon SLUG as text: the console has no
+   glyph atlas (that lives in the three native clients), so the slug itself
+   is the honest preview. */
+function haBadgePreviewHtml(l) {
+  const shape = l.overlay_shape || 'dot';
+  const color = l.overlay_color || '#3ddc84';
+  const bg = l.overlay_bg_color || '#1a1a1a';
+  const size = l.overlay_size != null ? l.overlay_size : 1;
+  const opacity = l.overlay_opacity != null ? l.overlay_opacity : 1;
+  const icon = l.overlay_icon || 'sensor';
+  const h = Math.round(26 * Math.max(0.5, Math.min(2, size)));
+  const isPill = shape === 'pill';
+  const w = isPill ? Math.round(h * 2.6) : h;
+  return `<div style="width:${w}px;height:${h}px;border-radius:${isPill ? (h/2)+'px' : '50%'};background:${esc(bg)};border:2px solid ${esc(color)};opacity:${opacity};display:flex;align-items:center;justify-content:center;color:${esc(color)};font-size:9px;font-weight:600;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:0 4px;box-sizing:border-box" title="${esc(icon)}">${esc(icon)}</div>`;
+}
+
+function haStylePanel(i, l) {
+  const iconOpts = ['<option value="">(auto — from device class)</option>']
+    .concat(HA_ICON_SLUGS.map(s => `<option value="${s}" ${(l.overlay_icon || '') === s ? 'selected' : ''}>${s}</option>`))
+    .join('');
+  const shape = l.overlay_shape || 'dot';
+  const size = l.overlay_size != null ? l.overlay_size : 1;
+  const opacity = l.overlay_opacity != null ? l.overlay_opacity : 1;
+  const unplacedHint = l.overlay_x == null
+    ? '<div class="card-hint" style="margin:6px 0 0">Not yet positioned on the video wall — saving will pin it centered; drag it into place from a live view afterwards.</div>' : '';
+  return `
+    <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+      <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
+        <div id="ha-style-preview-${i}">${haBadgePreviewHtml(l)}</div>
+        <span style="font-size:10px;color:var(--dim2)">Preview</span>
+      </div>
+      <div class="form-grid" style="min-width:170px">
+        <label class="fg-label" style="margin-top:0">Icon</label>
+        <div class="fg-ctl"><select onchange="haStyleSet(${i}, 'overlay_icon', this.value || null)">${iconOpts}</select></div>
+        <label class="fg-label">Shape</label>
+        <div class="fg-ctl">
+          <select onchange="haStyleSet(${i}, 'overlay_shape', this.value)">
+            <option value="dot" ${shape === 'dot' ? 'selected' : ''}>Dot</option>
+            <option value="pill" ${shape === 'pill' ? 'selected' : ''}>Pill</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-grid" style="min-width:170px">
+        <label class="fg-label" style="margin-top:0">Badge color</label>
+        <div class="fg-ctl">
+          <input type="color" value="${l.overlay_color || '#3ddc84'}" oninput="haStyleSet(${i}, 'overlay_color', this.value)" style="width:44px;padding:0" />
+          <button class="ghost sm" onclick="haStyleSet(${i}, 'overlay_color', null)" title="Clear override, use the state-derived default color">Auto</button>
+        </div>
+        <label class="fg-label">Background color</label>
+        <div class="fg-ctl">
+          <input type="color" value="${l.overlay_bg_color || '#1a1a1a'}" oninput="haStyleSet(${i}, 'overlay_bg_color', this.value)" style="width:44px;padding:0" />
+          <button class="ghost sm" onclick="haStyleSet(${i}, 'overlay_bg_color', null)" title="Clear override, use the default dark background">Auto</button>
+        </div>
+      </div>
+      <div class="form-grid" style="min-width:170px">
+        <label class="fg-label" style="margin-top:0">Size (<span id="ha-size-val-${i}">${size.toFixed(2)}&times;</span>)</label>
+        <div class="fg-ctl"><input type="range" min="0.5" max="3" step="0.05" value="${size}" oninput="haStyleSet(${i}, 'overlay_size', parseFloat(this.value))" /></div>
+        <label class="fg-label">Opacity (<span id="ha-opacity-val-${i}">${Math.round(opacity * 100)}%</span>)</label>
+        <div class="fg-ctl"><input type="range" min="0.05" max="1" step="0.05" value="${opacity}" oninput="haStyleSet(${i}, 'overlay_opacity', parseFloat(this.value))" /></div>
+      </div>
+      <div style="flex:0 0 100%;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="primary sm" onclick="haSaveStyle(${i})">Save appearance</button>
+        <span id="ha-style-msg-${i}" class="form-msg" style="margin:0"></span>
+      </div>
+      ${unplacedHint}
+    </div>`;
+}
+
+/* Mutate the working set + live-update the preview/readouts WITHOUT a full
+   re-render, so a color/range control keeps focus and drag gestures stay
+   smooth (same pattern as haSetLabel/haSetDeviceClass below). Persisted by
+   haSaveStyle(). */
+function haStyleSet(i, field, value) {
+  const l = HA_LINKS[i]; if (!l) return;
+  l[field] = value;
+  if (field === 'overlay_size') { const e = $('ha-size-val-' + i); if (e) e.textContent = value.toFixed(2) + '×'; }
+  if (field === 'overlay_opacity') { const e = $('ha-opacity-val-' + i); if (e) e.textContent = Math.round(value * 100) + '%'; }
+  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l);
+}
+
+/* Persists icon/shape/color/bg_color/size/opacity via PUT .../placement.
+   Only valid once the link has a server id (issue #439 — save links first).
+   Preserves the link's existing x/y (or centers it if never placed) and its
+   show_state/show_age/outline, and deliberately OMITS `label` from the body:
+   label is authored by the text input above and saved by "Save links"
+   (PUT .../ha/links), so this call must never also write it (ha.rs:471 warns
+   the two writers can clobber each other if both send it). */
+async function haSaveStyle(i) {
+  const l = HA_LINKS[i]; if (!l || l.id == null) return;
+  const msgId = 'ha-style-msg-' + i;
+  setMsg(msgId, '');
+  const body = {
+    x: l.overlay_x != null ? l.overlay_x : 0.5,
+    y: l.overlay_y != null ? l.overlay_y : 0.5,
+    size: l.overlay_size != null ? l.overlay_size : 1,
+    color: l.overlay_color || null,
+    icon: l.overlay_icon || null,
+    show_state: !!l.overlay_show_state,
+    show_age: !!l.overlay_show_age,
+    opacity: l.overlay_opacity != null ? l.overlay_opacity : 1,
+    shape: l.overlay_shape || null,
+    bg_color: l.overlay_bg_color || null,
+    outline: !!l.overlay_outline,
+  };
+  try {
+    const saved = await api('/cameras/' + HA_CAM_ID + '/ha/links/' + l.id + '/placement', { method: 'PUT', body: JSON.stringify(body) });
+    HA_LINKS[i] = haMapLinkFromServer(saved);
+    toast('Badge appearance saved.');
+    renderHaLinks(true);
+  } catch (e) {
+    setMsg(msgId, (e && e.message) || 'Save failed', 'err');
+  }
+}
+
+function haCtrlPanel(i, l) {
+  const domain = (l.entity_id.split('.')[0] || '');
+  const actions = HA_ACTION_ALLOWLIST_BY_DOMAIN[domain] || [];
+  const restricted = Array.isArray(l.allowed_actions);
+  const selected = new Set(restricted ? l.allowed_actions : actions);
+  const boxes = actions.map(a => `
+      <label class="chk" style="font-size:12px;margin-right:14px">
+        <input type="checkbox" ${selected.has(a) ? 'checked' : ''} ${restricted ? '' : 'disabled'} onchange="haToggleAction(${i}, '${a}', this.checked)" /> ${esc(a)}
+      </label>`).join('') || '<span class="card-hint" style="margin:0">No actions are defined for this entity\'s domain.</span>';
+  return `
+    <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+      <label class="chk" style="font-size:12px">
+        <input type="checkbox" ${l.require_confirm ? 'checked' : ''} onchange="haSetRequireConfirm(${i}, this.checked)" /> Require confirmation before firing any action on this control
+      </label>
+      <div style="margin-top:10px">
+        <label class="chk" style="font-size:12px">
+          <input type="checkbox" ${restricted ? 'checked' : ''} onchange="haToggleRestrictActions(${i}, this.checked)" /> Restrict which actions this control allows
+        </label>
+        <div style="margin-top:6px${restricted ? '' : ';opacity:.45'}">${boxes}</div>
+      </div>
+      <div class="card-hint" style="margin:8px 0 0">Saved together with the links below (Save links).</div>
+    </div>`;
+}
+
+function haSetRequireConfirm(i, v) { if (HA_LINKS[i]) HA_LINKS[i].require_confirm = v; }
+
+/* Unrestricted (allowed_actions === null) ⇒ every domain action is allowed
+   (today's default). Turning restriction ON seeds the checkbox set with the
+   full domain action list (all checked) rather than an empty set, so the
+   operator starts from "everything, now editable" instead of accidentally
+   disabling the control entirely. */
+function haToggleRestrictActions(i, v) {
+  const l = HA_LINKS[i]; if (!l) return;
+  const domain = (l.entity_id.split('.')[0] || '');
+  const actions = HA_ACTION_ALLOWLIST_BY_DOMAIN[domain] || [];
+  l.allowed_actions = v ? actions.slice() : null;
+  renderHaLinks(true);
+}
+function haToggleAction(i, action, checked) {
+  const l = HA_LINKS[i]; if (!l || !Array.isArray(l.allowed_actions)) return;
+  if (checked) { if (!l.allowed_actions.includes(action)) l.allowed_actions.push(action); }
+  else { l.allowed_actions = l.allowed_actions.filter(a => a !== action); }
 }
 
 /* Row-edit handlers: mutate the working set in place WITHOUT re-rendering, so a
@@ -5645,21 +5900,38 @@ function haPick(entity_id) {
   const ent = (HA_ENT_CACHE[domain] || []).find(e => e.entity_id === entity_id);
   if (!ent) return;
   if (HA_LINKS.some(l => l.entity_id === entity_id && l.role === role)) return;
-  HA_LINKS.push({ entity_id, role, device_class: ent.device_class || null, label: ent.friendly_name || null, sort_order: HA_LINKS.length });
+  HA_LINKS.push({
+    id: null, entity_id, role, device_class: ent.device_class || null, label: ent.friendly_name || null, sort_order: HA_LINKS.length,
+    require_confirm: false, allowed_actions: null,
+    overlay_x: null, overlay_y: null, overlay_size: null, overlay_color: null, overlay_icon: null,
+    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_outline: false,
+  });
   renderHaLinks(true);
 }
 
 function removeHaLink(i) {
   HA_LINKS.splice(i, 1);
+  HA_STYLE_OPEN = null;
+  HA_CTRL_OPEN = null;
   renderHaLinks(true);
 }
 
 async function saveHaLinks() {
-  const body = { links: HA_LINKS.map((l, i) => ({ entity_id: l.entity_id, role: l.role, device_class: l.device_class, label: l.label, sort_order: i })) };
+  const body = { links: HA_LINKS.map((l, i) => ({
+    entity_id: l.entity_id,
+    role: l.role,
+    device_class: l.device_class,
+    label: l.label,
+    sort_order: i,
+    require_confirm: !!l.require_confirm,
+    allowed_actions: l.allowed_actions,
+  })) };
   try {
     const saved = await api('/cameras/' + HA_CAM_ID + '/ha/links', { method: 'PUT', body: JSON.stringify(body) });
-    HA_LINKS = saved.map(l => ({ entity_id: l.entity_id, role: l.role, device_class: l.device_class, label: l.label, sort_order: l.sort_order }));
+    HA_LINKS = saved.map(haMapLinkFromServer);
     HA_PICKER = null;
+    HA_STYLE_OPEN = null;
+    HA_CTRL_OPEN = null;
     toast('Home Assistant links saved.');
     renderHaLinks(true);
   } catch (e) {
