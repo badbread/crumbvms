@@ -1689,9 +1689,7 @@ mod tests {
             &["turn_on".to_owned(), "toggle".to_owned()]
         )
         .is_ok());
-        assert!(
-            validate_allowed_actions("cover.garage", &["open_cover".to_owned()]).is_ok()
-        );
+        assert!(validate_allowed_actions("cover.garage", &["open_cover".to_owned()]).is_ok());
         // An empty list is a valid "no actions permitted" configuration.
         assert!(validate_allowed_actions("light.kitchen", &[]).is_ok());
 
