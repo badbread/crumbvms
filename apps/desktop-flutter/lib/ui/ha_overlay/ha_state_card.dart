@@ -20,6 +20,16 @@
 //   contracted never to throw, and resolves false on failure so the buttons
 //   come straight back.
 //
+// #442 Slice 1 adds an optional VALUE row below the button row: a `Slider`
+// driven entirely by the state feed's `HaControlDescriptor` (min/max/step/
+// unit — never hardcoded), for value-setting entities (a dimmable light, a
+// positionable cover, a speed-controllable fan). It commits on release with
+// exactly one `onValueAction` call per drag gesture, never while dragging;
+// the same never-flip-locally / settle-window contract as the buttons above
+// applies, and `cover.set_position` (like the discrete cover actions) or a
+// `require_confirm` link confirms with the target value in the prompt before
+// sending.
+//
 // This widget is just the card's CONTENT (plus swallowing taps on itself so
 // a host's tap-away scrim underneath doesn't dismiss when the card itself is
 // tapped) — the caller (`ha_overlay_layer.dart`) owns showing/hiding it and
@@ -53,6 +63,8 @@ class HaStateCard extends StatefulWidget {
     this.onDismiss,
     this.actions = const [],
     this.onAction,
+    this.control,
+    this.onValueAction,
     this.requireConfirm = false,
   });
 
@@ -82,6 +94,19 @@ class HaStateCard extends StatefulWidget {
   /// convergence window. Null (or an empty [actions]) means no controls.
   final Future<bool> Function(String action)? onAction;
 
+  /// The value-slider's capability descriptor (#442 Slice 1) — null (the
+  /// default) draws no slider at all. The host decides whether to pass one
+  /// (capability + role gate, same as [actions]/[onAction]) and drives its
+  /// bounds/step/unit from the descriptor, never hardcoded.
+  final HaControlDescriptor? control;
+
+  /// Fires the slider's committed value, by [control]'s wire action string,
+  /// and resolves to whether the server accepted it — same contract as
+  /// [onAction] (never throws, resolves false on failure). Called exactly
+  /// once per drag gesture, on release, never while dragging. Null (or a null
+  /// [control]) means no slider.
+  final Future<bool> Function(String action, double value)? onValueAction;
+
   /// Per-link control config (migration 0075, issue #440). When true, EVERY
   /// action confirms first, not just the hardcoded cover/lock cases — so an
   /// operator can require a deliberate tap on any device. Default false keeps
@@ -93,12 +118,21 @@ class HaStateCard extends StatefulWidget {
 }
 
 class _HaStateCardState extends State<HaStateCard> {
-  /// The action currently in flight or settling, or null when idle.
+  /// The action currently in flight or settling, or null when idle. Shared
+  /// between the button row and the value slider — only one of either kind
+  /// can be in flight at a time (both gate on this being null).
   String? _pending;
 
   /// True once the POST returned and we are just waiting for the state poll
   /// to catch up (spinner becomes a check).
   bool _sent = false;
+
+  /// The slider's live drag position, or the value it was released/sent at
+  /// while `_pending` holds it through the settle window. Null means "follow
+  /// the polled `control.value`" — the normal idle state. Never used to
+  /// optimistically report a NEW value as accepted; it only reflects what the
+  /// operator is doing with the thumb right now (or just released).
+  double? _dragValue;
 
   Timer? _settle;
 
@@ -158,6 +192,74 @@ class _HaStateCardState extends State<HaStateCard> {
       setState(() {
         _pending = null;
         _sent = false;
+      });
+    });
+  }
+
+  /// Commit the value slider's released position (#442 Slice 1). One POST per
+  /// drag gesture, called only from `onChangeEnd` — never while dragging.
+  /// Mirrors [_fire]'s confirm / pending / settle / never-flip-locally
+  /// contract exactly, just with a numeric payload instead of a bare action.
+  Future<void> _fireValue(HaControlDescriptor control, double value) async {
+    final run = widget.onValueAction;
+    if (run == null || _pending != null) return;
+    if (widget.requireConfirm || haValueActionNeedsConfirm(widget.domain)) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(
+            'Set ${widget.friendlyName} to ${haFormatControlValue(control, value)}?',
+          ),
+          content: Text(
+            'This controls a real device through Home Assistant.',
+            style: TextStyle(color: Theme.of(ctx).hintColor, fontSize: 12.5),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Set'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) {
+        // Snap the thumb back to the last polled value — the operator backed
+        // out of the confirm, nothing was sent.
+        setState(() => _dragValue = null);
+        return;
+      }
+    }
+    setState(() {
+      _dragValue = value;
+      _pending = control.action;
+      _sent = false;
+    });
+    final ok = await run(control.action, value);
+    if (!mounted) return;
+    if (!ok) {
+      // The host already surfaced the failure; hand the slider straight back
+      // so the operator can retry.
+      setState(() {
+        _pending = null;
+        _sent = false;
+        _dragValue = null;
+      });
+      return;
+    }
+    // Accepted: hold the released position for the convergence window, then
+    // let the polled `control.value` speak for itself.
+    setState(() => _sent = true);
+    _settle?.cancel();
+    _settle = Timer(_kSettleWindow, () {
+      if (!mounted) return;
+      setState(() {
+        _pending = null;
+        _sent = false;
+        _dragValue = null;
       });
     });
   }
@@ -260,11 +362,13 @@ class _HaStateCardState extends State<HaStateCard> {
                   ),
                 ),
               ],
-              if (widget.actions.isNotEmpty && widget.onAction != null) ...[
+              if (_hasActions || _hasControl) ...[
                 const SizedBox(height: 8),
                 const Divider(height: 1, color: Colors.white12),
                 const SizedBox(height: 8),
-                _controlRow(),
+                if (_hasActions) _controlRow(),
+                if (_hasActions && _hasControl) const SizedBox(height: 10),
+                if (_hasControl) _valueRow(),
               ],
             ],
           ),
@@ -272,6 +376,12 @@ class _HaStateCardState extends State<HaStateCard> {
       ),
     );
   }
+
+  bool get _hasActions =>
+      widget.actions.isNotEmpty && widget.onAction != null;
+
+  bool get _hasControl =>
+      widget.control != null && widget.onValueAction != null;
 
   /// The control buttons (issue #187). Wrapped so a three-button cover row
   /// still fits the card's 260px cap on a narrow layout.
@@ -290,6 +400,83 @@ class _HaStateCardState extends State<HaStateCard> {
             sent: _pending == a.action && _sent,
             onPressed: busy ? null : () => unawaited(_fire(a)),
           ),
+      ],
+    );
+  }
+
+  /// The value slider row (#442 Slice 1): a caption ("Brightness"), the
+  /// live/dragged value, and a `Slider` driven entirely by [control]'s
+  /// min/max/step — never hardcoded — so a future non-percent kind (Slice
+  /// 2's temperature) drops in unchanged. Disabled (greyed, non-interactive)
+  /// while ANY action (button or slider) is pending, same busy gate as
+  /// [_controlRow].
+  Widget _valueRow() {
+    final control = widget.control!;
+    final busy = _pending != null;
+    final display = (_dragValue ?? control.value)
+        .clamp(control.min, control.max)
+        .toDouble();
+    final divisions = control.max > control.min && control.step > 0
+        ? ((control.max - control.min) / control.step)
+            .round()
+            .clamp(1, 1000)
+            .toInt()
+        : null;
+    final pendingThis = _pending == control.action;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                haValueActionLabel(control.action),
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            if (pendingThis && !_sent)
+              const SizedBox(
+                width: 11,
+                height: 11,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else if (pendingThis)
+              const Icon(Icons.check, size: 13, color: Colors.white70)
+            else
+              Text(
+                haFormatControlValue(control, display),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+          ],
+        ),
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 3,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+            overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+          ),
+          child: Slider(
+            value: display,
+            min: control.min,
+            max: control.max,
+            divisions: divisions,
+            onChanged: busy
+                ? null
+                : (v) => setState(() => _dragValue = v),
+            // Commit exactly once, on release — never a POST per drag tick.
+            onChangeEnd: busy
+                ? null
+                : (v) => unawaited(_fireValue(control, v)),
+          ),
+        ),
       ],
     );
   }

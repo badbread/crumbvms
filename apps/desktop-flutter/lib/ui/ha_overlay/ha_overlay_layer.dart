@@ -26,6 +26,13 @@
 //   Every read-only / non-controllable badge opens the read-only card on click
 //   exactly as before. The card is placed beside the badge, flipped/clamped
 //   away from the pane edges.
+// * right-click (#442 Slice 1): a simple domain's left-click direct-fires and
+//   never reaches the card, so a dimmable light/fan (no dedicated card domain
+//   of its own) had no gesture to reach a value slider. A right-click on any
+//   controllable badge opens the detail card regardless of domain, alongside
+//   left-click, which keeps firing its primary action unchanged. The card
+//   itself decides whether to draw a slider (its live state's `control`
+//   descriptor, gated the same way as the button row).
 //
 // Purely a display widget: everything comes via the constructor, no
 // controller/global lookups (it builds its own private, ephemeral
@@ -595,6 +602,10 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
   /// Extra estimated height once the card carries a control row (issue #187).
   static const double _cardControlsEstHeight = 52;
 
+  /// Extra estimated height once the card carries a value slider row (#442
+  /// Slice 1) — caption/value line + the `Slider` itself.
+  static const double _cardValueEstHeight = 54;
+
   @override
   void dispose() {
     for (final t in _settleTimers.values) {
@@ -650,6 +661,8 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
                 ),
                 onTapItem: (item) =>
                     _handleTap((item as HaOverlayBadgeItem).link),
+                onSecondaryTapItem: (item) =>
+                    _handleSecondaryTap((item as HaOverlayBadgeItem).link),
                 onHoverItem: (item, hovering) {
                   final next = hovering
                       ? item.id
@@ -736,6 +749,17 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
     setState(() => _openLinkId = _openLinkId == link.id ? null : link.id);
   }
 
+  /// Right-click routing (#442 Slice 1): open the detail card for ANY
+  /// controllable badge, regardless of domain — the one gesture that reaches
+  /// a value slider on a simple domain (light/fan) whose left-click already
+  /// direct-fires and so never falls through to the card. A no-op on a
+  /// non-controllable badge (nothing to show beyond the read-only card
+  /// left-click already offers).
+  void _handleSecondaryTap(HaLink link) {
+    if (!_canControl(link)) return;
+    setState(() => _openLinkId = link.id);
+  }
+
   /// POST a direct-click action and show a brief in-flight spinner on the badge
   /// itself (issue #428). Reuses [_runAction]'s optimistic-never-flip-locally +
   /// toast-on-failure behavior; the spinner rides the settle window, then the
@@ -775,11 +799,28 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
         .toList();
   }
 
+  /// The value slider's capability descriptor for [link] (#442 Slice 1), or
+  /// null to draw no slider at all. Gated exactly like [_actionsFor]: this
+  /// account must be able to control the link AND (`allowed_actions` null, or
+  /// it names the descriptor's own value word — migration 0075's existing
+  /// per-link restriction, reused as-is for the value word). The descriptor
+  /// itself comes from the live state feed, so it is null whenever the entity
+  /// currently has nothing settable (e.g. a non-dimmable light).
+  HaControlDescriptor? _controlFor(HaLink link) {
+    if (!_canControl(link)) return null;
+    final control = widget.stateFor(link.entityId)?.control;
+    if (control == null || !link.actionAllowed(control.action)) return null;
+    return control;
+  }
+
   /// POST the action and surface any failure as a toast. Never throws; returns
   /// whether the server accepted it, which is all the card needs to decide
   /// between "settling" and "hand the buttons back". Deliberately does NOT
   /// flip the badge locally: the 3s `/ha/states` poll converges the state.
-  Future<bool> _runAction(HaLink link, String action) async {
+  ///
+  /// [value] carries a value slider's committed target (#442 Slice 1,
+  /// `HaControlDescriptor.action`) — null for every discrete button action.
+  Future<bool> _runAction(HaLink link, String action, {double? value}) async {
     final api = widget.api;
     final session = widget.session;
     final cameraId = widget.cameraId;
@@ -790,6 +831,7 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
         cameraId,
         linkId: link.id,
         action: action,
+        value: value,
       );
       return true;
     } on CrumbApiException catch (e) {
@@ -835,8 +877,10 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
       left = (x - 8 - _cardWidth).clamp(4.0, double.infinity).toDouble();
     }
     final actions = _actionsFor(open);
-    final estHeight =
-        _cardEstHeight + (actions.isEmpty ? 0.0 : _cardControlsEstHeight);
+    final control = _controlFor(open);
+    final estHeight = _cardEstHeight +
+        (actions.isEmpty ? 0.0 : _cardControlsEstHeight) +
+        (control == null ? 0.0 : _cardValueEstHeight);
     final top = y
         .clamp(4.0, (paneH - estHeight).clamp(4.0, double.infinity))
         .toDouble();
@@ -858,6 +902,10 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
         onAction: actions.isEmpty
             ? null
             : (action) => _runAction(open, action),
+        control: control,
+        onValueAction: control == null
+            ? null
+            : (action, value) => _runAction(open, action, value: value),
       ),
     );
   }

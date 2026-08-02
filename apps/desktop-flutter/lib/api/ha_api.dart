@@ -44,15 +44,26 @@
 //                                                       authenticated user;
 //                                                       RBAC-projected to the
 //                                                       caller's cameras)
-//   POST /cameras/{id}/ha/action  body {link_id,action} -> {ok:true}. Requires
-//                                                       the `actuators`
+//   POST /cameras/{id}/ha/action  body {link_id,action,value?} -> {ok:true}.
+//                                                       Requires the
+//                                                       `actuators`
 //                                                       capability (issue
 //                                                       #187); 403 without
 //                                                       it, 400/404 on a
 //                                                       rejected action or
 //                                                       unknown link, 502
 //                                                       when HA is
-//                                                       unreachable.
+//                                                       unreachable. `value`
+//                                                       (0..100) is REQUIRED
+//                                                       for a value action
+//                                                       (`set_brightness`,
+//                                                       `set_position`,
+//                                                       `set_speed`, #442
+//                                                       Slice 1, PR #460) and
+//                                                       must be omitted for
+//                                                       every other action —
+//                                                       either mismatch is a
+//                                                       400.
 
 import 'dart:convert';
 
@@ -315,6 +326,12 @@ extension HaApi on CrumbApi {
   /// - `400`/`404` — the server rejected the action or the link is gone.
   /// - `502` — Home Assistant is unreachable.
   ///
+  /// [value] is the value-slider's target (#442 Slice 1) — REQUIRED for a
+  /// value action (`set_brightness`/`set_position`/`set_speed`, from the
+  /// state feed's `HaControlDescriptor.action`) and must stay null for every
+  /// discrete action; the server 400s either mismatch, so callers must only
+  /// pass it alongside a value action.
+  ///
   /// Returns normally on success. Callers must NOT flip the badge locally:
   /// the 3s `/ha/states` poll is what converges the displayed state.
   Future<void> haAction(
@@ -322,6 +339,7 @@ extension HaApi on CrumbApi {
     String cameraId, {
     required String linkId,
     required String action,
+    double? value,
   }) async {
     final resp = await sharedHttpClient.post(
       Uri.parse('${s.base}/cameras/$cameraId/ha/action'),
@@ -329,7 +347,11 @@ extension HaApi on CrumbApi {
         'authorization': 'Bearer ${s.token}',
         'content-type': 'application/json',
       },
-      body: jsonEncode({'link_id': linkId, 'action': action}),
+      body: jsonEncode({
+        'link_id': linkId,
+        'action': action,
+        if (value != null) 'value': value,
+      }),
     );
     if (resp.statusCode == 200) return;
     final detail = _errorDetail(resp).trim();
