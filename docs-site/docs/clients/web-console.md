@@ -32,9 +32,13 @@ Console surfaces worth calling out:
   it, pick the engine and confidence, draw per-camera detection zones, and
   manage the watchlist and its fuzzy-match tolerance. The plate reads themselves
   are browsed in the native clients' LPR tab.
-- **Home Assistant.** Connect Crumb to your Home Assistant (a base URL plus a
-  token) and link each camera to its HA entities, so those sensors and controls
-  can drive recording and show up as the entity overlay in the desktop client.
+- **Home Assistant.** A dedicated hub: connect Crumb to your Home Assistant (a
+  base URL plus a token), link each camera to its HA entities (with a role,
+  icon, and style, plus per-control confirmation and allowed-actions settings
+  for anything actuatable), and see every linked entity across every camera in
+  one table with orphaned-link detection. Linked sensors and controls can drive
+  recording and show up as badges, actuatable ones included, in every native
+  client.
 
 If you've set up [TLS](/configuration/tls), the same console is also
 available at `https://<server-host>:8443/admin`, with the expected

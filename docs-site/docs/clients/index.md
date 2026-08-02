@@ -45,7 +45,7 @@ no video.
 | PTZ controls | no | yes | yes | no |
 | Data-saver / adaptive quality | n/a | yes (Data-saver tier, "SD" chip) | yes (Auto / Full / Data-saver) | no |
 | LPR (license-plate) reads tab | configures LPR | yes | yes | no |
-| Home Assistant | configures & links | entity overlay on live video | read-only entity sheet | no |
+| Home Assistant | configures, links & the hub | overlay + control | overlay + control | overlay + control |
 | Snapshot button | no | yes | yes (single-camera views) | no |
 
 Notes:
@@ -57,9 +57,12 @@ Notes:
 - **LPR** reads are browsed in the desktop and Android LPR tab (plate crops,
   watchlist search, fuzzy preview). The web console is where LPR is configured
   (engine, detection zones, watchlist).
-- **Home Assistant** is configured and linked in the web console. The desktop
-  client paints linked entity states as an overlay on live video; Android shows
-  a read-only per-camera entity sheet.
+- **Home Assistant** is configured, linked, and given its own hub (a
+  cross-camera link overview plus orphaned-link detection) in the web console.
+  Every native client, desktop, Android, and macOS/iOS, paints linked entity
+  states as badges on live video (Android also has a per-camera entity sheet),
+  and every client can operate a linked Control entity right from its badge,
+  when the signed-in user's role has the `actuators` permission.
 
 ## Before installing any native client
 

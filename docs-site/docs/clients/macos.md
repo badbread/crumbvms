@@ -23,9 +23,10 @@ a bit rougher.
 
 ## What you can do here
 
-Live view, timeline playback, clips, export, bookmarks, and motion tuning. The
-newer surfaces I've built on the Windows desktop and Android clients are not in
-the Apple app yet: no LPR license-plate tab, no Home Assistant overlay, and no
+Live view, timeline playback, clips, export, bookmarks, motion tuning, and
+Home Assistant, on-video badges plus tap-to-actuate control for a linked
+Control entity. The newer surfaces I've built on the Windows desktop and
+Android clients are not in the Apple app yet: no LPR license-plate tab, and no
 Data-saver quality tier. See
 [the client feature rundown](/clients/#what-each-client-can-do) if a specific
 feature is what you're after.

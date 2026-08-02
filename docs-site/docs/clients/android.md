@@ -24,7 +24,9 @@ Live wall, timeline playback with an Auto / Full / Data-saver quality control
 (Data-saver plays a 640p transcode and shows an "SD" badge; Auto uses full
 quality on Wi-Fi and Data-saver on a metered connection), clips and export,
 per-camera PTZ, a snapshot button (single-camera views), the LPR license-plate
-reads tab, and a read-only Home Assistant entity sheet per camera. See
+reads tab, and Home Assistant: on-video badges plus a per-camera entity sheet,
+both able to operate a linked Control entity directly, not just show its
+state. See
 [the client feature rundown](/clients/#what-each-client-can-do) for how this
 compares to the other clients.
 
