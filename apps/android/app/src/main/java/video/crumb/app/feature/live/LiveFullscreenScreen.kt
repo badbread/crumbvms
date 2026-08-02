@@ -249,6 +249,21 @@ fun LiveFullscreenScreen(
     // system manages the floating window's own lifecycle).
     KeepScreenOn(enabled = !inPip)
 
+    // PiP shows ONLY the camera video. The HA read-only sheet and the badge
+    // detail/control popups are Compose `Dialog`s — separate windows that are NOT
+    // clipped into the PiP surface, so one left open renders its icon/slider inside
+    // the floating window (and can get stuck there) instead of just the video
+    // (issue #469). On the PiP-enter transition, dismiss any open transient HA UI.
+    // Clearing the state (rather than merely hiding) also guarantees a clean state
+    // — no stuck dialog — when the user returns from PiP.
+    LaunchedEffect(inPip) {
+        if (inPip) {
+            haSheetOpen = false
+            haBadgeSelected = null
+            haControlSelected = null
+        }
+    }
+
     // Resolved RTSP URLs. `rtspUrl` is the ACTIVE url fed to the player: it starts
     // as the main (HD) stream and is swapped to `subUrl` if the main can't play on
     // this device (H265-over-RTSP — see the header). `mainUrl`/`subUrl` are the two
@@ -951,7 +966,9 @@ fun LiveFullscreenScreen(
 
         // Home Assistant entity sheet (read-only status). Opens over the video
         // from the HA button; renders in HA's own dark theme so it feels native.
-        if (haSheetOpen) {
+        // Never in PiP — a Dialog window isn't clipped into the PiP surface (#469);
+        // the inPip effect above also clears haSheetOpen so it can't reappear there.
+        if (!inPip && haSheetOpen) {
             HaEntitiesSheet(
                 cameraName = cameraNames[currentCameraId] ?: "Camera",
                 links = haLinks,
@@ -967,11 +984,13 @@ fun LiveFullscreenScreen(
         // the detail dialog the list sheet uses (issue #263). For an actuator this
         // is the reachable home for its controls: the action row and, for a
         // value-capable entity (dimmable light / fan / positionable cover), the
-        // value slider (#442, Slice 1) — a simple domain toggles on tap and only
+        // value slider (#442, Slice 1) � a simple domain toggles on tap and only
         // opens a dialog on long-press, so the slider has nowhere else to live.
         // Non-actuators (sensors) stay read-only via `showControls = canActuate &&
-        // isActuator` inside the dialog.
-        haBadgeSelected?.let { link ->
+        // isActuator` inside the dialog. Never in PiP (#469): this Dialog is a
+        // separate window not clipped into the PiP surface, and the inPip effect
+        // above also nulls the selection.
+        if (!inPip) haBadgeSelected?.let { link ->
             val st = haStates?.stateFor(link.entityId)
             // Same combined staleness the on-video badge uses (server OR client).
             val stale = haStates?.stale == true || haStale
@@ -987,8 +1006,10 @@ fun LiveFullscreenScreen(
         }
 
         // Tapping a controllable cover/lock badge opens the confirm-guarded control
-        // dialog (multi-action, physical-security) (#428).
-        haControlSelected?.let { link ->
+        // dialog (multi-action, physical-security) (#428). Never in PiP — this
+        // Dialog isn't clipped into the PiP surface (#469); the inPip effect above
+        // also nulls the selection.
+        if (!inPip) haControlSelected?.let { link ->
             val st = haStates?.stateFor(link.entityId)
             // Same combined staleness the on-video badge uses (server OR client).
             val stale = haStates?.stale == true || haStale
