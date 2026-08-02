@@ -160,6 +160,43 @@ fn validate_link_role(entity_id: &str, role: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a link's authored `allowed_actions` (migration 0075, issue #440) at
+/// write time: every entry MUST be a valid action for the entity's own HA
+/// domain, i.e. present in [`HA_ACTION_ALLOWLIST`] for that domain. An entry
+/// that could never fire (wrong domain, garbage word) is a silent
+/// misconfiguration, so it is rejected at the PUT with a clear 400 rather than
+/// stored as a dead restriction. An EMPTY list is accepted: it is the explicit
+/// "no action permitted" state (control fully disabled on the link).
+///
+/// Returns the 400 message on rejection. Pure, so it is unit-testable without a
+/// DB.
+fn validate_allowed_actions(entity_id: &str, allowed: &[String]) -> Result<(), String> {
+    let domain = domain_of(entity_id);
+    for action in allowed {
+        if allowed_service(domain, action).is_none() {
+            return Err(format!(
+                "allowed_actions entry '{action}' is not a valid action for a '{domain}' entity \
+                 ('{entity_id}'); it must be one of that domain's actions"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `action` is permitted by a link's `allowed_actions` restriction
+/// (migration 0075, issue #440). `None` ⇒ unrestricted: every action the domain
+/// allowlist already permits is allowed (today's behavior). `Some(list)` ⇒ the
+/// action must ALSO appear in `list`. This is the server-side enforcement
+/// `post_action` applies AFTER the domain allowlist check, so a viewer cannot
+/// fire a disallowed action even by crafting the request. Pure, so it is
+/// exhaustively unit-testable without a DB.
+fn action_permitted_by_link(allowed_actions: Option<&[String]>, action: &str) -> bool {
+    match allowed_actions {
+        None => true,
+        Some(list) => list.iter().any(|a| a.as_str() == action),
+    }
+}
+
 // ─── HTTP: shared client + picker filter ──────────────────────────────────────
 
 /// Build the shared `crumb_common::ha` client from stored settings, mapping the
@@ -297,6 +334,18 @@ struct HaLinkDto {
     overlay_bg_color: Option<String>,
     /// White outline + drop shadow (migration 0062; default false).
     overlay_outline: bool,
+    /// Per-link control config (migration 0075, issue #440). `require_confirm`
+    /// tells every client to prompt a confirmation before firing ANY action on
+    /// this link (on top of the hardcoded cover/lock safety confirm). Additive
+    /// and always present; an older client that does not know the field ignores
+    /// it and behaves exactly as today (default false).
+    require_confirm: bool,
+    /// Per-link control config (migration 0075, issue #440). When non-null, the
+    /// client presents ONLY these actions (intersected with the domain's action
+    /// set) AND the server refuses anything outside it (see `post_action`).
+    /// `null` ⇒ every domain action is offered/allowed (today's behavior). Older
+    /// clients ignore it and offer the full domain set as before.
+    allowed_actions: Option<Vec<String>>,
 }
 
 impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
@@ -320,6 +369,8 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             overlay_shape: l.overlay_shape,
             overlay_bg_color: l.overlay_bg_color,
             overlay_outline: l.overlay_outline,
+            require_confirm: l.require_confirm,
+            allowed_actions: l.allowed_actions,
         }
     }
 }
@@ -540,6 +591,16 @@ struct HaLinkInput {
     label: Option<String>,
     #[serde(default)]
     sort_order: i32,
+    /// Per-link control config (migration 0075, issue #440). Omitted ⇒ false
+    /// (today's behavior). A client-side confirm gate; not server-enforced.
+    #[serde(default)]
+    require_confirm: bool,
+    /// Per-link control config (migration 0075, issue #440). Omitted / `null` ⇒
+    /// every domain action is allowed (today's behavior). When present, each
+    /// entry is validated against the entity domain's allowlist at write time
+    /// and `post_action` refuses anything outside it.
+    #[serde(default)]
+    allowed_actions: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -668,11 +729,27 @@ async fn put_links(
         // a silent dead end (actuator that never fires, motion that never
         // triggers). Issue #434.
         validate_link_role(l.entity_id.trim(), &l.role).map_err(ApiError::BadRequest)?;
+        // allowed_actions entries must be real actions for the entity's domain,
+        // else the restriction is nonsense the operator can never satisfy
+        // (migration 0075, issue #440).
+        if let Some(allowed) = &l.allowed_actions {
+            validate_allowed_actions(l.entity_id.trim(), allowed).map_err(ApiError::BadRequest)?;
+        }
     }
     let tuples: Vec<db::HaLinkInsert> = body
         .links
         .into_iter()
-        .map(|l| (l.entity_id, l.role, l.device_class, l.label, l.sort_order))
+        .map(|l| {
+            (
+                l.entity_id,
+                l.role,
+                l.device_class,
+                l.label,
+                l.sort_order,
+                l.require_confirm,
+                l.allowed_actions,
+            )
+        })
         .collect();
     let links = db::replace_camera_ha_links(state.pool(), camera_id, &tuples)
         .await
@@ -932,6 +1009,8 @@ async fn audit_actuation(
 /// 3. `link_id` exists on THIS camera and has `role = 'actuator'` — else 404.
 /// 4. the action is allowlisted for the domain of the link's stored entity —
 ///    else 400.
+/// 5. the action is permitted by the link's own `allowed_actions` restriction
+///    (migration 0075, issue #440) — else 403. `null` ⇒ unrestricted.
 ///
 /// Returns `{"ok": true}` on an HA 2xx. No state is returned: clients converge
 /// on the existing 3s `GET /ha/states` poll, so there is one source of truth for
@@ -941,7 +1020,8 @@ async fn audit_actuation(
 ///
 /// * `400` — action not allowlisted for the entity's domain, or HA not
 ///   configured/enabled.
-/// * `403` — missing `actuators`, or the camera is outside the caller's grant.
+/// * `403` — missing `actuators`, the camera is outside the caller's grant, or
+///   the action is not in the link's `allowed_actions`.
 /// * `404` — no actuator link with that id on this camera.
 /// * `502` — Home Assistant unreachable or returned an error.
 async fn post_action(
@@ -989,6 +1069,31 @@ async fn post_action(
             None => format!("Crumb does not control '{domain}' entities"),
         }));
     };
+
+    // 5. per-link allowed_actions restriction (migration 0075, issue #440). The
+    //    domain allowlist above says the action is possible for this KIND of
+    //    entity; this narrows it to what the operator authored for THIS link. A
+    //    non-null list that omits the action is a real server-side denial (403),
+    //    not a client hint: a viewer cannot fire it by crafting the request.
+    if !action_permitted_by_link(link.allowed_actions.as_deref(), action) {
+        audit_actuation(
+            &state,
+            &user,
+            camera_id,
+            &link,
+            action,
+            "rejected: action not in link's allowed_actions",
+        )
+        .await;
+        let allowed = link
+            .allowed_actions
+            .as_deref()
+            .map(|l| l.join(", "))
+            .unwrap_or_default();
+        return Err(ApiError::Forbidden(format!(
+            "that action is not permitted on this link (allowed on this link: {allowed})"
+        )));
+    }
 
     let settings = effective_settings(&state).await?;
     if !settings.enabled {
@@ -1553,5 +1658,137 @@ mod tests {
         assert!(!canonical_icon("sensor_door")); // legacy shape-only example, not a slug.
         assert!(!canonical_icon("")); // empty is neither shape-valid nor a member.
         assert!(!canonical_icon("lightbulb2")); // near-miss of a real slug.
+    }
+
+    // ─── per-link control config (migration 0075, issue #440) ────────────────
+
+    #[test]
+    fn allowed_actions_enforcement_null_allows_all_and_list_restricts() {
+        // Null ⇒ unrestricted: every action the domain allowlist already permits
+        // still passes (today's behavior).
+        assert!(action_permitted_by_link(None, "turn_on"));
+        assert!(action_permitted_by_link(None, "turn_off"));
+        assert!(action_permitted_by_link(None, "toggle"));
+
+        // A link restricted to turn_on: turn_on passes, turn_off / toggle do not,
+        // even though they are perfectly valid LIGHT actions (this is the whole
+        // point — the restriction is tighter than the domain allowlist).
+        let only_on = [String::from("turn_on")];
+        assert!(action_permitted_by_link(Some(&only_on), "turn_on"));
+        assert!(!action_permitted_by_link(Some(&only_on), "turn_off"));
+        assert!(!action_permitted_by_link(Some(&only_on), "toggle"));
+
+        // An empty list ⇒ nothing is permitted (control fully disabled).
+        let none: [String; 0] = [];
+        assert!(!action_permitted_by_link(Some(&none), "turn_on"));
+    }
+
+    #[test]
+    fn allowed_actions_write_validation_matches_the_domain_allowlist() {
+        // A subset of the entity domain's own actions is accepted.
+        assert!(validate_allowed_actions(
+            "light.kitchen",
+            &["turn_on".to_owned(), "toggle".to_owned()]
+        )
+        .is_ok());
+        assert!(
+            validate_allowed_actions("cover.garage", &["open_cover".to_owned()]).is_ok()
+        );
+        // An empty list is a valid "no actions permitted" configuration.
+        assert!(validate_allowed_actions("light.kitchen", &[]).is_ok());
+
+        // An action from a DIFFERENT domain, or garbage, is rejected at write.
+        assert!(validate_allowed_actions("light.kitchen", &["open_cover".to_owned()]).is_err());
+        assert!(validate_allowed_actions("lock.front", &["turn_on".to_owned()]).is_err());
+        assert!(validate_allowed_actions("sensor.temp", &["turn_on".to_owned()]).is_err());
+        // The rejection names the offending action and carries no em-dash.
+        let msg = validate_allowed_actions("light.kitchen", &["explode".to_owned()]).unwrap_err();
+        assert!(msg.contains("explode"));
+        assert!(!msg.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn link_input_parses_control_config_with_today_default() {
+        // Omitted ⇒ require_confirm=false, allowed_actions=None (today's behavior),
+        // so an existing admin-console/desktop payload that predates #440 keeps
+        // writing links exactly as before.
+        let bare: HaLinkInput = serde_json::from_value(json!({
+            "entity_id": "light.kitchen", "role": "actuator"
+        }))
+        .unwrap();
+        assert!(!bare.require_confirm);
+        assert_eq!(bare.allowed_actions, None);
+
+        // Present ⇒ carried through verbatim.
+        let full: HaLinkInput = serde_json::from_value(json!({
+            "entity_id": "cover.garage", "role": "actuator",
+            "require_confirm": true,
+            "allowed_actions": ["open_cover", "close_cover"]
+        }))
+        .unwrap();
+        assert!(full.require_confirm);
+        assert_eq!(
+            full.allowed_actions,
+            Some(vec!["open_cover".to_owned(), "close_cover".to_owned()])
+        );
+    }
+
+    #[test]
+    fn link_dto_exposes_control_config_for_clients() {
+        use crumb_common::types::CameraHaLink;
+        let link = CameraHaLink {
+            id: Uuid::nil(),
+            camera_id: Uuid::nil(),
+            entity_id: "cover.garage".to_owned(),
+            role: "actuator".to_owned(),
+            device_class: None,
+            label: None,
+            sort_order: 0,
+            overlay_x: None,
+            overlay_y: None,
+            overlay_size: None,
+            overlay_color: None,
+            overlay_icon: None,
+            overlay_show_state: false,
+            overlay_show_age: false,
+            overlay_opacity: None,
+            overlay_shape: None,
+            overlay_bg_color: None,
+            overlay_outline: false,
+            require_confirm: true,
+            allowed_actions: Some(vec!["open_cover".to_owned()]),
+        };
+        let dto = HaLinkDto::from(link);
+        let v = serde_json::to_value(dto).unwrap();
+        assert_eq!(v["require_confirm"], true);
+        assert_eq!(v["allowed_actions"][0], "open_cover");
+
+        // A link with the migration defaults round-trips to the "unchanged"
+        // shape: require_confirm=false, allowed_actions=null.
+        let default = CameraHaLink {
+            id: Uuid::nil(),
+            camera_id: Uuid::nil(),
+            entity_id: "light.kitchen".to_owned(),
+            role: "actuator".to_owned(),
+            device_class: None,
+            label: None,
+            sort_order: 0,
+            overlay_x: None,
+            overlay_y: None,
+            overlay_size: None,
+            overlay_color: None,
+            overlay_icon: None,
+            overlay_show_state: false,
+            overlay_show_age: false,
+            overlay_opacity: None,
+            overlay_shape: None,
+            overlay_bg_color: None,
+            overlay_outline: false,
+            require_confirm: false,
+            allowed_actions: None,
+        };
+        let v = serde_json::to_value(HaLinkDto::from(default)).unwrap();
+        assert_eq!(v["require_confirm"], false);
+        assert!(v["allowed_actions"].is_null());
     }
 }

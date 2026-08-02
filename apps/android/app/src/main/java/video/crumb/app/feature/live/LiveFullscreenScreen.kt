@@ -60,7 +60,7 @@ import video.crumb.app.ui.KeepScreenOn
 import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
 import video.crumb.app.data.PtzPresetDto
-import video.crumb.app.data.haNeedsSheet
+import video.crumb.app.data.controlActions
 import video.crumb.app.data.haPrimaryAction
 import video.crumb.app.data.toUserMessage
 import video.crumb.app.di.appContainer
@@ -182,9 +182,14 @@ fun LiveFullscreenScreen(
     val onHaBadgeTap: (HaLinkDto) -> Unit = { link ->
         val canActuate = actuatorCapable && link.isActuator
         val primary = haPrimaryAction(link.domain)
+        // Direct-fire only when the link neither requires a confirm nor restricts
+        // its primary action away (migration 0075, issue #440). A require_confirm
+        // link, or one whose control set the primary is not in, opens the control
+        // dialog (which confirms and/or shows only the permitted actions).
+        val directOk = primary != null && !link.requireConfirm && link.actionAllowed(primary)
         when {
-            canActuate && primary != null -> fireHaAction(link, primary)
-            canActuate && haNeedsSheet(link.domain) -> haControlSelected = link
+            canActuate && directOk -> fireHaAction(link, primary!!)
+            canActuate && link.controlActions().isNotEmpty() -> haControlSelected = link
             else -> haBadgeSelected = link
         }
     }

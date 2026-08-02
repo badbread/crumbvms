@@ -151,6 +151,24 @@ List<HaControlAction> haActionsForDomain(String domain) {
   }
 }
 
+/// The FULL action set for a [domain] — a superset of [haActionsForDomain] used
+/// ONLY when a link restricts its actions (`allowed_actions` non-null, migration
+/// 0075). The simple on/off domains gain the `toggle` button their default card
+/// omits, so an operator can restrict a light to exactly `toggle` and still have
+/// it render. Every other domain equals its default set. The caller intersects
+/// this with the link's `allowedActions`.
+List<HaControlAction> haAllActionsForDomain(String domain) {
+  switch (domain) {
+    case 'light':
+    case 'switch':
+    case 'fan':
+    case 'siren':
+      return [..._kOnOffActions, _kToggleAction];
+    default:
+      return haActionsForDomain(domain);
+  }
+}
+
 /// The client interaction split for issue #428 — kept HERE (next to the
 /// server-mirroring action table) so every client and the state model agree on
 /// which domains a single click actuates directly vs which open the detail card.

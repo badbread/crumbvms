@@ -722,7 +722,13 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
   void _handleTap(HaLink link) {
     if (_canControl(link)) {
       final primary = haPrimaryAction(link.domain);
-      if (primary != null) {
+      // Direct-fire only when the link neither requires a confirm nor restricts
+      // its primary action away (migration 0075). A require_confirm link, or one
+      // whose primary is not in its allowed_actions, falls through to the card,
+      // which confirms and/or shows only the permitted actions.
+      if (primary != null &&
+          !link.requireConfirm &&
+          link.actionAllowed(primary.action)) {
         unawaited(_fireDirect(link, primary));
         return;
       }
@@ -759,7 +765,14 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
   /// actuate on a direct click (issue #428) and never open the card.
   List<HaControlAction> _actionsFor(HaLink link) {
     if (!_canControl(link)) return const [];
-    return haActionsForDomain(link.domain);
+    // allowed_actions null ⇒ the full default set for the domain (today's
+    // behavior). Non-null ⇒ present ONLY the permitted actions, intersected with
+    // the domain's full action set (migration 0075, issue #440).
+    final allowed = link.allowedActions;
+    if (allowed == null) return haActionsForDomain(link.domain);
+    return haAllActionsForDomain(link.domain)
+        .where((a) => allowed.contains(a.action))
+        .toList();
   }
 
   /// POST the action and surface any failure as a toast. Never throws; returns
@@ -839,6 +852,7 @@ class _HaOverlayLayerState extends State<HaOverlayLayer> {
         stale: widget.stale,
         iconOverride: open.overlayIcon,
         colorOverride: parseOverlayColorHex(open.overlayColor),
+        requireConfirm: open.requireConfirm,
         onDismiss: () => setState(() => _openLinkId = null),
         actions: actions,
         onAction: actions.isEmpty
