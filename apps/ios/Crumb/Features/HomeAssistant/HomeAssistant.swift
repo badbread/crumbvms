@@ -32,6 +32,7 @@ enum HA {
     static let blue = Color(hex: 0x33C3FF)
     static let green = Color(hex: 0x2BA84A)
     static let warmYellow = Color(hex: 0xFFCC33)
+    static let danger = Color(hex: 0xE5484D) // smoke/gas alarm active — attention red
 
     /// On/off/indeterminate edge, mirroring backend `edge_on`. Returns nil for
     /// anything not explicitly on or off (incl. unavailable/unknown/"").
@@ -43,7 +44,13 @@ enum HA {
         }
     }
 
-    /// device_class → coarse class, mirroring backend `label_for_device_class`.
+    /// device_class → coarse badge class. Mirrors desktop `labelForDeviceClass`
+    /// exactly, including the display-only extensions (lock/smoke/gas/leak) that
+    /// give problem sensors their own glyph + alert color instead of a generic
+    /// dot (issue #438, restoring the richness #437 flattened). A SUPERSET of the
+    /// backend's `label_for_device_class`; the shared first five cases stay
+    /// aligned with it. This ONE mapping backs both the badge and the entity
+    /// sheet.
     static func classForDeviceClass(_ dc: String?) -> String {
         switch (dc ?? "").lowercased() {
         case "motion", "moving", "vibration": return "motion"
@@ -51,6 +58,11 @@ enum HA {
         case "door", "opening": return "door"
         case "window": return "window"
         case "garage_door": return "garage"
+        // display-only extensions (badge/sheet richness, issue #438)
+        case "lock": return "lock"
+        case "smoke": return "smoke"
+        case "gas", "carbon_monoxide": return "gas"
+        case "moisture": return "leak"
         default: return "sensor"
         }
     }
@@ -134,6 +146,19 @@ enum HA {
         case "occupancy":
             return HAVisual(symbol: "person.fill", color: on ? blue : grey,
                             stateText: on ? "Occupied" : "Clear", indeterminate: false)
+        case "lock":
+            // A binary_sensor lock reads on = unsecured/unlocked, off = locked.
+            return HAVisual(symbol: on ? "lock.open.fill" : "lock.fill",
+                            color: on ? amber : neutral, stateText: on ? "Unlocked" : "Locked", indeterminate: false)
+        case "smoke":
+            return HAVisual(symbol: "smoke.fill", color: on ? danger : neutral,
+                            stateText: on ? "Smoke" : "Clear", indeterminate: false)
+        case "gas":
+            return HAVisual(symbol: "carbon.monoxide.cloud.fill", color: on ? danger : neutral,
+                            stateText: on ? "Gas" : "Clear", indeterminate: false)
+        case "leak":
+            return HAVisual(symbol: "drop.triangle.fill", color: on ? amber : neutral,
+                            stateText: on ? "Leak" : "Dry", indeterminate: false)
         default:
             return HAVisual(symbol: "sensor.fill", color: on ? blue : grey,
                             stateText: on ? "Active" : "Clear", indeterminate: false)
@@ -166,20 +191,59 @@ enum HA {
         return iconSlugToSymbol[slug]
     }
 
-    /// Curated overlay-icon slug → SF Symbol (subset of the desktop set; unknown
-    /// slugs fall back to the class default).
+    /// Curated overlay-icon slug → SF Symbol, covering the ENTIRE canonical closed
+    /// vocabulary defined once server-side (`CANONICAL_ICON_SLUGS` in
+    /// `services/api/src/ha.rs`, issue #438). Every slug there maps to a REAL SF
+    /// Symbol available on iOS 16 / macOS 13, so an operator's pick renders the
+    /// same on iOS as on desktop/Android instead of degrading to the generic
+    /// `sensor.fill` (the `?? classDefault` fallback in `overrideSymbol`).
+    ///
+    /// iOS has no dedicated window-covering symbol on our iOS 16 floor, so
+    /// cover/blinds/curtains/shade all resolve to `window.vertical.closed`; that
+    /// is an honest, compilable choice, not a missing glyph.
     static let iconSlugToSymbol: [String: String] = [
-        "door": "door.left.hand.closed", "garage": "door.garage.closed",
-        "window": "window.vertical.closed", "motion": "figure.run",
-        "occupancy": "person.fill", "presence": "person.fill", "person": "person.fill",
-        "doorbell": "bell.fill", "bell": "bell.fill", "lock": "lock.fill", "unlock": "lock.open.fill",
-        "lightbulb": "lightbulb.fill", "light": "lightbulb.fill", "power": "power",
-        "switch": "power", "outlet": "poweroutlet.type.b.fill", "plug": "powerplug.fill",
-        "thermostat": "thermometer", "temperature": "thermometer", "humidity": "humidity.fill",
-        "fan": "fan.fill", "camera": "video.fill", "car": "car.fill", "gate": "door.garage.closed",
-        "water": "drop.fill", "leak": "drop.fill", "smoke": "smoke.fill", "co": "carbon.dioxide.cloud.fill",
-        "fire": "flame.fill", "alarm": "alarm.fill", "shield": "shield.fill", "scene": "film",
-        "sensor": "sensor.fill", "lightswitch": "power", "sun": "sun.max.fill", "moon": "moon.fill",
+        // contact & openings
+        "door": "door.left.hand.closed", "window": "window.vertical.closed",
+        "gate": "door.left.hand.closed", "garage": "door.garage.closed",
+        "cover": "window.vertical.closed", "blinds": "window.vertical.closed",
+        "curtains": "window.vertical.closed", "shade": "window.vertical.closed",
+        "lock": "lock.fill", "key": "key.fill",
+        // motion & presence
+        "motion": "figure.run", "occupancy": "person.fill", "person": "person.fill",
+        "pet": "pawprint.fill", "vibration": "waveform",
+        // lighting
+        "lightbulb": "lightbulb.fill", "floodlight": "flashlight.on.fill",
+        "outdoor_light": "lightbulb.fill",
+        // power & switches
+        "switch": "switch.2", "power": "power", "plug": "powerplug.fill",
+        "outlet": "poweroutlet.type.b.fill", "energy": "bolt.fill", "meter": "gauge",
+        "battery": "battery.100", "solar": "sun.max.fill", "ev": "bolt.car.fill",
+        // climate & environment
+        "fan": "fanblades.fill", "ac": "snowflake", "heatpump": "thermometer.snowflake",
+        "hvac": "wind", "thermostat": "thermometer", "temperature": "thermometer",
+        "humidity": "humidity.fill", "sun": "sun.max.fill",
+        // safety & alarm
+        "smoke": "smoke.fill", "gas": "carbon.monoxide.cloud.fill",
+        "co": "carbon.dioxide.cloud.fill", "fire": "flame.fill",
+        "leak": "drop.triangle.fill", "water": "drop.fill", "valve": "drop.circle.fill",
+        "siren": "megaphone.fill", "security": "shield.fill", "armed": "checkmark.shield.fill",
+        "warning": "exclamationmark.triangle.fill", "doorbell": "bell.badge.fill",
+        "bell": "bell.fill",
+        // camera & media
+        "camera": "video.fill", "tv": "tv", "speaker": "hifispeaker.fill",
+        // network
+        "wifi": "wifi", "router": "network",
+        // vehicles & delivery
+        "vehicle": "car.fill", "package": "shippingbox.fill", "mail": "envelope.fill",
+        // appliances & outdoor
+        "vacuum": "sparkles", "lawn": "leaf.fill", "fridge": "snowflake",
+        "laundry": "tshirt.fill", "pool": "figure.pool.swim", "hottub": "water.waves",
+        // time
+        "clock": "clock.fill",
+        // automation
+        "scene": "film", "script": "curlybraces", "button": "hand.tap.fill",
+        // generic fallback
+        "sensor": "sensor.fill",
     ]
 
     static func colorFromHex(_ hex: String) -> Color? {

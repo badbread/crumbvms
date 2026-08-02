@@ -14,14 +14,23 @@
 // equivalent of the footage-loss bug class (AGENTS.md golden rule 2's
 // spirit, applied to state honesty rather than footage).
 //
-// NOTE for the reviewing human: `sensor_door`, `sensor_window`, `garage`,
-// `movie_filter`, `lightbulb`, `power`, `power_off` — plus the
-// [kHaBadgeIconChoices] set below (`doorbell`, `notifications_active`,
-// `water_drop`, `local_fire_department`, `thermostat`, `lock`, `videocam`,
-// `pets`, `window`) — were written without a local Flutter SDK to verify
-// against `Icons.<name>`, so please double check these compile on
-// `flutter analyze`. `directions_run` and `sensors` ARE already used
-// elsewhere (confirmed safe).
+// This map covers the ENTIRE canonical closed icon vocabulary defined once
+// server-side in `services/api/src/ha.rs` (`CANONICAL_ICON_SLUGS`, issue #438):
+// every slug there has a real glyph here, so an operator's pick renders the same
+// on desktop, iOS, and Android instead of degrading to a generic dot. The server
+// rejects any `overlay_icon` outside that set, so the `?? Icons.sensors` fallback
+// in [haVisualFor] is defense-in-depth (e.g. a newer server slug) rather than an
+// expected path.
+//
+// NOTE for the reviewing human: the following `Icons.<name>` glyphs were written
+// without a local Flutter SDK to verify, so please confirm they compile on
+// `flutter analyze`: `sensor_door`, `sensor_window`, `garage`, `movie_filter`,
+// `lightbulb`, `power`, `power_off`, `doorbell`, `notifications_active`,
+// `water_drop`, `local_fire_department`, `thermostat`, `lock`, `lock_open`,
+// `videocam`, `pets`, `window`, `co2`, `water_damage`, and the #438 additions
+// `blinds_closed`, `outlet`, `device_thermostat`, `gas_meter`, `terminal`,
+// `smart_button`. `directions_run` and `sensors` ARE already used elsewhere
+// (confirmed safe).
 
 import 'package:flutter/material.dart';
 
@@ -48,6 +57,7 @@ const Color _kNeutral = Color(0xFFB9C2CC); // closed/off but KNOWN — not grey
 const Color _kBlue = Color(0xFF33C3FF); // matches the person-detection blue family
 const Color _kGreen = Color(0xFF2BA84A);
 const Color _kWarmYellow = Color(0xFFFFCC33);
+const Color _kDanger = Color(0xFFE5484D); // smoke/gas alarm active — attention red
 
 /// HA `state` string -> on/off/indeterminate, mirroring
 /// `services/common/src/ha.rs::edge_on` EXACTLY (including which strings map
@@ -77,8 +87,16 @@ bool? edgeOn(String state) {
   }
 }
 
-/// Device-class -> Crumb label slug, mirroring
-/// `services/common/src/ha.rs::label_for_device_class` exactly.
+/// Device-class -> Crumb badge-class slug. A SUPERSET of the backend's
+/// `services/common/src/ha.rs::label_for_device_class` (which the recorder uses
+/// for timeline/notification labels and only needs motion/occupancy/door/window/
+/// garage): the display badge additionally distinguishes lock, smoke, gas/CO,
+/// and leak/moisture problem sensors so those read as their own glyph + alert
+/// color everywhere instead of a generic sensor dot (issue #438, restoring the
+/// richness #437 flattened). The FIRST five cases stay byte-for-byte aligned
+/// with the backend so the shared classes never disagree. This ONE function
+/// backs both the on-video badge and the entity sheet; the iOS
+/// `classForDeviceClass` and Android `labelForDeviceClass` mirror it exactly.
 String labelForDeviceClass(String? deviceClass) {
   switch (deviceClass?.trim().toLowerCase()) {
     case 'motion':
@@ -95,6 +113,16 @@ String labelForDeviceClass(String? deviceClass) {
       return 'window';
     case 'garage_door':
       return 'garage';
+    // ── display-only extensions (badge/sheet richness, issue #438) ──
+    case 'lock':
+      return 'lock';
+    case 'smoke':
+      return 'smoke';
+    case 'gas':
+    case 'carbon_monoxide':
+      return 'gas';
+    case 'moisture':
+      return 'leak';
     default:
       return 'sensor';
   }
@@ -167,6 +195,13 @@ const Map<String, (IconData, String)> kHaBadgeIconChoices = {
   'warning': (Icons.warning, 'Warning'),
   'pool': (Icons.pool, 'Pool'),
   'hottub': (Icons.hot_tub, 'Hot tub'),
+  // ── completes the canonical closed vocabulary (issue #438) ──────────────────
+  'cover': (Icons.blinds_closed, 'Cover'),
+  'outlet': (Icons.outlet, 'Outlet'),
+  'temperature': (Icons.device_thermostat, 'Temperature'),
+  'gas': (Icons.gas_meter, 'Gas / CO'),
+  'script': (Icons.terminal, 'Script'),
+  'button': (Icons.smart_button, 'Button'),
 };
 
 /// Parse a stored '#RRGGBB' badge color override into a [Color] (full
@@ -340,6 +375,35 @@ HaVisual _haVisualDefault({
         label: on ? 'Occupied' : 'Clear',
         pulsing: on,
       );
+    case 'lock':
+      // A binary_sensor lock reads on = unsecured/unlocked (attention),
+      // off = locked (secure/neutral).
+      return HaVisual(
+        on ? Icons.lock_open : Icons.lock,
+        on ? _kAmber : _kNeutral,
+        label: on ? 'Unlocked' : 'Locked',
+      );
+    case 'smoke':
+      return HaVisual(
+        Icons.local_fire_department,
+        on ? _kDanger : _kNeutral,
+        label: on ? 'Smoke' : 'Clear',
+        pulsing: on,
+      );
+    case 'gas':
+      return HaVisual(
+        Icons.co2,
+        on ? _kDanger : _kNeutral,
+        label: on ? 'Gas' : 'Clear',
+        pulsing: on,
+      );
+    case 'leak':
+      return HaVisual(
+        Icons.water_damage,
+        on ? _kAmber : _kNeutral,
+        label: on ? 'Leak' : 'Dry',
+        pulsing: on,
+      );
     default:
       return HaVisual(
         Icons.sensors,
@@ -364,6 +428,14 @@ IconData _iconFor({required String domain, String? deviceClass}) {
       return Icons.directions_run;
     case 'occupancy':
       return Icons.person;
+    case 'lock':
+      return Icons.lock;
+    case 'smoke':
+      return Icons.local_fire_department;
+    case 'gas':
+      return Icons.co2;
+    case 'leak':
+      return Icons.water_damage;
     default:
       return Icons.sensors;
   }

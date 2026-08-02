@@ -386,13 +386,121 @@ fn valid_overlay_shape(s: &str) -> bool {
     matches!(s, "dot" | "pill")
 }
 
-/// Validate a curated icon-slug override: short, lowercase `[a-z0-9_]` — the
-/// clients own the slug → glyph mapping, the server only sanity-checks shape.
+/// Validate a curated icon-slug override's SHAPE: short, lowercase `[a-z0-9_]`.
+/// Shape and membership are two separate gates: a slug must pass this AND be a
+/// member of [`CANONICAL_ICON_SLUGS`] (see [`canonical_icon`]) to be accepted.
+/// Keeping shape distinct gives the two rejections distinct, actionable messages.
 fn valid_overlay_icon(i: &str) -> bool {
     !i.is_empty()
         && i.len() <= 64
         && i.chars()
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+/// The ONE canonical closed vocabulary of on-video badge icon slugs (issue #438,
+/// epic #445). This list is the single source of truth: `overlay_icon` is
+/// validated against it here, and ALL THREE clients map every slug below to a
+/// native glyph:
+/// - desktop `ha_overlay/ha_icons.dart` (`kHaBadgeIconChoices`)
+/// - iOS `Features/HomeAssistant/HomeAssistant.swift` (`HA.iconSlugToSymbol`)
+/// - Android `feature/live/HaVisual.kt` (`badgeIconSlugs`)
+///
+/// So an icon an operator picks renders the same glyph everywhere instead of
+/// silently degrading to a generic fallback on a client that never knew the slug.
+/// The future console icon picker (#439) draws from this same list.
+///
+/// Grouped for maintenance; order is not significant (validation is set
+/// membership). To add a slug: add it here AND give it a real glyph in every
+/// client map named above. The unit tests below assert the list is deduped and
+/// that every slug passes the shape check.
+pub const CANONICAL_ICON_SLUGS: &[&str] = &[
+    // contact & openings
+    "door",
+    "window",
+    "gate",
+    "garage",
+    "cover",
+    "blinds",
+    "curtains",
+    "shade",
+    "lock",
+    "key",
+    // motion & presence
+    "motion",
+    "occupancy",
+    "person",
+    "pet",
+    "vibration",
+    // lighting
+    "lightbulb",
+    "floodlight",
+    "outdoor_light",
+    // power & switches
+    "switch",
+    "power",
+    "plug",
+    "outlet",
+    "energy",
+    "meter",
+    "battery",
+    "solar",
+    "ev",
+    // climate & environment
+    "fan",
+    "ac",
+    "heatpump",
+    "hvac",
+    "thermostat",
+    "temperature",
+    "humidity",
+    "sun",
+    // safety & alarm (incl. smoke/gas/CO problem sensors)
+    "smoke",
+    "gas",
+    "co",
+    "fire",
+    "leak",
+    "water",
+    "valve",
+    "siren",
+    "security",
+    "armed",
+    "warning",
+    "doorbell",
+    "bell",
+    // camera & media
+    "camera",
+    "tv",
+    "speaker",
+    // network
+    "wifi",
+    "router",
+    // vehicles & delivery
+    "vehicle",
+    "package",
+    "mail",
+    // appliances & outdoor
+    "vacuum",
+    "lawn",
+    "fridge",
+    "laundry",
+    "pool",
+    "hottub",
+    // time
+    "clock",
+    // automation
+    "scene",
+    "script",
+    "button",
+    // generic fallback (every client also renders unknown slugs as this)
+    "sensor",
+];
+
+/// Whether an icon slug is a member of the closed [`CANONICAL_ICON_SLUGS`]
+/// vocabulary. Membership is the contract the clients implement: a slug that
+/// passes here is guaranteed a real glyph on every client.
+fn canonical_icon(slug: &str) -> bool {
+    CANONICAL_ICON_SLUGS.contains(&slug)
 }
 
 /// One entity's current state in the `GET /ha/states` feed.
@@ -605,6 +713,17 @@ async fn put_placement(
                     return Err(ApiError::BadRequest(
                         "placement icon must be a short lowercase [a-z0-9_] slug".to_owned(),
                     ));
+                }
+                // Membership in the closed vocabulary is what guarantees every
+                // client can render the slug (issue #438). A shape-valid but
+                // off-list slug would render fine on the client that authored it
+                // and fall back to a generic glyph on the others, which is the
+                // exact divergence this endpoint now refuses.
+                if !canonical_icon(i) {
+                    return Err(ApiError::BadRequest(format!(
+                        "placement icon '{i}' is not a known badge icon (see the closed icon \
+                         vocabulary; the console icon picker only offers valid slugs)"
+                    )));
                 }
             }
             if let Some(s) = &p.shape {
@@ -1320,5 +1439,117 @@ mod tests {
         assert!(!valid_overlay_icon("Sensor_Door")); // uppercase
         assert!(!valid_overlay_icon("door bell")); // space
         assert!(!valid_overlay_icon(&"x".repeat(65))); // too long
+    }
+
+    #[test]
+    fn canonical_icon_vocabulary_is_well_formed() {
+        // The list is deduped: a stray duplicate would silently misrepresent the
+        // contract (and a future picker would show it twice).
+        let set: std::collections::HashSet<&&str> = CANONICAL_ICON_SLUGS.iter().collect();
+        assert_eq!(
+            set.len(),
+            CANONICAL_ICON_SLUGS.len(),
+            "CANONICAL_ICON_SLUGS contains a duplicate slug"
+        );
+        // Every canonical slug is itself shape-valid, so the two gates in the
+        // handler can never contradict each other (a canonical slug that failed
+        // the shape check would be permanently unusable).
+        for slug in CANONICAL_ICON_SLUGS {
+            assert!(
+                valid_overlay_icon(slug),
+                "canonical slug '{slug}' fails the shape check"
+            );
+            assert!(canonical_icon(slug), "canonical slug '{slug}' not a member");
+        }
+        // The generic fallback every client also renders must be in the set.
+        assert!(canonical_icon("sensor"));
+    }
+
+    #[test]
+    fn canonical_icon_covers_every_desktop_picker_slug() {
+        // The desktop badge editor was the most complete slug set before #438;
+        // every slug it could already store MUST remain accepted, or a prior
+        // placement's icon would start 400ing on the next edit. This is the
+        // regression guard for that stored-data compatibility.
+        for slug in [
+            "door",
+            "window",
+            "garage",
+            "gate",
+            "motion",
+            "person",
+            "lightbulb",
+            "power",
+            "plug",
+            "lock",
+            "doorbell",
+            "bell",
+            "water",
+            "fire",
+            "thermostat",
+            "fan",
+            "camera",
+            "pet",
+            "scene",
+            "sensor",
+            "floodlight",
+            "outdoor_light",
+            "siren",
+            "security",
+            "armed",
+            "blinds",
+            "curtains",
+            "shade",
+            "ac",
+            "heatpump",
+            "hvac",
+            "humidity",
+            "smoke",
+            "co",
+            "leak",
+            "valve",
+            "battery",
+            "energy",
+            "meter",
+            "switch",
+            "vibration",
+            "occupancy",
+            "sun",
+            "vehicle",
+            "package",
+            "mail",
+            "speaker",
+            "tv",
+            "vacuum",
+            "lawn",
+            "solar",
+            "ev",
+            "fridge",
+            "laundry",
+            "wifi",
+            "router",
+            "clock",
+            "key",
+            "warning",
+            "pool",
+            "hottub",
+        ] {
+            assert!(
+                canonical_icon(slug),
+                "desktop slug '{slug}' dropped from vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_icon_rejects_off_list_slugs() {
+        // Shape-valid but NOT in the vocabulary: exactly the case the handler now
+        // rejects (it would otherwise render as a generic glyph on clients that
+        // did not author it).
+        assert!(valid_overlay_icon("banana_phone")); // passes shape...
+        assert!(!canonical_icon("banana_phone")); // ...but is off-list.
+        assert!(!canonical_icon("sensor_door")); // legacy shape-only example, not a slug.
+        assert!(!canonical_icon("")); // empty is neither shape-valid nor a member.
+        assert!(!canonical_icon("lightbulb2")); // near-miss of a real slug.
     }
 }
