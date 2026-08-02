@@ -67,6 +67,25 @@ enum HA {
         }
     }
 
+    /// Human "Type" label for the detail card: the humanized `device_class` when
+    /// present, else the humanized entity domain — NEVER blank. Mirrors the
+    /// Android `haTypeLabel(domain, deviceClass)` and the desktop card exactly, so
+    /// a light with no device_class reads "Light", a cover with `garage_door`
+    /// reads "Garage door", `carbon_monoxide` reads "Carbon monoxide".
+    static func typeLabel(domain: String, deviceClass: String?) -> String {
+        let raw = (deviceClass?.isEmpty == false) ? deviceClass! : domain
+        return humanizeToken(raw)
+    }
+
+    /// underscores → spaces, and capitalize ONLY the first letter (interior words
+    /// untouched): `garage_door` → "Garage door". Not `.capitalized`, which would
+    /// title-case every word ("Garage Door").
+    private static func humanizeToken(_ token: String) -> String {
+        let spaced = token.replacingOccurrences(of: "_", with: " ")
+        guard let first = spaced.first else { return spaced }
+        return first.uppercased() + spaced.dropFirst()
+    }
+
     /// Relative age of a last-changed RFC3339 timestamp.
     static func relativeAgo(_ lastChanged: String?) -> String? {
         guard let s = lastChanged, let date = parseISO8601(s) else { return nil }
@@ -523,7 +542,7 @@ struct HAOverlayLayer: View {
         }
         .sheet(item: $tapped) { link in
             HAStateCard(link: link, controller: controller)
-                .macModalSize(width: 360, height: 340)
+                .macModalSize(width: 360, height: 368)
         }
         .alert("Control failed", isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })) {
             Button("OK", role: .cancel) { actionError = nil }
@@ -715,7 +734,16 @@ struct HAStateCard: View {
         let v = HA.visual(for: link, state: state, stale: stale)
         NavigationStack {
             VStack(spacing: 14) {
-                Image(systemName: v.symbol).font(.system(size: 40)).foregroundColor(v.color)
+                // Badge chip: the SAME state color as this entity's on-video badge
+                // (`HA.visual`), tinted into a circle exactly like the badge overlay,
+                // the entity-sheet row, and the Android/desktop detail cards — never
+                // a greyscale or washed-out header. A lit light reads clearly
+                // warm-yellow here, an active motion sensor blue, a smoke alarm red.
+                Image(systemName: v.symbol)
+                    .font(.system(size: 34))
+                    .foregroundColor(v.color)
+                    .frame(width: 68, height: 68)
+                    .background(v.color.opacity(0.16), in: Circle())
                 Text(link.displayName).font(.headline).foregroundColor(CrumbColors.textPrimary)
                 Text(v.stateText).font(.title3.weight(.semibold)).foregroundColor(v.color)
                 if let age = HA.relativeAgo(state?.lastChanged) {
@@ -733,9 +761,10 @@ struct HAStateCard: View {
                     Text(errorText).font(.caption).foregroundColor(CrumbColors.error)
                         .multilineTextAlignment(.center)
                 }
-                if let dc = link.deviceClass, !dc.isEmpty {
-                    detailRow("Device class", dc)
-                }
+                // Single "Type" row: humanized device_class when present, else the
+                // humanized domain (never blank), matching the Android
+                // `haTypeLabel` and the desktop card.
+                detailRow("Type", HA.typeLabel(domain: link.domain, deviceClass: link.deviceClass))
                 detailRow("Entity", link.entityId)
                 if stale {
                     Label("Stale — Home Assistant connection may be down",
@@ -979,7 +1008,7 @@ struct HAEntitySheet: View {
         }
         .sheet(item: $detail) { link in
             HAStateCard(link: link, controller: controller)
-                .macModalSize(width: 360, height: 340)
+                .macModalSize(width: 360, height: 368)
         }
         .alert("Control failed", isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })) {
             Button("OK", role: .cancel) { actionError = nil }
