@@ -227,6 +227,8 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
         deviceClass: l.deviceClass,
         label: l.label,
         sortOrder: l.sortOrder,
+        requireConfirm: l.requireConfirm,
+        allowedActions: l.allowedActions,
       );
     });
   }
@@ -240,6 +242,8 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
       deviceClass: l.deviceClass,
       label: trimmed.isEmpty ? null : label,
       sortOrder: l.sortOrder,
+      requireConfirm: l.requireConfirm,
+      allowedActions: l.allowedActions,
     );
   }
 
@@ -252,6 +256,8 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
       deviceClass: trimmed.isEmpty ? null : deviceClass,
       label: l.label,
       sortOrder: l.sortOrder,
+      requireConfirm: l.requireConfirm,
+      allowedActions: l.allowedActions,
     );
   }
 
@@ -269,6 +275,8 @@ class _HaLinkDialogState extends State<_HaLinkDialog> {
             deviceClass: _links[i].deviceClass,
             label: _links[i].label,
             sortOrder: i,
+            requireConfirm: _links[i].requireConfirm,
+            allowedActions: _links[i].allowedActions,
           ),
       ];
       final saved = await widget.api.saveCameraHaLinks(

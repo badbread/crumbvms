@@ -53,6 +53,7 @@ class HaStateCard extends StatefulWidget {
     this.onDismiss,
     this.actions = const [],
     this.onAction,
+    this.requireConfirm = false,
   });
 
   final String entityId;
@@ -81,6 +82,12 @@ class HaStateCard extends StatefulWidget {
   /// convergence window. Null (or an empty [actions]) means no controls.
   final Future<bool> Function(String action)? onAction;
 
+  /// Per-link control config (migration 0075, issue #440). When true, EVERY
+  /// action confirms first, not just the hardcoded cover/lock cases — so an
+  /// operator can require a deliberate tap on any device. Default false keeps
+  /// the pre-0075 behavior (only [HaControlAction.confirm] actions prompt).
+  final bool requireConfirm;
+
   @override
   State<HaStateCard> createState() => _HaStateCardState();
 }
@@ -104,7 +111,7 @@ class _HaStateCardState extends State<HaStateCard> {
   Future<void> _fire(HaControlAction action) async {
     final run = widget.onAction;
     if (run == null || _pending != null) return;
-    if (action.confirm) {
+    if (action.confirm || widget.requireConfirm) {
       final ok = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(

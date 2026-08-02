@@ -49,8 +49,40 @@ async fn seed_links(
     let mut tuples: Vec<db::HaLinkInsert> = Vec::new();
     for (i, (entity, role)) in links.iter().enumerate() {
         let order = i32::try_from(i).unwrap_or(0);
-        tuples.push(((*entity).to_owned(), (*role).to_owned(), None, None, order));
+        // Default control config (migration 0075): no confirm, no action
+        // restriction — today's behavior.
+        tuples.push((
+            (*entity).to_owned(),
+            (*role).to_owned(),
+            None,
+            None,
+            order,
+            false,
+            None,
+        ));
     }
+    db::replace_camera_ha_links(pool, camera_id, &tuples)
+        .await
+        .expect("replace_camera_ha_links")
+}
+
+/// Seed a single actuator link with an explicit `allowed_actions` restriction
+/// (migration 0075) so the server-side enforcement can be exercised end to end.
+async fn seed_link_with_allowed_actions(
+    pool: &deadpool_postgres::Pool,
+    camera_id: Uuid,
+    entity: &str,
+    allowed_actions: &[&str],
+) -> Vec<crumb_common::types::CameraHaLink> {
+    let tuples: Vec<db::HaLinkInsert> = vec![(
+        entity.to_owned(),
+        "actuator".to_owned(),
+        None,
+        None,
+        0,
+        false,
+        Some(allowed_actions.iter().map(|s| (*s).to_owned()).collect()),
+    )];
     db::replace_camera_ha_links(pool, camera_id, &tuples)
         .await
         .expect("replace_camera_ha_links")
@@ -316,6 +348,8 @@ async fn camera_links_payload_carries_the_fields_clients_need() {
         Some("garage".to_owned()),
         Some("Garage door".to_owned()),
         0,
+        false,
+        None,
     )];
     db::replace_camera_ha_links(app.pool(), cam, &tuples)
         .await
@@ -338,6 +372,71 @@ async fn camera_links_payload_carries_the_fields_clients_need() {
     // the long-standing `id`.
     assert!(link["link_id"].is_string());
     assert_eq!(link["link_id"], link["id"]);
+    // Per-link control config (migration 0075) is exposed for clients to honor;
+    // an unset link reports today's defaults: no confirm, no action restriction.
+    assert_eq!(link["require_confirm"], false);
+    assert!(link["allowed_actions"].is_null());
+}
+
+// ─── allowed_actions: the server-enforced per-link restriction (issue #440) ──
+
+#[tokio::test]
+async fn allowed_actions_lets_a_permitted_action_through_to_the_ha_call() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    // A light restricted to turn_on only. turn_on is BOTH domain-allowlisted and
+    // in the link's allowed_actions, so it must pass every gate and reach the HA
+    // call boundary (distinct "not enabled" 400, HA being unconfigured here).
+    let links =
+        seed_link_with_allowed_actions(app.pool(), cam, "light.kitchen", &["turn_on"]).await;
+
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[cam], caps_with_actuators()).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body(links[0].id, "turn_on"),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("not enabled"),
+        "an allowed action must pass the allowed_actions gate and reach the HA call, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn allowed_actions_forbids_a_domain_valid_but_unlisted_action() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    // A light restricted to turn_on only. turn_off IS a valid light action
+    // (passes the domain allowlist) but is NOT in allowed_actions, so the
+    // server must refuse it with a 403 BEFORE contacting HA — a real
+    // restriction, not merely a client-side hint.
+    let links =
+        seed_link_with_allowed_actions(app.pool(), cam, "light.kitchen", &["turn_on"]).await;
+
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[cam], caps_with_actuators()).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            &format!("/cameras/{cam}/ha/action"),
+            &token,
+            &action_body(links[0].id, "turn_off"),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_text(resp).await;
+    assert!(
+        !body.contains("not enabled"),
+        "a forbidden action must be refused before the HA call, got: {body}"
+    );
 }
 
 // ─── the capability itself: default-false everywhere ─────────────────────────
