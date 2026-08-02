@@ -69,6 +69,7 @@ class OverlayEditorLayer extends StatefulWidget {
     this.videoW,
     this.videoH,
     this.onTapItem,
+    this.onSecondaryTapItem,
     this.onHoverItem,
     this.emptyEditHint,
   });
@@ -96,6 +97,13 @@ class OverlayEditorLayer extends StatefulWidget {
   /// View-mode tap dispatch (e.g. show a state card). Edit-mode taps select
   /// the item instead and never call this.
   final void Function(OverlayItem item)? onTapItem;
+
+  /// View-mode right-click (secondary tap) dispatch — e.g. the HA host's
+  /// right-click-to-open-card gesture (#442 Slice 1) for a controllable badge
+  /// whose left-click already fires its primary action, so the card (and any
+  /// value slider) still has a way in. Null adds no secondary-tap handling at
+  /// all, same as [onTapItem]. Edit-mode never calls this.
+  final void Function(OverlayItem item)? onSecondaryTapItem;
 
   /// View-mode hover dispatch (mouse enter/leave over an item's hit target) —
   /// e.g. the HA host's hover-reveal of the badge's live state. Null adds no
@@ -184,6 +192,7 @@ class _OverlayEditorLayerState extends State<OverlayEditorLayer> {
                         controller.primarySelectedId == item.id,
                     buildItem: widget.buildItem,
                     onTap: widget.onTapItem,
+                    onSecondaryTap: widget.onSecondaryTapItem,
                     onHover: widget.onHoverItem,
                   ),
                 if (widget.editing)
@@ -319,6 +328,7 @@ class _OverlayItemWidget extends StatelessWidget {
     required this.isReference,
     required this.buildItem,
     required this.onTap,
+    this.onSecondaryTap,
     required this.onHover,
   });
 
@@ -333,6 +343,7 @@ class _OverlayItemWidget extends StatelessWidget {
   final bool isReference;
   final OverlayItemBuilder buildItem;
   final void Function(OverlayItem item)? onTap;
+  final void Function(OverlayItem item)? onSecondaryTap;
   final void Function(OverlayItem item, bool hovering)? onHover;
 
   static const double _handle = 16;
@@ -522,6 +533,8 @@ class _OverlayItemWidget extends StatelessWidget {
     final Widget body = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap == null ? null : () => onTap!(item),
+      onSecondaryTap:
+          onSecondaryTap == null ? null : () => onSecondaryTap!(item),
       child: _withOpacity(buildItem(item, editing: false, selected: false)),
     );
     final hover = onHover;

@@ -248,9 +248,85 @@ class HaLinkInput {
   };
 }
 
+/// A value-control capability descriptor on a `GET /ha/states` entry (#442
+/// Slice 1, backend contract frozen in PR #460). Present only when the entity
+/// currently exposes a settable value (a dimmable light, a positionable
+/// cover, a speed-controllable fan); absent (null) is how a client decides
+/// whether to draw a slider at all — an older server simply never sends the
+/// field, so [HaEntityState.control] stays null and behavior is unchanged.
+///
+/// Deliberately KIND-AGNOSTIC (`min`/`max`/`step`/`unit`, raw JSON numbers) so
+/// Slice 2's `climate.set_temperature` reuses this shape unchanged: a client
+/// must drive the slider's bounds from THESE fields, never hardcode 0..100.
+class HaControlDescriptor {
+  HaControlDescriptor({
+    required this.action,
+    required this.kind,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.step,
+    this.unit,
+  });
+
+  /// The value action word to send back as `action` in
+  /// `POST /cameras/:id/ha/action` together with the chosen `value`
+  /// (`set_brightness`, `set_position`, `set_speed`, ...).
+  final String action;
+
+  /// `"percent"` in this slice; a future kind (e.g. a temperature control)
+  /// reuses the rest of the shape unchanged.
+  final String kind;
+
+  /// Current value, then the slider bounds/step, all in the descriptor's own
+  /// units (integers for percent).
+  final double value;
+  final double min;
+  final double max;
+  final double step;
+
+  /// Unit label for non-percent kinds; null for percent.
+  final String? unit;
+
+  /// Parses a `control` object defensively: any missing/malformed required
+  /// field (not just outright absence) yields null rather than throwing, so
+  /// one odd entity can never take down the whole `/ha/states` decode.
+  static HaControlDescriptor? tryParse(dynamic j) {
+    if (j is! Map<String, dynamic>) return null;
+    final action = j['action'];
+    final kind = j['kind'];
+    final value = j['value'];
+    final min = j['min'];
+    final max = j['max'];
+    final step = j['step'];
+    if (action is! String ||
+        kind is! String ||
+        value is! num ||
+        min is! num ||
+        max is! num ||
+        step is! num) {
+      return null;
+    }
+    return HaControlDescriptor(
+      action: action,
+      kind: kind,
+      value: value.toDouble(),
+      min: min.toDouble(),
+      max: max.toDouble(),
+      step: step.toDouble(),
+      unit: j['unit'] as String?,
+    );
+  }
+}
+
 /// One entity's current reading from `GET /ha/states`.
 class HaEntityState {
-  HaEntityState({required this.state, this.lastChanged, this.unit});
+  HaEntityState({
+    required this.state,
+    this.lastChanged,
+    this.unit,
+    this.control,
+  });
 
   /// Raw HA state string (e.g. `"on"`, `"open"`, `"unavailable"`). Never
   /// reinterpret this as a boolean directly — use `ha_overlay/ha_icons.dart`'s
@@ -266,10 +342,15 @@ class HaEntityState {
   /// null default so an older server that omits the field still decodes.
   final String? unit;
 
+  /// Value-control capability (#442 Slice 1) — null means no settable value,
+  /// so a client renders no slider. See [HaControlDescriptor].
+  final HaControlDescriptor? control;
+
   factory HaEntityState.fromJson(Map<String, dynamic> j) => HaEntityState(
     state: (j['state'] as String?) ?? '',
     lastChanged: DateTime.tryParse((j['last_changed'] as String?) ?? ''),
     unit: j['unit'] as String?,
+    control: HaControlDescriptor.tryParse(j['control']),
   );
 }
 

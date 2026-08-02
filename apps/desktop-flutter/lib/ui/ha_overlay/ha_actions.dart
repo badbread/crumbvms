@@ -24,6 +24,8 @@
 
 import 'package:flutter/material.dart';
 
+import '../../api/ha_models.dart';
+
 /// One button on the badge detail card's control row.
 class HaControlAction {
   const HaControlAction({
@@ -206,12 +208,54 @@ HaControlAction? haPrimaryAction(String domain) {
 
 /// Domains whose control needs the detail CARD rather than a single click:
 /// `cover` (open / stop / close — three distinct actions) and `lock` (which
-/// also keeps its confirm dialog). A future value-setting control (a dimmer /
-/// position slider) would join this bucket once the backend action allow-list
-/// grows past on/off/toggle; today those two are the only card domains.
+/// also keeps its confirm dialog). Left-click routing is unchanged by the
+/// value-setting slider (#442 Slice 1): a dimmable light/fan still one-tap
+/// toggles on left-click exactly as before, it just ALSO gains a slider,
+/// reachable via a right-click open of the card (`ha_overlay_layer.dart`'s
+/// `onSecondaryTapItem`) rather than by joining this set.
 bool haNeedsCard(String domain) => domain == 'cover' || domain == 'lock';
 
 /// The confirm-step prompt for a physical-security action, e.g.
 /// "Unlock Front Door?" / "Close Garage Door?".
 String haConfirmPrompt(HaControlAction action, String friendlyName) =>
     '${action.label} $friendlyName?';
+
+/// The value slider's row caption for a value action word (#442 Slice 1),
+/// e.g. "Brightness" for `set_brightness` — mirrors [HaControlAction.label]'s
+/// role for the button row. Falls back to a generic caption for a future
+/// value word (e.g. Slice 2's `set_temperature`) this client doesn't know
+/// about yet, rather than showing nothing.
+String haValueActionLabel(String action) {
+  switch (action) {
+    case 'set_brightness':
+      return 'Brightness';
+    case 'set_position':
+      return 'Position';
+    case 'set_speed':
+      return 'Speed';
+    default:
+      return 'Value';
+  }
+}
+
+/// Whether a value slider's OWN commit should confirm first, independent of
+/// the link's `require_confirm` (migration 0075) — mirrors
+/// [HaControlAction.confirm]'s per-button flag for the discrete cover/lock
+/// actions, extended to the value slider: `cover.set_position` is a physical-
+/// security action exactly like open/stop/close, so it confirms the same way.
+bool haValueActionNeedsConfirm(String domain) =>
+    domain == 'cover' || domain == 'lock';
+
+/// Render a value slider's current/target reading for display (row caption,
+/// confirm-dialog prompt), from the descriptor's OWN `kind`/`unit` — never
+/// hardcoded to "%" — so Slice 2's non-percent kind formats correctly without
+/// this function changing. `"percent"` (this slice) always has a null [unit]
+/// and renders as e.g. `"62%"`; any other kind renders the rounded number
+/// plus its unit when present (e.g. `"72 degF"`), matching
+/// `ha_icons.dart`'s `haStateDisplay` convention for a numeric sensor.
+String haFormatControlValue(HaControlDescriptor control, double value) {
+  final rounded = value.round();
+  if (control.kind == 'percent') return '$rounded%';
+  final unit = control.unit;
+  return (unit != null && unit.isNotEmpty) ? '$rounded $unit' : '$rounded';
+}
