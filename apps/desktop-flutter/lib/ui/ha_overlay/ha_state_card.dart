@@ -1,7 +1,10 @@
 // Detail ("more info") card shown when an operator taps a placed HA badge
-// (issue #170 POC). Friendly name, current state, a relative "N ago" from
-// `last_changed`, the raw entity_id in mono-dim, and a stale note when
-// applicable.
+// (issue #170 POC). Friendly name (title), current state, a relative "N ago"
+// from `last_changed`, labeled Entity / Type rows (entity_id + device-type),
+// and a stale note when applicable. The header icon reuses the badge's own
+// `haVisualFor` color — never a muted/greyscale variant — so a lit light reads
+// warm-yellow here exactly as it does on the video badge (kept in step with the
+// Android/iOS detail cards: same coloring + entity/device-type presentation).
 //
 // Issue #187 (HA control Phase 2) adds an optional CONTROL row at the bottom:
 // the buttons for the entity's domain (`ha_actions.dart`, which mirrors the
@@ -142,6 +145,56 @@ class _HaStateCardState extends State<HaStateCard> {
     super.dispose();
   }
 
+  /// Human-readable device-type for the "Type" row: the HA `device_class`
+  /// when the link has one (`door` -> "Door"), else the entity_id's domain
+  /// (`light` -> "Light"). Null when neither is known, so the row is omitted
+  /// rather than showing an empty value.
+  String? _deviceTypeLabel() {
+    final dc = widget.deviceClass?.trim();
+    if (dc != null && dc.isNotEmpty) return _humanize(dc);
+    final dom = widget.domain.trim();
+    if (dom.isNotEmpty) return _humanize(dom);
+    return null;
+  }
+
+  static String _humanize(String s) => s
+      .split(RegExp(r'[._]'))
+      .where((w) => w.isNotEmpty)
+      .map((w) => w[0].toUpperCase() + w.substring(1))
+      .join(' ');
+
+  /// A labeled key/value row (fixed-width label + value), matching the card's
+  /// compact type scale. `mono` renders the value in the monospace face used
+  /// for raw ids like the entity_id.
+  Widget _infoRow(String label, String value, {bool mono = false}) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 44,
+            child: Text(
+              label,
+              style: const TextStyle(color: Colors.white38, fontSize: 10.5),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 10.5,
+                fontFamily: mono ? 'monospace' : null,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _fire(HaControlAction action) async {
     final run = widget.onAction;
     if (run == null || _pending != null) return;
@@ -276,6 +329,7 @@ class _HaStateCardState extends State<HaStateCard> {
     );
     final onDismiss = widget.onDismiss;
     final state = widget.state;
+    final deviceType = _deviceTypeLabel();
     return GestureDetector(
       // Swallow taps on the card so a tap-away scrim behind it (drawn by the
       // host) doesn't treat "tapping the card" as "tapping away".
@@ -343,14 +397,8 @@ class _HaStateCardState extends State<HaStateCard> {
                 ),
               ],
               const SizedBox(height: 6),
-              Text(
-                widget.entityId,
-                style: const TextStyle(
-                  color: Colors.white38,
-                  fontSize: 10.5,
-                  fontFamily: 'monospace',
-                ),
-              ),
+              _infoRow('Entity', widget.entityId, mono: true),
+              if (deviceType != null) _infoRow('Type', deviceType),
               if (widget.stale) ...[
                 const SizedBox(height: 6),
                 const Text(
