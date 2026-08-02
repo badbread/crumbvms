@@ -3,24 +3,75 @@
 package video.crumb.app.feature.live
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AcUnit
+import androidx.compose.material.icons.filled.Air
+import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.Blinds
+import androidx.compose.material.icons.filled.BlindsClosed
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Campaign
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.Co2
+import androidx.compose.material.icons.filled.Curtains
+import androidx.compose.material.icons.filled.DeviceThermostat
+import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Doorbell
+import androidx.compose.material.icons.filled.ElectricMeter
+import androidx.compose.material.icons.filled.ElectricalServices
+import androidx.compose.material.icons.filled.EvStation
+import androidx.compose.material.icons.filled.Fence
 import androidx.compose.material.icons.filled.Garage
+import androidx.compose.material.icons.filled.GasMeter
+import androidx.compose.material.icons.filled.GppGood
+import androidx.compose.material.icons.filled.Grass
+import androidx.compose.material.icons.filled.HeatPump
+import androidx.compose.material.icons.filled.Highlight
+import androidx.compose.material.icons.filled.HotTub
+import androidx.compose.material.icons.filled.Hvac
+import androidx.compose.material.icons.filled.Inventory2
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Kitchen
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.LocalFireDepartment
+import androidx.compose.material.icons.filled.LocalLaundryService
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.Mail
 import androidx.compose.material.icons.filled.MovieFilter
+import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.Opacity
+import androidx.compose.material.icons.filled.Outlet
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Pets
+import androidx.compose.material.icons.filled.Plumbing
+import androidx.compose.material.icons.filled.Pool
 import androidx.compose.material.icons.filled.Power
 import androidx.compose.material.icons.filled.PowerOff
+import androidx.compose.material.icons.filled.RollerShades
+import androidx.compose.material.icons.filled.Router
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.SensorDoor
+import androidx.compose.material.icons.filled.SensorOccupied
 import androidx.compose.material.icons.filled.SensorWindow
 import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.SmartButton
+import androidx.compose.material.icons.filled.SolarPower
+import androidx.compose.material.icons.filled.Speaker
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Thermostat
+import androidx.compose.material.icons.filled.ToggleOn
+import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.WaterDamage
 import androidx.compose.material.icons.filled.WaterDrop
+import androidx.compose.material.icons.filled.WbIncandescent
+import androidx.compose.material.icons.filled.WbSunny
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import video.crumb.app.data.HaLinkDto
@@ -33,8 +84,14 @@ import java.util.Locale
 // and the entity sheet + more-info dialog (`HaEntitiesSheet.kt`), so an entity
 // reads identically wherever Android draws it (issue #437). It is a faithful port
 // of the desktop `haVisualFor` + `edgeOn` (`ui/ha_overlay/ha_icons.dart`), which
-// keeps Android in step with the other clients. The closed-vocabulary rework is
-// tracked separately (issue #438) — do NOT widen the slug set here.
+// keeps Android in step with the other clients.
+//
+// `badgeIconSlugs` below covers the ENTIRE canonical closed icon vocabulary
+// defined once server-side in `services/api/src/ha.rs` (`CANONICAL_ICON_SLUGS`,
+// issue #438): every slug there maps to a Material glyph here, so an operator's
+// pick renders the same on Android as on desktop/iOS instead of degrading to the
+// generic `Sensors` dot. The server rejects any `overlay_icon` outside that set,
+// so the `?: base.icon` fallback in `badgeVisual` is defense-in-depth.
 
 // Palette — matches desktop `ha_icons.dart`.
 internal val BadgeGrey = Color(0xFF8E8E93)
@@ -43,6 +100,7 @@ internal val BadgeNeutral = Color(0xFFB9C2CC) // closed/off but KNOWN — not gr
 internal val BadgeBlue = Color(0xFF33C3FF) // motion / occupancy active
 internal val BadgeGreen = Color(0xFF2BA84A) // switch on
 internal val BadgeWarmYellow = Color(0xFFFFCC33) // light on
+internal val BadgeDanger = Color(0xFFE5484D) // smoke/gas alarm active — attention red
 
 /** Resolved look for one entity: state color, glyph, and a friendly state label. */
 internal data class BadgeVisual(val color: Color, val icon: ImageVector, val label: String)
@@ -62,7 +120,13 @@ private fun edgeOn(state: String): Boolean? = when (state.trim().lowercase(Local
     else -> null
 }
 
-/** device_class -> Crumb label slug (mirrors desktop `labelForDeviceClass`). */
+/**
+ * device_class -> Crumb badge-class slug. Mirrors desktop `labelForDeviceClass`
+ * exactly, including the display-only extensions (lock/smoke/gas/leak) that give
+ * problem sensors their own glyph + alert color instead of a generic dot (issue
+ * #438, restoring the richness #437 flattened). A SUPERSET of the backend's
+ * `label_for_device_class`; the shared first five cases stay aligned with it.
+ */
 private fun labelForDeviceClass(deviceClass: String?): String =
     when (deviceClass?.trim()?.lowercase(Locale.US)) {
         "motion", "moving", "vibration" -> "motion"
@@ -70,31 +134,101 @@ private fun labelForDeviceClass(deviceClass: String?): String =
         "door", "opening" -> "door"
         "window" -> "window"
         "garage_door" -> "garage"
+        // display-only extensions (badge/sheet richness, issue #438)
+        "lock" -> "lock"
+        "smoke" -> "smoke"
+        "gas", "carbon_monoxide" -> "gas"
+        "moisture" -> "leak"
         else -> "sensor"
     }
 
-/** Operator-pickable per-badge icon override (migration 0059 slug -> glyph). */
+/**
+ * Operator-pickable per-badge icon override (migration 0059 slug -> glyph),
+ * covering the ENTIRE canonical vocabulary (`CANONICAL_ICON_SLUGS`, issue #438).
+ * Each glyph is the Material equivalent of the desktop `kHaBadgeIconChoices`
+ * choice for the same slug, so the same pick reads the same across clients.
+ */
 private val badgeIconSlugs: Map<String, ImageVector> = mapOf(
+    // contact & openings
     "door" to Icons.Filled.SensorDoor,
     "window" to Icons.Filled.SensorWindow,
+    "gate" to Icons.Filled.Fence,
     "garage" to Icons.Filled.Garage,
-    "motion" to Icons.Filled.DirectionsRun,
-    "person" to Icons.Filled.Person,
-    "lightbulb" to Icons.Filled.Lightbulb,
-    "power" to Icons.Filled.Power,
-    "switch" to Icons.Filled.Power,
+    "cover" to Icons.Filled.BlindsClosed,
+    "blinds" to Icons.Filled.Blinds,
+    "curtains" to Icons.Filled.Curtains,
+    "shade" to Icons.Filled.RollerShades,
     "lock" to Icons.Filled.Lock,
-    "doorbell" to Icons.Filled.Doorbell,
-    "water" to Icons.Filled.WaterDrop,
-    "leak" to Icons.Filled.WaterDrop,
-    "fire" to Icons.Filled.LocalFireDepartment,
-    "smoke" to Icons.Filled.LocalFireDepartment,
-    "thermostat" to Icons.Filled.Thermostat,
-    "camera" to Icons.Filled.Videocam,
+    "key" to Icons.Filled.Key,
+    // motion & presence
+    "motion" to Icons.Filled.DirectionsRun,
+    "occupancy" to Icons.Filled.SensorOccupied,
+    "person" to Icons.Filled.Person,
     "pet" to Icons.Filled.Pets,
-    "scene" to Icons.Filled.MovieFilter,
-    "sensor" to Icons.Filled.Sensors,
+    "vibration" to Icons.Filled.Vibration,
+    // lighting
+    "lightbulb" to Icons.Filled.Lightbulb,
+    "floodlight" to Icons.Filled.Highlight,
+    "outdoor_light" to Icons.Filled.WbIncandescent,
+    // power & switches
+    "switch" to Icons.Filled.ToggleOn,
+    "power" to Icons.Filled.Power,
+    "plug" to Icons.Filled.ElectricalServices,
+    "outlet" to Icons.Filled.Outlet,
     "energy" to Icons.Filled.Bolt,
+    "meter" to Icons.Filled.ElectricMeter,
+    "battery" to Icons.Filled.BatteryFull,
+    "solar" to Icons.Filled.SolarPower,
+    "ev" to Icons.Filled.EvStation,
+    // climate & environment
+    "fan" to Icons.Filled.Air,
+    "ac" to Icons.Filled.AcUnit,
+    "heatpump" to Icons.Filled.HeatPump,
+    "hvac" to Icons.Filled.Hvac,
+    "thermostat" to Icons.Filled.Thermostat,
+    "temperature" to Icons.Filled.DeviceThermostat,
+    "humidity" to Icons.Filled.Opacity,
+    "sun" to Icons.Filled.WbSunny,
+    // safety & alarm
+    "smoke" to Icons.Filled.Cloud,
+    "gas" to Icons.Filled.GasMeter,
+    "co" to Icons.Filled.Co2,
+    "fire" to Icons.Filled.LocalFireDepartment,
+    "leak" to Icons.Filled.WaterDamage,
+    "water" to Icons.Filled.WaterDrop,
+    "valve" to Icons.Filled.Plumbing,
+    "siren" to Icons.Filled.Campaign,
+    "security" to Icons.Filled.Shield,
+    "armed" to Icons.Filled.GppGood,
+    "warning" to Icons.Filled.Warning,
+    "doorbell" to Icons.Filled.Doorbell,
+    "bell" to Icons.Filled.NotificationsActive,
+    // camera & media
+    "camera" to Icons.Filled.Videocam,
+    "tv" to Icons.Filled.Tv,
+    "speaker" to Icons.Filled.Speaker,
+    // network
+    "wifi" to Icons.Filled.Wifi,
+    "router" to Icons.Filled.Router,
+    // vehicles & delivery
+    "vehicle" to Icons.Filled.DirectionsCar,
+    "package" to Icons.Filled.Inventory2,
+    "mail" to Icons.Filled.Mail,
+    // appliances & outdoor
+    "vacuum" to Icons.Filled.CleaningServices,
+    "lawn" to Icons.Filled.Grass,
+    "fridge" to Icons.Filled.Kitchen,
+    "laundry" to Icons.Filled.LocalLaundryService,
+    "pool" to Icons.Filled.Pool,
+    "hottub" to Icons.Filled.HotTub,
+    // time
+    "clock" to Icons.Filled.Schedule,
+    // automation
+    "scene" to Icons.Filled.MovieFilter,
+    "script" to Icons.Filled.Terminal,
+    "button" to Icons.Filled.SmartButton,
+    // generic fallback
+    "sensor" to Icons.Filled.Sensors,
 )
 
 private fun defaultIcon(domain: String, deviceClass: String?): ImageVector = when {
@@ -107,6 +241,10 @@ private fun defaultIcon(domain: String, deviceClass: String?): ImageVector = whe
         "garage" -> Icons.Filled.Garage
         "motion" -> Icons.Filled.DirectionsRun
         "occupancy" -> Icons.Filled.Person
+        "lock" -> Icons.Filled.Lock
+        "smoke" -> Icons.Filled.LocalFireDepartment
+        "gas" -> Icons.Filled.Co2
+        "leak" -> Icons.Filled.WaterDamage
         else -> Icons.Filled.Sensors
     }
 }
@@ -139,6 +277,11 @@ private fun defaultVisual(
         "garage" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.Garage, if (on) "Open" else "Closed")
         "motion" -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.DirectionsRun, if (on) "Motion" else "Clear")
         "occupancy" -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.Person, if (on) "Occupied" else "Clear")
+        // A binary_sensor lock reads on = unsecured/unlocked, off = locked.
+        "lock" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, if (on) Icons.Filled.LockOpen else Icons.Filled.Lock, if (on) "Unlocked" else "Locked")
+        "smoke" -> BadgeVisual(if (on) BadgeDanger else BadgeNeutral, Icons.Filled.LocalFireDepartment, if (on) "Smoke" else "Clear")
+        "gas" -> BadgeVisual(if (on) BadgeDanger else BadgeNeutral, Icons.Filled.Co2, if (on) "Gas" else "Clear")
+        "leak" -> BadgeVisual(if (on) BadgeAmber else BadgeNeutral, Icons.Filled.WaterDamage, if (on) "Leak" else "Dry")
         else -> BadgeVisual(if (on) BadgeBlue else BadgeGrey, Icons.Filled.Sensors, if (on) "Active" else "Clear")
     }
 }
