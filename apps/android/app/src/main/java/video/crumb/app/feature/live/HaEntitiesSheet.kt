@@ -388,16 +388,50 @@ private fun HaValueSlider(
     onFire: (Double) -> Unit,
 ) {
     var dragging by remember(link.actionLinkId) { mutableStateOf(false) }
-    var pendingTarget by remember(link.actionLinkId) { mutableStateOf<Double?>(null) }
+    // A value awaiting the user's confirm (cover / lock / require_confirm); non-null
+    // only while its confirm dialog is up.
+    var awaitingConfirm by remember(link.actionLinkId) { mutableStateOf<Double?>(null) }
+    // A value we just committed and hold the thumb at until the /ha/states poll
+    // reflects it. Without this hold the poll -- which for a beat still reports the
+    // device's OLD value while it transitions -- snaps the thumb back the instant
+    // you release, then jumps it to the committed value a poll later (the bounce,
+    // issue #465).
+    var committed by remember(link.actionLinkId) { mutableStateOf<Double?>(null) }
     var localValue by remember(link.actionLinkId) { mutableStateOf(control.value) }
-    LaunchedEffect(control.value) {
-        if (!dragging && pendingTarget == null) localValue = control.value
+
+    val step = control.step.takeIf { it > 0.0 } ?: 1.0
+
+    // Track the live poll ONLY when the user is neither dragging nor holding a
+    // just-committed value. Release the hold once the poll converges to within a
+    // step of the committed value (absorbs percent<->brightness rounding), or when
+    // the safety timeout below clears it.
+    LaunchedEffect(control.value, committed) {
+        if (dragging) return@LaunchedEffect
+        val c = committed
+        if (c != null && kotlin.math.abs(control.value - c) <= step + 0.5) {
+            committed = null
+        }
+        if (committed == null) localValue = control.value
+    }
+    // Never hold forever: a dropped request or a device that never reaches the
+    // target would otherwise freeze the thumb. Drop the hold after a short window
+    // so it resumes tracking the real state.
+    LaunchedEffect(committed) {
+        if (committed != null) {
+            kotlinx.coroutines.delay(6000)
+            committed = null
+        }
+    }
+
+    fun commit(target: Double) {
+        localValue = target
+        committed = target
+        onFire(target)
     }
 
     val label = haValueLabel(control.action)
     val unitSuffix = control.unit ?: if (control.kind == "percent") "%" else ""
     val range = (control.max - control.min).coerceAtLeast(0.0)
-    val step = control.step.takeIf { it > 0.0 } ?: 1.0
     val steps = ((range / step).roundToInt() - 1).coerceAtLeast(0)
 
     Column(Modifier.fillMaxWidth().padding(top = 14.dp)) {
@@ -416,11 +450,7 @@ private fun HaValueSlider(
             onValueChangeFinished = {
                 dragging = false
                 val target = localValue.coerceIn(control.min, control.max)
-                if (needsConfirm) {
-                    pendingTarget = target
-                } else {
-                    onFire(target)
-                }
+                if (needsConfirm) awaitingConfirm = target else commit(target)
             },
             valueRange = control.min.toFloat()..control.max.toFloat(),
             steps = steps,
@@ -432,15 +462,15 @@ private fun HaValueSlider(
         )
     }
 
-    pendingTarget?.let { target ->
+    awaitingConfirm?.let { target ->
         HaConfirmDialog(
             prompt = "Set $label for $entityName to ${target.roundToInt()}$unitSuffix?",
             onConfirm = {
-                pendingTarget = null
-                onFire(target)
+                awaitingConfirm = null
+                commit(target)
             },
             onCancel = {
-                pendingTarget = null
+                awaitingConfirm = null
                 localValue = control.value
             },
         )
