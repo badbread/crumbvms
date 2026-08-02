@@ -392,8 +392,9 @@ routed over the same notification channels as every other alert: enable/tune it
 under Settings → Notifications → System alerts. No extra services or env keys.
 
 **After the wizard: Home Assistant (optional).** Also not a wizard step; it
-lives in the console under **Settings → Detection & clips → Home Assistant**
-(same panel as Frigate). OFF by default, fully self-hosted, footage never leaves
+lives in the console under its own **Settings → Home Assistant** section
+(connection config, a global overview of every linked entity across all
+cameras, and orphaned-link detection). OFF by default, fully self-hosted, footage never leaves
 Crumb. If the user runs Home
 Assistant, connect Crumb to it with the HA **base URL** and a **long-lived
 access token** (generate it from a dedicated *non-admin* HA user's profile), so

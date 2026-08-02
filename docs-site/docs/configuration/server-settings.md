@@ -43,8 +43,10 @@ The most common settings an operator changes after first-run setup:
 - **Motion decoding**, the requested hardware-decode backend (see
   [Hardware decode](/configuration/hardware-decode)).
 - **Detection & clips**, the Frigate detection integration's stream and API
-  bases, Home Assistant connection settings, and clip generation options
-  (see [Integrations](/integrations/)).
+  bases, and clip generation options (see [Integrations](/integrations/)).
+- **Home Assistant**, connection settings, a global overview of every linked
+  entity across all cameras, and orphaned-link detection (see
+  [Integrations](/integrations/)).
 - **LPR**, license-plate recognition: the per-camera engine selection
   (none / Frigate / crumb-alpr / both), OCR-confidence floor, detection
   zones, the plate watchlist with match fuzziness, and the crumb-alpr ingest

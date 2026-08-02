@@ -253,7 +253,7 @@ gating, pass timing) with sensible defaults, see
 ## Home Assistant (optional, off by default)
 
 A self-hosted integration, off until you enable it. Normally you configure
-this in the admin console (**Detection & clips → Home Assistant**), which
+this in the admin console (its own **Home Assistant** section), which
 stores it in the database, and the DB value wins. The keys below are only a
 read-time fallback used when the matching DB field is empty. Use a long-lived
 token from a dedicated **non-admin** HA user.

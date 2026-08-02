@@ -29,10 +29,13 @@ clients are for, see [Clients](/clients/).
 - **Motion tuning.** The motion tuner: per-camera detector choice, and
   exclusion zones drawn over a still-frame preview of the camera. See
   [Motion & Detection](/motion/).
-- **Detection and clips.** The Frigate detection integration, Home Assistant
-  connection settings (link a camera's HA motion, sensor, and actuator
-  entities, and use HA sensors as a recording trigger), and clip options.
-  See [Integrations](/integrations/).
+- **Detection and clips.** The Frigate detection integration and clip
+  options. See [Integrations](/integrations/).
+- **Home Assistant.** A dedicated hub: the HA connection settings, an
+  overview of every linked entity across all cameras with orphaned-link
+  detection, and (from each camera's Motion tab) linking that camera's HA
+  motion, sensor, and actuator entities, or using an HA sensor as a
+  recording trigger. See [Integrations](/integrations/).
 - **LPR.** License-plate recognition: per-camera engine (none, Frigate,
   crumb-alpr, or both), an OCR-confidence floor, detection zones, and a plate
   watchlist (watch or ignore entries, with adjustable match fuzziness). The
