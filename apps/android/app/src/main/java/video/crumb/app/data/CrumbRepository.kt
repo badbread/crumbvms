@@ -233,13 +233,16 @@ class CrumbRepository(private val container: AppContainer) {
 
     /**
      * Fire an HA service call ([action], e.g. "toggle"/"open_cover"/"unlock") for
-     * a linked entity ([linkId]) on [cameraId]. Success is a bare 200 `{ok:true}`;
-     * we don't flip state locally — the `/ha/states` poll converges the shown
-     * state. A capability/validation/HA-unreachable rejection is a [Result.failure]
-     * the UI turns into a compact error via [toUserMessage].
+     * a linked entity ([linkId]) on [cameraId]. [value] is the one numeric a
+     * value action carries (#442, Slice 1: `set_brightness`/`set_position`/
+     * `set_speed`, a 0..100 percent the server validates and rounds) — omit it
+     * for discrete actions. Success is a bare 200 `{ok:true}`; we don't flip
+     * state locally — the `/ha/states` poll converges the shown state. A
+     * capability/validation/HA-unreachable rejection is a [Result.failure] the
+     * UI turns into a compact error via [toUserMessage].
      */
-    suspend fun haAction(cameraId: String, linkId: String, action: String): Result<Unit> =
-        runCatchingCancellable { api.haAction(cameraId, HaActionRequest(linkId, action)); Unit }
+    suspend fun haAction(cameraId: String, linkId: String, action: String, value: Double? = null): Result<Unit> =
+        runCatchingCancellable { api.haAction(cameraId, HaActionRequest(linkId, action, value)); Unit }
 
     // ── motion tuner ───────────────────────────────────────────────────────────
     /** Latest live per-cell motion heatmap (null when none published yet). */

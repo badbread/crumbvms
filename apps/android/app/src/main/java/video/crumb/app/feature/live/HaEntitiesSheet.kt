@@ -23,9 +23,12 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,12 +40,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import video.crumb.app.data.HaControlDescriptor
 import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
 import video.crumb.app.data.controlActions
+import video.crumb.app.data.showsSlider
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
+import kotlin.math.roundToInt
 
 // Home Assistant default (dark) theme tokens — the sheet renders in HA's own
 // look regardless of the app theme, so it feels like an extension of the HA app.
@@ -84,8 +90,12 @@ private fun changedAgo(iso: String?): String? {
  * entities as HA-style tile cards with live state; tapping a tile opens an HA
  * "more-info"-style detail. Phase 2 (#187): when [canActuate] and the link is an
  * actuator, that detail also carries controls (with a confirm on cover/lock);
- * every other case stays read-only. [onAction] fires one service call for a link;
- * [inFlightLinkIds] holds the [HaLinkDto.actionLinkId]s currently posting.
+ * every other case stays read-only. Actuator links whose current state carries a
+ * `control` descriptor (#442, Slice 1: a dimmable light, a positionable cover, a
+ * speed-controllable fan) also get a value slider alongside the action pills.
+ * [onAction] fires one service call for a link — [value] is non-null only for a
+ * value action (a slider commit); [inFlightLinkIds] holds the
+ * [HaLinkDto.actionLinkId]s currently posting.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -96,7 +106,7 @@ fun HaEntitiesSheet(
     onDismiss: () -> Unit,
     canActuate: Boolean = false,
     inFlightLinkIds: Set<String> = emptySet(),
-    onAction: (HaLinkDto, String) -> Unit = { _, _ -> },
+    onAction: (HaLinkDto, String, Double?) -> Unit = { _, _, _ -> },
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selected by remember { mutableStateOf<HaLinkDto?>(null) }
@@ -151,9 +161,10 @@ fun HaEntitiesSheet(
         HaMoreInfoDialog(
             link, st?.state, st?.lastChanged, stale,
             unit = st?.unit,
+            control = st?.control,
             canActuate = canActuate && link.isActuator,
             inFlight = link.actionLinkId in inFlightLinkIds,
-            onAction = { action -> onAction(link, action) },
+            onAction = { action, value -> onAction(link, action, value) },
             onDismiss = { selected = null },
         )
     }
@@ -205,9 +216,11 @@ private fun HaTile(link: HaLinkDto, state: String?, unit: String?, stale: Boolea
  * long-pressing an on-video badge in [HaBadgeOverlayLayer], or tapping a
  * non-controllable one). When [canActuate] is true and the link is an actuator it
  * grows a control row: a single primary action for simple domains (fired
- * directly), and confirm-guarded multi-action buttons for `cover`/`lock`. A
- * future value-setting control (dimmer/position) will render here too; the
- * backend is on/off/toggle-only today, so there is no such UI yet (#428).
+ * directly), and confirm-guarded multi-action buttons for `cover`/`lock`. When
+ * [control] is also present (a dimmable light, a positionable cover, a
+ * speed-controllable fan — #442, Slice 1) it additionally grows a value slider
+ * beneath the control row, gated the same way (`allowed_actions`, migration
+ * 0075).
  */
 @Composable
 internal fun HaMoreInfoDialog(
@@ -217,14 +230,20 @@ internal fun HaMoreInfoDialog(
     stale: Boolean,
     onDismiss: () -> Unit,
     unit: String? = null,
+    control: HaControlDescriptor? = null,
     canActuate: Boolean = false,
     inFlight: Boolean = false,
-    onAction: (String) -> Unit = {},
+    // [value] is non-null only when this call is a slider commit (a value
+    // action); every discrete action call passes null.
+    onAction: (String, Double?) -> Unit = { _, _ -> },
 ) {
     val v = badgeVisual(link, state, stale)
-    // Pending confirm-guarded action (action verb -> human prompt), for cover/lock.
+    // Pending confirm-guarded discrete action (action verb -> human prompt),
+    // for cover/lock. The slider owns its own confirm state (it also needs to
+    // revert the thumb on cancel) — see [HaValueSlider].
     var pendingConfirm by remember { mutableStateOf<Pair<String, String>?>(null) }
     val showControls = canActuate && link.isActuator
+    val needsConfirm = haNeedsConfirm(link)
 
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Column(
@@ -254,13 +273,25 @@ internal fun HaMoreInfoDialog(
                 HaControlRow(
                     link = link,
                     inFlight = inFlight,
+                    needsConfirm = needsConfirm,
                     // Simple domains fire directly; cover/lock (and any link with
                     // require_confirm, migration 0075) route through the confirm
                     // prompt (physical-security guard).
-                    onFire = { action -> onAction(action) },
+                    onFire = { action -> onAction(action, null) },
                     onConfirm = { action, prompt -> pendingConfirm = action to prompt },
                     entityName = link.displayName,
                 )
+                // `control != null` re-stated (on top of `showsSlider`'s own check) so
+                // the compiler smart-casts `control` to non-null below.
+                if (!inFlight && control != null && link.showsSlider(control)) {
+                    HaValueSlider(
+                        link = link,
+                        control = control,
+                        entityName = link.displayName,
+                        needsConfirm = needsConfirm,
+                        onFire = { value -> onAction(control.action, value) },
+                    )
+                }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -274,12 +305,22 @@ internal fun HaMoreInfoDialog(
             prompt = prompt,
             onConfirm = {
                 pendingConfirm = null
-                onAction(action)
+                onAction(action, null)
             },
             onCancel = { pendingConfirm = null },
         )
     }
 }
+
+/**
+ * Whether [link]'s controls (discrete actions AND the value slider) must
+ * confirm before firing: the link's own `require_confirm` (migration 0075), or
+ * a physical-security domain (`cover`/`lock`) regardless of that flag. Shared
+ * by [HaControlRow] and [HaValueSlider] so a cover's Open/Close pills and its
+ * position slider confirm identically.
+ */
+private fun haNeedsConfirm(link: HaLinkDto): Boolean =
+    link.requireConfirm || link.domain == "cover" || link.domain == "lock"
 
 /**
  * The control row for an actuator detail. The button set is derived from the
@@ -296,6 +337,7 @@ private fun HaControlRow(
     link: HaLinkDto,
     inFlight: Boolean,
     entityName: String,
+    needsConfirm: Boolean,
     onFire: (String) -> Unit,
     onConfirm: (String, String) -> Unit,
 ) {
@@ -307,7 +349,6 @@ private fun HaControlRow(
         )
         return
     }
-    val needsConfirm = link.requireConfirm || link.domain == "cover" || link.domain == "lock"
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         for (action in link.controlActions()) {
             HaActionButton(action.label, haActionAccent(action.verb)) {
@@ -319,6 +360,103 @@ private fun HaControlRow(
             }
         }
     }
+}
+
+/**
+ * The value slider for a link's current [HaControlDescriptor] (#442, Slice 1):
+ * a dimmable light's brightness, a cover's position, a fan's speed. Drives
+ * [min]/[max]/[step] straight from the descriptor — never hardcoded 0..100 —
+ * so a future non-percent kind (Slice 2 temperature) renders correctly with no
+ * client change.
+ *
+ * Tracks the drag locally in [localValue] and re-syncs to the server-reported
+ * [HaControlDescriptor.value] whenever it changes AND the user is not mid-drag
+ * or mid-confirm, so the `/ha/states` poll converges the thumb exactly like the
+ * action buttons/badge — never an optimistic local flip on commit. Commits on
+ * release ([Slider]'s `onValueChangeFinished`): exactly ONE call per gesture,
+ * never continuously mid-drag. When [needsConfirm] (the link's own
+ * `require_confirm`, or a physical-security domain — same gate as
+ * [HaControlRow]), the release opens a confirm prompt with the target value
+ * baked in instead of firing immediately; cancelling reverts the thumb.
+ */
+@Composable
+private fun HaValueSlider(
+    link: HaLinkDto,
+    control: HaControlDescriptor,
+    entityName: String,
+    needsConfirm: Boolean,
+    onFire: (Double) -> Unit,
+) {
+    var dragging by remember(link.actionLinkId) { mutableStateOf(false) }
+    var pendingTarget by remember(link.actionLinkId) { mutableStateOf<Double?>(null) }
+    var localValue by remember(link.actionLinkId) { mutableStateOf(control.value) }
+    LaunchedEffect(control.value) {
+        if (!dragging && pendingTarget == null) localValue = control.value
+    }
+
+    val label = haValueLabel(control.action)
+    val unitSuffix = control.unit ?: if (control.kind == "percent") "%" else ""
+    val range = (control.max - control.min).coerceAtLeast(0.0)
+    val step = control.step.takeIf { it > 0.0 } ?: 1.0
+    val steps = ((range / step).roundToInt() - 1).coerceAtLeast(0)
+
+    Column(Modifier.fillMaxWidth().padding(top = 14.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, color = HaSecondaryText, fontSize = 13.sp)
+            Text(
+                "${localValue.roundToInt()}$unitSuffix",
+                color = HaPrimaryText,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+        Slider(
+            value = localValue.toFloat(),
+            onValueChange = { dragging = true; localValue = it.toDouble() },
+            onValueChangeFinished = {
+                dragging = false
+                val target = localValue.coerceIn(control.min, control.max)
+                if (needsConfirm) {
+                    pendingTarget = target
+                } else {
+                    onFire(target)
+                }
+            },
+            valueRange = control.min.toFloat()..control.max.toFloat(),
+            steps = steps,
+            colors = SliderDefaults.colors(
+                thumbColor = HaBlue,
+                activeTrackColor = HaBlue,
+                inactiveTrackColor = HaDivider,
+            ),
+        )
+    }
+
+    pendingTarget?.let { target ->
+        HaConfirmDialog(
+            prompt = "Set $label for $entityName to ${target.roundToInt()}$unitSuffix?",
+            onConfirm = {
+                pendingTarget = null
+                onFire(target)
+            },
+            onCancel = {
+                pendingTarget = null
+                localValue = control.value
+            },
+        )
+    }
+}
+
+/**
+ * Human label for a value action word — shown above the slider only (the
+ * discrete action pills read fine raw, see `HA_ACTION_LABELS` in admin.html
+ * for the same words with a "Set " prefix suited to a checkbox list).
+ */
+private fun haValueLabel(action: String): String = when (action) {
+    "set_brightness" -> "Brightness"
+    "set_position" -> "Position"
+    "set_speed" -> "Speed"
+    else -> action.removePrefix("set_").replaceFirstChar { it.uppercaseChar() }
 }
 
 /** Accent color for a control button, preserving the cover/lock/simple palette. */
