@@ -58,10 +58,10 @@ import kotlin.math.min
 // `edgeOn` EXACTLY (including the honesty rule: unknown/stale never reads as a
 // confident "off/closed").
 
-// The canonical entity visual mapping (`badgeVisual`, `BadgeVisual`, the palette,
-// `parseHexColor`) lives in `HaVisual.kt`, shared with the entity sheet + more-
-// info dialog so an entity reads identically wherever Android draws it (#437).
-private val BadgeDefaultBg = Color(0xFF17171B) // near-black opaque chip
+// The canonical entity visual mapping (`badgeVisual`, `BadgeVisual`, the palette
+// incl. `BadgeDefaultBg`, `parseHexColor`) lives in `HaVisual.kt`, shared with the
+// entity sheet + more-info dialog so an entity reads identically wherever Android
+// draws it (#437).
 
 private const val BASE_REF_PX = 22f // reference badge size at pane-scale 1.0
 private const val REF_SHORT_SIDE = 320f

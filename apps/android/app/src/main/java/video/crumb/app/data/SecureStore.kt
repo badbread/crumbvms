@@ -271,6 +271,24 @@ class SecureStore(context: Context) {
         set(value) = safeWrite { it.putBoolean(KEY_SHOW_ALL_CAMERAS_VIEW, value) }
 
     /**
+     * Whether the Home Assistant "more-info" popup shows the **Entity** row (the
+     * raw `entity_id`). A device-level display preference like [ptzStyle]; NOT
+     * cleared on logout. Default true (today's behavior — the row is shown).
+     */
+    var showHaEntityId: Boolean
+        get() = safeRead(true) { it.getBoolean(KEY_SHOW_HA_ENTITY_ID, true) }
+        set(value) = safeWrite { it.putBoolean(KEY_SHOW_HA_ENTITY_ID, value) }
+
+    /**
+     * Whether the Home Assistant "more-info" popup shows the **Type** row (the
+     * humanized `device_class`, falling back to the domain). A device-level
+     * display preference like [ptzStyle]; NOT cleared on logout. Default true.
+     */
+    var showHaDeviceType: Boolean
+        get() = safeRead(true) { it.getBoolean(KEY_SHOW_HA_DEVICE_TYPE, true) }
+        set(value) = safeWrite { it.putBoolean(KEY_SHOW_HA_DEVICE_TYPE, value) }
+
+    /**
      * Last playback-timeline zoom level (visible time span, in millis) the user left
      * the Playback surfaces on. Shared by BOTH single-camera playback and the playback
      * wall, so switching between them and back restores the same scale, and it survives
@@ -445,6 +463,8 @@ class SecureStore(context: Context) {
         private const val KEY_PTZ_STYLE = "ptz_style"
         private const val KEY_MOTION_TUNER = "motion_tuner_enabled"
         private const val KEY_SHOW_ALL_CAMERAS_VIEW = "show_all_cameras_view"
+        private const val KEY_SHOW_HA_ENTITY_ID = "show_ha_entity_id"
+        private const val KEY_SHOW_HA_DEVICE_TYPE = "show_ha_device_type"
         private const val KEY_PLAYBACK_SPAN_MS = "playback_span_ms"
         private const val KEY_PLATES_VIEW_MODE = "plates_view_mode"
         private const val KEY_LPR_IMAGE_MODE = "lpr_image_mode"

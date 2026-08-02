@@ -964,13 +964,26 @@ fun LiveFullscreenScreen(
         }
 
         // Long-pressing an on-video badge (or tapping a non-controllable one) opens
-        // the read-only detail dialog the list sheet uses (issue #263) — inspect
-        // without actuating (#428).
+        // the detail dialog the list sheet uses (issue #263). For an actuator this
+        // is the reachable home for its controls: the action row and, for a
+        // value-capable entity (dimmable light / fan / positionable cover), the
+        // value slider (#442, Slice 1) — a simple domain toggles on tap and only
+        // opens a dialog on long-press, so the slider has nowhere else to live.
+        // Non-actuators (sensors) stay read-only via `showControls = canActuate &&
+        // isActuator` inside the dialog.
         haBadgeSelected?.let { link ->
             val st = haStates?.stateFor(link.entityId)
             // Same combined staleness the on-video badge uses (server OR client).
             val stale = haStates?.stale == true || haStale
-            HaMoreInfoDialog(link, st?.state, st?.lastChanged, stale, onDismiss = { haBadgeSelected = null }, unit = st?.unit)
+            HaMoreInfoDialog(
+                link, st?.state, st?.lastChanged, stale,
+                onDismiss = { haBadgeSelected = null },
+                unit = st?.unit,
+                control = st?.control,
+                canActuate = actuatorCapable,
+                inFlight = link.actionLinkId in haInFlight,
+                onAction = { action, value -> fireHaAction(link, action, value) },
+            )
         }
 
         // Tapping a controllable cover/lock badge opens the confirm-guarded control
