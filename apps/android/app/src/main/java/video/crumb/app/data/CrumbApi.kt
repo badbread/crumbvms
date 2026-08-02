@@ -210,7 +210,10 @@ interface CrumbApi {
      * `actuators` capability (admin implies it); the server enforces its own
      * per-domain action allowlist and returns `{ "ok": true }` on success. A
      * missing capability is 403, a rejected/unknown link 400/404, HA unreachable
-     * 502 — all surfaced to the caller as a [retrofit2.HttpException].
+     * 502 — all surfaced to the caller as a [retrofit2.HttpException]. The
+     * body's `value` (#442, Slice 1) carries the one numeric a value action
+     * needs (`set_brightness`/`set_position`/`set_speed`, 0..100); a value on a
+     * discrete action, or a missing value on a value action, is a 400.
      */
     @POST("cameras/{camera_id}/ha/action")
     suspend fun haAction(

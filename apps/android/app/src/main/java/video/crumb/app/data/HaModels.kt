@@ -70,11 +70,20 @@ data class HaLinkDto(
     val isActuator: Boolean get() = role == "actuator"
 }
 
-/** Body for POST /cameras/{id}/ha/action — fire one HA service call for a link. */
+/**
+ * Body for POST /cameras/{id}/ha/action — fire one HA service call for a link.
+ * [value] is the ONE numeric a value action carries (#442, Slice 1: a dimmer
+ * level, a cover position, a fan speed — a plain 0..100 percent the server
+ * validates and rounds before HA). Omit it for discrete actions: the JSON
+ * layer has `explicitNulls = false` (see `Network.kt`), so a null [value]
+ * drops the key entirely rather than sending `"value":null`, matching the
+ * server's arity check (a value on a discrete action is a 400).
+ */
 @Serializable
 data class HaActionRequest(
     @SerialName("link_id") val linkId: String,
     val action: String,
+    val value: Double? = null,
 )
 
 /** Response for the HA action call: `{ "ok": true }` on success. */
@@ -103,10 +112,41 @@ fun haPrimaryAction(domain: String): String? = when (domain) {
  * Domains whose control opens the detail/control SHEET instead of a single tap,
  * because they are multi-action and/or physical-security devices that must
  * confirm before firing: `cover` (open/stop/close) and `lock` (lock/unlock).
- * A future value-setting control (dimmer/position) will also route here; the
- * backend is on/off/toggle-only today, so there is no such UI yet.
+ * The value slider (#442, Slice 1) also lives in that sheet — it rides the
+ * existing long-press/detail gesture, so it needs no entry here of its own.
  */
 fun haNeedsSheet(domain: String): Boolean = domain == "cover" || domain == "lock"
+
+// ── HA value-setting control (#442, Slice 1) ─────────────────────────────────
+// A dimmable light, a positionable cover, and a speed-controllable fan each get
+// a slider in the detail sheet alongside their action pills, instead of just an
+// on/off tap. The value words below mirror the server's `HA_ACTION_ALLOWLIST`
+// exactly (`services/api/src/ha.rs`) — climate `set_temperature` is Slice 2,
+// deliberately not here yet.
+
+/**
+ * The value-setting action word for a domain, Slice 1 (#442): the three
+ * already-trusted percent domains only. `null` for every other domain
+ * (including the discrete-only `light`-adjacent ones like `switch`/`siren`).
+ */
+fun haValueAction(domain: String): String? = when (domain) {
+    "light" -> "set_brightness"
+    "cover" -> "set_position"
+    "fan" -> "set_speed"
+    else -> null
+}
+
+/**
+ * Whether [this] link should offer a value slider given its current-state
+ * [control] descriptor: the descriptor must be present (the server says the
+ * entity currently exposes a settable value) AND its action must be permitted
+ * by the link's own `allowed_actions` gate (migration 0075) — `null` ⇒ every
+ * action including value words, matching [actionAllowed]. Capability/role
+ * gating (the `actuators` capability, [HaLinkDto.isActuator]) is the caller's
+ * job, same as the existing action-pill control row.
+ */
+fun HaLinkDto.showsSlider(control: HaControlDescriptor?): Boolean =
+    control != null && actionAllowed(control.action)
 
 /** One control action: its wire verb + human caption. */
 data class HaAction(val verb: String, val label: String)
@@ -157,6 +197,30 @@ fun HaLinkDto.controlActions(): List<HaAction> {
     return haFullActions(domain).filter { it.verb in allowed }
 }
 
+/**
+ * Value-control capability descriptor on a `GET /ha/states` entry (#442, Slice
+ * 1). Present only when the entity currently exposes a settable value (a
+ * dimmable light, a positionable cover, a speed-controllable fan); absent ⇒
+ * the client draws no slider — see [HaEntityState.control]. Kind-agnostic
+ * (min/max/step/unit as plain numbers, not hardcoded 0..100) so a future
+ * non-percent kind (Slice 2 temperature) decodes into the same shape
+ * unchanged; a client that does not recognize [kind] can still render a
+ * generic min..max/step slider with [unit] appended.
+ */
+@Serializable
+data class HaControlDescriptor(
+    /** The value action word to send back to POST .../ha/action (`set_brightness`, ...). */
+    val action: String,
+    /** `"percent"` in Slice 1; a future kind reuses the rest of this shape. */
+    val kind: String,
+    val value: Double,
+    val min: Double,
+    val max: Double,
+    val step: Double,
+    /** Unit label for non-percent kinds; `null` for percent. */
+    val unit: String? = null,
+)
+
 /** One entity's live state in the GET /ha/states feed. */
 @Serializable
 data class HaEntityState(
@@ -167,6 +231,9 @@ data class HaEntityState(
     // ...); null when the entity has no unit (issue #449). Default null so an
     // older server that omits the field still decodes.
     @SerialName("unit") val unit: String? = null,
+    // Value-control capability (#442, Slice 1). Nullable + defaulted so an
+    // older server that omits the field decodes exactly as today (no slider).
+    val control: HaControlDescriptor? = null,
 )
 
 /** GET /ha/states response: the entity states plus cache freshness. */

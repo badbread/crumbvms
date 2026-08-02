@@ -154,13 +154,15 @@ fun LiveFullscreenScreen(
     // controls hide and every badge stays read-only (#187).
     val actuatorCapable = store.isAdmin || store.capabilities.actuators
     // Fire one HA service call. Optimistic ONLY in the spinner sense; the shown
-    // state converges via the `/ha/states` poll (never a local flip). A rejection
-    // (no capability / bad link / HA unreachable) shows a compact toast.
-    val fireHaAction: (HaLinkDto, String) -> Unit = { link, action ->
+    // state converges via the `/ha/states` poll (never a local flip). [value] is
+    // non-null only for a value action (a slider commit, #442 Slice 1) — every
+    // discrete action passes null. A rejection (no capability / bad link / HA
+    // unreachable / out-of-range value) shows a compact toast.
+    val fireHaAction: (HaLinkDto, String, Double?) -> Unit = { link, action, value ->
         val id = link.actionLinkId
         haInFlight = haInFlight + id
         scope.launch {
-            val res = repo.haAction(currentCameraId, id, action)
+            val res = repo.haAction(currentCameraId, id, action, value)
             haInFlight = haInFlight - id
             res.onFailure {
                 Toast.makeText(
@@ -188,7 +190,7 @@ fun LiveFullscreenScreen(
         // dialog (which confirms and/or shows only the permitted actions).
         val directOk = primary != null && !link.requireConfirm && link.actionAllowed(primary)
         when {
-            canActuate && directOk -> fireHaAction(link, primary!!)
+            canActuate && directOk -> fireHaAction(link, primary!!, null)
             canActuate && link.controlActions().isNotEmpty() -> haControlSelected = link
             else -> haBadgeSelected = link
         }
@@ -956,7 +958,7 @@ fun LiveFullscreenScreen(
                 states = haStates,
                 canActuate = actuatorCapable,
                 inFlightLinkIds = haInFlight,
-                onAction = { link, action -> fireHaAction(link, action) },
+                onAction = { link, action, value -> fireHaAction(link, action, value) },
                 onDismiss = { haSheetOpen = false },
             )
         }
@@ -980,9 +982,10 @@ fun LiveFullscreenScreen(
             HaMoreInfoDialog(
                 link, st?.state, st?.lastChanged, stale,
                 unit = st?.unit,
+                control = st?.control,
                 canActuate = true,
                 inFlight = link.actionLinkId in haInFlight,
-                onAction = { action -> fireHaAction(link, action) },
+                onAction = { action, value -> fireHaAction(link, action, value) },
                 onDismiss = { haControlSelected = null },
             )
         }
