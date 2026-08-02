@@ -298,10 +298,15 @@ final class CrumbAPI {
     /// `400`/`404` (rejected link/action) or `502` (Home Assistant unreachable).
     /// The caller does NOT flip local state on success: the `/ha/states` poll
     /// stays the only source of truth for what the device is actually doing.
+    ///
+    /// `value` carries the single numeric a value action needs (issue #442
+    /// Slice 1: `set_brightness`/`set_position`/`set_speed`, 0...100). Pass it
+    /// ONLY for a value action — the server 400s a discrete action sent with a
+    /// value, or a value action sent without one.
     @discardableResult
-    func haAction(cameraId: String, linkId: String, action: String) async throws -> HaActionResponse {
+    func haAction(cameraId: String, linkId: String, action: String, value: Double? = nil) async throws -> HaActionResponse {
         try await post("cameras/\(cameraId)/ha/action",
-                       body: HaActionRequest(linkId: linkId, action: action))
+                       body: HaActionRequest(linkId: linkId, action: action, value: value))
     }
 
     // MARK: - Saved Views (server-backed, per-user; shared with desktop/android/web)

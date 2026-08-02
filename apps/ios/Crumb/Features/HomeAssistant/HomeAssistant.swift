@@ -433,11 +433,14 @@ final class HAController: ObservableObject {
     /// Deliberately does NOT mutate the shown state: the `/ha/states` poll is the
     /// only source of truth (state-honesty invariant above), so a call that HA
     /// silently drops can never leave the badge lying about the device.
-    func perform(link: HaLink, action: String) async throws {
+    ///
+    /// `value` carries the single numeric a value action needs (issue #442
+    /// Slice 1); nil for every discrete action, unchanged from before.
+    func perform(link: HaLink, action: String, value: Double? = nil) async throws {
         // Unreachable in practice (links only exist after `activate`), but a
         // missing camera must read as a failure, never as a silent success.
         guard let cameraId else { throw HAActionError.noCamera }
-        try await container.api.haAction(cameraId: cameraId, linkId: link.id, action: action)
+        try await container.api.haAction(cameraId: cameraId, linkId: link.id, action: action, value: value)
         // Nudge the poll so the real new state lands sooner than the next tick.
         await pollOnce()
     }
@@ -675,6 +678,9 @@ struct HAStateCard: View {
     @State private var inFlight: String?
     /// Awaiting confirmation (lock/cover only).
     @State private var pending: HAAction?
+    /// A value-slider commit awaiting confirmation (`require_confirm` or a
+    /// cover, issue #442 Slice 1) — the target value it would send.
+    @State private var pendingValue: PendingValueCommit?
     @State private var errorText: String?
 
     private var state: HaEntityState? { controller.state(for: link.entityId) }
@@ -691,6 +697,20 @@ struct HAStateCard: View {
         return HA.allActions(for: link.domain).filter { allowed.contains($0.action) }
     }
 
+    /// The value-setting slider's descriptor, or nil when none applies. Value
+    /// words (`set_brightness`/`set_position`/`set_speed`) are not buttons —
+    /// this slider is their entire UI (issue #442 Slice 1). Same actuate gate
+    /// as `actions`, plus the live `control` descriptor the state poll carries,
+    /// plus (when the link restricts actions) the descriptor's action word must
+    /// be one of the allowed ones — the same `allowed_actions` intersection the
+    /// button set already applies.
+    private var valueControl: HaControlDescriptor? {
+        guard controller.canActuate, link.isActuator else { return nil }
+        guard let control = state?.control else { return nil }
+        guard link.actionAllowed(control.action) else { return nil }
+        return control
+    }
+
     var body: some View {
         let v = HA.visual(for: link, state: state, stale: stale)
         NavigationStack {
@@ -700,6 +720,11 @@ struct HAStateCard: View {
                 Text(v.stateText).font(.title3.weight(.semibold)).foregroundColor(v.color)
                 if let age = HA.relativeAgo(state?.lastChanged) {
                     Text("Changed \(age)").font(.caption).foregroundColor(CrumbColors.textSecondary)
+                }
+                if let control = valueControl {
+                    HAValueSlider(control: control, disabled: inFlight != nil) { target in
+                        commitValue(control, target)
+                    }
                 }
                 if !actions.isEmpty {
                     controlsRow
@@ -742,6 +767,39 @@ struct HAStateCard: View {
                 }
             }
             Button("Cancel", role: .cancel) { pending = nil }
+        }
+        .confirmationDialog(
+            pendingValue.map { "Set \(link.displayName) to \($0.displayValue)?" } ?? "",
+            isPresented: Binding(get: { pendingValue != nil }, set: { if !$0 { pendingValue = nil } }),
+            titleVisibility: .visible
+        ) {
+            if let commit = pendingValue {
+                Button("Set") {
+                    pendingValue = nil
+                    Task { await fireValue(commit.control, commit.value) }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingValue = nil }
+        }
+    }
+
+    /// A value-slider commit awaiting confirmation, and the label the
+    /// confirmation dialog interpolates it into.
+    private struct PendingValueCommit {
+        let control: HaControlDescriptor
+        let value: Double
+        var displayValue: String { HAValueSlider.label(for: value, control: control) }
+    }
+
+    /// Route a slider commit through the same confirm gate as a button action:
+    /// the link's own `require_confirm`, or (physical-security parity with
+    /// cover's open/close buttons) the entity being a cover. Everything else
+    /// fires immediately, exactly like a light/fan toggle.
+    private func commitValue(_ control: HaControlDescriptor, _ value: Double) {
+        if link.requireConfirm || link.domain == "cover" {
+            pendingValue = PendingValueCommit(control: control, value: value)
+        } else {
+            Task { await fireValue(control, value) }
         }
     }
 
@@ -794,6 +852,20 @@ struct HAStateCard: View {
         inFlight = nil
     }
 
+    /// One value-setting service call (issue #442 Slice 1), with the slider
+    /// disabled for its duration. Same pattern as `fire`: the shown value is
+    /// left alone either way, the 3s poll converges it.
+    private func fireValue(_ control: HaControlDescriptor, _ value: Double) async {
+        errorText = nil
+        inFlight = control.action
+        do {
+            try await controller.perform(link: link, action: control.action, value: value)
+        } catch {
+            errorText = HA.actionMessage(for: error)
+        }
+        inFlight = nil
+    }
+
     private func detailRow(_ label: String, _ value: String) -> some View {
         HStack {
             Text(label).font(.caption).foregroundColor(CrumbColors.textTertiary)
@@ -801,6 +873,70 @@ struct HAStateCard: View {
             Text(value).font(.caption.monospaced()).foregroundColor(CrumbColors.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
         }
+    }
+}
+
+/// A value-setting slider for `HAStateCard` (issue #442 Slice 1). Kind-agnostic
+/// — driven entirely by the descriptor's `min`/`max`/`step`/`unit`, never a
+/// hardcoded 0...100, so Slice 2's temperature control reuses this unchanged.
+///
+/// Interaction is identical to the desktop/Android sliders: commits on
+/// release, exactly ONE `onCommit` call per gesture, via `onEditingChanged`
+/// going false. The shown value never flips optimistically on commit — it
+/// only advances when the descriptor's own `value` changes (i.e. when the next
+/// `/ha/states` poll lands), and only while the user isn't mid-drag.
+struct HAValueSlider: View {
+    let control: HaControlDescriptor
+    var disabled: Bool = false
+    /// Fired once per gesture, on release, with the rounded target value.
+    let onCommit: (Double) -> Void
+
+    @State private var value: Double
+    @State private var dragging = false
+
+    private var lowerBound: Double { control.min ?? 0 }
+    private var upperBound: Double { max(control.max ?? 100, lowerBound) }
+    private var stepSize: Double { max(control.step ?? 1, 0.01) }
+
+    init(control: HaControlDescriptor, disabled: Bool = false, onCommit: @escaping (Double) -> Void) {
+        self.control = control
+        self.disabled = disabled
+        self.onCommit = onCommit
+        _value = State(initialValue: control.value ?? control.min ?? 0)
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Slider(
+                value: $value,
+                in: lowerBound...upperBound,
+                step: stepSize,
+                onEditingChanged: { editing in
+                    dragging = editing
+                    if !editing { onCommit(value) }
+                }
+            )
+            .disabled(disabled)
+            Text(Self.label(for: value, control: control))
+                .font(.caption).foregroundColor(CrumbColors.textSecondary)
+        }
+        .padding(.top, 2)
+        // Re-seed from the live descriptor only while the user isn't actively
+        // dragging — a mid-drag poll tick must never yank the thumb (the
+        // state-honesty invariant applies to the drag gesture too).
+        .onChange(of: control.value) { newValue in
+            guard !dragging, let newValue else { return }
+            value = newValue
+        }
+    }
+
+    /// "62%" for the percent kind (every Slice 1 word); "72 °F" for a future
+    /// kind that carries a `unit`.
+    static func label(for value: Double, control: HaControlDescriptor) -> String {
+        let rounded = Int(value.rounded())
+        if control.kind == "percent" { return "\(rounded)%" }
+        if let unit = control.unit, !unit.isEmpty { return "\(rounded) \(unit)" }
+        return "\(rounded)"
     }
 }
 
