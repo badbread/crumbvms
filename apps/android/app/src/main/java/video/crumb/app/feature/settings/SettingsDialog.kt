@@ -80,6 +80,8 @@ fun SettingsDialog(
     var motionTunerOn by remember { mutableStateOf(store.motionTunerEnabled) }
     var snapshotView by remember { mutableStateOf(store.snapshotCapturesView) }
     var lprImageMode by remember { mutableStateOf(store.lprImageMode) }
+    var haShowEntityId by remember { mutableStateOf(store.showHaEntityId) }
+    var haShowDeviceType by remember { mutableStateOf(store.showHaDeviceType) }
 
     // Security — biometric app lock.
     val context = LocalContext.current
@@ -248,6 +250,82 @@ fun SettingsDialog(
                     Switch(
                         checked = showAllCamerasView,
                         onCheckedChange = onShowAllCamerasViewChange,
+                        colors = crumbSwitchColors(),
+                    )
+                }
+
+                // ── Home Assistant section ────────────────────────────────────────
+                // What the entity "more-info" popup (opened from the HA sheet or an
+                // on-video badge) shows below the state. Both default on; read/written
+                // straight through to [store], and [HaMoreInfoDialog] reads the same
+                // flags when it next opens.
+                Text(
+                    text = "Home Assistant — entity popup",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                    ) {
+                        Text(
+                            text = "Show entity type",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary,
+                        )
+                        Text(
+                            text = "Show the \"Type\" row (e.g. Light, Garage door) in the " +
+                                "entity detail popup.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                    Switch(
+                        checked = haShowDeviceType,
+                        onCheckedChange = { checked ->
+                            haShowDeviceType = checked
+                            store.showHaDeviceType = checked
+                        },
+                        colors = crumbSwitchColors(),
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                    ) {
+                        Text(
+                            text = "Show entity ID",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary,
+                        )
+                        Text(
+                            text = "Show the raw entity_id (e.g. light.front_porch) in the " +
+                                "entity detail popup.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                    Switch(
+                        checked = haShowEntityId,
+                        onCheckedChange = { checked ->
+                            haShowEntityId = checked
+                            store.showHaEntityId = checked
+                        },
                         colors = crumbSwitchColors(),
                     )
                 }

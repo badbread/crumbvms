@@ -46,6 +46,7 @@ import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
 import video.crumb.app.data.controlActions
 import video.crumb.app.data.showsSlider
+import video.crumb.app.di.appContainer
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -239,6 +240,12 @@ internal fun HaMoreInfoDialog(
     onAction: (String, Double?) -> Unit = { _, _ -> },
 ) {
     val v = badgeVisual(link, state, stale)
+    // The Entity (entity_id) and Type rows are each user-hideable (Settings ›
+    // Home Assistant), both default-on. Read straight from the shared store, so
+    // reopening the popup reflects a toggle change (the dialog is transient).
+    val settings = appContainer().store
+    val showEntityId = settings.showHaEntityId
+    val showDeviceType = settings.showHaDeviceType
     // Pending confirm-guarded discrete action (action verb -> human prompt),
     // for cover/lock. The slider owns its own confirm state (it also needs to
     // revert the thumb on cancel) — see [HaValueSlider].
@@ -323,9 +330,14 @@ internal fun HaMoreInfoDialog(
                 }
             }
 
-            Spacer(Modifier.height(16.dp))
-            HaAttrRow("Device class", link.deviceClass?.replace('_', ' ') ?: "—")
-            HaAttrRow("Entity", link.entityId)
+            if (showDeviceType || showEntityId) {
+                Spacer(Modifier.height(16.dp))
+                // "Type" = humanized device_class, else humanized domain, so the
+                // row is never blank (a light with no device_class reads "Light") —
+                // matches the desktop detail card. Entity is the raw entity_id.
+                if (showDeviceType) HaAttrRow("Type", haTypeLabel(link.domain, link.deviceClass))
+                if (showEntityId) HaAttrRow("Entity", link.entityId)
+            }
         }
     }
 
@@ -605,6 +617,19 @@ private fun HaConfirmDialog(prompt: String, onConfirm: () -> Unit, onCancel: () 
             }
         }
     }
+}
+
+/**
+ * The "Type" row's value for the more-info popup: the humanized `device_class`
+ * when the entity has one, else the humanized `domain`, so the row is never
+ * blank (a `light` with no device_class reads "Light"; a `cover` with
+ * device_class `garage_door` reads "Garage door"). Matches the desktop detail
+ * card's `_deviceTypeLabel`/`_humanize`: underscores → spaces, first letter
+ * capitalized. Pure, so it's unit-tested.
+ */
+internal fun haTypeLabel(domain: String, deviceClass: String?): String {
+    val raw = deviceClass?.trim()?.takeIf { it.isNotEmpty() } ?: domain
+    return raw.replace('_', ' ').replaceFirstChar { it.uppercaseChar() }
 }
 
 @Composable
