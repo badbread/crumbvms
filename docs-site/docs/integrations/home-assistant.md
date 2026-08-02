@@ -34,8 +34,10 @@ for the control phase, and it isn't wired.
 You need a base URL and a long-lived access token. Make the token from a
 **dedicated non-admin HA user**: the integration only reads state and (later)
 calls services, and a non-admin token is enough for both, which was confirmed on
-live HA hardware. Configure it in the console under **Detection & clips** (the
-same panel as Frigate). It stays dormant until you enable it.
+live HA hardware. Configure it in the console under its own **Home Assistant**
+section, which also lists every linked entity across all your cameras in one
+place and flags any whose entity has since been renamed or removed in HA
+("orphaned"). It stays dormant until you enable it.
 
 The token is write-only from Crumb's side: it's stored in a single `ha_config`
 row and never returned by the API. There's an env fallback (`HA_BASE_URL`,

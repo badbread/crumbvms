@@ -851,6 +851,7 @@ const ICON_PATHS = {
   motion:   '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>', /* activity/pulse → motion tuning */
   info:     '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>', /* info circle */
   integration: '<path d="M12 13v8"/><circle cx="12" cy="11" r="1.6"/><path d="M8 7.5a6 6 0 0 0 0 7"/><path d="M16 7.5a6 6 0 0 1 0 7"/><path d="M5.2 5a9.5 9.5 0 0 0 0 12"/><path d="M18.8 5a9.5 9.5 0 0 1 0 12"/>', /* broadcast → MQTT/Frigate */
+  ha:          '<path d="M3 9.5 12 3l9 6.5"/><path d="M5 9v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9"/><path d="M9 21v-6h6v6"/>', /* house → Home Assistant hub */
   idea:     '<path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1v.2h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z"/>', /* lightbulb → suggestion */
   reload:   '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>', /* refresh → recorder reload */
   bell:     '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>', /* notifications bell */
@@ -3909,6 +3910,7 @@ function routeFor() {
   if (selKind === 'security-root')    return '/security';
   if (selKind === 'storage-root')     return '/storage';
   if (selKind === 'detection-root')   return '/detection';
+  if (selKind === 'ha-root')          return '/ha';
   if (selKind === 'plates-root')      return '/plates';
   if (selKind === 'notifications-root') return '/notifications';
   if (selKind === 'server-root')      return '/server';
@@ -3963,6 +3965,7 @@ function routeApply(r) {
       return select('security-root');
     }
     if (sec === 'detection')     return select('detection-root');
+    if (sec === 'ha')            return select('ha-root');
     // LPR deep-link resolves whenever the admin LPR config loaded (the section
     // hosts the enable toggle itself now); otherwise fall through.
     if (sec === 'plates' && LPR_CONFIG) return select('plates-root');
@@ -4030,6 +4033,7 @@ function select(kind, id) {
   else if (kind === 'role') renderRole(id);
   else if (kind === 'add-camera') renderAddCamera();
   else if (kind === 'detection-root') renderDetectionClips();
+  else if (kind === 'ha-root') renderHaHub();
   else if (kind === 'plates-root') renderPlates();
   else if (kind === 'notifications-root') renderNotifications();
   else if (kind === 'server-root') renderServerSettings();
@@ -4069,6 +4073,7 @@ function renderTree() {
   const recActive = ['profiles-root','profile'].includes(selKind);
   const stoActive = ['storage-root','storage'].includes(selKind);
   const detActive = selKind === 'detection-root';
+  const haActive = selKind === 'ha-root';
   const notActive = selKind === 'notifications-root';
   const secActive = ['security-root','user','role'].includes(selKind);
   const srvActive = selKind === 'server-root';
@@ -4084,6 +4089,10 @@ function renderTree() {
     item("select('storage-root')",  icon('storage',17),     'Storage',            stoActive, STORAGES.length) +
     `<div class="rail-eyebrow">Intelligence</div>` +
     item("select('detection-root')",     icon('integration',17), 'Detection &amp; clips', detActive, null) +
+    // Home Assistant: its own hub (issue #441), always reachable so the
+    // connection can be enabled from here in the first place (unlike LPR
+    // below, there's no config object to gate visibility on).
+    item("select('ha-root')",            icon('ha',17),          'Home Assistant',        haActive, null) +
     // LPR: shown whenever the admin LPR config loaded (the section now hosts
     // the enable toggle + all LPR settings, so it must be reachable while
     // capture is still off). Watchlist/reads inside it stay gated on enabled.
@@ -5603,7 +5612,8 @@ function haRoleSelect(i, role) {
 function renderHaLinks(configured) {
   const el = $('ce-ha'); if (!el) return;
   if (!configured) {
-    el.innerHTML = '<div class="card-hint" style="margin:0">Configure and enable Home Assistant on the <b>Detection &amp; clips</b> page first, then link this camera\'s sensors and controls here.</div>';
+    el.innerHTML = '<div class="card-hint" style="margin:0">Configure and enable Home Assistant on the <b>Home Assistant</b> page first, then link this camera\'s sensors and controls here.</div>' +
+      '<button class="ghost sm" type="button" style="margin-top:8px" onclick="select(\'ha-root\')">Open Home Assistant</button>';
     return;
   }
   const rows = HA_LINKS.map((l, i) => {
@@ -5942,6 +5952,223 @@ async function saveHaLinks() {
     setMsg('ce-ha-msg', msg, 'err');
     toast(msg, 'err');
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   HOME ASSISTANT HUB (issue #441, epic #445 tier 2): a single coherent area
+   for Home Assistant instead of it being split across the Detection & clips
+   page (connection config) and each camera's editor (entity links). Hosts:
+     1. Connection (config/ha) — relocated verbatim from Detection & clips,
+        same fields/ids/save-test behavior, just a new home.
+     2. Global links overview — every HA link across every camera. There is no
+        bulk links endpoint, so this aggregates client-side from the existing
+        per-camera GET /cameras/:id/ha/links (camera counts on a self-hosted
+        box are small; N parallel fetches via Promise.all is cheap and keeps
+        this change admin.html-only, see the PR for the anti-rework rationale).
+     3. Orphaned-link detection — cross-references each link's entity_id
+        against GET /ha/states, which is RBAC-projected to exactly the
+        entities currently linked to caller-visible cameras: an entity_id
+        that HAS a link but is MISSING from that response no longer exists in
+        HA (renamed/removed/integration uninstalled).
+   Per-camera link AUTHORING (add/remove, icon/style, control config, issues
+   #439/#440) stays in the camera editor (renderHaLinks &c. above) — this hub
+   is the connection home base plus a read-only cross-camera view. */
+let HA_HUB_ENABLED = false;   // config/ha .enabled, for the "why no states" banner
+let HA_HUB_LINKS = null;      // [{cam, link}, ...] once loaded, else null while loading/unloaded
+let HA_HUB_STATES = null;     // GET /ha/states response, or null when HA is off/unreachable
+let HA_HUB_FILTER = '';
+let HA_HUB_ORPHANS_ONLY = false;
+
+async function renderHaHub() {
+  selKind = 'ha-root'; selId = null;
+  // Fresh filter state every time the section is (re)opened, so it can never
+  // render a checked/filled control that disagrees with a stale global (the
+  // same reset-on-open convention as the per-camera picker's HA_PICKER_SEARCH).
+  HA_HUB_FILTER = ''; HA_HUB_ORPHANS_ONLY = false;
+  $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('ha',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Home Assistant</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
+  let ha;
+  try { ha = await api('/config/ha'); }
+  catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
+  if (selKind !== 'ha-root') return; // navigated away mid-fetch
+  HA_HUB_ENABLED = !!ha.enabled;
+
+  $('right-pane').innerHTML = `
+    <div class="rp-head">
+      <div class="rp-head-left">
+        <span class="rp-head-icon">${icon('ha',22)}</span>
+        <div class="rp-head-titles">
+          <div class="rp-head-title">Home Assistant</div>
+          <div class="rp-head-sub">Connection, entity links across every camera, and orphaned-link detection</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Connection (ha_config): relocated from Detection & clips, unchanged fields/ids (issue #441). -->
+    <div class="rp-section-head" style="margin-top:4px">
+      <div class="policy-section-title" style="margin-bottom:0">Connection</div>
+      <button class="primary sm" onclick="saveHa()">Save</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Optional. Links your Home Assistant motion/door sensors and lights to cameras (from the camera editor). Use a token from a <b>non-admin</b> HA user: in Home Assistant add a user under Settings, People, then open that user's profile and create a Long-Lived Access Token.</div>
+      <label class="chk"><input type="checkbox" id="ha-enabled" ${ha.enabled?'checked':''}/> Enable Home Assistant integration</label>
+      <div class="grid2" style="margin-top:10px">
+        <div><label class="field-label" style="margin-top:0">Base URL</label><input id="ha-url" class="mono" value="${esc(ha.base_url)}" placeholder="http://homeassistant.local:8123" /></div>
+        <div><label class="field-label" style="margin-top:0">Long-lived access token</label><input id="ha-token" type="password" autocomplete="new-password" placeholder="${ha.has_token?'•••••••• (unchanged)':'(none set)'}" /></div>
+      </div>
+      <div style="margin-top:10px">
+        <button class="ghost sm" onclick="testHa()">Test connection</button>
+        <span id="ha-test" class="srv-note" style="margin-left:8px"></span>
+      </div>
+      <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection). Link individual sensors and controls to a camera from that camera's Motion tab.</div>
+      <div id="ha-msg" class="form-msg"></div>
+    </div>
+
+    <!-- Global links overview + orphan detection (issue #441). -->
+    <div class="rp-section-head" style="margin-top:22px">
+      <div class="policy-section-title" style="margin-bottom:0">Linked entities</div>
+      <button class="ghost sm" onclick="loadHaHubOverview()" title="Re-fetch links and live state from every camera">Refresh</button>
+    </div>
+    <div class="policy-section" style="margin-top:10px">
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Every Home Assistant entity linked to any camera, across the whole server. An entity flagged <b>orphaned</b> no longer exists in Home Assistant — open that camera's Motion tab to relink or remove it.</div>
+      <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
+        <input id="ha-hub-q" placeholder="Filter by camera, entity id, or label…" style="max-width:280px" oninput="haHubFilterChanged()" />
+        <label class="chk" style="margin:0"><input type="checkbox" id="ha-hub-orphans-only" onchange="haHubOrphansOnlyChanged()"/> Orphaned only</label>
+      </div>
+      <div id="ha-hub-overview" style="margin-top:12px"><div class="card-hint" style="padding:6px 2px">Loading…</div></div>
+    </div>`;
+  loadHaHubOverview();
+}
+
+/* saveHa() / testHa(): the connection editor's save + test-connection actions
+   (relocated from Detection & clips, issue #441). Behavior is unchanged, they
+   only read/write the DOM ids in the Connection card above and the config/ha
+   endpoints, so moving the markup here didn't require touching this logic. */
+async function saveHa() {
+  setMsg('ha-msg', '');
+  const body = { enabled: $('ha-enabled').checked, base_url: $('ha-url').value.trim() };
+  const tok = $('ha-token').value;
+  if (tok) body.token = tok;               // write-only: only sent when the user types one
+  if (body.enabled && !body.base_url) { setMsg('ha-msg', 'Base URL is required when enabled.', 'err'); return; }
+  try {
+    const res = await api('/config/ha', { method: 'PUT', body: JSON.stringify(body) });
+    $('ha-token').value = '';
+    $('ha-token').placeholder = res && res.has_token ? '•••••••• (unchanged)' : '(none set)';
+    HA_HUB_ENABLED = !!(res && res.enabled);
+    toast('Home Assistant settings saved.');
+  } catch (e) { setMsg('ha-msg', e.message, 'err'); }
+}
+async function testHa() {
+  const el = $('ha-test');
+  if (el) { el.textContent = 'Testing…'; el.style.color = 'var(--dim2)'; }
+  try {
+    await api('/config/ha/test', { method: 'POST' });
+    if (el) { el.textContent = 'Connected'; el.style.color = 'var(--ok)'; }
+  } catch (e) {
+    if (el) { el.textContent = (e && e.message) || 'Failed'; el.style.color = 'var(--danger)'; }
+  }
+}
+
+/* Fetch every camera's links (parallel, best-effort per camera) + the live HA
+   state snapshot, then render. A camera whose links fetch fails (e.g. a race
+   with camera deletion) degrades to "no links" for that camera rather than
+   failing the whole overview. */
+async function loadHaHubOverview() {
+  const box = $('ha-hub-overview'); if (!box) return;
+  box.innerHTML = '<div class="card-hint" style="padding:6px 2px">Loading…</div>';
+  HA_HUB_LINKS = null; HA_HUB_STATES = null;
+  const camList = CAMS.slice();
+  const perCam = await Promise.all(camList.map(c =>
+    api('/cameras/' + c.id + '/ha/links').then(links => ({ cam: c, links })).catch(() => ({ cam: c, links: [] }))
+  ));
+  const rows = [];
+  perCam.forEach(({ cam, links }) => (links || []).forEach(l => rows.push({ cam, link: l })));
+  HA_HUB_LINKS = rows;
+  // Live states are best-effort: /ha/states 400s when HA is disabled and can
+  // fail/502 when HA is unreachable, either way we degrade to "unknown" state
+  // (orphan flags just don't render) instead of failing the whole overview.
+  try { HA_HUB_STATES = await api('/ha/states'); } catch { HA_HUB_STATES = null; }
+  if (selKind !== 'ha-root' || !$('ha-hub-overview')) return; // navigated away mid-fetch
+  renderHaHubOverview();
+}
+
+function haHubFilterChanged() {
+  HA_HUB_FILTER = (($('ha-hub-q') && $('ha-hub-q').value) || '').trim().toLowerCase();
+  renderHaHubOverview();
+}
+function haHubOrphansOnlyChanged() {
+  HA_HUB_ORPHANS_ONLY = !!($('ha-hub-orphans-only') && $('ha-hub-orphans-only').checked);
+  renderHaHubOverview();
+}
+
+const HA_HUB_ROLE_LABEL = { motion: 'Motion', sensor: 'Sensor', actuator: 'Control' };
+
+/* Pure render from the cached HA_HUB_LINKS/HA_HUB_STATES + the filter state,
+   no fetch, so typing in the filter or toggling "Orphaned only" is instant. */
+function renderHaHubOverview() {
+  const box = $('ha-hub-overview'); if (!box) return;
+  if (!HA_HUB_LINKS) { box.innerHTML = '<div class="card-hint" style="padding:6px 2px">Loading…</div>'; return; }
+  if (!HA_HUB_LINKS.length) {
+    box.innerHTML = `<div class="card-hint" style="padding:6px 2px">No cameras have any Home Assistant links yet. Open a camera&#39;s <b>Motion</b> tab to link sensors or controls.</div>`;
+    return;
+  }
+  // entity_id → live state, only for entities GET /ha/states actually returned.
+  // Its absence (while the fetch itself succeeded) is exactly what "orphaned"
+  // means: the link's entity_id no longer exists in Home Assistant.
+  const stateByEntity = {};
+  if (HA_HUB_STATES && Array.isArray(HA_HUB_STATES.states)) {
+    HA_HUB_STATES.states.forEach(s => { stateByEntity[s.entity_id] = s; });
+  }
+  const statesKnown = !!HA_HUB_STATES;
+
+  const q = HA_HUB_FILTER;
+  const matches = (cam, l) => !q ||
+    (cam.name || '').toLowerCase().includes(q) ||
+    (l.entity_id || '').toLowerCase().includes(q) ||
+    (l.label || '').toLowerCase().includes(q) ||
+    (l.device_class || '').toLowerCase().includes(q);
+
+  let orphanCount = 0;
+  const filtered = HA_HUB_LINKS
+    .filter(({ cam, link: l }) => matches(cam, l))
+    .filter(({ link: l }) => !HA_HUB_ORPHANS_ONLY || (statesKnown && !stateByEntity[l.entity_id]))
+    .sort((a, b) => (a.cam.name || '').localeCompare(b.cam.name || '') || (a.link.entity_id || '').localeCompare(b.link.entity_id || ''));
+
+  const rowsHtml = filtered.map(({ cam, link: l }) => {
+    const orphaned = statesKnown && !stateByEntity[l.entity_id];
+    if (orphaned) orphanCount++;
+    const st = stateByEntity[l.entity_id];
+    const stateTxt = st
+      ? esc(st.state) + (st.unit ? ' ' + esc(st.unit) : '')
+      : (statesKnown ? '<span style="color:var(--warn);font-weight:600">orphaned</span>' : '<span style="color:var(--dim2)">—</span>');
+    return `<tr onclick="select('camera','${esc(cam.id)}')" style="cursor:pointer" title="Open ${esc(cam.name || 'camera')}">
+      <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(cam),16)}</span>${esc(cam.name || '(unnamed)')}</div></td>
+      <td class="mono" style="font-size:12px">${esc(l.entity_id)}${orphaned ? ' <span title="No longer exists in Home Assistant" style="color:var(--warn)">&#9888;</span>' : ''}</td>
+      <td>${esc(HA_HUB_ROLE_LABEL[l.role] || l.role)}</td>
+      <td>${l.device_class ? esc(l.device_class) : '<span style="color:var(--dim2)">—</span>'}</td>
+      <td>${l.label ? esc(l.label) : '<span style="color:var(--dim2)">—</span>'}</td>
+      <td>${stateTxt}</td>
+    </tr>`;
+  }).join('');
+  // Recompute the orphan count over ALL links (not just the filtered/visible
+  // rows) so the banner stays accurate while the operator is filtering.
+  const totalOrphans = statesKnown ? HA_HUB_LINKS.filter(({ link: l }) => !stateByEntity[l.entity_id]).length : 0;
+
+  const banner = !statesKnown
+    ? `<div class="info-note" style="margin-bottom:10px">${HA_HUB_ENABLED
+        ? 'Could not reach Home Assistant for live state — orphan detection is unavailable until it\'s reachable again.'
+        : 'Home Assistant integration is not enabled — enable it above to see live state and orphaned-link detection.'}</div>`
+    : (totalOrphans ? `<div class="warn-note" style="margin-bottom:10px"><b>${totalOrphans}</b> linked ${totalOrphans === 1 ? 'entity is' : 'entities are'} orphaned — no longer present in Home Assistant.</div>` : '');
+
+  const camCount = new Set(HA_HUB_LINKS.map(r => r.cam.id)).size;
+  box.innerHTML = `${banner}
+    <div class="card" style="padding:0">
+      <div class="table-wrap">
+        <table class="list-tbl"><thead><tr><th>Camera</th><th>Entity</th><th>Role</th><th>Device class</th><th>Label</th><th>State</th></tr></thead>
+        <tbody>${rowsHtml || '<tr><td colspan="6" style="color:var(--dim2);padding:20px;text-align:center">No links match.</td></tr>'}</tbody>
+      </table>
+      </div>
+    </div>
+    <div class="card-hint" style="margin-top:8px">${HA_HUB_LINKS.length} link${HA_HUB_LINKS.length===1?'':'s'} across ${camCount} camera${camCount===1?'':'s'}.</div>`;
 }
 
 /* At-a-glance summary line for the collapsed "Camera info (probed)" section: the
@@ -6832,8 +7059,8 @@ async function loadMotionCacheGauge() {
 async function renderDetectionClips() {
   selKind = 'detection-root'; selId = null;
   $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('integration',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Detection &amp; clips</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
-  let c, s, ha;
-  try { [c, s, ha] = await Promise.all([api('/config/frigate'), api('/config/server'), api('/config/ha')]); }
+  let c, s;
+  try { [c, s] = await Promise.all([api('/config/frigate'), api('/config/server')]); }
   catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
   // Stash the full server settings so saveDetectionServer() can send a COMPLETE
   // /config/server body, that PUT is a whole-row replace with required Crumb
@@ -6889,24 +7116,16 @@ async function renderDetectionClips() {
       <div id="fr-msg" class="form-msg"></div>
     </div>
 
-    <!-- Home Assistant integration (ha_config): optional, off by default. -->
+    <!-- Home Assistant now has its own hub section (issue #441): the
+         connection config, links across every camera, and orphaned-link
+         detection all live there instead of being split across this page
+         and the per-camera editor. -->
     <div class="rp-section-head" style="margin-top:22px">
       <div class="policy-section-title" style="margin-bottom:0">Home Assistant</div>
-      <button class="primary sm" onclick="saveHa()">Save</button>
     </div>
     <div class="policy-section" style="margin-top:10px">
-      <div class="card-hint" style="margin:-2px 0 10px 2px">Optional. Links your Home Assistant motion/door sensors and lights to cameras (from the camera editor). Use a token from a <b>non-admin</b> HA user: in Home Assistant add a user under Settings, People, then open that user's profile and create a Long-Lived Access Token.</div>
-      <label class="chk"><input type="checkbox" id="ha-enabled" ${ha.enabled?'checked':''}/> Enable Home Assistant integration</label>
-      <div class="grid2" style="margin-top:10px">
-        <div><label class="field-label" style="margin-top:0">Base URL</label><input id="ha-url" class="mono" value="${esc(ha.base_url)}" placeholder="http://homeassistant.local:8123" /></div>
-        <div><label class="field-label" style="margin-top:0">Long-lived access token</label><input id="ha-token" type="password" autocomplete="new-password" placeholder="${ha.has_token?'•••••••• (unchanged)':'(none set)'}" /></div>
-      </div>
-      <div style="margin-top:10px">
-        <button class="ghost sm" onclick="testHa()">Test connection</button>
-        <span id="ha-test" class="srv-note" style="margin-left:8px"></span>
-      </div>
-      <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection).</div>
-      <div id="ha-msg" class="form-msg"></div>
+      <div class="card-hint" style="margin:-2px 0 0 2px">Connection settings, entity links across every camera, and orphaned-link detection moved to their own <b>Home Assistant</b> section.</div>
+      <button class="ghost sm" type="button" style="margin-top:10px" onclick="select('ha-root')">Open Home Assistant</button>
     </div>
 
     <!-- License-plate recognition moved to the dedicated LPR section (item #2):
@@ -7072,30 +7291,8 @@ async function saveDetectionServer() {
     pollDecodeStatus();
   } catch (e) { setMsg('srv-frigate-msg', e.message, 'err'); }
 }
-/* ── Home Assistant integration config (ha_config) ── */
-async function saveHa() {
-  setMsg('ha-msg', '');
-  const body = { enabled: $('ha-enabled').checked, base_url: $('ha-url').value.trim() };
-  const tok = $('ha-token').value;
-  if (tok) body.token = tok;               // write-only: only sent when the user types one
-  if (body.enabled && !body.base_url) { setMsg('ha-msg', 'Base URL is required when enabled.', 'err'); return; }
-  try {
-    const res = await api('/config/ha', { method: 'PUT', body: JSON.stringify(body) });
-    $('ha-token').value = '';
-    $('ha-token').placeholder = res && res.has_token ? '•••••••• (unchanged)' : '(none set)';
-    toast('Home Assistant settings saved.');
-  } catch (e) { setMsg('ha-msg', e.message, 'err'); }
-}
-async function testHa() {
-  const el = $('ha-test');
-  if (el) { el.textContent = 'Testing…'; el.style.color = 'var(--dim2)'; }
-  try {
-    await api('/config/ha/test', { method: 'POST' });
-    if (el) { el.textContent = 'Connected'; el.style.color = 'var(--ok)'; }
-  } catch (e) {
-    if (el) { el.textContent = (e && e.message) || 'Failed'; el.style.color = 'var(--danger)'; }
-  }
-}
+/* saveHa() / testHa() (config/ha connection editor) moved to the Home
+   Assistant hub section (issue #441), grep "HOME ASSISTANT HUB". */
 /* ── License-plate recognition config (lpr_config) ──
    Toggles plate CAPTURE (privacy-sensitive, off by default) and the plate-read
    retention window, from the LPR section's Settings card. PARTIAL body: the

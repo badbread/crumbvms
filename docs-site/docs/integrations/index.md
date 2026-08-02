@@ -40,10 +40,12 @@ can link a camera to its HA `binary_sensor`s and controls, use those sensors
 as a recording trigger, and drag entity badges onto the live video (in the
 desktop app) for at-a-glance state next to the picture. Badges show state;
 control is not shipped yet. It's REST-only, reads state from your own HA, and
-sends no footage anywhere. You configure it in the console under Detection &
-clips (the same panel as Frigate), where it stays dormant until you enable
-it; a `HA_BASE_URL` / `HA_TOKEN_FILE` env fallback exists for headless setups
-but the console value wins. Off by default, like every integration here. See
+sends no footage anywhere. You configure it in the console under its own
+Home Assistant section, which also shows every linked entity across all your
+cameras and flags any that have gone orphaned (renamed or removed in HA), and
+it stays dormant until you enable it; a `HA_BASE_URL` / `HA_TOKEN_FILE` env
+fallback exists for headless setups but the console value wins. Off by
+default, like every integration here. See
 [Home Assistant](/integrations/home-assistant).
 
 ## Every integration is bring-your-own
