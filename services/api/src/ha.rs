@@ -73,21 +73,57 @@ pub fn routes() -> Router<AppState> {
 /// domain here widens what any `actuators` role can do, so it is a security
 /// decision, not a convenience one (see `docs/DECISIONS.md`, 2026-08-01).
 ///
-/// The action word and the HA service name are 1:1 within a domain, so the
-/// lookup returns a `&'static str` service that the URL is built from — the
-/// client's own string never reaches the HA request.
-const HA_ACTION_ALLOWLIST: &[(&str, &[&str])] = &[
-    ("light", &["turn_on", "turn_off", "toggle"]),
-    ("switch", &["turn_on", "turn_off", "toggle"]),
-    ("fan", &["turn_on", "turn_off", "toggle"]),
-    ("siren", &["turn_on", "turn_off", "toggle"]),
-    ("cover", &["open_cover", "close_cover", "stop_cover"]),
-    ("lock", &["lock", "unlock"]),
-    ("button", &["press"]),
-    ("input_button", &["press"]),
-    ("scene", &["turn_on"]),
-    ("script", &["turn_on"]),
+/// Each row is a [`HaActionSpec`]: the action *word* a client may send and the
+/// `&'static` HA service Crumb calls for it, held per-row so a word can map to a
+/// differently-named service. The `service` is always a `&'static str` from this
+/// table, never the client's string, so the URL is built entirely server-side.
+const HA_ACTION_ALLOWLIST: &[(&str, &[HaActionSpec])] = &[
+    (
+        "light",
+        &[spec("turn_on"), spec("turn_off"), spec("toggle")],
+    ),
+    (
+        "switch",
+        &[spec("turn_on"), spec("turn_off"), spec("toggle")],
+    ),
+    ("fan", &[spec("turn_on"), spec("turn_off"), spec("toggle")]),
+    (
+        "siren",
+        &[spec("turn_on"), spec("turn_off"), spec("toggle")],
+    ),
+    (
+        "cover",
+        &[
+            spec("open_cover"),
+            spec("close_cover"),
+            spec("stop_cover"),
+        ],
+    ),
+    ("lock", &[spec("lock"), spec("unlock")]),
+    ("button", &[spec("press")]),
+    ("input_button", &[spec("press")]),
+    ("scene", &[spec("turn_on")]),
+    ("script", &[spec("turn_on")]),
 ];
+
+/// One allowlisted action for a domain: the action *word* a client sends and the
+/// `&'static` HA service Crumb calls for it. A struct rather than a bare word so
+/// later work can hang metadata off a row (a value parameter arrives in Slice 1
+/// of #442) without reshaping the table or any of its callers.
+struct HaActionSpec {
+    /// The action word a client sends, looked up per the entity's own domain.
+    action: &'static str,
+    /// The HA service Crumb calls for it. `&'static`, never client input.
+    service: &'static str,
+}
+
+/// Build a spec whose action word IS its HA service name (the common case).
+const fn spec(action: &'static str) -> HaActionSpec {
+    HaActionSpec {
+        action,
+        service: action,
+    }
+}
 
 /// HA domain of an entity id: the text before the first `.` (`cover.garage` ⇒
 /// `cover`). Always derived SERVER-SIDE from the stored link, never taken from
@@ -97,13 +133,15 @@ fn domain_of(entity_id: &str) -> &str {
     entity_id.split_once('.').map_or("", |(d, _)| d)
 }
 
-/// Resolve `(domain, action)` to the `&'static str` HA service to call, or
-/// `None` when the pair is not allowlisted (unknown domain, unknown action, or
-/// an action that belongs to a different domain). Pure, so the allowlist is
-/// exhaustively unit-testable without HA or a DB.
-fn allowed_service(domain: &str, action: &str) -> Option<&'static str> {
-    let (_, actions) = HA_ACTION_ALLOWLIST.iter().find(|(d, _)| *d == domain)?;
-    actions.iter().copied().find(|s| *s == action)
+/// Resolve `(domain, action)` to its [`HaActionSpec`], or `None` when the pair
+/// is not allowlisted (unknown domain, unknown action, or an action that belongs
+/// to a different domain). Pure, so the allowlist is exhaustively unit-testable
+/// without HA or a DB.
+fn allowed_spec(domain: &str, action: &str) -> Option<&'static HaActionSpec> {
+    HA_ACTION_ALLOWLIST
+        .iter()
+        .find(|(d, _)| *d == domain)
+        .and_then(|(_, specs)| specs.iter().find(|s| s.action == action))
 }
 
 /// Every entity domain Crumb can actuate, derived straight from
@@ -172,7 +210,7 @@ fn validate_link_role(entity_id: &str, role: &str) -> Result<(), String> {
 fn validate_allowed_actions(entity_id: &str, allowed: &[String]) -> Result<(), String> {
     let domain = domain_of(entity_id);
     for action in allowed {
-        if allowed_service(domain, action).is_none() {
+        if allowed_spec(domain, action).is_none() {
             return Err(format!(
                 "allowed_actions entry '{action}' is not a valid action for a '{domain}' entity \
                  ('{entity_id}'); it must be one of that domain's actions"
@@ -1047,7 +1085,7 @@ async fn post_action(
     // 4. allowlist, on the domain derived from the STORED entity id.
     let domain = domain_of(&link.entity_id);
     let action = body.action.trim();
-    let Some(service) = allowed_service(domain, action) else {
+    let Some(spec) = allowed_spec(domain, action) else {
         audit_actuation(
             &state,
             &user,
@@ -1060,7 +1098,7 @@ async fn post_action(
         let allowed = HA_ACTION_ALLOWLIST
             .iter()
             .find(|(d, _)| *d == domain)
-            .map(|(_, a)| a.join(", "));
+            .map(|(_, a)| a.iter().map(|s| s.action).collect::<Vec<_>>().join(", "));
         return Err(ApiError::BadRequest(match allowed {
             Some(list) => {
                 format!("that action is not allowed for a '{domain}' entity (allowed: {list})")
@@ -1102,10 +1140,13 @@ async fn post_action(
     }
     let client = ha_client(&settings)?;
 
-    // `domain` is the stored entity's own prefix and `service` is a &'static str
-    // straight out of the allowlist, so nothing client-controlled reaches the
+    // `domain` is the stored entity's own prefix and `spec.service` is a &'static
+    // str straight out of the allowlist, so nothing client-controlled reaches the
     // HA URL; the entity id travels in the request body.
-    match client.call_service(domain, service, &link.entity_id).await {
+    match client
+        .call_service(domain, spec.service, &link.entity_id)
+        .await
+    {
         Ok(()) => {
             audit_actuation(&state, &user, camera_id, &link, action, "ok").await;
             Ok(Json(json!({ "ok": true })))
@@ -1352,7 +1393,7 @@ mod tests {
         // No dot ⇒ no domain ⇒ matches no allowlist row.
         assert_eq!(domain_of("garage"), "");
         assert_eq!(domain_of(""), "");
-        assert!(allowed_service(domain_of("garage"), "turn_on").is_none());
+        assert!(allowed_spec(domain_of("garage"), "turn_on").is_none());
     }
 
     #[test]
@@ -1373,10 +1414,11 @@ mod tests {
         ];
         for (domain, actions) in allowed {
             for action in *actions {
+                let spec = allowed_spec(domain, action)
+                    .unwrap_or_else(|| panic!("{domain}.{action} must be allowlisted"));
                 assert_eq!(
-                    allowed_service(domain, action),
-                    Some(*action),
-                    "{domain}.{action} must be allowed and map 1:1 to its service"
+                    spec.service, *action,
+                    "{domain}.{action} must map 1:1 to its service (discrete action)"
                 );
             }
         }
@@ -1389,33 +1431,30 @@ mod tests {
     #[test]
     fn allowlist_rejects_wrong_domain_unknown_and_garbage_actions() {
         // Right action word, wrong domain.
-        assert_eq!(allowed_service("lock", "turn_on"), None);
-        assert_eq!(allowed_service("light", "unlock"), None);
-        assert_eq!(allowed_service("cover", "toggle"), None);
-        assert_eq!(allowed_service("scene", "turn_off"), None);
-        assert_eq!(allowed_service("button", "turn_on"), None);
-        assert_eq!(allowed_service("script", "toggle"), None);
-        assert_eq!(allowed_service("lock", "open_cover"), None);
+        assert!(allowed_spec("lock", "turn_on").is_none());
+        assert!(allowed_spec("light", "unlock").is_none());
+        assert!(allowed_spec("cover", "toggle").is_none());
+        assert!(allowed_spec("scene", "turn_off").is_none());
+        assert!(allowed_spec("button", "turn_on").is_none());
+        assert!(allowed_spec("script", "toggle").is_none());
+        assert!(allowed_spec("lock", "open_cover").is_none());
 
         // Unknown domains, including HA domains Crumb deliberately won't drive.
-        assert_eq!(allowed_service("climate", "set_temperature"), None);
-        assert_eq!(allowed_service("alarm_control_panel", "alarm_disarm"), None);
-        assert_eq!(allowed_service("homeassistant", "turn_on"), None);
-        assert_eq!(allowed_service("shell_command", "turn_on"), None);
-        assert_eq!(allowed_service("", "turn_on"), None);
+        assert!(allowed_spec("climate", "set_temperature").is_none());
+        assert!(allowed_spec("alarm_control_panel", "alarm_disarm").is_none());
+        assert!(allowed_spec("homeassistant", "turn_on").is_none());
+        assert!(allowed_spec("shell_command", "turn_on").is_none());
+        assert!(allowed_spec("", "turn_on").is_none());
 
         // Unknown / garbage actions.
-        assert_eq!(allowed_service("light", "explode"), None);
-        assert_eq!(allowed_service("light", ""), None);
-        assert_eq!(allowed_service("light", "TURN_ON"), None); // case-sensitive
-        assert_eq!(allowed_service("light", "turn_on "), None); // handler trims
-        assert_eq!(allowed_service("light", "turn_on;reboot"), None);
-        assert_eq!(
-            allowed_service("light", "../../homeassistant/restart"),
-            None
-        );
-        assert_eq!(allowed_service("light", "turn_on/../restart"), None);
-        assert_eq!(allowed_service("light/../x", "turn_on"), None);
+        assert!(allowed_spec("light", "explode").is_none());
+        assert!(allowed_spec("light", "").is_none());
+        assert!(allowed_spec("light", "TURN_ON").is_none()); // case-sensitive
+        assert!(allowed_spec("light", "turn_on ").is_none()); // handler trims
+        assert!(allowed_spec("light", "turn_on;reboot").is_none());
+        assert!(allowed_spec("light", "../../homeassistant/restart").is_none());
+        assert!(allowed_spec("light", "turn_on/../restart").is_none());
+        assert!(allowed_spec("light/../x", "turn_on").is_none());
     }
 
     #[test]

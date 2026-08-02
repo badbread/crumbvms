@@ -92,7 +92,7 @@ impl HaClient {
     /// `domain` and `service` must be caller-chosen CONSTANTS, never strings
     /// that came off the wire: this method builds a URL path from them. The API
     /// obtains both from a static per-domain allowlist keyed by the linked
-    /// entity's own domain (`api/src/ha.rs::allowed_service`), so a client can
+    /// entity's own domain (`api/src/ha.rs::allowed_spec`), so a client can
     /// never reach an arbitrary HA service. `entity_id` is the stored link's
     /// entity, never a client-supplied one, and travels in the JSON body.
     ///
