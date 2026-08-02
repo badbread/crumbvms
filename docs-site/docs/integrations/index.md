@@ -36,17 +36,19 @@ side with a built-in A/B benchmark. It's off by default. See
 
 If you run Home Assistant, Crumb can connect to it (a base URL plus a
 long-lived access token, ideally from a dedicated non-admin HA user) so you
-can link a camera to its HA `binary_sensor`s and controls, use those sensors
-as a recording trigger, and drag entity badges onto the live video (in the
-desktop app) for at-a-glance state next to the picture. Badges show state;
-control is not shipped yet. It's REST-only, reads state from your own HA, and
-sends no footage anywhere. You configure it in the console under its own
-Home Assistant section, which also shows every linked entity across all your
-cameras and flags any that have gone orphaned (renamed or removed in HA), and
-it stays dormant until you enable it; a `HA_BASE_URL` / `HA_TOKEN_FILE` env
-fallback exists for headless setups but the console value wins. Off by
-default, like every integration here. See
-[Home Assistant](/integrations/home-assistant).
+can link a camera to its HA sensors and controls, use those sensors as a
+recording trigger, and pin entity badges onto the live video for at-a-glance
+state next to the picture. Entities linked with the Control role can also be
+operated right from the badge, lights, switches, covers, locks, and more,
+gated by a dedicated `actuators` permission that is off by default so seeing a
+camera never implies being able to work its devices. It's REST-only, reads
+state from (and sends actions to) your own HA, and sends no footage anywhere.
+You configure it in the console under its own Home Assistant section, which is
+also a hub: it shows every linked entity across all your cameras and flags any
+that have gone orphaned (renamed or removed in HA), and it stays dormant until
+you enable it; a `HA_BASE_URL` / `HA_TOKEN_FILE` env fallback exists for
+headless setups but the console value wins. Off by default, like every
+integration here. See [Home Assistant](/integrations/home-assistant).
 
 ## Every integration is bring-your-own
 

@@ -24,9 +24,10 @@ handles updates automatically from there.
 ## What it can do
 
 Because it shares the macOS SwiftUI codebase, the feature set matches the Apple
-desktop app: live view, timeline playback, clips, export, bookmarks, and motion
-tuning. The newer surfaces I've built on the Windows desktop and Android clients
-are not in the Apple app yet: no LPR license-plate tab, no Home Assistant
-overlay, and no Data-saver quality tier. See
+desktop app: live view, timeline playback, clips, export, bookmarks, motion
+tuning, and Home Assistant, on-video badges plus tap-to-actuate control for a
+linked Control entity. The newer surfaces I've built on the Windows desktop and
+Android clients are not in the Apple app yet: no LPR license-plate tab, and no
+Data-saver quality tier. See
 [the client feature rundown](/clients/#what-each-client-can-do) for the full
 comparison.

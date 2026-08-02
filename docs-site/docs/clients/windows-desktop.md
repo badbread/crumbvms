@@ -34,8 +34,9 @@ low-bitrate transcode, marked with an "SD" chip on the tile), timeline
 playback, clips and export, per-camera PTZ controls, the LPR license-plate
 reads tab with plate crops and watchlist search, and a Home Assistant entity
 overlay that paints your linked sensor and control states on top of the live
-video. See [the client feature rundown](/clients/#what-each-client-can-do) for
-how this compares to the other clients.
+video, and lets you operate a linked Control entity right from its badge. See
+[the client feature rundown](/clients/#what-each-client-can-do) for how this
+compares to the other clients.
 
 ## Troubleshooting
 
