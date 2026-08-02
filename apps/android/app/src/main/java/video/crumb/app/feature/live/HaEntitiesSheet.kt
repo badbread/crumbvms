@@ -39,7 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
-import video.crumb.app.data.haPrimaryAction
+import video.crumb.app.data.controlActions
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -252,10 +252,11 @@ internal fun HaMoreInfoDialog(
             if (showControls) {
                 Spacer(Modifier.height(18.dp))
                 HaControlRow(
-                    domain = link.domain,
+                    link = link,
                     inFlight = inFlight,
-                    // Simple domains fire directly; cover/lock route through the
-                    // confirm prompt (physical-security guard).
+                    // Simple domains fire directly; cover/lock (and any link with
+                    // require_confirm, migration 0075) route through the confirm
+                    // prompt (physical-security guard).
                     onFire = { action -> onAction(action) },
                     onConfirm = { action, prompt -> pendingConfirm = action to prompt },
                     entityName = link.displayName,
@@ -281,14 +282,18 @@ internal fun HaMoreInfoDialog(
 }
 
 /**
- * The control row for an actuator detail: one button for simple domains (toggle/
- * press/activate, fired directly via [onFire]), Open/Stop/Close for `cover` and
- * Lock/Unlock for `lock` (routed through [onConfirm] with a human prompt). While
- * [inFlight], buttons are disabled and a spinner shows.
+ * The control row for an actuator detail. The button set is derived from the
+ * link's [HaLinkDto.controlActions] (migration 0075): today's default single
+ * primary for simple domains, Open/Stop/Close for `cover`, Lock/Unlock for
+ * `lock`, or exactly the permitted subset when the link restricts
+ * `allowed_actions`. A button routes through [onConfirm] (a prompt) when the
+ * link requires a confirm or the domain is a physical-security one (cover/lock),
+ * else fires directly via [onFire]. While [inFlight], buttons are replaced by a
+ * spinner.
  */
 @Composable
 private fun HaControlRow(
-    domain: String,
+    link: HaLinkDto,
     inFlight: Boolean,
     entityName: String,
     onFire: (String) -> Unit,
@@ -302,28 +307,26 @@ private fun HaControlRow(
         )
         return
     }
-    when (domain) {
-        "cover" -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            HaActionButton("Open", HaBlue) { onConfirm("open_cover", "Open $entityName?") }
-            HaActionButton("Stop", HaGrey) { onConfirm("stop_cover", "Stop $entityName?") }
-            HaActionButton("Close", HaAmber) { onConfirm("close_cover", "Close $entityName?") }
-        }
-        "lock" -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            HaActionButton("Lock", HaBlue) { onConfirm("lock", "Lock $entityName?") }
-            HaActionButton("Unlock", HaRed) { onConfirm("unlock", "Unlock $entityName?") }
-        }
-        else -> {
-            // Simple direct-fire actuators (light/switch/fan/siren/button/scene/...).
-            val primary = haPrimaryAction(domain) ?: return
-            val label = when (primary) {
-                "toggle" -> "Toggle"
-                "press" -> "Press"
-                "turn_on" -> "Activate"
-                else -> primary.replaceFirstChar { it.uppercase() }
+    val needsConfirm = link.requireConfirm || link.domain == "cover" || link.domain == "lock"
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        for (action in link.controlActions()) {
+            HaActionButton(action.label, haActionAccent(action.verb)) {
+                if (needsConfirm) {
+                    onConfirm(action.verb, "${action.label} $entityName?")
+                } else {
+                    onFire(action.verb)
+                }
             }
-            HaActionButton(label, HaBlue) { onFire(primary) }
         }
     }
+}
+
+/** Accent color for a control button, preserving the cover/lock/simple palette. */
+private fun haActionAccent(verb: String): Color = when (verb) {
+    "turn_off", "close_cover" -> HaAmber
+    "unlock" -> HaRed
+    "stop_cover" -> HaGrey
+    else -> HaBlue // turn_on, toggle, open_cover, lock, press
 }
 
 /** A rounded pill action button in the HA sheet's dark theme. */

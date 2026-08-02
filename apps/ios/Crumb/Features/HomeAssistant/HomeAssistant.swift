@@ -312,6 +312,25 @@ extension HA {
         }
     }
 
+    /// The FULL action set for a domain, a SUPERSET of `actions(for:)` used only
+    /// when a link restricts its actions (`allowed_actions` non-null, migration
+    /// 0075). The simple on/off domains gain the `toggle` button the default card
+    /// omits, so an operator can restrict a light to exactly `toggle` and still
+    /// have it render. Every other domain equals its default set. Intersected
+    /// with the link's `allowedActions` at the call site.
+    static func allActions(for domain: String) -> [HAAction] {
+        switch domain {
+        case "light", "switch", "fan", "siren":
+            return [
+                HAAction("turn_on", "On", "power"),
+                HAAction("turn_off", "Off", "power"),
+                HAAction("toggle", "Toggle", "power"),
+            ]
+        default:
+            return actions(for: domain)
+        }
+    }
+
     /// Domains whose control is genuinely multi-action or needs a safety confirm,
     /// so a single tap cannot express it: the tap opens `HAStateCard` instead of
     /// firing. Today only `cover` (open/stop/close) and `lock` (lock/unlock, which
@@ -399,7 +418,14 @@ final class HAController: ObservableObject {
     /// (tap opens `HAStateCard`, exactly as the read-only Phase 1 UI did).
     func directTapAction(for link: HaLink) -> String? {
         guard canActuate, link.isActuator, !HA.needsCard(link.domain) else { return nil }
-        return HA.primaryAction(for: link.domain)
+        // A per-link confirm requirement, or an allowed_actions restriction that
+        // excludes the primary action, routes the tap to the card instead of
+        // firing directly (migration 0075, issue #440).
+        guard !link.requireConfirm else { return nil }
+        guard let primary = HA.primaryAction(for: link.domain), link.actionAllowed(primary) else {
+            return nil
+        }
+        return primary
     }
 
     /// Fire one HA service call for a link. Throws on any non-2xx so the caller
@@ -658,7 +684,11 @@ struct HAStateCard: View {
     /// `actuators` capability. Both false ⇒ the exact Phase 1 card.
     private var actions: [HAAction] {
         guard controller.canActuate, link.isActuator else { return [] }
-        return HA.actions(for: link.domain)
+        // allowed_actions nil ⇒ today's default set. Non-null ⇒ present ONLY the
+        // permitted actions, intersected with the domain's full set (migration
+        // 0075, issue #440).
+        guard let allowed = link.allowedActions else { return HA.actions(for: link.domain) }
+        return HA.allActions(for: link.domain).filter { allowed.contains($0.action) }
     }
 
     var body: some View {
@@ -721,7 +751,10 @@ struct HAStateCard: View {
         HStack(spacing: 10) {
             ForEach(actions) { action in
                 Button {
-                    if action.confirms {
+                    // Confirm when the action itself is physical-security
+                    // (cover/lock) OR the link requires a confirm on every action
+                    // (migration 0075, issue #440).
+                    if action.confirms || link.requireConfirm {
                         pending = action
                     } else {
                         Task { await fire(action) }

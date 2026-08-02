@@ -25,6 +25,8 @@ class HaLink {
     this.overlayShape,
     this.overlayBgColor,
     this.overlayOutline = false,
+    this.requireConfirm = false,
+    this.allowedActions,
   });
 
   /// The link's own UUID — this is the `link_id` the control endpoint takes
@@ -82,7 +84,24 @@ class HaLink {
   /// (migration 0062; default off).
   final bool overlayOutline;
 
+  /// Per-link control config (migration 0075, issue #440). When true, EVERY
+  /// action on this link prompts a confirmation first (on top of the hardcoded
+  /// cover/lock safety confirm). Parsed with a false default so an older server
+  /// that omits it behaves exactly as today.
+  final bool requireConfirm;
+
+  /// Per-link control config (migration 0075, issue #440). When non-null, only
+  /// these actions are offered (intersected with the domain set) and the server
+  /// refuses anything else. Null (the default, and what an older server sends)
+  /// means every domain action is offered, exactly as today.
+  final List<String>? allowedActions;
+
   bool get hasPlacement => overlayX != null && overlayY != null;
+
+  /// Whether [action] is permitted by this link's [allowedActions] gate. A null
+  /// [allowedActions] means "all of the domain's actions" (today's behavior).
+  bool actionAllowed(String action) =>
+      allowedActions == null || allowedActions!.contains(action);
 
   /// The entity_id's domain prefix (`binary_sensor`, `light`, `switch`,
   /// `scene`, ...); empty string if [entityId] has no dot.
@@ -117,6 +136,10 @@ class HaLink {
     overlayShape: j['overlay_shape'] as String?,
     overlayBgColor: j['overlay_bg_color'] as String?,
     overlayOutline: (j['overlay_outline'] as bool?) ?? false,
+    requireConfirm: (j['require_confirm'] as bool?) ?? false,
+    allowedActions: (j['allowed_actions'] as List<dynamic>?)
+        ?.map((e) => e as String)
+        .toList(),
   );
 }
 
@@ -179,6 +202,8 @@ class HaLinkInput {
     this.deviceClass,
     this.label,
     required this.sortOrder,
+    this.requireConfirm = false,
+    this.allowedActions,
   });
 
   final String entityId;
@@ -193,6 +218,12 @@ class HaLinkInput {
   final String? label;
   final int sortOrder;
 
+  /// Per-link control config (migration 0075, issue #440). Not edited by this
+  /// UI (that is the admin console, issue #439) but carried through every
+  /// re-save so a full link-list PUT never wipes a value the console set.
+  final bool requireConfirm;
+  final List<String>? allowedActions;
+
   /// Round-trip an already-saved [HaLink] back into an editable input (e.g.
   /// loading the working set from `GET /cameras/:id/ha/links`, or carrying
   /// an unchanged link forward into the next save).
@@ -202,6 +233,8 @@ class HaLinkInput {
     deviceClass: l.deviceClass,
     label: l.label,
     sortOrder: l.sortOrder,
+    requireConfirm: l.requireConfirm,
+    allowedActions: l.allowedActions,
   );
 
   Map<String, dynamic> toJson() => {
@@ -210,6 +243,8 @@ class HaLinkInput {
     'device_class': deviceClass,
     'label': label,
     'sort_order': sortOrder,
+    'require_confirm': requireConfirm,
+    'allowed_actions': allowedActions,
   };
 }
 

@@ -1647,6 +1647,8 @@ fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
         overlay_shape: row.get("overlay_shape"),
         overlay_bg_color: row.get("overlay_bg_color"),
         overlay_outline: row.get("overlay_outline"),
+        require_confirm: row.get("require_confirm"),
+        allowed_actions: row.get("allowed_actions"),
     }
 }
 
@@ -1662,7 +1664,8 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline
+                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    require_confirm, allowed_actions
              FROM camera_ha_links WHERE camera_id = $1
              ORDER BY sort_order, entity_id",
             &[&camera_id],
@@ -1690,7 +1693,8 @@ pub async fn get_camera_ha_links(
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline
+                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    require_confirm, allowed_actions
              FROM camera_ha_links WHERE camera_id = $1 AND role = $2
              ORDER BY sort_order, entity_id",
             &[&camera_id, &role],
@@ -1722,7 +1726,8 @@ pub async fn get_camera_ha_link(
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline
+                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    require_confirm, allowed_actions
              FROM camera_ha_links WHERE camera_id = $1 AND id = $2",
             &[&camera_id, &link_id],
         )
@@ -1732,8 +1737,18 @@ pub async fn get_camera_ha_link(
 }
 
 /// One camera↔HA link to persist: `(entity_id, role, device_class, label,
-/// sort_order)`. `id` is server-assigned.
-pub type HaLinkInsert = (String, String, Option<String>, Option<String>, i32);
+/// sort_order, require_confirm, allowed_actions)`. `id` is server-assigned.
+/// `require_confirm` + `allowed_actions` are the per-link control config
+/// (migration 0075); a `None` `allowed_actions` means "every domain action".
+pub type HaLinkInsert = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i32,
+    bool,
+    Option<Vec<String>>,
+);
 
 /// Replace the full set of a camera's HA links (delete-then-insert in one
 /// transaction) and bump `ha_config.version` so consumers hot-reload.
@@ -1810,7 +1825,9 @@ pub async fn replace_camera_ha_links(
     )
     .await
     .context("replace_camera_ha_links: delete")?;
-    for (entity_id, role, device_class, label, sort_order) in links {
+    for (entity_id, role, device_class, label, sort_order, require_confirm, allowed_actions) in
+        links
+    {
         let (
             ox,
             oy,
@@ -1834,9 +1851,10 @@ pub async fn replace_camera_ha_links(
                  (camera_id, entity_id, role, device_class, label, sort_order,
                   overlay_x, overlay_y, overlay_size,
                   overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                  overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline)
+                  overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                  require_confirm, allowed_actions)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                     $15, $16, $17)",
+                     $15, $16, $17, $18, $19)",
             &[
                 &camera_id,
                 entity_id,
@@ -1855,6 +1873,8 @@ pub async fn replace_camera_ha_links(
                 &oshape,
                 &obg_color,
                 &ooutline,
+                require_confirm,
+                allowed_actions,
             ],
         )
         .await
@@ -1958,7 +1978,8 @@ pub async fn update_ha_link_placement(
           RETURNING id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline",
+                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    require_confirm, allowed_actions",
             &[
                 &link_id,
                 &camera_id,
@@ -10617,6 +10638,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0074_role_actuators_capability.sql",
         include_str!("../../../db/migrations/0074_role_actuators_capability.sql"),
+    ),
+    (
+        "0075_ha_link_control_config.sql",
+        include_str!("../../../db/migrations/0075_ha_link_control_config.sql"),
     ),
 ];
 
