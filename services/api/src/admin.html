@@ -5236,18 +5236,29 @@ const HA_ICON_SLUGS = [
    editor (issue #440/#439). Source of truth: `HA_ACTION_ALLOWLIST` in
    services/api/src/ha.rs — `PUT .../ha/links` 400s if `allowed_actions`
    contains anything outside the entity's own domain here, so keep this
-   object in exact lockstep (same domains, same action words). */
+   object in exact lockstep (same domains, same action words). Value actions
+   (#442, Slice 1: set_brightness/set_position/set_speed) live in the same
+   allowed_actions vocabulary, so an operator can grant/restrict them here; the
+   value RANGE is not clamped per link (no per-link clamp in v1). */
 const HA_ACTION_ALLOWLIST_BY_DOMAIN = {
-  light: ['turn_on', 'turn_off', 'toggle'],
+  light: ['turn_on', 'turn_off', 'toggle', 'set_brightness'],
   switch: ['turn_on', 'turn_off', 'toggle'],
-  fan: ['turn_on', 'turn_off', 'toggle'],
+  fan: ['turn_on', 'turn_off', 'toggle', 'set_speed'],
   siren: ['turn_on', 'turn_off', 'toggle'],
-  cover: ['open_cover', 'close_cover', 'stop_cover'],
+  cover: ['open_cover', 'close_cover', 'stop_cover', 'set_position'],
   lock: ['lock', 'unlock'],
   button: ['press'],
   input_button: ['press'],
   scene: ['turn_on'],
   script: ['turn_on'],
+};
+
+/* Human labels for the value action words (the discrete words read fine raw).
+   Only the value words get a friendly label in the control-config checkboxes. */
+const HA_ACTION_LABELS = {
+  set_brightness: 'Set brightness',
+  set_position: 'Set position',
+  set_speed: 'Set speed',
 };
 
 /* ── Per-camera LPR zone editor (modal, opened from the LPR section's camera
@@ -5782,7 +5793,7 @@ function haCtrlPanel(i, l) {
   const selected = new Set(restricted ? l.allowed_actions : actions);
   const boxes = actions.map(a => `
       <label class="chk" style="font-size:12px;margin-right:14px">
-        <input type="checkbox" ${selected.has(a) ? 'checked' : ''} ${restricted ? '' : 'disabled'} onchange="haToggleAction(${i}, '${a}', this.checked)" /> ${esc(a)}
+        <input type="checkbox" ${selected.has(a) ? 'checked' : ''} ${restricted ? '' : 'disabled'} onchange="haToggleAction(${i}, '${a}', this.checked)" /> ${esc(HA_ACTION_LABELS[a] || a)}
       </label>`).join('') || '<span class="card-hint" style="margin:0">No actions are defined for this entity\'s domain.</span>';
   return `
     <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">

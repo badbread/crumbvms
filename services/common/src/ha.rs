@@ -104,11 +104,39 @@ impl HaClient {
     /// Returns an error if HA is unreachable, rejects the token, or answers
     /// non-2xx. The message carries only the HTTP status, no upstream body.
     pub async fn call_service(&self, domain: &str, service: &str, entity_id: &str) -> Result<()> {
+        self.call_service_with(domain, service, entity_id, &[])
+            .await
+    }
+
+    /// `POST /api/services/<domain>/<service>` with `{"entity_id": ...}` plus the
+    /// given `extra` service-data key/value pairs (e.g. `brightness_pct` for a
+    /// value action). Same security contract as [`call_service`]: `domain`,
+    /// `service`, and every `extra` KEY must be caller-chosen `&'static`
+    /// constants from the API's allowlist spec, never strings off the wire; only
+    /// the numeric VALUES originate from a validated request. `entity_id` is the
+    /// stored link's entity and travels in the JSON body, never the URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HA is unreachable, rejects the token, or answers
+    /// non-2xx. The message carries only the HTTP status, no upstream body.
+    pub async fn call_service_with(
+        &self,
+        domain: &str,
+        service: &str,
+        entity_id: &str,
+        extra: &[(&str, serde_json::Value)],
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        body.insert("entity_id".to_owned(), serde_json::json!(entity_id));
+        for (k, v) in extra {
+            body.insert((*k).to_owned(), v.clone());
+        }
         let resp = self
             .http
             .post(format!("{}/api/services/{domain}/{service}", self.base_url))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "entity_id": entity_id }))
+            .json(&serde_json::Value::Object(body))
             .send()
             .await
             .context("Home Assistant service call failed")?;
@@ -502,6 +530,40 @@ mod tests {
             .call_service("lock", "unlock", "lock.front")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn call_service_with_puts_extra_params_in_the_body_not_the_url() {
+        let mock = Arc::new(MockHa {
+            sensor_state: Mutex::new("off".to_owned()),
+            fail: AtomicBool::new(false),
+            service_calls: Mutex::new(Vec::new()),
+        });
+        let base = spawn_mock_ha(Arc::clone(&mock)).await;
+        let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
+
+        // A value action (set_brightness rides turn_on) carries its percent in the
+        // service data, alongside the entity id, never in the URL path.
+        client
+            .call_service_with(
+                "light",
+                "turn_on",
+                "light.kitchen",
+                &[("brightness_pct", serde_json::json!(62))],
+            )
+            .await
+            .expect("service call ok");
+
+        let calls = mock.service_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        // The URL is built from the &'static domain/service only.
+        assert_eq!(calls[0].0, "POST /api/services/light/turn_on");
+        let body: serde_json::Value = serde_json::from_str(&calls[0].1).expect("json body");
+        assert_eq!(body["entity_id"], "light.kitchen");
+        // Sent as a JSON integer, and it is exactly entity_id + the one extra key.
+        assert_eq!(body["brightness_pct"], 62);
+        assert!(body["brightness_pct"].is_i64() || body["brightness_pct"].is_u64());
+        assert_eq!(body.as_object().map(|o| o.len()), Some(2));
     }
 
     #[tokio::test]
