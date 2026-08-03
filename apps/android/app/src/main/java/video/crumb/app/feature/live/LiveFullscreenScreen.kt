@@ -984,7 +984,7 @@ fun LiveFullscreenScreen(
         // the detail dialog the list sheet uses (issue #263). For an actuator this
         // is the reachable home for its controls: the action row and, for a
         // value-capable entity (dimmable light / fan / positionable cover), the
-        // value slider (#442, Slice 1) — a simple domain toggles on tap and only
+        // value slider (#442, Slice 1) -- a simple domain toggles on tap and only
         // opens a dialog on long-press, so the slider has nowhere else to live.
         // Non-actuators (sensors) stay read-only via `showControls = canActuate &&
         // isActuator` inside the dialog. Never in PiP (#469): this Dialog is a
