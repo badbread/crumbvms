@@ -58,10 +58,17 @@ function title(cam) {
 }
 
 function anchorId(cam) {
+  // Mirror github-slugger (the slugger Docusaurus uses for heading ids): drop
+  // the characters it strips (punctuation such as `.`) rather than collapsing
+  // them to `-`, then turn spaces into `-`. The old collapse turned a model like
+  // `...ASE-2.8MM-S3` into `...ase-2-8mm-s3`, but the real heading slug is
+  // `...ase-28mm-s3` (the `.` is removed, not dashed), so the summary-table link
+  // pointed at a nonexistent anchor and the docs build emitted a broken-anchor
+  // warning.
   return title(cam)
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '');
+    .replace(/[^a-z0-9 -]+/g, '')
+    .replace(/ /g, '-');
 }
 
 function headlineQuirk(cam) {
