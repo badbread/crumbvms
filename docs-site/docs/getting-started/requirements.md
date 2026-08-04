@@ -27,7 +27,7 @@ slug: /getting-started/requirements
 ## GPU (optional)
 
 Not required. Motion detection runs on CPU by default
-(`MOTION_HWACCEL=auto`), and recording itself is never re-encoded (`-c copy`
+(`MOTION_HWACCEL=cpu`), and recording itself is never re-encoded (`-c copy`
 straight from the camera), so no decoder is needed for recording at all.
 Hardware-accelerated motion decode is an opt-in overlay for Intel/AMD iGPUs
 (VAAPI) or NVIDIA GPUs (NVDEC); see

@@ -66,7 +66,7 @@ the migrations to run; check `docker compose logs postgres` if it doesn't
 clear within a minute or two.
 
 **GPU not found for motion decode.** Drop the GPU overlay and run on CPU
-(`MOTION_HWACCEL=auto`); recording itself never needed the GPU in the
+(`MOTION_HWACCEL=cpu`, the default); recording itself never needed the GPU in the
 first place. See [Hardware decode](/configuration/hardware-decode).
 
 **The recorder won't start, and the error mentions

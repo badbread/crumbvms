@@ -56,7 +56,7 @@ CrumbVMS records **security cameras**. A misconfiguration is a privacy hazard, s
 - **Disk:** cameras consume **terabytes**. Identify a target disk/path with ample
   free space (Step 3). Warn the user if the chosen path is small.
 - **GPU (optional):** not required. CrumbVMS runs motion detection on CPU by default
-  (`MOTION_HWACCEL=auto`). NVIDIA GPU support is an opt-in overlay (Step 4).
+  (`MOTION_HWACCEL=cpu`), which works on any host. GPU decode is an opt-in overlay (Step 4).
 - **Images, pull vs. build:** the base compose file *pulls* prebuilt `api`/
   `recorder` images from GHCR (no Rust toolchain needed). The upstream
   `ghcr.io/badbread/crumbvms/{api,recorder}` images are **published and public**,
@@ -534,8 +534,8 @@ present; `GET /status` (or the recorder logs) shows it recording within ~30s.
 ### Hardware-accelerated motion decode (optional)
 
 Only the **motion-analysis** decode uses a decoder (recording is stream-copy).
-The base stack boots GPU-free (`motion_hwaccel: auto` → CPU when no NVIDIA GPU is
-present). To decode on hardware, the matching device must be **mapped into the
+The base stack boots GPU-free (`MOTION_HWACCEL=cpu`, software decode that works on
+any host). To decode on hardware, the matching device must be **mapped into the
 recorder container**, Docker never lets a running container grant itself
 devices, so this is always a host-side compose change (Frigate has the same
 constraint).
@@ -723,7 +723,7 @@ Default = LAN-only, do nothing. If the user wants to reach CrumbVMS away from ho
 - Port 8080 (or 8443/18554/8556) in use → another service on the host; remap
   the conflicting port in `docker-compose.yml` (or override `CRUMB_HTTPS_PORT`
   in `.env` for Caddy).
-- GPU not found → drop the GPU overlay, run CPU (`MOTION_HWACCEL=auto`).
+- GPU not found → drop the GPU overlay, run CPU (`MOTION_HWACCEL=cpu`, the default).
 - Camera won't connect → wrong RTSP URL / credentials; verify with the test-stream
   endpoint and `ffprobe` before adding.
 - Browser warns "not private" / "not trusted" at `https://<host>:8443` →

@@ -27,7 +27,7 @@ docker compose up -d      # boots; create your admin at http://<host>:8080/admin
   There is no `build:` stanza in the base file by design, so a stock
   `up -d` never triggers a Rust compile. See [docs/IMAGES.md](IMAGES.md).
 - **GPU decode** (optional NVDEC / VAAPI): add the matching overlay. Without it,
-  `MOTION_HWACCEL=auto` resolves to CPU, so motion still works with no GPU.
+  `MOTION_HWACCEL=cpu` (the default) runs motion decode in software, so motion works with no GPU.
   ```bash
   docker compose -f docker-compose.yml -f docker-compose.gpu.example.yml up -d     # NVIDIA/NVDEC
   docker compose -f docker-compose.yml -f docker-compose.vaapi.example.yml up -d   # Intel/AMD iGPU

@@ -356,8 +356,8 @@ When `FRIGATE_MQTT_URL` is empty the entire detection subsystem stays disabled.
 <details>
 <summary><b>GPU (optional)</b>: hardware motion decode</summary>
 
-The base stack runs GPU-free: `MOTION_HWACCEL=auto` probes for NVDEC and falls back to CPU
-when no NVIDIA GPU is present. The quickest way to enable hardware motion decode is the helper,
+The base stack runs GPU-free: `MOTION_HWACCEL=cpu` (the default) runs motion decode in software,
+which works on any host. The quickest way to enable hardware motion decode is the helper,
 which detects the host's hardware, writes a `docker-compose.override.yml`, and restarts the
 recorder:
 
