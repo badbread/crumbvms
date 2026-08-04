@@ -59,6 +59,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 - **A customizable on-video PTZ panel**: build your own control layout over the live feed, drag on a pan/tilt wheel, zoom, focus, iris, and your camera's presets, then size and place them how you like, per camera. Full ONVIF control
 - A per-camera **Data saver** stream (on-demand low-res transcode) for cheap remote or bandwidth-limited viewing
 - **Home Assistant entities on the live video, with live status.** Link a camera to its HA entities and drag each badge onto the frame where the thing actually is: the contact sensor on the front door, the light badge on the porch, the motion sensor over the driveway. Every badge shows live state right on the wall, updating as HA does
+- **Control Home Assistant from the badge.** Entities you mark as controls actuate right on the video: tap a light or switch to fire its action, open a small card for a cover or lock with more than one meaningful action, and drag a slider for brightness, blind position, or fan speed. Control is off by default and gated by its own permission. Works on desktop, Android, and iOS
 - **Real native clients, not a browser in a wrapper.** A Windows desktop app on libmpv, a native SwiftUI macOS app, and a native Android app, all purpose-built, which is what makes the live wall and frame-accurate H.265 scrubbing feel instant instead of a laggy web tab. The web admin console is there for when you just want a browser
 
 **Keep**
@@ -206,12 +207,17 @@ then it shows that entity's live state right on the video. A few from my own wal
 
 Make each badge yours: sixty icons to pick from, a compact dot or a labeled pill, your color,
 size, and background, and you choose whether it shows the state text, the time it last changed,
-or just the icon. You connect Home Assistant and link entities from inside the desktop app, no
-YAML. The Android app surfaces the same linked entities in a per-camera sheet (read-only for now).
+or just the icon. You connect Home Assistant and link entities from a dedicated Home Assistant hub
+in the console, no YAML: connection settings, every linked entity across every camera in one
+searchable table, and detection of links whose entity has since disappeared from HA. The Android
+and iOS apps surface the same linked entities in a per-camera sheet.
 
-The overlay ships in this release. **Control is the next step:** spot an open garage door on the
-camera, tap its badge in Crumb, and close it. That is in active development and not tagged yet,
-so if you have thoughts on how it should work,
+**Control ships too.** Mark an entity as a control and you can operate it right from its badge:
+spot an open garage door on the camera, tap its badge in Crumb, and close it. A single tap fires a
+simple device like a light or a switch; a cover or lock opens a small action card; and dimmable
+lights, blinds, and fans get a slider for brightness, position, and speed. Control works on
+desktop, Android, and iOS, is off by default, and is gated by its own permission. If you have
+thoughts on how it should work,
 [open an issue](https://github.com/badbread/crumbvms/issues).
 
 > [!IMPORTANT]

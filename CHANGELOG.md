@@ -9,6 +9,144 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
+## [0.2.0] - 2026-08-03
+
+Where 0.1.1 hardened what was already there, 0.2.0 finishes a feature that had
+been half-built for two releases: Home Assistant. Crumb could show a linked
+entity's state on the live wall, but you could not do anything with it, and
+authoring those links was a thin, awkward surface. This cycle rebuilt the
+authoring layer end to end and made the badges interactive: tap a light to turn
+it on, drag a slider to dim it, read a sensor's real value and units off the
+frame. The other headline items are adaptive live-wall quality on every client
+and human-readable plate names in LPR.
+
+### The Home Assistant overhaul
+
+- **Authoring got a real home.** Home Assistant is now its own area in the admin
+  console instead of a scattering of per-camera fields (#458), including
+  orphaned-entity detection that flags a link whose entity no longer exists. The
+  entity picker was widened from a narrow allow-list to every controllable
+  domain plus numeric sensors (#448), and each linked entity now carries an
+  editable role, device_class, and label (#453), validated against the entity's
+  real domain (#452).
+- **One icon vocabulary.** Badges used to drift between clients because each
+  mapped icons on its own; there is now a single canonical closed icon set,
+  enforced server-side and mapped identically on desktop, Android, and iOS
+  (#455, #447), with numeric sensor units rendered on the badge and detail card
+  (#454).
+- **Per-entity control config.** A link can require a confirmation tap before it
+  actuates and can restrict which actions it exposes (#456), authored from the
+  same console link editor that sets its icon and style (#457).
+
+### Interactive badges
+
+- **Device control shipped on all four surfaces.** A default-off actuators
+  capability gates a new control endpoint (#427); the on-video badge card gained
+  actuator buttons on desktop (#426), iOS (#425), and Android, and the
+  interaction model settled on a direct tap: a single tap actuates a simple
+  device such as a light or a switch, and only cover- or lock-type entities open
+  a card first (#429, #430, #431).
+- **Value controls.** Dimmable lights, covers, and fans get a slider for
+  brightness, position, and speed, wired through a new value-setting control on
+  the server (#460) and surfaced on desktop (#461), iOS (#462), and Android
+  (#463), with the detail card's icon color matched to the badge (#466, #467,
+  #468).
+
+### Added
+
+- **Adaptive live-wall quality** on every client: the wall steps stream quality
+  down under thermal or decode pressure and back up when it clears, so a busy
+  wall degrades gracefully instead of stuttering (Android #422, Apple #423,
+  desktop #424).
+- **Human-readable plate names in LPR.** A plate you have named shows that name
+  wherever the plate appears (reads, watchlist, and detail), with the raw plate
+  still legible underneath (#418, and the clients #419, #420, #421).
+- An **admin-only scrubbed diagnostics bundle** on the server, the counterpart
+  to the desktop diagnostics added in 0.1.1 (#385).
+- **Motion-detector-down** state is now surfaced in decode-status and the admin
+  console, and the recorder alerts when a detector is broken from startup rather
+  than failing silently (#415, #413).
+- An opt-out for the go2rtc RTSP restream's auth (`GO2RTC_AUTH=off`) for setups
+  that terminate access control elsewhere (#417).
+
+### Changed
+
+- **Digital-zoom ceilings raised** and aligned across clients: Android playback
+  to 10x (#405), iOS and desktop to 30x (#408), plus trackpad pinch-to-zoom on
+  desktop laptops (#410).
+- Media tokens minted by an older client are no longer rejected after an
+  upgrade: the server fills in default capability claims instead (#407), which
+  retires the post-upgrade blank-thumbnail window that 0.1.1 listed as a known
+  issue.
+
+### Fixed
+
+- Android keeps the playhead where you scrubbed even when it lands in a gap
+  (#406), holds digital zoom across motion-segment boundaries (#387), and uses
+  the Download glyph for the playback wall's Export action (#389).
+- Server discovery no longer prefers a TLS URL the app cannot actually use
+  (#403).
+- Setup fails early with a clear message when a bind-mounted config file is
+  missing, instead of booting into a confusing state (#397).
+- Frame-back works in the desktop LPR plate popup (#392), and the A/B report
+  carries the plate bounding box so crops line up (#393).
+
+### All merged changes
+
+Every pull request merged since 0.1.1, newest first:
+
+- fix(android): don't render HA entity popup inside the PiP window (#469) (#470)
+- feat(ios): match HA detail-card icon to the on-video badge color (#467)
+- fix(android): make the HA value slider usable + popup visuals match the badge (#442 Slice 1 follow-ups) (#468)
+- feat(desktop): match HA detail card icon color to badge + add entity/type rows (#466)
+- feat(android): HA value slider for brightness/position/speed (#442 Slice 1) (#463)
+- feat(ios): value slider for HA percent controls (brightness/position/speed) (#462)
+- feat(desktop): HA value-setting slider for dimmable lights/covers/fans (#461)
+- feat(ha): value-setting HA controls (brightness/position/speed), #442 Slice 1 (#460)
+- docs(integrations): bring the Home Assistant page up to date with epic #445 (#459)
+- feat(admin): unify Home Assistant into its own console area (#441) (#458)
+- feat(admin): HA link authoring — icon/style + control config (#439) (#457)
+- feat(ha): per-link control config — require_confirm + allowed_actions (#440) (#456)
+- feat(ha): one canonical closed icon vocabulary, enforced + mapped on all clients (#455)
+- feat(clients): render numeric HA sensor units on badge + entity detail (#454)
+- feat(ha-links): editable role, device_class, and label per linked entity (#453)
+- feat(api/ha): validate link role vs domain; expose sensor unit (#452)
+- feat(ha): widen entity picker to all controllable + numeric-sensor domains (#448)
+- fix(android): unify HA badge and entity-sheet icon/color mapping (#447)
+- docs(map): add Home Assistant control parity row; fix stale Android overlay cell (#432)
+- feat(android): Home Assistant control (Phase 2) with direct-tap interaction model (#431)
+- feat(ios): HA single-tap actuates simple devices; card only for cover/lock (#428) (#430)
+- feat(desktop): single-click actuates HA badge directly; card only for cover/lock (#428) (#429)
+- feat(desktop): HA device controls on the on-video badge card (#187) (#426)
+- feat(ios): HA control Phase 2, actuator buttons on the entity detail card (#425)
+- feat(api): Home Assistant control endpoint + default-off actuators capability (#427)
+- feat(desktop): adaptive live-wall quality, guardrail + backpressure (#382) (#424)
+- feat(apple): adaptive live-wall quality (thermalState backpressure + decode guardrail) (#383) (#423)
+- feat(android): adaptive live-wall quality (guardrail + decode backpressure) (#422)
+- feat(desktop): show operator-given plate name over the raw plate (LPR) (#421)
+- feat(android): show operator-assigned plate name over the raw plate in LPR UI (#420)
+- feat(ios): show operator-assigned plate name in LPR reads and watchlist (#419)
+- feat(lpr): human-readable plate names shown wherever a plate appears (#363) (#418)
+- feat(go2rtc): first-class RTSP restream auth opt-out (GO2RTC_AUTH=off) (#417)
+- docs(decisions): record no-autoheal-in-default-stack decision (#396) (#416)
+- feat(api): surface motion-detector-down state in decode-status + admin console (#415)
+- docs(recorder): VAAPI render-node robustness + escalated motion-decode-failure log (#414)
+- fix(recorder): alert when a motion detector is broken from startup (#411) (#413)
+- fix(desktop): support trackpad pinch-to-zoom on laptops (#410)
+- fix(ios,desktop): raise digital-zoom ceilings to 30x to match Android (#408)
+- fix(api): default media-token capability claims instead of rejecting old tokens (#407)
+- fix(android): keep the playhead where the user scrubbed, even in a gap (#406)
+- fix(android): raise the digital-zoom ceiling from 5x to 10x (#405)
+- fix(clients): stop discovery preferring a TLS URL the app cannot use (#403)
+- fix(setup): fail early when a bind-mounted config file is missing (#397)
+- docs: warn about the NVIDIA driver-upgrade trap on GPU hosts (#395)
+- perf(api,desktop): carry plate bbox in the ab-report (#393)
+- fix(desktop): make frame-back work in the LPR plate popup (#392)
+- fix(android): use Download glyph for playback wall Export action (#389)
+- fix(android): keep playback digital zoom across motion-segment gaps (#387)
+- feat(api): admin-only scrubbed diagnostics bundle (server side of #180) (#385)
+- fix(release): bump all client versions to 0.1.1 + document the step (#381)
+
 ## [0.1.1] - 2026-07-20
 
 A hardening release. Where 0.1.0 was about building the seat, 0.1.1 is about
@@ -296,7 +434,8 @@ wizard with generated secrets, LAN-only by default; and native desktop
 (then Tauri), Android, and web-admin clients. Runs entirely on your own hardware,
 no cloud, no account, no telemetry.
 
-[Unreleased]: https://github.com/badbread/crumbvms/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/badbread/crumbvms/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/badbread/crumbvms/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/badbread/crumbvms/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/badbread/crumbvms/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/badbread/crumbvms/releases/tag/v0.0.1
