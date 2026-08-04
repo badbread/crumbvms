@@ -138,4 +138,44 @@ final class HaValueControlTests: XCTestCase {
         let control = try XCTUnwrap(state.control)
         XCTAssertEqual(HAValueSlider.label(for: 33, control: control), "33%")
     }
+
+    // MARK: - Post-commit hold (issue #465: slider bounce-back on release)
+
+    /// The poll converges once it lands within a step (plus the rounding margin)
+    /// of the committed value; until then the thumb keeps holding the commit so
+    /// the transitioning OLD value can't snap it back — the #465 bounce.
+    func testHoldConvergesWithinAStepPlusMargin() {
+        // Exact hit converges.
+        XCTAssertTrue(HAValueSlider.holdConverged(polled: 60, committed: 60, step: 1))
+        // Off by one step (percent↔brightness rounding) still converges.
+        XCTAssertTrue(HAValueSlider.holdConverged(polled: 59, committed: 60, step: 1))
+        XCTAssertTrue(HAValueSlider.holdConverged(polled: 61, committed: 60, step: 1))
+        // Coarser grids honor their own step.
+        XCTAssertTrue(HAValueSlider.holdConverged(polled: 50, committed: 75, step: 25))
+    }
+
+    /// The device's transitioning OLD value (still far from target) must NOT be
+    /// treated as converged, or the thumb would bounce back to it.
+    func testHoldDoesNotConvergeOnTheStaleTransitioningValue() {
+        // Released at 80 but the first poll still reports the old 20 → hold.
+        XCTAssertFalse(HAValueSlider.holdConverged(polled: 20, committed: 80, step: 1))
+        // Two steps away on a step=25 grid is still a genuine mismatch.
+        XCTAssertFalse(HAValueSlider.holdConverged(polled: 25, committed: 75, step: 25))
+    }
+
+    /// On release the raw drag position is clamped and snapped to the
+    /// descriptor's grid (never a hardcoded 0...100) so the POSTed value is
+    /// step-aligned even though the slider tracks the finger continuously.
+    func testSnapToStepQuantizesAndClampsTheReleasedValue() {
+        // step=25 grid: 63 rounds to 75, 62 rounds to 50.
+        XCTAssertEqual(HAValueSlider.snapToStep(63, min: 0, max: 100, step: 25), 75)
+        XCTAssertEqual(HAValueSlider.snapToStep(62, min: 0, max: 100, step: 25), 50)
+        // Clamps outside the range.
+        XCTAssertEqual(HAValueSlider.snapToStep(140, min: 0, max: 100, step: 1), 100)
+        XCTAssertEqual(HAValueSlider.snapToStep(-5, min: 0, max: 100, step: 1), 0)
+        // Grid measured from a non-zero min (e.g. a 10–30 °C thermostat, step 0.5).
+        XCTAssertEqual(HAValueSlider.snapToStep(21.2, min: 10, max: 30, step: 0.5), 21)
+        // A degenerate step falls back to 1 rather than dividing by zero.
+        XCTAssertEqual(HAValueSlider.snapToStep(7.4, min: 0, max: 100, step: 0), 7)
+    }
 }

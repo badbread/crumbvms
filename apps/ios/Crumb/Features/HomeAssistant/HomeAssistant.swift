@@ -909,19 +909,40 @@ struct HAStateCard: View {
 /// — driven entirely by the descriptor's `min`/`max`/`step`/`unit`, never a
 /// hardcoded 0...100, so Slice 2's temperature control reuses this unchanged.
 ///
-/// Interaction is identical to the desktop/Android sliders: commits on
-/// release, exactly ONE `onCommit` call per gesture, via `onEditingChanged`
-/// going false. The shown value never flips optimistically on commit — it
-/// only advances when the descriptor's own `value` changes (i.e. when the next
-/// `/ha/states` poll lands), and only while the user isn't mid-drag.
+/// Interaction mirrors the desktop/Android sliders: commits on release, exactly
+/// ONE `onCommit` call per gesture, via `onEditingChanged` going false. The
+/// shown value never flips optimistically on commit — it only advances when the
+/// descriptor's own `value` changes (i.e. when the next `/ha/states` poll
+/// lands), and only while the user isn't mid-drag.
+///
+/// Post-commit HOLD (issue #465): on release the thumb is pinned to the
+/// committed target and the poll re-seed is suppressed until the polled value
+/// converges to within a step of it (see `holdConverged`) OR a safety timeout
+/// elapses. Without the hold the very first poll after a commit — which for a
+/// beat still reports the device's OLD value while it transitions — snaps the
+/// thumb back the instant you release, then jumps it to the target a poll later:
+/// the bounce. The slider is CONTINUOUS (no `step:`, which snaps the thumb to
+/// tick positions mid-drag and itself reads as a bounce); the released value is
+/// snapped to `step` in `snapToStep`, so the POSTed value stays grid-aligned —
+/// Android/desktop parity.
 struct HAValueSlider: View {
     let control: HaControlDescriptor
     var disabled: Bool = false
-    /// Fired once per gesture, on release, with the rounded target value.
+    /// Fired once per gesture, on release, with the step-snapped target value.
     let onCommit: (Double) -> Void
 
     @State private var value: Double
     @State private var dragging = false
+    /// A value we just committed and pin the thumb at until the `/ha/states`
+    /// poll reflects it (issue #465). `nil` means "follow the polled value" —
+    /// the normal idle state. Never an optimistic report of a NEW value as
+    /// accepted; it only holds where the operator just released.
+    @State private var committed: Double?
+
+    /// Safety net so a dropped request or a device that never reaches the target
+    /// can't freeze the thumb: the hold is released after this window even if the
+    /// poll never converges. Matches the Android slider's 6s timeout.
+    private static let holdTimeout: Duration = .seconds(6)
 
     private var lowerBound: Double { control.min ?? 0 }
     private var upperBound: Double { max(control.max ?? 100, lowerBound) }
@@ -936,13 +957,14 @@ struct HAValueSlider: View {
 
     var body: some View {
         VStack(spacing: 4) {
+            // CONTINUOUS slider (no `step:`): the thumb tracks the finger; the
+            // released value is snapped to the descriptor's grid in `commit`.
             Slider(
                 value: $value,
                 in: lowerBound...upperBound,
-                step: stepSize,
                 onEditingChanged: { editing in
                     dragging = editing
-                    if !editing { onCommit(value) }
+                    if !editing { commit() }
                 }
             )
             .disabled(disabled)
@@ -950,13 +972,59 @@ struct HAValueSlider: View {
                 .font(.caption).foregroundColor(CrumbColors.textSecondary)
         }
         .padding(.top, 2)
-        // Re-seed from the live descriptor only while the user isn't actively
-        // dragging — a mid-drag poll tick must never yank the thumb (the
-        // state-honesty invariant applies to the drag gesture too).
+        // Re-seed from the live descriptor only while the user isn't mid-drag
+        // AND no just-committed value is being held. A mid-drag poll tick must
+        // never yank the thumb; a held commit stays put until the poll converges
+        // to it — releasing the hold at that point (#465).
         .onChange(of: control.value) { newValue in
             guard !dragging, let newValue else { return }
+            if let target = committed {
+                guard Self.holdConverged(polled: newValue, committed: target, step: stepSize) else {
+                    return  // still transitioning — keep holding the committed value
+                }
+                committed = nil
+            }
             value = newValue
         }
+        // Never hold forever. Re-armed each time `committed` changes; the sleep
+        // is cancelled (and this early-returns) the moment the hold clears.
+        .task(id: committed) {
+            guard committed != nil else { return }
+            try? await Task.sleep(for: Self.holdTimeout)
+            guard !Task.isCancelled else { return }
+            committed = nil
+        }
+    }
+
+    /// Snap the released position to the descriptor's step grid, pin the thumb
+    /// there, and fire the one POST for this gesture.
+    private func commit() {
+        let target = Self.snapToStep(value, min: lowerBound, max: upperBound, step: stepSize)
+        value = target
+        committed = target
+        onCommit(target)
+    }
+
+    /// Snap a raw slider value onto the descriptor's grid: clamp to `min...max`,
+    /// then round to the nearest whole `step` measured from `min`. Kind-agnostic
+    /// (never a hardcoded 0...100). Applied ONCE on release so the drag stays
+    /// smooth (the slider is continuous) while the committed/POSTed value is
+    /// step-aligned. Pure, so it's unit-tested.
+    static func snapToStep(_ raw: Double, min: Double, max: Double, step: Double) -> Double {
+        let s = step > 0 ? step : 1
+        let clamped = Swift.min(Swift.max(raw, min), max)
+        let snapped = min + (((clamped - min) / s).rounded()) * s
+        return Swift.min(Swift.max(snapped, min), max)
+    }
+
+    /// Whether the just-committed value has been reflected by the poll: true once
+    /// the `polled` value is within a step (plus a small margin, to absorb
+    /// percent↔brightness rounding) of `committed`. While false the slider keeps
+    /// holding the committed value rather than snapping to the device's
+    /// transitioning old value (#465). Pure, so it's unit-tested. Mirrors the
+    /// Android `haHoldConverged`.
+    static func holdConverged(polled: Double, committed: Double, step: Double) -> Bool {
+        abs(polled - committed) <= step + 0.5
     }
 
     /// "62%" for the percent kind (every Slice 1 word); "72 °F" for a future
