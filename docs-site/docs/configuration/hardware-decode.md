@@ -8,8 +8,8 @@ slug: /configuration/hardware-decode
 
 Recording itself never re-encodes video, camera streams are copied
 straight to disk. Only the motion-analysis path needs a decoder, and the
-default stack runs that on CPU with no action required (`MOTION_HWACCEL=auto`,
-which falls back to CPU whenever no supported GPU is present).
+default stack runs that on CPU with no action required (`MOTION_HWACCEL=cpu`),
+which works on any host and is cheap at the ~320px/5fps analysis resolution.
 
 ## Enabling it
 

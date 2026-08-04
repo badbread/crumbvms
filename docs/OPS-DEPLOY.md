@@ -21,7 +21,7 @@ cd /opt/crumb/app
 # Generate a .env with strong secrets (see "Secrets" below).
 scripts/setup-env.sh                   # zero-edit: strong secrets + sane defaults
 
-# Boots GPU-free (MOTION_HWACCEL=auto → CPU when no GPU is present).
+# Boots GPU-free (MOTION_HWACCEL=cpu by default; software motion decode on any host).
 docker compose up -d
 docker compose ps                      # postgres healthy, recorder (embeds go2rtc) + api up
 ```

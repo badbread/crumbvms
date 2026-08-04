@@ -1,6 +1,6 @@
 # CrumbVMS — VAAPI overlay (optional Intel/AMD iGPU hardware decode for motion).
 #
-# The base docker-compose.yml boots GPU-free (MOTION_HWACCEL=auto → CPU). Apply
+# The base docker-compose.yml boots GPU-free (MOTION_HWACCEL defaults to 'cpu'). Apply
 # THIS overlay on a host with an Intel/AMD integrated GPU to decode the motion
 # sub-streams on the iGPU's fixed-function media block (e.g. Intel Quick Sync):
 #
@@ -56,7 +56,7 @@
 services:
   recorder:
     environment:
-      # Force VAAPI decode (overrides the base 'auto').
+      # Force VAAPI decode (overrides the base 'cpu').
       MOTION_HWACCEL: ${MOTION_HWACCEL:-vaapi}
       # DRI render node for the iGPU. Override if yours isn't renderD128. On a
       # multi-GPU host, prefer the stable by-path symlink over the renderD number

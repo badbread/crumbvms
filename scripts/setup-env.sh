@@ -253,9 +253,12 @@ LIVE_STORAGE_PATH=/data/live
 ARCHIVE_STORAGE_PATH=/data/archive
 
 # --- GPU / motion decode ---
-# 'auto' uses NVDEC when a GPU is present, else CPU. GPU access is opt-in via
-# docker-compose.gpu.example.yml. Set 'cuda' to force NVDEC, 'cpu' to force CPU.
-MOTION_HWACCEL=auto
+# 'cpu' is the safe default: software motion decode works on any host (including
+# GPU-less NUCs/VMs) and is fast enough for Crumb's fps-capped motion. Enable a GPU
+# explicitly: 'vaapi' for an Intel/AMD iGPU (docker-compose.vaapi.example.yml),
+# 'cuda' for NVIDIA NVDEC (docker-compose.gpu.example.yml), or 'auto' to probe for
+# NVDEC. Only affects motion DECODE; recording is always stream-copy.
+MOTION_HWACCEL=cpu
 
 # --- API auth ---
 JWT_SECRET=${JWT_SECRET}
