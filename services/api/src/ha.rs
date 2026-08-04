@@ -921,6 +921,29 @@ async fn get_links(
     Ok(Json(links.into_iter().map(HaLinkDto::from).collect()))
 }
 
+/// Build the DB insert tuples from validated link inputs, trimming `entity_id`
+/// so surrounding whitespace never persists. Validation above (emptiness,
+/// `validate_link_role`, `validate_allowed_actions`) runs on the *trimmed* id,
+/// so storing the raw padded value would leave a permanently un-actuatable dead
+/// link — the HA action path matches on the exact stored id. Pure, so the trim
+/// behavior is unit-testable without a DB.
+fn link_inserts(links: Vec<HaLinkInput>) -> Vec<db::HaLinkInsert> {
+    links
+        .into_iter()
+        .map(|l| {
+            (
+                l.entity_id.trim().to_owned(),
+                l.role,
+                l.device_class,
+                l.label,
+                l.sort_order,
+                l.require_confirm,
+                l.allowed_actions,
+            )
+        })
+        .collect()
+}
+
 /// `PUT /cameras/:id/ha/links` — admin. Replace the camera's full link set.
 async fn put_links(
     _admin: AdminUser,
@@ -951,21 +974,7 @@ async fn put_links(
             validate_allowed_actions(l.entity_id.trim(), allowed).map_err(ApiError::BadRequest)?;
         }
     }
-    let tuples: Vec<db::HaLinkInsert> = body
-        .links
-        .into_iter()
-        .map(|l| {
-            (
-                l.entity_id,
-                l.role,
-                l.device_class,
-                l.label,
-                l.sort_order,
-                l.require_confirm,
-                l.allowed_actions,
-            )
-        })
-        .collect();
+    let tuples = link_inserts(body.links);
     let links = db::replace_camera_ha_links(state.pool(), camera_id, &tuples)
         .await
         .map_err(ApiError::Internal)?;
@@ -1592,6 +1601,35 @@ mod tests {
         assert_eq!(p.bg_color.as_deref(), Some("#101014"));
         assert!(p.outline);
         assert_eq!(p.label.as_deref(), Some("Front door"));
+    }
+
+    #[test]
+    fn link_inserts_trims_entity_id_before_storage() {
+        // A padded entity_id validates on its trimmed form; storage must keep the
+        // trimmed value or the link becomes a permanently un-actuatable dead entry
+        // (the HA action path matches on the exact stored id).
+        let update: HaLinksUpdate = serde_json::from_value(json!({
+            "links": [
+                {"entity_id": "  binary_sensor.front_door 	", "role": "sensor"},
+                {"entity_id": "light.kitchen", "role": "actuator",
+                 "device_class": "outlet", "label": "Kitchen", "sort_order": 3,
+                 "require_confirm": true, "allowed_actions": ["turn_on"]}
+            ]
+        }))
+        .unwrap();
+        let tuples = link_inserts(update.links);
+        assert_eq!(tuples.len(), 2);
+        // Leading/trailing whitespace is stripped from the stored id.
+        assert_eq!(tuples[0].0, "binary_sensor.front_door");
+        assert_eq!(tuples[0].1, "sensor");
+        // An already-clean id and the other fields pass through unchanged.
+        assert_eq!(tuples[1].0, "light.kitchen");
+        assert_eq!(tuples[1].1, "actuator");
+        assert_eq!(tuples[1].2.as_deref(), Some("outlet"));
+        assert_eq!(tuples[1].3.as_deref(), Some("Kitchen"));
+        assert_eq!(tuples[1].4, 3);
+        assert!(tuples[1].5);
+        assert_eq!(tuples[1].6, Some(vec!["turn_on".to_owned()]));
     }
 
     #[test]
