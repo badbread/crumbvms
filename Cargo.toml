@@ -57,7 +57,7 @@ thiserror = "1"
 async-trait = "0.1"
 
 # MQTT client (Frigate detection ingestion)
-rumqttc = "0.24"
+rumqttc = { version = "0.24", default-features = false }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

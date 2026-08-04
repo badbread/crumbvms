@@ -166,14 +166,14 @@ async fn main() -> Result<()> {
         .context("seeding default recording policy")?;
 
     // ── 3. Admin user (optional) ──────────────────────────────────────────────
-    // Phase 0 has no API/auth layer yet, so the admin user is optional. Seed it
-    // only when SEED_ADMIN_PASSWORD_HASH is provided; otherwise skip with a
-    // warning so the recorder is never blocked from starting by a missing
-    // credential.
+    // The recorder only handles the pre-hashed admin seed (SEED_ADMIN_PASSWORD_HASH);
+    // on a normal deployment the api seeds the admin from the plaintext
+    // SEED_ADMIN_PASSWORD, so this path being empty is the expected, healthy case.
+    // Log it at INFO (not WARN) so operators grepping their logs aren't alarmed.
     if config.seed_admin_password_hash.is_empty() {
-        warn!(
-            "SEED_ADMIN_PASSWORD_HASH not set; skipping admin user seed \
-             (set it before the auth/API layer ships)"
+        info!(
+            "no pre-hashed admin seed (SEED_ADMIN_PASSWORD_HASH not set); \
+             the api seeds the admin user from SEED_ADMIN_PASSWORD"
         );
     } else {
         seed_admin_user(
