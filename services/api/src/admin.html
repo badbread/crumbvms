@@ -5208,6 +5208,7 @@ let HA_PICKER_SEARCH = '';
 let HA_PICKER_SHOWALL = false;
 let HA_STYLE_OPEN = null;     // index of the HA_LINKS row whose icon/style editor is expanded
 let HA_CTRL_OPEN = null;      // index of the HA_LINKS row whose control-config editor is expanded
+let HA_STYLE_PREVIEW_ON = {}; // HA_LINKS index -> bool: which state (on/off) the style mockup is currently showing
 // device_classes worth linking to a camera; the rest hide under "Other sensors".
 const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
 
@@ -5582,6 +5583,7 @@ function haMapLinkFromServer(l) {
     overlay_opacity: l.overlay_opacity ?? null,
     overlay_shape: l.overlay_shape ?? null,
     overlay_bg_color: l.overlay_bg_color ?? null,
+    overlay_bg_color_on: l.overlay_bg_color_on ?? null,
     overlay_outline: !!l.overlay_outline,
   };
 }
@@ -5599,6 +5601,7 @@ async function loadCameraHaLinks(camId) {
     HA_PICKER = null;
     HA_STYLE_OPEN = null;
     HA_CTRL_OPEN = null;
+    HA_STYLE_PREVIEW_ON = {};
     const configured = !!(cfg && cfg.enabled && cfg.base_url && cfg.has_token);
     renderHaLinks(configured);
   } catch (e) {
@@ -5675,11 +5678,14 @@ function haToggleCtrl(i) {
    in a live video canvas here (issue #439 — "a clean functional editor beats
    a fancy broken one"). Shows the icon SLUG as text: the console has no
    glyph atlas (that lives in the three native clients), so the slug itself
-   is the honest preview. */
-function haBadgePreviewHtml(l) {
+   is the honest preview. `onState` picks which of bg_color/bg_color_on the
+   mockup renders (see the On/Off chips in haStylePanel); base bg_color is
+   what actually shows while off/unknown, bg_color_on overrides it while on,
+   falling back to bg_color when unset ("Follows Off"). */
+function haBadgePreviewHtml(l, onState) {
   const shape = l.overlay_shape || 'dot';
   const color = l.overlay_color || '#3ddc84';
-  const bg = l.overlay_bg_color || '#1a1a1a';
+  const bg = onState ? (l.overlay_bg_color_on ?? l.overlay_bg_color ?? '#17171B') : (l.overlay_bg_color ?? '#17171B');
   const size = l.overlay_size != null ? l.overlay_size : 1;
   const opacity = l.overlay_opacity != null ? l.overlay_opacity : 1;
   const icon = l.overlay_icon || 'sensor';
@@ -5701,8 +5707,12 @@ function haStylePanel(i, l) {
   return `
     <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
       <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
-        <div id="ha-style-preview-${i}">${haBadgePreviewHtml(l)}</div>
+        <div id="ha-style-preview-${i}">${haBadgePreviewHtml(l, !!HA_STYLE_PREVIEW_ON[i])}</div>
         <span style="font-size:10px;color:var(--dim2)">Preview</span>
+        <div class="seg-toggle" role="group" aria-label="Preview state" style="margin-top:2px">
+          <button type="button" id="ha-preview-off-${i}" class="seg-btn ${!HA_STYLE_PREVIEW_ON[i] ? 'active' : ''}" style="padding:3px 8px;font-size:11px;min-height:auto" onclick="haSetPreviewState(${i}, false)">Off</button>
+          <button type="button" id="ha-preview-on-${i}" class="seg-btn ${HA_STYLE_PREVIEW_ON[i] ? 'active' : ''}" style="padding:3px 8px;font-size:11px;min-height:auto" onclick="haSetPreviewState(${i}, true)">On</button>
+        </div>
       </div>
       <div class="form-grid" style="min-width:170px">
         <label class="fg-label" style="margin-top:0">Icon</label>
@@ -5725,6 +5735,11 @@ function haStylePanel(i, l) {
         <div class="fg-ctl">
           <input type="color" value="${l.overlay_bg_color || '#1a1a1a'}" oninput="haStyleSet(${i}, 'overlay_bg_color', this.value)" style="width:44px;padding:0" />
           <button class="ghost sm" onclick="haStyleSet(${i}, 'overlay_bg_color', null)" title="Clear override, use the default dark background">Auto</button>
+        </div>
+        <label class="fg-label">Background (on)</label>
+        <div class="fg-ctl">
+          <input type="color" value="${l.overlay_bg_color_on || l.overlay_bg_color || '#1a1a1a'}" oninput="haStyleSet(${i}, 'overlay_bg_color_on', this.value)" style="width:44px;padding:0" />
+          <button class="ghost sm" onclick="haStyleSet(${i}, 'overlay_bg_color_on', null)" title="Clear override, follow the Background color while the entity is on">Auto (follows Off)</button>
         </div>
       </div>
       <div class="form-grid" style="min-width:170px">
@@ -5750,10 +5765,22 @@ function haStyleSet(i, field, value) {
   l[field] = value;
   if (field === 'overlay_size') { const e = $('ha-size-val-' + i); if (e) e.textContent = value.toFixed(2) + '×'; }
   if (field === 'overlay_opacity') { const e = $('ha-opacity-val-' + i); if (e) e.textContent = Math.round(value * 100) + '%'; }
-  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l);
+  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l, !!HA_STYLE_PREVIEW_ON[i]);
 }
 
-/* Persists icon/shape/color/bg_color/size/opacity via PUT .../placement.
+/* On/Off preview toggle in the style mockup (does not touch saved state): flips
+   which of bg_color / bg_color_on the swatch renders, so authoring bg_color_on
+   without a live entity to test against still shows the honest result. */
+function haSetPreviewState(i, on) {
+  const l = HA_LINKS[i]; if (!l) return;
+  HA_STYLE_PREVIEW_ON[i] = on;
+  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l, on);
+  const offBtn = $('ha-preview-off-' + i), onBtn = $('ha-preview-on-' + i);
+  if (offBtn) offBtn.classList.toggle('active', !on);
+  if (onBtn) onBtn.classList.toggle('active', on);
+}
+
+/* Persists icon/shape/color/bg_color/bg_color_on/size/opacity via PUT .../placement.
    Only valid once the link has a server id (issue #439 — save links first).
    Preserves the link's existing x/y (or centers it if never placed) and its
    show_state/show_age/outline, and deliberately OMITS `label` from the body:
@@ -5775,6 +5802,7 @@ async function haSaveStyle(i) {
     opacity: l.overlay_opacity != null ? l.overlay_opacity : 1,
     shape: l.overlay_shape || null,
     bg_color: l.overlay_bg_color || null,
+    bg_color_on: l.overlay_bg_color_on || null,
     outline: !!l.overlay_outline,
   };
   try {
@@ -5926,7 +5954,7 @@ function haPick(entity_id) {
     id: null, entity_id, role, device_class: ent.device_class || null, label: ent.friendly_name || null, sort_order: HA_LINKS.length,
     require_confirm: false, allowed_actions: null,
     overlay_x: null, overlay_y: null, overlay_size: null, overlay_color: null, overlay_icon: null,
-    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_outline: false,
+    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_bg_color_on: null, overlay_outline: false,
   });
   renderHaLinks(true);
 }
@@ -5935,6 +5963,7 @@ function removeHaLink(i) {
   HA_LINKS.splice(i, 1);
   HA_STYLE_OPEN = null;
   HA_CTRL_OPEN = null;
+  HA_STYLE_PREVIEW_ON = {};
   renderHaLinks(true);
 }
 
@@ -5954,6 +5983,7 @@ async function saveHaLinks() {
     HA_PICKER = null;
     HA_STYLE_OPEN = null;
     HA_CTRL_OPEN = null;
+    HA_STYLE_PREVIEW_ON = {};
     toast('Home Assistant links saved.');
     renderHaLinks(true);
   } catch (e) {
