@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/views_api.dart';
+import 'package:crumb_desktop/state/ha_overlay_prefs.dart';
 import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
     show AppliedView;
 import 'package:crumb_desktop/ui/saved_views/view_prefs.dart';
@@ -22,6 +23,7 @@ class ViewSelectorBar extends StatefulWidget {
     required this.onApply,
     this.onSnapshot,
     this.onConfigView,
+    this.showHaOverlayToggle = false,
     this.showAllCameras = true,
   });
 
@@ -33,6 +35,12 @@ class ViewSelectorBar extends StatefulWidget {
   /// active pane, and open the view/layout editor ("Config View").
   final VoidCallback? onSnapshot;
   final VoidCallback? onConfigView;
+
+  /// Show the global "hide Home Assistant overlays" quick-toggle. Live-only —
+  /// Playback has no HA badge layer, so its copy of this bar leaves it off.
+  /// The button reads/writes [HaOverlayPrefs.instance] directly (app-wide flag,
+  /// no per-bar state).
+  final bool showHaOverlayToggle;
 
   /// The currently-applied view's id. Null or [ViewPrefs.allCamerasId] means
   /// the "All Cameras" chip is active.
@@ -138,7 +146,27 @@ class _ViewSelectorBarState extends State<ViewSelectorBar> {
                 ],
               ),
             ),
-            // Right controls (snapshot + Config View), matching the old client.
+            // Right controls (HA overlays + snapshot + Config View), matching
+            // the old client.
+            if (widget.showHaOverlayToggle)
+              ListenableBuilder(
+                listenable: HaOverlayPrefs.instance,
+                builder: (context, _) {
+                  final hidden = HaOverlayPrefs.instance.hidden;
+                  return IconButton(
+                    tooltip: hidden
+                        ? 'Show Home Assistant overlays'
+                        : 'Hide Home Assistant overlays',
+                    iconSize: 17,
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(hidden ? Icons.sensors_off : Icons.sensors),
+                    // Tinted while hidden — the non-default state should be
+                    // visible at a glance, so nobody hunts for "missing" badges.
+                    color: hidden ? scheme.primary : null,
+                    onPressed: HaOverlayPrefs.instance.toggle,
+                  );
+                },
+              ),
             if (widget.onSnapshot != null)
               IconButton(
                 tooltip: 'Snapshot (S)',

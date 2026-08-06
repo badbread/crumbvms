@@ -23,6 +23,7 @@ import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/ha_overlay_prefs.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
@@ -736,6 +737,9 @@ class _WallScreenState extends State<WallScreen> {
       onToggleAudio: widget.audio == null
           ? null
           : () => widget.audio!.toggleAudio(),
+      // H — hide/show every on-video HA badge, wall-wide. Purely display; the
+      // right-click menu items stay available while hidden.
+      onToggleHaOverlays: HaOverlayPrefs.instance.toggle,
       // Ctrl+Z / Ctrl+Y drive the active overlay editor's undo/redo (issue
       // #4). Non-null only while an editor is open on the maximized pane, so
       // the shortcut is inert on the plain wall. The two editors are mutually
@@ -2025,14 +2029,21 @@ class _WallTileState extends State<_WallTile> {
                 if (_haLinks.any((l) => l.hasPlacement))
                   Positioned.fill(
                     child: ListenableBuilder(
-                      listenable: widget.liveStatus,
+                      listenable: Listenable.merge([
+                        widget.liveStatus,
+                        HaOverlayPrefs.instance,
+                      ]),
                       builder: (context, _) => HaOverlayLayer(
                         links: _haLinks,
                         stateFor: widget.liveStatus.haStateFor,
                         stale: widget.liveStatus.haStale,
                         videoW: _videoW,
                         videoH: _videoH,
-                        hideBadges: _scale > 1.01,
+                        // Hidden while zoomed (badges sit outside the zoom
+                        // transform) or while the operator has switched the HA
+                        // overlays off wall-wide.
+                        hideBadges:
+                            _scale > 1.01 || HaOverlayPrefs.instance.hidden,
                         // Actuation plumbing for the badge tap card (#187) —
                         // inert unless the account holds `actuators`.
                         api: widget.api,
@@ -3072,14 +3083,23 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                 else if (_haLinks.any((l) => l.hasPlacement))
                   Positioned.fill(
                     child: ListenableBuilder(
-                      listenable: widget.liveStatus,
+                      listenable: Listenable.merge([
+                        widget.liveStatus,
+                        HaOverlayPrefs.instance,
+                      ]),
                       builder: (context, _) => HaOverlayLayer(
                         links: _haLinks,
                         stateFor: widget.liveStatus.haStateFor,
                         stale: widget.liveStatus.haStale,
                         videoW: _videoW,
                         videoH: _videoH,
-                        hideBadges: _scale > 1.01,
+                        // Same two gates as the wall tile's copy: digital zoom,
+                        // and the wall-wide "hide HA overlays" toggle. The EDIT
+                        // branch above is deliberately NOT gated — opening
+                        // "Edit HA overlay…" while overlays are hidden shows the
+                        // badges for the editor session so they stay placeable.
+                        hideBadges:
+                            _scale > 1.01 || HaOverlayPrefs.instance.hidden,
                         // Actuation plumbing for the badge tap card (#187) —
                         // inert unless the account holds `actuators`.
                         api: widget.api,
