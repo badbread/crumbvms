@@ -2409,9 +2409,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// in the same frame, so a pane that mounts straight into edit mode never
   /// sees a mode TRANSITION and would otherwise reserve nothing.
   void _applyHaEditInsets(bool editing) {
-    widget.haOverlay?.editor
-      ..setEditTopInset(editing ? kHaEditTopBarHeight : 0)
-      ..setEditBottomInset(0);
+    final editor = widget.haOverlay?.editor;
+    if (editor == null) return;
+    editor.setEditTopInset(editing ? kHaEditTopBarHeight : 0);
+    editor.setEditBottomInset(0);
   }
 
   void _onHaOverlayChanged() {
