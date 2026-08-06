@@ -1,5 +1,7 @@
-// The camera's linked-entity picker for the HA overlay editor bar (issue
-// #170 §4.5, POC): a search field + the LINKED entities (already fetched via
+// The camera's linked-entity picker, used as the body of the HA overlay
+// editor's "+ Add entity" dropdown (issue #170 §4.5, POC — it was a
+// persistent palette in the retired side panel): a search field + the LINKED
+// entities (already fetched via
 // `HaApi.cameraHaLinks`) grouped by domain — Sensors (`binary_sensor.*`,
 // subtitled with device_class), Lights (`light.*`), Switches (`switch.*`),
 // Scenes (`scene.*`). Each row shows the same icon mapping as the on-video
@@ -24,6 +26,9 @@ class HaEntityPalette extends StatefulWidget {
     required this.links,
     required this.placedIds,
     required this.onPick,
+    this.showSearch = true,
+    this.width = 320,
+    this.maxListHeight = 220,
   });
 
   /// The camera's full linked-entity set (`GET /cameras/:id/ha/links`).
@@ -36,6 +41,17 @@ class HaEntityPalette extends StatefulWidget {
   final Set<String> placedIds;
 
   final void Function(HaLink link) onPick;
+
+  /// Show the search field. The "+ Add entity" dropdown turns it off for a
+  /// short list (≤8 linked entities), where a search box is pure noise and
+  /// steals the first tap; the whole list is on screen anyway.
+  final bool showSearch;
+
+  final double width;
+
+  /// Cap on the scrollable list's height (the rest of the widget is intrinsic),
+  /// so a dropdown can size itself to the pane it opens over.
+  final double maxListHeight;
 
   @override
   State<HaEntityPalette> createState() => _HaEntityPaletteState();
@@ -73,30 +89,34 @@ class _HaEntityPaletteState extends State<HaEntityPalette> {
     }
 
     return SizedBox(
-      width: 320,
+      width: widget.width,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            height: 32,
-            child: TextField(
-              controller: _searchCtrl,
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-              decoration: const InputDecoration(
-                isDense: true,
-                prefixIcon: Icon(Icons.search, color: Colors.white38, size: 16),
-                hintText: 'Search linked entities…',
-                hintStyle: TextStyle(color: Colors.white38),
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          if (widget.showSearch) ...[
+            SizedBox(
+              height: 32,
+              child: TextField(
+                controller: _searchCtrl,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  prefixIcon:
+                      Icon(Icons.search, color: Colors.white38, size: 16),
+                  hintText: 'Search linked entities…',
+                  hintStyle: TextStyle(color: Colors.white38),
+                  border: OutlineInputBorder(),
+                  contentPadding:
+                      EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                ),
+                onChanged: (v) => setState(() => _query = v),
               ),
-              onChanged: (v) => setState(() => _query = v),
             ),
-          ),
-          const SizedBox(height: 6),
+            const SizedBox(height: 6),
+          ],
           ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 220),
+            constraints: BoxConstraints(maxHeight: widget.maxListHeight),
             child: SingleChildScrollView(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,

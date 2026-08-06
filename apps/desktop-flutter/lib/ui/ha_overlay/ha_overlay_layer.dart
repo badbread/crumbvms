@@ -84,16 +84,19 @@ OverlayItemBuilder haBadgeItemBuilder({
   required HaEntityState? Function(String entityId) stateFor,
   required bool stale,
   Set<String> pendingLinkIds = const {},
+  bool? previewState,
 }) {
   return (item, {required bool editing, required bool selected}) {
     final badge = item as HaOverlayBadgeItem;
     final link = badge.link;
-    final state = stateFor(link.entityId);
+    final live = stateFor(link.entityId);
+    final state = haPreviewedState(previewState, live?.state);
+    final effStale = haPreviewedStale(previewState, stale);
     final visual = haVisualFor(
       domain: link.domain,
       deviceClass: link.deviceClass,
-      state: state?.state,
-      stale: stale,
+      state: state,
+      stale: effStale,
       iconOverride: badge.iconKey,
       colorOverride: parseOverlayColorHex(badge.colorHex),
     );
@@ -104,19 +107,39 @@ OverlayItemBuilder haBadgeItemBuilder({
       pillLabel: badge.pillLabel,
       bgColor: parseOverlayColorHex(badge.bgColorHex),
       bgColorOn: parseOverlayColorHex(badge.bgColorOnHex),
-      on: haEdgeOnFor(domain: link.domain, state: state?.state, stale: stale),
+      on: haEdgeOnFor(domain: link.domain, state: state, stale: effStale),
       outline: badge.outline,
       // Jelly motion (entrance pop + state-change squish) runs only in view
       // mode; while editing the badge is a static drag target.
       animate: !editing,
       // A change in this key (state string / staleness) drives the squish.
-      stateKey: '${state?.state ?? ''}|$stale',
+      stateKey: '${state ?? ''}|$effStale',
       // Brief in-flight spinner for a direct-click actuation (issue #428) while
       // the 3s /ha/states poll converges. Never set while editing.
       pending: !editing && pendingLinkIds.contains(link.id),
     );
   };
 }
+
+/// Apply the HA editor's state preview (`HaOverlayController.previewState`) to
+/// a badge's live state string. `null` (Live, and the ONLY value any viewing
+/// surface ever passes) returns the real reading untouched; `true`/`false`
+/// substitute the canonical `on`/`off` HA state words so every downstream
+/// consumer — `edgeOn`, `haEdgeOnFor`, the accent color, the per-state
+/// background, the caption text — resolves exactly as it would for a real
+/// device in that state, with no second code path to drift.
+///
+/// Pure so the substitution rule is unit-testable without pumping a widget.
+String? haPreviewedState(bool? previewState, String? live) =>
+    previewState == null ? live : (previewState ? 'on' : 'off');
+
+/// Staleness under the same preview. A forced On/Off preview must also clear
+/// staleness: `haEdgeOnFor` gates every state-varying visual to null while the
+/// feed is stale, so leaving it set would grey out the badge and hide the very
+/// colors the operator is picking. Live (`null`) passes real staleness through
+/// unchanged.
+bool haPreviewedStale(bool? previewState, bool stale) =>
+    previewState == null && stale;
 
 /// The default opaque badge background (migration 0062) — a near-black chip,
 /// dimmed only by the item's `overlay_opacity` (applied by the overlay layer's
@@ -396,6 +419,7 @@ class HaBadgeCaptions extends StatelessWidget {
     required this.videoW,
     required this.videoH,
     this.hoverLinkId,
+    this.previewState,
   });
 
   final List<HaOverlayBadgeItem> items;
@@ -407,6 +431,12 @@ class HaBadgeCaptions extends StatelessWidget {
   /// Link id currently hovered (view mode) — reveals its state+age even when
   /// not pinned. Null in edit mode.
   final String? hoverLinkId;
+
+  /// The edit session's state preview (`HaOverlayController.previewState`) —
+  /// always null in view mode. Applied through the same [haPreviewedState] /
+  /// [haPreviewedStale] pair as the badge itself so a pinned caption can never
+  /// disagree with the glyph it is captioning.
+  final bool? previewState;
 
   @override
   Widget build(BuildContext context) {
@@ -444,11 +474,13 @@ class HaBadgeCaptions extends StatelessWidget {
     );
     final link = item.link;
     final state = stateFor(link.entityId);
+    final shownState = haPreviewedState(previewState, state?.state);
+    final effStale = haPreviewedStale(previewState, stale);
     final visual = haVisualFor(
       domain: link.domain,
       deviceClass: link.deviceClass,
-      state: state?.state,
-      stale: stale,
+      state: shownState,
+      stale: effStale,
       iconOverride: item.iconKey,
       colorOverride: parseOverlayColorHex(item.colorHex),
     );
@@ -496,7 +528,7 @@ class HaBadgeCaptions extends StatelessWidget {
         ),
       if (showState)
         Text(
-          haStateDisplay(visual: visual, state: state?.state, unit: state?.unit),
+          haStateDisplay(visual: visual, state: shownState, unit: state?.unit),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(

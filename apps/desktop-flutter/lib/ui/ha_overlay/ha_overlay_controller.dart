@@ -32,8 +32,8 @@ import '../overlay_editor/overlay_item.dart';
 ///
 /// Also carries the badge's editable per-badge style (migration 0059) —
 /// [labelText], [colorHex], [iconKey], [showState], [showAge] — seeded from
-/// the link and mutated in-session by the badge style editor
-/// (`ha_badge_style_editor.dart`); persisted by
+/// the link and mutated in-session by the badge popover
+/// (`ha_badge_popover.dart`); persisted by
 /// [HaOverlayController.endEditAndSave].
 class HaOverlayBadgeItem implements OverlayItem {
   HaOverlayBadgeItem(this.link, {double? x, double? y})
@@ -82,11 +82,10 @@ class HaOverlayBadgeItem implements OverlayItem {
   String? bgColorHex;
 
   /// Per-state background override (wave A): the badge background while the
-  /// entity reads ON, or null for no override. No UI sets this yet (the
-  /// badge-style editor for it lands in a later PR) — this field exists
-  /// purely so an existing edit session (drag/resize/style-tweak on some
-  /// OTHER field) round-trips a value set elsewhere (e.g. by the admin
-  /// console) instead of silently clobbering it on save.
+  /// entity reads ON, or null to follow [bgColorHex] in every state. Edited
+  /// by the badge popover's paired Off/On background swatches
+  /// (`ha_badge_popover.dart`); see `ha_overlay_layer.dart`'s
+  /// `resolveBadgeBg` for the exact resolution order.
   String? bgColorOnHex;
 
   /// White outline + drop shadow so the badge pops on a busy scene.
@@ -113,6 +112,26 @@ class HaOverlayBadgeItem implements OverlayItem {
     final id = link.entityId;
     final dot = id.indexOf('.');
     return dot < 0 ? id : id.substring(dot + 1);
+  }
+
+  /// Reset every STYLE field to its default in one shot (the badge popover's
+  /// "Reset style" footer): icon, accent color, BOTH backgrounds, shape,
+  /// opacity, outline and the two pinned captions. Deliberately KEEPS the
+  /// badge's position, size and operator label — a style reset is not a
+  /// "start over", and re-placing/re-labelling a badge by hand is exactly the
+  /// work an operator would not want undone. Pure mutation: the caller pushes
+  /// the single undo entry (`OverlayEditorController.pushUndo`) and notifies,
+  /// per the editor's host-side style-edit contract.
+  void resetStyle() {
+    iconKey = null;
+    colorHex = null;
+    bgColorHex = null;
+    bgColorOnHex = null;
+    shape = null;
+    _opacity = 1.0;
+    outline = false;
+    showState = false;
+    showAge = false;
   }
 
   /// Session-only group membership — the placement PUT has no group field
@@ -266,6 +285,33 @@ class HaOverlayController {
 
   String? _cameraId;
 
+  /// EDIT-SESSION-ONLY state preview (the top bar's Live | On | Off segmented
+  /// control). `null` = Live: every badge renders its real state. `true`/
+  /// `false` force every badge to render as if its entity read on/off, so the
+  /// operator can see the colors they are editing — in particular the paired
+  /// Off/On background swatches, which are otherwise invisible until the real
+  /// device happens to change state.
+  ///
+  /// This does NOT violate the state-honesty rule (never show a possibly-false
+  /// reading): it is an explicit, operator-driven preview on an EDITING
+  /// surface, labelled as such by the segmented control, and it is reset on
+  /// every `beginEdit`/`endEdit` so no viewing surface can ever inherit it.
+  /// `ha_overlay_layer.dart`'s `haPreviewedState`/`haPreviewedStale` apply it,
+  /// and only the edit-mode render path passes it in.
+  bool? _previewState;
+
+  bool? get previewState => _previewState;
+
+  /// Set the preview and repaint the live badges. Routed through the editor's
+  /// structure notification (not a listenable of its own) so the badge layer,
+  /// the captions and the popover — all of which already rebuild on it —
+  /// pick the change up in the same frame.
+  set previewState(bool? v) {
+    if (_previewState == v) return;
+    _previewState = v;
+    editor.notifyItemsChanged();
+  }
+
   /// The camera's full linked-entity set (for the palette), refreshed by
   /// [loadLinks]. Includes both placed and unplaced links.
   List<HaLink> links = const [];
@@ -299,6 +345,7 @@ class HaOverlayController {
       for (final link in links)
         if (link.hasPlacement) HaOverlayBadgeItem(link),
     ];
+    _previewState = null; // every session starts on Live
     editor.beginEdit(items, anchor: OverlayAnchor.videoFrame);
   }
 
@@ -325,8 +372,21 @@ class HaOverlayController {
   /// failed request doesn't block the others; throws
   /// [HaOverlaySaveException] afterward if any failed, so the host can
   /// surface a retry prompt.
+  /// Abandon the edit session WITHOUT persisting anything (the top bar's X /
+  /// Esc → "Discard"). Safe by construction: the editor never touches storage
+  /// during a session (`overlay_editor_controller.dart`'s lifecycle contract),
+  /// so every drag, style tweak and placement made since `beginEdit` lives
+  /// only in the in-memory items being dropped here — there is nothing to roll
+  /// back server-side.
+  void cancelEdit() {
+    if (!editor.editMode) return;
+    _previewState = null;
+    editor.endEdit();
+  }
+
   Future<void> endEditAndSave() async {
     final cameraId = _cameraId;
+    _previewState = null;
     final result = editor.endEdit();
     if (cameraId == null) return; // never loaded — nothing to persist against
 
