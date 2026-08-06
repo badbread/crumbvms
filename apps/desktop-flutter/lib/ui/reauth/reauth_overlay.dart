@@ -12,6 +12,7 @@
 import 'package:flutter/material.dart';
 
 import '../../session/session_controller.dart';
+import '../hotkeys/hotkey_gate.dart';
 
 class ReauthOverlay extends StatefulWidget {
   const ReauthOverlay({super.key, required this.controller, required this.child});
@@ -83,8 +84,12 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
         // playback) exactly as before — a 401 must never tear it down.
         widget.child,
         if (c.needsReauth)
+          // This card blocks the shell but is not a pushed route, so the tab
+          // underneath still has its hotkeys registered — suppress them while
+          // the operator is typing credentials.
           Positioned.fill(
-            child: Container(
+            child: HotkeySuppressor(
+              child: Container(
               color: Colors.black.withValues(alpha: 0.6),
               alignment: Alignment.center,
               child: ConstrainedBox(
@@ -162,6 +167,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
                   ),
                 ),
               ),
+            ),
             ),
           ),
       ],

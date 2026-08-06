@@ -20,23 +20,27 @@ import 'package:flutter/services.dart';
 import '../../services/snapshot_service.dart';
 import '../../state/client_options.dart';
 import '../../state/keyboard_shortcuts.dart';
-import '../hotkeys/text_focus.dart';
+import '../hotkeys/hotkey_gate.dart';
 
-/// Wires the "S" hotkey to a snapshot of the active pane.
+/// Wires the "S" hotkey to a snapshot of the active pane, from any tab and
+/// wherever keyboard focus currently sits.
 ///
-/// This is a BUBBLE-PHASE handler (a plain `Focus.onKeyEvent`, not a
-/// `Shortcuts`/`SingleActivator`): the focused widget sees the key FIRST, so
-/// - typing an "s" into a text field (a password, a search box, …) is consumed
-///   by that field and never reaches here — the old `Shortcuts` binding fired
-///   on bare "s" even while typing, which stole keystrokes from the password
-///   field; and
-/// - a per-screen S handler (the live wall / playback) that already acted on
-///   the key isn't double-fired.
+/// It was a `Focus.onKeyEvent` node ("bubble phase", so a focused text field
+/// would swallow the key first). That reasoning was sound but the placement
+/// was not: this widget is mounted BELOW the app root's `FullscreenEscHandler`
+/// (`autofocus: true`), which permanently holds the route scope's focus, and
+/// Flutter dispatches only to the focused node and its ANCESTORS — so this
+/// node was never on the chain and S never fired at all. It is now a
+/// `HardwareKeyboard` handler, which runs for every key event independent of
+/// focus, with the guards it used to inherit re-applied explicitly (see
+/// hotkey_gate.dart): no typing, no pushed route, no suppressed overlay, and
+/// the master "keyboard shortcuts" toggle ([ClientOptionsStore.hotkeysEnabled])
+/// still turns it off.
 ///
-/// It also respects the "keyboard shortcuts" toggle ([ClientOptionsStore.
-/// hotkeysEnabled]) — with shortcuts off, S does nothing — and re-checks that no
-/// text field holds focus, belt-and-suspenders.
-class SnapshotHotkey extends StatelessWidget {
+/// One instance, at the signed-in shell (see main.dart). Screens must NOT also
+/// pass `onSnapshot` to their `GlobalHotkeysListener` — every registered
+/// hardware handler runs for every event, so both would fire.
+class SnapshotHotkey extends StatefulWidget {
   const SnapshotHotkey({
     super.key,
     required this.child,
@@ -55,25 +59,43 @@ class SnapshotHotkey extends StatelessWidget {
   final KeyboardShortcutsStore? shortcuts;
 
   @override
-  Widget build(BuildContext context) {
-    return Focus(
-      canRequestFocus: false, // never steal focus; just observe bubbled keys
-      skipTraversal: true,
-      onKeyEvent: (node, event) {
-        if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        if (event.logicalKey !=
-            (shortcuts?.keyFor(ShortcutAction.snapshot) ??
-                LogicalKeyboardKey.keyS)) {
-          return KeyEventResult.ignored;
-        }
-        if (!(options?.hotkeysEnabled ?? true)) return KeyEventResult.ignored;
-        if (textInputHasFocus()) return KeyEventResult.ignored;
-        SnapshotService.captureActivePane(context);
-        return KeyEventResult.handled;
-      },
-      child: child,
-    );
+  State<SnapshotHotkey> createState() => _SnapshotHotkeyState();
+}
+
+class _SnapshotHotkeyState extends State<SnapshotHotkey> {
+  @override
+  void initState() {
+    super.initState();
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
   }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    super.dispose();
+  }
+
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (!mounted) return false;
+    if (event.logicalKey !=
+        (widget.shortcuts?.keyFor(ShortcutAction.snapshot) ??
+            LogicalKeyboardKey.keyS)) {
+      return false;
+    }
+    // Ctrl+S / Alt+S / Win+S belong to whoever owns that chord.
+    final keys = HardwareKeyboard.instance;
+    if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
+      return false;
+    }
+    if (hotkeyContextBlocked(context)) return false;
+    if (shortcutsDisabled(widget.options)) return false;
+    SnapshotService.captureActivePane(context);
+    return true;
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 /// Toolbar button, old client: `#toolbar-snapshot-btn`

@@ -1456,17 +1456,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       ),
     );
 
-    // Keyboard: number keys load a camera (GlobalHotkeysListener, autofocus so
-    // it's the focused node); Space/arrows/,/./frame-step bubble up to the
+    // Keyboard: number keys load a camera (GlobalHotkeysListener, a
+    // HardwareKeyboard handler — it fires wherever focus sits, and takes no
+    // focus itself); Space/arrows/,/./frame-step are still the focus-chain
     // PlaybackHotkeysListener wrapping it.
     Widget tree = scaffold;
     final hk = widget.hotkeys;
-    final hasGlobal = hk != null;
-    if (hasGlobal) {
+    if (hk != null) {
       tree = GlobalHotkeysListener(
         store: hk,
         cameras: _cameras,
-        autofocus: true,
         shortcuts: widget.shortcuts,
         options: widget.clientOptions,
         onGoToCamera: _selectCamera,
@@ -1474,7 +1473,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       );
     }
     return PlaybackHotkeysListener(
-      autofocus: !hasGlobal,
+      // Nothing competes for the autofocus here any more (the listener above
+      // no longer claims a focus node), so always ask for it.
+      autofocus: true,
       shortcuts: widget.shortcuts,
       options: widget.clientOptions,
       isMaximized: _maximizedCameraId != null,

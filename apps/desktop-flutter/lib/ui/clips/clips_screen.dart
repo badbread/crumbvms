@@ -337,22 +337,15 @@ class _ClipsScreenState extends State<ClipsScreen> {
     return GlobalHotkeysListener(
       store: hk,
       cameras: widget.cameras,
-      autofocus: true,
       options: widget.clientOptions,
       shortcuts: widget.shortcuts,
       onGoToCamera: _filterToCamera,
-      // Esc closes an open clip player — defence in depth ONLY. The
-      // authoritative close-on-Esc is _ClipPlayerState's HardwareKeyboard
-      // handler, which fires no matter where keyboard focus sits. This
-      // focus-chain path (like the overlay's own FocusScope) only ever fires
-      // when this node happens to hold primary focus, which on real hardware
-      // it usually does NOT: this listener's `autofocus` is discarded because
-      // an app-root node (FullscreenEscHandler / SnapshotHotkey, both
-      // autofocus and built first) already holds focus in the same scope, and
-      // key events dispatch only through the focused node's ancestor chain —
-      // which does not include this sibling branch. Closing twice in the same
-      // event is idempotent.
-      onEscape: _playing == null ? null : () => setState(() => _playing = null),
+      // NO onEscape here. Closing the clip player on Esc belongs to
+      // _ClipPlayerState's own HardwareKeyboard handler, which also carries
+      // the "leave fullscreen first" priority. This listener is a hardware
+      // handler too now, and every registered handler runs for every event, so
+      // a second Esc branch here would close the player out from under that
+      // fullscreen-exit press.
       child: scaffold,
     );
   }
