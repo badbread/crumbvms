@@ -37,6 +37,7 @@ import 'package:crumb_desktop/src/rust/api/secret.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
 import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/ha_overlay_prefs.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
@@ -213,6 +214,9 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     final streamPrefs = await StreamPrefsStore.load();
     final hotkeys = await HotkeyConfigStore.load();
     final shortcuts = await KeyboardShortcutsStore.load();
+    // App-wide "hide HA overlays" flag — a singleton (see its file header), so
+    // it's loaded rather than held in this State's fields.
+    await HaOverlayPrefs.instance.load();
     // App-scoped adaptive-wall brain (issue #382): fed the decode-util signal +
     // tile registry by the live wall, and queried by the Settings guardrail.
     final adaptive = AdaptiveWallController(
@@ -866,6 +870,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
                     onConfigView: _index == _liveIndex
                         ? () => _openConfigView(session)
                         : null,
+                    // Live-only: the global "hide HA overlays" quick-toggle
+                    // (Playback draws no HA badges).
+                    showHaOverlayToggle: _index == _liveIndex,
                     // Hide the "All Cameras" chip when the option is off.
                     showAllCameras:
                         widget.clientOptions?.showAllCamerasView ?? true,
