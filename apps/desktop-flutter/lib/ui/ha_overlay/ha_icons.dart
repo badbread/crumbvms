@@ -232,6 +232,19 @@ const Map<String, (IconData, String)> kHaBadgeIconChoices = {
   'timer': (Icons.timer, 'Timer'),
 };
 
+/// The honesty-gated on/off reading shared by every piece of badge chrome
+/// that varies with state (the accent-dim color below, and
+/// `ha_overlay_layer.dart`'s per-state background resolution): null
+/// (indeterminate) for a scene, a stale states feed, or no known state yet —
+/// NEVER a raw `edgeOn(state)` call in those cases, so nothing downstream can
+/// read "on" for a reading that isn't actually known. Kept as the single
+/// source of truth so the accent and the background can never disagree.
+bool? haEdgeOnFor({
+  required String domain,
+  required String? state,
+  required bool stale,
+}) => (state == null || stale || domain == 'scene') ? null : edgeOn(state);
+
 /// Parse a stored '#RRGGBB' badge color override into a [Color] (full
 /// opacity), or null for absent/malformed values.
 Color? parseOverlayColorHex(String? hex) {
@@ -316,9 +329,7 @@ HaVisual haVisualFor({
   final overrideIcon = iconOverride == null
       ? null
       : kHaBadgeIconChoices[iconOverride]?.$1;
-  final on = (state == null || stale || domain == 'scene')
-      ? null
-      : edgeOn(state);
+  final on = haEdgeOnFor(domain: domain, state: state, stale: stale);
   final Color color;
   if (colorOverride != null && on != null) {
     color = on ? colorOverride : colorOverride.withValues(alpha: 0.45);
@@ -345,7 +356,7 @@ HaVisual _haVisualDefault({
     return const HaVisual(Icons.movie_filter, _kNeutral, label: 'Scene');
   }
 
-  final on = (state == null || stale) ? null : edgeOn(state);
+  final on = haEdgeOnFor(domain: domain, state: state, stale: stale);
   if (on == null) {
     return HaVisual(
       _iconFor(domain: domain, deviceClass: deviceClass),

@@ -232,7 +232,15 @@ extension HaApi on CrumbApi {
   /// the live state text / relative age next to the badge on the wall.
   /// `label` edits the LINK-level caption and follows the `PUT /config/ha`
   /// token convention: null ⇒ unchanged, `''` ⇒ cleared, non-empty ⇒ set.
-  /// Returns the updated link.
+  /// `bgColorOn` is the per-state background override (wave A) — the badge's
+  /// background while the entity reads ON. Like every other style field here
+  /// (`color`/`icon`/`bgColor`/`shape`/`outline`), this PUT replaces the
+  /// WHOLE placement each call: a null `bgColorOn` is sent as absent and the
+  /// server resets it to unset (NOT "leave whatever was there"), so a caller
+  /// must always pass the link's CURRENT value forward, not just a change —
+  /// see `HaOverlayController.endEditAndSave`, which does exactly that so a
+  /// desktop save can never clobber a `bg_color_on` set elsewhere. Returns
+  /// the updated link.
   Future<HaLink> saveHaPlacement(
     Session s,
     String cameraId,
@@ -247,6 +255,7 @@ extension HaApi on CrumbApi {
     double opacity = 1.0,
     String? shape,
     String? bgColor,
+    String? bgColorOn,
     bool outline = false,
     String? label,
   }) async {
@@ -261,6 +270,7 @@ extension HaApi on CrumbApi {
       'opacity': opacity,
       if (shape != null) 'shape': shape,
       if (bgColor != null) 'bg_color': bgColor,
+      if (bgColorOn != null) 'bg_color_on': bgColorOn,
       'outline': outline,
       if (label != null) 'label': label,
     });

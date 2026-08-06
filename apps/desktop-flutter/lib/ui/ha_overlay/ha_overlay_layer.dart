@@ -103,6 +103,8 @@ OverlayItemBuilder haBadgeItemBuilder({
       isPill: badge.isPill,
       pillLabel: badge.pillLabel,
       bgColor: parseOverlayColorHex(badge.bgColorHex),
+      bgColorOn: parseOverlayColorHex(badge.bgColorOnHex),
+      on: haEdgeOnFor(domain: link.domain, state: state?.state, stale: stale),
       outline: badge.outline,
       // Jelly motion (entrance pop + state-change squish) runs only in view
       // mode; while editing the badge is a static drag target.
@@ -121,6 +123,20 @@ OverlayItemBuilder haBadgeItemBuilder({
 /// `Opacity` wrapper), NOT a hardcoded translucent scrim. This is the #170
 /// readability fix: at the default opacity the chip reads solid.
 const Color _kBadgeDefaultBg = Color(0xFF17171B);
+
+/// Resolve the badge's solid background per the per-state override contract
+/// (wave A, `overlay_bg_color_on`): entity ON ⇒ `bgColorOn ?? bgColor ??
+/// default`; OFF, indeterminate/unknown, or stale ⇒ `bgColor ?? default`. A
+/// scene or an unknown/stale reading NEVER picks the on-color — [on] must
+/// come from `ha_icons.dart`'s [haEdgeOnFor] (the same honesty gate that
+/// drives the accent dim), never a raw `edgeOn()` call, so a badge's
+/// background and its icon accent can never disagree about whether the
+/// entity is "really" on. Pulled out of [HaBadgeChip] as a pure function so
+/// the resolution order itself is unit-testable without pumping a widget.
+Color resolveBadgeBg({required bool? on, Color? bgColor, Color? bgColorOn}) {
+  if (on == true && bgColorOn != null) return bgColorOn;
+  return bgColor ?? _kBadgeDefaultBg;
+}
 
 /// Snappy spring (matches the operator-chosen preview: k380 / damping 21).
 const SpringDescription _kJellySpring = SpringDescription(
@@ -144,6 +160,8 @@ class HaBadgeChip extends StatefulWidget {
     this.isPill = false,
     this.pillLabel,
     this.bgColor,
+    this.bgColorOn,
+    this.on,
     this.outline = false,
     this.animate = false,
     this.stateKey,
@@ -159,8 +177,20 @@ class HaBadgeChip extends StatefulWidget {
   /// Text inside the pill (ignored for a dot).
   final String? pillLabel;
 
-  /// Solid background color; null = the default dark chip ([_kBadgeDefaultBg]).
+  /// Solid background color for an OFF/indeterminate/stale/scene reading (or
+  /// the only color, when [bgColorOn] is unset); null = the default dark chip
+  /// ([_kBadgeDefaultBg]).
   final Color? bgColor;
+
+  /// Solid background color for an ON reading (wave A per-state override);
+  /// null = no override, so the badge keeps [bgColor] regardless of state.
+  /// See [resolveBadgeBg] for the exact resolution order.
+  final Color? bgColorOn;
+
+  /// The honesty-gated on/off reading driving [bgColorOn] (must come from
+  /// `ha_icons.dart`'s `haEdgeOnFor`, the same gate behind [visual]'s accent
+  /// dim) — null for a scene, a stale feed, or no known state yet.
+  final bool? on;
 
   /// Draw a white outline + drop shadow.
   final bool outline;
@@ -263,7 +293,11 @@ class _HaBadgeChipState extends State<HaBadgeChip>
       );
 
   BoxDecoration _decoration(BoxShape shape, BorderRadius? radius) {
-    final bg = widget.bgColor ?? _kBadgeDefaultBg;
+    final bg = resolveBadgeBg(
+      on: widget.on,
+      bgColor: widget.bgColor,
+      bgColorOn: widget.bgColorOn,
+    );
     return BoxDecoration(
       color: bg,
       shape: shape,
@@ -301,7 +335,11 @@ class _HaBadgeChipState extends State<HaBadgeChip>
     final fontSize = (height * 0.40).clamp(8.0, 26.0).toDouble();
     final padH = (height * 0.28).clamp(5.0, 16.0).toDouble();
     final gap = (height * 0.14).clamp(3.0, 8.0).toDouble();
-    final bg = widget.bgColor ?? _kBadgeDefaultBg;
+    final bg = resolveBadgeBg(
+      on: widget.on,
+      bgColor: widget.bgColor,
+      bgColorOn: widget.bgColorOn,
+    );
     // Label uses a neutral that always reads on the chosen background; the
     // icon carries the state color.
     final labelColor =
