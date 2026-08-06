@@ -41,6 +41,12 @@ struct LiveFullscreenView: View {
     /// when the link flips metered mid-session.
     @ObservedObject private var connectivity: ConnectivityMonitor
 
+    /// Observed (not just read through `vm.container`) so the HA-overlay
+    /// quick-toggle in the control bar re-renders its own icon the moment it's
+    /// tapped — `AppSettings` is a plain `let` on the container, so nothing else
+    /// here would publish the change. Same pattern `LiveWallView`/`RootView` use.
+    @ObservedObject private var settings: AppSettings
+
     /// Home Assistant entity links + live states for on-video badges + sheet.
     @StateObject private var ha: HAController
     @State private var haVideoSize: CGSize?
@@ -71,6 +77,7 @@ struct LiveFullscreenView: View {
         self.onSwipeCamera = onSwipeCamera
         self.onOpenPlayback = onOpenPlayback
         _connectivity = ObservedObject(wrappedValue: vm.container.connectivity)
+        _settings = ObservedObject(wrappedValue: vm.container.settings)
         _ha = StateObject(wrappedValue: HAController(container: vm.container))
     }
 
@@ -99,7 +106,7 @@ struct LiveFullscreenView: View {
                 // Hidden while digitally zoomed — the overlay lives outside the
                 // zoom transform and would otherwise sit on the wrong pixels.
                 if videoZoom <= 1.01 {
-                    HAOverlayLayer(controller: ha, settings: vm.container.settings, videoSize: haVideoSize)
+                    HAOverlayLayer(controller: ha, settings: settings, videoSize: haVideoSize)
                         .ignoresSafeArea()
                 }
 
@@ -370,6 +377,25 @@ struct LiveFullscreenView: View {
                             .foregroundColor(.white)
                     }
                     .accessibilityLabel("Home Assistant entities")
+
+                    // The same global show/hide-overlays quick-toggle the Live
+                    // wall carries, repeated here so it's reachable from where
+                    // the badges actually render — no backing out to the wall to
+                    // clear the video. Drives the identical persisted setting,
+                    // so the two buttons are always in agreement. Like the PiP
+                    // button, the icon alone carries the state (white on video).
+                    // Gated on `hasLinks` for the same reason as the sheet
+                    // button: nothing to hide on a camera with no linked
+                    // entities. Links keep loading while overlays are hidden, so
+                    // this button never strands the operator with no way back.
+                    Button { settings.showHaOverlays.toggle() } label: {
+                        Image(systemName: settings.showHaOverlays ? "house" : "house.slash")
+                            .font(.title3)
+                            .foregroundColor(.white)
+                    }
+                    .accessibilityLabel(settings.showHaOverlays
+                                        ? "Hide Home Assistant overlays"
+                                        : "Show Home Assistant overlays")
                 }
 
                 // Secondary actions in a menu — keeps the bar uncluttered
