@@ -31,8 +31,6 @@ import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.SignalWifiStatusbarConnectedNoInternet4
 import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -165,15 +163,6 @@ fun LiveScreen(
     // Built once (server URL + token are stable for the session). Used to derive the
     // per-tile still-frame URL for the instant-feel snapshot placeholder.
     val mediaUrls = remember { container.mediaUrls() }
-
-    // Global on-video Home Assistant overlay switch (the eye button in the action
-    // row below). Process-scoped and persisted, so this wall — which stays on the
-    // back stack while the user is inside a camera — always shows the same state
-    // the fullscreen view's twin button does.
-    val haOverlays = container.haOverlays
-    val haOverlaysVisible by rememberHaOverlaysVisible()
-    val haOverlaysLabel =
-        if (haOverlaysVisible) "Hide Home Assistant overlays" else "Show Home Assistant overlays"
 
     // Seed from the persisted layout (SecureStore is the source of truth) so the
     // chosen layout survives navigating into a camera and back — and app restarts.
@@ -575,25 +564,6 @@ fun LiveScreen(
                         GridLayoutToggle(layout, maxCols) { next ->
                             layout = next
                             store.liveGridLayout = next.ordinal
-                        }
-
-                        // Home Assistant overlays on/off — one tap hides EVERY
-                        // on-video HA badge, on every camera, and the fullscreen
-                        // view's matching button flips the same persisted state
-                        // (see HaOverlayVisibility). Display-only: entity links,
-                        // the per-camera entities sheet, and its detail/control
-                        // popups all stay exactly as they were.
-                        HintTooltip(haOverlaysLabel) {
-                            IconButton(onClick = { haOverlays.toggle() }) {
-                                Icon(
-                                    imageVector = if (haOverlaysVisible) {
-                                        Icons.Default.Visibility
-                                    } else {
-                                        Icons.Default.VisibilityOff
-                                    },
-                                    contentDescription = haOverlaysLabel,
-                                )
-                            }
                         }
 
                         // Take snapshot (#163) — only in a SINGLE-camera view. On a
