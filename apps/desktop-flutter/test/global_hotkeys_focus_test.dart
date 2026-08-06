@@ -23,6 +23,8 @@
 // Every test builds the REAL app-root sandwich, so the focus geometry under
 // test is the one the app actually ships.
 
+import 'dart:async' show unawaited;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -196,7 +198,14 @@ void main() {
         LogicalKeyboardKey.controlLeft,
         LogicalKeyboardKey.keyY,
       );
-      expect(wall.log, ['undo', 'redo']);
+      // Ctrl+Shift+Z is redo as well.
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pump();
+      expect(wall.log, ['undo', 'redo', 'redo']);
     });
 
     testWidgets('S snapshots via the app-level SnapshotHotkey', (tester) async {
@@ -207,7 +216,7 @@ void main() {
       // Nothing is registered as the active pane in a widget test, so the
       // service's "nothing to capture" toast is the observable proof that the
       // hotkey fired at all (it used to fire nothing whatsoever).
-      expect(find.text('Nothing to snapshot'), findsOneWidget);
+      expect(find.textContaining('Nothing to snapshot'), findsOneWidget);
       await drainToast(tester);
     });
   });
@@ -229,7 +238,7 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pump();
       expect(wall.log, isEmpty);
-      expect(find.text('Nothing to snapshot'), findsNothing);
+      expect(find.textContaining('Nothing to snapshot'), findsNothing);
     });
 
     testWidgets('a pushed route (dialog) owns the keyboard', (tester) async {
@@ -254,7 +263,7 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
       await tester.pump();
       expect(wall.log, isEmpty);
-      expect(find.text('Nothing to snapshot'), findsNothing);
+      expect(find.textContaining('Nothing to snapshot'), findsNothing);
     });
 
     testWidgets('a HotkeySuppressor (Settings panel) blocks everything', (
@@ -279,7 +288,7 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
       await tester.pump();
       expect(wall.log, isEmpty);
-      expect(find.text('Nothing to snapshot'), findsNothing);
+      expect(find.textContaining('Nothing to snapshot'), findsNothing);
 
       // …and unmounting it hands the keyboard back.
       await tester.pumpWidget(_appRoot(child: wall.widget));
@@ -304,7 +313,7 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
       await tester.pump();
       expect(wall.log, isEmpty);
-      expect(find.text('Nothing to snapshot'), findsNothing);
+      expect(find.textContaining('Nothing to snapshot'), findsNothing);
 
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pump();
@@ -318,9 +327,10 @@ void main() {
         _appRoot(child: wall.widget, fullscreen: fullscreen),
       );
       await tester.pump();
-      // window_manager has no platform side in a widget test; setFullscreen
-      // flips its own flag first and swallows the plugin failure.
-      await fullscreen.setFullscreen(true);
+      // NOT awaited: `setFullscreen` flips its own flag synchronously and then
+      // awaits window_manager, which has no platform side here — awaiting a
+      // real platform-channel future inside the fake-async zone never returns.
+      unawaited(fullscreen.setFullscreen(true));
       await tester.pump();
       expect(fullscreen.isFullscreen, isTrue);
 
