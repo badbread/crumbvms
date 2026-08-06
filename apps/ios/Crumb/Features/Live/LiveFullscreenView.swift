@@ -99,7 +99,7 @@ struct LiveFullscreenView: View {
                 // Hidden while digitally zoomed — the overlay lives outside the
                 // zoom transform and would otherwise sit on the wrong pixels.
                 if videoZoom <= 1.01 {
-                    HAOverlayLayer(controller: ha, videoSize: haVideoSize)
+                    HAOverlayLayer(controller: ha, settings: vm.container.settings, videoSize: haVideoSize)
                         .ignoresSafeArea()
                 }
 

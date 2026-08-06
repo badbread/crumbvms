@@ -517,6 +517,11 @@ final class HAController: ObservableObject {
 /// nothing is drawn (prevents misplaced badges).
 struct HAOverlayLayer: View {
     @ObservedObject var controller: HAController
+    /// The global "show HA overlays" quick-toggle. Observed *here*, inside the
+    /// overlay itself, rather than at each call site, so every live surface that
+    /// composites badges — the single-camera/fullscreen view today, anything
+    /// added later — is governed by the one flag and can't drift out of sync.
+    @ObservedObject var settings: AppSettings
     let videoSize: CGSize?
 
     /// Presents the detail card (read-only links + cover/lock on tap; any link on
@@ -528,6 +533,16 @@ struct HAOverlayLayer: View {
     @State private var actionError: String?
 
     var body: some View {
+        // Hidden = render nothing at all: no badges, and with them no tap /
+        // long-press targets, so the video underneath is completely clear.
+        // Display-only — the controller keeps polling, so flipping the toggle
+        // back shows live states immediately with no reload.
+        if settings.showHaOverlays {
+            overlayBody
+        }
+    }
+
+    private var overlayBody: some View {
         GeometryReader { geo in
             if let vs = videoSize, vs.width > 0, vs.height > 0, !controller.placedLinks.isEmpty {
                 let field = fieldRect(pane: geo.size, video: vs)
