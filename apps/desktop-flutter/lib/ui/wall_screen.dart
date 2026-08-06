@@ -33,6 +33,7 @@ import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/hotkeys/ha_overlay_hotkey.dart';
 import 'package:crumb_desktop/ui/live/pane_watchdog.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
@@ -701,11 +702,25 @@ class _WallScreenState extends State<WallScreen> {
       ),
     );
 
+    // H — hide/show every on-video HA badge, wall-wide (both the tiles and the
+    // maximized pane, which lives inside this subtree). Purely display; the
+    // right-click menu items stay available while hidden. It is a
+    // HardwareKeyboard hotkey, NOT a branch of the focus-chain listener below:
+    // that listener's node never holds primary focus on this screen, so a key
+    // branch in it would never run — see ha_overlay_hotkey.dart for the full
+    // why. Wrapping outermost keeps it live for the whole Live-tab lifetime.
+    Widget haKeyed(Widget child) => HaOverlayHotkey(
+      onToggle: HaOverlayPrefs.instance.toggle,
+      options: widget.clientOptions,
+      shortcuts: widget.shortcuts,
+      child: child,
+    );
+
     // Number-key hotkeys maximize the assigned camera; Esc restores; M toggles
     // audio. (S snapshot is handled by the app-level SnapshotHotkey.)
     final hk = widget.hotkeys;
-    if (hk == null) return scaffold;
-    return GlobalHotkeysListener(
+    if (hk == null) return haKeyed(scaffold);
+    final Widget keyed = GlobalHotkeysListener(
       store: hk,
       cameras: cams,
       autofocus: true,
@@ -737,9 +752,6 @@ class _WallScreenState extends State<WallScreen> {
       onToggleAudio: widget.audio == null
           ? null
           : () => widget.audio!.toggleAudio(),
-      // H — hide/show every on-video HA badge, wall-wide. Purely display; the
-      // right-click menu items stay available while hidden.
-      onToggleHaOverlays: HaOverlayPrefs.instance.toggle,
       // Ctrl+Z / Ctrl+Y drive the active overlay editor's undo/redo (issue
       // #4). Non-null only while an editor is open on the maximized pane, so
       // the shortcut is inert on the plain wall. The two editors are mutually
@@ -748,6 +760,7 @@ class _WallScreenState extends State<WallScreen> {
       onRedo: () => _activeOverlayEditor?.redo(),
       child: scaffold,
     );
+    return haKeyed(keyed);
   }
 
   /// The overlay-editor controller currently in edit mode (PTZ or HA), or null

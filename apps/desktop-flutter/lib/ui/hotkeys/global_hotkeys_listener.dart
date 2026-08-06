@@ -1,7 +1,6 @@
 // Global keyboard shortcuts: F8 (perf HUD), S (snapshot), M (toggle audio),
-// H (hide/show the Home Assistant overlays), Esc (restore maximize), and the
-// 1-9/0 + Shift+1-9/0 "go to camera" keys.
-// The four action keys (F8/S/M/H) are the DEFAULTS — a wired-up
+// Esc (restore maximize), and the 1-9/0 + Shift+1-9/0 "go to camera" keys.
+// The three action keys (F8/S/M) are the DEFAULTS — a wired-up
 // [KeyboardShortcutsStore] (Keyboard Shortcuts settings section) rebinds
 // them, and [ClientOptionsStore.hotkeysEnabled] is the master off switch for
 // everything except Esc.
@@ -98,7 +97,6 @@ class GlobalHotkeysListener extends StatelessWidget {
     this.onHudToggle,
     this.onSnapshot,
     this.onToggleAudio,
-    this.onToggleHaOverlays,
     this.onEscape,
     this.onUndo,
     this.onRedo,
@@ -140,10 +138,6 @@ class GlobalHotkeysListener extends StatelessWidget {
   /// M — toggle audio for the active camera. (app.js:4138-4141; wire to
   /// `AudioFollowController.toggleAudio()`.)
   final VoidCallback? onToggleAudio;
-
-  /// H — hide/show every on-video Home Assistant badge (wire to
-  /// `HaOverlayPrefs.instance.toggle`). Null on screens without live video.
-  final VoidCallback? onToggleHaOverlays;
 
   /// Esc — restore from maximize (only reached if nothing above this widget
   /// in the tree — e.g. `FullscreenEscHandler` — already consumed the Esc).
@@ -244,17 +238,6 @@ class GlobalHotkeysListener extends StatelessWidget {
                 LogicalKeyboardKey.keyM)) {
           if (onToggleAudio != null) {
             onToggleAudio!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Hide/show the HA badge layer on every pane (default H) — remappable.
-        if (event.logicalKey ==
-            (shortcuts?.keyFor(ShortcutAction.haOverlayToggle) ??
-                LogicalKeyboardKey.keyH)) {
-          if (onToggleHaOverlays != null) {
-            onToggleHaOverlays!();
             return KeyEventResult.handled;
           }
           return KeyEventResult.ignored;
