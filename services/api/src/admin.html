@@ -6040,7 +6040,7 @@ async function renderHaHub() {
       <button class="ghost sm" onclick="loadHaHubOverview()" title="Re-fetch links and live state from every camera">Refresh</button>
     </div>
     <div class="policy-section" style="margin-top:10px">
-      <div class="card-hint" style="margin:-2px 0 10px 2px">Every Home Assistant entity linked to any camera, across the whole server. An entity flagged <b>orphaned</b> no longer exists in Home Assistant — open that camera's Motion tab to relink or remove it.</div>
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Every Home Assistant entity linked to any camera, across the whole server. <b>To link a new sensor or control, open a camera and use its Motion tab</b> (entities are linked per camera, not from this page). An entity flagged <b>orphaned</b> no longer exists in Home Assistant; relink or remove it from that camera's Motion tab.</div>
       <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
         <input id="ha-hub-q" placeholder="Filter by camera, entity id, or label…" style="max-width:280px" oninput="haHubFilterChanged()" />
         <label class="chk" style="margin:0"><input type="checkbox" id="ha-hub-orphans-only" onchange="haHubOrphansOnlyChanged()"/> Orphaned only</label>
