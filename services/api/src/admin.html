@@ -5635,7 +5635,7 @@ function renderHaLinks(configured) {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         ${haRoleSelect(i, l.role)}
         <input value="${esc(l.label || '')}" placeholder="${esc(l.entity_id)}" oninput="haSetLabel(${i}, this.value)" title="Display label" style="flex:1;min-width:140px;font-size:13px" />
-        <input value="${esc(l.device_class || '')}" placeholder="device class" oninput="haSetDeviceClass(${i}, this.value)" title="Home Assistant device class" style="width:120px;font-size:12px" />
+        <input list="ha-dev-classes" value="${esc(l.device_class || '')}" placeholder="class (optional)" oninput="haSetDeviceClass(${i}, this.value)" title="Optional. Only meaningful for binary_sensor entities; it sets the badge glyph. Auto-filled from Home Assistant when the entity reports one. Leave blank for lights, switches and covers, their icon comes from the domain or the Icon &amp; style override." style="width:120px;font-size:12px" />
         <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
         <button class="ghost sm" onclick="haToggleStyle(${i})" ${canStyle ? '' : 'disabled'} title="${canStyle ? 'Badge icon, shape and color for this entity on the video wall' : 'Save links first to customize this entity\'s badge'}">${HA_STYLE_OPEN === i ? 'Hide style' : 'Icon &amp; style'}</button>
         ${isActuator ? `<button class="ghost sm" onclick="haToggleCtrl(${i})" title="Confirmation + which actions this control allows">${HA_CTRL_OPEN === i ? 'Hide controls' : 'Controls'}</button>` : ''}
@@ -5645,8 +5645,12 @@ function renderHaLinks(configured) {
       ${HA_CTRL_OPEN === i ? haCtrlPanel(i, l) : ''}
     </div>`;
   }).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
+  const devClassOpts = ['door', 'garage_door', 'window', 'opening', 'motion', 'occupancy', 'presence', 'vibration', 'moisture', 'smoke', 'gas', 'carbon_monoxide', 'lock']
+    .map(c => `<option value="${c}"></option>`).join('');
   el.innerHTML = `
     <div>${rows}</div>
+    <datalist id="ha-dev-classes">${devClassOpts}</datalist>
+    <div class="card-hint" style="margin-top:10px">The <b>class</b> box on each row is optional and only affects <code>binary_sensor</code> badge glyphs; it is auto-filled from Home Assistant. Leave it blank for lights, switches and covers.</div>
     <div class="card-hint" style="margin-top:10px">Where does an entity go? <b>Motion sensor</b> = motion or contact binary sensors. <b>Sensor reading</b> = numeric readings (temperature, power, humidity). <b>Control</b> = anything you operate (lights, switches, covers, locks, fans, sirens).</div>
     <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center">
       <button class="ghost sm" onclick="haOpenPicker('motion')">+ Motion sensor</button>
