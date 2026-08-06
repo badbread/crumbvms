@@ -352,3 +352,19 @@ internal fun parseHexColor(hex: String?): Color? {
     val v = h.toLongOrNull(16) ?: return null
     return Color(0xFF000000L or v)
 }
+
+/**
+ * The badge chip's background color: `overlay_bg_color_on` when the entity
+ * reads ON (and the operator set one) — else `overlay_bg_color` — else
+ * [BadgeDefaultBg]. Keyed on [active], the SAME tri-state `badgeVisual`
+ * computes (`active == true` = confidently on; `false`/`null` = off, scene,
+ * stale, or unknown), so a null `active` NEVER picks the on-color — same
+ * honesty rule the color/icon override already follows.
+ */
+internal fun resolveBadgeBg(link: HaLinkDto, active: Boolean?): Color {
+    val bg = parseHexColor(link.overlayBgColor)
+    if (active == true) {
+        parseHexColor(link.overlayBgColorOn)?.let { return it }
+    }
+    return bg ?: BadgeDefaultBg
+}
