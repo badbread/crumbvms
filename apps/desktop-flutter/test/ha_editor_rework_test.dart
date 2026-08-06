@@ -27,6 +27,8 @@ import 'package:crumb_desktop/ui/ha_overlay/ha_badge_popover.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_icons.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
+import 'package:crumb_desktop/ui/overlay_editor/overlay_editor_controller.dart';
+import 'package:crumb_desktop/ui/overlay_editor/overlay_item.dart';
 
 HaLink _link({
   String id = 'l1',
@@ -237,17 +239,20 @@ void main() {
       expect(p.top + popover.height, lessThanOrEqualTo(pane.height));
     });
 
-    test('topMargin keeps the popover clear of the sticky edit bar', () {
-      // A badge just under the bar: without the inset the popover clamps to
-      // the pane's top edge and slides under the bar, which paints above it.
-      const barHeight = 48.0;
+    test('topMargin keeps the popover clear of chrome floating over the frame',
+        () {
+      // The back button / camera-name pill float over the frame's top-left.
+      // Without the reservation the popover clamps to the pane's top edge and
+      // lands underneath them. (The editor's own top bar needs no reservation:
+      // it is a sibling of the video viewport, not an overlay on it.)
+      const chrome = 60.0;
       final p = resolveHaPopoverPlacement(
         badge: const Rect.fromLTWH(100, 56, 24, 24),
         popover: popover,
         pane: pane,
-        topMargin: barHeight + 8,
+        topMargin: chrome + 8,
       );
-      expect(p.top, greaterThanOrEqualTo(barHeight));
+      expect(p.top, greaterThanOrEqualTo(chrome));
     });
 
     test('the arrow stays inside the popover edge even when clamped', () {
@@ -362,6 +367,121 @@ void main() {
       expect(host.editor.primarySelectedId, 'b');
       expect(host.editor.items.first.x, closeTo(0.46, 1e-9));
       host.dispose();
+    });
+  });
+
+  group('the whole frame is reachable for placement', () {
+    // The editor's top bar is a SIBLING of the video viewport (the pane insets
+    // the video while editing) rather than an overlay on it, so no drag has to
+    // be clamped away from the top strip — which is prime badge real estate in
+    // normal viewing. Regression guard for "badges cannot be placed at the top
+    // of the frame".
+    OverlayEditorController seeded(HaOverlayBadgeItem item) {
+      final c = OverlayEditorController();
+      c.beginEdit([item], anchor: OverlayAnchor.videoFrame);
+      // A 16:9 video in a slightly wider pane: letterboxed left/right, so the
+      // frame spans the pane's FULL height and its top edge is the pane's.
+      c.updatePaneMetrics(1280, 672, videoW: 1920, videoH: 1080);
+      c.selectItem(item.id);
+      return c;
+    }
+
+    test('a badge drags all the way to the top edge of the frame', () {
+      final item = HaOverlayBadgeItem(_link());
+      final c = seeded(item);
+      c.beginDrag(item.id);
+      c.updateDrag(0, -5000, snap: false);
+      c.endDrag();
+      expect(item.y, 0.0);
+      c.dispose();
+    });
+
+    test('and all the way to the bottom edge', () {
+      final item = HaOverlayBadgeItem(_link());
+      final c = seeded(item);
+      c.beginDrag(item.id);
+      c.updateDrag(0, 5000, snap: false);
+      c.endDrag();
+      expect(item.y, greaterThan(0.9));
+      c.dispose();
+    });
+
+    test('a bottom-bar reservation still clamps (the PTZ editor relies on it)',
+        () {
+      final item = HaOverlayBadgeItem(_link());
+      final c = seeded(item)..setEditBottomInset(200);
+      c.beginDrag(item.id);
+      c.updateDrag(0, 5000, snap: false);
+      c.endDrag();
+      // 672px frame, 200px reserved => the badge cannot reach the bottom.
+      expect(item.y, lessThan(0.75));
+      c.dispose();
+    });
+  });
+
+  group('pill badges hug their content', () {
+    // The old width was a character-count estimate that ran well wide of the
+    // real text, and since `HaBadgeChip._pill` fills whatever box it is given,
+    // the surplus rendered as empty pill after the label.
+    test('a longer label makes a wider pill', () {
+      expect(
+        HaOverlayBadgeItem.pillBaseWidth('Floodlight'),
+        greaterThan(HaOverlayBadgeItem.pillBaseWidth('Yard')),
+      );
+    });
+
+    test('an empty label still leaves room for the icon and paddings', () {
+      final bare = HaOverlayBadgeItem.pillBaseWidth('');
+      expect(bare, greaterThan(HaOverlayBadgeItem.baseRefPx));
+      // Chrome only: 2 paddings + icon + gap = 1.26 * the reference size.
+      expect(bare, closeTo(HaOverlayBadgeItem.baseRefPx * 1.26, 0.01));
+    });
+
+    test('the width is content-derived, not the old per-character estimate',
+        () {
+      // The retired formula: 1.5 * ref + chars * ref * 0.42.
+      const ref = HaOverlayBadgeItem.baseRefPx;
+      double oldEstimate(String s) =>
+          ref * 1.5 + s.length.clamp(1, 16) * ref * 0.42;
+      for (final label in ['Yard', 'Floodlight', 'Back porch light']) {
+        expect(
+          HaOverlayBadgeItem.pillBaseWidth(label),
+          lessThan(oldEstimate(label)),
+          reason: label,
+        );
+      }
+    });
+
+    test('a runaway label is capped rather than spanning the frame', () {
+      final huge = HaOverlayBadgeItem.pillBaseWidth('W' * 400);
+      expect(huge, lessThanOrEqualTo(HaOverlayBadgeItem.baseRefPx * 10.3));
+    });
+
+    test('a dot is square and ignores its label entirely', () {
+      final dot = HaOverlayBadgeItem(_link())
+        ..labelText = 'A very long caption indeed';
+      final (w, h) = dot.baseSize();
+      expect(w, h);
+      expect(h, HaOverlayBadgeItem.baseRefPx);
+    });
+
+    test('pill width scales with the badge size multiplier', () {
+      final item = HaOverlayBadgeItem(_link())
+        ..shape = 'pill'
+        ..labelText = 'Floodlight';
+      final w1 = item.baseSize().$1;
+      item.setBaseSize(44, 44); // 2x
+      final w2 = item.baseSize().$1;
+      expect(w2, closeTo(w1 * 2, 0.01));
+    });
+
+    test('switching dot -> pill -> dot keeps the height stable', () {
+      final item = HaOverlayBadgeItem(_link())..labelText = 'Floodlight';
+      final h0 = item.baseSize().$2;
+      item.shape = 'pill';
+      expect(item.baseSize().$2, h0);
+      item.shape = null;
+      expect(item.baseSize(), (h0, h0));
     });
   });
 

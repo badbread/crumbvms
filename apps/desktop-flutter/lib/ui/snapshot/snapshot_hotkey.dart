@@ -20,7 +20,7 @@ import 'package:flutter/services.dart';
 import '../../services/snapshot_service.dart';
 import '../../state/client_options.dart';
 import '../../state/keyboard_shortcuts.dart';
-import '../hotkeys/text_focus.dart';
+import '../hotkeys/hotkey_gate.dart';
 
 /// Wires the "S" hotkey to a snapshot of the active pane.
 ///
@@ -67,7 +67,7 @@ class SnapshotHotkey extends StatelessWidget {
           return KeyEventResult.ignored;
         }
         if (!(options?.hotkeysEnabled ?? true)) return KeyEventResult.ignored;
-        if (textInputHasFocus()) return KeyEventResult.ignored;
+        if (hotkeyContextBlocked(context)) return KeyEventResult.ignored;
         SnapshotService.captureActivePane(context);
         return KeyEventResult.handled;
       },

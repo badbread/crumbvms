@@ -2399,20 +2399,18 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// `AnimatedBuilder` for that).
   bool _haEditing = false;
 
-  /// The HA editor's chrome is a TOP bar now (the bottom bar and the floating
-  /// style panel are both gone — per-badge styling is anchored to the badge
-  /// itself). Reserve that strip so a badge drag can't hide under it, and
-  /// release the old bottom reservation (issue #13).
+  /// The HA editor reserves NO drag-clamp inset (unlike the PTZ editor's
+  /// bottom bar, issue #13): its top bar is a sibling of the video viewport,
+  /// not an overlay on it, so no part of the frame is ever occluded and every
+  /// normalized coordinate stays reachable. This releases the bottom
+  /// reservation the retired HA bottom bar used to take.
   ///
   /// Called from BOTH [initState] and the change listener: the wall's
   /// `_beginHaOverlayEdit` maximizes and then begins the session synchronously
   /// in the same frame, so a pane that mounts straight into edit mode never
-  /// sees a mode TRANSITION and would otherwise reserve nothing.
+  /// sees a mode TRANSITION.
   void _applyHaEditInsets(bool editing) {
-    final editor = widget.haOverlay?.editor;
-    if (editor == null) return;
-    editor.setEditTopInset(editing ? kHaEditTopBarHeight : 0);
-    editor.setEditBottomInset(0);
+    widget.haOverlay?.editor.setEditBottomInset(0);
   }
 
   void _onHaOverlayChanged() {
@@ -2992,10 +2990,34 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   @override
   Widget build(BuildContext context) {
+    // While the HA overlay editor is open the pane's VIEWPORT is inset by the
+    // height of the sticky top bar, and the video re-letterboxes into what is
+    // left. The bar therefore never covers video, which is what makes the
+    // whole frame — including the top strip, prime badge real estate in normal
+    // viewing — reachable for placement. The alternative (bar overlapping the
+    // video, drags clamped out from under it) permanently traded a strip of
+    // the frame away for chrome that only exists while editing.
+    //
+    // Nothing else has to change: placements are normalized to the DISPLAYED
+    // video frame (`OverlayAnchor.videoFrame` + `OverlayGeometry.fieldRect`),
+    // so a badge dropped at the frame's top edge here renders at the frame's
+    // true top edge once Done restores the full-bleed pane.
+    //
+    // The outer Stack + Positioned are UNCONDITIONAL so entering/leaving edit
+    // mode only changes `top:` — the video subtree keeps its element identity
+    // and libmpv is never torn down and rebuilt mid-session.
+    final editInset = _haEditing ? kHaEditTopBarHeight : 0.0;
     return Positioned.fill(
       child: Container(
         color: Colors.black,
-        child: LayoutBuilder(
+        child: Stack(
+          children: [
+            Positioned(
+              left: 0,
+              right: 0,
+              top: editInset,
+              bottom: 0,
+              child: LayoutBuilder(
           builder: (context, constraints) {
             final pane = Size(constraints.maxWidth, constraints.maxHeight);
             return Stack(
@@ -3211,12 +3233,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                     ),
                   ),
 
-                // Close (back to wall) + camera name + zoom level. Pushed
-                // below the HA editor's sticky top bar while it is up, so the
-                // two don't stack on top of each other (the bar names the
-                // camera too, but Back must stay reachable).
+                // Close (back to wall) + camera name + zoom level.
                 Positioned(
-                  top: _haEditing ? kHaEditTopBarHeight + 10 : 12,
+                  top: 12,
                   left: 12,
                   child: Row(
                     children: [
@@ -3307,7 +3326,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                 // Live status badges (REC / motion / detection), top-right —
                 // the maximized view must show the same indicators as the wall.
                 Positioned(
-                  top: _haEditing ? kHaEditTopBarHeight + 12 : 14,
+                  top: 14,
                   right: 14,
                   child: ListenableBuilder(
                     listenable: widget.liveStatus,
@@ -3392,43 +3411,50 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                   ),
                 ],
 
-                // HA-overlay editor chrome (PR F restructure). Two pieces,
-                // both mutually exclusive with the PTZ chrome above by
-                // construction:
-                //  * a sticky TOP bar for everything session-wide (add
-                //    entity, the Live|On|Off state preview, snap/undo/redo,
-                //    Done/✕);
-                //  * a popover ANCHORED TO THE SELECTED BADGE for everything
-                //    per-badge, so the operator is never picking a color for
-                //    a badge a panel is covering.
-                // The retired floating `HaOverlayEditPanel` and the bottom
-                // `OverlayEditorBar` are gone; the bar's multi-select geometry
-                // tools live in the popover's 2+-selection body.
-                if (widget.haOverlay != null && _haEditing) ...[
+                // HA-overlay editor: the per-badge popover, ANCHORED TO THE
+                // SELECTED BADGE so the operator is never picking a color for
+                // a badge a panel is covering. Lives INSIDE the inset viewport
+                // (its coordinates are pane-local), alongside the editor
+                // layer. The session-wide top bar is a sibling of this whole
+                // viewport — see build's opening comment. The retired floating
+                // `HaOverlayEditPanel` and the bottom `OverlayEditorBar` are
+                // gone; the bar's multi-select geometry tools live in the
+                // popover's 2+-selection body. Mutually exclusive with the PTZ
+                // chrome above by construction.
+                if (widget.haOverlay != null && _haEditing)
                   Positioned.fill(
                     child: HaBadgePopoverLayer(
                       host: widget.haOverlay!,
                       videoW: _videoW,
                       videoH: _videoH,
-                      // The top bar paints above this layer.
-                      topInset: kHaEditTopBarHeight,
+                      // Not the edit bar (that's a sibling of this viewport,
+                      // occluding nothing) — the back button / name pill /
+                      // status badges, which DO float over the frame's top.
+                      topInset: 60,
                     ),
                   ),
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    top: 0,
-                    child: HaOverlayEditTopBar(
-                      host: widget.haOverlay!,
-                      cameraName: widget.camera.name,
-                      onDone: () => widget.onHaOverlayDone?.call(),
-                      onCancel: () => widget.onHaOverlayCancel?.call(),
-                    ),
-                  ),
-                ],
               ],
             );
           },
+              ),
+            ),
+            // The editor's sticky top bar: a SIBLING of the video viewport,
+            // never an overlay on top of it, so it occludes no part of the
+            // frame and no drag has to be clamped away from it.
+            if (widget.haOverlay != null && _haEditing)
+              Positioned(
+                left: 0,
+                right: 0,
+                top: 0,
+                height: kHaEditTopBarHeight,
+                child: HaOverlayEditTopBar(
+                  host: widget.haOverlay!,
+                  cameraName: widget.camera.name,
+                  onDone: () => widget.onHaOverlayDone?.call(),
+                  onCancel: () => widget.onHaOverlayCancel?.call(),
+                ),
+              ),
+          ],
         ),
       ),
     );

@@ -184,12 +184,6 @@ class OverlayEditorController extends ChangeNotifier {
   /// lost under the bar (issue #13). Plain field — no notification.
   double _editBottomInset = 0;
 
-  /// Top occlusion (logical px), the mirror of [_editBottomInset] for a host
-  /// whose editor chrome is a TOP bar instead of a bottom one (the HA badge
-  /// editor's sticky top bar). Default 0, so the PTZ host — whose bar is along
-  /// the bottom — is unaffected.
-  double _editTopInset = 0;
-
   /// Bumped on every `beginEdit`/`endEdit`. Hosts that kick off an async load
   /// BEFORE calling `beginEdit` (the mandated "host-loads-first" order)
   /// should capture this beforehand and compare it once the load resolves —
@@ -245,11 +239,6 @@ class OverlayEditorController extends ChangeNotifier {
   /// drop an item under it (issue #13). Plain field write — set by the host
   /// pane when it lays out a bottom bar; 0 when the chrome is a side panel.
   void setEditBottomInset(double px) => _editBottomInset = px;
-
-  /// Reserve `px` of TOP occlusion so a drag can't drop an item under a top
-  /// editor bar — see [_editTopInset]. Plain field write, same contract as
-  /// [setEditBottomInset].
-  void setEditTopInset(double px) => _editTopInset = px;
 
   /// Notify the bar/host (structure) AND tick geometry so a non-drag position
   /// change (align/distribute/match/opacity/undo) repaints the per-item
@@ -742,13 +731,12 @@ class OverlayEditorController extends ChangeNotifier {
     // keeps its shape at the edges instead of squashing item-by-item, and
     // never below the editor toolbar (issue #13).
     final maxLeft = math.max(fx, fx + fw - d.width);
-    final minTop = math.max(fy, _editTopInset);
     final maxTop = math.max(
-      minTop,
+      fy,
       math.min(fy + fh - d.height, _paneH - _editBottomInset - d.height),
     );
     var left = d.rawLeft.clamp(fx, maxLeft).toDouble();
-    var top = d.rawTop.clamp(minTop, maxTop).toDouble();
+    var top = d.rawTop.clamp(fy, maxTop).toDouble();
     double? gx, gy;
     if (snap && snapEnabled) {
       final sx =

@@ -32,7 +32,7 @@ import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
-import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 
 /// Wires the HA-overlay toggle key (default `H`, remappable) to [onToggle],
 /// regardless of where keyboard focus currently sits.
@@ -95,7 +95,7 @@ class _HaOverlayHotkeyState extends State<HaOverlayHotkey> {
 
     // The guards the focus chain would have applied for us:
     // typing an "h" into a label/search field must never toggle overlays…
-    if (textInputHasFocus()) return false;
+    if (hotkeyContextBlocked()) return false;
     // …a pushed route (dialog, picker, the bookmarks/config-view screens) owns
     // the keyboard while it's up…
     if (Navigator.maybeOf(context)?.canPop() ?? false) return false;

@@ -46,6 +46,7 @@
 import 'package:flutter/material.dart';
 
 import '../color_swatch_picker.dart';
+import '../hotkeys/hotkey_gate.dart';
 import '../overlay_editor/overlay_editor_controller.dart';
 import '../overlay_editor/overlay_geometry.dart';
 import 'ha_icons.dart';
@@ -123,10 +124,12 @@ class HaPopoverPlacement {
 /// [popover] is the caller's estimate of the rendered size; the widget itself
 /// self-sizes, so an estimate that is a little off only affects which side is
 /// chosen, never whether the popover renders correctly.
-/// [topMargin] (default [margin]) keeps the popover clear of chrome pinned to
-/// the top of the pane — the editor's own sticky bar, which paints above this
-/// layer and would otherwise cover a popover clamped against the pane's top
-/// edge.
+/// [topMargin] (default [margin]) reserves room for chrome pinned over the top
+/// of the video. The editor's own top bar does NOT need it — that bar is a
+/// sibling of the video viewport rather than an overlay on it, so the frame is
+/// never occluded (see the maximized pane's build) — but the pane's floating
+/// back button and camera-name pill do sit over the frame's top-left, and this
+/// is the knob for keeping clear of them.
 HaPopoverPlacement resolveHaPopoverPlacement({
   required Rect badge,
   required Size popover,
@@ -243,9 +246,12 @@ class HaBadgePopoverLayer extends StatefulWidget {
 
   final HaOverlayController host;
 
-  /// Height of the pane chrome pinned above this layer (the editor's sticky
-  /// top bar), which paints over it — the popover keeps clear of it rather
-  /// than sliding underneath when a badge sits near the top of the frame.
+  /// Height of the pane chrome that FLOATS over the video and paints above
+  /// this layer — the back button, the camera-name pill, the live-status
+  /// badges. The popover keeps clear of it rather than sliding underneath
+  /// when a badge sits near the top of the frame. (The editor's own top bar
+  /// is NOT included: it is a sibling of the video viewport, so it covers no
+  /// part of the frame.)
   final double topInset;
 
   /// Decoded video pixel size — the badges are video-frame anchored, so the
@@ -337,7 +343,7 @@ class _HaBadgePopoverLayerState extends State<HaBadgePopoverLayer> {
                 _estimateHeight(multi: multi, open: _section),
               ),
               pane: Size(paneW, paneH),
-              topMargin: widget.topInset + 8,
+              topMargin: widget.topInset > 0 ? widget.topInset + 8 : null,
             );
 
             final body = multi
@@ -516,6 +522,7 @@ class _StyleBodyState extends State<_StyleBody> {
   final _sizeCtrl = TextEditingController();
   final _sizeFocus = FocusNode();
   final _iconQueryCtrl = TextEditingController();
+  final _iconFocus = FocusNode();
 
   bool _editingLabel = false;
   String _iconQuery = '';
@@ -544,6 +551,7 @@ class _StyleBodyState extends State<_StyleBody> {
     _sizeCtrl.dispose();
     _sizeFocus.dispose();
     _iconQueryCtrl.dispose();
+    _iconFocus.dispose();
     super.dispose();
   }
 
@@ -652,7 +660,8 @@ class _StyleBodyState extends State<_StyleBody> {
           Expanded(
             child: SizedBox(
               height: 32,
-              child: TextField(
+              child: SuppressHotkeysWhileFocused(
+                child: TextField(
                 controller: _labelCtrl,
                 focusNode: _labelFocus,
                 autofocus: true,
@@ -672,6 +681,7 @@ class _StyleBodyState extends State<_StyleBody> {
                   _editor.notifyItemsChanged();
                 },
                 onSubmitted: (_) => setState(() => _editingLabel = false),
+                ),
               ),
             ),
           ),
@@ -772,8 +782,16 @@ class _StyleBodyState extends State<_StyleBody> {
         children: [
           SizedBox(
             height: 30,
-            child: TextField(
+            child: SuppressHotkeysWhileFocused(
+              child: TextField(
               controller: _iconQueryCtrl,
+              focusNode: _iconFocus,
+              // The operator opened this grid deliberately and the next thing
+              // they do is type a glyph name, so take focus immediately rather
+              // than making them find the box. It also closes the window in
+              // which a typed letter could reach a bare-key global shortcut
+              // instead of the field.
+              autofocus: true,
               style: const TextStyle(color: Colors.white, fontSize: 12.5),
               decoration: const InputDecoration(
                 isDense: true,
@@ -787,6 +805,7 @@ class _StyleBodyState extends State<_StyleBody> {
                     EdgeInsets.symmetric(horizontal: 6, vertical: 6),
               ),
               onChanged: (v) => setState(() => _iconQuery = v),
+              ),
             ),
           ),
           const SizedBox(height: 6),
@@ -1011,19 +1030,21 @@ class _StyleBodyState extends State<_StyleBody> {
             SizedBox(
               width: 52,
               height: 30,
-              child: TextField(
-                controller: _sizeCtrl,
-                focusNode: _sizeFocus,
-                keyboardType: TextInputType.number,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 12),
-                decoration: const InputDecoration(
-                  isDense: true,
-                  border: OutlineInputBorder(),
-                  contentPadding:
-                      EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+              child: SuppressHotkeysWhileFocused(
+                child: TextField(
+                  controller: _sizeCtrl,
+                  focusNode: _sizeFocus,
+                  keyboardType: TextInputType.number,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    contentPadding:
+                        EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                  ),
+                  onSubmitted: (_) => _submitSize(),
                 ),
-                onSubmitted: (_) => _submitSize(),
               ),
             ),
             const SizedBox(width: 6),
@@ -1105,9 +1126,18 @@ class _StyleBodyState extends State<_StyleBody> {
                   color: value ? const Color(0xFF4CC9FF) : Colors.white38,
                 ),
                 const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: const TextStyle(color: Colors.white, fontSize: 12.5),
+                // Expanded + ellipsis: the popover is a fixed 300px, and these
+                // captions are the longest strings in it. At a large text
+                // scale (or once these strings are translated) a bare Text
+                // overflows the row — the tooltip carries the full wording
+                // either way.
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 12.5),
+                  ),
                 ),
               ],
             ),

@@ -19,6 +19,8 @@
 //   // ... later, on Done:
 //   await ha.endEditAndSave();
 
+import 'package:flutter/painting.dart';
+
 import '../../api/crumb_api.dart';
 import '../../api/ha_api.dart';
 import '../../api/ha_models.dart';
@@ -164,14 +166,68 @@ class HaOverlayBadgeItem implements OverlayItem {
   (double w, double h) baseSize() {
     final h = baseRefPx * _scale;
     if (!isPill) return (h, h);
-    // Pill: icon + label in one chip. The item box is a fixed size (badges
-    // aren't drag-resizable), so estimate the width from the label length in
-    // the same ref units as [baseRefPx]; the chip ellipsizes if the estimate
-    // runs short (`HaBadgeChip`), so an over-long label can't blow out the box.
-    final chars = pillLabel.length.clamp(1, 16);
-    final textRefPx = chars * baseRefPx * 0.42; // ~0.42 ref-px per glyph
-    final w = (baseRefPx * 1.5 + textRefPx) * _scale; // icon + paddings + text
-    return (w, h);
+    return (pillBaseWidth(pillLabel) * _scale, h);
+  }
+
+  /// The pill's unscaled width: exactly what its content occupies — the icon,
+  /// both horizontal paddings, the icon/label gap, and the MEASURED width of
+  /// the label at the font size the chip actually uses.
+  ///
+  /// This used to be a character-count estimate (`chars * baseRefPx * 0.42`)
+  /// that ran far wide of the real text: at the chip's font size (0.40 of the
+  /// pill height) a ten-character label like "Floodlight" measures roughly
+  /// half what the estimate reserved. The item box is fixed-size and
+  /// `HaBadgeChip._pill` fills whatever box it is handed, so the surplus
+  /// rendered as a stretch of empty pill after the label. Measuring makes the
+  /// pill hug its content. The multipliers below mirror `_pill`'s layout
+  /// one-for-one — change one, change both.
+  ///
+  /// Nothing here consults the PINNED CAPTIONS: `HaBadgeCaptions` centres its
+  /// own chip on the badge and is free to be wider or narrower, so a long
+  /// "5 h ago" line never stretches the pill.
+  static double pillBaseWidth(String label) {
+    const iconRef = baseRefPx * 0.56;
+    const padHRef = baseRefPx * 0.28; // each side
+    const gapRef = baseRefPx * 0.14;
+    const fontRef = baseRefPx * 0.40;
+    // Cap a runaway label rather than letting one pill span the frame; the
+    // chip already ellipsizes, so the text degrades gracefully at the cap.
+    final textRef = (_labelWidthPerFontPx(label) * fontRef)
+        .clamp(0.0, baseRefPx * 9)
+        .toDouble();
+    return padHRef * 2 + iconRef + gapRef + textRef;
+  }
+
+  /// Width of `label` per 1px of font size, for the chip's text style. Text
+  /// advance scales linearly with font size, so measuring once at a large
+  /// probe and dividing is both stable and more precise than laying out at the
+  /// chip's actual ~9px. Memoised: `baseSize()` runs for every item on every
+  /// drag tick, and a `TextPainter.layout()` per call would be a real cost.
+  static final Map<String, double> _labelWidthCache = {};
+
+  static double _labelWidthPerFontPx(String label) {
+    final hit = _labelWidthCache[label];
+    if (hit != null) return hit;
+    const probe = 100.0;
+    final painter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: const TextStyle(
+          fontSize: probe,
+          fontWeight: FontWeight.w600,
+          height: 1.0,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout();
+    final perPx = painter.width / probe;
+    painter.dispose();
+    // Bounded so a pathological session can't grow this without limit; badge
+    // labels are few and long-lived.
+    if (_labelWidthCache.length > 512) _labelWidthCache.clear();
+    _labelWidthCache[label] = perPx;
+    return perPx;
   }
 
   @override

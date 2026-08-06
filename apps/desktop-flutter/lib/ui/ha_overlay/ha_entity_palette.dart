@@ -18,6 +18,7 @@
 import 'package:flutter/material.dart';
 
 import '../../api/ha_models.dart';
+import '../hotkeys/hotkey_gate.dart';
 import 'ha_icons.dart';
 
 class HaEntityPalette extends StatefulWidget {
@@ -97,20 +98,22 @@ class _HaEntityPaletteState extends State<HaEntityPalette> {
           if (widget.showSearch) ...[
             SizedBox(
               height: 32,
-              child: TextField(
-                controller: _searchCtrl,
-                style: const TextStyle(color: Colors.white, fontSize: 13),
-                decoration: const InputDecoration(
-                  isDense: true,
-                  prefixIcon:
-                      Icon(Icons.search, color: Colors.white38, size: 16),
-                  hintText: 'Search linked entities…',
-                  hintStyle: TextStyle(color: Colors.white38),
-                  border: OutlineInputBorder(),
-                  contentPadding:
-                      EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              child: SuppressHotkeysWhileFocused(
+                child: TextField(
+                  controller: _searchCtrl,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    prefixIcon:
+                        Icon(Icons.search, color: Colors.white38, size: 16),
+                    hintText: 'Search linked entities…',
+                    hintStyle: TextStyle(color: Colors.white38),
+                    border: OutlineInputBorder(),
+                    contentPadding:
+                        EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  ),
+                  onChanged: (v) => setState(() => _query = v),
                 ),
-                onChanged: (v) => setState(() => _query = v),
               ),
             ),
             const SizedBox(height: 6),

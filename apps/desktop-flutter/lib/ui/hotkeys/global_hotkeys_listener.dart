@@ -34,7 +34,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
-import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 
 /// A keydown -> hotkey token ("3", "s3", "n3"), or null. Uses the PHYSICAL key
 /// (independent of layout/shift symbol) — the Flutter equivalent of app.js's
@@ -161,7 +161,7 @@ class GlobalHotkeysListener extends StatelessWidget {
       autofocus: autofocus,
       onKeyEvent: (node, event) {
         if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        final textFocused = textInputHasFocus();
+        final textFocused = hotkeyContextBlocked();
 
         // Esc: restore from maximize. Checked BEFORE the text-focus guard AND
         // the master toggle — Esc must always work or a maximized pane becomes
