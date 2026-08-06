@@ -8,6 +8,66 @@ revisit.
 
 ---
 
+## 2026-08-06, The client-facing sub is a dedicated `<name>_subv` go2rtc restream (ffmpeg copy), because some cameras publish H264 with no `sprop-parameter-sets`
+
+**Context.** The Android live-wall tile plays a camera's SUB stream over RTSP
+(Media3/ExoPlayer). For one camera the tile reconnect-looped forever (#483), with
+`IllegalArgumentException: missing attribute fmtp` from Media3's RTSP client,
+which requires an `fmtp` attribute on the media tracks it builds. Fullscreen was
+unaffected (WebRTC/main path).
+
+The initial diagnosis blamed the camera's **audio** tracks (a
+`audio, sendonly, PCMU/8000` two-way-audio backchannel). Surveying every sub
+restream on a live install disproved that: cameras with PCMA and AAC audio all
+work, and go2rtc already drops the sendonly backchannel from its restream. The
+real discriminator is the **video** track. The failing camera is a Reolink whose
+own SDP advertises `m=video … H264/90000` with **no `a=fmtp` / no
+`sprop-parameter-sets`**, and go2rtc's plain restream passes that gap straight
+through — it was the only stream of eleven whose video track had no fmtp. Such a
+stream has no out-of-band parameter sets at all: `ffprobe` on it reports
+"non-existing PPS 0 referenced / decode_slice_header error / no frame!".
+
+**Decision — register a dedicated video-only sub restream `<name>_subv`** in the
+API's go2rtc reconcile loop, sourced `ffmpeg:<name>_sub#video=copy`, and point the
+client `rtsp_sub_url` at it. Passing the bitstream through ffmpeg recovers the
+in-band SPS/PPS, so go2rtc republishes a proper
+`a=fmtp:96 …sprop-parameter-sets=…`; omitting `#audio` makes go2rtc pass `-an`, so
+audio is dropped as a bonus (the wall is muted; two-way audio / listen uses
+WebRTC). `#video=copy` is a **remux, not a re-encode** (verified: identical
+h264/High/640x360 in and out), it reads the existing `_sub` stream by name so it
+shares that producer and adds no camera session, and go2rtc spawns the process
+lazily so an idle `_subv` costs nothing. `_subv` follows `_sub`'s exact lifecycle
+(created, updated, and deleted alongside it). Cameras that reconcile does not
+manage (Frigate-served, or legacy absolute `sub_url`) keep the previous
+resolution.
+
+**Rejected — putting the media filter in the CLIENT URL**
+(`rtsp://…/<name>_sub?video`). This was tried first and **falsified on-device**:
+it broke playback of *every* camera. `ffprobe` accepts a query-string RTSP URL,
+but Media3 derives per-track SETUP URLs by appending `/trackID=N` to the base URI,
+so `…?video` produces malformed SETUP URLs. It also would not have fixed the
+reported camera anyway — the filtered SDP still had no fmtp on the video track —
+and its single-segment rtsp path collides with a managed stream name, forcing
+reconcile onto the `PUT` path (object replacement) every pass. Lesson recorded:
+**prove a client-facing streaming fix with the client's own stack, not just
+ffprobe.**
+
+**Rejected — a per-client fix** (each client selecting only the video track, or
+tolerating a missing fmtp). It needs parallel changes in three clients on their
+own release cadences, Media3 offers no clean "skip an unparseable track" hook, and
+it leaves every future client re-hitting the trap. The server fix is one place and
+needs no client rebuild.
+
+**Revisit triggers (any one):**
+- The live wall needs audio on the RTSP sub (then request `#audio=` explicitly and
+  re-verify the SDP, keeping the fmtp repair).
+- go2rtc changes `ffmpeg:` source semantics, drops `#video=copy`, or stops
+  emitting `-an` when no `#audio` is given — re-verify the `_subv` SDP.
+- Cameras stop shipping H264 without `sprop-parameter-sets`, or Media3 gains
+  tolerance for a missing fmtp — the copy hop could then be dropped.
+- The per-consumer ffmpeg remux ever shows up as real load on a large install
+  (it is a copy, but it is a process per attached wall tile).
+
 ## 2026-08-01, Home Assistant value controls (brightness / position / speed) carry one optional server-validated number, discovered via a states `control` descriptor
 
 **Context.** The action model above shipped on/off/toggle/press control. The
