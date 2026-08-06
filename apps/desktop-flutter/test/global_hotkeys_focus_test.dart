@@ -505,6 +505,11 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
       await tester.pump();
       expect(pb.log, ['snapshot']);
+      // _appRoot also mounts the app-level SnapshotHotkey (main.dart), which
+      // fires on the same S press and pops its "nothing to capture" toast —
+      // drain its timer so it doesn't outlive the test (same as the wall's S
+      // test above).
+      await drainToast(tester);
     });
 
     testWidgets('Esc restores from a maximized tile', (tester) async {
