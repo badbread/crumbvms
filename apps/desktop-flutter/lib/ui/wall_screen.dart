@@ -2399,18 +2399,26 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// `AnimatedBuilder` for that).
   bool _haEditing = false;
 
+  /// The HA editor's chrome is a TOP bar now (the bottom bar and the floating
+  /// style panel are both gone — per-badge styling is anchored to the badge
+  /// itself). Reserve that strip so a badge drag can't hide under it, and
+  /// release the old bottom reservation (issue #13).
+  ///
+  /// Called from BOTH [initState] and the change listener: the wall's
+  /// `_beginHaOverlayEdit` maximizes and then begins the session synchronously
+  /// in the same frame, so a pane that mounts straight into edit mode never
+  /// sees a mode TRANSITION and would otherwise reserve nothing.
+  void _applyHaEditInsets(bool editing) {
+    widget.haOverlay?.editor
+      ..setEditTopInset(editing ? kHaEditTopBarHeight : 0)
+      ..setEditBottomInset(0);
+  }
+
   void _onHaOverlayChanged() {
     if (!mounted) return;
     final editing = widget.haOverlay?.editor.editMode ?? false;
     if (editing == _haEditing) return;
-    // The HA editor's chrome is a TOP bar now (the bottom bar and the floating
-    // style panel are both gone — per-badge styling is anchored to the badge
-    // itself). Reserve that strip so a badge drag can't hide under it, and
-    // release the old bottom reservation (issue #13).
-    widget.haOverlay?.editor.setEditTopInset(
-      editing ? kHaEditTopBarHeight : 0,
-    );
-    widget.haOverlay?.editor.setEditBottomInset(0);
+    _applyHaEditInsets(editing);
     setState(() => _haEditing = editing);
     // NOTE (issue #3): this pane deliberately does NOT re-fetch links when the
     // edit session ends. `editor.endEdit()` flips editMode false SYNCHRONOUSLY
@@ -2431,6 +2439,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     _panelEditing = rec?.$2 ?? false;
     widget.haOverlay?.editor.addListener(_onHaOverlayChanged);
     _haEditing = widget.haOverlay?.editor.editMode ?? false;
+    _applyHaEditInsets(_haEditing);
     _load();
     unawaited(_loadHaLinks());
   }
@@ -2945,6 +2954,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     _watchdog?.dispose();
     widget.ptzPanel?.removeListener(_onPtzPanelChanged);
     widget.haOverlay?.editor.removeListener(_onHaOverlayChanged);
+    // The editor outlives this pane (it belongs to the wall), so hand back the
+    // chrome reservation rather than leaving a phantom no-drag strip on the
+    // next camera's session.
+    _applyHaEditInsets(false);
     // Mirrors `_WallTileState.dispose`'s report — drops THIS PANE's
     // contribution to `_haPlacementsBySurface` so a closed maximized pane
     // can't keep /ha/states polling forever. Keyed by `'max:<cameraId>'`
@@ -3396,6 +3409,8 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                       host: widget.haOverlay!,
                       videoW: _videoW,
                       videoH: _videoH,
+                      // The top bar paints above this layer.
+                      topInset: kHaEditTopBarHeight,
                     ),
                   ),
                   Positioned(

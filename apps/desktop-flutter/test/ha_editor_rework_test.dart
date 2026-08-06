@@ -237,6 +237,19 @@ void main() {
       expect(p.top + popover.height, lessThanOrEqualTo(pane.height));
     });
 
+    test('topMargin keeps the popover clear of the sticky edit bar', () {
+      // A badge just under the bar: without the inset the popover clamps to
+      // the pane's top edge and slides under the bar, which paints above it.
+      const barHeight = 48.0;
+      final p = resolveHaPopoverPlacement(
+        badge: const Rect.fromLTWH(100, 56, 24, 24),
+        popover: popover,
+        pane: pane,
+        topMargin: barHeight + 8,
+      );
+      expect(p.top, greaterThanOrEqualTo(barHeight));
+    });
+
     test('the arrow stays inside the popover edge even when clamped', () {
       final p = resolveHaPopoverPlacement(
         badge: const Rect.fromLTWH(100, 0, 24, 24),

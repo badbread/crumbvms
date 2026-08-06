@@ -123,6 +123,10 @@ class HaPopoverPlacement {
 /// [popover] is the caller's estimate of the rendered size; the widget itself
 /// self-sizes, so an estimate that is a little off only affects which side is
 /// chosen, never whether the popover renders correctly.
+/// [topMargin] (default [margin]) keeps the popover clear of chrome pinned to
+/// the top of the pane — the editor's own sticky bar, which paints above this
+/// layer and would otherwise cover a popover clamped against the pane's top
+/// edge.
 HaPopoverPlacement resolveHaPopoverPlacement({
   required Rect badge,
   required Size popover,
@@ -130,18 +134,27 @@ HaPopoverPlacement resolveHaPopoverPlacement({
   double gap = 12,
   double margin = 8,
   double cornerPad = 18,
+  double? topMargin,
 }) {
-  double clampAxis(double v, double extent, double paneExtent) {
-    final max = paneExtent - margin - extent;
-    if (max <= margin) return margin; // pane smaller than the popover
+  final mTop = topMargin ?? margin;
+
+  double clampX(double v) {
+    final max = pane.width - margin - popover.width;
+    if (max <= margin) return margin; // pane narrower than the popover
     return v.clamp(margin, max).toDouble();
+  }
+
+  double clampY(double v) {
+    final max = pane.height - margin - popover.height;
+    if (max <= mTop) return mTop; // pane shorter than the popover
+    return v.clamp(mTop, max).toDouble();
   }
 
   // Room available on each side, in that side's own axis.
   final roomRight = pane.width - margin - (badge.right + gap);
   final roomLeft = (badge.left - gap) - margin;
   final roomBelow = pane.height - margin - (badge.bottom + gap);
-  final roomAbove = (badge.top - gap) - margin;
+  final roomAbove = (badge.top - gap) - mTop;
 
   final fits = <HaPopoverSide, bool>{
     HaPopoverSide.right: roomRight >= popover.width,
@@ -176,14 +189,9 @@ HaPopoverPlacement resolveHaPopoverPlacement({
     case HaPopoverSide.right:
     case HaPopoverSide.left:
       final left = side == HaPopoverSide.right
-          ? clampAxis(badge.right + gap, popover.width, pane.width)
-          : clampAxis(
-              badge.left - gap - popover.width, popover.width, pane.width);
-      final top = clampAxis(
-        badge.center.dy - popover.height / 2,
-        popover.height,
-        pane.height,
-      );
+          ? clampX(badge.right + gap)
+          : clampX(badge.left - gap - popover.width);
+      final top = clampY(badge.center.dy - popover.height / 2);
       return HaPopoverPlacement(
         side: side,
         left: left,
@@ -194,14 +202,9 @@ HaPopoverPlacement resolveHaPopoverPlacement({
     case HaPopoverSide.below:
     case HaPopoverSide.above:
       final top = side == HaPopoverSide.below
-          ? clampAxis(badge.bottom + gap, popover.height, pane.height)
-          : clampAxis(
-              badge.top - gap - popover.height, popover.height, pane.height);
-      final left = clampAxis(
-        badge.center.dx - popover.width / 2,
-        popover.width,
-        pane.width,
-      );
+          ? clampY(badge.bottom + gap)
+          : clampY(badge.top - gap - popover.height);
+      final left = clampX(badge.center.dx - popover.width / 2);
       return HaPopoverPlacement(
         side: side,
         left: left,
@@ -235,9 +238,15 @@ class HaBadgePopoverLayer extends StatefulWidget {
     required this.host,
     required this.videoW,
     required this.videoH,
+    this.topInset = 0,
   });
 
   final HaOverlayController host;
+
+  /// Height of the pane chrome pinned above this layer (the editor's sticky
+  /// top bar), which paints over it — the popover keeps clear of it rather
+  /// than sliding underneath when a badge sits near the top of the frame.
+  final double topInset;
 
   /// Decoded video pixel size — the badges are video-frame anchored, so the
   /// popover cannot compute its anchor rect without them (same gate as the
@@ -328,6 +337,7 @@ class _HaBadgePopoverLayerState extends State<HaBadgePopoverLayer> {
                 _estimateHeight(multi: multi, open: _section),
               ),
               pane: Size(paneW, paneH),
+              topMargin: widget.topInset + 8,
             );
 
             final body = multi
@@ -353,7 +363,7 @@ class _HaBadgePopoverLayerState extends State<HaBadgePopoverLayer> {
                     offstage: editor.isDragging,
                     child: _PopoverFrame(
                       placement: placement,
-                      maxHeight: paneH - 16,
+                      maxHeight: paneH - widget.topInset - 16,
                       child: body,
                     ),
                   ),
