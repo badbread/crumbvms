@@ -29,8 +29,12 @@
 // `water_drop`, `local_fire_department`, `thermostat`, `lock`, `lock_open`,
 // `videocam`, `pets`, `window`, `co2`, `water_damage`, and the #438 additions
 // `blinds_closed`, `outlet`, `device_thermostat`, `gas_meter`, `terminal`,
-// `smart_button`. `directions_run` and `sensors` ARE already used elsewhere
-// (confirmed safe).
+// `smart_button`, plus the vocabulary-expansion additions `wb_twilight`,
+// `wb_cloudy`, `grain`, `wind_power`, `thunderstorm`, `dark_mode`,
+// `smart_display`, `settings_remote`, `sports_esports`, `music_note`, `print`,
+// `dns`, `computer`, `storage`, `smartphone`, `outdoor_grill`, `whatshot`,
+// `coffee`, `eco`, `calendar_today`, `timer` (and `home`, `mic` already common).
+// `directions_run` and `sensors` ARE already used elsewhere (confirmed safe).
 
 import 'package:flutter/material.dart';
 
@@ -202,6 +206,30 @@ const Map<String, (IconData, String)> kHaBadgeIconChoices = {
   'gas': (Icons.gas_meter, 'Gas / CO'),
   'script': (Icons.terminal, 'Script'),
   'button': (Icons.smart_button, 'Button'),
+  // ── vocabulary expansion: outdoor cooking, weather, media/compute, etc. ─────
+  'home': (Icons.home, 'Home / zone'),
+  'landscape_light': (Icons.wb_twilight, 'Landscape light'),
+  'cloud': (Icons.wb_cloudy, 'Cloud / weather'),
+  'rain': (Icons.grain, 'Rain'),
+  'wind': (Icons.wind_power, 'Wind'),
+  'storm': (Icons.thunderstorm, 'Storm'),
+  'moon': (Icons.dark_mode, 'Moon / night'),
+  'media_player': (Icons.smart_display, 'Media player'),
+  'remote': (Icons.settings_remote, 'Remote'),
+  'game': (Icons.sports_esports, 'Game'),
+  'mic': (Icons.mic, 'Microphone'),
+  'music': (Icons.music_note, 'Music'),
+  'printer': (Icons.print, 'Printer'),
+  'server': (Icons.dns, 'Server'),
+  'computer': (Icons.computer, 'Computer'),
+  'storage': (Icons.storage, 'Storage / NAS'),
+  'phone': (Icons.smartphone, 'Phone'),
+  'grill': (Icons.outdoor_grill, 'Grill / BBQ'),
+  'smoker': (Icons.whatshot, 'Smoker'),
+  'coffee': (Icons.coffee, 'Coffee'),
+  'plant': (Icons.eco, 'Plant'),
+  'calendar': (Icons.calendar_today, 'Calendar'),
+  'timer': (Icons.timer, 'Timer'),
 };
 
 /// Parse a stored '#RRGGBB' badge color override into a [Color] (full

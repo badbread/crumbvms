@@ -9,15 +9,21 @@ import androidx.compose.material.icons.filled.BatteryFull
 import androidx.compose.material.icons.filled.Blinds
 import androidx.compose.material.icons.filled.BlindsClosed
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.CalendarToday
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Co2
+import androidx.compose.material.icons.filled.Coffee
+import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Curtains
+import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DeviceThermostat
 import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.DirectionsRun
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Doorbell
+import androidx.compose.material.icons.filled.Eco
 import androidx.compose.material.icons.filled.ElectricMeter
 import androidx.compose.material.icons.filled.ElectricalServices
 import androidx.compose.material.icons.filled.EvStation
@@ -25,9 +31,11 @@ import androidx.compose.material.icons.filled.Fence
 import androidx.compose.material.icons.filled.Garage
 import androidx.compose.material.icons.filled.GasMeter
 import androidx.compose.material.icons.filled.GppGood
+import androidx.compose.material.icons.filled.Grain
 import androidx.compose.material.icons.filled.Grass
 import androidx.compose.material.icons.filled.HeatPump
 import androidx.compose.material.icons.filled.Highlight
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.HotTub
 import androidx.compose.material.icons.filled.Hvac
 import androidx.compose.material.icons.filled.Inventory2
@@ -39,9 +47,12 @@ import androidx.compose.material.icons.filled.LocalLaundryService
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Mail
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MovieFilter
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Opacity
+import androidx.compose.material.icons.filled.OutdoorGrill
 import androidx.compose.material.icons.filled.Outlet
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Pets
@@ -49,6 +60,7 @@ import androidx.compose.material.icons.filled.Plumbing
 import androidx.compose.material.icons.filled.Pool
 import androidx.compose.material.icons.filled.Power
 import androidx.compose.material.icons.filled.PowerOff
+import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.RollerShades
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Schedule
@@ -56,12 +68,19 @@ import androidx.compose.material.icons.filled.SensorDoor
 import androidx.compose.material.icons.filled.SensorOccupied
 import androidx.compose.material.icons.filled.SensorWindow
 import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.SettingsRemote
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SmartButton
+import androidx.compose.material.icons.filled.SmartDisplay
+import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.SolarPower
 import androidx.compose.material.icons.filled.Speaker
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Thermostat
+import androidx.compose.material.icons.filled.Thunderstorm
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.ToggleOn
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material.icons.filled.Vibration
@@ -70,8 +89,12 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.WaterDamage
 import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material.icons.filled.WbIncandescent
+import androidx.compose.material.icons.filled.WbCloudy
 import androidx.compose.material.icons.filled.WbSunny
+import androidx.compose.material.icons.filled.WbTwilight
+import androidx.compose.material.icons.filled.Whatshot
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WindPower
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import video.crumb.app.data.HaLinkDto
@@ -178,12 +201,14 @@ private val badgeIconSlugs: Map<String, ImageVector> = mapOf(
     "motion" to Icons.Filled.DirectionsRun,
     "occupancy" to Icons.Filled.SensorOccupied,
     "person" to Icons.Filled.Person,
+    "home" to Icons.Filled.Home,
     "pet" to Icons.Filled.Pets,
     "vibration" to Icons.Filled.Vibration,
     // lighting
     "lightbulb" to Icons.Filled.Lightbulb,
     "floodlight" to Icons.Filled.Highlight,
     "outdoor_light" to Icons.Filled.WbIncandescent,
+    "landscape_light" to Icons.Filled.WbTwilight,
     // power & switches
     "switch" to Icons.Filled.ToggleOn,
     "power" to Icons.Filled.Power,
@@ -203,6 +228,12 @@ private val badgeIconSlugs: Map<String, ImageVector> = mapOf(
     "temperature" to Icons.Filled.DeviceThermostat,
     "humidity" to Icons.Filled.Opacity,
     "sun" to Icons.Filled.WbSunny,
+    // weather
+    "cloud" to Icons.Filled.WbCloudy,
+    "rain" to Icons.Filled.Grain,
+    "wind" to Icons.Filled.WindPower,
+    "storm" to Icons.Filled.Thunderstorm,
+    "moon" to Icons.Filled.DarkMode,
     // safety & alarm
     "smoke" to Icons.Filled.Cloud,
     "gas" to Icons.Filled.GasMeter,
@@ -221,9 +252,19 @@ private val badgeIconSlugs: Map<String, ImageVector> = mapOf(
     "camera" to Icons.Filled.Videocam,
     "tv" to Icons.Filled.Tv,
     "speaker" to Icons.Filled.Speaker,
-    // network
+    "media_player" to Icons.Filled.SmartDisplay,
+    "remote" to Icons.Filled.SettingsRemote,
+    "game" to Icons.Filled.SportsEsports,
+    "mic" to Icons.Filled.Mic,
+    "music" to Icons.Filled.MusicNote,
+    // network & computing
     "wifi" to Icons.Filled.Wifi,
     "router" to Icons.Filled.Router,
+    "printer" to Icons.Filled.Print,
+    "server" to Icons.Filled.Dns,
+    "computer" to Icons.Filled.Computer,
+    "storage" to Icons.Filled.Storage,
+    "phone" to Icons.Filled.Smartphone,
     // vehicles & delivery
     "vehicle" to Icons.Filled.DirectionsCar,
     "package" to Icons.Filled.Inventory2,
@@ -235,8 +276,14 @@ private val badgeIconSlugs: Map<String, ImageVector> = mapOf(
     "laundry" to Icons.Filled.LocalLaundryService,
     "pool" to Icons.Filled.Pool,
     "hottub" to Icons.Filled.HotTub,
+    "grill" to Icons.Filled.OutdoorGrill,
+    "smoker" to Icons.Filled.Whatshot,
+    "coffee" to Icons.Filled.Coffee,
+    "plant" to Icons.Filled.Eco,
     // time
     "clock" to Icons.Filled.Schedule,
+    "calendar" to Icons.Filled.CalendarToday,
+    "timer" to Icons.Filled.Timer,
     // automation
     "scene" to Icons.Filled.MovieFilter,
     "script" to Icons.Filled.Terminal,

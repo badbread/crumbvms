@@ -219,7 +219,9 @@ enum HA {
     ///
     /// iOS has no dedicated window-covering symbol on our iOS 16 floor, so
     /// cover/blinds/curtains/shade all resolve to `window.vertical.closed`; that
-    /// is an honest, compilable choice, not a missing glyph.
+    /// is an honest, compilable choice, not a missing glyph. Likewise the iOS 16
+    /// floor has no grill/BBQ or kitchen-appliance symbols, so outdoor cooking
+    /// leans on flame/smoke (`grill`→`flame.fill`, `smoker`→`smoke.fill`).
     static let iconSlugToSymbol: [String: String] = [
         // contact & openings
         "door": "door.left.hand.closed", "window": "window.vertical.closed",
@@ -229,10 +231,10 @@ enum HA {
         "lock": "lock.fill", "key": "key.fill",
         // motion & presence
         "motion": "figure.run", "occupancy": "person.fill", "person": "person.fill",
-        "pet": "pawprint.fill", "vibration": "waveform",
+        "home": "house.fill", "pet": "pawprint.fill", "vibration": "waveform",
         // lighting
         "lightbulb": "lightbulb.fill", "floodlight": "flashlight.on.fill",
-        "outdoor_light": "lightbulb.fill",
+        "outdoor_light": "lightbulb.fill", "landscape_light": "light.beacon.max.fill",
         // power & switches
         "switch": "switch.2", "power": "power", "plug": "powerplug.fill",
         "outlet": "poweroutlet.type.b.fill", "energy": "bolt.fill", "meter": "gauge",
@@ -241,6 +243,9 @@ enum HA {
         "fan": "fanblades.fill", "ac": "snowflake", "heatpump": "thermometer.snowflake",
         "hvac": "wind", "thermostat": "thermometer", "temperature": "thermometer",
         "humidity": "humidity.fill", "sun": "sun.max.fill",
+        // weather
+        "cloud": "cloud.fill", "rain": "cloud.rain.fill", "wind": "wind",
+        "storm": "cloud.bolt.rain.fill", "moon": "moon.fill",
         // safety & alarm
         "smoke": "smoke.fill", "gas": "carbon.monoxide.cloud.fill",
         "co": "carbon.dioxide.cloud.fill", "fire": "flame.fill",
@@ -250,15 +255,21 @@ enum HA {
         "bell": "bell.fill",
         // camera & media
         "camera": "video.fill", "tv": "tv", "speaker": "hifispeaker.fill",
-        // network
+        "media_player": "play.tv.fill", "remote": "av.remote.fill",
+        "game": "gamecontroller.fill", "mic": "mic.fill", "music": "music.note",
+        // network & computing
         "wifi": "wifi", "router": "network",
+        "printer": "printer.fill", "server": "server.rack", "computer": "desktopcomputer",
+        "storage": "externaldrive.fill", "phone": "iphone",
         // vehicles & delivery
         "vehicle": "car.fill", "package": "shippingbox.fill", "mail": "envelope.fill",
         // appliances & outdoor
         "vacuum": "sparkles", "lawn": "leaf.fill", "fridge": "snowflake",
         "laundry": "tshirt.fill", "pool": "figure.pool.swim", "hottub": "water.waves",
+        "grill": "flame.fill", "smoker": "smoke.fill", "coffee": "cup.and.saucer.fill",
+        "plant": "leaf.circle.fill",
         // time
-        "clock": "clock.fill",
+        "clock": "clock.fill", "calendar": "calendar", "timer": "timer",
         // automation
         "scene": "film", "script": "curlybraces", "button": "hand.tap.fill",
         // generic fallback
