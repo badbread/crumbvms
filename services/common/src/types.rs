@@ -284,9 +284,15 @@ pub struct CameraHaLink {
     /// Badge shape (migration 0062): `"dot"` (compact icon) or `"pill"`
     /// (labelled). `None` ⇒ the default dot.
     pub overlay_shape: Option<String>,
-    /// Solid background color as a '#RRGGBB' hex string (migration 0062).
+    /// BASE solid background color as a '#RRGGBB' hex string (migration 0062).
+    /// Renders when the entity reads off AND when it is indeterminate or stale.
     /// `None` ⇒ the client's default dark background.
     pub overlay_bg_color: Option<String>,
+    /// Background override applied ONLY while the entity reads on (migration
+    /// 0076). `None` ⇒ inherit `overlay_bg_color`. Client resolution is
+    /// `on ⇒ bg_color_on ?? bg_color ?? default`, anything else ⇒
+    /// `bg_color ?? default`.
+    pub overlay_bg_color_on: Option<String>,
     /// Draw a white outline + drop shadow so the badge pops on a busy scene
     /// (migration 0062; default false).
     pub overlay_outline: bool,

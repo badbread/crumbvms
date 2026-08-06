@@ -8,6 +8,80 @@ revisit.
 
 ---
 
+## 2026-08-06, Per-state HA badge backgrounds: one extra nullable column that inherits from the base (not paired per-state columns)
+
+**Context.** Migration 0062 gave a placed HA badge a single solid background
+(`overlay_bg_color`). Operators want the background itself to carry the state:
+dark when the door is shut, red when it is open. One column cannot express two
+states, and the wall is where a badge earns its keep, so this is wave A of the
+badge-customization rework: freeze the server contract first, then let the four
+renderers (admin console, desktop, Android, iOS) follow against a contract that
+is already merged rather than four clients racing a moving schema.
+
+**Decision.** One additive nullable column, `overlay_bg_color_on` (migration
+0076), with an inherit-from-base meaning:
+
+- `overlay_bg_color` keeps its 0062 meaning and becomes the BASE. It renders for
+  the off state AND for an indeterminate or stale reading (unknown, unavailable,
+  no reading yet). Every existing row therefore renders exactly as it does today.
+- `overlay_bg_color_on` overrides the base ONLY while the entity reads on
+  (`edge_on == true`). `NULL`, which is what every existing row gets, means
+  "inherit the base".
+
+Renderer resolution, identical in every client: on ⇒ `bg_color_on ?? bg_color ??
+#17171B`; any other state ⇒ `bg_color ?? default`. On the wire the field is
+additive on `HaLinkDto` and `PlacementInput` (`bg_color_on`, `#[serde(default)]`,
+validated by the same `valid_overlay_color` gate as `bg_color`, 400 on garbage),
+plus the same `'#RRGGBB'` CHECK in the migration that 0059 and 0062 use. A field
+null inside the placement object resets to inherit, following the existing
+per-badge override convention; a body-level null still clears the whole
+placement, unchanged.
+
+**Rejected:**
+
+- **Paired per-state columns (`overlay_bg_color_off` + `overlay_bg_color_on`,
+  base retired).** Cleaner on paper, but it is a breaking reinterpretation of an
+  already-shipped column: every existing badge would need a data migration, and
+  every client would need a version-aware read during the wave A to wave B
+  window. The gain is symmetry, not capability. Inherit-from-base gets the same
+  expressiveness with zero rows touched and no client flag day.
+- **A per-state ACCENT (foreground/icon color) in the same wave.** Real demand,
+  but `overlay_color` has the same base-column shape as `overlay_bg_color`, so it
+  is the same decision applied twice. Doing it now doubles the client work in
+  wave B for a knob nobody has asked for yet. If it lands, it lands as
+  `overlay_color_on` by exactly this pattern.
+- **A JSON style object (`overlay_style jsonb`) covering every per-state
+  attribute at once.** The right answer eventually, and clearly wrong now: it
+  throws away the per-column CHECK constraints that keep bad hex out of the
+  database, replaces typed `Option<String>` fields with untyped parsing in four
+  clients, and rewrites a wire contract three of the four renderers already ship
+  against. Not worth it for a third style column.
+- **Making the on color required whenever a base is set.** Would force a decision
+  on operators who just want one solid background. Optional and inheriting is the
+  smaller surface.
+
+**Trades knowingly accepted:**
+
+- The model is asymmetric: off and indeterminate share one color and cannot be
+  told apart by background alone. Staleness is signalled by the existing
+  treatment (the clients grey a badge after missed polls), not by the background.
+- Two hex columns per badge is one more thing an editor has to present. Wave B
+  owns that UX.
+
+**Revisit triggers:**
+
+- Operator demand for a per-state ACCENT (icon/text color, not just background)
+  ⇒ add `overlay_color_on` by this same inherit-from-base pattern, in one change
+  across all four renderers.
+- A demand for a FOURTH distinct style state (a separate unavailable or alarm
+  look, say) ⇒ stop adding columns and move the whole per-badge style block to a
+  single validated JSON style object, migrating the existing columns into it.
+- A mobile badge editor (issue #444, currently deferred) shipping ⇒ re-check that
+  the two-color model is authorable on a phone; if it is not, that is evidence
+  for the JSON style object plus a preset palette instead of free hex entry.
+
+---
+
 ## 2026-08-01, Home Assistant value controls (brightness / position / speed) carry one optional server-validated number, discovered via a states `control` descriptor
 
 **Context.** The action model above shipped on/off/toggle/press control. The
