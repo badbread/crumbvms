@@ -207,6 +207,13 @@ private fun HaBadge(
         // The chip sizes ITSELF from `hDp` (a pill may end up a hair taller than
         // the nominal box if the label's line box needs it), so this Box just
         // wraps it — the touch target is exactly what is drawn.
+        //
+        // CONTRACT: the gesture modifier belongs on the node that WRAPS the
+        // chip, and the chip must always measure to something. A chip that
+        // measured to nothing, or a gesture modifier moved onto a sibling,
+        // still draws a plausible badge while silently eating every touch —
+        // nothing about the rendering would look wrong. HaBadgeTouchTargetTest
+        // injects real touches through Compose hit-testing to hold that line.
         Box(
             modifier = Modifier
                 // Tap = primary gesture (fire/sheet/detail, decided by the caller);
