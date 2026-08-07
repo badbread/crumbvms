@@ -271,8 +271,10 @@ ARCHIVE_STORAGE_PATH=/data/archive
 # 'cpu' is the safe default: software motion decode works on any host (including
 # GPU-less NUCs/VMs) and is fast enough for Crumb's fps-capped motion. Enable a GPU
 # explicitly: 'vaapi' for an Intel/AMD iGPU (docker-compose.vaapi.example.yml),
-# 'cuda' for NVIDIA NVDEC (docker-compose.gpu.example.yml), or 'auto' to probe for
-# NVDEC. Only affects motion DECODE; recording is always stream-copy.
+# 'cuda' for NVIDIA NVDEC (docker-compose.gpu.example.yml), or 'auto' to use NVDEC
+# only when the recorder can really open an NVIDIA device (no device → cpu).
+# A hardware backend that can't decode a camera drops that camera to cpu.
+# Only affects motion DECODE; recording is always stream-copy.
 MOTION_HWACCEL=cpu
 
 # --- API auth ---
