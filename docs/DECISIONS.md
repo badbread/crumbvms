@@ -8,6 +8,85 @@ revisit.
 
 ---
 
+## 2026-08-06, Android walks a reactive fallback LADDER down to the server transcode; it does not ask the server what codec a stream is
+
+**Context.** Media3's RTSP stack cannot bring up H.265: the stream either errors
+with a decoder/format code or sits in BUFFERING and never produces a frame. The
+client already downgraded an unplayable MAIN to the sub, which covers the common
+"H265 main + H264 sub" camera. Cameras that ship H265 on **both** main and sub
+exist (some Uniview, Annke, Reolink, a lot of no-name ONVIF units, and any camera
+whose "smart codec" setting flipped the sub too), and on those the single-step
+downgrade landed on a second undecodable stream: fullscreen spun forever and the
+wall tile reconnect-looped, while the very same server was publishing an H.264
+`<name>_mobile` transcode that Media3 plays fine (#524). Recording, motion,
+desktop and playback were all unaffected — this was purely a live-client
+stream-selection gap.
+
+**Decision.**
+
+- The downgrade becomes a **ladder**, walked one rung per never-played stream:
+  fullscreen `main → subv → sub → mobile` (data-saver order on a metered link),
+  wall `subv → sub → mobile` (or `main → mobile` on a camera with no sub — the
+  wall never escalates to the main's bitrate when a sub exists). The server's
+  `_mobile` H.264 transcode is always the LAST rung, never a starting choice: it
+  costs a real ffmpeg process on the server for as long as a consumer is attached.
+- **Reactive, from playback evidence only.** A rung is abandoned when it never
+  reached a playable frame, or when it fails with a decoder/format `PlaybackException`
+  code. A stream that played and then dropped still reconnects to the same rung —
+  that is a camera reboot or an AP roam, not a codec.
+- The verdict is remembered **per camera, in memory, for the app run**, so a wall
+  reload or a fullscreen revisit reattaches straight to a rung that plays instead
+  of re-walking the ladder. It is dropped on relaunch, on a `config_version`
+  change (a camera edit), on an explicit Retry, and for any camera whose ladder
+  ran out with nothing playable (that is an outage, which is no evidence about
+  codecs).
+- The pure decision logic lives in `apps/android/.../feature/live/LiveStreamFallback.kt`
+  and is unit-tested on the JVM; the composables only wire it to the player.
+
+**Rejected:**
+
+- **Have the server advertise each stream's codec** (`GET /cameras/:id/streams`
+  carrying `main.codec` / `sub.codec`) so the client picks correctly on the first
+  try. This is the better end state and it is a real follow-up — but it is a wire
+  change that only helps clients talking to a NEW server, so the client still needs
+  the reactive ladder for every older server and every unmanaged/Frigate-served
+  camera. Doing the ladder first keeps this fix client-local and version-skew-proof.
+- **Always start Android on the `_mobile` transcode.** Trivially correct, and it
+  makes every Android session pay a server-side re-encode plus a real quality drop
+  for the large majority of cameras that publish a perfectly playable H264 sub.
+- **Add a software HEVC decoder to the client.** Out of proportion to the problem,
+  and it would burn phone battery decoding what the server can remux for free.
+- **Persist the verdict across launches.** A codec guess derived from a failure
+  should not outlive the app: the operator can re-encode a camera at any time, and
+  a stale "this camera is H265" would pin it to the transcode forever.
+
+**Trades knowingly accepted:**
+
+- The ladder costs one bounded unplayable-stream timeout per rung on the FIRST
+  encounter with such a camera (~6 s on the main, ~10 s on the derived rungs,
+  which are more patient because go2rtc spawns their ffmpeg lazily). After that,
+  the session memory makes revisits immediate.
+- A camera whose sub is merely slow to start (rather than undecodable) can be
+  downgraded to the transcode; the operator gets it back with Retry, a camera
+  edit, or a relaunch.
+- Walking the ladder no longer reports stalls to the wall's low-bandwidth
+  auto-fallback, so a wall of all-H265 cameras can't flip itself into
+  snapshot-polling on what is a codec problem, not a link problem.
+
+**Revisit triggers:**
+
+- The server growing per-stream codec metadata ⇒ make the START rung proactive and
+  keep the ladder only as the fallback for old servers / unmanaged cameras.
+- Media3 shipping a working RTSP HEVC depacketizer ⇒ the whole ladder can collapse
+  back to a bandwidth choice.
+- Operators reporting that healthy-but-slow sub streams get transcoded ⇒ raise
+  `DERIVED_FIRSTLOAD_BUFFER_MS`, or require a decoder/format error (not just a
+  timeout) before leaving a rung.
+- WebRTC live on Android being reconsidered (see the 2026-07-02 verdict) ⇒ its
+  codec negotiation would change this calculus entirely.
+
+---
+
 ## 2026-08-06, A non-success go2rtc `PUT` is resolved by ASKING go2rtc what it has, not by reading the status code; and a never-yet-seen camera gets a creation grace
 
 **Context.** Two bugs found by a hostile-camera compatibility matrix against the

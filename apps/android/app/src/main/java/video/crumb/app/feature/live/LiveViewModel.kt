@@ -126,6 +126,11 @@ class LiveViewModel(
      */
     fun retry() {
         repo.recoverConnections()
+        // An explicit Retry also drops the session's per-camera stream-fallback
+        // verdicts (#524): the operator may have just re-encoded a camera off
+        // H.265, and a tile parked on the server transcode should get its own
+        // (higher quality, cheaper for the server) sub stream back.
+        LiveStreamFallbackMemory.clearAll()
         refresh()
     }
 

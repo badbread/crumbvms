@@ -79,6 +79,11 @@ import kotlinx.coroutines.launch
  * - Uses the sub stream when available (low-res, conserves bandwidth in grid
  *   view), otherwise falls back to rtspMainUrl. Which sub is [subStreamUrl]'s
  *   call: the video-only `_subv` when the server offers one, else the raw sub.
+ * - A stream that never produces a playable frame steps DOWN the fallback ladder
+ *   ([wallStreamChain]) instead of reconnect-looping: `subv → sub → mobile`, or
+ *   `main → mobile` on a camera with no sub. Media3's RTSP stack can't decode
+ *   H.265, and a camera that ships H265 on BOTH main and sub (#524) has nothing
+ *   playable until the server's H.264 `_mobile` transcode — the last rung.
  * - The [LiveStreamsResponse] is pre-resolved by [LiveViewModel] so this
  *   composable never performs network I/O.
  * - The ExoPlayer is built once in [remember], starts playing immediately, and
@@ -332,13 +337,22 @@ private fun LiveRtspContent(
     // we show a subtle "Reconnecting…" badge instead of the hard error.
     var isReconnecting by remember { mutableStateOf(false) }
 
-    // Choose sub stream for grid; fall back to main. `subStreamUrl()` prefers the
-    // video-only `_subv` restream, which repairs the missing-fmtp SDP that makes
-    // Media3 reconnect-loop on some cameras (#483), and falls back to the raw sub
-    // when the server has no `_subv` for this camera (unmanaged / older server).
-    val rtspUrl: String? = remember(streams) {
-        streams?.subStreamUrl() ?: streams?.rtspMainUrl
+    // Fallback ladder for this tile: `subv → sub → mobile` when the camera has a
+    // sub (`subStreamUrl()`'s preference for the video-only `_subv` restream,
+    // which repairs the missing-fmtp SDP that makes Media3 reconnect-loop on some
+    // cameras (#483), is the first two rungs), else `main → mobile`. The wall
+    // never escalates to the main's bitrate on a camera that has a sub.
+    val chain: List<StreamTier> = remember(streams) { streams?.wallStreamChain() ?: emptyList() }
+    // Rungs already known unplayable for this camera THIS app run — seeded from
+    // the process-scoped memory so a wall reload (or a return from fullscreen)
+    // reattaches straight to a rung that plays instead of re-walking the ladder.
+    var failedTiers by remember(streams) {
+        mutableStateOf(LiveStreamFallbackMemory.failedTiers(camera.id))
     }
+    var tier by remember(streams) { mutableStateOf(startTier(chain, failedTiers)) }
+    // Derived (not remembered): a fallback swaps `tier`, which must re-key the
+    // player below onto the new URL.
+    val rtspUrl: String? = tier?.let { streams?.urlForTier(it) }
 
     // Device connectivity (#3). While offline, reconnect attempts PAUSE instead of
     // burning the fast-attempt budget against a link that can't reach the server
@@ -422,17 +436,50 @@ private fun LiveRtspContent(
         // Backoff bookkeeping. `attempt` is captured by the listener closure.
         var attempt = 0
         var reconnectJob: Job? = null
+        // Did THIS rung of the ladder ever reach a playable frame? Gates the
+        // fallback: only a stream that never played is treated as undecodable
+        // (one that played and then dropped is a transient blip → reconnect).
+        var everReady = false
 
-        fun scheduleReconnect() {
-            if (player == null || rtspUrl == null) return
-            if (reconnectJob?.isActive == true) return // one in flight already
+        /**
+         * Recover from a failure. Returns true when it stepped DOWN the fallback
+         * ladder (a codec verdict, not a link problem) — the caller uses that to
+         * decide whether the event is worth reporting as a stall.
+         */
+        fun scheduleReconnect(errorCode: Int? = null): Boolean {
+            if (player == null || rtspUrl == null) return false
+            if (reconnectJob?.isActive == true) return false // one in flight already
             // Offline: don't burn the attempt budget on a doomed re-prepare. Park
             // in the reconnecting state (not hard error) — connectivity regained
             // triggers an immediate reset + retry via the DisposableEffect below.
+            // Checked BEFORE the ladder so a dropped Wi-Fi link can't be mistaken
+            // for an undecodable codec and burn every rung.
             if (!isOnline) {
                 isReconnecting = true
                 hasError = false
-                return
+                return false
+            }
+            // ── H265 / unplayable-stream fallback ladder (#524) ──────────────────
+            // Never reached a playable frame ⇒ almost always a codec Media3's RTSP
+            // path can't decode. Step down to the next rung (ending at the server's
+            // H.264 `_mobile` transcode) rather than reconnect-looping forever.
+            val current = tier
+            val next = nextTier(chain, current, failedTiers)
+            if (current != null && next != null &&
+                shouldFallBackToNextTier(hasNextTier = true, everReady = everReady, errorCode = errorCode)
+            ) {
+                LiveStreamFallbackMemory.markFailed(camera.id, current)
+                failedTiers = failedTiers + current
+                tier = next // re-keys the player onto the next rung's URL
+                isReconnecting = false
+                hasError = false
+                return true
+            }
+            // Ladder exhausted with nothing ever playable ⇒ an outage, not a codec
+            // verdict: forget the recorded failures so the next wall load starts
+            // from the top again. Then fall through to the normal backoff.
+            if (next == null && !everReady) {
+                LiveStreamFallbackMemory.clear(camera.id)
             }
             // Past the fast-backoff budget: DON'T stop forever (#2) — fall back to
             // a slow, indefinite retry cadence so the tile keeps quietly trying to
@@ -457,6 +504,7 @@ private fun LiveRtspContent(
                 player.prepare()
                 player.playWhenReady = true
             }.also { trackPlayerJob(it) } // #135: cancellable on ON_STOP
+            return false
         }
 
         val listener = object : Player.Listener {
@@ -476,6 +524,8 @@ private fun LiveRtspContent(
                         isBuffering = false
                         hasError = false
                         isReconnecting = false
+                        // A real frame played — this rung is good, no downgrade.
+                        everReady = true
                     }
                     Player.STATE_ENDED -> {
                         isBuffering = false
@@ -488,13 +538,16 @@ private fun LiveRtspContent(
 
             override fun onPlayerError(error: PlaybackException) {
                 isBuffering = false
-                // Don't go straight to the hard error; try to reconnect first.
-                scheduleReconnect()
+                // Don't go straight to the hard error; try to reconnect first. The
+                // error code goes with it so a decoder/format failure steps down the
+                // fallback ladder even if this rung had been playing.
+                scheduleReconnect(error.errorCode)
             }
 
             override fun onRenderedFirstFrame() {
                 // Live video has painted — cross-fade the snapshot placeholder out.
                 firstFrameSeen = true
+                everReady = true
             }
         }
         player?.addListener(listener)
@@ -534,8 +587,11 @@ private fun LiveRtspContent(
                                 stuckMs += WATCHDOG_TICK_MS
                                 if (stuckMs >= FRAME_STALL_MS) {
                                     stuckMs = 0L; lastPos = -1L; readyHeldMs = 0L
-                                    onStallState.value()   // report to VM for auto-fallback
-                                    scheduleReconnect()
+                                    // Report to the VM for auto-fallback UNLESS this
+                                    // was a codec downgrade — a wall of all-H265
+                                    // cameras walking their ladders is not evidence
+                                    // of a bad link and must not trip low-bw mode.
+                                    if (!scheduleReconnect()) onStallState.value()
                                 }
                             } else {
                                 lastPos = pos
@@ -552,10 +608,19 @@ private fun LiveRtspContent(
                     Player.STATE_BUFFERING -> {
                         lastPos = -1L; stuckMs = 0L; readyHeldMs = 0L
                         bufferingMs += WATCHDOG_TICK_MS
-                        if (bufferingMs >= STALL_BUFFERING_MS) {
+                        // A stream Media3 can't decode (H265 over RTSP) sits in
+                        // BUFFERING without ever erroring. While a fallback rung is
+                        // left, bound that spin instead of waiting out the patient
+                        // stuck-buffering cap; the derived rungs (`_subv`/`_mobile`)
+                        // get longer, since go2rtc spawns their ffmpeg lazily.
+                        val limit = when {
+                            everReady || nextTier(chain, tier, failedTiers) == null -> STALL_BUFFERING_MS
+                            tier == StreamTier.MAIN -> MAIN_FIRSTLOAD_BUFFER_MS
+                            else -> DERIVED_FIRSTLOAD_BUFFER_MS
+                        }
+                        if (bufferingMs >= limit) {
                             bufferingMs = 0L
-                            onStallState.value()       // report to VM for auto-fallback
-                            scheduleReconnect()
+                            if (!scheduleReconnect()) onStallState.value()
                         }
                     }
                     else -> {
@@ -750,6 +815,27 @@ private fun LiveRtspContent(
             TileReconnectingOverlay(modifier = Modifier.align(Alignment.Center))
         }
 
+        // Server-transcode indicator (#524): this camera's own streams turned out
+        // to be undecodable on this device (H.265 over RTSP), so the tile fell all
+        // the way down to the server's H.264 `_mobile` transcode. Teal, not the
+        // amber auto-shed badge — this is a codec accommodation, not backpressure,
+        // and it makes an otherwise invisible degradation legible on the wall.
+        if (tier == StreamTier.MOBILE && !hasError && rtspUrl != null) {
+            Text(
+                text = "SD",
+                style = MaterialTheme.typography.labelSmall,
+                color = TealAccent,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 6.dp)
+                    .background(
+                        color = Color.Black.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(4.dp),
+                    )
+                    .padding(horizontal = 5.dp, vertical = 1.dp),
+            )
+        }
+
         // Hard error state — no stream URL, or reconnect exhausted its FAST
         // attempts (a slow background retry keeps trying regardless — see
         // scheduleReconnect above). Tap-to-retry (#2): bumping playerGeneration
@@ -807,6 +893,21 @@ private const val FRAME_STALL_MS = 4_000L
 private const val READY_SUSTAINED_MS = 30_000L
 /** Stuck-BUFFERING limit (ms) before forcing a reconnect — the bug #38 spinner cap. */
 private const val STALL_BUFFERING_MS = 15_000L
+
+/**
+ * Shorter buffering limit (ms) for a MAIN stream that has never reached READY and
+ * still has a fallback rung below it. An H265 main the RTSP path can't decode sits
+ * in BUFFERING rather than erroring; this bounds that spin. Mirrors the fullscreen
+ * constant of the same name and value.
+ */
+private const val MAIN_FIRSTLOAD_BUFFER_MS = 6_000L
+
+/**
+ * The same bound for the DERIVED rungs (`_subv`, `_mobile`) of the ladder, more
+ * patient because go2rtc spawns their ffmpeg lazily on first consumer connect, so
+ * a cold one legitimately needs a few seconds plus a keyframe wait (#524).
+ */
+private const val DERIVED_FIRSTLOAD_BUFFER_MS = 10_000L
 
 /**
  * If the app was backgrounded longer than this, re-prepare the RTSP source on
