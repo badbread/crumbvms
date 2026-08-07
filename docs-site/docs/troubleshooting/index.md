@@ -127,6 +127,44 @@ in the admin console, remember the stored DB value **overrides** the
 `MOTION_HWACCEL` / `MOTION_VAAPI_DEVICE` env vars, change it in the console
 too, or an env-only fix will appear to do nothing.
 
+**An alert says Crumb "can't write to storage", and the recorder log mentions a
+missing `.crumb-storage` marker.** Crumb keeps a small marker file in the root
+of every storage disk it uses. It is how the recorder tells "this is my disk" from
+"this is an empty folder where my disk should have been". If a disk fails to
+mount, the mount point is usually still there as an empty directory, and every
+recording Crumb has on that disk looks deleted, so without the marker Crumb
+would throw away its whole index of that disk's recordings (the video files
+themselves are never touched, but the motion flags, timeline markers and clip
+links are not recoverable).
+
+When the marker is missing, Crumb **stops** cleaning up that disk's recording
+index and raises this alert instead. Nothing is deleted and nothing stops
+recording elsewhere.
+
+**Fix:** check that the disk is actually mounted and holds your footage, for
+example `df -h` on the host and a look inside the media directory. Remount it if
+it isn't, and the alert clears on the next maintenance pass (within about
+15 minutes).
+
+If instead you deliberately wiped that disk and want Crumb to clear out its stale
+index entries, re-create the marker yourself and restart the recorder:
+
+```bash
+touch /path/to/your/media/disk/.crumb-storage
+docker compose restart recorder
+```
+
+Do not delete the marker file as routine housekeeping, it is what protects your
+recording index from an unmounted disk.
+
+**The same alert, but the log mentions a "circuit breaker".** Crumb noticed that
+most of one disk's recordings vanished at once, which is far more than normal
+retention can explain, so it stopped cleaning up that disk's index after a small
+number of entries and raised the alert. This usually means the disk was
+unmounted, swapped, or repointed at a different folder. Check the disk, then
+restart the recorder once you are happy the right disk is in place, cleanup stays
+off for that disk until the recorder restarts.
+
 ## Cameras
 
 **A camera won't connect.** Usually a wrong RTSP URL or credentials.

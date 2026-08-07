@@ -21,6 +21,16 @@
 //! 1. **Dangling rows** — rows in the `segments` table whose file no longer
 //!    exists.  Delete the row (the file is gone; the row is the lie).
 //!
+//!    Guarded by the **unmounted-storage guard** (issue #504): a storage root
+//!    that is present but EMPTY — a disk that failed to mount, a dropped
+//!    network mount, a Docker-auto-created bind source — makes every row on it
+//!    look dangling, and one pass would delete that storage's whole segment
+//!    index.  So the pass refuses to delete anything on a storage without a
+//!    [`STORAGE_MARKER_FILENAME`] marker, and a per-storage circuit breaker
+//!    ([`dangling_breaker_trips`]) halts deletions when far more of a storage's
+//!    rows are missing than retention could explain.  Both fail toward "skip
+//!    and alarm", never toward delete.
+//!
 //! 2. **Orphan files** — files on live or archive storage that have no
 //!    matching row in `segments`.  This happens when:
 //!    * The recorder was killed mid-segment (the file was written but the row
@@ -94,6 +104,327 @@ const ORPHAN_PROGRESS_INTERVAL: u64 = 10;
 /// reuse the exact same floor instead of drifting a second copy of the
 /// constant.
 pub(crate) const SUB_FLOOR_BYTES: u64 = 512;
+
+// ─── unmounted-storage guard (issue #504) ─────────────────────────────────────
+
+/// Marker file the recorder drops in the root of every storage it genuinely
+/// uses.  Its ABSENCE is what makes the dangling-row pass refuse to prune that
+/// storage's segment index.
+///
+/// The dangling pass deletes a row whose file it cannot stat.  A storage root
+/// that is PRESENT but EMPTY — an fstab `noauto` disk that never mounted, a
+/// dropped network mount, a Docker bind whose source directory Docker
+/// auto-created — makes EVERY row for that storage look dangling, so one pass
+/// would delete the whole storage's index in a few minutes.  The footage BYTES
+/// survive (nothing on disk is touched), but everything only the index carries
+/// does not: `has_motion`, motion bounding boxes, stage/stream labels,
+/// durations, clip and bookmark linkage.  Re-adoption after a remount is
+/// rate-limited ([`ORPHAN_INSERT_RATE_HZ`]) and re-adopts with
+/// `has_motion = false` and no bbox, so the motion history is gone for good.
+///
+/// A marker file rides ON the storage: when the real disk is mounted the marker
+/// is visible; when the mount is missing the bare mountpoint directory does not
+/// contain it.  That is what a "does the root exist?" check (which the orphan
+/// pass has, and which the dangling pass lacked) can never distinguish.
+///
+/// It is a dotfile, so the `.mp4`-only [`walk_storage`] never sees it.  It is
+/// written ONLY when the recorder can positively confirm the storage — see
+/// [`ensure_storage_marker`] (called from the recording path, at the moment
+/// footage is about to be written there) and [`seed_storage_markers`] (boot
+/// heal for installs that predate this guard).
+pub(crate) const STORAGE_MARKER_FILENAME: &str = ".crumb-storage";
+
+/// Contents written into a freshly created [`STORAGE_MARKER_FILENAME`].
+///
+/// Purely informational — only the file's EXISTENCE is ever tested — but an
+/// operator who finds it should immediately know what it is and why deleting it
+/// is a bad idea.
+const STORAGE_MARKER_BODY: &str = "\
+Crumb VMS storage marker. Do not delete.
+
+The recorder writes this file into the root of a storage it has confirmed. Before
+Crumb is allowed to delete any segment-index row for a storage (rows whose file
+is missing), it requires this marker to be present. That way an unmounted disk,
+whose mount point directory still exists but is empty, cannot be mistaken for a
+disk whose footage was deleted. Without this check, one maintenance pass would
+wipe that storage's entire segment index: motion flags, bounding boxes, stage
+labels, clip and bookmark links. The video files themselves are never touched,
+but that index is not recoverable.
+
+If you deliberately emptied this disk and want Crumb to clear out its stale index
+rows, re-create this file (an empty file is enough) and restart the recorder.
+";
+
+/// How many of a storage's NEWEST indexed segments [`seed_storage_markers`]
+/// samples when deciding whether it can confirm a storage.
+///
+/// Newest-first, because the oldest segments are exactly the ones retention and
+/// eviction legitimately remove; finding any one of the newest still on disk is
+/// strong evidence the mount is live.  A handful would do; 50 makes the check
+/// robust against a burst of recently-evicted rows without being expensive (one
+/// indexed query + at most 50 `stat`s, once per storage per pass, and only until
+/// the marker exists).
+const STORAGE_MARKER_CONFIRM_SAMPLE: i64 = 50;
+
+/// Circuit breaker (layer 2): the number of MISSING rows a storage must exceed
+/// in ONE pass before the breaker may trip.
+///
+/// Below this, a storage's missing rows are treated as ordinary dangling rows and
+/// deleted exactly as they always were — retention, an operator deleting files,
+/// or a crash legitimately produce a handful.  This floor is also the hard BOUND
+/// on how many rows a storage can lose to a mass-missing event: the breaker is
+/// evaluated BEFORE every delete, so at most this many deletions can happen
+/// before it fires.
+const DANGLING_BREAKER_MIN_MISSING: u64 = 100;
+
+/// Circuit breaker (layer 2): the percentage of a storage's CHECKED rows that
+/// must be missing — together with [`DANGLING_BREAKER_MIN_MISSING`] — to trip.
+///
+/// Half a storage's index disappearing between two passes is not a retention
+/// pattern; it is a mount, a path, or a disk that changed underneath us.  Both
+/// conditions must hold, so neither a small storage (few rows, high ratio) nor a
+/// large one with a slow trickle of genuine deletions (many rows, low ratio) can
+/// trip it.
+const DANGLING_BREAKER_MISSING_PCT: u64 = 50;
+
+/// The circuit-breaker predicate, in integer arithmetic so it is exactly
+/// testable: `missing > MIN` **and** `missing/checked > PCT%`.
+///
+/// Evaluated before EVERY dangling deletion (counts include the row about to be
+/// deleted), which is what bounds the damage of a mass-missing pass at
+/// [`DANGLING_BREAKER_MIN_MISSING`] rows per storage.
+fn dangling_breaker_trips(checked: u64, missing: u64) -> bool {
+    missing > DANGLING_BREAKER_MIN_MISSING
+        && missing.saturating_mul(100) > checked.saturating_mul(DANGLING_BREAKER_MISSING_PCT)
+}
+
+/// Storage roots whose circuit breaker has tripped during this recorder's
+/// lifetime.  Pruning stays OFF for those roots until the operator has fixed the
+/// storage and restarted the recorder.
+///
+/// Without the latch the breaker would only bound damage PER PASS, and reconcile
+/// runs on a timer: a storage that keeps looking wrong would still be drained
+/// [`DANGLING_BREAKER_MIN_MISSING`] rows at a time, pass after pass.  Latching
+/// converts "bounded per pass" into "stopped until a human looks", which is the
+/// footage-safe direction — the only cost of a false latch is stale index rows
+/// that survive one restart.
+static TRIPPED_STORAGE_ROOTS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// True when this storage root's breaker tripped earlier in this process.
+///
+/// A poisoned lock reads as "latched" (skip + alarm), the safe direction.
+fn storage_breaker_latched(storage_root: &str) -> bool {
+    TRIPPED_STORAGE_ROOTS
+        .lock()
+        .map_or(true, |set| set.contains(storage_root))
+}
+
+/// Latch this storage root: no further dangling deletions there until restart.
+fn latch_storage_breaker(storage_root: &str) {
+    if let Ok(mut set) = TRIPPED_STORAGE_ROOTS.lock() {
+        set.insert(storage_root.to_owned());
+    }
+}
+
+/// Per-storage-root state for ONE dangling-row pass (the issue #504 guard).
+///
+/// Keyed by storage ROOT PATH rather than `storage_id` on purpose: prod can
+/// carry DUPLICATE `storages` rows for the same on-disk path (see the orphan
+/// pass's note), and keying by id would give each duplicate its own separate
+/// deletion budget for the same physical disk.
+struct StorageGuard {
+    /// Marker present when this pass first touched the root.  `false` means
+    /// every row on this storage is skipped for the whole pass.
+    marker_ok: bool,
+    /// Rows on this root whose file this pass stat'ed.
+    checked: u64,
+    /// Rows on this root whose file this pass found missing.
+    missing: u64,
+    /// Dangling rows this pass actually deleted on this root.
+    deleted: u64,
+    /// The breaker has fired: no further deletions on this root this pass.
+    tripped: bool,
+}
+
+impl StorageGuard {
+    fn new(marker_ok: bool) -> Self {
+        Self {
+            marker_ok,
+            checked: 0,
+            missing: 0,
+            deleted: 0,
+            tripped: false,
+        }
+    }
+}
+
+/// Absolute path of a storage root's marker file.
+fn storage_marker_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(STORAGE_MARKER_FILENAME)
+}
+
+/// True when the storage marker is present at `storage_root`.
+///
+/// Any error (missing, unreadable, root itself gone) reads as ABSENT, which is
+/// the safe direction: absent means "skip this storage's deletions and alarm".
+async fn storage_marker_present(storage_root: &Path) -> bool {
+    tokio::fs::metadata(storage_marker_path(storage_root))
+        .await
+        .is_ok()
+}
+
+/// Create the storage marker at `storage_root` if it is not already there.
+///
+/// Called from the RECORDING path (`recording.rs`) at the moment the recorder is
+/// about to write footage into that root — actually writing footage there is the
+/// strongest confirmation available that the storage is the real, mounted one.
+///
+/// Idempotent and best-effort: an existing marker is never rewritten or
+/// truncated (`create_new`), and any failure is logged and ignored.  A storage
+/// that never gets a marker only ever loses index PRUNING (fail toward skip),
+/// never footage.
+pub(crate) async fn ensure_storage_marker(storage_root: &Path) {
+    let path = storage_marker_path(storage_root);
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return;
+    }
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+    {
+        Ok(mut f) => {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = f.write_all(STORAGE_MARKER_BODY.as_bytes()).await {
+                warn!(path = %path.display(), error = %e, "could not write storage marker body (the file itself is what matters)");
+            }
+            let _ = f.flush().await;
+            info!(path = %path.display(), "wrote storage marker (confirms this root to the reconcile dangling-row guard)");
+        }
+        // Another worker (or a concurrent pass) won the race — fine.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not create the storage marker; reconcile will SKIP pruning this storage's segment index (safe, but stale rows will accumulate)"
+            );
+        }
+    }
+}
+
+/// Raise the operator-visible alarm for a storage whose index pruning was
+/// refused (missing marker) or halted (breaker tripped).
+///
+/// Reuses the existing `storage_unwritable` event key rather than inventing a
+/// new one: it is already seeded (migration `0056`, 900 s cooldown, which also
+/// throttles the once-per-pass re-emit), already wired into every notification
+/// channel and the admin console, and its operator-facing meaning — "the
+/// recorder cannot use this storage; footage is not being saved there" — is
+/// exactly what an absent marker or a mass-missing pass indicates.
+///
+/// Best-effort: an insert failure is logged and never aborts the pass; the
+/// `error!` line the caller emits first is the primary signal.
+async fn raise_storage_guard_event(pool: &Pool, detail: &str) {
+    if let Err(e) = db::insert_system_event(pool, "storage_unwritable", None, Some(detail)).await {
+        warn!(
+            error = %e,
+            "failed to record storage_unwritable system event for the reconcile storage guard"
+        );
+    }
+}
+
+/// Seed [`STORAGE_MARKER_FILENAME`] on every storage the recorder can CONFIRM.
+///
+/// Runs at the top of every background pass so an install that predates this
+/// guard heals itself on the very first pass — without it, an upgrade would
+/// leave every storage marker-less and reconcile would stop pruning dangling
+/// rows entirely.
+///
+/// A marker is written ONLY on positive identification:
+///
+/// * the root must stat OK, **and**
+/// * at least one of the storage's [`STORAGE_MARKER_CONFIRM_SAMPLE`] newest
+///   indexed segment files must actually be present under that root.
+///
+/// A root that stats fine but holds NONE of its indexed segments is precisely the
+/// unmounted-disk shape this guard exists for: loud warning, no marker.  A
+/// storage with no indexed segments at all is indistinguishable from an empty
+/// foreign directory, so it gets no marker here either — the recorder writes one
+/// itself the moment it records there ([`ensure_storage_marker`]).
+///
+/// Entirely best-effort: every failure path simply leaves the marker absent,
+/// which only ever makes the dangling pass MORE conservative.
+async fn seed_storage_markers(pool: &Pool, shutdown: &CancellationToken) {
+    let storages = match db::list_storages(pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "reconcile: cannot list storages to seed storage markers; dangling pruning may be skipped this pass");
+            return;
+        }
+    };
+
+    for s in storages {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let root = PathBuf::from(&s.path);
+
+        // Already confirmed (possibly by a duplicate storage row for the same
+        // path earlier in this loop) — nothing to do.
+        if storage_marker_present(&root).await {
+            continue;
+        }
+
+        if tokio::fs::metadata(&root).await.is_err() {
+            debug!(root = %root.display(), "storage root missing/inaccessible; not seeding a marker");
+            continue;
+        }
+
+        let sample = match db::list_recent_segment_paths_for_storage(
+            pool,
+            s.id,
+            STORAGE_MARKER_CONFIRM_SAMPLE,
+        )
+        .await
+        {
+            Ok(paths) => paths,
+            Err(e) => {
+                warn!(root = %root.display(), error = %e, "cannot sample indexed segments to confirm storage; not seeding a marker");
+                continue;
+            }
+        };
+
+        if sample.is_empty() {
+            debug!(
+                root = %root.display(),
+                "storage has no indexed segments — cannot be told apart from an empty foreign directory; the marker is written when the recorder first records here"
+            );
+            continue;
+        }
+
+        let mut confirmed = false;
+        for rel in &sample {
+            if tokio::fs::metadata(root.join(rel)).await.is_ok() {
+                confirmed = true;
+                break;
+            }
+        }
+
+        if confirmed {
+            ensure_storage_marker(&root).await;
+        } else {
+            warn!(
+                root = %root.display(),
+                storage = %s.name,
+                sampled = sample.len(),
+                "storage root exists but NONE of its newest indexed segments are present — treating it as NOT the real storage (unmounted disk?); its segment index will NOT be pruned"
+            );
+        }
+    }
+}
 
 /// **Phase 1** — confirm the DB is reachable before camera workers start.
 ///
@@ -219,6 +550,14 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     let segment_len = Duration::seconds(i64::from(config.segment_seconds));
     let twice_segment = Duration::seconds(i64::from(config.segment_seconds) * 2);
 
+    // ── storage markers (issue #504) ─────────────────────────────────────────
+    //
+    // Confirm-and-seed BEFORE the dangling pass, so a healthy install that
+    // predates this guard is marked on its very first pass and prunes exactly as
+    // it always did. A storage that cannot be confirmed stays marker-less and its
+    // index is left alone (skip + alarm), which is the whole point.
+    seed_storage_markers(&pool, &shutdown).await;
+
     // ── dangling-row pass (paginated) ─────────────────────────────────────────
     //
     // For every row in `segments`, confirm the file still exists on disk. If the
@@ -233,6 +572,9 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     let mut dangling_count = 0u64;
     let mut size_repaired_count = 0u64;
     let mut indexed_paths: HashSet<(String, String)> = HashSet::new();
+    // Unmounted-storage guard state, one entry per storage ROOT PATH (issue
+    // #504). Built lazily as rows are walked; lives for exactly one pass.
+    let mut storage_guards: HashMap<String, StorageGuard> = HashMap::new();
 
     let mut cursor = Uuid::nil();
     'pages: loop {
@@ -303,7 +645,77 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             // other duplicate row look like an orphan (510k false orphans).
             indexed_paths.insert((storage_path.replace('\\', "/"), seg.path.replace('\\', "/")));
 
+            // ── UNMOUNTED-STORAGE GUARD, layer 1: the marker (issue #504) ────
+            //
+            // Everything below this point can DELETE this row. A storage root
+            // that is present but empty (a disk that failed to mount, a dropped
+            // network mount, a Docker-auto-created bind source) makes every one
+            // of its rows look dangling, so an unguarded pass wipes that
+            // storage's entire segment index. Without the marker we cannot tell
+            // "the real disk, whose footage is gone" from "not the real disk",
+            // so we refuse to touch ANY row on that storage this pass and raise
+            // a loud alarm. Note this runs AFTER `indexed_paths` above, so the
+            // orphan pass still knows these paths are indexed and can never
+            // treat them as adoptable orphans.
+            if !storage_guards.contains_key(&storage_path) {
+                // A breaker that tripped earlier in this process keeps pruning
+                // off for this root until a human has looked (see
+                // [`TRIPPED_STORAGE_ROOTS`]).
+                let latched = storage_breaker_latched(&storage_path);
+                let marker_ok = if latched {
+                    false
+                } else {
+                    storage_marker_present(Path::new(&storage_path)).await
+                };
+                if latched {
+                    error!(
+                        storage_root = %storage_path,
+                        "reconcile: this storage's safety circuit breaker tripped earlier — segment-index pruning stays disabled for it until the recorder restarts"
+                    );
+                    raise_storage_guard_event(
+                        &pool,
+                        &format!(
+                            "Reconcile is NOT pruning the segment index for storage \
+                             {storage_path}: its safety circuit breaker tripped earlier (far more \
+                             index rows were missing than retention can explain). Pruning stays \
+                             off for this storage until it is fixed and the recorder is \
+                             restarted. No footage is affected."
+                        ),
+                    )
+                    .await;
+                } else if !marker_ok {
+                    error!(
+                        storage_root = %storage_path,
+                        marker = STORAGE_MARKER_FILENAME,
+                        "reconcile: storage marker MISSING — refusing to prune this storage's segment index this pass (is the disk mounted?)"
+                    );
+                    raise_storage_guard_event(
+                        &pool,
+                        &format!(
+                            "Reconcile did NOT prune the segment index for storage {storage_path}: \
+                             its {STORAGE_MARKER_FILENAME} marker file is absent, which usually \
+                             means the disk is not mounted (an empty mountpoint directory makes \
+                             every indexed segment look deleted). No index rows were deleted and \
+                             no footage was touched. Check the mount; reconcile resumes \
+                             automatically once the storage is back."
+                        ),
+                    )
+                    .await;
+                }
+                storage_guards.insert(storage_path.clone(), StorageGuard::new(marker_ok));
+            }
+            if !storage_guards
+                .get(&storage_path)
+                .is_some_and(|g| g.marker_ok)
+            {
+                continue;
+            }
+
             let abs_path = PathBuf::from(&storage_path).join(&seg.path);
+
+            if let Some(g) = storage_guards.get_mut(&storage_path) {
+                g.checked += 1;
+            }
 
             match tokio::fs::metadata(&abs_path).await {
                 Ok(meta) => {
@@ -394,6 +806,15 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Feed the circuit breaker (issue #504, layer 2). Counted
+                    // here — at the FIRST missing stat, before the re-verify —
+                    // so a mass-missing storage is recognised as early as
+                    // possible; a row that the re-verify then rescues only makes
+                    // the breaker more conservative, never less.
+                    if let Some(g) = storage_guards.get_mut(&storage_path) {
+                        g.missing += 1;
+                    }
+
                     // RE-VERIFY BEFORE DELETE (defect 2 / correctness item 10
                     // hardening): `seg` and `abs_path` were captured from the
                     // page snapshot taken at the START of this pass, which can
@@ -462,6 +883,68 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
                                     );
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    // ── UNMOUNTED-STORAGE GUARD, layer 2: the
+                                    // circuit breaker (issue #504) ────────────
+                                    //
+                                    // Belt and suspenders behind the marker: a
+                                    // marker can be stale (written before a path
+                                    // was repointed, or left behind on the
+                                    // mountpoint by an earlier boot). Evaluated
+                                    // BEFORE every delete, with counts that
+                                    // include this row, so a mass-missing pass
+                                    // can never delete more than
+                                    // DANGLING_BREAKER_MIN_MISSING rows on one
+                                    // storage before it is halted.
+                                    let (allow_delete, just_tripped) = match storage_guards
+                                        .get_mut(&storage_path)
+                                    {
+                                        Some(g) if g.tripped => (false, false),
+                                        Some(g) if dangling_breaker_trips(g.checked, g.missing) => {
+                                            g.tripped = true;
+                                            latch_storage_breaker(&storage_path);
+                                            (false, true)
+                                        }
+                                        _ => (true, false),
+                                    };
+
+                                    if just_tripped {
+                                        let (checked, missing, deleted) = storage_guards
+                                            .get(&storage_path)
+                                            .map_or((0, 0, 0), |g| {
+                                                (g.checked, g.missing, g.deleted)
+                                            });
+                                        error!(
+                                            storage_root = %storage_path,
+                                            checked, missing, deleted,
+                                            "reconcile: CIRCUIT BREAKER tripped — too much of this storage's segment index is missing at once; halting dangling-row deletions for this storage this pass"
+                                        );
+                                        raise_storage_guard_event(
+                                            &pool,
+                                            &format!(
+                                                "Reconcile HALTED segment-index pruning for storage \
+                                                 {storage_path}: {missing} of {checked} checked \
+                                                 index rows had no file on disk, far more than \
+                                                 retention can explain — the disk may be \
+                                                 unmounted, repointed, or replaced. {deleted} \
+                                                 stale rows were removed before the halt; the \
+                                                 rest were left intact and no footage was \
+                                                 touched. Index pruning stays OFF for this \
+                                                 storage until it is fixed and the recorder is \
+                                                 restarted."
+                                            ),
+                                        )
+                                        .await;
+                                    }
+
+                                    if !allow_delete {
+                                        debug!(
+                                            segment_id = %seg.id,
+                                            path = %current_abs_path.display(),
+                                            "dangling deletion suppressed by the storage circuit breaker"
+                                        );
+                                        continue;
+                                    }
+
                                     warn!(
                                         segment_id = %seg.id,
                                         path       = %current_abs_path.display(),
@@ -471,6 +954,9 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
                                         error!(segment_id = %seg.id, error = %de, "failed to delete dangling segment row");
                                     } else {
                                         dangling_count += 1;
+                                        if let Some(g) = storage_guards.get_mut(&storage_path) {
+                                            g.deleted += 1;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -514,6 +1000,27 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
         size_repaired = size_repaired_count,
         "reconcile phase 2: dangling row pass complete"
     );
+
+    // Per-storage guard summary (issue #504) — one line per storage that was
+    // skipped or halted, so an operator reading the log sees exactly which
+    // storage was protected and why.
+    for (root, g) in &storage_guards {
+        if !g.marker_ok {
+            warn!(
+                storage_root = %root,
+                marker = STORAGE_MARKER_FILENAME,
+                "reconcile phase 2: segment index for this storage was NOT pruned (marker absent)"
+            );
+        } else if g.tripped {
+            warn!(
+                storage_root = %root,
+                checked = g.checked,
+                missing = g.missing,
+                deleted = g.deleted,
+                "reconcile phase 2: dangling-row deletions were HALTED for this storage (circuit breaker; stays off until the recorder restarts)"
+            );
+        }
+    }
 
     // ── orphan-file pass ─────────────────────────────────────────────────────
     //
@@ -1851,6 +2358,7 @@ mod tests {
         _live_dir: tempfile::TempDir,
         _archive_dir: tempfile::TempDir,
         live_path: PathBuf,
+        archive_path: PathBuf,
         camera_id: Uuid,
     }
 
@@ -1992,6 +2500,17 @@ mod tests {
                     );
                     CREATE UNIQUE INDEX segments_uniq_cam_stream_start
                         ON segments (camera_id, stream, start_ts);
+                    -- Mirror migration 0032: the reconcile storage guard
+                    -- (issue #504) raises a `storage_unwritable` system event
+                    -- when it refuses to prune a storage's index.
+                    CREATE TABLE system_events (
+                        id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        event_key  text NOT NULL,
+                        camera_id  uuid,
+                        ts         timestamptz NOT NULL DEFAULT now(),
+                        detail     text,
+                        created_at timestamptz NOT NULL DEFAULT now()
+                    );
                     CREATE TABLE bookmarks (
                         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                         camera_id uuid NOT NULL,
@@ -2104,6 +2623,7 @@ mod tests {
             schema,
             base_url: base_url.to_owned(),
             live_path: live_dir.path().to_path_buf(),
+            archive_path: archive_dir.path().to_path_buf(),
             _live_dir: live_dir,
             _archive_dir: archive_dir,
             camera_id,
@@ -2863,6 +3383,345 @@ mod tests {
             live_row.stage,
             SegmentStage::Live,
             "orphan on the live disk must stay stage=live"
+        );
+    }
+
+    // ── unmounted-storage guard (issue #504) ─────────────────────────────────
+
+    /// The circuit-breaker predicate, pure and DB-free: BOTH the absolute floor
+    /// and the ratio must be exceeded, so the breaker cannot change what
+    /// reconcile does in any ordinary situation.
+    #[test]
+    fn dangling_breaker_predicate_needs_both_floor_and_ratio() {
+        // Steady state — a handful of genuinely-deleted files on a big storage.
+        // This is the behaviour that MUST stay byte-identical to pre-fix.
+        assert!(!dangling_breaker_trips(50_000, 12));
+        // 100 % missing but under the absolute floor: a small storage an
+        // operator legitimately emptied. Still deleted, exactly as before.
+        assert!(!dangling_breaker_trips(80, 80));
+        assert!(
+            !dangling_breaker_trips(100, 100),
+            "exactly at the floor must not trip (bound is > MIN, so ≤100 deletions)"
+        );
+        // One row past the floor at 100 % missing — the unmounted-disk shape.
+        assert!(dangling_breaker_trips(101, 101));
+        // Past the floor but under the ratio: a big storage mid-eviction.
+        assert!(!dangling_breaker_trips(1_000, 300));
+        assert!(
+            !dangling_breaker_trips(1_000, 500),
+            "exactly 50 % must not trip"
+        );
+        assert!(dangling_breaker_trips(1_000, 501));
+    }
+
+    /// Count the guard's operator alarms raised so far.
+    async fn guard_event_count(pool: &Pool) -> i64 {
+        let client = pool.get().await.expect("conn");
+        let row = client
+            .query_one(
+                "SELECT count(*)::bigint FROM system_events WHERE event_key = 'storage_unwritable'",
+                &[],
+            )
+            .await
+            .expect("count system_events");
+        row.get(0)
+    }
+
+    /// Insert `count` segment rows on `storage_id` whose files do NOT exist.
+    async fn insert_fileless_rows(fx: &RFixture, storage_id: Uuid, count: i64) {
+        let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().expect("base ts");
+        for i in 0..count {
+            let start = base + Duration::seconds(i * 10);
+            crumb_common::db::insert_segment(
+                &fx.pool,
+                &crumb_common::db::InsertSegmentParams {
+                    camera_id: fx.camera_id,
+                    storage_id,
+                    stage: SegmentStage::Live,
+                    path: format!("{}/gone{i:04}.mp4", fx.camera_id),
+                    stream: SegmentStream::Main,
+                    start_ts: start,
+                    end_ts: start + Duration::seconds(4),
+                    duration_ms: 4000,
+                    has_motion: true,
+                    motion_score: 0.5,
+                    size_bytes: 800_000,
+                    motion_bbox: None,
+                },
+            )
+            .await
+            .expect("insert fileless row");
+        }
+    }
+
+    /// (a) ISSUE #504, the defect itself: a storage root that is PRESENT but
+    /// EMPTY — an unmounted disk whose mountpoint directory still exists — makes
+    /// every one of its rows look dangling. Pre-fix, one pass deleted the
+    /// storage's ENTIRE segment index (has_motion, bboxes, stage labels, clip
+    /// linkage; the bytes survive, that metadata does not). Post-fix the missing
+    /// storage marker makes the pass skip the storage entirely: ZERO deletions,
+    /// no marker invented, and a loud operator alarm.
+    #[tokio::test]
+    async fn dangling_pass_skips_storage_without_marker() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        // The whole index for this storage, with NOTHING on disk — exactly what
+        // a failed mount looks like from the recorder's side.
+        insert_fileless_rows(&fx, live.id, 5).await;
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments");
+        assert_eq!(
+            rows.len(),
+            5,
+            "an unmarked (unmounted) storage must lose ZERO index rows: {rows:?}"
+        );
+        assert!(
+            !fx.live_path.join(STORAGE_MARKER_FILENAME).exists(),
+            "the marker must NOT be invented for a root that holds none of its indexed segments"
+        );
+        assert!(
+            guard_event_count(&fx.pool).await >= 1,
+            "skipping a storage's index prune must raise an operator alarm"
+        );
+    }
+
+    /// (b) Layer 2: even WITH a marker (a stale one left on a mountpoint, or a
+    /// storage path repointed under a live marker), a pass in which most of a
+    /// storage's rows come back missing must HALT that storage's deletions. The
+    /// damage is bounded at DANGLING_BREAKER_MIN_MISSING rows — the breaker is
+    /// evaluated before every delete — and the alarm fires.
+    #[tokio::test]
+    async fn dangling_breaker_bounds_deletions_on_mass_missing() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        // Marker present (so layer 1 lets the pass through) but no files at all.
+        tokio::fs::write(fx.live_path.join(STORAGE_MARKER_FILENAME), b"")
+            .await
+            .expect("write marker");
+
+        let total = 150i64;
+        insert_fileless_rows(&fx, live.id, total).await;
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments");
+        let deleted = total - rows.len() as i64;
+        assert_eq!(
+            deleted, DANGLING_BREAKER_MIN_MISSING as i64,
+            "deletions must be bounded at the breaker floor ({DANGLING_BREAKER_MIN_MISSING}), got {deleted}"
+        );
+        assert_eq!(
+            rows.len() as i64,
+            total - DANGLING_BREAKER_MIN_MISSING as i64,
+            "the rest of the index must survive the pass"
+        );
+        assert!(
+            guard_event_count(&fx.pool).await >= 1,
+            "tripping the breaker must raise an operator alarm"
+        );
+
+        // A SECOND pass must not resume chewing through the remainder: the trip
+        // LATCHES for this storage (otherwise a timer-driven reconcile would
+        // simply drain the index a hundred rows per pass).
+        let rows_before = rows.len() as i64;
+        run_background(fx.pool.clone(), recon_config(), CancellationToken::new()).await;
+        let rows_after = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments")
+            .len() as i64;
+        assert_eq!(
+            rows_after, rows_before,
+            "a tripped storage must lose NOTHING on later passes (the trip latches until restart)"
+        );
+    }
+
+    /// (c) The normal case must behave EXACTLY as it did before this guard: a
+    /// storage the recorder can confirm (one of its indexed segments is really
+    /// there) gets its marker seeded, its genuinely-dangling rows deleted, its
+    /// healthy row untouched — and raises no alarm.
+    #[tokio::test]
+    async fn dangling_pass_deletes_genuine_dangling_rows_on_a_confirmed_storage() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        // Two rows whose files are genuinely gone…
+        insert_fileless_rows(&fx, live.id, 2).await;
+
+        // …and one healthy, indexed, on-disk segment (which is also what lets
+        // the pass CONFIRM the storage and seed its marker).
+        let cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+        let filename = "20260202T000000Z.mp4";
+        let healthy = cam_dir.join(filename);
+        tokio::fs::write(&healthy, vec![0u8; 800_000])
+            .await
+            .expect("write healthy segment");
+        backdate(&healthy, 3600).await;
+        crumb_common::db::insert_segment(
+            &fx.pool,
+            &crumb_common::db::InsertSegmentParams {
+                camera_id: fx.camera_id,
+                storage_id: live.id,
+                stage: SegmentStage::Live,
+                path: format!("{}/{filename}", fx.camera_id),
+                stream: SegmentStream::Main,
+                start_ts: "2026-02-02T00:00:00Z".parse().expect("start ts"),
+                end_ts: "2026-02-02T00:00:04Z".parse().expect("end ts"),
+                duration_ms: 4000,
+                has_motion: false,
+                motion_score: 0.0,
+                size_bytes: 800_000,
+                motion_bbox: None,
+            },
+        )
+        .await
+        .expect("insert healthy row");
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the two genuinely-dangling rows must still be pruned: {rows:?}"
+        );
+        assert!(rows[0].path.ends_with(filename));
+        assert!(healthy.exists(), "the healthy file itself is never touched");
+        assert!(
+            fx.live_path.join(STORAGE_MARKER_FILENAME).exists(),
+            "a confirmable storage must get its marker seeded"
+        );
+        assert_eq!(
+            guard_event_count(&fx.pool).await,
+            0,
+            "a normal pass must raise no storage alarm"
+        );
+    }
+
+    /// (d) Marker creation rules. The marker is only ever written when the
+    /// storage can be positively identified:
+    ///
+    /// * a root holding NONE of its indexed segments (an empty foreign
+    ///   directory / unmounted mountpoint) gets no marker,
+    /// * a storage with no indexed segments at all — indistinguishable from an
+    ///   empty foreign directory — gets no marker either (the recorder writes it
+    ///   when it actually records there),
+    /// * once ONE indexed segment is really present, the next pass seeds it.
+    #[tokio::test]
+    async fn storage_marker_is_seeded_only_when_the_storage_is_confirmable() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        // Rows on the live storage, nothing on disk → foreign/empty root.
+        insert_fileless_rows(&fx, live.id, 3).await;
+
+        run_background(fx.pool.clone(), recon_config(), CancellationToken::new()).await;
+
+        assert!(
+            !fx.live_path.join(STORAGE_MARKER_FILENAME).exists(),
+            "no marker on a root that holds none of its indexed segments"
+        );
+        assert!(
+            !fx.archive_path.join(STORAGE_MARKER_FILENAME).exists(),
+            "no marker on a storage with no indexed segments at all"
+        );
+
+        // Now make ONE of the indexed segments really present — the disk came
+        // back. The next pass can confirm the storage and seeds the marker.
+        let cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+        let restored = cam_dir.join("gone0002.mp4");
+        tokio::fs::write(&restored, vec![0u8; 800_000])
+            .await
+            .expect("write restored segment");
+        backdate(&restored, 3600).await;
+
+        run_background(fx.pool.clone(), recon_config(), CancellationToken::new()).await;
+
+        assert!(
+            fx.live_path.join(STORAGE_MARKER_FILENAME).exists(),
+            "a storage with a confirmed indexed segment must be marked"
+        );
+        assert!(
+            restored.exists(),
+            "confirming a storage must never touch footage"
+        );
+    }
+
+    /// `ensure_storage_marker` (the recording-path writer) is idempotent and
+    /// never clobbers an existing marker.
+    #[tokio::test]
+    async fn ensure_storage_marker_is_idempotent() {
+        let root = tempfile::Builder::new()
+            .prefix("crumb-marker")
+            .tempdir()
+            .expect("tempdir");
+        let marker = root.path().join(STORAGE_MARKER_FILENAME);
+
+        assert!(!storage_marker_present(root.path()).await);
+        ensure_storage_marker(root.path()).await;
+        assert!(storage_marker_present(root.path()).await, "marker created");
+        let first = tokio::fs::read(&marker).await.expect("read marker");
+        assert!(!first.is_empty(), "marker carries its explanatory body");
+
+        // Operator annotated it — a second call must leave it exactly as-is.
+        tokio::fs::write(&marker, b"operator note")
+            .await
+            .expect("overwrite marker");
+        ensure_storage_marker(root.path()).await;
+        assert_eq!(
+            tokio::fs::read(&marker).await.expect("re-read marker"),
+            b"operator note",
+            "an existing marker is never rewritten"
         );
     }
 
