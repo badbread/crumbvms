@@ -59,9 +59,9 @@ import kotlin.math.min
 // confident "off/closed").
 
 // The canonical entity visual mapping (`badgeVisual`, `BadgeVisual`, the palette
-// incl. `BadgeDefaultBg`, `parseHexColor`) lives in `HaVisual.kt`, shared with the
-// entity sheet + more-info dialog so an entity reads identically wherever Android
-// draws it (#437).
+// incl. `BadgeDefaultBg`, `parseHexColor`, `resolveBadgeBg`) lives in `HaVisual.kt`,
+// shared with the entity sheet + more-info dialog so an entity reads identically
+// wherever Android draws it (#437).
 
 private const val BASE_REF_PX = 22f // reference badge size at pane-scale 1.0
 private const val REF_SHORT_SIDE = 320f
@@ -186,7 +186,7 @@ private fun HaBadge(
     // Stale when the server says so OR this client has missed >= 2 polls (#371).
     val stale = states?.stale == true || clientStale
     val visual = badgeVisual(link, st?.state, stale)
-    val bg = parseHexColor(link.overlayBgColor) ?: BadgeDefaultBg
+    val bg = resolveBadgeBg(link, visual.active)
     val opacity = (link.overlayOpacity?.toFloat() ?: 1f).coerceIn(0.05f, 1f)
     val isPill = link.overlayShape == "pill"
 

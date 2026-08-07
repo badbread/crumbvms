@@ -37,6 +37,11 @@ data class HaLinkDto(
     @SerialName("overlay_opacity") val overlayOpacity: Double? = null,
     @SerialName("overlay_shape") val overlayShape: String? = null,
     @SerialName("overlay_bg_color") val overlayBgColor: String? = null,
+    // Per-state ON background override (badge only; default null → today's
+    // overlay_bg_color-or-default behavior byte-for-byte). Applies ONLY when the
+    // entity's tri-state `active` (see `HaVisual.badgeVisual`) is true — scenes,
+    // stale, and unknown/indeterminate readings never use it.
+    @SerialName("overlay_bg_color_on") val overlayBgColorOn: String? = null,
     @SerialName("overlay_outline") val overlayOutline: Boolean = false,
     // ── Per-link control config (migration 0075, issue #440). Both default to
     // today's behavior, so an older server that omits them decodes unchanged
