@@ -284,6 +284,41 @@ final class PlatesViewModel: ObservableObject {
         }
     }
 
+    // MARK: plate names
+
+    /// Set, edit, or clear a plate's human-readable name (`plate_labels`, issue
+    /// #363). Admin-only server-side, so the affordances that call this are
+    /// gated on `isAdmin` — a viewer never sees a control that would 403.
+    ///
+    /// This is naming, NOT alerting: it writes `plate_labels` only, so the plate
+    /// does not join the watchlist and no `plate_watchlist_hit` can result. A
+    /// blank `name` clears (matching the web console), and an unchanged name
+    /// spends no request. Returns nil on success, else a message to surface.
+    ///
+    /// On success both the reads and the watchlist reload, so the new name
+    /// paints everywhere that plate appears in this client.
+    func namePlate(_ plate: String, name: String, current: String?) async -> String? {
+        let action = PlateNaming.action(input: name, current: current)
+        guard action != .noChange else { return nil }
+        do {
+            switch action {
+            case .set(let label):
+                try await container.api.setPlateLabel(plate: plate, label: label)
+            case .clear:
+                try await container.api.clearPlateLabel(plate: plate)
+            case .noChange:
+                return nil
+            }
+        } catch let e as APIError where e.isForbidden {
+            return "Only admins can name a plate."
+        } catch {
+            return (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
+        load()
+        loadWatchlist()
+        return nil
+    }
+
     /// Remove a watchlist entry (admin only). Returns nil on success (incl. a
     /// 404 already-gone) or an error message. The API layer verifies the HTTP
     /// status — a non-2xx (e.g. 403) surfaces here rather than a false success.
@@ -310,6 +345,8 @@ struct PlatesView: View {
 
     @State private var showWatchlist = false
     @State private var toast: String?
+    /// The plate whose name is being edited (admin only); nil = sheet closed.
+    @State private var naming: PlateNameTarget?
     /// The plate-hit clip to play (tapping a read with an event opens the
     /// server-windowed clip, which lands on the car — see `openReadClip`).
     @State private var playingClip: ClipDescriptor?
@@ -333,6 +370,10 @@ struct PlatesView: View {
         .sheet(isPresented: $showWatchlist) {
             WatchlistSheet(vm: vm)
                 .macModalSize(width: 460, height: 560)
+        }
+        .sheet(item: $naming) { target in
+            PlateNameSheet(vm: vm, target: target) { flash($0) }
+                .macModalSize(width: 420, height: 340)
         }
         .fullScreenCoverCompat(item: $playingClip) { clip in
             ClipPlayerView(
@@ -520,7 +561,9 @@ struct PlatesView: View {
                         display: vm.imageDisplay,
                         fetchImages: imagesFetcher(for: read),
                         onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
-                        onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
+                        onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil,
+                        onCopied: { flash("Copied \($0)") },
+                        onName: nameAction(for: read)
                     )
                     Divider().overlay(CrumbColors.surface)
                 }
@@ -540,12 +583,22 @@ struct PlatesView: View {
                         watched: vm.isWatched(read.plate),
                         fetchImages: imagesFetcher(for: read),
                         onOpenPlayback: read.eventId != nil ? { openReadClip(read) } : nil,
-                        onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil
+                        onAddToWatchlist: vm.isAdmin ? { addToWatchlist(read.plate) } : nil,
+                        onCopied: { flash("Copied \($0)") },
+                        onName: nameAction(for: read)
                     )
                 }
             }
         }
         .padding(12)
+    }
+
+    /// The "name this plate" action for a read, or nil when the caller isn't an
+    /// admin or the read has no plate — `PUT`/`DELETE /lpr/plate-labels` are
+    /// admin-only, so a viewer must never see a control that would 403.
+    private func nameAction(for read: PlateRead) -> (() -> Void)? {
+        guard vm.isAdmin, !read.plate.isEmpty else { return nil }
+        return { naming = PlateNameTarget(plate: read.plate, current: read.resolvedName) }
     }
 
     private func centered<V: View>(@ViewBuilder _ v: () -> V) -> some View {
@@ -608,20 +661,91 @@ struct PlatesView: View {
 
 private extension PlateRead {
     /// The operator-assigned plate name, trimmed; nil when absent or blank so
-    /// the UI falls back to the raw plate exactly as before.
-    var resolvedName: String? {
-        guard let n = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !n.isEmpty else { return nil }
-        return n
-    }
+    /// the UI falls back to the raw plate exactly as before. Precedence between
+    /// a first-class name and a legacy watchlist label is resolved server-side.
+    var resolvedName: String? { PlateNaming.resolvedName(displayName) }
 }
 
 private extension WatchlistEntry {
     /// The operator-assigned plate name, trimmed; nil when absent or blank.
-    var resolvedName: String? {
-        guard let n = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !n.isEmpty else { return nil }
-        return n
+    var resolvedName: String? { PlateNaming.resolvedName(displayName) }
+}
+
+/// A plate the operator asked to name; drives the `PlateNameSheet`. Keyed on
+/// the raw plate, which is also the server's upsert key.
+private struct PlateNameTarget: Identifiable {
+    let plate: String
+    /// The name currently shown for this plate, for prefill (nil = unnamed).
+    let current: String?
+    var id: String { plate }
+}
+
+// MARK: - Copy affordance
+
+/// The copy button that sits next to a plate number. Copies the RAW plate even
+/// when an operator-assigned name is the prominent line above it, then flips to
+/// a checkmark for a moment so the operator can see it landed. Right-click /
+/// long-press "Copy plate number" on the surrounding row does the same thing.
+private struct CopyPlateButton: View {
+    let plate: String
+    /// The name shown for this plate, if any — passed only so the copy target
+    /// is chosen explicitly (it is always the plate, never the name).
+    var displayName: String? = nil
+    var size: CGFloat = 12
+    /// Optional extra confirmation (the Plates tab raises a toast).
+    var onCopied: ((String) -> Void)? = nil
+
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            copy()
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .font(.system(size: size, weight: .semibold))
+                .foregroundColor(copied ? CrumbColors.tealAccent : CrumbColors.textTertiary)
+        }
+        .buttonStyle(.plain)
+        .help(copied ? "Copied" : "Copy plate number")
+        .accessibilityLabel(copied ? "Plate number copied" : "Copy plate number")
+    }
+
+    private func copy() {
+        guard let value = PlateNaming.copyTarget(plate: plate, displayName: displayName),
+              CrumbClipboard.copy(value) else { return }
+        onCopied?(value)
+        withAnimation { copied = true }
+        Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            withAnimation { copied = false }
+        }
+    }
+}
+
+/// The shared context menu for any surface showing a plate: copy the number,
+/// and (admin only) name/rename it. Naming is display metadata — the menu keeps
+/// it visibly separate from the watchlist action, which is the alert list.
+@ViewBuilder
+private func plateContextMenu(
+    plate: String,
+    displayName: String?,
+    onCopied: @escaping (String) -> Void,
+    onName: (() -> Void)?
+) -> some View {
+    Button {
+        guard let value = PlateNaming.copyTarget(plate: plate, displayName: displayName),
+              CrumbClipboard.copy(value) else { return }
+        onCopied(value)
+    } label: {
+        Label("Copy plate number", systemImage: "doc.on.doc")
+    }
+    if let onName {
+        Button(action: onName) {
+            Label(
+                PlateNaming.resolvedName(displayName) == nil ? "Name this plate…" : "Rename this plate…",
+                systemImage: "tag"
+            )
+        }
     }
 }
 
@@ -639,6 +763,11 @@ private struct PlateRow: View {
     let fetchImages: (() async -> (PlatformImage?, PlatformImage?))?
     let onOpenPlayback: (() -> Void)?
     let onAddToWatchlist: (() -> Void)?
+    /// Raise the tab's transient confirmation ("Copied ABC123").
+    let onCopied: (String) -> Void
+    /// Open the name editor for this plate; nil for a non-admin (the naming
+    /// endpoints are admin-only, so the control is hidden rather than 403'd).
+    let onName: (() -> Void)?
 
     @State private var full: PlatformImage?
     @State private var crop: PlatformImage?
@@ -662,6 +791,11 @@ private struct PlateRow: View {
                         Text(read.plate.isEmpty ? "—" : read.plate)
                             .font(.system(size: 17, weight: .bold, design: .monospaced))
                             .foregroundColor(CrumbColors.textPrimary)
+                    }
+                    if !read.plate.isEmpty {
+                        CopyPlateButton(
+                            plate: read.plate, displayName: read.displayName, onCopied: onCopied
+                        )
                     }
                     if count > 1 {
                         Text("×\(count)")
@@ -699,6 +833,19 @@ private struct PlateRow: View {
         .padding(.horizontal, 16).padding(.vertical, 10)
         .contentShape(Rectangle())
         .onTapGesture { onOpenPlayback?() }
+        .contextMenu {
+            plateContextMenu(
+                plate: read.plate, displayName: read.displayName,
+                onCopied: onCopied, onName: onName
+            )
+            if let onAddToWatchlist {
+                Divider()
+                Button(action: onAddToWatchlist) {
+                    Label(watched ? "On watchlist" : "Add to watchlist", systemImage: "star")
+                }
+                .disabled(watched)
+            }
+        }
         .task(id: read.id) {
             // Off the row's critical path; the VM caches by event id so
             // re-scrolls resolve instantly without a refetch.
@@ -757,6 +904,10 @@ private struct PlateCard: View {
     let fetchImages: (() async -> (PlatformImage?, PlatformImage?))?
     let onOpenPlayback: (() -> Void)?
     let onAddToWatchlist: (() -> Void)?
+    /// Raise the tab's transient confirmation ("Copied ABC123").
+    let onCopied: (String) -> Void
+    /// Open the name editor for this plate; nil for a non-admin.
+    let onName: (() -> Void)?
 
     @State private var full: PlatformImage?
     @State private var crop: PlatformImage?
@@ -792,6 +943,12 @@ private struct PlateCard: View {
                             .font(.system(size: 15, weight: .bold, design: .monospaced))
                             .foregroundColor(CrumbColors.textPrimary).lineLimit(1)
                     }
+                    if !read.plate.isEmpty {
+                        CopyPlateButton(
+                            plate: read.plate, displayName: read.displayName,
+                            size: 11, onCopied: onCopied
+                        )
+                    }
                     Spacer()
                     ConfidenceChip(confidence: read.confidence)
                 }
@@ -814,6 +971,19 @@ private struct PlateCard: View {
         .background(CrumbColors.surface, in: RoundedRectangle(cornerRadius: 10))
         .contentShape(Rectangle())
         .onTapGesture { onOpenPlayback?() }
+        .contextMenu {
+            plateContextMenu(
+                plate: read.plate, displayName: read.displayName,
+                onCopied: onCopied, onName: onName
+            )
+            if let onAddToWatchlist {
+                Divider()
+                Button(action: onAddToWatchlist) {
+                    Label(watched ? "On watchlist" : "Add to watchlist", systemImage: "star")
+                }
+                .disabled(watched)
+            }
+        }
         .task(id: read.id) {
             guard full == nil, crop == nil, let fetchImages else { return }
             let pair = await fetchImages()
@@ -860,6 +1030,121 @@ private struct ConfidenceChip: View {
     }
 }
 
+// MARK: - Plate name sheet
+
+/// Set, edit, or clear a plate's human-readable name (issue #363). Mirrors the
+/// web console's `namePlate()`: prefilled with the name currently shown, and a
+/// blank field clears it.
+///
+/// Admin-only — `PUT`/`DELETE /lpr/plate-labels` are admin-gated server-side and
+/// the affordances that open this sheet are hidden for everyone else.
+///
+/// The footer says plainly that a name is not an alert, because the watchlist
+/// (which *is* the alert list) is one control away on the same tab.
+private struct PlateNameSheet: View {
+    @ObservedObject var vm: PlatesViewModel
+    let target: PlateNameTarget
+    /// Raise the tab's transient confirmation.
+    let onDone: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name: String
+    @State private var formError: String?
+    @State private var busy = false
+
+    init(vm: PlatesViewModel, target: PlateNameTarget, onDone: @escaping (String) -> Void) {
+        self.vm = vm
+        self.target = target
+        self.onDone = onDone
+        _name = State(initialValue: target.current ?? "")
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Plate") {
+                    HStack(spacing: 8) {
+                        Text(target.plate)
+                            .font(.system(.body, design: .monospaced).weight(.semibold))
+                            .foregroundColor(CrumbColors.textPrimary)
+                            .textSelection(.enabled)
+                        CopyPlateButton(plate: target.plate, displayName: target.current, size: 13)
+                        Spacer()
+                    }
+                }
+                Section {
+                    TextField("Name (e.g. Delivery van)", text: $name)
+                        .autocorrectionDisabled()
+                    if let formError {
+                        Text(formError).font(.caption).foregroundColor(CrumbColors.error)
+                    }
+                } header: {
+                    Text("Name")
+                } footer: {
+                    Text(
+                        "Shown wherever this plate appears. Naming a plate does not add it "
+                        + "to the watchlist and never triggers an alert. Leave blank to clear the name."
+                    )
+                    .font(.caption)
+                    .foregroundColor(CrumbColors.textTertiary)
+                }
+                #if os(macOS)
+                // macOS sheets don't reliably render the nav-bar toolbar, so the
+                // Cancel/Save pair also lives in the body here (same reason the
+                // watchlist sheet carries its own Done row).
+                HStack {
+                    Button("Cancel") { dismiss() }
+                        .buttonStyle(.plain)
+                        .foregroundColor(CrumbColors.textSecondary)
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button { Task { await save() } } label: {
+                        if busy { ProgressView().controlSize(.small) } else { Text("Save") }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(busy)
+                    .foregroundColor(CrumbColors.tealAccent)
+                    .keyboardShortcut(.defaultAction)
+                }
+                .listRowSeparator(.hidden)
+                #endif
+            }
+            .navigationTitle(target.current == nil ? "Name plate" : "Rename plate")
+            .navBarInline()
+            .toolbar {
+                ToolbarItem(placement: .barLeading) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundColor(CrumbColors.textSecondary)
+                }
+                ToolbarItem(placement: .barTrailing) {
+                    Button { Task { await save() } } label: {
+                        if busy { ProgressView().controlSize(.small) } else { Text("Save") }
+                    }
+                    .disabled(busy)
+                    .foregroundColor(CrumbColors.tealAccent)
+                }
+            }
+        }
+    }
+
+    private func save() async {
+        busy = true
+        let action = PlateNaming.action(input: name, current: target.current)
+        let err = await vm.namePlate(target.plate, name: name, current: target.current)
+        busy = false
+        if let err {
+            formError = err
+            return
+        }
+        switch action {
+        case .set: onDone("Plate named.")
+        case .clear: onDone("Name cleared.")
+        case .noChange: break
+        }
+        dismiss()
+    }
+}
+
 // MARK: - Watchlist sheet
 
 private struct WatchlistSheet: View {
@@ -873,6 +1158,9 @@ private struct WatchlistSheet: View {
     @State private var busy = false
     /// Entry being edited (admin taps a row); drives the edit sheet.
     @State private var editing: WatchlistEntry?
+    /// Plate whose name is being edited (admin only); nil = sheet closed.
+    @State private var naming: PlateNameTarget?
+    @State private var toast: String?
 
     var body: some View {
         NavigationStack {
@@ -931,9 +1219,15 @@ private struct WatchlistSheet: View {
                             .font(.caption).foregroundColor(CrumbColors.textTertiary)
                     }
                     ForEach(vm.watchlist) { entry in
-                        WatchlistRow(entry: entry, canRemove: vm.isAdmin) {
-                            Task { await remove(entry) }
-                        }
+                        WatchlistRow(
+                            entry: entry,
+                            canRemove: vm.isAdmin,
+                            onRemove: { Task { await remove(entry) } },
+                            onCopied: { flash("Copied \($0)") },
+                            onName: vm.isAdmin && !entry.plate.isEmpty
+                                ? { naming = PlateNameTarget(plate: entry.plate, current: entry.resolvedName) }
+                                : nil
+                        )
                         .contentShape(Rectangle())
                         .onTapGesture { if vm.isAdmin { editing = entry } }
                     }
@@ -947,10 +1241,33 @@ private struct WatchlistSheet: View {
                 }
             }
         }
+        .overlay(alignment: .bottom) {
+            if let toast {
+                Text(toast)
+                    .font(.subheadline.weight(.medium)).foregroundColor(.white)
+                    .padding(.horizontal, 18).padding(.vertical, 10)
+                    .background(Capsule().fill(.black.opacity(0.78)))
+                    .padding(.bottom, 24)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+        }
         .task { vm.loadWatchlist(); vm.loadLprConfig() }
         .sheet(item: $editing) { entry in
             WatchlistEditSheet(vm: vm, entry: entry)
                 .macModalSize(width: 420, height: 420)
+        }
+        .sheet(item: $naming) { target in
+            PlateNameSheet(vm: vm, target: target) { flash($0) }
+                .macModalSize(width: 420, height: 340)
+        }
+    }
+
+    private func flash(_ msg: String) {
+        withAnimation { toast = msg }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            withAnimation { toast = nil }
         }
     }
 
@@ -997,6 +1314,10 @@ private struct WatchlistRow: View {
     let entry: WatchlistEntry
     let canRemove: Bool
     let onRemove: () -> Void
+    /// Raise the sheet's transient confirmation ("Copied ABC123").
+    var onCopied: ((String) -> Void)? = nil
+    /// Open the name editor for this plate; nil for a non-admin.
+    var onName: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1020,6 +1341,11 @@ private struct WatchlistRow: View {
                     Text(label).font(.caption).foregroundColor(CrumbColors.textSecondary)
                 }
             }
+            if !entry.plate.isEmpty {
+                CopyPlateButton(
+                    plate: entry.plate, displayName: entry.displayName, onCopied: onCopied
+                )
+            }
             Spacer()
             if entry.kind == "ignore" {
                 Image(systemName: "eye.slash")
@@ -1039,6 +1365,12 @@ private struct WatchlistRow: View {
             }
         }
         .padding(.vertical, 2)
+        .contextMenu {
+            plateContextMenu(
+                plate: entry.plate, displayName: entry.displayName,
+                onCopied: { onCopied?($0) }, onName: onName
+            )
+        }
     }
 
     /// Parse a `#rrggbb` (or `rrggbb`) string into a `Color`, or nil.
@@ -1079,18 +1411,22 @@ private struct WatchlistEditSheet: View {
         NavigationStack {
             List {
                 Section("Plate") {
-                    VStack(alignment: .leading, spacing: 2) {
-                        if let name = entry.resolvedName {
-                            Text(name)
-                                .font(.body.weight(.semibold))
-                                .foregroundColor(CrumbColors.textPrimary)
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            if let name = entry.resolvedName {
+                                Text(name)
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(CrumbColors.textPrimary)
+                            }
+                            Text(entry.plate)
+                                .font(.system(.body, design: .monospaced).weight(.semibold))
+                                .foregroundColor(CrumbColors.textSecondary)
                         }
-                        Text(entry.plate)
-                            .font(.system(.body, design: .monospaced).weight(.semibold))
-                            .foregroundColor(CrumbColors.textSecondary)
+                        CopyPlateButton(plate: entry.plate, displayName: entry.displayName, size: 13)
+                        Spacer()
                     }
                 }
-                Section("Details") {
+                Section {
                     TextField("Label (optional)", text: $label)
                     Picker("Kind", selection: $kind) {
                         Text("Watch").tag("watch")
@@ -1104,6 +1440,15 @@ private struct WatchlistEditSheet: View {
                     if let formError {
                         Text(formError).font(.caption).foregroundColor(CrumbColors.error)
                     }
+                } header: {
+                    Text("Details")
+                } footer: {
+                    Text(
+                        "This label belongs to the watchlist entry. A plate name set with "
+                        + "\"Rename this plate\" wins over it wherever the plate is shown."
+                    )
+                    .font(.caption)
+                    .foregroundColor(CrumbColors.textTertiary)
                 }
             }
             .navigationTitle("Edit plate")

@@ -33,6 +33,33 @@ extension PlatformImage {
     }
 }
 
+// MARK: - Clipboard
+
+/// The system clipboard, one call site for both platforms: `UIPasteboard` on
+/// iOS, `NSPasteboard` on macOS (which needs an explicit `clearContents()`
+/// before a write, or the old contents can win the type negotiation).
+///
+/// Callers pass the RAW value they want on the clipboard — this never
+/// substitutes a display name for the thing it labels.
+enum CrumbClipboard {
+    /// Put `text` on the general pasteboard. Trims surrounding whitespace and
+    /// returns `false` (copying nothing) for an empty result, so a caller can
+    /// skip its "Copied" confirmation when there was nothing to copy.
+    @discardableResult
+    static func copy(_ text: String) -> Bool {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        #if os(macOS)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
+        #else
+        UIPasteboard.general.string = value
+        #endif
+        return true
+    }
+}
+
 // MARK: - Cross-platform View modifier shims
 //
 // SwiftUI's iOS-only modifiers don't exist on macOS; these compile to the iOS
