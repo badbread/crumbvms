@@ -8,133 +8,6 @@ revisit.
 
 ---
 
-## 2026-08-07, The plate report fetches the plate's history ONCE and filters it in the client; sighting images are downscaled in-client because the server derivative was never merged
-
-**Context.** The desktop single-plate PDF report shipped as a one-shot
-"Download PDF": pick a timezone, tick "include sighting history", and the file
-lands in a save dialog unseen. A real report from a live instance showed the
-gap, a plate with 27 sightings on one camera rendered 4 thumbnails under "Other
-sightings" and no list at all. Making the report useful as a handout means
-adding an occurrence table, a date range, a camera filter, an image-count
-control, operator notes, and a preview, which raises two questions: where the
-filtering happens, and how the file stays small enough to email.
-
-**Decision 1, ONE fetch on dialog open, all filtering client-side.** The
-builder pages `GET /plates?q=<plate>&match=exact` over the operator's cameras
-until `has_more` is false or a 2 000-read ceiling, keeps that list in memory,
-and derives everything from it: the live "N of M sightings match" summary, the
-camera filter's options, the dossier stats, and the occurrence table. Changing
-an option re-renders the PDF without touching the network. The window and
-camera filters are pure functions over that list
-(`plate_report_options.dart`), which is what makes them unit-testable. The
-ceiling is surfaced on the report itself rather than silently truncating.
-
-**Decision 2, sighting images are downscaled in the CLIENT before embedding.**
-Detection frames are stored at full camera resolution (~170 KB is typical) and
-the report draws a sighting thumbnail a couple of centimetres wide. Every
-embedded sighting image goes through `downscaleForReport` (longest edge 640 px,
-JPEG q72) on a background isolate. The subject read's own two images are left
-at full quality, they are the evidence. The image count is capped at 24 even
-for "all".
-
-**Rejected:**
-- **Re-querying the server on every option change.** Correct, and much worse:
-  a date-range or camera toggle would cost a round trip, the live summary
-  could not update as you type, and the printed list could disagree with the
-  printed window under a slow response. The client-side filter is re-applied
-  even though the window is also sent to the server, so the two can never
-  diverge.
-- **Asking the server for a downscaled derivative.** `GET
-  /events/:id/snapshot?w=N` and `GET /plates/:id/crop?tight=1` were proposed
-  under #394 for exactly this, but that PR was closed unmerged, so on `main`
-  both routes return the stored bytes verbatim. Client-side downscale is the
-  honest option today.
-- **Bundling a Unicode font.** The `pdf` package's built-in Helvetica/Courier
-  are Latin-1 only, so non-ASCII operator notes or camera names will not render
-  correctly. Shipping a TTF is a build-asset decision (golden rule 6) and is
-  left for its own change.
-- **A server-side report endpoint.** Composition stays in the client: the
-  report is a client feature with no other consumer, and moving it server-side
-  would mean the api reading media it deliberately mounts read-only.
-
-**Revisit triggers (any one):**
-- The `?w=` / `?tight=1` derivatives land on `main` (then fetch them instead of
-  downscaling locally, and drop `downscaleForReport` from the report path).
-- A plate routinely exceeds the 2 000-read fetch ceiling in practice (then page
-  lazily, or add a server-side aggregate).
-- Another client wants the same report (then the composition layer, which is
-  already a pure function of resolved inputs, is the thing to share, not the
-  dialog).
-- A non-ASCII locale reports garbled notes or camera names (then bundle a
-  Unicode font and accept the asset size).
-
----
-
-## 2026-08-07, MQTT packet limit: a generous fixed default with an env escape hatch, and oversize payloads treated as a latched condition, not a disconnect
-
-**Context.** rumqttc 0.24 defaults `max_incoming_packet_size` to 10 KiB and
-treats an over-limit incoming packet as a **fatal event-loop error**, not a
-skipped message. Neither MQTT client set the option, so both inherited that
-default. A real `frigate/events` payload measured 11409 bytes on a live install:
-the event loop died, the supervisor reconnected, the still-queued message killed
-it again — Frigate motion and Frigate detection ingest were both 100% dead, in a
-loop, on a v0.2.0 release candidate.
-
-**Decision 1: a fixed 256 KiB default, plus `FRIGATE_MQTT_MAX_PACKET_BYTES`.**
-
-| # | Option | Verdict |
-|---|--------|---------|
-| 1 | Raise the limit to a fixed value, no knob | Rejected: the envelope is Frigate's, not Crumb's — it grows with attributes, plate arrays and tracked-object path data — so "big enough" is not a claim Crumb can make permanently. A payload past the ceiling would again need a rebuild to fix. |
-| 2 | **Fixed 256 KiB default + env override, clamped 10 KiB–16 MiB** | **CHOSEN.** ~23x the observed payload, so nobody should ever touch the knob; the knob exists so that if they must, the log line that reports the failure also names the fix. Clamped at both ends: below rumqttc's own default would re-create this bug, and an unbounded value would remove the only thing stopping a hostile or broken broker from making Crumb buffer without limit. |
-| 3 | A DB-backed setting in the Frigate settings panel | Rejected for now: a migration, a DTO, an admin-console field and a hot-reload path, all for a value whose correct setting is "don't touch it". Config precedence (DB wins over env) exists for settings operators tune; this is an escape hatch. |
-| 4 | No limit at all (`usize::MAX`) | Rejected: the limit is a memory-safety bound on untrusted broker input. |
-
-The value is read at connect time rather than cached at startup, so each
-reconnect re-reads it and a restart is all that is needed to apply a change.
-
-**Decision 2: an oversize payload is a latched, non-transient condition.**
-
-The API ingester's back-off reset on `ConnAck` was correct for a broker outage
-and actively wrong here: the failure happens *after* `ConnAck`, so the delay
-reset to 1s on every cycle — a permanent condition retried once a second,
-forever. Worse, the same `ConnAck` set `healthy = true` and stamped the
-`frigate_heartbeat`, so `frigate_disconnected` never fired and the console
-showed a perfectly healthy integration ingesting nothing. That invisibility is
-why the bug survived to a release candidate.
-
-Rejected: **stop retrying entirely** (a dead provider cannot self-heal when the
-operator raises the limit, and it would need a restart to recover). Rejected:
-**skip the oversized message and continue** (rumqttc gives no such hook at 0.24;
-the framing error is fatal by construction). Chosen instead: latch on the
-oversize error, jump straight to the maximum back-off, withhold health and the
-heartbeat until a publish is actually received, and clear the latch on the first
-successful publish. The recorder side needs no retry change (its supervisor
-already backs off to 30s) but reports the specific cause through the existing
-`note_unhealthy_cause` slot, because a source that is broken from its first
-connection never transitions and so would otherwise show only the generic
-"not delivering frames".
-
-**Trades knowingly accepted:**
-
-- A limit raise still requires a restart (env-only, by decision 1).
-- While latched with a broker that publishes nothing at all, the API reports
-  Frigate disconnected even if the oversize condition has since resolved. Any
-  restart or any received publish clears it; reporting a stuck ingest as an
-  outage is the honest direction to err in.
-- Fail-open recording is untouched: a Motion-mode camera whose Frigate source
-  is dead keeps recording continuously, exactly as before.
-
-**Revisit triggers:**
-
-- Anyone actually needing `FRIGATE_MQTT_MAX_PACKET_BYTES` in the field → the
-  default is wrong; raise it, and reconsider option 3 (a real setting).
-- A rumqttc version that can skip an over-limit packet instead of failing the
-  connection → the latch becomes unnecessary; drop it and just log.
-- A second Crumb subsystem gaining an MQTT client → move the limit off the
-  `FRIGATE_`-prefixed key onto a neutral one, keeping the old key as an alias.
-
----
-
 ## 2026-08-07, The HA placement PUT stays a whole-object REPLACE, against the `PUT /config/server` merge convention (issue #552)
 
 **Context.** The v0.2.0 release-prep API audit flagged `PUT
@@ -739,6 +612,91 @@ stream-selection gap.
   timeout) before leaving a rung.
 - WebRTC live on Android being reconsidered (see the 2026-07-02 verdict) ⇒ its
   codec negotiation would change this calculus entirely.
+
+**2026-08-07 amendment (#560): H.265 was never the discriminator; the ladder is
+evidence-based, graduated, and no verdict is permanent.**
+
+The "healthy-but-slow rungs get downgraded" revisit trigger above fired within a
+day, on unmetered 5 GHz Wi-Fi with an excellent link, and measurement then
+undercut the premise of the entry itself.
+
+**Measured, 2026-08-07, Media3 1.4.1 on a Galaxy S24.** Media3's RTSP stack plays
+H.265 mains fine, 4K included: with one camera open fullscreen, go2rtc showed a
+single `AndroidXMedia3/1.4.1` consumer attached to the H.265 MAIN, video and audio
+both negotiated, held for well over twenty seconds, sharp picture, no SD badge.
+Seven of the operator's eleven cameras are H.265 mains. The claim in the code
+comments and the issue history — "Media3 can't bring up H.265 over RTSP" — is
+false as of the version this app ships, and it had already misled one session. It
+is corrected at the source in `LiveStreamFallback.kt`, and the comments in the two
+live composables now point there.
+
+What genuinely fails is per-stream and is about RTP **packetization**, not the
+codec: `RtpH265Reader` has never implemented RFC 7798 §4.4.2 Aggregation Packets
+(androidx/media#1008) and throws
+`UnsupportedOperationException("need to implement processAggregationPacket")` —
+verified present in the pinned `media3-exoplayer-rtsp:1.4.1`. Aggregation Packets
+pack SMALL NALs into one RTP packet, so an LPR camera at 1080p hits that path
+while the same vendor's 4K streams always fragment (FU, which Media3 does
+implement) and play fine. Of eleven cameras, exactly one should ever walk the
+ladder in fullscreen. `data/camera-compatibility.json` already had this right.
+
+**What was wrong.** `!everReady -> true` read *any* failure before the first frame
+as "this bitstream is undecodable". Media3 reports a failed or timed-out
+connection with an IO code that says nothing about the codec, and a camera with a
+long keyframe interval or a cold go2rtc restream can miss the first-load buffering
+limit once for entirely ordinary reasons. Worse, the resulting guess was latched in
+`LiveStreamFallbackMemory` for the whole app run, so one blip pinned that camera to
+SD until the app was force-stopped — where the pre-#529 single-step downgrade had
+at least been per-visit. Seven HD-capable cameras, one bad moment each, and the
+whole session is in SD: "very eager to go to SD" exactly.
+
+**The rule now**, in order: a decoder/format error, or a known-deterministic
+failure signature found in the exception chain (today: `processAggregationPacket`),
+steps down immediately — those repeat on every attempt, so retrying is pointless;
+a rung that has played a video frame stays put; a codec-agnostic failure (the
+`2000..2999` IO block, `ERROR_CODE_TIMEOUT`, `ERROR_CODE_BEHIND_LIVE_WINDOW`,
+`ERROR_CODE_DECODING_RESOURCES_RECLAIMED`) needs
+`CODEC_AGNOSTIC_FAILURES_BEFORE_FALLBACK` (5) in a row with no frame in between,
+which is the entire fast-backoff curve (~30 s); anything else before the first
+frame — the stall watchdog's silent BUFFERING spin — needs
+`PRE_FIRST_FRAME_FAILURES_BEFORE_FALLBACK` (2). Verdicts expire after
+`VERDICT_TTL_MS` (10 min). In fullscreen the "it played" signal is a RENDERED
+VIDEO FRAME, not `STATE_READY`, which can be reached on the audio track alone.
+Every attach, step-down and held rung is logged under `CrumbLiveFallback` with the
+tier, the transition, the error code and a credential-scrubbed exception chain.
+
+**Rejected:**
+
+- *An IO code never counts as evidence at all.* Clean, and it re-strands #524's
+  camera: the aggregation-packet exception is thrown inside the loader, so it
+  reaches the app wrapped in an `IOException` and arrives looking exactly like a
+  network failure. Hence the graduated threshold instead of a veto.
+- *Requiring a decoder/format error before ever leaving a rung.* An unbringable
+  stream frequently produces no exception at all, only a BUFFERING spin, so this
+  would restore #524 outright.
+- *Raising `MAIN_FIRSTLOAD_BUFFER_MS` / `DERIVED_FIRSTLOAD_BUFFER_MS` alone* (the
+  first option the original entry suggested). It trades the #524 spinner back in
+  for a slower wrong answer and does nothing about the latch, which is what turned
+  a one-off blip into a session-long complaint.
+- *Rendered-frame readiness on the WALL tile too.* A tile's surface can legitimately
+  go away underneath it, which would read as "never played" and push toward MORE
+  downgrades — the exact regression being fixed. Fullscreen's surface is always
+  attached, so the stricter signal is safe there and only there.
+- *Proactive codec selection.* Still the real fix (the parent entry's first revisit
+  trigger), still a server wire change, and now known to be the wrong lever anyway:
+  the codec is not what predicts failure — the packetization is, and nothing
+  advertises that.
+
+**Trades accepted:** the one genuinely unplayable camera takes up to ~30 s to
+escape a rung when its failure surfaces only as an IO code (immediate when the
+signature or a decoder error is present), and every camera re-tests the top of its
+ladder once every 10 minutes.
+
+**Revisit triggers:** androidx/media#1008 landing ⇒ the signature list and possibly
+the whole ladder can go; more deterministic signatures showing up in the field ⇒
+add them to `UNPLAYABLE_FAILURE_SIGNATURES` rather than lowering a threshold;
+operators reporting a camera takes too long to settle ⇒ lower
+`CODEC_AGNOSTIC_FAILURES_BEFORE_FALLBACK`, not the unexplained one.
 
 ---
 

@@ -220,19 +220,6 @@ disabled: no background task runs, and the events surface simply returns
 empty results. The behavior of pixel motion detection, recording, and
 everything else is completely unaffected either way.
 
-## If nothing arrives and the log mentions an oversized message
-
-MQTT limits how large a single message Crumb will read, and a Frigate event
-larger than that limit drops the broker connection rather than being skipped.
-Because the message is still waiting on the broker, the same thing happens on
-every reconnect: Frigate motion sources and detection ingest both go quiet and
-stay quiet. Crumb says so explicitly, naming the size of the message, the
-current limit, and the setting to change: `FRIGATE_MQTT_MAX_PACKET_BYTES` (see
-the [environment reference](/configuration/environment-reference)). The default
-of 256 KiB is many times larger than a normal Frigate event, so if you hit this,
-raise the limit, restart, and then look at whether something upstream is
-publishing unusually large events.
-
 ## What you're responsible for
 
 If you enable named recognition (identifying specific people or license
