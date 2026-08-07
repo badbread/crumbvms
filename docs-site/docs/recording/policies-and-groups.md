@@ -80,7 +80,7 @@ have its own budget, put it on its own policy.
 
 ## Camera groups
 
-Groups still exist in v0.1.0, but only as a bulk-assign convenience, not as
+Groups still exist, but only as a bulk-assign convenience, not as
 an inheritance layer. Assigning a policy to a group writes that policy
 directly onto every member camera's own assignment. There is no
 group-level policy that members silently inherit; the group is just a

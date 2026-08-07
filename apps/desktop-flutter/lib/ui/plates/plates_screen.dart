@@ -1500,7 +1500,7 @@ class _PlateThumb extends StatefulWidget {
   final double iconSize;
 
   /// Which image(s) to show — the full frame, the plate crop, or both. The crop
-  /// is derived client-side from the fetched snapshot (off the UI isolate,
+  /// is derived client-side from the fetched snapshot (engine-native decode,
   /// cached) and always falls back to the full frame when the read has no bbox
   /// or the crop fails.
   final PlateImageDisplay imageMode;
@@ -1565,8 +1565,8 @@ class _PlateThumbState extends State<_PlateThumb> {
 
   /// Derive the plate-region crop from [bytes] (no network) when this thumb is
   /// a cropping one and the read has a bbox. Uses the shared crop cache: a hit
-  /// is applied synchronously; a miss computes off the UI isolate and then
-  /// setState-s. Keyed by read id (bbox belongs to the read).
+  /// is applied synchronously; a miss computes via the engine's native codec
+  /// and then setState-s. Keyed by read id (bbox belongs to the read).
   void _maybeCrop(Uint8List bytes) {
     if (widget.imageMode == PlateImageDisplay.fullOnly || _disposed) return;
     final bbox = widget.read.bbox;
@@ -2795,9 +2795,9 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
 /// The prominent plate crop shown in the detail pop-up: the plate region
 /// cropped from the snapshot bytes already fetched for this read's tile (read
 /// straight from the shared snapshot cache — no network). The crop itself is
-/// computed off the UI isolate and cached (see plate_crop.dart). Renders
-/// nothing when there's no cached snapshot or no bbox, so the pop-up simply
-/// shows the clip in that case.
+/// computed with the engine's native codec and cached (see plate_crop.dart).
+/// Renders nothing when there's no cached snapshot or no bbox, so the pop-up
+/// simply shows the clip in that case.
 class _PlateDetailCrop extends StatefulWidget {
   const _PlateDetailCrop({
     required this.read,
