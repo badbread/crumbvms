@@ -1222,6 +1222,21 @@ impl UnhealthyAlertGate {
         *slot = Some(reason.to_owned());
     }
 
+    /// Record a specific unhealthy cause discovered while the source is ALREADY
+    /// unhealthy, i.e. with no health transition for [`report_health`] to hang
+    /// it on.
+    ///
+    /// A source that is broken from its first connection never transitions
+    /// (health starts `false`), so the only cause the aggregator would otherwise
+    /// have is its generic "not delivering frames". Issue #479's cuda-on-a-
+    /// deviceless-host is exactly that shape: the operator-actionable cause is
+    /// learned several seconds in, from ffmpeg's stderr. Telemetry only — same
+    /// slot, same rules as [`Self::set_unhealthy_reason`]; the fail-open watch
+    /// channel is untouched.
+    fn note_unhealthy_cause(&self, reason: &str) {
+        self.set_unhealthy_reason(reason);
+    }
+
     /// The cause of this source's most recent UNHEALTHY transition, if any.
     pub(crate) fn last_unhealthy_reason(&self) -> Option<String> {
         self.last_unhealthy_reason
@@ -1829,6 +1844,13 @@ async fn run_one_source(
 
     let mut backoff_secs = BACKOFF_BASE_SECS;
 
+    // Per-camera hardware-decode fallback latch (issue #479), owned here so it
+    // SURVIVES the reconnect back-off below: a hardware backend that cannot
+    // decode this camera must not be relaunched on every reconnect forever.
+    // Worker-lifetime by design — a recorder restart, a camera-config change, or
+    // a supervisor respawn all give the hardware another chance.
+    let mut hw_state = HwDecodeFallback::default();
+
     loop {
         if cancel.is_cancelled() {
             break;
@@ -1845,6 +1867,7 @@ async fn run_one_source(
                     &cancel,
                     &alert_gate,
                     alert_after_secs,
+                    &mut hw_state,
                 )
                 .await
             }
@@ -2090,6 +2113,9 @@ async fn aggregate_health(
     let mut last_healthy: std::collections::HashMap<SourceKind, bool> =
         enabled.iter().map(|&k| (k, false)).collect();
     let mut last_sent: Option<bool> = None;
+    // The fail-open reason last persisted, so a cause that becomes MORE
+    // specific mid-episode is written once (and only once) — see below.
+    let mut last_reason: Option<String> = None;
 
     let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2128,37 +2154,50 @@ async fn aggregate_health(
             }
         }
         let camera_healthy = gate.healthy(now);
-        if last_sent != Some(camera_healthy) {
+        let flipped = last_sent != Some(camera_healthy);
+        if flipped {
             // Flip the in-memory fail-open signal FIRST and unconditionally —
             // recording correctness must never wait on the telemetry DB write
             // below (same rule as report_health).
             let _ = health_tx.send(camera_healthy);
             last_sent = Some(camera_healthy);
-            if camera_healthy {
-                info!(camera_id = %camera_id, "motion health: RECOVERED (a source is healthy)");
-                // Level signal for the admin console (migration 0072): current
-                // state is healthy again — clears the "recording continuously"
-                // badge. Best-effort; never blocks the fail-open flip above.
-                persist_motion_health(&pool, camera_id, true, None).await;
-            } else {
-                // Prefer the SPECIFIC cause per source: a configuration fact
-                // (structurally disabled) outranks the last unhealthy
-                // transition's reason, which outranks the generic "not
-                // delivering frames" fallback inside `fail_open_reason`.
-                let mut reasons: std::collections::HashMap<SourceKind, String> = alert_gates
-                    .iter()
-                    .filter_map(|(&kind, gate)| gate.last_unhealthy_reason().map(|r| (kind, r)))
-                    .collect();
-                for (&kind, &reason) in &structural_disabled {
-                    reasons.insert(kind, reason.to_owned());
-                }
-                let reason = fail_open_reason(&last_healthy, &reasons);
+        }
+        if flipped && camera_healthy {
+            info!(camera_id = %camera_id, "motion health: RECOVERED (a source is healthy)");
+            // Level signal for the admin console (migration 0072): current
+            // state is healthy again — clears the "recording continuously"
+            // badge. Best-effort; never blocks the fail-open flip above.
+            persist_motion_health(&pool, camera_id, true, None).await;
+            last_reason = None;
+        } else if !camera_healthy {
+            // Prefer the SPECIFIC cause per source: a configuration fact
+            // (structurally disabled) outranks the last unhealthy
+            // transition's reason, which outranks the generic "not
+            // delivering frames" fallback inside `fail_open_reason`.
+            let mut reasons: std::collections::HashMap<SourceKind, String> = alert_gates
+                .iter()
+                .filter_map(|(&kind, gate)| gate.last_unhealthy_reason().map(|r| (kind, r)))
+                .collect();
+            for (&kind, &reason) in &structural_disabled {
+                reasons.insert(kind, reason.to_owned());
+            }
+            let reason = fail_open_reason(&last_healthy, &reasons);
+            // Re-persist while STILL unhealthy when the cause has changed, not
+            // only on the flip into fail-open (issue #479). A source that is
+            // broken from its first connection is already fail-open, with only
+            // the generic "not delivering frames", by the time it learns the
+            // real cause (e.g. cuda cannot initialise here) seconds later —
+            // pinning the reason at flip time would strand the operator with
+            // the vaguest wording the run will ever produce. Still one write
+            // per distinct cause: unchanged reasons are skipped.
+            if flipped || last_reason.as_deref() != Some(reason.as_str()) {
                 warn!(
                     camera_id = %camera_id,
                     reason = %reason,
                     "motion health: FAIL-OPEN (no source healthy, or one down past grace)"
                 );
                 persist_motion_health(&pool, camera_id, false, Some(&reason)).await;
+                last_reason = Some(reason);
             }
         }
 
@@ -2298,6 +2337,7 @@ async fn run_pixel_diff_loop(
     cancel: &CancellationToken,
     alert_gate: &Arc<UnhealthyAlertGate>,
     alert_after_secs: u64,
+    hw_state: &mut HwDecodeFallback,
 ) -> Result<()> {
     // Fail-open: every (re)entry into this function is a fresh connection
     // attempt — mark unhealthy up front so a camera stuck cycling through
@@ -2447,15 +2487,22 @@ async fn run_pixel_diff_loop(
     // Correctness item 11: acquire one permit before opening an NVDEC session.
     // Fall back to CPU decode if the semaphore is exhausted.
     //
-    // HwAccel::Auto (§6.2 / O3): probe whether NVDEC is actually usable in this
-    // container via `nvdec_available()` (OnceLock-cached). On a GPU-absent host
-    // the probe returns false and we fall through to CPU, so a plain
-    // `docker compose up` (no GPU overlay) never tries cuda and fails.
-    let want_cuda = match config.motion_hwaccel {
-        HwAccel::Cpu | HwAccel::Vaapi => false,
-        HwAccel::Cuda => true,
-        HwAccel::Auto => crumb_common::config::nvdec_available(),
-    };
+    // HwAccel::Auto (§6.2 / O3): resolve against a RUNTIME cuda-device probe
+    // (`ffmpeg -init_hw_device cuda`, cached for the process — see
+    // `decode_probe::cuda_runtime_available`). Issue #479: the old probe asked
+    // `ffmpeg -hwaccels` whether cuda was COMPILED IN, which is true on every
+    // host running the bundled image, so `auto` picked cuda on GPU-less hosts
+    // and motion never recovered. A plain `docker compose up` (no GPU overlay)
+    // now resolves to CPU.
+    //
+    // `hw_state` is the per-camera, worker-lifetime latch (issue #479): once a
+    // hardware backend has proven it cannot decode this camera, every later
+    // (re)connect uses CPU instead of relaunching the same failing flags.
+    let cuda_runtime_ok = matches!(config.motion_hwaccel, HwAccel::Auto)
+        && crate::decode_probe::cuda_runtime_available().await;
+    let resolved = config.motion_hwaccel.resolve_auto(cuda_runtime_ok);
+    let demoted = hw_state.forced_cpu().map(str::to_owned);
+    let want_cuda = matches!(resolved, HwAccel::Cuda) && demoted.is_none();
     // VAAPI (Intel/AMD iGPU) decode is an explicit opt-in. It shares neither the
     // NVDEC semaphore nor the cuda filter path: the iGPU decodes the sub-stream and
     // ffmpeg downloads frames to system memory, so the analysis-side video filter
@@ -2465,7 +2512,7 @@ async fn run_pixel_diff_loop(
     // the DRI render node must be mapped into the container (the vaapi compose
     // overlay). If an operator picks VAAPI without that mapping, degrade to CPU
     // decode instead of looping on an ffmpeg device-creation error forever.
-    let use_vaapi = matches!(config.motion_hwaccel, HwAccel::Vaapi) && {
+    let use_vaapi = matches!(resolved, HwAccel::Vaapi) && demoted.is_none() && {
         let present = std::path::Path::new(&config.motion_vaapi_device).exists();
         if !present {
             warn!(
@@ -2506,14 +2553,19 @@ async fn run_pixel_diff_loop(
     // presence + semaphore outcome), not ffmpeg's runtime init result. The one
     // known launch-vs-runtime gap — explicit `cuda` on a build/host without
     // usable NVDEC — is called out explicitly below.
-    let active = if use_cuda {
-        "cuda"
+    let launched_hw = if use_cuda {
+        LaunchedHw::Cuda
     } else if use_vaapi {
-        "vaapi"
+        LaunchedHw::Vaapi
     } else {
-        "cpu"
+        LaunchedHw::None
     };
-    let fallback_reason: Option<String> = if want_cuda && !use_cuda {
+    let active = launched_hw.as_str().unwrap_or("cpu");
+    // A latched runtime demotion outranks every launch-time explanation: it is
+    // the most specific thing we know about this camera (issue #479).
+    let fallback_reason: Option<String> = if let Some(reason) = demoted {
+        Some(reason)
+    } else if want_cuda && !use_cuda {
         Some("NVDEC session limit reached (MAX_GPU_DECODE_SESSIONS); decoding on CPU".to_owned())
     } else {
         match config.motion_hwaccel {
@@ -2528,9 +2580,12 @@ async fn run_pixel_diff_loop(
                  compose overlay, e.g. docker-compose.gpu.example.yml)"
                     .to_owned(),
             ),
-            HwAccel::Auto if !want_cuda => {
-                Some("auto: NVDEC not detected in this container; using CPU decode".to_owned())
-            }
+            HwAccel::Auto if !want_cuda => Some(
+                "auto: ffmpeg could not create a cuda hardware device in this container \
+                 (no NVIDIA GPU mapped in, or the driver libraries are missing); using CPU \
+                 decode"
+                    .to_owned(),
+            ),
             _ => None,
         }
     };
@@ -2671,10 +2726,8 @@ async fn run_pixel_diff_loop(
     // NVDEC session + VRAM leak indefinitely).  We drain stderr line-by-line in
     // a background task, logging at DEBUG level.
     let camera_id_log = camera.id;
-    let vaapi_selected = use_vaapi;
-    let stderr_handle = tokio::spawn(async move {
-        drain_motion_stderr(stderr, camera_id_log, vaapi_selected).await;
-    });
+    let stderr_handle =
+        tokio::spawn(async move { drain_motion_stderr(stderr, camera_id_log, launched_hw).await });
 
     // ── 7. Initialise per-loop state ──────────────────────────────────────────
     let w = MOTION_FRAME_WIDTH as usize;
@@ -3243,10 +3296,51 @@ async fn run_pixel_diff_loop(
     }
 
     // Wait for the stderr drain task (exits when stderr pipe closes).
-    let _ = stderr_handle.await;
+    let drain = stderr_handle.await.unwrap_or_default();
 
     // Reap the child process.
     let _ = child.wait().await;
+
+    // ── 9. Hardware-decode runtime verdict (issue #479) ───────────────────────
+    //
+    // The child is gone; `frames_seen` is now the honest answer to "did this
+    // hardware backend actually decode anything". A backend that produced no
+    // frames — with a recognised init-failure signature, or repeatedly — demotes
+    // this camera to CPU decode for the rest of the worker's life, so the outer
+    // back-off reconnect stops relaunching the same failing flags forever (the
+    // second half of the bug: `auto` picked cuda, and nothing ever un-picked it).
+    //
+    // Skipped on cancellation: a worker torn down before its first frame has not
+    // demonstrated anything about the hardware.
+    if !cancel.is_cancelled() {
+        if let Some(reason) =
+            hw_state.note_attempt(launched_hw, frames_seen, drain.init_failure.as_deref())
+        {
+            error!(
+                camera_id = %camera.id,
+                requested = config.motion_hwaccel.as_str(),
+                reason    = %reason,
+                "motion hardware decode is not working for this camera; switching this camera's \
+                 motion decode to CPU on the next reconnect (recording is unaffected — it never \
+                 decodes)"
+            );
+            // Name the specific cause on the health surfaces. The detector is
+            // already unhealthy here (no frames were decoded), so `report_health`
+            // would no-op without publishing a cause; record it directly on the
+            // gate the aggregator reads (issue #523's mechanism), and refresh the
+            // decode-status row so the console explains the switch immediately
+            // instead of only after the next connect.
+            alert_gate.note_unhealthy_cause(&reason);
+            report_decode_status(
+                pool,
+                camera.id,
+                config.motion_hwaccel.as_str(),
+                "cpu",
+                Some(&reason),
+            )
+            .await;
+        }
+    }
 
     // If the loop ended because the sub-stream CLOSED (ffmpeg EOF) rather than a
     // real cancellation, return Err so the outer run() applies back-off and
@@ -3419,6 +3513,157 @@ fn is_vaapi_init_failure(line: &str) -> bool {
         || (l.contains("device type vaapi") && l.contains("needed for"))
 }
 
+/// True when an ffmpeg stderr line signals CUDA/NVDEC hardware-decode
+/// INITIALISATION failure — the twin of [`is_vaapi_init_failure`] for the
+/// NVIDIA path (issue #479).
+///
+/// The bundled ffmpeg has cuda COMPILED IN on every host, so a container with
+/// no NVIDIA device (or with the driver libraries missing after a host driver
+/// upgrade) still launches `-hwaccel cuda` happily and then dies before the
+/// first frame. Observed lines on a cuda-compiled, deviceless host:
+///
+/// ```text
+/// Cannot load libcuda.so.1
+/// Could not dynamically load CUDA
+/// Device creation failed: -1.
+/// No device available for decoder: device type cuda needed for codec h264.
+/// ```
+fn is_cuda_init_failure(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("cannot load libcuda")
+        || l.contains("could not dynamically load cuda")
+        || l.contains("device creation failed")
+        || l.contains("no cuda-capable device")
+        || l.contains("cuda_error_no_device")
+        || l.contains("no device available for decoder")
+        || (l.contains("device type cuda") && l.contains("needed for"))
+}
+
+/// The hardware backend a motion ffmpeg child was actually LAUNCHED with.
+///
+/// Distinct from the *requested* [`HwAccel`]: the requested value may have been
+/// demoted before launch (NVDEC semaphore exhausted, missing render node, a
+/// latched runtime fallback), and the runtime-failure accounting must only ever
+/// judge what was really on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchedHw {
+    /// Software decode — nothing to fall back FROM.
+    None,
+    Cuda,
+    Vaapi,
+}
+
+impl LaunchedHw {
+    /// The backend token for logs/reasons, or `None` for software decode.
+    fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Cuda => Some("cuda"),
+            Self::Vaapi => Some("vaapi"),
+        }
+    }
+
+    /// Whether `line` is this backend's hardware-init failure signature.
+    fn is_init_failure(self, line: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Cuda => is_cuda_init_failure(line),
+            Self::Vaapi => is_vaapi_init_failure(line),
+        }
+    }
+}
+
+/// Consecutive hardware-decode attempts that must end with ZERO decoded frames
+/// before a camera is demoted to CPU decode without a recognised init-failure
+/// signature in stderr. Three attempts (with the caller's 1→2→4 s back-off) is
+/// ~7 s of no motion analysis, well inside the fail-open window, and far enough
+/// from one to not react to a single unlucky reconnect.
+const HW_EMPTY_ATTEMPTS_BEFORE_CPU: u32 = 3;
+
+/// Per-camera, worker-lifetime latch that demotes motion decode to CPU when the
+/// selected hardware backend cannot decode (issue #479).
+///
+/// Recording is untouched by any of this — it is `-c copy` and never decodes.
+/// The latch only changes which ffmpeg flags the NEXT motion (re)connect uses.
+#[derive(Debug, Default)]
+struct HwDecodeFallback {
+    /// Consecutive hardware-decode attempts that produced no frames at all.
+    consecutive_empty: u32,
+    /// Set once the camera has been demoted; carries the operator-facing cause
+    /// that reaches `decode_status.fallback_reason` and `motion_health_reason`.
+    forced_cpu: Option<String>,
+}
+
+/// Decide whether one finished hardware-decode attempt should demote the camera
+/// to CPU, and with what operator-facing reason. Pure so the decision is
+/// unit-testable without a GPU (or the lack of one).
+///
+/// * `frames_seen > 0` — the hardware path works; never demote.
+/// * a recognised init-failure signature — demote immediately; the signature is
+///   unambiguous and re-trying it only reproduces the failure.
+/// * otherwise — demote after [`HW_EMPTY_ATTEMPTS_BEFORE_CPU`] consecutive
+///   attempts that decoded nothing. This is the belt-and-braces arm for a
+///   failure mode whose wording we do not recognise. It can also fire for a
+///   camera that is simply offline; that is deliberate and harmless — CPU decode
+///   works for every stream, so the worst case is losing hardware offload until
+///   the worker restarts, never losing footage.
+fn hw_fallback_reason(
+    backend: &str,
+    frames_seen: u64,
+    consecutive_empty: u32,
+    init_failure: Option<&str>,
+) -> Option<String> {
+    if frames_seen > 0 {
+        return None;
+    }
+    if let Some(line) = init_failure {
+        return Some(format!(
+            "{backend} hardware decode could not initialise in this container ({line}); \
+             motion decode fell back to CPU for this camera"
+        ));
+    }
+    if consecutive_empty >= HW_EMPTY_ATTEMPTS_BEFORE_CPU {
+        return Some(format!(
+            "{backend} hardware decode produced no frames on {consecutive_empty} consecutive \
+             attempts; motion decode fell back to CPU for this camera"
+        ));
+    }
+    None
+}
+
+impl HwDecodeFallback {
+    /// Record the outcome of ONE hardware-decode attempt.
+    ///
+    /// Returns the demotion reason exactly once — on the attempt that latches it
+    /// — so the caller can log/report it without repeating itself on every later
+    /// reconnect. Already-latched and software-decode attempts are no-ops.
+    fn note_attempt(
+        &mut self,
+        hw: LaunchedHw,
+        frames_seen: u64,
+        init_failure: Option<&str>,
+    ) -> Option<String> {
+        let backend = hw.as_str()?;
+        if self.forced_cpu.is_some() {
+            return None;
+        }
+        if frames_seen > 0 {
+            self.consecutive_empty = 0;
+        } else {
+            self.consecutive_empty = self.consecutive_empty.saturating_add(1);
+        }
+        let reason =
+            hw_fallback_reason(backend, frames_seen, self.consecutive_empty, init_failure)?;
+        self.forced_cpu = Some(reason.clone());
+        Some(reason)
+    }
+
+    /// The latched demotion cause, if this camera has been demoted.
+    fn forced_cpu(&self) -> Option<&str> {
+        self.forced_cpu.as_deref()
+    }
+}
+
 /// Drain the motion ffmpeg child's stderr to DEBUG logs until EOF, returning
 /// the number of lines drained (exercised by tests).
 ///
@@ -3433,31 +3678,29 @@ fn is_vaapi_init_failure(line: &str) -> bool {
 /// than ending the drain, because only EOF (`Ok(0)` — the child exited) means
 /// there is nothing left to drain.
 ///
-/// `vaapi_selected` = this child was launched with `-hwaccel vaapi`. When set,
-/// the FIRST stderr line matching [`is_vaapi_init_failure`] is re-logged at
-/// ERROR with an operator-actionable, greppable message (the render-node trap,
-/// issue #411). Escalated at most once per child so a back-off reconnect loop
-/// leaves a recurring-but-not-spammy trail. This only ADDS a log line; it does
-/// not change decode behavior or the fail-open path.
+/// `hw` = the hardware backend this child was launched with. When it is not
+/// [`LaunchedHw::None`], the FIRST stderr line matching that backend's
+/// init-failure signature is re-logged at ERROR with an operator-actionable,
+/// greppable message (the VAAPI render-node trap, issue #411; the cuda
+/// deviceless trap, issue #479) and returned to the caller, which uses it to
+/// demote this camera to CPU decode. Escalated at most once per child so a
+/// back-off reconnect loop leaves a recurring-but-not-spammy trail.
 async fn drain_motion_stderr(
     stderr: impl tokio::io::AsyncRead + Unpin,
     camera_id: uuid::Uuid,
-    vaapi_selected: bool,
-) -> u64 {
+    hw: LaunchedHw,
+) -> StderrDrain {
     let mut reader = tokio::io::BufReader::new(stderr);
     let mut line: Vec<u8> = Vec::new();
-    let mut drained: u64 = 0;
+    let mut drained = StderrDrain::default();
     let mut consecutive_errors: u32 = 0;
-    // Escalate the VAAPI-init-failure signature at most once per child, so a
-    // back-off reconnect loop doesn't flood the log with duplicate ERRORs.
-    let mut vaapi_failure_escalated = false;
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line).await {
             Ok(0) => break, // EOF — ffmpeg has exited.
             Ok(_) => {
                 consecutive_errors = 0;
-                drained += 1;
+                drained.lines += 1;
                 let text = String::from_utf8_lossy(&line);
                 let trimmed = text.trim_end();
                 if !trimmed.is_empty() {
@@ -3466,23 +3709,41 @@ async fn drain_motion_stderr(
                         ffmpeg_stderr = trimmed,
                         "motion ffmpeg"
                     );
-                    if vaapi_selected && !vaapi_failure_escalated && is_vaapi_init_failure(trimmed)
-                    {
-                        vaapi_failure_escalated = true;
-                        error!(
-                            camera_id     = %camera_id,
-                            ffmpeg_stderr = trimmed,
-                            "motion VAAPI decode init FAILING for this camera: the mapped \
-                             render node has no usable VAAPI driver, so the decoder exited \
-                             with no frames. Motion detection is DOWN for this camera and \
-                             recording has failed OPEN to continuous as a safety fallback. \
-                             Likely cause: the /dev/dri render-node NUMBER moved across a \
-                             GPU-driver upgrade + reboot (issue #411). Map the iGPU by its \
-                             STABLE by-path symlink (/dev/dri/by-path/pci-<addr>-render) \
-                             instead of a bare renderD128, or set motion decode to cpu \
-                             (note: server_settings.motion_hwaccel in the DB OVERRIDES the \
-                             MOTION_HWACCEL env var)."
-                        );
+                    // Escalate the hw-init-failure signature at most once per
+                    // child, so a back-off reconnect loop doesn't flood the log
+                    // with duplicate ERRORs.
+                    if drained.init_failure.is_none() && hw.is_init_failure(trimmed) {
+                        drained.init_failure = Some(trimmed.to_owned());
+                        match hw {
+                            LaunchedHw::Vaapi => error!(
+                                camera_id     = %camera_id,
+                                ffmpeg_stderr = trimmed,
+                                "motion VAAPI decode init FAILING for this camera: the mapped \
+                                 render node has no usable VAAPI driver, so the decoder exited \
+                                 with no frames. Motion detection is DOWN for this camera and \
+                                 recording has failed OPEN to continuous as a safety fallback. \
+                                 Likely cause: the /dev/dri render-node NUMBER moved across a \
+                                 GPU-driver upgrade + reboot (issue #411). Map the iGPU by its \
+                                 STABLE by-path symlink (/dev/dri/by-path/pci-<addr>-render) \
+                                 instead of a bare renderD128, or set motion decode to cpu \
+                                 (note: server_settings.motion_hwaccel in the DB OVERRIDES the \
+                                 MOTION_HWACCEL env var)."
+                            ),
+                            LaunchedHw::Cuda => error!(
+                                camera_id     = %camera_id,
+                                ffmpeg_stderr = trimmed,
+                                "motion CUDA/NVDEC decode init FAILING for this camera: ffmpeg \
+                                 has cuda compiled in but no usable NVIDIA device is visible \
+                                 here, so the decoder exited with no frames. This camera's \
+                                 motion decode is falling back to CPU (issue #479); recording \
+                                 is unaffected. Fix the GPU mapping (docker-compose.gpu.\
+                                 example.yml, and re-check it after a host NVIDIA driver \
+                                 upgrade) or set motion decode to cpu (note: \
+                                 server_settings.motion_hwaccel in the DB OVERRIDES the \
+                                 MOTION_HWACCEL env var)."
+                            ),
+                            LaunchedHw::None => {}
+                        }
                     }
                 }
             }
@@ -3510,6 +3771,17 @@ async fn drain_motion_stderr(
         }
     }
     drained
+}
+
+/// What [`drain_motion_stderr`] observed over one ffmpeg child's lifetime.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct StderrDrain {
+    /// Lines drained (exercised by tests; the drain exists to keep the pipe
+    /// from filling — correctness item 5).
+    lines: u64,
+    /// The first hardware-init failure line, when the child was launched with a
+    /// hardware backend and ffmpeg reported one.
+    init_failure: Option<String>,
 }
 
 // ─── motion state ─────────────────────────────────────────────────────────────
@@ -4845,10 +5117,9 @@ mod tests {
         // stdout frame reader stalled (correctness item 5). The byte drain
         // must reach EOF having seen all three lines.
         let stderr: &[u8] = b"frame=1 fps=5\n\xff\xfe bad bytes\nframe=2 fps=5\n";
-        assert_eq!(
-            drain_motion_stderr(stderr, uuid::Uuid::nil(), false).await,
-            3
-        );
+        let drained = drain_motion_stderr(stderr, uuid::Uuid::nil(), LaunchedHw::None).await;
+        assert_eq!(drained.lines, 3);
+        assert_eq!(drained.init_failure, None);
     }
 
     #[tokio::test]
@@ -4856,10 +5127,9 @@ mod tests {
         // A child that dies mid-line leaves a final chunk without '\n' — it is
         // still drained (read_until returns Ok(n>0) for it) before the Ok(0) EOF.
         let stderr: &[u8] = b"line one\ntruncated";
-        assert_eq!(
-            drain_motion_stderr(stderr, uuid::Uuid::nil(), true).await,
-            2
-        );
+        let drained = drain_motion_stderr(stderr, uuid::Uuid::nil(), LaunchedHw::Vaapi).await;
+        assert_eq!(drained.lines, 2);
+        assert_eq!(drained.init_failure, None);
     }
 
     // ── VAAPI init-failure signature (render-node reorder trap, issue #411) ──────
@@ -4888,6 +5158,199 @@ mod tests {
         assert!(!is_vaapi_init_failure(
             "Using VAAPI device /dev/dri/renderD128"
         ));
+    }
+
+    // ── CUDA runtime failure + per-camera fallback (issue #479) ──────────────────
+
+    #[test]
+    fn cuda_init_failure_matches_the_deviceless_host_signature() {
+        // Captured verbatim from a cuda-COMPILED ffmpeg on a host with no NVIDIA
+        // device — the exact configuration in issue #479 (`ffmpeg -hwaccels`
+        // lists cuda, `-hwaccel cuda` dies before frame 1).
+        assert!(is_cuda_init_failure(
+            "[AVHWDeviceContext @ 0x5a26f2de9ec0] Cannot load libcuda.so.1"
+        ));
+        assert!(is_cuda_init_failure(
+            "[AVHWDeviceContext @ 0x5a26f2de9ec0] Could not dynamically load CUDA"
+        ));
+        assert!(is_cuda_init_failure("Device creation failed: -1."));
+        assert!(is_cuda_init_failure(
+            "[dec:h264 @ 0x..] No device available for decoder: device type cuda needed for codec h264."
+        ));
+        // Driver/device-level wording from other hosts.
+        assert!(is_cuda_init_failure("CUDA_ERROR_NO_DEVICE"));
+        assert!(is_cuda_init_failure("no CUDA-capable device is detected"));
+    }
+
+    #[test]
+    fn cuda_init_failure_ignores_ordinary_stderr() {
+        assert!(!is_cuda_init_failure("frame= 42 fps=5.0 q=-0.0 size=N/A"));
+        assert!(!is_cuda_init_failure(
+            "[rtsp @ 0x...] method DESCRIBE failed: 401 Unauthorized"
+        ));
+        // A WORKING cuda decode announces itself; that must not read as failure.
+        assert!(!is_cuda_init_failure(
+            "Using cuda hwaccel with device 0 (NVIDIA RTX 4000)"
+        ));
+    }
+
+    #[test]
+    fn launched_hw_matches_only_its_own_signature() {
+        // The two traps must not cross-report: a cuda-only line must not be
+        // blamed on a VAAPI child (and software decode matches nothing at all).
+        assert!(LaunchedHw::Cuda.is_init_failure("Cannot load libcuda.so.1"));
+        assert!(!LaunchedHw::Vaapi.is_init_failure("Cannot load libcuda.so.1"));
+        assert!(LaunchedHw::Vaapi
+            .is_init_failure("Failed to initialise VAAPI connection: unknown libva error."));
+        assert!(!LaunchedHw::Cuda
+            .is_init_failure("Failed to initialise VAAPI connection: unknown libva error."));
+        assert!(!LaunchedHw::None.is_init_failure("Cannot load libcuda.so.1"));
+        assert_eq!(LaunchedHw::None.as_str(), None);
+    }
+
+    /// Issue #479, second half — THE DEFECT. A cuda child on a deviceless host
+    /// exits immediately having decoded nothing; the EOF watchdog reconnected
+    /// with the SAME cuda flags forever, so motion never came back. The decision
+    /// function must demote on the very first attempt that carries the
+    /// unambiguous init-failure signature.
+    #[test]
+    fn cuda_init_failure_demotes_on_the_first_attempt() {
+        let reason = hw_fallback_reason(
+            "cuda",
+            0,
+            1,
+            Some("[AVHWDeviceContext @ 0x..] Cannot load libcuda.so.1"),
+        )
+        .expect("a recognised init failure with zero frames must demote immediately");
+        assert!(
+            reason.contains("cuda"),
+            "reason names the backend: {reason}"
+        );
+        assert!(
+            reason.contains("Cannot load libcuda.so.1"),
+            "reason carries the specific ffmpeg cause: {reason}"
+        );
+        assert!(
+            reason.contains("CPU"),
+            "reason states what happens next: {reason}"
+        );
+    }
+
+    #[test]
+    fn unsignatured_hw_failure_demotes_only_after_repeated_empty_attempts() {
+        // No recognised signature: give the hardware a few chances (a single
+        // unlucky reconnect must not cost a working GPU its offload) …
+        for n in 1..HW_EMPTY_ATTEMPTS_BEFORE_CPU {
+            assert_eq!(
+                hw_fallback_reason("vaapi", 0, n, None),
+                None,
+                "attempt {n} of {HW_EMPTY_ATTEMPTS_BEFORE_CPU} must not demote yet"
+            );
+        }
+        // … then demote, so the reconnect loop stops relaunching failing flags.
+        let reason = hw_fallback_reason("vaapi", 0, HW_EMPTY_ATTEMPTS_BEFORE_CPU, None)
+            .expect("the bound must demote");
+        assert!(reason.contains("vaapi"), "{reason}");
+    }
+
+    #[test]
+    fn a_hardware_backend_that_decoded_frames_is_never_demoted() {
+        // Frames decoded ⇒ the hardware path works. Even a stderr line that
+        // matches the signature (ffmpeg can log a failed FIRST device try and
+        // then succeed) must not cost a working accelerator.
+        assert_eq!(hw_fallback_reason("cuda", 1, 9, None), None);
+        assert_eq!(
+            hw_fallback_reason("cuda", 5_000, 9, Some("Device creation failed: -1.")),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_latch_reports_once_and_then_forces_cpu() {
+        let mut state = HwDecodeFallback::default();
+        assert_eq!(state.forced_cpu(), None, "starts on the hardware path");
+        // Two empty attempts, no signature: not latched yet.
+        assert_eq!(state.note_attempt(LaunchedHw::Cuda, 0, None), None);
+        assert_eq!(state.note_attempt(LaunchedHw::Cuda, 0, None), None);
+        assert_eq!(state.forced_cpu(), None);
+        // The third latches, and reports the cause exactly ONCE …
+        let reason = state
+            .note_attempt(LaunchedHw::Cuda, 0, None)
+            .expect("third empty attempt latches");
+        assert_eq!(state.forced_cpu(), Some(reason.as_str()));
+        assert_eq!(
+            state.note_attempt(LaunchedHw::Cuda, 0, None),
+            None,
+            "an already-latched camera must not re-log its demotion every reconnect"
+        );
+        // … and the latch sticks, which is what makes `auto` RECOVER instead of
+        // reconnecting into the same failure forever.
+        assert_eq!(state.forced_cpu(), Some(reason.as_str()));
+    }
+
+    #[test]
+    fn a_healthy_hardware_attempt_resets_the_empty_run() {
+        let mut state = HwDecodeFallback::default();
+        assert_eq!(state.note_attempt(LaunchedHw::Vaapi, 0, None), None);
+        assert_eq!(state.note_attempt(LaunchedHw::Vaapi, 0, None), None);
+        // A reconnect that DID decode (a camera blip, not a decoder fault)
+        // clears the run, so a flaky stream can never accumulate its way to a
+        // demotion across hours.
+        assert_eq!(state.note_attempt(LaunchedHw::Vaapi, 4_200, None), None);
+        assert_eq!(state.note_attempt(LaunchedHw::Vaapi, 0, None), None);
+        assert_eq!(state.note_attempt(LaunchedHw::Vaapi, 0, None), None);
+        assert_eq!(
+            state.forced_cpu(),
+            None,
+            "two post-recovery empty attempts must not reach the bound"
+        );
+    }
+
+    #[test]
+    fn software_decode_never_latches() {
+        // A CPU child that decodes nothing is a stream problem, not a decoder
+        // one — there is nothing to fall back to, and the existing watchdogs
+        // own that case.
+        let mut state = HwDecodeFallback::default();
+        for _ in 0..(HW_EMPTY_ATTEMPTS_BEFORE_CPU + 5) {
+            assert_eq!(
+                state.note_attempt(LaunchedHw::None, 0, Some("Cannot load libcuda.so.1")),
+                None
+            );
+        }
+        assert_eq!(state.forced_cpu(), None);
+    }
+
+    /// The demotion cause must reach the operator on the SAME surfaces the rest
+    /// of the motion-health wiring uses (issue #523's pattern): the alert gate
+    /// records it even though there is no health TRANSITION to hang it on (the
+    /// source was never healthy), and `fail_open_reason` then prefers it over
+    /// the generic "not delivering frames".
+    #[tokio::test]
+    async fn demotion_cause_reaches_the_motion_health_reason() {
+        let gate = UnhealthyAlertGate::new();
+        let mut state = HwDecodeFallback::default();
+        let reason = state
+            .note_attempt(LaunchedHw::Cuda, 0, Some("Cannot load libcuda.so.1"))
+            .expect("signature demotes immediately");
+        gate.note_unhealthy_cause(&reason);
+        assert_eq!(
+            gate.last_unhealthy_reason().as_deref(),
+            Some(reason.as_str())
+        );
+
+        let last_healthy = std::collections::HashMap::from([(SourceKind::Pixel, false)]);
+        let specific = std::collections::HashMap::from([(SourceKind::Pixel, reason.clone())]);
+        assert_eq!(
+            fail_open_reason(&last_healthy, &specific),
+            reason,
+            "a single down source surfaces its specific cause verbatim"
+        );
+        // Control: with no specific cause the original generic wording stands.
+        assert_eq!(
+            fail_open_reason(&last_healthy, &std::collections::HashMap::new()),
+            "pixel motion detection not delivering frames"
+        );
     }
 
     // ── frame_absdiff ─────────────────────────────────────────────────────────
