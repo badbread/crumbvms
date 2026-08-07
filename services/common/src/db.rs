@@ -3698,6 +3698,11 @@ pub async fn create_camera(pool: &Pool, p: &CreateCameraParams<'_>) -> Result<Ca
 /// (i.e. ones whose go2rtc config the API owns).
 #[derive(Debug, Clone)]
 pub struct CameraStream {
+    /// `cameras.id` — so the API's reconcile pass can attribute a go2rtc stream
+    /// rejection to a camera in `system_events` (issue #519).
+    pub id: Uuid,
+    /// `cameras.name` — the operator-facing label used in that alert's detail.
+    pub name: String,
     pub go2rtc_name: String,
     pub source_url: String,
     pub source_sub_url: Option<String>,
@@ -3709,7 +3714,7 @@ pub async fn list_camera_streams(pool: &Pool) -> Result<Vec<CameraStream>> {
     let client = get_conn(pool).await?;
     let rows = client
         .query(
-            "SELECT go2rtc_name, source_url, source_sub_url
+            "SELECT id, name, go2rtc_name, source_url, source_sub_url
              FROM cameras
              WHERE source_url IS NOT NULL AND source_url <> ''
              ORDER BY go2rtc_name",
@@ -3720,6 +3725,8 @@ pub async fn list_camera_streams(pool: &Pool) -> Result<Vec<CameraStream>> {
     Ok(rows
         .iter()
         .map(|r| CameraStream {
+            id: r.get("id"),
+            name: r.get("name"),
             go2rtc_name: r.get("go2rtc_name"),
             source_url: r.get("source_url"),
             source_sub_url: r.get("source_sub_url"),
@@ -10720,6 +10727,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0076_ha_overlay_bg_on.sql",
         include_str!("../../../db/migrations/0076_ha_overlay_bg_on.sql"),
+    ),
+    (
+        "0077_camera_stream_rejected_alert.sql",
+        include_str!("../../../db/migrations/0077_camera_stream_rejected_alert.sql"),
     ),
 ];
 

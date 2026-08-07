@@ -178,6 +178,28 @@ struct Inner {
     /// falls back to the raw sub and is no worse off than before #483.
     subv_needed: DashMap<String, ()>,
 
+    /// Cameras (by `go2rtc_name`) whose stream go2rtc is currently REJECTING —
+    /// the reconcile pass tried to create the stream, go2rtc answered a
+    /// non-success status, and a confirming `GET /api/streams` showed the
+    /// stream is genuinely absent (issue #519). `DashMap<_, ()>` used as a
+    /// concurrent set, exactly like [`subv_needed`](Inner::subv_needed).
+    ///
+    /// This is the state-transition latch for the `camera_stream_rejected`
+    /// system event. The reconcile loop re-tries a rejected stream on every
+    /// pass — as often as every `CHECK_INTERVAL` (~5 s), because a missing
+    /// stream reads as a stream-count shortfall — so without a latch a
+    /// permanently-bad source URL would write a `system_events` row (and fire a
+    /// push) several times a minute, forever. Membership means "the operator
+    /// has already been told about this one"; the entry is dropped the moment
+    /// the stream applies cleanly, so a later regression alerts again.
+    ///
+    /// In-memory with no migration, deliberately, for the same reason as
+    /// `subv_needed`: it is a runtime property of go2rtc's current answer, not
+    /// operator configuration. A restart re-derives it, costing at most one
+    /// repeat alert for a still-broken camera — the same trade-off the
+    /// `camera_offline` watchdog latch already makes.
+    stream_rejected: DashMap<String, ()>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -291,6 +313,7 @@ impl AppState {
             clip_inflight: DashMap::new(),
             go2rtc_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             subv_needed: DashMap::new(),
+            stream_rejected: DashMap::new(),
             thumb_semaphore,
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
@@ -516,6 +539,35 @@ impl AppState {
     /// cannot pin memory or resurface if its `go2rtc_name` is later reused.
     pub fn retain_subv_needed(&self, live: &std::collections::HashSet<String>) {
         self.0.subv_needed.retain(|name, ()| live.contains(name));
+    }
+
+    // ── go2rtc stream-rejection latch (issue #519) ────────────────────────────
+
+    /// Has the operator already been alerted that go2rtc is rejecting this
+    /// camera's stream? See the field docs on
+    /// [`stream_rejected`](Inner::stream_rejected).
+    #[inline]
+    pub fn stream_rejected(&self, go2rtc_name: &str) -> bool {
+        self.0.stream_rejected.contains_key(go2rtc_name)
+    }
+
+    /// Record this pass's verdict for one camera. Idempotent, so the reconcile
+    /// pass can call it unconditionally every time.
+    pub fn set_stream_rejected(&self, go2rtc_name: &str, rejected: bool) {
+        if rejected {
+            self.0.stream_rejected.insert(go2rtc_name.to_owned(), ());
+        } else {
+            self.0.stream_rejected.remove(go2rtc_name);
+        }
+    }
+
+    /// Drop latches for cameras that no longer exist, so a deleted camera's
+    /// entry cannot pin memory or suppress a genuine alert if its
+    /// `go2rtc_name` is later reused.
+    pub fn retain_stream_rejected(&self, live: &std::collections::HashSet<String>) {
+        self.0
+            .stream_rejected
+            .retain(|name, ()| live.contains(name));
     }
 
     // ── health-alert maintenance window (issue #46) ───────────────────────────

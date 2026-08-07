@@ -143,12 +143,127 @@ fn mobile_src(input_stream: &str, width: u32) -> String {
     format!("ffmpeg:{input_stream}#video=h264#width={width}#audio=aac")
 }
 
+/// Longest go2rtc error body we keep when reporting a rejected stream. go2rtc's
+/// own rejections are one short line ("streams: source with spaces may be
+/// insecure"); the cap only exists so a misconfigured `crumb_api_base` pointing
+/// at something that answers with an HTML error page cannot dump a page into the
+/// log and the `system_events` detail.
+const MAX_GO2RTC_ERROR_BODY: usize = 200;
+
+/// Why one managed stream failed to apply — the distinction that decides whether
+/// an operator gets a per-camera alert (issue #519).
+///
+/// [`ApplyError::Rejected`] is CAMERA-SPECIFIC and actionable: go2rtc answered a
+/// `4xx` and, on confirmation, does not have the stream. That camera records
+/// nothing until its source is fixed, and the reason (from go2rtc's body) is
+/// something the operator can act on — so it raises `camera_stream_rejected`.
+///
+/// [`ApplyError::Unavailable`] is NOT camera-specific: a transport error or a
+/// `5xx` means go2rtc couldn't be asked at all, which affects every camera at
+/// once. Raising a per-camera alert for it would page the operator N times for
+/// one fault, so it is logged only — exactly the pre-#519 behavior for these
+/// cases. `recorder_offline` / `camera_offline` remain the signals for a
+/// restreamer that is down.
+#[derive(Debug)]
+enum ApplyError {
+    Rejected(String),
+    Unavailable(String),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(m) | Self::Unavailable(m) => f.write_str(m),
+        }
+    }
+}
+
+/// Turn go2rtc's refusal of a stream into one operator-readable line.
+///
+/// The body is the whole point (issue #519): go2rtc's status code alone says
+/// nothing, but its body names the actual reason — `"streams: source with spaces
+/// may be insecure"` for the very common case of an RTSP URL pasted out of a
+/// camera's web UI with a literal space in the path. Whitespace is collapsed so
+/// a multi-line body stays one log line / one alert detail, credentials are
+/// redacted (a body that echoes the source would otherwise leak the camera
+/// password), and the result is truncated to [`MAX_GO2RTC_ERROR_BODY`].
+///
+/// Pure + unit-tested; the network half is exercised by the `put_stream` tests
+/// against a stub go2rtc.
+fn go2rtc_reject_reason(status: reqwest::StatusCode, body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = crumb_common::redact::redact_url_credentials(&collapsed);
+    if redacted.is_empty() {
+        return format!("HTTP {status}");
+    }
+    let mut short: String = redacted.chars().take(MAX_GO2RTC_ERROR_BODY).collect();
+    if redacted.chars().count() > MAX_GO2RTC_ERROR_BODY {
+        short.push('…');
+    }
+    format!("HTTP {status}: {short}")
+}
+
+/// Is `name` currently registered in go2rtc? Used only to interpret a non-success
+/// `PUT` (see [`put_stream`]) — never to decide what to apply.
+async fn stream_exists(
+    c: &reqwest::Client,
+    api_base: &str,
+    name: &str,
+    auth: (&str, &str),
+) -> Result<bool> {
+    let url = format!("{}/api/streams", api_base.trim_end_matches('/'));
+    let resp = c
+        .get(&url)
+        .basic_auth(auth.0, Some(auth.1))
+        .send()
+        .await
+        .with_context(|| format!("GET go2rtc streams to confirm {name} ({url})"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("go2rtc GET /api/streams -> HTTP {}", resp.status());
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("parse go2rtc /api/streams response")?;
+    match body {
+        serde_json::Value::Object(map) => Ok(map.contains_key(name)),
+        _ => anyhow::bail!("go2rtc /api/streams did not return a JSON object"),
+    }
+}
+
 /// PUT a stream into go2rtc (idempotent — sets/replaces the stream by name).
 ///
-/// NOTE: go2rtc REGISTERS the stream even when it answers `400` (its immediate
-/// source probe failed — e.g. the camera is briefly unreachable). So only a
-/// transport error or a `5xx` means the stream wasn't submitted; `4xx` is a probe
-/// warning, not a failure.
+/// # A non-success status is not, on its own, proof of anything (issue #519)
+///
+/// go2rtc answers a `4xx` in two completely different situations:
+///
+/// * **The stream WAS registered.** Its immediate source probe failed (camera
+///   briefly unreachable), or its post-registration `PatchConfig` failed because
+///   Crumb mounts `go2rtc.yaml` read-only — see [`patch_stream`]. Recording is
+///   fine; treating this as a failure would fire a false alarm on every healthy
+///   camera add, which is the exact class of bug issue #520 is about.
+/// * **The stream was REJECTED and does not exist.** go2rtc refused the source
+///   outright — e.g. `400 "streams: source with spaces may be insecure"` for an
+///   RTSP URL with a literal space, which operators paste straight out of a
+///   camera's web UI. This used to return `Ok(())`: the camera row existed, the
+///   console showed it as normal, nothing was ever recorded, and the only trace
+///   was the recorder reconnect-looping against a restream that was never there.
+///
+/// The status cannot tell those apart, so this asks go2rtc what actually
+/// happened: on any non-success, read the body (which carries the reason) and
+/// confirm against `GET /api/streams` whether the stream is now registered.
+/// Present ⇒ benign, `Ok(())` as before. Absent ⇒ a real rejection, returned as
+/// an error so [`apply_stream`]'s caller can warn AND raise a
+/// `camera_stream_rejected` system event naming the reason.
+///
+/// Only a `4xx` gets that treatment. A transport error or a `5xx` is
+/// [`ApplyError::Unavailable`] — go2rtc couldn't be asked, which is a
+/// server-wide fault, not this camera's fault (the pre-#519 behavior, kept).
+///
+/// If the confirming GET itself fails we deliberately assume "registered"
+/// (`Ok(())`): a false alarm is worse than a delayed one, the reconcile loop
+/// retries within seconds, and a go2rtc that is genuinely unreachable makes the
+/// `PUT` a transport error, which still fails here.
 ///
 /// `auth` (P0-GO2RTC lighter lockdown): Basic-auth credentials for Crumb's own
 /// go2rtc REST API, required now that go2rtc's API auth (`local_auth: true`)
@@ -160,19 +275,56 @@ async fn put_stream(
     name: &str,
     src: &str,
     auth: (&str, &str),
-) -> Result<()> {
+) -> std::result::Result<(), ApplyError> {
     let url = format!("{}/api/streams", api_base.trim_end_matches('/'));
-    let resp = c
+    let resp = match c
         .put(&url)
         .basic_auth(auth.0, Some(auth.1))
         .query(&[("name", name), ("src", src)])
         .send()
         .await
-        .with_context(|| format!("PUT go2rtc stream {name} ({url})"))?;
-    if resp.status().is_server_error() {
-        anyhow::bail!("go2rtc PUT {name} -> HTTP {}", resp.status());
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(ApplyError::Unavailable(format!(
+                "PUT go2rtc stream {name} ({url}): {e}"
+            )))
+        }
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
     }
-    Ok(())
+    // Body first (it names the reason), then confirm what go2rtc actually did.
+    let body = resp.text().await.unwrap_or_default();
+    let reason = go2rtc_reject_reason(status, &body);
+    if status.is_server_error() {
+        return Err(ApplyError::Unavailable(format!(
+            "go2rtc PUT {name} -> {reason}"
+        )));
+    }
+    match stream_exists(c, api_base, name, auth).await {
+        Ok(true) => {
+            tracing::debug!(
+                stream = %name,
+                reason = %reason,
+                "go2rtc PUT answered non-success but the stream is registered; treating as applied"
+            );
+            Ok(())
+        }
+        Ok(false) => Err(ApplyError::Rejected(format!(
+            "go2rtc rejected the stream source ({reason})"
+        ))),
+        Err(e) => {
+            tracing::debug!(
+                stream = %name,
+                reason = %reason,
+                error = %format!("{e:#}"),
+                "go2rtc PUT answered non-success and the confirming GET failed; assuming applied (will retry)"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// PATCH a stream in go2rtc — in-place `SetSource` on the stream's EXISTING
@@ -621,7 +773,13 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
         .collect();
 
     for s in &streams {
-        apply_stream(
+        // Issue #519: the two streams whose source an OPERATOR typed. A go2rtc
+        // rejection of either means this camera cannot record (main) or cannot
+        // do pixel motion (sub), so it is collected here and reported once, per
+        // camera, through the `camera_stream_rejected` latch below.
+        let mut rejection: Option<String> = None;
+
+        if let Err(e) = apply_stream(
             &c,
             api_base,
             &s.go2rtc_name,
@@ -630,23 +788,31 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             &managed,
             auth,
         )
-        .await;
+        .await
+        {
+            rejection = rejection.or_else(|| classify_apply_error("main", &s.go2rtc_name, &e));
+        }
         let has_sub = s
             .source_sub_url
             .as_deref()
             .is_some_and(|u| !u.trim().is_empty());
         if has_sub {
-            apply_stream(
+            let sub = sub_name(&s.go2rtc_name);
+            if let Err(e) = apply_stream(
                 &c,
                 api_base,
-                &sub_name(&s.go2rtc_name),
+                &sub,
                 s.source_sub_url.as_deref().unwrap_or_default(),
                 existing,
                 &managed,
                 auth,
             )
-            .await;
+            .await
+            {
+                rejection = rejection.or_else(|| classify_apply_error("sub", &sub, &e));
+            }
         }
+        report_stream_rejection(state, s, rejection).await;
         // #483 follow-up: the client-facing VIDEO-ONLY sub, derived from the
         // `_sub` stream above — registered ONLY for a camera whose sub actually
         // publishes video with no `a=fmtp`, and DELETED again the moment it
@@ -660,7 +826,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             .copied()
             .unwrap_or(false)
         {
-            apply_stream(
+            apply_stream_logged(
                 &c,
                 api_base,
                 &subv,
@@ -691,7 +857,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             } else {
                 s.go2rtc_name.clone()
             };
-            apply_stream(
+            apply_stream_logged(
                 &c,
                 api_base,
                 &mobile_name(&s.go2rtc_name),
@@ -703,13 +869,107 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             .await;
         }
     }
+    // Forget rejection latches for cameras deleted between passes, so a reused
+    // `go2rtc_name` can't inherit a stale "already alerted" flag.
+    state.retain_stream_rejected(&streams.iter().map(|s| s.go2rtc_name.clone()).collect());
     Ok(())
 }
 
+/// Split one stream's failure into "the operator needs to know" vs "just log
+/// it" (issue #519).
+///
+/// A [`ApplyError::Rejected`] is returned as the alert detail fragment
+/// (`"main stream — go2rtc rejected the stream source (HTTP 400: …)"`); an
+/// [`ApplyError::Unavailable`] is logged exactly as the pre-#519 code did and
+/// returns `None`, because go2rtc being unreachable is one fault affecting every
+/// camera, not N per-camera faults worth N pushes.
+fn classify_apply_error(role: &str, name: &str, e: &ApplyError) -> Option<String> {
+    match e {
+        ApplyError::Rejected(m) => Some(format!("{role} stream — {m}")),
+        ApplyError::Unavailable(m) => {
+            tracing::warn!(stream = %name, error = %m, "go2rtc stream apply failed");
+            None
+        }
+    }
+}
+
+/// Raise (or clear) the `camera_stream_rejected` alert for one camera, on the
+/// state TRANSITION only (issue #519).
+///
+/// The reconcile loop re-tries a rejected stream on every pass — and a missing
+/// stream reads as a count shortfall, which escalates the loop to a pass every
+/// ~5 s — so writing the event unconditionally would mean a `system_events` row
+/// and a push notification several times a minute for as long as the camera
+/// stays misconfigured. The latch on [`AppState`] means exactly one event per
+/// broken→fixed cycle, mirroring the `camera_offline` watchdog's own latch.
+///
+/// Clearing on success is what re-arms it: once the operator fixes the URL and
+/// the stream applies, a later regression alerts again.
+async fn report_stream_rejection(
+    state: &AppState,
+    s: &crumb_common::db::CameraStream,
+    rejection: Option<String>,
+) {
+    let already = state.stream_rejected(&s.go2rtc_name);
+    match rejection {
+        Some(reason) => {
+            if already {
+                tracing::debug!(
+                    camera_id = %s.id,
+                    stream = %s.go2rtc_name,
+                    reason = %reason,
+                    "go2rtc still rejecting this camera's stream (already alerted)"
+                );
+                return;
+            }
+            let detail = format!("camera \"{}\": {reason}", s.name);
+            tracing::warn!(
+                camera_id = %s.id,
+                stream = %s.go2rtc_name,
+                reason = %reason,
+                "go2rtc REJECTED this camera's stream — it will record nothing until the source is fixed"
+            );
+            if let Err(e) = crumb_common::db::insert_system_event(
+                state.pool(),
+                "camera_stream_rejected",
+                Some(s.id),
+                Some(&detail),
+            )
+            .await
+            {
+                // Don't latch on a failed insert — retry on the next pass.
+                tracing::warn!(error = %e, camera_id = %s.id, "insert_system_event(camera_stream_rejected) failed");
+            } else {
+                state.set_stream_rejected(&s.go2rtc_name, true);
+            }
+        }
+        None => {
+            if already {
+                tracing::info!(
+                    camera_id = %s.id,
+                    stream = %s.go2rtc_name,
+                    "go2rtc now accepts this camera's stream (previously rejected)"
+                );
+                state.set_stream_rejected(&s.go2rtc_name, false);
+            }
+        }
+    }
+}
+
 /// Reconcile a single managed stream with the right verb (`PUT` to create /
-/// `PATCH` to update in place), redacting credentials from any error log.
-/// Per-stream failures are warned and swallowed so one bad camera can't block
-/// the pass.
+/// `PATCH` to update in place), redacting credentials from the error message.
+///
+/// Returns the failure instead of swallowing it (issue #519) so the caller can
+/// decide what it means: the two operator-facing streams (main + sub) route a
+/// [`ApplyError::Rejected`] into a `camera_stream_rejected` system event, while
+/// the derived streams just log. Either way one bad camera never aborts the
+/// pass — the caller logs and moves on.
+///
+/// Credentials are redacted here, once, for every path: `{e:#}` prints the whole
+/// context chain (".. : connection refused"), which is what an operator needs
+/// when go2rtc is down, but reqwest embeds the FULL request URL (including the
+/// `?src=<camera-url>` query, with the camera's percent-encoded `user:pass@`) in
+/// that error.
 #[allow(clippy::too_many_arguments)]
 async fn apply_stream(
     c: &reqwest::Client,
@@ -719,20 +979,38 @@ async fn apply_stream(
     existing: &HashSet<String>,
     managed: &HashSet<String>,
     auth: (&str, &str),
-) {
+) -> std::result::Result<(), ApplyError> {
     let res = match choose_verb(existing.contains(name), src, managed) {
         StreamVerb::Create => put_stream(c, api_base, name, src, auth).await,
-        StreamVerb::Patch => patch_stream(c, api_base, name, src, auth).await,
+        StreamVerb::Patch => patch_stream(c, api_base, name, src, auth)
+            .await
+            .map_err(|e| ApplyError::Unavailable(format!("{e:#}"))),
     };
-    if let Err(e) = res {
-        // `{e:#}` prints the whole context chain (".. : connection refused"), not
-        // just the outermost context — the transport error is the one thing an
-        // operator needs when go2rtc is down/unreachable. But reqwest embeds the
-        // FULL request URL (including the `?src=<camera-url>` query, with the
-        // camera's percent-encoded `user:pass@`) in that error, so redact
-        // credentials before logging.
-        let err = crumb_common::redact::redact_url_credentials(&format!("{e:#}"));
-        tracing::warn!(stream = %name, error = %err, "go2rtc stream apply failed");
+    res.map_err(|e| match e {
+        ApplyError::Rejected(m) => {
+            ApplyError::Rejected(crumb_common::redact::redact_url_credentials(&m))
+        }
+        ApplyError::Unavailable(m) => {
+            ApplyError::Unavailable(crumb_common::redact::redact_url_credentials(&m))
+        }
+    })
+}
+
+/// [`apply_stream`] for a DERIVED stream (`_subv`, `_mobile`) — nothing an
+/// operator typed, so a failure is logged exactly as before #519 and never
+/// raises a per-camera alert.
+#[allow(clippy::too_many_arguments)]
+async fn apply_stream_logged(
+    c: &reqwest::Client,
+    api_base: &str,
+    name: &str,
+    src: &str,
+    existing: &HashSet<String>,
+    managed: &HashSet<String>,
+    auth: (&str, &str),
+) {
+    if let Err(e) = apply_stream(c, api_base, name, src, existing, managed, auth).await {
+        tracing::warn!(stream = %name, error = %e, "go2rtc stream apply failed");
     }
 }
 
@@ -1029,6 +1307,217 @@ mod tests {
 
     fn names(list: &[&str]) -> HashSet<String> {
         list.iter().copied().map(String::from).collect()
+    }
+
+    // ── go2rtc stream rejection (issue #519) ────────────────────────────────
+    //
+    // The bug: `put_stream` returned `Ok(())` for every non-5xx answer, so
+    // go2rtc's `400 "streams: source with spaces may be insecure"` — which
+    // registers NOTHING — was recorded as a successful apply. The camera row
+    // existed, the console showed it as normal, and nothing was ever recorded.
+    //
+    // These drive the real HTTP path against a stub that answers exactly the way
+    // go2rtc does in each case, because the whole fix is "the status code alone
+    // is not the answer, ask go2rtc what it actually has".
+
+    /// Spawn a stub go2rtc on an ephemeral port. `put_status`/`put_body` are what
+    /// it answers to `PUT /api/streams`; `streams_json` is what `GET
+    /// /api/streams` then reports (i.e. whether the stream actually landed).
+    /// Returns its base URL.
+    async fn stub_go2rtc(
+        put_status: u16,
+        put_body: &'static str,
+        streams_json: &'static str,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/api/streams",
+            axum::routing::put(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(put_status).unwrap(),
+                    put_body,
+                )
+            })
+            .get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    streams_json,
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn put_stream_fails_when_go2rtc_rejected_the_source() {
+        // go2rtc's real answer to an RTSP URL with a literal space, and its real
+        // follow-up state: the stream is NOT there.
+        let base = stub_go2rtc(400, "streams: source with spaces may be insecure\n", "{}").await;
+        let c = client().unwrap();
+        let err = put_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid:554/odd path/cam",
+            ("u", "p"),
+        )
+        .await
+        .expect_err("a 400 with the stream absent must NOT be reported as applied (#519)");
+        assert!(
+            matches!(err, ApplyError::Rejected(_)),
+            "a 4xx with the stream absent is this camera's fault, not go2rtc being down: {err}"
+        );
+        // The operator needs go2rtc's own reason, not just a status code.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("400"),
+            "status must survive into the message: {msg}"
+        );
+        assert!(
+            msg.contains("source with spaces may be insecure"),
+            "go2rtc's reason must survive into the message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_stream_tolerates_a_4xx_when_the_stream_was_actually_registered() {
+        // The other 4xx: go2rtc DID register the stream and then failed its own
+        // post-registration config write (Crumb mounts go2rtc.yaml read-only) or
+        // its immediate source probe. Treating this as a failure would fire a
+        // false alarm on healthy cameras — the #520 class of bug.
+        let base = stub_go2rtc(400, "failed to write config", r#"{"front_door":{}}"#).await;
+        let c = client().unwrap();
+        put_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid/live",
+            ("u", "p"),
+        )
+        .await
+        .expect("a 4xx whose stream IS registered must stay a success");
+    }
+
+    #[tokio::test]
+    async fn put_stream_treats_5xx_as_unavailable_not_a_camera_fault() {
+        // A 5xx means go2rtc could not be asked — server-wide, so it must never
+        // raise a per-camera alert (it would page once per camera for one fault).
+        let base = stub_go2rtc(500, "boom", "{}").await;
+        let c = client().unwrap();
+        let err = put_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid/live",
+            ("u", "p"),
+        )
+        .await
+        .expect_err("a 5xx is still a failure");
+        assert!(
+            matches!(err, ApplyError::Unavailable(_)),
+            "5xx must not be attributed to the camera: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_stream_succeeds_on_2xx_without_a_confirming_get() {
+        // The happy path must not pay for the confirmation round-trip: the stub
+        // reports an EMPTY stream list, which would look like a rejection if the
+        // 2xx path consulted it.
+        let base = stub_go2rtc(200, "", "{}").await;
+        let c = client().unwrap();
+        put_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid/live",
+            ("u", "p"),
+        )
+        .await
+        .expect("2xx is a success, full stop");
+    }
+
+    #[tokio::test]
+    async fn put_stream_assumes_applied_when_the_confirming_get_is_unusable() {
+        // Fail-safe direction: if go2rtc's answer to the confirming GET can't be
+        // read, prefer a delayed alert over a false one — the reconcile loop
+        // retries within seconds.
+        let base = stub_go2rtc(400, "who knows", "not json at all").await;
+        let c = client().unwrap();
+        put_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid/live",
+            ("u", "p"),
+        )
+        .await
+        .expect("an unreadable confirmation must not invent a rejection");
+    }
+
+    #[test]
+    fn reject_reason_carries_the_body_and_collapses_it_to_one_line() {
+        let r = go2rtc_reject_reason(
+            reqwest::StatusCode::BAD_REQUEST,
+            "streams: source with spaces\n  may be insecure\n",
+        );
+        assert_eq!(
+            r, "HTTP 400 Bad Request: streams: source with spaces may be insecure",
+            "a multi-line body must stay one log line / one alert detail"
+        );
+    }
+
+    #[test]
+    fn reject_reason_survives_an_empty_body() {
+        let r = go2rtc_reject_reason(reqwest::StatusCode::BAD_REQUEST, "   \n");
+        assert_eq!(r, "HTTP 400 Bad Request");
+    }
+
+    #[test]
+    fn reject_reason_redacts_credentials_echoed_back_by_go2rtc() {
+        let r = go2rtc_reject_reason(
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad source rtsp://admin:hunter2@cam.invalid/live",
+        );
+        assert!(
+            !r.contains("hunter2"),
+            "a body that echoes the source must not leak the camera password: {r}"
+        );
+    }
+
+    #[test]
+    fn reject_reason_truncates_a_runaway_body() {
+        let body = "x".repeat(MAX_GO2RTC_ERROR_BODY * 3);
+        let r = go2rtc_reject_reason(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert!(r.ends_with('…'), "truncation must be visible: {r}");
+        assert!(
+            r.chars().count() < MAX_GO2RTC_ERROR_BODY + 40,
+            "an HTML error page must not land in a notification: {} chars",
+            r.chars().count()
+        );
+    }
+
+    #[test]
+    fn only_a_rejection_becomes_an_operator_alert() {
+        // The routing rule the alert depends on: a camera-specific refusal is
+        // reported, an unreachable go2rtc is only logged.
+        assert_eq!(
+            classify_apply_error("main", "front_door", &ApplyError::Rejected("nope".into())),
+            Some("main stream — nope".to_owned())
+        );
+        assert_eq!(
+            classify_apply_error(
+                "sub",
+                "front_door_sub",
+                &ApplyError::Unavailable("connection refused".into())
+            ),
+            None,
+            "go2rtc being down is one fault, not one per camera"
+        );
     }
 
     // ── mobile transcode stream (Phase 2) ───────────────────────────────────
