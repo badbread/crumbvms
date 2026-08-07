@@ -16,6 +16,13 @@ ALTER TABLE camera_ha_links
     ADD COLUMN IF NOT EXISTS overlay_show_state boolean NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS overlay_show_age   boolean NOT NULL DEFAULT false;
 
+-- Idempotent (DROP IF EXISTS + re-ADD, the 0071 pattern): ADD CONSTRAINT has no
+-- IF NOT EXISTS form, and the runner records schema_migrations in a SEPARATE
+-- statement from the apply, so an interrupted boot must be able to re-run this
+-- file instead of erroring with SQLSTATE 42710.
+ALTER TABLE camera_ha_links
+    DROP CONSTRAINT IF EXISTS camera_ha_links_overlay_color_hex,
+    DROP CONSTRAINT IF EXISTS camera_ha_links_overlay_icon_len;
 ALTER TABLE camera_ha_links
     ADD CONSTRAINT camera_ha_links_overlay_color_hex
         CHECK (overlay_color IS NULL OR overlay_color ~ '^#[0-9a-fA-F]{6}$'),
