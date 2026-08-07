@@ -26,8 +26,13 @@ tags = ["homelab", "network"]
 
 [[rules]]
 id = "homelab-mount-path"
-description = "Internal NAS / array mount path (Synology / Unraid conventions)"
-regex = '''(/volume1|/mnt/user)(/|\b)'''
+description = "Internal NAS mount path (Synology convention)"
+# `/mnt/user` was dropped: it is Unraid's universal default share path, so any
+# platform-compatibility doc must be able to say it — it identifies nothing.
+# If a Synology doc ever legitimately needs `/volume1` examples, retire this
+# rule too and move the maintainer's specific subtree to the private denylist
+# (HOMELAB_DENYLIST_B64), which is where non-generic paths belong anyway.
+regex = '''/volume1(/|\b)'''
 tags = ["homelab", "path"]
 
 [[rules]]

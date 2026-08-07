@@ -240,6 +240,10 @@ thoughts on how it should work,
 > all go in [**GitHub Issues**](https://github.com/badbread/crumbvms/issues). Read the
 > [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) first. Early testers are how this gets good,
 > so thank you.
+>
+> **Start here: [TESTING.md](TESTING.md).** It is the tester's page: a fifteen-minute
+> quickstart, what is worth testing, and how to write a report that can be acted on,
+> including where the scrubbed diagnostics bundle and the client logs live.
 
 ## How it compares
 
@@ -285,7 +289,13 @@ one-person project.
 ## Install
 
 **What you need:** one machine on your home network with **Docker** installed and some free
-disk for recordings. Linux is ideal. Windows and macOS work via Docker Desktop. New to Docker?
+disk for recordings. Linux on **x86-64** is ideal, and is what this is actually tested on. The
+server images are amd64 only, so a **Raspberry Pi or other ARM board will not run the server
+yet**. Windows and macOS work via Docker Desktop for trying it out, though bind-mount
+permissions and speed make them a poor choice for a recorder that runs for months (and Apple
+Silicon runs the images emulated). NAS appliances, Unraid, and unprivileged Proxmox LXC all
+work differently enough around storage ownership to be worth reading first, see
+[Platform notes](https://docs.crumbvms.com/getting-started/platform-notes). New to Docker?
 Install [Docker Engine](https://docs.docker.com/engine/install/) (Linux) or
 [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows/macOS) first, then
 come back here.
@@ -299,6 +309,9 @@ git clone https://github.com/badbread/crumbvms.git
 cd crumbvms
 
 # 2. Generate a .env file with strong random secrets
+#    Recording onto a mounted disk or NAS share? Name it here, so the script
+#    prepares and permission-checks the real target:
+#      MEDIA_HOST_PATH=/mnt/tank/crumb ./scripts/setup-env.sh
 ./scripts/setup-env.sh
 
 # 3. Download the images and start the stack (recorder + api + postgres + caddy)
@@ -308,6 +321,14 @@ docker compose up -d
 # 4. Confirm every service came up healthy
 docker compose ps
 ```
+
+**If step 2 stops with a storage error, do not skip past it.** The recorder writes as user ID
+1001, and `setup-env.sh` checks that it actually can before you start anything. When that check
+fails, an install looks completely healthy and records nothing: live view works, the wizard
+shows green, and no footage is ever saved. The script prints the exact fix, usually
+`sudo chown -R 1001:1001 <your media path>` on a local disk, or a server-side permission change
+on a NAS share. Details per platform:
+[Platform notes](https://docs.crumbvms.com/getting-started/platform-notes).
 
 **Then open `http://<your-server-ip>:8080/admin` in a browser** and sign in with username
 `admin` and the memorable password `setup-env.sh` printed (it is also stored in `.env` as
@@ -327,9 +348,12 @@ That is the whole install. A few options if you want them:
 - **Build from source** instead of pulling images (you are developing Crumb, running
   air-gapped, or on a fork that has not published images):
   `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`
-- **Running on Proxmox?** Same stack in a Debian/Ubuntu VM or LXC, though nobody has verified
-  that path yet. See [Running on Proxmox](docs/AI-INSTALL.md#running-on-proxmox-vm-or-lxc)
-  for the VM-vs-LXC tradeoff, GPU passthrough, and where to put recordings.
+- **Running on Proxmox, a NAS, or Unraid?** Read
+  [Platform notes](https://docs.crumbvms.com/getting-started/platform-notes) first. It is an
+  honest table of what is tested, what should work but is unverified, and what is not supported
+  yet, plus the storage gotcha specific to each. For Proxmox in particular, see
+  [Running on Proxmox](docs/AI-INSTALL.md#running-on-proxmox-vm-or-lxc) for the VM-vs-LXC
+  tradeoff, GPU passthrough, and where to put recordings
   ([docs/IMAGES.md](docs/IMAGES.md)).
 
 > Headless/CI: the admin is already seeded from `SEED_ADMIN_PASSWORD`; accept the terms and
@@ -425,6 +449,7 @@ For contributors working in this repo:
 - **Configuration:** [docs/COMPOSE.md](docs/COMPOSE.md) (the Compose file, explained) · [docs/IMAGES.md](docs/IMAGES.md) (prebuilt images) · [.env.example](.env.example) (every env knob)
 - **Architecture & design:** [docs/DECISIONS.md](docs/DECISIONS.md) · [docs/RECORDER-CORRECTNESS.md](docs/RECORDER-CORRECTNESS.md)
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
+- **Testing:** [TESTING.md](TESTING.md) (tester quickstart, what to test, how to report)
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) (ground rules for AI coding sessions)
 
 ```

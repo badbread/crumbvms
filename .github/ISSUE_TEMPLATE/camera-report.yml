@@ -90,6 +90,19 @@ body:
       description: Anything that needed a workaround, and the fix that worked.
       placeholder: "e.g. Android fullscreen live falls back to SD; fix was setting the main stream to H264 in the camera web UI."
   - type: textarea
+    id: recommended_settings
+    attributes:
+      label: Recommended camera settings
+      description: The settings you would tell the next person to use on this model, one per line. These become the "recommended settings" shown in the compatibility database.
+      placeholder: |
+        Set the Main stream codec to H264 in the camera web UI (Setup > Video > Encoding).
+        Keep the keyframe (I-frame) interval near 1 second.
+  - type: input
+    id: crumb_version
+    attributes:
+      label: Crumb version you tested with
+      placeholder: "0.2.0 (sha-1a2b3c4)"
+  - type: textarea
     id: how_tested
     attributes:
       label: How did you test this?

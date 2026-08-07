@@ -382,9 +382,16 @@ impl Config {
             "SEGMENT_SECONDS must be in [2, 6], got {segment_seconds}"
         );
 
-        // Default is "auto" so a fresh install works on both GPU and CPU hosts
-        // without any env configuration.  "cuda" and "cpu" are explicit overrides.
-        let hwaccel_str = optional_env("MOTION_HWACCEL", "auto");
+        // Default is "cpu": software motion decode works on ANY host, and is fast
+        // enough for Crumb's fps-capped motion. This must match the shipped
+        // docker-compose.yml / .env.example default (#478) — an install that does
+        // not go through compose, or an upgrade whose existing .env predates that
+        // change, reaches this default instead, and "auto" on a GPU-less host is
+        // the broken path (motion dies, the recorder falls back to continuous
+        // recording, retention pressure follows). "cuda"/"vaapi" enable a GPU
+        // explicitly (see the compose overlays); "auto" probes for NVDEC and stays
+        // opt-in until its probe is made robust (#479).
+        let hwaccel_str = optional_env("MOTION_HWACCEL", "cpu");
         let motion_hwaccel = HwAccel::from_str(&hwaccel_str).with_context(|| {
             format!("MOTION_HWACCEL must be 'cuda', 'vaapi', 'cpu', or 'auto', got '{hwaccel_str}'")
         })?;

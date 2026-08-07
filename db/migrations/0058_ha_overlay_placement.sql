@@ -17,6 +17,14 @@ ALTER TABLE camera_ha_links
 -- x and y are set together or not at all (a half-placed badge is meaningless),
 -- and both live in [0,1] (fractions of the video frame). size is left
 -- unconstrained beyond NULL-vs-set; the API clamps it to a sane range.
+--
+-- Idempotent (DROP IF EXISTS + re-ADD, the 0071 pattern): ADD CONSTRAINT has no
+-- IF NOT EXISTS form, and the runner records schema_migrations in a SEPARATE
+-- statement from the apply, so an interrupted boot must be able to re-run this
+-- file instead of erroring with SQLSTATE 42710.
+ALTER TABLE camera_ha_links
+    DROP CONSTRAINT IF EXISTS camera_ha_links_overlay_xy_paired,
+    DROP CONSTRAINT IF EXISTS camera_ha_links_overlay_range;
 ALTER TABLE camera_ha_links
     ADD CONSTRAINT camera_ha_links_overlay_xy_paired
         CHECK ((overlay_x IS NULL) = (overlay_y IS NULL)),

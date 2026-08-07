@@ -12743,6 +12743,168 @@ mod tests {
         assert!(check_migration_parsing_invariants(conc, true).is_ok());
     }
 
+    /// Find every `ADD CONSTRAINT` in one migration that the runner could NOT
+    /// safely re-apply, returning the offending constraint names.
+    ///
+    /// `ALTER TABLE ... ADD CONSTRAINT` has no `IF NOT EXISTS` form in Postgres,
+    /// and [`run_migrations_locked`] applies a migration's SQL and records it in
+    /// `schema_migrations` as two SEPARATE statements. A process killed between
+    /// the two leaves the DDL committed but unrecorded, so the next boot
+    /// re-applies the file — and a bare `ADD CONSTRAINT` then fails with
+    /// SQLSTATE 42710 (`constraint ... already exists`). `run_migrations` returns
+    /// `Err`, and since the api AND the recorder both embed this migration set
+    /// and run it at startup, NEITHER boots: recording stops until someone
+    /// hand-edits the database.
+    ///
+    /// An `ADD CONSTRAINT` is considered guarded when either:
+    ///
+    /// * a matching `DROP CONSTRAINT IF EXISTS <same name>` appears EARLIER in
+    ///   the same file (the 0058/0059/0060/0062/0071/0076 pattern), or
+    /// * it sits inside a `$$ ... $$` body, i.e. a `DO` block that does its own
+    ///   catalog existence check (the 0014/0018/0054/0069 pattern).
+    fn unguarded_add_constraints(sql: &str) -> Vec<String> {
+        // Strip `--` comments exactly as the runner does, so prose that merely
+        // mentions `ADD CONSTRAINT` (several files discuss this very hazard)
+        // cannot false-trigger. Then collapse each run of whitespace to a single
+        // space so `ADD\n    CONSTRAINT` and `DROP CONSTRAINT  IF EXISTS` match
+        // as written; all offsets below are into this normalized string.
+        let stripped: String = sql
+            .lines()
+            .map(|l| l.find("--").map_or(l, |pos| &l[..pos]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let norm: String = {
+            let mut out = String::with_capacity(stripped.len());
+            let mut prev_ws = false;
+            for ch in stripped.chars() {
+                if ch.is_ascii_whitespace() {
+                    if !prev_ws {
+                        out.push(' ');
+                    }
+                    prev_ws = true;
+                } else {
+                    out.push(ch);
+                    prev_ws = false;
+                }
+            }
+            out
+        };
+        // `to_ascii_uppercase` rewrites only ASCII a-z, so byte offsets into
+        // `upper` line up with `norm` exactly even if the SQL has non-ASCII.
+        let upper = norm.to_ascii_uppercase();
+
+        // Byte ranges spanned by a `$$ ... $$` body. The existing
+        // `migrations_satisfy_runner_parsing_invariants` tripwire already proves
+        // dollar-quoting in these files is well formed, so pairing the marks in
+        // order is sound.
+        let mut bodies: Vec<(usize, usize)> = Vec::new();
+        let mut marks = upper.match_indices("$$").map(|(i, _)| i);
+        while let (Some(open), Some(close)) = (marks.next(), marks.next()) {
+            bodies.push((open, close));
+        }
+
+        let mut offenders = Vec::new();
+        for (pos, _) in upper.match_indices("ADD CONSTRAINT") {
+            if bodies.iter().any(|(o, c)| pos > *o && pos < *c) {
+                continue; // inside a DO block's own existence guard
+            }
+            let name: String = norm[pos + "ADD CONSTRAINT".len()..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue; // e.g. a `format('... ADD CONSTRAINT %I')` template
+            }
+            let guard = format!("DROP CONSTRAINT IF EXISTS {}", name.to_ascii_uppercase());
+            let guarded = upper.match_indices(&guard).any(|(g, _)| {
+                // Earlier in the file, and a whole-identifier match (not a
+                // prefix of some longer constraint name).
+                g < pos
+                    && !upper[g + guard.len()..]
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            });
+            if !guarded {
+                offenders.push(name);
+            }
+        }
+        offenders
+    }
+
+    /// Every registered migration must be safely RE-APPLIABLE, because the
+    /// runner records `schema_migrations` in a separate statement from the apply
+    /// — see [`unguarded_add_constraints`]. This is the CI tripwire for a FUTURE
+    /// migration that would otherwise only fail after an interrupted prod boot,
+    /// by refusing to start the api and the recorder.
+    #[test]
+    fn migrations_guard_add_constraint_for_reapply() {
+        for (filename, sql) in MIGRATIONS {
+            let offenders = unguarded_add_constraints(sql);
+            assert!(
+                offenders.is_empty(),
+                "{filename}: unguarded ADD CONSTRAINT {offenders:?} — Postgres has \
+                 no ADD CONSTRAINT IF NOT EXISTS, and the migration runner may \
+                 re-apply this file after an interrupted boot, which would fail \
+                 with SQLSTATE 42710 and stop BOTH the api and the recorder from \
+                 starting. Precede each ADD with `ALTER TABLE <t> DROP CONSTRAINT \
+                 IF EXISTS <name>;` (the 0071 pattern), or wrap it in a DO $$ \
+                 block that checks the catalog first (the 0069 pattern)."
+            );
+        }
+    }
+
+    /// The scanner itself must actually catch the flaw — otherwise the tripwire
+    /// above is a no-op.
+    #[test]
+    fn add_constraint_scanner_detects_unguarded() {
+        // Bare ADD CONSTRAINT: the bug this exists to prevent.
+        let bare = "ALTER TABLE t ADD CONSTRAINT t_chk CHECK (c > 0);";
+        assert_eq!(unguarded_add_constraints(bare), vec!["t_chk".to_string()]);
+
+        // A DROP that comes AFTER the ADD does not save the re-apply.
+        let after = "ALTER TABLE t ADD CONSTRAINT t_chk CHECK (c > 0);\n\
+                     ALTER TABLE t DROP CONSTRAINT IF EXISTS t_chk;";
+        assert_eq!(unguarded_add_constraints(after), vec!["t_chk".to_string()]);
+
+        // A DROP of a DIFFERENT constraint does not guard this one.
+        let other = "ALTER TABLE t DROP CONSTRAINT IF EXISTS t_other;\n\
+                     ALTER TABLE t ADD CONSTRAINT t_chk CHECK (c > 0);";
+        assert_eq!(unguarded_add_constraints(other), vec!["t_chk".to_string()]);
+
+        // A DROP of a LONGER name that merely starts with this one is not a
+        // match either (`t_chk` vs `t_chk_extra`).
+        let prefix = "ALTER TABLE t DROP CONSTRAINT IF EXISTS t_chk_extra;\n\
+                      ALTER TABLE t ADD CONSTRAINT t_chk CHECK (c > 0);";
+        assert_eq!(unguarded_add_constraints(prefix), vec!["t_chk".to_string()]);
+
+        // Only the unguarded one of a pair is reported.
+        let mixed = "ALTER TABLE t DROP CONSTRAINT IF EXISTS a_chk;\n\
+                     ALTER TABLE t ADD CONSTRAINT a_chk CHECK (c > 0),\n\
+                     ADD CONSTRAINT b_chk CHECK (d > 0);";
+        assert_eq!(unguarded_add_constraints(mixed), vec!["b_chk".to_string()]);
+
+        // Guarded forms pass. The 0071 pattern (DROP IF EXISTS, then ADD)...
+        let guarded = "ALTER TABLE t DROP CONSTRAINT IF EXISTS t_chk;\n\
+                       ALTER TABLE t ADD CONSTRAINT t_chk CHECK (c > 0);";
+        assert!(unguarded_add_constraints(guarded).is_empty());
+        // ...including the multi-clause 0058/0062 shape, and across a line break.
+        let multi = "ALTER TABLE t\n    DROP CONSTRAINT IF EXISTS a_chk,\n\
+                     \x20   DROP CONSTRAINT IF EXISTS b_chk;\nALTER TABLE t\n\
+                     \x20   ADD\n    CONSTRAINT a_chk CHECK (c > 0),\n\
+                     \x20   ADD CONSTRAINT b_chk CHECK (d > 0);";
+        assert!(unguarded_add_constraints(multi).is_empty());
+        // ...and the 0069 pattern (a DO block that checks the catalog itself).
+        let do_block = "DO $$ BEGIN\n IF NOT EXISTS (SELECT 1 FROM pg_constraint \
+                        WHERE conname = 't_chk') THEN\n  ALTER TABLE t ADD \
+                        CONSTRAINT t_chk CHECK (c > 0);\n END IF;\nEND $$;";
+        assert!(unguarded_add_constraints(do_block).is_empty());
+
+        // Prose mentioning the keywords is stripped before the scan.
+        let comment = "-- never write a bare ADD CONSTRAINT foo_chk here\n\
+                       ALTER TABLE t ADD COLUMN IF NOT EXISTS c int;";
+        assert!(unguarded_add_constraints(comment).is_empty());
+    }
+
     // ── reap_invalid_indexes — throwaway-DB integration test ─────────────────
     //
     // Opt-in: skips (passes) unless `TEST_DATABASE_URL` points at a reachable

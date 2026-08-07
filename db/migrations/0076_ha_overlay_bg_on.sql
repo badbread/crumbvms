@@ -27,6 +27,13 @@
 ALTER TABLE camera_ha_links
     ADD COLUMN IF NOT EXISTS overlay_bg_color_on text;
 
+-- Idempotent (DROP IF EXISTS + re-ADD, the 0071 pattern): ALTER TABLE ... ADD
+-- CONSTRAINT has no IF NOT EXISTS form, and the runner records
+-- schema_migrations in a SEPARATE statement from the apply — so an interrupted
+-- boot must be able to re-run this file harmlessly instead of erroring with
+-- SQLSTATE 42710 and refusing to start the api and the recorder.
+ALTER TABLE camera_ha_links
+    DROP CONSTRAINT IF EXISTS camera_ha_links_overlay_bg_color_on_hex;
 ALTER TABLE camera_ha_links
     ADD CONSTRAINT camera_ha_links_overlay_bg_color_on_hex
         CHECK (overlay_bg_color_on IS NULL OR overlay_bg_color_on ~ '^#[0-9a-fA-F]{6}$');

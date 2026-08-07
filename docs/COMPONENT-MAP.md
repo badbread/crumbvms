@@ -72,7 +72,7 @@ All paths below are repo-relative and verified to exist as of 2026-07-06.
 | Android release | `.github/workflows/android-release.yml` | `v*` tag, signed APK + sha256 on the GitHub Release. Keystore is a CI secret. Also `workflow_dispatch` (input: `release_tag`) to re-ship an Android-only fix onto an existing release without a new tag — bump `apps/android/version.properties` `VERSION_CODE` first |
 | CLA bot | `.github/workflows/cla.yml`, `CLA.md`, `CCLA.md`, `DCO` | |
 | Release orchestration | `scripts/release/` (`release.sh`, `lib.sh`, `backend.sh`, `android.sh`, `ios.sh`, `desktop-windows.sh`, `desktop-linux.sh`, `README.md`), `VERSION`, `docs/RELEASE.md` | Multi-host build fan-out over SSH; versioned-image deploy/rollback contract |
-| GitHub presence | `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`, `.github/FUNDING.yml`, `.github/media/` (README GIFs/screenshots), `LICENSE`, `NOTICE`, `SECURITY.md`, `CONTRIBUTING.md` | README screenshots/GIFs live in `.github/media/` and go stale when the UI changes |
+| GitHub presence | `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`, `.github/FUNDING.yml`, `.github/media/` (README GIFs/screenshots), `LICENSE`, `NOTICE`, `SECURITY.md`, `CONTRIBUTING.md`, `TESTING.md` | README screenshots/GIFs live in `.github/media/` and go stale when the UI changes. `TESTING.md` is the tester onboarding page (quickstart, what to test, how to report + where the diagnostics bundle lives); the `bug_report.yml` issue form asks for the same evidence, so the two move together |
 
 ### 1.5 Docs and marketing
 
