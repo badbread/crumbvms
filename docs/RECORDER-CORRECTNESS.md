@@ -201,6 +201,16 @@ recorder, and later the API) must satisfy these *by construction*.
     after warm-up; a panicked source task is supervised and immediately reads
     unhealthy → fail-open; a `MotionSignal` dropped on a full channel flips the
     source to fail-open via an interposed health watch (never silently lost).
+    **Unhealthy is not the same as alert-worthy.** A source the camera's
+    *configuration* makes permanently incapable of a verdict — today, a pixel
+    source on a camera with no sub-stream (item 12: motion runs on the SUB
+    stream only) — stays unhealthy, so fail-open recording and the console's
+    degraded-motion badge behave exactly as they do for a fault; but no startup
+    unhealthy-alert timer is armed for it, or it pages on every recorder start
+    forever about a camera working exactly as configured (issue #523). The
+    specific cause (`NO_SUB_STREAM_REASON`) is shared verbatim by the
+    decode-status `fallback_reason`, the recorder log, and the persisted
+    `motion_health_reason`, so those surfaces cannot disagree.
 
 ## stall watchdog & boot reap
 27. **The segment-receipt stall watchdog is anchored to the last received segment,
