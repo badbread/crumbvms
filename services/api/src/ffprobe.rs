@@ -97,12 +97,7 @@ pub async fn probe_video(url: &str, timeout: Duration) -> Result<ProbeStats, Str
 
     let (ok, stdout, stderr) = run_capture(FFPROBE_BIN, &args, timeout).await?;
     if !ok {
-        let msg = first_line(&stderr);
-        return Err(if msg.is_empty() {
-            "Could not open the stream.".to_owned()
-        } else {
-            msg
-        });
+        return Err(friendly_error(url, &first_line(&stderr)));
     }
 
     let stats = parse_probe(&stdout)?;
@@ -149,6 +144,171 @@ pub fn first_line(s: &str) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("")
         .to_owned()
+}
+
+// ─── operator-facing error mapping (issue #517) ───────────────────────────────
+//
+// ffmpeg's stderr was the camera-error UI: an operator who typed the wrong
+// password got `[rtsp @ 0x5d901a899040] method DESCRIBE failed: 401Unauthorized`
+// (pointer address, missing space, no idea what to do). The handful of failures
+// that actually occur on a first run are mapped to a sentence that names the fix;
+// anything unrecognised still falls through to the cleaned-up raw line, so a
+// novel ffmpeg error is never swallowed.
+
+/// Strip ffmpeg's `[proto @ 0xADDR] ` prefix, redact any `user:pass@` userinfo,
+/// and put the missing space back into `401Unauthorized` / `404Not Found`.
+fn clean_detail(raw: &str) -> String {
+    let mut s = raw.trim();
+    // `[rtsp @ 0x59d67f90d5c0] method DESCRIBE failed: …` → `method DESCRIBE …`
+    if s.starts_with('[') {
+        if let Some((head, tail)) = s.split_once("] ") {
+            if head.contains(" @ ") {
+                s = tail.trim();
+            }
+        }
+    }
+    fix_status_spacing(&redact_userinfo(s))
+}
+
+/// Replace `scheme://user:pass@host` with `scheme://…@host` so a credentialed
+/// URL echoed back by ffmpeg can't put the password in the console (or a log).
+fn redact_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let (before, after) = rest.split_at(i + 3);
+        out.push_str(before);
+        // Userinfo, if any, ends at the first '@' before the authority ends.
+        let auth_end = after.find(['/', '?', ' ', ')']).unwrap_or(after.len());
+        if let Some(at) = after[..auth_end].find('@') {
+            out.push_str("…@");
+            rest = &after[at + 1..];
+        } else {
+            out.push_str(&after[..auth_end]);
+            rest = &after[auth_end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `failed: 401Unauthorized` → `failed: 401 Unauthorized`. RTSP status lines
+/// come back from ffmpeg with the space eaten, so they don't even read as
+/// English. Scoped to text right after `failed: ` so nothing else is touched.
+fn fix_status_spacing(s: &str) -> String {
+    let Some(i) = s.find("failed: ") else {
+        return s.to_owned();
+    };
+    let (head, tail) = s.split_at(i + "failed: ".len());
+    let b = tail.as_bytes();
+    if b.len() > 3 && b[..3].iter().all(u8::is_ascii_digit) && b[3].is_ascii_alphabetic() {
+        format!("{head}{} {}", &tail[..3], &tail[3..])
+    } else {
+        s.to_owned()
+    }
+}
+
+/// `host` and optional `port` of a stream URL, userinfo stripped.
+fn url_host_port(url: &str) -> (String, Option<String>) {
+    let s = url.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let s = s.split(['/', '?', '#']).next().unwrap_or(s);
+    let s = s.rsplit_once('@').map_or(s, |(_, h)| h);
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((h, tail)) = rest.split_once(']') {
+            return (
+                format!("[{h}]"),
+                tail.strip_prefix(':')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    match s.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_owned(), Some(p.to_owned()))
+        }
+        _ => (s.to_owned(), None),
+    }
+}
+
+/// The hostname out of `Failed to resolve hostname front-door.local: Name or …`.
+fn unresolved_hostname(detail: &str) -> Option<String> {
+    let rest = detail.split_once("resolve hostname ")?.1;
+    let name = rest.split([':', ' ']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Turn one line of ffmpeg/ffprobe stderr into a message a novice can act on.
+///
+/// The recognised failure keeps the cleaned raw line as secondary detail in
+/// parentheses (the raw text is what a forum search needs); an unrecognised
+/// failure returns the cleaned raw line alone, exactly as before.
+#[must_use]
+pub fn friendly_error(url: &str, raw: &str) -> String {
+    let detail = clean_detail(raw);
+    let low = detail.to_ascii_lowercase();
+    let is_http = {
+        let u = url.trim_start().to_ascii_lowercase();
+        u.starts_with("http://") || u.starts_with("https://")
+    };
+
+    let head = if low.contains("401 unauthorized") || low.contains("failed: 401") {
+        Some(
+            "The camera rejected the username and password. Check the credentials, and \
+             note that some cameras need a separate stream account."
+                .to_owned(),
+        )
+    } else if low.contains("404 not found") || low.contains("failed: 404") {
+        Some(
+            "Connected to the camera, but there is no stream at that path. Check the \
+             stream path (try Discover), or the channel / sub-stream number."
+                .to_owned(),
+        )
+    } else if is_http && low.contains("invalid data found when processing input") {
+        Some(
+            "That address answered, but it is not a video stream. A camera web-page URL \
+             will not work here, you need the RTSP address (usually rtsp://…:554/…)."
+                .to_owned(),
+        )
+    } else if let Some(name) = unresolved_hostname(&detail) {
+        Some(format!(
+            "Could not find a host called '{name}' on your network. \
+             Try the camera's IP address instead."
+        ))
+    } else if low.contains("connection refused") {
+        // Prefer the endpoint ffmpeg actually dialled (it appears in the line as
+        // `tcp://host:port?…`), falling back to the URL the operator typed.
+        let hp = detail
+            .split_once("tcp://")
+            .and_then(|(_, r)| r.split(['?', ' ']).next())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let (host, port) = if hp.is_empty() {
+            url_host_port(url)
+        } else {
+            url_host_port(&format!("tcp://{hp}"))
+        };
+        Some(match port {
+            Some(p) => format!(
+                "Nothing is listening on port {p} at {host}. \
+                 Check the port (RTSP is usually 554)."
+            ),
+            None => format!(
+                "Nothing at {host} accepted the connection. \
+                 Check the address and port (RTSP is usually 554)."
+            ),
+        })
+    } else {
+        None
+    };
+
+    match head {
+        Some(h) if detail.is_empty() => h,
+        Some(h) => format!("{h} ({detail})"),
+        None if detail.is_empty() => "Could not open the stream.".to_owned(),
+        None => detail,
+    }
 }
 
 /// Parse ffprobe `avg_frame_rate` (e.g. `"30000/1001"`) into fps.
@@ -284,5 +444,109 @@ mod tests {
     #[test]
     fn parse_probe_garbage_json_is_error() {
         assert!(parse_probe(b"not json").is_err());
+    }
+
+    // ── operator-facing error mapping (issue #517) ───────────────────────────
+
+    #[test]
+    fn wrong_credentials_talk_about_credentials() {
+        let m = friendly_error(
+            "rtsp://cam.example:554/live",
+            "[rtsp @ 0x5d901a899040] method DESCRIBE failed: 401Unauthorized",
+        );
+        assert!(
+            m.starts_with("The camera rejected the username and password."),
+            "{m}"
+        );
+        // Pointer address gone, status line readable, raw detail kept.
+        assert!(!m.contains("0x5d901a899040"), "{m}");
+        assert!(
+            m.contains("method DESCRIBE failed: 401 Unauthorized"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn wrong_path_talks_about_the_stream_path() {
+        let m = friendly_error(
+            "rtsp://cam.example:554/nope",
+            "[rtsp @ 0x6317bd34b0c0] method DESCRIBE failed: 404Not Found",
+        );
+        assert!(m.contains("no stream at that path"), "{m}");
+        assert!(m.contains("404 Not Found"), "{m}");
+    }
+
+    #[test]
+    fn http_web_page_is_not_a_video_stream() {
+        let m = friendly_error(
+            "http://cam.example/",
+            "http://cam.example/: Invalid data found when processing input",
+        );
+        assert!(m.contains("not a video stream"), "{m}");
+        // The same ffmpeg text on an rtsp:// URL is NOT the web-page mistake.
+        let r = friendly_error(
+            "rtsp://cam.example/live",
+            "rtsp://cam.example/live: Invalid data found when processing input",
+        );
+        assert!(!r.contains("not a video stream"), "{r}");
+    }
+
+    #[test]
+    fn unresolved_host_names_the_host() {
+        let m = friendly_error(
+            "rtsp://front-door-camera.local:554/live",
+            "[tcp @ 0x5d0dd3cfb0c0] Failed to resolve hostname front-door-camera.local: Name or service not known",
+        );
+        assert!(m.contains("host called 'front-door-camera.local'"), "{m}");
+        assert!(m.contains("IP address instead"), "{m}");
+    }
+
+    #[test]
+    fn connection_refused_names_the_port_ffmpeg_dialled() {
+        let m = friendly_error(
+            "rtsp://cam.example:5544/live",
+            "[tcp @ 0x5a3a326840c0] Connection to tcp://cam.example:5544?timeout=12000000 failed: Connection refused",
+        );
+        assert!(m.contains("port 5544 at cam.example"), "{m}");
+        assert!(m.contains("usually 554"), "{m}");
+    }
+
+    #[test]
+    fn unrecognised_stderr_falls_through_to_the_cleaned_line() {
+        let m = friendly_error(
+            "rtsp://cam.example/live",
+            "[rtsp @ 0xdeadbeef] something new",
+        );
+        assert_eq!(m, "something new");
+        assert_eq!(
+            friendly_error("rtsp://cam.example/live", ""),
+            "Could not open the stream."
+        );
+    }
+
+    #[test]
+    fn credentials_are_never_echoed_back() {
+        let m = friendly_error(
+            "rtsp://bob:hunter2@cam.example/live",
+            "rtsp://bob:hunter2@cam.example/live: Invalid data found when processing input",
+        );
+        assert!(!m.contains("hunter2"), "{m}");
+        assert!(m.contains("…@cam.example"), "{m}");
+    }
+
+    #[test]
+    fn url_host_port_handles_ipv6_and_missing_port() {
+        assert_eq!(
+            url_host_port("rtsp://u:p@cam.example:554/live"),
+            ("cam.example".to_owned(), Some("554".to_owned()))
+        );
+        assert_eq!(
+            url_host_port("rtsp://cam.example/live"),
+            ("cam.example".to_owned(), None)
+        );
+        assert_eq!(
+            url_host_port("rtsp://[2001:db8::1]:554/live"),
+            ("[2001:db8::1]".to_owned(), Some("554".to_owned()))
+        );
     }
 }

@@ -178,9 +178,11 @@ generated secrets, so capture the new admin password), or do the ownership and
 write check by hand as below.
 
 **The recorder writes as uid 1001, and this is the failure that hurts.** If uid
-1001 cannot write to `MEDIA_HOST_PATH`, live view still works, the wizard still
-shows green (the api mounts `/data` read-only and cannot test writing), and
-**nothing is ever recorded**. `setup-env.sh` now preflights it:
+1001 cannot write to `MEDIA_HOST_PATH`, live view still works and **nothing is
+ever recorded**. The wizard's own preflight now catches the common shape of this
+(a media directory owned by another user), because the api and recorder run as
+the same uid, so the folder's ownership answers the question even though the api
+mounts `/data` read-only. Catch it earlier anyway, `setup-env.sh` preflights it:
 
 - It reports the media directory's **filesystem type**, and prints a prominent
   block for NFS / SMB-CIFS / FUSE mounts, where `chown 1001:1001` on this host
@@ -355,9 +357,10 @@ via `PUT /config/beta-terms`). Then:
    **"Keep at most"** (GB) and **"Keep at least"** (days). These write the default
    recording policy, so every camera added afterwards inherits them. The path is
    **preflighted live** (`POST /config/fs/check`): a green line confirms free
-   space, and the wizard **refuses to advance** if the folder isn't writable or
-   reports zero free bytes, so a full/unwritable disk can't silently record
-   nothing.
+   space, and the wizard **refuses to advance** if the folder is missing, isn't
+   writable by the recorder's uid, or reports zero free bytes, so a
+   full/unwritable disk can't silently record nothing. The same live check now
+   runs in **Settings → Storage** when you add or edit a location.
 4. **Find your cameras**, enter an IP range (pre-filled with the server's likely
    `/24`) and a **credential list**, add one username/password set per camera
    brand ("＋ Add another credential set"), then **Scan**. The sweep runs with the
@@ -475,7 +478,8 @@ All wizard steps have API equivalents. Do them in order:
 3. **Storage + retention.** Confirm/adjust the disk via `GET`/`POST /config/storages`,
    optionally preflight the path first with `POST /config/fs/check` `{path}` →
    `{status: "ok"|"warn"|"error", writable, free_bytes, total_bytes, message}`
-   (reject an `error`: not writable, outside the media root, or zero free space),
+   (reject an `error`: not writable by the recorder's uid, a parent folder that
+   doesn't exist, outside the media root, or zero free space),
    then point the default policy at it and set caps in ONE call:
    `PUT /config/policy/default` `{live_storage_id, live_max_bytes, live_retention_hours}`
    (bytes and hours). Every camera clones this policy on creation, so this is how

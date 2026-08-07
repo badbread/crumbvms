@@ -887,12 +887,30 @@ async fn get_config(
     Ok(Json(effective_settings(&state).await?.into()))
 }
 
+/// Is `base` an `http(s)://` URL? A base URL pasted without a scheme
+/// (`host:8123`, the single most common paste error) is not a URL at all and
+/// fails deep inside reqwest with an unhelpful message — reject it at save
+/// time instead, the way the Frigate HTTP test already does.
+fn has_http_scheme(base: &str) -> bool {
+    ["http://", "https://"].iter().any(|p| {
+        base.get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    })
+}
+
 /// `PUT /config/ha` — admin. Update connection config; bumps the version.
 async fn put_config(
     _admin: AdminUser,
     State(state): State<AppState>,
     Json(body): Json<HaConfigUpdate>,
 ) -> Result<Json<HaConfigDto>, ApiError> {
+    let base = body.base_url.trim();
+    if !base.is_empty() && !has_http_scheme(base) {
+        return Err(ApiError::BadRequest(format!(
+            "The Home Assistant address must start with http:// or https:// \
+             (for example http://homeassistant.local:8123). Got '{base}'."
+        )));
+    }
     let s = db::update_ha_settings(
         state.pool(),
         body.enabled,
@@ -1478,6 +1496,15 @@ fn project_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_url_scheme_is_required_on_save() {
+        assert!(has_http_scheme("http://ha.example:8123"));
+        assert!(has_http_scheme("HTTPS://ha.example"));
+        assert!(!has_http_scheme("ha.example:8123"));
+        assert!(!has_http_scheme("ws://ha.example:8123"));
+        assert!(!has_http_scheme(""));
+    }
 
     #[test]
     fn entities_filter_by_domain_with_name_fallback() {

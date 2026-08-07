@@ -22,6 +22,129 @@ use chrono::{DateTime, Utc};
 
 use crate::types::HaSettings;
 
+/// Does this `GET /api/` body actually look like Home Assistant?
+///
+/// Home Assistant answers `{"message": "API running."}`. Anything that is not a
+/// JSON object with a non-empty `message` string (an HTML login page, a bare
+/// "OK", an array) is some other web server, and reporting it as "Connected"
+/// sends the operator off configuring entities against a router admin page.
+/// Deliberately shape-based rather than exact-string, so an HA release that
+/// reworded the text does not start failing a healthy install.
+#[must_use]
+pub fn looks_like_home_assistant(body: &str) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(body.trim())
+    else {
+        return false;
+    };
+    map.get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|m| !m.trim().is_empty())
+}
+
+/// `host[:port]` of a base URL, with any `user:pass@` userinfo stripped, for
+/// operator-facing messages. (The HA token is a header, never part of the URL,
+/// so it can't reach here; userinfo is stripped anyway on principle.)
+fn host_port(base_url: &str) -> String {
+    let s = base_url.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let s = s.split(['/', '?', '#']).next().unwrap_or(s);
+    s.rsplit_once('@').map_or(s, |(_, host)| host).to_owned()
+}
+
+/// Split `host[:port]` (IPv6-literal aware) into its host and optional port.
+fn split_host_port(hp: &str) -> (String, Option<String>) {
+    if let Some(rest) = hp.strip_prefix('[') {
+        if let Some((h, tail)) = rest.split_once(']') {
+            return (
+                format!("[{h}]"),
+                tail.strip_prefix(':')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    match hp.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_owned(), Some(p.to_owned()))
+        }
+        _ => (hp.to_owned(), None),
+    }
+}
+
+/// Deepest source in an error chain, first line only — reqwest's own `Display`
+/// repeats the URL the operator just typed; the root cause ("Connection
+/// refused", "dns error", …) is the part worth showing.
+fn deepest_line(e: &reqwest::Error) -> String {
+    let mut src: &dyn std::error::Error = e;
+    while let Some(next) = src.source() {
+        src = next;
+    }
+    src.to_string()
+        .lines()
+        .next()
+        .unwrap_or("request failed")
+        .to_owned()
+}
+
+/// Turn a transport-level reqwest failure into a sentence an operator can act
+/// on. Every one of "HA is switched off", "nothing is listening on that port",
+/// "that hostname doesn't resolve" and "the base URL has no scheme" used to
+/// surface as the same four words ("Home Assistant request failed").
+fn transport_error(base_url: &str, e: &reqwest::Error) -> anyhow::Error {
+    let hp = host_port(base_url);
+    let (host, port) = split_host_port(&hp);
+    let detail = deepest_line(e);
+    let low = detail.to_ascii_lowercase();
+
+    // A base URL with no (or a non-http) scheme, e.g. "host:8123", isn't a URL
+    // reqwest can use at all: it fails while BUILDING the request, before any
+    // socket is opened. Checked on the URL itself as well as the error kind, so
+    // the message doesn't depend on which reqwest error variant that produces.
+    let http_scheme = ["http://", "https://"].iter().any(|p| {
+        base_url
+            .trim()
+            .get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    });
+    if !http_scheme || e.is_builder() {
+        return anyhow::anyhow!(
+            "'{}' is not a valid address. The Home Assistant address must start with \
+             http:// or https:// (for example http://homeassistant.local:8123).",
+            base_url.trim()
+        );
+    }
+    if e.is_timeout() {
+        return anyhow::anyhow!(
+            "Home Assistant did not answer in time at {hp}. \
+             Check that it is running and reachable from this server."
+        );
+    }
+    if low.contains("dns error")
+        || low.contains("failed to lookup address")
+        || low.contains("name or service not known")
+        || low.contains("nodename nor servname")
+        || low.contains("no such host")
+    {
+        return anyhow::anyhow!(
+            "Could not find a host called '{host}' on your network. \
+             Check the spelling, or use the IP address instead."
+        );
+    }
+    if low.contains("connection refused") || e.is_connect() {
+        return match port {
+            Some(p) => anyhow::anyhow!(
+                "Nothing answered at {host}:{p}. Is Home Assistant running, and is that \
+                 the right port? (Home Assistant is usually :8123.)"
+            ),
+            None => anyhow::anyhow!(
+                "Nothing answered at {host}. Is Home Assistant running, and is that the \
+                 right address? (Home Assistant is usually on port 8123.)"
+            ),
+        };
+    }
+    anyhow::anyhow!("Could not reach Home Assistant at {hp} ({detail}).")
+}
+
 /// A Home Assistant REST client (base URL + long-lived token). Timeouts are
 /// bounded so a dead/hung HA surfaces as an `Err` quickly.
 #[derive(Clone)]
@@ -59,19 +182,34 @@ impl HaClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("Home Assistant request failed")
+            .map_err(|e| transport_error(&self.base_url, &e))
     }
 
-    /// `GET /api/` — a cheap authenticated reachability check. `Ok` on 2xx.
+    /// `GET /api/` — a cheap authenticated reachability check.
+    ///
+    /// A 2xx is necessary but NOT sufficient: any web server (a router login
+    /// page, a NAS, a mistyped port that happens to answer) returns 200 for
+    /// `GET /api/`, and treating that as success reported "Connected" for a
+    /// base URL that is not Home Assistant at all. Home Assistant's `/api/`
+    /// answers `{"message": "API running."}`, so the body shape is checked too
+    /// (see [`looks_like_home_assistant`]).
     pub async fn test_connection(&self) -> Result<()> {
         let resp = self.get("/api/").await?;
         let code = resp.status();
-        if code.is_success() {
-            Ok(())
-        } else if code.as_u16() == 401 {
+        if code.as_u16() == 401 {
             anyhow::bail!("Home Assistant rejected the token (HTTP 401)")
-        } else {
+        }
+        if !code.is_success() {
             anyhow::bail!("Home Assistant returned HTTP {}", code.as_u16())
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if looks_like_home_assistant(&body) {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Something answered at that address, but it is not Home Assistant. \
+                 Check the host and port (Home Assistant is usually :8123)."
+            )
         }
     }
 
@@ -576,6 +714,103 @@ mod tests {
         assert!(
             client.get_states().await.is_err(),
             "an unreachable HA must surface as Err (arms fail-open)"
+        );
+    }
+
+    // ── first-run error-message quality (issue #517) ─────────────────────────
+
+    #[test]
+    fn ha_shape_accepts_real_api_body_and_rejects_other_servers() {
+        assert!(looks_like_home_assistant(r#"{"message": "API running."}"#));
+        assert!(looks_like_home_assistant(
+            "  {\"message\":\"API running.\"}\n"
+        ));
+        // Another HA wording would still pass — the check is shape-based.
+        assert!(looks_like_home_assistant(
+            r#"{"message":"API funktioniert."}"#
+        ));
+        // Anything that is not an object with a message is not Home Assistant.
+        assert!(!looks_like_home_assistant(
+            "<html><body>Login</body></html>"
+        ));
+        assert!(!looks_like_home_assistant("OK"));
+        assert!(!looks_like_home_assistant("[]"));
+        assert!(!looks_like_home_assistant(r#"{"status":"ok"}"#));
+        assert!(!looks_like_home_assistant(r#"{"message":"  "}"#));
+        assert!(!looks_like_home_assistant(""));
+    }
+
+    #[test]
+    fn host_port_strips_scheme_userinfo_and_path() {
+        assert_eq!(host_port("http://ha.example:8123/"), "ha.example:8123");
+        assert_eq!(host_port("https://u:p@ha.example/api"), "ha.example");
+        assert_eq!(
+            split_host_port("ha.example:8123").1.as_deref(),
+            Some("8123")
+        );
+        assert_eq!(split_host_port("ha.example").1, None);
+        assert_eq!(
+            split_host_port("[::1]:8123"),
+            ("[::1]".to_owned(), Some("8123".to_owned()))
+        );
+    }
+
+    /// A plain web server that is NOT Home Assistant must fail the test, not
+    /// render as "Connected" (the console's green verdict).
+    #[tokio::test]
+    async fn test_connection_rejects_a_non_home_assistant_web_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut tmp = [0u8; 1024];
+                let _ = sock.read(&mut tmp).await;
+                let body = "<html><body>Router login</body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
+        let err = client
+            .test_connection()
+            .await
+            .expect_err("a 200 from a non-HA server must NOT report success");
+        assert!(
+            err.to_string().contains("not Home Assistant"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_port_names_the_host_and_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        drop(listener);
+        let client = HaClient::from_settings(&settings_for(base)).expect("client builds");
+        let err = client.test_connection().await.expect_err("closed port");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&addr.port().to_string()) && msg.contains("Nothing answered"),
+            "unexpected message: {msg}"
+        );
+        assert!(!msg.contains("Home Assistant request failed"));
+    }
+
+    #[tokio::test]
+    async fn base_url_without_a_scheme_says_so() {
+        let client =
+            HaClient::from_settings(&settings_for("ha.example:8123".to_owned())).expect("builds");
+        let err = client.test_connection().await.expect_err("not a URL");
+        assert!(
+            err.to_string()
+                .contains("must start with http:// or https://"),
+            "unexpected message: {err}"
         );
     }
 }

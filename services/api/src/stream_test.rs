@@ -139,7 +139,7 @@ async fn test_frame(_admin: AdminUser, Json(req): Json<TestRequest>) -> Result<R
     args.push("-skip_frame".to_owned());
     args.push("nokey".to_owned());
     args.push("-i".to_owned());
-    args.push(url);
+    args.push(url.clone());
     // Two frames, no audio, MJPEG to stdout. `-q:v 3` keeps the preview crisp.
     // Concatenated JPEGs land back-to-back on stdout; `last_complete_jpeg` picks
     // the last fully-received one.
@@ -169,16 +169,19 @@ async fn test_frame(_admin: AdminUser, Json(req): Json<TestRequest>) -> Result<R
                     .into_response())
             } else {
                 tracing::debug!(stderr = %stderr, "test-frame: no complete JPEG in ffmpeg output");
+                // Only claim we CONNECTED when ffmpeg actually opened the input.
+                // At `-loglevel error` a successful open prints nothing, so any
+                // stderr line means the input never opened (wrong password, wrong
+                // path, not a video stream) — telling that operator to look at
+                // their keyframe interval sent them after the wrong thing
+                // entirely. Surface the real reason instead (issue #517 §3.1).
                 let hint = ffprobe::first_line(&stderr);
                 Err(ApiError::BadRequest(if hint.is_empty() {
-                    "Connected but no frame arrived — the camera may use a very long \
+                    "Connected, but no frame arrived. The camera may use a very long \
                      keyframe interval."
                         .to_owned()
                 } else {
-                    format!(
-                        "Connected but no frame arrived — the camera may use a very long \
-                         keyframe interval. ({hint})"
-                    )
+                    ffprobe::friendly_error(&url, &hint)
                 }))
             }
         }
