@@ -12,6 +12,7 @@
 import 'package:flutter/material.dart';
 
 import '../../session/session_controller.dart';
+import '../hotkeys/hotkey_gate.dart';
 
 class ReauthOverlay extends StatefulWidget {
   const ReauthOverlay({super.key, required this.controller, required this.child});
@@ -83,80 +84,85 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
         // playback) exactly as before — a 401 must never tear it down.
         widget.child,
         if (c.needsReauth)
+          // This card blocks the shell but is not a pushed route, so the tab
+          // underneath still has its hotkeys registered — suppress them while
+          // the operator is typing credentials.
           Positioned.fill(
-            child: Container(
-              color: Colors.black.withValues(alpha: 0.6),
-              alignment: Alignment.center,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 380),
-                child: Card(
-                  elevation: 8,
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Form(
-                      key: _formKey,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          Text(
-                            'Session expired',
-                            style: Theme.of(context).textTheme.titleLarge,
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            'Sign back in to keep watching — the wall stays connected.',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                          const SizedBox(height: 16),
-                          TextFormField(
-                            controller: _usernameCtrl,
-                            enabled: !c.reauthing,
-                            decoration: const InputDecoration(
-                              labelText: 'Username',
+            child: HotkeySuppressor(
+              child: Container(
+                color: Colors.black.withValues(alpha: 0.6),
+                alignment: Alignment.center,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 380),
+                  child: Card(
+                    elevation: 8,
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Form(
+                        key: _formKey,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Text(
+                              'Session expired',
+                              style: Theme.of(context).textTheme.titleLarge,
                             ),
-                            textInputAction: TextInputAction.next,
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: _passwordCtrl,
-                            enabled: !c.reauthing,
-                            decoration: const InputDecoration(
-                              labelText: 'Password',
-                            ),
-                            obscureText: true,
-                            textInputAction: TextInputAction.done,
-                            onFieldSubmitted: (_) => _submit(),
-                          ),
-                          Row(
-                            children: [
-                              Checkbox(
-                                value: _remember,
-                                onChanged: c.reauthing
-                                    ? null
-                                    : (v) =>
-                                          setState(() => _remember = v ?? true),
-                              ),
-                              const Text('Keep me signed in'),
-                            ],
-                          ),
-                          if (c.reauthError != null) ...[
                             const SizedBox(height: 4),
                             Text(
-                              c.reauthError!,
-                              style: TextStyle(
-                                color: Theme.of(context).colorScheme.error,
+                              'Sign back in to keep watching — the wall stays connected.',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                            const SizedBox(height: 16),
+                            TextFormField(
+                              controller: _usernameCtrl,
+                              enabled: !c.reauthing,
+                              decoration: const InputDecoration(
+                                labelText: 'Username',
+                              ),
+                              textInputAction: TextInputAction.next,
+                            ),
+                            const SizedBox(height: 12),
+                            TextFormField(
+                              controller: _passwordCtrl,
+                              enabled: !c.reauthing,
+                              decoration: const InputDecoration(
+                                labelText: 'Password',
+                              ),
+                              obscureText: true,
+                              textInputAction: TextInputAction.done,
+                              onFieldSubmitted: (_) => _submit(),
+                            ),
+                            Row(
+                              children: [
+                                Checkbox(
+                                  value: _remember,
+                                  onChanged: c.reauthing
+                                      ? null
+                                      : (v) =>
+                                            setState(() => _remember = v ?? true),
+                                ),
+                                const Text('Keep me signed in'),
+                              ],
+                            ),
+                            if (c.reauthError != null) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                c.reauthError!,
+                                style: TextStyle(
+                                  color: Theme.of(context).colorScheme.error,
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 16),
+                            FilledButton(
+                              onPressed: c.reauthing ? null : _submit,
+                              child: Text(
+                                c.reauthing ? 'Signing in…' : 'Sign in',
                               ),
                             ),
                           ],
-                          const SizedBox(height: 16),
-                          FilledButton(
-                            onPressed: c.reauthing ? null : _submit,
-                            child: Text(
-                              c.reauthing ? 'Signing in…' : 'Sign in',
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                   ),

@@ -27,6 +27,7 @@ import 'package:crumb_desktop/state/ha_overlay_prefs.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
+import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/ha_link/ha_link_dialog.dart';
 import 'package:crumb_desktop/ui/live/adaptive_guardrail_dialog.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
@@ -86,6 +87,7 @@ class WallScreen extends StatefulWidget {
     this.audio,
     this.hotkeys,
     this.shortcuts,
+    this.fullscreen,
     this.onMaximizedCameraChanged,
     this.statsSink,
     this.onConfigChanged,
@@ -122,6 +124,11 @@ class WallScreen extends StatefulWidget {
   /// Remapped action-shortcut bindings (Keyboard Shortcuts settings) for the
   /// wall's key listener. Null → the hardcoded defaults.
   final KeyboardShortcutsStore? shortcuts;
+
+  /// The app's OS-window fullscreen state. Read only by the wall's Esc
+  /// handling, to keep the old client's order: the first Esc leaves the
+  /// fullscreen camera wall, the next one un-maximizes a pane.
+  final FullscreenController? fullscreen;
 
   /// Per-camera stream (main/sub) + PTZ-disable prefs. Drives the right-click
   /// menu on a tile and which stream each pane plays.
@@ -723,9 +730,12 @@ class _WallScreenState extends State<WallScreen> {
     final Widget keyed = GlobalHotkeysListener(
       store: hk,
       cameras: cams,
-      autofocus: true,
       shortcuts: widget.shortcuts,
       options: widget.clientOptions,
+      // Esc leaves the fullscreen camera wall before it un-maximizes a pane
+      // (old-client order) — the listener stands down on Esc while the window
+      // is fullscreen so FullscreenEscHandler gets that first press.
+      fullscreen: widget.fullscreen,
       onGoToCamera: (id) {
         for (final c in cams) {
           if (c.id == id) {
