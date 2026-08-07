@@ -1071,6 +1071,50 @@ impl RecorderSupervisor {
     /// requiring a separate `seed` run for storage rows.  Camera rows still
     /// require the `seed` binary.
     async fn seed_storages(&self) -> Result<()> {
+        // The `*_STORAGE_NAME` code defaults track docker-compose.yml (`Live` /
+        // `Archive`). A deployment that predates that and does NOT get the names
+        // from compose still has rows under the old defaults, so the upsert
+        // below would INSERT a second row for the same directory. That is
+        // tolerated (reconcile keys duplicates by root path) and loses no
+        // footage — existing segments keep their `storage_id` and the default
+        // policy keeps its `live_storage_id` — but it must not happen silently.
+        match db::list_storages(&self.pool).await {
+            Ok(existing) => {
+                let rows: Vec<(String, String)> =
+                    existing.into_iter().map(|s| (s.name, s.path)).collect();
+                for (name, path) in [
+                    (
+                        &self.config.live_storage_name,
+                        &self.config.live_storage_path,
+                    ),
+                    (
+                        &self.config.archive_storage_name,
+                        &self.config.archive_storage_path,
+                    ),
+                ] {
+                    if let Some(other) =
+                        db::duplicate_path_under_other_name(rows.iter().cloned(), name, path)
+                    {
+                        warn!(
+                            path = %path,
+                            existing_name = %other,
+                            configured_name = %name,
+                            "DUPLICATE STORAGE PATH: an existing storage row already points at \
+                             this path under a different name, so seeding the configured name \
+                             adds a SECOND row for the same directory. No footage is affected \
+                             (existing segments keep their storage). To merge them, either set \
+                             LIVE_STORAGE_NAME / ARCHIVE_STORAGE_NAME to the existing name, or \
+                             rename the existing storage in the console."
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Advisory only — never block the seed (and therefore recording).
+                warn!(error = %e, "could not list storages to check for duplicate paths before seeding");
+            }
+        }
+
         db::upsert_storage(
             &self.pool,
             &self.config.live_storage_name,

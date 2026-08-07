@@ -1504,7 +1504,7 @@ function wizardBody(key) {
       <input id="wz-addr" class="mono" value="${esc(addr)}" placeholder="http://198.51.100.50:8080" style="font-size:13px" />
       <label class="field-label" style="margin-top:12px">Camera streaming base, RTSP <span style="color:var(--dim2);font-weight:400">(native desktop / phone apps use this)</span></label>
       <input id="wz-rtsp" class="mono" value="${esc(rtsp)}" placeholder="rtsp://198.51.100.50:18554" style="font-size:13px" />
-      <div class="login-sub" style="margin-top:8px">For encrypted access, use <code>https://&lt;this-host&gt;:8443</code> instead (a Caddy sidecar terminates TLS in front of the console, self-signed by default on a LAN install). See <b>Server</b> → TLS, or docs/TLS.md, to trust the certificate or switch to a real domain.</div>`;
+      <div class="login-sub" style="margin-top:8px">For encrypted access, use <code>https://&lt;this-host&gt;:8443</code> instead (a Caddy sidecar terminates TLS in front of the console, self-signed by default on a LAN install). See the <b>Server</b> section, or docs/TLS.md, to trust the certificate or switch to a real domain.</div>`;
   }
   if (key === 'storage')    return wizardStorageBody();
   if (key === 'cam-find')   return wizardFindBody();
@@ -1586,8 +1586,8 @@ async function wizardDetectHwEnter() {
    Lightweight one-destination form over the SAME channels API the console's
    Notifications panel uses (POST /notifications/channels + .../test). Only the
    simplest providers are offered here; the full surface (per-camera rules,
-   quiet hours, Discord/Slack/Telegram, system alerts) lives in Settings →
-   Notifications. */
+   quiet hours, Discord/Slack/Telegram, system alerts) lives in the console's
+   own Notifications section. */
 const WIZARD_NOTIFY_KINDS = ['ntfy', 'pushover', 'webhook'];
 function wizardNotifyState() {
   if (!WZ.notifyCh) WZ.notifyCh = { kind: 'ntfy', id: null, name: '', vals: {} };
@@ -1612,7 +1612,7 @@ function wizardNotifyBody() {
       <button class="ghost sm" onclick="wizardNotifyTest()">Save &amp; send test</button>
       <span id="wz-nf-test" style="font-size:12px"></span>
     </div>
-    <div class="login-sub" style="margin-top:12px;margin-bottom:0">This destination will cover <b>all cameras</b> and be available to all users. Full options, per-camera rules, quiet hours, more channel types (Discord, Slack, Telegram) and system alerts, live in <b>Settings → Notifications</b>.</div>`;
+    <div class="login-sub" style="margin-top:12px;margin-bottom:0">This destination will cover <b>all cameras</b> and be available to all users. Full options, per-camera rules, quiet hours, more channel types (Discord, Slack, Telegram) and system alerts, live in the <b>Notifications</b> section of this console.</div>`;
 }
 function wizardNotifyKind(k) {
   const st = wizardNotifyState();
@@ -1699,7 +1699,7 @@ function wizardUsersBody() {
         <span id="wz-us-msg" style="font-size:12px;color:var(--danger)"></span>
       </div>
     </div>
-    <div class="login-sub" style="margin-top:12px;margin-bottom:0">Roles decide which cameras a user sees and what they can do. Fine-grained control (custom roles, per-user camera grants) lives in <b>Settings → Users &amp; Security</b>.</div>`;
+    <div class="login-sub" style="margin-top:12px;margin-bottom:0">Roles decide which cameras a user sees and what they can do. Fine-grained control (custom roles, per-user camera grants) lives in the <b>Users &amp; security</b> section of this console.</div>`;
 }
 async function wizardUserAdd() {
   const msg = $('wz-us-msg'); if (msg) msg.textContent = '';
@@ -1832,9 +1832,9 @@ function wizardStorageCheckHtml(res) {
   return `<span style="color:${color};font-weight:700">${mark}</span> <span style="color:var(--dim)">${esc(res.message || '')}</span>`;
 }
 
-/* ── The SAME preflight, for Settings → Storage ──────────────────────────────
+/* ── The SAME preflight, for the Storage section ────────────────────────────
    fs/check used to be called from exactly one place (the wizard), so the
-   Settings pane happily saved a path that does not exist or is not writable and
+   Storage pane happily saved a path that does not exist or is not writable and
    said nothing at all (HTTP 201, silence). Paints a live status line under the
    path box and returns the verdict so add/save can refuse an `error`. */
 let _stCheckSeq = 0;
@@ -9943,7 +9943,7 @@ const SYS_ALERT_META = {
   stream_no_segments:   { title: 'Camera records nothing',            desc: 'A camera keeps connecting but never produces a recordable segment before the stall watchdog reconnects it, so no footage is saved. Usually a long/adaptive keyframe interval (smart codec, e.g. Hikvision/Dahua H.264+/H.265+) or very low fps, exceeding the segment-receipt timeout. Fix the camera’s I-frame interval / disable the smart codec, or raise SEGMENT_RECEIPT_TIMEOUT_SECS.', unit: null },
   storage_unwritable:   { title: 'Storage not writable',              desc: 'The recorder cannot create a camera’s media directory under the storage root (permission denied) — footage is NOT being saved. Usually the host media dir is root-owned while the recorder runs as non-root uid 1001; fix the media dir ownership/permissions.', unit: null },
   plate_watchlist_hit:  { title: 'License-plate watchlist hit',        desc: 'A watchlisted license plate was seen on a camera (managed in LPR → Watchlist).', unit: null },
-  update_available:     { title: 'Crumb update available',             desc: 'A newer Crumb release is available on GitHub. Off by default and only fires when the update-available check is also enabled (Settings → Updates) — notify-only, no download or install. Fires once per new version.', unit: null },
+  update_available:     { title: 'Crumb update available',             desc: 'A newer Crumb release is available on GitHub. Off by default and only fires when the update-available check is also enabled (Server → Update checks) — notify-only, no download or install. Fires once per new version.', unit: null },
 };
 
 /* Per-kind connection-field descriptors. */

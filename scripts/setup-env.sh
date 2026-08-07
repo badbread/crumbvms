@@ -17,6 +17,11 @@
 #   scripts/setup-env.sh                # generate all secrets, write .env
 #   scripts/setup-env.sh --prompt       # prompt for the admin password instead
 #   scripts/setup-env.sh --force        # overwrite an existing .env
+#
+# Two paths can be chosen up front, as environment variables, so the script
+# writes them into .env AND prepares them (ownership + preflight):
+#   MEDIA_HOST_PATH=/mnt/tank/crumb scripts/setup-env.sh        # footage
+#   DB_BACKUP_HOST_PATH=/mnt/nas/crumb-backups scripts/setup-env.sh  # DB dumps
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -179,6 +184,20 @@ case "${MEDIA_HOST_PATH_VALUE}" in
   *)  MEDIA_DIR_HOST="${REPO_ROOT}/${MEDIA_HOST_PATH_VALUE#./}" ;;
 esac
 
+# ── Where the nightly DB dumps will be written ───────────────────────────────
+# Same deal as MEDIA_HOST_PATH, and accepted the same way:
+#
+#   DB_BACKUP_HOST_PATH=/mnt/nas/crumb-backups scripts/setup-env.sh
+#
+# Whatever it points at is written into .env AND gets the uid-1001 prep below.
+# (It used to be hardcoded to ${REPO_ROOT}/backups, so a custom path was written
+# into .env but never prepared, and the operator hit a root-owned bind mount.)
+DB_BACKUP_HOST_PATH_VALUE="${DB_BACKUP_HOST_PATH:-./backups}"
+case "${DB_BACKUP_HOST_PATH_VALUE}" in
+  /*) BACKUP_DIR_HOST="${DB_BACKUP_HOST_PATH_VALUE}" ;;
+  *)  BACKUP_DIR_HOST="${REPO_ROOT}/${DB_BACKUP_HOST_PATH_VALUE#./}" ;;
+esac
+
 # Write atomically: build in a temp file, then move into place.
 TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
 trap 'rm -f "${TMP}"' EXIT
@@ -295,9 +314,10 @@ EXPORT_TTL_SECONDS=86400
 # --- Database backup (built into the api; ON by default -- docs/BACKUP.md) ---
 # The api runs a nightly pg_dump (03:15 local) with rotation into this host
 # dir. Put it on a DIFFERENT disk than MEDIA_HOST_PATH where practical, and
-# keep it writable by uid 1001 (the api's user) -- setup-env.sh prepares the
-# default ./backups dir; if you point this elsewhere, chown it yourself.
-DB_BACKUP_HOST_PATH=./backups
+# keep it writable by uid 1001 (the api's user) -- setup-env.sh prepares
+# whatever this points at. To put it somewhere else, re-run setup-env.sh with
+# DB_BACKUP_HOST_PATH=/your/path so that directory is prepared too.
+DB_BACKUP_HOST_PATH=${DB_BACKUP_HOST_PATH_VALUE}
 
 # --- Off-host backup copy (OPTIONAL; see docs/BACKUP.md "Off-host copies") ---
 # The api's built-in backup job (ON by default) writes dumps to a directory on
@@ -550,12 +570,13 @@ if [[ -d "${MEDIA_DIR_HOST}" ]]; then
 fi
 
 # ── DB-backup directory prep ─────────────────────────────────────────────────
-# The api container (uid 1001) writes nightly pg_dumps into ./backups (see
-# DB_BACKUP_HOST_PATH). If Docker auto-creates the bind-mount dir it ends up
-# root-owned and the api can't write (backups get disabled with a warning), so
-# create it here with the right ownership while we can. Best-effort: a non-root
-# run without sudo still works — the api will say exactly what to fix.
-BACKUP_DIR_HOST="${REPO_ROOT}/backups"
+# The api container (uid 1001) writes nightly pg_dumps into DB_BACKUP_HOST_PATH.
+# If Docker auto-creates the bind-mount dir it ends up root-owned and the api
+# can't write (backups get disabled with a warning), so create it here with the
+# right ownership while we can. Best-effort: a non-root run without sudo still
+# works — the api will say exactly what to fix.
+# (BACKUP_DIR_HOST was resolved from DB_BACKUP_HOST_PATH above, so a custom path
+# is prepared exactly like the default ./backups one.)
 mkdir -p "${BACKUP_DIR_HOST}" 2>/dev/null || true
 if [[ -d "${BACKUP_DIR_HOST}" ]]; then
   if chown 1001:1001 "${BACKUP_DIR_HOST}" 2>/dev/null; then

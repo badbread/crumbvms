@@ -19,6 +19,18 @@ use anyhow::{Context, Result};
 use std::env;
 use std::sync::OnceLock;
 
+/// Default for `LIVE_STORAGE_NAME`.
+///
+/// MUST stay equal to the `${LIVE_STORAGE_NAME:-...}` default in
+/// `docker-compose.yml` — `compose_storage_name_defaults_match_the_code` asserts
+/// it. Compose is what every supported install runs, so a code default that
+/// disagrees only ever shows up on a bare-metal run, as a differently-labelled
+/// storage row that nobody expected.
+pub const DEFAULT_LIVE_STORAGE_NAME: &str = "Live";
+
+/// Default for `ARCHIVE_STORAGE_NAME`. See [`DEFAULT_LIVE_STORAGE_NAME`].
+pub const DEFAULT_ARCHIVE_STORAGE_NAME: &str = "Archive";
+
 /// Fully-resolved runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -92,7 +104,9 @@ pub struct Config {
 
     /// `LIVE_STORAGE_NAME` — human label inserted/upserted into `storages`.
     ///
-    /// Default: `"NVMe-Live"`
+    /// Default: `"Live"` — the same value `docker-compose.yml` passes
+    /// (`${LIVE_STORAGE_NAME:-Live}`), so a non-compose run produces the same
+    /// storage label the console, the docs and every compose install show.
     pub live_storage_name: String,
 
     /// `ARCHIVE_STORAGE_PATH` — filesystem path for archive recordings.
@@ -102,7 +116,8 @@ pub struct Config {
 
     /// `ARCHIVE_STORAGE_NAME` — human label for the archive storage row.
     ///
-    /// Default: `"Bulk-Archive"`
+    /// Default: `"Archive"` — matches `docker-compose.yml`
+    /// (`${ARCHIVE_STORAGE_NAME:-Archive}`), see [`Config::live_storage_name`].
     pub archive_storage_name: String,
 
     /// `RECORDER_TZ` — IANA timezone the per-camera archive-schedule cron is
@@ -457,9 +472,12 @@ impl Config {
             go2rtc_pass: optional_env("GO2RTC_PASS", ""),
             segment_seconds,
             live_storage_path: optional_env("LIVE_STORAGE_PATH", "/data/live"),
-            live_storage_name: optional_env("LIVE_STORAGE_NAME", "NVMe-Live"),
+            live_storage_name: optional_env("LIVE_STORAGE_NAME", DEFAULT_LIVE_STORAGE_NAME),
             archive_storage_path: optional_env("ARCHIVE_STORAGE_PATH", "/data/archive"),
-            archive_storage_name: optional_env("ARCHIVE_STORAGE_NAME", "Bulk-Archive"),
+            archive_storage_name: optional_env(
+                "ARCHIVE_STORAGE_NAME",
+                DEFAULT_ARCHIVE_STORAGE_NAME,
+            ),
             // RECORDER_TZ wins; otherwise inherit the container's TZ (compose
             // forwards it, and setup-env.sh sets it to the host zone) so a
             // non-US operator's archive/retention cron matches their wall clock.
@@ -634,7 +652,10 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{go2rtc_rtsp_auth_enabled, optional_env, parse_env, parse_tz_env, HwAccel};
+    use super::{
+        go2rtc_rtsp_auth_enabled, optional_env, parse_env, parse_tz_env, HwAccel,
+        DEFAULT_ARCHIVE_STORAGE_NAME, DEFAULT_LIVE_STORAGE_NAME,
+    };
 
     /// Issue #479 — THE DEFECT. `auto` used to resolve through
     /// `nvdec_available()`, i.e. "is cuda COMPILED into this ffmpeg", which is
@@ -669,6 +690,47 @@ mod tests {
             assert_eq!(HwAccel::Vaapi.resolve_auto(probe), HwAccel::Vaapi);
             assert_eq!(HwAccel::Cpu.resolve_auto(probe), HwAccel::Cpu);
         }
+    }
+
+    /// Read the `${NAME:-default}` fallback compose declares for `key`, from the
+    /// repo's `docker-compose.yml`. `None` when the file is unreadable (a
+    /// vendored crate outside the repo) or the key is absent.
+    fn compose_default(key: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker-compose.yml")
+            .canonicalize()
+            .ok()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let needle = format!("${{{key}:-");
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{key}:")) && l.contains(&needle))?;
+        let rest = &line[line.find(&needle)? + needle.len()..];
+        Some(rest[..rest.find('}')?].to_owned())
+    }
+
+    /// Drift guard: the storage-name code defaults MUST equal the values
+    /// `docker-compose.yml` passes. They disagreed once (`NVMe-Live`/
+    /// `Bulk-Archive` in code vs `Live`/`Archive` in compose), which was
+    /// invisible on every compose install and surfaced only as oddly-named
+    /// storage rows on a bare-metal run. This test fails the moment either side
+    /// moves without the other.
+    #[test]
+    fn compose_storage_name_defaults_match_the_code() {
+        let Some(live) = compose_default("LIVE_STORAGE_NAME") else {
+            eprintln!("skipping: docker-compose.yml not readable from this checkout");
+            return;
+        };
+        assert_eq!(
+            live, DEFAULT_LIVE_STORAGE_NAME,
+            "docker-compose.yml LIVE_STORAGE_NAME default drifted from the code default"
+        );
+        let archive =
+            compose_default("ARCHIVE_STORAGE_NAME").expect("ARCHIVE_STORAGE_NAME in compose");
+        assert_eq!(
+            archive, DEFAULT_ARCHIVE_STORAGE_NAME,
+            "docker-compose.yml ARCHIVE_STORAGE_NAME default drifted from the code default"
+        );
     }
 
     /// The admin-editable DB setting round-trips through the same tokens, and an

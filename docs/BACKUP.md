@@ -63,8 +63,13 @@ The api container runs as **uid 1001**, so the host directory behind
 sudo chown -R 1001:1001 "${DB_BACKUP_HOST_PATH:-./backups}"
 ```
 
-`scripts/setup-env.sh` prepares the default `./backups` dir for you when it
-can. If the dir is unwritable, the api logs a clear warning, emits one
+`scripts/setup-env.sh` prepares this directory for you when it can. It
+prepares whatever `DB_BACKUP_HOST_PATH` points at, not just the default
+`./backups`, so choose the path up front and the ownership is handled:
+
+```bash
+DB_BACKUP_HOST_PATH=/mnt/nas/crumb-db-backups scripts/setup-env.sh
+``` If the dir is unwritable, the api logs a clear warning, emits one
 `backup_failed` alert, and **disables backups without affecting the api
 itself**, backups being broken never takes the API down.
 
@@ -176,6 +181,10 @@ mount, etc.) on the host and point the existing variable at it:
 # .env
 DB_BACKUP_HOST_PATH=/mnt/nas/crumb-db-backups
 ```
+
+On a fresh install you can pass the same value to `scripts/setup-env.sh` (see
+Permissions above) so it writes that path into `.env` **and** prepares its
+ownership, instead of writing the path and leaving the chown to you.
 
 The api writes its daily/weekly/monthly dumps straight to that mount —
 they're off-host the moment `pg_dump` finishes, with no sync step, no second
