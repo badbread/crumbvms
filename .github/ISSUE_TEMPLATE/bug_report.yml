@@ -96,8 +96,8 @@ body:
     id: gpu
     attributes:
       label: GPU and hardware decode
-      description: Leave blank if you are on the CPU default.
-      placeholder: "NVIDIA RTX A2000 with nvidia-container-toolkit, MOTION_HWACCEL=nvdec"
+      description: Leave blank if you are on the default (MOTION_HWACCEL=cpu). Valid values are auto, cpu, cuda, and vaapi.
+      placeholder: "NVIDIA RTX A2000 with nvidia-container-toolkit, MOTION_HWACCEL=cuda"
   - type: input
     id: camera
     attributes:

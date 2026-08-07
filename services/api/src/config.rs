@@ -19,6 +19,15 @@ use std::{collections::HashMap, env, net::SocketAddr};
 
 use crate::ptz::OnvifCameraConfig;
 
+/// Default for `EXPORT_DIR`.
+///
+/// A TOP-LEVEL directory, deliberately NOT under `/data`: the api mounts media
+/// storage READ-ONLY at `/data`, so any default beneath it is unwritable by
+/// construction. `docker-compose.yml` gives exports their own writable
+/// `crumb_exports:/exports` volume; `compose_export_dir_default_matches_the_code`
+/// asserts the two stay equal.
+pub const DEFAULT_EXPORT_DIR: &str = "/exports";
+
 /// Fully-resolved runtime configuration for the API service.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -153,7 +162,12 @@ pub struct ApiConfig {
     // -- export -------------------------------------------------------------
     /// `EXPORT_DIR` -- directory where completed export MP4 files are written.
     ///
-    /// Default: `/data/exports`
+    /// Default: `/exports` -- a TOP-LEVEL directory, deliberately NOT under
+    /// `/data`. The api mounts media storage READ-ONLY at `/data`, so a default
+    /// beneath it could never be written to; `docker-compose.yml` gives exports
+    /// their own writable `crumb_exports:/exports` volume and passes
+    /// `${EXPORT_DIR:-/exports}`. The code default matches that so a non-compose
+    /// run lands somewhere writable too.
     pub export_dir: String,
 
     /// `EXPORT_TTL_SECONDS` -- how long export files are kept before cleanup.
@@ -427,7 +441,7 @@ impl ApiConfig {
             go2rtc_pass,
             // Issue #398: secure by default — auth ON unless GO2RTC_AUTH=off.
             go2rtc_rtsp_auth: crumb_common::config::go2rtc_rtsp_auth_enabled_env(),
-            export_dir: optional_env("EXPORT_DIR", "/data/exports"),
+            export_dir: optional_env("EXPORT_DIR", DEFAULT_EXPORT_DIR),
             export_ttl_seconds: parse_env("EXPORT_TTL_SECONDS", 86_400_u64)?,
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),
             clip_gen_max_concurrency: parse_env("CLIP_GEN_MAX_CONCURRENCY", 4usize)?.max(1),
@@ -555,7 +569,7 @@ fn parse_onvif_config() -> Result<HashMap<String, OnvifCameraConfig>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_env;
+    use super::{parse_env, DEFAULT_EXPORT_DIR};
 
     /// #249: compose forwards keys as `${VAR:-}`, so an unset key arrives as an
     /// empty string. The api's `parse_env` must treat that as "use the default",
@@ -576,5 +590,42 @@ mod tests {
         std::env::remove_var("CRUMB_API_TEST_EMPTY_NUM");
         std::env::remove_var("CRUMB_API_TEST_WS_NUM");
         std::env::remove_var("CRUMB_API_TEST_SET_NUM");
+    }
+
+    /// Read the `${NAME:-default}` fallback compose declares for `key`.
+    /// `None` when `docker-compose.yml` is unreadable or the key is absent.
+    fn compose_default(key: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker-compose.yml")
+            .canonicalize()
+            .ok()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let needle = format!("${{{key}:-");
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{key}:")) && l.contains(&needle))?;
+        let rest = &line[line.find(&needle)? + needle.len()..];
+        Some(rest[..rest.find('}')?].to_owned())
+    }
+
+    /// Drift guard. The code default used to be `/data/exports`, which cannot
+    /// work: the api mounts `/data` READ-ONLY, so a non-compose run wrote (or
+    /// rather failed to write) exports into a read-only tree. Compose has always
+    /// passed `/exports` from its own writable volume; the code now agrees, and
+    /// this test keeps them that way.
+    #[test]
+    fn compose_export_dir_default_matches_the_code() {
+        let Some(export_dir) = compose_default("EXPORT_DIR") else {
+            eprintln!("skipping: docker-compose.yml not readable from this checkout");
+            return;
+        };
+        assert_eq!(
+            export_dir, DEFAULT_EXPORT_DIR,
+            "docker-compose.yml EXPORT_DIR default drifted from the code default"
+        );
+        assert!(
+            !DEFAULT_EXPORT_DIR.starts_with("/data"),
+            "EXPORT_DIR must not default under /data — the api mounts it read-only"
+        );
     }
 }

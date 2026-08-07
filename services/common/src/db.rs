@@ -272,6 +272,57 @@ pub async fn upsert_storage(pool: &Pool, name: &str, path: &str) -> Result<Stora
     Ok(storage_from_row(&row))
 }
 
+/// Detect the one way an operator-visible `*_STORAGE_NAME` change can bite: a
+/// row already exists at `path` under a DIFFERENT name, and no row carries
+/// `name` yet, so the next [`upsert_storage`] would INSERT a second row for the
+/// same physical directory instead of reusing the first.
+///
+/// Returns the existing row's name in that case, otherwise `None`.
+///
+/// This is a *detector*, never a fixer. Adopting the existing row by renaming it
+/// was considered and rejected: `PUT /config/storages/{id}` lets an operator
+/// rename a storage deliberately, and a boot-time rename would silently undo
+/// that. Duplicate rows for one path are already a tolerated condition (the
+/// reconcile orphan pass keys on the storage ROOT PATH, not the id, precisely so
+/// duplicates cannot double-index or double-budget a disk), so the safe move is
+/// to say so loudly and let the operator merge them.
+///
+/// # Examples
+///
+/// ```
+/// # use crumb_common::db::duplicate_path_under_other_name;
+/// let rows = [("NVMe-Live".to_owned(), "/data/live".to_owned())];
+/// // Renaming the default would insert a SECOND row for /data/live:
+/// assert_eq!(
+///     duplicate_path_under_other_name(rows.iter().cloned(), "Live", "/data/live"),
+///     Some("NVMe-Live".to_owned())
+/// );
+/// // Once a row already carries the target name there is nothing to warn about.
+/// let rows = [("Live".to_owned(), "/data/live".to_owned())];
+/// assert_eq!(
+///     duplicate_path_under_other_name(rows.iter().cloned(), "Live", "/data/live"),
+///     None
+/// );
+/// ```
+#[must_use]
+pub fn duplicate_path_under_other_name<I>(rows: I, name: &str, path: &str) -> Option<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut clash: Option<String> = None;
+    for (row_name, row_path) in rows {
+        if row_name == name {
+            // The target name already exists: upsert_storage updates it in
+            // place, no new row, nothing to warn about.
+            return None;
+        }
+        if row_path == path && clash.is_none() {
+            clash = Some(row_name);
+        }
+    }
+    clash
+}
+
 /// Fetch a storage row by its UUID.
 ///
 /// Returns `None` if the row does not exist.
@@ -12567,6 +12618,62 @@ pub async fn system_events_since(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `*_STORAGE_NAME` code defaults were realigned onto the compose
+    /// values (`Live` / `Archive`). On a compose install nothing changes, but a
+    /// non-compose deployment carrying the OLD defaults must not silently gain a
+    /// second `storages` row for the same directory without saying so.
+    #[test]
+    fn duplicate_path_detector_flags_a_renamed_default() {
+        let rows = || {
+            vec![
+                ("NVMe-Live".to_owned(), "/data/live".to_owned()),
+                ("Bulk-Archive".to_owned(), "/data/archive".to_owned()),
+            ]
+        };
+        assert_eq!(
+            duplicate_path_under_other_name(rows(), "Live", "/data/live"),
+            Some("NVMe-Live".to_owned()),
+        );
+        assert_eq!(
+            duplicate_path_under_other_name(rows(), "Archive", "/data/archive"),
+            Some("Bulk-Archive".to_owned()),
+        );
+    }
+
+    /// The common cases stay silent: a fresh DB, an already-migrated DB, and a
+    /// genuinely new path that happens to be seeded alongside an existing one.
+    #[test]
+    fn duplicate_path_detector_is_quiet_when_there_is_no_clash() {
+        // Fresh install: no rows at all.
+        assert_eq!(
+            duplicate_path_under_other_name(Vec::new(), "Live", "/data/live"),
+            None,
+        );
+        // Compose install: the row already carries the target name, so
+        // upsert_storage updates it in place.
+        let rows = vec![("Live".to_owned(), "/data/live".to_owned())];
+        assert_eq!(
+            duplicate_path_under_other_name(rows, "Live", "/data/live"),
+            None,
+        );
+        // A name match anywhere wins even when another row shares the path,
+        // because ON CONFLICT (name) targets that row.
+        let rows = vec![
+            ("NVMe-Live".to_owned(), "/data/live".to_owned()),
+            ("Live".to_owned(), "/data/live".to_owned()),
+        ];
+        assert_eq!(
+            duplicate_path_under_other_name(rows, "Live", "/data/live"),
+            None,
+        );
+        // Different path: seeding Archive must not be blamed on the Live row.
+        let rows = vec![("Live".to_owned(), "/data/live".to_owned())];
+        assert_eq!(
+            duplicate_path_under_other_name(rows, "Archive", "/data/archive"),
+            None,
+        );
+    }
 
     #[test]
     fn levenshtein_treats_confusable_chars_as_free() {
