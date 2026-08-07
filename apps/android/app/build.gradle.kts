@@ -202,6 +202,16 @@ dependencies {
     // extractor test (Gate 3: proves +global_sidx makes a fragmented segment
     // seekable to ExoPlayer, and a no-sidx one is not).
     testImplementation(libs.junit)
+    // Compose UI tests run under Robolectric (no device/emulator needed): they
+    // drive REAL touch injection through Compose hit-testing, which is the only
+    // way to assert that a badge is actually tappable where it is drawn
+    // (HaBadgeTouchTargetTest). Both artifacts come from the Compose BOM above.
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(libs.androidx.ui.test.junit4)
+    // Supplies the bare ComponentActivity the Compose test rule hosts its
+    // content in. Debug-only (unit tests run against the debug variant); the
+    // release APK never sees it.
+    debugImplementation(libs.androidx.ui.test.manifest)
     testImplementation("androidx.media3:media3-test-utils:1.4.1")
     testImplementation("org.robolectric:robolectric:4.11.1")
     testImplementation("androidx.test.ext:junit:1.1.5")

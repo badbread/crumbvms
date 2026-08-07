@@ -23,11 +23,18 @@ class HaVisualActiveTest {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private fun link(entityId: String, deviceClass: String? = null): HaLinkDto {
+    private fun link(
+        entityId: String,
+        deviceClass: String? = null,
+        bgColor: String? = null,
+        bgColorOn: String? = null,
+    ): HaLinkDto {
         val dc = if (deviceClass != null) ",\"device_class\":\"$deviceClass\"" else ""
+        val bg = if (bgColor != null) ",\"overlay_bg_color\":\"$bgColor\"" else ""
+        val bgOn = if (bgColorOn != null) ",\"overlay_bg_color_on\":\"$bgColorOn\"" else ""
         return json.decodeFromString(
             HaLinkDto.serializer(),
-            "{\"id\":\"l\",\"entity_id\":\"$entityId\",\"role\":\"actuator\",\"sort_order\":0$dc}",
+            "{\"id\":\"l\",\"entity_id\":\"$entityId\",\"role\":\"actuator\",\"sort_order\":0$dc$bg$bgOn}",
         )
     }
 
@@ -68,5 +75,49 @@ class HaVisualActiveTest {
         val v = badgeVisual(link("binary_sensor.front_door", deviceClass = "door"), "on", stale = false)
         assertEquals(true, v.active)
         assertEquals("Open", v.label)
+    }
+
+    // ── Badge chip background resolution: overlay_bg_color_on / overlay_bg_color
+    // / default, keyed on the SAME `active` tri-state above. ─────────────────────
+
+    @Test
+    fun `no overlay_bg_color_on decodes to null, unchanged byte-for-byte`() {
+        val l = link("light.kitchen", bgColor = "#112233")
+        assertNull(l.overlayBgColorOn)
+        // Existing bg-color-only behavior is untouched, on or off.
+        assertEquals(parseHexColor("#112233"), resolveBadgeBg(l, active = true))
+        assertEquals(parseHexColor("#112233"), resolveBadgeBg(l, active = false))
+    }
+
+    @Test
+    fun `an on entity with both colors set uses the ON background`() {
+        val l = link("light.kitchen", bgColor = "#112233", bgColorOn = "#ffcc00")
+        assertEquals(parseHexColor("#ffcc00"), resolveBadgeBg(l, active = true))
+    }
+
+    @Test
+    fun `an off entity with both colors set falls back to the base background`() {
+        val l = link("light.kitchen", bgColor = "#112233", bgColorOn = "#ffcc00")
+        assertEquals(parseHexColor("#112233"), resolveBadgeBg(l, active = false))
+    }
+
+    @Test
+    fun `stale or unknown active never uses the ON background`() {
+        val l = link("light.kitchen", bgColor = "#112233", bgColorOn = "#ffcc00")
+        assertEquals(parseHexColor("#112233"), resolveBadgeBg(l, active = null))
+    }
+
+    @Test
+    fun `neither color set falls back to BadgeDefaultBg`() {
+        val l = link("light.kitchen")
+        assertEquals(BadgeDefaultBg, resolveBadgeBg(l, active = true))
+        assertEquals(BadgeDefaultBg, resolveBadgeBg(l, active = false))
+        assertEquals(BadgeDefaultBg, resolveBadgeBg(l, active = null))
+    }
+
+    @Test
+    fun `only bg_color_on set, entity off, falls back to BadgeDefaultBg`() {
+        val l = link("light.kitchen", bgColorOn = "#ffcc00")
+        assertEquals(BadgeDefaultBg, resolveBadgeBg(l, active = false))
     }
 }
