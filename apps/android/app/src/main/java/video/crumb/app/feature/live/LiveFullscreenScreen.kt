@@ -20,6 +20,8 @@ import androidx.compose.material.icons.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.CircularProgressIndicator
@@ -196,11 +198,25 @@ fun LiveFullscreenScreen(
             else -> haBadgeSelected = link
         }
     }
-    // Poll HA states while this camera has linked entities (to keep the on-video
-    // badges live) or the sheet is open. Server demand-caches with a ~2s TTL.
-    // Gate on lifecycle so it doesn't poll while backgrounded, and back off under
-    // failure (matches the motion poll below).
+    // Global on-video-overlay switch (the eye button in the controls row below and
+    // its twin on the Live wall). Hiding is display-only — it removes the badges
+    // and, with them, their tap/long-press targets; the entities sheet and every
+    // popup reachable from it keep working exactly as before.
+    val haOverlays = container.haOverlays
+    val haOverlaysVisible by rememberHaOverlaysVisible()
+    val haOverlaysLabel =
+        if (haOverlaysVisible) "Hide Home Assistant overlays" else "Show Home Assistant overlays"
+
+    // Poll HA states while this camera has VISIBLE on-video badges (to keep them
+    // live) or the sheet is open. Server demand-caches with a ~2s TTL. Gate on
+    // lifecycle so it doesn't poll while backgrounded, and back off under failure
+    // (matches the motion poll below).
     val haHasPlaced = haLinks.any { it.hasPlacement }
+    // Placed badges only need fresh states while they're actually drawn — with the
+    // overlays hidden there is nothing on screen to keep converged, so the poll
+    // stands down (the sheet/dialog conditions below still hold it up whenever some
+    // other HA surface is open).
+    val haBadgesLive = haHasPlaced && haOverlaysVisible
     // Client-side staleness. The server `stale` flag only reflects Crumb->HA
     // reachability; it says nothing about whether THIS phone is still reaching
     // Crumb. If the phone loses the Crumb API (Wi-Fi drop, server restart) while
@@ -213,8 +229,8 @@ fun LiveFullscreenScreen(
     // Keep polling while any detail/control dialog is open too, so a fired action
     // converges the shown state even when no badge is placed on this camera (#428).
     val haDialogOpen = haBadgeSelected != null || haControlSelected != null
-    LaunchedEffect(currentCameraId, haHasPlaced, haSheetOpen, haDialogOpen) {
-        if (!haHasPlaced && !haSheetOpen && !haDialogOpen) return@LaunchedEffect
+    LaunchedEffect(currentCameraId, haBadgesLive, haSheetOpen, haDialogOpen) {
+        if (!haBadgesLive && !haSheetOpen && !haDialogOpen) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 val res = repo.haStates().onSuccess { haStates = it }
@@ -696,7 +712,9 @@ fun LiveFullscreenScreen(
         // the zoom surface (not inside it), so it is hidden while digitally zoomed
         // (badges would misalign) and in PiP (video only). Only badge hit-boxes
         // are interactive; the rest passes touches through to the video/PTZ.
-        if (player != null && !playerError && !inPip && zoomScale <= 1.01f) {
+        // The global eye toggle suppresses the whole layer — and with it every
+        // badge tap/long-press target, since they only exist while drawn.
+        if (player != null && !playerError && !inPip && zoomScale <= 1.01f && haOverlaysVisible) {
             HaBadgeOverlayLayer(
                 links = haLinks,
                 states = haStates,
@@ -928,6 +946,9 @@ fun LiveFullscreenScreen(
 
             // Home Assistant — the camera's linked entities in an HA-style sheet.
             // Shown only when this camera has links, so a non-HA camera stays clean.
+            // Deliberately NOT gated on the overlay toggle: hiding the on-video
+            // badges is about a clean picture, and inspecting entities has to keep
+            // working precisely then.
             if (haLinks.isNotEmpty()) {
                 HintTooltip("Home Assistant") {
                     IconButton(onClick = { haSheetOpen = true }) {
@@ -935,6 +956,26 @@ fun LiveFullscreenScreen(
                             imageVector = Icons.Default.Home,
                             contentDescription = "Home Assistant entities",
                             tint = Color.White,
+                        )
+                    }
+                }
+            }
+
+            // Show/hide the on-video HA badges — the same global, persisted switch
+            // as the eye button on the Live wall's action row. Offered only when
+            // this camera actually has placed badges; on any other camera there is
+            // nothing on screen for it to change.
+            if (haHasPlaced) {
+                HintTooltip(haOverlaysLabel) {
+                    IconButton(onClick = { haOverlays.toggle() }) {
+                        Icon(
+                            imageVector = if (haOverlaysVisible) {
+                                Icons.Default.Visibility
+                            } else {
+                                Icons.Default.VisibilityOff
+                            },
+                            contentDescription = haOverlaysLabel,
+                            tint = if (haOverlaysVisible) TealAccent else Color.White,
                         )
                     }
                 }

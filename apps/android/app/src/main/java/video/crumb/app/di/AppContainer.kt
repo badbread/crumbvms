@@ -14,6 +14,7 @@ import video.crumb.app.data.Network
 import video.crumb.app.data.SecureStore
 import video.crumb.app.data.CrumbApi
 import video.crumb.app.data.CrumbRepository
+import video.crumb.app.feature.live.HaOverlayVisibility
 import video.crumb.app.feature.live.NetworkStatusObserver
 
 /**
@@ -34,6 +35,16 @@ class AppContainer(context: Context) {
      * one shared callback for the whole process (#137).
      */
     val networkStatus = NetworkStatusObserver(context.applicationContext)
+
+    /**
+     * App-wide on/off state for the on-video Home Assistant badges, shared by the
+     * eye quick-toggle on the Live wall's action row and the matching one in the
+     * fullscreen controls — one switch, two places to flip it. Seeded from (and
+     * written back to) [SecureStore.showHaOverlays], so the choice survives app
+     * restarts; see [HaOverlayVisibility] for why this is process-scoped state
+     * rather than a per-screen `remember`.
+     */
+    val haOverlays = HaOverlayVisibility(store.showHaOverlays) { store.showHaOverlays = it }
 
     /**
      * Emits when an authenticated request returns `401` (session expired or
