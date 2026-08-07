@@ -32,9 +32,11 @@ import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
 import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_crop.dart';
+import 'package:crumb_desktop/ui/plates/plate_name_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 
@@ -67,6 +69,7 @@ class PlatesScreen extends StatefulWidget {
     required this.cameras,
     required this.onViewFootage,
     this.canManageWatchlist = false,
+    this.canNamePlates = false,
   });
 
   final CrumbApi api;
@@ -85,6 +88,15 @@ class PlatesScreen extends StatefulWidget {
   /// per-entry management affordances are hidden. Server-side 403s are still
   /// handled defensively even when this is true (stale/edge cases).
   final bool canManageWatchlist;
+
+  /// Whether this account may set/clear a plate's human-readable NAME
+  /// (`PUT`/`DELETE /lpr/plate-labels`, admin-only on the server — issue #363).
+  /// Kept as its own flag rather than folded into [canManageWatchlist] because
+  /// the two are different concerns: a plate name is display metadata for every
+  /// read of that plate, the watchlist is an alert list. They happen to share
+  /// the same admin gate today. False hides the Name/Rename affordances
+  /// entirely, so a non-admin is never offered a control that 403s.
+  final bool canNamePlates;
 
   @override
   State<PlatesScreen> createState() => _PlatesScreenState();
@@ -414,6 +426,64 @@ class _PlatesScreenState extends State<PlatesScreen> {
     }
   }
 
+  /// Set, edit, or clear a plate's human-readable NAME (issue #363). [plate]
+  /// is the normalized plate; [currentName] is the server-resolved
+  /// `display_name` shown in the UI, used to prefill the field and to decide
+  /// whether the dialog offers "Clear name".
+  ///
+  /// A blank submission clears, matching the web console. Clearing tolerates a
+  /// 404: the shown name may have come from a WATCHLIST label rather than a
+  /// first-class plate name, in which case there is no name row to delete and
+  /// the plate is already unnamed as far as this table is concerned.
+  ///
+  /// Both lists are reloaded afterwards, since a name resolves onto reads and
+  /// watchlist rows alike. Admin-only server-side; the 403 is still handled
+  /// here defensively even though the affordance is gated on
+  /// [PlatesScreen.canNamePlates].
+  Future<void> _namePlate(String plate, String? currentName) async {
+    if (plate.isEmpty) return;
+    final choice = await showPlateNameDialog(
+      context,
+      plate: plate,
+      currentName: currentName,
+    );
+    if (choice == null || !mounted) return;
+    try {
+      if (choice.isEmpty) {
+        await widget.api.clearPlateLabel(widget.session, plate);
+      } else {
+        await widget.api.setPlateLabel(
+          widget.session,
+          plate: plate,
+          label: choice,
+        );
+      }
+      await _load();
+      await _loadWatchlist();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(choice.isEmpty ? 'Name cleared.' : 'Plate named.'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } on CrumbApiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.statusCode == 403 ? 'Only admins can name plates.' : e.message,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Save name failed: $e')),
+      );
+    }
+  }
+
   void _onSearchChanged(String v) {
     setState(() => _query = v); // keep the clear button in sync as you type
     _searchDebounce?.cancel();
@@ -514,6 +584,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
                           loading: _watchlistLoading,
                           error: _watchlistError,
                           canManage: widget.canManageWatchlist,
+                          canName: widget.canNamePlates,
+                          onName: (e) => _namePlate(e.plate, e.displayName),
                           fuzz: _lprConfig?.watchlistFuzz,
                           fuzzLoading: _lprConfigLoading,
                           onSaveFuzz: _saveFuzz,
@@ -540,7 +612,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
                     byId[playing.cameraId]?.name ?? '(unknown camera)',
                 imageMode: _imageDisplay,
                 cropSize: _cropSize,
+                canName: widget.canNamePlates,
                 onReport: () => _openPlateReport(playing),
+                onNamePlate: () =>
+                    _namePlate(playing.plate, playing.displayName),
                 onClose: () => setState(() => _playing = null),
                 // Same one-shot seek/focus hand-off the Clips "View on
                 // timeline" uses: close the pop-up, then jump Playback to this
@@ -776,8 +851,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
               cropSize: _cropSize,
               onTap: () => _openRead(p),
               canManage: widget.canManageWatchlist,
+              canName: widget.canNamePlates,
               watched: watched.contains(p.plate),
               onAddToWatchlist: () => _addReadToWatchlist(p),
+              onNamePlate: () => _namePlate(p.plate, p.displayName),
               onReport: () => _openPlateReport(p),
             );
           },
@@ -806,8 +883,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
           cropSize: _cropSize,
           onTap: _openRead,
           canManage: widget.canManageWatchlist,
+          canName: widget.canNamePlates,
           watched: watched,
           onAddToWatchlist: _addReadToWatchlist,
+          onNamePlate: (r) => _namePlate(r.plate, r.displayName),
           onReport: _openPlateReport,
         );
       case PlatesViewMode.timeline:
@@ -1153,8 +1232,10 @@ class _PlateRow extends StatelessWidget {
     required this.cropSize,
     required this.onTap,
     required this.canManage,
+    required this.canName,
     required this.watched,
     required this.onAddToWatchlist,
+    required this.onNamePlate,
     required this.onReport,
     this.group,
   });
@@ -1177,11 +1258,18 @@ class _PlateRow extends StatelessWidget {
   /// Admin — may add this read's plate to the watchlist.
   final bool canManage;
 
+  /// Admin — may set/clear this plate's human-readable name (issue #363).
+  /// Separate from [canManage] because naming is not watchlisting.
+  final bool canName;
+
   /// This read's plate is already on the watchlist (shows a filled star).
   final bool watched;
 
   /// Add this read's plate to the watchlist.
   final VoidCallback onAddToWatchlist;
+
+  /// Set/edit/clear this plate's human-readable name.
+  final VoidCallback onNamePlate;
 
   /// Open the single-plate report builder for this read.
   final VoidCallback onReport;
@@ -1317,6 +1405,37 @@ class _PlateRow extends StatelessWidget {
                 ],
               ),
             ),
+            // Copy the PLATE (never the display name) — available to anyone who
+            // can see the row, since copying reads nothing new.
+            if (plateCopyText(read).isNotEmpty) ...[
+              const SizedBox(width: 4),
+              IconButton(
+                tooltip: 'Copy plate',
+                visualDensity: VisualDensity.compact,
+                onPressed: () =>
+                    copyPlateToClipboard(context, plateCopyText(read)),
+                icon: const Icon(
+                  Icons.content_copy_outlined,
+                  size: 16,
+                  color: Colors.white38,
+                ),
+              ),
+            ],
+            if (canOfferPlateName(isAdmin: canName, plate: read.plate)) ...[
+              const SizedBox(width: 4),
+              IconButton(
+                tooltip: plateNameActionTooltip(read.displayName),
+                visualDensity: VisualDensity.compact,
+                onPressed: onNamePlate,
+                icon: Icon(
+                  Icons.label_outline,
+                  size: 18,
+                  color: plateHasName(read.displayName)
+                      ? const Color(0xFF57C888)
+                      : Colors.white38,
+                ),
+              ),
+            ],
             if (canManage && read.plate.isNotEmpty) ...[
               const SizedBox(width: 4),
               IconButton(
@@ -1936,8 +2055,10 @@ class _PlateGroupedList extends StatelessWidget {
     required this.cropSize,
     required this.onTap,
     required this.canManage,
+    required this.canName,
     required this.watched,
     required this.onAddToWatchlist,
+    required this.onNamePlate,
     required this.onReport,
   });
 
@@ -1951,8 +2072,10 @@ class _PlateGroupedList extends StatelessWidget {
   final PlateCropSize cropSize;
   final void Function(PlateRead) onTap;
   final bool canManage;
+  final bool canName;
   final Set<String> watched;
   final void Function(PlateRead) onAddToWatchlist;
+  final void Function(PlateRead) onNamePlate;
   final void Function(PlateRead) onReport;
 
   List<_PlateGroup> _group() {
@@ -2040,8 +2163,10 @@ class _PlateGroupedList extends StatelessWidget {
                   cropSize: cropSize,
                   onTap: () => onTap(r),
                   canManage: canManage,
+                  canName: canName,
                   watched: watched.contains(r.plate),
                   onAddToWatchlist: () => onAddToWatchlist(r),
+                  onNamePlate: () => onNamePlate(r),
                   onReport: () => onReport(r),
                 ),
             ],
@@ -2207,7 +2332,9 @@ class _PlateClipPlayer extends StatefulWidget {
     required this.cameraName,
     required this.imageMode,
     required this.cropSize,
+    required this.canName,
     required this.onReport,
+    required this.onNamePlate,
     required this.onClose,
     required this.onViewOnTimeline,
   });
@@ -2223,7 +2350,14 @@ class _PlateClipPlayer extends StatefulWidget {
 
   /// How tall the prominent plate crop renders above the clip.
   final PlateCropSize cropSize;
+
+  /// Admin — may set/clear this plate's human-readable name (issue #363).
+  /// False hides the Name/Rename action entirely.
+  final bool canName;
   final VoidCallback onReport;
+
+  /// Set/edit/clear this plate's human-readable name.
+  final VoidCallback onNamePlate;
   final VoidCallback onClose;
   final VoidCallback onViewOnTimeline;
 
@@ -2267,12 +2401,33 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   /// Lifetime-of-the-open-clip Esc handler; consumes only the Esc it acts on.
   bool _onKeyEvent(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
-    if (event.logicalKey != LogicalKeyboardKey.escape) return false;
     if (!mounted) return false;
-    // A pushed route on top (dialog, menu) owns Esc — don't close under it.
-    if (Navigator.of(context).canPop()) return false;
-    widget.onClose();
-    return true;
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      // A pushed route on top (dialog, menu) owns Esc — don't close under it.
+      if (Navigator.of(context).canPop()) return false;
+      widget.onClose();
+      return true;
+    }
+    // Ctrl+C copies THIS read's plate while its detail pop-up is open. Scoped
+    // to the pop-up (the handler is only registered while it is mounted), so
+    // it never shadows a normal copy anywhere else in the app, and routed
+    // through the shared gate (hotkey_gate.dart) so it stands down for a
+    // focused text field, a mounted HotkeySuppressor, or a pushed dialog —
+    // including this tab's own Name dialog, whose field must keep Ctrl+C.
+    //
+    // Deliberately NOT gated on the "Enable keyboard shortcuts" switch, for
+    // the same reason Esc above isn't: Ctrl+C is the platform's own copy
+    // binding, not a Crumb-invented shortcut, and silently breaking copy is
+    // not what an operator turning off wall shortcuts asked for.
+    if (event.logicalKey == LogicalKeyboardKey.keyC &&
+        HardwareKeyboard.instance.isControlPressed) {
+      if (hotkeyContextBlocked(context)) return false;
+      final text = plateCopyText(widget.read);
+      if (text.isEmpty) return false;
+      unawaited(copyPlateToClipboard(context, text));
+      return true;
+    }
+    return false;
   }
 
   /// `/clip/d:<event-uuid>/clip.mp4?q=preview` — the detection clip for this
@@ -2485,6 +2640,28 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
             busy: _qualityBusy,
             onChanged: _setQuality,
           ),
+          // Copies the PLATE, not the name in the title above it.
+          if (plateCopyText(read).isNotEmpty)
+            TextButton.icon(
+              onPressed: () =>
+                  copyPlateToClipboard(context, plateCopyText(read)),
+              icon: const Icon(Icons.content_copy_outlined,
+                  size: 16, color: Colors.white70),
+              label: const Text(
+                'Copy plate',
+                style: TextStyle(fontSize: 12, color: Colors.white70),
+              ),
+            ),
+          if (canOfferPlateName(isAdmin: widget.canName, plate: read.plate))
+            TextButton.icon(
+              onPressed: widget.onNamePlate,
+              icon: const Icon(Icons.label_outline,
+                  size: 16, color: Colors.white70),
+              label: Text(
+                plateNameActionLabel(read.displayName),
+                style: const TextStyle(fontSize: 12, color: Colors.white70),
+              ),
+            ),
           TextButton.icon(
             onPressed: widget.onReport,
             icon: const Icon(Icons.description_outlined,
@@ -2776,6 +2953,8 @@ class _WatchlistPanel extends StatefulWidget {
     required this.loading,
     required this.error,
     required this.canManage,
+    required this.canName,
+    required this.onName,
     required this.fuzz,
     required this.fuzzLoading,
     required this.onSaveFuzz,
@@ -2789,6 +2968,15 @@ class _WatchlistPanel extends StatefulWidget {
   final bool loading;
   final String? error;
   final bool canManage;
+
+  /// Admin — may set/clear a plate's human-readable NAME (issue #363). A name
+  /// is not a watchlist label: it shows on every read of the plate, and the
+  /// server resolves `display_name` as name-then-watchlist-label. Kept as its
+  /// own flag so the two affordances stay conceptually separate.
+  final bool canName;
+
+  /// Set/edit/clear the name for this entry's plate.
+  final void Function(PlateWatchlistEntry entry) onName;
 
   /// Current watchlist fuzziness (0.0..0.5) from `GET /config/lpr`, or null
   /// when not an admin / not yet loaded — the control only renders when set.
@@ -3147,6 +3335,8 @@ class _WatchlistPanelState extends State<_WatchlistPanel> {
           onEdit: () => _editEntry(e),
           entry: e,
           canManage: widget.canManage,
+          canName: widget.canName,
+          onName: () => widget.onName(e),
           onRemove: () => _remove(e),
         );
       },
@@ -3675,13 +3865,17 @@ class _WatchlistTile extends StatelessWidget {
   const _WatchlistTile({
     required this.entry,
     required this.canManage,
+    required this.canName,
     required this.onEdit,
+    required this.onName,
     required this.onRemove,
   });
 
   final PlateWatchlistEntry entry;
   final bool canManage;
+  final bool canName;
   final VoidCallback onEdit;
+  final VoidCallback onName;
   final VoidCallback onRemove;
 
   @override
@@ -3755,6 +3949,19 @@ class _WatchlistTile extends StatelessWidget {
                   : Icons.notifications_off_outlined,
               size: 15,
               color: entry.notify ? const Color(0xFF57C888) : Colors.white24,
+            ),
+          if (canOfferPlateName(isAdmin: canName, plate: entry.plate))
+            IconButton(
+              tooltip: plateNameActionTooltip(entry.displayName),
+              onPressed: onName,
+              visualDensity: VisualDensity.compact,
+              icon: Icon(
+                Icons.label_outline,
+                size: 15,
+                color: plateHasName(entry.displayName)
+                    ? const Color(0xFF57C888)
+                    : Colors.white38,
+              ),
             ),
           if (canManage) ...[
             IconButton(

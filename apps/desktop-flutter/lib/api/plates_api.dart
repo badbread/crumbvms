@@ -508,6 +508,67 @@ extension PlatesApi on CrumbApi {
     }
   }
 
+  /// `PUT /lpr/plate-labels` → set or edit a plate's human-readable NAME
+  /// (issue #363). [plate] is sent raw and normalized server-side, so the same
+  /// name keys every read of that plate. Returns `204`.
+  ///
+  /// This is deliberately NOT the watchlist: `plate_labels` is a separate
+  /// naming table, and the server resolves what clients render as
+  /// `COALESCE(plate_labels.label, lpr_watchlist.label)`. Naming a plate
+  /// creates no watchlist entry and raises no alert — use [addWatchlist] for
+  /// that. Use [clearPlateLabel] to remove a name.
+  ///
+  /// **Admin-only.** A non-admin gets HTTP 403, surfaced as a
+  /// [CrumbApiException] with `statusCode == 403` and a friendly message. A
+  /// blank [label] or a plate that normalizes to empty is a `400` server-side,
+  /// surfaced the same way.
+  Future<void> setPlateLabel(
+    Session s, {
+    required String plate,
+    required String label,
+  }) async {
+    final resp = await _client.put(
+      Uri.parse('${s.base}/lpr/plate-labels'),
+      headers: {
+        'authorization': 'Bearer ${s.token}',
+        'content-type': 'application/json',
+      },
+      body: jsonEncode({'plate': plate, 'label': label}),
+    );
+    if (resp.statusCode != 204 && resp.statusCode != 200) {
+      throw CrumbApiException(
+        switch (resp.statusCode) {
+          403 => 'Only admins can name plates.',
+          400 => 'Enter a name for this plate.',
+          _ => 'Failed to save plate name (HTTP ${resp.statusCode}).',
+        },
+        statusCode: resp.statusCode,
+      );
+    }
+  }
+
+  /// `DELETE /lpr/plate-labels/{plate}` → clear a plate's name. [plate] is
+  /// normalized server-side before lookup. A `404` (no name set) is treated as
+  /// success — the plate is unnamed either way. Reads then fall back to any
+  /// watchlist label, else the raw plate.
+  ///
+  /// **Admin-only.** A non-admin gets HTTP 403, surfaced as a
+  /// [CrumbApiException] with `statusCode == 403` and a friendly message.
+  Future<void> clearPlateLabel(Session s, String plate) async {
+    final resp = await _client.delete(
+      Uri.parse('${s.base}/lpr/plate-labels/${Uri.encodeComponent(plate)}'),
+      headers: {'authorization': 'Bearer ${s.token}'},
+    );
+    if (resp.statusCode != 204 && resp.statusCode != 404) {
+      throw CrumbApiException(
+        resp.statusCode == 403
+            ? 'Only admins can name plates.'
+            : 'Failed to clear plate name (HTTP ${resp.statusCode}).',
+        statusCode: resp.statusCode,
+      );
+    }
+  }
+
   /// `GET /lpr/ab-report` → the dual-engine LPR benchmark: paired passes plus
   /// per-engine aggregates for every `lpr_engine == 'both'` camera the caller
   /// may see (or just [cameraId] when given). Gated by the same `view_plates`

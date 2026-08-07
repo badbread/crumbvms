@@ -1362,6 +1362,11 @@ class _MainShellState extends State<MainShell> with WindowListener {
           session: session,
           cameras: widget.cameras,
           canManageWatchlist: _isAdmin,
+          // Naming a plate is admin-only server-side (PUT/DELETE
+          // /lpr/plate-labels), same gate as the watchlist writes — but a
+          // distinct flag, because a name is display metadata for every read
+          // of the plate, not an alert-list membership.
+          canNamePlates: _isAdmin,
           // Row click → jump to Playback at that read's moment on that camera.
           // Same one-shot seek/focus hand-off the Clips "View on timeline" uses
           // (no origin clip → Esc/double-click returns to the live wall, since
