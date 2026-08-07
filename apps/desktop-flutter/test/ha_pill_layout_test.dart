@@ -317,9 +317,26 @@ void main() {
       expect(m.gap, closeTo(5.6, 1e-9));
     });
 
-    test('a runaway label is still capped at 9 pill-heights', () {
-      final m = HaPillMetrics.forHeight(22);
-      expect(m.contentWidth(1000), lessThanOrEqualTo(22 * 9 + 22 * 1.3));
+    test('a runaway label is capped — at the same LABEL at every height', () {
+      // Unchanged where nothing is clamped: 22.5 em of a 0.40h font is the
+      // 9-pill-heights width this has always capped at.
+      final ref = HaPillMetrics.forHeight(22);
+      expect(ref.contentWidth(1000), lessThanOrEqualTo(22 * 9 + 22 * 1.3));
+      expect(
+        ref.contentWidth(1000) - ref.contentWidth(0),
+        closeTo(22 * 9, 1e-9),
+      );
+      // And a label that fits under the cap is never trimmed by it, at any
+      // height — including where the font floor is active (a height-based cap
+      // shrank faster than the floored text and cut a fitting label short).
+      for (final h in [8.0, 12.4, 22.0, 120.0]) {
+        final m = HaPillMetrics.forHeight(h);
+        expect(
+          m.contentWidth(8) - m.contentWidth(0),
+          closeTo(8 * m.fontSize, 1e-9),
+          reason: 'h=$h',
+        );
+      }
     });
   });
 
@@ -365,13 +382,15 @@ void main() {
       await expectLabelIntact(tester, label: 'Floodlight', paneScale: 0.5625);
     });
 
-    testWidgets('a small badge on a small tile (both floors compounding)',
+    testWidgets('a shrunk badge on a small tile (every floor active)',
         (tester) async {
+      // 8.8px tall — about as small as a badge gets, since
+      // `OverlayGeometry.rectFor` floors the rendered box at 8px.
       await expectLabelIntact(
         tester,
         label: 'Floodlight',
         paneScale: 0.5,
-        overlaySize: 0.6,
+        overlaySize: 0.8,
       );
     });
 

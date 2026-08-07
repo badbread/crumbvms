@@ -251,16 +251,24 @@ class HaPillMetrics {
   /// Icon-to-label gap.
   final double gap;
 
+  /// Longest label the pill will size itself to, in ems of its own font — one
+  /// runaway caption must not span the frame, and the chip ellipsizes past
+  /// this, which is the graceful degradation the cap is for.
+  ///
+  /// The cap is in EMs, not pill-heights, on purpose. In the un-clamped band
+  /// the two are the same number (`22.5 * 0.40h == 9h`, the width this has
+  /// always capped at), but where the 8px font floor is active a height-based
+  /// cap shrinks faster than the text it is capping, so a label that fits
+  /// perfectly well would be cut off on a small tile — the very truncation
+  /// this class exists to prevent. Measured in ems it caps the same LABEL at
+  /// every rendered size.
+  static const double maxLabelEm = 22.5;
+
   /// Width of everything inside the pill for a label whose advance is
   /// [labelWidthPerFontPx] logical px per 1px of font size (measured once per
   /// label by `HaOverlayBadgeItem.labelWidthPerFontPx`).
-  ///
-  /// The label is capped at 9 pill-heights so one runaway caption can't span
-  /// the frame; the chip ellipsizes past that, which is the graceful
-  /// degradation the cap is there for.
   double contentWidth(double labelWidthPerFontPx) {
-    final text =
-        (labelWidthPerFontPx * fontSize).clamp(0.0, height * 9).toDouble();
+    final text = labelWidthPerFontPx.clamp(0.0, maxLabelEm) * fontSize;
     return padH * 2 + iconSize + gap + text;
   }
 }
