@@ -15,7 +15,7 @@
 #   runtime — minimal bookworm-slim image with jellyfin-ffmpeg + the binary.
 #
 # GPU is OPT-IN: the base docker-compose.yml boots this image GPU-free
-# (MOTION_HWACCEL=auto → CPU when no GPU). NVDEC is enabled by the GPU overlay
+# (MOTION_HWACCEL=cpu, software motion decode). NVDEC is enabled by the GPU overlay
 # docker-compose.gpu.example.yml, which re-adds the nvidia device reservation +
 # 'video' capability + NVIDIA_DRIVER_CAPABILITIES=video,compute,utility.
 
@@ -122,13 +122,15 @@ RUN groupadd --gid 1001 crumb \
 USER crumb
 
 # Default environment (overridden by docker-compose.yml / .env).
-# MOTION_HWACCEL defaults to 'auto': the recorder probes for NVDEC and falls back
-# to CPU when no GPU is present, so this image boots GPU-free. Force NVDEC with the
-# GPU overlay (docker-compose.gpu.example.yml) or MOTION_HWACCEL=cuda.
+# MOTION_HWACCEL defaults to 'cpu': software motion decode works on any host, so
+# this image boots GPU-free and motion always runs. Matches the shipped
+# docker-compose.yml / .env.example default (#478). Enable a GPU explicitly with
+# the overlays (docker-compose.gpu.example.yml / .vaapi.example.yml) or
+# MOTION_HWACCEL=cuda / vaapi; 'auto' probes for NVDEC and stays opt-in (#479).
 ENV LOG_FORMAT=json \
     RUST_LOG=info \
     SEGMENT_SECONDS=4 \
-    MOTION_HWACCEL=auto \
+    MOTION_HWACCEL=cpu \
     MAX_GPU_DECODE_SESSIONS=4 \
     CONFIG_POLL_SECONDS=30 \
     MEDIA_ROOT=/data \
