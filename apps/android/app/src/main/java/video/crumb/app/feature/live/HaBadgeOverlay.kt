@@ -10,9 +10,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -40,7 +39,6 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import video.crumb.app.data.HaLinkDto
 import video.crumb.app.data.HaStatesResponse
 import java.time.Duration
@@ -63,8 +61,10 @@ import kotlin.math.min
 // shared with the entity sheet + more-info dialog so an entity reads identically
 // wherever Android draws it (#437).
 
-private const val BASE_REF_PX = 22f // reference badge size at pane-scale 1.0
-private const val REF_SHORT_SIDE = 320f
+// Every dp/font proportion (badge height, pill icon/label/padding/gap, caption
+// text + padding) comes from `HaBadgeMetrics`, the port of the desktop chip's
+// scaling contract. Nothing in this file may hardcode a size that should scale
+// with the badge — that is what made small pills spill their label.
 
 /** Compact "just now / 5s / 3m / 2h / 4d" from an RFC3339 timestamp. */
 private fun relativeAgo(iso: String?): String? {
@@ -84,7 +84,7 @@ private fun relativeAgo(iso: String?): String? {
 // ── Geometry (dp units) — port of desktop `overlay_geometry.dart`. ───────────
 
 private fun paneScale(paneW: Float, paneH: Float): Float =
-    (min(paneW, paneH) / REF_SHORT_SIDE).coerceIn(0.5f, 3.0f)
+    HaBadgeMetrics.paneScale(paneW, paneH)
 
 /**
  * The contain-fit (letterboxed) video rect within a `paneW`x`paneH` pane, in dp.
@@ -98,14 +98,22 @@ private fun fieldRect(paneW: Float, paneH: Float, videoW: Int, videoH: Int): Flo
     return floatArrayOf((paneW - fw) / 2f, (paneH - fh) / 2f, fw, fh)
 }
 
-/** Rendered badge box size (w, h) in dp for [link] at the given pane scale. */
+/**
+ * Rendered badge box size (w, h) in dp for [link] at the given pane scale.
+ *
+ * A pill's width is the desktop-authored footprint WIDENED to whatever the
+ * icon + label + padding actually need at this height ([HaBadgeMetrics
+ * .pillWidth]). The authored footprint alone is a char-count estimate taken
+ * against the un-clamped font size, so on a phone-sized pane (small pane =
+ * small pane-scale = a badge only a dozen dp tall) it came out NARROWER than
+ * the chip's own contents and the label spilled past the rounded background.
+ * Returning the true footprint here also keeps the edge clamp below, and the
+ * badge's touch target, honest about what is drawn.
+ */
 private fun badgeSize(link: HaLinkDto, ps: Float): FloatArray {
-    val size = (link.overlaySize ?: 1.0).toFloat()
-    val h = (BASE_REF_PX * size * ps).coerceAtLeast(8f)
+    val h = HaBadgeMetrics.badgeHeight(link.overlaySize?.toFloat(), ps)
     if (link.overlayShape != "pill") return floatArrayOf(h, h)
-    val chars = link.displayName.length.coerceIn(1, 16)
-    val w = ((BASE_REF_PX * 1.5f + chars * BASE_REF_PX * 0.42f) * size * ps).coerceAtLeast(8f)
-    return floatArrayOf(w, h)
+    return floatArrayOf(HaBadgeMetrics.pillWidth(h, link.displayName), h)
 }
 
 /**
@@ -196,9 +204,18 @@ private fun HaBadge(
             .alpha(opacity),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        // The chip sizes ITSELF from `hDp` (a pill may end up a hair taller than
+        // the nominal box if the label's line box needs it), so this Box just
+        // wraps it — the touch target is exactly what is drawn.
+        //
+        // CONTRACT: the gesture modifier belongs on the node that WRAPS the
+        // chip, and the chip must always measure to something. A chip that
+        // measured to nothing, or a gesture modifier moved onto a sibling,
+        // still draws a plausible badge while silently eating every touch —
+        // nothing about the rendering would look wrong. HaBadgeTouchTargetTest
+        // injects real touches through Compose hit-testing to hold that line.
         Box(
             modifier = Modifier
-                .size(width = wDp.dp, height = hDp.dp)
                 // Tap = primary gesture (fire/sheet/detail, decided by the caller);
                 // long-press = read-only inspect. Both consumed here so the touch
                 // does not fall through to the video/PTZ beneath. (#428)
@@ -213,21 +230,21 @@ private fun HaBadge(
                 pillLabel = link.displayName,
                 bgColor = bg,
                 outline = link.overlayOutline,
+                widthDp = wDp,
                 heightDp = hDp,
-                modifier = Modifier.fillMaxSize(),
             )
             // Brief in-flight spinner while an action posts — we never flip the
             // shown state locally; the `/ha/states` poll converges it. (#428)
             if (inFlight) {
                 Box(
                     modifier = Modifier
-                        .fillMaxSize()
+                        .matchParentSize()
                         .clip(if (isPill) RoundedCornerShape(percent = 50) else CircleShape)
                         .background(Color.Black.copy(alpha = 0.45f)),
                     contentAlignment = Alignment.Center,
                 ) {
                     CircularProgressIndicator(
-                        modifier = Modifier.fillMaxSize(0.6f),
+                        modifier = Modifier.size(HaBadgeMetrics.spinnerSize(wDp, hDp).dp),
                         color = Color.White,
                         strokeWidth = 2.dp,
                     )
@@ -245,17 +262,25 @@ private fun HaBadge(
             }
         }
         if (caption.isNotBlank()) {
+            // Caption text AND its chrome scale with the badge (desktop
+            // `_captionFor`): a fixed-padding, theme-line-height caption made a
+            // small dot look like a speck under an oversized label.
+            val captionFont = dpAsSp(HaBadgeMetrics.captionFontSize(hDp))
             Box(
                 modifier = Modifier
-                    .padding(top = 2.dp)
-                    .clip(RoundedCornerShape(4.dp))
+                    .padding(top = HaBadgeMetrics.captionGap(hDp).dp)
+                    .clip(RoundedCornerShape(5.dp))
                     .background(Color.Black.copy(alpha = 0.62f))
-                    .padding(horizontal = 5.dp, vertical = 2.dp),
+                    .padding(
+                        horizontal = HaBadgeMetrics.captionPadH(hDp).dp,
+                        vertical = HaBadgeMetrics.captionPadV(hDp).dp,
+                    ),
             ) {
                 Text(
                     text = caption,
                     color = visual.color,
-                    fontSize = (hDp * 0.42f).coerceIn(9f, 15f).sp,
+                    fontSize = captionFont,
+                    lineHeight = captionFont,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     softWrap = false,
@@ -265,7 +290,15 @@ private fun HaBadge(
     }
 }
 
-/** A single badge chip — `dot` (icon only) or `pill` (icon + label). */
+/**
+ * A single badge chip — `dot` (icon only) or `pill` (icon + label).
+ *
+ * Sizes itself: a dot is a [heightDp] square, a pill is [widthDp] wide (already
+ * widened to fit its contents by [HaBadgeMetrics.pillWidth]) and at LEAST
+ * [heightDp] tall. Every inner length — icon, label, horizontal padding, the
+ * icon/label gap — is a fraction of [heightDp], the same fractions the desktop
+ * chip uses, so the whole badge scales as one piece at any size.
+ */
 @Composable
 private fun HaBadgeChip(
     visual: BadgeVisual,
@@ -273,11 +306,18 @@ private fun HaBadgeChip(
     pillLabel: String,
     bgColor: Color,
     outline: Boolean,
+    widthDp: Float,
     heightDp: Float,
-    modifier: Modifier = Modifier,
 ) {
     val shape = if (isPill) RoundedCornerShape(percent = 50) else CircleShape
-    val base = modifier
+    // The stadium/circle radius follows the box (percent corners are taken off
+    // the shorter side), so the corner scales with the badge for free.
+    val sizing = if (isPill) {
+        Modifier.width(widthDp.dp).heightIn(min = heightDp.dp)
+    } else {
+        Modifier.size(heightDp.dp)
+    }
+    val base = sizing
         .then(if (outline) Modifier.shadow(4.dp, shape) else Modifier)
         .clip(shape)
         .background(bgColor)
@@ -285,25 +325,36 @@ private fun HaBadgeChip(
 
     if (!isPill) {
         Box(base, contentAlignment = Alignment.Center) {
-            Icon(visual.icon, contentDescription = null, tint = visual.color, modifier = Modifier.fillMaxSize(0.58f))
+            Icon(
+                visual.icon,
+                contentDescription = null,
+                tint = visual.color,
+                modifier = Modifier.size(HaBadgeMetrics.dotIconSize(heightDp).dp),
+            )
         }
     } else {
         val labelColor = if (bgColor.luminance() > 0.5f) Color.Black else Color.White
+        // Font size AND line height come from the badge height. Without an
+        // explicit lineHeight the label inherits the app theme's body line box
+        // (22sp) whatever its font size, which is what made a small pill's text
+        // taller than the pill.
+        val labelFont = dpAsSp(HaBadgeMetrics.pillFontSize(heightDp))
         Row(
-            modifier = base.padding(horizontal = 6.dp),
+            modifier = base.padding(horizontal = HaBadgeMetrics.pillPadH(heightDp).dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
                 visual.icon,
                 contentDescription = null,
                 tint = visual.color,
-                modifier = Modifier.fillMaxHeight(0.56f).aspectRatio(1f),
+                modifier = Modifier.size(HaBadgeMetrics.pillIconSize(heightDp).dp),
             )
-            Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.width(HaBadgeMetrics.pillGap(heightDp).dp))
             Text(
                 text = pillLabel,
                 color = labelColor,
-                fontSize = (heightDp * 0.40f).coerceIn(8f, 26f).sp,
+                fontSize = labelFont,
+                lineHeight = labelFont,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 softWrap = false,
@@ -313,3 +364,15 @@ private fun HaBadgeChip(
         }
     }
 }
+
+/**
+ * A dp length as an sp font size at the current density.
+ *
+ * Badge text is part of a scale drawing pinned to the video, not body copy: the
+ * operator sizes it on the desktop editor and the container geometry is in dp,
+ * so the phone's font-scale setting must not stretch the label out of its pill.
+ * (Every other text surface in the app — sheets, dialogs, the entity list —
+ * still honors the system font scale.)
+ */
+@Composable
+private fun dpAsSp(valueDp: Float) = with(LocalDensity.current) { valueDp.dp.toSp() }
