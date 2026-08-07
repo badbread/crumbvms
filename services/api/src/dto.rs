@@ -1308,8 +1308,27 @@ pub struct LiveStreamsResponse {
     /// camera on this server; treat this response like any other
     /// authenticated, per-user payload (JWT/RBAC-gated, not further exposed).
     pub rtsp_main_url: String,
-    /// RTSP URL for the sub stream (same credential note as `rtsp_main_url`).
+    /// RTSP URL for the RAW sub stream `<name>_sub` (same credential note as
+    /// `rtsp_main_url`). This is the always-warm restream: reconcile keeps one
+    /// producer per camera running, so a consumer attaches to it immediately.
+    /// Desktop (libmpv) and iOS use this.
     pub rtsp_sub_url: Option<String>,
+    /// RTSP URL for the client-facing VIDEO-ONLY sub restream `<name>_subv` —
+    /// the raw sub run through an ffmpeg **copy** (remux, never a re-encode) so
+    /// go2rtc republishes a proper `a=fmtp:96 …sprop-parameter-sets=…` even for
+    /// cameras that publish H264 with no out-of-band parameter sets (#483).
+    /// `None` when the camera has no sub, or when reconcile does not manage its
+    /// go2rtc streams (Frigate-served, or a legacy row with no `source_url`) —
+    /// no `_subv` exists for those.
+    ///
+    /// **Only Media3/ExoPlayer clients (Android) should prefer this over
+    /// `rtsp_sub_url`.** go2rtc spawns the remux ffmpeg LAZILY on first consumer
+    /// connect and reaps it when consumerless, so every tile that opens `_subv`
+    /// cold pays a process spawn plus a wait for the next keyframe. Players that
+    /// tolerate the missing-fmtp SDP (libmpv on desktop, `AVFoundation` on iOS)
+    /// must keep using `rtsp_sub_url` and attach to the warm producer instead.
+    /// Same embedded-credential + sensitivity note as `rtsp_main_url`.
+    pub rtsp_subv_url: Option<String>,
     /// RTSP URL for the on-demand mobile transcode (`<name>_mobile`) — a low-res
     /// H.264 variant produced by go2rtc only while a consumer is connected, for a
     /// cellular "Data saver" fullscreen-live mode. `None` when the feature is

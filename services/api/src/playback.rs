@@ -660,33 +660,58 @@ async fn live_streams(
     // Crumb-synthesised stream names (`_subv`, `_mobile`) really exist. A legacy
     // `served_by='crumb'` row with an absolute `main_url` but empty `source_url`
     // is NOT managed, so we must not advertise a synthesised name for it.
-    let has_source = cam
-        .source_url
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty());
-    let crumb_managed = cam.served_by != "frigate" && has_source;
+    let crumb_managed = is_crumb_managed(&cam.served_by, cam.source_url.as_deref());
 
     // Only expose a sub RTSP URL if the camera actually has a sub stream
-    // configured.
+    // configured.  Resolve from cam.sub_url (which may be absolute or relative)
+    // rather than synthesising a `_sub` name — synthesised names can differ from
+    // the actual go2rtc stream name for legacy cameras.
     //
-    // #483: for Crumb-managed cameras the client gets the dedicated VIDEO-ONLY
-    // sub restream `<name>_subv` (registered by the reconcile loop — see
-    // `go2rtc::subv_src`), NOT the raw `<name>_sub`.
+    // This is the RAW sub, `<name>_sub`, and it stays that way for every client
+    // that can play it. Reconcile keeps exactly one `_sub` producer per camera
+    // running at all times, so a consumer attaches to a warm stream and gets a
+    // keyframe on the next GOP — which is why the desktop wall can bring eleven
+    // tiles up quickly. See `rtsp_subv_url` below for the client that needs more.
+    let rtsp_sub_url = cam
+        .sub_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|sub_stream| {
+            crumb_common::db::resolve_stream_url(
+                &cam.served_by,
+                sub_stream,
+                &crumb_rtsp_authed,
+                &b.frigate_rtsp,
+            )
+        });
+
+    // #483: the dedicated VIDEO-ONLY sub restream `<name>_subv`, registered by
+    // the reconcile loop (see `go2rtc::subv_src`), offered ALONGSIDE the raw sub
+    // rather than in place of it.
     //
-    // The live wall plays the sub over RTSP (Android Media3/ExoPlayer, and the
-    // desktop sub-fallback). Media3's RTSP client requires an `fmtp` attribute on
-    // the media tracks it builds and throws
-    // `IllegalArgumentException: missing attribute fmtp` without one, rejecting
-    // the whole DESCRIBE before video decodes → the tile "reconnects" forever.
-    // Some cameras (verified: Reolink) publish an H264 track with NO
-    // `sprop-parameter-sets`, and go2rtc's plain restream passes that gap through,
-    // so `<name>_sub` advertises a video track with no fmtp at all — such a stream
-    // is undecodable out-of-band (ffprobe on it reports "non-existing PPS 0
-    // referenced / no frame!"). `<name>_subv` runs the sub through an ffmpeg
-    // **copy** (no re-encode), which recovers the in-band SPS/PPS so go2rtc
-    // republishes a proper `a=fmtp:96 …sprop-parameter-sets=…`, and drops audio
-    // (go2rtc passes `-an` when no `#audio` is requested) — the wall is muted and
-    // two-way audio / listen uses the WebRTC path anyway.
+    // Media3's RTSP client (Android) requires an `fmtp` attribute on the media
+    // tracks it builds and throws `IllegalArgumentException: missing attribute
+    // fmtp` without one, rejecting the whole DESCRIBE before video decodes → the
+    // tile "reconnects" forever. Some cameras (verified: Reolink) publish an H264
+    // track with NO `sprop-parameter-sets`, and go2rtc's plain restream passes
+    // that gap through, so `<name>_sub` advertises a video track with no fmtp at
+    // all — such a stream is undecodable out-of-band (ffprobe on it reports
+    // "non-existing PPS 0 referenced / no frame!"). `<name>_subv` runs the sub
+    // through an ffmpeg **copy** (no re-encode), which recovers the in-band
+    // SPS/PPS so go2rtc republishes a proper
+    // `a=fmtp:96 …sprop-parameter-sets=…`, and drops audio (go2rtc passes `-an`
+    // when no `#audio` is requested) — the wall is muted and two-way audio /
+    // listen uses the WebRTC path anyway.
+    //
+    // WHY IT IS A SEPARATE FIELD and not just the value of `rtsp_sub_url`: go2rtc
+    // spawns the remux ffmpeg LAZILY on first consumer connect and reaps it when
+    // the last consumer leaves. An idle `_subv` costs nothing, but a COLD one
+    // costs a process spawn plus a wait for the next keyframe through an extra
+    // hop — per tile. Pointing every client at it made a fresh desktop wall open
+    // cold-spawn one ffmpeg per tile and take many seconds to fill, where before
+    // it attached straight to the warm `_sub` producers. Only Media3 needs the
+    // repair, so only Android pays for it; desktop (libmpv) and iOS keep
+    // `rtsp_sub_url`.
     //
     // Crucially the client URL stays CLEAN (no query string): an earlier attempt
     // appended go2rtc's `?video` selector to the client URL, which ffprobe accepts
@@ -695,31 +720,16 @@ async fn live_streams(
     // URLs and broke EVERY camera. The media filtering is therefore done
     // server-side, inside go2rtc's own source.
     //
-    // Unmanaged rows (Frigate-served, or legacy absolute `sub_url`) keep the
-    // previous behaviour: resolve `cam.sub_url` as-is, since no `_subv` exists for
-    // them and a synthesised name can differ from their real go2rtc stream name.
-    // The `<name>_sub` stream, the recorder's own internal sub consumption
-    // (motion, over loopback), `webrtc_sub_url`, main and mobile are untouched.
-    let rtsp_sub_url = cam
-        .sub_url
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|sub_stream| {
-            if crumb_managed {
-                format!(
-                    "{}/{}",
-                    crumb_rtsp_authed.trim_end_matches('/'),
-                    crate::go2rtc::subv_name(&cam.go2rtc_name)
-                )
-            } else {
-                crumb_common::db::resolve_stream_url(
-                    &cam.served_by,
-                    sub_stream,
-                    &crumb_rtsp_authed,
-                    &b.frigate_rtsp,
-                )
-            }
-        });
+    // `None` for rows reconcile does not manage (Frigate-served, or legacy
+    // absolute `sub_url` with no `source_url`): no `_subv` exists for them, and a
+    // client must fall back to `rtsp_sub_url` rather than burn its reconnect
+    // budget on a dead stream name.
+    let video_only_sub_url = subv_url(
+        crumb_managed,
+        cam.sub_url.as_deref(),
+        &cam.go2rtc_name,
+        &crumb_rtsp_authed,
+    );
 
     // WebRTC signaling now goes through the AUTHENTICATED API proxy
     // (`POST /live/{camera_id}/webrtc?stream=main|sub`), NOT directly at
@@ -744,9 +754,10 @@ async fn live_streams(
     // an absolute `main_url` but empty `source_url` gets no `_mobile` stream, so we
     // must not advertise a URL that resolves to nothing (else fullscreen live would
     // burn its reconnect budget on a dead stream). go2rtc spawns the transcode
-    // ffmpeg lazily on first consumer connect (idle cost zero). `crumb_managed`
+    // ffmpeg lazily on first consumer connect (idle cost zero — and only ONE
+    // fullscreen consumer ever attaches, unlike a wall of tiles). `crumb_managed`
     // is that same "Crumb-owned AND has a source_url" predicate, hoisted above
-    // because the `_subv` sub URL needs it too.
+    // because the `_subv` URL needs it too.
     let rtsp_mobile_url = (state.config().mobile_stream_enabled && crumb_managed).then(|| {
         format!(
             "{}/{}_mobile",
@@ -761,11 +772,50 @@ async fn live_streams(
         webrtc_sub_url,
         rtsp_main_url,
         rtsp_sub_url,
+        rtsp_subv_url: video_only_sub_url,
         rtsp_mobile_url,
     }))
 }
 
 // ─── private helpers ──────────────────────────────────────────────────────────
+
+/// Does the API's go2rtc reconcile loop actually manage this camera's streams?
+///
+/// This is the exact predicate `db::list_camera_streams` filters on, so it is
+/// also the predicate for "do Crumb-synthesised stream names (`<name>_subv`,
+/// `<name>_mobile`) really exist for this camera". Frigate-served cameras live on
+/// a separate BYO go2rtc Crumb does not touch, and a legacy `served_by='crumb'`
+/// row with an absolute `main_url` but empty `source_url` is never reconciled —
+/// advertising a synthesised name for either would hand the client a URL that
+/// resolves to nothing.
+///
+/// Pure + unit-tested; kept next to the two call sites that must agree.
+fn is_crumb_managed(served_by: &str, source_url: Option<&str>) -> bool {
+    served_by != "frigate" && source_url.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Build the client-facing VIDEO-ONLY sub restream URL (`<name>_subv`), or
+/// `None` when the camera has no sub stream or reconcile does not manage it.
+///
+/// See the `rtsp_subv_url` block in [`live_streams`] for why this is a separate
+/// field from `rtsp_sub_url` rather than a replacement for it (go2rtc spawns the
+/// remux ffmpeg lazily, per consumer — only clients that actually need the fmtp
+/// repair should pay it). Pure + unit-tested.
+fn subv_url(
+    crumb_managed: bool,
+    sub_url: Option<&str>,
+    go2rtc_name: &str,
+    crumb_rtsp_authed: &str,
+) -> Option<String> {
+    let has_sub = sub_url.is_some_and(|s| !s.is_empty());
+    (crumb_managed && has_sub).then(|| {
+        format!(
+            "{}/{}",
+            crumb_rtsp_authed.trim_end_matches('/'),
+            crate::go2rtc::subv_name(go2rtc_name)
+        )
+    })
+}
 
 /// Convert a [`crumb_common::Segment`] to the [`ResolvedSegment`] DTO.
 ///
@@ -997,6 +1047,89 @@ mod tests {
         assert_eq!(out, "rtsp://host:18554", "no user:pass@ when auth is off");
         assert!(!out.contains('@'), "auth-off URL must carry no userinfo");
         assert_eq!(format!("{out}/driveway"), "rtsp://host:18554/driveway");
+    }
+
+    // ── sub vs subv stream selection (#483 / the desktop cold-open regression) ─
+
+    const BASE: &str = "rtsp://u:p@host:18554";
+    const FRIGATE: &str = "rtsp://frigate:8554";
+
+    /// The two "reconcile really registers this camera's synthesised streams"
+    /// cases. A Crumb row with a `source_url` is managed; nothing else is.
+    #[test]
+    fn crumb_managed_predicate() {
+        assert!(is_crumb_managed("crumb", Some("rtsp://cam/live")));
+        // Frigate-served: a separate BYO go2rtc Crumb does not manage.
+        assert!(!is_crumb_managed("frigate", Some("rtsp://cam/live")));
+        // Legacy Crumb row: absolute main_url, no source_url → never reconciled.
+        assert!(!is_crumb_managed("crumb", None));
+        assert!(!is_crumb_managed("crumb", Some("")));
+        assert!(
+            !is_crumb_managed("crumb", Some("   ")),
+            "whitespace is empty"
+        );
+    }
+
+    /// `rtsp_sub_url` is the RAW `<name>_sub`, always — that is the always-warm
+    /// producer every client can attach to instantly. It must NOT be the `_subv`
+    /// remux: pointing every client at the lazily-spawned `_subv` made a fresh
+    /// desktop wall cold-spawn one ffmpeg per tile.
+    #[test]
+    fn rtsp_sub_url_is_the_raw_sub_for_a_crumb_managed_camera() {
+        let out = crumb_common::db::resolve_stream_url("crumb", "famroom_sub", BASE, FRIGATE);
+        assert_eq!(out, "rtsp://u:p@host:18554/famroom_sub");
+        assert!(!out.ends_with("_subv"), "the sub field never carries _subv");
+    }
+
+    /// `rtsp_subv_url` is offered ALONGSIDE it for Crumb-managed cameras that
+    /// have a sub — the video-only remux Media3 needs for its fmtp.
+    #[test]
+    fn rtsp_subv_url_present_for_crumb_managed_camera_with_a_sub() {
+        assert_eq!(
+            subv_url(true, Some("famroom_sub"), "famroom", BASE).as_deref(),
+            Some("rtsp://u:p@host:18554/famroom_subv"),
+        );
+        // A trailing slash on the base must not double up.
+        assert_eq!(
+            subv_url(
+                true,
+                Some("famroom_sub"),
+                "famroom",
+                "rtsp://u:p@host:18554/"
+            )
+            .as_deref(),
+            Some("rtsp://u:p@host:18554/famroom_subv"),
+        );
+        // Clean URL: no go2rtc `?video` query string (Media3 appends
+        // `/trackID=N` to the base URI and would build malformed SETUP URLs).
+        assert!(!subv_url(true, Some("famroom_sub"), "famroom", BASE)
+            .unwrap()
+            .contains('?'));
+    }
+
+    /// …and absent everywhere reconcile never registered a `_subv`, so a client
+    /// falls back to `rtsp_sub_url` instead of burning its reconnect budget on a
+    /// dead stream name.
+    #[test]
+    fn rtsp_subv_url_absent_when_unmanaged_or_no_sub() {
+        // No sub stream configured at all.
+        assert_eq!(subv_url(true, None, "famroom", BASE), None);
+        assert_eq!(subv_url(true, Some(""), "famroom", BASE), None);
+        // Frigate-served / legacy rows: `is_crumb_managed` already said no.
+        assert_eq!(subv_url(false, Some("famroom_sub"), "famroom", BASE), None);
+        // End to end through the predicate, the way the handler wires it.
+        for (served_by, source_url) in [
+            ("frigate", Some("rtsp://cam/live")),
+            ("crumb", None),
+            ("crumb", Some("")),
+        ] {
+            let managed = is_crumb_managed(served_by, source_url);
+            assert_eq!(
+                subv_url(managed, Some("famroom_sub"), "famroom", BASE),
+                None,
+                "{served_by}/{source_url:?} must not advertise a _subv",
+            );
+        }
     }
 
     // ── guard_path_traversal ──────────────────────────────────────────────────

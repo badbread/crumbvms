@@ -78,7 +78,10 @@ fn sub_name(go2rtc_name: &str) -> String {
 
 /// The go2rtc stream name for a camera's CLIENT-facing, VIDEO-ONLY sub restream
 /// (`<name>_subv`). `pub(crate)` because `playback.rs` builds the client
-/// `rtsp_sub_url` from it — the two must never drift apart.
+/// `rtsp_subv_url` from it — the two must never drift apart. Registered for
+/// every camera that has a `_sub`, whether or not a client asks for it; only
+/// Media3/ExoPlayer clients (Android) actually connect to it, and go2rtc spawns
+/// the ffmpeg lazily, so an unused registration costs nothing.
 pub(crate) fn subv_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_subv")
 }
@@ -89,7 +92,9 @@ fn mobile_name(go2rtc_name: &str) -> String {
 }
 
 /// Build the go2rtc source for a camera's `<name>_subv` — the video-only sub
-/// restream the live wall / desktop sub-fallback actually plays (#483).
+/// restream the ANDROID live wall plays (#483). Desktop and iOS stay on the raw
+/// `<name>_sub`; see `playback.rs`'s `rtsp_subv_url` for why the choice is the
+/// client's.
 ///
 /// It reads the EXISTING `<name>_sub` stream by name (go2rtc's documented
 /// restream form), so it shares that stream's single producer and adds no extra
