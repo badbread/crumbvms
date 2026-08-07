@@ -8,6 +8,95 @@ revisit.
 
 ---
 
+## 2026-08-06, A non-success go2rtc `PUT` is resolved by ASKING go2rtc what it has, not by reading the status code; and a never-yet-seen camera gets a creation grace
+
+**Context.** Two bugs found by a hostile-camera compatibility matrix against the
+v0.2.0 RC, filed separately (#519, #520) but decided together because the second
+is what made the first invisible.
+
+`put_stream` failed only on `5xx`, on the documented belief that "go2rtc
+registers the stream even when it answers 400". That is true for some 400s and
+false for others: go2rtc also answers `400 "streams: source with spaces may be
+insecure"` and registers NOTHING, which is what an operator gets for pasting an
+RTSP URL out of a camera's own web UI (several brands ship paths like
+`/Streaming Channels/101`). Crumb recorded that as a successful apply, so the
+camera row was created, the console showed it as normal, no warning was logged,
+and the recorder reconnect-looped forever against a restream that never existed.
+
+Meanwhile `camera_offline` treated "no liveness signal at all" as offline and
+suppressed only inside a grace keyed on the RECORDER's boot, so every camera
+added to a running server alarmed within ~20-40 s of being added. In the matrix
+run 12 of 12 cameras fired it and 11 were healthy — which is exactly why the one
+camera that was genuinely dead (the #519 case) was indistinguishable from noise.
+
+**Decision.**
+
+- On a non-success `PUT /api/streams`, read the body (it carries go2rtc's reason)
+  and then **confirm against `GET /api/streams` whether the stream is actually
+  registered**. Present ⇒ benign, `Ok(())` as before. Absent ⇒ a real rejection.
+  Only a `4xx` gets that treatment; a transport error or `5xx` stays a
+  server-wide "couldn't ask", logged and never attributed to one camera.
+- A confirmed rejection of a camera's MAIN or SUB stream raises a new
+  `camera_stream_rejected` system event (migration `0077`) carrying go2rtc's own
+  reason, on the accepted→rejected TRANSITION only — an in-memory latch on
+  `AppState`, mirroring the `camera_offline` watchdog's latch, because a missing
+  stream reads as a stream-count shortfall and drives a reconcile pass every ~5 s.
+- `camera_offline` gains a per-camera creation grace: a camera that has NEVER
+  reported any liveness signal is held for `max(threshold, boot_grace)` after its
+  `created_at`. A camera that has reported even once is judged by the threshold
+  alone, exactly as before.
+
+**Rejected:**
+
+- **Treat every non-success status as a failure** (the obvious reading of #519).
+  It would fire a false `camera_stream_rejected` on healthy camera adds: Crumb
+  mounts `go2rtc.yaml` read-only, so go2rtc's own post-registration config write
+  fails and it answers `4xx` for a stream it did register. Trading a silent
+  failure for a false alarm on every install is not a fix, it is #520 again.
+- **Pattern-match go2rtc's error body** ("spaces may be insecure" ⇒ fatal,
+  anything else ⇒ benign). Couples Crumb to another project's error strings and
+  silently regains the silent-failure bug the first time go2rtc rephrases a
+  message or adds a rejection reason. The confirming GET is version-independent.
+- **Validate/normalize `source_url` at add time instead** (reject or
+  percent-encode a URL that `Url::parse` round-trips differently). Worth doing,
+  but it is a different fix: it catches only the space case, only on the add
+  path, and leaves every other go2rtc refusal as silent as it is today.
+- **Replace the recorder-boot grace with a creation grace.** The two cover
+  different windows (a restart of an established install vs. a brand-new row);
+  #520 is an additional condition, not a substitute.
+- **Suppress purely on row age, regardless of liveness.** Would create a real
+  blind spot: a camera that recorded fine and then died 30 s later would be held
+  for the whole window. Gating on `age.is_none()` means the grace can only ever
+  delay the FIRST alert for a camera that has never worked.
+
+**Trades knowingly accepted:**
+
+- A rejection costs one extra HTTP round-trip — on the error path only, against
+  the local go2rtc.
+- If the confirming GET itself fails, `put_stream` assumes the stream applied. A
+  late alert beats a false one, and the loop retries within seconds.
+- Both latches are in-memory, so a restart re-derives them and a still-broken
+  camera can alert once more. Same trade the `camera_offline` latch already makes.
+- A genuinely dead NEW camera now alerts after the creation grace (~3 min by
+  default) rather than ~20 s. Nothing was being recorded in either case, and
+  `camera_stream_rejected` fires within seconds for the subset that is dead
+  because go2rtc refused the stream.
+
+**Revisit triggers:**
+
+- go2rtc gaining a response that distinguishes "registered" from "rejected" (a
+  structured error body, or `201` vs `200`) ⇒ drop the confirming GET.
+- Add-time source-URL validation landing ⇒ re-check whether the
+  `camera_stream_rejected` detail should point at the field instead of go2rtc's
+  raw message.
+- Operators reporting that the creation grace hides a real fault for too long ⇒
+  give it its own env knob instead of borrowing `CAMERA_OFFLINE_BOOT_GRACE_SECS`.
+- A second consumer needing "is this camera's stream actually registered?" (the
+  console wanting a per-camera health pill) ⇒ promote the latch to a queryable
+  LEVEL signal, the way `camera_motion_health` did for detector health.
+
+---
+
 ## 2026-08-06, Per-state HA badge backgrounds: one extra nullable column that inherits from the base (not paired per-state columns)
 
 **Context.** Migration 0062 gave a placed HA badge a single solid background

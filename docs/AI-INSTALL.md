@@ -653,10 +653,21 @@ CrumbVMS can notify the user when something breaks, via the admin **Notification
 panel (Discord / Slack / Pushover / Telegram / ntfy / webhook):
 
 - Add a **channel** (their destination).
-- The **System alerts**, `recorder_offline`, `camera_offline`, `low_disk`,
-  `backup_failed`, `frigate_disconnected`, are rule-based and mostly **on by
-  default**; they fire to the channel(s) when the recorder dies, a camera stops
-  writing, disk runs low, the backup goes stale, or Frigate disconnects.
+- The **System alerts**, `recorder_offline`, `camera_offline`,
+  `camera_stream_rejected`, `low_disk`, `backup_failed`,
+  `frigate_disconnected`, are rule-based and mostly **on by default**; they fire
+  to the channel(s) when the recorder dies, a camera stops writing, a camera's
+  stream is refused outright, disk runs low, the backup goes stale, or Frigate
+  disconnects.
+
+**`camera_stream_rejected` is the one to read carefully.** It means Crumb's
+go2rtc refused to register that camera's stream at all, so the camera looks
+completely normal in the console but there is no restream behind it and
+**nothing is being recorded**. The alert detail carries go2rtc's own reason. By
+far the most common one is a literal space in the RTSP URL, which several camera
+brands put in their own web UI (`.../Streaming Channels/101`) and which go2rtc
+refuses with "source with spaces may be insecure". The fix is to percent-encode
+the path (`%20` for each space) in the camera's source URL and save.
 
 **Suppress false alarms during planned maintenance.** Before a deliberate stack
 cutover or recorder restart, arm a **maintenance window** so the transient
@@ -669,6 +680,14 @@ extra safety nets need no action: a **recorder-startup grace**
 `camera_offline` alerts for the reconnect window after the recorder (re)starts,
 and `MAINTENANCE_UNTIL` (unix-seconds env, default off) can pre-arm a window at
 boot for scripted cutovers.
+
+A third safety net covers **adding** cameras: a camera that has never reported
+anything yet is held for the same window, measured from when the camera was
+created, so working through a first-run camera list does not produce one false
+`camera_offline` push per camera while each one makes its first connection. A
+camera that still has not reported when that window closes alerts normally, and
+a camera that HAS been online is judged only by the `camera_offline` threshold,
+so genuine outages are unaffected.
 
 **Important limitation, cover the API itself separately.** The alert engine
 runs **inside the API process**, so it catches recorder/camera/disk/backup

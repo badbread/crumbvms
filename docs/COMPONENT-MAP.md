@@ -165,7 +165,7 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Surface | Path | Why |
 |---|---|---|
 | API | `services/api/src/ptz.rs`, `cameras.rs`, `config_routes.rs`, `stream_test.rs`, `discover.rs` (plus row A) | |
-| go2rtc seam | `services/api/src/go2rtc.rs` (reconcile), `services/recorder/src/go2rtc_embed.rs` | Streams are managed at runtime from the `cameras` table. Never hand-edit `go2rtc/go2rtc.yaml` beyond listeners; never point `crumb_api_base` anywhere but Crumb's own go2rtc REST endpoint. Reconcile is diff-based (PATCH existing, PUT missing; see DECISIONS 2026-07-06), do not regress to PUT-all |
+| go2rtc seam | `services/api/src/go2rtc.rs` (reconcile), `services/recorder/src/go2rtc_embed.rs` | Streams are managed at runtime from the `cameras` table. Never hand-edit `go2rtc/go2rtc.yaml` beyond listeners; never point `crumb_api_base` anywhere but Crumb's own go2rtc REST endpoint. Reconcile is diff-based (PATCH existing, PUT missing; see DECISIONS 2026-07-06), do not regress to PUT-all. A non-success `PUT` is NOT self-describing: go2rtc answers `4xx` both when it registered the stream anyway and when it refused it outright, so `put_stream` confirms against `GET /api/streams` and only the confirmed-absent case raises `camera_stream_rejected` (issue #519) |
 | Clients | desktop `app.js` (on-video PTZ panel), android `feature/live`, iOS `Features/Live`, `admin.html` | Parity walk, section 3 |
 | Client setup doc | `docs/CLIENTS.md` | If the operator must configure anything (e.g. the reachable stream address for native live video) |
 | Camera compatibility DB | `data/camera-compatibility.json` | When a specific make/model shows a quirk or needs a workaround (codec/stream oddity, ONVIF gap), add or update its entry and regenerate (`node scripts/gen-camera-compat.mjs`). PR-curated, no telemetry |
@@ -222,6 +222,8 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Surface | Path | Why |
 |---|---|---|
 | Server | `services/api/src/notifications.rs`, `channel_notify.rs`, `alerts.rs`; migrations `0015`/`0017`/`0032` | |
+| New system-alert `event_key` | ALL FOUR, or the alert is silently dropped: the emit site (`alerts.rs`, `go2rtc.rs`, or the recorder), a `system_alert_rules` INSERT migration (`0038`/`0056`/`0077` pattern) **registered in the `MIGRATIONS` array**, `system_alert_title` in `notifications.rs`, and `SYS_ALERT_META` in `admin.html` | The engine skips any `event_key` with no rule row, so an unregistered key writes `system_events` nobody ever receives |
+| Alert-suppression logic | `alerts.rs` grace/latch helpers (`within_boot_grace`, `within_camera_create_grace`, the per-camera `was_offline` latch) | A false alert costs more trust than a late one, but every suppression must EXPIRE — unit-test both the hold and the release (issues #46, #520) |
 | Admin console | notifications section in `admin.html` | Rules/history CRUD |
 | Clients | android polling/local-notification path, desktop toasts, iOS `Settings` | Delivery ends on a client |
 | Env/config | rows B and I for any new channel credential (`ALERT_WEBHOOK_URL`, ntfy/Pushover keys) | Never log or hardcode channel secrets |

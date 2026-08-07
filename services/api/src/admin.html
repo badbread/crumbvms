@@ -9658,7 +9658,8 @@ let NOTIF_SYS_ALERTS = [];  /* loaded array of system_alert_rules rows (P0-HEALT
 /* Human-readable title + short description for each system-alert event_key. */
 const SYS_ALERT_META = {
   recorder_offline:     { title: 'Recorder offline',                  desc: 'The recorder process heartbeat has gone stale, recording may be down.', unit: 'secs' },
-  camera_offline:       { title: 'Camera offline',                    desc: 'A camera has written no new footage for longer than the threshold.', unit: 'secs' },
+  camera_offline:       { title: 'Camera offline',                    desc: 'A camera has written no new footage for longer than the threshold. Newly added cameras are given a grace window from the moment they are created, so a camera that has never reported yet does not alarm while it makes its first connection.', unit: 'secs' },
+  camera_stream_rejected: { title: 'Camera stream rejected',          desc: 'Crumb’s go2rtc refused to register a camera’s stream, so there is no restream behind the camera and NOTHING is being recorded even though the camera looks normal. The alert detail carries go2rtc’s own reason; the usual cause is a literal space in the RTSP URL (“source with spaces may be insecure”) pasted out of the camera’s web UI, fixed by percent-encoding the path as %20.', unit: null },
   premature_rollover:   { title: 'Footage evicted early',             desc: 'Footage was deleted before its configured retention because a size cap or disk-full forced it, actual footage loss.', unit: null },
   low_disk:             { title: 'Low disk space',                    desc: 'A storage volume has dropped below its configured free-space floor.', unit: 'pct' },
   policy_over_cap:      { title: 'Recording policy over cap',         desc: 'A policy’s live or archive footage is at/over its configured byte cap.', unit: null },

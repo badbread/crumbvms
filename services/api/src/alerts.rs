@@ -592,6 +592,48 @@ fn offline_from_age(age_secs: Option<i64>, threshold_secs: i64) -> bool {
     age_secs.is_none_or(|a| a > threshold_secs)
 }
 
+/// Pure decision for the per-camera CREATION grace (issue #520): should the
+/// `camera_offline` watchdog hold its fire because this camera was only just
+/// added and has never reported anything yet?
+///
+/// [`within_boot_grace`] is keyed on the RECORDER's boot, so it does nothing for
+/// a camera added to a long-running server: [`offline_from_age`] treats "no
+/// liveness signal at all" (`age_secs == None`) as offline, so on the very next
+/// 20 s watchdog tick a brand-new camera fired `camera_offline` — "has never
+/// reported a segment" — seconds before its first segment landed. Every camera
+/// added during first-run setup did this, which is one false push per camera at
+/// exactly the moment a new operator can least tell a real fault from noise, and
+/// it devalued the one event that WAS real in that batch.
+///
+/// Deliberately narrow, so genuine offline detection is untouched:
+///
+/// * It only applies while `age_secs` is `None` — the camera has NEVER been seen
+///   alive. A camera that has reported even once has a real age, so its outage
+///   is judged by `threshold_secs` exactly as before, however young the row is.
+/// * It expires. A camera that never connects at all (a typo'd URL, or a go2rtc
+///   stream that was rejected outright — issue #519) still alerts once
+///   `grace_secs` elapses; the alert is delayed, never suppressed.
+/// * Like the boot grace, the caller does NOT latch during the window, so the
+///   first tick after it closes re-evaluates and fires.
+fn within_camera_create_grace(
+    age_secs: Option<i64>,
+    secs_since_created: i64,
+    grace_secs: i64,
+) -> bool {
+    age_secs.is_none() && secs_since_created < grace_secs
+}
+
+/// The creation-grace window for a camera that has never reported: long enough
+/// to cover the whole add→restream→first-segment path (go2rtc reconcile pass,
+/// producer dial, and — with `-c copy -f segment` — a wait for the camera's
+/// first keyframe), and never shorter than the offline threshold itself, which
+/// is the operator's own statement of how long silence is tolerable. Reuses the
+/// existing `CAMERA_OFFLINE_BOOT_GRACE_SECS` knob rather than adding a second
+/// one: both answer the same question ("how long is a reconnect gap normal?").
+fn camera_create_grace_secs(threshold_secs: i64, boot_grace_secs: i64) -> i64 {
+    threshold_secs.max(boot_grace_secs)
+}
+
 /// `camera_offline` — for every enabled camera, checks a liveness signal and
 /// fires once per camera per offline→online cycle when it exceeds the
 /// configured threshold.
@@ -651,6 +693,15 @@ fn offline_from_age(age_secs: Option<i64>, threshold_secs: i64) -> bool {
 /// transition is held — the transient reconnect gap after a (re)start is not a
 /// real outage. A camera that stays silent past the grace still fires. This
 /// applies identically to both liveness signals.
+///
+/// Camera-creation grace (issue #520): the boot grace above is keyed on the
+/// RECORDER's boot, so it did nothing for a camera added to an already-running
+/// server — every such camera fired a false `camera_offline` within ~20-40 s of
+/// being added, before its first segment could possibly land. A camera that has
+/// never reported ANY liveness signal is therefore also held for
+/// [`camera_create_grace_secs`] after its `created_at`; see
+/// [`within_camera_create_grace`] for why this cannot weaken detection for a
+/// camera that has been online.
 async fn check_camera_offline(
     pool: &Pool,
     rule: Option<&db::SystemAlertRule>,
@@ -668,6 +719,7 @@ async fn check_camera_offline(
             .unwrap_or(DEFAULT_CAMERA_OFFLINE_SECS as i32),
     );
     let in_boot_grace = within_boot_grace(secs_since_recorder_boot, boot_grace_secs);
+    let create_grace_secs = camera_create_grace_secs(threshold, boot_grace_secs);
 
     let cameras = match db::list_enabled_cameras(pool).await {
         Ok(c) => c,
@@ -743,6 +795,23 @@ async fn check_camera_offline(
                 secs_since_recorder_boot,
                 boot_grace_secs,
                 "system-health: camera_offline suppressed inside recorder-startup grace"
+            );
+            continue;
+        }
+
+        // Camera-creation grace (issue #520): a camera that has NEVER reported
+        // and was added moments ago is still making its first connection, not
+        // offline. Same shape as the boot grace above — hold the NEW transition
+        // without latching, so the first tick after the window closes fires if
+        // the camera is genuinely dead.
+        let secs_since_created = (now - cam.created_at).num_seconds();
+        if offline && !was && within_camera_create_grace(age, secs_since_created, create_grace_secs)
+        {
+            tracing::debug!(
+                camera_id = %cam.id,
+                secs_since_created,
+                create_grace_secs,
+                "system-health: camera_offline suppressed inside camera-creation grace"
             );
             continue;
         }
@@ -1108,5 +1177,88 @@ mod tests {
         // If the recorder's worker for this camera dies, the heartbeat stops
         // landing entirely -> the row goes stale past threshold -> offline.
         assert!(offline_from_age(Some(300), 120));
+    }
+
+    // ── Guard 3: per-camera creation grace (issue #520) ───────────────────────
+    //
+    // The bug: `offline_from_age(None, _)` is `true`, and the only suppression
+    // was `within_boot_grace`, keyed on the RECORDER's boot. A camera added to a
+    // server that had been up for hours was therefore "offline" on the very next
+    // 20 s tick — every camera added during first-run setup produced one false
+    // "has never reported a segment" push.
+
+    #[test]
+    fn the_defect_that_made_every_new_camera_alarm() {
+        // Pin the pre-fix behavior these two guards must now catch: a camera
+        // added long after boot has NO liveness signal (so it reads offline) and
+        // the boot grace does not apply to it (so nothing held the transition).
+        let long_after_boot = 4 * 60 * 60;
+        assert!(offline_from_age(None, 120), "no signal reads as offline");
+        assert!(
+            !within_boot_grace(long_after_boot, 180),
+            "the recorder-boot grace does nothing for a camera added hours later"
+        );
+        // The creation grace is what covers it now.
+        assert!(within_camera_create_grace(None, 5, 180));
+    }
+
+    #[test]
+    fn create_grace_holds_a_brand_new_camera_that_has_never_reported() {
+        // The observed timings from #520: the event fired 13-26 s after the add,
+        // seconds before the first segment landed.
+        assert!(within_camera_create_grace(None, 13, 180));
+        assert!(within_camera_create_grace(None, 26, 180));
+        assert!(within_camera_create_grace(None, 0, 180));
+        assert!(
+            within_camera_create_grace(None, 179, 180),
+            "one second before the grace ends is still grace"
+        );
+    }
+
+    #[test]
+    fn create_grace_expires_so_a_never_connecting_camera_still_alerts() {
+        // A camera whose go2rtc stream was rejected outright (#519) never
+        // reports anything — the alert is DELAYED by the grace, never suppressed.
+        assert!(
+            !within_camera_create_grace(None, 180, 180),
+            "exactly at the grace boundary the grace is over (strict <, matching within_boot_grace)"
+        );
+        assert!(!within_camera_create_grace(None, 3600, 180));
+    }
+
+    #[test]
+    fn create_grace_never_covers_a_camera_that_has_been_online() {
+        // The load-bearing narrowing: once a camera has reported even once it
+        // has a real age, so a genuine outage is judged by the threshold alone —
+        // no matter how recently the row was created. A camera that recorded and
+        // then died 10 minutes into its first hour must still alert.
+        assert!(!within_camera_create_grace(Some(600), 30, 180));
+        assert!(!within_camera_create_grace(Some(0), 0, 180));
+        assert!(
+            !within_camera_create_grace(Some(100_000), 5, 180),
+            "an old outage on a young row is still an outage"
+        );
+    }
+
+    #[test]
+    fn create_grace_zero_disables_suppression() {
+        // Mirrors `boot_grace_zero_disables_suppression`: an operator who sets
+        // CAMERA_OFFLINE_BOOT_GRACE_SECS=0 AND a 0 threshold gets no holding.
+        assert!(!within_camera_create_grace(None, 0, 0));
+        assert!(!within_camera_create_grace(None, 5, 0));
+    }
+
+    #[test]
+    fn create_grace_window_is_the_longer_of_threshold_and_boot_grace() {
+        // Defaults: 120 s threshold, 180 s boot grace -> 180 s.
+        assert_eq!(
+            camera_create_grace_secs(DEFAULT_CAMERA_OFFLINE_SECS, 180),
+            180
+        );
+        // An operator who raises the offline threshold to 10 min is saying that
+        // much silence is normal for them; the creation window follows it.
+        assert_eq!(camera_create_grace_secs(600, 180), 600);
+        // And it can be turned off entirely.
+        assert_eq!(camera_create_grace_secs(0, 0), 0);
     }
 }

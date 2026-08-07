@@ -2031,6 +2031,7 @@ fn system_alert_title(event_key: &str) -> &str {
     match event_key {
         "recorder_offline" => "Recorder offline",
         "camera_offline" => "Camera offline",
+        "camera_stream_rejected" => "Camera stream rejected — recording nothing",
         "premature_rollover" => "Footage evicted early (premature rollover)",
         "low_disk" => "Low disk space",
         "policy_over_cap" => "Recording policy over size cap",
