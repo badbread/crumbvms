@@ -14,13 +14,21 @@
 //  3. a fixed width really is fixed: it does not vary with the label, which is
 //     what makes several badges set to the same mode line up;
 //  4. an edit session (drag, resize, a tweak to some OTHER field) carries both
-//     values through capture/restore and the style reset clears them.
+//     values through capture/restore and the style reset clears them;
+//  5. `auto` hugs its content at the height the pill is actually RENDERED at,
+//     not just at the reference height — the "Floodli…" truncation the
+//     maintainer hit on a wall tile, where the chip's font/icon/padding floors
+//     made the content wider than a linearly-scaled box.
 //
-// Pure, headless assertions — every rule under test is a plain function.
+// Mostly pure, headless assertions — every rule under test is a plain
+// function; the last group pumps the real chip to prove the paragraph is not
+// ellipsized inside the box the geometry hands it.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:crumb_desktop/api/ha_models.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_icons.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 
@@ -117,11 +125,20 @@ void main() {
   group('HaOverlayBadgeItem.baseSize with a width mode', () {
     test('auto keeps the measured hug-the-content width, unchanged', () {
       final auto = HaOverlayBadgeItem(_link());
-      final measured =
-          HaOverlayBadgeItem.pillBaseWidth('Front Door', widthMode: 'auto');
+      final measured = HaOverlayBadgeItem.pillWidthAtHeight(
+        'Front Door',
+        HaOverlayBadgeItem.baseRefPx,
+        widthMode: 'auto',
+      );
       expect(auto.baseSize().$1, measured);
       // And null behaves identically — the two spellings of "default".
-      expect(HaOverlayBadgeItem.pillBaseWidth('Front Door'), measured);
+      expect(
+        HaOverlayBadgeItem.pillWidthAtHeight(
+          'Front Door',
+          HaOverlayBadgeItem.baseRefPx,
+        ),
+        measured,
+      );
     });
 
     test('a fixed mode is an exact multiple of the badge HEIGHT', () {
@@ -174,6 +191,200 @@ void main() {
       final (w, h) = big.baseSize();
       expect(h, closeTo(HaOverlayBadgeItem.baseRefPx * 2.5, 1e-9));
       expect(w, closeTo(h * 8.0, 1e-9));
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // The live bug this group locks down: a pill on a small wall tile rendered
+  // "Floodli…". `auto` measured the label at the REFERENCE height and scaled
+  // the result linearly, but `HaBadgeChip._pill` clamps its icon/font/padding
+  // at the height it is DRAWN at (floors 10/8/5/3px, ceilings 40/26/16/8px).
+  // Below ~21px of rendered height the floors make the content wider than the
+  // linearly-scaled box, so `TextOverflow.ellipsis` ate the label; above ~57px
+  // the ceilings cap the content while the box kept growing, leaving dead
+  // space. Both sides now derive from `HaPillMetrics` at the rendered height.
+  group('auto width hugs the content at EVERY rendered height', () {
+    // A 320x180 wall tile — pane scale 0.5625, so a default-size badge renders
+    // ~12.4px tall and every one of the chip's floors is active. This is the
+    // maintainer's screenshot, in numbers.
+    const tilePaneScale = 0.5625;
+    const label = 'Floodlight';
+
+    double contentWidthAt(double h) => HaPillMetrics.forHeight(h)
+        .contentWidth(HaOverlayBadgeItem.labelWidthPerFontPx(label));
+
+    test('the small-tile case: the box fits the CLAMPED content', () {
+      final item = HaOverlayBadgeItem(_link(label: label));
+      final (w, h) = item.renderedSize(tilePaneScale);
+      // Precondition: we really are in floor territory (font floor at h < 20).
+      expect(h, lessThan(20.0));
+      expect(HaPillMetrics.forHeight(h).fontSize, 8.0);
+      expect(w, greaterThanOrEqualTo(contentWidthAt(h)));
+    });
+
+    test('...which the old linear scaling did NOT — the regression', () {
+      final item = HaOverlayBadgeItem(_link(label: label));
+      final (_, h) = item.renderedSize(tilePaneScale);
+      final linear = item.baseSize().$1 * tilePaneScale;
+      expect(linear, lessThan(contentWidthAt(h)));
+    });
+
+    test('no truncation and no dead space across the whole size range', () {
+      for (final scale in [0.5, 0.5625, 0.8, 1.0, 1.5, 2.0, 3.0]) {
+        for (final size in [0.4, 1.0, 2.5]) {
+          final item = HaOverlayBadgeItem(_link(label: label))
+            ..setBaseSize(0, HaOverlayBadgeItem.baseRefPx * size);
+          final (w, h) = item.renderedSize(scale);
+          // Exactly the content: >= is "never truncates", <= is "never pads".
+          expect(w, closeTo(contentWidthAt(h), 1e-9), reason: '$scale/$size');
+        }
+      }
+    });
+
+    test('baseSize() is renderedSize(1.0) — the item-space invariant', () {
+      for (final mode in [null, 'auto', 'narrow', 'wide']) {
+        final item = HaOverlayBadgeItem(_link(pillWidth: mode, label: label));
+        expect(item.baseSize(), item.renderedSize(1.0), reason: '$mode');
+      }
+      // ...and the height half of it is the shape-invariant, at any scale.
+      final item = HaOverlayBadgeItem(_link(label: label));
+      expect(
+        item.renderedSize(2.0).$2,
+        closeTo(HaOverlayBadgeItem.baseRefPx * 2.0, 1e-9),
+      );
+    });
+
+    test('a fixed mode stays EXACTLY n x height at every pane scale', () {
+      for (final (mode, factor) in [
+        ('narrow', 4.0),
+        ('medium', 6.0),
+        ('wide', 8.0),
+      ]) {
+        for (final scale in [0.5, 1.0, 3.0]) {
+          final item = HaOverlayBadgeItem(_link(pillWidth: mode, label: label));
+          final (w, h) = item.renderedSize(scale);
+          expect(w, closeTo(h * factor, 1e-9), reason: '$mode@$scale');
+        }
+      }
+    });
+
+    test('a fixed pill always has room for its icon + padding + gap', () {
+      // A fixed width ellipsizes an over-long LABEL by design, but the chrome
+      // around it must never overflow the box (a RenderFlex overflow).
+      for (final mode in ['narrow', 'medium', 'wide']) {
+        for (final h in [8.0, 12.4, 22.0, 120.0]) {
+          final m = HaPillMetrics.forHeight(h);
+          final chrome = m.padH * 2 + m.iconSize + m.gap;
+          final w = HaOverlayBadgeItem.pillWidthAtHeight(
+            label,
+            h,
+            widthMode: mode,
+          );
+          expect(w, greaterThanOrEqualTo(chrome), reason: '$mode@$h');
+        }
+      }
+    });
+
+    test('a dot is untouched by any of this', () {
+      final dot = HaOverlayBadgeItem(_link(shape: 'dot', label: label));
+      final (w, h) = dot.renderedSize(tilePaneScale);
+      expect(w, h);
+    });
+  });
+
+  group('HaPillMetrics — one source for the chip clamps', () {
+    test('the floors bite on a small tile', () {
+      final m = HaPillMetrics.forHeight(10);
+      expect(m.iconSize, 10.0);
+      expect(m.fontSize, 8.0);
+      expect(m.padH, 5.0);
+      expect(m.gap, 3.0);
+    });
+
+    test('the ceilings bite on a huge badge', () {
+      final m = HaPillMetrics.forHeight(200);
+      expect(m.iconSize, 40.0);
+      expect(m.fontSize, 26.0);
+      expect(m.padH, 16.0);
+      expect(m.gap, 8.0);
+    });
+
+    test('in the linear band nothing is clamped', () {
+      final m = HaPillMetrics.forHeight(40);
+      expect(m.iconSize, closeTo(22.4, 1e-9));
+      expect(m.fontSize, closeTo(16.0, 1e-9));
+      expect(m.padH, closeTo(11.2, 1e-9));
+      expect(m.gap, closeTo(5.6, 1e-9));
+    });
+
+    test('a runaway label is still capped at 9 pill-heights', () {
+      final m = HaPillMetrics.forHeight(22);
+      expect(m.contentWidth(1000), lessThanOrEqualTo(22 * 9 + 22 * 1.3));
+    });
+  });
+
+  group('the chip really does not ellipsize in the box it is given', () {
+    // The math above says the box fits; this pumps the actual chip in exactly
+    // the rect `OverlayGeometry.rectFor` would hand it and asks the laid-out
+    // paragraph whether it had to cut anything.
+    Future<void> expectLabelIntact(
+      WidgetTester tester, {
+      required String label,
+      required double paneScale,
+      double overlaySize = 1.0,
+    }) async {
+      final item = HaOverlayBadgeItem(_link(label: label))
+        ..setBaseSize(0, HaOverlayBadgeItem.baseRefPx * overlaySize);
+      final (w, h) = item.renderedSize(paneScale);
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(
+            child: SizedBox(
+              width: w,
+              height: h,
+              child: HaBadgeChip(
+                visual: const HaVisual(Icons.lightbulb_outline, Colors.amber),
+                isPill: true,
+                pillLabel: label,
+              ),
+            ),
+          ),
+        ),
+      );
+      final para = tester.renderObject<RenderParagraph>(find.text(label));
+      expect(para.didExceedMaxLines, isFalse, reason: 'ellipsized at h=$h');
+      expect(
+        para.size.width,
+        greaterThanOrEqualTo(para.getMaxIntrinsicWidth(double.infinity) - 0.01),
+        reason: 'label was squeezed at h=$h',
+      );
+    }
+
+    testWidgets('"Floodlight" on a 320x180 wall tile', (tester) async {
+      await expectLabelIntact(tester, label: 'Floodlight', paneScale: 0.5625);
+    });
+
+    testWidgets('a small badge on a small tile (both floors compounding)',
+        (tester) async {
+      await expectLabelIntact(
+        tester,
+        label: 'Floodlight',
+        paneScale: 0.5,
+        overlaySize: 0.6,
+      );
+    });
+
+    testWidgets('and still intact at the sizes that already worked',
+        (tester) async {
+      for (final (s, size) in [(1.0, 1.0), (2.0, 1.0), (3.0, 2.5)]) {
+        await expectLabelIntact(
+          tester,
+          label: 'Back garden floodlight',
+          paneScale: s,
+          overlaySize: size,
+        );
+      }
     });
   });
 

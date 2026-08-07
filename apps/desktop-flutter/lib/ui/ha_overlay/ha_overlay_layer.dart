@@ -206,6 +206,65 @@ MainAxisAlignment haPillAlignment(String? align) {
   }
 }
 
+/// The pill chip's INTERNAL metrics at one rendered height — the single source
+/// of the factors AND their clamps, shared by the renderer ([HaBadgeChip._pill],
+/// which lays the chip out) and by the measurement
+/// (`HaOverlayBadgeItem.pillWidthAtHeight`, which sizes the box the chip is
+/// handed). They MUST come from here in both places: the whole class of bug
+/// this fixes is the two sides disagreeing.
+///
+/// Why the clamps matter for the width: each part is a fraction of the height
+/// *until* it hits a floor or a ceiling, so the content's width is NOT linear
+/// in the height. Sizing the box from the un-clamped fractions made a small
+/// wall-tile pill narrower than the content it had to draw — at a rendered
+/// height under ~21px the 8px font floor (and the 10/5/3px icon/padding/gap
+/// floors) are active — so `TextOverflow.ellipsis` chopped "Floodlight" into
+/// "Floodli…". The same mismatch runs the other way past ~57px, where the
+/// ceilings cap the content and the box kept growing, leaving dead space after
+/// the label.
+class HaPillMetrics {
+  const HaPillMetrics({
+    required this.height,
+    required this.iconSize,
+    required this.fontSize,
+    required this.padH,
+    required this.gap,
+  });
+
+  /// Every part of a pill derives from the height it is RENDERED at — not from
+  /// the item's base size, which is the same number only at pane-scale 1.0.
+  factory HaPillMetrics.forHeight(double height) => HaPillMetrics(
+        height: height,
+        iconSize: (height * 0.56).clamp(10.0, 40.0).toDouble(),
+        fontSize: (height * 0.40).clamp(8.0, 26.0).toDouble(),
+        padH: (height * 0.28).clamp(5.0, 16.0).toDouble(),
+        gap: (height * 0.14).clamp(3.0, 8.0).toDouble(),
+      );
+
+  final double height;
+  final double iconSize;
+  final double fontSize;
+
+  /// Horizontal padding, EACH side.
+  final double padH;
+
+  /// Icon-to-label gap.
+  final double gap;
+
+  /// Width of everything inside the pill for a label whose advance is
+  /// [labelWidthPerFontPx] logical px per 1px of font size (measured once per
+  /// label by `HaOverlayBadgeItem.labelWidthPerFontPx`).
+  ///
+  /// The label is capped at 9 pill-heights so one runaway caption can't span
+  /// the frame; the chip ellipsizes past that, which is the graceful
+  /// degradation the cap is there for.
+  double contentWidth(double labelWidthPerFontPx) {
+    final text =
+        (labelWidthPerFontPx * fontSize).clamp(0.0, height * 9).toDouble();
+    return padH * 2 + iconSize + gap + text;
+  }
+}
+
 /// Snappy spring (matches the operator-chosen preview: k380 / damping 21).
 const SpringDescription _kJellySpring = SpringDescription(
   mass: 1.0,
@@ -219,7 +278,9 @@ const SpringDescription _kJellySpring = SpringDescription(
 /// a spring pop-in on appear and a squish-and-rebound whenever the entity's
 /// state changes. Sizes itself to fill whatever rect the overlay layer gives it
 /// (`overlay_editor_layer.dart`'s `SizedBox`/`Positioned` wrap) — for a pill
-/// that rect is pre-widened by `HaOverlayBadgeItem.baseSize()`.
+/// that rect is pre-widened by `HaOverlayBadgeItem.renderedSize()`, which
+/// measures the content with the SAME [HaPillMetrics] this chip lays itself
+/// out from, at the same rendered height.
 class HaBadgeChip extends StatefulWidget {
   const HaBadgeChip({
     super.key,
@@ -406,10 +467,14 @@ class _HaBadgeChipState extends State<HaBadgeChip>
       );
 
   Widget _pill(double height) {
-    final iconSize = (height * 0.56).clamp(10.0, 40.0).toDouble();
-    final fontSize = (height * 0.40).clamp(8.0, 26.0).toDouble();
-    final padH = (height * 0.28).clamp(5.0, 16.0).toDouble();
-    final gap = (height * 0.14).clamp(3.0, 8.0).toDouble();
+    // Metrics come from the SHARED source so the box the layer measured
+    // (`HaOverlayBadgeItem.pillWidthAtHeight`, via `OverlayGeometry.rectFor`)
+    // and the content drawn here can't drift apart — see [HaPillMetrics].
+    final m = HaPillMetrics.forHeight(height);
+    final iconSize = m.iconSize;
+    final fontSize = m.fontSize;
+    final padH = m.padH;
+    final gap = m.gap;
     final bg = resolveBadgeBg(
       on: widget.on,
       bgColor: widget.bgColor,

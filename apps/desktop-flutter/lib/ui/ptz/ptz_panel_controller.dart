@@ -64,6 +64,16 @@ class PtzOverlayButtonItem implements OverlayItem {
   @override
   (double w, double h) baseSize() => button.baseSize();
 
+  /// Plain linear scaling: a PTZ button's glyph and label are laid out as
+  /// fractions of the box it is given, with nothing that clamps at a rendered
+  /// size, so its rendered footprint IS its base size scaled (see
+  /// [OverlayItem.renderedSize] for the item that isn't).
+  @override
+  (double w, double h) renderedSize(double paneScale) {
+    final (w, h) = button.baseSize();
+    return (w * paneScale, h * paneScale);
+  }
+
   @override
   void setBaseSize(double w, double h) {
     double clamp(double v) => v.clamp(kPtzBtnMin, kPtzBtnMax).toDouble();
