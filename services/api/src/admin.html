@@ -7985,11 +7985,6 @@ async function saveCamEdit() {
       camBody.motion_grid_rows = cmState.rows;
     }
 
-    // Groups are retired (Phase 3), so a camera is never "grouped" now. The flag
-    // is kept because the Motion-tab override write below still reads it (it stays
-    // false, so that path is simply always allowed for an ungrouped camera).
-    const isGrouped = !!groupOfCamera(id);
-
     // Recording assignment (Recording tab): ONE control now — a single policy
     // select. Every camera belongs to exactly one named policy (Phase 2), so the
     // save just pins the chosen policy_id. `mode` stays null when the Recording
@@ -8017,10 +8012,18 @@ async function saveCamEdit() {
     // motion_sensitivity is sent ALONGSIDE motion_threshold so the threshold is
     // actually honored, in the default 'dynamic' mode a bare threshold is a no-op,
     // so we must flip the mode to 'manual' for the operator's value to take effect.
-    // Phase 3: skip entirely for a grouped camera, a motion fork would re-create
-    // the very per-camera override grouping forbids (the backend rejects it too).
-    let devTransition = null;
-    if (!isGrouped && activeCamTab === 'motion' && $('cm-sensitivity')) {
+    // This used to be skipped outright for a camera in a legacy group, which made
+    // the tab's sensitivity / triggering floor / pre- and post-buffer edits vanish
+    // without a word: the camera PUT succeeded, the override write never happened,
+    // and the operator still got "Camera saved." The write is now always attempted.
+    // The server keeps a grouped-camera guard on THIS endpoint (a per-camera fork
+    // is what grouping forbids), unlike the plain policy_id assignment path whose
+    // guard migration 0068 dropped, so a grouped camera gets that 400 surfaced
+    // verbatim ("change the group's profile or ungroup the camera first") instead
+    // of a silent no-op. Groups have no console screen and are legacy, so this is
+    // an edge case, but a wrong recording setting must never look like it stuck.
+    let devTransition = null, policyErr = null;
+    if (activeCamTab === 'motion' && $('cm-sensitivity')) {
       const mb = {};
       const sens = $('cm-sensitivity').value;
       mb.motion_sensitivity = sens;
@@ -8035,15 +8038,27 @@ async function saveCamEdit() {
       // policy, or minted a new named one (and offer Undo → the policy it left).
       const prevPol = effectivePolicy(c).policy || {};
       const prevId = prevPol.id;
-      const resultPol = await api('/config/cameras/' + id + '/policy', { method: 'PUT', body: JSON.stringify(mb) });
-      if (resultPol && resultPol.id && resultPol.id !== prevId) {
-        devTransition = { camId: id, prevId, resultPol };
-      }
+      // Caught rather than thrown: the camera PUT above already landed, so the
+      // pane still has to refresh onto the saved state. Rethrowing here would
+      // leave the console showing pre-save values next to an error.
+      try {
+        const resultPol = await api('/config/cameras/' + id + '/policy', { method: 'PUT', body: JSON.stringify(mb) });
+        if (resultPol && resultPol.id && resultPol.id !== prevId) {
+          devTransition = { camId: id, prevId, resultPol };
+        }
+      } catch (pe) { policyErr = pe.message || String(pe); }
     }
     await ensureCams(); await ensureGroups();
     renderTree();
     renderCamera(id);
-    if (devTransition) showDeviationToast(devTransition);
+    if (policyErr) {
+      // Partial save: name/stream/zones persisted, the recording-behavior edits
+      // did not. Say exactly that, and never claim "Camera saved."
+      const msg = 'Camera saved, but the recording settings on this tab were not: ' + policyErr;
+      setMsg('ce-msg', msg, 'err');
+      toast(msg, 'err', 8000);
+    }
+    else if (devTransition) showDeviationToast(devTransition);
     else toast('Camera saved.');
   } catch (e) { setMsg('ce-msg', e.message, 'err'); }
 }
