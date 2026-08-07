@@ -10348,6 +10348,7 @@ async function loadWatchlist() {
       <span style="flex:0 0 130px;font-weight:600;font-family:var(--mono,monospace)">${esc(w.plate)}</span>
       ${kindTag}
       <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</span>
+      <button class="ghost sm" title="Copy the plate number" onclick="copyPlate('${esc(w.plate)}')">Copy</button>
       <button class="ghost sm" title="Name this plate (shown wherever it appears)" onclick="namePlate('${esc(w.plate)}')">${named ? 'Rename' : 'Name'}</button>
       <button class="danger-ghost sm" onclick="delWatch('${esc(w.id)}','${esc(w.plate)}')">Remove</button>
     </div>`;
@@ -10440,6 +10441,9 @@ function renderPlateTable(host, data) {
       <span style="flex:1;font-size:12px;color:var(--dim);white-space:nowrap">${esc(when)}</span>
       <span style="flex:0 0 60px;font-size:12px;color:var(--dim)">${esc(conf)}</span>
       <span style="flex:0 0 110px;font-size:12px;color:var(--dim2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(src)}">${esc(src)}</span>
+      ${p.plate
+        ? `<button class="ghost sm" style="flex:0 0 auto" title="Copy the plate number" onclick="copyPlate('${esc(p.plate)}')">Copy</button>`
+        : `<span style="flex:0 0 52px"></span>`}
       <button class="ghost sm" title="Give this plate a human-readable name shown wherever it appears" onclick="namePlate('${esc(p.plate)}')">${named ? 'Rename' : 'Name'}</button>
     </div>`;
   }).join('');
@@ -10447,11 +10451,24 @@ function renderPlateTable(host, data) {
     ? `<div class="card-hint" style="margin-top:8px">More reads exist, narrow your search to see them.</div>` : '';
   host.innerHTML = `
     <div style="display:flex;gap:10px;padding:2px 0 4px;font-size:11px;color:var(--dim2)">
-      <span style="flex:0 0 150px">Plate</span><span style="flex:0 0 150px">Camera</span><span style="flex:1">Time</span><span style="flex:0 0 60px">Conf.</span><span style="flex:0 0 110px">Source</span><span style="flex:0 0 62px"></span>
+      <span style="flex:0 0 150px">Plate</span><span style="flex:0 0 150px">Camera</span><span style="flex:1">Time</span><span style="flex:0 0 60px">Conf.</span><span style="flex:0 0 110px">Source</span><span style="flex:0 0 124px"></span>
     </div>
     ${rows}
     <div class="card-hint" style="margin-top:8px">${esc(String((data && data.total) != null ? data.total : plates.length))} total plate read${((data && data.total) === 1) ? '' : 's'}.</div>
     ${more}`;
+}
+
+/* Copy a plate number to the clipboard from a reads row or a watchlist row.
+   Always the RAW plate, never the operator-assigned display name: an operator
+   copying a plate wants the string that matches the read (to paste into a
+   report, a search box, or another system), and the name is a local label.
+   copyText() handles the clipboard itself — including the execCommand fallback
+   the console needs when it is served over plain HTTP on a LAN address, where
+   navigator.clipboard is undefined because that is not a secure context. */
+function copyPlate(plate) {
+  const raw = String(plate == null ? '' : plate).trim();
+  if (!raw) { toast('This read has no plate text to copy.', 'err'); return; }
+  copyText(raw);
 }
 
 /* Set, edit, or clear a plate's human-readable name (issue #363, admin-only

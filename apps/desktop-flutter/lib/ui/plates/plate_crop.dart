@@ -1,13 +1,14 @@
 // Shared license-plate crop helper: crop a detection snapshot down to the
-// plate's normalized bbox, off the UI isolate, with a small result cache.
+// plate's normalized bbox, with a small result cache.
 //
-// Used by the PDF report (plate_report_dialog.dart) and the Plates UI
-// gallery/detail crop (plates_screen.dart) so all three share ONE crop
-// implementation + cache rather than each re-deriving (and re-decoding) the
-// same plate region.
+// Used by the PDF report (plate_report_dialog.dart), the Plates UI
+// gallery/detail crop (plates_screen.dart), and the Engine Benchmark rows
+// (ab_benchmark.dart) so all three share ONE crop implementation + cache
+// rather than each re-deriving (and re-decoding) the same plate region.
 
 import 'dart:isolate';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:image/image.dart' as img;
 
@@ -22,32 +23,79 @@ import 'package:image/image.dart' as img;
 /// without the snapshot's real dimensions (which vary by camera — never assume
 /// 16:9), and callers must not re-derive it from a hard-coded frame aspect.
 ///
-/// The decode/crop/encode (all `package:image`, which is isolate-safe) runs on
-/// a background isolate via [Isolate.run] so a full-frame JPEG doesn't freeze
-/// the UI isolate. The closure captures only sendable data (the byte list + the
-/// bbox doubles) and calls a top-level function.
+/// Decode goes through the engine's native codec, NOT package:image: the
+/// pure-Dart decoder was the Engine Benchmark's measured bottleneck (#391) at
+/// ~130 ms per 1080p frame (~260 ms at 4 MP) against ~18 ms native, paid per
+/// newly-mounted row. Only the bbox region is rasterized and read back, so the
+/// full decoded frame never crosses into Dart; package:image touches just the
+/// small crop (near-black guard + JPEG re-encode, single-digit ms). If the
+/// engine can't decode the bytes at all, the old pure-Dart path
+/// ([cropPlateToBboxSync], on a background isolate) is the fallback.
 Future<(Uint8List, int, int)?> cropPlateToBbox(
   Uint8List fullBytes,
   List<double> bbox,
-) {
-  return Isolate.run(() => cropPlateToBboxSync(fullBytes, bbox));
+) async {
+  ui.Codec? codec;
+  ui.Image? image;
+  try {
+    final buffer = await ui.ImmutableBuffer.fromUint8List(fullBytes);
+    codec = await ui.instantiateImageCodecWithSize(buffer);
+    image = (await codec.getNextFrame()).image;
+  } catch (_) {
+    // Engine codec can't decode these bytes — the pure-Dart decoder handles
+    // more formats, so keep it as the (slow, off-UI-isolate) fallback.
+    codec?.dispose();
+    return Isolate.run(() => cropPlateToBboxSync(fullBytes, bbox));
+  }
+  try {
+    final w = image.width;
+    final h = image.height;
+    final (cx, cy, cw, ch) = _clampBbox(bbox, w, h);
+    // Rasterize just the bbox region: the readback (and everything package:
+    // image sees) is crop-sized, not frame-sized.
+    final recorder = ui.PictureRecorder();
+    ui.Canvas(recorder).drawImageRect(
+      image,
+      ui.Rect.fromLTWH(
+        cx.toDouble(),
+        cy.toDouble(),
+        cw.toDouble(),
+        ch.toDouble(),
+      ),
+      ui.Rect.fromLTWH(0, 0, cw.toDouble(), ch.toDouble()),
+      ui.Paint(),
+    );
+    final picture = recorder.endRecording();
+    final small = await picture.toImage(cw, ch);
+    picture.dispose();
+    final raw = await small.toByteData(format: ui.ImageByteFormat.rawRgba);
+    small.dispose();
+    if (raw == null) return null;
+    final cropped = img.Image.fromBytes(
+      width: cw,
+      height: ch,
+      bytes: raw.buffer,
+      order: img.ChannelOrder.rgba,
+    );
+    if (_isNearlyBlack(cropped)) return null;
+    return (img.encodeJpg(cropped, quality: 90), cw, ch);
+  } finally {
+    image.dispose();
+    codec.dispose();
+  }
 }
 
-/// The synchronous crop, safe to run inside a background isolate. The rect is
-/// clamped into the image so an out-of-range or degenerate box still yields a
-/// crop. Returns `(jpegBytes, width, height)` — see [cropPlateToBbox].
+/// The pure-Dart (package:image) crop, safe to run inside a background
+/// isolate. Reference implementation and decode fallback for
+/// [cropPlateToBbox]; the clamping and near-black semantics there must match
+/// this. Returns `(jpegBytes, width, height)` — see [cropPlateToBbox].
 (Uint8List, int, int)? cropPlateToBboxSync(
   Uint8List fullBytes,
   List<double> bbox,
 ) {
   final decoded = img.decodeImage(fullBytes);
   if (decoded == null) return null;
-  final w = decoded.width;
-  final h = decoded.height;
-  final cx = (bbox[0] * w).round().clamp(0, w - 1);
-  final cy = (bbox[1] * h).round().clamp(0, h - 1);
-  final cw = (bbox[2] * w).round().clamp(1, w - cx);
-  final ch = (bbox[3] * h).round().clamp(1, h - cy);
+  final (cx, cy, cw, ch) = _clampBbox(bbox, decoded.width, decoded.height);
   final cropped = img.copyCrop(decoded, x: cx, y: cy, width: cw, height: ch);
   // Defense-in-depth (issue #179): if the box landed on a near-black region
   // (a frame-mismatched box that points off the actual plate), treat it as a
@@ -57,6 +105,17 @@ Future<(Uint8List, int, int)?> cropPlateToBbox(
   // full frame still contains the plate somewhere.
   if (_isNearlyBlack(cropped)) return null;
   return (img.encodeJpg(cropped, quality: 90), cropped.width, cropped.height);
+}
+
+/// Clamp the normalized [bbox] into a [w]x[h] frame as integer pixels, so an
+/// out-of-range or degenerate box still yields a crop. One implementation for
+/// both the engine path and the pure-Dart path — they must agree on the rect.
+(int, int, int, int) _clampBbox(List<double> bbox, int w, int h) {
+  final cx = (bbox[0] * w).round().clamp(0, w - 1);
+  final cy = (bbox[1] * h).round().clamp(0, h - 1);
+  final cw = (bbox[2] * w).round().clamp(1, w - cx);
+  final ch = (bbox[3] * h).round().clamp(1, h - cy);
+  return (cx, cy, cw, ch);
 }
 
 /// True when [im] is almost entirely black — the signature of a crop box that
@@ -101,8 +160,8 @@ final Map<String, double> _plateCropAspect = {};
 final Uint8List _cropFailed = Uint8List(0);
 
 /// Return the cached crop for [key], or compute it once from [fullBytes]+[bbox]
-/// (off the UI isolate) and cache the result. Returns null when the crop failed
-/// (the caller falls back to the full frame). Never does any network I/O.
+/// and cache the result. Returns null when the crop failed (the caller falls
+/// back to the full frame). Never does any network I/O.
 Future<Uint8List?> cachedPlateCrop(
   String key,
   Uint8List fullBytes,

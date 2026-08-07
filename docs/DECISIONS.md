@@ -8,6 +8,46 @@ revisit.
 
 ---
 
+## 2026-08-07, Plate-crop images: fix the client's decode (engine codec), not the payload (server-side derivatives)
+
+**Context.** The LPR Engine Benchmark's pass images loaded slowly (issue #391).
+The first diagnosis blamed the ~148 KB stored frames and produced server-side
+downscale/tight-crop derivatives (PR #394); live measurement then falsified the
+premise — the API answers the report in 3 ms and a full frame in 8 ms, so on a
+LAN the bytes cost ~1-2 ms and #394 was closed unmerged. A client-side
+measurement pass (real dialog mounted against an in-process server, plus
+micro-benchmarks of `plate_crop.dart`) found the actual cost: `package:image`'s
+pure-Dart JPEG decode of the full frame, run per newly-mounted row to derive
+the plate crop — ~130 ms per 1080p frame (~260 ms at 4 MP) vs ~18 ms for the
+engine's native codec. A 10-row screenful spent 478 ms wall on images, only
+43 ms of it fetch.
+
+**Decision.** Fix the decode where it happens (PR #545): `cropPlateToBbox`
+decodes with the engine codec and rasterizes only the bbox region, so the full
+decoded frame never crosses into Dart; `package:image` handles just the small
+crop (near-black guard + JPEG re-encode). The pure-Dart path stays as the
+reference implementation and decode fallback. Screenful: 478 → 156 ms. The
+list itself was already lazy (`ListView.separated`, ~7 rows mounted, ~10
+fetches) — the other #391 candidates (eager 165-row build, client fetch
+stampede) were measured and refuted.
+
+**Rejected.**
+
+- *Server-side derivatives as the fix (#394's framing).* Attacks transfer
+  size, which is ~43 ms of a ~478 ms problem on a LAN, and trades a ~1 ms
+  transfer saving for a 40 ms cold ffmpeg spawn per image server-side.
+- *Bounding client fetch concurrency / restructuring the list.* Measured fast
+  already; nothing to fix.
+- *Keeping the whole crop in `package:image` but skipping the isolate.* The
+  decode itself is the cost; where it runs doesn't change it.
+
+**Revisit if:** remote viewing over VPN/cellular becomes a priority — then
+#394's derivatives become a genuine transfer-cost win (its closing comment has
+the details, including the `?tight=1` serde-bool trap) and they compose fine
+with the engine-decode path; or the engine codec proves unable to decode some
+camera's snapshots in the field (the fallback logs nothing today — it would
+just be slow again for that camera).
+
 ## 2026-08-06, HA badge pill layout: a four-value width mode in units of the badge HEIGHT (not free pixels, not a max-width)
 
 **Context.** Live testing of the v0.2.0 overlay editor (issue #497) turned up two
