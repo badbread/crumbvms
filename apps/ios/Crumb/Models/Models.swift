@@ -494,6 +494,12 @@ struct HaLink: Decodable, Identifiable {
     let overlayOpacity: Double?
     let overlayShape: String?
     let overlayBgColor: String?
+    /// Background color used ONLY while the entity resolves "on" (the same
+    /// `edgeOn` tri-state that dims the accent color), falling back to
+    /// `overlayBgColor` when unset. `nil` (including on an older server that
+    /// omits the key) ⇒ today's state-invariant background. OFF and
+    /// indeterminate/stale readings never consult this field.
+    let overlayBgColorOn: String?
     let overlayOutline: Bool
     /// Per-link control config (migration 0075, issue #440). When true, EVERY
     /// action on this link prompts a confirmation first (on top of the hardcoded
@@ -545,6 +551,7 @@ struct HaLink: Decodable, Identifiable {
         case overlayOpacity = "overlay_opacity"
         case overlayShape = "overlay_shape"
         case overlayBgColor = "overlay_bg_color"
+        case overlayBgColorOn = "overlay_bg_color_on"
         case overlayOutline = "overlay_outline"
         case requireConfirm = "require_confirm"
         case allowedActions = "allowed_actions"
@@ -572,6 +579,7 @@ struct HaLink: Decodable, Identifiable {
         overlayOpacity = try c.decodeIfPresent(Double.self, forKey: .overlayOpacity)
         overlayShape = try c.decodeIfPresent(String.self, forKey: .overlayShape)
         overlayBgColor = try c.decodeIfPresent(String.self, forKey: .overlayBgColor)
+        overlayBgColorOn = try c.decodeIfPresent(String.self, forKey: .overlayBgColorOn)
         overlayOutline = try c.decodeIfPresent(Bool.self, forKey: .overlayOutline) ?? false
         requireConfirm = try c.decodeIfPresent(Bool.self, forKey: .requireConfirm) ?? false
         allowedActions = try c.decodeIfPresent([String].self, forKey: .allowedActions)

@@ -17,6 +17,16 @@ final class HaBadgeVisualTests: XCTestCase {
         return try JSONDecoder().decode(HaLink.self, from: Data(json.utf8))
     }
 
+    /// A link carrying `overlay_bg_color`/`overlay_bg_color_on`, either of which
+    /// may be omitted (mirroring an older server / an unset field).
+    private func linkWithBg(_ entityId: String, bgColor: String? = nil, bgColorOn: String? = nil) throws -> HaLink {
+        var json = #"{"id":"l","entity_id":"\#(entityId)","role":"sensor","sort_order":0"#
+        if let bgColor { json += #","overlay_bg_color":"\#(bgColor)""# }
+        if let bgColorOn { json += #","overlay_bg_color_on":"\#(bgColorOn)""# }
+        json += "}"
+        return try JSONDecoder().decode(HaLink.self, from: Data(json.utf8))
+    }
+
     private func state(_ raw: String) -> HaEntityState {
         HaEntityState(entityId: "e", state: raw, lastChanged: nil, unit: nil, control: nil)
     }
@@ -84,5 +94,74 @@ final class HaBadgeVisualTests: XCTestCase {
     func testTypeCapitalizesFirstLetterOnly() {
         XCTAssertEqual(HA.typeLabel(domain: "binary_sensor", deviceClass: "garage_door"), "Garage door")
         XCTAssertNotEqual(HA.typeLabel(domain: "cover", deviceClass: "garage_door"), "Garage Door")
+    }
+
+    // MARK: - Badge background (`overlay_bg_color` / `overlay_bg_color_on`)
+    //
+    // Resolution order (frozen contract): entity ON -> bg_color_on ?? bg_color
+    // ?? default; OFF or indeterminate/stale -> bg_color ?? default. "On" is the
+    // SAME `HAVisual.isOn` the tri-state `edgeOn` logic above already drives
+    // (it also dims `overlayColor` to 45% when off) — never a separate notion of
+    // "on" invented for the background.
+
+    func testOverlayBgColorOnDecodesWhenPresent() throws {
+        let l = try linkWithBg("light.kitchen", bgColorOn: "#22FF22")
+        XCTAssertEqual(l.overlayBgColorOn, "#22FF22")
+    }
+
+    func testOverlayBgColorOnNilWhenAbsent() throws {
+        let l = try linkWithBg("light.kitchen", bgColor: "#111111")
+        XCTAssertNil(l.overlayBgColorOn)
+    }
+
+    func testBadgeBackgroundOnPrefersBgColorOn() throws {
+        let l = try linkWithBg("light.kitchen", bgColor: "#111111", bgColorOn: "#22FF22")
+        let v = HA.visual(for: l, state: state("on"), stale: false)
+        XCTAssertTrue(v.isOn)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: v), HA.colorFromHex("#22FF22"))
+    }
+
+    /// No `bg_color_on` set -> falls back to `bg_color` even while on.
+    func testBadgeBackgroundOnFallsBackToBgColorWhenNoBgColorOn() throws {
+        let l = try linkWithBg("light.kitchen", bgColor: "#111111")
+        let v = HA.visual(for: l, state: state("on"), stale: false)
+        XCTAssertTrue(v.isOn)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: v), HA.colorFromHex("#111111"))
+    }
+
+    /// Off NEVER consults `bg_color_on`, even when one is set.
+    func testBadgeBackgroundOffNeverUsesBgColorOn() throws {
+        let l = try linkWithBg("light.kitchen", bgColor: "#111111", bgColorOn: "#22FF22")
+        let v = HA.visual(for: l, state: state("off"), stale: false)
+        XCTAssertFalse(v.isOn)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: v), HA.colorFromHex("#111111"))
+    }
+
+    /// Unknown/indeterminate NEVER consults `bg_color_on` either.
+    func testBadgeBackgroundIndeterminateNeverUsesBgColorOn() throws {
+        let l = try linkWithBg("sensor.kitchen", bgColor: "#111111", bgColorOn: "#22FF22")
+        let v = HA.visual(for: l, state: state("unknown"), stale: false)
+        XCTAssertTrue(v.indeterminate)
+        XCTAssertFalse(v.isOn)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: v), HA.colorFromHex("#111111"))
+    }
+
+    /// Stale NEVER consults `bg_color_on`, even for an entity whose last-known
+    /// reading was "on" — same state-honesty invariant as the color dimming.
+    func testBadgeBackgroundStaleNeverUsesBgColorOn() throws {
+        let l = try linkWithBg("light.kitchen", bgColor: "#111111", bgColorOn: "#22FF22")
+        let v = HA.visual(for: l, state: state("on"), stale: true)
+        XCTAssertTrue(v.indeterminate)
+        XCTAssertFalse(v.isOn)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: v), HA.colorFromHex("#111111"))
+    }
+
+    /// Neither set -> the shared default badge background, on or off.
+    func testBadgeBackgroundDefaultsWhenNeitherSet() throws {
+        let l = try link("light.kitchen")
+        let onVisual = HA.visual(for: l, state: state("on"), stale: false)
+        let offVisual = HA.visual(for: l, state: state("off"), stale: false)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: onVisual), HA.defaultBadgeBackground)
+        XCTAssertEqual(HA.badgeBackground(link: l, visual: offVisual), HA.defaultBadgeBackground)
     }
 }
