@@ -129,9 +129,10 @@ pub(crate) const SUB_FLOOR_BYTES: u64 = 512;
 ///
 /// It is a dotfile, so the `.mp4`-only [`walk_storage`] never sees it.  It is
 /// written ONLY when the recorder can positively confirm the storage — see
-/// [`ensure_storage_marker`] (called from the recording path, at the moment
-/// footage is about to be written there) and [`seed_storage_markers`] (boot
-/// heal for installs that predate this guard).
+/// [`ensure_storage_marker`] (called from the recording path AFTER a real segment
+/// has been written and indexed under the root, never at directory-creation time)
+/// and [`seed_storage_markers`] (boot heal for installs that predate this guard).
+/// Both writers share one rule: a marker means a real indexed segment is present.
 pub(crate) const STORAGE_MARKER_FILENAME: &str = ".crumb-storage";
 
 /// Contents written into a freshly created [`STORAGE_MARKER_FILENAME`].
@@ -276,9 +277,15 @@ async fn storage_marker_present(storage_root: &Path) -> bool {
 
 /// Create the storage marker at `storage_root` if it is not already there.
 ///
-/// Called from the RECORDING path (`recording.rs`) at the moment the recorder is
-/// about to write footage into that root — actually writing footage there is the
-/// strongest confirmation available that the storage is the real, mounted one.
+/// Called from the RECORDING path (`recording::index_segment`) right after a real
+/// ≥floor segment has been fsync'd on disk AND committed to the index under this
+/// root — a real indexed segment present under the root is the strongest
+/// confirmation available that the storage is the real, mounted one, and is the
+/// SAME signal [`seed_storage_markers`] confirms on. It is deliberately NOT
+/// written at directory-creation time: a bare unmounted mountpoint the recorder
+/// can `create_dir_all` into but has no committed footage on must never earn a
+/// marker (issue #504 — a false marker there lets the dangling pass prune the
+/// real disk's index rows).
 ///
 /// Idempotent and best-effort: an existing marker is never rewritten or
 /// truncated (`create_new`), and any failure is logged and ignored.  A storage
@@ -3722,6 +3729,150 @@ mod tests {
             tokio::fs::read(&marker).await.expect("re-read marker"),
             b"operator note",
             "an existing marker is never rewritten"
+        );
+    }
+
+    /// v0.2.0 re-audit defect, PROVING THE FIX (recording-path side). The
+    /// RECORDING-path marker writer (`recording::index_segment`) must be exactly
+    /// as trustworthy as the seed pass: it writes `.crumb-storage` ONLY after a
+    /// real segment is on disk AND committed to the index under the root — never
+    /// merely because a directory was created. The pre-fix code planted the
+    /// marker at `create_dir_all` time (BEFORE any footage), so a bare unmounted
+    /// mountpoint earned a FALSE marker and the next reconcile pass pruned the
+    /// real disk's index. Here:
+    ///   * a sub-floor (28-byte) segment is NOT committed → NO marker (the
+    ///     bare-mountpoint shape exactly: a writable directory, no real footage),
+    ///   * a genuine ≥floor segment IS committed → the marker appears.
+    #[tokio::test]
+    async fn recording_path_marker_written_only_after_a_committed_segment() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+        let camera = crumb_common::db::get_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("get camera")
+            .expect("camera exists");
+        let root = fx.live_path.to_str().expect("utf8 root");
+
+        let cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+
+        let marker = fx.live_path.join(STORAGE_MARKER_FILENAME);
+        assert!(
+            !marker.exists(),
+            "creating the camera directory alone must NOT write a marker"
+        );
+
+        // (a) SUB-FLOOR: a 28-byte header-only file. index_segment rejects it
+        //     below the floor and commits NOTHING → no marker. This is the bare
+        //     unmounted-mountpoint shape: a writable dir, but no real indexed
+        //     footage, so the storage must NOT be confirmed.
+        let subfloor_path = cam_dir.join("20260101T000000Z.mp4");
+        tokio::fs::write(&subfloor_path, vec![0u8; 28])
+            .await
+            .expect("write subfloor");
+        let indexed = crate::recording::index_segment(
+            &crate::recording::PendingSegment {
+                path: subfloor_path.to_string_lossy().into_owned(),
+                start_ts: "2026-01-01T00:00:00Z".parse().expect("start"),
+                end_ts: "2026-01-01T00:00:04Z".parse().expect("end"),
+                size_bytes: 28,
+            },
+            &camera,
+            &live.id,
+            root,
+            &fx.pool,
+            &[],
+            false,
+        )
+        .await;
+        assert!(!indexed, "a sub-floor segment must not be committed");
+        assert!(
+            !marker.exists(),
+            "no committed segment ⇒ no marker: a bare mountpoint must never be confirmed"
+        );
+
+        // (b) GENUINE: a ≥floor file → committed to the index → marker written.
+        let good_path = cam_dir.join("20260101T000010Z.mp4");
+        tokio::fs::write(&good_path, vec![0u8; 4096])
+            .await
+            .expect("write good");
+        let indexed = crate::recording::index_segment(
+            &crate::recording::PendingSegment {
+                path: good_path.to_string_lossy().into_owned(),
+                start_ts: "2026-01-01T00:00:10Z".parse().expect("start"),
+                end_ts: "2026-01-01T00:00:14Z".parse().expect("end"),
+                size_bytes: 4096,
+            },
+            &camera,
+            &live.id,
+            root,
+            &fx.pool,
+            &[],
+            false,
+        )
+        .await;
+        assert!(indexed, "a genuine ≥floor segment must be committed");
+        assert!(
+            marker.exists(),
+            "a committed real segment under the root confirms the storage → marker written"
+        );
+    }
+
+    /// v0.2.0 re-audit defect, REPRODUCING THE DANGER (reconcile side). A marker
+    /// present on a storage with index rows but NO files on disk — the
+    /// bare-mountpoint shape the pre-fix recording path produced by writing the
+    /// marker at directory-creation time — lets the dangling pass delete the
+    /// whole index. The layer-2 breaker does NOT save a SMALL storage: it only
+    /// trips ABOVE `DANGLING_BREAKER_MIN_MISSING` (100) rows, so below that floor
+    /// a false marker costs the ENTIRE index (motion flags, bboxes, stage labels,
+    /// clip/bookmark linkage). This is exactly why the marker must be confirmable
+    /// (previous test), not planted on directory creation.
+    #[tokio::test]
+    async fn a_false_marker_below_the_breaker_floor_prunes_the_whole_small_index() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+            .await
+            .expect("get live storage")
+            .expect("live storage exists");
+
+        // The FALSE marker the pre-fix recording path wrote at create_dir_all
+        // time, on a root whose indexed footage is all missing (unmounted disk).
+        tokio::fs::write(fx.live_path.join(STORAGE_MARKER_FILENAME), b"")
+            .await
+            .expect("write false marker");
+
+        // Fewer rows than the breaker floor, so layer 2 never trips and cannot
+        // bound the loss.
+        let total = 20i64;
+        assert!(total < DANGLING_BREAKER_MIN_MISSING as i64);
+        insert_fileless_rows(&fx, live.id, total).await;
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("list segments");
+        assert!(
+            rows.is_empty(),
+            "a FALSE marker on a small unmounted storage prunes the ENTIRE index (the \
+             breaker only bounds losses above its 100-row floor) — which is precisely why \
+             the marker must be confirmable, not planted at directory creation: {rows:?}"
         );
     }
 

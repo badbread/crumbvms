@@ -291,15 +291,22 @@ recorder, and later the API) must satisfy these *by construction*.
     layers, both failing toward skip-and-alarm, never toward delete:
 
     - **Marker.** The recorder writes `<storage_root>/.crumb-storage` when it
-      can positively confirm a storage — from the recording path at the moment
-      it is about to write footage there, and from a boot/heal pass that
+      can positively confirm a storage — from the recording path
+      (`index_segment`) only AFTER a real ≥floor segment is fsync'd on disk AND
+      committed to the index under that root, and from a boot/heal pass that
       requires at least one of the storage's newest INDEXED segment files to
-      really be present under the root. It is never invented for a root that
-      holds none of its indexed segments (the unmounted shape), nor for a
-      storage with no indexed segments at all (indistinguishable from an empty
-      foreign directory). The dangling pass deletes NOTHING on a storage whose
-      marker is absent. The marker rides on the storage, so an unmounted disk
-      cannot present one.
+      really be present under the root. Both writers share ONE rule: a marker
+      means a real indexed segment is present. It is deliberately NOT written at
+      directory-creation time — `create_dir_all` succeeding proves only that
+      SOME directory was writable, so a bare unmounted mountpoint (Docker
+      auto-creates an empty bind source) would earn a FALSE marker before any
+      footage exists, defeating this guard in exactly the scenario it is for
+      (the v0.2.0 re-audit defect). It is never invented for a root that holds
+      none of its indexed segments (the unmounted shape), nor for a storage with
+      no indexed segments at all (indistinguishable from an empty foreign
+      directory). The dangling pass deletes NOTHING on a storage whose marker is
+      absent. The marker rides on the storage, so an unmounted disk cannot
+      present one.
     - **Circuit breaker.** Even with a marker (stale marker, repointed path),
       deletions for a storage stop once more than `DANGLING_BREAKER_MIN_MISSING`
       (100) of its rows AND more than `DANGLING_BREAKER_MISSING_PCT` (50 %) of
@@ -318,5 +325,10 @@ recorder, and later the API) must satisfy these *by construction*.
     `reconcile::tests::dangling_pass_skips_storage_without_marker`,
     `dangling_breaker_bounds_deletions_on_mass_missing`,
     `dangling_pass_deletes_genuine_dangling_rows_on_a_confirmed_storage` and
-    `storage_marker_is_seeded_only_when_the_storage_is_confirmable`. See
-    `docs/DECISIONS.md` (2026-08-06) for the rejected mountpoint heuristics.
+    `storage_marker_is_seeded_only_when_the_storage_is_confirmable`; the
+    recording-path writer's confirmable timing (and the danger of a false marker
+    at directory-creation time) by
+    `recording_path_marker_written_only_after_a_committed_segment` and
+    `a_false_marker_below_the_breaker_floor_prunes_the_whole_small_index`. See
+    `docs/DECISIONS.md` (2026-08-06, and the 2026-08-07 follow-up) for the
+    rejected mountpoint heuristics and why the marker is written post-commit.
