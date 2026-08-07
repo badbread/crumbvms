@@ -8,6 +8,96 @@ revisit.
 
 ---
 
+## 2026-08-06, `PUT /config/server` MERGES: omitted key = leave alone, `""` = clear (issue #472)
+
+**Context.** `PUT /config/server` was a whole-row replace whose DTO carried
+`#[serde(default)]` on most fields. A programmatic caller sending a partial body
+(`{"motion_hwaccel": "vaapi"}`) got every unmentioned field deserialized to `""`
+and written, silently resetting the Frigate bases, the stream bases and the
+VAAPI device to their env fallbacks. The console and first-run wizard were safe
+only by convention: they use a full-body stash pattern that round-trips every
+key. The exposure was scripts and third-party integrations, and
+`docs/AI-INSTALL.md` step 7 was literally instructing agents to work around it.
+
+PR #518 had already solved this for exactly one field: `frigate_api_base` became
+`Option<String>` so an omitted key could mean "leave the stored legacy column
+alone" rather than "wipe the value a pre-0014 install still resolves from".
+
+**Decision.** Generalize #518's semantics to the whole DTO. Every settable field
+is `Option<String>` with `#[serde(default)]`, and the three states are distinct:
+
+| Body | Meaning |
+|---|---|
+| key omitted / `null` ⇒ `None` | leave the stored column alone |
+| `"value"` ⇒ `Some(v)` | set it (trimmed) |
+| `""` ⇒ `Some("")` | clear it ⇒ falls back to the container env |
+
+`Some("")` is deliberately NOT collapsed into "omitted". Crumb's config
+precedence is *admin-set DB value wins over env; EMPTY DB value falls back to
+env*, so an empty string is the operator's way of saying "go back to the env
+default". Merging it away would remove the only way to undo a setting through
+the API.
+
+The DB layer expresses it directly: `COALESCE($n::text, column)`, one parameter
+per field, `None` binding SQL `NULL`. `version` is still bumped on every call,
+so a no-op merge still tells the recorder and clients to re-read.
+
+**Rejected:**
+
+- **Drop `#[serde(default)]` so a partial body 422s loudly** (the issue's other
+  option). Honest, but it makes the endpoint *harder* to use correctly rather
+  than easier — every caller must fetch-then-echo nine fields to change one, and
+  a fetch/PUT race then clobbers a concurrent edit with stale values. It also
+  contradicts the direction #518 already set for `frigate_api_base`, leaving one
+  field with merge semantics and eight without.
+- **PATCH as a separate route, leaving PUT a replace.** Strictly correct REST,
+  but it doubles the surface and leaves the footgun armed on the route every
+  existing caller uses. Nothing in the codebase relies on PUT's replace
+  semantics: the only clients that call it send full rows.
+- **Rewrite the console/wizard to send minimal per-pane bodies.** Tempting now
+  that merging works, and it would honor "wizard/console code must only ever
+  write the specific fields it edits" more literally. Deliberately NOT done in
+  this change: a full body means the same thing under both semantics, so keeping
+  the stash pattern makes this a pure server-side fix with zero console
+  behavior change to re-verify. Doing both at once would make a console
+  regression indistinguishable from a DTO regression.
+- **Treat `""` as "leave alone" too** (i.e. only non-empty values write). Would
+  make "reset this back to the env default" unreachable through the API and
+  quietly break the console's existing "clear the field" behavior.
+
+**Trades knowingly accepted:**
+
+- Four fields that were structurally required (`server_address`,
+  `crumb_rtsp_base`, `crumb_api_base`, `frigate_rtsp_base`) are now optional, so
+  a body that omits them succeeds instead of 422ing. That is the point, but it
+  does mean a caller with a typo'd key name now silently no-ops that field
+  instead of erroring. Accepted: the same is already true of every
+  `#[serde(default)]` field on every other config route, and the alternative
+  costs the merge.
+- The `frigate_go2rtc_api_base` seeding rule gets one more state to reason
+  about. `Some("")` still falls back to a legacy value in the same body (the
+  pre-0014 client contract, unchanged); only a fully absent key means "leave
+  alone". Both branches are unit-tested.
+- The legacy column's "clear the old console's go2rtc duplicate" cleanup only
+  fires when the body actually decides the go2rtc base. A PUT that mentions
+  neither column can't tell a duplicate from operator intent, so it touches
+  neither — a stale duplicate now survives such a request instead of being
+  cleaned up as a side effect.
+
+**Revisit triggers:**
+
+- A field where `""` becomes a meaningful *value* rather than "fall back to
+  env" ⇒ that field needs `Option<Option<String>>` (or a sentinel) and this
+  three-state table stops being sufficient.
+- The generated OpenAPI spec (ROADMAP initiative 4) landing ⇒ the three states
+  must be expressible in it, or the endpoint's contract goes back to living only
+  in doc comments.
+- Any second config route growing the same partial-body hazard ⇒ factor the
+  `Option<String>` + `COALESCE` pattern into a shared helper instead of
+  hand-rolling it a third time.
+
+---
+
 ## 2026-08-06, The storage preflight infers recorder writability from the folder's OWNERSHIP when its own write probe is inconclusive, rather than asking the recorder
 
 **Context.** `POST /config/fs/check` is the wizard's gate on "this disk will

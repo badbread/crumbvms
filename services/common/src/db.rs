@@ -9939,13 +9939,21 @@ pub async fn server_settings_version(pool: &Pool) -> Result<i64> {
 /// Update the singleton server settings and BUMP `version` (so any future
 /// hot-reload pollers pick up the change).  Returns the updated settings.
 ///
-/// All settable fields are replaced; pass the current values for fields the
-/// caller does not want to change.  Empty strings are valid (mean "fall back to
-/// env").
+/// Every settable field is `Option<&str>` and the two states mean different
+/// things (issue #472):
 ///
-/// The two new fields added by migration 0014 (`frigate_go2rtc_api_base` and
-/// `frigate_http_api_base`) are also updated.  The API-routes caller must include
-/// them in `UpdateServerSettingsRequest`; see the contract in the audit.
+/// * `Some(v)` — write `v`. `Some("")` is a real value: an EMPTY column is what
+///   "fall back to the env default" means under Crumb's config-precedence rule,
+///   so clearing a field is how an operator returns it to the env.
+/// * `None` — **leave the stored column untouched** (`COALESCE($n, column)`).
+///   This is what lets `PUT /config/server` merge a partial body instead of
+///   resetting every field the caller did not mention.
+///
+/// The version counter is bumped on every call regardless, so a no-op merge
+/// still signals "re-read" to the recorder / clients exactly as before.
+///
+/// The two fields added by migration 0014 (`frigate_go2rtc_api_base` and
+/// `frigate_http_api_base`) are updated the same way.
 ///
 /// `frigate_api_base` is the deprecated pre-0014 column. The caller decides what
 /// to write back for it (`config_routes::resolve_frigate_bases`) — it is never
@@ -9959,30 +9967,34 @@ pub async fn server_settings_version(pool: &Pool) -> Result<i64> {
 #[allow(clippy::too_many_arguments)]
 pub async fn update_server_settings(
     pool: &Pool,
-    server_address: &str,
-    crumb_rtsp_base: &str,
-    crumb_api_base: &str,
-    frigate_rtsp_base: &str,
-    frigate_api_base: &str,
-    frigate_go2rtc_api_base: &str,
-    frigate_http_api_base: &str,
-    motion_hwaccel: &str,
-    motion_vaapi_device: &str,
+    server_address: Option<&str>,
+    crumb_rtsp_base: Option<&str>,
+    crumb_api_base: Option<&str>,
+    frigate_rtsp_base: Option<&str>,
+    frigate_api_base: Option<&str>,
+    frigate_go2rtc_api_base: Option<&str>,
+    frigate_http_api_base: Option<&str>,
+    motion_hwaccel: Option<&str>,
+    motion_vaapi_device: Option<&str>,
 ) -> Result<ServerSettings> {
     let client = get_conn(pool).await?;
+    // COALESCE($n::text, col): a NULL parameter (the field was omitted from the
+    // request body) keeps the stored value; a non-NULL one — INCLUDING the empty
+    // string — overwrites it. The explicit ::text casts keep Postgres from having
+    // to infer a parameter type it can't see through COALESCE.
     let row = client
         .query_one(
             r"
             UPDATE server_settings SET
-                server_address          = $1,
-                crumb_rtsp_base         = $2,
-                crumb_api_base          = $3,
-                frigate_rtsp_base       = $4,
-                frigate_api_base        = $5,
-                frigate_go2rtc_api_base = $6,
-                frigate_http_api_base   = $7,
-                motion_hwaccel          = $8,
-                motion_vaapi_device     = $9,
+                server_address          = COALESCE($1::text, server_address),
+                crumb_rtsp_base         = COALESCE($2::text, crumb_rtsp_base),
+                crumb_api_base          = COALESCE($3::text, crumb_api_base),
+                frigate_rtsp_base       = COALESCE($4::text, frigate_rtsp_base),
+                frigate_api_base        = COALESCE($5::text, frigate_api_base),
+                frigate_go2rtc_api_base = COALESCE($6::text, frigate_go2rtc_api_base),
+                frigate_http_api_base   = COALESCE($7::text, frigate_http_api_base),
+                motion_hwaccel          = COALESCE($8::text, motion_hwaccel),
+                motion_vaapi_device     = COALESCE($9::text, motion_vaapi_device),
                 version                 = version + 1,
                 updated_at              = now()
             WHERE id = 1

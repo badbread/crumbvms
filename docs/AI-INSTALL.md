@@ -472,6 +472,10 @@ All wizard steps have API equivalents. Do them in order:
    gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
 2. **Server address.** `PUT /config/server` with the host's **LAN** address
    (`server_address`, `crumb_rtsp_base`, …). Use the LAN IP, never a public one.
+   The PUT merges: send only the keys you are setting, and every other column
+   keeps its stored value. (Sending a key as `""` is an explicit clear that falls
+   the setting back to its container-environment default, so do not pad the body
+   with empty strings for fields you are not changing.)
    (`GET /auth/setup-status` returns a suggested address derived from the request,
    plus `suggested_scan_range`, the server's own `/24`, a good default for the
    discovery scan below. It's `null` when the console was reached by hostname.)
@@ -549,12 +553,13 @@ All wizard steps have API equivalents. Do them in order:
    motion-only; members = the group's existing ids ∪ the new ids).
    For an already-added ONVIF camera you can re-probe with
    `POST /config/cameras/:id/redetect`.
-7. **Motion decode backend (optional).** `PUT /config/server` with the full body
-   from `GET /config/server`, overriding only `motion_hwaccel`
-   (`"auto"|"cpu"|"vaapi"|"cuda"`) and `motion_vaapi_device` (e.g.
-   `"/dev/dri/renderD128"`, only meaningful for vaapi). The PUT is a
-   **whole-row replace**, always send back every field you fetched, changing
-   only these two. Then **verify the truth** with `GET /config/decode-status`:
+7. **Motion decode backend (optional).** `PUT /config/server` with just
+   `motion_hwaccel` (`"auto"|"cpu"|"vaapi"|"cuda"`) and `motion_vaapi_device`
+   (e.g. `"/dev/dri/renderD128"`, only meaningful for vaapi). The PUT **merges**:
+   a key you omit is left exactly as stored, so you do not have to round-trip the
+   whole row. A key sent as `""` is a deliberate **clear**, which resets that
+   setting to its container-environment default, so only send `""` when that is
+   what you mean. Then **verify the truth** with `GET /config/decode-status`:
    per camera it reports `requested` vs `active` plus a human `fallback_reason`
    when they differ (e.g. the render node isn't mapped into the recorder
    container, see "Hardware-accelerated motion decode" below). `capabilities:
