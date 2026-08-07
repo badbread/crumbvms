@@ -164,6 +164,21 @@ else
   log "NOTE: could not detect a host LAN IP — leaving WEBRTC_CANDIDATE blank. Set it to <server-LAN-ip>:8556 in .env for iOS/WebRTC live view (docs/IOS-LIVE-VIDEO.md)."
 fi
 
+# ── Where footage will be written ────────────────────────────────────────────
+# Defaults to ./_data (relative to the repo root), which is what a plain
+# `git clone && setup-env.sh` wants. Real installs usually record onto a
+# mounted disk or a NAS share instead, so accept it up front rather than making
+# the operator hand-edit .env and re-do the ownership work by hand:
+#
+#   MEDIA_HOST_PATH=/mnt/tank/crumb scripts/setup-env.sh
+#
+# Whatever it points at gets the same prep + storage preflight below.
+MEDIA_HOST_PATH_VALUE="${MEDIA_HOST_PATH:-./_data}"
+case "${MEDIA_HOST_PATH_VALUE}" in
+  /*) MEDIA_DIR_HOST="${MEDIA_HOST_PATH_VALUE}" ;;
+  *)  MEDIA_DIR_HOST="${REPO_ROOT}/${MEDIA_HOST_PATH_VALUE#./}" ;;
+esac
+
 # Write atomically: build in a temp file, then move into place.
 TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
 trap 'rm -f "${TMP}"' EXIT
@@ -247,7 +262,7 @@ MOTION_RECORDING_SHADOW=0
 # --- Storage ---
 # ONE broad media root, bind-mounted into both containers. Add a disk by mounting
 # it under MEDIA_HOST_PATH and adding the storage path '/data/<subdir>' in the UI.
-MEDIA_HOST_PATH=./_data
+MEDIA_HOST_PATH=${MEDIA_HOST_PATH_VALUE}
 MEDIA_ROOT=/data
 LIVE_STORAGE_PATH=/data/live
 ARCHIVE_STORAGE_PATH=/data/archive
@@ -355,7 +370,7 @@ trap - EXIT
 # probe writability). Prep it here with the right ownership so a stock install
 # actually records. Best-effort: a non-root run without sudo prints exactly what
 # to fix, and the recorder now also raises a loud `storage_unwritable` alert.
-MEDIA_DIR_HOST="${REPO_ROOT}/_data"
+# (MEDIA_DIR_HOST was resolved from MEDIA_HOST_PATH above.)
 mkdir -p "${MEDIA_DIR_HOST}" 2>/dev/null || true
 if [[ -d "${MEDIA_DIR_HOST}" ]]; then
   if chown 1001:1001 "${MEDIA_DIR_HOST}" 2>/dev/null; then
@@ -367,6 +382,169 @@ if [[ -d "${MEDIA_DIR_HOST}" ]]; then
   fi
 else
   log "NOTE: could not create ${MEDIA_DIR_HOST} — create it and chown 1001:1001 before 'docker compose up', or the recorder records nothing."
+fi
+
+# ── Storage preflight ────────────────────────────────────────────────────────
+# The chown above is best-effort AND, on a lot of real hosts, meaningless: it
+# reports success while the recorder still cannot write a byte. The three that
+# actually bite people:
+#
+#   * Network mounts (NFS / SMB-CIFS). chown either fails or is ignored, because
+#     the SERVER owns the permissions. NFS root_squash maps root to nobody; SMB
+#     applies whatever uid the mount options say, for the whole mount.
+#   * FUSE user shares (Unraid /mnt/user, rclone, sshfs, MergerFS). Ownership is
+#     synthesised by the fuse driver from mount options, not stored on disk.
+#   * A root-owned directory and a non-root run with no sudo. chown fails, the
+#     script says so, and the operator does not notice.
+#
+# In every one of those the failure mode is identical and silent: live view
+# works, the wizard shows green, and NOTHING is recorded. So probe for real
+# instead of assuming, and fail the run when the answer is definitely no.
+# Platform-by-platform notes: docs-site/docs/getting-started/platform-notes.md.
+STORAGE_PREFLIGHT_FAILED=0
+FREE_SPACE_FLOOR_KIB=10485760   # 10 GiB
+
+# Filesystem type of the mount holding $1. Empty = could not determine (that is
+# a "skip the check", never a failure). GNU stat first, then df -T, then mount.
+fs_type_of() {
+  local dir="$1" t=""
+  t="$(stat -f -c %T "${dir}" 2>/dev/null || true)"
+  [[ -n "${t}" ]] && { printf '%s' "${t}"; return 0; }
+  t="$(df -T "${dir}" 2>/dev/null | awk 'NR==2 {print $2}' || true)"
+  [[ -n "${t}" ]] && { printf '%s' "${t}"; return 0; }
+  t="$(mount 2>/dev/null | awk -v d="${dir}" '$3 == d {print $5}' | head -n1 || true)"
+  printf '%s' "${t}"
+}
+
+# True for filesystems where uid/gid are decided somewhere other than this
+# host's inode bits, so `chown 1001:1001` is not the fix (or not the whole fix).
+fs_is_remapping() {
+  case "$1" in
+    nfs*|cifs|smb*|fuse|fuse.*|fuseblk|9p|drvfs|afs|sshfs|gluster*|ceph*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Can uid 1001 create a file in $1? Prints exactly one of: pass | fail | unknown.
+# Tiers, most faithful first; each tier only answers when it can answer honestly.
+probe_uid1001_write() {
+  local dir="$1" marker="$1/.crumb-write-test" rc=0 img mode owner group u g o
+
+  # Tier 1 — actually become uid 1001. Needs root, and is the real answer.
+  if [[ "$(id -u)" -eq 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      if sudo -n -u '#1001' touch "${marker}" 2>/dev/null; then
+        rm -f "${marker}" 2>/dev/null || true; printf 'pass'; return 0
+      fi
+      # Distinguish "uid 1001 was refused" from "sudo itself is unusable here".
+      if sudo -n -u '#1001' true 2>/dev/null; then printf 'fail'; return 0; fi
+    elif command -v setpriv >/dev/null 2>&1; then
+      if setpriv --reuid=1001 --regid=1001 --clear-groups touch "${marker}" 2>/dev/null; then
+        rm -f "${marker}" 2>/dev/null || true; printf 'pass'; return 0
+      fi
+      if setpriv --reuid=1001 --regid=1001 --clear-groups true 2>/dev/null; then
+        printf 'fail'; return 0
+      fi
+    fi
+  fi
+
+  # Tier 2 — the actual runtime: a container as uid 1001 with the dir bind-mounted.
+  # Only ever with an image ALREADY on this host; setup-env must not pull anything.
+  # The marker is created AND removed inside the same container, because it lands
+  # owned by uid 1001: a non-root run of this script often cannot unlink it
+  # afterwards, and leaving litter in the footage root is not acceptable.
+  # Exit 1 is the verdict (touch hit EACCES); docker's own 125/126/127 are not.
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    for img in alpine:latest busybox:latest debian:stable-slim ubuntu:latest; do
+      docker image inspect "${img}" >/dev/null 2>&1 || continue
+      if docker run --rm --user 1001:1001 --entrypoint sh \
+           -v "${dir}:/probe" "${img}" \
+           -c 'touch /probe/.crumb-write-test && rm -f /probe/.crumb-write-test' \
+           >/dev/null 2>&1; then
+        printf 'pass'; return 0
+      else
+        rc=$?
+      fi
+      [[ "${rc}" -eq 1 ]] && { printf 'fail'; return 0; }
+      break   # 125/126/127: docker/exec problem, not a verdict about permissions
+    done
+  fi
+
+  # Tier 3 — no way to impersonate (non-root, no usable docker). Read the
+  # directory's own owner/group/mode. Creating a file needs BOTH w and x, so the
+  # relevant octal digits are 3 (-wx) and 7 (rwx).
+  owner="$(stat -c %u "${dir}" 2>/dev/null || true)"
+  group="$(stat -c %g "${dir}" 2>/dev/null || true)"
+  mode="$(stat -c %a "${dir}" 2>/dev/null || true)"
+  [[ -n "${owner}" && -n "${mode}" ]] || { printf 'unknown'; return 0; }
+  while [[ "${#mode}" -lt 4 ]]; do mode="0${mode}"; done
+  u="${mode:1:1}"; g="${mode:2:1}"; o="${mode:3:1}"
+  if [[ "${owner}" == "1001" ]] && [[ "${u}" == "3" || "${u}" == "7" ]]; then printf 'pass'; return 0; fi
+  if [[ "${group}" == "1001" ]] && [[ "${g}" == "3" || "${g}" == "7" ]]; then printf 'pass'; return 0; fi
+  if [[ "${o}" == "3" || "${o}" == "7" ]]; then printf 'pass'; return 0; fi
+  printf 'fail'
+}
+
+if [[ -d "${MEDIA_DIR_HOST}" ]]; then
+  MEDIA_FS="$(fs_type_of "${MEDIA_DIR_HOST}")"
+  if [[ -n "${MEDIA_FS}" ]]; then log "media filesystem: ${MEDIA_FS} (${MEDIA_DIR_HOST})"; fi
+
+  # 1. Network / remapping filesystem: say plainly that this is a SERVER-side fix.
+  MEDIA_FS_REMAPS=0
+  if [[ -n "${MEDIA_FS}" ]] && fs_is_remapping "${MEDIA_FS}"; then
+    MEDIA_FS_REMAPS=1
+    log ""
+    log "  ┌─ NETWORK / REMAPPING FILESYSTEM (${MEDIA_FS}) ───────────────────────"
+    log "  │ ${MEDIA_DIR_HOST} is not a plain local disk, so 'chown 1001:1001'"
+    log "  │ here may do nothing at all — the export's server decides ownership."
+    log "  │ Grant uid 1001 write access on the SERVER side instead:"
+    log "  │"
+    log "  │   NFS  : export with no_root_squash, or chown the directory to"
+    log "  │          uid 1001 ON THE NFS SERVER (root_squash maps root->nobody)."
+    log "  │   SMB  : mount with uid=1001,gid=1001 (and file_mode/dir_mode=0775),"
+    log "  │          or map the share's user to uid 1001 on the NAS."
+    log "  │   FUSE : ownership comes from the mount options, not the disk"
+    log "  │          (Unraid /mnt/user, rclone, sshfs, MergerFS)."
+    log "  │"
+    log "  │ Confirm it yourself, from this host, before adding cameras:"
+    log "  │   sudo -u '#1001' touch ${MEDIA_DIR_HOST}/.crumb-write-test"
+    log "  └──────────────────────────────────────────────────────────────────────"
+    log ""
+  fi
+
+  # 2. The probe that decides whether this install can record at all.
+  MEDIA_WRITE="$(probe_uid1001_write "${MEDIA_DIR_HOST}")"
+  case "${MEDIA_WRITE}" in
+    pass)
+      log "storage preflight: uid 1001 CAN write to ${MEDIA_DIR_HOST}" ;;
+    fail)
+      STORAGE_PREFLIGHT_FAILED=1
+      log "storage preflight: uid 1001 CANNOT write to ${MEDIA_DIR_HOST} — see the failure at the end." ;;
+    *)
+      log "storage preflight: could not determine whether uid 1001 can write to ${MEDIA_DIR_HOST}."
+      log "      Check it by hand before adding cameras:"
+      log "        sudo -u '#1001' touch ${MEDIA_DIR_HOST}/.crumb-write-test && sudo rm ${MEDIA_DIR_HOST}/.crumb-write-test" ;;
+  esac
+
+  # A remapping filesystem plus a negative probe is still worth failing on, but
+  # the fix is the server-side one printed above, not a local chown — so say so.
+  if [[ "${STORAGE_PREFLIGHT_FAILED}" -eq 1 && "${MEDIA_FS_REMAPS}" -eq 1 ]]; then
+    log "      (on ${MEDIA_FS} the fix is server-side, per the block above — a local chown will not help.)"
+  fi
+
+  # 3. Free space. A warning, never a failure: a small disk is a legitimate
+  #    choice, an unnoticed one is not.
+  MEDIA_FREE_KIB="$(df -Pk "${MEDIA_DIR_HOST}" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  if [[ -n "${MEDIA_FREE_KIB}" ]]; then
+    if [[ "${MEDIA_FREE_KIB}" -lt "${FREE_SPACE_FLOOR_KIB}" ]]; then
+      log "NOTE: only $(( MEDIA_FREE_KIB / 1024 )) MiB free at ${MEDIA_DIR_HOST}."
+      log "      Cameras eat terabytes. Point MEDIA_HOST_PATH at a real disk, or set"
+      log "      retention low enough that this fills predictably rather than by surprise:"
+      log "        MEDIA_HOST_PATH=/mnt/<disk>/crumb scripts/setup-env.sh --force"
+    else
+      log "storage preflight: $(( MEDIA_FREE_KIB / 1048576 )) GiB free at ${MEDIA_DIR_HOST}"
+    fi
+  fi
 fi
 
 # ── DB-backup directory prep ─────────────────────────────────────────────────
@@ -428,4 +606,30 @@ log "    username: ${SEED_ADMIN_USERNAME}"
 log "    password: ${SEED_ADMIN_PASSWORD}"
 log ""
 log "  (also stored as SEED_ADMIN_PASSWORD in ${ENV_FILE}; change it in the console after first login)"
+
+# The storage preflight verdict is reported LAST and, on a definite failure,
+# exits nonzero. It runs earlier (right after the media dir is prepped) but the
+# exit is deferred to here on purpose: the admin password above is printed once,
+# and dying before it would cost the operator their credential to save them a
+# scroll. .env itself is complete and correct either way — what is broken is the
+# host's storage, not the config.
+if [[ "${STORAGE_PREFLIGHT_FAILED}" -eq 1 ]]; then
+  log ""
+  printf '[setup-env] ERROR: %s\n' "the recorder (uid 1001) cannot write to ${MEDIA_DIR_HOST}." >&2
+  printf '[setup-env]        %s\n' "Starting the stack like this looks fine and records NOTHING: live" >&2
+  printf '[setup-env]        %s\n' "view works, the wizard shows green, and no footage is ever saved." >&2
+  printf '[setup-env]        %s\n' "" >&2
+  printf '[setup-env]        %s\n' "Local disk, fix and re-run:" >&2
+  printf '[setup-env]        %s\n' "  sudo chown -R 1001:1001 ${MEDIA_DIR_HOST}" >&2
+  printf '[setup-env]        %s\n' "" >&2
+  printf '[setup-env]        %s\n' "NFS / SMB / FUSE share, grant uid 1001 write access on the SERVER" >&2
+  printf '[setup-env]        %s\n' "or in the mount options (see the block printed above)." >&2
+  printf '[setup-env]        %s\n' "" >&2
+  printf '[setup-env]        %s\n' "Then confirm, and only then 'docker compose up -d':" >&2
+  printf '[setup-env]        %s\n' "  sudo -u '#1001' touch ${MEDIA_DIR_HOST}/.crumb-write-test" >&2
+  printf '[setup-env]        %s\n' "" >&2
+  printf '[setup-env]        %s\n' "Platform-by-platform notes: docs-site/docs/getting-started/platform-notes.md" >&2
+  exit 1
+fi
+
 log "NEXT: 'docker compose up -d', then open http://<host>:8080/admin and sign in with the above."
