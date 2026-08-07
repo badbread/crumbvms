@@ -1321,7 +1321,8 @@ mod tests {
     // is not the answer, ask go2rtc what it actually has".
 
     /// Spawn a stub go2rtc on an ephemeral port. `put_status`/`put_body` are what
-    /// it answers to `PUT /api/streams`; `streams_json` is what `GET
+    /// it answers to BOTH `PUT` and `PATCH /api/streams` (go2rtc gives the same
+    /// status to a rejected source on either verb); `streams_json` is what `GET
     /// /api/streams` then reports (i.e. whether the stream actually landed).
     /// Returns its base URL.
     async fn stub_go2rtc(
@@ -1334,6 +1335,12 @@ mod tests {
         let app = axum::Router::new().route(
             "/api/streams",
             axum::routing::put(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(put_status).unwrap(),
+                    put_body,
+                )
+            })
+            .patch(move || async move {
                 (
                     axum::http::StatusCode::from_u16(put_status).unwrap(),
                     put_body,
@@ -1457,6 +1464,90 @@ mod tests {
         )
         .await
         .expect("an unreadable confirmation must not invent a rejection");
+    }
+
+    // ── a source-URL EDIT must not swallow a rejection (issue #519, re-opened) ──
+    //
+    // `reconcile` reaches an ALREADY-registered stream, so [`apply_stream`]
+    // chooses `PATCH`. These prove WHY a source-URL edit had to be re-routed
+    // through `reconnect` (DELETE+PUT): the PATCH path swallows a go2rtc
+    // rejection, the Create path (which reconnect's DELETE forces) surfaces it.
+
+    #[tokio::test]
+    async fn a_patch_in_place_swallows_a_go2rtc_rejection_the_bug() {
+        // The pre-fix silence: go2rtc REFUSES the newly-typed source (400, stream
+        // absent) but the name is already registered, so `apply_stream` PATCHes —
+        // and a PATCH only bails on 5xx, so the refusal is discarded as Ok. This
+        // is exactly why `update_camera` must NOT push a source change through
+        // reconcile; the assertion documents the swallow it used to rely on.
+        let base = stub_go2rtc(400, "streams: source with spaces may be insecure\n", "{}").await;
+        let c = client().unwrap();
+        let present = names(&["front_door"]);
+        let managed = names(&["front_door"]);
+        apply_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid:554/odd path/cam",
+            &present,
+            &managed,
+            ("u", "p"),
+        )
+        .await
+        .expect(
+            "the PATCH path swallows a 4xx — this is the #519-for-edits bug the fix routes around",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_path_reconnect_forces_surfaces_a_rejection() {
+        // After `reconnect`'s DELETE the name is ABSENT, so `apply_stream` takes
+        // the Create (`PUT`) path — which confirms by existence and returns the
+        // rejection. This is the signal a source-URL edit now gets.
+        let base = stub_go2rtc(400, "streams: source with spaces may be insecure\n", "{}").await;
+        let c = client().unwrap();
+        let absent = names(&[]);
+        let managed = names(&["front_door"]);
+        let err = apply_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid:554/odd path/cam",
+            &absent,
+            &managed,
+            ("u", "p"),
+        )
+        .await
+        .expect_err("an absent stream + 4xx must surface as a rejection");
+        assert!(
+            matches!(err, ApplyError::Rejected(_)),
+            "an edit to a go2rtc-refused source is this camera's fault: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("source with spaces may be insecure"),
+            "the operator needs go2rtc's own reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_source_edit_applies_cleanly() {
+        // The good edit: the Create path with a 2xx is a plain success.
+        let base = stub_go2rtc(200, "", "{}").await;
+        let c = client().unwrap();
+        let absent = names(&[]);
+        let managed = names(&["front_door"]);
+        apply_stream(
+            &c,
+            &base,
+            "front_door",
+            "rtsp://cam.invalid:554/live",
+            &absent,
+            &managed,
+            ("u", "p"),
+        )
+        .await
+        .expect("a valid source must apply without an alert");
     }
 
     #[test]
