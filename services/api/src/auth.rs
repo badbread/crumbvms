@@ -97,15 +97,24 @@ use crate::{
 /// about the token's own claims. It holds only while every endpoint reachable
 /// with `?token=` returns something no more durable and no broader than the
 /// token itself. An endpoint whose *response body* contains a longer-lived or
-/// wider-scoped credential silently voids it, because the holder can trade the
-/// weak token for the strong one — no matter how tightly the token is scoped.
+/// wider-scoped credential — or that mutates state, registers a device, mints
+/// another token, or lists/revokes sessions — silently voids it, because the
+/// holder can trade the weak token for the strong effect, no matter how tightly
+/// the token is scoped.
 ///
-/// `GET /cameras/{id}/streams` was such an endpoint (its RTSP URLs embed the
-/// server-wide, non-expiring go2rtc restreamer credentials) and now takes
-/// [`crate::auth_mw::FullSessionUser`], which rejects media-token principals
-/// with 403. Apply the same extractor to any future endpoint whose response
-/// carries a credential, a long-lived URL, or data spanning more than the one
-/// camera the token names.
+/// This is now enforced structurally as a **class**, not per-endpoint (audit
+/// 2026-08 follow-up to #516): the default [`crate::auth_mw::AuthUser`]
+/// extractor **rejects** media-token principals with 403, and only the audited
+/// single-camera media-read surface (segments, low-res segments, filmstrip
+/// frames, camera stills, clip video/thumbnails, detection-event snapshots,
+/// plate crops, live fMP4/WebRTC) opts back in via
+/// [`crate::auth_mw::MediaOrFullUser`]. `GET /cameras/{id}/streams` (whose RTSP
+/// URLs embed the server-wide, non-expiring go2rtc restreamer credentials),
+/// `POST /auth/refresh`, `GET /media-token`, the `/auth/sessions*` surface and
+/// the notification/config mutation routes are therefore all unreachable by a
+/// media token. A new endpoint on the bare `AuthUser` extractor is safe by
+/// default; reach for `MediaOrFullUser` ONLY for a genuine single-camera
+/// media-byte read.
 const MEDIA_TOKEN_EXPIRY_SECONDS: i64 = 900;
 
 // ── helpers ───────────────────────────────────────────────────────────────────

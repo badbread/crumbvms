@@ -18,7 +18,8 @@
 //!
 //! * **Secure by default.** Same auth as `/segments/{id}`: `require_playback()` +
 //!   `assert_camera_access()` + the scoped per-camera `?token=` media claim (the
-//!   [`AuthUser`] extractor accepts it), so it serves directly as a `<video>` /
+//!   [`crate::auth_mw::MediaOrFullUser`] extractor accepts it — this is a genuine
+//!   single-camera media-read), so it serves directly as a `<video>` /
 //!   `ExoPlayer` source. The same path-traversal guard
 //!   ([`crate::playback::guard_path_traversal`]) runs before any file I/O.
 //! * **Read-only footage.** The API mounts media read-only; this reads the
@@ -46,7 +47,9 @@ use uuid::Uuid;
 
 use crumb_common::db;
 
-use crate::{auth_mw::AuthUser, error::ApiError, playback::guard_path_traversal, state::AppState};
+use crate::{
+    auth_mw::MediaOrFullUser, error::ApiError, playback::guard_path_traversal, state::AppState,
+};
 
 /// Same ffmpeg the clip machinery uses (bundled jellyfin-ffmpeg in the API image).
 const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
@@ -62,7 +65,7 @@ const LOW_TRANSCODE_TIMEOUT_SECS: u64 = 120;
 const CACHE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Mount `GET /segments/{id}/low.mp4`. Lives in `media_routes` (no 30 s JSON
-/// timeout; `AuthUser` accepts `?token=`), a sibling of the raw
+/// timeout; `MediaOrFullUser` accepts `?token=`), a sibling of the raw
 /// `/segments/{id}` route which stays byte-transparent.
 pub fn routes() -> Router<AppState> {
     Router::new().route("/segments/:segment_id/low.mp4", get(get_segment_low))
@@ -78,7 +81,9 @@ pub fn routes() -> Router<AppState> {
 /// * `404` — segment row not found, or the file is missing on disk.
 /// * `500` — storage row missing / transcode failed.
 async fn get_segment_low(
-    user: AuthUser,
+    // Media-read: low-res segment bytes fetched via scoped `?token=` (mirrors
+    // serve_segment). Accepts a scoped media token or a full session.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(segment_id): Path<Uuid>,
     req: Request,

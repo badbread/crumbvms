@@ -66,7 +66,7 @@ use uuid::Uuid;
 use crumb_common::db;
 
 use crate::{
-    auth_mw::AuthUser,
+    auth_mw::{AuthUser, MediaOrFullUser},
     dto::{FilmstripFrame, FilmstripQuery, FilmstripResponse},
     error::ApiError,
     state::AppState,
@@ -213,7 +213,10 @@ fn default_thumb_width() -> u32 {
 /// 400 on path traversal attempts, and `image/jpeg` with immutable caching
 /// headers on success.
 async fn serve_frame(
-    user: AuthUser,
+    // Media-read: filmstrip preview JPEGs are fetched with a scoped `?token=`
+    // (export_api.dart / MediaUrls). The list endpoint above stays full-session
+    // (Bearer). Camera scope enforced below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(camera_id): Path<Uuid>,
     Query(q): Query<FrameQuery>,
