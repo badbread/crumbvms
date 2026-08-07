@@ -1041,17 +1041,41 @@ function setMsg(id, msg, type = 'ok') {
 }
 
 /* ── API helper ── */
+/* Routes where a 401 means "those credentials are wrong", NOT "your session
+   expired". The blanket 401 handler below used to swallow both, so a wrong
+   password on a FRESH login screen was reported as "Session expired, sign in
+   again." — there was no session, and the real reason never reached the user. */
+const AUTH_ENTRY_RE = /^\/auth\/(login|bootstrap)\b/;
 async function api(path, opts = {}) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
   if (TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
   const res = await fetch(path, Object.assign({}, opts, { headers }));
-  if (res.status === 401) { logout(); throw new Error('Session expired, sign in again.'); }
+  if (res.status === 401 && !AUTH_ENTRY_RE.test(path)) { sessionExpired(); throw apiError('Session expired, sign in again.', res); }
   if (!res.ok) {
     let msg = res.statusText;
     try { const j = await res.json(); msg = j.message || j.error || msg; } catch {}
-    throw new Error(msg);
+    throw apiError(msg, res);
   }
   return res.status === 204 ? null : res.json();
+}
+/* An Error carrying the HTTP status (and the server's Retry-After hint, when it
+   sent one) so callers can say something better than the raw server string. */
+function apiError(msg, res) {
+  const e = new Error(msg);
+  if (res) {
+    e.status = res.status;
+    const ra = parseInt(res.headers.get('Retry-After') || '', 10);
+    if (!isNaN(ra) && ra >= 0) e.retryAfter = ra;
+  }
+  return e;
+}
+/* One place that handles "the session is gone": drop the token, return to the
+   login screen, and SAY so. Three raw-fetch call sites used to call logout()
+   and show nothing at all, so the screen just emptied out. */
+function sessionExpired() {
+  logout();
+  const wz = $('wizard-screen'); if (wz) wz.classList.add('hidden');
+  const el = $('lg-err'); if (el) el.textContent = 'Your session expired. Sign in to continue.';
 }
 
 /* Download the admin-only scrubbed diagnostics bundle (GET /diagnostics/bundle).
@@ -1061,7 +1085,7 @@ async function downloadDiagnostics() {
   setMsg('diag-msg', 'Preparing…');
   try {
     const res = await fetch('/diagnostics/bundle', { headers: { Authorization: 'Bearer ' + TOKEN } });
-    if (res.status === 401) { logout(); return; }
+    if (res.status === 401) { sessionExpired(); return; }
     if (!res.ok) {
       let m = res.statusText;
       try { const j = await res.json(); m = j.message || j.error || m; } catch {}
@@ -1111,7 +1135,22 @@ async function login() {
     TOKEN = data.token;
     localStorage.setItem('crumb_admin_token', TOKEN);
     await afterAuth();
-  } catch (e) { $('lg-err').textContent = e.message; }
+  } catch (e) { $('lg-err').textContent = signInErrorText(e); }
+}
+/* Sign-in failures in the operator's words. 401 = the credentials are wrong (the
+   server's own "invalid username or password" is accurate but reads like a log
+   line); 429 = the brute-force lockout, which sends Retry-After — say how long,
+   because "try again later" is unbounded from the user's side, and the lockout
+   rejects the CORRECT password too until it lapses. */
+function signInErrorText(e) {
+  if (e && e.status === 401) return 'That username or password is not right.';
+  if (e && e.status === 429) {
+    const n = e.retryAfter;
+    return (typeof n === 'number' && n > 0)
+      ? `Too many failed sign-in attempts. Try again in ${n} second${n === 1 ? '' : 's'}.`
+      : 'Too many failed sign-in attempts. Wait a few seconds and try again.';
+  }
+  return (e && e.message) || 'Could not sign in.';
 }
 
 /* After a successful login/token-restore: resume the first-run wizard if setup
@@ -1158,7 +1197,7 @@ async function bootstrapAdmin() {
       $('bootstrap-screen').classList.add('hidden');
       $('login-screen').classList.remove('hidden');
     } else {
-      msg.textContent = e.message;
+      msg.textContent = signInErrorText(e);
     }
   }
 }
@@ -1210,7 +1249,7 @@ async function fsbLoad(path) {
       toast('Folder browsing is not available on this server.', 'warn');
       return;
     }
-    if (res.status === 401) { logout(); return; }
+    if (res.status === 401) { sessionExpired(); return; }
     if (!res.ok) {
       let m = res.statusText;
       try { const j = await res.json(); m = j.message || j.error || m; } catch {}
@@ -1764,7 +1803,7 @@ async function wizardStorageCheck() {
       body: JSON.stringify({ path })
     });
     if (r.status === 404) { FS_CHECK_AVAILABLE = false; if (el) el.innerHTML = ''; return null; }
-    if (r.status === 401) { logout(); return null; }
+    if (r.status === 401) { sessionExpired(); return null; }
     if (!r.ok) {
       let m = r.statusText; try { const j = await r.json(); m = j.message || j.error || m; } catch {}
       if (el && seq === _wzStorageCheckSeq) el.innerHTML = `<span style="color:var(--warn)">Couldn't check this folder: ${esc(m)}</span>`;
@@ -1785,6 +1824,53 @@ function wizardStorageCheckHtml(res) {
   const color = res.status === 'error' ? 'var(--danger)' : (res.status === 'warn' ? 'var(--warn)' : 'var(--ok)');
   const mark  = res.status === 'error' ? '✕' : (res.status === 'warn' ? '!' : '✓');
   return `<span style="color:${color};font-weight:700">${mark}</span> <span style="color:var(--dim)">${esc(res.message || '')}</span>`;
+}
+
+/* ── The SAME preflight, for Settings → Storage ──────────────────────────────
+   fs/check used to be called from exactly one place (the wizard), so the
+   Settings pane happily saved a path that does not exist or is not writable and
+   said nothing at all (HTTP 201, silence). Paints a live status line under the
+   path box and returns the verdict so add/save can refuse an `error`. */
+let _stCheckSeq = 0;
+let _stCheckT = null;
+function storagePathCheckDebounced(inputId, outId) {
+  clearTimeout(_stCheckT);
+  _stCheckT = setTimeout(() => { storagePathCheck(inputId, outId); }, 400);
+}
+async function storagePathCheck(inputId, outId) {
+  const inp = $(inputId), el = $(outId);
+  if (!inp) return null;
+  const path = (inp.value || '').trim();
+  if (!path) { if (el) el.innerHTML = ''; return null; }
+  if (!FS_CHECK_AVAILABLE) return null;
+  if (el) el.innerHTML = '<span style="color:var(--dim2)">Checking folder…</span>';
+  const seq = ++_stCheckSeq;
+  let res;
+  try {
+    const r = await fetch('/config/fs/check', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}),
+      body: JSON.stringify({ path })
+    });
+    if (r.status === 404) { FS_CHECK_AVAILABLE = false; if (el) el.innerHTML = ''; return null; }
+    if (r.status === 401) { sessionExpired(); return null; }
+    if (r.ok) {
+      res = await r.json();
+    } else {
+      // fs/check rejects blank / relative / outside-the-root paths outright, and
+      // those are real problems the save would hit anyway — treat as an error.
+      let m = r.statusText;
+      try { const j = await r.json(); m = j.message || j.error || m; } catch {}
+      res = { status: 'error', message: m };
+    }
+  } catch (_) {
+    // Network hiccup: say so, but never block the save on it.
+    if (el && seq === _stCheckSeq) el.innerHTML = `<span style="color:var(--warn)">Couldn't check this folder.</span>`;
+    return null;
+  }
+  if (seq !== _stCheckSeq) return res; // superseded by a newer keystroke
+  if (el) el.innerHTML = wizardStorageCheckHtml(res);
+  return res;
 }
 
 /* Existing cameras, used client-side to grey out already-added devices in the
@@ -2764,6 +2850,10 @@ async function wizardCreateCamera(it) {
   if (it.ptz) payload.camera_type = 'ptz';
   const res = await fetch('/config/cameras', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}) }, body: JSON.stringify(payload) });
   if (res.ok) { let body = null; try { body = await res.json(); } catch (_) {} return { ok: true, id: body && body.id }; }
+  // A session that expires mid-bulk-add rendered a row of bare "✗ Unauthorized"
+  // and left the operator in a wizard that could no longer save anything. Send
+  // them to the login screen with an explanation instead.
+  if (res.status === 401) { sessionExpired(); return { error: 'Your session expired. Sign in again, then re-run setup.' }; }
   let msg = res.statusText; try { const j = await res.json(); msg = j.message || j.error || msg; } catch (_) {}
   if (res.status === 409) return { conflict: true, error: msg };
   return { error: msg };
@@ -3142,7 +3232,10 @@ async function stestFrameLoop() {
         fails++;
         if (!gotFrame && fails >= 2) {
           let msg = 'Could not grab a preview frame.';
-          try { const j = await res.json(); if (j && j.error) msg = j.error; } catch (_) {}
+          // /config/test-frame fails with the ApiError shape {error,message};
+          // `error` is the bare status label ("Bad Request"), the useful text is
+          // in `message` — reading `error` first showed the label, not the reason.
+          try { const j = await res.json(); if (j && (j.message || j.error)) msg = j.message || j.error; } catch (_) {}
           setMsg('stest-err', msg, 'err');
           const w = $('stest-wait'); if (w && w.style.display !== 'none') w.textContent = 'No preview frame yet, see the error above. Retrying…';
         }
@@ -4237,7 +4330,8 @@ function renderStorageRoot() {
         <label class="fg-label" for="st-name">Name</label>
         <div class="fg-ctl"><input id="st-name" placeholder="NAS-Archive" style="max-width:320px" /></div>
         <label class="fg-label" for="st-path">Filesystem path</label>
-        <div class="fg-ctl"><input id="st-path" class="mono" placeholder="/mnt/nas/vms" />${fsbBtn('st-path')}</div>
+        <div class="fg-ctl"><input id="st-path" class="mono" placeholder="/mnt/nas/vms" oninput="storagePathCheckDebounced('st-path','st-check')" />${fsbBtn('st-path')}</div>
+        <div class="fg-full" style="font-size:12px;margin:-4px 0 2px" id="st-check"></div>
         <div class="fg-full" style="margin-top:4px"><button class="primary" onclick="addStorage()">Add location</button></div>
       </div>
       <div id="st-msg" class="form-msg"></div>
@@ -9262,7 +9356,8 @@ function renderStorage(id) {
         <label class="fg-label" for="st-edit-name">Name</label>
         <div class="fg-ctl"><input id="st-edit-name" value="${esc(s.name)}" style="max-width:320px" /></div>
         <label class="fg-label" for="st-edit-path">Filesystem path</label>
-        <div class="fg-ctl"><input id="st-edit-path" class="mono" value="${esc(s.path)}" />${fsbBtn('st-edit-path')}</div>
+        <div class="fg-ctl"><input id="st-edit-path" class="mono" value="${esc(s.path)}" oninput="storagePathCheckDebounced('st-edit-path','st-edit-check')" />${fsbBtn('st-edit-path')}</div>
+        <div class="fg-full" style="font-size:12px;margin:-4px 0 2px" id="st-edit-check"></div>
         <label class="fg-label" for="st-edit-icon">Disk icon <span id="st-icon-preview" class="ce-icon-preview"></span></label>
         <div class="fg-ctl"><select id="st-edit-icon" style="font-size:13px;max-width:220px" onchange="stPreviewIcon()" title="Auto detects SSD vs hard disk from the name; override if it guesses wrong.">${storageIconOpts(s.icon)}</select></div>
       </div>
@@ -9302,6 +9397,10 @@ async function addStorage() {
   setMsg('st-msg', '');
   const name = $('st-name').value.trim(), path = $('st-path').value.trim();
   if (!name || !path) { setMsg('st-msg', 'Name and path are required.', 'err'); return; }
+  // Preflight the folder the same way the wizard does, and refuse to save a path
+  // the recorder can't write to. `warn` (low/unverifiable free space) still saves.
+  const chk = await storagePathCheck('st-path', 'st-check');
+  if (chk && chk.status === 'error') { setMsg('st-msg', chk.message || 'This folder can\'t be used for recordings.', 'err'); return; }
   try {
     const created = await api('/config/storages', { method: 'POST', body: JSON.stringify({ name, path }) });
     toast(`Location "${name}" added.`);
@@ -9313,6 +9412,8 @@ async function addStorage() {
 }
 async function saveStorage(id) {
   setMsg('st-edit-msg', '');
+  const chk = await storagePathCheck('st-edit-path', 'st-edit-check');
+  if (chk && chk.status === 'error') { setMsg('st-edit-msg', chk.message || 'This folder can\'t be used for recordings.', 'err'); return; }
   try {
     await api('/config/storages/' + id, { method: 'PUT', body: JSON.stringify({ name: $('st-edit-name').value.trim(), path: $('st-edit-path').value.trim(), icon: ($('st-edit-icon') ? $('st-edit-icon').value : '') || null }) });
     toast('Location updated.');

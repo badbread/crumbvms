@@ -8,6 +8,61 @@ revisit.
 
 ---
 
+## 2026-08-06, The storage preflight infers recorder writability from the folder's OWNERSHIP when its own write probe is inconclusive, rather than asking the recorder
+
+**Context.** `POST /config/fs/check` is the wizard's gate on "this disk will
+actually record". The api mounts `/data` **read-only** by design (the recorder
+holds the RW mount), so its throwaway write probe fails on every stock install
+and the endpoint returned `status:"warn"` with "can't confirm the recorder can
+write here" for a perfectly healthy disk. A genuinely unwritable folder (a
+root-owned `chmod 555` media directory, the single most common first-run
+failure) produced the **identical** amber warning, and the wizard only blocks on
+`status:"error"`, so the one check that exists to stop a silently-non-recording
+install could not stop one. Found by a hostile first-run pass (#517 §1.3).
+
+**Decision.** When the write probe is inconclusive *because the api's own mount
+is read-only*, derive the verdict from the directory's `stat` instead: both
+service images pin their container user to uid 1001, so "would uid 1001 be
+allowed to create a file here" has a real answer that the api can read without
+being able to write. Ownership + mode says writable ⇒ `ok` (with the honest
+caveat that the write itself is confirmed by the recorder on first write);
+says not writable ⇒ `error` naming the owning uid, the mode, and the `chown`
+that fixes it; metadata unreadable ⇒ the old `warn`, which is now the rare case
+rather than the default.
+
+**Rejected:**
+
+- **Have the api ask the recorder to probe writability** (the issue's own
+  suggestion). It is the more correct answer and stays the long-term target, but
+  it needs a new recorder-side endpoint or a DB-mediated request/response with
+  its own liveness, timeout, and "recorder is restarting" semantics, on the
+  service that must never be destabilised (golden rule 2). Out of proportion for
+  a message-quality pass, and the ownership read gets the same verdict for every
+  failure shape seen in practice.
+- **Keep returning `warn` and only reword it.** The wizard would still walk past
+  an unwritable disk, which is the actual bug.
+- **Green-light on free space alone.** That is the P0-1 regression: a root-owned
+  media directory reports plenty of free space and records nothing.
+
+**Trades knowingly accepted:**
+
+- The uid is a constant (1001), not configuration. An install that overrides the
+  recorder's container user to root would see a false `error` on a root-owned
+  folder it can in fact write. That override is not a supported path, the message
+  names the exact uid it assumed, and the operator can still set the path through
+  `POST /config/storages` with a path that passes.
+- Ownership is necessary, not sufficient: an exotic mount (NFS with
+  `root_squash`, an ACL, a full disk) can still refuse the write. The `ok` copy
+  says so rather than promising success.
+
+**Revisit when:** the recorder publishes a storage-writability signal (a health
+row or heartbeat field per storage). At that point prefer it here and demote the
+ownership read to the fallback, or when an install path that legitimately runs
+the recorder as another uid becomes supported, at which point the constant has to
+become configuration.
+
+---
+
 ## 2026-08-06, A non-success go2rtc `PUT` is resolved by ASKING go2rtc what it has, not by reading the status code; and a never-yet-seen camera gets a creation grace
 
 **Context.** Two bugs found by a hostile-camera compatibility matrix against the

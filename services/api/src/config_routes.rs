@@ -940,7 +940,9 @@ async fn create_camera(
         // preserved verbatim (O3 backward-compatible pass-through).
         let name = trimmed(&body.go2rtc_name).ok_or_else(|| {
             ApiError::BadRequest(
-                "either source_url, or go2rtc_name + main_url, is required".to_owned(),
+                "A camera needs a stream URL. Enter the camera's RTSP address, \
+                 or use Discover to find it."
+                    .to_owned(),
             )
         })?;
         let main = trimmed(&body.main_url).ok_or_else(|| {
@@ -1111,6 +1113,16 @@ async fn update_camera(
     let ptz_control_enabled = body
         .ptz_control_enabled
         .unwrap_or(existing.ptz_control_enabled);
+
+    // Same scheme guard as create, but only on a value this request actually
+    // SETS — re-validating a stored value would make an unrelated edit (rename,
+    // policy change) fail on a camera that predates the check (#517 §2).
+    if let Some(Some(v)) = body.source_url.as_ref() {
+        validate_source_url("stream URL", Some(v.as_str()))?;
+    }
+    if let Some(Some(v)) = body.source_sub_url.as_ref() {
+        validate_source_url("sub-stream URL", Some(v.as_str()))?;
+    }
 
     // source_url / source_sub_url: Option<Option<String>>; trimmed to non-empty.
     let clean = |s: Option<String>| s.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
@@ -2413,6 +2425,19 @@ async fn check_fs(
         }
         None => Some(false),
     };
+
+    // When the api's own probe was inconclusive (its /data mount is read-only by
+    // design), fall back to the folder's ownership + mode. The api and recorder
+    // containers run as the SAME uid, so "would that uid be allowed to create a
+    // file here" is a real answer even without a write probe — which is what
+    // lets this endpoint tell a healthy disk apart from a root-owned `chmod 555`
+    // one instead of returning the identical amber warning for both (#517 §1.3).
+    let by_mode = if writable.is_none() {
+        probe_dir.as_deref().and_then(recorder_mode_verdict)
+    } else {
+        None
+    };
+
     let (total_bytes, free_bytes) = match probe_dir
         .as_deref()
         .and_then(|d| disk_stats_for_path(&d.to_string_lossy()))
@@ -2440,12 +2465,47 @@ async fn check_fs(
             "error",
             format!("'{requested}' can't be created — it has no parent folder."),
         )
+    } else if let Some(missing) = probe_dir
+        .as_deref()
+        .filter(|d| !d.exists())
+        .and_then(|_| first_missing_ancestor(p))
+    {
+        // The folder AND its parent are missing. The recorder creates only the
+        // leaf subdir, so this can't work — and blaming permissions (what the
+        // failed write probe below would have said) sent operators chown-hunting
+        // for a folder that simply isn't there (#517 §6.2).
+        (
+            "error",
+            format!(
+                "'{requested}' can't be created because '{}' doesn't exist. \
+                 Create the folder first, or pick one that exists.",
+                missing.display()
+            ),
+        )
     } else if writable == Some(false) {
         (
             "error",
             "The recorder can't write to this folder (permission denied). \
-             Check ownership/permissions on the mounted disk."
+             Check ownership and permissions on the mounted disk."
                 .to_owned(),
+        )
+    } else if let Some(v) = by_mode.filter(|v| !v.writable) {
+        (
+            "error",
+            format!(
+                "The recorder (uid {}) can't write here: '{}' is owned by uid {} with \
+                 permissions {:o}, so recording would silently write nothing. Fix the \
+                 ownership on the mounted disk (chown -R {}:{} on the host path behind \
+                 it), or pick another folder.",
+                RECORDER_UID,
+                probe_dir
+                    .as_deref()
+                    .map_or_else(|| requested.clone(), |d| d.to_string_lossy().into_owned()),
+                v.uid,
+                v.mode & 0o7777,
+                RECORDER_UID,
+                RECORDER_GID,
+            ),
         )
     } else if free_bytes == Some(0) {
         (
@@ -2454,15 +2514,52 @@ async fn check_fs(
              Point Crumb at a disk with real free space."
                 .to_owned(),
         )
-    } else if writable != Some(true) {
-        // writable is None here (Some(false) already errored above, Some(true)
-        // makes this false): the api mounts /data READ-ONLY, so a write probe
-        // couldn't affirmatively confirm the recorder (RW mount, uid 1001) can
-        // write. Do NOT green-light on free space alone — the root-owned-`_data`
+    } else if writable == Some(true) || by_mode.is_some_and(|v| v.writable) {
+        // Writable — either proved by the api's own write probe, or (on the
+        // standard install, where the api's /data mount is read-only by design)
+        // by the folder's ownership matching the uid both containers run as.
+        // The old code returned an amber "can't confirm" here on EVERY healthy
+        // stock install, which trained testers to ignore the one warning that
+        // was supposed to stop a silently-unwritable disk (#517 §1.3).
+        let checked_by_recorder = writable != Some(true);
+        match free_bytes {
+            Some(f) if f < LOW_FREE_BYTES => (
+                "warn",
+                format!(
+                    "Only {} free — footage will be evicted almost immediately. \
+                     Use a larger disk if you can.",
+                    fmt_bytes_dec(f)
+                ),
+            ),
+            Some(f) => (
+                "ok",
+                format!(
+                    "{} free of {}.{}",
+                    fmt_bytes_dec(f),
+                    total_bytes.map_or_else(|| "?".to_owned(), fmt_bytes_dec),
+                    if checked_by_recorder {
+                        " The folder's ownership is right for the recorder; \
+                         writing itself is confirmed by the recorder on first write."
+                    } else {
+                        ""
+                    }
+                ),
+            ),
+            // Under the media root and writable, but statvfs couldn't read the
+            // size — usable but unverified (exotic mount).
+            None => (
+                "warn",
+                "This folder is writable, but its free space couldn't be read. \
+                 Make sure the disk has room for recordings."
+                    .to_owned(),
+            ),
+        }
+    } else {
+        // The api's /data mount is read-only (normal) AND the folder's ownership
+        // couldn't be read, so nothing here can prove or disprove writability.
+        // Do NOT green-light on free space alone — the root-owned-`_data`
         // default-install bug reports plenty of free space while the recorder
-        // silently can't write a single segment (P0-1). Return an honest warning
-        // the wizard surfaces instead of a false "ok". (When the recorder starts
-        // publishing a storage-writability signal, prefer surfacing that here.)
+        // silently can't write a single segment (P0-1).
         let space = match free_bytes {
             Some(f) => format!(
                 " ({} free of {})",
@@ -2474,40 +2571,11 @@ async fn check_fs(
         (
             "warn",
             format!(
-                "Can't confirm the recorder can write here{space} — the API sees \
-                 this disk read-only, which is normal, so writability can't be \
-                 verified from here. If recordings or playback stay empty, fix \
-                 the media directory ownership so the recorder (uid 1001) can write."
+                "Can't confirm the recorder can write here{space}. The API sees this \
+                 disk read-only (which is normal), and the folder's ownership can't be read. \
+                 If recordings or playback stay empty, make sure the media directory is \
+                 owned by uid {RECORDER_UID}."
             ),
-        )
-    } else if let Some(f) = free_bytes {
-        if f < LOW_FREE_BYTES {
-            (
-                "warn",
-                format!(
-                    "Only {} free — footage will be evicted almost immediately. \
-                     Use a larger disk if you can.",
-                    fmt_bytes_dec(f)
-                ),
-            )
-        } else {
-            (
-                "ok",
-                format!(
-                    "{} free of {}.",
-                    fmt_bytes_dec(f),
-                    total_bytes.map_or_else(|| "?".to_owned(), fmt_bytes_dec)
-                ),
-            )
-        }
-    } else {
-        // Writability affirmatively confirmed and under the media root, but
-        // statvfs couldn't read the size — usable but unverified (exotic mount).
-        (
-            "warn",
-            "This folder is writable, but its free space couldn't be read. \
-             Make sure the disk has room for recordings."
-                .to_owned(),
         )
     };
 
@@ -2562,6 +2630,63 @@ async fn probe_writable(dir: &std::path::Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The uid/gid the recorder container runs as. Both service Dockerfiles pin the
+/// `crumb` user to 1001, and the rest of the codebase (`db_backup.rs`, the
+/// install runbook, `setup-env.sh`'s storage preflight) states the same number.
+const RECORDER_UID: u32 = 1001;
+const RECORDER_GID: u32 = 1001;
+
+/// What a directory's ownership + mode say about the recorder's ability to
+/// create files in it. `Copy` so the verdict can be inspected in more than one
+/// arm of the fs-check `if`/`else` chain.
+#[derive(Debug, Clone, Copy)]
+struct ModeVerdict {
+    writable: bool,
+    uid: u32,
+    mode: u32,
+}
+
+/// Best-effort "could the recorder's uid create a file in `dir`?", derived from
+/// the directory's own ownership and permission bits.
+///
+/// Used ONLY when the api's write probe was inconclusive because its own `/data`
+/// mount is read-only by design. The api and recorder containers run as the same
+/// uid, so the permission question has a real answer here even though the api
+/// cannot itself write. `None` when the metadata can't be read at all.
+#[cfg(unix)]
+fn recorder_mode_verdict(dir: &std::path::Path) -> Option<ModeVerdict> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(dir).ok()?;
+    let (mode, uid, gid) = (m.mode(), m.uid(), m.gid());
+    let writable = m.is_dir()
+        && (mode & 0o002 != 0
+            || (uid == RECORDER_UID && mode & 0o200 != 0)
+            || (gid == RECORDER_GID && mode & 0o020 != 0));
+    Some(ModeVerdict {
+        writable,
+        uid,
+        mode,
+    })
+}
+
+#[cfg(not(unix))]
+fn recorder_mode_verdict(dir: &std::path::Path) -> Option<ModeVerdict> {
+    let _ = dir;
+    None
+}
+
+/// The shallowest ancestor of `p` (root first) that does not exist — i.e. the
+/// folder an operator has to create before `p` can be created. `None` when every
+/// component already exists.
+fn first_missing_ancestor(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut chain: Vec<&std::path::Path> = p.ancestors().collect();
+    chain.reverse(); // filesystem root first
+    chain
+        .into_iter()
+        .find(|a| !a.exists())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Compact decimal byte formatting (1 GB = 1,000,000,000 B) for preflight
@@ -3653,8 +3778,17 @@ async fn test_frigate_http(
                 Ok(r) if r.status().is_success() => {
                     let v = r.text().await.unwrap_or_default();
                     let v: String = v.trim().trim_matches('"').chars().take(40).collect();
+                    // An HTML page (or an empty body) is exactly the thing that
+                    // must FAIL here: any web server answers 200 with markup, and
+                    // reporting that as "Frigate API answered" told operators a
+                    // router page was Frigate (issue #517 §1.2). Mirrors the
+                    // go2rtc branch above, which gets this right.
                     if v.is_empty() || v.contains('<') {
-                        pass("Frigate API answered /api/version.".to_owned())
+                        fail(
+                            "Responded 200 but not with Frigate's version. Is this the \
+                             Frigate HTTP API base (usually :5000)?"
+                                .to_owned(),
+                        )
                     } else {
                         pass(format!("Frigate {v}."))
                     }
@@ -3662,10 +3796,22 @@ async fn test_frigate_http(
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
                     let surl = format!("{base}/api/stats");
                     match client.get(&surl).send().await {
-                        Ok(r2) if r2.status().is_success() => pass(
-                            "Frigate API answered /api/stats (no /api/version on this version)."
-                                .to_owned(),
-                        ),
+                        // Same rule as /api/version: 200 alone proves nothing,
+                        // Frigate's /api/stats is a JSON object.
+                        Ok(r2) if r2.status().is_success() => {
+                            match r2.json::<serde_json::Value>().await {
+                                Ok(serde_json::Value::Object(_)) => pass(
+                                    "Frigate API answered /api/stats (no /api/version on \
+                                     this version)."
+                                        .to_owned(),
+                                ),
+                                Ok(_) | Err(_) => fail(
+                                    "Responded 200 but not with Frigate's JSON. Is this the \
+                                     Frigate HTTP API base (usually :5000)?"
+                                        .to_owned(),
+                                ),
+                            }
+                        }
                         Ok(r2) => fail(format!(
                             "HTTP {} from {surl} (and 404 from /api/version).",
                             r2.status().as_u16()
@@ -4599,10 +4745,77 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
 fn validate_create_camera(body: &CreateCameraRequest) -> Result<(), ApiError> {
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest(
-            "camera name must not be blank".to_owned(),
+            "A camera needs a name. Enter one and try again.".to_owned(),
         ));
     }
+    validate_source_url("stream URL", body.source_url.as_deref())?;
+    validate_source_url("sub-stream URL", body.source_sub_url.as_deref())?;
     Ok(())
+}
+
+/// Replace `scheme://user:pass@host` with `scheme://…@host` so a URL echoed
+/// back in an error can never carry the camera password.
+fn redact_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // No scheme at all: userinfo can still precede the authority.
+        let auth_end = url.find(['/', '?']).unwrap_or(url.len());
+        return match url[..auth_end].find('@') {
+            Some(at) => format!("…@{}", &url[at + 1..]),
+            None => url.to_owned(),
+        };
+    };
+    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    match rest[..auth_end].find('@') {
+        Some(at) => format!("{scheme}://…@{}", &rest[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
+/// Schemes a camera `source_url` may use.
+///
+/// Wider than [`crate::ffprobe::is_supported_scheme`] (which is deliberately
+/// probe-only) because `onvif://` is a first-class Crumb source: go2rtc pulls it
+/// directly and `db::parse_onvif_source` backfills the ONVIF host/credential
+/// columns from it. Narrower than "anything go2rtc accepts" on purpose — a
+/// console-added camera is always one of these, and `exec:`/`file:` style
+/// sources have no business arriving over the HTTP API.
+const CAMERA_URL_SCHEMES: [&str; 5] = ["rtsp://", "rtsps://", "http://", "https://", "onvif://"];
+
+/// Reject a camera source URL that Crumb cannot possibly pull.
+///
+/// `POST /config/cameras` used to accept literally anything — a bare IP with no
+/// scheme returned `201 Created`, the camera appeared in the list, and it never
+/// recorded a frame with nothing anywhere saying why (#517 §2). This is the
+/// cheap half of the fix: a scheme check at create/update time, with copy that
+/// says what to type instead. A camera that is merely offline right now is still
+/// perfectly legal to add.
+fn validate_source_url(field: &str, raw: Option<&str>) -> Result<(), ApiError> {
+    let Some(url) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if CAMERA_URL_SCHEMES.iter().any(|p| {
+        url.get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    }) {
+        return Ok(());
+    }
+    let shown = redact_url_userinfo(url);
+    Err(ApiError::BadRequest(if url.contains("://") {
+        format!(
+            "A camera {field} must start with rtsp:// (most cameras) or http://. \
+             '{shown}' uses an address type Crumb can't pull from."
+        )
+    } else if shown.contains(':') {
+        format!(
+            "A camera {field} must start with rtsp:// (most cameras) or http://. \
+             '{shown}' has no scheme, try rtsp://{shown}/… instead."
+        )
+    } else {
+        format!(
+            "A camera {field} must start with rtsp:// (most cameras) or http://. \
+             '{shown}' has no scheme, try rtsp://{shown}:554/… instead."
+        )
+    }))
 }
 
 /// Slugify a camera name into a safe, lowercase go2rtc stream name (alphanumerics
@@ -4859,25 +5072,41 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
 /// and can always access the dir once the recorder creates it).
 fn validate_storage_path(path: &str) -> Result<(), ApiError> {
     let root = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/data".to_owned());
-    let p = std::path::Path::new(path);
+    let trimmed = path.trim();
+    let p = std::path::Path::new(trimmed);
     let canon_root = std::path::Path::new(&root);
+
+    // An empty path, a relative path, a file, and a genuinely-outside-the-root
+    // path used to share ONE message ("must be under the media root"), which was
+    // good advice and the wrong diagnosis for three of the four (#517 §6.3).
+    if trimmed.is_empty() {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "Enter the folder the recorder should write to, under '{root}/…'."
+        )));
+    }
+    if !p.is_absolute() {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "The folder path must be absolute (start with '/'), got '{trimmed}'. \
+             Use a path under '{root}/…'."
+        )));
+    }
 
     // Require the path to be under (or equal to) MEDIA_ROOT so the recorder
     // can reach it via its RW mount.  We compare without canonicalization to
     // avoid accessing the filesystem for paths that don't exist yet.
     if !p.starts_with(canon_root) {
         return Err(ApiError::UnprocessableEntity(format!(
-            "storage path must be under the media root '{root}' (the disk Crumb can write to). \
-             Add the disk under '{root}/…'. \
+            "This folder is outside the recorder's writable area ('{root}', the disk Crumb \
+             can write to). Choose a path under '{root}/…'. \
              To use a disk at another mount point, mount it as a subdirectory of '{root}'."
         )));
     }
 
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::metadata(trimmed) {
         // Path exists: must be a directory.
         if !meta.is_dir() {
             return Err(ApiError::UnprocessableEntity(format!(
-                "storage path '{path}' exists but is not a directory"
+                "'{trimmed}' is a file, not a folder. Pick a folder under '{root}/…'."
             )));
         }
     } else {
@@ -4888,14 +5117,20 @@ fn validate_storage_path(path: &str) -> Result<(), ApiError> {
             Ok(m) if m.is_dir() => { /* parent accessible — accept */ }
             Ok(_) => {
                 return Err(ApiError::UnprocessableEntity(format!(
-                    "storage path '{path}' does not exist and its parent is not a directory"
+                    "'{trimmed}' can't be created because '{}' is a file, not a folder.",
+                    parent.display()
                 )));
             }
-            Err(e) => {
+            Err(_) => {
+                // Name the folder that actually has to be created, rather than
+                // blaming permissions on a path that simply isn't there.
+                let missing = first_missing_ancestor(p)
+                    .unwrap_or_else(|| parent.to_path_buf())
+                    .display()
+                    .to_string();
                 return Err(ApiError::UnprocessableEntity(format!(
-                    "storage path '{path}' does not exist and its parent is not accessible: {e}. \
-                         The recorder will create the directory on first write once you \
-                         start recording to this location."
+                    "'{trimmed}' can't be created because '{missing}' doesn't exist. \
+                     Create the folder first, or pick one that exists."
                 )));
             }
         }
@@ -5103,5 +5338,120 @@ mod frigate_base_tests {
         assert_eq!(legacy, "http://old-frigate:1984");
         assert_eq!(go2rtc, GO2RTC);
         assert_eq!(http, HTTP);
+    }
+}
+
+// ─── first-run error-message quality (issue #517) ─────────────────────────────
+
+#[cfg(test)]
+mod first_run_message_tests {
+    use super::*;
+
+    fn msg(e: &ApiError) -> String {
+        e.to_string()
+    }
+
+    #[test]
+    fn camera_url_without_a_scheme_is_rejected_with_a_suggestion() {
+        let e = validate_source_url("stream URL", Some("192.0.2.64")).expect_err("no scheme");
+        let m = msg(&e);
+        assert!(m.contains("must start with rtsp://"), "{m}");
+        assert!(m.contains("rtsp://192.0.2.64:554/"), "{m}");
+    }
+
+    #[test]
+    fn camera_url_without_a_scheme_but_with_a_port_suggests_that_port() {
+        let e = validate_source_url("stream URL", Some("192.0.2.64:8554")).expect_err("no scheme");
+        let m = msg(&e);
+        assert!(m.contains("rtsp://192.0.2.64:8554/"), "{m}");
+        assert!(!m.contains(":8554:554"), "{m}");
+    }
+
+    #[test]
+    fn supported_camera_schemes_pass_including_onvif() {
+        for u in [
+            "rtsp://192.0.2.5:554/Streaming/Channels/101",
+            "RTSP://192.0.2.5/live",
+            "rtsps://192.0.2.5/live",
+            "http://192.0.2.5/video.cgi",
+            "https://192.0.2.5/video.cgi",
+            // onvif:// is a first-class Crumb source (go2rtc pulls it and the DB
+            // backfills ONVIF host/creds from it) — it must NOT be rejected.
+            "onvif://admin:pw@192.0.2.5",
+        ] {
+            assert!(
+                validate_source_url("stream URL", Some(u)).is_ok(),
+                "rejected {u}"
+            );
+        }
+        // Blank / absent is the "no URL yet" flow, handled elsewhere.
+        assert!(validate_source_url("stream URL", None).is_ok());
+        assert!(validate_source_url("stream URL", Some("   ")).is_ok());
+    }
+
+    #[test]
+    fn unsupported_camera_scheme_is_rejected_without_echoing_credentials() {
+        let e = validate_source_url("stream URL", Some("ftp://bob:hunter2@192.0.2.5/x"))
+            .expect_err("ftp");
+        let m = msg(&e);
+        assert!(!m.contains("hunter2"), "{m}");
+        assert!(m.contains("…@192.0.2.5/x"), "{m}");
+    }
+
+    #[test]
+    fn storage_path_mistakes_get_distinct_diagnoses() {
+        // Deliberately env-independent: MEDIA_ROOT defaults to /data.
+        let empty = msg(&validate_storage_path("   ").expect_err("empty"));
+        assert!(empty.contains("Enter the folder"), "{empty}");
+
+        let rel = msg(&validate_storage_path("media").expect_err("relative"));
+        assert!(rel.contains("must be absolute"), "{rel}");
+        assert!(rel.contains("'media'"), "{rel}");
+
+        let outside = msg(&validate_storage_path("/etc/crumb").expect_err("outside root"));
+        assert!(
+            outside.contains("outside the recorder's writable area"),
+            "{outside}"
+        );
+    }
+
+    #[test]
+    fn missing_ancestor_is_named_rather_than_blamed_on_permissions() {
+        let tmp = std::env::temp_dir().join(format!("crumb-517-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let deep = tmp.join("a/b/c/d");
+        let missing = first_missing_ancestor(&deep).expect("something is missing");
+        assert_eq!(missing, tmp.join("a"));
+        // Everything present ⇒ nothing missing.
+        assert!(first_missing_ancestor(&tmp).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mode_verdict_tells_a_writable_folder_from_a_locked_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("crumb-517-mode-{}", std::process::id()));
+        let open = base.join("open");
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&open).expect("mkdir open");
+        std::fs::create_dir_all(&locked).expect("mkdir locked");
+
+        // World-writable is writable for anyone, whatever uid the test runs as.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(recorder_mode_verdict(&open).expect("metadata").writable);
+
+        // r-xr-xr-x with no matching uid/gid: not writable by the recorder's uid.
+        // (Skipped when the tests run as root, which bypasses mode bits and would
+        // make the folder writable in practice.)
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let v = recorder_mode_verdict(&locked).expect("metadata");
+        if v.uid != RECORDER_UID && v.uid != 0 {
+            assert!(!v.writable, "0o555 folder reported writable: {v:?}");
+        }
+
+        assert!(recorder_mode_verdict(&base.join("does-not-exist")).is_none());
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
