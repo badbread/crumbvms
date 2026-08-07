@@ -1362,6 +1362,131 @@ async fn scoped_media_token_plays_only_its_camera() {
 }
 
 #[tokio::test]
+async fn scoped_media_token_cannot_redeem_for_the_restream_credential() {
+    // A media token is worth "one camera's bytes for ~15 minutes". That holds
+    // only if nothing it can reach hands back something stronger.
+    // `GET /cameras/{id}/streams` returns RTSP URLs carrying the server's
+    // go2rtc restreamer credentials — long-lived and covering every camera — so
+    // it takes `FullSessionUser` and refuses a media-token principal outright.
+    let fx = build_rbac_fixture().await;
+
+    // Minted by an ADMIN for a camera the admin can obviously reach, so a
+    // failure here can only be the media-token gate, never camera scoping.
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    let denied = fx
+        .app
+        .send(get(&format!("/cameras/{}/streams?token={media}", fx.cam_a)))
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a scoped media token must NOT be redeemable for the go2rtc restream credential"
+    );
+
+    // Control: the same camera over a full login session still works, so the
+    // assertion above is about the principal type and not a broken route. This
+    // is the path all four clients actually use (Authorization: Bearer, during
+    // session setup).
+    let ok = fx
+        .app
+        .send(get_auth(
+            &format!("/cameras/{}/streams", fx.cam_a),
+            &fx.admin_token,
+        ))
+        .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a full bearer session must still reach /streams"
+    );
+
+    // And the media token is not broken in general — it still serves the media
+    // it is actually for.
+    let pool = fx.app.pool().clone();
+    let storage_id = seed_storage(&pool, fx.storage_root.path().to_str().unwrap()).await;
+    let seg = seed_segment_with_file(&pool, fx.cam_a, storage_id, fx.storage_root.path()).await;
+    let media_ok = fx
+        .app
+        .send(get(&format!("/segments/{seg}?token={media}")))
+        .await;
+    assert_eq!(
+        media_ok.status(),
+        StatusCode::OK,
+        "the media token must still serve its own camera's segments"
+    );
+}
+
+// ─── CORS: the /auth carve-out ────────────────────────────────────────────────
+
+/// Header name the tests below assert on.
+const ACAO: &str = "access-control-allow-origin";
+
+/// A cross-origin-looking request: same shape a hostile page's `fetch()` would
+/// produce.
+fn get_with_origin(uri: &str) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("origin", "https://not-your-server.example")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn auth_routes_do_not_send_a_wildcard_cors_header() {
+    // `Access-Control-Allow-Origin: *` on /auth would let any page the operator
+    // happens to load script their server's credential surface: creating the
+    // first admin on a not-yet-bootstrapped install (POST /auth/bootstrap is
+    // unauthenticated by design), and reading /auth/login responses instead of
+    // being blind to them. The layer is composed to skip /auth entirely.
+    let app = TestApp::new_with_cors().await;
+
+    let resp = app.send(get_with_origin("/auth/needs-bootstrap")).await;
+    assert!(
+        resp.headers().get(ACAO).is_none(),
+        "/auth must not carry a CORS allow-origin header, got {:?}",
+        resp.headers().get(ACAO)
+    );
+
+    // The preflight a cross-origin POST would send first. Whatever status axum
+    // returns for it, the browser only proceeds if the CORS headers are there.
+    let preflight = app
+        .send(
+            axum::http::Request::builder()
+                .method("OPTIONS")
+                .uri("/auth/login")
+                .header("origin", "https://not-your-server.example")
+                .header("access-control-request-method", "POST")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(
+        preflight.headers().get(ACAO).is_none(),
+        "an /auth preflight must not be answered with CORS headers"
+    );
+}
+
+#[tokio::test]
+async fn non_auth_routes_still_carry_the_cors_header() {
+    // Control for the test above: proves the carve-out is a carve-out and not
+    // simply a router that lost its CORS layer (which would make the assertion
+    // above pass vacuously). If the project later decides to drop the permissive
+    // layer everywhere, this test is the one to delete — deliberately, not by
+    // accident.
+    let app = TestApp::new_with_cors().await;
+
+    // Unauthenticated, so this 401s — the CORS layer still stamps the response.
+    let resp = app.send(get_with_origin("/status")).await;
+    assert_eq!(
+        resp.headers().get(ACAO).and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "non-/auth routes keep the permissive CORS layer"
+    );
+}
+
+#[tokio::test]
 async fn full_jwt_via_query_token_is_rejected_on_media_routes() {
     // Fail-closed (audit 2026-07-05 #2): the legacy `?token=<full login JWT>`
     // media path is now REJECTED — a login credential in a URL can leak into
