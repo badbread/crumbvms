@@ -1,0 +1,150 @@
+name: Bug report
+description: Report something that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Crumb. The more of this form you fill in, the faster it can be fixed.
+
+        **Do not report security vulnerabilities here.** Use the private path in [SECURITY.md](https://github.com/badbread/crumbvms/blob/main/SECURITY.md).
+
+        New to reporting? [TESTING.md](https://github.com/badbread/crumbvms/blob/main/TESTING.md) explains how to grab the diagnostics bundle and the client logs.
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead.
+      placeholder: "Live view showed a black tile for one camera. I expected video, like the other three cameras on the same wall."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps from a known starting point, including the values you typed. Scrub anything you would not want public.
+      placeholder: |
+        1. Sign in to the admin console
+        2. Cameras, Add camera, paste rtsp://<ip>:554/Streaming/Channels/102
+        3. Click Test stream
+        4. It spins for about 30 seconds, then shows an error
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Where did you see it
+      description: The surface the bug shows up in. Pick the closest one.
+      options:
+        - Web admin console (/admin)
+        - Desktop client (Windows)
+        - Desktop client (macOS)
+        - Android app
+        - iOS app
+        - Server, recording or playback (recorder)
+        - Server, API or setup wizard (api)
+        - Install, Docker Compose, or upgrade
+        - Not sure
+      default: 8
+    validations:
+      required: true
+  - type: input
+    id: server_version
+    attributes:
+      label: Server version
+      description: "Admin console footer, or `curl -s http://<server>:8080/version`, or the image tag you deployed."
+      placeholder: "0.2.0 (sha-1a2b3c4)"
+    validations:
+      required: true
+  - type: input
+    id: client_version
+    attributes:
+      label: Client version
+      description: Version of the client you saw it in. Put "web console" if you were only in a browser (and name the browser).
+      placeholder: "Android 0.2.0, or desktop 0.2.0, or web console (Firefox 141)"
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method
+      options:
+        - Docker Compose, pulled images from GHCR
+        - Docker Compose, built from source
+        - Upgraded an existing install
+        - Other (describe below)
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: host_platform
+    attributes:
+      label: Server host
+      description: OS, version, and architecture of the machine running the stack. Note it if it is a VM, LXC, NAS, or Docker Desktop.
+      placeholder: "Ubuntu 24.04 x86-64, bare metal"
+    validations:
+      required: true
+  - type: input
+    id: client_platform
+    attributes:
+      label: Client platform
+      description: Only if the bug is in a client. Device or OS you were using.
+      placeholder: "Windows 11 24H2, or Pixel 8 / Android 15"
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and hardware decode
+      description: Leave blank if you are on the CPU default.
+      placeholder: "NVIDIA RTX A2000 with nvidia-container-toolkit, MOTION_HWACCEL=nvdec"
+  - type: input
+    id: camera
+    attributes:
+      label: Camera make and model
+      description: Only if a camera is involved. Include the stream (main or sub), resolution, and codec if you know them.
+      placeholder: "Hikvision DS-2CD2143G2-I, sub stream, 640x360 H264"
+  - type: dropdown
+    id: via_frigate
+    attributes:
+      label: Is this camera going through Frigate?
+      options:
+        - "No"
+        - "Yes"
+        - Not applicable
+      default: 2
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: |
+        Paste the relevant lines here, and attach the bigger files by dragging them into this box. See TESTING.md for where each one lives.
+        Scrub secrets and tokens. LAN IPs and camera names are fine.
+      placeholder: |
+        docker compose logs --tail 500 api
+        docker compose logs --tail 500 recorder
+      render: shell
+  - type: checkboxes
+    id: attachments
+    attributes:
+      label: What you attached
+      options:
+        - label: Server diagnostics bundle (admin console, Settings, Detection & clips, Diagnostics, Download bundle)
+        - label: Desktop client diagnostics export (Settings, Diagnostics, Export logs)
+        - label: "`docker compose logs` for api and/or recorder"
+        - label: Screenshot or screen recording
+        - label: None of these apply to this bug
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Config snippets with secrets removed, how often it happens, whether it started after an upgrade, anything you already ruled out.
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and this is not already reported
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md)
+          required: true
