@@ -1289,8 +1289,6 @@ const WIZARD_ALL_STEPS = [
 //   scan   : { range, user, pass, results:[], scanned, total, scanning, done, error, seenIps:Set }
 //   rows   : per-result-index { sel, name, main, sub, verify:{state,thumb,stats,error} }
 //   existing: [{ip-ish keys}] existing cameras (for already-added greying)
-//   group  : { mode:'none'|'existing'|'new', id, name }
-//   groups : existing camera groups
 //   defaultPolicy / defaultStorage : for the storage + recording-target copy
 let WZ = null;
 /* Per-tab persistence of the wizard's current STEP so a refresh resumes there. */
@@ -1379,8 +1377,7 @@ async function openWizard(status) {
     steps, i: 0, server: null, suggested: status || {}, storages: null, _storageId: null,
     defaultPolicy: null, defaultStorage: null,
     scan: wizardFreshScan(),
-    rows: {}, existing: null, groups: null,
-    groupOf: {}, groupNewOpen: false,
+    rows: {}, existing: null,
     commit: null,
     brands: null, probeOk: null,
     // detect-hw / notify / users step state (decode undefined = not fetched yet)
@@ -1404,7 +1401,7 @@ async function openWizard(status) {
   $('app').classList.add('hidden');
   $('wizard-screen').classList.remove('hidden');
   // Already authenticated (entering past admin creation)? Preload server settings.
-  if (!needAdmin && TOKEN) { try { WZ.server = await api('/config/server'); } catch { WZ.server = {}; } }
+  if (!needAdmin && TOKEN) { try { WZ.server = noteServerTz(await api('/config/server')); } catch { WZ.server = {}; } }
   wizardRender();
 }
 
@@ -2705,8 +2702,7 @@ function wizardCommitBody() {
   const stName = (WZ.defaultStorage && (WZ.defaultStorage.name || WZ.defaultStorage.path)) || 'the default disk';
   const days = dp.live_retention_hours ? Math.round(dp.live_retention_hours / 24) : null;
   const capGb = dp.live_max_bytes ? Math.round(dp.live_max_bytes / 1e9) : null;
-  const targetLine = `Ungrouped cameras record continuously to <b>${esc(stName)}</b>${days ? `, keeping ${days} day${days !== 1 ? 's' : ''}` : ''}${capGb ? ` / ${capGb} GB` : ''} (the default policy). Grouped cameras follow their group's policy.`;
-  const groupCtl = wizardGroupBar();
+  const targetLine = `New cameras record continuously to <b>${esc(stName)}</b>${days ? `, keeping ${days} day${days !== 1 ? 's' : ''}` : ''}${capGb ? ` / ${capGb} GB` : ''} (the default policy). Change that any time under <b>Recording</b>.`;
   const rows = items.map((it, k) => {
     const cr = WZ.commit ? WZ.commit[it.key] : null;
     const res = !cr ? '' :
@@ -2714,24 +2710,18 @@ function wizardCommitBody() {
       cr.state === 'run' ? '<span style="color:var(--dim)">adding…</span>' :
       `<span style="color:var(--danger);font-weight:600">✗ ${esc(cr.error || 'failed')}</span>`
         + (cr.conflict ? ` <button class="sm ghost" onclick="wizardRetryConflict('${esc(it.key)}')">Retry as “${esc(cr.suggestName || (it.name + ' 2'))}”</button>` : '');
-    // Once a row is committed its grouping has been applied, show it read-only.
-    const gCell = (cr && cr.state === 'ok')
-      ? `<span style="font-size:12px;color:var(--dim)">${esc((WZ.groups || []).find(x => x.id === WZ.groupOf[it.key])?.name || '—')}</span>`
-      : wizardGroupSelect(it.key);
     return `<tr>
       <td>${esc(it.name)}</td>
       <td class="mono" style="font-size:12px">${esc(it.ip || '—')}</td>
       <td>${it.main ? '<span style="color:var(--ok);font-size:12px">stream set</span>' : '<span style="color:var(--warn);font-size:12px">no URL</span>'}</td>
-      <td>${gCell}</td>
       <td class="td-right">${res}</td>
     </tr>`;
   }).join('');
   return `
     <div class="login-sub" style="margin-top:0;margin-bottom:10px">${targetLine}</div>
-    ${groupCtl}
     <div class="table-wrap" style="border-top:1px solid var(--border);margin-top:12px">
       <table>
-        <thead><tr><th>Name</th><th style="width:16%">IP</th><th style="width:13%">Stream</th><th style="width:22%">Group</th><th style="width:20%" class="td-right">Result</th></tr></thead>
+        <thead><tr><th>Name</th><th style="width:18%">IP</th><th style="width:15%">Stream</th><th style="width:24%" class="td-right">Result</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -2755,142 +2745,6 @@ function wizardCommitItems() {
       onvif_host: m.onvif_host || null, onvif_port: null, onvif_user: m.onvif_user || null, onvif_password: m.onvif_password || null });
   });
   return out;
-}
-
-/* Per-camera group assignment (commercial-VMS-style): each row picks its own group
-   in the review table, some cameras can go in a "motion" group, others in an
-   "always record" group, in one batch. The bar offers a "set all" convenience
-   and inline group creation (created eagerly so it appears in every dropdown). */
-function wizardGroupBar() {
-  const groups = WZ.groups || [];
-  const opts = groups.map(x => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');
-  return `<div style="margin-top:4px">
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span style="font-size:13px;color:var(--dim)">Group <span style="color:var(--dim2)">(optional, a group applies one recording policy, e.g. motion-only vs always-record)</span>:</span>
-      <select onchange="wizardGroupSetAll(this.value)">
-        <option value="__hdr" selected>set all to…</option>
-        <option value="">No group</option>
-        ${opts}
-      </select>
-      <button class="sm ghost" onclick="wizardGroupNewToggle()">${WZ.groupNewOpen ? 'Cancel' : '＋ New group'}</button>
-      ${WZ.groupNewOpen ? `<input id="wz-group-new-name" placeholder="Group name (e.g. Motion only)" style="width:190px" onkeydown="if(event.key==='Enter'){event.preventDefault();wizardGroupCreate();}" />
-        <button class="sm" onclick="wizardGroupCreate()">Create</button>` : ''}
-    </div>
-    ${wizardGroupManager(groups)}
-    <div class="login-sub" style="margin-top:6px">Pick per camera in the table below, different cameras can go in different groups. Policies are edited later under <b>Recording</b>.</div>
-  </div>`;
-}
-
-/* Created-groups manager: a compact chip list of the existing groups so the
-   operator can SEE what they've made this session, rename a typo, or delete one
-   they didn't mean to create, without leaving the review step. Rename uses
-   PUT /config/groups/:id; delete uses DELETE /config/groups/:id (both already
-   exist). WZ.groupRenaming holds the id currently in inline-edit. */
-function wizardGroupManager(groups) {
-  groups = groups || [];
-  if (!groups.length) return '';
-  const chips = groups.map(g => {
-    if (WZ.groupRenaming === g.id) {
-      return `<span style="display:inline-flex;align-items:center;gap:4px;border:1px solid var(--accent);border-radius:12px;padding:2px 4px 2px 8px;background:var(--panel)">
-        <input id="wz-group-rn-${esc(g.id)}" value="${esc(g.name)}" style="font-size:12px;width:130px;border:none;background:transparent;padding:2px"
-          onkeydown="if(event.key==='Enter'){event.preventDefault();wizardGroupRenameCommit('${esc(g.id)}');}else if(event.key==='Escape'){event.preventDefault();wizardGroupRenameCancel();}" />
-        <button class="sm" onclick="wizardGroupRenameCommit('${esc(g.id)}')" style="padding:1px 7px">Save</button>
-        <button class="sm ghost" onclick="wizardGroupRenameCancel()" style="padding:1px 7px">✕</button>
-      </span>`;
-    }
-    const memberCount = ((g.camera_ids || []).length);
-    return `<span style="display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:12px;padding:3px 6px 3px 10px;background:var(--panel)">
-      <span style="font-size:12px;color:var(--text)">${esc(g.name)}</span>
-      ${memberCount ? `<span style="font-size:10px;color:var(--dim2)">${memberCount} cam${memberCount !== 1 ? 's' : ''}</span>` : ''}
-      ${WZ.groupRenameOk !== false ? `<button class="sm ghost" title="Rename" onclick="wizardGroupRenameStart('${esc(g.id)}')" style="padding:0 5px;font-size:12px">✎</button>` : ''}
-      <button class="sm ghost" title="Delete group" onclick="wizardGroupDelete('${esc(g.id)}')" style="padding:0 6px;font-size:13px;color:var(--danger)">×</button>
-    </span>`;
-  }).join('');
-  return `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px">
-    <span style="font-size:11px;color:var(--dim2);text-transform:uppercase;letter-spacing:.4px;font-weight:600">Groups</span>
-    ${chips}
-  </div>`;
-}
-function wizardGroupSetAll(v) {
-  if (v === '__hdr') return;
-  for (const it of wizardCommitItems()) WZ.groupOf[it.key] = v;
-  if (wizardStepKey() === 'cam-commit') wizardBodySet(wizardCommitBody());
-}
-function wizardGroupNewToggle() {
-  WZ.groupNewOpen = !WZ.groupNewOpen;
-  if (wizardStepKey() === 'cam-commit') wizardBodySet(wizardCommitBody());
-  const inp = $('wz-group-new-name'); if (inp) inp.focus();
-}
-async function wizardGroupCreate() {
-  const name = (($('wz-group-new-name') || {}).value || '').trim();
-  if (!name) { wizardMsg('Enter a group name.'); return; }
-  try {
-    const created = await api('/config/groups', { method: 'POST', body: JSON.stringify({ name }) });
-    WZ.groups = [...(WZ.groups || []), created];
-    WZ.groupNewOpen = false;
-    if (wizardStepKey() === 'cam-commit') wizardBodySet(wizardCommitBody());
-    toast(`Group “${name}” created, assign cameras to it below.`);
-  } catch (e) { wizardMsg('Create group failed: ' + (e && e.message ? e.message : e)); }
-}
-
-/* Host-correct re-render of the review step (wizardBodySet dispatches to the
-   right container, #wizard-body for the wizard, #ca-disc-body for the console). */
-function wizardGroupMgrRefresh() {
-  if (wizardStepKey() === 'cam-commit') wizardBodySet(wizardCommitBody());
-}
-function wizardGroupRenameStart(id) {
-  WZ.groupRenaming = id;
-  wizardGroupMgrRefresh();
-  const inp = $('wz-group-rn-' + id); if (inp) { inp.focus(); inp.select(); }
-}
-function wizardGroupRenameCancel() { WZ.groupRenaming = null; wizardGroupMgrRefresh(); }
-async function wizardGroupRenameCommit(id) {
-  const inp = $('wz-group-rn-' + id);
-  const name = ((inp && inp.value) || '').trim();
-  const g = (WZ.groups || []).find(x => x.id === id);
-  if (!name) { wizardMsg('Group name can\'t be blank.'); return; }
-  if (g && g.name === name) { WZ.groupRenaming = null; wizardGroupMgrRefresh(); return; }
-  try {
-    const updated = await api('/config/groups/' + id, { method: 'PUT', body: JSON.stringify({ name }) });
-    WZ.groups = (WZ.groups || []).map(x => x.id === id ? Object.assign({}, x, updated || { name }) : x);
-    WZ.groupRenaming = null;
-    wizardGroupMgrRefresh();
-    toast(`Group renamed to “${name}”.`);
-  } catch (e) {
-    // Feature-detect: if PUT-rename isn't available on this server, degrade to
-    // delete-only so the manager still works.
-    const msg = (e && e.message) ? e.message : String(e);
-    if (/404|405|not found|method not allowed/i.test(msg)) {
-      WZ.groupRenameOk = false; WZ.groupRenaming = null; wizardGroupMgrRefresh();
-      wizardMsg('Renaming groups isn\'t supported on this server, you can still delete and recreate.');
-    } else {
-      wizardMsg('Rename failed: ' + msg);
-    }
-  }
-}
-async function wizardGroupDelete(id) {
-  const g = (WZ.groups || []).find(x => x.id === id);
-  const memberCount = (g && g.camera_ids || []).length;
-  // Guard: a group that already has members needs confirmation; a brand-new empty
-  // group deletes freely.
-  if (memberCount > 0 && !confirm(`Delete “${(g && g.name) || 'this group'}”? Its ${memberCount} camera${memberCount !== 1 ? 's' : ''} will keep recording but revert to the default policy.`)) return;
-  try {
-    await api('/config/groups/' + id, { method: 'DELETE' });
-    WZ.groups = (WZ.groups || []).filter(x => x.id !== id);
-    // Don't strand a WZ.groupOf pointer at the now-deleted group.
-    for (const k of Object.keys(WZ.groupOf || {})) { if (WZ.groupOf[k] === id) WZ.groupOf[k] = ''; }
-    if (WZ.groupRenaming === id) WZ.groupRenaming = null;
-    wizardGroupMgrRefresh();
-    toast(`Group “${(g && g.name) || ''}” deleted.`);
-  } catch (e) { wizardMsg('Delete group failed: ' + (e && e.message ? e.message : e)); }
-}
-function wizardGroupSelect(key) {
-  const groups = WZ.groups || [];
-  const sel = WZ.groupOf[key] || '';
-  return `<select onchange="WZ.groupOf['${esc(key)}']=this.value" style="font-size:12px;max-width:170px">
-    <option value="">No group</option>
-    ${groups.map(x => `<option value="${esc(x.id)}" ${sel === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
-  </select>`;
 }
 
 /* POST one camera. Returns { ok } or { conflict } or { error }. Uses a raw fetch
@@ -2925,10 +2779,6 @@ async function wizardCommit() {
     else { WZ.commit[it.key] = { state: 'err', error: r.error || 'failed' }; }
     wizardBodySet(wizardCommitBody());
   }
-  // Apply per-camera group membership for everything that DID get created —
-  // even when some rows failed, the successful ones get their grouping.
-  try { await wizardApplyGroups(items); }
-  catch (e) { wizardMsg('Cameras added, but grouping failed: ' + (e && e.message ? e.message : e)); }
   const failed = items.filter(it => { const c = WZ.commit[it.key]; return !c || c.state !== 'ok'; });
   if (failed.length) {
     // (The console host has no Skip button, same code path, host-fitted copy.)
@@ -2938,28 +2788,6 @@ async function wizardCommit() {
   // Refresh existing-camera list so a re-run greys the new ones.
   try { WZ.existing = await api('/config/cameras'); } catch (_) {}
   return true;
-}
-
-/* Apply each successfully-created camera's chosen group (§3.4, per-camera):
-   bucket new ids by group, then one members-PUT per group (existing ∪ new).
-   Rows already grouped on a previous pass are skipped via _grouped. */
-async function wizardApplyGroups(items) {
-  const byGroup = {};
-  for (const it of items) {
-    const cr = WZ.commit[it.key];
-    const gid = WZ.groupOf[it.key];
-    if (!cr || cr.state !== 'ok' || !cr.id || cr._grouped || !gid) continue;
-    (byGroup[gid] = byGroup[gid] || []).push(it.key);
-  }
-  for (const gid of Object.keys(byGroup)) {
-    const grp = (WZ.groups || []).find(x => x.id === gid);
-    const existingMembers = (grp && grp.camera_ids) || [];
-    const ids = byGroup[gid].map(k => WZ.commit[k].id);
-    const members = Array.from(new Set([...existingMembers, ...ids]));
-    await api('/config/groups/' + gid + '/members', { method: 'PUT', body: JSON.stringify({ camera_ids: members }) });
-    if (grp) grp.camera_ids = members; // keep the local copy current for the next bucket/pass
-    for (const k of byGroup[gid]) WZ.commit[k]._grouped = true;
-  }
 }
 
 /* Retry a name-conflicted create under a suffixed name. */
@@ -2973,8 +2801,6 @@ async function wizardRetryConflict(key) {
   const r = await wizardCreateCamera(it);
   if (r.ok) {
     WZ.commit[key] = { state: 'ok', id: r.id };
-    // Apply this camera's chosen group too (self-filters via _grouped).
-    try { await wizardApplyGroups(items); } catch (_) { /* surfaced on next commit pass */ }
   }
   else if (r.conflict) WZ.commit[key] = { state: 'err', error: r.error, conflict: true, suggestName: it.name + ' 2' };
   else WZ.commit[key] = { state: 'err', error: r.error || 'failed' };
@@ -3001,7 +2827,7 @@ async function wizardSave(key) {
     if (p !== p2) { wizardMsg('Passwords do not match.'); return false; }
     const data = await api('/auth/bootstrap', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
     TOKEN = data.token; localStorage.setItem('crumb_admin_token', TOKEN);
-    try { WZ.server = await api('/config/server'); } catch { WZ.server = {}; }
+    try { WZ.server = noteServerTz(await api('/config/server')); } catch { WZ.server = {}; }
     return true;
   }
   if (key === 'server') {
@@ -3012,7 +2838,7 @@ async function wizardSave(key) {
     // and broke them on every wizard-installed system.
     const body = Object.assign(wizardServerBody(), { server_address: addr, crumb_rtsp_base: rtsp });
     await api('/config/server', { method: 'PUT', body: JSON.stringify(body) });
-    WZ.server = await api('/config/server');
+    WZ.server = noteServerTz(await api('/config/server'));
     return true;
   }
   if (key === 'storage') {
@@ -3077,8 +2903,6 @@ async function wizardSave(key) {
       const hasAny = (m.name || '').trim() || (m.main || '').trim() || (m.ip || '').trim();
       if (hasAny && (!(m.name || '').trim() || !(m.main || '').trim())) { wizardMsg('Each manually-added camera needs a name and a main stream URL, press Discover to find it, or type the URL (or remove the empty row).'); return false; }
     }
-    // Load groups for the recording-target control on the next step.
-    if (WZ.groups === null) { try { WZ.groups = await api('/config/groups'); } catch { WZ.groups = []; } }
     return true;
   }
   if (key === 'cam-commit') {
@@ -3088,7 +2912,7 @@ async function wizardSave(key) {
     const go2 = ($('wz-frg-go2rtc').value || '').trim(), http = ($('wz-frg-http').value || '').trim();
     const body = Object.assign(wizardServerBody(), { frigate_go2rtc_api_base: go2, frigate_http_api_base: http, frigate_api_base: go2 });
     await api('/config/server', { method: 'PUT', body: JSON.stringify(body) });
-    WZ.server = await api('/config/server');
+    WZ.server = noteServerTz(await api('/config/server'));
     return true;
   }
   if (key === 'detect-hw') {
@@ -3101,7 +2925,7 @@ async function wizardSave(key) {
       motion_vaapi_device: pick === 'vaapi' ? (dev || '/dev/dri/renderD128') : ((WZ.server || {}).motion_vaapi_device || ''),
     });
     await api('/config/server', { method: 'PUT', body: JSON.stringify(body) });
-    WZ.server = await api('/config/server');
+    WZ.server = noteServerTz(await api('/config/server'));
     return true;
   }
   if (key === 'notify') {
@@ -3517,16 +3341,38 @@ function describeSchedule(s) {
 }
 
 /* The IANA zone the SERVER evaluates schedules in, reported by GET /config/server
-   (#237). Falls back to America/Los_Angeles for an old backend that doesn't send
-   it, matching the server's own default. */
+   (#237).
+
+   This is cached on its own (SERVER_TZ) rather than read out of the wizard state:
+   WZ is null in every session that didn't run the wizard, so reading WZ.server
+   here threw a TypeError and blanked whatever was rendering (the archive-enabled
+   profile page, the schedule control, the policy banners). Worse, an empty
+   schedule control reads back as "no schedule", which a subsequent save would
+   have persisted as a CLEARED cron. serverTz() must therefore never throw:
+   cached value → wizard state (populated first during a wizard run) → ''.
+   '' means "unknown", callers degrade to zone-less copy instead of asserting a
+   zone we don't actually know. */
+let SERVER_TZ = '';
+/* Remember the tz off any GET/PUT /config/server response. Tolerates null. */
+function noteServerTz(sv) {
+  const tz = sv && sv.tz;
+  if (typeof tz === 'string' && tz) SERVER_TZ = tz;
+  return sv;
+}
 function serverTz() {
-  const tz = WZ.server && WZ.server.tz;
-  return (typeof tz === 'string' && tz) ? tz : 'America/Los_Angeles';
+  if (SERVER_TZ) return SERVER_TZ;
+  try {
+    const tz = (typeof WZ !== 'undefined' && WZ && WZ.server) ? WZ.server.tz : null;
+    if (typeof tz === 'string' && tz) return tz;
+  } catch (_) { /* never let a tz lookup break a render */ }
+  return '';
 }
 /* Short human label for the server's zone (e.g. "PST", "CET", "GMT+9") for
-   inline schedule copy; falls back to the IANA name if the browser can't. */
+   inline schedule copy; falls back to the IANA name if the browser can't, and to
+   a neutral "server time" when the zone is unknown. */
 function serverTzLabel() {
   const tz = serverTz();
+  if (!tz) return 'server time';
   try {
     const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
       .formatToParts(new Date());
@@ -3537,11 +3383,18 @@ function serverTzLabel() {
 /* "Next run" preview computed in the server's schedule timezone. */
 function nextRunPreview(s) {
   if (!s || s.type === 'none' || s.type === 'custom') return '';
+  // Without a known server zone there is no honest "next run" to compute (the
+  // browser's zone is not the server's), so say nothing rather than guess.
+  const tz = serverTz();
+  if (!tz) return '';
   // Current wall-clock components in the server's zone.
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: serverTz(), hour12: false,
-    weekday: 'short', hour: '2-digit', minute: '2-digit'
-  }).formatToParts(new Date());
+  let parts;
+  try {
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false,
+      weekday: 'short', hour: '2-digit', minute: '2-digit'
+    }).formatToParts(new Date());
+  } catch (_) { return ''; } // unknown/invalid zone → no preview, never throw
   const get = t => parts.find(p => p.type === t)?.value;
   let H = parseInt(get('hour'), 10); if (H === 24) H = 0;
   const M = parseInt(get('minute'), 10);
@@ -3659,7 +3512,9 @@ function renderSchedControl(pfx, cron) {
       ${customRow}
     </div>
     <div class="sched-preview" id="${pfx}-sched-preview"></div>
-    <div class="sched-tz">Schedules run in ${esc(serverTz())} time (set by the server's TZ).</div>`;
+    <div class="sched-tz">${serverTz()
+      ? `Schedules run in ${esc(serverTz())} time (set by the server's TZ).`
+      : `Schedules run in the server's own timezone (set by its TZ).`}</div>`;
 
   schedChanged(pfx);
 }
@@ -3760,6 +3615,14 @@ async function ensureUsers() {
 async function ensureRoles() {
   try { ROLES = await api('/config/roles'); } catch { ROLES = []; }
   return ROLES;
+}
+/* Cache the server's schedule timezone for serverTz(). Fail-soft: a non-admin
+   session (the endpoint is admin-only) or a hiccup simply leaves SERVER_TZ
+   empty, and schedule copy degrades to "server time" instead of blowing up a
+   render. */
+async function ensureServerTz() {
+  try { noteServerTz(await api('/config/server')); } catch { /* keep whatever we have */ }
+  return SERVER_TZ;
 }
 function groupOfCamera(camId) { return (GROUPS || []).find(g => (g.camera_ids || []).includes(camId)) || null; }
 function groupName(camId) { const g = groupOfCamera(camId); return g ? g.name : null; }
@@ -3866,6 +3729,9 @@ function directCamsForProfile(profileId) {
 async function loadAll() {
   await ensureStorages(); await ensurePolicies(); await ensureDefaultPolicy();
   await ensureGroups(); await ensureCams(); await ensureUsers(); await ensureRoles();
+  // Schedule copy needs the server's zone in EVERY session, not just after a
+  // wizard run (see serverTz()).
+  await ensureServerTz();
   // LPR config gates the Plates nav entry; fail-soft so a config hiccup never
   // blanks the tree (Plates simply stays hidden).
   try { LPR_CONFIG = await api('/config/lpr'); } catch { LPR_CONFIG = null; }
@@ -4690,8 +4556,7 @@ function consoleDiscEnsure() {
     steps: [], i: 0, server: null, suggested: {},
     storages: null, _storageId: null, defaultPolicy: null, defaultStorage: null,
     scan: wizardFreshScan(),
-    rows: {}, existing: null, groups: null,
-    groupOf: {}, groupNewOpen: false, commit: null,
+    rows: {}, existing: null, commit: null,
     brands: null, probeOk: null,
   };
   wizardLoadBrands();
@@ -6315,7 +6180,7 @@ function renderCamMotionTab(c) {
       <div class="cm-painter-bar">
         <span class="cm-hint" id="cm-mask-status"></span>
         <button class="ghost sm" onclick="cmClearMask()">Clear all</button>
-        <button class="primary sm" onclick="cmSaveMask()">Save zones</button>
+        <button class="primary sm" onclick="cmSaveMask()" title="Saves just the painted zones and grid. The Save button at the top of the camera saves these too, along with every other change on this tab.">Save zones only</button>
       </div>
       <div id="cm-mask-err" class="field-err hidden"></div>
     </div>
@@ -7333,7 +7198,7 @@ async function saveDetectionServer() {
     motion_vaapi_device:     $('srv-vaapi-device') ? $('srv-vaapi-device').value.trim() : (s.motion_vaapi_device || ''),
   };
   try {
-    const updated = await api('/config/server', { method: 'PUT', body: JSON.stringify(body) });
+    const updated = noteServerTz(await api('/config/server', { method: 'PUT', body: JSON.stringify(body) }));
     DETECTION_SERVER = updated || DETECTION_SERVER;
     toast('Detection settings saved.');
     // The recorder hot-reloads its motion workers within a few seconds, poll
@@ -7432,7 +7297,7 @@ async function renderServerSettings() {
   selKind = 'server-root'; selId = null;
   $('right-pane').innerHTML = `<div class="rp-head"><div class="rp-head-left"><span class="rp-head-icon">${icon('storage',22)}</span><div class="rp-head-titles"><div class="rp-head-title">Server</div><div class="rp-head-sub">Loading…</div></div></div></div>`;
   let s;
-  try { s = await api('/config/server'); }
+  try { s = noteServerTz(await api('/config/server')); }
   catch (e) { $('right-pane').innerHTML += `<div class="policy-section"><div class="form-msg err">${esc(e.message)}</div></div>`; return; }
   // Stash the full settings so saveServerSettings() can send a COMPLETE body:
   // /config/server is a whole-row replace and the Frigate/motion columns now live
@@ -7547,7 +7412,7 @@ async function saveServerSettings() {
     motion_vaapi_device:     s.motion_vaapi_device || '',
   };
   try {
-    const updated = await api('/config/server', { method: 'PUT', body: JSON.stringify(body) });
+    const updated = noteServerTz(await api('/config/server', { method: 'PUT', body: JSON.stringify(body) }));
     SERVER_SETTINGS = updated || SERVER_SETTINGS;
     toast('Server settings saved.');
     renderServerSettings();
@@ -7964,19 +7829,6 @@ function profileSelectLabel(p) {
   return `${p.name || 'Default'} (${bits.join(' / ')})`;
 }
 
-function ceGroupChanged() {
-  const sel = $('ce-group');
-  if (sel.value === '__new__') {
-    const name = prompt('Name for the new group:');
-    if (name && name.trim()) {
-      api('/config/groups', { method: 'POST', body: JSON.stringify({ name: name.trim() }) })
-        .then(async () => { await ensureGroups(); toast('Group created.'); renderTree(); renderCamera(selId); })
-        .catch(e => toast(e.message, 'err'));
-    } else { sel.value = ''; }
-  }
-  ceAssignChanged();
-}
-
 /* Phase 3: one control — the policy select. The banner previews whatever policy
    is currently selected; the assignment persists on the camera's Save button. */
 function ceAssignChanged() { renderCeBanner(); }
@@ -8121,6 +7973,18 @@ async function saveCamEdit() {
     if ($('ce-motion-ha')) camBody.motion_ha_enabled = $('ce-motion-ha').checked;
     if ($('ce-motion-algorithm')) camBody.motion_algorithm = $('ce-motion-algorithm').value;
 
+    // Exclusion zones (Detection tab). The painter's state lives in cmState, not
+    // in form fields, so a header Save that ignored it PUT the camera and then
+    // re-rendered from the server, silently discarding everything just painted.
+    // Whenever the painter is mounted for THIS camera, its mask + authoring grid
+    // ride along with the rest of the save. (The "Save zones only" button remains
+    // as the quick path that touches nothing else.)
+    if (cmPainterActive()) {
+      camBody.motion_mask = cmCellsToMask();
+      camBody.motion_grid_cols = cmState.cols;
+      camBody.motion_grid_rows = cmState.rows;
+    }
+
     // Groups are retired (Phase 3), so a camera is never "grouped" now. The flag
     // is kept because the Motion-tab override write below still reads it (it stays
     // false, so that path is simply always allowed for an ungrouped camera).
@@ -8182,38 +8046,6 @@ async function saveCamEdit() {
     if (devTransition) showDeviationToast(devTransition);
     else toast('Camera saved.');
   } catch (e) { setMsg('ce-msg', e.message, 'err'); }
-}
-
-/* Move a camera into `groupId` (or out of all groups if blank). */
-async function applyGroupMembership(camId, groupId) {
-  const current = groupOfCamera(camId);
-  const target = (groupId && groupId !== '__new__') ? groupId : null;
-  if ((current ? current.id : null) === target) return; // no change
-  if (current) {
-    const ids = (current.camera_ids || []).filter(x => x !== camId);
-    await api('/config/groups/' + current.id + '/members', { method: 'PUT', body: JSON.stringify({ camera_ids: ids }) });
-  }
-  if (target) {
-    const tg = (GROUPS||[]).find(g => g.id === target);
-    const ids = [...new Set([...(tg ? tg.camera_ids||[] : []), camId])];
-    await api('/config/groups/' + target + '/members', { method: 'PUT', body: JSON.stringify({ camera_ids: ids }) });
-  }
-  await ensureGroups();
-}
-
-/* Phase 3: ungroup a camera so per-camera storage/profile overrides become
-   available. Removes it from its current group (reusing applyGroupMembership's
-   members-replace primitive with a null target) and re-renders the camera, the
-   Storage tab now takes the UNGROUPED branch and exposes the override controls. */
-async function ceUngroup(camId) {
-  setMsg('ce-msg', '');
-  try {
-    await applyGroupMembership(camId, null);
-    toast('Camera ungrouped, you can now set per-camera storage.');
-    await ensureCams();
-    renderTree();
-    renderCamera(camId);
-  } catch (e) { setMsg('ce-msg', e.message, 'err'); toast(e.message, 'err', 5000); }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -8965,20 +8797,6 @@ async function delGroup(id) {
   } catch (e) { setMsg('ge-msg', e.message, 'err'); toast(e.message, 'err', 5000); }
 }
 
-/* Create a new group, then select it so the operator can immediately assign a
-   profile + members. Used by the Cameras-root "+ New group" affordance. */
-async function newGroup() {
-  const name = prompt('Name for the new group:');
-  if (!name || !name.trim()) return;
-  try {
-    const created = await api('/config/groups', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
-    toast('Group created.');
-    await ensureGroups();
-    renderTree();
-    if (created && created.id) select('group', created.id);
-  } catch (e) { toast(e.message, 'err', 5000); }
-}
-
 function renderProfile(id) {
   selKind = 'profile'; selId = id;
   if (id === '__new__') { profileEditMode = true; renderProfileEdit(null); return; }
@@ -8997,6 +8815,13 @@ function renderProfile(id) {
   if (direct.length) refBits.push(`${direct.length} camera${direct.length!==1?'s':''}`);
   if (viaGroups.length) refBits.push(`${viaGroups.length} group${viaGroups.length!==1?'s':''}`);
   const profRemoveDisabled = !isDefault && refBits.length > 0;
+  // What the operator can actually DO about it, from THIS screen. Cameras move
+  // with "Assign cameras" below. Legacy camera groups have no console screen, so
+  // state the fact instead of pointing at a page that doesn't exist.
+  const reassignHint = [
+    direct.length ? 'Move those cameras to another profile with “Assign cameras” below' : '',
+    viaGroups.length ? `${viaGroups.length} legacy camera group${viaGroups.length!==1?'s':''} still point${viaGroups.length===1?'s':''} at it` : '',
+  ].filter(Boolean).join('; ');
 
   $('right-pane').innerHTML = `
     <div class="rp-head">
@@ -9013,7 +8838,7 @@ function renderProfile(id) {
         ${isDefault ? '' : `<button class="danger-ghost" onclick="delProfile('${esc(p.id)}')" ${profRemoveDisabled?`disabled title="Assigned to ${esc(refBits.join(' and '))}, reassign before deleting"`:''}>Remove</button>`}
       </div>
     </div>
-    ${profRemoveDisabled?`<div class="warn-note" style="margin-top:0">This profile is assigned to ${esc(refBits.join(' and '))}. Reassign ${direct.length?'those cameras':''}${direct.length&&viaGroups.length?' / ':''}${viaGroups.length?'those groups':''} to another profile before it can be deleted.</div>`:''}
+    ${profRemoveDisabled?`<div class="warn-note" style="margin-top:0">This profile is assigned to ${esc(refBits.join(' and '))}, so it can't be deleted yet. ${esc(reassignHint)}.</div>`:''}
 
     <div class="policy-section" style="margin-top:0">
       <div class="policy-section-title">Recording behavior</div>
@@ -9111,7 +8936,7 @@ function renderProfileEdit(p) {
       <div class="rp-head-actions">
         <button class="primary" onclick="saveProfile()">Save</button>
         <button class="ghost" onclick="cancelProfileEdit()">Cancel</button>
-        ${(!isNew && !isDefault) ? `<button class="danger-ghost" onclick="delProfile('${esc(p.id)}')" ${peRemoveDisabled?'disabled title="Reassign its cameras/groups to another profile before deleting"':''}>Remove</button>` : ''}
+        ${(!isNew && !isDefault) ? `<button class="danger-ghost" onclick="delProfile('${esc(p.id)}')" ${peRemoveDisabled?'disabled title="Still in use, deleting is blocked while cameras or groups reference this profile"':''}>Remove</button>` : ''}
       </div>
     </div>
     <div id="pe-form-body"></div>
@@ -9203,14 +9028,13 @@ function openAssignPanel(profileId) {
   const assignedIds = new Set(assigned.map(c => c.id));
   const available = (CAMS||[]).filter(c => !assignedIds.has(c.id));
   const row = c => {
+    // Group membership is informational only. The Phase-3 server rule that
+    // rejected pinning a grouped camera to a policy is gone (migration 0068:
+    // groups write through to the camera's policy_id), so every camera is
+    // assignable here; the group name just says where it came from.
     const grp = groupName(c.id);
-    // A grouped camera follows its GROUP's profile and cannot be pinned to a
-    // profile directly (the server rejects it), render it disabled with a pointer
-    // to assign the group instead, so a save can't silently fail on it.
-    if (grp) {
-      return `<label class="chk" style="padding:3px 0;opacity:.5" title="Controlled by group ${esc(grp)}, assign the group to a profile instead"><input type="checkbox" disabled/> ${esc(c.name)} <span style="color:var(--dim2);font-size:11px">· follows group ${esc(grp)}</span></label>`;
-    }
-    return `<label class="chk" style="padding:3px 0"><input type="checkbox" value="${c.id}" ${assignedIds.has(c.id)?'checked':''}/> ${esc(c.name)}</label>`;
+    const grpNote = grp ? ` <span style="color:var(--dim2);font-size:11px">· follows group ${esc(grp)}</span>` : '';
+    return `<label class="chk" style="padding:3px 0"><input type="checkbox" value="${c.id}" ${assignedIds.has(c.id)?'checked':''}/> ${esc(c.name)}${grpNote}</label>`;
   };
   panel.innerHTML = `
     <div class="inline-expander">
@@ -9226,7 +9050,7 @@ function openAssignPanel(profileId) {
           <div class="checklist-box" id="assign-avail-${profileId}">${available.map(row).join('') || '<span style="color:var(--dim2);font-size:12px">None</span>'}</div>
         </div>
       </div>
-      <div class="card-hint" style="margin-top:8px">Assigning a camera here pins it directly to this profile (overriding any group inheritance).</div>
+      <div class="card-hint" style="margin-top:8px">Assigning a camera here pins it directly to this profile.</div>
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="primary sm" onclick="saveAssign('${profileId}')">Save assignment</button>
         <button class="ghost sm" onclick="openAssignPanel('${profileId}')">Cancel</button>
@@ -9278,63 +9102,6 @@ async function saveAssign(profileId) {
     renderTree();
     renderProfile(profileId);
   } catch (e) { setMsg('assign-msg-'+profileId, e.message, 'err'); }
-}
-
-/* Assign whole camera GROUPS to a profile (sets each group's policy_id). This is
-   the correct way to put grouped cameras on a profile, grouped cameras can't be
-   pinned individually. Mirrors openAssignPanel/saveAssign but operates on groups. */
-function openAssignGroupPanel(profileId) {
-  const panel = $('assign-group-panel-' + profileId);
-  if (!panel) return;
-  if (panel.dataset.open === '1') { panel.innerHTML = ''; panel.dataset.open = '0'; return; }
-  panel.dataset.open = '1';
-  const groups = (GROUPS || []).slice().sort((a, b) => (a.name || '').toLowerCase().localeCompare((b.name || '').toLowerCase()));
-  if (!groups.length) {
-    panel.innerHTML = `<div class="inline-expander"><div style="color:var(--dim2);font-size:12px">No camera groups exist yet, create one from the Cameras section.</div>
-      <div style="margin-top:10px"><button class="ghost sm" onclick="openAssignGroupPanel('${profileId}')">Close</button></div></div>`;
-    return;
-  }
-  const row = g => {
-    const n = (g.camera_ids || []).length;
-    return `<label class="chk" style="padding:3px 0"><input type="checkbox" value="${g.id}" ${g.policy_id === profileId ? 'checked' : ''}/> ${esc(g.name)} <span style="color:var(--dim2);font-size:11px">· ${n} camera${n !== 1 ? 's' : ''}</span></label>`;
-  };
-  panel.innerHTML = `
-    <div class="inline-expander">
-      <div style="font-size:13px;font-weight:500;margin-bottom:6px">Assign camera groups to this profile</div>
-      <div class="checklist-box" id="assign-group-box-${profileId}">${groups.map(row).join('')}</div>
-      <div class="card-hint" style="margin-top:8px">Every camera in a checked group records with this profile. Unchecking a group makes it inherit the global default.</div>
-      <div style="display:flex;gap:8px;margin-top:12px">
-        <button class="primary sm" onclick="saveGroupAssign('${profileId}')">Save</button>
-        <button class="ghost sm" onclick="openAssignGroupPanel('${profileId}')">Cancel</button>
-      </div>
-      <div id="assign-group-msg-${profileId}" class="form-msg"></div>
-    </div>`;
-}
-
-async function saveGroupAssign(profileId) {
-  setMsg('assign-group-msg-' + profileId, '');
-  const box = $('assign-group-box-' + profileId);
-  if (!box) return;
-  const checked = new Set();
-  box.querySelectorAll('input[type=checkbox]:checked').forEach(cb => checked.add(cb.value));
-  const wasAssigned = new Set((GROUPS || []).filter(g => g.policy_id === profileId).map(g => g.id));
-  const toAssign = [...checked].filter(id => !wasAssigned.has(id));
-  const toClear = [...wasAssigned].filter(id => !checked.has(id));
-  if (!toAssign.length && !toClear.length) { setMsg('assign-group-msg-' + profileId, 'No changes.'); return; }
-  try {
-    for (const id of toAssign) {
-      const g = (GROUPS || []).find(x => x.id === id);
-      await api('/config/groups/' + id, { method: 'PUT', body: JSON.stringify({ name: g.name, policy_id: profileId }) });
-    }
-    for (const id of toClear) {
-      const g = (GROUPS || []).find(x => x.id === id);
-      await api('/config/groups/' + id, { method: 'PUT', body: JSON.stringify({ name: g.name, policy_id: null }) });
-    }
-    toast('Group assignment updated.');
-    await ensureGroups(); await ensureCams();
-    renderTree();
-    renderProfile(profileId);
-  } catch (e) { setMsg('assign-group-msg-' + profileId, e.message, 'err'); }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
