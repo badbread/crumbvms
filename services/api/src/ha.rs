@@ -520,9 +520,34 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
 /// badge at `(x, y)` on the video frame with an optional size multiplier and
 /// optional per-badge display overrides (migration 0059).
 ///
-/// `label` edits the LINK-level caption (shared with the admin console's link
-/// list) and follows the `PUT /config/ha` token convention: omitted ⇒
-/// unchanged, `""` ⇒ cleared, non-empty ⇒ set.
+/// # Contract: this body is the WHOLE placement, not a patch (issue #552)
+///
+/// This endpoint deliberately does NOT merge, and that is the one place it
+/// differs from the `PUT /config/server` convention (issue #472,
+/// `docs/DECISIONS.md` 2026-08-06), where an omitted key means "leave the
+/// stored value alone". Here the object IS the badge's complete appearance:
+///
+/// | Body | Meaning |
+/// |---|---|
+/// | body-level `null` | clear the placement entirely (badge unplaced, every override reset) |
+/// | field omitted **or** explicit `null` | that override is UNSET — the badge falls back to its state/class-derived default |
+/// | field with a value | set it (validated, then clamped where numeric) |
+///
+/// Omission and `null` are indistinguishable ON PURPOSE. The style columns are
+/// hex colors and closed vocabularies, so unlike the settings row there is no
+/// `""` state to mean "clear"; `null` is the only reset an operator has, and a
+/// merge reading would make "Reset style" in the desktop badge popover
+/// unreachable over the wire. Every caller therefore sends the badge's CURRENT
+/// values forward, not just the fields it changed: `admin.html`'s `haSaveStyle`
+/// and `ha_overlay_controller.dart`'s `endEditAndSave` both do. Android and iOS
+/// never write here.
+///
+/// `label` is the ONE exception, because it is a LINK-level field this body
+/// merely rides along with (the console's link list owns it too, and the two
+/// writers would otherwise clobber each other). It follows the `PUT /config/ha`
+/// token convention: omitted ⇒ unchanged, `""` ⇒ cleared, non-empty ⇒ set.
+///
+/// `services/api/tests/ha_placement_replace_semantics.rs` pins all of this.
 #[derive(Deserialize)]
 struct PlacementInput {
     x: f64,
@@ -1088,6 +1113,10 @@ async fn put_links(
 /// Coordinates are clamped to the video frame `[0,1]`; size to a sane range;
 /// color/icon are format-validated. Returns the updated link, 404 if no such
 /// link exists on that camera.
+///
+/// The body is the WHOLE placement, never a patch: an omitted style key resets
+/// that override exactly like an explicit `null`. See [`PlacementInput`] for the
+/// full contract table and why it does not merge (issue #552).
 async fn put_placement(
     _admin: AdminUser,
     State(state): State<AppState>,

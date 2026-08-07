@@ -647,7 +647,7 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             // Record this row's (storage ROOT PATH, rel path) for the orphan pass.
             // Key by the storage PATH, NOT its id: prod has DUPLICATE storage rows
             // for the same /data/live and /data/archive paths (e.g. "2TB NVMe" vs
-            // "NVMe-Live"); segments may reference either, and reconcile looks the
+            // "Live"); segments may reference either, and reconcile looks the
             // storage up by config NAME — keying by id made every file on the
             // other duplicate row look like an orphan (510k false orphans).
             indexed_paths.insert((storage_path.replace('\\', "/"), seg.path.replace('\\', "/")));
@@ -2590,14 +2590,14 @@ mod tests {
         // Storage rows NAMED to match Config defaults so run_background finds them.
         let live_storage = crumb_common::db::upsert_storage(
             &pool,
-            "NVMe-Live",
+            "Live",
             live_dir.path().to_str().expect("utf8"),
         )
         .await
         .expect("live storage");
         crumb_common::db::upsert_storage(
             &pool,
-            "Bulk-Archive",
+            "Archive",
             archive_dir.path().to_str().expect("utf8"),
         )
         .await
@@ -2727,7 +2727,7 @@ mod tests {
             .await
             .expect("mkdir cam");
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -2828,7 +2828,7 @@ mod tests {
             .await
             .expect("mkdir cam");
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -2902,7 +2902,7 @@ mod tests {
             .await
             .expect("mkdir cam");
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -2968,7 +2968,7 @@ mod tests {
         let fx = setup_reconcile(&url).await;
 
         // Disk A: the existing storage the healthy row points at.
-        let disk_a = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let disk_a = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get disk A")
             .expect("disk A exists");
@@ -3086,7 +3086,7 @@ mod tests {
             .await
             .expect("mkdir cam");
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3198,7 +3198,7 @@ mod tests {
             .await
             .expect("mkdir cam");
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3263,7 +3263,7 @@ mod tests {
                 .expect("set record_stream = sub");
         }
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3321,7 +3321,7 @@ mod tests {
         let config = recon_config();
 
         // A per-policy archive disk that is NOT the config-name default
-        // ("Bulk-Archive") — the case the old labelling missed.
+        // ("Archive") — the case the old labelling missed.
         let policy_arch_dir = tempfile::Builder::new()
             .prefix("crumb-recon-policy-arch")
             .tempdir()
@@ -3477,7 +3477,7 @@ mod tests {
         let fx = setup_reconcile(&url).await;
         let config = recon_config();
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3520,7 +3520,7 @@ mod tests {
         let fx = setup_reconcile(&url).await;
         let config = recon_config();
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3581,7 +3581,7 @@ mod tests {
         let fx = setup_reconcile(&url).await;
         let config = recon_config();
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3661,7 +3661,7 @@ mod tests {
         };
         let fx = setup_reconcile(&url).await;
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3751,7 +3751,7 @@ mod tests {
         };
         let fx = setup_reconcile(&url).await;
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");
@@ -3846,7 +3846,7 @@ mod tests {
         let fx = setup_reconcile(&url).await;
         let config = recon_config();
 
-        let live = crumb_common::db::get_storage_by_name(&fx.pool, "NVMe-Live")
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
             .await
             .expect("get live storage")
             .expect("live storage exists");

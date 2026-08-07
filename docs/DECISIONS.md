@@ -70,6 +70,92 @@ for "all".
 
 ---
 
+## 2026-08-07, The HA placement PUT stays a whole-object REPLACE, against the `PUT /config/server` merge convention (issue #552)
+
+**Context.** The v0.2.0 release-prep API audit flagged `PUT
+/cameras/:id/ha/links/:link_id/placement` as inconsistent with the merge
+semantics #533 had just given `PUT /config/server` (issue #472). `PlacementInput`
+carries `#[serde(default)]` on every optional field, so an omitted key and an
+explicit `null` are the same request, and both write "no override". A body that
+names only the position therefore resets the badge's saved color, icon, shape,
+backgrounds, pill width, alignment, opacity, size, outline and pinned captions.
+
+Before deciding, every caller on all four surfaces was read:
+
+| Surface | Writes placements? | Body |
+|---|---|---|
+| Web console (`admin.html` `haSaveStyle`) | yes | complete — all 13 style keys plus `x`/`y`, each explicitly `null` when unset, round-tripped through `haMapLinkFromServer` |
+| Desktop Flutter (`ha_api.dart` → `ha_overlay_controller.dart` `endEditAndSave`) | yes | complete — `HaOverlayBadgeItem` seeds every style field from the link at `beginEdit` and the whole set is PUT once at end-of-session; there is no per-drag or per-popover instant-apply PUT |
+| Android | no | `GET /cameras/:id/ha/links` only |
+| iOS | no | `GET /cameras/:id/ha/links` only |
+
+So nothing is currently biting: no shipped client sends a partial body.
+
+**Decision.** Keep replace semantics. Document the contract on the DTO, on the
+handler, and in `docs/COMPONENT-MAP.md`, and pin it end to end with
+`services/api/tests/ha_placement_replace_semantics.rs` so it cannot drift
+silently in either direction. Three facts drove this, and any one of them alone
+would have been enough:
+
+- **There is no `""` state to clear a style field.** #533's three-state table
+  works because Crumb's config precedence makes an empty string mean "fall back
+  to env". These columns are `'#RRGGBB'` hex and closed vocabularies
+  (`auto`/`narrow`/`medium`/`wide`, `start`/`center`/`end`) validated at the PUT,
+  so `""` is a 400. Under merge semantics, `null` would mean "leave alone" and
+  an operator would have NO way to undo an override through the API. Restoring
+  one would need `Option<Option<_>>` (`double_option`), i.e. a second, different
+  mechanism for the same problem — not the consistency the finding was after.
+- **A shipped client depends on reset-by-omission.** The desktop badge popover's
+  "Reset style" is `HaOverlayBadgeItem.resetStyle()`, which nulls the style
+  fields; `ha_api.dart` then drops null keys from the body. Under merge
+  semantics that button would silently do nothing. The admin console is compiled
+  INTO the api binary so it can never skew, but the desktop client is released
+  independently — a v0.1.x desktop against a v0.2.0 server is normal, and the
+  failure mode would be silent-wrong, not an error. #533 had no such skew
+  surface, which is the substantive difference between the two endpoints.
+- **The body is a resource representation, not a settings patch.** A body-level
+  `null` already means "clear the placement", so the object form is naturally
+  "this is the badge's complete appearance". `x`/`y` are required, so a
+  style-only partial body is refused (422) before it can reset anything; a
+  partial body has to deliberately name a position.
+
+**Rejected:**
+
+| Option | Why not |
+|---|---|
+| `Option<Option<_>>` merge on the five nullable string fields | Leaves `size`/`opacity`/`show_state`/`show_age`/`outline` still resetting on omission — a half-merge whose contract is harder to state than either pure rule. |
+| Full merge: `Option<Option<_>>` on the strings AND `Option<_>` on the numerics/bools, with per-column `COALESCE` in `update_ha_link_placement` | The honest version of the above, and it is what a future change should look like — but it breaks old desktop clients silently (see skew above) for zero known benefit today, and rewrites the DB write path on an admin route in a release-prep window. |
+| Copy #533 literally (`Option<T>`, omitted/null ⇒ leave alone, `""` ⇒ clear) | `""` is not a legal value for any of these columns; it would 400 at validation. The convention does not transfer. |
+| Add a separate `PATCH .../placement` | Doubles the surface for a route with two GUI callers and no scripted ones, and leaves the PUT exactly as it is anyway. |
+| Change nothing and write nothing down | The behavior is currently an accident of `#[serde(default)]`. The next audit finds it again, or a refactor flips it and no test notices. |
+
+**Trades knowingly accepted:**
+
+- The API now has two documented answers to "what does an omitted key mean",
+  which a script author has to look up per endpoint. Accepted, and made cheap:
+  both answers are stated in the DTO doc comment where the reader already is.
+- A third-party script doing `{"x": 0.2, "y": 0.3}` to nudge a badge still wipes
+  its appearance. That is now the documented contract rather than a surprise,
+  but it is still a sharp edge; the 422 on a missing position is the only guard.
+- `label` remains the one merge-semantics field on this body (omitted ⇒
+  unchanged, `""` ⇒ clear), because the console's link editor writes it too. An
+  exception inside an otherwise uniform rule, kept because the alternative is
+  the two writers clobbering each other.
+
+**Revisit triggers:**
+
+- A non-GUI caller appears (a script, an integration, an `openapi`-generated
+  client) that wants to change one property of a badge ⇒ do the full merge, and
+  ship the desktop client change that always sends explicit `null`s in the same
+  release.
+- Any style field gains a meaningful `""` value ⇒ the replace rule and the
+  `label` exception stop being separable and the whole body needs one contract.
+- The generated OpenAPI spec (ROADMAP initiative 4) lands ⇒ the two conventions
+  become visible side by side in one document, which is the point at which
+  "consistent" stops being a preference and starts being a doc-quality bug.
+
+---
+
 ---
 
 ## 2026-08-07, Plate-crop images: fix the client's decode (engine codec), not the payload (server-side derivatives)
