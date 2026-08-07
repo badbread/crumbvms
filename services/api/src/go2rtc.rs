@@ -76,9 +76,55 @@ fn sub_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_sub")
 }
 
+/// The go2rtc stream name for a camera's CLIENT-facing, VIDEO-ONLY sub restream
+/// (`<name>_subv`). `pub(crate)` because `playback.rs` builds the client
+/// `rtsp_subv_url` from it — the two must never drift apart. Registered for
+/// every camera that has a `_sub`, whether or not a client asks for it; only
+/// Media3/ExoPlayer clients (Android) actually connect to it, and go2rtc spawns
+/// the ffmpeg lazily, so an unused registration costs nothing.
+pub(crate) fn subv_name(go2rtc_name: &str) -> String {
+    format!("{go2rtc_name}_subv")
+}
+
 /// The go2rtc stream name for a camera's on-demand MOBILE transcode.
 fn mobile_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_mobile")
+}
+
+/// Build the go2rtc source for a camera's `<name>_subv` — the video-only sub
+/// restream the ANDROID live wall plays (#483). Desktop and iOS stay on the raw
+/// `<name>_sub`; see `playback.rs`'s `rtsp_subv_url` for why the choice is the
+/// client's.
+///
+/// It reads the EXISTING `<name>_sub` stream by name (go2rtc's documented
+/// restream form), so it shares that stream's single producer and adds no extra
+/// camera session; go2rtc only spawns the ffmpeg process while a consumer is
+/// attached, so an idle `_subv` costs nothing.
+///
+/// `#video=copy` is a **remux, never a re-encode** (verified against a live
+/// camera: identical h264/High/640x360 in and out). Two things come out of it,
+/// both required:
+///
+/// * **Audio is dropped** — go2rtc passes `-an` when no `#audio` is requested.
+///   The wall is muted, and two-way audio / listen uses the WebRTC path.
+/// * **The H264 parameter sets are recovered.** Some cameras (verified: Reolink)
+///   advertise an H264 track with NO `sprop-parameter-sets`, and go2rtc's plain
+///   restream passes that gap straight through — so `<name>_sub` publishes a
+///   video track with no `a=fmtp` line at all (ffprobe on such a stream reports
+///   "non-existing PPS 0 referenced / no frame!"). Android Media3 requires fmtp
+///   and throws `IllegalArgumentException: missing attribute fmtp`, so the tile
+///   reconnect-loops forever. Passing the bitstream through ffmpeg recovers the
+///   in-band SPS/PPS, and go2rtc then republishes a proper
+///   `a=fmtp:96 …sprop-parameter-sets=…`.
+///
+/// Deliberately NOT an `rtsp://…/<name>_sub?video` source: that form also yields
+/// a video-only SDP, but it leaves the video track's fmtp missing (so Media3
+/// still fails), and its single-segment path collides with a managed stream name,
+/// which would force reconcile down the `PUT` path forever (see
+/// [`is_patch_alias_collision`]). An `ffmpeg:` source can never alias-collide, so
+/// `_subv` `PATCH`es in place exactly like `_mobile`. Pure + unit-tested.
+fn subv_src(sub_stream: &str) -> String {
+    format!("ffmpeg:{sub_stream}#video=copy")
 }
 
 /// Build the go2rtc source for a camera's `<name>_mobile` transcode. It reads
@@ -356,6 +402,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             let mut names = vec![s.go2rtc_name.clone()];
             if has_sub {
                 names.push(sub_name(&s.go2rtc_name));
+                names.push(subv_name(&s.go2rtc_name));
             }
             if mobile_enabled {
                 names.push(mobile_name(&s.go2rtc_name));
@@ -385,6 +432,20 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
                 api_base,
                 &sub_name(&s.go2rtc_name),
                 s.source_sub_url.as_deref().unwrap_or_default(),
+                &existing,
+                &managed,
+                auth,
+            )
+            .await;
+            // #483: the client-facing VIDEO-ONLY sub, derived from the `_sub`
+            // stream above. Registered on exactly the same condition as `_sub`
+            // (and torn down with it), so `playback.rs` can advertise
+            // `<name>_subv` whenever the camera has a sub. go2rtc pulls it lazily.
+            apply_stream(
+                &c,
+                api_base,
+                &subv_name(&s.go2rtc_name),
+                &subv_src(&sub_name(&s.go2rtc_name)),
                 &existing,
                 &managed,
                 auth,
@@ -462,6 +523,9 @@ pub async fn remove(state: &AppState, go2rtc_name: &str) -> Result<()> {
     let c = client()?;
     delete_stream(&c, api_base, go2rtc_name, auth).await?;
     delete_stream(&c, api_base, &sub_name(go2rtc_name), auth).await?;
+    // Best-effort: drop the video-only client sub too (a no-op if the camera
+    // never had a sub — go2rtc DELETE tolerates a missing name).
+    let _ = delete_stream(&c, api_base, &subv_name(go2rtc_name), auth).await;
     // Best-effort: drop the mobile transcode too (a no-op if it was never
     // registered — go2rtc DELETE tolerates a missing name).
     let _ = delete_stream(&c, api_base, &mobile_name(go2rtc_name), auth).await;
@@ -497,6 +561,11 @@ pub async fn reconnect(state: &AppState, go2rtc_name: &str) -> Result<()> {
     }
     if let Err(e) = delete_stream(&c, api_base, &sub_name(go2rtc_name), auth).await {
         tracing::warn!(go2rtc_name, error = %format!("{e:#}"), "reconnect: DELETE sub stream failed (ignoring)");
+    }
+    // The video-only client sub is derived from `_sub`, so it must be re-dialled
+    // with it (its ffmpeg reader is bound to the old `_sub` object otherwise).
+    if let Err(e) = delete_stream(&c, api_base, &subv_name(go2rtc_name), auth).await {
+        tracing::warn!(go2rtc_name, error = %format!("{e:#}"), "reconnect: DELETE video-only sub stream failed (ignoring)");
     }
     // Drop the mobile transcode too, so a source-URL change re-derives it fresh
     // (its input stream name is unchanged, but symmetry with reconcile's PUT-all
@@ -761,6 +830,52 @@ mod tests {
             choose_verb(true, &mobile_src("driveway_sub", 640), &managed),
             StreamVerb::Patch
         );
+    }
+
+    // ── video-only client sub (#483) ────────────────────────────────────────
+
+    #[test]
+    fn subv_name_and_src_shapes() {
+        assert_eq!(subv_name("famroom"), "famroom_subv");
+        // Sources the EXISTING `_sub` stream by name (shares its producer) and
+        // COPIES video. No `#audio` ⇒ go2rtc passes `-an` ⇒ audio dropped.
+        assert_eq!(
+            subv_src(&sub_name("famroom")),
+            "ffmpeg:famroom_sub#video=copy"
+        );
+    }
+
+    #[test]
+    fn subv_src_is_a_copy_not_a_transcode() {
+        // Guard against someone "helpfully" turning this into a re-encode: the
+        // whole point is a remux that recovers SPS/PPS at zero decode cost.
+        let src = subv_src(&sub_name("driveway"));
+        assert!(src.contains("#video=copy"), "must copy, got: {src}");
+        assert!(!src.contains("#video=h264"), "must not re-encode: {src}");
+        assert!(!src.contains("#audio"), "must not request audio: {src}");
+    }
+
+    #[test]
+    fn subv_src_is_never_an_rtsp_alias_collision() {
+        // The reason `_subv` uses an `ffmpeg:` source rather than
+        // `rtsp://…/<name>_sub?video`: an rtsp source whose single-segment path
+        // equals a managed stream name trips the alias guard, which would force
+        // PUT (object replacement) on EVERY reconcile pass. An `ffmpeg:` source
+        // can't alias-collide, so `_subv` PATCHes in place like `_mobile`.
+        let managed = names(&["famroom", "famroom_sub", "famroom_subv"]);
+        assert!(!is_patch_alias_collision(
+            &subv_src(&sub_name("famroom")),
+            &managed
+        ));
+        assert_eq!(
+            choose_verb(true, &subv_src(&sub_name("famroom")), &managed),
+            StreamVerb::Patch
+        );
+        // ...whereas the rejected rtsp form WOULD collide (documents the trap).
+        assert!(is_patch_alias_collision(
+            "rtsp://127.0.0.1:8554/famroom_sub?video",
+            &managed
+        ));
     }
 
     // ── choose_verb (create-vs-patch fan-out fix) ───────────────────────────
