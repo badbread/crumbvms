@@ -259,6 +259,7 @@ for the full setup.
 | `FRIGATE_API_BASE` | empty | fallback; the admin console setting overrides it |
 | `FRIGATE_MIN_SCORE` | `0.3` | detection confidence floor |
 | `FRIGATE_CATCHUP_HOURS` | `24` | how far back to backfill on startup |
+| `FRIGATE_MQTT_MAX_PACKET_BYTES` | `262144` (256 KiB) | largest single MQTT packet Crumb will accept. An event bigger than this **drops the broker connection**, and it recurs on every reconnect, so Frigate motion and Frigate detection ingest both stop until the limit is raised. Crumb logs the exact byte count and names this key when it happens. Values are clamped to `10240`–`16777216`; you should not normally need to change it. |
 
 ## Crumb-native LPR worker (optional, `alpr` profile)
 

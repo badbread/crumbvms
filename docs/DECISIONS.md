@@ -70,6 +70,71 @@ for "all".
 
 ---
 
+## 2026-08-07, MQTT packet limit: a generous fixed default with an env escape hatch, and oversize payloads treated as a latched condition, not a disconnect
+
+**Context.** rumqttc 0.24 defaults `max_incoming_packet_size` to 10 KiB and
+treats an over-limit incoming packet as a **fatal event-loop error**, not a
+skipped message. Neither MQTT client set the option, so both inherited that
+default. A real `frigate/events` payload measured 11409 bytes on a live install:
+the event loop died, the supervisor reconnected, the still-queued message killed
+it again — Frigate motion and Frigate detection ingest were both 100% dead, in a
+loop, on a v0.2.0 release candidate.
+
+**Decision 1: a fixed 256 KiB default, plus `FRIGATE_MQTT_MAX_PACKET_BYTES`.**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Raise the limit to a fixed value, no knob | Rejected: the envelope is Frigate's, not Crumb's — it grows with attributes, plate arrays and tracked-object path data — so "big enough" is not a claim Crumb can make permanently. A payload past the ceiling would again need a rebuild to fix. |
+| 2 | **Fixed 256 KiB default + env override, clamped 10 KiB–16 MiB** | **CHOSEN.** ~23x the observed payload, so nobody should ever touch the knob; the knob exists so that if they must, the log line that reports the failure also names the fix. Clamped at both ends: below rumqttc's own default would re-create this bug, and an unbounded value would remove the only thing stopping a hostile or broken broker from making Crumb buffer without limit. |
+| 3 | A DB-backed setting in the Frigate settings panel | Rejected for now: a migration, a DTO, an admin-console field and a hot-reload path, all for a value whose correct setting is "don't touch it". Config precedence (DB wins over env) exists for settings operators tune; this is an escape hatch. |
+| 4 | No limit at all (`usize::MAX`) | Rejected: the limit is a memory-safety bound on untrusted broker input. |
+
+The value is read at connect time rather than cached at startup, so each
+reconnect re-reads it and a restart is all that is needed to apply a change.
+
+**Decision 2: an oversize payload is a latched, non-transient condition.**
+
+The API ingester's back-off reset on `ConnAck` was correct for a broker outage
+and actively wrong here: the failure happens *after* `ConnAck`, so the delay
+reset to 1s on every cycle — a permanent condition retried once a second,
+forever. Worse, the same `ConnAck` set `healthy = true` and stamped the
+`frigate_heartbeat`, so `frigate_disconnected` never fired and the console
+showed a perfectly healthy integration ingesting nothing. That invisibility is
+why the bug survived to a release candidate.
+
+Rejected: **stop retrying entirely** (a dead provider cannot self-heal when the
+operator raises the limit, and it would need a restart to recover). Rejected:
+**skip the oversized message and continue** (rumqttc gives no such hook at 0.24;
+the framing error is fatal by construction). Chosen instead: latch on the
+oversize error, jump straight to the maximum back-off, withhold health and the
+heartbeat until a publish is actually received, and clear the latch on the first
+successful publish. The recorder side needs no retry change (its supervisor
+already backs off to 30s) but reports the specific cause through the existing
+`note_unhealthy_cause` slot, because a source that is broken from its first
+connection never transitions and so would otherwise show only the generic
+"not delivering frames".
+
+**Trades knowingly accepted:**
+
+- A limit raise still requires a restart (env-only, by decision 1).
+- While latched with a broker that publishes nothing at all, the API reports
+  Frigate disconnected even if the oversize condition has since resolved. Any
+  restart or any received publish clears it; reporting a stuck ingest as an
+  outage is the honest direction to err in.
+- Fail-open recording is untouched: a Motion-mode camera whose Frigate source
+  is dead keeps recording continuously, exactly as before.
+
+**Revisit triggers:**
+
+- Anyone actually needing `FRIGATE_MQTT_MAX_PACKET_BYTES` in the field → the
+  default is wrong; raise it, and reconsider option 3 (a real setting).
+- A rumqttc version that can skip an over-limit packet instead of failing the
+  connection → the latch becomes unnecessary; drop it and just log.
+- A second Crumb subsystem gaining an MQTT client → move the limit off the
+  `FRIGATE_`-prefixed key onto a neutral one, keeping the old key as an alias.
+
+---
+
 ## 2026-08-07, The HA placement PUT stays a whole-object REPLACE, against the `PUT /config/server` merge convention (issue #552)
 
 **Context.** The v0.2.0 release-prep API audit flagged `PUT

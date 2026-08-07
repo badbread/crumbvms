@@ -27,6 +27,17 @@
 //! exponential back-off (1s → 30s, reset on a successful `ConnAck`) in the
 //! disconnect/error arm, raced against the stop signal so shutdown stays prompt.
 //!
+//! One failure is deliberately *not* treated as a transient disconnect: a
+//! `frigate/events` payload larger than the configured incoming packet limit
+//! (see [`crumb_common::mqtt`]). rumqttc fails the whole event loop on it, and
+//! the offending message is still queued/retained, so it recurs on every
+//! reconnect — a permanent condition with a one-line fix, not a flaky broker.
+//! It therefore latches: the connection goes straight to the longest back-off,
+//! `healthy` stays false and the connectivity heartbeat is withheld (so
+//! `frigate_disconnected` reports the outage instead of the `ConnAck` masking it),
+//! and the log names the byte counts and the env knob. Receiving any publish
+//! clears the latch.
+//!
 //! # HTTP backfill
 //!
 //! On startup (before entering the MQTT loop) the provider fetches
@@ -49,7 +60,7 @@ use deadpool_postgres::Pool;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crumb_common::db::load_camera_name_map;
@@ -363,25 +374,22 @@ impl DetectionSource for FrigateProvider {
         // rumqttc expects host/port separately.
         let endpoint = parse_mqtt_url(&self.cfg.mqtt_url)?;
 
-        let mut mqttoptions = MqttOptions::new(
+        // Broker authentication (optional). A broker Frigate publishes to may
+        // require credentials; an anonymous broker leaves these unset. The
+        // explicit `mqtt_user`/`mqtt_password` config fields win; otherwise fall
+        // back to credentials embedded in the URL (`mqtt://user:pass@host`).
+        let mqtt_user = self.cfg.mqtt_user.clone().or(endpoint.username);
+        let mqtt_password = self.cfg.mqtt_password.clone().or(endpoint.password);
+
+        let max_packet = crumb_common::mqtt::max_packet_bytes();
+        let mqttoptions = build_mqtt_options(
             format!("crumb-api-{}", uuid::Uuid::new_v4()),
             &endpoint.host,
             endpoint.port,
+            mqtt_user,
+            mqtt_password,
+            max_packet,
         );
-        mqttoptions.set_keep_alive(Duration::from_secs(30));
-        mqttoptions.set_clean_session(true);
-        // Allow internal reconnection queue depth.
-        mqttoptions.set_inflight(100);
-        // Broker authentication (optional). The homelab broker Frigate already
-        // publishes to requires credentials; an anonymous broker leaves these
-        // unset. The explicit `mqtt_user`/`mqtt_password` config fields win;
-        // otherwise fall back to credentials embedded in the URL
-        // (`mqtt://user:pass@host`).
-        let mqtt_user = self.cfg.mqtt_user.clone().or(endpoint.username);
-        let mqtt_password = self.cfg.mqtt_password.clone().or(endpoint.password);
-        if let Some(user) = mqtt_user {
-            mqttoptions.set_credentials(user, mqtt_password.unwrap_or_default());
-        }
 
         let (client, mut event_loop) = AsyncClient::new(mqttoptions, 512);
 
@@ -412,6 +420,17 @@ impl DetectionSource for FrigateProvider {
         let hb_pool = self.pool.clone();
         let mut last_hb: Option<std::time::Instant> = None;
 
+        // Latched "the broker is sending packets we refuse to read". Set by the
+        // oversize-payload arm, cleared only by a Publish we actually managed to
+        // receive. It exists because that failure happens AFTER `ConnAck`, which
+        // made the two bookkeeping rails below lie:
+        //   * the back-off reset on ConnAck turned a permanent condition into a
+        //     ~1s reconnect loop hammering the broker forever, and
+        //   * `healthy` + the heartbeat were stamped on that same ConnAck, so
+        //     `frigate_disconnected` never fired and the console showed a
+        //     perfectly healthy integration that was ingesting nothing.
+        let mut oversize_latched = false;
+
         // Drive the event loop.
         loop {
             tokio::select! {
@@ -430,7 +449,17 @@ impl DetectionSource for FrigateProvider {
                     // — so frigate_disconnected doesn't false-fire during a
                     // connected-but-quiet period. On an Err (disconnect) we skip,
                     // letting the heartbeat go stale so the watchdog sees the outage.
+                    // While `oversize_latched`, a ConnAck/PingResp proves only
+                    // that the socket works, not that events can be ingested —
+                    // stamping a heartbeat on it would keep the watchdog quiet
+                    // through a total ingest outage. Withhold it so
+                    // `frigate_disconnected` fires, which is the truth.
+                    let oversize_bytes = notification
+                        .as_ref()
+                        .err()
+                        .and_then(oversize_payload_bytes);
                     if notification.is_ok()
+                        && !oversize_latched
                         && last_hb.is_none_or(|t| t.elapsed() >= HEARTBEAT_INTERVAL)
                     {
                         if let Err(e) = crumb_common::db::write_frigate_heartbeat(&hb_pool).await {
@@ -441,13 +470,28 @@ impl DetectionSource for FrigateProvider {
                     match notification {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
                             info!("FrigateProvider: MQTT connected, subscribing to {}", topic_clone);
-                            healthy_clone.store(true, Ordering::Relaxed);
-                            reconnect_delay = Duration::from_secs(1); // connected → reset back-off
+                            // Connecting is not the same as ingesting: while the
+                            // oversize condition is latched the link comes up and
+                            // dies again on the first event, so neither the health
+                            // flag nor the back-off may be reset by it.
+                            healthy_clone.store(!oversize_latched, Ordering::Relaxed);
+                            if !oversize_latched {
+                                reconnect_delay = Duration::from_secs(1); // connected → reset back-off
+                            }
                             if let Err(e) = client.subscribe(&topic_clone, QoS::AtLeastOnce).await {
                                 warn!(error = %e, "FrigateProvider: subscribe failed");
                             }
                         }
                         Ok(Event::Incoming(Packet::Publish(publish))) => {
+                            // A message we actually received: whatever was too big
+                            // is gone (or the limit was raised), so un-latch and
+                            // let health/heartbeat/back-off behave normally again.
+                            if oversize_latched {
+                                info!("FrigateProvider: oversized-payload condition cleared, ingest resumed");
+                                oversize_latched = false;
+                                healthy_clone.store(true, Ordering::Relaxed);
+                                reconnect_delay = Duration::from_secs(1);
+                            }
                             // Read the maps under scoped guards so they're
                             // dropped before the `.await` below (RwLock guard
                             // is !Send).
@@ -478,6 +522,18 @@ impl DetectionSource for FrigateProvider {
                         }
                         Ok(Event::Incoming(Packet::Disconnect)) | Err(_) => {
                             healthy_clone.store(false, Ordering::Relaxed);
+                            if let Some(bytes) = oversize_bytes {
+                                // Distinct from a broker outage, and permanent
+                                // until an operator acts: go straight to the
+                                // longest back-off instead of retrying every
+                                // second forever, and say exactly what to do.
+                                oversize_latched = true;
+                                reconnect_delay = MAX_RECONNECT_DELAY;
+                                error!(
+                                    "FrigateProvider: {}",
+                                    crumb_common::mqtt::oversize_payload_message(bytes, max_packet)
+                                );
+                            }
                             // rumqttc 0.24 retries with NO delay, so without this
                             // back-off an unreachable broker hot-spins the loop and
                             // steals CPU from the co-located recorder. Wait (capped,
@@ -1301,11 +1357,104 @@ fn parse_mqtt_url(url: &str) -> Result<MqttEndpoint> {
     })
 }
 
+// ── MQTT client options ───────────────────────────────────────────────────────
+
+/// Build the rumqttc options for the detection ingester's broker connection.
+///
+/// Split out of [`FrigateProvider::start`] so the packet-size limit is
+/// assertable without a broker: rumqttc 0.24 caps incoming packets at 10 KiB by
+/// default and treats an over-limit packet as a **fatal event-loop error**, so a
+/// Frigate whose `frigate/events` payloads are larger than that could never be
+/// ingested at all (see `crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES`).
+fn build_mqtt_options(
+    client_id: String,
+    host: &str,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    max_packet: usize,
+) -> MqttOptions {
+    let mut opts = MqttOptions::new(client_id, host, port);
+    opts.set_keep_alive(Duration::from_secs(30));
+    opts.set_clean_session(true);
+    // Allow internal reconnection queue depth.
+    opts.set_inflight(100);
+    // Outgoing is raised to the same value for symmetry; the ingester only sends
+    // CONNECT/SUBSCRIBE/PINGREQ, so nothing depends on it today.
+    opts.set_max_packet_size(max_packet, max_packet);
+    if let Some(user) = username {
+        opts.set_credentials(user, password.unwrap_or_default());
+    }
+    opts
+}
+
+/// `Some(payload_bytes)` when a rumqttc connection error is really "the broker
+/// sent a packet bigger than our incoming limit".
+///
+/// Matched structurally rather than by string so a rumqttc bump that reworded
+/// the `Display` impl fails to compile instead of silently folding this back
+/// into the generic "disconnected/unreachable" it was indistinguishable from.
+fn oversize_payload_bytes(e: &rumqttc::ConnectionError) -> Option<usize> {
+    match e {
+        rumqttc::ConnectionError::MqttState(rumqttc::StateError::Deserialization(
+            rumqttc::mqttbytes::Error::PayloadSizeLimitExceeded(bytes),
+        )) => Some(*bytes),
+        _ => None,
+    }
+}
+
 // ── unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mqtt_options_apply_the_configured_packet_limit() {
+        // Guard the premise: rumqttc's stock incoming limit is smaller than a
+        // real frigate/events payload (11409 bytes, measured), and an over-limit
+        // packet kills the event loop rather than being skipped.
+        let stock = MqttOptions::new("probe", "192.0.2.10", 1883);
+        assert_eq!(stock.max_packet_size(), 10 * 1024, "rumqttc default moved");
+
+        let opts = build_mqtt_options(
+            "crumb-api-test".to_owned(),
+            "192.0.2.10",
+            1883,
+            Some("frigate".to_owned()),
+            Some("secret".to_owned()),
+            crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES,
+        );
+        assert_eq!(
+            opts.max_packet_size(),
+            crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES
+        );
+        assert!(
+            opts.max_packet_size() > 11409,
+            "the observed payload must fit"
+        );
+        assert_eq!(opts.keep_alive(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn oversize_payload_is_classified_apart_from_a_broker_outage() {
+        use rumqttc::{ConnectionError, StateError};
+
+        let oversize = ConnectionError::MqttState(StateError::Deserialization(
+            rumqttc::mqttbytes::Error::PayloadSizeLimitExceeded(11409),
+        ));
+        assert_eq!(oversize_payload_bytes(&oversize), Some(11409));
+
+        // These are the "broker is down" cases the oversize error used to be
+        // reported as; they must keep the generic back-off path.
+        for other in [
+            ConnectionError::NetworkTimeout,
+            ConnectionError::MqttState(StateError::AwaitPingResp),
+            ConnectionError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+        ] {
+            assert_eq!(oversize_payload_bytes(&other), None, "{other}");
+        }
+    }
 
     #[test]
     fn ts_from_f64_round_trip() {

@@ -1230,10 +1230,13 @@ impl UnhealthyAlertGate {
     /// (health starts `false`), so the only cause the aggregator would otherwise
     /// have is its generic "not delivering frames". Issue #479's cuda-on-a-
     /// deviceless-host is exactly that shape: the operator-actionable cause is
-    /// learned several seconds in, from ffmpeg's stderr. Telemetry only — same
+    /// learned several seconds in, from ffmpeg's stderr, and so is the Frigate
+    /// source's oversize-MQTT-payload case (the loop reports "frigate
+    /// connecting" ⇒ unhealthy before it can possibly know why it will fail).
+    /// Telemetry only — same
     /// slot, same rules as [`Self::set_unhealthy_reason`]; the fail-open watch
     /// channel is untouched.
-    fn note_unhealthy_cause(&self, reason: &str) {
+    pub(crate) fn note_unhealthy_cause(&self, reason: &str) {
         self.set_unhealthy_reason(reason);
     }
 

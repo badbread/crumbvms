@@ -96,6 +96,10 @@ services:
       HA_BASE_URL: ${HA_BASE_URL:-}
       HA_TOKEN: ${HA_TOKEN:-}
       HA_TOKEN_FILE: ${HA_TOKEN_FILE:-}
+      # Largest single MQTT packet accepted from the Frigate broker (bytes). A
+      # bigger event drops the connection on every reconnect, so Frigate motion
+      # stops entirely; raise only if the logs say so. Clamped 10240..16777216.
+      FRIGATE_MQTT_MAX_PACKET_BYTES: ${FRIGATE_MQTT_MAX_PACKET_BYTES:-262144}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-}                   # sqlx pool size (empty = default 32)
       # Retention low-disk safety floor: eviction keeps at least this much free
       # on the physical disk. Empty = defaults (5% / 50 GiB). (#241)
@@ -165,6 +169,10 @@ services:
       FRIGATE_API_BASE: ${FRIGATE_API_BASE:-}
       FRIGATE_MIN_SCORE: ${FRIGATE_MIN_SCORE:-0.3}
       FRIGATE_CATCHUP_HOURS: ${FRIGATE_CATCHUP_HOURS:-24}
+      # Largest single MQTT packet accepted from the broker (bytes). A bigger
+      # event drops the connection on every reconnect, so detection ingest stops
+      # entirely; raise only if the logs say so. Clamped 10240..16777216.
+      FRIGATE_MQTT_MAX_PACKET_BYTES: ${FRIGATE_MQTT_MAX_PACKET_BYTES:-262144}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}         # Discord/Slack webhook on recorder-heartbeat stall; empty = silent
       UPDATE_CHECK_ENABLED: ${UPDATE_CHECK_ENABLED:-false}   # opt-in (issue #7); false = zero github.com requests
       RUST_LOG: ${RUST_LOG:-info}
