@@ -157,6 +157,27 @@ struct Inner {
     /// so a single global lock is fine.
     go2rtc_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Cameras (by `go2rtc_name`) whose SUB stream needs the video-only `_subv`
+    /// repair — i.e. whose producer SDP advertises a video track with NO
+    /// `a=fmtp` line, which Android's Media3 RTSP client rejects outright
+    /// (#483). `DashMap<_, ()>` used as a concurrent set, exactly like
+    /// [`revoked_jtis`](Inner::revoked_jtis).
+    ///
+    /// Written by the go2rtc reconcile pass (which reads every producer's SDP
+    /// out of the `GET /api/streams` response it already fetches) and read by
+    /// `playback.rs` to decide whether to advertise `rtsp_subv_url` for a
+    /// camera. **Membership is the exception, not the rule:** on the reference
+    /// install exactly one camera of eleven is affected, and every other camera
+    /// keeps attaching to the always-warm raw `_sub`.
+    ///
+    /// In-memory with no migration, deliberately: this is a runtime-detectable
+    /// property of the camera's current firmware/stream, not operator
+    /// configuration, so a restart should re-derive it rather than trust a
+    /// stale row. An empty set (cold start, before the first pass completes)
+    /// means "nobody needs the repair", which is the safe direction: a client
+    /// falls back to the raw sub and is no worse off than before #483.
+    subv_needed: DashMap<String, ()>,
+
     /// In-memory cache of permission [`Role`]s keyed by id. The `AuthUser`
     /// extractor resolves a token's `role_id` to its effective capabilities +
     /// cameras through this, so per-request auth costs no DB round-trip after the
@@ -269,6 +290,7 @@ impl AppState {
             clip_gen_semaphore,
             clip_inflight: DashMap::new(),
             go2rtc_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            subv_needed: DashMap::new(),
             thumb_semaphore,
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
@@ -468,6 +490,32 @@ impl AppState {
     /// [`go2rtc_reconcile_lock`](Inner::go2rtc_reconcile_lock).
     pub fn go2rtc_reconcile_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.0.go2rtc_reconcile_lock)
+    }
+
+    // ── `_subv` repair flags (#483 follow-up) ─────────────────────────────────
+
+    /// Does this camera's sub stream need the video-only `_subv` repair? See the
+    /// field docs on [`subv_needed`](Inner::subv_needed). `false` for anything
+    /// the reconcile pass has not positively flagged, including a cold start.
+    #[inline]
+    pub fn subv_needed(&self, go2rtc_name: &str) -> bool {
+        self.0.subv_needed.contains_key(go2rtc_name)
+    }
+
+    /// Record this pass's verdict for one camera. Idempotent, so the reconcile
+    /// pass can call it unconditionally every time.
+    pub fn set_subv_needed(&self, go2rtc_name: &str, needed: bool) {
+        if needed {
+            self.0.subv_needed.insert(go2rtc_name.to_owned(), ());
+        } else {
+            self.0.subv_needed.remove(go2rtc_name);
+        }
+    }
+
+    /// Drop flags for cameras that no longer exist, so a deleted camera's entry
+    /// cannot pin memory or resurface if its `go2rtc_name` is later reused.
+    pub fn retain_subv_needed(&self, live: &std::collections::HashSet<String>) {
+        self.0.subv_needed.retain(|name, ()| live.contains(name));
     }
 
     // ── health-alert maintenance window (issue #46) ───────────────────────────

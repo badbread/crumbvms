@@ -713,6 +713,17 @@ async fn live_streams(
     // repair, so only Android pays for it; desktop (libmpv) and iOS keep
     // `rtsp_sub_url`.
     //
+    // AND WHY IT IS PER-CAMERA: scoping to Android alone was still too broad. It
+    // sent all ~11 tiles of an Android wall through a lazily-spawned remux when
+    // only ONE camera's sub is actually malformed, so the Android wall then
+    // opened slowly for the same reason the desktop one had. `state.subv_needed`
+    // is the reconcile loop's per-camera verdict (it reads each producer's SDP
+    // out of the `GET /api/streams` payload it already fetches, see
+    // `go2rtc::sdp_video_lacks_fmtp`), so a healthy camera advertises NO
+    // `rtsp_subv_url` at all and its Android tile attaches to the warm raw sub
+    // exactly like every other client. Nothing flagged ⇒ nothing changes for
+    // anyone.
+    //
     // Crucially the client URL stays CLEAN (no query string): an earlier attempt
     // appended go2rtc's `?video` selector to the client URL, which ffprobe accepts
     // but Media3 does not — it derives per-track SETUP URLs by appending
@@ -723,9 +734,10 @@ async fn live_streams(
     // `None` for rows reconcile does not manage (Frigate-served, or legacy
     // absolute `sub_url` with no `source_url`): no `_subv` exists for them, and a
     // client must fall back to `rtsp_sub_url` rather than burn its reconnect
-    // budget on a dead stream name.
+    // budget on a dead stream name. Also `None` before the first reconcile pass
+    // has reached a verdict — the same fail-safe direction.
     let video_only_sub_url = subv_url(
-        crumb_managed,
+        crumb_managed && state.subv_needed(&cam.go2rtc_name),
         cam.sub_url.as_deref(),
         &cam.go2rtc_name,
         &crumb_rtsp_authed,
@@ -795,20 +807,26 @@ fn is_crumb_managed(served_by: &str, source_url: Option<&str>) -> bool {
 }
 
 /// Build the client-facing VIDEO-ONLY sub restream URL (`<name>_subv`), or
-/// `None` when the camera has no sub stream or reconcile does not manage it.
+/// `None` when the camera has no sub stream.
+///
+/// `registered` is the caller's answer to "does this `_subv` stream actually
+/// exist in go2rtc right now" — reconcile manages the camera AND has positively
+/// flagged its sub as missing fmtp. Both halves matter: a synthesised name for
+/// an unmanaged row resolves to nothing, and a name for a healthy camera is one
+/// reconcile deliberately does not create (and actively deletes).
 ///
 /// See the `rtsp_subv_url` block in [`live_streams`] for why this is a separate
 /// field from `rtsp_sub_url` rather than a replacement for it (go2rtc spawns the
-/// remux ffmpeg lazily, per consumer — only clients that actually need the fmtp
-/// repair should pay it). Pure + unit-tested.
+/// remux ffmpeg lazily, per consumer — only the cameras that actually need the
+/// fmtp repair should pay it). Pure + unit-tested.
 fn subv_url(
-    crumb_managed: bool,
+    registered: bool,
     sub_url: Option<&str>,
     go2rtc_name: &str,
     crumb_rtsp_authed: &str,
 ) -> Option<String> {
     let has_sub = sub_url.is_some_and(|s| !s.is_empty());
-    (crumb_managed && has_sub).then(|| {
+    (registered && has_sub).then(|| {
         format!(
             "{}/{}",
             crumb_rtsp_authed.trim_end_matches('/'),
@@ -1081,10 +1099,13 @@ mod tests {
         assert!(!out.ends_with("_subv"), "the sub field never carries _subv");
     }
 
-    /// `rtsp_subv_url` is offered ALONGSIDE it for Crumb-managed cameras that
-    /// have a sub — the video-only remux Media3 needs for its fmtp.
+    /// `rtsp_subv_url` is offered ALONGSIDE it, but ONLY for a camera reconcile
+    /// has flagged and registered a `_subv` for — the video-only remux Media3
+    /// needs for its fmtp. `registered` folds together "Crumb-managed" and
+    /// "detected as missing fmtp"; the handler passes
+    /// `crumb_managed && state.subv_needed(name)`.
     #[test]
-    fn rtsp_subv_url_present_for_crumb_managed_camera_with_a_sub() {
+    fn rtsp_subv_url_present_for_a_flagged_camera_with_a_sub() {
         assert_eq!(
             subv_url(true, Some("famroom_sub"), "famroom", BASE).as_deref(),
             Some("rtsp://u:p@host:18554/famroom_subv"),
@@ -1107,15 +1128,16 @@ mod tests {
             .contains('?'));
     }
 
-    /// …and absent everywhere reconcile never registered a `_subv`, so a client
+    /// …and absent everywhere reconcile never registered a `_subv`, so the client
     /// falls back to `rtsp_sub_url` instead of burning its reconnect budget on a
     /// dead stream name.
     #[test]
-    fn rtsp_subv_url_absent_when_unmanaged_or_no_sub() {
+    fn rtsp_subv_url_absent_when_unregistered_or_no_sub() {
         // No sub stream configured at all.
         assert_eq!(subv_url(true, None, "famroom", BASE), None);
         assert_eq!(subv_url(true, Some(""), "famroom", BASE), None);
-        // Frigate-served / legacy rows: `is_crumb_managed` already said no.
+        // Not registered: unmanaged row, OR a healthy camera reconcile never
+        // flagged (the common case — ten of eleven on the reference install).
         assert_eq!(subv_url(false, Some("famroom_sub"), "famroom", BASE), None);
         // End to end through the predicate, the way the handler wires it.
         for (served_by, source_url) in [
@@ -1128,6 +1150,26 @@ mod tests {
                 subv_url(managed, Some("famroom_sub"), "famroom", BASE),
                 None,
                 "{served_by}/{source_url:?} must not advertise a _subv",
+            );
+        }
+    }
+
+    /// The gate the handler actually computes: `crumb_managed && subv_needed`.
+    /// A HEALTHY managed camera is the case this whole follow-up exists for —
+    /// it must advertise no `_subv` at all, so its Android tile attaches to the
+    /// warm raw sub and the wall opens fast.
+    #[test]
+    fn rtsp_subv_url_is_gated_on_the_per_camera_repair_flag() {
+        for (managed, needed, want) in [
+            (true, true, Some("rtsp://u:p@host:18554/famroom_subv")),
+            (true, false, None),
+            (false, true, None),
+            (false, false, None),
+        ] {
+            assert_eq!(
+                subv_url(managed && needed, Some("famroom_sub"), "famroom", BASE).as_deref(),
+                want,
+                "managed={managed} needed={needed}",
             );
         }
     }
