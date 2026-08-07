@@ -1,4 +1,5 @@
-// Remappable ACTION shortcut bindings (snapshot / toggle audio / perf HUD) —
+// Remappable ACTION shortcut bindings (snapshot / toggle audio / perf HUD /
+// hide HA overlays) —
 // the single-key "do something" hotkeys, as opposed to the per-camera number
 // keys ([HotkeyConfigStore], lib/state/hotkey_config.dart) and the inherent
 // transport keys (Space/arrows/,/. in playback_hotkeys_listener.dart), which
@@ -13,7 +14,7 @@
 // they don't need to listen.
 //
 // Every consumer treats a missing store (null) as "use the defaults" — the
-// hardcoded S/M/F8 the listeners shipped with — so nothing crashes if the
+// hardcoded S/M/F8/H the listeners shipped with — so nothing crashes if the
 // store failed to load.
 
 import 'dart:async' show unawaited;
@@ -33,7 +34,14 @@ enum ShortcutAction {
   toggleAudio('Toggle audio', 'Mute or unmute the active pane\'s audio.'),
 
   /// Show/hide the live performance HUD footer. Default `F8`.
-  hudToggle('Performance HUD', 'Show or hide the performance footer.');
+  hudToggle('Performance HUD', 'Show or hide the performance footer.'),
+
+  /// Hide/show every on-video Home Assistant badge, on every camera.
+  /// Default `H`.
+  haOverlayToggle(
+    'Home Assistant overlays',
+    'Hide or show the HA badges on live video.',
+  );
 
   const ShortcutAction(this.label, this.description);
 
@@ -49,6 +57,7 @@ enum ShortcutAction {
     ShortcutAction.snapshot => LogicalKeyboardKey.keyS,
     ShortcutAction.toggleAudio => LogicalKeyboardKey.keyM,
     ShortcutAction.hudToggle => LogicalKeyboardKey.f8,
+    ShortcutAction.haOverlayToggle => LogicalKeyboardKey.keyH,
   };
 }
 

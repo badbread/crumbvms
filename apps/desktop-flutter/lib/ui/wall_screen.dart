@@ -23,6 +23,7 @@ import 'package:crumb_desktop/services/snapshot_registry.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/state/adaptive_wall.dart';
 import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/state/ha_overlay_prefs.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
@@ -32,6 +33,7 @@ import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/hotkeys/ha_overlay_hotkey.dart';
 import 'package:crumb_desktop/ui/live/pane_watchdog.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
@@ -700,11 +702,25 @@ class _WallScreenState extends State<WallScreen> {
       ),
     );
 
+    // H — hide/show every on-video HA badge, wall-wide (both the tiles and the
+    // maximized pane, which lives inside this subtree). Purely display; the
+    // right-click menu items stay available while hidden. It is a
+    // HardwareKeyboard hotkey, NOT a branch of the focus-chain listener below:
+    // that listener's node never holds primary focus on this screen, so a key
+    // branch in it would never run — see ha_overlay_hotkey.dart for the full
+    // why. Wrapping outermost keeps it live for the whole Live-tab lifetime.
+    Widget haKeyed(Widget child) => HaOverlayHotkey(
+      onToggle: HaOverlayPrefs.instance.toggle,
+      options: widget.clientOptions,
+      shortcuts: widget.shortcuts,
+      child: child,
+    );
+
     // Number-key hotkeys maximize the assigned camera; Esc restores; M toggles
     // audio. (S snapshot is handled by the app-level SnapshotHotkey.)
     final hk = widget.hotkeys;
-    if (hk == null) return scaffold;
-    return GlobalHotkeysListener(
+    if (hk == null) return haKeyed(scaffold);
+    final Widget keyed = GlobalHotkeysListener(
       store: hk,
       cameras: cams,
       autofocus: true,
@@ -744,6 +760,7 @@ class _WallScreenState extends State<WallScreen> {
       onRedo: () => _activeOverlayEditor?.redo(),
       child: scaffold,
     );
+    return haKeyed(keyed);
   }
 
   /// The overlay-editor controller currently in edit mode (PTZ or HA), or null
@@ -2025,14 +2042,21 @@ class _WallTileState extends State<_WallTile> {
                 if (_haLinks.any((l) => l.hasPlacement))
                   Positioned.fill(
                     child: ListenableBuilder(
-                      listenable: widget.liveStatus,
+                      listenable: Listenable.merge([
+                        widget.liveStatus,
+                        HaOverlayPrefs.instance,
+                      ]),
                       builder: (context, _) => HaOverlayLayer(
                         links: _haLinks,
                         stateFor: widget.liveStatus.haStateFor,
                         stale: widget.liveStatus.haStale,
                         videoW: _videoW,
                         videoH: _videoH,
-                        hideBadges: _scale > 1.01,
+                        // Hidden while zoomed (badges sit outside the zoom
+                        // transform) or while the operator has switched the HA
+                        // overlays off wall-wide.
+                        hideBadges:
+                            _scale > 1.01 || HaOverlayPrefs.instance.hidden,
                         // Actuation plumbing for the badge tap card (#187) —
                         // inert unless the account holds `actuators`.
                         api: widget.api,
@@ -3087,14 +3111,23 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                 else if (_haLinks.any((l) => l.hasPlacement))
                   Positioned.fill(
                     child: ListenableBuilder(
-                      listenable: widget.liveStatus,
+                      listenable: Listenable.merge([
+                        widget.liveStatus,
+                        HaOverlayPrefs.instance,
+                      ]),
                       builder: (context, _) => HaOverlayLayer(
                         links: _haLinks,
                         stateFor: widget.liveStatus.haStateFor,
                         stale: widget.liveStatus.haStale,
                         videoW: _videoW,
                         videoH: _videoH,
-                        hideBadges: _scale > 1.01,
+                        // Same two gates as the wall tile's copy: digital zoom,
+                        // and the wall-wide "hide HA overlays" toggle. The EDIT
+                        // branch above is deliberately NOT gated — opening
+                        // "Edit HA overlay…" while overlays are hidden shows the
+                        // badges for the editor session so they stay placeable.
+                        hideBadges:
+                            _scale > 1.01 || HaOverlayPrefs.instance.hidden,
                         // Actuation plumbing for the badge tap card (#187) —
                         // inert unless the account holds `actuators`.
                         api: widget.api,
