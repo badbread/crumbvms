@@ -25,14 +25,20 @@ Edit `.env` and set `MEDIA_HOST_PATH` to a disk with real headroom:
 MEDIA_HOST_PATH=/mnt/your-disk/crumb-data
 ```
 
-The default `./_data` folder works for testing, but cameras fill terabytes over time. If you point at a disk of your own, make the directory writable by the recorder's user (uid 1001) before bringing the stack up, or nothing records:
+The default `./_data` folder works for testing, but cameras fill terabytes over time. Whichever path you use, it has to be writable by the recorder's user (uid 1001) before you bring the stack up, or nothing records:
 
 ```bash
 sudo mkdir -p /mnt/your-disk/crumb-data
 sudo chown -R 1001:1001 /mnt/your-disk/crumb-data
 ```
 
-(`setup-env.sh` already does this for the default `./_data`. A directory Docker auto-creates ends up root-owned, the recorder can't write, and footage is silently lost while live view still works.)
+`setup-env.sh` creates the directory and *tries* the ownership change, but that only succeeds if you ran it as root, and the command in step 1 does not. It tells you when it couldn't, and prints the exact `chown` to run. It then preflights the directory for real: it names the filesystem, attempts a write there as uid 1001, and stops with a non-zero exit rather than let you continue if the answer is definitely no. On an NFS or SMB share no local `chown` helps, the fix belongs in the export or the mount options.
+
+Getting this wrong is quiet: a directory Docker auto-creates ends up root-owned, the recorder can't write, and footage is lost while live view (which touches no disk) keeps working. Set `MEDIA_HOST_PATH` before you run `setup-env.sh` and it preflights the real target instead of `./_data`:
+
+```bash
+MEDIA_HOST_PATH=/mnt/your-disk/crumb-data ./scripts/setup-env.sh
+```
 
 ## 3. Bring up the stack
 

@@ -46,12 +46,28 @@ sudo mkdir -p /mnt/your-disk/crumb-data
 sudo chown -R 1001:1001 /mnt/your-disk/crumb-data
 ```
 
-`setup-env.sh` does this automatically for the default `./_data`, but a
-custom path that Docker auto-creates on first `up` ends up root-owned. The
-recorder then can't write to it and footage is silently lost, while live
-view (which touches no disk) still works and the setup wizard still shows
-green, so this is worth getting right up front. You can add more disks later
-without touching the compose file: mount them under this same host path (or a
+`setup-env.sh` creates the media directory and attempts the ownership change
+itself, but that attempt only succeeds when the script runs as root, and the
+invocation in step 1 does not. When it fails the script says so and prints the
+exact `chown` command to run. Either way it then preflights the directory: it
+reports the filesystem, actually tries to create a file there as uid 1001, and
+exits non-zero rather than let a definitely-unwritable target through. On NFS,
+SMB, FUSE, or any other mount that remaps ownership, a local `chown` won't fix
+it and the script says so, the change belongs on the server or in the mount
+options.
+
+You can point the script at the real target so it preflights that instead of
+`./_data`:
+
+```bash
+MEDIA_HOST_PATH=/mnt/your-disk/crumb-data ./scripts/setup-env.sh
+```
+
+This matters because the failure is quiet: a custom path that Docker
+auto-creates on first `up` ends up root-owned, the recorder can't write to it
+and footage is lost, while live view (which touches no disk) still works and
+the setup wizard still shows green. You can add more disks later without
+touching the compose file: mount them under this same host path (or a
 subdirectory) and add the storage path in the admin console.
 
 ## 3. Bring up the stack
