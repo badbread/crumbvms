@@ -5,27 +5,39 @@
 // them, and [ClientOptionsStore.hotkeysEnabled] is the master off switch for
 // everything except Esc.
 //
-// Port of app.js `handleKeyDown` (app.js:4106-4151). Follows the same
-// Focus/onKeyEvent shape already established by
-// lib/ui/fullscreen/fullscreen_controller.dart's `FullscreenEscHandler` —
-// put THAT widget ABOVE this one in the tree (fullscreen-exit must win over
-// un-maximize on Esc, same ordering as app.js:4113-4129) and this one around
-// whatever body hosts the live wall. All callbacks are optional so a screen
-// that doesn't support a given action (e.g. no snapshot plugin wired up yet)
-// can simply omit it — the key is then a no-op instead of a crash.
+// Port of app.js `handleKeyDown` (app.js:4106-4151).
 //
-// Ignores every key while a text field has focus, matching app.js's
-// `e.target.tagName === 'INPUT' || 'TEXTAREA'` guard (app.js:4108).
+// THIS USED TO BE A `Focus.onKeyEvent` NODE, AND THAT IS WHY NONE OF IT
+// WORKED. Flutter delivers a key event to `primaryFocus` and its ANCESTORS
+// only, and the app root (`FullscreenEscHandler`, `autofocus: true`, built
+// first) permanently owns the route scope's `focusedChild`, so this widget's
+// own `autofocus: true` was silently discarded and its node sat BELOW the
+// focused one, off the dispatch chain. Nothing on the wall handed it focus
+// later either — the tiles are `Listener`/`GestureDetector`, which take no
+// keyboard focus. Every shortcut in here was inert in the shipped client.
 //
-// NOTE on overlap: `S` and `M` already have dedicated, independently-ported
-// widgets elsewhere in this app — lib/ui/snapshot/snapshot_hotkey.dart
-// (`SnapshotHotkey` -> `SnapshotService.captureActivePane`) and
+// It is now a `HardwareKeyboard` handler (registered on mount, removed on
+// dispose), the mechanism the H overlay toggle, the clip player's Esc and the
+// Shift-hint layer already use: `KeyEventManager` invokes EVERY registered
+// handler for every key event, independent of focus. The guards the focus
+// chain used to provide are re-applied explicitly via
+// [hotkeyContextBlocked] — see hotkey_gate.dart.
+//
+// ORDERING NOTES, since hardware handlers have no tree to order them:
+// - Every registered handler runs for every event; a `true` return marks the
+//   event consumed but does NOT stop the other handlers, nor the focus
+//   dispatch that follows them. So two handlers claiming the same key both
+//   fire. Keep [onSnapshot] null wherever the app-level `SnapshotHotkey` is
+//   mounted (it always is, main.dart), and keep [onEscape] null where a
+//   screen already has its own hardware Esc handler (the Clips clip player).
+// - Esc priority (app.js:4113-4129: leave the fullscreen camera wall first,
+//   un-maximize second) used to come from tree position. It now comes from
+//   the explicit [fullscreen] check below, which stands this handler down
+//   while the OS window is fullscreen so `FullscreenEscHandler` gets the key.
+//
+// NOTE on overlap: `M` also has a dedicated, independently-ported widget —
 // lib/ui/audio/audio_toggle_button.dart (`AudioHotkeyListener` ->
-// `AudioFollowController.toggleAudio()`). If those are already wired into
-// the screen, leave [onSnapshot] / [onToggleAudio] null here so the key
-// isn't handled twice by two separate Focus nodes — this widget's S/M hooks
-// exist only so a screen that has NOT adopted those dedicated widgets still
-// gets S/M as part of one unified listener alongside F8/Esc/digits.
+// `AudioFollowController.toggleAudio()`). Don't wire both on one screen.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -34,6 +46,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
+import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 
 /// A keydown -> hotkey token ("3", "s3", "n3"), or null. Uses the PHYSICAL key
@@ -84,10 +97,15 @@ String? _hotkeyTokenFromEvent(KeyEvent event) {
 }
 
 /// Wraps [child] with the global number-key/HUD/snapshot/audio/escape
-/// shortcuts. [cameras] should be the current viewer-visible camera list
-/// (same list the wall builds tiles from) — pass a live/rebuilt list so the
-/// auto hotkey assignment stays in sync with `hotkeysAuto`.
-class GlobalHotkeysListener extends StatelessWidget {
+/// shortcuts, live for exactly as long as it is mounted. [cameras] should be
+/// the current viewer-visible camera list (same list the wall builds tiles
+/// from) — pass a live/rebuilt list so the auto hotkey assignment stays in
+/// sync with `hotkeysAuto`.
+///
+/// Mount ONE of these per screen, and only on screens that are mutually
+/// exclusive (Live / Playback / Clips are separate tabs, only one body is
+/// built at a time) — two mounted at once means every key fires twice.
+class GlobalHotkeysListener extends StatefulWidget {
   const GlobalHotkeysListener({
     super.key,
     required this.store,
@@ -100,9 +118,9 @@ class GlobalHotkeysListener extends StatelessWidget {
     this.onEscape,
     this.onUndo,
     this.onRedo,
-    this.autofocus = false,
     this.shortcuts,
     this.options,
+    this.fullscreen,
   });
 
   final HotkeyConfigStore store;
@@ -139,10 +157,17 @@ class GlobalHotkeysListener extends StatelessWidget {
   /// `AudioFollowController.toggleAudio()`.)
   final VoidCallback? onToggleAudio;
 
-  /// Esc — restore from maximize (only reached if nothing above this widget
-  /// in the tree — e.g. `FullscreenEscHandler` — already consumed the Esc).
+  /// Esc — restore from maximize. Fires only when the OS window is NOT
+  /// fullscreen: the old client left the fullscreen camera wall on the first
+  /// Esc and un-maximized on the second (app.js:4113-4129), and [fullscreen]
+  /// is how that order is preserved now that both handlers see every key.
   /// (app.js:4121-4129.)
   final VoidCallback? onEscape;
+
+  /// The app's OS-window fullscreen state, used only for the Esc priority
+  /// above. Null → this handler takes Esc unconditionally (fine on a screen
+  /// that can't be fullscreen).
+  final FullscreenController? fullscreen;
 
   /// Ctrl+Z / Ctrl+Y — undo/redo for the active overlay editor (issue #4).
   /// Only fire while an editor is open; null → no-op. Suppressed while a text
@@ -150,114 +175,127 @@ class GlobalHotkeysListener extends StatelessWidget {
   final VoidCallback? onUndo;
   final VoidCallback? onRedo;
 
-  /// Whether this Focus node should grab focus immediately. Leave false if
-  /// an ancestor `Focus`/`FullscreenEscHandler` already autofocuses — only
-  /// one autofocus is needed per screen.
-  final bool autofocus;
+  @override
+  State<GlobalHotkeysListener> createState() => _GlobalHotkeysListenerState();
+}
+
+class _GlobalHotkeysListenerState extends State<GlobalHotkeysListener> {
+  @override
+  void initState() {
+    super.initState();
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
+  }
 
   @override
-  Widget build(BuildContext context) {
-    return Focus(
-      autofocus: autofocus,
-      onKeyEvent: (node, event) {
-        if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        final textFocused = hotkeyContextBlocked();
-
-        // Esc: restore from maximize. Checked BEFORE the text-focus guard AND
-        // the master toggle — Esc must always work or a maximized pane becomes
-        // a trap (a focused editor text field must still yield to Esc).
-        if (event.logicalKey == LogicalKeyboardKey.escape) {
-          if (onEscape != null) {
-            onEscape!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        final keys = HardwareKeyboard.instance;
-        // Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) — overlay-editor undo/redo. Only
-        // when NOT typing (a focused text field keeps native undo), and only
-        // while an editor is open (the callbacks are null otherwise).
-        if (!textFocused &&
-            keys.isControlPressed &&
-            !keys.isAltPressed &&
-            !keys.isMetaPressed) {
-          final isZ = event.logicalKey == LogicalKeyboardKey.keyZ;
-          final isY = event.logicalKey == LogicalKeyboardKey.keyY;
-          if (isZ && keys.isShiftPressed) {
-            if (onRedo != null) {
-              onRedo!();
-              return KeyEventResult.handled;
-            }
-          } else if (isZ) {
-            if (onUndo != null) {
-              onUndo!();
-              return KeyEventResult.handled;
-            }
-          } else if (isY) {
-            if (onRedo != null) {
-              onRedo!();
-              return KeyEventResult.handled;
-            }
-          }
-        }
-
-        // Every single-key shortcut below stands down while a text input has
-        // focus (issue #2).
-        if (textFocused) return KeyEventResult.ignored;
-
-        // Master "Enable keyboard shortcuts" toggle: everything below —
-        // actions AND camera number keys — is inert while it's off.
-        if (!(options?.hotkeysEnabled ?? true)) return KeyEventResult.ignored;
-
-        // Perf HUD toggle (default F8) — remappable via KeyboardShortcutsStore.
-        if (event.logicalKey ==
-            (shortcuts?.keyFor(ShortcutAction.hudToggle) ??
-                LogicalKeyboardKey.f8)) {
-          if (onHudToggle != null) {
-            onHudToggle!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Snapshot the active pane (default S) — remappable.
-        if (event.logicalKey ==
-            (shortcuts?.keyFor(ShortcutAction.snapshot) ??
-                LogicalKeyboardKey.keyS)) {
-          if (onSnapshot != null) {
-            onSnapshot!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Toggle audio for the active camera (default M) — remappable.
-        if (event.logicalKey ==
-            (shortcuts?.keyFor(ShortcutAction.toggleAudio) ??
-                LogicalKeyboardKey.keyM)) {
-          if (onToggleAudio != null) {
-            onToggleAudio!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Number keys: "go to" the assigned camera. Remappable via
-        // HotkeyConfigStore / HotkeyRemapScreen.
-        final token = _hotkeyTokenFromEvent(event);
-        if (token != null) {
-          final camId = store.cameraForToken(cameras, token);
-          if (camId != null && onGoToCamera != null) {
-            onGoToCamera!(camId);
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        return KeyEventResult.ignored;
-      },
-      child: child,
-    );
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    super.dispose();
   }
+
+  /// Returns true only for the press it actually acted on; everything else
+  /// (and every guarded case) falls through untouched.
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (!mounted) return false;
+
+    // Typing, a pushed route, or a mounted HotkeySuppressor (the Settings
+    // panel / re-auth overlay) — nothing here fires, Esc included.
+    if (hotkeyContextBlocked(context)) return false;
+
+    final keys = HardwareKeyboard.instance;
+
+    // Esc: restore from maximize. Checked BEFORE the master toggle — turning
+    // shortcuts off must not make a maximized pane a trap.
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      if (widget.onEscape == null) return false;
+      // Old-client priority (app.js:4113-4129): the fullscreen camera wall
+      // exits first, un-maximize is the NEXT Esc. `FullscreenEscHandler` is a
+      // focus-chain node that runs after the hardware handlers on the same
+      // event, so standing down here is what hands it the key.
+      if (widget.fullscreen?.isFullscreen ?? false) return false;
+      widget.onEscape!();
+      return true;
+    }
+
+    // Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) — overlay-editor undo/redo. Editor
+    // controls rather than "shortcuts", so they too ignore the master toggle;
+    // the callbacks are null unless an editor is actually open.
+    if (keys.isControlPressed && !keys.isAltPressed && !keys.isMetaPressed) {
+      final isZ = event.logicalKey == LogicalKeyboardKey.keyZ;
+      final isY = event.logicalKey == LogicalKeyboardKey.keyY;
+      if (isZ && keys.isShiftPressed) {
+        if (widget.onRedo != null) {
+          widget.onRedo!();
+          return true;
+        }
+      } else if (isZ) {
+        if (widget.onUndo != null) {
+          widget.onUndo!();
+          return true;
+        }
+      } else if (isY) {
+        if (widget.onRedo != null) {
+          widget.onRedo!();
+          return true;
+        }
+      }
+    }
+
+    // Master "Enable keyboard shortcuts" toggle: everything below — actions
+    // AND camera number keys — is inert while it's off.
+    if (shortcutsDisabled(widget.options)) return false;
+
+    // The action keys are bare, unmodified presses; a Ctrl/Alt/Win chord
+    // belongs to whoever owns that chord. (Shift is allowed — it's how the
+    // 11-20 camera bank is reached, and a bare letter binding fires either
+    // way.)
+    if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
+      return false;
+    }
+
+    // Perf HUD toggle (default F8) — remappable via KeyboardShortcutsStore.
+    if (event.logicalKey ==
+        (widget.shortcuts?.keyFor(ShortcutAction.hudToggle) ??
+            LogicalKeyboardKey.f8)) {
+      if (widget.onHudToggle == null) return false;
+      widget.onHudToggle!();
+      return true;
+    }
+
+    // Snapshot the active pane (default S) — remappable. Null on every
+    // current screen; the app-level SnapshotHotkey owns this key.
+    if (event.logicalKey ==
+        (widget.shortcuts?.keyFor(ShortcutAction.snapshot) ??
+            LogicalKeyboardKey.keyS)) {
+      if (widget.onSnapshot == null) return false;
+      widget.onSnapshot!();
+      return true;
+    }
+
+    // Toggle audio for the active camera (default M) — remappable.
+    if (event.logicalKey ==
+        (widget.shortcuts?.keyFor(ShortcutAction.toggleAudio) ??
+            LogicalKeyboardKey.keyM)) {
+      if (widget.onToggleAudio == null) return false;
+      widget.onToggleAudio!();
+      return true;
+    }
+
+    // Number keys: "go to" the assigned camera. Remappable via
+    // HotkeyConfigStore / HotkeyRemapScreen.
+    final token = _hotkeyTokenFromEvent(event);
+    if (token != null) {
+      final camId = widget.store.cameraForToken(widget.cameras, token);
+      if (camId != null && widget.onGoToCamera != null) {
+        widget.onGoToCamera!(camId);
+        return true;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }

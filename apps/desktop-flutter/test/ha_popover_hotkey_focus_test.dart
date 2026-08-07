@@ -15,7 +15,7 @@
 //     once it does not.
 //
 // The suppression itself is deliberately EXPLICIT
-// (`SuppressHotkeysWhileFocused`) rather than another focus-tree heuristic:
+// (`HotkeySuppressor.whileFocused`) rather than another focus-tree heuristic:
 // `textInputHasFocus()` can only answer for a field that has focus, which is
 // exactly the state that was in doubt.
 
@@ -119,7 +119,7 @@ void main() {
       // `textInputHasFocus()`: the focus-tree heuristic cannot see this field
       // (see text_focus.dart's KNOWN LIMIT), which is the whole reason the
       // popover declares its suppression explicitly.
-      expect(hotkeysExplicitlySuppressed, isTrue);
+      expect(hotkeysSuppressed, isTrue);
       expect(hotkeyContextBlocked(), isTrue);
 
       await tester.enterText(search, 'spot');
@@ -161,7 +161,7 @@ void main() {
       // losing focus (it was disposed holding it).
       await tester.tap(find.text('Auto').first);
       await tester.pumpAndSettle();
-      expect(hotkeysExplicitlySuppressed, isFalse);
+      expect(hotkeysSuppressed, isFalse);
 
       // Flutter parks focus on the nearest surviving node when the focused one
       // is disposed, which in this popover can be another text field's wrapper
@@ -211,7 +211,7 @@ void main() {
 
       // The size box is the popover's only number field.
       final size = find.descendant(
-        of: find.byType(SuppressHotkeysWhileFocused),
+        of: find.byType(HotkeySuppressor),
         matching: find.byType(TextField),
       );
       await tester.tap(size.last);
@@ -220,7 +220,7 @@ void main() {
     });
   });
 
-  group('SuppressHotkeysWhileFocused', () {
+  group('HotkeySuppressor.whileFocused', () {
     testWidgets('suppression is released when the subtree is disposed',
         (tester) async {
       useDesktopSurface(tester);
@@ -229,7 +229,7 @@ void main() {
       await tester.pumpWidget(
         _appRoot(
           onH: () {},
-          child: SuppressHotkeysWhileFocused(
+          child: HotkeySuppressor.whileFocused(
             child: TextField(focusNode: node),
           ),
         ),
@@ -241,14 +241,14 @@ void main() {
       // global_hotkeys_focus_test.dart's note on the same geometry).
       node.requestFocus();
       await tester.pumpAndSettle();
-      expect(hotkeysExplicitlySuppressed, isTrue);
+      expect(hotkeysSuppressed, isTrue);
 
       // Popover closes (Done) while the field still holds focus.
       await tester.pumpWidget(
         _appRoot(onH: () {}, child: const SizedBox.expand()),
       );
       await tester.pumpAndSettle();
-      expect(hotkeysExplicitlySuppressed, isFalse);
+      expect(hotkeysSuppressed, isFalse);
     });
 
     testWidgets('overlapping fields do not release each other', (tester) async {
@@ -256,14 +256,14 @@ void main() {
       // must not un-suppress midway.
       final releaseA = pushHotkeySuppression();
       final releaseB = pushHotkeySuppression();
-      expect(hotkeysExplicitlySuppressed, isTrue);
+      expect(hotkeysSuppressed, isTrue);
       releaseA();
-      expect(hotkeysExplicitlySuppressed, isTrue);
+      expect(hotkeysSuppressed, isTrue);
       releaseB();
-      expect(hotkeysExplicitlySuppressed, isFalse);
+      expect(hotkeysSuppressed, isFalse);
       // Double-release is a no-op, not an underflow.
       releaseB();
-      expect(hotkeysExplicitlySuppressed, isFalse);
+      expect(hotkeysSuppressed, isFalse);
     });
   });
 

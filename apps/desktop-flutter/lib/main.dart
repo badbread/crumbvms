@@ -50,6 +50,7 @@ import 'package:crumb_desktop/ui/export/export_screen.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/fullscreen/launch_fullscreen_option.dart';
 import 'package:crumb_desktop/ui/hints/shift_hints.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/login_screen.dart';
 import 'package:crumb_desktop/ui/motion_tuner/motion_tuner_screen.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
@@ -884,8 +885,14 @@ class _MainShellState extends State<MainShell> with WindowListener {
                     _buildBody(session),
                     // The floating Settings panel overlays the current tab with
                     // no scrim, so the wall behind stays live + interactive.
+                    // It is NOT a pushed route, so the tab underneath keeps its
+                    // hotkey handlers registered — HotkeySuppressor is what
+                    // stops a keypress in the shortcut-capture box from also
+                    // firing the shortcut behind the panel.
                     if (_settingsOpen)
-                      Positioned.fill(child: _settingsPanel(session)),
+                      Positioned.fill(
+                        child: HotkeySuppressor(child: _settingsPanel(session)),
+                      ),
                   ],
                 ),
               ),
@@ -1400,6 +1407,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
           hotkeys: widget.hotkeys,
           // Remapped action shortcuts for the wall's key listener.
           shortcuts: widget.shortcuts,
+          // Esc order on the wall: leave the fullscreen camera wall first,
+          // un-maximize on the next press (old-client behavior).
+          fullscreen: widget.fullscreen,
           // Remember which pane is maximized so Playback can open on it.
           onMaximizedCameraChanged: (id) => _liveMaximizedId = id,
           // Perf/debug line → bottom status bar (not a floating wall overlay).

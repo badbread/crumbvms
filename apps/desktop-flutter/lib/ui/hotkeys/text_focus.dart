@@ -29,7 +29,7 @@
 //
 // So: this stays a cheap best-effort signal, and anything that must be CERTAIN
 // it owns the keyboard declares it explicitly with `hotkey_gate.dart`'s
-// `SuppressHotkeysWhileFocused`. The gate treats either signal as blocking.
+// `HotkeySuppressor.whileFocused`. The gate treats either signal as blocking.
 
 import 'package:flutter/widgets.dart';
 

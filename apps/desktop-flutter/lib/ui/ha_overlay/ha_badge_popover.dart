@@ -660,7 +660,7 @@ class _StyleBodyState extends State<_StyleBody> {
           Expanded(
             child: SizedBox(
               height: 32,
-              child: SuppressHotkeysWhileFocused(
+              child: HotkeySuppressor.whileFocused(
                 child: TextField(
                 controller: _labelCtrl,
                 focusNode: _labelFocus,
@@ -782,7 +782,7 @@ class _StyleBodyState extends State<_StyleBody> {
         children: [
           SizedBox(
             height: 30,
-            child: SuppressHotkeysWhileFocused(
+            child: HotkeySuppressor.whileFocused(
               child: TextField(
               controller: _iconQueryCtrl,
               focusNode: _iconFocus,
@@ -1030,7 +1030,7 @@ class _StyleBodyState extends State<_StyleBody> {
             SizedBox(
               width: 52,
               height: 30,
-              child: SuppressHotkeysWhileFocused(
+              child: HotkeySuppressor.whileFocused(
                 child: TextField(
                   controller: _sizeCtrl,
                   focusNode: _sizeFocus,

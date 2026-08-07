@@ -98,7 +98,7 @@ class _HaEntityPaletteState extends State<HaEntityPalette> {
           if (widget.showSearch) ...[
             SizedBox(
               height: 32,
-              child: SuppressHotkeysWhileFocused(
+              child: HotkeySuppressor.whileFocused(
                 child: TextField(
                   controller: _searchCtrl,
                   style: const TextStyle(color: Colors.white, fontSize: 13),

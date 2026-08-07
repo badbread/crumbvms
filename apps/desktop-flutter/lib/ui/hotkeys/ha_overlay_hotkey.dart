@@ -75,8 +75,10 @@ class _HaOverlayHotkeyState extends State<HaOverlayHotkey> {
     super.dispose();
   }
 
-  /// Returns true only for the press it actually consumed — every other key
-  /// (and every guarded case) falls through to the normal focus dispatch.
+  /// Returns true only for the press it actually acted on, marking the event
+  /// consumed for the platform. (It does not stop the focus dispatch that
+  /// follows — `KeyEventManager` runs that unconditionally — which is why the
+  /// guards below, not the return value, are what protect a focused field.)
   bool _onKeyEvent(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
     if (!mounted) return false;
@@ -93,14 +95,14 @@ class _HaOverlayHotkeyState extends State<HaOverlayHotkey> {
       return false;
     }
 
-    // The guards the focus chain would have applied for us:
-    // typing an "h" into a label/search field must never toggle overlays…
-    if (hotkeyContextBlocked()) return false;
-    // …a pushed route (dialog, picker, the bookmarks/config-view screens) owns
-    // the keyboard while it's up…
-    if (Navigator.maybeOf(context)?.canPop() ?? false) return false;
+    // The guards the focus chain would have applied for us — typing, a pushed
+    // route (dialog, picker, the bookmarks/config-view screens), or an in-tree
+    // overlay that owns the keyboard (the Settings panel's shortcut-capture
+    // box, the re-auth prompt). Shared with every other hardware hotkey; see
+    // hotkey_gate.dart.
+    if (hotkeyContextBlocked(context)) return false;
     // …and the master shortcuts switch turns every shortcut off.
-    if (!(widget.options?.hotkeysEnabled ?? true)) return false;
+    if (shortcutsDisabled(widget.options)) return false;
 
     // Deliberate: this still fires while the HA overlay EDITOR is open. The
     // editor force-shows the badges so they stay placeable (wall_screen.dart's

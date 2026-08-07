@@ -1,97 +1,125 @@
-// The single "should a bare-key global shortcut stand down right now?" gate,
-// plus an EXPLICIT suppression mechanism for the cases focus introspection
-// cannot see.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// ── Why introspection alone is not enough ───────────────────────────────────
-// `text_focus.dart`'s `textInputHasFocus()` answers the question by walking
-// the focus tree, and it works — for a field that actually holds focus. The
-// failure it cannot catch is the inverse one: a text field the operator is
-// TYPING AT that never received focus in the first place. Then no guard fires,
-// the key bubbles all the way up, and a bare-letter shortcut eats the
-// keystroke. That is exactly what happened to the HA badge popover's icon
-// search box: typing "spotlights" lost the leading "s" to the snapshot hotkey
-// (issue: PR #495 live test).
+// The shared guard rails for every "always fires" hotkey in this app — the
+// ones registered on `HardwareKeyboard.addHandler` rather than a
+// `Focus.onKeyEvent` node.
 //
-// So a widget that owns a text field can declare the suppression itself rather
-// than hoping the focus tree reads correctly:
+// WHY THIS EXISTS. Flutter dispatches a key event to `primaryFocus` and its
+// ANCESTORS only. On this app the app root (`FullscreenEscHandler`,
+// `autofocus: true`, built first) permanently owns the route scope's
+// `focusedChild` — a scope applies at most one autofocus request
+// (`_Autofocus.applyIfValid` bails once `scope.focusedChild != null`) — so any
+// `Focus.onKeyEvent` listener mounted BELOW it is off the dispatch chain and
+// its handler never runs. That is what made the whole live-wall shortcut set
+// (S / M / F8 / the camera number banks / Esc) inert in the shipped client.
+// The repair is to register on `HardwareKeyboard`, which invokes every
+// registered handler for every key event, independent of focus.
 //
-//   SuppressHotkeysWhileFocused(child: TextField(...))
+// The cost of leaving the focus chain is that its natural guards leave with
+// it, so each handler has to re-apply them itself — and, because
+// `KeyEventManager` runs the focus dispatch *unconditionally* after the
+// hardware handlers (`_dispatchKeyMessage` is not gated on the handlers'
+// return value, hardware_keyboard.dart), returning true does NOT stop a
+// focused text field from also receiving the key. The text-focus check below
+// is therefore the ONLY thing standing between an operator typing a camera
+// name and the wall jumping cameras under them. Every hardware hotkey calls
+// [hotkeyContextBlocked] first; nothing else is a substitute.
 //
-// which holds a process-wide suppression for exactly as long as that subtree
-// holds focus, and releases it on dispose no matter how the widget goes away.
-// Belt and suspenders: the focus check still runs, and either one blocking is
-// enough.
+// ── TWO WAYS TO BLOCK, because focus introspection is not always enough ─────
+// [textInputHasFocus] answers by walking Flutter's focus tree, and it has a
+// documented blind spot (see text_focus.dart): a field given an explicit
+// `focusNode:` puts the focused element INSIDE its own `EditableText`, so a
+// downward walk finds nothing. That is the shape of the HA badge editor's
+// icon-search box, and with the snapshot key now a hardware handler the
+// consequence was that typing "spotlights" into it BOTH inserted the text and
+// fired a snapshot (PR #495 live test).
 //
-// Every bare-key handler in the app routes through [hotkeyContextBlocked] —
-// the snapshot key, the wall's number/M/F8 keys, the HA-overlay H key, and the
-// playback transport keys — so there is one place to reason about, and one
-// place to add the next exception.
+// So a widget may also DECLARE that it owns the keyboard, via
+// [HotkeySuppressor], instead of hoping the focus tree reads correctly. Two
+// shapes, one primitive:
+//
+//   HotkeySuppressor(child: …)                    // while MOUNTED
+//   HotkeySuppressor.whileFocused(child: …)       // while the subtree has focus
+//
+// The first is for an in-tree overlay that owns the keyboard for as long as it
+// is up (the floating Settings panel's shortcut-capture box, the re-auth
+// prompt). The second wraps an individual TEXT FIELD whose focus the tree walk
+// cannot see. Either way the gate treats the declaration and the focus check
+// as independent reasons to block — whichever notices first wins.
 
 import 'package:flutter/widgets.dart';
 
-import 'text_focus.dart';
+import 'package:crumb_desktop/state/client_options.dart';
+import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
 
-/// Active explicit suppressions. A counter, not a flag: two text fields can
-/// briefly overlap during a focus handoff, and the second one releasing must
-/// not un-suppress while the first is still typing.
-int _suppressions = 0;
+/// Outstanding suppressions. A DEPTH COUNTER, not a bool, so nested and
+/// overlapping suppressors compose — two text fields briefly overlap during a
+/// focus handoff, and the one letting go must not un-suppress while the other
+/// is still typing.
+int _suppressDepth = 0;
 
-/// True while any [SuppressHotkeysWhileFocused] (or [pushHotkeySuppression])
-/// is holding the keyboard.
-bool get hotkeysExplicitlySuppressed => _suppressions > 0;
+/// True while any [HotkeySuppressor] is holding the keyboard.
+bool get hotkeysSuppressed => _suppressDepth > 0;
 
-/// Take a suppression directly. Returns the release callback — call it exactly
-/// once. Prefer [SuppressHotkeysWhileFocused], which cannot leak.
+/// Take a suppression directly. Returns its release callback, which is
+/// idempotent — calling it twice cannot underflow the counter. Prefer
+/// [HotkeySuppressor], which cannot leak one.
 VoidCallback pushHotkeySuppression() {
-  _suppressions++;
+  _suppressDepth++;
   var released = false;
   return () {
     if (released) return;
     released = true;
-    if (_suppressions > 0) _suppressions--;
+    if (_suppressDepth > 0) _suppressDepth--;
   };
 }
 
-/// Visible for tests: drop every outstanding suppression.
+/// Visible for tests: drop every outstanding suppression, so one test's
+/// teardown cannot leak into the next.
 @visibleForTesting
-void resetHotkeySuppressionForTest() => _suppressions = 0;
+void resetHotkeySuppressionForTest() => _suppressDepth = 0;
 
-/// The gate every bare-key global shortcut consults before acting.
+/// Declares that this subtree owns the keyboard, so no hardware hotkey fires
+/// while it does.
 ///
-/// Blocked when:
-/// * something explicitly suppressed the keyboard (a text field declaring
-///   itself — see the file doc); or
-/// * the focus tree says a text input has focus; or
-/// * `context` is given and a route is pushed over the app (a dialog, a
-///   picker, the bookmarks/config screens own the keyboard while up).
-bool hotkeyContextBlocked([BuildContext? context]) {
-  if (hotkeysExplicitlySuppressed) return true;
-  if (textInputHasFocus()) return true;
-  if (context != null && (Navigator.maybeOf(context)?.canPop() ?? false)) {
-    return true;
-  }
-  return false;
-}
+/// The default constructor suppresses for as long as the widget is MOUNTED —
+/// for an in-tree overlay that is not a pushed route, and so is invisible to
+/// the `Navigator.canPop()` check: the floating Settings panel and the re-auth
+/// overlay, both of which render in a `Stack` over the still-mounted Live tab
+/// (the wall's hotkeys are still registered underneath them). Without this,
+/// pressing a key in the Keyboard Shortcuts capture box would both record the
+/// binding AND fire the shortcut behind the panel.
+///
+/// [HotkeySuppressor.whileFocused] instead suppresses only while something in
+/// the subtree holds focus — for wrapping a TEXT FIELD the focus-tree walk
+/// cannot see. Wrap the field itself, not the whole panel: the wrapper's own
+/// node cannot take focus, but `hasFocus` is true whenever a DESCENDANT holds
+/// it, so wrapping tightly keeps the suppression precise (clicking a button
+/// elsewhere in the same panel must not silence the keyboard).
+class HotkeySuppressor extends StatefulWidget {
+  const HotkeySuppressor({super.key, required this.child})
+      : whileFocused = false;
 
-/// Holds a hotkey suppression for as long as anything in [child] has focus.
-///
-/// Wrap a TEXT FIELD (not a whole panel): the wrapper's own [FocusNode] cannot
-/// take focus itself, but `hasFocus` is true whenever a DESCENDANT holds it,
-/// so wrapping just the field keeps the suppression precise — clicking a
-/// button elsewhere in the same panel does not silence the keyboard.
-class SuppressHotkeysWhileFocused extends StatefulWidget {
-  const SuppressHotkeysWhileFocused({super.key, required this.child});
+  const HotkeySuppressor.whileFocused({super.key, required this.child})
+      : whileFocused = true;
 
   final Widget child;
 
+  /// False: suppress from mount to dispose. True: only while focused.
+  final bool whileFocused;
+
   @override
-  State<SuppressHotkeysWhileFocused> createState() =>
-      _SuppressHotkeysWhileFocusedState();
+  State<HotkeySuppressor> createState() => _HotkeySuppressorState();
 }
 
-class _SuppressHotkeysWhileFocusedState
-    extends State<SuppressHotkeysWhileFocused> {
+class _HotkeySuppressorState extends State<HotkeySuppressor> {
   VoidCallback? _release;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.whileFocused) _release = pushHotkeySuppression();
+  }
 
   void _onFocusChange(bool hasFocus) {
     if (hasFocus) {
@@ -104,18 +132,58 @@ class _SuppressHotkeysWhileFocusedState
 
   @override
   void dispose() {
-    // Release on the way out even if focus never reported leaving (the field
-    // can be disposed while focused — the popover closing on Done, say).
+    // Release on the way out even if focus never reported leaving — a field
+    // can be disposed while still holding focus (the HA badge popover's icon
+    // grid collapsing, say).
     _release?.call();
     _release = null;
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => Focus(
-        canRequestFocus: false,
-        skipTraversal: true,
-        onFocusChange: _onFocusChange,
-        child: widget.child,
-      );
+  Widget build(BuildContext context) {
+    if (!widget.whileFocused) return widget.child;
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      onFocusChange: _onFocusChange,
+      child: widget.child,
+    );
+  }
 }
+
+/// True when NO hotkey may fire right now, Esc included: a text input holds
+/// focus (typing must never drive the wall), a route is pushed on top (a
+/// dialog/picker/full-screen settings surface owns the keyboard), or a
+/// [HotkeySuppressor] is mounted/focused.
+///
+/// Deliberately covers Esc too. The focus-chain listeners this replaces
+/// checked Esc *before* their text-focus guard, but they could afford to: a
+/// focused field saw the key first and swallowed it. A hardware handler has no
+/// such ordering, so exempting Esc would steal it from the field/dropdown that
+/// wants it. Nothing is trapped by this: the field loses focus and the next
+/// Esc lands.
+///
+/// [context] is optional ONLY so a caller with no element of its own (a test,
+/// or a non-widget guard) can still ask the other two questions; omitting it
+/// skips the pushed-route check. Every real hotkey handler has a context and
+/// passes it.
+bool hotkeyContextBlocked([BuildContext? context]) {
+  if (hotkeysSuppressed) return true;
+  if (textInputHasFocus()) return true;
+  if (context != null && (Navigator.maybeOf(context)?.canPop() ?? false)) {
+    return true;
+  }
+  return false;
+}
+
+/// The master "Enable keyboard shortcuts" switch
+/// ([ClientOptionsStore.hotkeysEnabled]), read live at key-press time. Null →
+/// shortcuts on.
+///
+/// Checked SEPARATELY from [hotkeyContextBlocked] because the two aren't the
+/// same question: Esc (restore from maximize) and the overlay editors' Ctrl+Z
+/// deliberately ignore this switch — they're escape hatches and editor
+/// controls, not "shortcuts", and turning them off would trap the user.
+bool shortcutsDisabled(ClientOptionsStore? options) =>
+    !(options?.hotkeysEnabled ?? true);
