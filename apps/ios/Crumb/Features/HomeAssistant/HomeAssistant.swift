@@ -391,6 +391,16 @@ extension HA {
         domain == "cover" || domain == "lock"
     }
 
+    /// Whether a VALUE commit (the `HAValueSlider`) for `link` must be confirmed
+    /// before it fires: the link's own `require_confirm` (migration 0075), or a
+    /// physical-security domain regardless of that flag, so a cover's position
+    /// slider confirms exactly like its Open/Close buttons. Mirrors the Android
+    /// `haNeedsConfirm`, `lock` included: a lock exposes no value control today,
+    /// but if one ever appears it must confirm rather than silently actuate.
+    static func valueNeedsConfirm(_ link: HaLink) -> Bool {
+        link.requireConfirm || link.domain == "cover" || link.domain == "lock"
+    }
+
     /// The single service call a one-tap fires for a directly-controllable
     /// (simple) actuator domain, mirroring the server allow-list: `toggle` for
     /// on/off devices, `press` for buttons, `turn_on` (activate/run) for
@@ -740,9 +750,6 @@ struct HAStateCard: View {
     @State private var inFlight: String?
     /// Awaiting confirmation (lock/cover only).
     @State private var pending: HAAction?
-    /// A value-slider commit awaiting confirmation (`require_confirm` or a
-    /// cover, issue #442 Slice 1) — the target value it would send.
-    @State private var pendingValue: PendingValueCommit?
     @State private var errorText: String?
 
     private var state: HaEntityState? { controller.state(for: link.entityId) }
@@ -793,8 +800,18 @@ struct HAStateCard: View {
                     Text("Changed \(age)").font(.caption).foregroundColor(CrumbColors.textSecondary)
                 }
                 if let control = valueControl {
-                    HAValueSlider(control: control, disabled: inFlight != nil) { target in
-                        commitValue(control, target)
+                    // The slider owns its own confirm prompt and its own
+                    // committed-hold state machine (Android parity): a
+                    // confirm-gated release must not pin the thumb before the
+                    // POST is actually authorized, and a rejected POST must
+                    // release the pin at once.
+                    HAValueSlider(
+                        control: control,
+                        entityName: link.displayName,
+                        needsConfirm: HA.valueNeedsConfirm(link),
+                        disabled: inFlight != nil
+                    ) { target in
+                        await fireValue(control, target)
                     }
                 }
                 if !actions.isEmpty {
@@ -839,39 +856,6 @@ struct HAStateCard: View {
                 }
             }
             Button("Cancel", role: .cancel) { pending = nil }
-        }
-        .confirmationDialog(
-            pendingValue.map { "Set \(link.displayName) to \($0.displayValue)?" } ?? "",
-            isPresented: Binding(get: { pendingValue != nil }, set: { if !$0 { pendingValue = nil } }),
-            titleVisibility: .visible
-        ) {
-            if let commit = pendingValue {
-                Button("Set") {
-                    pendingValue = nil
-                    Task { await fireValue(commit.control, commit.value) }
-                }
-            }
-            Button("Cancel", role: .cancel) { pendingValue = nil }
-        }
-    }
-
-    /// A value-slider commit awaiting confirmation, and the label the
-    /// confirmation dialog interpolates it into.
-    private struct PendingValueCommit {
-        let control: HaControlDescriptor
-        let value: Double
-        var displayValue: String { HAValueSlider.label(for: value, control: control) }
-    }
-
-    /// Route a slider commit through the same confirm gate as a button action:
-    /// the link's own `require_confirm`, or (physical-security parity with
-    /// cover's open/close buttons) the entity being a cover. Everything else
-    /// fires immediately, exactly like a light/fan toggle.
-    private func commitValue(_ control: HaControlDescriptor, _ value: Double) {
-        if link.requireConfirm || link.domain == "cover" {
-            pendingValue = PendingValueCommit(control: control, value: value)
-        } else {
-            Task { await fireValue(control, value) }
         }
     }
 
@@ -927,15 +911,23 @@ struct HAStateCard: View {
     /// One value-setting service call (issue #442 Slice 1), with the slider
     /// disabled for its duration. Same pattern as `fire`: the shown value is
     /// left alone either way, the 3s poll converges it.
-    private func fireValue(_ control: HaControlDescriptor, _ value: Double) async {
+    ///
+    /// Returns whether the server accepted the call. A `false` tells the slider
+    /// to drop its committed hold immediately and re-seed from the live polled
+    /// value, so a rejected (403/400) or dropped POST can never leave the thumb
+    /// parked at a position the device was never set to.
+    private func fireValue(_ control: HaControlDescriptor, _ value: Double) async -> Bool {
         errorText = nil
         inFlight = control.action
+        var accepted = true
         do {
             try await controller.perform(link: link, action: control.action, value: value)
         } catch {
             errorText = HA.actionMessage(for: error)
+            accepted = false
         }
         inFlight = nil
+        return accepted
     }
 
     private func detailRow(_ label: String, _ value: String) -> some View {
@@ -958,29 +950,61 @@ struct HAStateCard: View {
 /// descriptor's own `value` changes (i.e. when the next `/ha/states` poll
 /// lands), and only while the user isn't mid-drag.
 ///
-/// Post-commit HOLD (issue #465): on release the thumb is pinned to the
-/// committed target and the poll re-seed is suppressed until the polled value
-/// converges to within a step of it (see `holdConverged`) OR a safety timeout
-/// elapses. Without the hold the very first poll after a commit — which for a
+/// Post-commit HOLD (issue #465): on an UNGATED commit the thumb is pinned to
+/// the committed target and the poll re-seed is suppressed until the polled
+/// value converges to within a step of it (see `holdConverged`) OR the hold is
+/// cleared. Without the hold the very first poll after a commit — which for a
 /// beat still reports the device's OLD value while it transitions — snaps the
 /// thumb back the instant you release, then jumps it to the target a poll later:
 /// the bounce. The slider is CONTINUOUS (no `step:`, which snaps the thumb to
 /// tick positions mid-drag and itself reads as a bounce); the released value is
 /// snapped to `step` in `snapToStep`, so the POSTed value stays grid-aligned —
 /// Android/desktop parity.
+///
+/// STATE HONESTY (issue #505). The hold pins the thumb at a value the operator
+/// asked for, so it may only ever exist while that value is genuinely on its way
+/// to the device — otherwise a cover slider reads 80% while the cover sits at
+/// 20%, which for a physical-security device is a lie, not a cosmetic glitch.
+/// Two rules follow, both mirroring the Android `HaValueSlider`:
+///
+///  * A confirm-gated release (`needsConfirm`: `require_confirm`, or a
+///    cover/lock) sets `awaitingConfirm`, NOT the hold. Nothing has been sent
+///    yet. Only accepting the confirm sets the hold and fires; cancelling
+///    reverts the thumb to the live polled value.
+///  * A commit the server rejected or that never landed clears the hold
+///    immediately rather than pinning the thumb for the whole timeout window.
+///
+/// Every hold-clear path (converge, timeout, error, confirm-cancel) funnels
+/// through the SAME `syncThumb` decision, which is re-run by `onChange` on each
+/// of the inputs it reads — `control.value`, `committed` AND `awaitingConfirm` —
+/// so clearing a hold always re-seeds from the live value even when the polled
+/// value itself has not changed since the commit (keying only on `control.value`
+/// is what left the thumb stranded after a hold cleared).
 struct HAValueSlider: View {
     let control: HaControlDescriptor
+    /// Entity name, interpolated into the confirm prompt.
+    var entityName: String = ""
+    /// Whether a commit must be confirmed before it fires — `HA.valueNeedsConfirm`
+    /// at the call site, the same gate the discrete action buttons use.
+    var needsConfirm: Bool = false
     var disabled: Bool = false
-    /// Fired once per gesture, on release, with the step-snapped target value.
-    let onCommit: (Double) -> Void
+    /// Fired once per gesture, on release, with the step-snapped target value —
+    /// and only AFTER the confirm was accepted when one was required. Returns
+    /// whether the server accepted the call; `false` drops the hold at once.
+    let onCommit: (Double) async -> Bool
 
     @State private var value: Double
     @State private var dragging = false
     /// A value we just committed and pin the thumb at until the `/ha/states`
     /// poll reflects it (issue #465). `nil` means "follow the polled value" —
     /// the normal idle state. Never an optimistic report of a NEW value as
-    /// accepted; it only holds where the operator just released.
+    /// accepted; it only holds a value that has actually been POSTed.
     @State private var committed: Double?
+    /// A target awaiting the operator's confirm; non-nil only while its prompt
+    /// is up. NOTHING has been sent for it, so it deliberately does not pin the
+    /// thumb the way `committed` does — it merely suspends poll tracking so the
+    /// prompt and the thumb agree on the value being asked about (#505).
+    @State private var awaitingConfirm: Double?
 
     /// Safety net so a dropped request or a device that never reaches the target
     /// can't freeze the thumb: the hold is released after this window even if the
@@ -991,8 +1015,16 @@ struct HAValueSlider: View {
     private var upperBound: Double { max(control.max ?? 100, lowerBound) }
     private var stepSize: Double { max(control.step ?? 1, 0.01) }
 
-    init(control: HaControlDescriptor, disabled: Bool = false, onCommit: @escaping (Double) -> Void) {
+    init(
+        control: HaControlDescriptor,
+        entityName: String = "",
+        needsConfirm: Bool = false,
+        disabled: Bool = false,
+        onCommit: @escaping (Double) async -> Bool
+    ) {
         self.control = control
+        self.entityName = entityName
+        self.needsConfirm = needsConfirm
         self.disabled = disabled
         self.onCommit = onCommit
         _value = State(initialValue: control.value ?? control.min ?? 0)
@@ -1001,13 +1033,13 @@ struct HAValueSlider: View {
     var body: some View {
         VStack(spacing: 4) {
             // CONTINUOUS slider (no `step:`): the thumb tracks the finger; the
-            // released value is snapped to the descriptor's grid in `commit`.
+            // released value is snapped to the descriptor's grid in `release`.
             Slider(
                 value: $value,
                 in: lowerBound...upperBound,
                 onEditingChanged: { editing in
                     dragging = editing
-                    if !editing { commit() }
+                    if !editing { release() }
                 }
             )
             .disabled(disabled)
@@ -1015,20 +1047,13 @@ struct HAValueSlider: View {
                 .font(.caption).foregroundColor(CrumbColors.textSecondary)
         }
         .padding(.top, 2)
-        // Re-seed from the live descriptor only while the user isn't mid-drag
-        // AND no just-committed value is being held. A mid-drag poll tick must
-        // never yank the thumb; a held commit stays put until the poll converges
-        // to it — releasing the hold at that point (#465).
-        .onChange(of: control.value) { newValue in
-            guard !dragging, let newValue else { return }
-            if let target = committed {
-                guard Self.holdConverged(polled: newValue, committed: target, step: stepSize) else {
-                    return  // still transitioning — keep holding the committed value
-                }
-                committed = nil
-            }
-            value = newValue
-        }
+        // ONE decision (`syncThumb`), re-run whenever any input it reads
+        // changes. Keying on `committed`/`awaitingConfirm` too is what makes a
+        // cleared hold resume tracking immediately instead of waiting for the
+        // next value CHANGE from the poll.
+        .onChange(of: control.value) { _ in syncThumb() }
+        .onChange(of: committed) { _ in syncThumb() }
+        .onChange(of: awaitingConfirm) { _ in syncThumb() }
         // Never hold forever. Re-armed each time `committed` changes; the sleep
         // is cancelled (and this early-returns) the moment the hold clears.
         .task(id: committed) {
@@ -1037,15 +1062,73 @@ struct HAValueSlider: View {
             guard !Task.isCancelled else { return }
             committed = nil
         }
+        .confirmationDialog(
+            awaitingConfirm.map { "Set \(entityName) to \(Self.label(for: $0, control: control))?" } ?? "",
+            isPresented: Binding(get: { awaitingConfirm != nil }, set: { if !$0 { cancelConfirm() } }),
+            titleVisibility: .visible
+        ) {
+            // `target` is captured by value, so this fires the value that was
+            // shown in the prompt no matter which way round SwiftUI orders the
+            // button action and the dismissal.
+            if let target = awaitingConfirm {
+                Button("Set") { commit(target) }
+            }
+            Button("Cancel", role: .cancel) { cancelConfirm() }
+        }
     }
 
-    /// Snap the released position to the descriptor's step grid, pin the thumb
-    /// there, and fire the one POST for this gesture.
-    private func commit() {
-        let target = Self.snapToStep(value, min: lowerBound, max: upperBound, step: stepSize)
+    /// Releasing the slider: snap to the grid, then either fire (pinning the
+    /// thumb) or ask first (pinning nothing).
+    private func release() {
+        switch Self.releaseDecision(raw: value, needsConfirm: needsConfirm,
+                                    min: lowerBound, max: upperBound, step: stepSize) {
+        case .confirm(let target):
+            // Show the exact value the prompt is asking about, but set NO hold:
+            // if the operator cancels, `cancelConfirm` reverts to the live value.
+            value = target
+            awaitingConfirm = target
+        case .commit(let target):
+            commit(target)
+        }
+    }
+
+    /// Pin the thumb at `target` and fire the one POST for this gesture. Called
+    /// straight from `release` for an ungated control, or from the confirm's
+    /// accept button — never before the call is authorized.
+    private func commit(_ target: Double) {
         value = target
         committed = target
-        onCommit(target)
+        awaitingConfirm = nil
+        Task { @MainActor in
+            let accepted = await onCommit(target)
+            // A rejected or dropped POST must not keep asserting the target for
+            // the rest of the timeout window. Guarded on the hold still being
+            // OURS so a newer gesture's hold is never clobbered by an older
+            // failure landing late.
+            if !accepted, committed == target { committed = nil }
+        }
+    }
+
+    /// Dismiss the confirm without firing: drop the pending target and let
+    /// `syncThumb` put the thumb back on the live polled value. Idempotent, so
+    /// the accept path (which clears `awaitingConfirm` itself) can't trip it.
+    private func cancelConfirm() {
+        guard awaitingConfirm != nil else { return }
+        awaitingConfirm = nil
+    }
+
+    /// Apply the `thumbSync` decision. `.follow` is also the point where a hold
+    /// that has served its purpose is dropped.
+    private func syncThumb() {
+        switch Self.thumbSync(polled: control.value, fallback: lowerBound,
+                              dragging: dragging, awaitingConfirm: awaitingConfirm != nil,
+                              committed: committed, step: stepSize) {
+        case .ignore, .hold:
+            return
+        case .follow(let live):
+            if committed != nil { committed = nil }
+            value = live
+        }
     }
 
     /// Snap a raw slider value onto the descriptor's grid: clamp to `min...max`,
@@ -1068,6 +1151,56 @@ struct HAValueSlider: View {
     /// Android `haHoldConverged`.
     static func holdConverged(polled: Double, committed: Double, step: Double) -> Bool {
         abs(polled - committed) <= step + 0.5
+    }
+
+    /// What releasing the slider does with the raw drag position.
+    enum ReleaseDecision: Equatable {
+        /// Fire now, and pin the thumb at this target until the poll converges.
+        case commit(Double)
+        /// Ask first. Deliberately carries no hold: the POST has not happened,
+        /// so the thumb must be free to snap back to reality on a cancel (#505).
+        case confirm(Double)
+    }
+
+    /// Whether a release fires straight away or has to be confirmed, and the
+    /// step-snapped target either way. Pure, so it's unit-tested. The whole
+    /// point of the two cases is that ONLY `.commit` is allowed to set the hold.
+    static func releaseDecision(raw: Double, needsConfirm: Bool,
+                                min: Double, max: Double, step: Double) -> ReleaseDecision {
+        let target = snapToStep(raw, min: min, max: max, step: step)
+        return needsConfirm ? .confirm(target) : .commit(target)
+    }
+
+    /// Where the thumb belongs whenever anything the slider tracks changes.
+    enum ThumbSync: Equatable {
+        /// Leave the thumb alone: the operator owns it right now (mid-drag, or
+        /// a confirm prompt is up asking about the value it shows).
+        case ignore
+        /// Keep holding a committed value the device is still transitioning to.
+        case hold
+        /// Track the live value — and release any hold, which has either
+        /// converged or been cleared.
+        case follow(Double)
+    }
+
+    /// The single re-seed decision, shared by every path that can move the thumb
+    /// (a poll tick, a converged hold, a timed-out hold, a failed commit, a
+    /// cancelled confirm). Pure, so it's unit-tested. Mirrors the Android
+    /// slider's `LaunchedEffect(control.value, committed)`, including its
+    /// `dragging || awaitingConfirm` bail-out.
+    ///
+    /// - Parameter polled: the descriptor's live value; `nil` when HA has never
+    ///   reported one, in which case the thumb falls back to `fallback` (the
+    ///   descriptor's `min`, exactly what the slider seeds itself with) rather
+    ///   than sitting on a number nothing ever confirmed.
+    static func thumbSync(polled: Double?, fallback: Double, dragging: Bool,
+                          awaitingConfirm: Bool, committed: Double?, step: Double) -> ThumbSync {
+        if dragging || awaitingConfirm { return .ignore }
+        let live = polled ?? fallback
+        if let target = committed, !holdConverged(polled: live, committed: target, step: step) {
+            return .hold
+        }
+        return .follow(live)
     }
 
     /// "62%" for the percent kind (every Slice 1 word); "72 °F" for a future
