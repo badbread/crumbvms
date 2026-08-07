@@ -103,6 +103,57 @@ Both raise the existing `storage_unwritable` system event.
 
 ---
 
+## 2026-08-06, setup-env.sh fails the install when uid 1001 cannot write to the media dir (tiered probe, deferred exit)
+
+**Context.** A media directory the recorder (uid 1001) cannot write is the worst
+failure mode Crumb has, because it does not present as a failure: live view runs
+off go2rtc and never touches disk, the first-run wizard shows green (the api
+mounts `/data` read-only and so cannot test writing), and footage is silently
+never saved. `setup-env.sh` only did a best-effort `chown 1001:1001`, which on a
+large share of real hosts reports success while changing nothing the container
+sees: NFS `root_squash`, SMB uid mapping, FUSE user shares (Unraid `/mnt/user`),
+and the 100000 uid shift of an unprivileged Proxmox LXC.
+
+**Decision.** Preflight the media directory and **exit non-zero** on a definite
+negative, rather than warn. Recording nothing is not a degraded install, it is a
+non-install, and the operator finds out days later when they go looking for
+footage. Three supporting choices:
+
+- **Tiered probe, most faithful method that can answer honestly.** Impersonate
+  uid 1001 (root, `sudo -u '#1001'` or `setpriv`), else a container run as
+  `--user 1001`, else read the directory's own owner/group/mode. An inconclusive
+  tier never produces a verdict, it falls through; if no tier can answer, the
+  script prints the manual one-liner and exits 0. A false hard failure on a
+  working install would be worse than the warning it replaces.
+- **The docker tier never pulls.** It runs only against an image already on the
+  host, and discriminates `touch`'s exit 1 (a real EACCES verdict) from docker's
+  own 125/126/127 (an exec problem, not a verdict). setup-env runs before any
+  `docker compose pull`, and making secret generation depend on registry
+  reachability would break air-gapped installs.
+- **The exit is deferred to the end of the run**, after the one-time admin
+  password is printed. `.env` is complete and correct when storage is broken;
+  what failed is the host. Dying mid-script would cost the operator their
+  credential to save them a scroll.
+
+**Rejected:** warn-only (the status quo that produced the bug, and the reason
+nobody noticed); probing from the recorder at boot *instead of* here (it already
+raises `storage_unwritable`, but by then the operator has walked away believing
+the install succeeded, so this is additive, not a replacement); requiring root
+for setup-env (would break the documented non-root install path).
+
+**Trade-off accepted:** a plain non-root `git clone && ./scripts/setup-env.sh`
+on a host where the media dir is not yet uid-1001-writable now exits 1 where it
+previously printed a NOTE and exited 0. That is intended, it is exactly the
+broken install this catches, and the error names the fix. Any automation that
+treated setup-env's exit code as "secrets generated" needs to read it as
+"secrets generated AND storage verified".
+
+**Revisit when:** the probe produces a false negative on a real operator's host
+(then narrow the tier that got it wrong, do not weaken the exit), or the wizard
+grows a genuine server-side write test that makes the pre-boot check redundant.
+
+---
+
 ## 2026-08-06, Per-state HA badge backgrounds: one extra nullable column that inherits from the base (not paired per-state columns)
 
 **Context.** Migration 0062 gave a placed HA badge a single solid background
