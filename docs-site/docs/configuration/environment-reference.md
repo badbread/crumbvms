@@ -189,7 +189,7 @@ See [Backups](/configuration/backups) for the full picture.
 | `ALERT_WEBHOOK_URL` | empty | a generic JSON webhook (Discord/Slack-compatible) for recorder-death paging; empty means silent |
 | `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
-| `MOTION_UNHEALTHY_ALERT_SECS` | `180` | how long a camera's motion detector must stay *continuously* unhealthy before the recorder raises a system alert. This is alert hysteresis for flaky cameras that blip and self-heal; it delays only the alert, never the fail-open recording safety rail. |
+| `MOTION_UNHEALTHY_ALERT_SECS` | `180` | how long a camera's motion detector must stay *continuously* unhealthy before the recorder raises a system alert. This is alert hysteresis for flaky cameras that blip and self-heal; it delays only the alert, never the fail-open recording safety rail. A camera added with a main stream only (no sub-stream) never raises this alert at all: pixel motion needs the sub-stream, so that camera records continuously by design rather than being broken. |
 
 ## Update-available check (issue #7)
 

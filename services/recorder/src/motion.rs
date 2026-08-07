@@ -1196,13 +1196,38 @@ async fn report_decode_status(
 /// dangling timer that pages later on an unrelated episode.
 pub(crate) struct UnhealthyAlertGate {
     generation: std::sync::atomic::AtomicU64,
+    /// The reason string of the most recent UNHEALTHY transition on this
+    /// source, kept so the health aggregator can surface the *specific* cause
+    /// instead of its generic "not delivering frames" fallback (issue #523).
+    /// Telemetry only — nothing about fail-open recording reads this.
+    last_unhealthy_reason: std::sync::Mutex<Option<String>>,
 }
 
 impl UnhealthyAlertGate {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             generation: std::sync::atomic::AtomicU64::new(0),
+            last_unhealthy_reason: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Record the cause of an UNHEALTHY transition. Never held across an
+    /// `.await` (see [`report_health`]); a poisoned lock is recovered from
+    /// rather than propagated — this is telemetry, not a correctness rail.
+    fn set_unhealthy_reason(&self, reason: &str) {
+        let mut slot = self
+            .last_unhealthy_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(reason.to_owned());
+    }
+
+    /// The cause of this source's most recent UNHEALTHY transition, if any.
+    pub(crate) fn last_unhealthy_reason(&self) -> Option<String> {
+        self.last_unhealthy_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -1263,6 +1288,11 @@ pub(crate) async fn report_health(
     } else {
         warn!(camera_id = %camera_id, "motion detector health: UNHEALTHY ({reason}); \
               will alert in {alert_after_secs}s if still unhealthy");
+        // Remember the SPECIFIC cause so the aggregator's persisted
+        // `motion_health_reason` can name it (issue #523) instead of falling
+        // back to the generic "not delivering frames". Scoped tightly: the
+        // guard is dropped before any `.await` below.
+        gate.set_unhealthy_reason(reason);
         if alert_after_secs == 0 {
             // Hysteresis disabled — preserve the original immediate-alert
             // behaviour exactly.
@@ -1377,6 +1407,51 @@ fn should_emit_unhealthy_alert(
     already_alerted: bool,
 ) -> bool {
     !already_alerted && unhealthy_elapsed_secs >= threshold_secs
+}
+
+/// The single operator-facing cause for a camera configured with a MAIN stream
+/// only. Shared by the decode-status telemetry (`fallback_reason`), the
+/// motion-health reason (`camera_motion_health.reason`, surfaced as
+/// `motion_health_reason`) and the skip-the-startup-alert decision below, so
+/// all three surfaces state the same cause (issue #523: they disagreed, and
+/// the two generic ones sent operators hunting a decode fault that did not
+/// exist).
+pub(crate) const NO_SUB_STREAM_REASON: &str = "camera has no sub-stream; motion analysis disabled";
+
+/// Is motion analysis STRUCTURALLY disabled for this source — i.e. does the
+/// camera's *configuration* mean the source can never become healthy, as
+/// opposed to a fault that may clear? Returns the specific cause when so.
+///
+/// Today the one such condition is a pixel source on a camera with no
+/// sub-stream: `run_pixel_diff_loop` deliberately parks (correctness item 12,
+/// motion runs on the SUB stream only) and reports unhealthy forever, which is
+/// the RIGHT fail-open state (a Motion-mode policy must persist every segment)
+/// but is not a detector fault worth paging about. Frigate/HA sources are
+/// unaffected: a main-only camera can still be perfectly healthy on those, so
+/// their alerts must keep firing.
+#[must_use]
+fn structural_disable_reason(kind: SourceKind, has_sub_stream: bool) -> Option<&'static str> {
+    match kind {
+        SourceKind::Pixel if !has_sub_stream => Some(NO_SUB_STREAM_REASON),
+        _ => None,
+    }
+}
+
+/// Should `run_one_source` arm the startup unhealthy-alert timer (#411) for
+/// this source?
+///
+/// #411 arms a generation-0 timer so a source that is broken *from boot* and
+/// never recovers still alerts (a dead VAAPI decoder ran fail-open silently
+/// for 5 days). That is only meaningful for a source that COULD become
+/// healthy. A structurally-disabled source never can, so the timer would fire
+/// ~`MOTION_UNHEALTHY_ALERT_SECS` after EVERY recorder start, forever, on an
+/// unactionable configuration (issue #523). Skipping the arm suppresses that
+/// alert without touching the fail-open state, which stays unhealthy on
+/// purpose so Motion mode keeps recording everything and the console's
+/// degraded-motion badge still shows.
+#[must_use]
+fn should_arm_startup_alert(kind: SourceKind, has_sub_stream: bool) -> bool {
+    structural_disable_reason(kind, has_sub_stream).is_none()
 }
 
 /// Pure gate for the pixel detector's healthy report: a real keep/discard
@@ -1519,6 +1594,24 @@ pub async fn run(
         std::collections::HashMap::new();
     let mut task_kinds: std::collections::HashMap<tokio::task::Id, SourceKind> =
         std::collections::HashMap::new();
+    // One hysteresis gate per source, owned HERE (rather than inside
+    // `run_one_source`) so a respawned source keeps its alert bookkeeping and
+    // so the health aggregator can read each source's last unhealthy cause for
+    // the persisted `motion_health_reason` (issue #523).
+    let mut alert_gates: std::collections::HashMap<SourceKind, Arc<UnhealthyAlertGate>> =
+        std::collections::HashMap::new();
+    // Sources that configuration has structurally disabled (today: a pixel
+    // source on a camera with no sub-stream). These stay unhealthy on purpose —
+    // fail-open keeps recording everything — but the cause is a configuration
+    // fact, not a fault, so it is both the reason we surface and the reason no
+    // startup alert is armed for them.
+    let structural_disabled: std::collections::HashMap<SourceKind, &'static str> = enabled
+        .iter()
+        .filter_map(|&kind| {
+            structural_disable_reason(kind, camera.sub_rtsp_url_opt().is_some())
+                .map(|reason| (kind, reason))
+        })
+        .collect();
 
     // Spawn (or respawn) ONE source task; the returned SourceKind lets the
     // supervision loop identify a cleanly-returned task, and `task_kinds` maps
@@ -1526,7 +1619,8 @@ pub async fn run(
     let spawn_source = |supervisors: &mut tokio::task::JoinSet<SourceKind>,
                         task_kinds: &mut std::collections::HashMap<tokio::task::Id, SourceKind>,
                         kind: SourceKind,
-                        src_tx: MotionHealthTx| {
+                        src_tx: MotionHealthTx,
+                        alert_gate: Arc<UnhealthyAlertGate>| {
         let camera = camera.clone();
         let pool = pool.clone();
         let config = config.clone();
@@ -1542,6 +1636,7 @@ pub async fn run(
                 src_tx,
                 cancel,
                 alert_after_secs,
+                alert_gate,
             )
             .await;
             kind
@@ -1558,7 +1653,9 @@ pub async fn run(
             SourceKind::Ha => ha_rx = Some(src_rx),
         }
         src_txs.insert(kind, src_tx.clone());
-        spawn_source(&mut supervisors, &mut task_kinds, kind, src_tx);
+        let gate = UnhealthyAlertGate::new();
+        alert_gates.insert(kind, Arc::clone(&gate));
+        spawn_source(&mut supervisors, &mut task_kinds, kind, src_tx, gate);
     }
 
     // Health aggregator: collapses the per-source watches into the single camera
@@ -1567,9 +1664,19 @@ pub async fn run(
         let health_tx = health_tx.clone();
         let cancel = cancel.clone();
         let pool = pool.clone();
+        let gates = alert_gates.clone();
         tokio::spawn(async move {
             aggregate_health(
-                enabled, pixel_rx, frigate_rx, ha_rx, health_tx, camera_id, pool, cancel,
+                enabled,
+                pixel_rx,
+                frigate_rx,
+                ha_rx,
+                health_tx,
+                camera_id,
+                pool,
+                cancel,
+                gates,
+                structural_disabled,
             )
             .await;
         })
@@ -1633,7 +1740,11 @@ pub async fn run(
                     () = tokio::time::sleep(tokio::time::Duration::from_secs(BACKOFF_BASE_SECS)) => {}
                 }
                 if let Some(src_tx) = src_txs.get(&kind) {
-                    spawn_source(&mut supervisors, &mut task_kinds, kind, src_tx.clone());
+                    let gate = alert_gates
+                        .entry(kind)
+                        .or_insert_with(UnhealthyAlertGate::new)
+                        .clone();
+                    spawn_source(&mut supervisors, &mut task_kinds, kind, src_tx.clone(), gate);
                 }
             }
         }
@@ -1662,10 +1773,12 @@ async fn run_one_source(
     health_tx: MotionHealthTx,
     cancel: CancellationToken,
     alert_after_secs: u64,
+    alert_gate: Arc<UnhealthyAlertGate>,
 ) {
-    // One hysteresis gate for this source's lifetime — every report_health call
-    // below shares it so a transition retires a stale alert timer.
-    let alert_gate = UnhealthyAlertGate::new();
+    // The hysteresis gate is owned by `run` (one per source, shared with a
+    // respawn of this task and readable by the health aggregator) — every
+    // report_health call below shares it so a transition retires a stale alert
+    // timer and records the specific unhealthy cause.
 
     // Arm the STARTUP unhealthy episode explicitly (issue #411).
     //
@@ -1683,20 +1796,36 @@ async fn run_one_source(
     // a later healthy→unhealthy flap arms its own — so this is purely additive
     // to the existing transition-armed scheme. `alert_after_secs == 0` keeps its
     // immediate-alert semantics via the timer's 0-second sleep.
-    spawn_unhealthy_alert_timer(
-        Arc::clone(&alert_gate),
-        alert_gate
-            .generation
-            .load(std::sync::atomic::Ordering::SeqCst),
-        health_tx.clone(),
-        pool.clone(),
-        camera.id,
-        format!(
-            "{} motion detector never became healthy after startup",
-            kind.as_str()
-        ),
-        alert_after_secs,
-    );
+    //
+    // EXCEPT for a source that is structurally disabled by configuration and so
+    // can NEVER become healthy (issue #523): arming there means a guaranteed
+    // false alert on every recorder start, forever. See
+    // [`should_arm_startup_alert`].
+    if should_arm_startup_alert(kind, camera.sub_rtsp_url_opt().is_some()) {
+        spawn_unhealthy_alert_timer(
+            Arc::clone(&alert_gate),
+            alert_gate
+                .generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            health_tx.clone(),
+            pool.clone(),
+            camera.id,
+            format!(
+                "{} motion detector never became healthy after startup",
+                kind.as_str()
+            ),
+            alert_after_secs,
+        );
+    } else {
+        info!(
+            camera_id = %camera.id,
+            source = kind.as_str(),
+            reason = structural_disable_reason(kind, camera.sub_rtsp_url_opt().is_some())
+                .unwrap_or_default(),
+            "motion source is disabled by configuration; recording fails open but no \
+             startup health alert is armed"
+        );
+    }
 
     let mut backoff_secs = BACKOFF_BASE_SECS;
 
@@ -1949,6 +2078,8 @@ async fn aggregate_health(
     camera_id: uuid::Uuid,
     pool: Pool,
     cancel: CancellationToken,
+    alert_gates: std::collections::HashMap<SourceKind, Arc<UnhealthyAlertGate>>,
+    structural_disabled: std::collections::HashMap<SourceKind, &'static str>,
 ) {
     let start = Utc::now();
     let mut gate = FailOpenGate::new(&enabled, start, DEFAULT_SOURCE_DOWN_GRACE);
@@ -2010,7 +2141,18 @@ async fn aggregate_health(
                 // badge. Best-effort; never blocks the fail-open flip above.
                 persist_motion_health(&pool, camera_id, true, None).await;
             } else {
-                let reason = fail_open_reason(&last_healthy);
+                // Prefer the SPECIFIC cause per source: a configuration fact
+                // (structurally disabled) outranks the last unhealthy
+                // transition's reason, which outranks the generic "not
+                // delivering frames" fallback inside `fail_open_reason`.
+                let mut reasons: std::collections::HashMap<SourceKind, String> = alert_gates
+                    .iter()
+                    .filter_map(|(&kind, gate)| gate.last_unhealthy_reason().map(|r| (kind, r)))
+                    .collect();
+                for (&kind, &reason) in &structural_disabled {
+                    reasons.insert(kind, reason.to_owned());
+                }
+                let reason = fail_open_reason(&last_healthy, &reasons);
                 warn!(
                     camera_id = %camera_id,
                     reason = %reason,
@@ -2068,21 +2210,57 @@ async fn persist_motion_health(
 /// Pure (no I/O) and deterministic (down sources sorted) so it is unit-testable
 /// and the DTO/badge text is stable. `last_healthy` maps each enabled source to
 /// its last-observed health; a source reads as down when `false`.
+///
+/// `specific` carries a per-source cause when one is known (a configuration
+/// fact like [`NO_SUB_STREAM_REASON`], or the last unhealthy transition's
+/// reason recorded by [`report_health`]). Issue #523: the generic fallback
+/// alone claimed "not delivering frames" for a camera that has no sub-stream
+/// to deliver frames from, contradicting `fallback_reason` on the very same
+/// `/config/decode-status` object. A source with no specific cause keeps the
+/// original generic wording. When exactly one source is down its specific
+/// cause stands alone (so a single-source camera reads exactly like
+/// `fallback_reason`); with several, each is prefixed by its source name so
+/// the text stays unambiguous.
 #[must_use]
-fn fail_open_reason(last_healthy: &std::collections::HashMap<SourceKind, bool>) -> String {
-    let mut down: Vec<&'static str> = last_healthy
+fn fail_open_reason(
+    last_healthy: &std::collections::HashMap<SourceKind, bool>,
+    specific: &std::collections::HashMap<SourceKind, String>,
+) -> String {
+    let mut down: Vec<SourceKind> = last_healthy
         .iter()
         .filter(|&(_, &healthy)| !healthy)
-        .map(|(kind, _)| kind.as_str())
+        .map(|(&kind, _)| kind)
         .collect();
-    down.sort_unstable();
-    match down.as_slice() {
-        // Empty only if every source reads healthy — the gate can still fail
-        // open transiently on the down-past-grace clause; give a generic cause.
-        [] => "motion detection unhealthy".to_string(),
-        [one] => format!("{one} motion detection not delivering frames"),
-        many => format!("{} motion sources not delivering frames", many.join(", ")),
+    down.sort_unstable_by_key(|k| k.as_str());
+    if down.is_empty() {
+        // Only if every source reads healthy — the gate can still fail open
+        // transiently on the down-past-grace clause; give a generic cause.
+        return "motion detection unhealthy".to_string();
     }
+    let single = down.len() == 1;
+    let (explained, generic): (Vec<SourceKind>, Vec<SourceKind>) =
+        down.iter().copied().partition(|k| specific.contains_key(k));
+    let mut parts: Vec<String> = explained
+        .iter()
+        .filter_map(|k| specific.get(k).map(|r| (k, r)))
+        .map(|(k, reason)| {
+            if single {
+                reason.clone()
+            } else {
+                format!("{}: {reason}", k.as_str())
+            }
+        })
+        .collect();
+    let generic: Vec<&'static str> = generic.iter().map(|k| k.as_str()).collect();
+    match generic.as_slice() {
+        [] => {}
+        [one] => parts.push(format!("{one} motion detection not delivering frames")),
+        many => parts.push(format!(
+            "{} motion sources not delivering frames",
+            many.join(", ")
+        )),
+    }
+    parts.join("; ")
 }
 
 /// Await the next change on an optional per-source health watch. A `None` slot
@@ -2159,18 +2337,24 @@ async fn run_pixel_diff_loop(
                 camera.id,
                 config.motion_hwaccel.as_str(),
                 "none",
-                Some("camera has no sub-stream; motion analysis disabled"),
+                Some(NO_SUB_STREAM_REASON),
             )
             .await;
             // Fail-open: no sub-stream means motion detection is permanently
             // disabled for this camera, so a Motion-mode policy must persist
-            // every segment rather than silently record nothing extra.
+            // every segment rather than silently record nothing extra. Same
+            // wording as the decode-status telemetry above and the aggregator's
+            // persisted `motion_health_reason` — issue #523: the three
+            // disagreed. No alert is raised for this state: `run_one_source`
+            // does not arm the startup timer for a structurally-disabled
+            // source, and health starts `false` so there is no transition to
+            // arm one either.
             report_health(
                 health_tx,
                 pool,
                 camera.id,
                 false,
-                "camera has no sub-stream",
+                NO_SUB_STREAM_REASON,
                 alert_gate,
                 alert_after_secs,
             )
@@ -4427,12 +4611,24 @@ mod tests {
         pairs.iter().copied().collect()
     }
 
+    /// No source has a specific cause — exercises the generic fallback wording.
+    fn no_reasons() -> std::collections::HashMap<SourceKind, String> {
+        std::collections::HashMap::new()
+    }
+
+    fn reason_map(pairs: &[(SourceKind, &str)]) -> std::collections::HashMap<SourceKind, String> {
+        pairs
+            .iter()
+            .map(|&(k, r)| (k, r.to_string()))
+            .collect::<std::collections::HashMap<_, _>>()
+    }
+
     #[test]
     fn fail_open_reason_names_the_single_down_source() {
         // The #411 scenario: a single pixel detector producing zero frames.
         let m = health_map(&[(SourceKind::Pixel, false)]);
         assert_eq!(
-            fail_open_reason(&m),
+            fail_open_reason(&m, &no_reasons()),
             "pixel motion detection not delivering frames"
         );
     }
@@ -4447,7 +4643,7 @@ mod tests {
             (SourceKind::Frigate, false),
         ]);
         assert_eq!(
-            fail_open_reason(&m),
+            fail_open_reason(&m, &no_reasons()),
             "frigate, ha, pixel motion sources not delivering frames"
         );
     }
@@ -4457,7 +4653,7 @@ mod tests {
         // A healthy source is not named; only the source(s) that stopped.
         let m = health_map(&[(SourceKind::Pixel, true), (SourceKind::Frigate, false)]);
         assert_eq!(
-            fail_open_reason(&m),
+            fail_open_reason(&m, &no_reasons()),
             "frigate motion detection not delivering frames"
         );
     }
@@ -4468,7 +4664,122 @@ mod tests {
         // every source's last reading is healthy — give a generic, non-empty
         // cause rather than an empty string.
         let m = health_map(&[(SourceKind::Pixel, true)]);
-        assert_eq!(fail_open_reason(&m), "motion detection unhealthy");
+        assert_eq!(
+            fail_open_reason(&m, &no_reasons()),
+            "motion detection unhealthy"
+        );
+    }
+
+    // ── issue #523: no-sub-stream camera (structurally disabled motion) ─────────
+
+    #[test]
+    fn no_sub_stream_pixel_source_is_structurally_disabled() {
+        // The self-service add flow allows a camera with a main stream only;
+        // run_pixel_diff_loop parks and never analyses a frame. That is a
+        // configuration fact, not a detector fault.
+        assert_eq!(
+            structural_disable_reason(SourceKind::Pixel, false),
+            Some(NO_SUB_STREAM_REASON)
+        );
+        // With a sub-stream the pixel source can become healthy — not structural.
+        assert_eq!(structural_disable_reason(SourceKind::Pixel, true), None);
+    }
+
+    #[test]
+    fn no_sub_stream_does_not_disable_frigate_or_ha_sources() {
+        // A main-only camera can still be perfectly healthy on an external
+        // motion source, so those must keep alerting when they break.
+        assert_eq!(structural_disable_reason(SourceKind::Frigate, false), None);
+        assert_eq!(structural_disable_reason(SourceKind::Ha, false), None);
+        assert!(should_arm_startup_alert(SourceKind::Frigate, false));
+        assert!(should_arm_startup_alert(SourceKind::Ha, false));
+    }
+
+    #[test]
+    fn no_sub_stream_camera_does_not_arm_the_startup_alert() {
+        // THE DEFECT (issue #523): 0.2.0 armed the #411 generation-0 timer
+        // unconditionally. A no-sub-stream source never becomes healthy, so its
+        // episode is never superseded and the pure decision below says "emit" —
+        // i.e. an alert on EVERY recorder start, forever, for a camera that is
+        // working exactly as configured. Assert the pre-fix arithmetic still
+        // holds (nothing about the hysteresis rule changed) and that the fix is
+        // to not arm the timer at all for this configuration.
+        let superseded = false; // never recovers ⇒ generation never moves
+        assert!(
+            should_emit_unhealthy_alert(180, 180, superseded),
+            "pre-fix: an armed startup timer WOULD have emitted here — that was the false alert"
+        );
+        assert!(
+            !should_arm_startup_alert(SourceKind::Pixel, false),
+            "no-sub-stream pixel source must not arm the startup alert timer"
+        );
+    }
+
+    #[test]
+    fn genuinely_broken_pixel_source_still_arms_the_startup_alert() {
+        // Regression guard for #411: a camera WITH a sub-stream whose decoder
+        // is dead at boot (the VAAPI-after-driver-upgrade incident) must still
+        // arm the timer and, having never recovered, still alert.
+        assert!(
+            should_arm_startup_alert(SourceKind::Pixel, true),
+            "a camera with a sub-stream must still arm the startup alert"
+        );
+        let superseded = false; // never became healthy
+        assert!(
+            should_emit_unhealthy_alert(180, 180, superseded),
+            "a genuinely broken detector must still alert after the threshold"
+        );
+    }
+
+    #[test]
+    fn fail_open_reason_uses_the_no_sub_stream_cause_verbatim() {
+        // The three surfaces must agree: /config/decode-status fallback_reason,
+        // motion_health_reason, and the recorder log all say the same thing.
+        let m = health_map(&[(SourceKind::Pixel, false)]);
+        let reasons = reason_map(&[(SourceKind::Pixel, NO_SUB_STREAM_REASON)]);
+        assert_eq!(fail_open_reason(&m, &reasons), NO_SUB_STREAM_REASON);
+    }
+
+    #[test]
+    fn fail_open_reason_surfaces_the_specific_last_unhealthy_cause() {
+        // The keyframes-only fail-open logs an actionable cause; it must reach
+        // motion_health_reason too instead of "not delivering frames".
+        let gop = "keyframes-only/long-GOP sub-stream: too few distinct frames for a pixel verdict";
+        let m = health_map(&[(SourceKind::Pixel, false)]);
+        let reasons = reason_map(&[(SourceKind::Pixel, gop)]);
+        assert_eq!(fail_open_reason(&m, &reasons), gop);
+    }
+
+    #[test]
+    fn fail_open_reason_mixes_specific_and_generic_causes() {
+        // Two down sources, one with a specific cause: the specific one is
+        // prefixed by its source name (unambiguous), the other keeps the
+        // generic wording, and the order stays deterministic.
+        let m = health_map(&[
+            (SourceKind::Pixel, false),
+            (SourceKind::Frigate, false),
+            (SourceKind::Ha, true),
+        ]);
+        let reasons = reason_map(&[(SourceKind::Pixel, NO_SUB_STREAM_REASON)]);
+        assert_eq!(
+            fail_open_reason(&m, &reasons),
+            format!(
+                "pixel: {NO_SUB_STREAM_REASON}; frigate motion detection not delivering frames"
+            )
+        );
+    }
+
+    #[test]
+    fn alert_gate_records_the_last_unhealthy_reason() {
+        // The slot report_health writes on an UNHEALTHY transition and the
+        // aggregator reads for the persisted reason.
+        let gate = UnhealthyAlertGate::new();
+        assert_eq!(gate.last_unhealthy_reason(), None);
+        gate.set_unhealthy_reason("frame-stall watchdog fired");
+        assert_eq!(
+            gate.last_unhealthy_reason().as_deref(),
+            Some("frame-stall watchdog fired")
+        );
     }
 
     #[test]
@@ -6136,6 +6447,8 @@ mod tests {
             uuid::Uuid::nil(),
             unreachable_pool(),
             cancel.clone(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
         ));
 
         // The source proves healthy → the camera is healthy (motion-gated).
