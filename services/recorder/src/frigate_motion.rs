@@ -37,7 +37,7 @@ use deadpool_postgres::Pool;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, SubscribeReasonCode};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crumb_common::{types::Camera, MotionSignal};
@@ -380,13 +380,14 @@ pub async fn run_frigate_motion_loop(
     let topic = format!("{}/events", cfg.mqtt_prefix);
     let (host, port) = parse_mqtt_url(&cfg.mqtt_url)?;
 
-    let mut opts = MqttOptions::new(format!("crumb-recorder-mot-{}", camera.id), &host, port);
-    opts.set_keep_alive(Duration::from_secs(30));
-    opts.set_clean_session(true);
-    opts.set_inflight(100);
-    if let Some(user) = &cfg.mqtt_user {
-        opts.set_credentials(user, cfg.mqtt_password.clone().unwrap_or_default());
-    }
+    let max_packet = crumb_common::mqtt::max_packet_bytes();
+    let opts = build_mqtt_options(
+        format!("crumb-recorder-mot-{}", camera.id),
+        &host,
+        port,
+        cfg,
+        max_packet,
+    );
     let (client, mut event_loop) = AsyncClient::new(opts, 256);
 
     let mut tracker = CameraTracker::default();
@@ -418,6 +419,13 @@ pub async fn run_frigate_motion_loop(
     let cam_id = camera.id;
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(256);
     let poll_cancel = cancel.clone();
+    // The poll task's exit reason, handed back to the main loop (which only sees
+    // "channel closed"). Set BEFORE the sender is dropped, so a `recv() == None`
+    // always observes a fully-written slot. Used to turn the oversize-payload
+    // case — otherwise a raw rumqttc string in the log and a generic error out —
+    // into one actionable message.
+    let exit_reason: std::sync::Arc<std::sync::OnceLock<String>> = std::sync::Arc::default();
+    let poll_reason = std::sync::Arc::clone(&exit_reason);
     let poll_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -432,7 +440,16 @@ pub async fn run_frigate_motion_loop(
                     Err(e) => {
                         // Connection lost / keepalive failed: drop the sender so the
                         // main loop sees the disconnect and fails the camera OPEN.
-                        warn!(camera_id = %cam_id, error = %e, "frigate motion: MQTT connection error");
+                        if let Some(bytes) = oversize_payload_bytes(&e) {
+                            // NOT a flaky broker: a permanent condition that will
+                            // repeat on every reconnect until the limit is raised.
+                            // Say so, with the knob, at ERROR.
+                            let msg = crumb_common::mqtt::oversize_payload_message(bytes, max_packet);
+                            error!(camera_id = %cam_id, "frigate motion: {msg}");
+                            let _ = poll_reason.set(msg);
+                        } else {
+                            warn!(camera_id = %cam_id, error = %e, "frigate motion: MQTT connection error");
+                        }
                         break;
                     }
                 }
@@ -517,6 +534,16 @@ pub async fn run_frigate_motion_loop(
                         // Poll task ended: a connection error (or shutdown). Treat as
                         // a lost connection → `Err` so the supervisor backs off and
                         // fails the camera OPEN.
+                        if let Some(msg) = exit_reason.get() {
+                            // A cause specific enough to act on (today: oversize
+                            // payload). Park it on the alert gate as well as the
+                            // error: the source went unhealthy at "frigate
+                            // connecting" and never transitions again, so without
+                            // this the console would only ever show the generic
+                            // reason for a failure that has a precise fix.
+                            alert_gate.note_unhealthy_cause(msg);
+                            break Err(anyhow!("frigate motion MQTT connection lost: {msg}"));
+                        }
                         break Err(anyhow!("frigate motion MQTT connection lost"));
                     }
                 }
@@ -532,6 +559,49 @@ pub async fn run_frigate_motion_loop(
         emit(motion_tx, camera.id, t);
     }
     result
+}
+
+/// Build the rumqttc options for one camera's Frigate motion subscription.
+///
+/// Split out of [`run_frigate_motion_loop`] purely so the packet-size limit —
+/// the thing this file got wrong, silently, for every Frigate deployment whose
+/// events exceed 10 KiB — is assertable in a unit test with no broker.
+fn build_mqtt_options(
+    client_id: String,
+    host: &str,
+    port: u16,
+    cfg: &FrigateMotionConfig,
+    max_packet: usize,
+) -> MqttOptions {
+    let mut opts = MqttOptions::new(client_id, host, port);
+    opts.set_keep_alive(Duration::from_secs(30));
+    opts.set_clean_session(true);
+    opts.set_inflight(100);
+    // rumqttc 0.24 caps BOTH directions at 10 KiB by default and treats an
+    // over-limit incoming packet as a fatal event-loop error, not a skipped
+    // message — see `crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES`. Outgoing is
+    // raised to the same value for symmetry; the recorder only ever sends
+    // CONNECT/SUBSCRIBE/PINGREQ, so nothing depends on it today.
+    opts.set_max_packet_size(max_packet, max_packet);
+    if let Some(user) = &cfg.mqtt_user {
+        opts.set_credentials(user, cfg.mqtt_password.clone().unwrap_or_default());
+    }
+    opts
+}
+
+/// `Some(payload_bytes)` when a rumqttc connection error is really "the broker
+/// sent a packet bigger than our incoming limit".
+///
+/// Matched structurally rather than by string so a rumqttc bump that reworded
+/// the `Display` impl fails to compile instead of silently reverting the
+/// operator-facing message to the raw library text.
+fn oversize_payload_bytes(e: &rumqttc::ConnectionError) -> Option<usize> {
+    match e {
+        rumqttc::ConnectionError::MqttState(rumqttc::StateError::Deserialization(
+            rumqttc::mqttbytes::Error::PayloadSizeLimitExceeded(bytes),
+        )) => Some(*bytes),
+        _ => None,
+    }
 }
 
 /// Whether a broker `SubAck` actually GRANTED the subscription. Any `Failure`
@@ -584,6 +654,72 @@ mod tests {
         })
         .to_string()
         .into_bytes()
+    }
+
+    fn test_cfg() -> FrigateMotionConfig {
+        FrigateMotionConfig {
+            mqtt_url: "mqtt://192.0.2.10:1883".to_owned(),
+            mqtt_prefix: "frigate".to_owned(),
+            mqtt_user: None,
+            mqtt_password: None,
+            min_score: 0.3,
+        }
+    }
+
+    #[test]
+    fn mqtt_options_apply_the_configured_packet_limit() {
+        // The regression this file exists to prevent: rumqttc 0.24 defaults the
+        // incoming limit to 10 KiB, which a real frigate/events payload
+        // (11409 bytes, observed) exceeds — killing the event loop forever.
+        let stock = MqttOptions::new("probe", "192.0.2.10", 1883);
+        assert_eq!(stock.max_packet_size(), 10 * 1024, "rumqttc default moved");
+
+        let opts = build_mqtt_options(
+            "crumb-recorder-mot-test".to_owned(),
+            "192.0.2.10",
+            1883,
+            &test_cfg(),
+            crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES,
+        );
+        assert_eq!(
+            opts.max_packet_size(),
+            crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES
+        );
+        assert!(
+            opts.max_packet_size() > 11409,
+            "the observed payload must fit"
+        );
+        // The rest of the connection contract is unchanged.
+        assert_eq!(opts.keep_alive(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn oversize_payload_is_classified_apart_from_other_failures() {
+        use rumqttc::{ConnectionError, StateError};
+
+        let oversize = ConnectionError::MqttState(StateError::Deserialization(
+            rumqttc::mqttbytes::Error::PayloadSizeLimitExceeded(11409),
+        ));
+        assert_eq!(oversize_payload_bytes(&oversize), Some(11409));
+
+        // A plain broker outage must NOT be reported as an oversize payload.
+        for other in [
+            ConnectionError::NetworkTimeout,
+            ConnectionError::MqttState(StateError::AwaitPingResp),
+            ConnectionError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+        ] {
+            assert_eq!(oversize_payload_bytes(&other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn oversize_message_is_actionable() {
+        let msg = crumb_common::mqtt::oversize_payload_message(
+            11409,
+            crumb_common::mqtt::DEFAULT_MAX_PACKET_BYTES,
+        );
+        assert!(msg.contains("11409"), "{msg}");
+        assert!(msg.contains(crumb_common::mqtt::MAX_PACKET_ENV), "{msg}");
     }
 
     #[test]
