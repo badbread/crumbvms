@@ -22,7 +22,7 @@ you can turn each one on independently:
 These are additive. A camera records on the **union** of whichever sources
 you enable, so you can run pixel analysis and Frigate together, Frigate on
 its own, pixel plus a door sensor, or any other combination. In the camera
-editor's Motion tab, each source is a separate checkbox.
+editor's Detection tab, each source is a separate checkbox.
 
 Frigate and Home Assistant are both entirely optional and entirely
 bring-your-own: Crumb does not bundle or run either one, and pixel motion

@@ -33,8 +33,8 @@ clients are for, see [Clients](/clients/).
   options. See [Integrations](/integrations/).
 - **Home Assistant.** A dedicated hub: the HA connection settings, an
   overview of every linked entity across all cameras with orphaned-link
-  detection, and (from each camera's Motion tab) linking that camera's HA
-  motion, sensor, and actuator entities, or using an HA sensor as a
+  detection, and (from each camera's Connection tab) linking that camera's HA
+  motion, sensor, and control entities, or using an HA sensor as a
   recording trigger. See [Integrations](/integrations/).
 - **LPR.** License-plate recognition: per-camera engine (none, Frigate,
   crumb-alpr, or both), an OCR-confidence floor, detection zones, and a plate

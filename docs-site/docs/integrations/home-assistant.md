@@ -32,6 +32,13 @@ What works today:
 Seeing a badge never implies being able to operate it; control is gated by its
 own permission, see [Permissions](#permissions) below.
 
+![A light badge pinned over a front-yard camera's live video, opened into its
+control card: the entity name, its On state, On and Off buttons, and a
+brightness slider set to 100 percent.](/img/screenshots/ha-control-slider.png)
+
+That card is the whole feature in one picture: the badge sits on the thing it
+controls, and operating it never leaves the camera view.
+
 ## Connect Crumb to Home Assistant
 
 You need a base URL and a long-lived access token. Make the token from a
@@ -55,7 +62,7 @@ HA within about a second, so the fail-open behavior below stays honest.
 
 ## Link a camera's entities
 
-In the camera editor's **Home Assistant** section (under its Motion tab) you
+In the camera editor's **Home Assistant** section (under its Connection tab) you
 link the camera to HA entities and save the set with `PUT /cameras/:id/ha/links`.
 Each linked entity gets:
 
@@ -69,21 +76,29 @@ Each linked entity gets:
 - A **label**, the text shown on the badge and in pickers; defaults to the HA
   entity's friendly name.
 
-Three pickers add entities, one per role:
+![The console's per-camera Home Assistant section: five linked entities, each row
+with a role dropdown reading Control, Sensor, or Motion, a label, the raw entity
+id, and Icon and style, Controls, and Remove buttons, above three add buttons and
+a Save links button.](/img/screenshots/ha-link-entities.png)
 
-- **+ Add sensor** searches `binary_sensor` entities for a **Motion** link. The
-  relevant device classes (motion, occupancy, presence, moving, door, window,
-  opening, garage door) are grouped first, with the rest under a "show all"
-  toggle, so nothing is unreachable.
-- **+ Add value** searches numeric `sensor` entities (temperature, humidity, and
-  so on) for a **Sensor** link; the entity's unit is carried through so a badge
-  or detail card can show, for example, `72°F` instead of a bare number.
-- **+ Add control** searches every domain Crumb can actuate for a **Control**
-  link: `light`, `switch`, `fan`, `siren`, `cover`, `lock`, `button`,
-  `input_button`, `scene`, and `script`, grouped by domain.
+Three add buttons put a new entity in, one per role, each opening a searchable
+picker scoped to the domains that role accepts:
+
+- The **Motion** picker searches `binary_sensor` entities. The relevant device
+  classes (motion, occupancy, presence, moving, door, window, opening, garage
+  door) are grouped first, with the rest under a "show all" toggle, so nothing
+  is unreachable.
+- The **Sensor** picker searches numeric `sensor` entities (temperature,
+  humidity, and so on); the entity's unit is carried through so a badge or
+  detail card can show, for example, `72°F` instead of a bare number.
+- The **Control** picker searches every domain Crumb can actuate: `light`,
+  `switch`, `fan`, `siren`, `cover`, `lock`, `button`, `input_button`, `scene`,
+  and `script`, grouped by domain. If you are looking for a switch or a light,
+  this is the button; they are not in the sensor pickers.
 
 Every picker has a search box, and an entity already linked under that role
-shows as "(linked)" instead of being hidden.
+shows as "(linked)" instead of being hidden. Nothing is saved until you hit
+**Save links**.
 
 The role is validated against the entity's actual HA domain when you save: a
 Control link needs one of the actuatable domains above, a Motion link needs a
@@ -101,8 +116,8 @@ only** to filter to links whose entity id no longer appears in HA's own state
 list, which is exactly what "orphaned" means here: the entity was renamed,
 removed, or its integration was reconfigured on the HA side, so the link now
 points at nothing. A banner at the top counts how many links are currently
-orphaned. Fixing one means opening that camera's Motion tab, removing the stale
-link, and relinking the entity's new id if it still exists in HA. Orphan
+orphaned. Fixing one means opening that camera's Connection tab, removing the
+stale link, and relinking the entity's new id if it still exists in HA. Orphan
 detection needs a reachable HA; if HA is unreachable or not enabled, the hub
 says so instead of guessing.
 
@@ -162,6 +177,12 @@ positioning itself):
 - **Outline** (a white edge plus shadow) so a badge pops on a busy scene, and
   **pinned captions** (live state text and/or last-changed age) next to the
   badge, both set from the desktop live view's badge editor.
+
+![The desktop app in Editing HA overlay mode on a back-door camera, with a badge
+style popover open: an icon dropdown, Dot and Pill shape buttons, an accent color
+swatch grid, background color, size and opacity controls, and checkboxes for
+pinning state text, pinning last-changed time, and an outline with
+shadow.](/img/screenshots/ha-badge-icon-editor.png)
 
 The desktop editor supports undo and multi-select align/group operations;
 everything saves when you hit Done. The console's style editor shows a small

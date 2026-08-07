@@ -327,8 +327,9 @@ via `PUT /config/beta-terms`). Then:
    logins inline (a working one-off is remembered for the rest of the session).
 5. **Choose cameras to add**, tick the ones to onboard (all stream-ready cameras
    are pre-ticked), edit names/URLs inline, and **Verify** each (shows a live
-   thumbnail + resolution/codec/fps). There's also **＋ Add one manually** for a
-   camera that's offline right now.
+   thumbnail + resolution/codec/fps). There's also **＋ Add a camera by address**
+   (offered on both the find and the select step) for a camera the scan didn't
+   turn up, plus a per-camera **Rescan** to retry one that's since come online.
 6. **Review & add**, confirm the list and optionally pick a **group per
    camera** (each group applies its own recording policy, e.g. an
    "always record" group and a "motion only" group in the same batch; a
@@ -743,12 +744,14 @@ Default = LAN-only, do nothing. If the user wants to reach CrumbVMS away from ho
 ## For maintainers (keeping this runbook honest)
 
 This doc encodes real endpoints, ports, and scripts, so it can drift from the code.
-Unlike prose docs, an agent-runnable runbook is **testable**: add a CI job that, on
-a clean VM, runs these steps end-to-end (`setup-env.sh` → `docker compose up -d` →
-wait for `/health` → log in as the seeded admin + add a synthetic RTSP camera via
-the API → assert it records) and fails if any Verify check fails. That turns "the install
-works" into a green check and stops this file from rotting against the compose /
-API surface.
+Unlike prose docs, an agent-runnable runbook is **testable**, and it is tested:
+`scripts/test/fresh-install-smoke.sh` runs these steps end-to-end on a clean
+stack (`setup-env.sh` → `docker compose up -d` → wait for `/health` → log in as
+the seeded admin → add a synthetic RTSP camera via the API → assert it actually
+records), and `.github/workflows/smoke.yml` runs it nightly, on pushes to main,
+and on any PR that touches the install surface. That turns "the install works"
+into a green check and stops this file from rotting against the compose / API
+surface. When you change something here, change the smoke script with it.
 
 **This runbook MUST be updated in the same change that touches any of the
 install/config surface it describes.** If your PR/commit changes any of the

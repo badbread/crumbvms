@@ -37,7 +37,7 @@
 It is a side project. One maintainer, built on my own time, running at home in production
 today: eleven cameras, multiple storage volumes, recording day in and day out for months.
 **It is about 90% of where I want v1 to be. The first minor release (v0.1.0) shipped in July
-2026, and the work continues toward v1.** The recorder, the Windows desktop client, and the Android app are the polished daily
+2026, v0.2.0 followed in August, and the work continues toward v1.** The recorder, the Windows desktop client, and the Android app are the polished daily
 drivers. The macOS app works but sits behind Android and Windows until demand says otherwise,
 and the iOS app is built and actively developed but not yet distributable (Apple wants a paid
 developer account, see [License](#license)). Both macOS and iOS get kept up to date, they just
@@ -90,10 +90,10 @@ are not as hammered on as the desktop and Android. Client details are in the
 - **Retention your way**: named recording policies, each camera assigned to one, with size caps and free-space headroom.
 - **Custom roles** with per-camera and per-group access.
 - **LPR display options**: which images to show, crop size, where the plate crop pins, and the watchlist fuzziness.
-- **Home Assistant**: connect HA, link a camera's entities, and pin their door, motion, and light badges onto the live view, live state and all.
+- **Home Assistant**: connect HA, link a camera's entities, and pin their door, motion, and light badges onto the live view, live state and all. Style each badge (icon, dot or pill, color, size, opacity), and give the ones you mark as controls a tap action or a slider.
 
 <p align="center">
-  <img src=".github/media/wall-builder.png" alt="Live-wall builder with carousels, hotspots, detection tiles and clocks"><br><sub><b>Design a custom layout</b>: start from a preset or merge/split the grid, drag on carousels, a motion-following hotspot, clocks, or web panes, then save it as a view.</sub>
+  <img src=".github/media/custom-view-designer.png" alt="The view designer with a finished seven-box layout: one large camera, three stacked tiles, and a hotspot tile set to auto-follow, next to the presets, grid steppers, and draggable special tiles"><br><sub><b>Design a custom layout</b>: start from a preset or merge/split the grid, drag on carousels, a motion-following hotspot, clocks, or web panes, then save it as a view.</sub>
 </p>
 
 ## The details that earn their keep
@@ -120,15 +120,15 @@ seat instead of a hobby dashboard, and honestly it is where most of the work goe
 
 ## Screenshots
 
-<sub>From a current build. LPR and the Home Assistant overlay are shown on demo / non-sensitive cameras; a couple of secondary screens still lag the newest polish.</sub>
+<sub>From a current build. Plates are redacted and the LPR list uses demo data; a couple of secondary screens still lag the newest polish.</sub>
 
 <table>
   <tr>
     <td width="50%"><img src=".github/media/lpr-list.png" alt="License-plate reads with crops, per-engine tags, and confidence"><br><sub><b>LPR</b>: searchable plate reads, Frigate and Crumb engine tags, watchlist (demo data shown).</sub></td>
-    <td width="50%"><img src=".github/media/ha-overlay.png" alt="Home Assistant entity badges pinned on the live camera view"><br><sub><b>Home Assistant</b>: entity badges pinned on the live video, live state and all.</sub></td>
+    <td width="50%"><img src=".github/media/ha-control-slider.png" alt="A Home Assistant light badge on live video opened into its control card, with On and Off buttons and a brightness slider"><br><sub><b>Home Assistant</b>: badges pinned on the live video, and controls you can actually operate, sliders and all.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src=".github/media/wall-builder.png" alt="Live-wall builder with carousels, hotspots, detection tiles and clocks"><br><sub><b>Build a live wall</b>: carousels, hotspots, detection tiles, clocks, web panes.</sub></td>
+    <td width="50%"><img src=".github/media/lpr-engine-benchmark.png" alt="Engine Benchmark screen comparing Frigate and Crumb ALPR side by side, with per-engine hit rate and confidence and a list of paired vehicle passes"><br><sub><b>Race the plate readers</b>: run Frigate and Crumb's engine on one camera and watch them go head to head on your own traffic (plates redacted).</sub></td>
     <td width="50%"><img src=".github/media/motion-tuning.png" alt="Draw motion exclusion zones on the live image, pick a detector"><br><sub><b>Tune motion</b>: draw exclusion zones on the live image, pick a detector.</sub></td>
   </tr>
   <tr>
@@ -311,10 +311,11 @@ docker compose ps
 
 **Then open `http://<your-server-ip>:8080/admin` in a browser** and sign in with username
 `admin` and the memorable password `setup-env.sh` printed (it is also stored in `.env` as
-`SEED_ADMIN_PASSWORD`). A first-run wizard walks you through the rest: accept the alpha terms,
-set the address your phone and desktop apps will use, storage and retention, and add your first
-camera by its name and RTSP URL. Crumb restreams it and starts recording right away. To stop
-everything, run `docker compose down`.
+`SEED_ADMIN_PASSWORD`). A first-run wizard walks you through the rest: accept the tester terms,
+set the address your phone and desktop apps will use, storage and retention, and then find your
+cameras. It scans the network and lists what it finds, you tick the ones to add, and anything the
+scan misses you can still add by address. Crumb restreams them and starts recording right away. To
+stop everything, run `docker compose down`.
 
 That is the whole install. A few options if you want them:
 
