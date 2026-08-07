@@ -760,6 +760,21 @@ pub fn get_auth(uri: &str, token: &str) -> axum::http::Request<axum::body::Body>
         .unwrap()
 }
 
+/// Build a PUT request with a Bearer token and a JSON body.
+pub fn put_auth_json(
+    uri: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
 /// Build a POST request with a Bearer token and a JSON body.
 pub fn post_auth_json(
     uri: &str,
