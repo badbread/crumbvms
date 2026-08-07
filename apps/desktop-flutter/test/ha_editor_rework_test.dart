@@ -423,15 +423,21 @@ void main() {
     // The old width was a character-count estimate that ran well wide of the
     // real text, and since `HaBadgeChip._pill` fills whatever box it is given,
     // the surplus rendered as empty pill after the label.
+    //
+    // Width at the REFERENCE height (pane scale 1.0, `overlay_size` 1.0) —
+    // `ha_pill_layout_test.dart` covers the other heights, where the chip's
+    // clamps make the content width non-linear.
+    double widthOf(String label) => HaOverlayBadgeItem.pillWidthAtHeight(
+          label,
+          HaOverlayBadgeItem.baseRefPx,
+        );
+
     test('a longer label makes a wider pill', () {
-      expect(
-        HaOverlayBadgeItem.pillBaseWidth('Floodlight'),
-        greaterThan(HaOverlayBadgeItem.pillBaseWidth('Yard')),
-      );
+      expect(widthOf('Floodlight'), greaterThan(widthOf('Yard')));
     });
 
     test('an empty label still leaves room for the icon and paddings', () {
-      final bare = HaOverlayBadgeItem.pillBaseWidth('');
+      final bare = widthOf('');
       expect(bare, greaterThan(HaOverlayBadgeItem.baseRefPx));
       // Chrome only: 2 paddings + icon + gap = 1.26 * the reference size.
       expect(bare, closeTo(HaOverlayBadgeItem.baseRefPx * 1.26, 0.01));
@@ -444,17 +450,15 @@ void main() {
       double oldEstimate(String s) =>
           ref * 1.5 + s.length.clamp(1, 16) * ref * 0.42;
       for (final label in ['Yard', 'Floodlight', 'Back porch light']) {
-        expect(
-          HaOverlayBadgeItem.pillBaseWidth(label),
-          lessThan(oldEstimate(label)),
-          reason: label,
-        );
+        expect(widthOf(label), lessThan(oldEstimate(label)), reason: label);
       }
     });
 
     test('a runaway label is capped rather than spanning the frame', () {
-      final huge = HaOverlayBadgeItem.pillBaseWidth('W' * 400);
-      expect(huge, lessThanOrEqualTo(HaOverlayBadgeItem.baseRefPx * 10.3));
+      expect(
+        widthOf('W' * 400),
+        lessThanOrEqualTo(HaOverlayBadgeItem.baseRefPx * 10.3),
+      );
     });
 
     test('a dot is square and ignores its label entirely', () {

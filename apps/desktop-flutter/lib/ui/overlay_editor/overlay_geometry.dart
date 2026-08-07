@@ -61,11 +61,42 @@ class OverlayGeometry {
     return ((paneW - fw) / 2, (paneH - fh) / 2, fw, fh);
   }
 
+  /// Clamp a rendered box's TOP-LEFT [pos] on one axis so the box stays inside
+  /// the `[origin, origin + field]` field span, given the box's [box] extent
+  /// on that axis. Order-safe by construction: when [box] is at least as large
+  /// as [field] the naive upper limit (`origin + field - box`) falls at or
+  /// below [origin], so `num.clamp(origin, hi)` would get `lowerLimit > hi`
+  /// and THROW an `ArgumentError`. That is exactly the oversized-badge case (a
+  /// `wide` or large-`overlay_size` HA pill whose rendered width exceeds the
+  /// letterboxed video field, or a very tall badge on the Y axis); we pin such
+  /// a box to [origin] instead — the pill already ellipsizes its label, so
+  /// degrading a too-big badge to the field's edge is the right, non-throwing
+  /// behavior. For a normal box ([box] < [field]) this is byte-identical to
+  /// `pos.clamp(origin, origin + field - box)` — including the `box == field`
+  /// boundary, where both yield [origin].
+  static double _clampAxis(double pos, double origin, double field, double box) {
+    final hi = origin + field - box;
+    if (hi <= origin) return origin;
+    return pos.clamp(origin, hi).toDouble();
+  }
+
   /// Rendered pixel rect (x, y, w, h) of `item` within a `paneW`x`paneH`
   /// pane, honoring its [OverlayItem.anchor] (`ptzPanelBtnRect`/
   /// `PtzPanelGeometry.rectFor` lifted + anchor-aware). Floors rendered size
   /// at [minRenderedPx] so a shrunk item never disappears; clamps inside its
   /// anchor field.
+  ///
+  /// Size comes from [OverlayItem.renderedSize] rather than `baseSize() * s`
+  /// so an item whose content does not scale linearly with its box (the HA
+  /// pill badge) gets the box it actually needs at this pane scale. This is
+  /// the ONE place base → rendered happens, so rendering, hit-testing and the
+  /// editor's drag/snap math all move together.
+  ///
+  /// Position clamping runs through [_clampAxis] on BOTH axes so a badge whose
+  /// rendered box is larger than its anchor field (an oversized `wide`/large
+  /// pill horizontally, or a very tall badge vertically) pins to the field
+  /// edge instead of inverting `num.clamp`'s range and throwing — the crash
+  /// that turned an affected wall tile into a persistent red error widget.
   static (double x, double y, double w, double h) rectFor(
     OverlayItem item,
     double paneW,
@@ -73,10 +104,10 @@ class OverlayGeometry {
     int? videoW,
     int? videoH,
   }) {
-    final (baseW, baseH) = item.baseSize();
     final s = paneScale(paneW, paneH);
-    final bw = (baseW * s).clamp(minRenderedPx, double.infinity).toDouble();
-    final bh = (baseH * s).clamp(minRenderedPx, double.infinity).toDouble();
+    final (rw, rh) = item.renderedSize(s);
+    final bw = rw.clamp(minRenderedPx, double.infinity).toDouble();
+    final bh = rh.clamp(minRenderedPx, double.infinity).toDouble();
     final (fx, fy, fw, fh) = fieldRect(
       item.anchor,
       paneW,
@@ -84,8 +115,8 @@ class OverlayGeometry {
       videoW: videoW,
       videoH: videoH,
     );
-    final x = (fx + item.x * fw).clamp(fx, fx + fw - bw).toDouble();
-    final y = (fy + item.y * fh).clamp(fy, fy + fh - bh).toDouble();
+    final x = _clampAxis(fx + item.x * fw, fx, fw, bw);
+    final y = _clampAxis(fy + item.y * fh, fy, fh, bh);
     return (x, y, bw, bh);
   }
 }

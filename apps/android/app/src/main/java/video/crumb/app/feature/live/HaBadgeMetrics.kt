@@ -105,13 +105,45 @@ internal object HaBadgeMetrics {
             labelWidth(height, label)
 
     /**
+     * A FIXED pill width as a multiple of the pill's HEIGHT (migration 0078,
+     * issue #497), or null for `auto` — and for any value this build does not
+     * know, which degrades to today's content-derived width rather than
+     * guessing at a newer server's vocabulary.
+     *
+     * Height is the unit deliberately: it is the one length desktop, Android
+     * and iOS already derive identically from `overlay_size` and the pane
+     * scale, so `medium` is the same pill everywhere. A pixel width would be
+     * three different pills on three different panes.
+     *
+     * The vocabulary is frozen and shared: `services/api/src/ha.rs`'s
+     * `HA_PILL_WIDTH_MODES`, the desktop `haPillWidthFactor`, the iOS
+     * `HA.pillWidthFactor`, and the console's width `<select>`.
+     */
+    fun pillWidthFactor(mode: String?): Float? = when (mode) {
+        "narrow" -> 4f
+        "medium" -> 6f
+        "wide" -> 8f
+        else -> null // "auto", null, or anything unrecognized
+    }
+
+    /**
      * The rendered pill width (dp): the desktop-authored footprint, widened when
      * the (clamped) icon + label would not fit inside it. This is the fix for
      * the overflow — the container is derived from the content, never assumed to
      * be big enough for it.
+     *
+     * A FIXED [widthMode] short-circuits all of that: the pill is EXACTLY that
+     * multiple of its height, deliberately NOT widened to fit, because an
+     * operator who asked for four pills the same width gets four pills the same
+     * width and an over-long label ellipsizes (which the chip already does).
+     * That exactness is the whole point of the mode, and it is also what keeps
+     * the four renderers agreeing on a number.
      */
-    fun pillWidth(height: Float, label: String): Float =
-        max(nominalPillWidth(height, label), pillContentWidth(height, label))
+    fun pillWidth(height: Float, label: String, widthMode: String? = null): Float {
+        val factor = pillWidthFactor(widthMode)
+        if (factor != null) return factor * height
+        return max(nominalPillWidth(height, label), pillContentWidth(height, label))
+    }
 
     /** Estimated rendered label width (dp) at this badge height. */
     fun labelWidth(height: Float, label: String): Float =

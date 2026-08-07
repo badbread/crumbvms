@@ -239,7 +239,11 @@ extension HaApi on CrumbApi {
   /// server resets it to unset (NOT "leave whatever was there"), so a caller
   /// must always pass the link's CURRENT value forward, not just a change —
   /// see `HaOverlayController.endEditAndSave`, which does exactly that so a
-  /// desktop save can never clobber a `bg_color_on` set elsewhere. Returns
+  /// desktop save can never clobber a `bg_color_on` set elsewhere.
+  /// `pillWidth` / `textAlign` (issue #497) are the pill LAYOUT contract —
+  /// `auto`/`narrow`/`medium`/`wide` and `start`/`center`/`end` — and follow
+  /// the same replace-the-whole-placement rule: null is sent as absent, which
+  /// the server reads as the default (auto width, start-aligned). Returns
   /// the updated link.
   Future<HaLink> saveHaPlacement(
     Session s,
@@ -256,6 +260,8 @@ extension HaApi on CrumbApi {
     String? shape,
     String? bgColor,
     String? bgColorOn,
+    String? pillWidth,
+    String? textAlign,
     bool outline = false,
     String? label,
   }) async {
@@ -271,6 +277,8 @@ extension HaApi on CrumbApi {
       if (shape != null) 'shape': shape,
       if (bgColor != null) 'bg_color': bgColor,
       if (bgColorOn != null) 'bg_color_on': bgColorOn,
+      if (pillWidth != null) 'pill_width': pillWidth,
+      if (textAlign != null) 'text_align': textAlign,
       'outline': outline,
       if (label != null) 'label': label,
     });

@@ -164,4 +164,47 @@ final class HaBadgeVisualTests: XCTestCase {
         XCTAssertEqual(HA.badgeBackground(link: l, visual: onVisual), HA.defaultBadgeBackground)
         XCTAssertEqual(HA.badgeBackground(link: l, visual: offVisual), HA.defaultBadgeBackground)
     }
+
+    // MARK: - Pill layout (migration 0078, issue #497)
+
+    /// An older server that omits the layout keys decodes to nil, which is
+    /// today's rendering: a pill hugging its content, label at the leading edge.
+    func testPillLayoutAbsentDecodesToNil() throws {
+        let l = try link("binary_sensor.front")
+        XCTAssertNil(l.overlayPillWidth)
+        XCTAssertNil(l.overlayTextAlign)
+        XCTAssertNil(HA.pillWidthFactor(l.overlayPillWidth))
+        XCTAssertEqual(HA.pillAlignment(l.overlayTextAlign), .leading)
+    }
+
+    /// The frozen width vocabulary — the same numbers `services/api/src/ha.rs`,
+    /// the desktop `haPillWidthFactor` and `HaBadgeMetrics.pillWidthFactor` use.
+    /// A fixed width is a multiple of the badge HEIGHT, so `medium` is the same
+    /// pill on every client and pane.
+    func testPillWidthFactorVocabulary() {
+        XCTAssertNil(HA.pillWidthFactor(nil))
+        XCTAssertNil(HA.pillWidthFactor("auto"))
+        XCTAssertEqual(HA.pillWidthFactor("narrow"), 4)
+        XCTAssertEqual(HA.pillWidthFactor("medium"), 6)
+        XCTAssertEqual(HA.pillWidthFactor("wide"), 8)
+    }
+
+    /// A value this build has never shipped degrades to auto rather than
+    /// inventing a width.
+    func testUnknownPillWidthDegradesToAuto() {
+        for bad in ["", "AUTO", "huge", "fixed", "8"] {
+            XCTAssertNil(HA.pillWidthFactor(bad), bad)
+        }
+    }
+
+    /// Alignment vocabulary, with the same never-guess rule.
+    func testPillAlignmentVocabulary() {
+        XCTAssertEqual(HA.pillAlignment(nil), .leading)
+        XCTAssertEqual(HA.pillAlignment("start"), .leading)
+        XCTAssertEqual(HA.pillAlignment("center"), .center)
+        XCTAssertEqual(HA.pillAlignment("end"), .trailing)
+        for bad in ["", "left", "right", "justify", "CENTER"] {
+            XCTAssertEqual(HA.pillAlignment(bad), .leading, bad)
+        }
+    }
 }

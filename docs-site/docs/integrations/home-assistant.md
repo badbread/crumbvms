@@ -173,6 +173,18 @@ positioning itself):
   entity's device class.
 - **Shape:** a compact **dot** or a labelled **pill**.
 - **Color** for the foreground and, on a pill, the background (`#RRGGBB`).
+- **Pill width** and **text align**, on a pill. By default a pill is **Auto**:
+  it hugs its label, so a short name gets a short badge. Pick **Narrow**,
+  **Medium** or **Wide** instead and the pill takes a fixed width of four, six
+  or eight times its own height. Because that is a multiple of the badge height
+  rather than a pixel count, a set of badges given the same width comes out the
+  same size on every client and in every pane, which is what lets a column of
+  them line up down a door frame. A label longer than the width you picked is
+  shortened with an ellipsis. **Text align** then decides where the icon and
+  label sit in the space: **Start** (the default, against the leading edge),
+  **Center**, or **End**. Align has nothing to move on an Auto pill, which has
+  no spare room by definition, so set a fixed width first. Dots ignore both
+  settings.
 - **Size** multiplier and **opacity** (down to nearly transparent).
 - **Outline** (a white edge plus shadow) so a badge pops on a busy scene, and
   **pinned captions** (live state text and/or last-changed age) next to the

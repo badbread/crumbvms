@@ -459,6 +459,16 @@ struct HaLinkDto {
     /// `on ⇒ overlay_bg_color_on ?? overlay_bg_color ?? #17171B`, any other
     /// state ⇒ `overlay_bg_color ?? #17171B`.
     overlay_bg_color_on: Option<String>,
+    /// Pill WIDTH mode (migration 0078, issue #497): `"auto"`/`"narrow"`/
+    /// `"medium"`/`"wide"`; `null` ⇒ `"auto"`, the hug-the-content width every
+    /// renderer draws today. The fixed modes are exact multiples of the badge
+    /// HEIGHT — 4x / 6x / 8x — so the same value renders the same pill on every
+    /// client and pane. Only a `pill` uses it; a `dot` ignores it.
+    overlay_pill_width: Option<String>,
+    /// Where the pill's icon + label group sits inside the pill (migration
+    /// 0078, issue #497): `"start"`/`"center"`/`"end"`; `null` ⇒ `"start"`,
+    /// today's layout. Only observable once the pill is wider than its content.
+    overlay_text_align: Option<String>,
     /// White outline + drop shadow (migration 0062; default false).
     overlay_outline: bool,
     /// Per-link control config (migration 0075, issue #440). `require_confirm`
@@ -496,6 +506,8 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             overlay_shape: l.overlay_shape,
             overlay_bg_color: l.overlay_bg_color,
             overlay_bg_color_on: l.overlay_bg_color_on,
+            overlay_pill_width: l.overlay_pill_width,
+            overlay_text_align: l.overlay_text_align,
             overlay_outline: l.overlay_outline,
             require_confirm: l.require_confirm,
             allowed_actions: l.allowed_actions,
@@ -543,6 +555,14 @@ struct PlacementInput {
     /// body-level `null` still clears the whole placement.
     #[serde(default)]
     bg_color_on: Option<String>,
+    /// Pill width mode (migration 0078): `auto`/`narrow`/`medium`/`wide`;
+    /// omitted/`null` = `auto` (hug the content, today's rendering).
+    #[serde(default)]
+    pill_width: Option<String>,
+    /// Pill icon+label justification (migration 0078): `start`/`center`/`end`;
+    /// omitted/`null` = `start` (today's rendering).
+    #[serde(default)]
+    text_align: Option<String>,
     /// White outline + drop shadow (migration 0062); omitted = false.
     #[serde(default)]
     outline: bool,
@@ -571,6 +591,28 @@ fn valid_overlay_color(c: &str) -> bool {
 /// `dot` / `pill` (mirrors the migration CHECK so a bad value 400s clearly).
 fn valid_overlay_shape(s: &str) -> bool {
     matches!(s, "dot" | "pill")
+}
+
+/// The closed vocabulary of pill WIDTH modes (migration 0078, issue #497).
+/// `auto` is the hug-the-content width every renderer draws today; the other
+/// three are EXACT widths, in multiples of the pill's own height, so a set of
+/// badges given the same mode line up. Mirrors the migration CHECK, and is the
+/// list every renderer and the console `<select>` must carry verbatim.
+const HA_PILL_WIDTH_MODES: &[&str] = &["auto", "narrow", "medium", "wide"];
+
+/// The closed vocabulary of pill text justifications (migration 0078, issue
+/// #497): where the icon + label group sits once the pill is wider than its
+/// content. `start` is today's leading-edge layout.
+const HA_TEXT_ALIGNS: &[&str] = &["start", "center", "end"];
+
+/// Validate a pill width mode (migration 0078); see [`HA_PILL_WIDTH_MODES`].
+fn valid_overlay_pill_width(w: &str) -> bool {
+    HA_PILL_WIDTH_MODES.contains(&w)
+}
+
+/// Validate a pill text justification (migration 0078); see [`HA_TEXT_ALIGNS`].
+fn valid_overlay_text_align(a: &str) -> bool {
+    HA_TEXT_ALIGNS.contains(&a)
 }
 
 /// Validate a curated icon-slug override's SHAPE: short, lowercase `[a-z0-9_]`.
@@ -1108,6 +1150,22 @@ async fn put_placement(
                     ));
                 }
             }
+            if let Some(w) = &p.pill_width {
+                if !valid_overlay_pill_width(w) {
+                    return Err(ApiError::BadRequest(format!(
+                        "placement pill_width must be one of {}",
+                        HA_PILL_WIDTH_MODES.join(", ")
+                    )));
+                }
+            }
+            if let Some(a) = &p.text_align {
+                if !valid_overlay_text_align(a) {
+                    return Err(ApiError::BadRequest(format!(
+                        "placement text_align must be one of {}",
+                        HA_TEXT_ALIGNS.join(", ")
+                    )));
+                }
+            }
             // Label edit rides the placement PUT: omitted = unchanged,
             // "" = cleared, non-empty = set (trimmed).
             label_update = p.label.as_deref().map(|l| {
@@ -1130,6 +1188,8 @@ async fn put_placement(
                 shape: p.shape.clone(),
                 bg_color: p.bg_color.clone(),
                 bg_color_on: p.bg_color_on.clone(),
+                pill_width: p.pill_width.clone(),
+                text_align: p.text_align.clone(),
                 outline: p.outline,
             })
         }
@@ -1651,6 +1711,11 @@ mod tests {
         assert_eq!(p.shape, None); // shape/background/outline default off (0062)
         assert_eq!(p.bg_color, None);
         assert_eq!(p.bg_color_on, None); // per-state background inherits (0076)
+
+        // Pill layout (0078) defaults to "unset" ⇒ auto width, start-aligned:
+        // exactly the hug-the-content pill every renderer already draws.
+        assert_eq!(p.pill_width, None);
+        assert_eq!(p.text_align, None);
         assert!(!p.outline);
         assert_eq!(p.label, None);
 
@@ -1666,6 +1731,7 @@ mod tests {
             "color": "#FFB143", "icon": "doorbell",
             "show_state": true, "show_age": true, "opacity": 0.5,
             "shape": "pill", "bg_color": "#101014", "bg_color_on": "#B3261E",
+            "pill_width": "medium", "text_align": "center",
             "outline": true,
             "label": "Front door"
         }))
@@ -1678,6 +1744,8 @@ mod tests {
         assert_eq!(p.shape.as_deref(), Some("pill"));
         assert_eq!(p.bg_color.as_deref(), Some("#101014"));
         assert_eq!(p.bg_color_on.as_deref(), Some("#B3261E"));
+        assert_eq!(p.pill_width.as_deref(), Some("medium"));
+        assert_eq!(p.text_align.as_deref(), Some("center"));
         assert!(p.outline);
         assert_eq!(p.label.as_deref(), Some("Front door"));
     }
@@ -1718,6 +1786,56 @@ mod tests {
             assert!(
                 !valid_overlay_color(bad),
                 "bg_color_on '{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_input_pill_layout_is_a_closed_vocabulary_that_resets_on_null() {
+        // Migration 0078 (issue #497). Both fields are small closed sets, NOT
+        // free values, precisely so the four renderers cannot disagree about
+        // what a badge looks like. Everything the wire accepts is listed here.
+        for w in HA_PILL_WIDTH_MODES {
+            let p: PlacementInput =
+                serde_json::from_value(json!({"x": 0.1, "y": 0.1, "pill_width": w})).unwrap();
+            assert_eq!(p.pill_width.as_deref(), Some(*w));
+            assert!(valid_overlay_pill_width(w));
+        }
+        for a in HA_TEXT_ALIGNS {
+            let p: PlacementInput =
+                serde_json::from_value(json!({"x": 0.1, "y": 0.1, "text_align": a})).unwrap();
+            assert_eq!(p.text_align.as_deref(), Some(*a));
+            assert!(valid_overlay_text_align(a));
+        }
+
+        // The vocabulary is frozen: these EXACT strings are what admin.html's
+        // selects, the desktop popover, the Android metrics and the iOS badge
+        // all switch on. Changing one without changing the others is the bug
+        // this assertion exists to catch.
+        assert_eq!(HA_PILL_WIDTH_MODES, &["auto", "narrow", "medium", "wide"]);
+        assert_eq!(HA_TEXT_ALIGNS, &["start", "center", "end"]);
+
+        // A field-level null is the RESET back to the default rendering
+        // (auto width, start-aligned), matching the bg_color_on convention.
+        let reset: PlacementInput = serde_json::from_value(json!({
+            "x": 0.2, "y": 0.3, "pill_width": null, "text_align": null
+        }))
+        .unwrap();
+        assert_eq!(reset.pill_width, None);
+        assert_eq!(reset.text_align, None);
+
+        // Anything else is refused by the same gate the handler 400s on, so a
+        // bad value never reaches the migration-0078 CHECK as a Postgres error.
+        for bad in ["", "AUTO", "fixed", "compact", "left", "8", "wide "] {
+            assert!(
+                !valid_overlay_pill_width(bad),
+                "pill_width '{bad}' must be rejected"
+            );
+        }
+        for bad in ["", "START", "left", "right", "justify", "centre"] {
+            assert!(
+                !valid_overlay_text_align(bad),
+                "text_align '{bad}' must be rejected"
             );
         }
     }
@@ -2361,6 +2479,8 @@ mod tests {
             overlay_shape: None,
             overlay_bg_color: None,
             overlay_bg_color_on: None,
+            overlay_pill_width: None,
+            overlay_text_align: None,
             overlay_outline: false,
             require_confirm: true,
             allowed_actions: Some(vec!["open_cover".to_owned()]),
@@ -2391,6 +2511,8 @@ mod tests {
             overlay_shape: None,
             overlay_bg_color: None,
             overlay_bg_color_on: None,
+            overlay_pill_width: None,
+            overlay_text_align: None,
             overlay_outline: false,
             require_confirm: false,
             allowed_actions: None,
@@ -2422,6 +2544,8 @@ mod tests {
             overlay_shape: Some("pill".to_owned()),
             overlay_bg_color: Some("#17171B".to_owned()),
             overlay_bg_color_on: Some("#B3261E".to_owned()),
+            overlay_pill_width: Some("medium".to_owned()),
+            overlay_text_align: Some("center".to_owned()),
             overlay_outline: false,
             require_confirm: false,
             allowed_actions: None,
@@ -2430,15 +2554,24 @@ mod tests {
         // Both backgrounds ride the wire; the client picks by edge_on.
         assert_eq!(v["overlay_bg_color"], "#17171B");
         assert_eq!(v["overlay_bg_color_on"], "#B3261E");
+        // Pill layout (0078) rides the same DTO, spelled exactly as every
+        // renderer switches on it.
+        assert_eq!(v["overlay_pill_width"], "medium");
+        assert_eq!(v["overlay_text_align"], "center");
 
         // A badge that predates 0076 serializes the new field as null, which is
         // exactly "inherit the base for the on state" — i.e. today's rendering.
         let inherited = CameraHaLink {
             overlay_bg_color_on: None,
+            overlay_pill_width: None,
+            overlay_text_align: None,
             ..base
         };
         let v = serde_json::to_value(HaLinkDto::from(inherited)).unwrap();
         assert_eq!(v["overlay_bg_color"], "#17171B");
         assert!(v["overlay_bg_color_on"].is_null());
+        // Null pill layout ⇒ auto width, start-aligned ⇒ today's pill.
+        assert!(v["overlay_pill_width"].is_null());
+        assert!(v["overlay_text_align"].is_null());
     }
 }
