@@ -8117,6 +8117,12 @@ pub async fn get_event_provider(
 /// then the legacy `frigate_api_base`, then the Frigate-integration `api_base`.
 /// Returns `None` when nothing is configured — callers fall back to the
 /// `FRIGATE_API_BASE` env.
+///
+/// The legacy step only serves pre-0014 installs, where that single column was
+/// the only place a Frigate HTTP base could be stored. It is safe to keep because
+/// the write path (`config_routes::resolve_frigate_bases`) never lets a go2rtc
+/// (:1984) base reach the legacy column any more, and clears the one the old
+/// console used to copy there.
 pub async fn frigate_http_base(pool: &Pool) -> Result<Option<String>> {
     if let Some(s) = get_server_settings(pool).await? {
         let http = s.frigate_http_api_base.trim().to_owned();
@@ -9900,6 +9906,11 @@ pub async fn server_settings_version(pool: &Pool) -> Result<i64> {
 /// The two new fields added by migration 0014 (`frigate_go2rtc_api_base` and
 /// `frigate_http_api_base`) are also updated.  The API-routes caller must include
 /// them in `UpdateServerSettingsRequest`; see the contract in the audit.
+///
+/// `frigate_api_base` is the deprecated pre-0014 column. The caller decides what
+/// to write back for it (`config_routes::resolve_frigate_bases`) — it is never
+/// derived from the two split values here, and in particular a go2rtc (:1984)
+/// base must never end up standing in for the Frigate HTTP (:5000) base.
 ///
 /// # Errors
 ///
