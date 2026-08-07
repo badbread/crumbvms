@@ -8,6 +8,91 @@ revisit.
 
 ---
 
+## 2026-08-06, HA badge pill layout: a four-value width mode in units of the badge HEIGHT (not free pixels, not a max-width)
+
+**Context.** Live testing of the v0.2.0 overlay editor (issue #497) turned up two
+gaps in the `pill` badge. Operators want several pills to be the SAME width so a
+column of them lines up down a door frame, and they want to move the label off
+the leading edge once a pill is wider than its content. The shrink-to-content
+work already landed, so `auto` is the right default; what was missing was any
+way to say something other than `auto`.
+
+**Decision.** Two additive nullable columns (migration `0078`), each a small
+closed vocabulary, applying only to `shape = 'pill'`:
+
+- `overlay_pill_width` = `auto` | `narrow` | `medium` | `wide`. `NULL` means
+  `auto`, which is today's measured hug-the-content width, byte for byte. The
+  three fixed modes are EXACT widths, expressed as multiples of the pill's own
+  HEIGHT: `4x`, `6x`, `8x`.
+- `overlay_text_align` = `start` | `center` | `end`. `NULL` means `start`, the
+  leading-edge layout every renderer already draws. It governs the icon + label
+  group as a unit, and is only observable once a fixed width has left the pill
+  some slack.
+
+Resolution rule, identical in every renderer: width `auto`/`NULL`/unrecognized ⇒
+measure the content; `narrow`/`medium`/`wide` ⇒ `4/6/8 x height`. Align
+`start`/`NULL`/unrecognized ⇒ leading; `center` ⇒ centred; `end` ⇒ trailing. A
+dot ignores both. On the wire the fields are additive on `HaLinkDto`
+(`overlay_pill_width`/`overlay_text_align`) and `PlacementInput`
+(`pill_width`/`text_align`, `#[serde(default)]`), validated against the same
+lists the migration CHECKs enforce; a field-level `null` inside the placement
+object is the reset back to the default, matching `bg_color_on`.
+
+**Why height is the unit.** The badge height is the one length all four
+renderers already derive identically, from `overlay_size` and the pane scale. A
+pixel width would resolve differently on a phone pane, a wall tile and a
+maximized pane, so "make these three the same width" would be true on exactly
+one surface.
+
+**Rejected:**
+
+- **A free pixel (or fractional) width field.** The obvious ask, and the one
+  thing four renderers cannot agree on: there is no shared pixel space (see
+  above), and it hands the operator a control whose result varies by client.
+  It also invites values that make the badge unusable, which then needs its own
+  clamp vocabulary anyway.
+- **A MAX-width (clamp) instead of an exact width.** Safer sounding, but it does
+  not solve the actual ask: under a max-width, two pills with different labels
+  still render different widths, so nothing lines up. Exact-plus-ellipsis loses
+  a few characters on an over-long label, which every renderer already handles,
+  and delivers the alignment the exact mode exists for.
+- **Deriving the width from a character count (`width = N chars`).** Font
+  metrics differ per platform (Android already ships a glyph-advance estimate
+  where desktop measures), so the same N would be a different pill on each
+  client. Multiples of height are metric-free.
+- **A per-badge "align to this other badge" / layout-group concept.** The
+  general answer to lining badges up, and much bigger: the placement model has
+  no group that survives a session (see `OverlayItem.groupId`), so it would need
+  a new persisted relation, plus reflow rules, plus an editor for it. A shared
+  width mode gets most of the value for two nullable columns.
+- **Folding both into an `overlay_style jsonb` blob.** Same reasoning as the
+  2026-08-06 per-state-background entry: it discards the per-column CHECKs and
+  retypes the field in four clients. Still the eventual answer, still not now.
+
+**Trades knowingly accepted:**
+
+- Three fixed widths is a coarse ladder. An operator who wants `5x` cannot have
+  it; they pick `narrow` or `medium` and live with it. That coarseness is what
+  buys identical rendering across four independent implementations.
+- A fixed width narrower than the label truncates. Deliberate: the pill already
+  ellipsizes, and the alternative (silently widening) is exactly the
+  "nothing lines up" failure the mode exists to fix.
+- `overlay_text_align` does nothing on an `auto` pill. It is presented directly
+  under the width control in every editor so the relationship is visible, but a
+  puzzled operator setting align-only is a real possibility.
+- Android's `auto` width is still its char-count estimate widened to fit its
+  content (PR #499), while desktop measures the text; those two can disagree by
+  a few px. Untouched here on purpose — the fixed modes are exact everywhere,
+  and re-litigating `auto` parity belongs with whatever revisits #499.
+
+**Revisit when:** operators ask for a fourth or fifth fixed width (then either
+extend the ladder or reopen free values with a per-renderer normalization), when
+a real layout-group/alignment-guide feature lands in the overlay editor (which
+would subsume the "make them line up" use case), or when a renderer is added
+that cannot express an exact width in units of height.
+
+---
+
 ## 2026-08-06, A non-success go2rtc `PUT` is resolved by ASKING go2rtc what it has, not by reading the status code; and a never-yet-seen camera gets a creation grace
 
 **Context.** Two bugs found by a hostile-camera compatibility matrix against the

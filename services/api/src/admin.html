@@ -5478,6 +5478,8 @@ function haMapLinkFromServer(l) {
     overlay_shape: l.overlay_shape ?? null,
     overlay_bg_color: l.overlay_bg_color ?? null,
     overlay_bg_color_on: l.overlay_bg_color_on ?? null,
+    overlay_pill_width: l.overlay_pill_width ?? null,
+    overlay_text_align: l.overlay_text_align ?? null,
     overlay_outline: !!l.overlay_outline,
   };
 }
@@ -5572,6 +5574,17 @@ function haToggleCtrl(i) {
   renderHaLinks(true);
 }
 
+/* Pill LAYOUT vocabulary (migration 0078, issue #497). These EXACT strings are
+   the contract: `services/api/src/ha.rs` validates them (HA_PILL_WIDTH_MODES /
+   HA_TEXT_ALIGNS), and the desktop (`haPillWidthFactor`/`haPillAlignment`),
+   Android (`HaBadgeMetrics.pillWidthFactor`) and iOS (`HA.pillWidthFactor`)
+   renderers switch on them. A fixed width is an exact multiple of the badge
+   HEIGHT — height is the one length every renderer derives identically, so a
+   pixel value would mean four different pills. 'auto' (and a null column) is
+   the hug-the-content default, i.e. today's badge unchanged. */
+const HA_PILL_WIDTH_FACTORS = { auto: null, narrow: 4, medium: 6, wide: 8 };
+const HA_TEXT_ALIGN_JUSTIFY = { start: 'flex-start', center: 'center', end: 'flex-end' };
+
 /* Small badge mockup mirroring the on-video overlay's shape/color/bg/opacity
    so an icon/style edit gets SOME immediate visual feedback without pulling
    in a live video canvas here (issue #439 — "a clean functional editor beats
@@ -5590,8 +5603,14 @@ function haBadgePreviewHtml(l, onState) {
   const icon = l.overlay_icon || 'sensor';
   const h = Math.round(26 * Math.max(0.5, Math.min(2, size)));
   const isPill = shape === 'pill';
-  const w = isPill ? Math.round(h * 2.6) : h;
-  return `<div style="width:${w}px;height:${h}px;border-radius:${isPill ? (h/2)+'px' : '50%'};background:${esc(bg)};border:2px solid ${esc(color)};opacity:${opacity};display:flex;align-items:center;justify-content:center;color:${esc(color)};font-size:9px;font-weight:600;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:0 4px;box-sizing:border-box" title="${esc(icon)}">${esc(icon)}</div>`;
+  // Pill layout (migration 0078): a fixed width is an exact multiple of the
+  // badge HEIGHT, the same rule the three native renderers apply, so the mock
+  // widens/narrows the way the real badge will. 'auto' keeps the old 2.6x mock
+  // stand-in for "hugs its content" (the console has no glyph/text metrics).
+  const wf = isPill ? HA_PILL_WIDTH_FACTORS[l.overlay_pill_width || 'auto'] : null;
+  const w = isPill ? Math.round(h * (wf || 2.6)) : h;
+  const justify = isPill ? (HA_TEXT_ALIGN_JUSTIFY[l.overlay_text_align || 'start'] || 'flex-start') : 'center';
+  return `<div style="width:${w}px;height:${h}px;border-radius:${isPill ? (h/2)+'px' : '50%'};background:${esc(bg)};border:2px solid ${esc(color)};opacity:${opacity};display:flex;align-items:center;justify-content:${justify};color:${esc(color)};font-size:9px;font-weight:600;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:0 4px;box-sizing:border-box" title="${esc(icon)}">${esc(icon)}</div>`;
 }
 
 function haStylePanel(i, l) {
@@ -5599,6 +5618,8 @@ function haStylePanel(i, l) {
     .concat(HA_ICON_SLUGS.map(s => `<option value="${s}" ${(l.overlay_icon || '') === s ? 'selected' : ''}>${s}</option>`))
     .join('');
   const shape = l.overlay_shape || 'dot';
+  const pillWidth = l.overlay_pill_width || '';
+  const textAlign = l.overlay_text_align || '';
   const size = l.overlay_size != null ? l.overlay_size : 1;
   const opacity = l.overlay_opacity != null ? l.overlay_opacity : 1;
   const unplacedHint = l.overlay_x == null
@@ -5623,6 +5644,24 @@ function haStylePanel(i, l) {
             <option value="pill" ${shape === 'pill' ? 'selected' : ''}>Pill</option>
           </select>
         </div>
+        <label class="fg-label" title="Pill only: Auto hugs the label, the fixed widths are exact multiples of the badge height so several badges line up">Pill width</label>
+        <div class="fg-ctl">
+          <select onchange="haStyleSet(${i}, 'overlay_pill_width', this.value || null)">
+            <option value="" ${!pillWidth ? 'selected' : ''}>Auto (fit the label)</option>
+            <option value="narrow" ${pillWidth === 'narrow' ? 'selected' : ''}>Narrow (4&times; height)</option>
+            <option value="medium" ${pillWidth === 'medium' ? 'selected' : ''}>Medium (6&times; height)</option>
+            <option value="wide" ${pillWidth === 'wide' ? 'selected' : ''}>Wide (8&times; height)</option>
+          </select>
+        </div>
+        <label class="fg-label" title="Pill only: where the icon and label sit once the pill is wider than they are">Text align</label>
+        <div class="fg-ctl">
+          <select onchange="haStyleSet(${i}, 'overlay_text_align', this.value || null)">
+            <option value="" ${!textAlign ? 'selected' : ''}>Start (default)</option>
+            <option value="center" ${textAlign === 'center' ? 'selected' : ''}>Center</option>
+            <option value="end" ${textAlign === 'end' ? 'selected' : ''}>End</option>
+          </select>
+        </div>
+        <div id="ha-pill-hint-${i}" class="card-hint" style="grid-column:1/-1;margin:2px 0 0;${shape === 'pill' ? 'display:none' : ''}">Pill width and text align apply to the Pill shape only.</div>
       </div>
       <div class="form-grid" style="min-width:170px">
         <label class="fg-label" style="margin-top:0">Badge color</label>
@@ -5664,6 +5703,7 @@ function haStyleSet(i, field, value) {
   l[field] = value;
   if (field === 'overlay_size') { const e = $('ha-size-val-' + i); if (e) e.textContent = value.toFixed(2) + '×'; }
   if (field === 'overlay_opacity') { const e = $('ha-opacity-val-' + i); if (e) e.textContent = Math.round(value * 100) + '%'; }
+  if (field === 'overlay_shape') { const h = $('ha-pill-hint-' + i); if (h) h.style.display = value === 'pill' ? 'none' : ''; }
   const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l, !!HA_STYLE_PREVIEW_ON[i]);
 }
 
@@ -5702,6 +5742,8 @@ async function haSaveStyle(i) {
     shape: l.overlay_shape || null,
     bg_color: l.overlay_bg_color || null,
     bg_color_on: l.overlay_bg_color_on || null,
+    pill_width: l.overlay_pill_width || null,
+    text_align: l.overlay_text_align || null,
     outline: !!l.overlay_outline,
   };
   try {
@@ -5856,7 +5898,8 @@ function haPick(entity_id) {
     id: null, entity_id, role, device_class: ent.device_class || null, label: ent.friendly_name || null, sort_order: HA_LINKS.length,
     require_confirm: false, allowed_actions: null,
     overlay_x: null, overlay_y: null, overlay_size: null, overlay_color: null, overlay_icon: null,
-    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_bg_color_on: null, overlay_outline: false,
+    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_bg_color_on: null,
+    overlay_pill_width: null, overlay_text_align: null, overlay_outline: false,
   });
   renderHaLinks(true);
 }

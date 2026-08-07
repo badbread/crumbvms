@@ -27,6 +27,7 @@ import '../../api/ha_models.dart';
 import '../../api/models.dart';
 import '../overlay_editor/overlay_editor_controller.dart';
 import '../overlay_editor/overlay_item.dart';
+import 'ha_overlay_layer.dart' show haPillWidthFactor;
 
 /// [OverlayItem] adapter over a placed [HaLink] — video-frame anchored,
 /// always-square badge, resized via the editor bar's size stepper only (no
@@ -51,6 +52,8 @@ class HaOverlayBadgeItem implements OverlayItem {
       shape = link.overlayShape,
       bgColorHex = link.overlayBgColor,
       bgColorOnHex = link.overlayBgColorOn,
+      pillWidthMode = link.overlayPillWidth,
+      textAlign = link.overlayTextAlign,
       outline = link.overlayOutline;
 
   final HaLink link;
@@ -89,6 +92,17 @@ class HaOverlayBadgeItem implements OverlayItem {
   /// (`ha_badge_popover.dart`); see `ha_overlay_layer.dart`'s
   /// `resolveBadgeBg` for the exact resolution order.
   String? bgColorOnHex;
+
+  /// Pill WIDTH mode (migration 0078, issue #497): `'auto'`, `'narrow'`,
+  /// `'medium'` or `'wide'`; null = `'auto'`, the hug-the-content width. Only
+  /// a pill uses it — see [baseSize] and `ha_overlay_layer.dart`'s
+  /// `haPillWidthFactor`.
+  String? pillWidthMode;
+
+  /// Where the pill's icon + label group sits (migration 0078, issue #497):
+  /// `'start'` (or null), `'center'`, `'end'`. Rendered by
+  /// `ha_overlay_layer.dart`'s `haPillAlignment`.
+  String? textAlign;
 
   /// White outline + drop shadow so the badge pops on a busy scene.
   bool outline;
@@ -129,6 +143,8 @@ class HaOverlayBadgeItem implements OverlayItem {
     colorHex = null;
     bgColorHex = null;
     bgColorOnHex = null;
+    pillWidthMode = null;
+    textAlign = null;
     shape = null;
     _opacity = 1.0;
     outline = false;
@@ -166,7 +182,7 @@ class HaOverlayBadgeItem implements OverlayItem {
   (double w, double h) baseSize() {
     final h = baseRefPx * _scale;
     if (!isPill) return (h, h);
-    return (pillBaseWidth(pillLabel) * _scale, h);
+    return (pillBaseWidth(pillLabel, widthMode: pillWidthMode) * _scale, h);
   }
 
   /// The pill's unscaled width: exactly what its content occupies — the icon,
@@ -185,7 +201,13 @@ class HaOverlayBadgeItem implements OverlayItem {
   /// Nothing here consults the PINNED CAPTIONS: `HaBadgeCaptions` centres its
   /// own chip on the badge and is free to be wider or narrower, so a long
   /// "5 h ago" line never stretches the pill.
-  static double pillBaseWidth(String label) {
+  static double pillBaseWidth(String label, {String? widthMode}) {
+    // A fixed width mode (migration 0078) short-circuits the measurement: the
+    // pill is EXACTLY that multiple of its height, so a set of badges given the
+    // same mode line up down a door frame. A label too long for it ellipsizes
+    // in `HaBadgeChip._pill`, exactly as an over-long auto label already does.
+    final factor = haPillWidthFactor(widthMode);
+    if (factor != null) return baseRefPx * factor;
     const iconRef = baseRefPx * 0.56;
     const padHRef = baseRefPx * 0.28; // each side
     const gapRef = baseRefPx * 0.14;
@@ -270,6 +292,8 @@ class HaOverlayBadgeItem implements OverlayItem {
         shape: shape,
         bgColor: bgColorHex,
         bgColorOn: bgColorOnHex,
+        pillWidth: pillWidthMode,
+        textAlign: textAlign,
         outline: outline,
         group: _groupId,
       );
@@ -289,6 +313,8 @@ class HaOverlayBadgeItem implements OverlayItem {
       String? shape,
       String? bgColor,
       String? bgColorOn,
+      String? pillWidth,
+      String? textAlign,
       bool outline,
       String? group,
     });
@@ -304,6 +330,8 @@ class HaOverlayBadgeItem implements OverlayItem {
     shape = s.shape;
     bgColorHex = s.bgColor;
     bgColorOnHex = s.bgColorOn;
+    pillWidthMode = s.pillWidth;
+    textAlign = s.textAlign;
     outline = s.outline;
     _groupId = s.group;
   }
@@ -472,6 +500,8 @@ class HaOverlayController {
           shape: item.shape,
           bgColor: item.bgColorHex,
           bgColorOn: item.bgColorOnHex,
+          pillWidth: item.pillWidthMode,
+          textAlign: item.textAlign,
           outline: item.outline,
           label: newLabel == oldLabel ? null : newLabel,
         );

@@ -107,6 +107,7 @@ OverlayItemBuilder haBadgeItemBuilder({
       pillLabel: badge.pillLabel,
       bgColor: parseOverlayColorHex(badge.bgColorHex),
       bgColorOn: parseOverlayColorHex(badge.bgColorOnHex),
+      textAlign: badge.textAlign,
       on: haEdgeOnFor(domain: link.domain, state: state, stale: effStale),
       outline: badge.outline,
       // Jelly motion (entrance pop + state-change squish) runs only in view
@@ -161,6 +162,50 @@ Color resolveBadgeBg({required bool? on, Color? bgColor, Color? bgColorOn}) {
   return bgColor ?? _kBadgeDefaultBg;
 }
 
+/// The pill LAYOUT contract (migration 0078, issue #497) — the same closed
+/// vocabulary the server validates (`services/api/src/ha.rs`'s
+/// `HA_PILL_WIDTH_MODES` / `HA_TEXT_ALIGNS`), the console authors, and the
+/// Android/iOS renderers switch on. Changing a spelling here without changing
+/// it in all five places is the divergence these lists exist to prevent.
+const List<String> kHaPillWidthModes = ['auto', 'narrow', 'medium', 'wide'];
+const List<String> kHaTextAligns = ['start', 'center', 'end'];
+
+/// A fixed pill width as a multiple of the pill's HEIGHT, or null for `auto`
+/// (and for any unknown value from a newer server — degrade to today's
+/// hug-the-content width rather than guess).
+///
+/// Height is the multiplier's unit deliberately: it is the one length every
+/// renderer already derives identically from `overlay_size` and the pane
+/// scale, so `medium` means the same pill on a phone, a wall tile and a
+/// maximized pane. A fixed width is EXACT, not a minimum — a label too long
+/// for it ellipsizes, which is what makes several badges set to the same mode
+/// actually line up.
+double? haPillWidthFactor(String? mode) {
+  switch (mode) {
+    case 'narrow':
+      return 4.0;
+    case 'medium':
+      return 6.0;
+    case 'wide':
+      return 8.0;
+    default:
+      return null; // 'auto', null, or anything unrecognized
+  }
+}
+
+/// Where the pill's icon + label group sits inside the pill. `null`/`'start'`
+/// (and anything unrecognized) is the leading edge — today's layout.
+MainAxisAlignment haPillAlignment(String? align) {
+  switch (align) {
+    case 'center':
+      return MainAxisAlignment.center;
+    case 'end':
+      return MainAxisAlignment.end;
+    default:
+      return MainAxisAlignment.start;
+  }
+}
+
 /// Snappy spring (matches the operator-chosen preview: k380 / damping 21).
 const SpringDescription _kJellySpring = SpringDescription(
   mass: 1.0,
@@ -184,6 +229,7 @@ class HaBadgeChip extends StatefulWidget {
     this.pillLabel,
     this.bgColor,
     this.bgColorOn,
+    this.textAlign,
     this.on,
     this.outline = false,
     this.animate = false,
@@ -209,6 +255,12 @@ class HaBadgeChip extends StatefulWidget {
   /// null = no override, so the badge keeps [bgColor] regardless of state.
   /// See [resolveBadgeBg] for the exact resolution order.
   final Color? bgColorOn;
+
+  /// Where the pill's icon + label group sits inside the pill (migration
+  /// 0078): `'start'` (or null, today's layout), `'center'`, `'end'`. Only
+  /// observable once the pill is wider than its content, i.e. with a fixed
+  /// `overlay_pill_width`. Ignored by a dot. See [haPillAlignment].
+  final String? textAlign;
 
   /// The honesty-gated on/off reading driving [bgColorOn] (must come from
   /// `ha_icons.dart`'s `haEdgeOnFor`, the same gate behind [visual]'s accent
@@ -376,6 +428,9 @@ class _HaBadgeChipState extends State<HaBadgeChip>
         padding: EdgeInsets.symmetric(horizontal: padH),
         child: Row(
           mainAxisSize: MainAxisSize.max,
+          // Auto-width pills have no slack, so this only bites once the
+          // operator has pinned a fixed width (migration 0078).
+          mainAxisAlignment: haPillAlignment(widget.textAlign),
           children: [
             Icon(widget.visual.icon, color: widget.visual.color, size: iconSize),
             SizedBox(width: gap),

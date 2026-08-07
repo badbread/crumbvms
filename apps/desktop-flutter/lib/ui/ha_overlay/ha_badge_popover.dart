@@ -283,9 +283,14 @@ class _HaBadgePopoverLayerState extends State<HaBadgePopoverLayer> {
 
   /// Rough rendered height, used ONLY to choose which side of the badge the
   /// popover opens on (see [resolveHaPopoverPlacement]).
-  double _estimateHeight({required bool multi, required _Section? open}) {
+  double _estimateHeight({
+    required bool multi,
+    required _Section? open,
+    bool pill = false,
+  }) {
     if (multi) return 300;
-    var h = 470.0;
+    // Base single-badge body; a pill adds the two layout rows (#497).
+    var h = 470.0 + (pill ? 74 : 0);
     switch (open) {
       case _Section.icon:
         h += 214;
@@ -340,7 +345,11 @@ class _HaBadgePopoverLayerState extends State<HaBadgePopoverLayer> {
               badge: Rect.fromLTWH(x, y, w, h),
               popover: Size(
                 kHaPopoverWidth,
-                _estimateHeight(multi: multi, open: _section),
+                _estimateHeight(
+                  multi: multi,
+                  open: _section,
+                  pill: primary.isPill,
+                ),
               ),
               pane: Size(paneW, paneH),
               topMargin: widget.topInset > 0 ? widget.topInset + 8 : null,
@@ -595,6 +604,14 @@ class _StyleBodyState extends State<_StyleBody> {
         if (widget.section == _Section.icon) _iconGrid(),
         const SizedBox(height: 8),
         _shapeRow(),
+        // Width + alignment only mean something for a pill: a dot has no
+        // label inside it to lay out (migration 0078, issue #497).
+        if (item.isPill) ...[
+          const SizedBox(height: 6),
+          _pillWidthRow(),
+          const SizedBox(height: 6),
+          _pillAlignRow(),
+        ],
         const SizedBox(height: 10),
         const _SectionLabel('Colors'),
         const SizedBox(height: 6),
@@ -901,6 +918,79 @@ class _StyleBodyState extends State<_StyleBody> {
     _mutate(() => _item.shape = shape);
   }
 
+  // ── Pill layout: width + text alignment (issue #497) ─────────────────────
+
+  /// Four discrete widths rather than a pixel field: the same badge has to
+  /// render identically on the console preview, desktop, Android and iOS, and
+  /// only a mode name survives that trip intact (a pixel value would mean four
+  /// different pills on four different panes). `Auto` is the hug-the-content
+  /// default; the rest are exact multiples of the badge height, so several
+  /// badges set to the same mode line up.
+  Widget _pillWidthRow() {
+    final mode = _item.pillWidthMode ?? 'auto';
+    return _FieldRow(
+      label: 'Width',
+      child: Row(
+        children: [
+          _seg('Auto', mode == 'auto', () => _setPillWidth(null)),
+          const SizedBox(width: 4),
+          _seg('S', mode == 'narrow', () => _setPillWidth('narrow')),
+          const SizedBox(width: 4),
+          _seg('M', mode == 'medium', () => _setPillWidth('medium')),
+          const SizedBox(width: 4),
+          _seg('L', mode == 'wide', () => _setPillWidth('wide')),
+        ],
+      ),
+    );
+  }
+
+  /// Where the icon + label group sits once the pill is wider than its
+  /// content. Invisible on an `Auto` pill by construction (there is no slack),
+  /// which is why it sits directly under the width control.
+  Widget _pillAlignRow() {
+    final align = _item.textAlign ?? 'start';
+    return _FieldRow(
+      label: 'Align',
+      child: Row(
+        children: [
+          _alignSeg(
+            Icons.format_align_left,
+            'Label against the leading edge (default)',
+            align == 'start',
+            () => _setTextAlign(null),
+          ),
+          const SizedBox(width: 4),
+          _alignSeg(
+            Icons.format_align_center,
+            'Label centred in the pill',
+            align == 'center',
+            () => _setTextAlign('center'),
+          ),
+          const SizedBox(width: 4),
+          _alignSeg(
+            Icons.format_align_right,
+            'Label against the trailing edge',
+            align == 'end',
+            () => _setTextAlign('end'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// `null` is the wire value for the default, exactly like the background
+  /// overrides: sending `'auto'`/`'start'` would persist an explicit value
+  /// that means the same thing, so the reset stays a real reset.
+  void _setPillWidth(String? mode) {
+    if ((_item.pillWidthMode ?? 'auto') == (mode ?? 'auto')) return;
+    _mutate(() => _item.pillWidthMode = mode);
+  }
+
+  void _setTextAlign(String? align) {
+    if ((_item.textAlign ?? 'start') == (align ?? 'start')) return;
+    _mutate(() => _item.textAlign = align);
+  }
+
   // ── Colors ───────────────────────────────────────────────────────────────
 
   Widget _accentRow() {
@@ -1140,6 +1230,37 @@ class _StyleBodyState extends State<_StyleBody> {
                   ),
                 ),
               ],
+            ),
+          ),
+        ),
+      );
+
+  /// [_seg]'s glyph twin, for the alignment control — three left/centre/right
+  /// icons read faster than three words in a 300px popover.
+  Widget _alignSeg(
+    IconData icon,
+    String tooltip,
+    bool active,
+    VoidCallback onTap,
+  ) =>
+      Expanded(
+        child: Tooltip(
+          message: tooltip,
+          child: SizedBox(
+            height: 28,
+            child: TextButton(
+              onPressed: onTap,
+              style: TextButton.styleFrom(
+                backgroundColor:
+                    active ? const Color(0xFF2CA3E8) : const Color(0xFF2A2F36),
+                foregroundColor: active ? Colors.white : Colors.white70,
+                padding: EdgeInsets.zero,
+                minimumSize: Size.zero,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(5),
+                ),
+              ),
+              child: Icon(icon, size: 15),
             ),
           ),
         ),

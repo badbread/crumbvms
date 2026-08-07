@@ -42,6 +42,16 @@ data class HaLinkDto(
     // entity's tri-state `active` (see `HaVisual.badgeVisual`) is true — scenes,
     // stale, and unknown/indeterminate readings never use it.
     @SerialName("overlay_bg_color_on") val overlayBgColorOn: String? = null,
+    // Pill LAYOUT (migration 0078, issue #497). Both default to null, which is
+    // today's rendering byte-for-byte: a pill hugging its content with the icon
+    // and label against the leading edge. A dot ignores both.
+    //   overlay_pill_width: "auto" | "narrow" | "medium" | "wide" — the three
+    //     fixed modes are EXACT multiples of the badge height (see
+    //     HaBadgeMetrics.pillWidthFactor), so badges sharing a mode line up.
+    //   overlay_text_align: "start" | "center" | "end" — where the icon+label
+    //     group sits once the pill is wider than its content.
+    @SerialName("overlay_pill_width") val overlayPillWidth: String? = null,
+    @SerialName("overlay_text_align") val overlayTextAlign: String? = null,
     @SerialName("overlay_outline") val overlayOutline: Boolean = false,
     // ── Per-link control config (migration 0075, issue #440). Both default to
     // today's behavior, so an older server that omits them decodes unchanged

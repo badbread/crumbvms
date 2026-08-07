@@ -500,6 +500,16 @@ struct HaLink: Decodable, Identifiable {
     /// omits the key) ⇒ today's state-invariant background. OFF and
     /// indeterminate/stale readings never consult this field.
     let overlayBgColorOn: String?
+    /// Pill WIDTH mode (migration 0078, issue #497): `"auto"`, `"narrow"`,
+    /// `"medium"` or `"wide"`. `nil` — including on an older server that omits
+    /// the key — means `"auto"`, the hug-the-content pill drawn today. The
+    /// three fixed modes are EXACT multiples of the badge height; see
+    /// `HA.pillWidthFactor`. A dot ignores it.
+    let overlayPillWidth: String?
+    /// Where the pill's icon + label group sits inside the pill (migration
+    /// 0078, issue #497): `"start"` (or `nil`, today's layout), `"center"`,
+    /// `"end"`. Only observable once the pill is wider than its content.
+    let overlayTextAlign: String?
     let overlayOutline: Bool
     /// Per-link control config (migration 0075, issue #440). When true, EVERY
     /// action on this link prompts a confirmation first (on top of the hardcoded
@@ -552,6 +562,8 @@ struct HaLink: Decodable, Identifiable {
         case overlayShape = "overlay_shape"
         case overlayBgColor = "overlay_bg_color"
         case overlayBgColorOn = "overlay_bg_color_on"
+        case overlayPillWidth = "overlay_pill_width"
+        case overlayTextAlign = "overlay_text_align"
         case overlayOutline = "overlay_outline"
         case requireConfirm = "require_confirm"
         case allowedActions = "allowed_actions"
@@ -580,6 +592,8 @@ struct HaLink: Decodable, Identifiable {
         overlayShape = try c.decodeIfPresent(String.self, forKey: .overlayShape)
         overlayBgColor = try c.decodeIfPresent(String.self, forKey: .overlayBgColor)
         overlayBgColorOn = try c.decodeIfPresent(String.self, forKey: .overlayBgColorOn)
+        overlayPillWidth = try c.decodeIfPresent(String.self, forKey: .overlayPillWidth)
+        overlayTextAlign = try c.decodeIfPresent(String.self, forKey: .overlayTextAlign)
         overlayOutline = try c.decodeIfPresent(Bool.self, forKey: .overlayOutline) ?? false
         requireConfirm = try c.decodeIfPresent(Bool.self, forKey: .requireConfirm) ?? false
         allowedActions = try c.decodeIfPresent([String].self, forKey: .allowedActions)
