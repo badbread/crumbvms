@@ -240,6 +240,10 @@ thoughts on how it should work,
 > all go in [**GitHub Issues**](https://github.com/badbread/crumbvms/issues). Read the
 > [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) first. Early testers are how this gets good,
 > so thank you.
+>
+> **Start here: [TESTING.md](TESTING.md).** It is the tester's page: a fifteen-minute
+> quickstart, what is worth testing, and how to write a report that can be acted on,
+> including where the scrubbed diagnostics bundle and the client logs live.
 
 ## How it compares
 
@@ -425,6 +429,7 @@ For contributors working in this repo:
 - **Configuration:** [docs/COMPOSE.md](docs/COMPOSE.md) (the Compose file, explained) · [docs/IMAGES.md](docs/IMAGES.md) (prebuilt images) · [.env.example](.env.example) (every env knob)
 - **Architecture & design:** [docs/DECISIONS.md](docs/DECISIONS.md) · [docs/RECORDER-CORRECTNESS.md](docs/RECORDER-CORRECTNESS.md)
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
+- **Testing:** [TESTING.md](TESTING.md) (tester quickstart, what to test, how to report)
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) (ground rules for AI coding sessions)
 
 ```
