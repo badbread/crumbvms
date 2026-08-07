@@ -7141,6 +7141,7 @@ async function renderDetectionClips() {
     </div>
     <div class="policy-section">
       <div class="policy-section-title">MQTT broker</div>
+      <div class="card-hint" style="margin-top:0;margin-bottom:8px">Plaintext <code>mqtt://</code> only. Crumb's MQTT client has no TLS transport, so <code>mqtts://</code> is rejected rather than connected in the clear, keep the broker on a trusted LAN.</div>
       <div class="grid2">
         <div><label class="field-label" style="margin-top:0">Broker URL</label><input id="fr-url" class="mono" value="${esc(c.mqtt_url)}" placeholder="mqtt://frigate-host:1883" /></div>
         <div><label class="field-label" style="margin-top:0">Topic prefix</label><input id="fr-prefix" value="${esc(c.mqtt_prefix)}" placeholder="frigate" /></div>
@@ -7312,6 +7313,12 @@ async function saveFrigate() {
   if ($('fr-pass-clear').checked) body.mqtt_password = '';
   else if ($('fr-pass').value) body.mqtt_password = $('fr-pass').value;
   if (body.enabled && !body.mqtt_url) { setMsg('fr-msg', 'Broker URL is required when Frigate is enabled.', 'err'); return; }
+  // Mirror of the server-side guard (#477) so the operator gets the answer
+  // without a round trip. The API is still authoritative and 400s the same way.
+  if (/^(mqtts|ssl|mqtt\+ssl|tls|wss):\/\//i.test(body.mqtt_url)) {
+    setMsg('fr-msg', "TLS MQTT is not yet supported: use 'mqtt://' on a trusted LAN.", 'err');
+    return;
+  }
   try {
     DETECTION_FRIGATE = await api('/config/frigate', { method: 'PUT', body: JSON.stringify(body) }) || DETECTION_FRIGATE;
     // One field, two columns: mirror it into server_settings as well, otherwise
