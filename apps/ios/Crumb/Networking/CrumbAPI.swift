@@ -277,6 +277,34 @@ final class CrumbAPI {
         }
     }
 
+    /// `PUT /lpr/plate-labels` — set or edit a plate's human-readable name
+    /// (issue #363, `plate_labels` migration 0073). ADMIN ONLY (403 otherwise).
+    /// The plate is normalized server-side, so this is an upsert keyed on it and
+    /// the name then applies to every read of that plate.
+    ///
+    /// A name is display metadata, NOT an alert: this writes `plate_labels` and
+    /// never touches `lpr_watchlist`, so naming a plate cannot put it on the
+    /// watchlist or fire a `plate_watchlist_hit`.
+    func setPlateLabel(plate: String, label: String) async throws {
+        struct Body: Encodable {
+            let plate: String
+            let label: String
+        }
+        let _: EmptyResponse = try await put("lpr/plate-labels", body: Body(plate: plate, label: label))
+    }
+
+    /// `DELETE /lpr/plate-labels/{plate}` — clear a plate's name. ADMIN ONLY.
+    /// A `404` means the plate had no first-class name (any name on screen came
+    /// from a legacy watchlist label, which this endpoint does not own) — the
+    /// desired end state, treated as success, matching the web console.
+    func clearPlateLabel(plate: String) async throws {
+        do {
+            let _: EmptyResponse = try await delete("lpr/plate-labels/\(PlateNaming.pathEscaped(plate))")
+        } catch let error as APIError where error.isNotFound {
+            // No first-class name to clear — already the desired end state.
+        }
+    }
+
     // MARK: - Home Assistant overlay
 
     /// `GET /cameras/:id/ha/links` — the camera's linked HA entities (+ overlay
