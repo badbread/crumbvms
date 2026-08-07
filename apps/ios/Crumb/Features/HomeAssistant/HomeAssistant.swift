@@ -22,6 +22,12 @@ struct HAVisual {
     let color: Color
     let stateText: String
     let indeterminate: Bool
+    /// The tri-state `edgeOn` reading resolved to a determinate "on" (mirrors
+    /// exactly what dims `overlayColor` to 45% in `applyOverrides` below).
+    /// `false` for an off reading AND for anything indeterminate/stale/scene —
+    /// badge background resolution (`HA.badgeBackground`) only consults
+    /// `overlay_bg_color_on` when this is `true`.
+    let isOn: Bool
 }
 
 enum HA {
@@ -105,7 +111,7 @@ enum HA {
 
         // Scene is stateless.
         if domain == "scene" {
-            return applyOverrides(link, base: HAVisual(symbol: "film", color: neutral, stateText: "Scene", indeterminate: false), on: nil)
+            return applyOverrides(link, base: HAVisual(symbol: "film", color: neutral, stateText: "Scene", indeterminate: false, isOn: false), on: nil)
         }
 
         // Indeterminate (unknown/unavailable/stale) → grey, honest state text.
@@ -114,7 +120,7 @@ enum HA {
         if stale || state == nil || (on == nil && domain != "light" && domain != "switch") {
             let sym = baseSymbol(domain: domain, deviceClass: link.deviceClass, on: false)
             let text = raw.isEmpty ? "Unknown" : stateTextWithUnit(raw, unit: state?.unit)
-            return HAVisual(symbol: overrideSymbol(link) ?? sym, color: grey, stateText: text, indeterminate: true)
+            return HAVisual(symbol: overrideSymbol(link) ?? sym, color: grey, stateText: text, indeterminate: true, isOn: false)
         }
 
         // Known reading.
@@ -123,10 +129,10 @@ enum HA {
         switch domain {
         case "light":
             base = HAVisual(symbol: isOn ? "lightbulb.fill" : "lightbulb",
-                            color: isOn ? warmYellow : grey, stateText: isOn ? "On" : "Off", indeterminate: false)
+                            color: isOn ? warmYellow : grey, stateText: isOn ? "On" : "Off", indeterminate: false, isOn: isOn)
         case "switch":
             base = HAVisual(symbol: "power",
-                            color: isOn ? green : grey, stateText: isOn ? "On" : "Off", indeterminate: false)
+                            color: isOn ? green : grey, stateText: isOn ? "On" : "Off", indeterminate: false, isOn: isOn)
         default:
             base = classVisual(HA.classForDeviceClass(link.deviceClass), on: isOn)
         }
@@ -152,35 +158,35 @@ enum HA {
         switch cls {
         case "door":
             return HAVisual(symbol: on ? "door.left.hand.open" : "door.left.hand.closed",
-                            color: on ? amber : neutral, stateText: on ? "Open" : "Closed", indeterminate: false)
+                            color: on ? amber : neutral, stateText: on ? "Open" : "Closed", indeterminate: false, isOn: on)
         case "window":
             return HAVisual(symbol: on ? "window.vertical.open" : "window.vertical.closed",
-                            color: on ? amber : neutral, stateText: on ? "Open" : "Closed", indeterminate: false)
+                            color: on ? amber : neutral, stateText: on ? "Open" : "Closed", indeterminate: false, isOn: on)
         case "garage":
             return HAVisual(symbol: on ? "door.garage.open" : "door.garage.closed",
-                            color: on ? amber : neutral, stateText: on ? "Open" : "Closed", indeterminate: false)
+                            color: on ? amber : neutral, stateText: on ? "Open" : "Closed", indeterminate: false, isOn: on)
         case "motion":
             return HAVisual(symbol: "figure.run", color: on ? blue : grey,
-                            stateText: on ? "Motion" : "Clear", indeterminate: false)
+                            stateText: on ? "Motion" : "Clear", indeterminate: false, isOn: on)
         case "occupancy":
             return HAVisual(symbol: "person.fill", color: on ? blue : grey,
-                            stateText: on ? "Occupied" : "Clear", indeterminate: false)
+                            stateText: on ? "Occupied" : "Clear", indeterminate: false, isOn: on)
         case "lock":
             // A binary_sensor lock reads on = unsecured/unlocked, off = locked.
             return HAVisual(symbol: on ? "lock.open.fill" : "lock.fill",
-                            color: on ? amber : neutral, stateText: on ? "Unlocked" : "Locked", indeterminate: false)
+                            color: on ? amber : neutral, stateText: on ? "Unlocked" : "Locked", indeterminate: false, isOn: on)
         case "smoke":
             return HAVisual(symbol: "smoke.fill", color: on ? danger : neutral,
-                            stateText: on ? "Smoke" : "Clear", indeterminate: false)
+                            stateText: on ? "Smoke" : "Clear", indeterminate: false, isOn: on)
         case "gas":
             return HAVisual(symbol: "carbon.monoxide.cloud.fill", color: on ? danger : neutral,
-                            stateText: on ? "Gas" : "Clear", indeterminate: false)
+                            stateText: on ? "Gas" : "Clear", indeterminate: false, isOn: on)
         case "leak":
             return HAVisual(symbol: "drop.triangle.fill", color: on ? amber : neutral,
-                            stateText: on ? "Leak" : "Dry", indeterminate: false)
+                            stateText: on ? "Leak" : "Dry", indeterminate: false, isOn: on)
         default:
             return HAVisual(symbol: "sensor.fill", color: on ? blue : grey,
-                            stateText: on ? "Active" : "Clear", indeterminate: false)
+                            stateText: on ? "Active" : "Clear", indeterminate: false, isOn: on)
         }
     }
 
@@ -202,7 +208,7 @@ enum HA {
         if !base.indeterminate, let hex = link.overlayColor, let c = colorFromHex(hex) {
             color = (on == false) ? c.opacity(0.45) : c
         }
-        return HAVisual(symbol: symbol, color: color, stateText: base.stateText, indeterminate: base.indeterminate)
+        return HAVisual(symbol: symbol, color: color, stateText: base.stateText, indeterminate: base.indeterminate, isOn: base.isOn)
     }
 
     private static func overrideSymbol(_ link: HaLink) -> String? {
@@ -219,7 +225,9 @@ enum HA {
     ///
     /// iOS has no dedicated window-covering symbol on our iOS 16 floor, so
     /// cover/blinds/curtains/shade all resolve to `window.vertical.closed`; that
-    /// is an honest, compilable choice, not a missing glyph.
+    /// is an honest, compilable choice, not a missing glyph. Likewise the iOS 16
+    /// floor has no grill/BBQ or kitchen-appliance symbols, so outdoor cooking
+    /// leans on flame/smoke (`grill`→`flame.fill`, `smoker`→`smoke.fill`).
     static let iconSlugToSymbol: [String: String] = [
         // contact & openings
         "door": "door.left.hand.closed", "window": "window.vertical.closed",
@@ -229,10 +237,10 @@ enum HA {
         "lock": "lock.fill", "key": "key.fill",
         // motion & presence
         "motion": "figure.run", "occupancy": "person.fill", "person": "person.fill",
-        "pet": "pawprint.fill", "vibration": "waveform",
+        "home": "house.fill", "pet": "pawprint.fill", "vibration": "waveform",
         // lighting
         "lightbulb": "lightbulb.fill", "floodlight": "flashlight.on.fill",
-        "outdoor_light": "lightbulb.fill",
+        "outdoor_light": "lightbulb.fill", "landscape_light": "light.beacon.max.fill",
         // power & switches
         "switch": "switch.2", "power": "power", "plug": "powerplug.fill",
         "outlet": "poweroutlet.type.b.fill", "energy": "bolt.fill", "meter": "gauge",
@@ -241,6 +249,9 @@ enum HA {
         "fan": "fanblades.fill", "ac": "snowflake", "heatpump": "thermometer.snowflake",
         "hvac": "wind", "thermostat": "thermometer", "temperature": "thermometer",
         "humidity": "humidity.fill", "sun": "sun.max.fill",
+        // weather
+        "cloud": "cloud.fill", "rain": "cloud.rain.fill", "wind": "wind",
+        "storm": "cloud.bolt.rain.fill", "moon": "moon.fill",
         // safety & alarm
         "smoke": "smoke.fill", "gas": "carbon.monoxide.cloud.fill",
         "co": "carbon.dioxide.cloud.fill", "fire": "flame.fill",
@@ -250,15 +261,21 @@ enum HA {
         "bell": "bell.fill",
         // camera & media
         "camera": "video.fill", "tv": "tv", "speaker": "hifispeaker.fill",
-        // network
+        "media_player": "play.tv.fill", "remote": "av.remote.fill",
+        "game": "gamecontroller.fill", "mic": "mic.fill", "music": "music.note",
+        // network & computing
         "wifi": "wifi", "router": "network",
+        "printer": "printer.fill", "server": "server.rack", "computer": "desktopcomputer",
+        "storage": "externaldrive.fill", "phone": "iphone",
         // vehicles & delivery
         "vehicle": "car.fill", "package": "shippingbox.fill", "mail": "envelope.fill",
         // appliances & outdoor
         "vacuum": "sparkles", "lawn": "leaf.fill", "fridge": "snowflake",
         "laundry": "tshirt.fill", "pool": "figure.pool.swim", "hottub": "water.waves",
+        "grill": "flame.fill", "smoker": "smoke.fill", "coffee": "cup.and.saucer.fill",
+        "plant": "leaf.circle.fill",
         // time
-        "clock": "clock.fill",
+        "clock": "clock.fill", "calendar": "calendar", "timer": "timer",
         // automation
         "scene": "film", "script": "curlybraces", "button": "hand.tap.fill",
         // generic fallback
@@ -270,6 +287,20 @@ enum HA {
         if s.hasPrefix("#") { s.removeFirst() }
         guard s.count == 6, let v = UInt(s, radix: 16) else { return nil }
         return Color(hex: v)
+    }
+
+    /// On-video badge background. When `visual.isOn` (a determinate "on"
+    /// reading — never a scene, never off, never indeterminate/stale)
+    /// `overlay_bg_color_on` wins if set; every other case, including a
+    /// missing/unparseable `overlay_bg_color_on`, falls back to
+    /// `overlay_bg_color`, then the shared default badge background. Off and
+    /// indeterminate/stale readings NEVER consult `overlay_bg_color_on`.
+    static let defaultBadgeBackground = Color(hex: 0x17171B)
+
+    static func badgeBackground(link: HaLink, visual: HAVisual) -> Color {
+        if visual.isOn, let hexOn = link.overlayBgColorOn, let c = colorFromHex(hexOn) { return c }
+        if let hex = link.overlayBgColor, let c = colorFromHex(hex) { return c }
+        return defaultBadgeBackground
     }
 }
 
@@ -517,6 +548,11 @@ final class HAController: ObservableObject {
 /// nothing is drawn (prevents misplaced badges).
 struct HAOverlayLayer: View {
     @ObservedObject var controller: HAController
+    /// The global "show HA overlays" quick-toggle. Observed *here*, inside the
+    /// overlay itself, rather than at each call site, so every live surface that
+    /// composites badges — the single-camera/fullscreen view today, anything
+    /// added later — is governed by the one flag and can't drift out of sync.
+    @ObservedObject var settings: AppSettings
     let videoSize: CGSize?
 
     /// Presents the detail card (read-only links + cover/lock on tap; any link on
@@ -528,6 +564,16 @@ struct HAOverlayLayer: View {
     @State private var actionError: String?
 
     var body: some View {
+        // Hidden = render nothing at all: no badges, and with them no tap /
+        // long-press targets, so the video underneath is completely clear.
+        // Display-only — the controller keeps polling, so flipping the toggle
+        // back shows live states immediately with no reload.
+        if settings.showHaOverlays {
+            overlayBody
+        }
+    }
+
+    private var overlayBody: some View {
         GeometryReader { geo in
             if let vs = videoSize, vs.width > 0, vs.height > 0, !controller.placedLinks.isEmpty {
                 let field = fieldRect(pane: geo.size, video: vs)
@@ -621,10 +667,7 @@ private struct HABadge: View {
     /// A direct-tap action is in flight — dim the icon and overlay a spinner.
     var busy: Bool = false
 
-    private var bgColor: Color {
-        if let hex = link.overlayBgColor, let c = HA.colorFromHex(hex) { return c }
-        return Color(hex: 0x17171B)
-    }
+    private var bgColor: Color { HA.badgeBackground(link: link, visual: visual) }
     private var isPill: Bool { (link.overlayShape ?? "dot") == "pill" }
 
     var body: some View {

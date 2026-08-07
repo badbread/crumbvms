@@ -306,12 +306,44 @@ data class LiveStreamsResponse(
     @SerialName("rtsp_main_url") val rtspMainUrl: String,
     @SerialName("rtsp_sub_url") val rtspSubUrl: String? = null,
     /**
+     * Video-only sub restream (`<name>_subv`): the raw sub run through an ffmpeg
+     * copy so go2rtc republishes a proper `a=fmtp:…sprop-parameter-sets=…`.
+     *
+     * Media3's RTSP client REQUIRES an `fmtp` attribute on every track it builds
+     * and throws `IllegalArgumentException: missing attribute fmtp` without one,
+     * so a camera that publishes H264 with no out-of-band parameter sets (seen on
+     * Reolink) reconnect-loops forever on the plain sub (#483). This is the
+     * Media3-specific repair — desktop and iOS deliberately stay on [rtspSubUrl],
+     * because go2rtc spawns the remux ffmpeg lazily, per consumer.
+     *
+     * `null` when the camera has no sub, or when the server does not manage its
+     * go2rtc streams (Frigate-served / legacy rows) — and on any server older
+     * than the field, which is why it is nullable-with-default: we fall back to
+     * [rtspSubUrl] and behave exactly as before.
+     */
+    @SerialName("rtsp_subv_url") val rtspSubvUrl: String? = null,
+    /**
      * On-demand low-res H.264 transcode for cellular "Data saver" fullscreen live.
      * `null` when the server has the feature disabled or the camera is
      * Frigate-served. Nullable-with-default so older servers deserialize cleanly.
      */
     @SerialName("rtsp_mobile_url") val rtspMobileUrl: String? = null,
 )
+
+/**
+ * The low-res (sub) stream this client should play, or `null` when the camera
+ * exposes no sub at all.
+ *
+ * Prefer the video-only [LiveStreamsResponse.rtspSubvUrl] because Media3 needs
+ * its repaired `fmtp`; fall back to the raw [LiveStreamsResponse.rtspSubUrl]
+ * when the server published none — an unmanaged (Frigate-served / legacy)
+ * camera, or a server predating the field. Never invents a URL, so a caller's
+ * own main-stream fallback still applies when both are `null`.
+ *
+ * Single source of truth for the pick order: the live wall tile and fullscreen
+ * live must not drift apart.
+ */
+fun LiveStreamsResponse.subStreamUrl(): String? = rtspSubvUrl ?: rtspSubUrl
 
 // ─── export ──────────────────────────────────────────────────────────────────
 

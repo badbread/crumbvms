@@ -48,6 +48,7 @@ class HaOverlayBadgeItem implements OverlayItem {
       showAge = link.overlayShowAge,
       shape = link.overlayShape,
       bgColorHex = link.overlayBgColor,
+      bgColorOnHex = link.overlayBgColorOn,
       outline = link.overlayOutline;
 
   final HaLink link;
@@ -79,6 +80,14 @@ class HaOverlayBadgeItem implements OverlayItem {
   /// Solid background '#RRGGBB' override, or null for the default dark
   /// background (migration 0062).
   String? bgColorHex;
+
+  /// Per-state background override (wave A): the badge background while the
+  /// entity reads ON, or null for no override. No UI sets this yet (the
+  /// badge-style editor for it lands in a later PR) — this field exists
+  /// purely so an existing edit session (drag/resize/style-tweak on some
+  /// OTHER field) round-trips a value set elsewhere (e.g. by the admin
+  /// console) instead of silently clobbering it on save.
+  String? bgColorOnHex;
 
   /// White outline + drop shadow so the badge pops on a busy scene.
   bool outline;
@@ -185,6 +194,7 @@ class HaOverlayBadgeItem implements OverlayItem {
         showAge: showAge,
         shape: shape,
         bgColor: bgColorHex,
+        bgColorOn: bgColorOnHex,
         outline: outline,
         group: _groupId,
       );
@@ -203,6 +213,7 @@ class HaOverlayBadgeItem implements OverlayItem {
       bool showAge,
       String? shape,
       String? bgColor,
+      String? bgColorOn,
       bool outline,
       String? group,
     });
@@ -217,6 +228,7 @@ class HaOverlayBadgeItem implements OverlayItem {
     showAge = s.showAge;
     shape = s.shape;
     bgColorHex = s.bgColor;
+    bgColorOnHex = s.bgColorOn;
     outline = s.outline;
     _groupId = s.group;
   }
@@ -343,6 +355,7 @@ class HaOverlayController {
           opacity: item.opacity,
           shape: item.shape,
           bgColor: item.bgColorHex,
+          bgColorOn: item.bgColorOnHex,
           outline: item.outline,
           label: newLabel == oldLabel ? null : newLabel,
         );

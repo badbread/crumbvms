@@ -289,6 +289,23 @@ class SecureStore(context: Context) {
         set(value) = safeWrite { it.putBoolean(KEY_SHOW_HA_DEVICE_TYPE, value) }
 
     /**
+     * Whether the on-video Home Assistant badges are drawn on live video. The
+     * global quick-toggle behind the eye button on the Live wall's action row and
+     * in the fullscreen controls row; both flip THIS value (via the app-wide
+     * [video.crumb.app.feature.live.HaOverlayVisibility] holder, which is what the
+     * screens actually observe).
+     *
+     * Purely a display preference: it never touches entity linking, badge
+     * placement, the read-only entities sheet, or the popup reachable from it —
+     * an operator can still inspect every linked entity with the video kept clean.
+     * A device-level preference like [ptzStyle]/[showHaEntityId]; NOT cleared on
+     * logout. Default true (overlays shown — the behavior before the toggle).
+     */
+    var showHaOverlays: Boolean
+        get() = safeRead(true) { it.getBoolean(KEY_SHOW_HA_OVERLAYS, true) }
+        set(value) = safeWrite { it.putBoolean(KEY_SHOW_HA_OVERLAYS, value) }
+
+    /**
      * Last playback-timeline zoom level (visible time span, in millis) the user left
      * the Playback surfaces on. Shared by BOTH single-camera playback and the playback
      * wall, so switching between them and back restores the same scale, and it survives
@@ -465,6 +482,7 @@ class SecureStore(context: Context) {
         private const val KEY_SHOW_ALL_CAMERAS_VIEW = "show_all_cameras_view"
         private const val KEY_SHOW_HA_ENTITY_ID = "show_ha_entity_id"
         private const val KEY_SHOW_HA_DEVICE_TYPE = "show_ha_device_type"
+        private const val KEY_SHOW_HA_OVERLAYS = "show_ha_overlays"
         private const val KEY_PLAYBACK_SPAN_MS = "playback_span_ms"
         private const val KEY_PLATES_VIEW_MODE = "plates_view_mode"
         private const val KEY_LPR_IMAGE_MODE = "lpr_image_mode"

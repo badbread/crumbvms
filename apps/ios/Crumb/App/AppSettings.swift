@@ -50,6 +50,13 @@ final class AppSettings: ObservableObject {
     /// defaulting it off avoids surprising an existing user with a new gate
     /// they never asked for.
     @Published var biometricLockEnabled: Bool { didSet { defaults.set(biometricLockEnabled, forKey: Keys.biometricLockEnabled) } }
+    /// Global quick-toggle for the on-video Home Assistant badges. `false` hides
+    /// every HA overlay on every live surface (wall and single-camera) at once —
+    /// purely a display switch: links, placement and config are untouched, and
+    /// the entity sheet / detail card reached from other entry points still
+    /// works. On by default, so an operator who linked entities keeps seeing
+    /// them until they deliberately clear the video.
+    @Published var showHaOverlays: Bool { didSet { defaults.set(showHaOverlays, forKey: Keys.showHaOverlays) } }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -65,6 +72,7 @@ final class AppSettings: ObservableObject {
         showAllCamerasView = defaults.object(forKey: Keys.showAllCamerasView) as? Bool ?? true
         activeViewId = defaults.string(forKey: Keys.activeViewId)
         biometricLockEnabled = defaults.object(forKey: Keys.biometricLockEnabled) as? Bool ?? false
+        showHaOverlays = defaults.object(forKey: Keys.showHaOverlays) as? Bool ?? true
     }
 
     // MARK: - Per-camera audio preference
@@ -98,5 +106,6 @@ final class AppSettings: ObservableObject {
         static let showAllCamerasView = "show_all_cameras_view"
         static let activeViewId = "active_view_id"
         static let biometricLockEnabled = "biometric_lock_enabled"
+        static let showHaOverlays = "show_ha_overlays"
     }
 }

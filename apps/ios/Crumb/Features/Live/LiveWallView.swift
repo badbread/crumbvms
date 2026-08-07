@@ -556,6 +556,19 @@ struct LiveWallView: View {
             Spacer()
 
             if showLiveActions {
+                // Global HA-overlay quick-toggle (see `haOverlayButton`), with
+                // the desktop bar's plain style + hover help.
+                Button {
+                    settings.showHaOverlays.toggle()
+                } label: {
+                    Image(systemName: settings.showHaOverlays ? "house" : "house.slash")
+                        .foregroundColor(settings.showHaOverlays ? CrumbColors.teal : CrumbColors.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .help(settings.showHaOverlays
+                      ? "Hide Home Assistant overlays"
+                      : "Show Home Assistant overlays")
+
                 if settings.bookmarksButtonEnabled && (container.isAdmin || container.capabilities.canBookmark) {
                     Button {
                         showBookmarks = true
@@ -647,6 +660,21 @@ struct LiveWallView: View {
         }
     }
 
+    /// Global quick-toggle: hide (or restore) every Home Assistant overlay badge
+    /// on live video, across every camera and both the wall and the
+    /// single-camera view. Purely a display switch — entity links, placement and
+    /// config are untouched, and the read-only entity sheet reached from the
+    /// fullscreen toolbar still opens. The choice persists (`show_ha_overlays`).
+    private var haOverlayButton: some View {
+        Button { settings.showHaOverlays.toggle() } label: {
+            Image(systemName: settings.showHaOverlays ? "house" : "house.slash")
+                .foregroundColor(settings.showHaOverlays ? CrumbColors.teal : CrumbColors.textTertiary)
+        }
+        .accessibilityLabel(settings.showHaOverlays
+                            ? "Hide Home Assistant overlays"
+                            : "Show Home Assistant overlays")
+    }
+
     private var settingsButton: some View {
         Button { showSettings = true } label: {
             Image(systemName: "gearshape.fill")
@@ -670,6 +698,7 @@ struct LiveWallView: View {
                     modeTabs
                     Spacer()
                     tileSizeButton
+                    haOverlayButton
                     bookmarksButton
                     settingsButton
                 }
@@ -686,6 +715,7 @@ struct LiveWallView: View {
                     Spacer()
 
                     tileSizeButton
+                    haOverlayButton
                     bookmarksButton
                     settingsButton
                 }
