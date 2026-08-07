@@ -7,6 +7,7 @@
 
 package video.crumb.app.feature.plates
 
+import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -38,6 +39,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -89,7 +91,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -156,6 +160,7 @@ fun PlatesScreen(
     val isAdmin = store.isAdmin
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
 
     var showCameraPicker by remember { mutableStateOf(false) }
     var showJump by remember { mutableStateOf(false) }
@@ -252,6 +257,19 @@ fun PlatesScreen(
                             if (ms != null) onOpenPlateAt(p.cameraId, ms)
                         }
                         val cameraName: (PlateRead) -> String = { byId[it.cameraId]?.name ?: "(unknown camera)" }
+                        // Put the RAW plate on the clipboard (see plateCopyText) and confirm
+                        // it, except where the platform already confirms for us.
+                        val onCopy: (PlateRead) -> Unit = { p ->
+                            val text = plateCopyText(p)
+                            if (text == null) {
+                                scope.launch { snackbarHostState.showSnackbar("This read has no plate text to copy.") }
+                            } else {
+                                clipboard.setText(AnnotatedString(text))
+                                if (!systemConfirmsClipboardWrite(Build.VERSION.SDK_INT)) {
+                                    scope.launch { snackbarHostState.showSnackbar("Copied $text") }
+                                }
+                            }
+                        }
                         when (state.viewMode) {
                             PlatesViewMode.LIST -> PlatesListView(
                                 plates = state.plates,
@@ -261,6 +279,7 @@ fun PlatesScreen(
                                 isAdmin = isAdmin,
                                 onAddToWatchlist = { addKindForPlate = it },
                                 onReport = { reportFor = it },
+                                onCopy = onCopy,
                             )
                             PlatesViewMode.GALLERY -> PlatesGalleryView(
                                 plates = state.plates,
@@ -268,18 +287,21 @@ fun PlatesScreen(
                                 mediaUrls = mediaUrls,
                                 onOpen = onOpen,
                                 onReport = { reportFor = it },
+                                onCopy = onCopy,
                             )
                             PlatesViewMode.GROUPED -> PlatesGroupedView(
                                 plates = state.plates,
                                 cameraName = cameraName,
                                 mediaUrls = mediaUrls,
                                 onOpen = onOpen,
+                                onCopy = onCopy,
                             )
                             PlatesViewMode.TIMELINE -> PlatesTimelineView(
                                 plates = state.plates,
                                 cameraName = cameraName,
                                 mediaUrls = mediaUrls,
                                 onOpen = onOpen,
+                                onCopy = onCopy,
                             )
                         }
                     }
@@ -441,6 +463,7 @@ private fun PlatesListView(
     isAdmin: Boolean,
     onAddToWatchlist: (String) -> Unit,
     onReport: (PlateRead) -> Unit,
+    onCopy: (PlateRead) -> Unit,
 ) {
     LazyColumn(Modifier.fillMaxSize()) {
         items(plates, key = { it.id }) { p ->
@@ -450,6 +473,7 @@ private fun PlatesListView(
                 mediaUrls = mediaUrls,
                 onClick = { onOpen(p) },
                 onReport = { onReport(p) },
+                onCopy = { onCopy(p) },
                 // Only admins can manage the watchlist; viewers still see the read-only
                 // list via the toolbar. A 403 is handled defensively in the ViewModel
                 // regardless (stale role → friendly notice).
@@ -469,6 +493,7 @@ private fun PlatesGalleryView(
     mediaUrls: MediaUrls,
     onOpen: (PlateRead) -> Unit,
     onReport: (PlateRead) -> Unit,
+    onCopy: (PlateRead) -> Unit,
 ) {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 168.dp),
@@ -484,6 +509,7 @@ private fun PlatesGalleryView(
                 mediaUrls = mediaUrls,
                 onClick = { onOpen(p) },
                 onReport = { onReport(p) },
+                onCopy = { onCopy(p) },
             )
         }
     }
@@ -496,6 +522,7 @@ private fun PlateGalleryCard(
     mediaUrls: MediaUrls,
     onClick: () -> Unit,
     onReport: () -> Unit,
+    onCopy: () -> Unit,
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -518,6 +545,7 @@ private fun PlateGalleryCard(
                         displayName = read.displayName,
                         plate = read.plate,
                         nameStyle = MaterialTheme.typography.titleMedium,
+                        onCopy = onCopy,
                     )
                     Text(
                         text = cameraName,
@@ -555,13 +583,14 @@ private fun PlatesGroupedView(
     cameraName: (PlateRead) -> String,
     mediaUrls: MediaUrls,
     onOpen: (PlateRead) -> Unit,
+    onCopy: (PlateRead) -> Unit,
 ) {
     // Group by normalized plate text (blank plates collapse under "—"). Newest
     // sighting first within each group; groups ordered by most-recent last-seen.
     val groups = remember(plates) { groupByPlate(plates) }
     LazyColumn(Modifier.fillMaxSize()) {
         items(groups, key = { it.key }) { g ->
-            PlateGroupRow(group = g, cameraName = cameraName, mediaUrls = mediaUrls, onOpen = onOpen)
+            PlateGroupRow(group = g, cameraName = cameraName, mediaUrls = mediaUrls, onOpen = onOpen, onCopy = onCopy)
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
         }
     }
@@ -574,6 +603,7 @@ private fun PlateGroupRow(
     cameraName: (PlateRead) -> String,
     mediaUrls: MediaUrls,
     onOpen: (PlateRead) -> Unit,
+    onCopy: (PlateRead) -> Unit,
 ) {
     var expanded by remember(group.key) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth()) {
@@ -591,6 +621,9 @@ private fun PlateGroupRow(
                     displayName = group.latest.displayName,
                     plate = group.plate,
                     nameStyle = MaterialTheme.typography.titleMedium,
+                    // The group's reads all share this plate, so any of them
+                    // resolves to the same raw string.
+                    onCopy = { onCopy(group.latest) },
                 )
                 Text(
                     text = "${group.count} sighting${if (group.count == 1) "" else "s"} · ${group.cameraNames(cameraName)}",
@@ -648,6 +681,7 @@ private fun PlatesTimelineView(
     cameraName: (PlateRead) -> String,
     mediaUrls: MediaUrls,
     onOpen: (PlateRead) -> Unit,
+    onCopy: (PlateRead) -> Unit,
 ) {
     LazyColumn(
         Modifier.fillMaxSize(),
@@ -670,6 +704,7 @@ private fun PlatesTimelineView(
                             displayName = p.displayName,
                             plate = p.plate,
                             nameStyle = MaterialTheme.typography.headlineSmall,
+                            onCopy = { onCopy(p) },
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Filled.Videocam, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(15.dp))
@@ -906,18 +941,29 @@ private fun PlateLabel(
     plate: String,
     nameStyle: TextStyle,
     modifier: Modifier = Modifier,
+    /**
+     * When non-null, a small copy button is drawn beside the RAW plate text —
+     * on the plate line in both layouts, so what the button copies is never
+     * ambiguous even when a name is the prominent line. Suppressed for a read
+     * with no plate text, where there would be nothing to copy.
+     */
+    onCopy: (() -> Unit)? = null,
 ) {
+    val copy = onCopy?.takeIf { plate.isNotBlank() }
     val name = displayName?.takeIf { it.isNotBlank() }
     if (name == null) {
-        Text(
-            text = plate.ifEmpty { "—" },
-            color = MaterialTheme.colorScheme.onSurface,
-            fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace,
-            style = nameStyle,
-            maxLines = 1,
-            modifier = modifier,
-        )
+        Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = plate.ifEmpty { "—" },
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                style = nameStyle,
+                maxLines = 1,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            PlateCopyButton(copy)
+        }
     } else {
         Column(modifier) {
             Text(
@@ -927,16 +973,56 @@ private fun PlateLabel(
                 style = nameStyle,
                 maxLines = 1,
             )
-            Text(
-                text = plate.ifEmpty { "—" },
-                color = TextSecondary,
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = plate.ifEmpty { "—" },
+                    color = TextSecondary,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                PlateCopyButton(copy)
+            }
         }
     }
 }
+
+/**
+ * The copy-the-plate affordance: a small icon button beside the raw plate text.
+ * A visible control rather than a long-press-only gesture, so an operator can
+ * see the plate is copyable; it is compact enough to sit in the dense list row
+ * and the gallery card alike. Renders nothing when [onCopy] is null.
+ */
+@Composable
+private fun PlateCopyButton(onCopy: (() -> Unit)?) {
+    if (onCopy == null) return
+    IconButton(onClick = onCopy, modifier = Modifier.size(32.dp)) {
+        Icon(
+            Icons.Filled.ContentCopy,
+            contentDescription = "Copy plate number",
+            tint = TextSecondary,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+/**
+ * What a copy action puts on the clipboard for a plate read: always the RAW
+ * plate string, never the operator-assigned display name, even when the name is
+ * what the row shows most prominently. The name is a local label; the raw plate
+ * is the value that matches the read elsewhere (search, reports, other systems).
+ * Returns null when there is nothing to copy (a read with no plate text).
+ */
+internal fun plateCopyText(read: PlateRead): String? = read.plate.trim().takeIf { it.isNotEmpty() }
+
+/**
+ * Whether the platform shows its own confirmation when an app writes to the
+ * clipboard. Android 13 (API 33) added a system clipboard-write panel, so an
+ * in-app snackbar on top of it would be a duplicate confirmation; below 33 there
+ * is no system feedback and the snackbar is the only thing the operator sees.
+ */
+internal fun systemConfirmsClipboardWrite(sdkInt: Int): Boolean = sdkInt >= Build.VERSION_CODES.TIRAMISU
 
 // ─── plate row + lazy snapshot ─────────────────────────────────────────────────
 
@@ -947,6 +1033,7 @@ private fun PlateRow(
     mediaUrls: MediaUrls,
     onClick: () -> Unit,
     onReport: () -> Unit = {},
+    onCopy: (() -> Unit)? = null,
     showAddToWatchlist: Boolean = false,
     onAddToWatchlist: () -> Unit = {},
 ) {
@@ -964,6 +1051,7 @@ private fun PlateRow(
                 displayName = read.displayName,
                 plate = read.plate,
                 nameStyle = MaterialTheme.typography.titleMedium,
+                onCopy = onCopy,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
