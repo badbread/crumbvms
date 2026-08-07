@@ -6156,6 +6156,12 @@ function renderCamMotionTab(c) {
   const gridOpts = CM_GRID_OPTS.map(([v,l]) => `<option value="${v}" ${gridKey===v?'selected':''}>${l}</option>`).join('');
   // Manual-floor SLIDER seed: the effective threshold as a % of frame (0.05–5).
   const thPct = p.motion_threshold != null ? +(p.motion_threshold * 100).toFixed(2) : 0.5;
+  // Pixel analysis runs on the SUB stream only (recorder: `sub_rtsp_url_opt()`),
+  // so a main-only camera can never produce a motion event — it just fails open
+  // and records continuously. That was invisible here while the box stayed
+  // ticked, so warn on the tab that owns the setting (#522). Same emptiness test
+  // the recorder uses; `sub_url` is derived from the Connection tab's sub URL.
+  const hasSub = !!(c.sub_url && String(c.sub_url).trim());
   // LIVE-TUNER-FIRST layout (UX principle): the tuner window is pinned at the TOP,
   // settings sit UNDER it in two columns, so changing a setting and seeing the live
   // meter result needs no scrolling.
@@ -6199,6 +6205,7 @@ function renderCamMotionTab(c) {
             <label class="chk"><input type="checkbox" id="ce-motion-ha" ${(c.motion_ha_enabled ?? (c.motion_source==='ha'))?'checked':''} onchange="ceMotionSourceChanged()"/> Home Assistant sensors</label>
           </div>
         </div>
+        ${hasSub ? '' : `<div id="ce-motion-nosub-warn" class="warn-note hidden"><b>This camera has no sub-stream, so pixel analysis can't run.</b> Crumb's pixel detector reads the sub-stream only, so this camera produces no motion events, no timeline motion track and no motion clips — a Motion-mode policy falls back to recording continuously. Add a <b>sub-stream URL</b> on the <b>Connection</b> tab, or use Frigate detections / Home Assistant sensors as the motion source instead.</div>`}
         <div id="ce-motion-algo-wrap" style="margin-top:8px">
           <div class="form-grid narrow">
             <label class="fg-label" for="ce-motion-algorithm">Algorithm ${infoHint(MOTION_ALGO_HINT_ALL)}</label>
@@ -7813,6 +7820,11 @@ function ceMotionSourceChanged() {
   const wrap = $('ce-motion-algo-wrap');
   const help = $('ce-motion-algo-help');
   if (wrap) wrap.classList.toggle('hidden', !pixel);
+  // #522: the no-sub warning only exists when the camera HAS no sub-stream; show
+  // it exactly while pixel analysis is the (silently no-op) selected source, so
+  // ticking the box surfaces the problem before the operator ever hits Save.
+  const noSub = $('ce-motion-nosub-warn');
+  if (noSub) noSub.classList.toggle('hidden', !pixel);
   if (help) {
     help.innerHTML = pixel
       ? motionAlgoHelp($('ce-motion-algorithm') ? $('ce-motion-algorithm').value : 'census')
