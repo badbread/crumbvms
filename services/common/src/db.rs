@@ -2859,6 +2859,39 @@ pub async fn list_storages(pool: &Pool) -> Result<Vec<Storage>> {
     Ok(rows.iter().map(storage_from_row).collect())
 }
 
+/// Sample the relative paths of the NEWEST indexed segments on one storage.
+///
+/// Used by the recorder's reconcile pass to CONFIRM that a storage root really
+/// is the storage the index describes before it is allowed to prune rows there
+/// (issue #504): if none of a storage's newest indexed segment files can be
+/// found under its root, the root is almost certainly an empty mountpoint whose
+/// disk failed to mount, not a disk whose footage was genuinely deleted.
+///
+/// Newest-first because the oldest segments are the ones retention/eviction
+/// legitimately removes; a freshly-written segment is the strongest evidence
+/// that the mount is live.
+pub async fn list_recent_segment_paths_for_storage(
+    pool: &Pool,
+    storage_id: Uuid,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT path
+            FROM segments
+            WHERE storage_id = $1
+            ORDER BY start_ts DESC
+            LIMIT $2
+            ",
+            &[&storage_id, &limit],
+        )
+        .await
+        .context("list_recent_segment_paths_for_storage")?;
+    Ok(rows.iter().map(|r| r.get::<_, String>("path")).collect())
+}
+
 /// Create a new storage row.
 ///
 /// Returns the created [`Storage`].  Errors on `name` uniqueness violation.
@@ -8124,6 +8157,12 @@ pub async fn get_event_provider(
 /// then the legacy `frigate_api_base`, then the Frigate-integration `api_base`.
 /// Returns `None` when nothing is configured — callers fall back to the
 /// `FRIGATE_API_BASE` env.
+///
+/// The legacy step only serves pre-0014 installs, where that single column was
+/// the only place a Frigate HTTP base could be stored. It is safe to keep because
+/// the write path (`config_routes::resolve_frigate_bases`) never lets a go2rtc
+/// (:1984) base reach the legacy column any more, and clears the one the old
+/// console used to copy there.
 pub async fn frigate_http_base(pool: &Pool) -> Result<Option<String>> {
     if let Some(s) = get_server_settings(pool).await? {
         let http = s.frigate_http_api_base.trim().to_owned();
@@ -9907,6 +9946,11 @@ pub async fn server_settings_version(pool: &Pool) -> Result<i64> {
 /// The two new fields added by migration 0014 (`frigate_go2rtc_api_base` and
 /// `frigate_http_api_base`) are also updated.  The API-routes caller must include
 /// them in `UpdateServerSettingsRequest`; see the contract in the audit.
+///
+/// `frigate_api_base` is the deprecated pre-0014 column. The caller decides what
+/// to write back for it (`config_routes::resolve_frigate_bases`) — it is never
+/// derived from the two split values here, and in particular a go2rtc (:1984)
+/// base must never end up standing in for the Frigate HTTP (:5000) base.
 ///
 /// # Errors
 ///

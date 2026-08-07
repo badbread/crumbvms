@@ -101,7 +101,11 @@ dataset:
 
 - **LXC:** a mount point to a ZFS dataset, e.g.
   `pct set <id> --mp0 /tank/crumb-media,mp=/data/media`, then set
-  `MEDIA_HOST_PATH=/data/media` in `.env`.
+  `MEDIA_HOST_PATH=/data/media` in `.env`. **Unprivileged LXC shifts user IDs**:
+  container uid 1001 is host uid **101001** with the usual 100000 offset, so the
+  ownership fix runs on the Proxmox *host*
+  (`chown -R 101001:101001 /tank/crumb-media`). Getting this wrong is the most
+  likely reason an LXC install records nothing; Step 3's preflight catches it.
 - **VM:** a separate virtio disk on the pool, mounted in the guest, then point
   `MEDIA_HOST_PATH` at that mount.
 
@@ -161,9 +165,47 @@ Set the media path in `.env` to the target disk:
 - `MEDIA_HOST_PATH`: host directory bind-mounted into the containers.
 - (Storage buckets live under it; the default live/archive paths are fine for most.)
 
-Ensure the directory exists and is writable by the container user.
+**Prefer setting it BEFORE Step 2**, so `setup-env.sh` prepares and preflights
+the real target instead of the `./_data` default:
 
-**Verify:** the path exists, is on the intended disk, and is writable.
+```sh
+MEDIA_HOST_PATH=/mnt/tank/crumb scripts/setup-env.sh
+```
+
+If you already ran Step 2, edit `MEDIA_HOST_PATH` in `.env` and re-run
+`MEDIA_HOST_PATH=<path> scripts/setup-env.sh --force` (this rotates the
+generated secrets, so capture the new admin password), or do the ownership and
+write check by hand as below.
+
+**The recorder writes as uid 1001, and this is the failure that hurts.** If uid
+1001 cannot write to `MEDIA_HOST_PATH`, live view still works, the wizard still
+shows green (the api mounts `/data` read-only and cannot test writing), and
+**nothing is ever recorded**. `setup-env.sh` now preflights it:
+
+- It reports the media directory's **filesystem type**, and prints a prominent
+  block for NFS / SMB-CIFS / FUSE mounts, where `chown 1001:1001` on this host
+  may do nothing because the server or the mount options decide ownership.
+- It **probes an actual uid-1001 write** (impersonating uid 1001 when run as
+  root, otherwise a container as `--user 1001`, otherwise reading the
+  directory's own mode) and **exits non-zero** when the answer is definitely no.
+  The admin password is still printed before it exits.
+- It **warns** (does not fail) when free space is under 10 GiB.
+
+**Verify:** the path exists, is on the intended disk, and `setup-env.sh` exited
+0 with `storage preflight: uid 1001 CAN write to <path>`. If you set the path up
+by hand, confirm it yourself:
+
+```sh
+sudo -u '#1001' touch <MEDIA_HOST_PATH>/.crumb-write-test && sudo rm <MEDIA_HOST_PATH>/.crumb-write-test
+```
+
+**Not a plain Debian/Ubuntu host?** NAS appliances (Synology, QNAP), Unraid user
+shares, unprivileged Proxmox LXC (uid shift), and Docker Desktop / WSL2 each
+break the ownership assumption differently, and the Crumb server images are
+**amd64 only** so Raspberry Pi and other ARM boards are not supported yet. The
+per-platform caveats and what to check are in
+`docs-site/docs/getting-started/platform-notes.md`
+(published at `/getting-started/platform-notes`).
 
 **About the recording modes (read before adding cameras).** Continuous
 records every camera to disk 24/7, the safe, well-understood default.

@@ -78,6 +78,7 @@ mod channel_notify;
 mod clips;
 mod config;
 mod config_routes;
+mod cors;
 mod db_backup;
 #[cfg(feature = "detection")]
 mod detection;
@@ -116,12 +117,7 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde_json::json;
-use tower_http::{
-    compression::CompressionLayer,
-    cors::{Any, CorsLayer},
-    timeout::TimeoutLayer,
-    trace::TraceLayer,
-};
+use tower_http::{compression::CompressionLayer, timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::info;
 
 use crumb_common::db::build_pool;
@@ -461,63 +457,74 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── 5. router ─────────────────────────────────────────────────────────────
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // Per-client rate limiter for the JSON routes (generous: burst 240, ~4/s
+    // sustained). Protects auth/timeline/status/config from abuse without
+    // touching high-frequency media serving.
+    let rate_limiter = rate_limit::RateLimiter::new(240, 4.0);
 
     // JSON/API routes get gzip + a 30s request timeout (bounds DB-heavy endpoints
     // like /timeline + fails slow clients fast). MEDIA routes (segment/video
     // serving, export file downloads, filmstrip JPEGs) are deliberately EXCLUDED:
     // gzip would break 206 range requests / waste CPU on already-compressed video,
     // and a 30s timeout would cut large/slow downloads.
-    // Per-client rate limiter for the JSON routes (generous: burst 240, ~4/s
-    // sustained). Protects auth/timeline/status/config from abuse without
-    // touching high-frequency media serving.
-    let rate_limiter = rate_limit::RateLimiter::new(240, 4.0);
-
-    let json_routes = Router::new()
-        .nest("/auth", auth::routes())
-        // Scoped-media-token mint (P0-SESSIONS): GET /media-token?camera=… — an
-        // authenticated JSON call, so it lives here (rate-limited + timed out),
-        // not among the media routes it hands tokens out for.
-        .merge(auth::media_token_routes())
-        .nest("/config", config_routes::routes())
-        .merge(cameras::json_routes())
-        .merge(camera_compat::routes())
-        .merge(ha::routes())
-        .merge(views::routes())
-        .merge(bookmarks::routes())
-        .merge(timeline::routes())
-        .merge(status::routes())
-        .merge(diagnostics::routes())
-        .merge(stats::routes())
-        .merge(ptz::routes())
-        // Detection events list (authenticated, subject to rate-limit + gzip).
-        // Snapshot proxy is in media_routes below (authenticated via ?token=, no timeout).
-        .merge(events::json_routes())
-        .merge(plates::json_routes())
-        // Clips feed (detections + derived motion), source-abstracted.
-        .merge(clips::json_routes())
-        // Notification devices, rules, snooze, presence, and log.
-        .merge(notifications::routes())
-        // Update-available check (issue #7): GET /updates/latest, any user.
-        .merge(updates::routes())
+    //
+    // Factored into a closure because `/auth` is now routed as its own subtree
+    // (so `cors::compose` can skip it) and must keep the IDENTICAL stack — in
+    // particular the rate limiter, which is what makes `/auth/login` expensive
+    // to brute-force.
+    let json_layers = |r: Router<AppState>| {
         // Layers applied outermost-first: rate-limit (reject early) → timeout →
         // gzip (compress handler output, innermost).
-        .layer(CompressionLayer::new())
-        // TimeoutLayer::new's 408-on-timeout default is exactly what we want;
-        // suppress the deprecation in favour of the (otherwise-identical here)
-        // with_status_code form.
-        .layer({
-            #[allow(deprecated)]
-            let timeout = TimeoutLayer::new(std::time::Duration::from_secs(30));
-            timeout
-        })
-        .layer(axum::middleware::from_fn_with_state(
-            rate_limiter.clone(),
-            rate_limit::rate_limit_mw,
-        ));
+        r.layer(CompressionLayer::new())
+            // TimeoutLayer::new's 408-on-timeout default is exactly what we want;
+            // suppress the deprecation in favour of the (otherwise-identical here)
+            // with_status_code form.
+            .layer({
+                #[allow(deprecated)]
+                let timeout = TimeoutLayer::new(std::time::Duration::from_secs(30));
+                timeout
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                rate_limiter.clone(),
+                rate_limit::rate_limit_mw,
+            ))
+    };
+
+    // The credential surface. Split out of `json_routes` for exactly one reason:
+    // so the permissive CORS layer does NOT reach it (see `cors.rs` for why a
+    // wildcard `Access-Control-Allow-Origin` on `/auth` is a hazard). Nothing
+    // Crumb ships calls `/auth` cross-origin — the clients are native and the
+    // admin console is served from this same origin.
+    let auth_routes = json_layers(Router::new().nest("/auth", auth::routes()));
+
+    let json_routes = json_layers(
+        Router::new()
+            // Scoped-media-token mint (P0-SESSIONS): GET /media-token?camera=… — an
+            // authenticated JSON call, so it lives here (rate-limited + timed out),
+            // not among the media routes it hands tokens out for.
+            .merge(auth::media_token_routes())
+            .nest("/config", config_routes::routes())
+            .merge(cameras::json_routes())
+            .merge(camera_compat::routes())
+            .merge(ha::routes())
+            .merge(views::routes())
+            .merge(bookmarks::routes())
+            .merge(timeline::routes())
+            .merge(status::routes())
+            .merge(diagnostics::routes())
+            .merge(stats::routes())
+            .merge(ptz::routes())
+            // Detection events list (authenticated, subject to rate-limit + gzip).
+            // Snapshot proxy is in media_routes below (authenticated via ?token=, no timeout).
+            .merge(events::json_routes())
+            .merge(plates::json_routes())
+            // Clips feed (detections + derived motion), source-abstracted.
+            .merge(clips::json_routes())
+            // Notification devices, rules, snooze, presence, and log.
+            .merge(notifications::routes())
+            // Update-available check (issue #7): GET /updates/latest, any user.
+            .merge(updates::routes()),
+    );
 
     let media_routes = Router::new()
         .merge(playback::routes())
@@ -536,24 +543,28 @@ async fn main() -> anyhow::Result<()> {
         // Clip media: generated clip.mp4 + thumbnail.jpg (authenticated; ?token= ok).
         .merge(clips::media_routes());
 
-    let app = Router::new()
-        // Health check — no auth, no tracing noise.  Returns 200 OK when DB
-        // responds and the recorder heartbeat is fresh; 503 otherwise so
-        // Docker / load-balancers can detect degraded state automatically.
-        .route("/health", get(health))
-        // Build/version diagnostics — no auth (no secrets; aids support + rollback).
-        .route("/version", get(version))
-        // Server-served admin console (the page itself is public; it signs in to
-        // the API via /auth and drives the admin-only /config endpoints).
-        .route("/admin", get(serve_admin))
-        // Prometheus metrics — no auth (no secrets), no rate limit (scraper).
-        .merge(metrics::routes())
-        .merge(json_routes)
-        .merge(media_routes)
-        // Layers applied outermost-first (LIFO evaluation order in tower).
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
-        .with_state(state.clone());
+    // CORS covers the first argument and deliberately NOT the second (`/auth`).
+    // Layers that must cover everything (tracing) go outside the call.
+    let app = cors::compose(
+        Router::new()
+            // Health check — no auth, no tracing noise.  Returns 200 OK when DB
+            // responds and the recorder heartbeat is fresh; 503 otherwise so
+            // Docker / load-balancers can detect degraded state automatically.
+            .route("/health", get(health))
+            // Build/version diagnostics — no auth (no secrets; aids support + rollback).
+            .route("/version", get(version))
+            // Server-served admin console (the page itself is public; it signs in to
+            // the API via /auth and drives the admin-only /config endpoints).
+            .route("/admin", get(serve_admin))
+            // Prometheus metrics — no auth (no secrets), no rate limit (scraper).
+            .merge(metrics::routes())
+            .merge(json_routes)
+            .merge(media_routes),
+        auth_routes,
+    )
+    // Layers applied outermost-first (LIFO evaluation order in tower).
+    .layer(TraceLayer::new_for_http())
+    .with_state(state.clone());
 
     // ── 6. export TTL sweeper ─────────────────────────────────────────────────
     let sweeper_state = state.clone();

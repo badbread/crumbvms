@@ -776,6 +776,11 @@ let CAMS = [], STORAGES = [], POLICIES = [], DEFAULT_POLICY = null, GROUPS = [],
    editing only their own subset of columns. */
 let DETECTION_SERVER = null;
 let SERVER_SETTINGS = null;
+/* Frigate integration settings last fetched by the Detection & clips pane, so
+   the one "Frigate HTTP API (:5000)" field can write frigate_config.api_base
+   alongside server_settings.frigate_http_api_base without losing the MQTT
+   settings (PUT /config/frigate is a whole-row replace too). */
+let DETECTION_FRIGATE = null;
 /* License-plate recognition config (GET /config/lpr), fetched at boot and kept
    fresh by the Detection & clips pane. Its `enabled` flag gates the left-nav
    Plates entry + the Plates view, so plate reads never surface when capture is
@@ -1405,6 +1410,11 @@ async function openWizard(status) {
   wizardRender();
 }
 
+/* A COMPLETE /config/server body (whole-row replace) from what the wizard has
+   fetched. `frigate_api_base` is deliberately absent: it is the deprecated
+   pre-split column, an omitted key leaves whatever an upgraded install stored
+   there untouched, and writing the go2rtc base into it is what used to poison
+   the Frigate HTTP base. */
 function wizardServerBody() {
   const s = WZ.server || {};
   return {
@@ -1414,7 +1424,6 @@ function wizardServerBody() {
     frigate_rtsp_base:       s.frigate_rtsp_base || '',
     frigate_go2rtc_api_base: s.frigate_go2rtc_api_base || '',
     frigate_http_api_base:   s.frigate_http_api_base || '',
-    frigate_api_base:        s.frigate_api_base || '',
     motion_hwaccel:          s.motion_hwaccel || '',
     motion_vaapi_device:     s.motion_vaapi_device || '',
   };
@@ -2910,9 +2919,29 @@ async function wizardSave(key) {
   }
   if (key === 'frigate') {
     const go2 = ($('wz-frg-go2rtc').value || '').trim(), http = ($('wz-frg-http').value || '').trim();
-    const body = Object.assign(wizardServerBody(), { frigate_go2rtc_api_base: go2, frigate_http_api_base: http, frigate_api_base: go2 });
+    const body = Object.assign(wizardServerBody(), { frigate_go2rtc_api_base: go2, frigate_http_api_base: http });
     await api('/config/server', { method: 'PUT', body: JSON.stringify(body) });
     WZ.server = noteServerTz(await api('/config/server'));
+    // The Frigate HTTP base has two consumers (snapshot/clip proxying reads
+    // server_settings, the event ingester reads frigate_config), so set both
+    // here as well. Best-effort: a Frigate row that can't be written must not
+    // block the wizard.
+    if (http) {
+      try {
+        const c = await api('/config/frigate');
+        if ((c.api_base || '') !== http && !(c.enabled && !(c.mqtt_url || '').trim())) {
+          await api('/config/frigate', { method: 'PUT', body: JSON.stringify({
+            enabled: !!c.enabled,
+            mqtt_url: c.mqtt_url || '',
+            mqtt_prefix: c.mqtt_prefix || 'frigate',
+            mqtt_user: c.mqtt_user || null,
+            api_base: http,
+            min_score: c.min_score,
+            catchup_hours: c.catchup_hours,
+          }) });
+        }
+      } catch (_) { /* non-fatal: the addresses above are already saved */ }
+    }
     return true;
   }
   if (key === 'detect-hw') {
@@ -6648,10 +6677,12 @@ async function cmSaveMask() {
    hot-reloaded) with the Frigate address bases / hwaccel / clip settings that
    used to live under "Server & streaming" (S3, S4).
 
-   NOTE (Phase 1): this is a UI reorganization only. The two Frigate-HTTP-API
-   fields (frigate_config.api_base and server_settings.frigate_http_api_base)
-   still write their OWN columns, collapsing them to one owner is D3 (Phase 4).
-   Saving a section only touches that section's backing table.
+   NOTE: the two Frigate-HTTP-API fields this page used to show (one writing
+   frigate_config.api_base, one writing server_settings.frigate_http_api_base,
+   with different consumers) are COLLAPSED into the single "Frigate HTTP API
+   (:5000)" field under "Frigate stream addresses". The schema still has both
+   columns; whichever Save button the operator presses mirrors the value into
+   the other one. Everything else here still saves only its own backing table.
 ═══════════════════════════════════════════════════════════════════════════ */
 /* ── Motion-decode TRUTH (GET /config/decode-status) ─────────────────────────
    "I switched to VAAPI and have no idea if it's running." The recorder reports
@@ -6982,6 +7013,10 @@ async function renderDetectionClips() {
   // fields, so a partial body would 400 (missing fields) or blank the Crumb bases
   // this pane doesn't show. The Crumb bases stay owned/edited by the Server pane.
   DETECTION_SERVER = s;
+  // Same for frigate_config: the single "Frigate HTTP API (:5000)" field writes
+  // BOTH backing columns, so "Save addresses" needs a complete /config/frigate
+  // body to carry the MQTT settings through unchanged.
+  DETECTION_FRIGATE = c;
   $('right-pane').innerHTML = `
     <div class="rp-head">
       <div class="rp-head-left">
@@ -7025,9 +7060,9 @@ async function renderDetectionClips() {
       <div class="grid2">
         <div><label class="field-label" style="margin-top:0">Min score (0–1) ${infoHint('Confidence floor, an object scored below this is ignored. 0.3 is a sensible default.')}</label><input id="fr-score" type="number" min="0" max="1" step="0.05" value="${c.min_score}" /></div>
         <div><label class="field-label" style="margin-top:0">Backfill hours ${infoHint('On (re)connect the API backfills this many hours of past Frigate events so the timeline isn’t blank. API only.')}</label><input id="fr-catchup" type="number" min="0" max="720" value="${c.catchup_hours}" /></div>
-        <div style="grid-column:1/3"><label class="field-label" style="margin-top:0">Frigate HTTP API base <span style="color:var(--dim2);font-weight:400">(for event backfill)</span></label><input id="fr-apibase" class="mono" value="${esc(c.api_base)}" placeholder="http://frigate-host:5000" /></div>
       </div>
       <div class="card-hint" style="margin-top:4px">Saving Frigate applies immediately, the recorder and API reconnect MQTT within ~15&nbsp;s, no restart.</div>
+      <div class="card-hint" style="margin-top:4px">Frigate's HTTP API address (event backfill and snapshots) is set once below, under <b>Frigate stream addresses</b>.</div>
       <div id="fr-msg" class="form-msg"></div>
     </div>
 
@@ -7066,8 +7101,8 @@ async function renderDetectionClips() {
         </div>
         <div>
           <label class="field-label" style="margin-top:0">Frigate HTTP API (:5000)</label>
-          <input id="srv-frigate-http-api" class="mono" value="${esc(s.frigate_http_api_base||'')}" placeholder="http://&lt;frigate-host&gt;:5000" />
-          <div class="card-hint" style="margin-top:4px">Frigate HTTP base, event snapshots &amp; timeline backfill.</div>
+          <input id="srv-frigate-http-api" class="mono" value="${esc(s.frigate_http_api_base || c.api_base || '')}" placeholder="http://&lt;frigate-host&gt;:5000" />
+          <div class="card-hint" style="margin-top:4px">Frigate HTTP base, event snapshots &amp; timeline backfill. This one field drives every Frigate HTTP consumer, snapshots, clips and event backfill alike.</div>
         </div>
       </div>
       <div class="export-dest-row" style="margin-top:10px;align-items:flex-start">
@@ -7151,6 +7186,16 @@ async function renderDetectionClips() {
   loadClipMotionHighlight();
   refreshDecodeStatus(); // live decode truth (strip + per-camera badges); hidden on older servers
 }
+/* The Frigate HTTP API base has ONE field on this page (srv-frigate-http-api,
+   under "Frigate stream addresses"); it owns both backing columns, so read it
+   here too rather than letting this save blank frigate_config.api_base. Falls
+   back to the fetched value if the addresses section isn't in the DOM. */
+function frigateHttpApiFieldValue() {
+  const el = $('srv-frigate-http-api');
+  if (el) return el.value.trim();
+  const c = DETECTION_FRIGATE || {}, s = DETECTION_SERVER || {};
+  return (s.frigate_http_api_base || c.api_base || '').trim();
+}
 async function saveFrigate() {
   setMsg('fr-msg', '');
   const body = {
@@ -7158,7 +7203,7 @@ async function saveFrigate() {
     mqtt_url: $('fr-url').value.trim(),
     mqtt_prefix: $('fr-prefix').value.trim() || 'frigate',
     mqtt_user: $('fr-user').value.trim() || null,
-    api_base: $('fr-apibase').value.trim() || null,
+    api_base: frigateHttpApiFieldValue() || null,
     min_score: parseFloat($('fr-score').value),
     catchup_hours: parseInt($('fr-catchup').value, 10),
   };
@@ -7167,39 +7212,88 @@ async function saveFrigate() {
   else if ($('fr-pass').value) body.mqtt_password = $('fr-pass').value;
   if (body.enabled && !body.mqtt_url) { setMsg('fr-msg', 'Broker URL is required when Frigate is enabled.', 'err'); return; }
   try {
-    await api('/config/frigate', { method: 'PUT', body: JSON.stringify(body) });
+    DETECTION_FRIGATE = await api('/config/frigate', { method: 'PUT', body: JSON.stringify(body) }) || DETECTION_FRIGATE;
+    // One field, two columns: mirror it into server_settings as well, otherwise
+    // snapshots/clips (which prefer frigate_http_api_base) would keep using the
+    // old address while backfill used the new one.
+    await mirrorFrigateHttpToServerSettings(body.api_base || '');
     toast('Frigate settings saved, reconnecting (no restart).');
     renderDetectionClips();
   } catch (e) { setMsg('fr-msg', e.message, 'err'); }
+}
+/* ── One Frigate HTTP API base, two backing columns ─────────────────────────
+   `frigate_config.api_base` drives the event ingester/backfill;
+   `server_settings.frigate_http_api_base` is what snapshot + clip proxying
+   prefers. They used to be two separate fields on this page with no hint that
+   filling one left the other unset, so the console now shows a single field and
+   writes both. Each mirror is a no-op when the value already matches: a
+   /config/frigate PUT bumps its version and makes the recorder + API reconnect
+   MQTT, so it must not fire on every unrelated save. */
+async function mirrorFrigateHttpToFrigateConfig(v) {
+  const c = DETECTION_FRIGATE;
+  if (!c || (c.api_base || '') === v) return;
+  // Whole-row replace; carry the MQTT settings through untouched. mqtt_password
+  // is omitted on purpose, that means "leave the stored password alone".
+  if (c.enabled && !(c.mqtt_url || '').trim()) return;  // row can't be PUT while enabled without a broker
+  const body = {
+    enabled: !!c.enabled,
+    mqtt_url: c.mqtt_url || '',
+    mqtt_prefix: c.mqtt_prefix || 'frigate',
+    mqtt_user: c.mqtt_user || null,
+    api_base: v || null,
+    min_score: c.min_score,
+    catchup_hours: c.catchup_hours,
+  };
+  DETECTION_FRIGATE = await api('/config/frigate', { method: 'PUT', body: JSON.stringify(body) }) || DETECTION_FRIGATE;
+}
+async function mirrorFrigateHttpToServerSettings(v) {
+  const s = DETECTION_SERVER;
+  if (!s || (s.frigate_http_api_base || '') === v) return;
+  const body = detectionServerBody(s);
+  body.frigate_http_api_base = v;
+  DETECTION_SERVER = await api('/config/server', { method: 'PUT', body: JSON.stringify(body) }) || DETECTION_SERVER;
+}
+/* A COMPLETE /config/server body built from the fetched settings (the PUT is a
+   whole-row replace with required Crumb fields). The deprecated
+   `frigate_api_base` key is deliberately NOT sent: the server treats an omitted
+   key as "leave the stored legacy column alone", and sending the go2rtc base in
+   it is exactly what used to poison frigate_http_api_base. */
+function detectionServerBody(s) {
+  return {
+    server_address:          s.server_address || '',
+    crumb_rtsp_base:         s.crumb_rtsp_base || '',
+    crumb_api_base:          s.crumb_api_base || '',
+    frigate_rtsp_base:       s.frigate_rtsp_base || '',
+    frigate_go2rtc_api_base: s.frigate_go2rtc_api_base || '',
+    frigate_http_api_base:   s.frigate_http_api_base || '',
+    motion_hwaccel:          s.motion_hwaccel || 'auto',
+    motion_vaapi_device:     s.motion_vaapi_device || '',
+  };
 }
 /* Save the Detection & clips server_settings knobs (Frigate address bases +
    motion-decode backend). /config/server is a whole-row replace whose Crumb
    fields are REQUIRED, so we send a COMPLETE body, the Crumb bases come from the
    fetched settings (DETECTION_SERVER) unchanged; only the Frigate + decode fields
-   below reflect this pane. Phase 1 keeps writing the same columns as before
-   (frigate_http_api_base stays distinct from frigate_config.api_base, D3/Phase 4). */
+   below reflect this pane. The single "Frigate HTTP API (:5000)" field is then
+   mirrored into frigate_config.api_base so both consumers agree. */
 async function saveDetectionServer() {
   setMsg('srv-frigate-msg', '');
   const s = DETECTION_SERVER || {};
-  const frigateGo2rtc = ($('srv-frigate-go2rtc-api') && $('srv-frigate-go2rtc-api').value.trim()) || '';
-  const body = {
-    // Crumb-owned fields (required by the PUT), preserve the fetched values.
-    server_address:          s.server_address || '',
-    crumb_rtsp_base:         s.crumb_rtsp_base || '',
-    crumb_api_base:          s.crumb_api_base || '',
+  const frigateHttp = frigateHttpApiFieldValue();
+  const body = Object.assign(detectionServerBody(s), {
     // Frigate address bases (this pane).
     frigate_rtsp_base:       $('srv-frigate-rtsp') ? $('srv-frigate-rtsp').value.trim() : (s.frigate_rtsp_base || ''),
-    frigate_go2rtc_api_base: frigateGo2rtc,
-    frigate_http_api_base:   $('srv-frigate-http-api') ? $('srv-frigate-http-api').value.trim() : (s.frigate_http_api_base || ''),
-    // Keep the legacy single-field column in sync (= go2rtc base) for back-compat.
-    frigate_api_base:        frigateGo2rtc,
+    frigate_go2rtc_api_base: ($('srv-frigate-go2rtc-api') && $('srv-frigate-go2rtc-api').value.trim()) || '',
+    frigate_http_api_base:   frigateHttp,
     // Motion decode backend (recorder hot-reloads its workers on change).
     motion_hwaccel:          $('srv-hwaccel') ? $('srv-hwaccel').value : (s.motion_hwaccel || 'auto'),
     motion_vaapi_device:     $('srv-vaapi-device') ? $('srv-vaapi-device').value.trim() : (s.motion_vaapi_device || ''),
-  };
+  });
   try {
     const updated = noteServerTz(await api('/config/server', { method: 'PUT', body: JSON.stringify(body) }));
     DETECTION_SERVER = updated || DETECTION_SERVER;
+    // One field, two columns: the event ingester reads frigate_config.api_base.
+    await mirrorFrigateHttpToFrigateConfig(frigateHttp);
     toast('Detection settings saved.');
     // The recorder hot-reloads its motion workers within a few seconds, poll
     // the decode truth so the operator watches requested → active converge.
@@ -7404,10 +7498,10 @@ async function saveServerSettings() {
     crumb_rtsp_base:         $('srv-crumb-rtsp').value.trim(),
     crumb_api_base:          $('srv-crumb-api').value.trim(),
     // Preserve Frigate + motion-decode fields owned by Detection & clips.
+    // (`frigate_api_base` is omitted on purpose, see detectionServerBody.)
     frigate_rtsp_base:       s.frigate_rtsp_base || '',
     frigate_go2rtc_api_base: s.frigate_go2rtc_api_base || '',
     frigate_http_api_base:   s.frigate_http_api_base || '',
-    frigate_api_base:        s.frigate_api_base || '',
     motion_hwaccel:          s.motion_hwaccel || 'auto',
     motion_vaapi_device:     s.motion_vaapi_device || '',
   };

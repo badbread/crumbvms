@@ -97,6 +97,229 @@ camera that was genuinely dead (the #519 case) was indistinguishable from noise.
 
 ---
 
+## 2026-08-06, Media-token scope on `/cameras/:id/streams`: gate the endpoint on a full session now, defer per-request RTSP credentials
+
+**Context.** A scoped media token (`?token=`, `typ: "media"`, ~15 min, one
+camera, media only) exists so that browser elements which cannot set an
+`Authorization` header still get something weak instead of the full login JWT.
+`auth.rs` documents that property as "a leak grants at most view one camera's
+media for a few minutes".
+
+That property is about what a token can *reach*, not just what its claims say,
+and it is not self-enforcing. It holds only while every endpoint reachable with
+`?token=` returns something no more durable and no broader than the token.
+`GET /cameras/:id/streams` was not such an endpoint: it lives in `media_routes`,
+and its RTSP URLs embed `GO2RTC_USER`/`GO2RTC_PASS` — one server-wide,
+non-expiring pair covering every stream go2rtc serves. A media-token holder
+could therefore trade the weak credential for a strictly stronger one, which
+makes the token's careful scoping decorative on that path. Found in the v0.2.0
+release audit (#506).
+
+**Decision.** Two changes, both minimum-scope for the v0.2.0 tag:
+
+- A new `FullSessionUser` extractor in `auth_mw.rs`, backed by a
+  `media_scoped: bool` marker on `AuthUser` set at the two construction sites.
+  It wraps `AuthUser` and rejects a media-token principal with 403.
+  `live_streams` takes it instead of `AuthUser`. The endpoint stays in
+  `media_routes` — the extractor, not the mount point, is what carries the
+  rule, and it now reads as an explicit property of the handler.
+- `/auth` is routed as its own subtree so the permissive CORS layer skips it
+  (`cors.rs`, `cors::compose`). It keeps the identical rate-limit / timeout /
+  compression stack — the rate limiter in particular is what makes
+  `/auth/login` expensive to brute-force, and losing it silently would be a
+  worse outcome than the wildcard header.
+
+Client verification before changing the extractor: all four surfaces
+(`apps/desktop-flutter/lib/api/crumb_api.dart`, Android `CrumbApi.kt` via its
+`AuthInterceptor`, `apps/ios/.../CrumbAPI.swift`, and `admin.html`'s `api()`
+helper) already call `/cameras/:id/streams` with the `Authorization: Bearer`
+header during session setup. No client change, no version skew.
+
+**Rejected:**
+
+- **Per-request short-lived RTSP credentials** — the structurally correct fix:
+  the response would carry nothing durable and the property would hold by
+  construction instead of by endpoint-by-endpoint review. Deferred to #507, not
+  dismissed. It needs go2rtc's auth model investigated (per-stream credentials
+  may not be expressible without hand-managing `go2rtc.yaml`, which the
+  reconcile loop owns), and a credential that expires mid-live-view means a
+  renewal path in three clients. That is a design task with its own testing
+  pass, not something to land inside a release-audit fix.
+- **Moving the route out of `media_routes` into `json_routes`.** Equivalent
+  security outcome, but it would silently add the 30 s timeout and the JSON
+  rate limiter to a call every client makes once per camera at session setup,
+  and it leaves the next reader to infer the rule from a mount point. The
+  extractor states it.
+- **Dropping the permissive CORS layer everywhere, not just `/auth`.** Probably
+  right — nothing Crumb ships needs CORS at all, since the clients are native
+  and the console is same-origin. Deliberately not done in a security-fix PR
+  bound for a release tag: it could break an operator's own LAN page or script
+  with no warning, and that is a change that deserves its own note in the
+  release notes rather than a footnote in a hardening commit.
+
+**Trade-offs accepted.** The go2rtc credential is still server-wide and
+non-expiring; a full login session can still read it, which is exactly the
+status quo for every client. The `media_scoped` flag is a marker a future
+extractor must remember to check — the mitigation is that `FullSessionUser`
+exists and is documented as the thing to reach for, rather than each handler
+re-deriving the rule.
+
+**Revisit triggers.** Any of: #507 lands (this entry's first half becomes
+redundant); go2rtc gains a usable per-stream or token auth mechanism; a
+deployment mode appears where the RTSP endpoint is reachable beyond the LAN;
+another endpoint turns up returning a credential broader than its caller's
+proof, which would mean the one-off extractor gate is the wrong shape and a
+response-side rule is needed; or the permissive CORS layer is dropped from the
+remaining routes, at which point `cors.rs` and its control test collapse.
+
+---
+
+## 2026-08-06, Unmounted-storage guard: a marker FILE plus a circuit breaker, not a mountpoint heuristic
+
+**Context.** Reconcile's dangling-row pass stats `storage.path / seg.path` for
+every indexed segment and deletes the row when the file is missing. Nothing
+checked that the storage root was the real storage. A root that is PRESENT but
+EMPTY — an fstab `noauto` disk that never mounted, a dropped network mount, a
+Docker bind source Docker auto-created after a host path moved — makes every row
+on that storage look dangling, so ONE pass deletes that storage's entire segment
+index (issue #504). The footage bytes survive, but everything only the index
+carries does not: `has_motion`, motion bounding boxes, stage and stream labels,
+durations, clip and bookmark linkage. Re-adoption after a remount is
+rate-limited and re-adopts with `has_motion = false` and no bbox, so the motion
+history is gone for good. The orphan pass already had a root-exists guard; the
+dangling pass had none, and that guard cannot see this case anyway because the
+root does stat fine.
+
+**Decision.** Two independent layers in `services/recorder/src/reconcile.rs`,
+both failing toward "skip and alarm", never toward delete:
+
+1. **A marker file, `<storage_root>/.crumb-storage`.** The dangling pass deletes
+   nothing on a storage whose marker is absent. The marker rides ON the storage,
+   so an unmounted disk (a bare mountpoint directory) simply does not have one —
+   which is exactly the distinction a "does the root exist?" check cannot make.
+   It is written only on positive confirmation: by the recording path the moment
+   the recorder is about to write footage into that root
+   (`ensure_storage_marker`), and by a boot/heal pass that requires at least one
+   of the storage's newest indexed segment files to actually be present
+   (`seed_storage_markers`). A storage with no indexed segments at all is
+   indistinguishable from an empty foreign directory and gets no marker from
+   reconcile; the recorder writes it when it records there.
+2. **A per-storage circuit breaker.** Even with a marker present (a stale marker,
+   a repointed path), deletions halt for a storage once more than 100 of its rows
+   AND more than 50 % of its checked rows come back missing in one pass. It is
+   evaluated before every delete, so a mass-missing event costs at most 100 rows
+   per storage, and the trip LATCHES for the process — otherwise a timer-driven
+   reconcile would simply drain the index 100 rows per pass. Both thresholds must
+   be exceeded, so neither a small storage an operator emptied nor a large one
+   mid-eviction can trip it.
+
+Both raise the existing `storage_unwritable` system event.
+
+**Rejected:**
+
+- **Mountpoint-only heuristics** (compare `st_dev` of the root against its
+  parent, parse `/proc/self/mountinfo`, or require the root to be a mount
+  point). Too weak in both directions: a perfectly valid storage is very often
+  NOT its own mount point (a subdirectory of one big data disk, the default
+  compose layout's `/data/live` and `/data/archive`), so this would refuse to
+  prune on healthy installs; and a mount that succeeded onto the WRONG device,
+  or a bind mount of an empty directory, passes the check while being exactly
+  the failure we are guarding against. It also does not survive containers,
+  overlayfs, or network filesystems predictably. A marker written by the
+  recorder answers the question that actually matters — "is this the storage I
+  have been writing to?" — instead of a proxy for it.
+- **A count-based-only guard (breaker without the marker).** Bounds the damage
+  but does not prevent it: a genuinely unmounted disk would still lose up to 100
+  rows per storage, and the first 100 rows of an index are just as unrecoverable
+  as the rest. The marker makes the common case cost zero rows.
+- **A DB-side "storage last seen healthy" timestamp instead of a file.** Lives in
+  the wrong place: the whole question is whether the FILESYSTEM in front of us is
+  the one the index describes, and only something stored on that filesystem can
+  answer it. A DB flag would happily say "healthy" about a disk that is no longer
+  there.
+- **Refusing to prune whenever ANY row on a storage is missing.** Safe, but it
+  turns off dangling-row cleanup permanently on any real install (retention,
+  crashes, and operator deletions produce dangling rows continuously), letting
+  the index rot instead.
+
+**Trades knowingly accepted:**
+
+- A storage whose footage an operator genuinely deleted wholesale, on a disk with
+  no marker, stops being pruned: its stale rows survive and it alarms until the
+  operator re-creates `.crumb-storage` (an empty file is enough; the marker body
+  says so). Stale rows are a visible, fixable annoyance; a deleted index is not.
+- A latched breaker keeps pruning off for that storage until the recorder
+  restarts, so a genuine mass deletion needs a restart to be cleaned up.
+- One extra dotfile per storage root, and one indexed sample query per storage
+  per pass until its marker exists.
+
+**Revisit triggers:**
+
+- Operators hitting the "I really did delete everything" case often enough that
+  re-creating the marker becomes a support burden → add an explicit admin action
+  ("this disk is empty on purpose, re-mark it") instead of documenting a `touch`.
+- A storage backend where the recorder cannot write a dotfile into the root (a
+  read-only mount used as archive-only storage that another process fills) →
+  the marker would have to be seeded from the API side, or the confirmation rule
+  relaxed to "any indexed segment present" without a marker.
+- Evidence that 100 rows / 50 % is the wrong shape (e.g. a real deployment where
+  a single pass legitimately sees a majority of one storage's rows disappear)
+  → retune `DANGLING_BREAKER_MIN_MISSING` / `DANGLING_BREAKER_MISSING_PCT`, which
+  exist as constants for exactly that reason.
+
+---
+
+## 2026-08-06, setup-env.sh fails the install when uid 1001 cannot write to the media dir (tiered probe, deferred exit)
+
+**Context.** A media directory the recorder (uid 1001) cannot write is the worst
+failure mode Crumb has, because it does not present as a failure: live view runs
+off go2rtc and never touches disk, the first-run wizard shows green (the api
+mounts `/data` read-only and so cannot test writing), and footage is silently
+never saved. `setup-env.sh` only did a best-effort `chown 1001:1001`, which on a
+large share of real hosts reports success while changing nothing the container
+sees: NFS `root_squash`, SMB uid mapping, FUSE user shares (Unraid `/mnt/user`),
+and the 100000 uid shift of an unprivileged Proxmox LXC.
+
+**Decision.** Preflight the media directory and **exit non-zero** on a definite
+negative, rather than warn. Recording nothing is not a degraded install, it is a
+non-install, and the operator finds out days later when they go looking for
+footage. Three supporting choices:
+
+- **Tiered probe, most faithful method that can answer honestly.** Impersonate
+  uid 1001 (root, `sudo -u '#1001'` or `setpriv`), else a container run as
+  `--user 1001`, else read the directory's own owner/group/mode. An inconclusive
+  tier never produces a verdict, it falls through; if no tier can answer, the
+  script prints the manual one-liner and exits 0. A false hard failure on a
+  working install would be worse than the warning it replaces.
+- **The docker tier never pulls.** It runs only against an image already on the
+  host, and discriminates `touch`'s exit 1 (a real EACCES verdict) from docker's
+  own 125/126/127 (an exec problem, not a verdict). setup-env runs before any
+  `docker compose pull`, and making secret generation depend on registry
+  reachability would break air-gapped installs.
+- **The exit is deferred to the end of the run**, after the one-time admin
+  password is printed. `.env` is complete and correct when storage is broken;
+  what failed is the host. Dying mid-script would cost the operator their
+  credential to save them a scroll.
+
+**Rejected:** warn-only (the status quo that produced the bug, and the reason
+nobody noticed); probing from the recorder at boot *instead of* here (it already
+raises `storage_unwritable`, but by then the operator has walked away believing
+the install succeeded, so this is additive, not a replacement); requiring root
+for setup-env (would break the documented non-root install path).
+
+**Trade-off accepted:** a plain non-root `git clone && ./scripts/setup-env.sh`
+on a host where the media dir is not yet uid-1001-writable now exits 1 where it
+previously printed a NOTE and exited 0. That is intended, it is exactly the
+broken install this catches, and the error names the fix. Any automation that
+treated setup-env's exit code as "secrets generated" needs to read it as
+"secrets generated AND storage verified".
+
+**Revisit when:** the probe produces a false negative on a real operator's host
+(then narrow the tier that got it wrong, do not weaken the exit), or the wizard
+grows a genuine server-side write test that makes the pre-boot check redundant.
+
+---
+
 ## 2026-08-06, Per-state HA badge backgrounds: one extra nullable column that inherits from the base (not paired per-state columns)
 
 **Context.** Migration 0062 gave a placed HA badge a single solid background

@@ -57,7 +57,7 @@ use uuid::Uuid;
 use crumb_common::db;
 
 use crate::{
-    auth_mw::AuthUser,
+    auth_mw::{AuthUser, FullSessionUser},
     dto::{
         AlignedPlaybackQuery, LiveStreamQuery, LiveStreamsResponse, PlaybackQuery, ResolvedSegment,
     },
@@ -587,12 +587,24 @@ async fn serve_segment(
 ///   has no LAN host-publish, so clients no longer hit it directly; the API
 ///   brokers the offer/answer after an `assert_camera_access` check.
 ///
+/// # Authentication
+///
+/// Takes [`FullSessionUser`], **not** [`AuthUser`]: the RTSP URLs in the
+/// response embed the server's go2rtc restreamer credentials, which are
+/// long-lived and cover every camera. A scoped media token is meant to be worth
+/// "one camera's bytes for a few minutes"; letting one redeem here would trade
+/// it for a strictly stronger credential, so a media-token principal gets 403.
+/// All clients already call this with the `Authorization: Bearer` header during
+/// session setup. (The deeper fix — per-request short-lived RTSP credentials so
+/// the response carries nothing durable at all — is tracked separately; see
+/// `docs/DECISIONS.md`.)
+///
 /// # Errors
 ///
-/// * `403` — caller cannot access this camera.
+/// * `403` — caller presented a scoped media token, or cannot access this camera.
 /// * `404` — camera not found in the DB.
 async fn live_streams(
-    user: AuthUser,
+    FullSessionUser(user): FullSessionUser,
     State(state): State<AppState>,
     AxumPath(camera_id): AxumPath<Uuid>,
 ) -> Result<Json<LiveStreamsResponse>, ApiError> {

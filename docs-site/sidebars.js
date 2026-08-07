@@ -11,6 +11,7 @@ const sidebars = {
         'getting-started/quickstart',
         'getting-started/what-is-crumb',
         'getting-started/requirements',
+        'getting-started/platform-notes',
         'getting-started/install-docker-compose',
         'getting-started/install-with-ai-agent',
         'getting-started/first-run-wizard',
