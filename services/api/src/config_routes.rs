@@ -4029,7 +4029,9 @@ async fn get_server_settings(
 /// Resolve the three Frigate base-URL columns for a `PUT /config/server`.
 ///
 /// Returns `(frigate_api_base, frigate_go2rtc_api_base, frigate_http_api_base)`
-/// — legacy, go2rtc REST (:1984), Frigate HTTP (:5000).
+/// — legacy, go2rtc REST (:1984), Frigate HTTP (:5000). Each is an
+/// `Option<String>`: `Some(v)` is the value to write (`Some("")` clears the
+/// column), `None` means **leave the stored column untouched** (issue #472).
 ///
 /// Migration 0014 split the legacy `frigate_api_base` in two because one field
 /// could not mean both services. The old back-compat rule copied the legacy
@@ -4044,60 +4046,69 @@ async fn get_server_settings(
 /// * **go2rtc** — the split field wins; an old client that only sends the legacy
 ///   field still seeds it. Safe: the console has always kept legacy == the
 ///   go2rtc base, and the go2rtc readers already fall back to legacy themselves.
+///   A body that omits the key entirely AND carries no legacy value leaves the
+///   stored column alone rather than clearing it.
 /// * **HTTP** — the split field, and nothing else. The legacy value is never
-///   copied here. Empty means "fall back at read time" (`frigate_config.api_base`,
-///   then the `FRIGATE_API_BASE` env), which is what an operator who configured
-///   only the Frigate integration row actually wants.
+///   copied here. `Some("")` means "fall back at read time"
+///   (`frigate_config.api_base`, then the `FRIGATE_API_BASE` env), which is what
+///   an operator who configured only the Frigate integration row actually wants.
+///   `None` leaves the stored column alone.
 /// * **legacy** — `None` (current clients omit the key) leaves the stored value
 ///   alone, so a whole-row PUT from a new client cannot wipe a value a pre-0014
 ///   install still resolves its Frigate HTTP base from. The one exception is the
-///   known-bad write: a stored legacy value identical to the go2rtc base is the
-///   old console's "keep in sync" copy, not operator intent, and leaving it would
-///   let the read-side legacy→HTTP fallback keep resolving :1984. That case is
-///   cleared — the value survives in the go2rtc column, which is where every
-///   go2rtc reader looks first.
+///   known-bad write: a stored legacy value identical to the go2rtc base being
+///   written is the old console's "keep in sync" copy, not operator intent, and
+///   leaving it would let the read-side legacy→HTTP fallback keep resolving
+///   :1984. That case is cleared — the value survives in the go2rtc column,
+///   which is where every go2rtc reader looks first. A body that says nothing
+///   about either column can't make that judgement, so it touches neither.
 fn resolve_frigate_bases(
     body_legacy: Option<&str>,
-    body_go2rtc: &str,
-    body_http: &str,
+    body_go2rtc: Option<&str>,
+    body_http: Option<&str>,
     stored_legacy: &str,
-) -> (String, String, String) {
+) -> (Option<String>, Option<String>, Option<String>) {
     let body_legacy = body_legacy.map(str::trim);
-    let go2rtc = {
-        let v = body_go2rtc.trim();
-        if v.is_empty() {
-            body_legacy.unwrap_or("")
-        } else {
-            v
-        }
+    // A non-empty legacy value in the body still seeds the go2rtc column (the
+    // pre-0014 client contract). Otherwise: present-but-empty clears, omitted
+    // preserves.
+    let seed = body_legacy.filter(|v| !v.is_empty());
+    let go2rtc: Option<String> = match body_go2rtc.map(str::trim) {
+        Some(v) if !v.is_empty() => Some(v.to_owned()),
+        Some(_) => Some(seed.unwrap_or("").to_owned()),
+        None => seed.map(ToOwned::to_owned),
     };
     // Never seeded from the legacy field — that is the whole point of this fix.
-    let http = body_http.trim();
-    let legacy = if let Some(v) = body_legacy {
-        v
-    } else {
-        let stored = stored_legacy.trim();
-        if !stored.is_empty() && stored == go2rtc {
-            ""
-        } else {
-            stored
-        }
+    let http = body_http.map(|v| v.trim().to_owned());
+    let legacy = match body_legacy {
+        Some(v) => Some(v.to_owned()),
+        // Only clear the old console's duplicate when this PUT actually decides
+        // what the go2rtc base is; otherwise leave the column untouched.
+        None => go2rtc.as_deref().and_then(|g| {
+            let stored = stored_legacy.trim();
+            (!stored.is_empty() && stored == g).then(String::new)
+        }),
     };
-    (legacy.to_owned(), go2rtc.to_owned(), http.to_owned())
+    (legacy, go2rtc, http)
 }
 
 /// `PUT /config/server` — update server & streaming base-URL settings.
 ///
-/// All fields accept an empty string to fall back to the container environment
-/// / internal docker service-name default.  Bumps the version counter so
-/// downstream consumers (recorder, API, clients) can detect and reload.
+/// A **merge**, not a whole-row replace (issue #472). A field the body omits is
+/// left exactly as stored; a field sent as `""` is cleared, which is how an
+/// operator returns it to the container environment / internal docker
+/// service-name default. See [`UpdateServerSettingsRequest`].
+///
+/// Bumps the version counter so downstream consumers (recorder, API, clients)
+/// can detect and reload.
 async fn update_server_settings(
     _admin: AdminUser,
     State(state): State<AppState>,
     Json(body): Json<UpdateServerSettingsRequest>,
 ) -> Result<Json<ServerSettingsDto>, ApiError> {
-    // Trim each field; allow empty (means "fall back to env / docker service
-    // name").  No homelab IPs baked in here — the operator provides them.
+    // Trim each supplied field; an explicit empty means "fall back to env /
+    // docker service name". No homelab IPs baked in here — the operator
+    // provides them.
     //
     // The legacy `frigate_api_base` column is only ever preserved/seeded now, so
     // read the stored row to decide what to write back for it.
@@ -4108,24 +4119,29 @@ async fn update_server_settings(
         .unwrap_or_default();
     let (legacy, go2rtc_api, http_api) = resolve_frigate_bases(
         body.frigate_api_base.as_deref(),
-        &body.frigate_go2rtc_api_base,
-        &body.frigate_http_api_base,
+        body.frigate_go2rtc_api_base.as_deref(),
+        body.frigate_http_api_base.as_deref(),
         &stored_legacy,
     );
 
+    /// `Some(field)` → the trimmed value to write; `None` → leave it alone.
+    fn set(v: Option<&String>) -> Option<&str> {
+        v.map(|s| s.trim())
+    }
+
     let s = crumb_common::db::update_server_settings(
         state.pool(),
-        body.server_address.trim(),
-        body.crumb_rtsp_base.trim(),
-        body.crumb_api_base.trim(),
-        body.frigate_rtsp_base.trim(),
-        &legacy,
-        &go2rtc_api,
-        &http_api,
+        set(body.server_address.as_ref()),
+        set(body.crumb_rtsp_base.as_ref()),
+        set(body.crumb_api_base.as_ref()),
+        set(body.frigate_rtsp_base.as_ref()),
+        legacy.as_deref(),
+        go2rtc_api.as_deref(),
+        http_api.as_deref(),
         // Motion decode backend (admin-editable, hot-reloaded by the recorder).
         // Empty ⇒ recorder falls back to its MOTION_HWACCEL / MOTION_VAAPI_DEVICE env.
-        body.motion_hwaccel.trim(),
-        body.motion_vaapi_device.trim(),
+        set(body.motion_hwaccel.as_ref()),
+        set(body.motion_vaapi_device.as_ref()),
     )
     .await
     .context("update_server_settings")?;
@@ -5293,24 +5309,28 @@ mod frigate_base_tests {
     /// through to `frigate_config.api_base` / the env.
     #[test]
     fn legacy_never_seeds_the_http_base() {
-        let (_, _, http) = resolve_frigate_bases(Some(GO2RTC), GO2RTC, "", GO2RTC);
-        assert_eq!(http, "");
+        let (_, _, http) = resolve_frigate_bases(Some(GO2RTC), Some(GO2RTC), Some(""), GO2RTC);
+        assert_eq!(http.as_deref(), Some(""));
 
         // Same for an old client that sends ONLY the legacy field.
-        let (_, go2rtc, http) = resolve_frigate_bases(Some(GO2RTC), "", "", "");
-        assert_eq!(go2rtc, GO2RTC, "legacy may still seed the go2rtc base");
-        assert_eq!(http, "");
+        let (_, go2rtc, http) = resolve_frigate_bases(Some(GO2RTC), Some(""), Some(""), "");
+        assert_eq!(
+            go2rtc.as_deref(),
+            Some(GO2RTC),
+            "legacy may still seed the go2rtc base"
+        );
+        assert_eq!(http.as_deref(), Some(""));
 
         // And for a stored legacy value with nothing about it in the body.
-        let (_, _, http) = resolve_frigate_bases(None, GO2RTC, "", GO2RTC);
-        assert_eq!(http, "");
+        let (_, _, http) = resolve_frigate_bases(None, Some(GO2RTC), Some(""), GO2RTC);
+        assert_eq!(http.as_deref(), Some(""));
     }
 
     #[test]
     fn explicit_http_value_is_kept_verbatim() {
-        let (_, go2rtc, http) = resolve_frigate_bases(None, GO2RTC, HTTP, "");
-        assert_eq!(go2rtc, GO2RTC);
-        assert_eq!(http, HTTP);
+        let (_, go2rtc, http) = resolve_frigate_bases(None, Some(GO2RTC), Some(HTTP), "");
+        assert_eq!(go2rtc.as_deref(), Some(GO2RTC));
+        assert_eq!(http.as_deref(), Some(HTTP));
     }
 
     #[test]
@@ -5318,10 +5338,10 @@ mod frigate_base_tests {
         // Pre-0014 install: the legacy column holds a Frigate HTTP base and the
         // split columns are empty. A whole-row PUT from a new client (which omits
         // the key) must not wipe it — the read side still resolves from it.
-        let (legacy, go2rtc, http) = resolve_frigate_bases(None, "", "", HTTP);
-        assert_eq!(legacy, HTTP);
-        assert_eq!(go2rtc, "");
-        assert_eq!(http, "");
+        let (legacy, go2rtc, http) = resolve_frigate_bases(None, Some(""), Some(""), HTTP);
+        assert_eq!(legacy, None, "None = leave the stored legacy column alone");
+        assert_eq!(go2rtc.as_deref(), Some(""));
+        assert_eq!(http.as_deref(), Some(""));
     }
 
     #[test]
@@ -5329,29 +5349,62 @@ mod frigate_base_tests {
         // Legacy == the go2rtc base is the old console's "keep in sync" copy.
         // Clearing it stops the read-side legacy→HTTP fallback from resolving
         // :1984; the value itself survives in the go2rtc column.
-        let (legacy, go2rtc, http) = resolve_frigate_bases(None, GO2RTC, "", GO2RTC);
-        assert_eq!(legacy, "");
-        assert_eq!(go2rtc, GO2RTC);
-        assert_eq!(http, "");
+        let (legacy, go2rtc, http) = resolve_frigate_bases(None, Some(GO2RTC), Some(""), GO2RTC);
+        assert_eq!(legacy.as_deref(), Some(""));
+        assert_eq!(go2rtc.as_deref(), Some(GO2RTC));
+        assert_eq!(http.as_deref(), Some(""));
     }
 
     #[test]
     fn explicit_empty_legacy_clears_it() {
-        let (legacy, _, _) = resolve_frigate_bases(Some(""), GO2RTC, HTTP, GO2RTC);
-        assert_eq!(legacy, "");
+        let (legacy, _, _) = resolve_frigate_bases(Some(""), Some(GO2RTC), Some(HTTP), GO2RTC);
+        assert_eq!(legacy.as_deref(), Some(""));
     }
 
     #[test]
     fn split_fields_win_over_legacy_and_everything_is_trimmed() {
         let (legacy, go2rtc, http) = resolve_frigate_bases(
             Some("  http://old-frigate:1984  "),
-            "  http://frigate-host:1984  ",
-            "  http://frigate-host:5000  ",
+            Some("  http://frigate-host:1984  "),
+            Some("  http://frigate-host:5000  "),
             "",
         );
-        assert_eq!(legacy, "http://old-frigate:1984");
-        assert_eq!(go2rtc, GO2RTC);
-        assert_eq!(http, HTTP);
+        assert_eq!(legacy.as_deref(), Some("http://old-frigate:1984"));
+        assert_eq!(go2rtc.as_deref(), Some(GO2RTC));
+        assert_eq!(http.as_deref(), Some(HTTP));
+    }
+
+    // ── #472: omitted ≠ cleared ───────────────────────────────────────────────
+
+    /// A partial body that mentions none of the three Frigate columns must leave
+    /// all three alone. Before #472 an omitted split field deserialized to `""`
+    /// and wiped the stored value.
+    #[test]
+    fn a_body_that_omits_every_frigate_key_touches_nothing() {
+        let (legacy, go2rtc, http) = resolve_frigate_bases(None, None, None, GO2RTC);
+        assert_eq!(legacy, None);
+        assert_eq!(go2rtc, None);
+        assert_eq!(http, None);
+    }
+
+    /// Omitting only the HTTP key preserves it; the go2rtc key it DOES send
+    /// still applies, and the legacy duplicate is still cleared.
+    #[test]
+    fn omitting_only_the_http_key_preserves_it() {
+        let (legacy, go2rtc, http) = resolve_frigate_bases(None, Some(GO2RTC), None, GO2RTC);
+        assert_eq!(legacy.as_deref(), Some(""));
+        assert_eq!(go2rtc.as_deref(), Some(GO2RTC));
+        assert_eq!(http, None);
+    }
+
+    /// A pre-0014 client sends ONLY the legacy key (no split keys at all). It
+    /// must still seed the go2rtc column, exactly as before.
+    #[test]
+    fn legacy_only_body_still_seeds_go2rtc_when_split_keys_are_absent() {
+        let (legacy, go2rtc, http) = resolve_frigate_bases(Some(GO2RTC), None, None, "");
+        assert_eq!(legacy.as_deref(), Some(GO2RTC));
+        assert_eq!(go2rtc.as_deref(), Some(GO2RTC));
+        assert_eq!(http, None, "the HTTP column is never seeded from legacy");
     }
 }
 

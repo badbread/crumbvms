@@ -973,16 +973,44 @@ pub struct ServerSettingsDto {
     pub tz: String,
 }
 
-/// `PUT /config/server` request body.
+/// `PUT /config/server` request body — a **merge**, not a whole-row replace.
 ///
-/// All fields are required. Pass empty strings to fall back to the container
-/// environment / internal docker service-name defaults.
+/// Every field is `Option<String>` with `#[serde(default)]`, and the two states
+/// mean different things (issue #472). This is the generalization of the rule
+/// `frigate_api_base` already had:
+///
+/// | Body | Meaning |
+/// |---|---|
+/// | key omitted (or `null`) ⇒ `None` | **leave the stored value alone** |
+/// | `"some value"` ⇒ `Some(v)` | set it (trimmed) |
+/// | `""` ⇒ `Some("")` | **clear** it, which means "fall back to the container env / internal docker service-name default" |
+///
+/// `Some("")` is a real, distinct state, not a synonym for omitted: the config
+/// precedence rule is that an admin-set DB value wins over the env default and
+/// an EMPTY DB value falls back to env, so clearing a field is how an operator
+/// returns it to the env default. Omitting it must not do that silently.
+///
+/// The whole-row bodies the console and first-run wizard send today are
+/// unaffected: every key is present, so every field is `Some(...)` and the write
+/// is byte-identical to the old behavior. The fix is for programmatic callers
+/// that send a partial body and previously had every unmentioned
+/// `#[serde(default)]` field silently reset.
 #[derive(Debug, Deserialize)]
 pub struct UpdateServerSettingsRequest {
-    pub server_address: String,
-    pub crumb_rtsp_base: String,
-    pub crumb_api_base: String,
-    pub frigate_rtsp_base: String,
+    /// Externally reachable address of this server (what clients are told to
+    /// use). Empty ⇒ derived/env default.
+    #[serde(default)]
+    pub server_address: Option<String>,
+    /// RTSP base for Crumb's own go2rtc restream. Empty ⇒ env.
+    #[serde(default)]
+    pub crumb_rtsp_base: Option<String>,
+    /// REST base for Crumb's own go2rtc (`http://go2rtc:1984` by default).
+    /// Empty ⇒ env. Never point this at the Crumb API itself.
+    #[serde(default)]
+    pub crumb_api_base: Option<String>,
+    /// RTSP base for an external Frigate's restream. Empty ⇒ env.
+    #[serde(default)]
+    pub frigate_rtsp_base: Option<String>,
     /// Legacy combined Frigate API base — DEPRECATED, do not send from new
     /// clients. Migration 0014 split it into `frigate_go2rtc_api_base` (:1984)
     /// and `frigate_http_api_base` (:5000) because one field could not mean
@@ -992,27 +1020,31 @@ pub struct UpdateServerSettingsRequest {
     /// `None` (key omitted, what current clients do) means "leave the stored
     /// legacy column alone" — a whole-row PUT from a new client must not wipe a
     /// value an old install still relies on. `Some("")` explicitly clears it.
+    /// This field is where the omitted-≠-cleared rule was first established;
+    /// every other field above now follows it.
     #[serde(default)]
     pub frigate_api_base: Option<String>,
     /// HTTP API base for the external Frigate go2rtc REST endpoint (:1984).
-    /// When omitted/empty the handler falls back to the legacy `frigate_api_base`.
+    /// `Some("")` (present but empty) still falls back to the legacy
+    /// `frigate_api_base` when the body supplies one, which is how a pre-0014
+    /// client seeds this column; `None` leaves the stored value alone.
     #[serde(default)]
-    pub frigate_go2rtc_api_base: String,
+    pub frigate_go2rtc_api_base: Option<String>,
     /// HTTP base for the Frigate HTTP event/snapshot API (:5000).
-    /// Empty ⇒ fall back to `frigate_config.api_base` / the `FRIGATE_API_BASE`
-    /// env at read time. Deliberately NOT seeded from the legacy field.
+    /// `Some("")` ⇒ fall back to `frigate_config.api_base` / the
+    /// `FRIGATE_API_BASE` env at read time. Deliberately NOT seeded from the
+    /// legacy field. `None` leaves the stored value alone.
     #[serde(default)]
-    pub frigate_http_api_base: String,
-    /// Motion-decode backend: `"auto"`/`"cuda"`/`"vaapi"`/`"cpu"`. Empty ⇒ the
-    /// recorder's `MOTION_HWACCEL` env default. `#[serde(default)]` only avoids a
-    /// deserialization error when the field is omitted — `PUT /config/server` is a
-    /// WHOLE-ROW replace, so the client must send a complete body (see admin.html's
-    /// stash pattern); the server does NOT merge omitted fields.
+    pub frigate_http_api_base: Option<String>,
+    /// Motion-decode backend: `"auto"`/`"cuda"`/`"vaapi"`/`"cpu"`.
+    /// `Some("")` ⇒ the recorder's `MOTION_HWACCEL` env default;
+    /// `None` ⇒ leave the stored value alone.
     #[serde(default)]
-    pub motion_hwaccel: String,
-    /// DRI render node for VAAPI decode (e.g. `/dev/dri/renderD128`). Empty ⇒ env.
+    pub motion_hwaccel: Option<String>,
+    /// DRI render node for VAAPI decode (e.g. `/dev/dri/renderD128`).
+    /// `Some("")` ⇒ env default; `None` ⇒ leave the stored value alone.
     #[serde(default)]
-    pub motion_vaapi_device: String,
+    pub motion_vaapi_device: Option<String>,
 }
 
 // ─── motion-decode truth (decode-status panel) ────────────────────────────────

@@ -772,8 +772,11 @@ code{background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:12px
 let TOKEN = localStorage.getItem('crumb_admin_token') || '';
 let CAMS = [], STORAGES = [], POLICIES = [], DEFAULT_POLICY = null, GROUPS = [], USERS = [], ROLES = [];
 /* Server settings last fetched, so the Detection & clips and Server panes can
-   each send a COMPLETE /config/server body (the PUT is a whole-row replace) while
-   editing only their own subset of columns. */
+   each send a COMPLETE /config/server body while editing only their own subset
+   of columns. The PUT now MERGES (an omitted key leaves the stored column alone,
+   issue #472), so the full-body stash is belt-and-braces rather than required —
+   it is kept as-is because it is the behavior these panes were written against
+   and a full body means the same thing under both semantics. */
 let DETECTION_SERVER = null;
 let SERVER_SETTINGS = null;
 /* Frigate integration settings last fetched by the Detection & clips pane, so
@@ -7361,11 +7364,12 @@ async function mirrorFrigateHttpToServerSettings(v) {
   body.frigate_http_api_base = v;
   DETECTION_SERVER = await api('/config/server', { method: 'PUT', body: JSON.stringify(body) }) || DETECTION_SERVER;
 }
-/* A COMPLETE /config/server body built from the fetched settings (the PUT is a
-   whole-row replace with required Crumb fields). The deprecated
-   `frigate_api_base` key is deliberately NOT sent: the server treats an omitted
-   key as "leave the stored legacy column alone", and sending the go2rtc base in
-   it is exactly what used to poison frigate_http_api_base. */
+/* A COMPLETE /config/server body built from the fetched settings. The PUT merges
+   (an omitted key leaves the stored column alone, issue #472), so this is no
+   longer strictly required — but a full body is unambiguous under both
+   semantics, so it stays. The deprecated `frigate_api_base` key is deliberately
+   NOT sent: an omitted key leaves the stored legacy column alone, and sending the
+   go2rtc base in it is exactly what used to poison frigate_http_api_base. */
 function detectionServerBody(s) {
   return {
     server_address:          s.server_address || '',
