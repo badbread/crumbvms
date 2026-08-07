@@ -725,6 +725,35 @@ Both raise the existing `storage_unwritable` system event.
   → retune `DANGLING_BREAKER_MIN_MISSING` / `DANGLING_BREAKER_MISSING_PCT`, which
   exist as constants for exactly that reason.
 
+**2026-08-07 follow-up — the recording-path marker is written post-commit, not at
+directory creation.** The v0.2.0 re-audit found that the recording path defeated
+its own layer-1 guard: `record_camera` called `ensure_storage_marker` right after
+`create_dir_all` succeeded, BEFORE any footage existed. On the exact failure this
+guard is for — a host reboot where the live disk fails to mount and Docker leaves
+an empty mountpoint directory — `create_dir_all` succeeds on that empty dir and
+the marker was planted there, a FALSE confirmation. The next reconcile pass saw
+`marker_ok` and pruned the (unmounted) real disk's whole segment index; only the
+layer-2 breaker bounded the loss, and only above its 100-row floor. The
+`seed_storage_markers` boot pass had never had this hole because it refuses to
+write a marker unless at least one INDEXED segment is actually present under the
+root. **Fix:** move the marker write into `index_segment`, firing only on a
+genuine commit — a real ≥floor segment fsync'd on disk AND a row in the index for
+it. That is the same "a real indexed segment is present under the root" signal the
+seed pass confirms on, so the two writers are now equally trustworthy. A healthy
+storage still gets its marker the moment it records its first segment (and the
+seed pass still heals pre-existing installs), so normal pruning is unchanged; a
+bare mountpoint the recorder writes into no longer earns a marker until footage is
+genuinely both on disk and indexed there. **Rejected** (again) the direct
+mountpoint / `st_dev` shape check for the recording path, for the same reasons this
+entry rejected it for reconcile: it is unreliable across bind mounts, overlayfs and
+network filesystems. "Confirm via a real indexed segment" reuses the mechanism
+already chosen here rather than adding a second, weaker signal. **Trade-off
+accepted:** the marker now appears a few seconds later (after the first indexed
+segment) than at directory creation — immaterial for a healthy install, and the
+right direction for safety. Guarded by
+`reconcile::tests::recording_path_marker_written_only_after_a_committed_segment`
+and `a_false_marker_below_the_breaker_floor_prunes_the_whole_small_index`.
+
 ---
 
 ## 2026-08-06, setup-env.sh fails the install when uid 1001 cannot write to the media dir (tiered probe, deferred exit)

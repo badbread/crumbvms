@@ -954,14 +954,18 @@ async fn run_ffmpeg_loop(
         return Err(anyhow::Error::from(e).context(format!("create_dir_all {camera_dir:?}")));
     }
 
-    // STORAGE MARKER (issue #504): we are about to write footage into this
-    // storage root, which is the strongest confirmation available that it is the
-    // real, mounted storage. Drop the marker reconcile's dangling-row guard keys
-    // off, so an unmounted disk (an empty mountpoint directory, which carries no
-    // marker) can never be mistaken for a disk whose footage was deleted and have
-    // its whole segment index pruned. Idempotent + best-effort: never rewrites an
-    // existing marker, and a failure only costs index PRUNING, never footage.
-    crate::reconcile::ensure_storage_marker(Path::new(&live_storage.path)).await;
+    // STORAGE MARKER (issue #504): the confirmation marker is NOT written here.
+    // `create_dir_all` succeeding proves only that SOME directory was writable —
+    // on a disk that failed to mount, Docker leaves an empty mountpoint directory
+    // and this spot would plant a FALSE `.crumb-storage` on it BEFORE any footage
+    // exists, defeating the guard in exactly the scenario it was built for: the
+    // next reconcile pass would then see a marker and prune the real (unmounted)
+    // disk's segment-index rows as "missing". The marker is instead written by
+    // `index_segment`, only AFTER a real ≥floor segment is fsync'd on disk AND
+    // committed to the index — the very "a real indexed segment is present under
+    // the root" signal the boot/heal pass (`seed_storage_markers`) confirms on,
+    // so the recording-path writer is exactly as trustworthy as the seed pass.
+    // See docs/RECORDER-CORRECTNESS.md item 34 and docs/DECISIONS.md (2026-08-07).
 
     // ── 2b. Motion-mode RAM cache dir (persist-on-motion) ──────────────────────
     //
@@ -2551,7 +2555,17 @@ fn decide_persist_for_segment(
 /// DO-NOTHING insert so an already-indexed segment at the same
 /// `(camera_id, stream, start_ts)` is never repointed/overwritten — used by the
 /// persist path when it detects a backward-clock filename collision.
-async fn index_segment(
+///
+/// On a genuine commit (a NEW row for the file we just fsync'd) this also drops
+/// the `<storage_root>/.crumb-storage` confirmation marker (issue #504). That is
+/// the correct, confirmable moment to write it — a real segment on disk that the
+/// index now knows about — rather than at directory-creation time, where a bare
+/// unmounted mountpoint would earn a false marker (see the note at the
+/// `create_dir_all` call site and docs/RECORDER-CORRECTNESS.md item 34).
+///
+/// `pub(crate)` so the reconcile marker-guard integration test can exercise the
+/// recording-path writer against the shared reconcile fixture.
+pub(crate) async fn index_segment(
     seg: &PendingSegment,
     camera: &Camera,
     storage_id: &uuid::Uuid,
@@ -2662,6 +2676,9 @@ async fn index_segment(
                     start_ts   = %seg.start_ts,
                     "segment indexed (clock-regression: non-colliding key)"
                 );
+                // A real segment is now on disk AND in the index under this root
+                // — confirm the storage (see the normal-path note below).
+                crate::reconcile::ensure_storage_marker(Path::new(storage_root)).await;
                 true
             }
             Ok(None) => {
@@ -2697,6 +2714,16 @@ async fn index_segment(
                 has_motion = has_motion,
                 "segment indexed"
             );
+            // STORAGE MARKER (issue #504 / 2026-08-07 follow-up): a row is now
+            // committed for a real ≥floor file we just fsync'd under this root —
+            // the strongest "this is the real, mounted storage" signal available,
+            // and exactly the condition `seed_storage_markers` confirms on. Writing
+            // it HERE (not at directory creation) means a bare, unmounted mountpoint
+            // the recorder never actually indexed footage on never earns a false
+            // marker that would let reconcile prune the real disk's index rows.
+            // Idempotent + best-effort: never rewrites an existing marker, and a
+            // failure only costs index PRUNING, never footage.
+            crate::reconcile::ensure_storage_marker(Path::new(storage_root)).await;
             true
         }
         Err(e) => {
