@@ -240,6 +240,10 @@ fun LiveScreen(
                     // Refresh on a CHANGE only (skip the first observation so opening the
                     // screen doesn't double-load). vm.refresh() re-resolves all streams.
                     if (cv.isNotEmpty() && lastConfigVersion != null && cv != lastConfigVersion) {
+                        // A server-side camera edit may have changed the codec, so
+                        // drop the session's per-camera stream-fallback verdicts and
+                        // let every tile re-walk its ladder from the top (#524).
+                        LiveStreamFallbackMemory.clearAll()
                         vm.refresh()
                     }
                     if (cv.isNotEmpty()) lastConfigVersion = cv
