@@ -2,6 +2,7 @@
 
 package video.crumb.app.feature.plates
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -11,6 +12,10 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.pdf.PdfDocument
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import androidx.annotation.RequiresApi
 import androidx.core.content.FileProvider
 import coil.ImageLoader
 import coil.request.CachePolicy
@@ -23,6 +28,7 @@ import video.crumb.app.data.PlateRead
 import video.crumb.app.data.PlateWatchlistEntry
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -55,9 +61,12 @@ import kotlin.math.roundToInt
  * with `allowHardware(false)` so we get a software bitmap to draw.
  *
  * The finished PDF is written to the app-private `reports/` cache subdir (exposed
- * by `res/xml/file_paths.xml`) so [sharePlatesPdf] can hand it to the system
- * share sheet via a scoped `content://` FileProvider Uri — never a token-bearing
- * URL (same posture as the Export share path).
+ * by `res/xml/file_paths.xml`). From there the operator is offered three
+ * deliveries: [openPlatesPdf] (view it now in the device PDF viewer),
+ * [savePlateReportToDownloads] (a durable copy in the public Downloads folder,
+ * findable in the Files app), and [sharePlatesPdf] (the system share sheet). The
+ * open/share paths hand out a scoped `content://` FileProvider Uri — never a
+ * `file://` Uri or a token-bearing URL (same posture as the Export screen).
  */
 
 /** A4 portrait at 72 dpi (points). */
@@ -183,10 +192,8 @@ suspend fun generatePlateReportPdf(
             val dir = File(context.cacheDir, REPORTS_CACHE_SUBDIR).apply { mkdirs() }
             val stamp = android.text.format.DateFormat
                 .format("yyyyMMdd_HHmmss", System.currentTimeMillis())
-            val plateSlug = read.plate.ifBlank { "plate" }
-                .filter { it.isLetterOrDigit() }
-                .ifBlank { "plate" }
-            val file = File(dir, "crumb-plate-$plateSlug-$stamp.pdf")
+                .toString()
+            val file = File(dir, plateReportFileName(read.plate, stamp))
             FileOutputStream(file).use { out -> doc.writeTo(out) }
             file
         } finally {
@@ -773,6 +780,166 @@ internal fun acceptedMisreadExamples(plate: String, allowed: Int): List<String> 
         }
     }
     return out
+}
+
+// ─── report filenames (pure, unit-testable) ──────────────────────────────────
+
+/**
+ * Sanitize a plate string into a filesystem-safe slug for report filenames:
+ * ASCII letters/digits only (drops spaces, punctuation, and any non-alphanumeric
+ * characters that could break a path or MediaStore display name), falling back to
+ * `"plate"` when the plate is blank or has no usable characters (older reads / a
+ * no-text detection). Pure so it can be unit-tested without a device.
+ */
+internal fun sanitizePlateForFilename(plate: String): String =
+    plate.filter { it.isLetterOrDigit() }.ifBlank { "plate" }
+
+/**
+ * Assemble the report's on-disk filename: `crumb-plate-<slug>-<stamp>.pdf`, where
+ * [stamp] is a caller-formatted timestamp (e.g. `yyyyMMdd_HHmmss`) that makes
+ * repeated exports collision-safe. Kept pure (the timestamp is passed in, not read
+ * from the clock) so the naming is unit-testable. Used both for the cache copy the
+ * report is rendered into and, reused verbatim, for the Downloads copy.
+ */
+internal fun plateReportFileName(plate: String, stamp: String): String =
+    "crumb-plate-${sanitizePlateForFilename(plate)}-$stamp.pdf"
+
+// ─── delivery: open / save / share ────────────────────────────────────────────
+
+/** Sub-folder created under the device Downloads dir for saved plate reports —
+ *  same convention as the Export screen's Downloads save (`ExportScreen.kt`). */
+private const val REPORT_DOWNLOAD_SUBDIR = "CrumbVMS"
+
+/**
+ * Open a generated report PDF in the device's default PDF viewer via
+ * `ACTION_VIEW`, using the SAME scoped `content://` FileProvider Uri as the share
+ * path (read permission granted to the viewer only, for this file only — never a
+ * `file://` Uri, and never a token-bearing URL). This is the "I just want to view
+ * it on my phone" path.
+ *
+ * Returns `true` when a viewer was launched, `false` when no app can view a PDF
+ * (`ActivityNotFoundException`) so the caller can surface a clear "no PDF viewer
+ * installed" message instead of crashing on a minimal device with no PDF app.
+ */
+fun openPlatesPdf(context: Context, file: File): Boolean =
+    try {
+        val authority = "${context.packageName}.fileprovider"
+        val uri = FileProvider.getUriForFile(context, authority, file)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/pdf")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(intent)
+        true
+    } catch (e: android.content.ActivityNotFoundException) {
+        false
+    }
+
+/**
+ * Save a durable copy of a generated report PDF to the device's **public
+ * Downloads** collection so the operator can find it in the Files app (unlike the
+ * app-private cache the report is rendered into, which is invisible to Files and
+ * is pruned by [video.crumb.app.data.CacheJanitor]). Mirrors the Export screen's
+ * Downloads save exactly:
+ * - API 29+ (scoped storage): inserts into [MediaStore.Downloads] under
+ *   `Downloads/CrumbVMS/`, `IS_PENDING` until the copy finishes. **No storage
+ *   permission required** — this is the path a modern phone (e.g. a Galaxy S24 on
+ *   API 34) takes.
+ * - API ≤ 28: writes to the public Downloads dir directly, which needs the legacy
+ *   `WRITE_EXTERNAL_STORAGE` permission already declared (`maxSdkVersion=28`). If
+ *   that isn't granted the copy throws and surfaces as a normal save failure.
+ *
+ * Reuses the cache file's already-collision-safe name (`crumb-plate-…-<stamp>.pdf`)
+ * so the saved copy matches; MediaStore additionally de-dupes a colliding display
+ * name, and the legacy path guards with [uniqueLegacyFile]. Returns the
+ * user-visible saved location on success. Runs off the main thread.
+ */
+suspend fun savePlateReportToDownloads(context: Context, file: File): Result<String> =
+    withContext(Dispatchers.IO) {
+        runCatching {
+            val fileName = file.name
+            file.inputStream().use { input ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    writeReportToMediaStoreDownloads(context, fileName, input)
+                } else {
+                    writeReportToLegacyDownloads(fileName, input)
+                }
+            }
+        }
+    }
+
+/**
+ * API 29+ path: stream [input] into a new [MediaStore.Downloads] entry under
+ * `Downloads/CrumbVMS/`. Uses `IS_PENDING` so the file isn't visible to other apps
+ * until the copy completes, and rolls the entry back if the copy fails so no
+ * 0-byte ghost is left behind. Returns the user-visible location. (Same shape as
+ * `ExportScreen.writeToMediaStoreDownloads`, with a PDF mime type.)
+ */
+@RequiresApi(Build.VERSION_CODES.Q)
+private fun writeReportToMediaStoreDownloads(
+    context: Context,
+    fileName: String,
+    input: InputStream,
+): String {
+    val resolver = context.contentResolver
+    val values = ContentValues().apply {
+        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+        put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+        put(
+            MediaStore.Downloads.RELATIVE_PATH,
+            Environment.DIRECTORY_DOWNLOADS + "/" + REPORT_DOWNLOAD_SUBDIR,
+        )
+        put(MediaStore.Downloads.IS_PENDING, 1)
+    }
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        ?: error("Could not create a Downloads entry")
+    try {
+        resolver.openOutputStream(uri)?.use { out -> input.copyTo(out) }
+            ?: error("Could not open the Downloads output stream")
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    } catch (t: Throwable) {
+        runCatching { resolver.delete(uri, null, null) }
+        throw t
+    }
+    return "Downloads/$REPORT_DOWNLOAD_SUBDIR/$fileName"
+}
+
+/**
+ * API ≤ 28 path: write [input] to the public Downloads dir directly (needs the
+ * legacy `WRITE_EXTERNAL_STORAGE` permission declared for `maxSdkVersion=28`).
+ * Guards against clobbering an existing file with [uniqueLegacyFile]. Returns the
+ * user-visible location.
+ */
+@Suppress("DEPRECATION")
+private fun writeReportToLegacyDownloads(fileName: String, input: InputStream): String {
+    val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+    val dir = File(downloads, REPORT_DOWNLOAD_SUBDIR).apply { mkdirs() }
+    val dest = uniqueLegacyFile(dir, fileName)
+    dest.outputStream().use { out -> input.copyTo(out) }
+    return "Downloads/$REPORT_DOWNLOAD_SUBDIR/${dest.name}"
+}
+
+/**
+ * Resolve a non-colliding [File] in [dir] for [fileName]: returns it as-is if free,
+ * else inserts a ` (1)`, ` (2)`, … suffix before the extension (the same disambig
+ * scheme MediaStore uses on API 29+, applied by hand for the legacy path so a
+ * repeated save never silently overwrites an earlier report). Pure given the
+ * filesystem state, so it's unit-testable against a temp dir.
+ */
+internal fun uniqueLegacyFile(dir: File, fileName: String): File {
+    val first = File(dir, fileName)
+    if (!first.exists()) return first
+    val dot = fileName.lastIndexOf('.')
+    val base = if (dot > 0) fileName.substring(0, dot) else fileName
+    val ext = if (dot > 0) fileName.substring(dot) else ""
+    var n = 1
+    while (true) {
+        val candidate = File(dir, "$base ($n)$ext")
+        if (!candidate.exists()) return candidate
+        n++
+    }
 }
 
 // ─── share ──────────────────────────────────────────────────────────────────
