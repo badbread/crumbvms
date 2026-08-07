@@ -3037,22 +3037,37 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                   // paint the wall tile's still-live video (if we got one) in
                   // its place — never a black pane while mpv waits for a
                   // keyframe. Errors still show the camera-off icon.
+                  //
+                  // The spinner/warm-frame branch keeps the right-click menu
+                  // reachable: after a stream-quality switch (e.g. Data
+                  // saver's on-demand transcode spinning up) the pane sits in
+                  // this branch for a few seconds, and without a gesture
+                  // handler the user couldn't open the menu to switch back.
+                  // Menu actions don't need a live controller.
                   child: _controller == null || !_firstFrame
-                      ? (_error != null
-                            ? Center(
-                                child: Icon(
-                                  Icons.videocam_off,
-                                  color: Colors.red.shade300,
-                                  size: 40,
+                      ? GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onDoubleTap: widget.onClose,
+                          onSecondaryTapDown: (d) =>
+                              _showMaximizedMenu(d.globalPosition),
+                          child: _error != null
+                              ? Center(
+                                  child: Icon(
+                                    Icons.videocam_off,
+                                    color: Colors.red.shade300,
+                                    size: 40,
+                                  ),
+                                )
+                              : widget.warmController != null
+                              ? Video(
+                                  controller: widget.warmController!,
+                                  controls: NoVideoControls,
+                                  fit: BoxFit.contain,
+                                )
+                              : const Center(
+                                  child: CircularProgressIndicator(),
                                 ),
-                              )
-                            : widget.warmController != null
-                            ? Video(
-                                controller: widget.warmController!,
-                                controls: NoVideoControls,
-                                fit: BoxFit.contain,
-                              )
-                            : const Center(child: CircularProgressIndicator()))
+                        )
                       : Listener(
                           onPointerDown: (e) {
                             // Mouse "back" button returns to the wall.
