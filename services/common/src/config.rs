@@ -117,9 +117,11 @@ pub struct Config {
     ///
     /// Accepted values: `cuda` (NVDEC via ffmpeg `-hwaccel cuda`), `vaapi`
     /// (Intel/AMD iGPU via ffmpeg `-hwaccel vaapi`), `cpu` (software decode), or
-    /// `auto` (probe at startup — uses NVDEC when available, otherwise CPU).
+    /// `auto` (probe at startup — uses NVDEC only when a cuda hardware device
+    /// can actually be INITIALISED in this container, otherwise CPU; see
+    /// [`HwAccel::resolve_auto`]).
     ///
-    /// Default: `auto`.
+    /// Default: `cpu`.
     pub motion_hwaccel: HwAccel,
 
     /// `MOTION_VAAPI_DEVICE` — DRI render node used for VAAPI decode when
@@ -236,10 +238,18 @@ pub enum HwAccel {
     Vaapi,
     /// Software (CPU) decode.
     Cpu,
-    /// Probe at startup: use NVDEC when [`nvdec_available`] returns `true`,
-    /// otherwise fall back to CPU.  This is the default and the correct choice
-    /// for distributable deployments where GPU presence is unknown at image-build
-    /// time.
+    /// Probe at startup: use NVDEC only when a cuda hardware device can actually
+    /// be created in this container, otherwise fall back to CPU. The correct
+    /// choice for distributable deployments where GPU presence is unknown at
+    /// image-build time.
+    ///
+    /// **The probe must be a RUNTIME one** (issue #479). [`nvdec_available`]
+    /// answers "was cuda compiled into this ffmpeg", which is `true` on every
+    /// host running the bundled image — resolving `Auto` with it selected cuda
+    /// on GPU-less hosts, every motion ffmpeg exited immediately, and the
+    /// reconnect watchdog re-launched the same failing flags forever. The
+    /// recorder resolves `Auto` through [`HwAccel::resolve_auto`] fed by an
+    /// `-init_hw_device cuda` probe instead.
     Auto,
 }
 
@@ -294,10 +304,37 @@ impl HwAccel {
     pub fn from_setting(s: &str, default: Self) -> Self {
         Self::from_str(s).unwrap_or(default)
     }
+
+    /// Resolve [`HwAccel::Auto`] into a concrete backend against a **runtime**
+    /// cuda-device probe. Every other variant is an explicit operator choice and
+    /// passes through untouched (the per-camera runtime fallback in the recorder
+    /// is what protects an explicit `cuda`/`vaapi` that cannot decode).
+    ///
+    /// `cuda_runtime_ok` must mean "an ffmpeg cuda hardware device was actually
+    /// created here", not "cuda appears in `ffmpeg -hwaccels`" — see
+    /// [`HwAccel::Auto`] and [`nvdec_available`] (issue #479).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crumb_common::config::HwAccel;
+    /// // ffmpeg has cuda compiled in, but this host has no usable device:
+    /// assert_eq!(HwAccel::Auto.resolve_auto(false), HwAccel::Cpu);
+    /// assert_eq!(HwAccel::Auto.resolve_auto(true), HwAccel::Cuda);
+    /// // An explicit request is never rewritten by the probe.
+    /// assert_eq!(HwAccel::Cuda.resolve_auto(false), HwAccel::Cuda);
+    /// ```
+    #[must_use]
+    pub fn resolve_auto(self, cuda_runtime_ok: bool) -> Self {
+        match self {
+            Self::Auto if cuda_runtime_ok => Self::Cuda,
+            Self::Auto => Self::Cpu,
+            other => other,
+        }
+    }
 }
 
-/// Probe whether NVDEC (cuda hwaccel) is actually usable in THIS
-/// process/container.
+/// Probe whether this ffmpeg build was **compiled with** the cuda hwaccel.
 ///
 /// Runs `ffmpeg -hide_banner -hwaccels` and checks whether the output contains
 /// the string `cuda`.  The result is cached in a [`OnceLock`] so repeated calls
@@ -308,21 +345,23 @@ impl HwAccel {
 /// - the process exits with a non-zero status,
 /// - the output does not mention `cuda`.
 ///
-/// The cheap `-hwaccels` probe reports *built-in* support rather than *runtime*
-/// usability (a host can list cuda but lack the driver/device).  A false-positive
-/// causes motion to attempt cuda; the per-camera ffmpeg will then fail and the
-/// existing NVDEC semaphore/EOF watchdog recovers to CPU.  See Risk R5 in the
-/// distributability spec; escalate to the `-init_hw_device cuda` probe only if
-/// false-positives are observed.
+/// **This is a BUILD-time capability check, not a runtime one** — a host can
+/// list cuda and still have no driver or device behind it, and the bundled
+/// image lists cuda on every host. It therefore MUST NOT be used to decide
+/// [`HwAccel::Auto`] (issue #479: it selected cuda on GPU-less hosts and motion
+/// stayed dead through every reconnect). The recorder resolves `Auto` from an
+/// `-init_hw_device cuda` probe via [`HwAccel::resolve_auto`]; what remains
+/// useful here is explaining an explicit `MOTION_HWACCEL=cuda` on a build that
+/// has no cuda at all.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use crumb_common::config::nvdec_available;
 /// if nvdec_available() {
-///     println!("NVDEC is available; using cuda hwaccel");
+///     println!("this ffmpeg has cuda compiled in");
 /// } else {
-///     println!("No NVDEC; using CPU decode");
+///     println!("this ffmpeg cannot do cuda at all");
 /// }
 /// ```
 pub fn nvdec_available() -> bool {
@@ -389,8 +428,10 @@ impl Config {
         // change, reaches this default instead, and "auto" on a GPU-less host is
         // the broken path (motion dies, the recorder falls back to continuous
         // recording, retention pressure follows). "cuda"/"vaapi" enable a GPU
-        // explicitly (see the compose overlays); "auto" probes for NVDEC and stays
-        // opt-in until its probe is made robust (#479).
+        // explicitly (see the compose overlays); "auto" now probes for a REAL
+        // cuda device (`-init_hw_device cuda`, #479) and resolves to cpu when
+        // there isn't one, so an upgraded install whose .env still pins
+        // MOTION_HWACCEL=auto lands on working software decode.
         let hwaccel_str = optional_env("MOTION_HWACCEL", "cpu");
         let motion_hwaccel = HwAccel::from_str(&hwaccel_str).with_context(|| {
             format!("MOTION_HWACCEL must be 'cuda', 'vaapi', 'cpu', or 'auto', got '{hwaccel_str}'")
@@ -593,7 +634,56 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{go2rtc_rtsp_auth_enabled, optional_env, parse_env, parse_tz_env};
+    use super::{go2rtc_rtsp_auth_enabled, optional_env, parse_env, parse_tz_env, HwAccel};
+
+    /// Issue #479 — THE DEFECT. `auto` used to resolve through
+    /// `nvdec_available()`, i.e. "is cuda COMPILED into this ffmpeg", which is
+    /// true on every host running the bundled image. On a host with no NVIDIA
+    /// device that selected cuda, every motion ffmpeg exited immediately, and
+    /// the reconnect watchdog relaunched the same failing flags forever.
+    ///
+    /// `resolve_auto` takes the RUNTIME probe result instead: cuda only when a
+    /// hardware device was actually created.
+    #[test]
+    fn auto_resolves_to_cpu_when_no_runtime_cuda_device() {
+        assert_eq!(
+            HwAccel::Auto.resolve_auto(false),
+            HwAccel::Cpu,
+            "auto on a deviceless host MUST resolve to cpu, whatever ffmpeg was compiled with"
+        );
+        assert_eq!(
+            HwAccel::Auto.resolve_auto(true),
+            HwAccel::Cuda,
+            "auto on a host with a usable cuda device keeps NVDEC"
+        );
+    }
+
+    /// `resolve_auto` only ever rewrites `Auto`. An explicit operator choice is
+    /// left alone (the per-camera runtime fallback in the recorder is what
+    /// rescues an explicit `cuda`/`vaapi` that cannot decode), and `cpu` is
+    /// never "upgraded" to a GPU behind the operator's back.
+    #[test]
+    fn resolve_auto_leaves_explicit_choices_untouched() {
+        for probe in [false, true] {
+            assert_eq!(HwAccel::Cuda.resolve_auto(probe), HwAccel::Cuda);
+            assert_eq!(HwAccel::Vaapi.resolve_auto(probe), HwAccel::Vaapi);
+            assert_eq!(HwAccel::Cpu.resolve_auto(probe), HwAccel::Cpu);
+        }
+    }
+
+    /// The admin-editable DB setting round-trips through the same tokens, and an
+    /// empty/garbage value inherits the env default — `auto` included, so the
+    /// upgrade path in #479 (a pinned `MOTION_HWACCEL=auto`) is exercised.
+    #[test]
+    fn from_setting_round_trips_auto() {
+        assert_eq!(HwAccel::from_setting("auto", HwAccel::Cpu), HwAccel::Auto);
+        assert_eq!(HwAccel::from_setting("", HwAccel::Auto), HwAccel::Auto);
+        assert_eq!(
+            HwAccel::from_setting("nonsense", HwAccel::Auto),
+            HwAccel::Auto
+        );
+        assert_eq!(HwAccel::Auto.as_str(), "auto");
+    }
 
     /// Issue #398 — secure by default: auth is ON for every input except the
     /// explicit `off` token. Unset, empty, and unrecognized values MUST all keep

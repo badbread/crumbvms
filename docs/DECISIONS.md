@@ -63,6 +63,96 @@ become configuration.
 
 ---
 
+## 2026-08-06, `MOTION_HWACCEL=auto` is decided by a RUNTIME device probe, and a hardware backend that cannot decode is latched off per camera
+
+**Context.** Issue #479, found by the v0.1.1 → v0.2.0 upgrade test. `auto`
+resolved through `nvdec_available()`, which runs `ffmpeg -hwaccels` and looks for
+`cuda` — a **build**-time capability. The bundled ffmpeg has cuda compiled in on
+every host, so `auto` selected cuda on a machine with no NVIDIA device at all.
+Each per-camera motion ffmpeg then died before its first frame (`Cannot load
+libcuda.so.1` / `Device creation failed`), the EOF/reconnect watchdog relaunched
+it with the same flags, and motion detection stayed down forever. Fail-open did
+its job — every camera recorded continuously — so nothing was lost, but a Motion
+policy silently behaved like Continuous and storage filled at the Continuous
+rate. #513 changed the shipped default to `cpu`, which protects fresh installs
+only: an upgrader's generated `.env` pins `MOTION_HWACCEL=auto` explicitly, so
+`auto` itself had to start working.
+
+**Decision.**
+
+- **Resolve `auto` from a runtime probe.** `decode_probe::cuda_runtime_available()`
+  runs `ffmpeg -init_hw_device cuda=… -f lavfi -i nullsrc -frames:v 1 -f null -`
+  once per process (cached, 15 s deadline) and only reports true when ffmpeg
+  actually created the device. `HwAccel::resolve_auto` (pure, in `common`) maps
+  the result to `Cuda`/`Cpu`; every explicit choice passes through untouched.
+  Spawn failure, non-zero exit, and timeout all resolve to `cpu` — the backend
+  that works everywhere.
+- **Latch a failing accelerator off, per camera, for the worker's life.** After a
+  motion ffmpeg that was launched with cuda/vaapi exits having decoded zero
+  frames, the camera is demoted to CPU decode when either ffmpeg logged a
+  recognised hardware-init failure (immediately — the signature is unambiguous)
+  or three consecutive attempts decoded nothing. The latch lives in
+  `run_one_source`, so it survives the reconnect back-off that was re-arming the
+  failure; a recorder restart, a camera-config change, or a supervisor respawn
+  all give the hardware another try.
+- **Name the cause on the existing surfaces**, following the 2026-08-04 (#523)
+  pattern rather than adding a channel: the demotion reason becomes
+  `decode_status.fallback_reason` and is recorded on the source's
+  `UnhealthyAlertGate` so `fail_open_reason` prefers it over the generic "not
+  delivering frames". Because a source that is broken from its first connection
+  never transitions, the health aggregator now also re-persists
+  `motion_health_reason` when the cause changes **within** an unhealthy episode
+  (one write per distinct cause), instead of pinning the vaguest wording the run
+  will ever produce.
+
+**Rejected:**
+
+- **Glob `/dev/nvidia*` and call that the probe.** Cheap and no spawn, but it
+  answers a different question: nodes can be present while the driver libraries
+  are missing (the classic post-driver-upgrade state), and a future container
+  runtime could expose the device another way. It stays in the log line for
+  context, not in the decision.
+- **Keep the build-time probe and rely on the per-camera fallback alone.** It
+  would work, but it spends a failed decode (and a fail-open window) on every
+  camera on every restart to rediscover a fact one process-wide probe answers in
+  milliseconds.
+- **Retry the accelerator periodically after demotion.** A GPU cannot appear in a
+  running container (Docker never grants a live container new devices), so the
+  retry could only re-break motion on a schedule. Recovery is deliberately tied
+  to an event that CAN change the answer: a restart.
+- **Demote globally on the first camera's failure.** Faster to converge, but it
+  lets one camera's stream quirk cost every other camera its GPU offload. Per
+  camera keeps the blast radius at the evidence.
+- **Count stall-watchdog timeouts as hardware failures too.** A stalled child is
+  alive and producing nothing, which is a stream fault the existing watchdogs
+  own; the hardware verdict is scoped to attempts where the decoder actually
+  exited.
+- **Thread the reason through the fail-open `watch<bool>`.** Same rejection as
+  #523: that channel is a correctness rail, not a telemetry bus.
+
+**Trades knowingly accepted:**
+
+- One extra ffmpeg spawn per recorder process when `auto` is set (only then).
+- The unsignatured arm can demote a camera that was merely offline for three
+  reconnects. Harmless — CPU decode works for every stream — and it costs the
+  hardware offload only until the worker restarts. The alternative (never
+  demoting without a known signature) leaves an unrecognised failure mode
+  looping forever, which is the bug.
+- The latch is in-memory, so a restart re-tries a still-broken accelerator and
+  re-learns the same thing. Same trade the `camera_offline` latch makes.
+
+**Revisit triggers:**
+
+- A container runtime that can hot-add a GPU to a running container ⇒ revisit
+  the "never retry after demotion" half.
+- A hardware failure mode that produces frames but garbage (the latch keys on
+  ZERO frames, so it would not fire) ⇒ needs a different detector, not a bigger
+  threshold.
+- `auto` becoming the shipped default again ⇒ re-run the GPU-less upgrade test
+  first; the probe is what makes that safe.
+
+---
+
 ## 2026-08-06, Android walks a reactive fallback LADDER down to the server transcode; it does not ask the server what codec a stream is
 
 **Context.** Media3's RTSP stack cannot bring up H.265: the stream either errors
