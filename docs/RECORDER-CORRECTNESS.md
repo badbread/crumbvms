@@ -253,3 +253,49 @@ recorder, and later the API) must satisfy these *by construction*.
     precede every reconcile mutation and every live-path index insert**, and
     live as shared constants — never two drifting copies. Any new
     reconcile/adoption path must route through the same gates.
+
+## the segment index is footage metadata, and it is not reconstructible
+34. **Reconcile may not prune a storage's segment index until it has CONFIRMED
+    that storage, and a mass-missing pass halts itself.** "The file is missing"
+    is only evidence that the row is a lie if we are looking at the right
+    disk. A storage root that is PRESENT but EMPTY — an fstab `noauto` disk
+    that never mounted, a dropped network mount, a bind source Docker
+    auto-created after a host path moved — makes EVERY row on that storage look
+    dangling, and the unguarded pass deleted the whole index in one sweep
+    (issue #504). The bytes survive; `has_motion`, motion bboxes, stage/stream
+    labels, durations and clip/bookmark linkage do not, and re-adoption after a
+    remount is rate-limited and comes back with `has_motion = false` and no
+    bbox. Note the orphan pass's `metadata(storage_root).is_err()` check does
+    NOT cover this: the root stats fine, it is just empty. Two independent
+    layers, both failing toward skip-and-alarm, never toward delete:
+
+    - **Marker.** The recorder writes `<storage_root>/.crumb-storage` when it
+      can positively confirm a storage — from the recording path at the moment
+      it is about to write footage there, and from a boot/heal pass that
+      requires at least one of the storage's newest INDEXED segment files to
+      really be present under the root. It is never invented for a root that
+      holds none of its indexed segments (the unmounted shape), nor for a
+      storage with no indexed segments at all (indistinguishable from an empty
+      foreign directory). The dangling pass deletes NOTHING on a storage whose
+      marker is absent. The marker rides on the storage, so an unmounted disk
+      cannot present one.
+    - **Circuit breaker.** Even with a marker (stale marker, repointed path),
+      deletions for a storage stop once more than `DANGLING_BREAKER_MIN_MISSING`
+      (100) of its rows AND more than `DANGLING_BREAKER_MISSING_PCT` (50 %) of
+      its checked rows are missing in one pass. It is evaluated BEFORE every
+      delete, so the loss is bounded at 100 rows per storage, and the trip
+      latches for the process lifetime (a timer-driven reconcile would otherwise
+      drain the index 100 rows per pass). Both conditions must hold, so a small
+      storage an operator emptied, or a large one mid-eviction, still prunes
+      exactly as before.
+
+    Both raise the existing `storage_unwritable` system event so the condition
+    is loud rather than silent. Consequence to accept: a disk whose footage was
+    genuinely deleted wholesale stops being pruned until an operator re-creates
+    the marker file (an empty file is enough) — stale rows are visible and
+    fixable, a deleted index is neither. Guarded by
+    `reconcile::tests::dangling_pass_skips_storage_without_marker`,
+    `dangling_breaker_bounds_deletions_on_mass_missing`,
+    `dangling_pass_deletes_genuine_dangling_rows_on_a_confirmed_storage` and
+    `storage_marker_is_seeded_only_when_the_storage_is_confirmable`. See
+    `docs/DECISIONS.md` (2026-08-06) for the rejected mountpoint heuristics.

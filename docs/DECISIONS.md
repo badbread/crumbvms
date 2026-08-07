@@ -8,6 +8,101 @@ revisit.
 
 ---
 
+## 2026-08-06, Unmounted-storage guard: a marker FILE plus a circuit breaker, not a mountpoint heuristic
+
+**Context.** Reconcile's dangling-row pass stats `storage.path / seg.path` for
+every indexed segment and deletes the row when the file is missing. Nothing
+checked that the storage root was the real storage. A root that is PRESENT but
+EMPTY — an fstab `noauto` disk that never mounted, a dropped network mount, a
+Docker bind source Docker auto-created after a host path moved — makes every row
+on that storage look dangling, so ONE pass deletes that storage's entire segment
+index (issue #504). The footage bytes survive, but everything only the index
+carries does not: `has_motion`, motion bounding boxes, stage and stream labels,
+durations, clip and bookmark linkage. Re-adoption after a remount is
+rate-limited and re-adopts with `has_motion = false` and no bbox, so the motion
+history is gone for good. The orphan pass already had a root-exists guard; the
+dangling pass had none, and that guard cannot see this case anyway because the
+root does stat fine.
+
+**Decision.** Two independent layers in `services/recorder/src/reconcile.rs`,
+both failing toward "skip and alarm", never toward delete:
+
+1. **A marker file, `<storage_root>/.crumb-storage`.** The dangling pass deletes
+   nothing on a storage whose marker is absent. The marker rides ON the storage,
+   so an unmounted disk (a bare mountpoint directory) simply does not have one —
+   which is exactly the distinction a "does the root exist?" check cannot make.
+   It is written only on positive confirmation: by the recording path the moment
+   the recorder is about to write footage into that root
+   (`ensure_storage_marker`), and by a boot/heal pass that requires at least one
+   of the storage's newest indexed segment files to actually be present
+   (`seed_storage_markers`). A storage with no indexed segments at all is
+   indistinguishable from an empty foreign directory and gets no marker from
+   reconcile; the recorder writes it when it records there.
+2. **A per-storage circuit breaker.** Even with a marker present (a stale marker,
+   a repointed path), deletions halt for a storage once more than 100 of its rows
+   AND more than 50 % of its checked rows come back missing in one pass. It is
+   evaluated before every delete, so a mass-missing event costs at most 100 rows
+   per storage, and the trip LATCHES for the process — otherwise a timer-driven
+   reconcile would simply drain the index 100 rows per pass. Both thresholds must
+   be exceeded, so neither a small storage an operator emptied nor a large one
+   mid-eviction can trip it.
+
+Both raise the existing `storage_unwritable` system event.
+
+**Rejected:**
+
+- **Mountpoint-only heuristics** (compare `st_dev` of the root against its
+  parent, parse `/proc/self/mountinfo`, or require the root to be a mount
+  point). Too weak in both directions: a perfectly valid storage is very often
+  NOT its own mount point (a subdirectory of one big data disk, the default
+  compose layout's `/data/live` and `/data/archive`), so this would refuse to
+  prune on healthy installs; and a mount that succeeded onto the WRONG device,
+  or a bind mount of an empty directory, passes the check while being exactly
+  the failure we are guarding against. It also does not survive containers,
+  overlayfs, or network filesystems predictably. A marker written by the
+  recorder answers the question that actually matters — "is this the storage I
+  have been writing to?" — instead of a proxy for it.
+- **A count-based-only guard (breaker without the marker).** Bounds the damage
+  but does not prevent it: a genuinely unmounted disk would still lose up to 100
+  rows per storage, and the first 100 rows of an index are just as unrecoverable
+  as the rest. The marker makes the common case cost zero rows.
+- **A DB-side "storage last seen healthy" timestamp instead of a file.** Lives in
+  the wrong place: the whole question is whether the FILESYSTEM in front of us is
+  the one the index describes, and only something stored on that filesystem can
+  answer it. A DB flag would happily say "healthy" about a disk that is no longer
+  there.
+- **Refusing to prune whenever ANY row on a storage is missing.** Safe, but it
+  turns off dangling-row cleanup permanently on any real install (retention,
+  crashes, and operator deletions produce dangling rows continuously), letting
+  the index rot instead.
+
+**Trades knowingly accepted:**
+
+- A storage whose footage an operator genuinely deleted wholesale, on a disk with
+  no marker, stops being pruned: its stale rows survive and it alarms until the
+  operator re-creates `.crumb-storage` (an empty file is enough; the marker body
+  says so). Stale rows are a visible, fixable annoyance; a deleted index is not.
+- A latched breaker keeps pruning off for that storage until the recorder
+  restarts, so a genuine mass deletion needs a restart to be cleaned up.
+- One extra dotfile per storage root, and one indexed sample query per storage
+  per pass until its marker exists.
+
+**Revisit triggers:**
+
+- Operators hitting the "I really did delete everything" case often enough that
+  re-creating the marker becomes a support burden → add an explicit admin action
+  ("this disk is empty on purpose, re-mark it") instead of documenting a `touch`.
+- A storage backend where the recorder cannot write a dotfile into the root (a
+  read-only mount used as archive-only storage that another process fills) →
+  the marker would have to be seeded from the API side, or the confirmation rule
+  relaxed to "any indexed segment present" without a marker.
+- Evidence that 100 rows / 50 % is the wrong shape (e.g. a real deployment where
+  a single pass legitimately sees a majority of one storage's rows disappear)
+  → retune `DANGLING_BREAKER_MIN_MISSING` / `DANGLING_BREAKER_MISSING_PCT`, which
+  exist as constants for exactly that reason.
+
+---
+
 ## 2026-08-06, setup-env.sh fails the install when uid 1001 cannot write to the media dir (tiered probe, deferred exit)
 
 **Context.** A media directory the recorder (uid 1001) cannot write is the worst
