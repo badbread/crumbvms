@@ -205,7 +205,7 @@ then it shows that entity's live state right on the video. A few from my own wal
 - the **porch and backyard lights** showing **On / Off** so one glance tells you what's lit,
 - a **driveway motion sensor** that reads **Detected** the instant it trips, right next to whatever the camera caught.
 
-Make each badge yours: sixty icons to pick from, a compact dot or a labeled pill, your color,
+Make each badge yours: ninety icons to pick from, a compact dot or a labeled pill, your color,
 size, and background, and you choose whether it shows the state text, the time it last changed,
 or just the icon. You connect Home Assistant and link entities from a dedicated Home Assistant hub
 in the console, no YAML: connection settings, every linked entity across every camera in one
@@ -310,7 +310,7 @@ cd crumbvms
 
 # 2. Generate a .env file with strong random secrets
 #    Recording onto a mounted disk or NAS share? Name it here, so the script
-#    prepares and permission-checks the real target:
+#    permission-checks the real target instead of the ./_data default:
 #      MEDIA_HOST_PATH=/mnt/tank/crumb ./scripts/setup-env.sh
 ./scripts/setup-env.sh
 

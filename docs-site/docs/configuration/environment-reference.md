@@ -7,10 +7,11 @@ slug: /configuration/environment-reference
 # Environment reference
 
 The keys Crumb reads from `.env`, grouped by area (a few generic ones like
-`RUST_LOG` and `LOG_FORMAT` are omitted). The authoritative copy
-lives in `.env.example` in the repository; this page mirrors it for
-browsing. Most installs never need to touch most of these, `setup-env.sh`
-fills in the values that matter for a first boot.
+`RUST_LOG` and `LOG_FORMAT` are omitted, and so are the deep internals that
+exist only to make a test or a support session easier). `.env.example` in the
+repository carries the same set with inline comments; this page is the browsable
+version of it, and the two are kept in step. Most installs never need to touch
+most of these, `setup-env.sh` fills in the values that matter for a first boot.
 
 Every key below is wired into the stock `docker-compose.yml` (the GPU keys
 ride in via their opt-in overlay files), so the workflow is uniform: set the
@@ -18,6 +19,11 @@ key in `.env`, restart the affected container, done. No
 `docker-compose.override.yml` is needed. Where a value is also editable in
 the admin console, the console value (stored in the database) wins over the
 env default; that's flagged in the notes.
+
+Every secret-bearing key also answers to a `_FILE` twin (`JWT_SECRET_FILE`,
+`GO2RTC_PASS_FILE`, and the rest) holding a path to read the value from, for
+Docker secrets. Only `HA_TOKEN_FILE` gets its own row below, because the others
+are mechanical; see [Secrets](/configuration/secrets) for the list.
 
 ## Time zone
 
@@ -102,13 +108,14 @@ container: set them in `.env` and restart the api. For the five
 console-editable knobs, prefer the console anyway; once an operator sets a
 value there, the database copy wins and the env value is just the default.
 
-One honest footnote: the compose file also forwards a few more `THUMB_*`
-names (`THUMB_INTERVAL_SECS`, `THUMB_MAX_ATTEMPTS`, `THUMB_MAX_WIDTH`,
-`THUMB_MIN_WIDTH`, `THUMB_NEAR_BLACK_LUMA`, `THUMB_EXTRACT_TIMEOUT_SECS`)
-that the current release treats as fixed built-in constants (a 4-second
-preview grid, widths clamped 48-640, a 12-second extract timeout, and the
-black-frame retry logic). Setting those in `.env` today has no effect;
-they're plumbed through for a future release, so they don't get rows here.
+One honest footnote: a few more `THUMB_*` names exist in the source
+(`THUMB_INTERVAL_SECS`, `THUMB_MAX_ATTEMPTS`, `THUMB_MAX_WIDTH`,
+`THUMB_MIN_WIDTH`, `THUMB_NEAR_BLACK_LUMA`, `THUMB_EXTRACT_TIMEOUT_SECS`) as
+fixed built-in constants (a 4-second preview grid, widths clamped 48-640, a
+12-second extract timeout, and the black-frame retry logic). They are *not*
+read from the environment and the compose file deliberately does not forward
+them, because forwarding a name implies a tunability that does not exist.
+Setting them in `.env` does nothing, so they don't get rows here.
 
 | Key | Default | Console-editable? | Notes |
 |---|---|---|---|
@@ -125,10 +132,14 @@ they're plumbed through for a future release, so they don't get rows here.
 
 | Key | Default | Notes |
 |---|---|---|
-| `MEDIA_HOST_PATH` | `./_data` | host directory bind-mounted into both containers |
+| `MEDIA_HOST_PATH` | `./_data` | host directory bind-mounted into both containers. It must be writable by **uid 1001**, the user the recorder runs as, or nothing records while live view still looks fine. `setup-env.sh` reads this key as an input, prepares the directory when it can, and preflights it either way, see [Platform notes](/getting-started/platform-notes) |
 | `MEDIA_ROOT` | `/data` | container-side root; all storage paths must live under it |
 | `LIVE_STORAGE_PATH` | `/data/live` | default live bucket |
+| `LIVE_STORAGE_NAME` | `Live` | display name for the live bucket in the console and clients; cosmetic, and only read when the bucket is first created |
 | `ARCHIVE_STORAGE_PATH` | `/data/archive` | default archive bucket; unset means archive shares the live disk |
+| `ARCHIVE_STORAGE_NAME` | `Archive` | display name for the archive bucket, same rules as above |
+| `MIN_FREE_FRACTION` | `0.05` (5%) | free-space floor as a fraction of the disk, `0.0` up to but not including `1.0`. Eviction starts before the disk fills rather than after. An unparseable or out-of-range value falls back to the default without complaining. Re-read on every sweep, so a change takes effect without a restart. A per-policy override, set in the console, replaces it for that policy. See [Storage tiers](/recording/storage-tiers) |
+| `MIN_FREE_BYTES` | `53687091200` (50 GiB) | absolute free-space floor. The **stricter** of this and `MIN_FREE_FRACTION` wins, with one guard: if the absolute floor is at least half the disk it is ignored entirely, so a small test disk isn't permanently in eviction. Free space is measured as blocks available to a non-privileged writer, so the filesystem's root reserve doesn't count as free |
 
 ## GPU / motion decode
 
@@ -138,6 +149,7 @@ they're plumbed through for a future release, so they don't get rows here.
 | `MAX_GPU_DECODE_SESSIONS` | `4` | global cap on concurrent NVDEC decode sessions; a camera past the cap decodes on CPU instead of failing |
 | `MOTION_VAAPI_DEVICE` | `/dev/dri/renderD128` | DRI render node used when `MOTION_HWACCEL=vaapi`; wired in by the `docker-compose.vaapi.example.yml` overlay, ignored otherwise. On a multi-GPU host prefer the stable `/dev/dri/by-path/pci-<addr>-render` symlink, `renderD*` numbers can reorder across a driver upgrade + reboot. Also overridden by the DB (`server_settings.motion_vaapi_device`). See [Hardware decode](/configuration/hardware-decode) |
 | `RENDER_GID` | `993` | host `render` group GID, read by the VAAPI overlay's `group_add` (not by Crumb itself) so the uid-1001 container user can open the render node; find yours with `getent group render` |
+| `NVIDIA_VISIBLE_DEVICES` | `all` | which GPUs the NVIDIA container runtime exposes to the recorder; read by the runtime, not by Crumb. Wired in by `docker-compose.gpu.example.yml`, ignored otherwise. Narrow it to a device index or UUID on a host whose other GPUs belong to something else |
 
 See [Hardware decode](/configuration/hardware-decode) for enabling this.
 
@@ -153,6 +165,8 @@ See [Hardware decode](/configuration/hardware-decode) for enabling this.
 | Key | Default | Notes |
 |---|---|---|
 | `API_BIND` | `0.0.0.0:8080` | Leave this at `0.0.0.0:8080`. Docker already gates host exposure through the compose `ports:` mapping. Setting `127.0.0.1:8080` here does **not** lock the API to the host, it binds container-local, so the published port answers nothing while the healthcheck still passes: a silently dead API. To restrict the API to localhost, change the compose port mapping to `"127.0.0.1:8080:8080"` instead. |
+| `CRUMB_HTTPS_PORT` | `8443` | the port the bundled Caddy serves HTTPS on. Read by Caddy, not by Crumb, and used on **both** sides of the compose port mapping because the Caddyfile binds the templated port; changing it needs the caddy container recreated, not just restarted. The api's plain `:8080` is unaffected. See [TLS](/configuration/tls) |
+| `TRUST_PROXY` | unset (off) | tells the api to take the client address from the first hop of `X-Forwarded-For` instead of the TCP peer, for rate-limiting purposes only. Set it when the api sits behind a reverse proxy, including the bundled Caddy: without it every HTTPS request keys on the proxy's container IP, so all your HTTPS users share one rate-limit bucket. Do **not** set it when the api is reachable directly, because then a client can forge its own bucket key. This is a set/unset flag, not a boolean: any non-empty value turns it **on**, including `TRUST_PROXY=false`. Read once at startup, so restart the api after changing it. |
 
 ## Export
 
@@ -160,6 +174,18 @@ See [Hardware decode](/configuration/hardware-decode) for enabling this.
 |---|---|---|
 | `EXPORT_DIR` | `/exports` | its own volume, not under the read-only `/data` mount |
 | `EXPORT_TTL_SECONDS` | `86400` | how long a completed export survives before cleanup |
+| `EXPORT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | size budget for the on-disk export cache; oldest entries are dropped past it |
+
+## Streams the server generates on demand
+
+Crumb builds two derived streams lazily, only while something is watching. Both
+are sized for a phone on a slow link.
+
+| Key | Default | Notes |
+|---|---|---|
+| `MOBILE_STREAM_ENABLED` | `true` | the on-demand H.264 transcode that mobile clients fall back to when a camera's own streams won't decode on the device, notably a camera that is H.265 all the way down. Turning it off saves server CPU and costs those cameras live view on Android |
+| `MOBILE_STREAM_WIDTH` | `640` | transcode width in pixels, floored at 160 |
+| `SEGMENT_LOW_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | size budget for the cache of low-resolution playback segments |
 
 ## Database backup
 
@@ -167,8 +193,9 @@ See [Backups](/configuration/backups) for the full picture.
 
 | Key | Default | Notes |
 |---|---|---|
-| `DB_BACKUP_ENABLED` | `true` | |
-| `DB_BACKUP_HOST_PATH` | `./backups` | must be writable by uid 1001 |
+| `DB_BACKUP_ENABLED` | `true` | only `false`, `0`, `no`, or `off` opts out |
+| `DB_BACKUP_HOST_PATH` | `./backups` | host directory holding the dumps; must be writable by uid 1001 |
+| `BACKUP_DIR` | `/backups` | the container-side path the above is mounted at. Leave it alone: if it is unset or empty the api disables the backup job entirely, which is not a failure you want to discover from a missing dump |
 | `DB_BACKUP_SCHEDULE` | `03:15` | local wall-clock time |
 | `DB_BACKUP_KEEP_DAYS` | `7` | |
 | `DB_BACKUP_KEEP_WEEKS` | `4` | |
@@ -190,6 +217,12 @@ See [Backups](/configuration/backups) for the full picture.
 | `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MOTION_UNHEALTHY_ALERT_SECS` | `180` | how long a camera's motion detector must stay *continuously* unhealthy before the recorder raises a system alert. This is alert hysteresis for flaky cameras that blip and self-heal; it delays only the alert, never the fail-open recording safety rail. A camera added with a main stream only (no sub-stream) never raises this alert at all: pixel motion needs the sub-stream, so that camera records continuously by design rather than being broken. |
+
+## ONVIF (PTZ, presets, focus)
+
+| Key | Default | Notes |
+|---|---|---|
+| `ONVIF_CONFIG_B64` | empty | a legacy fallback, and normally left blank. Per-camera ONVIF host and credentials live in the database and are edited in the admin camera editor, which always wins. This key holds the pre-database form: a base64-encoded JSON object keyed by each camera's go2rtc stream name. It is base64 so the JSON survives `.env` and compose substitution unmangled; the raw `ONVIF_CONFIG` name is still read if the base64 one is empty. `setup-env.sh` writes the key blank |
 
 ## Update-available check (issue #7)
 
