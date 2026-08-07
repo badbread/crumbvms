@@ -138,6 +138,49 @@ bool _isNearlyBlack(img.Image im) {
   return (sum / n) < 10.0; // ~4% of 255 — only near-pure-black regions
 }
 
+// ─── report downscale ──────────────────────────────────────────────────────
+
+/// Shrink [bytes] so its longest edge is at most [maxEdge] pixels and re-encode
+/// as JPEG at [quality], for embedding in the plate report.
+///
+/// Detection frames are stored at full camera resolution (~170 KB each is
+/// typical), but the report draws a sighting thumbnail into a box a couple of
+/// centimetres wide. Embedding the original is how a report with a dozen
+/// sightings turns into a PDF nobody can email. The server has no downscaled
+/// derivative to ask for (`GET /events/:id/snapshot` returns the stored frame
+/// verbatim), so the client does it.
+///
+/// Returns the input unchanged when it cannot be decoded, when it is already
+/// within [maxEdge], or when the re-encode somehow came out larger — the
+/// report would rather carry a big image than no image.
+Future<Uint8List> downscaleForReport(
+  Uint8List bytes, {
+  int maxEdge = 640,
+  int quality = 72,
+}) {
+  return Isolate.run(
+    () => downscaleForReportSync(bytes, maxEdge: maxEdge, quality: quality),
+  );
+}
+
+/// The synchronous downscale, safe to run inside a background isolate.
+Uint8List downscaleForReportSync(
+  Uint8List bytes, {
+  int maxEdge = 640,
+  int quality = 72,
+}) {
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) return bytes;
+  final longest =
+      decoded.width > decoded.height ? decoded.width : decoded.height;
+  if (longest <= maxEdge) return bytes;
+  final scaled = decoded.width >= decoded.height
+      ? img.copyResize(decoded, width: maxEdge)
+      : img.copyResize(decoded, height: maxEdge);
+  final out = img.encodeJpg(scaled, quality: quality);
+  return out.length < bytes.length ? out : bytes;
+}
+
 // ─── result cache ──────────────────────────────────────────────────────────
 
 /// Small process-wide cache of computed plate crops, keyed by a caller-supplied

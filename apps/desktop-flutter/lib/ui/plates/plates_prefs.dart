@@ -11,6 +11,8 @@
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:crumb_desktop/ui/plates/plate_report_options.dart';
+
 /// The four Plates layouts. Stored by [name] so adding a mode never renumbers
 /// an existing persisted value.
 enum PlatesViewMode { list, gallery, grouped, timeline }
@@ -182,5 +184,75 @@ class PlatesPrefs {
     } catch (_) {
       /* best-effort persistence */
     }
+  }
+
+  // ─── plate-report builder options ────────────────────────────────────────
+  //
+  // The report dialog has enough knobs that re-picking them on every report is
+  // real friction, and an operator producing several reports in one sitting
+  // almost always wants the same shape each time. Only the SHAPE persists —
+  // the custom date bounds, the camera selection, and the operator notes are
+  // per-report and deliberately start empty every time, so yesterday's window
+  // or yesterday's note can never end up on today's handout.
+
+  static const String _kReportRange = 'crumb_plate_report_range';
+  static const String _kReportThumbs = 'crumb_plate_report_thumbs';
+  static const String _kReportImageType = 'crumb_plate_report_image_type';
+  static const String _kReportSort = 'crumb_plate_report_sort';
+  static const String _kReportPageSize = 'crumb_plate_report_page_size';
+  static const String _kReportHistory = 'crumb_plate_report_history';
+  static const String _kReportList = 'crumb_plate_report_list';
+
+  /// The last-used report shape, or the defaults when never set (or when
+  /// persistence is unavailable). Never restores the custom dates, the camera
+  /// filter, or the notes.
+  static Future<PlateReportOptions> getReportOptions() async {
+    final o = PlateReportOptions();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      o.range = _enumOr(
+          ReportRange.values, prefs.getString(_kReportRange), o.range);
+      o.thumbCount = _enumOr(
+          ReportThumbCount.values, prefs.getString(_kReportThumbs), o.thumbCount);
+      o.imageType = _enumOr(ReportImageType.values,
+          prefs.getString(_kReportImageType), o.imageType);
+      o.sort = _enumOr(ReportSort.values, prefs.getString(_kReportSort), o.sort);
+      o.pageSize = _enumOr(ReportPageSize.values,
+          prefs.getString(_kReportPageSize), o.pageSize);
+      o.includeHistory = prefs.getBool(_kReportHistory) ?? o.includeHistory;
+      o.includeOccurrenceList =
+          prefs.getBool(_kReportList) ?? o.includeOccurrenceList;
+    } catch (_) {
+      /* fall through to the defaults */
+    }
+    // A persisted "custom" range has no bounds to restore, so it would open the
+    // dialog on an unbounded custom window. Fall back to all-time instead.
+    if (o.range == ReportRange.custom) o.range = ReportRange.allTime;
+    return o;
+  }
+
+  static Future<void> setReportOptions(PlateReportOptions o) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kReportRange, o.range.name);
+      await prefs.setString(_kReportThumbs, o.thumbCount.name);
+      await prefs.setString(_kReportImageType, o.imageType.name);
+      await prefs.setString(_kReportSort, o.sort.name);
+      await prefs.setString(_kReportPageSize, o.pageSize.name);
+      await prefs.setBool(_kReportHistory, o.includeHistory);
+      await prefs.setBool(_kReportList, o.includeOccurrenceList);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Resolve a persisted enum [name] against [values], falling back to
+  /// [fallback] when it is absent or no longer a member (a renamed/removed
+  /// value must degrade to the default, not crash).
+  static T _enumOr<T extends Enum>(List<T> values, String? name, T fallback) {
+    for (final v in values) {
+      if (v.name == name) return v;
+    }
+    return fallback;
   }
 }
