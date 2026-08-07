@@ -198,7 +198,10 @@ but nothing shows up in Crumb's Plates tab, that's the first thing to check. See
 
 1. Point Crumb at the MQTT broker your detector publishes to (the
    `FRIGATE_MQTT_URL` environment variable, or the equivalent admin
-   console setting).
+   console setting). Use a plaintext `mqtt://` address: Crumb's MQTT
+   client is built without a TLS transport, so an `mqtts://` URL is
+   rejected with a clear error rather than quietly connected in the
+   clear. Keep the broker on a trusted LAN.
 2. For each camera, set its detector-side camera name in the admin
    camera editor, so Crumb can map incoming events to the right camera.
 3. Optionally point Crumb at the detector's HTTP API base as well, for

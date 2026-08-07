@@ -548,14 +548,18 @@ fn suback_granted(return_codes: &[SubscribeReasonCode]) -> bool {
             .all(|rc| matches!(rc, SubscribeReasonCode::Success(_)))
 }
 
-/// Parse `host` and `port` from an `mqtt://host:port` (or `mqtts://`, or bare
-/// `host[:port]`) URL; defaults to port 1883. Mirrors the API ingester's helper
-/// (kept local so the recorder doesn't depend on the api crate).
+/// Parse `host` and `port` from an `mqtt://host:port` (or bare `host[:port]`)
+/// URL; defaults to port 1883. Mirrors the API ingester's helper (kept local so
+/// the recorder doesn't depend on the api crate).
+///
+/// **Rejects `mqtts://`** (and the other TLS-implying schemes) via the shared
+/// [`crumb_common::mqtt::check_plaintext_scheme`] guard: rumqttc is built with
+/// `default-features = false`, so there is no TLS transport and stripping the
+/// scheme would connect in cleartext behind the operator's back (issue #477).
 fn parse_mqtt_url(url: &str) -> Result<(String, u16)> {
-    let stripped = url
-        .strip_prefix("mqtt://")
-        .or_else(|| url.strip_prefix("mqtts://"))
-        .unwrap_or(url);
+    crumb_common::mqtt::check_plaintext_scheme(url).map_err(|msg| anyhow!("{msg}"))?;
+
+    let stripped = url.strip_prefix("mqtt://").unwrap_or(url);
     let (host, port) = if let Some((h, p)) = stripped.split_once(':') {
         let port: u16 = p
             .parse()
@@ -721,5 +725,22 @@ mod tests {
             parse_mqtt_url("192.0.2.1:1884").unwrap(),
             ("192.0.2.1".into(), 1884)
         );
+    }
+
+    #[test]
+    fn parse_mqtt_url_rejects_tls_schemes() {
+        // #477: the old helper stripped `mqtts://` and connected in cleartext.
+        // rumqttc has no TLS transport compiled in, so refuse loudly. The motion
+        // supervisor treats the Err as a source error (back-off + unhealthy →
+        // fail-open), which is the safe direction for a Motion-mode camera.
+        for url in ["mqtts://broker.lan:8883", "ssl://broker.lan:8883"] {
+            let err = parse_mqtt_url(url)
+                .expect_err("TLS MQTT URL must be rejected, not silently downgraded");
+            assert!(
+                err.to_string()
+                    .contains(crumb_common::mqtt::MQTT_TLS_UNSUPPORTED),
+                "unexpected error for {url}: {err}"
+            );
+        }
     }
 }

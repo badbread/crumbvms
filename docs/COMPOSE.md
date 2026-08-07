@@ -185,7 +185,9 @@ page itself, `/auth/login`, and the first-run
 - **Frigate detection is optional and bring-your-own.** Point `FRIGATE_MQTT_URL`
   at the broker your own Frigate already publishes to and set each camera's
   Frigate name in the admin UI. Empty `FRIGATE_MQTT_URL` ⇒ the whole detection
-  subsystem stays disabled.
+  subsystem stays disabled. The broker URL must be plaintext `mqtt://`, Crumb's
+  MQTT client is built without a TLS transport and rejects `mqtts://` rather
+  than connecting in the clear, so keep the broker on a trusted LAN.
 - Other forwarded knobs: the same `HA_BASE_URL`/`HA_TOKEN`/`HA_TOKEN_FILE`
   (Home Assistant) and `DB_POOL_SIZE` as the recorder; `MAINTENANCE_UNTIL`
   (unix seconds) suppresses low-disk/camera-offline alerts during planned

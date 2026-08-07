@@ -3478,6 +3478,11 @@ async fn update_frigate(
             "MQTT broker URL is required when Frigate is enabled".to_owned(),
         ));
     }
+    // #477: refuse a TLS-implying broker URL at config time rather than storing
+    // it and connecting in cleartext. Checked regardless of `enabled` so a URL
+    // saved now can't silently downgrade when the integration is turned on later.
+    crumb_common::mqtt::check_plaintext_scheme(&body.mqtt_url)
+        .map_err(|msg| ApiError::BadRequest(msg.to_owned()))?;
     let prefix = body
         .mqtt_prefix
         .as_deref()
@@ -3529,6 +3534,15 @@ async fn test_frigate(
     _admin: AdminUser,
     Json(body): Json<UpdateFrigateConfigRequest>,
 ) -> Result<Json<FrigateTestResult>, ApiError> {
+    // A TLS-implying URL can't be tested meaningfully: a bare TCP connect to
+    // :8883 would report "Reachable" for a link Crumb will refuse to make
+    // (#477). Say so instead of implying the config is good.
+    if let Err(msg) = crumb_common::mqtt::check_plaintext_scheme(&body.mqtt_url) {
+        return Ok(Json(FrigateTestResult {
+            ok: false,
+            detail: msg.to_owned(),
+        }));
+    }
     // Parse host:port from an `mqtt://host:port` (or bare `host:port`) URL.
     let raw = body.mqtt_url.trim();
     let after = raw.split_once("://").map_or(raw, |(_, rest)| rest);

@@ -8,6 +8,86 @@ revisit.
 
 ---
 
+## 2026-08-06, MQTT stays plaintext-only: `mqtts://` is REJECTED loudly, not implemented (issue #477)
+
+**Context.** Both MQTT clients (the API's Frigate detection ingester,
+`services/api/src/detection/frigate.rs`, and the recorder's Frigate-as-motion
+loop, `services/recorder/src/frigate_motion.rs`) accepted an `mqtts://` URL,
+stripped the scheme, and connected in cleartext. `MqttOptions::new` +
+no `set_transport` is a plaintext socket. An operator who typed `mqtts://`
+believed their broker credentials were encrypted; they were on the wire in the
+clear. That is a silent security downgrade, which is worse than an unsupported
+feature.
+
+The obvious fix, "just turn TLS on", is not cheap here. Three days earlier,
+PR #476 deliberately set `rumqttc = { version = "0.24", default-features = false }`
+precisely to drop the crate's `use-rustls` tree, which cleared four
+rustls-webpki 0.102.8 certificate-verification advisories
+(RUSTSEC-2026-0049 / 0098 / 0099 / 0104) and the unmaintained `rustls-pemfile`
+warning. rumqttc's TLS feature is pinned to `rustls-webpki ^0.102.2`
+(0.25 requires `^0.102.8`), i.e. the vulnerable semver line — it cannot resolve
+to the patched 0.103.13 that `reqwest` already uses on Crumb's outbound-TLS
+path. So enabling it does not reuse the rustls stack Crumb already compiles; it
+adds a SECOND, older, advisory-carrying one.
+
+**Decision.** Ship the loud rejection, not TLS. One shared guard,
+`crumb_common::mqtt::check_plaintext_scheme`, refuses `mqtts://`, `ssl://`,
+`mqtt+ssl://`, `tls://` and `wss://` at three layers:
+
+- `PUT /config/frigate` 400s with the operator-facing message (config time,
+  regardless of `enabled`, so a URL stored while disabled cannot downgrade when
+  it is switched on later).
+- `POST /config/frigate/test` reports it instead of TCP-connecting to :8883 and
+  cheerfully answering "Reachable" for a link Crumb will refuse to make.
+- Both `parse_mqtt_url()` helpers `Err` at connect time, which covers the
+  env-seeded (`FRIGATE_MQTT_URL`) path that never passes through the HTTP route.
+
+**Rejected:**
+
+- **Enable rumqttc 0.24 `use-rustls`.** Reintroduces the exact four
+  cert-verification advisories PR #476 removed, plus a duplicate rustls 0.22 /
+  tokio-rustls 0.25 tree alongside the rustls 0.23 that reqwest already pulls.
+  Shipping TLS on a known-vulnerable certificate verifier is not "secure by
+  default", it is the same lie in a different font.
+- **Bump to rumqttc 0.25.** Same `rustls-webpki ^0.102.8` floor, and its
+  tokio-rustls 0.26 defaults to `aws-lc-rs`: a C/assembly crypto build
+  (cmake + nasm) in the Docker builder. Golden rule 6, a heavyweight dependency
+  and new build-time toolchain, needs its own discussion, not a bug-fix PR.
+- **`use-native-tls`.** Pulls `openssl-sys`, which means OpenSSL dev headers in
+  the builder image and a system-OpenSSL runtime dependency. Same objection,
+  different tree.
+- **Silently keep accepting `mqtts://`** (the status quo) or **downgrade with a
+  warning log.** Golden rule 1: a misconfiguration on a security recorder is a
+  privacy hazard. A warning nobody reads is indistinguishable from silence.
+- **Reject every non-`mqtt://` scheme.** Deliberately narrower: only the schemes
+  that *imply encryption* are refused, so no URL form that works today breaks.
+
+**Trades knowingly accepted:**
+
+- MQTT is plaintext-only, period. Crumb's posture already assumes a trusted LAN
+  for the broker (the bundled mosquitto binds `127.0.0.1:1883`), and the docs
+  now say so explicitly instead of implying `mqtts://` works.
+- An operator whose stored row already contains `mqtts://` (env-seeded, or saved
+  before this change) now gets a 400 on their next `/config/frigate` save, even
+  when editing an unrelated field. That is the intended forcing function: the
+  message names the problem and the fix.
+- The guard is a new `crumb_common::mqtt` module rather than the full shared
+  MQTT helper `docs/ROADMAP.md` still wants. Factoring the two duplicated
+  `parse_mqtt_url()` + connect/back-off skeletons together stays that item's job.
+
+**Revisit triggers:**
+
+- rumqttc publishing a release whose TLS feature resolves to a **patched**
+  rustls-webpki (0.103+) on the rustls stack Crumb already compiles, with no
+  `aws-lc-rs` default ⇒ implement `mqtts://` for real and delete the guard.
+- Any deployment story where the broker is NOT on a trusted LAN (a hosted or
+  cross-site broker, MQTT over a WAN link) ⇒ TLS stops being optional and the
+  dependency cost has to be paid.
+- A shared `crumb_common::mqtt` client landing (ROADMAP "MQTT publisher") ⇒ fold
+  this guard into it rather than keeping a standalone module.
+
+---
+
 ## 2026-08-06, A non-success go2rtc `PUT` is resolved by ASKING go2rtc what it has, not by reading the status code; and a never-yet-seen camera gets a creation grace
 
 **Context.** Two bugs found by a hostile-camera compatibility matrix against the

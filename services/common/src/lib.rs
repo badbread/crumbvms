@@ -12,6 +12,7 @@
 //! | [`db`] | deadpool-postgres pool creation and typed query accessors. |
 //! | [`icons`] | Shared storage/camera glyph resolution (override → name/type). |
 //! | [`logging`] | Global tracing subscriber initialisation. |
+//! | [`mqtt`] | MQTT URL guards shared by the api + recorder MQTT clients. |
 //! | [`detection`] | Pluggable detection-event framework ([`DetectionSource`] trait + types). |
 
 // Several enums expose an inherent `from_str(&str) -> Option<Self>` that parses a
@@ -27,6 +28,7 @@ pub mod ha;
 pub mod icons;
 pub mod logging;
 pub mod lpr_ab;
+pub mod mqtt;
 pub mod redact;
 pub mod types;
 

@@ -155,6 +155,8 @@ services:
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}     # seeded by default (setup-env.sh generates it); blank = browser create-admin wizard
       ONVIF_CONFIG_B64: ${ONVIF_CONFIG_B64:-}           # legacy fallback; per-camera ONVIF creds live in the DB now
       # Frigate detection (optional, BRING YOUR OWN broker). Empty FRIGATE_MQTT_URL = detection disabled.
+      # Plaintext mqtt:// only — the MQTT client has no TLS transport, so mqtts:// is rejected
+      # (loudly) rather than connected in the clear. Keep the broker on a trusted LAN.
       FRIGATE_MQTT_URL: ${FRIGATE_MQTT_URL:-}
       FRIGATE_MQTT_USER: ${FRIGATE_MQTT_USER:-}
       FRIGATE_MQTT_PASSWORD: ${FRIGATE_MQTT_PASSWORD:-}

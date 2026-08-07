@@ -220,7 +220,7 @@ for the full setup.
 
 | Key | Default | Notes |
 |---|---|---|
-| `FRIGATE_MQTT_URL` | empty | leaving this unset disables **the Frigate MQTT provider** (no broker connection, no background task). It does not touch Crumb's other detection paths, Home Assistant motion sources and the crumb-alpr LPR ingest work independently of it. |
+| `FRIGATE_MQTT_URL` | empty | leaving this unset disables **the Frigate MQTT provider** (no broker connection, no background task). It does not touch Crumb's other detection paths, Home Assistant motion sources and the crumb-alpr LPR ingest work independently of it. **Plaintext `mqtt://` only** (or a bare `host:port`). Crumb's MQTT client is built without a TLS transport, so an `mqtts://` URL is refused with a clear error instead of being connected in the clear, keep the broker on a trusted LAN. |
 | `FRIGATE_MQTT_USER` / `FRIGATE_MQTT_PASSWORD` / `FRIGATE_MQTT_PASSWORD_B64` | empty | broker auth, only if required |
 | `FRIGATE_MQTT_PREFIX` | `frigate` | |
 | `FRIGATE_API_BASE` | empty | fallback; the admin console setting overrides it |

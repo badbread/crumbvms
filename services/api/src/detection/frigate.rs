@@ -1250,9 +1250,17 @@ struct MqttEndpoint {
 /// - **Userinfo** — `mqtt://user:pass@host` (the `user:pass@host` authority also
 ///   splits wrong on the first colon). Any credentials are returned separately.
 ///
-/// Accepts a bare `host[:port]` with no scheme (a default `mqtt://` is prepended)
-/// and `mqtts://`. Port defaults to 1883 when absent.
+/// Accepts `mqtt://` and a bare `host[:port]` with no scheme (a default
+/// `mqtt://` is prepended). Port defaults to 1883 when absent.
+///
+/// **Rejects `mqtts://`** (and the other TLS-implying schemes, see
+/// [`crumb_common::mqtt::check_plaintext_scheme`]). rumqttc is built with
+/// `default-features = false`, so no TLS transport exists; accepting `mqtts://`
+/// and stripping the scheme would connect in cleartext while the operator
+/// believed the link was encrypted (issue #477). Fail loudly instead.
 fn parse_mqtt_url(url: &str) -> Result<MqttEndpoint> {
+    crumb_common::mqtt::check_plaintext_scheme(url).map_err(|msg| anyhow::anyhow!("{msg}"))?;
+
     // The `url` crate needs a scheme to parse an authority; accept the legacy
     // bare `host[:port]` form by supplying one.
     let with_scheme = if url.contains("://") {
@@ -1357,11 +1365,31 @@ mod tests {
     #[test]
     fn parse_mqtt_url_ipv6_with_credentials() {
         // Both hard cases at once: userinfo AND a bracketed IPv6 literal.
-        let ep = parse_mqtt_url("mqtts://user:pw@[fe80::1]:8883").unwrap();
+        let ep = parse_mqtt_url("mqtt://user:pw@[fe80::1]:8883").unwrap();
         assert_eq!(ep.host, "fe80::1");
         assert_eq!(ep.port, 8883);
         assert_eq!(ep.username.as_deref(), Some("user"));
         assert_eq!(ep.password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn parse_mqtt_url_rejects_tls_schemes() {
+        // #477: rumqttc is compiled without a TLS transport, so an accepted
+        // `mqtts://` used to connect in cleartext. It must fail loudly instead,
+        // with a message the operator can act on.
+        for url in [
+            "mqtts://broker.lan:8883",
+            "mqtts://user:pw@[fe80::1]:8883",
+            "ssl://broker.lan:8883",
+        ] {
+            let err = parse_mqtt_url(url)
+                .expect_err(&format!("{url} must be rejected, not silently downgraded"));
+            assert!(
+                err.to_string()
+                    .contains(crumb_common::mqtt::MQTT_TLS_UNSUPPORTED),
+                "unexpected error for {url}: {err}"
+            );
+        }
     }
 
     #[test]
