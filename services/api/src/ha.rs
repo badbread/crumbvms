@@ -616,12 +616,14 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "motion",
     "occupancy",
     "person",
+    "home",
     "pet",
     "vibration",
     // lighting
     "lightbulb",
     "floodlight",
     "outdoor_light",
+    "landscape_light",
     // power & switches
     "switch",
     "power",
@@ -641,6 +643,12 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "temperature",
     "humidity",
     "sun",
+    // weather
+    "cloud",
+    "rain",
+    "wind",
+    "storm",
+    "moon",
     // safety & alarm (incl. smoke/gas/CO problem sensors)
     "smoke",
     "gas",
@@ -659,9 +667,19 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "camera",
     "tv",
     "speaker",
-    // network
+    "media_player",
+    "remote",
+    "game",
+    "mic",
+    "music",
+    // network & computing
     "wifi",
     "router",
+    "printer",
+    "server",
+    "computer",
+    "storage",
+    "phone",
     // vehicles & delivery
     "vehicle",
     "package",
@@ -673,8 +691,14 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "laundry",
     "pool",
     "hottub",
+    "grill",
+    "smoker",
+    "coffee",
+    "plant",
     // time
     "clock",
+    "calendar",
+    "timer",
     // automation
     "scene",
     "script",
