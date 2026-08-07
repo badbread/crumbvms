@@ -62,6 +62,7 @@ import video.crumb.app.data.HaStatesResponse
 import video.crumb.app.data.PtzPresetDto
 import video.crumb.app.data.controlActions
 import video.crumb.app.data.haPrimaryAction
+import video.crumb.app.data.subStreamUrl
 import video.crumb.app.data.toUserMessage
 import video.crumb.app.di.appContainer
 import video.crumb.app.ui.player.MediaFactory
@@ -369,13 +370,19 @@ fun LiveFullscreenScreen(
             repo.liveStreams(currentCameraId).fold(
                 onSuccess = { streams ->
                     mainUrl = streams.rtspMainUrl
-                    subUrl = streams.rtspSubUrl
+                    // `subStreamUrl()` prefers the video-only `_subv` restream
+                    // (repaired fmtp — without it Media3 rejects the DESCRIBE on
+                    // some cameras, #483) and falls back to the raw sub when the
+                    // server offers no `_subv`. Both the H265-main fallback below
+                    // and the metered start-low path use this one value.
+                    val lowRes = streams.subStreamUrl()
+                    subUrl = lowRes
                     // On a metered link, start on a data-saver stream: the camera's
                     // sub when it has one, else the server's on-demand mobile
                     // transcode. Off metered (Wi-Fi/LAN), start on the main (HD)
                     // stream. Either way the codec-failure fallback + "tap for HD"
                     // badge below still apply.
-                    val lowFirst = if (isMetered) (streams.rtspSubUrl ?: streams.rtspMobileUrl) else null
+                    val lowFirst = if (isMetered) (lowRes ?: streams.rtspMobileUrl) else null
                     if (lowFirst != null) {
                         usingSub = true
                         hdUnavailable = true

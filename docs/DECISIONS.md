@@ -8,6 +8,99 @@ revisit.
 
 ---
 
+## 2026-08-06, Android alone plays a dedicated `<name>_subv` go2rtc restream (ffmpeg copy), because some cameras publish H264 with no `sprop-parameter-sets`
+
+**Context.** The Android live-wall tile plays a camera's SUB stream over RTSP
+(Media3/ExoPlayer). For one camera the tile reconnect-looped forever (#483), with
+`IllegalArgumentException: missing attribute fmtp` from Media3's RTSP client,
+which requires an `fmtp` attribute on the media tracks it builds. Fullscreen was
+unaffected (WebRTC/main path).
+
+The initial diagnosis blamed the camera's **audio** tracks (a
+`audio, sendonly, PCMU/8000` two-way-audio backchannel). Surveying every sub
+restream on a live install disproved that: cameras with PCMA and AAC audio all
+work, and go2rtc already drops the sendonly backchannel from its restream. The
+real discriminator is the **video** track. The failing camera is a Reolink whose
+own SDP advertises `m=video … H264/90000` with **no `a=fmtp` / no
+`sprop-parameter-sets`**, and go2rtc's plain restream passes that gap straight
+through — it was the only stream of eleven whose video track had no fmtp. Such a
+stream has no out-of-band parameter sets at all: `ffprobe` on it reports
+"non-existing PPS 0 referenced / decode_slice_header error / no frame!".
+
+**Decision — register a dedicated video-only sub restream `<name>_subv`** in the
+API's go2rtc reconcile loop, sourced `ffmpeg:<name>_sub#video=copy`, and hand it
+to clients as its own `rtsp_subv_url` field **alongside** the raw
+`rtsp_sub_url`. Passing the bitstream through ffmpeg recovers the in-band
+SPS/PPS, so go2rtc republishes a proper `a=fmtp:96 …sprop-parameter-sets=…`;
+omitting `#audio` makes go2rtc pass `-an`, so audio is dropped as a bonus (the
+wall is muted; two-way audio / listen uses WebRTC). `#video=copy` is a **remux,
+not a re-encode** (verified: identical h264/High/640x360 in and out), it reads
+the existing `_sub` stream by name so it shares that producer and adds no camera
+session. `_subv` follows `_sub`'s exact lifecycle (created, updated, and deleted
+alongside it), and is registered for every camera that has a sub whether or not
+any client asks for it. `rtsp_subv_url` is null for cameras reconcile does not
+manage (Frigate-served, or a legacy row with no `source_url`), because no
+`_subv` exists for those; `rtsp_sub_url` keeps its original meaning for every
+camera.
+
+**Which stream a client plays is the CLIENT's choice, and only Android takes
+`_subv`.** Android picks `rtsp_subv_url ?: rtsp_sub_url`; desktop (libmpv) and
+iOS (AVFoundation) keep `rtsp_sub_url` untouched, because both already tolerate
+the missing-fmtp SDP that Media3 rejects. That split is not tidiness, it is the
+performance budget. go2rtc spawns the remux ffmpeg **lazily, on first consumer
+connect**, and reaps it when the last consumer leaves: an idle `_subv` costs
+nothing, but a **cold** one costs a process spawn plus a wait for a keyframe
+through an extra hop, **per consumer**. The first cut of this change pointed
+`rtsp_sub_url` itself at `_subv`, so every client got it. On the owner's install
+a fresh desktop wall then cold-spawned roughly eleven ffmpeg processes on open
+and took many seconds to fill, where before it attached straight to the
+always-warm `_sub` producers that reconcile keeps running. Splitting the field
+restored the fast open and kept the Media3 repair. Reconcile still registers
+`_subv` unconditionally, which is free while nothing connects and means an
+Android client never waits for a reconcile pass.
+
+**Rejected — making `_subv` eager** (an always-running remux per camera so it is
+warm for everybody, keeping a single `rtsp_sub_url` field). That is a permanent
+extra ffmpeg process per camera on every install, paid by operators whose clients
+never need it, purely to avoid a cost only Media3 incurs. Lazy plus
+client-scoped is strictly cheaper and needs no new configuration.
+
+**Rejected — putting the media filter in the CLIENT URL**
+(`rtsp://…/<name>_sub?video`). This was tried first and **falsified on-device**:
+it broke playback of *every* camera. `ffprobe` accepts a query-string RTSP URL,
+but Media3 derives per-track SETUP URLs by appending `/trackID=N` to the base URI,
+so `…?video` produces malformed SETUP URLs. It also would not have fixed the
+reported camera anyway — the filtered SDP still had no fmtp on the video track —
+and its single-segment rtsp path collides with a managed stream name, forcing
+reconcile onto the `PUT` path (object replacement) every pass. Lesson recorded:
+**prove a client-facing streaming fix with the client's own stack, not just
+ffprobe.**
+
+**Rejected — fixing it inside the client** (each client selecting only the video
+track itself, or tolerating a missing fmtp). Media3 offers no clean "skip an
+unparseable track" hook, and every future client would re-hit the trap. The
+**repair** therefore stays server-side and is built once; what is per-client is
+only the one-line choice of which of two published URLs to open, which is exactly
+where the knowledge of "my player needs fmtp" lives. An old client that never
+learns about `rtsp_subv_url` keeps working on the raw sub, unchanged.
+
+**Revisit triggers (any one):**
+- The live wall needs audio on the RTSP sub (then request `#audio=` explicitly and
+  re-verify the SDP, keeping the fmtp repair).
+- go2rtc changes `ffmpeg:` source semantics, drops `#video=copy`, or stops
+  emitting `-an` when no `#audio` is given — re-verify the `_subv` SDP.
+- Cameras stop shipping H264 without `sprop-parameter-sets`, or Media3 gains
+  tolerance for a missing fmtp — the copy hop could then be dropped, and with it
+  the second URL field.
+- The per-consumer ffmpeg remux shows up as real load, or as a slow wall open, on
+  a large install. It is a copy, but it is a process per attached tile and it
+  spawns cold. Now that only Media3 clients connect to it, this applies to a
+  MOBILE wall (and desktop only if it ever switches to `rtsp_subv_url`); the fix
+  then is a warm/eager `_subv` for the cameras a wall actually shows, not a
+  wider default.
+- A third client adopts a player that also rejects a missing fmtp. It should take
+  `rtsp_subv_url` the same way and measure its own cold-open cost first.
+
 ## 2026-08-01, Home Assistant value controls (brightness / position / speed) carry one optional server-validated number, discovered via a states `control` descriptor
 
 **Context.** The action model above shipped on/off/toggle/press control. The

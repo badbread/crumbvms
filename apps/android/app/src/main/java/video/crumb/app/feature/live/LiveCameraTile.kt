@@ -63,6 +63,7 @@ import video.crumb.app.data.CameraDto
 import video.crumb.app.data.DetectionIcons
 import video.crumb.app.data.LiveStreamsResponse
 import video.crumb.app.data.MediaUrls
+import video.crumb.app.data.subStreamUrl
 import video.crumb.app.ui.player.MediaFactory
 import video.crumb.app.ui.player.PlayerSurface
 import video.crumb.app.ui.theme.DangerRed
@@ -75,8 +76,9 @@ import kotlinx.coroutines.launch
  * A single camera tile for the live wall grid.
  *
  * Playback notes:
- * - Uses rtspSubUrl when available (low-res, conserves bandwidth in grid view),
- *   otherwise falls back to rtspMainUrl.
+ * - Uses the sub stream when available (low-res, conserves bandwidth in grid
+ *   view), otherwise falls back to rtspMainUrl. Which sub is [subStreamUrl]'s
+ *   call: the video-only `_subv` when the server offers one, else the raw sub.
  * - The [LiveStreamsResponse] is pre-resolved by [LiveViewModel] so this
  *   composable never performs network I/O.
  * - The ExoPlayer is built once in [remember], starts playing immediately, and
@@ -330,9 +332,12 @@ private fun LiveRtspContent(
     // we show a subtle "Reconnecting…" badge instead of the hard error.
     var isReconnecting by remember { mutableStateOf(false) }
 
-    // Choose sub stream for grid; fall back to main.
+    // Choose sub stream for grid; fall back to main. `subStreamUrl()` prefers the
+    // video-only `_subv` restream, which repairs the missing-fmtp SDP that makes
+    // Media3 reconnect-loop on some cameras (#483), and falls back to the raw sub
+    // when the server has no `_subv` for this camera (unmanaged / older server).
     val rtspUrl: String? = remember(streams) {
-        streams?.rtspSubUrl ?: streams?.rtspMainUrl
+        streams?.subStreamUrl() ?: streams?.rtspMainUrl
     }
 
     // Device connectivity (#3). While offline, reconnect attempts PAUSE instead of
