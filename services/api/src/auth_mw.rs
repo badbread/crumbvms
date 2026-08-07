@@ -84,6 +84,14 @@ pub struct AuthUser {
     /// media tokens. Lets `/auth/refresh` rotate and `/auth/sessions` mark the
     /// current session without re-parsing the JWT.
     pub jti: Option<Uuid>,
+    /// `true` when this principal came from a scoped short-lived **media token**
+    /// (`?token=`, `typ: "media"`) rather than a full login JWT.
+    ///
+    /// A media token is deliberately weak: one camera, ~15 minutes, media only.
+    /// Endpoints that hand back something more durable or broader than "this
+    /// camera's bytes for a few minutes" must therefore refuse it — see
+    /// [`FullSessionUser`], which is the extractor that enforces that.
+    pub media_scoped: bool,
 }
 
 impl AuthUser {
@@ -422,6 +430,10 @@ impl AuthUser {
             capabilities,
             role_id,
             jti,
+            // Reached only via a full login JWT (Bearer header, or ?token= on
+            // the explicitly-permissive export-download routes). The scoped
+            // media-token path returns earlier, in `try_media_token`.
+            media_scoped: false,
         })
     }
 }
@@ -466,6 +478,56 @@ impl FromRequestParts<AppState> for LegacyQueryTokenUser {
         Ok(LegacyQueryTokenUser(
             AuthUser::authenticate(parts, state, true).await?,
         ))
+    }
+}
+
+// ─── FullSessionUser ──────────────────────────────────────────────────────────
+
+/// Auth extractor for endpoints that a **scoped media token must not reach**.
+///
+/// Identical to [`AuthUser`] except that a principal minted from a scoped
+/// media token (`?token=`, `typ: "media"`) is rejected with **403** instead of
+/// being accepted. Access the inner principal via `.0`.
+///
+/// # Why this exists
+///
+/// A media token's whole security property is that it is *weak*: one camera,
+/// ~15 minutes, media bytes only (see `MEDIA_TOKEN_EXPIRY_SECONDS` in
+/// `auth.rs`). That property only holds if every endpoint a media token can
+/// reach hands back something no more durable and no broader than that. An
+/// endpoint that returns a longer-lived or wider-scoped credential in its
+/// response body breaks the property no matter how tightly the token itself is
+/// scoped, because the caller can simply trade the weak token for the strong
+/// one.
+///
+/// `GET /cameras/{id}/streams` is exactly that shape — its RTSP URLs embed the
+/// server's go2rtc restreamer credentials — so it takes this extractor rather
+/// than [`AuthUser`]. All four clients (desktop, Android, iOS, the web admin
+/// console) already call it with the `Authorization: Bearer` header during
+/// session setup, so requiring a full session costs them nothing.
+///
+/// Use this for any future endpoint whose response body contains a credential,
+/// a long-lived URL, or data spanning more than the one camera a media token
+/// names.
+pub struct FullSessionUser(pub AuthUser);
+
+#[async_trait]
+impl FromRequestParts<AppState> for FullSessionUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let user = AuthUser::from_request_parts(parts, state).await?;
+        if user.media_scoped {
+            return Err(ApiError::Forbidden(
+                "this endpoint requires a full login session; a scoped media token \
+                 cannot be used here"
+                    .to_owned(),
+            ));
+        }
+        Ok(FullSessionUser(user))
     }
 }
 
@@ -553,6 +615,7 @@ fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
         role_id: None,
         // A media token is not a revocable session; it self-expires in ~15 min.
         jti: None,
+        media_scoped: true,
     })
 }
 

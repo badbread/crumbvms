@@ -90,6 +90,22 @@ use crate::{
 /// minutes", vs the full (up to 10-year, all-camera) login JWT it replaces in
 /// URLs. Clients read the real expiry from the response `expires_at`. See
 /// [`MediaClaims`] / P0-SESSIONS.
+///
+/// # The "one camera, a few minutes" property is not self-enforcing
+///
+/// That property is a statement about what a media token can *reach*, not just
+/// about the token's own claims. It holds only while every endpoint reachable
+/// with `?token=` returns something no more durable and no broader than the
+/// token itself. An endpoint whose *response body* contains a longer-lived or
+/// wider-scoped credential silently voids it, because the holder can trade the
+/// weak token for the strong one — no matter how tightly the token is scoped.
+///
+/// `GET /cameras/{id}/streams` was such an endpoint (its RTSP URLs embed the
+/// server-wide, non-expiring go2rtc restreamer credentials) and now takes
+/// [`crate::auth_mw::FullSessionUser`], which rejects media-token principals
+/// with 403. Apply the same extractor to any future endpoint whose response
+/// carries a credential, a long-lived URL, or data spanning more than the one
+/// camera the token names.
 const MEDIA_TOKEN_EXPIRY_SECONDS: i64 = 900;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
