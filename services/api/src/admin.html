@@ -1539,7 +1539,9 @@ function wizardBody(key) {
    the wizardServerBody() spread pattern. */
 function wizardDetectHwBody() {
   const s = WZ.server || {};
-  const cur = WZ.hwPick || s.motion_hwaccel || 'auto';
+  // "" (Server default) is a legitimate pick, so probe for a real prior choice
+  // with != null, not `||` (which would treat "" as unset and fall to 'auto').
+  const cur = WZ.hwPick != null ? WZ.hwPick : (s.motion_hwaccel || '');
   WZ.hwPick = cur;
   const opt = (v, title, sub) => `
     <label class="chk" style="display:flex;align-items:flex-start;gap:8px;margin-top:8px">
@@ -1547,7 +1549,8 @@ function wizardDetectHwBody() {
       <span><b>${title}</b><br><span style="color:var(--dim2);font-size:12px">${sub}</span></span>
     </label>`;
   return `
-    ${opt('auto', 'Auto (recommended)', 'Probe NVDEC, else decode on CPU. Safe everywhere.')}
+    ${opt('', 'Server default (recommended)', 'Inherit the recorder\'s MOTION_HWACCEL env default (CPU unless a GPU was set up). Safe everywhere.')}
+    ${opt('auto', 'Auto', 'Probe NVDEC, else decode on CPU.')}
     ${opt('cpu', 'CPU', 'Software decode. On many boxes this is also the most power-efficient choice.')}
     ${opt('vaapi', 'Intel / AMD iGPU, VAAPI', 'Quick Sync / AMD media block. Needs the render node mapped into the recorder container.')}
     ${opt('cuda', 'NVIDIA, NVDEC', 'Discrete NVIDIA GPU. Needs the GPU mapped into the recorder container.')}
@@ -3038,7 +3041,9 @@ async function wizardSave(key) {
     return true;
   }
   if (key === 'detect-hw') {
-    const pick = WZ.hwPick || (WZ.server || {}).motion_hwaccel || 'auto';
+    // "" (Server default) is a real pick — preserve it with != null so we send
+    // "" (inherit env, #533), not a coerced 'auto'.
+    const pick = WZ.hwPick != null ? WZ.hwPick : ((WZ.server || {}).motion_hwaccel || '');
     const dev = $('wz-hw-vaapi-device') ? $('wz-hw-vaapi-device').value.trim() : '';
     // Same rule as the 'server' step: spread wizardServerBody() and override
     // ONLY the fields this step edits, never touch crumb_api_base & friends.
@@ -7243,7 +7248,8 @@ async function renderDetectionClips() {
         <div>
           <label class="field-label" style="margin-top:0">Decode backend</label>
           <select id="srv-hwaccel" class="mono" onchange="onHwaccelChange()">
-            <option value="auto"${(s.motion_hwaccel||'auto')==='auto'?' selected':''}>Auto, probe NVDEC, else CPU</option>
+            <option value=""${!s.motion_hwaccel?' selected':''}>Server default, inherit MOTION_HWACCEL env</option>
+            <option value="auto"${s.motion_hwaccel==='auto'?' selected':''}>Auto, probe NVDEC, else CPU</option>
             <option value="cpu"${s.motion_hwaccel==='cpu'?' selected':''}>CPU, software decode</option>
             <option value="cuda"${s.motion_hwaccel==='cuda'?' selected':''}>NVDEC, NVIDIA discrete GPU</option>
             <option value="vaapi"${s.motion_hwaccel==='vaapi'?' selected':''}>VAAPI, Intel/AMD iGPU (Quick Sync)</option>
@@ -7378,7 +7384,11 @@ function detectionServerBody(s) {
     frigate_rtsp_base:       s.frigate_rtsp_base || '',
     frigate_go2rtc_api_base: s.frigate_go2rtc_api_base || '',
     frigate_http_api_base:   s.frigate_http_api_base || '',
-    motion_hwaccel:          s.motion_hwaccel || 'auto',
+    // Blank means "no DB override, inherit the recorder's MOTION_HWACCEL env
+    // default" (now cpu, #513/#533) — NOT the literal string 'auto'. Coercing a
+    // deliberate blank to 'auto' here silently pinned Auto and clobbered the
+    // GPU-less-upgrader cpu default this save was meant to leave alone (#533).
+    motion_hwaccel:          s.motion_hwaccel || '',
     motion_vaapi_device:     s.motion_vaapi_device || '',
   };
 }
@@ -7397,8 +7407,10 @@ async function saveDetectionServer() {
     frigate_rtsp_base:       $('srv-frigate-rtsp') ? $('srv-frigate-rtsp').value.trim() : (s.frigate_rtsp_base || ''),
     frigate_go2rtc_api_base: ($('srv-frigate-go2rtc-api') && $('srv-frigate-go2rtc-api').value.trim()) || '',
     frigate_http_api_base:   frigateHttp,
-    // Motion decode backend (recorder hot-reloads its workers on change).
-    motion_hwaccel:          $('srv-hwaccel') ? $('srv-hwaccel').value : (s.motion_hwaccel || 'auto'),
+    // Motion decode backend (recorder hot-reloads its workers on change). The
+    // dropdown's blank option sends "" = inherit the MOTION_HWACCEL env default;
+    // never coerce a blank to 'auto' (#533).
+    motion_hwaccel:          $('srv-hwaccel') ? $('srv-hwaccel').value : (s.motion_hwaccel || ''),
     motion_vaapi_device:     $('srv-vaapi-device') ? $('srv-vaapi-device').value.trim() : (s.motion_vaapi_device || ''),
   });
   try {
@@ -7614,7 +7626,9 @@ async function saveServerSettings() {
     frigate_rtsp_base:       s.frigate_rtsp_base || '',
     frigate_go2rtc_api_base: s.frigate_go2rtc_api_base || '',
     frigate_http_api_base:   s.frigate_http_api_base || '',
-    motion_hwaccel:          s.motion_hwaccel || 'auto',
+    // Preserve the fetched decode backend verbatim; a blank stays "" (inherit
+    // the MOTION_HWACCEL env default), never coerced to 'auto' (#533).
+    motion_hwaccel:          s.motion_hwaccel || '',
     motion_vaapi_device:     s.motion_vaapi_device || '',
   };
   try {
