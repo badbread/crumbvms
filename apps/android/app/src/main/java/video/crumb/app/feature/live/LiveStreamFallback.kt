@@ -10,14 +10,23 @@ import video.crumb.app.data.subStreamUrl
  * rung of the fallback ladder walked when a stream turns out to be unplayable
  * on this device.
  *
- * The ladder exists because Media3's RTSP stack cannot bring up H.265: its HEVC
- * depacketizer never reaches a playable frame, so an H265 stream spins in
- * BUFFERING (or errors out) forever while the same camera records fine and
- * plays fine on desktop. Cameras that ship H265 on the main only were already
- * handled by the single-step main→sub downgrade; cameras that ship H265 on
- * **both** main and sub (#524) were not — they exhausted the reconnect ladder
- * on two unplayable streams and never reached [MOBILE], the server-side H.264
- * transcode that exists for exactly this case.
+ * **H.265 is not the discriminator — read this before "fixing" anything here.**
+ * The comments and issue history around #483/#524 said Media3's RTSP stack cannot
+ * bring up H.265 at all. Measured on device (Media3 1.4.1, 2026-08-07): it plays
+ * H.265 mains over RTSP perfectly well, 4K included, and on a typical install most
+ * cameras' mains are H.265. Do not add anything that avoids H.265 pre-emptively;
+ * doing so downgrades cameras that would have played in HD, which is exactly the
+ * regression #560 was.
+ *
+ * What genuinely fails is narrower and is about RTP **packetization**, not the
+ * codec: Media3's `RtpH265Reader` has never implemented RFC 7798 §4.4.2
+ * Aggregation Packets (androidx/media#1008), so a stream whose NALs are small
+ * enough to be aggregated — seen on an LPR camera at 1080p, while the same
+ * vendor's 4K streams always fragment and play fine — throws every time. Some
+ * devices also lack an HEVC hardware decoder entirely. Both are real, both are
+ * per-stream, and neither is knowable in advance: hence a REACTIVE ladder, walked
+ * only on observed playback failure, ending at [MOBILE], the server-side H.264
+ * transcode that exists for exactly this case (#524).
  */
 enum class StreamTier {
     /** Full-resolution main stream (`rtsp_main_url`). */
@@ -138,28 +147,220 @@ private val UNPLAYABLE_FORMAT_ERROR_CODES = setOf(1004, 3003, 4001, 4002, 4004, 
 fun isUnplayableFormatError(errorCode: Int): Boolean = errorCode in UNPLAYABLE_FORMAT_ERROR_CODES
 
 /**
+ * Media3 `PlaybackException` error codes that say **nothing about the codec**, so
+ * they can never be evidence for stepping down the ladder (#560). Verified
+ * against the pinned `androidx.media3:media3-common:1.4.1`:
+ *
+ * - `2000..2999` — the whole IO block (2000 `ERROR_CODE_IO_UNSPECIFIED`, 2001
+ *   `..._NETWORK_CONNECTION_FAILED`, 2002 `..._NETWORK_CONNECTION_TIMEOUT`,
+ *   2003…2008). The range is matched rather than enumerated so a newer Media3
+ *   adding an IO code lands on the retry side by default. The bytes did not
+ *   arrive; that is not a statement about whether they were decodable.
+ * - 1002 `ERROR_CODE_BEHIND_LIVE_WINDOW` and 1003 `ERROR_CODE_TIMEOUT` — the
+ *   stream fell behind, or an operation timed out. A re-prepare fixes both; a
+ *   different codec fixes neither.
+ * - 4006 `ERROR_CODE_DECODING_RESOURCES_RECLAIMED` — the platform took the
+ *   decoder away (another app, or a surface that went away). It sits in the
+ *   decoder block but it is a resource event, not a verdict on the bitstream.
+ *
+ * A camera slow to hand out its first keyframe, an AP roam, a phone coming back
+ * from doze: on RTSP these all land here BEFORE the stream ever produced a frame,
+ * which is exactly the case #529 read as "undecodable codec".
+ */
+fun isCodecAgnosticError(errorCode: Int): Boolean =
+    errorCode in 2000..2999 || errorCode == 1002 || errorCode == 1003 || errorCode == 4006
+
+/**
+ * Substrings that identify a failure Media3 will hit **every single time** on this
+ * stream, from the exception chain rather than the error code.
+ *
+ * The one that matters today is `RtpH265Reader`'s
+ * `UnsupportedOperationException("need to implement processAggregationPacket")`,
+ * verified present in the pinned `media3-exoplayer-rtsp:1.4.1`. RFC 7798 §4.4.2
+ * Aggregation Packets pack several SMALL NALs into one RTP packet, and Media3 has
+ * never implemented that path (androidx/media#1008). It is thrown from inside the
+ * loader, so it reaches the app wrapped in an `IOException` and arrives with an
+ * IO error code that looks exactly like a network problem — which is precisely
+ * why the code alone is not enough to classify it.
+ *
+ * This is a *narrow* list on purpose: a signature here means "step down now, do
+ * not retry", so only failures that are structurally deterministic belong in it.
+ */
+private val UNPLAYABLE_FAILURE_SIGNATURES = listOf("processAggregationPacket")
+
+/**
+ * True when a failure's [detail] (see [failureDetail]) names a deterministic,
+ * stream-specific limitation rather than a moment's bad luck.
+ */
+fun isUnplayableFailureDetail(detail: String?): Boolean =
+    detail != null && UNPLAYABLE_FAILURE_SIGNATURES.any { it in detail }
+
+/**
+ * Strip anything URL-shaped out of text bound for logcat. RTSP URLs in this app
+ * carry the stream credentials, and Media3 puts the URL it was loading into plenty
+ * of its exception messages — a diagnostic log must never be the thing that leaks
+ * them (golden rule 1).
+ */
+fun redactUrls(text: String?): String? =
+    text?.replace(Regex("""[a-zA-Z][a-zA-Z0-9+.\-]*://\S*"""), "<url>")
+
+/**
+ * A short, credential-free summary of a failure's exception chain, for both
+ * [isUnplayableFailureDetail] and the log line: `Class: message` per level, most
+ * specific cause last. Capped so a deep chain can't flood logcat.
+ */
+fun failureDetail(error: Throwable?, maxDepth: Int = 4): String? {
+    if (error == null) return null
+    val parts = ArrayList<String>(maxDepth)
+    var t: Throwable? = error
+    var depth = 0
+    while (t != null && depth < maxDepth) {
+        val msg = redactUrls(t.message)?.takeIf { it.isNotBlank() }
+        parts += if (msg != null) "${t.javaClass.simpleName}: $msg" else t.javaClass.simpleName
+        t = t.cause?.takeIf { it !== t }
+        depth += 1
+    }
+    return parts.joinToString(" <- ")
+}
+
+/**
+ * How many pre-first-frame failures a rung has to accumulate before an
+ * **unexplained** failure (the stall watchdog's silent spin, an unspecified
+ * error) is accepted as "nothing will ever play here".
+ *
+ * One is too few: the first attempt at a cold rung competes with go2rtc spawning
+ * an ffmpeg, the camera's keyframe interval, and whatever else the wall is doing
+ * over the same Wi-Fi. Two, each already bounded by the first-load buffering
+ * limit and separated by a re-prepare, keeps a genuinely unplayable stream's walk
+ * fast while making a one-off slow start cost a retry rather than a permanent
+ * downgrade.
+ */
+const val PRE_FIRST_FRAME_FAILURES_BEFORE_FALLBACK = 2
+
+/**
+ * How many pre-first-frame failures it takes before even a **codec-agnostic**
+ * failure (an IO code) is treated as a reason to leave the rung.
+ *
+ * This is the safety valve, not the main path. A stream that structurally cannot
+ * be depacketized can surface as an IO error every attempt (see
+ * [UNPLAYABLE_FAILURE_SIGNATURES]: the exception is thrown inside the loader and
+ * arrives wrapped in an `IOException`), so "an IO code never counts" would strand
+ * such a camera on a rung forever — the #524 spinner, back again. Five in a row
+ * with not one frame in between spans the whole fast-backoff curve (~30 s of
+ * 1 s + 2 s + 4 s + 8 s + 15 s), which no ordinary Wi-Fi blip or slow camera start
+ * survives, but a deterministic failure reaches every time.
+ */
+const val CODEC_AGNOSTIC_FAILURES_BEFORE_FALLBACK = 5
+
+/**
+ * Running tally of consecutive failures on the CURRENT rung before it ever showed
+ * a frame. Reset by the rung playing, and implicitly by moving to another rung
+ * (the caller's counter lives with the player, which is re-keyed on the rung's
+ * URL).
+ */
+fun tallyPreFirstFrameFailure(previous: Int, everReady: Boolean): Int =
+    if (everReady) 0 else previous + 1
+
+/**
  * Should this failure step DOWN the ladder instead of reconnecting to the same
  * stream?
  *
  * - No rung left ⇒ never (fall through to the normal backoff/slow-retry ladder).
- * - The stream never reached a playable frame ⇒ yes. This is the H265 signature:
- *   Media3 either errors immediately or sits in BUFFERING, and no amount of
- *   reconnecting will change the codec. (It is also the pre-existing rule for
- *   the main→sub downgrade, kept verbatim.)
- * - The stream DID play and then dropped ⇒ only for a decoder/format error.
- *   Everything else is a transient blip (camera reboot, AP roam, Wi-Fi drop) and
- *   must reconnect to the SAME stream — downgrading there would quietly strand a
- *   healthy camera on the transcode.
+ * - A decoder/format error, or a known-deterministic failure signature
+ *   ([isUnplayableFailureDetail]) ⇒ always, immediately, played or not: this is
+ *   the device or the depacketizer saying outright that it cannot handle this
+ *   stream, and every retry will land in the same place.
+ * - The stream DID play and then dropped ⇒ never (bar the above). That is a
+ *   camera reboot, an AP roam or a Wi-Fi drop, and downgrading would quietly
+ *   strand a healthy camera on the transcode.
+ * - A codec-agnostic failure before the first frame ⇒ only after
+ *   [CODEC_AGNOSTIC_FAILURES_BEFORE_FALLBACK] of them in a row. #529 read *any*
+ *   pre-first-frame failure as a codec verdict, so one Wi-Fi blip or one slow
+ *   camera start pinned the camera to SD for the rest of the app run (#560);
+ *   requiring the whole backoff curve to go by with nothing playing keeps the
+ *   escape hatch without the false positives.
+ * - Anything else before the first frame (the stall watchdog's silent BUFFERING
+ *   spin, an unspecified error) ⇒ after
+ *   [PRE_FIRST_FRAME_FAILURES_BEFORE_FALLBACK]. A stream that spins in BUFFERING
+ *   without ever erroring is the classic undecodable signature, so the ladder
+ *   still walks down — just on repeated evidence rather than the first timeout.
  *
  * @param errorCode Media3 `PlaybackException.errorCode`, or `null` when the
  *   failure came from the stall watchdog (which sees no exception at all).
+ * @param failureDetail the exception chain summary from [failureDetail], if any.
+ * @param preFirstFrameFailures this rung's [tallyPreFirstFrameFailure] count,
+ *   including the failure being judged now.
  */
-fun shouldFallBackToNextTier(hasNextTier: Boolean, everReady: Boolean, errorCode: Int?): Boolean =
+fun shouldFallBackToNextTier(
+    hasNextTier: Boolean,
+    everReady: Boolean,
+    errorCode: Int?,
+    failureDetail: String?,
+    preFirstFrameFailures: Int,
+): Boolean =
     when {
         !hasNextTier -> false
-        !everReady -> true
-        else -> errorCode != null && isUnplayableFormatError(errorCode)
+        errorCode != null && isUnplayableFormatError(errorCode) -> true
+        isUnplayableFailureDetail(failureDetail) -> true
+        everReady -> false
+        errorCode != null && isCodecAgnosticError(errorCode) ->
+            preFirstFrameFailures >= CODEC_AGNOSTIC_FAILURES_BEFORE_FALLBACK
+        else -> preFirstFrameFailures >= PRE_FIRST_FRAME_FAILURES_BEFORE_FALLBACK
     }
+
+/**
+ * logcat tag for every fallback-ladder decision, on the wall and in fullscreen
+ * alike. `adb logcat -s CrumbLiveFallback:I` shows exactly which rung a camera
+ * left, which one it moved to, and what the evidence was — without it a step-down
+ * is invisible and "my cameras went to SD" can only be guessed at (#560).
+ */
+const val FALLBACK_LOG_TAG = "CrumbLiveFallback"
+
+/**
+ * One line describing a fallback decision, in a format both the wall tile and
+ * fullscreen emit so a logcat capture reads the same either way. Carries the
+ * camera's id (a UUID, not an operator-visible name), the rungs, and the whole
+ * basis for the call: the Media3 error code (or `none` when the stall watchdog
+ * fired with no exception), whether the rung had ever played, and how many
+ * pre-first-frame failures it has accumulated.
+ */
+fun fallbackLogLine(
+    cameraId: String,
+    from: StreamTier?,
+    to: StreamTier?,
+    steppedDown: Boolean,
+    everReady: Boolean,
+    errorCode: Int?,
+    failureDetail: String?,
+    preFirstFrameFailures: Int,
+): String {
+    val verb = if (steppedDown) "step down to ${to?.name ?: "?"}" else "hold"
+    val code = errorCode?.let {
+        val kind = when {
+            isUnplayableFormatError(it) -> "format"
+            isCodecAgnosticError(it) -> "retryable"
+            else -> "other"
+        }
+        "$it/$kind"
+    } ?: "none"
+    val detail = failureDetail?.let {
+        " detail=\"$it\"${if (isUnplayableFailureDetail(it)) " (known-unplayable)" else ""}"
+    } ?: ""
+    return "camera=$cameraId rung=${from?.name ?: "?"} $verb " +
+        "errorCode=$code everReady=$everReady noFrameFailures=$preFirstFrameFailures$detail"
+}
+
+/** One line naming the rung a camera is about to attach to, and the ladder it sits in. */
+fun attachLogLine(
+    cameraId: String,
+    surface: String,
+    tier: StreamTier?,
+    chain: List<StreamTier>,
+    failed: Set<StreamTier>,
+): String =
+    "camera=$cameraId $surface attach rung=${tier?.name ?: "none"} " +
+        "chain=[${chain.joinToString(",") { it.name }}] " +
+        "skipped=[${chain.filter { it in failed }.joinToString(",") { it.name }}]"
 
 /**
  * Text for the fullscreen "not on HD" badge, or `null` on the main stream (no
@@ -188,20 +389,49 @@ fun sdBadgeLabel(tier: StreamTier?): String? = when (tier) {
  * `LiveScreen`'s config-version watch. It is also dropped for a camera whose
  * ladder is exhausted with nothing playable, since a total outage is no evidence
  * about codecs.
+ *
+ * Verdicts additionally **expire** after [VERDICT_TTL_MS] (#560). A guess made
+ * from a failure should not outlive the conditions that produced it: without a
+ * TTL, one bad moment — a congested AP, a camera still booting, a server that
+ * had not warmed the restream yet — pinned a camera to a lower rung until the
+ * app was force-stopped. Re-testing the top rung costs at most one more walk down
+ * the ladder, which is bounded and silent; being wrong for a whole day is not.
  */
 object LiveStreamFallbackMemory {
 
-    private val failedByCamera = HashMap<String, MutableSet<StreamTier>>()
+    /**
+     * How long a rung stays marked unplayable. Long enough that a session of
+     * flipping between the wall and fullscreen never re-walks the ladder, short
+     * enough that a wrong verdict heals itself while the operator is still
+     * holding the phone.
+     */
+    const val VERDICT_TTL_MS = 10 * 60 * 1000L
 
-    /** Rungs already known to be unplayable for [cameraId] this run. */
+    private val ttlNanos = VERDICT_TTL_MS * 1_000_000L
+
+    /** Monotonic clock, swapped in tests. `nanoTime` because a verdict's age must
+     *  not be affected by a wall-clock or timezone change. */
+    internal var nanoTime: () -> Long = { System.nanoTime() }
+
+    private val failedByCamera = HashMap<String, MutableMap<StreamTier, Long>>()
+
+    /** Rungs known to be unplayable for [cameraId], minus any whose verdict aged out. */
     @Synchronized
-    fun failedTiers(cameraId: String): Set<StreamTier> =
-        failedByCamera[cameraId]?.toSet() ?: emptySet()
+    fun failedTiers(cameraId: String): Set<StreamTier> {
+        val marks = failedByCamera[cameraId] ?: return emptySet()
+        val now = nanoTime()
+        marks.entries.retainAll { now - it.value < ttlNanos }
+        if (marks.isEmpty()) {
+            failedByCamera.remove(cameraId)
+            return emptySet()
+        }
+        return marks.keys.toSet()
+    }
 
     /** Record that [tier] never produced a playable frame for [cameraId]. */
     @Synchronized
     fun markFailed(cameraId: String, tier: StreamTier) {
-        failedByCamera.getOrPut(cameraId) { mutableSetOf() }.add(tier)
+        failedByCamera.getOrPut(cameraId) { mutableMapOf() }[tier] = nanoTime()
     }
 
     /** Forget one camera's verdicts (ladder exhausted, or the camera was edited). */

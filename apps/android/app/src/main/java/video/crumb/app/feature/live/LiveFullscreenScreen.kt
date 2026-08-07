@@ -84,23 +84,24 @@ import kotlinx.coroutines.launch
  * [CrumbRepository.liveStreams]; a loading spinner is shown while the
  * network call is in-flight and while the player is buffering.
  *
- * H265 fallback LADDER: many cameras (e.g. Uniview LPR) ship an **H265 main +
- * H264 sub**, and Media3's RTSP stack can't reliably bring up H265 over RTSP —
- * the main would spin/error forever even though the wall tiles (which play the
- * H264 sub) work fine. Some cameras ship H265 on **both** main and sub (#524),
- * where a single main→sub downgrade lands on a second unplayable stream and the
- * view spins forever. So the downgrade is a ladder, not a step: each rung that
- * never reaches a playable frame steps down to the next one this camera exposes
- * (`main → subv → sub → mobile`, see [fullscreenStreamChain]), ending at the
- * server's H.264 `_mobile` transcode — a codec Media3 can always decode. A
- * stream that plays and *then* drops is treated as a transient blip and
- * reconnects to the same rung (no permanent downgrade) unless the error is
- * specifically a decoder/format one. Anything below the main shows the "SD"
- * badge, which names the transcode when that's what is playing. The verdict is
- * remembered per camera for the app run ([LiveStreamFallbackMemory]) so a
- * revisit reattaches straight to the rung that worked. Recorded playback is
- * unaffected (fMP4 over HTTP decodes H265 fine; only the live RTSP path has the
- * depacketizer limitation).
+ * Unplayable-stream fallback LADDER: a rung that repeatedly fails to reach a
+ * playable VIDEO frame, with nothing to explain it, steps down to the next one
+ * this camera exposes (`main → subv → sub → mobile`, see [fullscreenStreamChain]),
+ * ending at the server's H.264 `_mobile` transcode (#524). **This is not about
+ * H.265** — measured on device, Media3 1.4.1 plays H.265 mains over RTSP fine,
+ * 4K included; what actually fails is narrower and per-stream (an RTP
+ * packetization Media3 never implemented, or a device with no HEVC decoder), so
+ * the ladder is reactive only and must never pre-empt on codec. See [StreamTier]
+ * for the measurements. A stream that plays and *then* drops is a transient blip
+ * and reconnects to the same rung, and so is a connect/timeout failure or a slow
+ * first keyframe before it (#560); only a decoder/format error or a known
+ * deterministic failure signature steps down at once. Anything below the main
+ * shows the "SD" badge, which names the transcode when that's what is playing.
+ * The verdict is remembered per camera for the app run
+ * ([LiveStreamFallbackMemory], expiring after
+ * [LiveStreamFallbackMemory.VERDICT_TTL_MS]) so a revisit reattaches straight to
+ * the rung that worked. Recorded playback is unaffected (fMP4 over HTTP decodes
+ * H265 fine; only the live RTSP path has the depacketizer limitation).
  *
  * Controls are minimal to preserve immersion: a back arrow (top-left) and a
  * playback shortcut (top-right) float over the black video surface.
@@ -414,6 +415,10 @@ fun LiveFullscreenScreen(
                     val start = startTier(resolvedChain, failed)
                     tier = start
                     rtspUrl = start?.let { resolved.urlForTier(it) }
+                    android.util.Log.i(
+                        FALLBACK_LOG_TAG,
+                        attachLogLine(currentCameraId, "fullscreen", start, resolvedChain, failed),
+                    )
                     isResolving = false
                 },
                 onFailure = { cause ->
@@ -453,12 +458,22 @@ fun LiveFullscreenScreen(
         val url = rtspUrl // captured; non-null whenever player != null
         var attempt = 0
         var reconnectJob: Job? = null
-        // Did this stream ever reach a playable frame? Gates the H265-main fallback:
-        // only a main that NEVER played downgrades to sub (a main that played then
-        // dropped is transient and reconnects to main).
+        // Did this stream ever reach a playable state? Drives the buffering
+        // watchdog's patience, and the UI.
         var everReady = false
+        // Did this stream ever paint an actual VIDEO frame? THIS is what gates the
+        // fallback ladder, not `everReady`: `STATE_READY` can be reached on the
+        // AUDIO track alone, so a rung whose video renderer is dead would otherwise
+        // read as "playing fine" and never step down. Fullscreen only — its surface
+        // is always attached and visible, so a missing first frame really does mean
+        // no video; a wall tile's surface can legitimately go away underneath it.
+        var everRenderedFrame = false
+        // Consecutive failures on THIS rung before it ever showed a frame. Lives
+        // with the player, which is re-keyed on the rung's URL, so moving down the
+        // ladder starts a fresh count (#560).
+        var noFrameFailures = 0
 
-        fun scheduleReconnect(errorCode: Int? = null) {
+        fun scheduleReconnect(errorCode: Int? = null, failureDetail: String? = null) {
             if (player == null || url == null) return
             if (reconnectJob?.isActive == true) return // one already in flight
             // Offline (#3): don't burn the attempt budget on a doomed re-prepare.
@@ -472,17 +487,43 @@ fun LiveFullscreenScreen(
                 return
             }
             // ── H265 / unplayable-stream fallback ladder (#524) ─────────────────
-            // A stream that never reached a playable state is almost always a codec
-            // the RTSP path can't handle on this device (many cameras ship an H265
-            // main, and some ship H265 on the sub too; Media3's RTSP HEVC
-            // depacketizer is unreliable). Reconnecting to it would loop forever, so
-            // step DOWN to the next rung this camera exposes — ending at the
-            // server's H.264 `_mobile` transcode, which always decodes.
+            // A stream that repeatedly fails to reach a playable state with nothing
+            // to blame it on is almost always a codec the RTSP path can't handle on
+            // this device (many cameras ship an H265 main, and some ship H265 on the
+            // sub too; Media3's RTSP HEVC depacketizer is unreliable). Reconnecting
+            // to it would loop forever, so step DOWN to the next rung this camera
+            // exposes — ending at the server's H.264 `_mobile` transcode, which
+            // always decodes. A TRANSPORT failure is not that evidence (#560): a
+            // connect/timeout error, or one slow first keyframe, reconnects here.
+            noFrameFailures = tallyPreFirstFrameFailure(noFrameFailures, everRenderedFrame)
             val current = tier
             val next = nextTier(chain, current, failedTiers)
-            if (current != null && next != null &&
-                shouldFallBackToNextTier(hasNextTier = true, everReady = everReady, errorCode = errorCode)
-            ) {
+            val stepDown = current != null && next != null && shouldFallBackToNextTier(
+                hasNextTier = true,
+                everReady = everRenderedFrame,
+                errorCode = errorCode,
+                failureDetail = failureDetail,
+                preFirstFrameFailures = noFrameFailures,
+            )
+            // Log the ladder's reasoning, but only for the cases it exists for: a
+            // step down, or a rung that has not played yet. An ordinary reconnect
+            // on a stream that was playing is the reconnect ladder's business.
+            if (current != null && (stepDown || !everRenderedFrame)) {
+                android.util.Log.i(
+                    FALLBACK_LOG_TAG,
+                    fallbackLogLine(
+                        cameraId = currentCameraId,
+                        from = current,
+                        to = next,
+                        steppedDown = stepDown,
+                        everReady = everRenderedFrame,
+                        errorCode = errorCode,
+                        failureDetail = failureDetail,
+                        preFirstFrameFailures = noFrameFailures,
+                    ),
+                )
+            }
+            if (stepDown) {
                 // Remember the verdict for the app run so a revisit (or the wall)
                 // reattaches straight to a rung that can actually play.
                 LiveStreamFallbackMemory.markFailed(currentCameraId, current)
@@ -551,10 +592,18 @@ fun LiveFullscreenScreen(
             override fun onPlayerError(error: PlaybackException) {
                 isBuffering = false
                 // Try to reconnect before showing the hard error. The error code
-                // goes with it: a decoder/format failure steps down the ladder even
-                // if this stream had been playing, while an IO/timeout failure
+                // AND the (credential-scrubbed) exception chain go with it: a
+                // decoder/format failure, or a known-deterministic signature like
+                // the RTP HEVC aggregation-packet one, steps down the ladder even if
+                // this stream had been playing, while an IO/timeout failure
                 // reconnects to the same rung (see shouldFallBackToNextTier).
-                scheduleReconnect(error.errorCode)
+                scheduleReconnect(error.errorCode, failureDetail(error))
+            }
+
+            override fun onRenderedFirstFrame() {
+                // Real video reached the surface — this rung decodes, whatever the
+                // codec. The one signal the ladder trusts as "playable".
+                everRenderedFrame = true
             }
 
             override fun onVideoSizeChanged(vs: VideoSize) {
@@ -608,7 +657,8 @@ fun LiveFullscreenScreen(
                         lastPos = -1L; stuckMs = 0L; readyHeldMs = 0L
                         bufferingMs += WATCHDOG_TICK_MS
                         // A stream that never reaches READY can sit in BUFFERING
-                        // instead of erroring (H265 the RTSP path can't decode). While
+                        // instead of erroring (an unbringable stream — see
+                        // LiveStreamFallback.kt; not H.265 as such). While
                         // there is a rung left to fall back to, bound that spin;
                         // on the last rung use the patient threshold. The derived
                         // rungs (`_subv` / `_mobile`) get a longer allowance because
@@ -1177,7 +1227,7 @@ private const val READY_SUSTAINED_MS = 30_000L
 private const val STALL_BUFFERING_MS = 15_000L
 /**
  * Shorter buffering limit (ms) applied ONLY to a main stream that has never
- * reached READY and has a sub stream to fall back to. An H265 main the RTSP path
+ * reached READY and has a sub stream to fall back to. A stream the RTSP path
  * can't decode may sit in BUFFERING rather than erroring; this bounds how long
  * the HD attempt spins before downgrading to the (H264) sub stream.
  */
