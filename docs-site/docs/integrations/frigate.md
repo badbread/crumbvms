@@ -206,6 +206,12 @@ but nothing shows up in Crumb's Plates tab, that's the first thing to check. See
    console's Frigate settings panel includes a test button that checks
    both bases before you save.
 
+Those two addresses are different services and are not interchangeable. The
+**go2rtc API (:1984)** base is only used to pull live video for cameras served
+by Frigate; the **HTTP API (:5000)** base is what fetches event snapshots and
+backfills events. Setting one never fills in the other, so if snapshots are
+missing while detections arrive fine, the HTTP API base is the field to check.
+
 When the MQTT URL is left unset, the entire detection subsystem stays
 disabled: no background task runs, and the events surface simply returns
 empty results. The behavior of pixel motion detection, recording, and
