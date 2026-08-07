@@ -935,10 +935,10 @@ pub struct ServerSettingsDto {
     /// (e.g. `"rtsp://frigate-host:8554"`). Only needed when cameras have
     /// `served_by = "frigate"`.
     pub frigate_rtsp_base: String,
-    /// HTTP API base for the external Frigate go2rtc REST API (:1984 — MSE
-    /// proxy, frame-grab for Frigate-served cameras).
-    /// (e.g. `"http://frigate-host:1984"`).
-    /// Kept for back-compat; new code should prefer `frigate_go2rtc_api_base`.
+    /// DEPRECATED pre-0014 combined Frigate API base, echoed back so an old
+    /// client can round-trip it. New code must read `frigate_go2rtc_api_base`
+    /// (:1984) or `frigate_http_api_base` (:5000) instead — this field is not
+    /// authoritative for either.
     pub frigate_api_base: String,
     /// HTTP API base for the external Frigate go2rtc REST API (:1984).
     /// Used by cameras/playback frame+MSE+WebRTC proxy for `served_by="frigate"` cams.
@@ -983,18 +983,24 @@ pub struct UpdateServerSettingsRequest {
     pub crumb_rtsp_base: String,
     pub crumb_api_base: String,
     pub frigate_rtsp_base: String,
-    /// Legacy combined Frigate API base. Consumers that have not migrated to
-    /// the split fields may still send this; the handler copies it into both
-    /// `frigate_go2rtc_api_base` and `frigate_http_api_base` when those are
-    /// absent so existing admin-console saves keep working.
+    /// Legacy combined Frigate API base — DEPRECATED, do not send from new
+    /// clients. Migration 0014 split it into `frigate_go2rtc_api_base` (:1984)
+    /// and `frigate_http_api_base` (:5000) because one field could not mean
+    /// both. Old clients that still send it seed the go2rtc field only; it is
+    /// NEVER copied into the HTTP field (see `resolve_frigate_bases`).
+    ///
+    /// `None` (key omitted, what current clients do) means "leave the stored
+    /// legacy column alone" — a whole-row PUT from a new client must not wipe a
+    /// value an old install still relies on. `Some("")` explicitly clears it.
     #[serde(default)]
-    pub frigate_api_base: String,
+    pub frigate_api_base: Option<String>,
     /// HTTP API base for the external Frigate go2rtc REST endpoint (:1984).
-    /// When omitted/empty the handler falls back to `frigate_api_base`.
+    /// When omitted/empty the handler falls back to the legacy `frigate_api_base`.
     #[serde(default)]
     pub frigate_go2rtc_api_base: String,
     /// HTTP base for the Frigate HTTP event/snapshot API (:5000).
-    /// When omitted/empty the handler falls back to `frigate_api_base`.
+    /// Empty ⇒ fall back to `frigate_config.api_base` / the `FRIGATE_API_BASE`
+    /// env at read time. Deliberately NOT seeded from the legacy field.
     #[serde(default)]
     pub frigate_http_api_base: String,
     /// Motion-decode backend: `"auto"`/`"cuda"`/`"vaapi"`/`"cpu"`. Empty ⇒ the

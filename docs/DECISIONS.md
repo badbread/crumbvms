@@ -72,6 +72,83 @@ alert.
 
 ---
 
+## 2026-08-06, Media-token scope on `/cameras/:id/streams`: gate the endpoint on a full session now, defer per-request RTSP credentials
+
+**Context.** A scoped media token (`?token=`, `typ: "media"`, ~15 min, one
+camera, media only) exists so that browser elements which cannot set an
+`Authorization` header still get something weak instead of the full login JWT.
+`auth.rs` documents that property as "a leak grants at most view one camera's
+media for a few minutes".
+
+That property is about what a token can *reach*, not just what its claims say,
+and it is not self-enforcing. It holds only while every endpoint reachable with
+`?token=` returns something no more durable and no broader than the token.
+`GET /cameras/:id/streams` was not such an endpoint: it lives in `media_routes`,
+and its RTSP URLs embed `GO2RTC_USER`/`GO2RTC_PASS` — one server-wide,
+non-expiring pair covering every stream go2rtc serves. A media-token holder
+could therefore trade the weak credential for a strictly stronger one, which
+makes the token's careful scoping decorative on that path. Found in the v0.2.0
+release audit (#506).
+
+**Decision.** Two changes, both minimum-scope for the v0.2.0 tag:
+
+- A new `FullSessionUser` extractor in `auth_mw.rs`, backed by a
+  `media_scoped: bool` marker on `AuthUser` set at the two construction sites.
+  It wraps `AuthUser` and rejects a media-token principal with 403.
+  `live_streams` takes it instead of `AuthUser`. The endpoint stays in
+  `media_routes` — the extractor, not the mount point, is what carries the
+  rule, and it now reads as an explicit property of the handler.
+- `/auth` is routed as its own subtree so the permissive CORS layer skips it
+  (`cors.rs`, `cors::compose`). It keeps the identical rate-limit / timeout /
+  compression stack — the rate limiter in particular is what makes
+  `/auth/login` expensive to brute-force, and losing it silently would be a
+  worse outcome than the wildcard header.
+
+Client verification before changing the extractor: all four surfaces
+(`apps/desktop-flutter/lib/api/crumb_api.dart`, Android `CrumbApi.kt` via its
+`AuthInterceptor`, `apps/ios/.../CrumbAPI.swift`, and `admin.html`'s `api()`
+helper) already call `/cameras/:id/streams` with the `Authorization: Bearer`
+header during session setup. No client change, no version skew.
+
+**Rejected:**
+
+- **Per-request short-lived RTSP credentials** — the structurally correct fix:
+  the response would carry nothing durable and the property would hold by
+  construction instead of by endpoint-by-endpoint review. Deferred to #507, not
+  dismissed. It needs go2rtc's auth model investigated (per-stream credentials
+  may not be expressible without hand-managing `go2rtc.yaml`, which the
+  reconcile loop owns), and a credential that expires mid-live-view means a
+  renewal path in three clients. That is a design task with its own testing
+  pass, not something to land inside a release-audit fix.
+- **Moving the route out of `media_routes` into `json_routes`.** Equivalent
+  security outcome, but it would silently add the 30 s timeout and the JSON
+  rate limiter to a call every client makes once per camera at session setup,
+  and it leaves the next reader to infer the rule from a mount point. The
+  extractor states it.
+- **Dropping the permissive CORS layer everywhere, not just `/auth`.** Probably
+  right — nothing Crumb ships needs CORS at all, since the clients are native
+  and the console is same-origin. Deliberately not done in a security-fix PR
+  bound for a release tag: it could break an operator's own LAN page or script
+  with no warning, and that is a change that deserves its own note in the
+  release notes rather than a footnote in a hardening commit.
+
+**Trade-offs accepted.** The go2rtc credential is still server-wide and
+non-expiring; a full login session can still read it, which is exactly the
+status quo for every client. The `media_scoped` flag is a marker a future
+extractor must remember to check — the mitigation is that `FullSessionUser`
+exists and is documented as the thing to reach for, rather than each handler
+re-deriving the rule.
+
+**Revisit triggers.** Any of: #507 lands (this entry's first half becomes
+redundant); go2rtc gains a usable per-stream or token auth mechanism; a
+deployment mode appears where the RTSP endpoint is reachable beyond the LAN;
+another endpoint turns up returning a credential broader than its caller's
+proof, which would mean the one-off extractor gate is the wrong shape and a
+response-side rule is needed; or the permissive CORS layer is dropped from the
+remaining routes, at which point `cors.rs` and its control test collapse.
+
+---
+
 ## 2026-08-06, Unmounted-storage guard: a marker FILE plus a circuit breaker, not a mountpoint heuristic
 
 **Context.** Reconcile's dangling-row pass stats `storage.path / seg.path` for

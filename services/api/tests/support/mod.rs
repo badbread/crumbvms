@@ -55,6 +55,8 @@ pub mod clips;
 pub mod config;
 #[path = "../../src/config_routes.rs"]
 pub mod config_routes;
+#[path = "../../src/cors.rs"]
+pub mod cors;
 #[path = "../../src/db_backup.rs"]
 pub mod db_backup;
 #[path = "../../src/diagnostics.rs"]
@@ -388,6 +390,24 @@ pub fn test_router() -> Router<AppState> {
         .merge(notifications::routes())
 }
 
+/// Build a router using the **production** CORS composition
+/// ([`cors::compose`]), so the `/auth` carve-out is asserted against the real
+/// code rather than a mirror of it.
+///
+/// Mirrors `main.rs`'s split: `/auth` is passed as the `no_cors` subtree and
+/// everything else goes inside the permissive layer. Only two route groups are
+/// mounted — `/auth` (the carve-out) and `/media-token` + `/status` (the
+/// control, proving the layer is still wired and the assertions aren't
+/// vacuous). Nothing here depends on which other routes exist.
+pub fn cors_test_router() -> Router<AppState> {
+    cors::compose(
+        Router::new()
+            .merge(auth::media_token_routes())
+            .merge(status::routes()),
+        Router::new().nest("/auth", auth::routes()),
+    )
+}
+
 /// A running instance of the test app: state + built router, ready to
 /// `.oneshot(request)`.
 pub struct TestApp {
@@ -399,6 +419,14 @@ impl TestApp {
     pub async fn new() -> Self {
         let state = test_state().await;
         let router = test_router().with_state(state.clone());
+        Self { state, router }
+    }
+
+    /// Variant whose router carries the production CORS composition
+    /// ([`cors_test_router`]). Used by the `/auth` CORS carve-out tests.
+    pub async fn new_with_cors() -> Self {
+        let state = test_state().await;
+        let router = cors_test_router().with_state(state.clone());
         Self { state, router }
     }
 
