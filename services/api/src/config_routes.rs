@@ -1082,6 +1082,72 @@ async fn get_camera(
     Ok(Json(camera_to_dto(camera)))
 }
 
+/// How a `update_camera` edit must be pushed into go2rtc. Chosen by
+/// [`plan_camera_sync`] from the camera's before/after source + stream name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraSync {
+    /// The camera has no Crumb-managed source (and had none) — nothing to do.
+    Nothing,
+    /// The camera was just DETACHED from Crumb management (source cleared) —
+    /// tear down the streams it used to own.
+    Remove,
+    /// A managed edit that changed NEITHER the source URLs nor the stream name —
+    /// `reconcile` (in-place `PATCH`, no producer re-dial), the fan-out-safe path.
+    Reconcile,
+    /// A managed camera's source URL (main or sub) changed under an UNCHANGED
+    /// stream name — `reconnect` (DELETE+PUT). A plain `reconcile` here would
+    /// `PATCH` the existing stream in place, which (a) does not re-dial the
+    /// producer onto the new source and (b) SWALLOWS a go2rtc rejection of the
+    /// new source — re-opening #519 for edits. `reconnect` re-creates the
+    /// stream, so an unusable new URL surfaces as a `camera_stream_rejected`
+    /// event exactly as it does on the add path (#528).
+    Reconnect,
+    /// A managed camera's `go2rtc_name` changed — the OLD name's streams are now
+    /// orphaned (reconcile is additive and never prunes), so remove them, then
+    /// `reconcile` PUTs the fresh names (the Create path, which is rejection-aware).
+    RemoveOldThenReconcile,
+}
+
+/// Decide how to reconcile a camera edit with go2rtc (pure — unit-tested).
+///
+/// The one case that must NOT stay a `reconcile` is a source-URL change on an
+/// already-managed camera whose stream name is unchanged: that stream already
+/// exists in go2rtc, so `reconcile` would `PATCH` it in place and discard any
+/// 4xx rejection of the new source (issue #519, re-opened for edits). Route it
+/// through `reconnect` (DELETE+PUT) so it re-enters the confirm-by-existence +
+/// `camera_stream_rejected` path #528 built for adds.
+fn plan_camera_sync(
+    new_source_url: Option<&str>,
+    new_source_sub_url: Option<&str>,
+    new_go2rtc_name: &str,
+    old_source_url: Option<&str>,
+    old_source_sub_url: Option<&str>,
+    old_go2rtc_name: &str,
+) -> CameraSync {
+    if new_source_url.is_none() {
+        // Not (or no longer) Crumb-managed.
+        return if old_source_url.is_some() {
+            CameraSync::Remove
+        } else {
+            CameraSync::Nothing
+        };
+    }
+    if old_source_url.is_none() {
+        // Newly managed: no existing managed stream to re-dial or orphan. A
+        // plain reconcile PUTs it (Create path), which already surfaces a
+        // go2rtc rejection.
+        return CameraSync::Reconcile;
+    }
+    // Was and still is managed.
+    if new_go2rtc_name != old_go2rtc_name {
+        return CameraSync::RemoveOldThenReconcile;
+    }
+    if new_source_url != old_source_url || new_source_sub_url != old_source_sub_url {
+        return CameraSync::Reconnect;
+    }
+    CameraSync::Reconcile
+}
+
 /// `PUT /config/cameras/{id}` — partial update of camera fields.
 ///
 /// Only non-`null` / present JSON fields are applied.  Returns the updated row.
@@ -1426,15 +1492,45 @@ async fn update_camera(
             .context("set_camera_policy")?;
     }
 
-    // Apply go2rtc changes: re-sync if managed; remove the stream if it was just
-    // detached from Crumb management.
-    if source_url.is_some() {
-        if let Err(e) = crate::go2rtc::reconcile(&state).await {
-            tracing::warn!(camera_id = %id, error = %e, "go2rtc re-sync failed; reconcile loop will retry");
+    // Apply go2rtc changes. A source-URL change must go through `reconnect`
+    // (DELETE+PUT), not a plain `reconcile`: reconcile `PATCH`es the existing
+    // stream in place, which neither re-dials the producer onto the new source
+    // NOR surfaces a go2rtc rejection of it — it swallows the 4xx, re-opening
+    // #519 for edits. See `plan_camera_sync` / `go2rtc::reconnect`.
+    match plan_camera_sync(
+        source_url.as_deref(),
+        source_sub_url.as_deref(),
+        &go2rtc_name,
+        existing.source_url.as_deref(),
+        existing.source_sub_url.as_deref(),
+        &existing.go2rtc_name,
+    ) {
+        CameraSync::Nothing => {}
+        CameraSync::Remove => {
+            if let Err(e) = crate::go2rtc::remove(&state, &existing.go2rtc_name).await {
+                tracing::warn!(camera_id = %id, error = %e, "go2rtc stream removal failed");
+            }
         }
-    } else if existing.source_url.is_some() {
-        if let Err(e) = crate::go2rtc::remove(&state, &existing.go2rtc_name).await {
-            tracing::warn!(camera_id = %id, error = %e, "go2rtc stream removal failed");
+        CameraSync::Reconcile => {
+            if let Err(e) = crate::go2rtc::reconcile(&state).await {
+                tracing::warn!(camera_id = %id, error = %e, "go2rtc re-sync failed; reconcile loop will retry");
+            }
+        }
+        CameraSync::Reconnect => {
+            if let Err(e) = crate::go2rtc::reconnect(&state, &go2rtc_name).await {
+                tracing::warn!(camera_id = %id, error = %e, "go2rtc reconnect after source change failed; reconcile loop will retry");
+            }
+        }
+        CameraSync::RemoveOldThenReconcile => {
+            // The stream NAME changed: the old name's streams are orphaned
+            // (reconcile never prunes), so tear them down first, then reconcile
+            // PUTs the fresh names (the rejection-aware Create path).
+            if let Err(e) = crate::go2rtc::remove(&state, &existing.go2rtc_name).await {
+                tracing::warn!(camera_id = %id, error = %e, "go2rtc: removing renamed camera's old stream failed");
+            }
+            if let Err(e) = crate::go2rtc::reconcile(&state).await {
+                tracing::warn!(camera_id = %id, error = %e, "go2rtc re-sync failed; reconcile loop will retry");
+            }
         }
     }
 
@@ -5520,5 +5616,93 @@ mod first_run_message_tests {
         assert!(recorder_mode_verdict(&base.join("does-not-exist")).is_none());
         let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+// ─── go2rtc sync routing on a camera edit (issue #519, re-opened for edits) ────
+//
+// The regression these guard: `update_camera` pushed EVERY managed edit through
+// `reconcile`, which `PATCH`es an already-registered stream in place. A PATCH
+// only bails on a 5xx, so a go2rtc 4xx REJECTION of a newly-typed source URL
+// (e.g. a literal space) was discarded — the camera silently stopped recording
+// with no `camera_stream_rejected` event, exactly the #519 bug for edits. The
+// fix routes a source-URL change through `reconnect` (DELETE+PUT), which
+// re-enters the confirm-by-existence + rejection-event path #528 built for adds.
+#[cfg(test)]
+mod plan_camera_sync_tests {
+    use super::*;
+
+    const A: &str = "rtsp://cam.invalid:554/main";
+    const B: &str = "rtsp://cam.invalid:554/other";
+
+    /// THE fix: editing an already-managed camera's source URL (same stream
+    /// name) must `reconnect`, not `reconcile` — reconnect is the only path that
+    /// re-creates the stream and so surfaces a go2rtc rejection of the new URL.
+    #[test]
+    fn a_source_url_change_reconnects() {
+        assert_eq!(
+            plan_camera_sync(Some(B), None, "front", Some(A), None, "front"),
+            CameraSync::Reconnect
+        );
+    }
+
+    /// A sub-source change is just as operator-typed and just as rejectable, so
+    /// it takes the same reconnect path.
+    #[test]
+    fn a_sub_source_url_change_reconnects() {
+        assert_eq!(
+            plan_camera_sync(Some(A), Some(B), "front", Some(A), Some(A), "front"),
+            CameraSync::Reconnect
+        );
+    }
+
+    /// A metadata-only edit (name, policy, motion, …) leaves both source URLs
+    /// and the stream name untouched — stay on the fan-out-safe in-place PATCH,
+    /// so a live-view producer is not needlessly re-dialled.
+    #[test]
+    fn an_edit_that_touches_no_source_reconciles_in_place() {
+        assert_eq!(
+            plan_camera_sync(Some(A), Some(B), "front", Some(A), Some(B), "front"),
+            CameraSync::Reconcile
+        );
+    }
+
+    /// A `go2rtc_name` rename orphans the old name's streams (reconcile never
+    /// prunes), so they are removed before reconcile PUTs the fresh names.
+    #[test]
+    fn a_stream_name_rename_removes_the_old_streams_first() {
+        assert_eq!(
+            plan_camera_sync(Some(A), None, "back", Some(A), None, "front"),
+            CameraSync::RemoveOldThenReconcile
+        );
+    }
+
+    /// Detaching a camera from Crumb management (source cleared) tears its
+    /// streams down.
+    #[test]
+    fn clearing_the_source_removes_the_streams() {
+        assert_eq!(
+            plan_camera_sync(None, None, "front", Some(A), None, "front"),
+            CameraSync::Remove
+        );
+    }
+
+    /// A brand-new managed source has no existing stream to re-dial or orphan;
+    /// a plain reconcile PUTs it (the Create path already surfaces a rejection).
+    #[test]
+    fn newly_adding_a_source_reconciles() {
+        assert_eq!(
+            plan_camera_sync(Some(A), None, "front", None, None, "front"),
+            CameraSync::Reconcile
+        );
+    }
+
+    /// An unmanaged camera that stays unmanaged touches go2rtc not at all.
+    #[test]
+    fn an_unmanaged_camera_does_nothing() {
+        assert_eq!(
+            plan_camera_sync(None, None, "front", None, None, "front"),
+            CameraSync::Nothing
+        );
     }
 }
