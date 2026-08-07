@@ -78,10 +78,10 @@ fn sub_name(go2rtc_name: &str) -> String {
 
 /// The go2rtc stream name for a camera's CLIENT-facing, VIDEO-ONLY sub restream
 /// (`<name>_subv`). `pub(crate)` because `playback.rs` builds the client
-/// `rtsp_subv_url` from it — the two must never drift apart. Registered for
-/// every camera that has a `_sub`, whether or not a client asks for it; only
-/// Media3/ExoPlayer clients (Android) actually connect to it, and go2rtc spawns
-/// the ffmpeg lazily, so an unused registration costs nothing.
+/// `rtsp_subv_url` from it — the two must never drift apart.
+///
+/// Registered ONLY for cameras whose sub actually needs the repair, as detected
+/// per-pass by [`sdp_video_lacks_fmtp`]. See [`reconcile`].
 pub(crate) fn subv_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_subv")
 }
@@ -92,9 +92,9 @@ fn mobile_name(go2rtc_name: &str) -> String {
 }
 
 /// Build the go2rtc source for a camera's `<name>_subv` — the video-only sub
-/// restream the ANDROID live wall plays (#483). Desktop and iOS stay on the raw
-/// `<name>_sub`; see `playback.rs`'s `rtsp_subv_url` for why the choice is the
-/// client's.
+/// restream the ANDROID live wall plays for the FEW cameras that need it (#483).
+/// Desktop and iOS stay on the raw `<name>_sub`; see `playback.rs`'s
+/// `rtsp_subv_url` for why the choice is the client's.
 ///
 /// It reads the EXISTING `<name>_sub` stream by name (go2rtc's documented
 /// restream form), so it shares that stream's single producer and adds no extra
@@ -269,23 +269,95 @@ async fn get_stream_count(
     }
 }
 
-/// GET the SET of stream names go2rtc currently has (`GET /api/streams` keys).
-/// Used by [`reconcile`] to choose CREATE (`PUT`, name missing) vs in-place
-/// UPDATE (`PATCH`, name present) per stream. On any error the caller falls back
-/// to treating every stream as missing (PUT-all) — the pre-fan-out-fix behavior —
-/// so a go2rtc that is unreachable / mid-restart still gets its full set applied.
-async fn get_stream_names(
+/// What one `GET /api/streams` pass tells us about go2rtc's current state.
+///
+/// Both fields come out of the SAME response, deliberately: the reconcile pass
+/// already had to fetch the stream names, and go2rtc includes each producer's
+/// raw SDP in that payload, so detecting broken subs costs **zero** extra
+/// requests and cannot itself slow a pass down or dial a camera.
+#[derive(Debug, Default)]
+struct StreamIndex {
+    /// The stream names go2rtc currently has (the JSON object's keys).
+    names: HashSet<String>,
+    /// Per stream name, a DEFINITE verdict on its producer's video track:
+    /// `true` ⇒ the SDP advertises video with no `a=fmtp` (needs the `_subv`
+    /// repair), `false` ⇒ it has one. A name is ABSENT when no verdict could be
+    /// reached — no producer attached yet, no SDP, or no video section — which
+    /// callers must treat as "don't know", never as "broken".
+    video_lacks_fmtp: std::collections::HashMap<String, bool>,
+}
+
+/// Does this SDP describe a video track with NO `a=fmtp` attribute?
+///
+/// `None` ⇒ no verdict (empty SDP, or no `m=video` section at all). `Some(true)`
+/// ⇒ the video track carries no `a=fmtp` line, which is exactly the condition
+/// that makes Android's Media3 RTSP client throw
+/// `IllegalArgumentException: missing attribute fmtp` and reconnect-loop the
+/// tile forever (#483). Such a stream has no out-of-band parameter sets at all
+/// (ffprobe on it reports "non-existing PPS 0 referenced / no frame!").
+///
+/// Attributes belong to the media section they follow, so this walks sections
+/// rather than scanning the whole SDP: a `a=fmtp` on the AUDIO track must not
+/// make a broken video track look healthy. Session-level lines (before the
+/// first `m=`) are skipped for the same reason. Pure + unit-tested against real
+/// SDPs from the reference install.
+fn sdp_video_lacks_fmtp(sdp: &str) -> Option<bool> {
+    let mut in_video = false;
+    let mut saw_video = false;
+    let mut has_fmtp = false;
+    for line in sdp.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(media) = line.strip_prefix("m=") {
+            // A second video section would be unusual; the first one is the one
+            // a player builds its track from, so stop looking after it ends.
+            if saw_video {
+                break;
+            }
+            in_video = media.starts_with("video");
+            saw_video |= in_video;
+        } else if in_video && line.to_ascii_lowercase().starts_with("a=fmtp:") {
+            has_fmtp = true;
+        }
+    }
+    saw_video.then_some(!has_fmtp)
+}
+
+/// Reach a verdict for one entry of go2rtc's `/api/streams` object.
+///
+/// A stream can have several producers (go2rtc keeps one per source). We take
+/// the FIRST producer that yields a verdict: they all restream the same camera,
+/// and a stream with no producer attached yet yields `None` (unknown) rather
+/// than a guess. Pure + unit-tested.
+fn stream_video_lacks_fmtp(entry: &serde_json::Value) -> Option<bool> {
+    entry
+        .get("producers")?
+        .as_array()?
+        .iter()
+        .filter_map(|p| p.get("sdp")?.as_str())
+        .find_map(sdp_video_lacks_fmtp)
+}
+
+/// GET go2rtc's current stream index (`GET /api/streams`) — the names it has,
+/// plus the per-stream SDP verdict described on [`StreamIndex`].
+///
+/// [`reconcile`] uses the names to choose CREATE (`PUT`, name missing) vs
+/// in-place UPDATE (`PATCH`, name present) per stream. On any error the caller
+/// falls back to an empty index, so every stream is treated as missing (PUT-all,
+/// the pre-fan-out-fix behavior) and every verdict is "unknown" — a go2rtc that
+/// is unreachable / mid-restart still gets its full set applied, and no camera
+/// is newly accused of needing the repair.
+async fn get_stream_index(
     c: &reqwest::Client,
     api_base: &str,
     auth: (&str, &str),
-) -> Result<HashSet<String>> {
+) -> Result<StreamIndex> {
     let url = format!("{}/api/streams", api_base.trim_end_matches('/'));
     let resp = c
         .get(&url)
         .basic_auth(auth.0, Some(auth.1))
         .send()
         .await
-        .with_context(|| format!("GET go2rtc stream names ({url})"))?;
+        .with_context(|| format!("GET go2rtc stream index ({url})"))?;
     if !resp.status().is_success() {
         anyhow::bail!("go2rtc GET /api/streams -> HTTP {}", resp.status());
     }
@@ -294,9 +366,41 @@ async fn get_stream_names(
         .await
         .context("parse go2rtc /api/streams response")?;
     match body {
-        serde_json::Value::Object(map) => Ok(map.into_iter().map(|(k, _)| k).collect()),
+        serde_json::Value::Object(map) => Ok(index_from_streams(&map)),
         _ => anyhow::bail!("go2rtc /api/streams did not return a JSON object"),
     }
+}
+
+/// Decide whether a camera needs the `_subv` repair, given THIS pass's verdict
+/// for its `_sub` stream and what we believed last pass.
+///
+/// * a definite verdict always wins — this is how a camera gets flagged, and how
+///   it gets un-flagged again after a firmware fix or a camera swap;
+/// * `None` (unknown: no producer attached yet, no SDP, no video section) is
+///   STICKY. A `_sub` between producers must not silently lose a repair a live
+///   Android session is currently playing, nor gain one it never needed;
+/// * unknown with nothing remembered ⇒ `false`. That is the fail-safe
+///   direction: the client falls back to the always-warm raw sub, exactly as it
+///   behaved before #483, instead of every camera paying for a lazy remux.
+///
+/// Pure + unit-tested.
+fn resolve_needs_subv(verdict: Option<bool>, previously_needed: bool) -> bool {
+    verdict.unwrap_or(previously_needed)
+}
+
+/// Build a [`StreamIndex`] from go2rtc's `/api/streams` object (pure — split out
+/// so the parse is unit-testable against captured payloads without a go2rtc).
+fn index_from_streams(map: &serde_json::Map<String, serde_json::Value>) -> StreamIndex {
+    let mut idx = StreamIndex {
+        names: map.keys().cloned().collect(),
+        ..StreamIndex::default()
+    };
+    for (name, entry) in map {
+        if let Some(lacks) = stream_video_lacks_fmtp(entry) {
+            idx.video_lacks_fmtp.insert(name.clone(), lacks);
+        }
+    }
+    idx
 }
 
 /// Which go2rtc verb to reconcile a managed stream with. See [`choose_verb`].
@@ -379,19 +483,59 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     let streams = crumb_common::db::list_camera_streams(state.pool()).await?;
     let c = client()?;
 
-    // The names go2rtc already has. On error (unreachable / mid-restart), an
-    // empty set ⇒ every stream is treated as missing (PUT-all) — the pre-fix
-    // behavior, which is exactly what a cold/empty go2rtc needs.
-    let existing = get_stream_names(&c, api_base, auth)
+    // What go2rtc currently has: stream names, plus the per-stream SDP verdict
+    // used below to decide who needs `_subv`. On error (unreachable /
+    // mid-restart), an empty index ⇒ every stream is treated as missing
+    // (PUT-all, the pre-fix behavior, exactly what a cold/empty go2rtc needs)
+    // and every verdict is "unknown" (see `needs_subv`).
+    let index = get_stream_index(&c, api_base, auth)
         .await
         .unwrap_or_default();
+    let existing = &index.names;
 
     let mobile_enabled = state.config().mobile_stream_enabled;
     let mobile_width = state.config().mobile_stream_width;
 
+    // Which cameras actually need the video-only `_subv` repair, this pass.
+    //
+    // #483 follow-up: the first cut of `_subv` registered it for EVERY camera
+    // with a sub and pointed the client at it, which meant an eleven-tile
+    // Android wall cold-spawned eleven lazy ffmpeg remuxes on open. On the
+    // reference install exactly ONE camera of eleven publishes H264 with no
+    // `sprop-parameter-sets` — the rest were always fine on the raw `_sub`. So
+    // detect the broken ones and repair only those.
+    //
+    // `resolve_needs_subv` is STICKY across an unknown verdict: a camera whose
+    // `_sub` has no producer attached at this instant (cold start, mid-redial)
+    // keeps whatever it was last known to be, so a transient blind spot can
+    // never tear down a working repair mid-session — nor invent one. Never seen
+    // at all ⇒ not needed, which is the safe default: the client falls back to
+    // the always-warm raw sub and is no worse off than before #483.
+    let mut needs_subv: std::collections::HashMap<&str, bool> =
+        std::collections::HashMap::with_capacity(streams.len());
+    for s in &streams {
+        let has_sub = s
+            .source_sub_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+        let needed = has_sub
+            && resolve_needs_subv(
+                index
+                    .video_lacks_fmtp
+                    .get(&sub_name(&s.go2rtc_name))
+                    .copied(),
+                state.subv_needed(&s.go2rtc_name),
+            );
+        needs_subv.insert(s.go2rtc_name.as_str(), needed);
+        state.set_subv_needed(&s.go2rtc_name, needed);
+    }
+    // Forget cameras that no longer exist (deleted between passes).
+    state.retain_subv_needed(&streams.iter().map(|s| s.go2rtc_name.clone()).collect());
+
     // Every name WE manage (main + sub + mobile) — for the PATCH alias-collision
     // guard. (The mobile source is `ffmpeg:…`, never `rtsp://`, so it can't
     // itself alias-collide, but keeping the full managed set is correct.)
+    // `_subv` is only ours for cameras we are actually repairing.
     let managed: HashSet<String> = streams
         .iter()
         .flat_map(|s| {
@@ -402,6 +546,12 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             let mut names = vec![s.go2rtc_name.clone()];
             if has_sub {
                 names.push(sub_name(&s.go2rtc_name));
+            }
+            if needs_subv
+                .get(s.go2rtc_name.as_str())
+                .copied()
+                .unwrap_or(false)
+            {
                 names.push(subv_name(&s.go2rtc_name));
             }
             if mobile_enabled {
@@ -417,7 +567,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             api_base,
             &s.go2rtc_name,
             &s.source_url,
-            &existing,
+            existing,
             &managed,
             auth,
         )
@@ -432,25 +582,47 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
                 api_base,
                 &sub_name(&s.go2rtc_name),
                 s.source_sub_url.as_deref().unwrap_or_default(),
-                &existing,
+                existing,
                 &managed,
                 auth,
             )
             .await;
-            // #483: the client-facing VIDEO-ONLY sub, derived from the `_sub`
-            // stream above. Registered on exactly the same condition as `_sub`
-            // (and torn down with it), so `playback.rs` can advertise
-            // `<name>_subv` whenever the camera has a sub. go2rtc pulls it lazily.
+        }
+        // #483 follow-up: the client-facing VIDEO-ONLY sub, derived from the
+        // `_sub` stream above — registered ONLY for a camera whose sub actually
+        // publishes video with no `a=fmtp`, and DELETED again the moment it
+        // stops needing it (a firmware update, or a camera swapped behind the
+        // same row). Keeping a stale `_subv` around would be harmless to
+        // go2rtc but would leave `playback.rs` free to advertise a stream we no
+        // longer maintain, so the two are kept in lockstep here.
+        let subv = subv_name(&s.go2rtc_name);
+        if needs_subv
+            .get(s.go2rtc_name.as_str())
+            .copied()
+            .unwrap_or(false)
+        {
             apply_stream(
                 &c,
                 api_base,
-                &subv_name(&s.go2rtc_name),
+                &subv,
                 &subv_src(&sub_name(&s.go2rtc_name)),
-                &existing,
+                existing,
                 &managed,
                 auth,
             )
             .await;
+        } else if existing.contains(&subv) {
+            // Best-effort: a failed DELETE just leaves an idle, consumerless
+            // stream that costs nothing and gets retried next pass.
+            if let Err(e) = delete_stream(&c, api_base, &subv, auth).await {
+                tracing::warn!(
+                    stream = %subv,
+                    error = %crumb_common::redact::redact_url_credentials(&format!("{e:#}")),
+                    "go2rtc: dropping no-longer-needed video-only sub failed (will retry)"
+                );
+            } else {
+                tracing::info!(stream = %subv, "go2rtc: sub no longer needs the fmtp repair; removed");
+            }
         }
         // On-demand mobile transcode: source the SUB stream when the camera has
         // one (already low-res), else the MAIN stream. go2rtc pulls it lazily.
@@ -465,7 +637,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
                 api_base,
                 &mobile_name(&s.go2rtc_name),
                 &mobile_src(&input, mobile_width),
-                &existing,
+                existing,
                 &managed,
                 auth,
             )
@@ -830,6 +1002,135 @@ mod tests {
             choose_verb(true, &mobile_src("driveway_sub", 640), &managed),
             StreamVerb::Patch
         );
+    }
+
+    // ── detecting WHICH subs need the repair (#483 follow-up) ───────────────
+
+    /// The real SDP of the one broken camera on the reference install (a
+    /// Reolink), IPs genericised. Note the shape that makes this test matter:
+    /// the VIDEO track has no `a=fmtp`, but the AUDIO track below it does. A
+    /// naive `sdp.contains("a=fmtp:")` would call this stream healthy and the
+    /// Android tile would go on reconnect-looping forever.
+    const SDP_BROKEN: &str = "v=0\r\n\
+        o=- 1786058169509450 1 IN IP4 192.0.2.12\r\n\
+        s=Session streamed by \"preview\"\r\n\
+        i=reolink rtsp stream\r\n\
+        t=0 0\r\n\
+        a=control:*\r\n\
+        m=video 0 RTP/AVP 96\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=rtpmap:96 H264/90000\r\n\
+        a=control:track1\r\n\
+        m=audio 0 RTP/AVP 97\r\n\
+        a=rtpmap:97 MPEG4-GENERIC/16000\r\n\
+        a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr\r\n\
+        a=control:track2\r\n";
+
+    /// A healthy camera's real SDP (same install), IPs genericised.
+    const SDP_HEALTHY: &str = "v=0\r\n\
+        o=- 1785682862462808 1 IN IP4 192.0.2.4\r\n\
+        t=0 0\r\n\
+        a=control:*\r\n\
+        m=video 0 RTP/AVP 96\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=rtpmap:96 H264/90000\r\n\
+        a=fmtp:96 packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==\r\n\
+        a=control:track1\r\n\
+        m=audio 0 RTP/AVP 97\r\n\
+        a=rtpmap:97 MPEG4-GENERIC/16000\r\n\
+        a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr\r\n\
+        a=control:track2\r\n";
+
+    #[test]
+    fn sdp_verdict_reads_the_video_section_only() {
+        // The whole point: audio fmtp must not mask a missing video fmtp.
+        assert_eq!(sdp_video_lacks_fmtp(SDP_BROKEN), Some(true));
+        assert_eq!(sdp_video_lacks_fmtp(SDP_HEALTHY), Some(false));
+        assert!(
+            SDP_BROKEN.contains("a=fmtp:"),
+            "fixture must keep the audio fmtp that makes a naive scan wrong",
+        );
+    }
+
+    #[test]
+    fn sdp_verdict_is_unknown_without_a_video_section() {
+        // No verdict is NOT a "broken" verdict — an audio-only or empty SDP must
+        // never flag a camera into paying for a remux.
+        assert_eq!(sdp_video_lacks_fmtp(""), None);
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\r\nm=audio 0 RTP/AVP 97\r\na=fmtp:97 x\r\n"),
+            None,
+        );
+        // Session-level attributes before the first `m=` belong to no track.
+        assert_eq!(sdp_video_lacks_fmtp("v=0\r\na=fmtp:96 stray\r\n"), None);
+    }
+
+    #[test]
+    fn sdp_verdict_tolerates_lf_only_and_case() {
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n"),
+            Some(true),
+        );
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\nm=video 0 RTP/AVP 96\nA=FMTP:96 packetization-mode=1\n"),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn stream_verdict_walks_producers() {
+        let broken = serde_json::json!({ "producers": [{ "sdp": SDP_BROKEN }] });
+        let healthy = serde_json::json!({ "producers": [{ "sdp": SDP_HEALTHY }] });
+        assert_eq!(stream_video_lacks_fmtp(&broken), Some(true));
+        assert_eq!(stream_video_lacks_fmtp(&healthy), Some(false));
+
+        // No producer attached yet (the cold-start / lazily-dialled case) is the
+        // single most likely reason for an unknown verdict, and must stay unknown.
+        assert_eq!(
+            stream_video_lacks_fmtp(&serde_json::json!({ "producers": [] })),
+            None,
+        );
+        assert_eq!(stream_video_lacks_fmtp(&serde_json::json!({})), None);
+        assert_eq!(stream_video_lacks_fmtp(&serde_json::Value::Null), None);
+        // A producer with no SDP is skipped in favour of one that has it.
+        let mixed = serde_json::json!({
+            "producers": [{ "url": "rtsp://cam/1" }, { "sdp": SDP_BROKEN }],
+        });
+        assert_eq!(stream_video_lacks_fmtp(&mixed), Some(true));
+    }
+
+    #[test]
+    fn index_carries_names_and_only_definite_verdicts() {
+        let body = serde_json::json!({
+            "famroom_sub":  { "producers": [{ "sdp": SDP_BROKEN }] },
+            "backdoor_sub": { "producers": [{ "sdp": SDP_HEALTHY }] },
+            "garage_sub":   { "producers": [] },
+        });
+        let idx = index_from_streams(body.as_object().unwrap());
+        assert_eq!(
+            idx.names,
+            names(&["famroom_sub", "backdoor_sub", "garage_sub"]),
+        );
+        assert_eq!(idx.video_lacks_fmtp.get("famroom_sub"), Some(&true));
+        assert_eq!(idx.video_lacks_fmtp.get("backdoor_sub"), Some(&false));
+        // Producerless ⇒ NO entry at all, so the caller sees "unknown", not false.
+        assert_eq!(idx.video_lacks_fmtp.get("garage_sub"), None);
+    }
+
+    #[test]
+    fn needs_subv_defaults_off_and_is_sticky_while_unknown() {
+        // A definite verdict always wins, in both directions.
+        assert!(resolve_needs_subv(Some(true), false), "flag on detection");
+        assert!(
+            !resolve_needs_subv(Some(false), true),
+            "un-flag once the camera reports fmtp again",
+        );
+        // Unknown keeps what we had: never tear down a repair a live Android
+        // session is playing just because the producer blinked...
+        assert!(resolve_needs_subv(None, true));
+        // ...and never invent one. Nothing known ⇒ nothing to repair, which is
+        // the whole fail-safe posture of this feature.
+        assert!(!resolve_needs_subv(None, false));
     }
 
     // ── video-only client sub (#483) ────────────────────────────────────────

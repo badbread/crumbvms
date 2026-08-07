@@ -81,7 +81,7 @@ placement, unchanged.
   for the JSON style object plus a preset palette instead of free hex entry.
 
 ---
-## 2026-08-06, Android alone plays a dedicated `<name>_subv` go2rtc restream (ffmpeg copy), because some cameras publish H264 with no `sprop-parameter-sets`
+## 2026-08-06, Only the CAMERAS that publish H264 without `sprop-parameter-sets` get a `<name>_subv` repair stream, detected per camera from the producer SDP
 
 **Context.** The Android live-wall tile plays a camera's SUB stream over RTSP
 (Media3/ExoPlayer). For one camera the tile reconnect-looped forever (#483), with
@@ -109,15 +109,43 @@ omitting `#audio` makes go2rtc pass `-an`, so audio is dropped as a bonus (the
 wall is muted; two-way audio / listen uses WebRTC). `#video=copy` is a **remux,
 not a re-encode** (verified: identical h264/High/640x360 in and out), it reads
 the existing `_sub` stream by name so it shares that producer and adds no camera
-session. `_subv` follows `_sub`'s exact lifecycle (created, updated, and deleted
-alongside it), and is registered for every camera that has a sub whether or not
-any client asks for it. `rtsp_subv_url` is null for cameras reconcile does not
-manage (Frigate-served, or a legacy row with no `source_url`), because no
-`_subv` exists for those; `rtsp_sub_url` keeps its original meaning for every
-camera.
+session. `rtsp_subv_url` is null for cameras reconcile does not manage (Frigate-served,
+or a legacy row with no `source_url`), because no `_subv` exists for those;
+`rtsp_sub_url` keeps its original meaning for every camera.
 
-**Which stream a client plays is the CLIENT's choice, and only Android takes
-`_subv`.** Android picks `rtsp_subv_url ?: rtsp_sub_url`; desktop (libmpv) and
+**Register it ONLY for the cameras that actually need it, detected per camera.**
+This is the part two earlier revisions got wrong, in the same way twice. `_subv`
+is repaired but LAZY: go2rtc spawns its ffmpeg on first consumer connect and
+reaps it when the last consumer leaves, so a cold one costs a process spawn plus
+a wait for a keyframe through an extra hop, per consumer. Registering it for
+every camera and pointing a whole wall at it therefore converts "attach to N
+always-warm `_sub` producers" into "cold-spawn N ffmpeg processes", which is a
+multi-second wall open. On the reference install **one camera of eleven** is
+affected. So the reconcile pass decides per camera:
+
+* It already fetches `GET /api/streams` every pass to choose PUT vs PATCH. That
+  payload includes **each producer's raw SDP**, so the detection costs **zero**
+  extra requests, no RTSP DESCRIBE, and cannot dial a camera.
+* A camera is flagged when its `<name>_sub` producer SDP has an `m=video`
+  section with no `a=fmtp` line. The check walks media sections rather than
+  scanning the whole SDP, because the broken camera's SDP *does* contain
+  `a=fmtp:97` — on its AUDIO track. A naive `contains("a=fmtp:")` calls the one
+  broken stream healthy.
+* An unknown verdict (no producer attached yet, no SDP, no video section) is
+  **sticky**: keep the previous answer, so a producer blinking between passes
+  can neither tear down a repair a live session is playing nor invent one.
+  Nothing known at all means not flagged, the fail-safe direction: the client
+  falls back to the always-warm raw sub and is no worse off than before #483.
+* Flagged cameras get `_subv` registered and `rtsp_subv_url` advertised.
+  Unflagged ones get any stale `_subv` **deleted** in the same pass, so the
+  stream set and what the API advertises never drift apart.
+* The verdict lives in memory only (no DB column, no migration). It is a runtime
+  property of the camera's current firmware, not operator configuration, so a
+  restart re-derives it rather than trusting a stale row; the empty cold-start
+  set means "nobody needs it", again the safe direction.
+
+**Which stream a client plays is also the CLIENT's choice, and only Android
+takes `_subv`.** Android picks `rtsp_subv_url ?: rtsp_sub_url`; desktop (libmpv) and
 iOS (AVFoundation) keep `rtsp_sub_url` untouched, because both already tolerate
 the missing-fmtp SDP that Media3 rejects. That split is not tidiness, it is the
 performance budget. go2rtc spawns the remux ffmpeg **lazily, on first consumer
@@ -128,15 +156,31 @@ through an extra hop, **per consumer**. The first cut of this change pointed
 a fresh desktop wall then cold-spawned roughly eleven ffmpeg processes on open
 and took many seconds to fill, where before it attached straight to the
 always-warm `_sub` producers that reconcile keeps running. Splitting the field
-restored the fast open and kept the Media3 repair. Reconcile still registers
-`_subv` unconditionally, which is free while nothing connects and means an
-Android client never waits for a reconcile pass.
+restored the fast open for desktop and kept the Media3 repair — but on its own it
+was still too coarse, because it moved the same cost onto the Android wall, whose
+eleven tiles then all cold-spawned. Client scoping and per-camera detection are
+both needed, and they answer different questions: *which player needs a repaired
+SDP*, and *which camera actually publishes a broken one*.
+
+**Rejected — registering `_subv` for every camera and letting only the client
+choose** (the shipped-then-reverted #485 behaviour). It looked cheap because an
+unconnected `_subv` really is free, but the cost is not the registration, it is
+the first CONNECT — and the Android wall connects to all of them at once. The
+owner's verdict on the blanket version was the right one: applying a repair to
+ten working cameras to fix one is nuclear.
 
 **Rejected — making `_subv` eager** (an always-running remux per camera so it is
 warm for everybody, keeping a single `rtsp_sub_url` field). That is a permanent
 extra ffmpeg process per camera on every install, paid by operators whose clients
-never need it, purely to avoid a cost only Media3 incurs. Lazy plus
-client-scoped is strictly cheaper and needs no new configuration.
+never need it, purely to avoid a cost only Media3 incurs on one camera. Lazy plus
+detected is strictly cheaper and needs no new configuration. (A narrower version
+of this — pre-warming only the FLAGGED stream — stays available as a revisit
+trigger below.)
+
+**Rejected — an operator toggle** ("repair this camera's sub", per camera in the
+admin console). It makes an operator diagnose an SDP-level fault that the server
+can see for itself, and it goes stale silently when firmware changes. Detection
+is not hard here: the evidence is already in a payload reconcile fetches anyway.
 
 **Rejected — putting the media filter in the CLIENT URL**
 (`rtsp://…/<name>_sub?video`). This was tried first and **falsified on-device**:
@@ -165,14 +209,28 @@ learns about `rtsp_subv_url` keeps working on the raw sub, unchanged.
 - Cameras stop shipping H264 without `sprop-parameter-sets`, or Media3 gains
   tolerance for a missing fmtp — the copy hop could then be dropped, and with it
   the second URL field.
-- The per-consumer ffmpeg remux shows up as real load, or as a slow wall open, on
-  a large install. It is a copy, but it is a process per attached tile and it
-  spawns cold. Now that only Media3 clients connect to it, this applies to a
-  MOBILE wall (and desktop only if it ever switches to `rtsp_subv_url`); the fix
-  then is a warm/eager `_subv` for the cameras a wall actually shows, not a
-  wider default.
+- **Even ONE lazy spawn is noticeable** on the flagged camera's tile (it is now
+  the only one paying, but it still opens cold). The fix then is to PRE-WARM the
+  flagged `_subv` — hold a single server-side consumer on it so the remux stays
+  running — which is affordable precisely because the flagged set is tiny. Do
+  not solve it by widening the set again.
+- **A large fraction of an install's cameras get flagged.** The whole design
+  assumes broken subs are rare (one of eleven on the reference install). If a
+  vendor ships a firmware generation that drops `sprop-parameter-sets` broadly,
+  the arithmetic behind "targeted" collapses and pre-warming (or a fix further
+  upstream) becomes the right answer.
+- **The detection proves unreliable in the field** — a camera flapping between
+  flagged and healthy, or a stream whose producer SDP never settles. The sticky
+  unknown handles a blink; sustained flapping would want hysteresis (N passes
+  agreeing) or an operator override, neither of which is worth building on
+  speculation.
+- go2rtc stops including producer SDPs in `GET /api/streams`, or changes their
+  shape. Detection would silently go quiet (everything "unknown" ⇒ nothing
+  flagged ⇒ the #483 tile reconnect-loops again), so re-verify the parse against
+  a real payload on any go2rtc major bump. This is the one failure mode that is
+  quiet rather than loud.
 - A third client adopts a player that also rejects a missing fmtp. It should take
-  `rtsp_subv_url` the same way and measure its own cold-open cost first.
+  `rtsp_subv_url` the same way; nothing server-side needs to change.
 
 ## 2026-08-01, Home Assistant value controls (brightness / position / speed) carry one optional server-validated number, discovered via a states `control` descriptor
 

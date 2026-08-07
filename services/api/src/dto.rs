@@ -1317,14 +1317,22 @@ pub struct LiveStreamsResponse {
     /// the raw sub run through an ffmpeg **copy** (remux, never a re-encode) so
     /// go2rtc republishes a proper `a=fmtp:96 …sprop-parameter-sets=…` even for
     /// cameras that publish H264 with no out-of-band parameter sets (#483).
-    /// `None` when the camera has no sub, or when reconcile does not manage its
-    /// go2rtc streams (Frigate-served, or a legacy row with no `source_url`) —
-    /// no `_subv` exists for those.
+    ///
+    /// **Normally `None` — it is the exception, not the rule.** Set only when
+    /// the reconcile loop has POSITIVELY DETECTED that this camera's sub needs
+    /// the repair (its producer SDP advertises video with no `a=fmtp`; see
+    /// `go2rtc::sdp_video_lacks_fmtp`), which on the reference install is one
+    /// camera out of eleven. Also `None` when the camera has no sub, when
+    /// reconcile does not manage its go2rtc streams (Frigate-served, or a legacy
+    /// row with no `source_url`), and before the first reconcile pass has
+    /// reached a verdict.
     ///
     /// **Only Media3/ExoPlayer clients (Android) should prefer this over
-    /// `rtsp_sub_url`.** go2rtc spawns the remux ffmpeg LAZILY on first consumer
-    /// connect and reaps it when consumerless, so every tile that opens `_subv`
-    /// cold pays a process spawn plus a wait for the next keyframe. Players that
+    /// `rtsp_sub_url`**, and even they get it for the few cameras above. go2rtc
+    /// spawns the remux ffmpeg LAZILY on first consumer connect and reaps it
+    /// when consumerless, so every tile that opens `_subv` cold pays a process
+    /// spawn plus a wait for the next keyframe — which is why this is neither
+    /// handed to every client nor registered for every camera. Players that
     /// tolerate the missing-fmtp SDP (libmpv on desktop, `AVFoundation` on iOS)
     /// must keep using `rtsp_sub_url` and attach to the warm producer instead.
     /// Same embedded-credential + sensitivity note as `rtsp_main_url`.

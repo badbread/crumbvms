@@ -316,9 +316,12 @@ data class LiveStreamsResponse(
      * Media3-specific repair — desktop and iOS deliberately stay on [rtspSubUrl],
      * because go2rtc spawns the remux ffmpeg lazily, per consumer.
      *
-     * `null` when the camera has no sub, or when the server does not manage its
-     * go2rtc streams (Frigate-served / legacy rows) — and on any server older
-     * than the field, which is why it is nullable-with-default: we fall back to
+     * Normally `null`: the server only sets it for a camera it has POSITIVELY
+     * DETECTED as broken (one of eleven on the reference install), so most tiles
+     * fall through to [rtspSubUrl] and attach to the always-warm raw sub. Also
+     * `null` when the camera has no sub, when the server does not manage its
+     * go2rtc streams (Frigate-served / legacy rows), and on any server older
+     * than the field — which is why it is nullable-with-default: we fall back to
      * [rtspSubUrl] and behave exactly as before.
      */
     @SerialName("rtsp_subv_url") val rtspSubvUrl: String? = null,
