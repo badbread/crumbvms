@@ -53,6 +53,7 @@ Future<ColorPickResult?> showColorSwatchPicker(
                 color: color,
                 current: current,
                 usedByNames: usedBy[color.toARGB32()],
+                onTap: () => Navigator.pop(ctx, color),
               ),
             if (allowCustom)
               _CustomSwatch(
@@ -99,27 +100,91 @@ Future<Color?> showCustomColorDialog(
   );
 }
 
+/// The same swatch grid the dialog shows, as a plain INLINE widget — for
+/// surfaces that must not push a route to pick a color (the HA badge popover,
+/// which is itself a transient overlay: a dialog on top of it would steal
+/// focus, hide the badge being recolored, and break the live-preview loop the
+/// popover exists for). Identical visuals to [showColorSwatchPicker]'s grid;
+/// [onPicked] fires per tap with no navigation of its own, so the host decides
+/// whether picking collapses the strip.
+class ColorSwatchStrip extends StatelessWidget {
+  const ColorSwatchStrip({
+    super.key,
+    required this.onPicked,
+    this.current,
+    this.palette,
+    this.allowCustom = true,
+    this.swatchSize = 24,
+    this.spacing = 7,
+  });
+
+  /// Called with the picked color. The "Custom…" tile still opens the
+  /// free-form dialog (a full RGB editor cannot be a strip) and reports
+  /// through this same callback.
+  final ValueChanged<Color> onPicked;
+
+  /// Rings the currently-active color, exactly as the dialog does.
+  final Color? current;
+
+  final List<Color>? palette;
+  final bool allowCustom;
+  final double swatchSize;
+  final double spacing;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = palette ?? kCameraPickerPalette;
+    return Wrap(
+      spacing: spacing,
+      runSpacing: spacing,
+      children: [
+        for (final color in colors)
+          _ColorSwatch(
+            color: color,
+            current: current,
+            usedByNames: null,
+            size: swatchSize,
+            onTap: () => onPicked(color),
+          ),
+        if (allowCustom)
+          _CustomSwatch(
+            size: swatchSize,
+            onTap: () async {
+              final custom =
+                  await showCustomColorDialog(context, initial: current);
+              if (custom != null) onPicked(custom);
+            },
+          ),
+      ],
+    );
+  }
+}
+
 class _ColorSwatch extends StatelessWidget {
   const _ColorSwatch({
     required this.color,
     required this.current,
     required this.usedByNames,
+    required this.onTap,
+    this.size = 30,
   });
 
   final Color color;
   final Color? current;
   final List<String>? usedByNames;
+  final VoidCallback onTap;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
     final isCurrent = current != null && color == current;
     final used = usedByNames != null && usedByNames!.isNotEmpty;
     final swatch = InkWell(
-      onTap: () => Navigator.pop(context, color),
+      onTap: onTap,
       customBorder: const CircleBorder(),
       child: Container(
-        width: 30,
-        height: 30,
+        width: size,
+        height: size,
         decoration: BoxDecoration(
           color: color,
           shape: BoxShape.circle,
@@ -155,8 +220,9 @@ class _ColorSwatch extends StatelessWidget {
 /// The "Custom…" tile in the swatch grid — a rainbow-ringed "+" that opens the
 /// free-form color dialog.
 class _CustomSwatch extends StatelessWidget {
-  const _CustomSwatch({required this.onTap});
+  const _CustomSwatch({required this.onTap, this.size = 30});
   final VoidCallback onTap;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
@@ -166,8 +232,8 @@ class _CustomSwatch extends StatelessWidget {
         onTap: onTap,
         customBorder: const CircleBorder(),
         child: Container(
-          width: 30,
-          height: 30,
+          width: size,
+          height: size,
           decoration: const BoxDecoration(
             shape: BoxShape.circle,
             gradient: SweepGradient(

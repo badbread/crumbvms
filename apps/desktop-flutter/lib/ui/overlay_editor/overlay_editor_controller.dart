@@ -213,6 +213,14 @@ class OverlayEditorController extends ChangeNotifier {
 
   bool isSelected(String id) => _selected.contains(id);
 
+  /// True while a move or resize gesture is in flight. For chrome that must
+  /// get out of the way of a drag (the HA badge popover, which is anchored to
+  /// the item being dragged). Read it from a widget subscribed to BOTH this
+  /// controller and [geometry] — a drag reports its ticks on [geometry] only,
+  /// by the anti-stutter contract, so a structure-only listener would not see
+  /// the gesture start.
+  bool get isDragging => _moveDrag != null || _resizeDrag != null;
+
   /// True when any selected item belongs to a group.
   bool get selectionGrouped =>
       _selectedItems().any((i) => i.groupId != null);

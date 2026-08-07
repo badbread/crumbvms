@@ -11,7 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
-import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 
 /// Speaker icon button. Tap toggles master audio for the active (maximized
 /// else selected) camera. Mirrors `updateAudioButton`'s icon/label swap —
@@ -102,7 +102,7 @@ class AudioHotkeyListener extends StatelessWidget {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
 
     // Typing in a text field — the robust, subtree-aware guard (issue #2).
-    if (textInputHasFocus()) return KeyEventResult.ignored;
+    if (hotkeyContextBlocked()) return KeyEventResult.ignored;
 
     if (event.logicalKey == LogicalKeyboardKey.keyM) {
       unawaited(_toggle());

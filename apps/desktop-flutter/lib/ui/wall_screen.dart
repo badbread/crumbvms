@@ -30,7 +30,8 @@ import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/ha_link/ha_link_dialog.dart';
 import 'package:crumb_desktop/ui/live/adaptive_guardrail_dialog.dart';
-import 'package:crumb_desktop/ui/ha_overlay/ha_badge_style_editor.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_badge_popover.dart';
+import 'package:crumb_desktop/ui/ha_overlay/ha_edit_top_bar.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
@@ -595,6 +596,34 @@ class _WallScreenState extends State<WallScreen> {
     if (cam != null) unawaited(_refreshHaLinksFor(cam));
   }
 
+  /// Esc / the top bar's ✕: leave the HA overlay editor WITHOUT the implicit
+  /// save that Done performs. An untouched session (`canUndo == false` — the
+  /// editor snapshots undo before every mutation, geometry and style alike)
+  /// just closes; anything else asks first, because the editor's whole model
+  /// is deferred save and "Esc" is genuinely ambiguous between "throw this
+  /// away" and "I'm finished".
+  Future<void> _exitHaOverlayEditWithPrompt() async {
+    if (!_haOverlay.editor.editMode) return;
+    if (!_haOverlay.editor.canUndo) {
+      // Nothing changed, so there is nothing to PUT — discard is both
+      // cheaper and more honest than a no-op round trip.
+      _haEditCameraId = null;
+      _haOverlay.cancelEdit();
+      return;
+    }
+    final choice = await confirmHaEditExit(context);
+    if (!mounted || !_haOverlay.editor.editMode) return;
+    switch (choice) {
+      case HaEditExitChoice.keepEditing:
+        return;
+      case HaEditExitChoice.discard:
+        _haEditCameraId = null;
+        _haOverlay.cancelEdit();
+      case HaEditExitChoice.saveAndClose:
+        await _endHaOverlayEdit();
+    }
+  }
+
   /// Re-fetch `cameraId`'s HA links and push them into whichever mounted
   /// surfaces are showing that camera (its wall tile, and the maximized pane
   /// if it's the one showing it) — mirrors `_tileKeys`' per-camera
@@ -699,6 +728,8 @@ class _WallScreenState extends State<WallScreen> {
               canActuate: widget.canActuate,
               onEditHaOverlay: () => unawaited(_beginHaOverlayEdit(_maximized!)),
               onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
+              onHaOverlayCancel: () =>
+                  unawaited(_exitHaOverlayEditWithPrompt()),
               onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(_maximized!)),
               onLinkHaEntities: () => unawaited(_refreshHaLinksFor(_maximized!.id)),
               onHaLinksLoaded: _onHaLinksLoaded,
@@ -754,7 +785,9 @@ class _WallScreenState extends State<WallScreen> {
               if (_ptzPanel.editing) {
                 unawaited(_ptzPanel.endEditAndSave());
               } else if (_haOverlay.editor.editMode) {
-                unawaited(_endHaOverlayEdit());
+                // Esc is CANCEL, not save: it prompts when there is unsaved
+                // work (see _exitHaOverlayEditWithPrompt). Done is the save.
+                unawaited(_exitHaOverlayEditWithPrompt());
               } else {
                 _restore();
               }
@@ -2198,6 +2231,7 @@ class _MaximizedPane extends StatefulWidget {
     this.canActuate = false,
     this.onEditHaOverlay,
     this.onHaOverlayDone,
+    this.onHaOverlayCancel,
     this.onEditPtzPanel,
     this.onLinkHaEntities,
     this.onHaLinksLoaded,
@@ -2261,6 +2295,12 @@ class _MaximizedPane extends StatefulWidget {
   /// calling `haOverlay!.endEditAndSave()` itself) because the cross-tile
   /// refresh needs the wall's `_tileKeys`/`_maximizedPaneKey`.
   final VoidCallback? onHaOverlayDone;
+
+  /// The top bar's ✕ — the same path Esc takes: the wall prompts about
+  /// unsaved changes and then discards or saves
+  /// (`_WallScreenState._exitHaOverlayEditWithPrompt`). A callback for the
+  /// same reason [onHaOverlayDone] is.
+  final VoidCallback? onHaOverlayCancel;
 
   /// "Edit PTZ panel…" from the maximized pane's right-click menu — begins
   /// the panel editor over the full-pane video (the old builder's primary UX
@@ -2369,26 +2409,26 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// `AnimatedBuilder` for that).
   bool _haEditing = false;
 
-  /// Top-left position of the draggable HA edit panel (#255). Null = its default
-  /// top-right anchor; a drag pins an explicit offset for the rest of the edit
-  /// session so the operator can move it off a spot they want to place a badge
-  /// on. Clamped to the pane in `build`; reset when the session ends.
-  Offset? _haPanelOffset;
+  /// The HA editor reserves NO drag-clamp inset (unlike the PTZ editor's
+  /// bottom bar, issue #13): its top bar is a sibling of the video viewport,
+  /// not an overlay on it, so no part of the frame is ever occluded and every
+  /// normalized coordinate stays reachable. This releases the bottom
+  /// reservation the retired HA bottom bar used to take.
+  ///
+  /// Called from BOTH [initState] and the change listener: the wall's
+  /// `_beginHaOverlayEdit` maximizes and then begins the session synchronously
+  /// in the same frame, so a pane that mounts straight into edit mode never
+  /// sees a mode TRANSITION.
+  void _applyHaEditInsets(bool editing) {
+    widget.haOverlay?.editor.setEditBottomInset(0);
+  }
 
   void _onHaOverlayChanged() {
     if (!mounted) return;
     final editing = widget.haOverlay?.editor.editMode ?? false;
     if (editing == _haEditing) return;
-    // Reserve room for the slim HA bottom bar (generic ops only — the badge
-    // style lives in the right-side panel now), so a badge drag can't hide
-    // under it (issue #13).
-    widget.haOverlay?.editor.setEditBottomInset(editing ? 78 : 0);
-    setState(() {
-      _haEditing = editing;
-      // Fresh session starts at the default anchor (a stale drag position from a
-      // previous camera's edit could land off-pane after a resize).
-      if (!editing) _haPanelOffset = null;
-    });
+    _applyHaEditInsets(editing);
+    setState(() => _haEditing = editing);
     // NOTE (issue #3): this pane deliberately does NOT re-fetch links when the
     // edit session ends. `editor.endEdit()` flips editMode false SYNCHRONOUSLY
     // — before `endEditAndSave` has awaited its placement PUTs — so a reload
@@ -2408,6 +2448,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     _panelEditing = rec?.$2 ?? false;
     widget.haOverlay?.editor.addListener(_onHaOverlayChanged);
     _haEditing = widget.haOverlay?.editor.editMode ?? false;
+    _applyHaEditInsets(_haEditing);
     _load();
     unawaited(_loadHaLinks());
   }
@@ -2922,6 +2963,10 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
     _watchdog?.dispose();
     widget.ptzPanel?.removeListener(_onPtzPanelChanged);
     widget.haOverlay?.editor.removeListener(_onHaOverlayChanged);
+    // The editor outlives this pane (it belongs to the wall), so hand back the
+    // chrome reservation rather than leaving a phantom no-drag strip on the
+    // next camera's session.
+    _applyHaEditInsets(false);
     // Mirrors `_WallTileState.dispose`'s report — drops THIS PANE's
     // contribution to `_haPlacementsBySurface` so a closed maximized pane
     // can't keep /ha/states polling forever. Keyed by `'max:<cameraId>'`
@@ -2955,10 +3000,34 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   @override
   Widget build(BuildContext context) {
+    // While the HA overlay editor is open the pane's VIEWPORT is inset by the
+    // height of the sticky top bar, and the video re-letterboxes into what is
+    // left. The bar therefore never covers video, which is what makes the
+    // whole frame — including the top strip, prime badge real estate in normal
+    // viewing — reachable for placement. The alternative (bar overlapping the
+    // video, drags clamped out from under it) permanently traded a strip of
+    // the frame away for chrome that only exists while editing.
+    //
+    // Nothing else has to change: placements are normalized to the DISPLAYED
+    // video frame (`OverlayAnchor.videoFrame` + `OverlayGeometry.fieldRect`),
+    // so a badge dropped at the frame's top edge here renders at the frame's
+    // true top edge once Done restores the full-bleed pane.
+    //
+    // The outer Stack + Positioned are UNCONDITIONAL so entering/leaving edit
+    // mode only changes `top:` — the video subtree keeps its element identity
+    // and libmpv is never torn down and rebuilt mid-session.
+    final editInset = _haEditing ? kHaEditTopBarHeight : 0.0;
     return Positioned.fill(
       child: Container(
         color: Colors.black,
-        child: LayoutBuilder(
+        child: Stack(
+          children: [
+            Positioned(
+              left: 0,
+              right: 0,
+              top: editInset,
+              bottom: 0,
+              child: LayoutBuilder(
           builder: (context, constraints) {
             final pane = Size(constraints.maxWidth, constraints.maxHeight);
             return Stack(
@@ -3107,14 +3176,29 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                 // digital-zoom POC rule as the wall tile's copy).
                 if (widget.haOverlay != null && _haEditing)
                   Positioned.fill(
-                    child: OverlayEditorLayer(
-                      controller: widget.haOverlay!.editor,
-                      editing: true,
-                      videoW: _videoW,
-                      videoH: _videoH,
-                      buildItem: haBadgeItemBuilder(
-                        stateFor: widget.liveStatus.haStateFor,
-                        stale: widget.liveStatus.haStale,
+                    // The item builder is a CLOSURE over the state lookup and
+                    // the editor's state preview, so it has to be rebuilt when
+                    // either changes — `OverlayEditorLayer`'s own
+                    // AnimatedBuilder would otherwise keep calling the stale
+                    // one (`previewState`'s setter notifies the editor).
+                    child: ListenableBuilder(
+                      listenable: Listenable.merge([
+                        widget.haOverlay!.editor,
+                        widget.liveStatus,
+                      ]),
+                      builder: (context, _) => OverlayEditorLayer(
+                        controller: widget.haOverlay!.editor,
+                        editing: true,
+                        videoW: _videoW,
+                        videoH: _videoH,
+                        emptyEditHint:
+                            'Add entities from the bar above, then drag them '
+                            'where you want them.',
+                        buildItem: haBadgeItemBuilder(
+                          stateFor: widget.liveStatus.haStateFor,
+                          stale: widget.liveStatus.haStale,
+                          previewState: widget.haOverlay!.previewState,
+                        ),
                       ),
                     ),
                   )
@@ -3167,6 +3251,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                             stale: widget.liveStatus.haStale,
                             videoW: _videoW,
                             videoH: _videoH,
+                            previewState: widget.haOverlay!.previewState,
                           ),
                         ),
                       ),
@@ -3351,62 +3436,50 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
                   ),
                 ],
 
-                // HA-overlay editor (issue #170 P0 + readability #9): the
-                // badge-specific chrome — the entity palette + the selected
-                // badge's grouped style form (label/size/opacity/color/icon/
-                // pins) — lives in a vertical RIGHT-SIDE panel (uses the
-                // available height), while the bottom bar keeps only the
-                // generic multi-select geometry ops (align/group/match/undo).
-                // Mutually exclusive with the PTZ chrome above by construction.
-                if (widget.haOverlay != null && _haEditing) ...[
-                  () {
-                    // Draggable (#255): default to the top-right anchor, but once
-                    // the operator drags the panel's header, honor that offset —
-                    // clamped so the header can never leave the pane.
-                    const panelW = 300.0;
-                    final defaultLeft =
-                        (pane.width - panelW - 14).clamp(0.0, pane.width);
-                    final maxLeft = (pane.width - panelW).clamp(0.0, pane.width);
-                    final maxTop = (pane.height - 44).clamp(0.0, pane.height);
-                    final pos = _haPanelOffset ?? Offset(defaultLeft, 64);
-                    return Positioned(
-                      left: pos.dx.clamp(0.0, maxLeft),
-                      top: pos.dy.clamp(0.0, maxTop),
-                      child: HaOverlayEditPanel(
-                        host: widget.haOverlay!,
-                        onDragHeader: (delta) {
-                          setState(() {
-                            final base = _haPanelOffset ?? Offset(defaultLeft, 64);
-                            // Clamp here (not just at render) so dragging past an
-                            // edge can't bank up phantom offset to unwind later.
-                            _haPanelOffset = Offset(
-                              (base.dx + delta.dx).clamp(0.0, maxLeft),
-                              (base.dy + delta.dy).clamp(0.0, maxTop),
-                            );
-                          });
-                        },
-                      ),
-                    );
-                  }(),
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: OverlayEditorBar(
-                      controller: widget.haOverlay!.editor,
-                      paletteSlot: const SizedBox.shrink(),
-                      showSizeControls: false,
-                      showOpacityControl: false,
-                      itemLabel: (item) =>
-                          (item as HaOverlayBadgeItem).displayLabel,
-                      onClear: widget.haOverlay!.editor.clearAll,
-                      onDone: () => widget.onHaOverlayDone?.call(),
+                // HA-overlay editor: the per-badge popover, ANCHORED TO THE
+                // SELECTED BADGE so the operator is never picking a color for
+                // a badge a panel is covering. Lives INSIDE the inset viewport
+                // (its coordinates are pane-local), alongside the editor
+                // layer. The session-wide top bar is a sibling of this whole
+                // viewport — see build's opening comment. The retired floating
+                // `HaOverlayEditPanel` and the bottom `OverlayEditorBar` are
+                // gone; the bar's multi-select geometry tools live in the
+                // popover's 2+-selection body. Mutually exclusive with the PTZ
+                // chrome above by construction.
+                if (widget.haOverlay != null && _haEditing)
+                  Positioned.fill(
+                    child: HaBadgePopoverLayer(
+                      host: widget.haOverlay!,
+                      videoW: _videoW,
+                      videoH: _videoH,
+                      // Not the edit bar (that's a sibling of this viewport,
+                      // occluding nothing) — the back button / name pill /
+                      // status badges, which DO float over the frame's top.
+                      topInset: 60,
                     ),
                   ),
-                ],
               ],
             );
           },
+              ),
+            ),
+            // The editor's sticky top bar: a SIBLING of the video viewport,
+            // never an overlay on top of it, so it occludes no part of the
+            // frame and no drag has to be clamped away from it.
+            if (widget.haOverlay != null && _haEditing)
+              Positioned(
+                left: 0,
+                right: 0,
+                top: 0,
+                height: kHaEditTopBarHeight,
+                child: HaOverlayEditTopBar(
+                  host: widget.haOverlay!,
+                  cameraName: widget.camera.name,
+                  onDone: () => widget.onHaOverlayDone?.call(),
+                  onCancel: () => widget.onHaOverlayCancel?.call(),
+                ),
+              ),
+          ],
         ),
       ),
     );
