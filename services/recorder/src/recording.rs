@@ -954,6 +954,15 @@ async fn run_ffmpeg_loop(
         return Err(anyhow::Error::from(e).context(format!("create_dir_all {camera_dir:?}")));
     }
 
+    // STORAGE MARKER (issue #504): we are about to write footage into this
+    // storage root, which is the strongest confirmation available that it is the
+    // real, mounted storage. Drop the marker reconcile's dangling-row guard keys
+    // off, so an unmounted disk (an empty mountpoint directory, which carries no
+    // marker) can never be mistaken for a disk whose footage was deleted and have
+    // its whole segment index pruned. Idempotent + best-effort: never rewrites an
+    // existing marker, and a failure only costs index PRUNING, never footage.
+    crate::reconcile::ensure_storage_marker(Path::new(&live_storage.path)).await;
+
     // ── 2b. Motion-mode RAM cache dir (persist-on-motion) ──────────────────────
     //
     // For Motion-mode cameras (and shadow mode OFF), ffmpeg writes segments into

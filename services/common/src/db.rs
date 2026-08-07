@@ -2859,6 +2859,39 @@ pub async fn list_storages(pool: &Pool) -> Result<Vec<Storage>> {
     Ok(rows.iter().map(storage_from_row).collect())
 }
 
+/// Sample the relative paths of the NEWEST indexed segments on one storage.
+///
+/// Used by the recorder's reconcile pass to CONFIRM that a storage root really
+/// is the storage the index describes before it is allowed to prune rows there
+/// (issue #504): if none of a storage's newest indexed segment files can be
+/// found under its root, the root is almost certainly an empty mountpoint whose
+/// disk failed to mount, not a disk whose footage was genuinely deleted.
+///
+/// Newest-first because the oldest segments are the ones retention/eviction
+/// legitimately removes; a freshly-written segment is the strongest evidence
+/// that the mount is live.
+pub async fn list_recent_segment_paths_for_storage(
+    pool: &Pool,
+    storage_id: Uuid,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT path
+            FROM segments
+            WHERE storage_id = $1
+            ORDER BY start_ts DESC
+            LIMIT $2
+            ",
+            &[&storage_id, &limit],
+        )
+        .await
+        .context("list_recent_segment_paths_for_storage")?;
+    Ok(rows.iter().map(|r| r.get::<_, String>("path")).collect())
+}
+
 /// Create a new storage row.
 ///
 /// Returns the created [`Storage`].  Errors on `name` uniqueness violation.
