@@ -37,6 +37,17 @@ nothing.
   the video image itself, in an editable panel mode, rather than only in a
   fixed side control strip.
 
+![The desktop client's PTZ panel editor: a row of buttons to add, including a
+D-pad, tilt and pan arrows, Home, zoom in and out, focus near and far,
+autofocus, iris open and close, auto-iris, and presets, with several already
+dropped onto the video and each carrying a small remove
+handle.](/img/screenshots/ptz-panel-builder.png)
+
+In panel edit mode you pick the buttons you actually use, drag each one where
+you want it over the picture, and multi-select or box-select to move a group.
+Buttons snap to a grid unless you hold Alt, and Ctrl+Z and Ctrl+Y undo and redo.
+Hit Done and the layout is saved for that camera.
+
 ## Requirements
 
 The camera needs to support ONVIF's PTZ (and, for focus/iris, imaging)

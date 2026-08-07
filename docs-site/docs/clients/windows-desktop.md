@@ -38,6 +38,32 @@ video, and lets you operate a linked Control entity right from its badge. See
 [the client feature rundown](/clients/#what-each-client-can-do) for how this
 compares to the other clients.
 
+## Design your own views
+
+![The desktop client's view setup screen: a list of saved views on the left with
+a name field, grid presets, column and row steppers, and draggable special tiles
+for carousel, hotspot, image, clock, text, detections and web, next to a live
+preview of a seven-box layout with one large camera, three stacked tiles, and a
+tile marked hotspot with auto-follow.](/img/screenshots/custom-view-designer.png)
+
+A view is a saved layout of the live wall. Start from a preset (2x2, 3x3, 1+5,
+1+7, Hero) or set the column and row counts yourself, then hold Shift to merge
+and split boxes into the shape you want. Drop a camera into a box, or drag one
+of the special tiles onto it:
+
+- **Carousel**, a box that cycles through a set of cameras.
+- **Hotspot**, a box that follows the most recently active camera on its own.
+- **Image**, **Clock**, and **Text**, for a logo, a wall clock, or a label.
+- **Detections**, a running feed of recent detection events.
+- **Web**, an embedded web pane.
+
+Name the view and give it an emoji, and it saves to the server against your
+account, so the same views are there when you sign in from another machine.
+Creating or editing one needs the `manage_views` capability. Two things stay
+local to the machine you are on: the order the views are listed in, and which
+one you star as the view that opens on launch. The same screen is where you
+rename or delete views you already have.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

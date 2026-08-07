@@ -339,7 +339,7 @@ ONVIF_CONFIG_B64=
 # Images pull from the public default prefix (ghcr.io/badbread/crumbvms) with no
 # login. Pin a release with CRUMB_VERSION; only override CRUMB_IMAGE_PREFIX when
 # running a fork's own registry (form: ghcr.io/<owner>/<repo>).
-# CRUMB_VERSION=v0.1.0
+# CRUMB_VERSION=v0.2.0
 EOF
 
 chmod 600 "${TMP}"

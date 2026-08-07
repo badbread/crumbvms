@@ -55,7 +55,7 @@ segment exactly like Continuous mode (nothing is discarded), but Crumb also
 runs the motion buffer's keep/discard decision in parallel and stamps the
 verdict on each segment. That lets you see what Motion mode *would* have
 thrown away before you trust it to actually throw anything away. There is
-no console switch for this in v0.1.0; it is an env-level opt-in you set once
+no console switch for this today; it is an env-level opt-in you set once
 for the whole server.
 
 ## Recommendation for a new camera

@@ -151,6 +151,17 @@ engines, each read tagged by its source. The desktop app
 screen whenever at least one dual-engine camera exists, that puts the two engines
 head to head.
 
+![The Engine Benchmark screen comparing Frigate and Crumb ALPR over 24 hours:
+per-engine cards for reads, passes seen, hit rate and average confidence, a
+shared vehicle-pass count and agreement percentage in the middle, and a list of
+paired passes below, each with both engines' plate crops and a match, differ, or
+miss verdict.](/img/screenshots/lpr-engine-benchmark.png)
+
+<small>Plates redacted for publication. The numbers are one real camera on a
+wide entry angle over 24 hours, which is the exact case the local worker was
+written for; on a tighter, plate-filling angle expect the two engines to land
+much closer together.</small>
+
 `GET /lpr/ab-report` clusters the raw reads into vehicle passes at report time
 (there's no stored "pass" entity), pairing Frigate and worker reads that fall
 within a short window (8 seconds by default). The screen shows two side-by-side

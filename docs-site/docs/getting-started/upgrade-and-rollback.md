@@ -22,7 +22,7 @@ scripts/backup-db.sh
 # In .env, pin the version you want (the image prefix already defaults to
 # the public ghcr.io/badbread/crumbvms, so leave CRUMB_IMAGE_PREFIX alone
 # unless you run a fork on a different registry):
-#   CRUMB_VERSION=v0.1.0
+#   CRUMB_VERSION=v0.2.0
 
 docker compose pull
 docker compose up -d
@@ -53,7 +53,7 @@ Versioned images make rollback symmetrical with upgrade:
 ```bash
 cd /opt/crumb/app
 
-# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.0.1
+# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.1.0
 
 docker compose pull
 docker compose up -d
