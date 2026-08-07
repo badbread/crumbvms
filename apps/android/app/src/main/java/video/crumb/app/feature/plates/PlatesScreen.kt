@@ -42,6 +42,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.ExpandLess
@@ -54,8 +55,10 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.ViewAgenda
 import androidx.compose.material.icons.filled.ViewList
 import androidx.compose.material3.AlertDialog
@@ -72,8 +75,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -126,6 +131,7 @@ import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
 import video.crumb.app.ui.theme.TimelineColors
+import java.io.File
 import kotlin.math.roundToInt
 
 /**
@@ -172,6 +178,9 @@ fun PlatesScreen(
     // an in-flight guard so the dialog can show a spinner + block re-taps.
     var reportFor by remember { mutableStateOf<PlateRead?>(null) }
     var generatingReport by remember { mutableStateOf(false) }
+    // The just-generated report PDF (app-private cache file). Non-null opens the
+    // post-generate actions sheet: Open (view now) / Save to Downloads / Share.
+    var reportActionsFile by remember { mutableStateOf<File?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Surface the ViewModel's one-shot messages (add/remove result, admin-only
@@ -409,11 +418,64 @@ fun PlatesScreen(
                     generatingReport = false
                     reportFor = null
                     result
-                        .onSuccess { file -> sharePlatesPdf(context, file) }
+                        // Don't auto-fire the share sheet (the operator often just
+                        // wants to VIEW or SAVE the report, not send it). Offer all
+                        // three deliveries in a follow-up sheet instead.
+                        .onSuccess { file -> reportActionsFile = file }
                         .onFailure { snackbarHostState.showSnackbar("Couldn't build the plate report.") }
                 }
             },
             onDismiss = { if (!generatingReport) reportFor = null },
+        )
+    }
+
+    // Post-generate deliveries: Open (view now in a PDF viewer), Save to Downloads
+    // (a durable copy the Files app can find), or Share. Replaces the old
+    // share-only behavior, which left the operator with no way to just view or
+    // keep the report on the phone.
+    val actionsFile = reportActionsFile
+    if (actionsFile != null) {
+        PlateReportActionsDialog(
+            onOpen = {
+                val launched = openPlatesPdf(context, actionsFile)
+                reportActionsFile = null
+                if (!launched) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            "No PDF viewer is installed. Try Save to Downloads or Share instead.",
+                        )
+                    }
+                }
+            },
+            onSave = {
+                reportActionsFile = null
+                scope.launch {
+                    savePlateReportToDownloads(context, actionsFile)
+                        .onSuccess { location ->
+                            val res = snackbarHostState.showSnackbar(
+                                message = "Saved to $location",
+                                actionLabel = "Open",
+                                duration = SnackbarDuration.Long,
+                            )
+                            if (res == SnackbarResult.ActionPerformed) {
+                                // The public-Downloads copy isn't a FileProvider
+                                // path; open the still-present cache original, which
+                                // is byte-identical, through the reports provider.
+                                if (!openPlatesPdf(context, actionsFile)) {
+                                    snackbarHostState.showSnackbar("No PDF viewer is installed.")
+                                }
+                            }
+                        }
+                        .onFailure { e ->
+                            snackbarHostState.showSnackbar("Couldn't save to Downloads: ${e.message}")
+                        }
+                }
+            },
+            onShare = {
+                sharePlatesPdf(context, actionsFile)
+                reportActionsFile = null
+            },
+            onDismiss = { reportActionsFile = null },
         )
     }
 }
@@ -1822,4 +1884,75 @@ private fun PlateReportDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !generating) { Text("Cancel") } },
     )
+}
+
+/**
+ * Post-generate delivery chooser for a finished plate report. The old flow fired
+ * the system share sheet automatically, which left an operator who "just wants to
+ * view it on my phone" with no way to open or keep the report. This offers the
+ * three obvious choices as a stacked action row:
+ *  - **Open** — view it right now in the device's default PDF viewer.
+ *  - **Save to Downloads** — a durable copy the Files app can find.
+ *  - **Share** — the original system share sheet.
+ */
+@Composable
+private fun PlateReportActionsDialog(
+    onOpen: () -> Unit,
+    onSave: () -> Unit,
+    onShare: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.PictureAsPdf, contentDescription = null) },
+        title = { Text("Report ready") },
+        text = {
+            Column {
+                Text(
+                    "View it now, save a copy to your Downloads folder, or share it.",
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(12.dp))
+                ReportActionButton(
+                    icon = Icons.Filled.Visibility,
+                    label = "Open",
+                    onClick = onOpen,
+                )
+                ReportActionButton(
+                    icon = Icons.Filled.Download,
+                    label = "Save to Downloads",
+                    onClick = onSave,
+                )
+                ReportActionButton(
+                    icon = Icons.Filled.Share,
+                    label = "Share",
+                    onClick = onShare,
+                )
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+/** One full-width action in the [PlateReportActionsDialog] (icon + label). */
+@Composable
+private fun ReportActionButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    TextButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
+        Text(
+            label,
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 12.dp),
+        )
+    }
 }
