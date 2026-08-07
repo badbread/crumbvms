@@ -189,3 +189,26 @@ a reboot leaves the running module and the installed modules out of step.
 If you hit this, [Troubleshooting](/troubleshooting/) covers recovery,
 including how to get the recorder running again without the GPU when a
 reboot has to wait.
+
+## When hardware decode isn't working, motion falls back to CPU
+
+You do not have to catch a broken accelerator yourself. Two safety nets run
+regardless of which backend you picked:
+
+- **`MOTION_HWACCEL=auto` only picks NVDEC when there is really an NVIDIA
+  device.** At startup the recorder asks ffmpeg to open a cuda device, rather
+  than only asking whether ffmpeg was built with cuda support (the bundled
+  ffmpeg is, on every host, GPU or not). No device means `auto` resolves to CPU
+  decode, so a GPU-less host running `auto` gets working software motion.
+- **A camera whose hardware decode cannot produce frames is switched to CPU
+  decode.** If the accelerator's ffmpeg exits with an initialisation error, or
+  simply decodes nothing several reconnects in a row, that camera's motion
+  decode drops to software for the rest of the recorder's run instead of
+  retrying the same broken setup forever. Search the recorder logs for
+  `VAAPI decode init FAILING` or `CUDA/NVDEC decode init FAILING`, and see the
+  console's decode-status panel: the camera reads `cpu` with the specific reason
+  next to it.
+
+Neither one touches recording, which never decodes video. And the fallback is
+not a fix, it is a floor: a camera on software decode is using CPU you meant to
+offload, so treat the reason line as something to repair, not to live with.

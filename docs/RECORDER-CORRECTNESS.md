@@ -57,6 +57,17 @@ recorder, and later the API) must satisfy these *by construction*.
 11. **Cap concurrent NVDEC decode sessions** with a global semaphore (env-configurable,
     e.g. `MAX_GPU_DECODE_SESSIONS`). When exhausted, fall back to CPU decode. Prevents VRAM
     exhaustion that would starve other GPU workloads sharing the host.
+    **A hardware backend that cannot decode must also lose the camera, not the
+    reconnect loop.** `MOTION_HWACCEL=auto` is resolved by a RUNTIME probe (ffmpeg
+    must actually create the device), never by "was cuda compiled in" — the bundled
+    ffmpeg answers yes on every host, so the build-time check selected cuda on
+    GPU-less machines (issue #479). And whatever backend was selected, a motion
+    ffmpeg that exits having decoded ZERO frames — with a known hw-init signature,
+    or repeatedly — latches that camera to CPU decode for the worker's lifetime, so
+    the EOF/reconnect watchdog stops relaunching the same failing flags forever.
+    Fail-open (item 19) is what keeps footage safe while this plays out; the latch
+    is what makes detection come BACK instead of staying down until an operator
+    notices.
 12. **Recording is `-c copy` (zero decode). Motion runs on the SUB stream only.** Streams
     come from Crumb's own embedded go2rtc restreamer (run by the recorder), not an external one.
 
