@@ -448,8 +448,17 @@ struct HaLinkDto {
     overlay_opacity: Option<f32>,
     /// Badge shape (migration 0062): `"dot"` or `"pill"`; `null` = default dot.
     overlay_shape: Option<String>,
-    /// Solid background '#RRGGBB' (migration 0062); `null` = default dark.
+    /// BASE solid background '#RRGGBB' (migration 0062); `null` = default dark.
+    /// This is the background for the OFF state and for an indeterminate or
+    /// stale reading (unknown/unavailable/no reading yet).
     overlay_bg_color: Option<String>,
+    /// Background override applied ONLY while the entity reads on (migration
+    /// 0076); `null` ⇒ inherit `overlay_bg_color`. Additive: an older client
+    /// that does not know the field keeps using the base for both states,
+    /// exactly as today. Resolution every client implements:
+    /// `on ⇒ overlay_bg_color_on ?? overlay_bg_color ?? #17171B`, any other
+    /// state ⇒ `overlay_bg_color ?? #17171B`.
+    overlay_bg_color_on: Option<String>,
     /// White outline + drop shadow (migration 0062; default false).
     overlay_outline: bool,
     /// Per-link control config (migration 0075, issue #440). `require_confirm`
@@ -486,6 +495,7 @@ impl From<crumb_common::types::CameraHaLink> for HaLinkDto {
             overlay_opacity: l.overlay_opacity,
             overlay_shape: l.overlay_shape,
             overlay_bg_color: l.overlay_bg_color,
+            overlay_bg_color_on: l.overlay_bg_color_on,
             overlay_outline: l.overlay_outline,
             require_confirm: l.require_confirm,
             allowed_actions: l.allowed_actions,
@@ -523,9 +533,16 @@ struct PlacementInput {
     /// Badge shape (migration 0062): `"dot"`/`"pill"`; omitted = default dot.
     #[serde(default)]
     shape: Option<String>,
-    /// Solid background '#RRGGBB' (migration 0062); omitted = default dark.
+    /// BASE solid background '#RRGGBB' (migration 0062); omitted/`null` =
+    /// default dark. Used for the off state and for indeterminate/stale.
     #[serde(default)]
     bg_color: Option<String>,
+    /// Background override for the ON state (migration 0076); omitted/`null` =
+    /// inherit `bg_color`. Field-level `null` inside the placement object is
+    /// the reset ("go back to inheriting"), matching the other overrides; a
+    /// body-level `null` still clears the whole placement.
+    #[serde(default)]
+    bg_color_on: Option<String>,
     /// White outline + drop shadow (migration 0062); omitted = false.
     #[serde(default)]
     outline: bool,
@@ -599,12 +616,14 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "motion",
     "occupancy",
     "person",
+    "home",
     "pet",
     "vibration",
     // lighting
     "lightbulb",
     "floodlight",
     "outdoor_light",
+    "landscape_light",
     // power & switches
     "switch",
     "power",
@@ -624,6 +643,12 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "temperature",
     "humidity",
     "sun",
+    // weather
+    "cloud",
+    "rain",
+    "wind",
+    "storm",
+    "moon",
     // safety & alarm (incl. smoke/gas/CO problem sensors)
     "smoke",
     "gas",
@@ -642,9 +667,19 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "camera",
     "tv",
     "speaker",
-    // network
+    "media_player",
+    "remote",
+    "game",
+    "mic",
+    "music",
+    // network & computing
     "wifi",
     "router",
+    "printer",
+    "server",
+    "computer",
+    "storage",
+    "phone",
     // vehicles & delivery
     "vehicle",
     "package",
@@ -656,8 +691,14 @@ pub const CANONICAL_ICON_SLUGS: &[&str] = &[
     "laundry",
     "pool",
     "hottub",
+    "grill",
+    "smoker",
+    "coffee",
+    "plant",
     // time
     "clock",
+    "calendar",
+    "timer",
     // automation
     "scene",
     "script",
@@ -1042,6 +1083,13 @@ async fn put_placement(
                     ));
                 }
             }
+            if let Some(c) = &p.bg_color_on {
+                if !valid_overlay_color(c) {
+                    return Err(ApiError::BadRequest(
+                        "placement bg_color_on must be a '#RRGGBB' hex string".to_owned(),
+                    ));
+                }
+            }
             // Label edit rides the placement PUT: omitted = unchanged,
             // "" = cleared, non-empty = set (trimmed).
             label_update = p.label.as_deref().map(|l| {
@@ -1063,6 +1111,7 @@ async fn put_placement(
                 opacity: Some(p.opacity.clamp(0.05, 1.0)),
                 shape: p.shape.clone(),
                 bg_color: p.bg_color.clone(),
+                bg_color_on: p.bg_color_on.clone(),
                 outline: p.outline,
             })
         }
@@ -1574,6 +1623,7 @@ mod tests {
         assert!((p.opacity - 1.0).abs() < f32::EPSILON); // migration 0060 default
         assert_eq!(p.shape, None); // shape/background/outline default off (0062)
         assert_eq!(p.bg_color, None);
+        assert_eq!(p.bg_color_on, None); // per-state background inherits (0076)
         assert!(!p.outline);
         assert_eq!(p.label, None);
 
@@ -1588,7 +1638,8 @@ mod tests {
             "x": 0.4, "y": 0.6, "size": 1.5,
             "color": "#FFB143", "icon": "doorbell",
             "show_state": true, "show_age": true, "opacity": 0.5,
-            "shape": "pill", "bg_color": "#101014", "outline": true,
+            "shape": "pill", "bg_color": "#101014", "bg_color_on": "#B3261E",
+            "outline": true,
             "label": "Front door"
         }))
         .unwrap();
@@ -1599,8 +1650,49 @@ mod tests {
         assert!((p.opacity - 0.5).abs() < f32::EPSILON);
         assert_eq!(p.shape.as_deref(), Some("pill"));
         assert_eq!(p.bg_color.as_deref(), Some("#101014"));
+        assert_eq!(p.bg_color_on.as_deref(), Some("#B3261E"));
         assert!(p.outline);
         assert_eq!(p.label.as_deref(), Some("Front door"));
+    }
+
+    #[test]
+    fn placement_input_per_state_background_accepts_valid_hex_and_resets_on_null() {
+        // Mirrors the 0062 bg_color coverage for the 0076 ON-state override.
+        // A valid '#RRGGBB' is carried through verbatim...
+        let set: PlacementInput = serde_json::from_value(json!({
+            "x": 0.2, "y": 0.3, "bg_color": "#17171B", "bg_color_on": "#b3261e"
+        }))
+        .unwrap();
+        assert_eq!(set.bg_color.as_deref(), Some("#17171B"));
+        assert_eq!(set.bg_color_on.as_deref(), Some("#b3261e"));
+        assert!(valid_overlay_color(set.bg_color_on.as_deref().unwrap()));
+
+        // ...an explicit field-level null is the RESET: it reads as None, so the
+        // badge goes back to inheriting the base background on the on state.
+        // (A body-level null clears the whole placement, which is a different
+        // thing entirely and is covered by the defaults test above.)
+        let reset: PlacementInput = serde_json::from_value(json!({
+            "x": 0.2, "y": 0.3, "bg_color": "#17171B", "bg_color_on": null
+        }))
+        .unwrap();
+        assert_eq!(reset.bg_color.as_deref(), Some("#17171B"));
+        assert_eq!(reset.bg_color_on, None);
+
+        // Setting only the ON color while the base inherits the client default
+        // is legal: resolution is bg_color_on ?? bg_color ?? default.
+        let on_only: PlacementInput =
+            serde_json::from_value(json!({"x": 0.0, "y": 0.0, "bg_color_on": "#0F9D58"})).unwrap();
+        assert_eq!(on_only.bg_color, None);
+        assert_eq!(on_only.bg_color_on.as_deref(), Some("#0F9D58"));
+
+        // Garbage is rejected by the same gate the handler 400s on. These are
+        // the exact strings the bg_color validation test rejects.
+        for bad in ["B3261E", "#B3261", "#B3261EE", "#GGB143", "", "red"] {
+            assert!(
+                !valid_overlay_color(bad),
+                "bg_color_on '{bad}' must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2241,6 +2333,7 @@ mod tests {
             overlay_opacity: None,
             overlay_shape: None,
             overlay_bg_color: None,
+            overlay_bg_color_on: None,
             overlay_outline: false,
             require_confirm: true,
             allowed_actions: Some(vec!["open_cover".to_owned()]),
@@ -2270,6 +2363,7 @@ mod tests {
             overlay_opacity: None,
             overlay_shape: None,
             overlay_bg_color: None,
+            overlay_bg_color_on: None,
             overlay_outline: false,
             require_confirm: false,
             allowed_actions: None,
@@ -2277,5 +2371,47 @@ mod tests {
         let v = serde_json::to_value(HaLinkDto::from(default)).unwrap();
         assert_eq!(v["require_confirm"], false);
         assert!(v["allowed_actions"].is_null());
+    }
+
+    #[test]
+    fn link_dto_carries_per_state_background_to_clients() {
+        use crumb_common::types::CameraHaLink;
+        let base = CameraHaLink {
+            id: Uuid::nil(),
+            camera_id: Uuid::nil(),
+            entity_id: "binary_sensor.front_door".to_owned(),
+            role: "sensor".to_owned(),
+            device_class: Some("door".to_owned()),
+            label: None,
+            sort_order: 0,
+            overlay_x: Some(0.25),
+            overlay_y: Some(0.75),
+            overlay_size: Some(1.0),
+            overlay_color: None,
+            overlay_icon: None,
+            overlay_show_state: false,
+            overlay_show_age: false,
+            overlay_opacity: None,
+            overlay_shape: Some("pill".to_owned()),
+            overlay_bg_color: Some("#17171B".to_owned()),
+            overlay_bg_color_on: Some("#B3261E".to_owned()),
+            overlay_outline: false,
+            require_confirm: false,
+            allowed_actions: None,
+        };
+        let v = serde_json::to_value(HaLinkDto::from(base.clone())).unwrap();
+        // Both backgrounds ride the wire; the client picks by edge_on.
+        assert_eq!(v["overlay_bg_color"], "#17171B");
+        assert_eq!(v["overlay_bg_color_on"], "#B3261E");
+
+        // A badge that predates 0076 serializes the new field as null, which is
+        // exactly "inherit the base for the on state" — i.e. today's rendering.
+        let inherited = CameraHaLink {
+            overlay_bg_color_on: None,
+            ..base
+        };
+        let v = serde_json::to_value(HaLinkDto::from(inherited)).unwrap();
+        assert_eq!(v["overlay_bg_color"], "#17171B");
+        assert!(v["overlay_bg_color_on"].is_null());
     }
 }

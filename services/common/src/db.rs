@@ -1646,6 +1646,7 @@ fn ha_link_from_row(row: &tokio_postgres::Row) -> CameraHaLink {
         overlay_opacity: row.get("overlay_opacity"),
         overlay_shape: row.get("overlay_shape"),
         overlay_bg_color: row.get("overlay_bg_color"),
+        overlay_bg_color_on: row.get("overlay_bg_color_on"),
         overlay_outline: row.get("overlay_outline"),
         require_confirm: row.get("require_confirm"),
         allowed_actions: row.get("allowed_actions"),
@@ -1664,7 +1665,8 @@ pub async fn list_camera_ha_links(pool: &Pool, camera_id: Uuid) -> Result<Vec<Ca
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    overlay_opacity, overlay_shape, overlay_bg_color,
+                    overlay_bg_color_on, overlay_outline,
                     require_confirm, allowed_actions
              FROM camera_ha_links WHERE camera_id = $1
              ORDER BY sort_order, entity_id",
@@ -1693,7 +1695,8 @@ pub async fn get_camera_ha_links(
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    overlay_opacity, overlay_shape, overlay_bg_color,
+                    overlay_bg_color_on, overlay_outline,
                     require_confirm, allowed_actions
              FROM camera_ha_links WHERE camera_id = $1 AND role = $2
              ORDER BY sort_order, entity_id",
@@ -1726,7 +1729,8 @@ pub async fn get_camera_ha_link(
             "SELECT id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    overlay_opacity, overlay_shape, overlay_bg_color,
+                    overlay_bg_color_on, overlay_outline,
                     require_confirm, allowed_actions
              FROM camera_ha_links WHERE camera_id = $1 AND id = $2",
             &[&camera_id, &link_id],
@@ -1786,6 +1790,7 @@ pub async fn replace_camera_ha_links(
         Option<f32>,
         Option<String>,
         Option<String>,
+        Option<String>,
         bool,
     );
     let mut placements: std::collections::HashMap<(String, String), Placement> =
@@ -1794,7 +1799,8 @@ pub async fn replace_camera_ha_links(
         .query(
             "SELECT entity_id, role, overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline
+                    overlay_opacity, overlay_shape, overlay_bg_color,
+                    overlay_bg_color_on, overlay_outline
              FROM camera_ha_links WHERE camera_id = $1",
             &[&camera_id],
         )
@@ -1815,6 +1821,7 @@ pub async fn replace_camera_ha_links(
                 row.get("overlay_opacity"),
                 row.get("overlay_shape"),
                 row.get("overlay_bg_color"),
+                row.get("overlay_bg_color_on"),
                 row.get("overlay_outline"),
             ),
         );
@@ -1839,22 +1846,24 @@ pub async fn replace_camera_ha_links(
             oopacity,
             oshape,
             obg_color,
+            obg_color_on,
             ooutline,
         ) = placements
             .get(&(entity_id.clone(), role.clone()))
             .cloned()
             .unwrap_or((
-                None, None, None, None, None, false, false, None, None, None, false,
+                None, None, None, None, None, false, false, None, None, None, None, false,
             ));
         tx.execute(
             "INSERT INTO camera_ha_links
                  (camera_id, entity_id, role, device_class, label, sort_order,
                   overlay_x, overlay_y, overlay_size,
                   overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                  overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                  overlay_opacity, overlay_shape, overlay_bg_color,
+                  overlay_bg_color_on, overlay_outline,
                   require_confirm, allowed_actions)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                     $15, $16, $17, $18, $19)",
+                     $15, $16, $17, $18, $19, $20)",
             &[
                 &camera_id,
                 entity_id,
@@ -1872,6 +1881,7 @@ pub async fn replace_camera_ha_links(
                 &oopacity,
                 &oshape,
                 &obg_color,
+                &obg_color_on,
                 &ooutline,
                 require_confirm,
                 allowed_actions,
@@ -1912,8 +1922,12 @@ pub struct HaOverlayPlacement {
     pub opacity: Option<f32>,
     /// Badge shape (migration 0062): `"dot"` or `"pill"`; `None` = default dot.
     pub shape: Option<String>,
-    /// Solid background '#RRGGBB' (migration 0062); `None` = default dark.
+    /// BASE solid background '#RRGGBB' (migration 0062); `None` = default dark.
+    /// Renders for the off state and for indeterminate/stale readings.
     pub bg_color: Option<String>,
+    /// Background override used ONLY while the entity reads on (migration
+    /// 0076); `None` = inherit `bg_color`.
+    pub bg_color_on: Option<String>,
     /// White outline + drop shadow (migration 0062).
     pub outline: bool,
 }
@@ -1943,25 +1957,38 @@ pub async fn update_ha_link_placement(
     placement: Option<&HaOverlayPlacement>,
     label: Option<Option<&str>>,
 ) -> Result<Option<CameraHaLink>> {
-    let (x, y, size, color, icon, show_state, show_age, opacity, shape, bg_color, outline) =
-        match placement {
-            Some(p) => (
-                Some(p.x),
-                Some(p.y),
-                Some(p.size),
-                p.color.as_deref(),
-                p.icon.as_deref(),
-                p.show_state,
-                p.show_age,
-                p.opacity,
-                p.shape.as_deref(),
-                p.bg_color.as_deref(),
-                p.outline,
-            ),
-            None => (
-                None, None, None, None, None, false, false, None, None, None, false,
-            ),
-        };
+    let (
+        x,
+        y,
+        size,
+        color,
+        icon,
+        show_state,
+        show_age,
+        opacity,
+        shape,
+        bg_color,
+        bg_color_on,
+        outline,
+    ) = match placement {
+        Some(p) => (
+            Some(p.x),
+            Some(p.y),
+            Some(p.size),
+            p.color.as_deref(),
+            p.icon.as_deref(),
+            p.show_state,
+            p.show_age,
+            p.opacity,
+            p.shape.as_deref(),
+            p.bg_color.as_deref(),
+            p.bg_color_on.as_deref(),
+            p.outline,
+        ),
+        None => (
+            None, None, None, None, None, false, false, None, None, None, None, false,
+        ),
+    };
     let set_label = label.is_some();
     let label_value: Option<&str> = label.flatten();
     let client = get_conn(pool).await?;
@@ -1972,13 +1999,15 @@ pub async fn update_ha_link_placement(
                     overlay_color = $6, overlay_icon = $7,
                     overlay_show_state = $8, overlay_show_age = $9,
                     overlay_opacity = $12,
-                    overlay_shape = $13, overlay_bg_color = $14, overlay_outline = $15,
+                    overlay_shape = $13, overlay_bg_color = $14,
+                    overlay_bg_color_on = $16, overlay_outline = $15,
                     label = CASE WHEN $10 THEN $11 ELSE label END
               WHERE id = $1 AND camera_id = $2
           RETURNING id, camera_id, entity_id, role, device_class, label, sort_order,
                     overlay_x, overlay_y, overlay_size,
                     overlay_color, overlay_icon, overlay_show_state, overlay_show_age,
-                    overlay_opacity, overlay_shape, overlay_bg_color, overlay_outline,
+                    overlay_opacity, overlay_shape, overlay_bg_color,
+                    overlay_bg_color_on, overlay_outline,
                     require_confirm, allowed_actions",
             &[
                 &link_id,
@@ -1996,6 +2025,7 @@ pub async fn update_ha_link_placement(
                 &shape,
                 &bg_color,
                 &outline,
+                &bg_color_on,
             ],
         )
         .await
@@ -10642,6 +10672,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0075_ha_link_control_config.sql",
         include_str!("../../../db/migrations/0075_ha_link_control_config.sql"),
+    ),
+    (
+        "0076_ha_overlay_bg_on.sql",
+        include_str!("../../../db/migrations/0076_ha_overlay_bg_on.sql"),
     ),
 ];
 

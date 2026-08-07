@@ -197,7 +197,7 @@ table.list-tbl tbody tr{cursor:pointer;}
 .mt-preview{position:relative;background:#000;border:1px solid var(--border,#2a2f3a);border-radius:6px;min-height:160px;max-height:46vh;display:flex;align-items:center;justify-content:center;overflow:hidden;}
 .mt-preview img{max-width:100%;max-height:46vh;display:none;}
 .mt-frame-ph{color:var(--dim2);font-size:13px;padding:24px;text-align:center;}
-/* ── Inline motion-mask painter (camera Motion tab) ── */
+/* ── Inline motion-mask painter (camera Detection tab) ── */
 .cm-stage{position:relative;background:#0a0c10;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;width:100%;aspect-ratio:16/9;max-height:46vh;margin:0 auto;}
 .cm-stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;user-select:none;-webkit-user-drag:none;}
 .cm-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none;}
@@ -243,7 +243,7 @@ details.detail-section .ds-body .policy-section:first-child{margin-top:0;}
 details.detail-section .ds-body>.policy-section{background:transparent;border:none;padding:0;margin-top:12px;}
 details.detail-section .ds-body>.policy-section:first-child{margin-top:0;}
 details.detail-section .ds-body>.policy-section>.policy-section-title{position:static;background:transparent;padding:0;margin-bottom:8px;line-height:1.4;}
-/* ── Motion tab two-column (live tuner pinned above, settings split below) ── */
+/* ── Detection tab two-column (live tuner pinned above, settings split below) ── */
 .mt-settings-cols{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;}
 @media(max-width:760px){.mt-settings-cols{grid-template-columns:1fr;}}
 /* live slider for the manual triggering floor */
@@ -791,7 +791,7 @@ const stName = id => { const s = STORAGES.find(s => s.id === id); return s ? s.n
 const GB = 1e9;
 /* True when the console is embedded in the Crumb Client (loaded with
    #embed=1 → bootSSO adds body.embedded). The desktop owns its own motion-tuning
-   menu, so the camera Motion tab is hidden in embed mode (item #4). */
+   menu, so the camera Detection tab is hidden in embed mode (item #4). */
 const isEmbedded = () => document.body.classList.contains('embedded');
 
 /* ── Mobile drawer toggle ──
@@ -5208,6 +5208,7 @@ let HA_PICKER_SEARCH = '';
 let HA_PICKER_SHOWALL = false;
 let HA_STYLE_OPEN = null;     // index of the HA_LINKS row whose icon/style editor is expanded
 let HA_CTRL_OPEN = null;      // index of the HA_LINKS row whose control-config editor is expanded
+let HA_STYLE_PREVIEW_ON = {}; // HA_LINKS index -> bool: which state (on/off) the style mockup is currently showing
 // device_classes worth linking to a camera; the rest hide under "Other sensors".
 const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
 
@@ -5218,16 +5219,17 @@ const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','wind
    not significant) or a save here will fail server-side validation. */
 const HA_ICON_SLUGS = [
   'door','window','gate','garage','cover','blinds','curtains','shade','lock','key',
-  'motion','occupancy','person','pet','vibration',
-  'lightbulb','floodlight','outdoor_light',
+  'motion','occupancy','person','home','pet','vibration',
+  'lightbulb','floodlight','outdoor_light','landscape_light',
   'switch','power','plug','outlet','energy','meter','battery','solar','ev',
   'fan','ac','heatpump','hvac','thermostat','temperature','humidity','sun',
+  'cloud','rain','wind','storm','moon',
   'smoke','gas','co','fire','leak','water','valve','siren','security','armed','warning','doorbell','bell',
-  'camera','tv','speaker',
-  'wifi','router',
+  'camera','tv','speaker','media_player','remote','game','mic','music',
+  'wifi','router','printer','server','computer','storage','phone',
   'vehicle','package','mail',
-  'vacuum','lawn','fridge','laundry','pool','hottub',
-  'clock',
+  'vacuum','lawn','fridge','laundry','pool','hottub','grill','smoker','coffee','plant',
+  'clock','calendar','timer',
   'scene','script','button',
   'sensor',
 ];
@@ -5581,6 +5583,7 @@ function haMapLinkFromServer(l) {
     overlay_opacity: l.overlay_opacity ?? null,
     overlay_shape: l.overlay_shape ?? null,
     overlay_bg_color: l.overlay_bg_color ?? null,
+    overlay_bg_color_on: l.overlay_bg_color_on ?? null,
     overlay_outline: !!l.overlay_outline,
   };
 }
@@ -5598,6 +5601,7 @@ async function loadCameraHaLinks(camId) {
     HA_PICKER = null;
     HA_STYLE_OPEN = null;
     HA_CTRL_OPEN = null;
+    HA_STYLE_PREVIEW_ON = {};
     const configured = !!(cfg && cfg.enabled && cfg.base_url && cfg.has_token);
     renderHaLinks(configured);
   } catch (e) {
@@ -5635,7 +5639,7 @@ function renderHaLinks(configured) {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         ${haRoleSelect(i, l.role)}
         <input value="${esc(l.label || '')}" placeholder="${esc(l.entity_id)}" oninput="haSetLabel(${i}, this.value)" title="Display label" style="flex:1;min-width:140px;font-size:13px" />
-        <input value="${esc(l.device_class || '')}" placeholder="device class" oninput="haSetDeviceClass(${i}, this.value)" title="Home Assistant device class" style="width:120px;font-size:12px" />
+        <input list="ha-dev-classes" value="${esc(l.device_class || '')}" placeholder="class (optional)" oninput="haSetDeviceClass(${i}, this.value)" title="Optional. Only meaningful for binary_sensor entities; it sets the badge glyph. Auto-filled from Home Assistant when the entity reports one. Leave blank for lights, switches and covers, their icon comes from the domain or the Icon &amp; style override." style="width:120px;font-size:12px" />
         <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
         <button class="ghost sm" onclick="haToggleStyle(${i})" ${canStyle ? '' : 'disabled'} title="${canStyle ? 'Badge icon, shape and color for this entity on the video wall' : 'Save links first to customize this entity\'s badge'}">${HA_STYLE_OPEN === i ? 'Hide style' : 'Icon &amp; style'}</button>
         ${isActuator ? `<button class="ghost sm" onclick="haToggleCtrl(${i})" title="Confirmation + which actions this control allows">${HA_CTRL_OPEN === i ? 'Hide controls' : 'Controls'}</button>` : ''}
@@ -5645,12 +5649,17 @@ function renderHaLinks(configured) {
       ${HA_CTRL_OPEN === i ? haCtrlPanel(i, l) : ''}
     </div>`;
   }).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
+  const devClassOpts = ['door', 'garage_door', 'window', 'opening', 'motion', 'occupancy', 'presence', 'vibration', 'moisture', 'smoke', 'gas', 'carbon_monoxide', 'lock']
+    .map(c => `<option value="${c}"></option>`).join('');
   el.innerHTML = `
     <div>${rows}</div>
-    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
-      <button class="ghost sm" onclick="haOpenPicker('motion')">+ Add sensor</button>
-      <button class="ghost sm" onclick="haOpenPicker('sensor')">+ Add value</button>
-      <button class="ghost sm" onclick="haOpenPicker('actuator')">+ Add control</button>
+    <datalist id="ha-dev-classes">${devClassOpts}</datalist>
+    <div class="card-hint" style="margin-top:10px">The <b>class</b> box on each row is optional and only affects <code>binary_sensor</code> badge glyphs; it is auto-filled from Home Assistant. Leave it blank for lights, switches and covers.</div>
+    <div class="card-hint" style="margin-top:10px">Where does an entity go? <b>Motion sensor</b> = motion or contact binary sensors. <b>Sensor reading</b> = numeric readings (temperature, power, humidity). <b>Control</b> = anything you operate (lights, switches, covers, locks, fans, sirens).</div>
+    <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center">
+      <button class="ghost sm" onclick="haOpenPicker('motion')">+ Motion sensor</button>
+      <button class="ghost sm" onclick="haOpenPicker('sensor')">+ Sensor reading</button>
+      <button class="ghost sm" onclick="haOpenPicker('actuator')">+ Control (lights, switches, covers&hellip;)</button>
       <button class="primary sm" onclick="saveHaLinks()" style="margin-left:auto">Save links</button>
     </div>
     <div id="ce-ha-picker"></div>
@@ -5674,11 +5683,14 @@ function haToggleCtrl(i) {
    in a live video canvas here (issue #439 — "a clean functional editor beats
    a fancy broken one"). Shows the icon SLUG as text: the console has no
    glyph atlas (that lives in the three native clients), so the slug itself
-   is the honest preview. */
-function haBadgePreviewHtml(l) {
+   is the honest preview. `onState` picks which of bg_color/bg_color_on the
+   mockup renders (see the On/Off chips in haStylePanel); base bg_color is
+   what actually shows while off/unknown, bg_color_on overrides it while on,
+   falling back to bg_color when unset ("Follows Off"). */
+function haBadgePreviewHtml(l, onState) {
   const shape = l.overlay_shape || 'dot';
   const color = l.overlay_color || '#3ddc84';
-  const bg = l.overlay_bg_color || '#1a1a1a';
+  const bg = onState ? (l.overlay_bg_color_on ?? l.overlay_bg_color ?? '#17171B') : (l.overlay_bg_color ?? '#17171B');
   const size = l.overlay_size != null ? l.overlay_size : 1;
   const opacity = l.overlay_opacity != null ? l.overlay_opacity : 1;
   const icon = l.overlay_icon || 'sensor';
@@ -5700,8 +5712,12 @@ function haStylePanel(i, l) {
   return `
     <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
       <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
-        <div id="ha-style-preview-${i}">${haBadgePreviewHtml(l)}</div>
+        <div id="ha-style-preview-${i}">${haBadgePreviewHtml(l, !!HA_STYLE_PREVIEW_ON[i])}</div>
         <span style="font-size:10px;color:var(--dim2)">Preview</span>
+        <div class="seg-toggle" role="group" aria-label="Preview state" style="margin-top:2px">
+          <button type="button" id="ha-preview-off-${i}" class="seg-btn ${!HA_STYLE_PREVIEW_ON[i] ? 'active' : ''}" style="padding:3px 8px;font-size:11px;min-height:auto" onclick="haSetPreviewState(${i}, false)">Off</button>
+          <button type="button" id="ha-preview-on-${i}" class="seg-btn ${HA_STYLE_PREVIEW_ON[i] ? 'active' : ''}" style="padding:3px 8px;font-size:11px;min-height:auto" onclick="haSetPreviewState(${i}, true)">On</button>
+        </div>
       </div>
       <div class="form-grid" style="min-width:170px">
         <label class="fg-label" style="margin-top:0">Icon</label>
@@ -5724,6 +5740,11 @@ function haStylePanel(i, l) {
         <div class="fg-ctl">
           <input type="color" value="${l.overlay_bg_color || '#1a1a1a'}" oninput="haStyleSet(${i}, 'overlay_bg_color', this.value)" style="width:44px;padding:0" />
           <button class="ghost sm" onclick="haStyleSet(${i}, 'overlay_bg_color', null)" title="Clear override, use the default dark background">Auto</button>
+        </div>
+        <label class="fg-label">Background (on)</label>
+        <div class="fg-ctl">
+          <input type="color" value="${l.overlay_bg_color_on || l.overlay_bg_color || '#1a1a1a'}" oninput="haStyleSet(${i}, 'overlay_bg_color_on', this.value)" style="width:44px;padding:0" />
+          <button class="ghost sm" onclick="haStyleSet(${i}, 'overlay_bg_color_on', null)" title="Clear override, follow the Background color while the entity is on">Auto (follows Off)</button>
         </div>
       </div>
       <div class="form-grid" style="min-width:170px">
@@ -5749,10 +5770,22 @@ function haStyleSet(i, field, value) {
   l[field] = value;
   if (field === 'overlay_size') { const e = $('ha-size-val-' + i); if (e) e.textContent = value.toFixed(2) + '×'; }
   if (field === 'overlay_opacity') { const e = $('ha-opacity-val-' + i); if (e) e.textContent = Math.round(value * 100) + '%'; }
-  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l);
+  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l, !!HA_STYLE_PREVIEW_ON[i]);
 }
 
-/* Persists icon/shape/color/bg_color/size/opacity via PUT .../placement.
+/* On/Off preview toggle in the style mockup (does not touch saved state): flips
+   which of bg_color / bg_color_on the swatch renders, so authoring bg_color_on
+   without a live entity to test against still shows the honest result. */
+function haSetPreviewState(i, on) {
+  const l = HA_LINKS[i]; if (!l) return;
+  HA_STYLE_PREVIEW_ON[i] = on;
+  const prev = $('ha-style-preview-' + i); if (prev) prev.innerHTML = haBadgePreviewHtml(l, on);
+  const offBtn = $('ha-preview-off-' + i), onBtn = $('ha-preview-on-' + i);
+  if (offBtn) offBtn.classList.toggle('active', !on);
+  if (onBtn) onBtn.classList.toggle('active', on);
+}
+
+/* Persists icon/shape/color/bg_color/bg_color_on/size/opacity via PUT .../placement.
    Only valid once the link has a server id (issue #439 — save links first).
    Preserves the link's existing x/y (or centers it if never placed) and its
    show_state/show_age/outline, and deliberately OMITS `label` from the body:
@@ -5774,6 +5807,7 @@ async function haSaveStyle(i) {
     opacity: l.overlay_opacity != null ? l.overlay_opacity : 1,
     shape: l.overlay_shape || null,
     bg_color: l.overlay_bg_color || null,
+    bg_color_on: l.overlay_bg_color_on || null,
     outline: !!l.overlay_outline,
   };
   try {
@@ -5907,12 +5941,15 @@ function renderHaResults() {
     all.filter(match).forEach(e => { const d = e.entity_id.split('.')[0]; (byDom[d] = byDom[d] || []).push(e); });
     Object.keys(byDom).sort().forEach(d => groups.push({ title: d, items: byDom[d] }));
   }
+  const emptyMsg = role === 'actuator'
+    ? '<div class="card-hint" style="margin:4px 0">No matching entities.</div>'
+    : '<div class="card-hint" style="margin:4px 0">No matching entities. Not here? Switches, lights, covers and locks are under <b>Control</b>.</div>';
   results.innerHTML = groups.map(g => `
     <div style="margin-top:6px"><div style="font-size:11px;color:var(--dim2);text-transform:uppercase;letter-spacing:.04em">${esc(g.title)}</div>
       ${g.items.map(e => `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;${linked.has(e.entity_id) ? 'opacity:.45' : ''}" onclick="haPick('${esc(e.entity_id)}')">
         <span style="flex:1;font-size:13px">${esc(e.friendly_name)}${linked.has(e.entity_id) ? ' (linked)' : ''}</span>
         <span class="mono" style="color:var(--dim2);font-size:11px">${esc(e.entity_id)}</span></div>`).join('')}
-    </div>`).join('') || '<div class="card-hint" style="margin:4px 0">No matching entities.</div>';
+    </div>`).join('') || emptyMsg;
 }
 
 function haPick(entity_id) {
@@ -5925,7 +5962,7 @@ function haPick(entity_id) {
     id: null, entity_id, role, device_class: ent.device_class || null, label: ent.friendly_name || null, sort_order: HA_LINKS.length,
     require_confirm: false, allowed_actions: null,
     overlay_x: null, overlay_y: null, overlay_size: null, overlay_color: null, overlay_icon: null,
-    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_outline: false,
+    overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_bg_color_on: null, overlay_outline: false,
   });
   renderHaLinks(true);
 }
@@ -5934,6 +5971,7 @@ function removeHaLink(i) {
   HA_LINKS.splice(i, 1);
   HA_STYLE_OPEN = null;
   HA_CTRL_OPEN = null;
+  HA_STYLE_PREVIEW_ON = {};
   renderHaLinks(true);
 }
 
@@ -5953,6 +5991,7 @@ async function saveHaLinks() {
     HA_PICKER = null;
     HA_STYLE_OPEN = null;
     HA_CTRL_OPEN = null;
+    HA_STYLE_PREVIEW_ON = {};
     toast('Home Assistant links saved.');
     renderHaLinks(true);
   } catch (e) {
@@ -6030,7 +6069,7 @@ async function renderHaHub() {
         <button class="ghost sm" onclick="testHa()">Test connection</button>
         <span id="ha-test" class="srv-note" style="margin-left:8px"></span>
       </div>
-      <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection). Link individual sensors and controls to a camera from that camera's Motion tab.</div>
+      <div class="card-hint" style="margin-top:4px">Save first, then Test (Test checks the saved connection). Link individual sensors and controls to a camera from that camera's Connection tab (Home Assistant section).</div>
       <div id="ha-msg" class="form-msg"></div>
     </div>
 
@@ -6040,7 +6079,7 @@ async function renderHaHub() {
       <button class="ghost sm" onclick="loadHaHubOverview()" title="Re-fetch links and live state from every camera">Refresh</button>
     </div>
     <div class="policy-section" style="margin-top:10px">
-      <div class="card-hint" style="margin:-2px 0 10px 2px">Every Home Assistant entity linked to any camera, across the whole server. An entity flagged <b>orphaned</b> no longer exists in Home Assistant — open that camera's Motion tab to relink or remove it.</div>
+      <div class="card-hint" style="margin:-2px 0 10px 2px">Every Home Assistant entity linked to any camera, across the whole server. An entity flagged <b>orphaned</b> no longer exists in Home Assistant — open that camera's Connection tab (Home Assistant section) to relink or remove it.</div>
       <div class="export-dest-row" style="align-items:center;gap:8px;flex-wrap:wrap">
         <input id="ha-hub-q" placeholder="Filter by camera, entity id, or label…" style="max-width:280px" oninput="haHubFilterChanged()" />
         <label class="chk" style="margin:0"><input type="checkbox" id="ha-hub-orphans-only" onchange="haHubOrphansOnlyChanged()"/> Orphaned only</label>
@@ -6119,7 +6158,7 @@ function renderHaHubOverview() {
   const box = $('ha-hub-overview'); if (!box) return;
   if (!HA_HUB_LINKS) { box.innerHTML = '<div class="card-hint" style="padding:6px 2px">Loading…</div>'; return; }
   if (!HA_HUB_LINKS.length) {
-    box.innerHTML = `<div class="card-hint" style="padding:6px 2px">No cameras have any Home Assistant links yet. Open a camera&#39;s <b>Motion</b> tab to link sensors or controls.</div>`;
+    box.innerHTML = `<div class="card-hint" style="padding:6px 2px">No cameras have any Home Assistant links yet. Open a camera&#39;s <b>Connection</b> tab (Home Assistant section) to link sensors or controls.</div>`;
     return;
   }
   // entity_id → live state, only for entities GET /ha/states actually returned.
@@ -8076,7 +8115,7 @@ async function saveCamEdit() {
       if (managed) { camBody.source_url = src; camBody.source_sub_url = sub; }
       else         { camBody.main_url   = src; camBody.sub_url        = sub; }
     }
-    // Additive motion sources + (pixel) algorithm (Motion tab).
+    // Additive motion sources + (pixel) algorithm (Detection tab).
     if ($('ce-motion-pixel')) camBody.motion_pixel_enabled = $('ce-motion-pixel').checked;
     if ($('ce-motion-frigate')) camBody.motion_frigate_enabled = $('ce-motion-frigate').checked;
     if ($('ce-motion-ha')) camBody.motion_ha_enabled = $('ce-motion-ha').checked;
@@ -8109,7 +8148,7 @@ async function saveCamEdit() {
     }
 
     await api('/config/cameras/' + id, { method: 'PUT', body: JSON.stringify(camBody) });
-    // Motion tab: persist per-camera motion sensitivity/buffers as a custom policy
+    // Detection tab: persist per-camera motion sensitivity/buffers as a custom policy
     // override (copy-on-write), only when those fields were edited on the tab.
     // motion_sensitivity is sent ALONGSIDE motion_threshold so the threshold is
     // actually honored, in the default 'dynamic' mode a bare threshold is a no-op,

@@ -29,8 +29,12 @@
 // `water_drop`, `local_fire_department`, `thermostat`, `lock`, `lock_open`,
 // `videocam`, `pets`, `window`, `co2`, `water_damage`, and the #438 additions
 // `blinds_closed`, `outlet`, `device_thermostat`, `gas_meter`, `terminal`,
-// `smart_button`. `directions_run` and `sensors` ARE already used elsewhere
-// (confirmed safe).
+// `smart_button`, plus the vocabulary-expansion additions `wb_twilight`,
+// `wb_cloudy`, `grain`, `wind_power`, `thunderstorm`, `dark_mode`,
+// `smart_display`, `settings_remote`, `sports_esports`, `music_note`, `print`,
+// `dns`, `computer`, `storage`, `smartphone`, `outdoor_grill`, `whatshot`,
+// `coffee`, `eco`, `calendar_today`, `timer` (and `home`, `mic` already common).
+// `directions_run` and `sensors` ARE already used elsewhere (confirmed safe).
 
 import 'package:flutter/material.dart';
 
@@ -202,7 +206,44 @@ const Map<String, (IconData, String)> kHaBadgeIconChoices = {
   'gas': (Icons.gas_meter, 'Gas / CO'),
   'script': (Icons.terminal, 'Script'),
   'button': (Icons.smart_button, 'Button'),
+  // ── vocabulary expansion: outdoor cooking, weather, media/compute, etc. ─────
+  'home': (Icons.home, 'Home / zone'),
+  'landscape_light': (Icons.wb_twilight, 'Landscape light'),
+  'cloud': (Icons.wb_cloudy, 'Cloud / weather'),
+  'rain': (Icons.grain, 'Rain'),
+  'wind': (Icons.wind_power, 'Wind'),
+  'storm': (Icons.thunderstorm, 'Storm'),
+  'moon': (Icons.dark_mode, 'Moon / night'),
+  'media_player': (Icons.smart_display, 'Media player'),
+  'remote': (Icons.settings_remote, 'Remote'),
+  'game': (Icons.sports_esports, 'Game'),
+  'mic': (Icons.mic, 'Microphone'),
+  'music': (Icons.music_note, 'Music'),
+  'printer': (Icons.print, 'Printer'),
+  'server': (Icons.dns, 'Server'),
+  'computer': (Icons.computer, 'Computer'),
+  'storage': (Icons.storage, 'Storage / NAS'),
+  'phone': (Icons.smartphone, 'Phone'),
+  'grill': (Icons.outdoor_grill, 'Grill / BBQ'),
+  'smoker': (Icons.whatshot, 'Smoker'),
+  'coffee': (Icons.coffee, 'Coffee'),
+  'plant': (Icons.eco, 'Plant'),
+  'calendar': (Icons.calendar_today, 'Calendar'),
+  'timer': (Icons.timer, 'Timer'),
 };
+
+/// The honesty-gated on/off reading shared by every piece of badge chrome
+/// that varies with state (the accent-dim color below, and
+/// `ha_overlay_layer.dart`'s per-state background resolution): null
+/// (indeterminate) for a scene, a stale states feed, or no known state yet —
+/// NEVER a raw `edgeOn(state)` call in those cases, so nothing downstream can
+/// read "on" for a reading that isn't actually known. Kept as the single
+/// source of truth so the accent and the background can never disagree.
+bool? haEdgeOnFor({
+  required String domain,
+  required String? state,
+  required bool stale,
+}) => (state == null || stale || domain == 'scene') ? null : edgeOn(state);
 
 /// Parse a stored '#RRGGBB' badge color override into a [Color] (full
 /// opacity), or null for absent/malformed values.
@@ -288,9 +329,7 @@ HaVisual haVisualFor({
   final overrideIcon = iconOverride == null
       ? null
       : kHaBadgeIconChoices[iconOverride]?.$1;
-  final on = (state == null || stale || domain == 'scene')
-      ? null
-      : edgeOn(state);
+  final on = haEdgeOnFor(domain: domain, state: state, stale: stale);
   final Color color;
   if (colorOverride != null && on != null) {
     color = on ? colorOverride : colorOverride.withValues(alpha: 0.45);
@@ -317,7 +356,7 @@ HaVisual _haVisualDefault({
     return const HaVisual(Icons.movie_filter, _kNeutral, label: 'Scene');
   }
 
-  final on = (state == null || stale) ? null : edgeOn(state);
+  final on = haEdgeOnFor(domain: domain, state: state, stale: stale);
   if (on == null) {
     return HaVisual(
       _iconFor(domain: domain, deviceClass: deviceClass),

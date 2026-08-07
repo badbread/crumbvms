@@ -24,6 +24,7 @@ class HaLink {
     this.overlayOpacity,
     this.overlayShape,
     this.overlayBgColor,
+    this.overlayBgColorOn,
     this.overlayOutline = false,
     this.requireConfirm = false,
     this.allowedActions,
@@ -80,6 +81,18 @@ class HaLink {
   /// dark background.
   final String? overlayBgColor;
 
+  /// Per-state background override: the badge background when the entity
+  /// reads ON (wave A backend contract). Null = no override — the badge keeps
+  /// [overlayBgColor] (or the default) regardless of state, exactly as today.
+  /// Never applied to an OFF, indeterminate/unknown, or stale reading, nor to
+  /// a scene (`on == null`) — resolution mirrors `ha_icons.dart`'s accent-dim
+  /// honesty gate: ON ⇒ `overlayBgColorOn ?? overlayBgColor ?? default`;
+  /// everything else ⇒ `overlayBgColor ?? default`. Parsed defensively (an
+  /// older server that omits the field decodes to null, i.e. today's
+  /// behavior) so this client degrades gracefully ahead of the server field
+  /// landing.
+  final String? overlayBgColorOn;
+
   /// White outline + drop shadow so the badge pops on a busy scene
   /// (migration 0062; default off).
   final bool overlayOutline;
@@ -135,6 +148,7 @@ class HaLink {
     overlayOpacity: (j['overlay_opacity'] as num?)?.toDouble(),
     overlayShape: j['overlay_shape'] as String?,
     overlayBgColor: j['overlay_bg_color'] as String?,
+    overlayBgColorOn: j['overlay_bg_color_on'] as String?,
     overlayOutline: (j['overlay_outline'] as bool?) ?? false,
     requireConfirm: (j['require_confirm'] as bool?) ?? false,
     allowedActions: (j['allowed_actions'] as List<dynamic>?)
