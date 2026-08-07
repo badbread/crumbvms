@@ -6,6 +6,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -109,11 +110,18 @@ private fun fieldRect(paneW: Float, paneH: Float, videoW: Int, videoH: Int): Flo
  * the chip's own contents and the label spilled past the rounded background.
  * Returning the true footprint here also keeps the edge clamp below, and the
  * badge's touch target, honest about what is drawn.
+ *
+ * A pill with a FIXED `overlay_pill_width` (migration 0078) skips the widening
+ * entirely and takes the exact multiple of its height the operator asked for —
+ * see [HaBadgeMetrics.pillWidth].
  */
 private fun badgeSize(link: HaLinkDto, ps: Float): FloatArray {
     val h = HaBadgeMetrics.badgeHeight(link.overlaySize?.toFloat(), ps)
     if (link.overlayShape != "pill") return floatArrayOf(h, h)
-    return floatArrayOf(HaBadgeMetrics.pillWidth(h, link.displayName), h)
+    return floatArrayOf(
+        HaBadgeMetrics.pillWidth(h, link.displayName, link.overlayPillWidth),
+        h,
+    )
 }
 
 /**
@@ -228,6 +236,7 @@ private fun HaBadge(
                 visual = visual,
                 isPill = isPill,
                 pillLabel = link.displayName,
+                textAlign = link.overlayTextAlign,
                 bgColor = bg,
                 outline = link.overlayOutline,
                 widthDp = wDp,
@@ -304,6 +313,7 @@ private fun HaBadgeChip(
     visual: BadgeVisual,
     isPill: Boolean,
     pillLabel: String,
+    textAlign: String?,
     bgColor: Color,
     outline: Boolean,
     widthDp: Float,
@@ -339,9 +349,19 @@ private fun HaBadgeChip(
         // (22sp) whatever its font size, which is what made a small pill's text
         // taller than the pill.
         val labelFont = dpAsSp(HaBadgeMetrics.pillFontSize(heightDp))
+        // Where the icon+label group sits in the pill (migration 0078). Only
+        // observable once a fixed width has left the pill some slack; an `auto`
+        // pill hugs its content, so every value looks the same — which is
+        // exactly why null must resolve to Start and nothing else.
+        val arrangement = when (textAlign) {
+            "center" -> Arrangement.Center
+            "end" -> Arrangement.End
+            else -> Arrangement.Start
+        }
         Row(
             modifier = base.padding(horizontal = HaBadgeMetrics.pillPadH(heightDp).dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = arrangement,
         ) {
             Icon(
                 visual.icon,

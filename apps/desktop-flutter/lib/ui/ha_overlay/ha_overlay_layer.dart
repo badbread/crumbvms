@@ -107,6 +107,7 @@ OverlayItemBuilder haBadgeItemBuilder({
       pillLabel: badge.pillLabel,
       bgColor: parseOverlayColorHex(badge.bgColorHex),
       bgColorOn: parseOverlayColorHex(badge.bgColorOnHex),
+      textAlign: badge.textAlign,
       on: haEdgeOnFor(domain: link.domain, state: state, stale: effStale),
       outline: badge.outline,
       // Jelly motion (entrance pop + state-change squish) runs only in view
@@ -161,6 +162,117 @@ Color resolveBadgeBg({required bool? on, Color? bgColor, Color? bgColorOn}) {
   return bgColor ?? _kBadgeDefaultBg;
 }
 
+/// The pill LAYOUT contract (migration 0078, issue #497) — the same closed
+/// vocabulary the server validates (`services/api/src/ha.rs`'s
+/// `HA_PILL_WIDTH_MODES` / `HA_TEXT_ALIGNS`), the console authors, and the
+/// Android/iOS renderers switch on. Changing a spelling here without changing
+/// it in all five places is the divergence these lists exist to prevent.
+const List<String> kHaPillWidthModes = ['auto', 'narrow', 'medium', 'wide'];
+const List<String> kHaTextAligns = ['start', 'center', 'end'];
+
+/// A fixed pill width as a multiple of the pill's HEIGHT, or null for `auto`
+/// (and for any unknown value from a newer server — degrade to today's
+/// hug-the-content width rather than guess).
+///
+/// Height is the multiplier's unit deliberately: it is the one length every
+/// renderer already derives identically from `overlay_size` and the pane
+/// scale, so `medium` means the same pill on a phone, a wall tile and a
+/// maximized pane. A fixed width is EXACT, not a minimum — a label too long
+/// for it ellipsizes, which is what makes several badges set to the same mode
+/// actually line up.
+double? haPillWidthFactor(String? mode) {
+  switch (mode) {
+    case 'narrow':
+      return 4.0;
+    case 'medium':
+      return 6.0;
+    case 'wide':
+      return 8.0;
+    default:
+      return null; // 'auto', null, or anything unrecognized
+  }
+}
+
+/// Where the pill's icon + label group sits inside the pill. `null`/`'start'`
+/// (and anything unrecognized) is the leading edge — today's layout.
+MainAxisAlignment haPillAlignment(String? align) {
+  switch (align) {
+    case 'center':
+      return MainAxisAlignment.center;
+    case 'end':
+      return MainAxisAlignment.end;
+    default:
+      return MainAxisAlignment.start;
+  }
+}
+
+/// The pill chip's INTERNAL metrics at one rendered height — the single source
+/// of the factors AND their clamps, shared by the renderer ([HaBadgeChip._pill],
+/// which lays the chip out) and by the measurement
+/// (`HaOverlayBadgeItem.pillWidthAtHeight`, which sizes the box the chip is
+/// handed). They MUST come from here in both places: the whole class of bug
+/// this fixes is the two sides disagreeing.
+///
+/// Why the clamps matter for the width: each part is a fraction of the height
+/// *until* it hits a floor or a ceiling, so the content's width is NOT linear
+/// in the height. Sizing the box from the un-clamped fractions made a small
+/// wall-tile pill narrower than the content it had to draw — at a rendered
+/// height under ~21px the 8px font floor (and the 10/5/3px icon/padding/gap
+/// floors) are active — so `TextOverflow.ellipsis` chopped "Floodlight" into
+/// "Floodli…". The same mismatch runs the other way past ~57px, where the
+/// ceilings cap the content and the box kept growing, leaving dead space after
+/// the label.
+class HaPillMetrics {
+  const HaPillMetrics({
+    required this.height,
+    required this.iconSize,
+    required this.fontSize,
+    required this.padH,
+    required this.gap,
+  });
+
+  /// Every part of a pill derives from the height it is RENDERED at — not from
+  /// the item's base size, which is the same number only at pane-scale 1.0.
+  factory HaPillMetrics.forHeight(double height) => HaPillMetrics(
+        height: height,
+        iconSize: (height * 0.56).clamp(10.0, 40.0).toDouble(),
+        fontSize: (height * 0.40).clamp(8.0, 26.0).toDouble(),
+        padH: (height * 0.28).clamp(5.0, 16.0).toDouble(),
+        gap: (height * 0.14).clamp(3.0, 8.0).toDouble(),
+      );
+
+  final double height;
+  final double iconSize;
+  final double fontSize;
+
+  /// Horizontal padding, EACH side.
+  final double padH;
+
+  /// Icon-to-label gap.
+  final double gap;
+
+  /// Longest label the pill will size itself to, in ems of its own font — one
+  /// runaway caption must not span the frame, and the chip ellipsizes past
+  /// this, which is the graceful degradation the cap is for.
+  ///
+  /// The cap is in EMs, not pill-heights, on purpose. In the un-clamped band
+  /// the two are the same number (`22.5 * 0.40h == 9h`, the width this has
+  /// always capped at), but where the 8px font floor is active a height-based
+  /// cap shrinks faster than the text it is capping, so a label that fits
+  /// perfectly well would be cut off on a small tile — the very truncation
+  /// this class exists to prevent. Measured in ems it caps the same LABEL at
+  /// every rendered size.
+  static const double maxLabelEm = 22.5;
+
+  /// Width of everything inside the pill for a label whose advance is
+  /// [labelWidthPerFontPx] logical px per 1px of font size (measured once per
+  /// label by `HaOverlayBadgeItem.labelWidthPerFontPx`).
+  double contentWidth(double labelWidthPerFontPx) {
+    final text = labelWidthPerFontPx.clamp(0.0, maxLabelEm) * fontSize;
+    return padH * 2 + iconSize + gap + text;
+  }
+}
+
 /// Snappy spring (matches the operator-chosen preview: k380 / damping 21).
 const SpringDescription _kJellySpring = SpringDescription(
   mass: 1.0,
@@ -174,7 +286,9 @@ const SpringDescription _kJellySpring = SpringDescription(
 /// a spring pop-in on appear and a squish-and-rebound whenever the entity's
 /// state changes. Sizes itself to fill whatever rect the overlay layer gives it
 /// (`overlay_editor_layer.dart`'s `SizedBox`/`Positioned` wrap) — for a pill
-/// that rect is pre-widened by `HaOverlayBadgeItem.baseSize()`.
+/// that rect is pre-widened by `HaOverlayBadgeItem.renderedSize()`, which
+/// measures the content with the SAME [HaPillMetrics] this chip lays itself
+/// out from, at the same rendered height.
 class HaBadgeChip extends StatefulWidget {
   const HaBadgeChip({
     super.key,
@@ -184,6 +298,7 @@ class HaBadgeChip extends StatefulWidget {
     this.pillLabel,
     this.bgColor,
     this.bgColorOn,
+    this.textAlign,
     this.on,
     this.outline = false,
     this.animate = false,
@@ -209,6 +324,12 @@ class HaBadgeChip extends StatefulWidget {
   /// null = no override, so the badge keeps [bgColor] regardless of state.
   /// See [resolveBadgeBg] for the exact resolution order.
   final Color? bgColorOn;
+
+  /// Where the pill's icon + label group sits inside the pill (migration
+  /// 0078): `'start'` (or null, today's layout), `'center'`, `'end'`. Only
+  /// observable once the pill is wider than its content, i.e. with a fixed
+  /// `overlay_pill_width`. Ignored by a dot. See [haPillAlignment].
+  final String? textAlign;
 
   /// The honesty-gated on/off reading driving [bgColorOn] (must come from
   /// `ha_icons.dart`'s `haEdgeOnFor`, the same gate behind [visual]'s accent
@@ -354,10 +475,14 @@ class _HaBadgeChipState extends State<HaBadgeChip>
       );
 
   Widget _pill(double height) {
-    final iconSize = (height * 0.56).clamp(10.0, 40.0).toDouble();
-    final fontSize = (height * 0.40).clamp(8.0, 26.0).toDouble();
-    final padH = (height * 0.28).clamp(5.0, 16.0).toDouble();
-    final gap = (height * 0.14).clamp(3.0, 8.0).toDouble();
+    // Metrics come from the SHARED source so the box the layer measured
+    // (`HaOverlayBadgeItem.pillWidthAtHeight`, via `OverlayGeometry.rectFor`)
+    // and the content drawn here can't drift apart — see [HaPillMetrics].
+    final m = HaPillMetrics.forHeight(height);
+    final iconSize = m.iconSize;
+    final fontSize = m.fontSize;
+    final padH = m.padH;
+    final gap = m.gap;
     final bg = resolveBadgeBg(
       on: widget.on,
       bgColor: widget.bgColor,
@@ -376,6 +501,9 @@ class _HaBadgeChipState extends State<HaBadgeChip>
         padding: EdgeInsets.symmetric(horizontal: padH),
         child: Row(
           mainAxisSize: MainAxisSize.max,
+          // Auto-width pills have no slack, so this only bites once the
+          // operator has pinned a fixed width (migration 0078).
+          mainAxisAlignment: haPillAlignment(widget.textAlign),
           children: [
             Icon(widget.visual.icon, color: widget.visual.color, size: iconSize),
             SizedBox(width: gap),

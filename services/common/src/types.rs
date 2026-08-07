@@ -293,6 +293,18 @@ pub struct CameraHaLink {
     /// `on ⇒ bg_color_on ?? bg_color ?? default`, anything else ⇒
     /// `bg_color ?? default`.
     pub overlay_bg_color_on: Option<String>,
+    /// Pill WIDTH mode (migration 0078, issue #497): `"auto"` | `"narrow"` |
+    /// `"medium"` | `"wide"`. `None` ⇒ `"auto"`, the hug-the-content width
+    /// every renderer draws today. The three fixed modes are exact multiples of
+    /// the badge HEIGHT (4x / 6x / 8x) — height is the one length all four
+    /// renderers already derive identically, so a pixel width would mean four
+    /// answers on four panes. Ignored by a `dot`.
+    pub overlay_pill_width: Option<String>,
+    /// Where the pill's icon + label group sits inside the pill (migration
+    /// 0078, issue #497): `"start"` | `"center"` | `"end"`. `None` ⇒ `"start"`,
+    /// today's leading-edge layout. Only observable once the pill is wider than
+    /// its content (i.e. with a fixed `overlay_pill_width`). Ignored by a `dot`.
+    pub overlay_text_align: Option<String>,
     /// Draw a white outline + drop shadow so the badge pops on a busy scene
     /// (migration 0062; default false).
     pub overlay_outline: bool,

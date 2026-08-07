@@ -66,6 +66,12 @@ class OverlayGeometry {
   /// `PtzPanelGeometry.rectFor` lifted + anchor-aware). Floors rendered size
   /// at [minRenderedPx] so a shrunk item never disappears; clamps inside its
   /// anchor field.
+  ///
+  /// Size comes from [OverlayItem.renderedSize] rather than `baseSize() * s`
+  /// so an item whose content does not scale linearly with its box (the HA
+  /// pill badge) gets the box it actually needs at this pane scale. This is
+  /// the ONE place base → rendered happens, so rendering, hit-testing and the
+  /// editor's drag/snap math all move together.
   static (double x, double y, double w, double h) rectFor(
     OverlayItem item,
     double paneW,
@@ -73,10 +79,10 @@ class OverlayGeometry {
     int? videoW,
     int? videoH,
   }) {
-    final (baseW, baseH) = item.baseSize();
     final s = paneScale(paneW, paneH);
-    final bw = (baseW * s).clamp(minRenderedPx, double.infinity).toDouble();
-    final bh = (baseH * s).clamp(minRenderedPx, double.infinity).toDouble();
+    final (rw, rh) = item.renderedSize(s);
+    final bw = rw.clamp(minRenderedPx, double.infinity).toDouble();
+    final bh = rh.clamp(minRenderedPx, double.infinity).toDouble();
     final (fx, fy, fw, fh) = fieldRect(
       item.anchor,
       paneW,

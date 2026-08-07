@@ -36,11 +36,32 @@ abstract class OverlayItem {
 
   OverlayAnchor get anchor;
 
-  /// Current BASE (unscaled) size in logical px at pane-scale 1.0 — the
-  /// rendered size is `base * OverlayGeometry.paneScale(...)`, so the item
-  /// reads the same on a small grid tile and a maximized pane (WYSIWYG,
-  /// matches the PTZ panel's rationale).
+  /// Current BASE (unscaled) size in logical px at pane-scale 1.0 — item
+  /// space. Everything that reasons about an item's size independently of the
+  /// pane it happens to be on (the editor bar's readout, [setBaseSize]'s
+  /// round-trip, group/align math) works in these units.
+  ///
+  /// It is `renderedSize(1.0)` by definition, so the item still reads the same
+  /// on a small grid tile and a maximized pane (WYSIWYG, matches the PTZ
+  /// panel's rationale).
   (double w, double h) baseSize();
+
+  /// Size in RENDERED px on a pane of scale [paneScale]
+  /// (`OverlayGeometry.paneScale`). For almost every item this is simply
+  /// `baseSize()` scaled — `(w * paneScale, h * paneScale)`, which is what an
+  /// implementation should return unless it has the reason below.
+  ///
+  /// The reason exists for one item: an HA badge drawn as a PILL, whose chip
+  /// clamps its own icon/font/padding to floors and ceilings at the height it
+  /// is drawn at, so its CONTENT width is not linear in its height. Scaling a
+  /// base width linearly then hands a small badge a box narrower than the text
+  /// it must draw (the label ellipsizes) and a large one a box wider than it
+  /// needs (dead space). Such an item measures itself at the rendered height
+  /// instead; see `ha_overlay_controller.dart`'s `HaOverlayBadgeItem`.
+  ///
+  /// `OverlayGeometry.rectFor` is the ONE caller — position and hit-testing
+  /// therefore agree with what is painted, for free.
+  (double w, double h) renderedSize(double paneScale);
 
   /// Apply a new base size — already the result of a drag-resize delta (or
   /// the editor bar's +/- stepper) divided back to base units.

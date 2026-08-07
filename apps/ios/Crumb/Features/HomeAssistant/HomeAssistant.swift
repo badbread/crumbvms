@@ -302,6 +302,37 @@ enum HA {
         if let hex = link.overlayBgColor, let c = colorFromHex(hex) { return c }
         return defaultBadgeBackground
     }
+
+    /// A FIXED pill width as a multiple of the pill's HEIGHT (migration 0078,
+    /// issue #497), or nil for `auto` — and for any value this build does not
+    /// know, which degrades to today's hug-the-content width rather than
+    /// guessing at a newer server's vocabulary.
+    ///
+    /// Height is the unit because it is the one length desktop, Android and iOS
+    /// already derive identically from `overlay_size` and the pane scale, so
+    /// `medium` is the same pill everywhere. The vocabulary is frozen and
+    /// shared with `services/api/src/ha.rs`'s `HA_PILL_WIDTH_MODES`, the
+    /// desktop `haPillWidthFactor`, the Android `HaBadgeMetrics.pillWidthFactor`
+    /// and the console's width select.
+    static func pillWidthFactor(_ mode: String?) -> CGFloat? {
+        switch mode {
+        case "narrow": return 4
+        case "medium": return 6
+        case "wide": return 8
+        default: return nil // "auto", nil, or anything unrecognized
+        }
+    }
+
+    /// Where the pill's icon + label group sits once a fixed width has left it
+    /// some slack (migration 0078). nil/`"start"` is the leading edge, today's
+    /// layout, and is what anything unrecognized falls back to.
+    static func pillAlignment(_ align: String?) -> Alignment {
+        switch align {
+        case "center": return .center
+        case "end": return .trailing
+        default: return .leading
+        }
+    }
 }
 
 // MARK: - Actions (Phase 2 controls, issue #187)
@@ -707,17 +738,27 @@ private struct HABadge: View {
 
     @ViewBuilder private var content: some View {
         if isPill {
+            // A fixed width mode (migration 0078) pins the pill to an exact
+            // multiple of its height and lets `alignment` place the icon+label
+            // group in the slack; `auto` (nil) keeps today's hug-the-content
+            // pill, where the frame is intrinsic and alignment is a no-op.
+            let fixedWidth = HA.pillWidthFactor(link.overlayPillWidth).map { $0 * side }
             HStack(spacing: side * 0.2) {
                 Image(systemName: visual.symbol).font(.system(size: min(side * 0.56, 40)))
                 Text(link.displayName).font(.system(size: min(side * 0.4, 26), weight: .semibold)).lineLimit(1)
             }
             .foregroundColor(.white)
-            .padding(.horizontal, side * 0.4).frame(height: side)
-            .background(Capsule().fill(bgColor))
-            .overlay(outline(Capsule()))
+            .padding(.horizontal, side * 0.4)
+            // The state pip rides the CONTENT box, not the (possibly widened)
+            // pill, so a centred/trailing label keeps its pip beside it instead
+            // of stranding it against the leading edge. Identical geometry on an
+            // auto-width pill, where the two boxes are the same box.
             .overlay(alignment: .leading) {
                 Circle().fill(visual.color).frame(width: side * 0.24, height: side * 0.24).padding(.leading, side * 0.2)
             }
+            .frame(width: fixedWidth, height: side, alignment: HA.pillAlignment(link.overlayTextAlign))
+            .background(Capsule().fill(bgColor))
+            .overlay(outline(Capsule()))
         } else {
             Image(systemName: visual.symbol)
                 .font(.system(size: min(side * 0.58, 40)))

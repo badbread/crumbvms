@@ -27,6 +27,7 @@ import '../../api/ha_models.dart';
 import '../../api/models.dart';
 import '../overlay_editor/overlay_editor_controller.dart';
 import '../overlay_editor/overlay_item.dart';
+import 'ha_overlay_layer.dart' show HaPillMetrics, haPillWidthFactor;
 
 /// [OverlayItem] adapter over a placed [HaLink] — video-frame anchored,
 /// always-square badge, resized via the editor bar's size stepper only (no
@@ -51,6 +52,8 @@ class HaOverlayBadgeItem implements OverlayItem {
       shape = link.overlayShape,
       bgColorHex = link.overlayBgColor,
       bgColorOnHex = link.overlayBgColorOn,
+      pillWidthMode = link.overlayPillWidth,
+      textAlign = link.overlayTextAlign,
       outline = link.overlayOutline;
 
   final HaLink link;
@@ -89,6 +92,17 @@ class HaOverlayBadgeItem implements OverlayItem {
   /// (`ha_badge_popover.dart`); see `ha_overlay_layer.dart`'s
   /// `resolveBadgeBg` for the exact resolution order.
   String? bgColorOnHex;
+
+  /// Pill WIDTH mode (migration 0078, issue #497): `'auto'`, `'narrow'`,
+  /// `'medium'` or `'wide'`; null = `'auto'`, the hug-the-content width. Only
+  /// a pill uses it — see [baseSize] and `ha_overlay_layer.dart`'s
+  /// `haPillWidthFactor`.
+  String? pillWidthMode;
+
+  /// Where the pill's icon + label group sits (migration 0078, issue #497):
+  /// `'start'` (or null), `'center'`, `'end'`. Rendered by
+  /// `ha_overlay_layer.dart`'s `haPillAlignment`.
+  String? textAlign;
 
   /// White outline + drop shadow so the badge pops on a busy scene.
   bool outline;
@@ -129,6 +143,8 @@ class HaOverlayBadgeItem implements OverlayItem {
     colorHex = null;
     bgColorHex = null;
     bgColorOnHex = null;
+    pillWidthMode = null;
+    textAlign = null;
     shape = null;
     _opacity = 1.0;
     outline = false;
@@ -162,50 +178,79 @@ class HaOverlayBadgeItem implements OverlayItem {
   /// (`live_status/live_status_badges.dart`).
   static const double baseRefPx = 22;
 
+  /// Size in ITEM space (pane-scale 1.0), per [OverlayItem.baseSize].
+  ///
+  /// INVARIANT (the reason [renderedSize] exists): `baseSize()` is exactly
+  /// `renderedSize(1.0)`, and for an `auto` pill that is the ONLY pane scale at
+  /// which the two agree — the chip's metrics clamp, so its content width is
+  /// not linear in its height and `baseSize().w * paneScale` is not the width
+  /// the pill needs on screen. Anything that positions or hit-tests a badge
+  /// must go through `OverlayGeometry.rectFor`, which asks [renderedSize].
+  /// Item-space consumers (the editor bar's width readout, `setBaseSize`'s
+  /// scale round-trip, group/align math) keep working against this one
+  /// unchanged: the HEIGHT, which is what a badge's size actually means, is
+  /// still `baseRefPx * scale` in both shapes.
   @override
-  (double w, double h) baseSize() {
-    final h = baseRefPx * _scale;
+  (double w, double h) baseSize() => _sizeForHeight(baseRefPx * _scale);
+
+  /// Size in RENDERED px at [paneScale] — the pill's width measured at the
+  /// height it will actually be drawn at, so the box hugs the content the chip
+  /// draws into it at EVERY size (see [HaPillMetrics] for the clamps that make
+  /// this non-linear, and the truncation/dead-space bug it fixes).
+  @override
+  (double w, double h) renderedSize(double paneScale) =>
+      _sizeForHeight(baseRefPx * _scale * paneScale);
+
+  (double w, double h) _sizeForHeight(double h) {
     if (!isPill) return (h, h);
-    return (pillBaseWidth(pillLabel) * _scale, h);
+    return (pillWidthAtHeight(pillLabel, h, widthMode: pillWidthMode), h);
   }
 
-  /// The pill's unscaled width: exactly what its content occupies — the icon,
-  /// both horizontal paddings, the icon/label gap, and the MEASURED width of
-  /// the label at the font size the chip actually uses.
+  /// The pill's width at a pill HEIGHT of [height] px: exactly what its content
+  /// occupies at that height — the icon, both horizontal paddings, the
+  /// icon/label gap, and the MEASURED width of the label at the font size the
+  /// chip actually uses. Every part comes from [HaPillMetrics], the same object
+  /// `HaBadgeChip._pill` lays itself out from, so the measurement and the
+  /// render cannot drift.
   ///
-  /// This used to be a character-count estimate (`chars * baseRefPx * 0.42`)
-  /// that ran far wide of the real text: at the chip's font size (0.40 of the
-  /// pill height) a ten-character label like "Floodlight" measures roughly
-  /// half what the estimate reserved. The item box is fixed-size and
-  /// `HaBadgeChip._pill` fills whatever box it is handed, so the surplus
-  /// rendered as a stretch of empty pill after the label. Measuring makes the
-  /// pill hug its content. The multipliers below mirror `_pill`'s layout
-  /// one-for-one — change one, change both.
+  /// Two bugs live in getting this wrong. It used to be a character-count
+  /// estimate (`chars * baseRefPx * 0.42`) that ran far wide of the real text,
+  /// leaving a stretch of empty pill after a short label. Measuring fixed that
+  /// but measured at the REFERENCE height and scaled the result linearly, which
+  /// ignores the chip's clamps: on a small wall tile the floors (8px font, 10px
+  /// icon, 5px padding, 3px gap) make the content wider than the linearly
+  /// scaled box, and `TextOverflow.ellipsis` chopped "Floodlight" to
+  /// "Floodli…". Passing the height the pill is really drawn at is what makes
+  /// `auto` hug its content on a 2x pane and a thumbnail tile alike.
   ///
   /// Nothing here consults the PINNED CAPTIONS: `HaBadgeCaptions` centres its
   /// own chip on the badge and is free to be wider or narrower, so a long
   /// "5 h ago" line never stretches the pill.
-  static double pillBaseWidth(String label) {
-    const iconRef = baseRefPx * 0.56;
-    const padHRef = baseRefPx * 0.28; // each side
-    const gapRef = baseRefPx * 0.14;
-    const fontRef = baseRefPx * 0.40;
-    // Cap a runaway label rather than letting one pill span the frame; the
-    // chip already ellipsizes, so the text degrades gracefully at the cap.
-    final textRef = (_labelWidthPerFontPx(label) * fontRef)
-        .clamp(0.0, baseRefPx * 9)
-        .toDouble();
-    return padHRef * 2 + iconRef + gapRef + textRef;
+  static double pillWidthAtHeight(
+    String label,
+    double height, {
+    String? widthMode,
+  }) {
+    // A fixed width mode (migration 0078) short-circuits the measurement: the
+    // pill is EXACTLY that multiple of its height, so a set of badges given the
+    // same mode line up down a door frame. A label too long for it ellipsizes
+    // in `HaBadgeChip._pill`, exactly as an over-long auto label already does.
+    final factor = haPillWidthFactor(widthMode);
+    if (factor != null) return height * factor;
+    return HaPillMetrics.forHeight(height)
+        .contentWidth(labelWidthPerFontPx(label));
   }
 
   /// Width of `label` per 1px of font size, for the chip's text style. Text
   /// advance scales linearly with font size, so measuring once at a large
   /// probe and dividing is both stable and more precise than laying out at the
-  /// chip's actual ~9px. Memoised: `baseSize()` runs for every item on every
-  /// drag tick, and a `TextPainter.layout()` per call would be a real cost.
+  /// chip's actual ~9px — and it is exactly what lets one measurement serve
+  /// every rendered height. Memoised: `baseSize()`/`renderedSize()` run for
+  /// every item on every drag tick, and a `TextPainter.layout()` per call would
+  /// be a real cost.
   static final Map<String, double> _labelWidthCache = {};
 
-  static double _labelWidthPerFontPx(String label) {
+  static double labelWidthPerFontPx(String label) {
     final hit = _labelWidthCache[label];
     if (hit != null) return hit;
     const probe = 100.0;
@@ -270,6 +315,8 @@ class HaOverlayBadgeItem implements OverlayItem {
         shape: shape,
         bgColor: bgColorHex,
         bgColorOn: bgColorOnHex,
+        pillWidth: pillWidthMode,
+        textAlign: textAlign,
         outline: outline,
         group: _groupId,
       );
@@ -289,6 +336,8 @@ class HaOverlayBadgeItem implements OverlayItem {
       String? shape,
       String? bgColor,
       String? bgColorOn,
+      String? pillWidth,
+      String? textAlign,
       bool outline,
       String? group,
     });
@@ -304,6 +353,8 @@ class HaOverlayBadgeItem implements OverlayItem {
     shape = s.shape;
     bgColorHex = s.bgColor;
     bgColorOnHex = s.bgColorOn;
+    pillWidthMode = s.pillWidth;
+    textAlign = s.textAlign;
     outline = s.outline;
     _groupId = s.group;
   }
@@ -472,6 +523,8 @@ class HaOverlayController {
           shape: item.shape,
           bgColor: item.bgColorHex,
           bgColorOn: item.bgColorOnHex,
+          pillWidth: item.pillWidthMode,
+          textAlign: item.textAlign,
           outline: item.outline,
           label: newLabel == oldLabel ? null : newLabel,
         );

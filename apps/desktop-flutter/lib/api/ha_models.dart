@@ -25,6 +25,8 @@ class HaLink {
     this.overlayShape,
     this.overlayBgColor,
     this.overlayBgColorOn,
+    this.overlayPillWidth,
+    this.overlayTextAlign,
     this.overlayOutline = false,
     this.requireConfirm = false,
     this.allowedActions,
@@ -93,6 +95,19 @@ class HaLink {
   /// landing.
   final String? overlayBgColorOn;
 
+  /// Pill WIDTH mode (migration 0078, issue #497): `'auto'`, `'narrow'`,
+  /// `'medium'` or `'wide'`. Null (and an older server that omits the field)
+  /// means `'auto'` — the hug-the-content pill drawn today. The three fixed
+  /// modes are exact multiples of the pill's HEIGHT, resolved by
+  /// `ha_overlay_layer.dart`'s `haPillWidthFactor`. Ignored by a dot.
+  final String? overlayPillWidth;
+
+  /// Where the pill's icon + label group sits inside the pill (migration
+  /// 0078, issue #497): `'start'`, `'center'` or `'end'`. Null = `'start'`,
+  /// today's leading-edge layout; only observable once the pill is wider than
+  /// its content. Ignored by a dot.
+  final String? overlayTextAlign;
+
   /// White outline + drop shadow so the badge pops on a busy scene
   /// (migration 0062; default off).
   final bool overlayOutline;
@@ -149,6 +164,8 @@ class HaLink {
     overlayShape: j['overlay_shape'] as String?,
     overlayBgColor: j['overlay_bg_color'] as String?,
     overlayBgColorOn: j['overlay_bg_color_on'] as String?,
+    overlayPillWidth: j['overlay_pill_width'] as String?,
+    overlayTextAlign: j['overlay_text_align'] as String?,
     overlayOutline: (j['overlay_outline'] as bool?) ?? false,
     requireConfirm: (j['require_confirm'] as bool?) ?? false,
     allowedActions: (j['allowed_actions'] as List<dynamic>?)
