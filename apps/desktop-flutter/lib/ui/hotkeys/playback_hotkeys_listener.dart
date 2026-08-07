@@ -13,17 +13,43 @@
 //
 // All callbacks are optional; a key with no matching callback is a no-op
 // (ignored, so it still bubbles for anything above/below to use).
-
+//
+// THIS USED TO BE A `Focus.onKeyEvent` NODE, AND THAT IS WHY NONE OF IT
+// WORKED. Flutter dispatches a key event to `primaryFocus` and its ANCESTORS
+// only. On this app the app root (`FullscreenEscHandler`, `autofocus: true`,
+// built first) permanently owns the route scope's `focusedChild` — a scope
+// applies at most one autofocus request (`_Autofocus.applyIfValid` bails once
+// `scope.focusedChild != null`) — so this widget's own `autofocus: true` was
+// silently discarded and its node sat BELOW the focused one, off the
+// dispatch chain. Nothing hands it focus later either: the playback tiles
+// are `Listener`/`GestureDetector`, which take no keyboard focus. That is
+// why Space/arrows/,/./Esc did nothing here, same root cause as the live
+// wall's shortcuts (see global_hotkeys_listener.dart) and the H overlay
+// toggle (ha_overlay_hotkey.dart).
+//
+// It is now a `HardwareKeyboard` handler (registered on mount, removed on
+// dispose), the same mechanism every other always-fires hotkey in this app
+// uses. The guards the focus chain used to provide are re-applied explicitly
+// via [hotkeyContextBlocked] (hotkey_gate.dart) — deliberately including Esc,
+// same rationale as the wall listener.
+//
+// ESC OVERLAP NOTE: while this screen is a clip-originated single-camera
+// focus (`PlaybackScreen.onExitFocus` set), Esc-to-leave-focus is owned
+// EXCLUSIVELY by main.dart's `_playbackFocusEscHandler` (registered at the
+// app-shell level, with its own fullscreen-priority ordering). The playback
+// screen's `onExitMaximize` callback is null in that case — see
+// playback_screen.dart's `build()` — so the two handlers never both act on
+// the same press.
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
-import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 
 /// Wraps [child] with the playback-transport shortcuts. Mount this only
 /// while playback is the active tab/screen.
-class PlaybackHotkeysListener extends StatelessWidget {
+class PlaybackHotkeysListener extends StatefulWidget {
   const PlaybackHotkeysListener({
     super.key,
     required this.child,
@@ -35,7 +61,6 @@ class PlaybackHotkeysListener extends StatelessWidget {
     this.onFrameStep,
     this.onSnapshot,
     this.onExitMaximize,
-    this.autofocus = false,
     this.shortcuts,
     this.options,
   });
@@ -78,99 +103,108 @@ class PlaybackHotkeysListener extends StatelessWidget {
   /// global `snapshotActivePane`.)
   final VoidCallback? onSnapshot;
 
-  /// Esc while a tile is maximized — restore the playback grid.
+  /// Esc while a tile is maximized — restore the playback grid. Null while
+  /// this screen is a clip-originated single-camera focus (see the ESC
+  /// OVERLAP NOTE above): that case is handled entirely by main.dart instead.
   /// (app.js:8173-8178.)
   final VoidCallback? onExitMaximize;
 
-  final bool autofocus;
+  @override
+  State<PlaybackHotkeysListener> createState() =>
+      _PlaybackHotkeysListenerState();
+}
+
+class _PlaybackHotkeysListenerState extends State<PlaybackHotkeysListener> {
+  @override
+  void initState() {
+    super.initState();
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
+  }
 
   @override
-  Widget build(BuildContext context) {
-    return Focus(
-      autofocus: autofocus,
-      onKeyEvent: (node, event) {
-        if (event is! KeyDownEvent) return KeyEventResult.ignored;
-        if (textInputHasFocus()) return KeyEventResult.ignored;
-
-        if (event.logicalKey == LogicalKeyboardKey.escape) {
-          if (isMaximized && onExitMaximize != null) {
-            onExitMaximize!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        if (event.logicalKey == LogicalKeyboardKey.space) {
-          if (onTogglePlay != null) {
-            onTogglePlay!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
-          if (onShiftWindow != null) {
-            onShiftWindow!(const Duration(seconds: -30));
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
-          if (onShiftWindow != null) {
-            onShiftWindow!(const Duration(seconds: 30));
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Comma/period carry frame-step (Shift) vs motion-jump (plain) on
-        // the SAME physical key, exactly like app.js distinguishing ','/'.'
-        // from the shifted '<'/'>' via `e.key`. HardwareKeyboard's shift
-        // state is checked directly rather than relying on the shifted
-        // logical-key glyph, so this works across keyboard layouts.
-        final shiftDown = HardwareKeyboard.instance.isShiftPressed;
-        if (event.logicalKey == LogicalKeyboardKey.comma) {
-          if (shiftDown) {
-            if (onFrameStep != null) {
-              onFrameStep!(false);
-              return KeyEventResult.handled;
-            }
-          } else if (onPrevMotion != null) {
-            onPrevMotion!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        if (event.logicalKey == LogicalKeyboardKey.period) {
-          if (shiftDown) {
-            if (onFrameStep != null) {
-              onFrameStep!(true);
-              return KeyEventResult.handled;
-            }
-          } else if (onNextMotion != null) {
-            onNextMotion!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        // Snapshot (default S) — remappable; inert while the master
-        // "Enable keyboard shortcuts" toggle is off.
-        if (event.logicalKey ==
-            (shortcuts?.keyFor(ShortcutAction.snapshot) ??
-                LogicalKeyboardKey.keyS)) {
-          if (onSnapshot != null && (options?.hotkeysEnabled ?? true)) {
-            onSnapshot!();
-            return KeyEventResult.handled;
-          }
-          return KeyEventResult.ignored;
-        }
-
-        return KeyEventResult.ignored;
-      },
-      child: child,
-    );
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    super.dispose();
   }
+
+  /// Returns true only for the press it actually acted on; everything else
+  /// (and every guarded case) falls through untouched.
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (!mounted) return false;
+
+    // Typing, a pushed route (dialog/goto picker/dropdown), or a mounted
+    // HotkeySuppressor (the Settings panel / re-auth overlay) — nothing here
+    // fires, Esc included. Shared with every other hardware hotkey; see
+    // hotkey_gate.dart.
+    if (hotkeyContextBlocked(context)) return false;
+
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      if (!widget.isMaximized || widget.onExitMaximize == null) return false;
+      widget.onExitMaximize!();
+      return true;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.space) {
+      if (widget.onTogglePlay == null) return false;
+      widget.onTogglePlay!();
+      return true;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+      if (widget.onShiftWindow == null) return false;
+      widget.onShiftWindow!(const Duration(seconds: -30));
+      return true;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+      if (widget.onShiftWindow == null) return false;
+      widget.onShiftWindow!(const Duration(seconds: 30));
+      return true;
+    }
+
+    // Comma/period carry frame-step (Shift) vs motion-jump (plain) on the
+    // SAME physical key, exactly like app.js distinguishing ','/'.' from the
+    // shifted '<'/'>' via `e.key`. HardwareKeyboard's shift state is checked
+    // directly rather than relying on the shifted logical-key glyph, so this
+    // works across keyboard layouts.
+    final shiftDown = HardwareKeyboard.instance.isShiftPressed;
+    if (event.logicalKey == LogicalKeyboardKey.comma) {
+      if (shiftDown) {
+        if (widget.onFrameStep == null) return false;
+        widget.onFrameStep!(false);
+        return true;
+      }
+      if (widget.onPrevMotion == null) return false;
+      widget.onPrevMotion!();
+      return true;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.period) {
+      if (shiftDown) {
+        if (widget.onFrameStep == null) return false;
+        widget.onFrameStep!(true);
+        return true;
+      }
+      if (widget.onNextMotion == null) return false;
+      widget.onNextMotion!();
+      return true;
+    }
+
+    // Snapshot (default S) — remappable; inert while the master "Enable
+    // keyboard shortcuts" toggle is off, unlike the transport keys above.
+    if (shortcutsDisabled(widget.options)) return false;
+    if (event.logicalKey ==
+        (widget.shortcuts?.keyFor(ShortcutAction.snapshot) ??
+            LogicalKeyboardKey.keyS)) {
+      if (widget.onSnapshot == null) return false;
+      widget.onSnapshot!();
+      return true;
+    }
+
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }

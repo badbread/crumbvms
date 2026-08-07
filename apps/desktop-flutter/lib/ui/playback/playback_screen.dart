@@ -1456,10 +1456,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       ),
     );
 
-    // Keyboard: number keys load a camera (GlobalHotkeysListener, a
-    // HardwareKeyboard handler — it fires wherever focus sits, and takes no
-    // focus itself); Space/arrows/,/./frame-step are still the focus-chain
-    // PlaybackHotkeysListener wrapping it.
+    // Keyboard: both listeners below are HardwareKeyboard handlers now — they
+    // fire wherever focus sits and take no focus themselves (see
+    // hotkey_gate.dart). GlobalHotkeysListener: number keys load a camera.
+    // PlaybackHotkeysListener: Space/arrows/,/./frame-step/Esc.
     Widget tree = scaffold;
     final hk = widget.hotkeys;
     if (hk != null) {
@@ -1473,9 +1473,6 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       );
     }
     return PlaybackHotkeysListener(
-      // Nothing competes for the autofocus here any more (the listener above
-      // no longer claims a focus node), so always ask for it.
-      autofocus: true,
       shortcuts: widget.shortcuts,
       options: widget.clientOptions,
       isMaximized: _maximizedCameraId != null,
@@ -1484,7 +1481,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       onPrevMotion: () => _jumpMotion(false),
       onNextMotion: () => _jumpMotion(true),
       onFrameStep: _frameStep,
-      onExitMaximize: _maximizedCameraId != null
+      // Null while this is a clip-originated single-camera focus
+      // (widget.onExitFocus set): main.dart's `_playbackFocusEscHandler`
+      // owns Esc exclusively there (it also orders fullscreen-exit before
+      // leaving focus), so wiring this too would double-fire on one press.
+      onExitMaximize: (_maximizedCameraId != null && widget.onExitFocus == null)
           ? () => _toggleMaximize(_maximizedCameraId!)
           : null,
       child: tree,

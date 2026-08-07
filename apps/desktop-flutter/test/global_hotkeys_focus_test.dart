@@ -2,7 +2,8 @@
 //
 // Regression tests for "the live wall's keyboard shortcuts do nothing"
 // (the H hotkey, PR #487; then the whole set: S / M / F8 / Esc / the camera
-// number banks).
+// number banks) and its Playback twin (Space / arrows / , / . / Esc,
+// `PlaybackHotkeysListener`).
 //
 // The shortcuts used to live in `Focus.onKeyEvent` nodes mounted inside the
 // wall (`GlobalHotkeysListener`) and just under the app root
@@ -37,6 +38,7 @@ import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/hotkeys/ha_overlay_hotkey.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
+import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
 
 /// The app-root wrapper stack from main.dart: MaterialApp -> Esc handler ->
@@ -103,6 +105,31 @@ void main() {
         onEscape: () => log.add('escape'),
         onUndo: () => log.add('undo'),
         onRedo: () => log.add('redo'),
+        child: child,
+      ),
+    );
+  }
+
+  // A Playback listener with every callback wired, plus the log they append
+  // to, mirroring `wallListener` above.
+  ({Widget widget, List<String> log}) playbackListener({
+    ClientOptionsStore? options,
+    bool isMaximized = false,
+    Widget child = const SizedBox.expand(),
+  }) {
+    final log = <String>[];
+    return (
+      log: log,
+      widget: PlaybackHotkeysListener(
+        options: options,
+        isMaximized: isMaximized,
+        onTogglePlay: () => log.add('play'),
+        onShiftWindow: (by) => log.add('shift:${by.inSeconds}'),
+        onPrevMotion: () => log.add('prevMotion'),
+        onNextMotion: () => log.add('nextMotion'),
+        onFrameStep: (forward) => log.add('frameStep:$forward'),
+        onSnapshot: () => log.add('snapshot'),
+        onExitMaximize: () => log.add('exitMaximize'),
         child: child,
       ),
     );
@@ -419,6 +446,204 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyH);
       await tester.pump();
       expect(toggles, 1);
+    });
+  });
+
+  group('PlaybackHotkeysListener', () {
+    testWidgets('Space toggles play', (tester) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.pump();
+      expect(pb.log, ['play']);
+    });
+
+    testWidgets('Left/Right arrow shift the window +/- 30s', (tester) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+      expect(pb.log, ['shift:-30', 'shift:30']);
+    });
+
+    testWidgets(', / . jump to the previous/next motion event', (
+      tester,
+    ) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+      await tester.sendKeyEvent(LogicalKeyboardKey.period);
+      await tester.pump();
+      expect(pb.log, ['prevMotion', 'nextMotion']);
+    });
+
+    testWidgets('Shift+, / Shift+. frame-step back/forward', (tester) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await pressWith(
+        tester,
+        LogicalKeyboardKey.shiftLeft,
+        LogicalKeyboardKey.comma,
+      );
+      await pressWith(
+        tester,
+        LogicalKeyboardKey.shiftLeft,
+        LogicalKeyboardKey.period,
+      );
+      expect(pb.log, ['frameStep:false', 'frameStep:true']);
+    });
+
+    testWidgets('S snapshots the active pane', (tester) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
+      await tester.pump();
+      expect(pb.log, ['snapshot']);
+      // _appRoot also mounts the app-level SnapshotHotkey (main.dart), which
+      // fires on the same S press and pops its "nothing to capture" toast —
+      // drain its timer so it doesn't outlive the test (same as the wall's S
+      // test above).
+      await drainToast(tester);
+    });
+
+    testWidgets('Esc restores from a maximized tile', (tester) async {
+      final pb = playbackListener(isMaximized: true);
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(pb.log, ['exitMaximize']);
+    });
+
+    testWidgets('Esc is a no-op while nothing is maximized', (tester) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(pb.log, isEmpty);
+    });
+
+    testWidgets('a focused text field swallows every playback key', (
+      tester,
+    ) async {
+      final controller = TextEditingController();
+      addTearDown(controller.dispose);
+      final pb = playbackListener(
+        isMaximized: true,
+        child: Material(
+          child: TextField(controller: controller, autofocus: true),
+        ),
+      );
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+      await tester.sendKeyEvent(LogicalKeyboardKey.period);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(pb.log, isEmpty);
+    });
+
+    testWidgets('a pushed route (dialog) owns the keyboard', (tester) async {
+      late BuildContext inner;
+      final pb = playbackListener(
+        isMaximized: true,
+        child: Builder(
+          builder: (context) {
+            inner = context;
+            return const SizedBox.expand();
+          },
+        ),
+      );
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      showDialog<void>(
+        context: inner,
+        builder: (_) => const AlertDialog(content: Text('dialog')),
+      );
+      await tester.pumpAndSettle();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(pb.log, isEmpty);
+    });
+
+    testWidgets('a HotkeySuppressor (Settings panel) blocks everything', (
+      tester,
+    ) async {
+      final pb = playbackListener(isMaximized: true);
+      await tester.pumpWidget(
+        _appRoot(
+          child: Stack(
+            children: [
+              pb.widget,
+              const HotkeySuppressor(child: SizedBox.shrink()),
+            ],
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(hotkeysSuppressed, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(pb.log, isEmpty);
+
+      // …and unmounting it hands the keyboard back.
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      expect(hotkeysSuppressed, isFalse);
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.pump();
+      expect(pb.log, ['play']);
+    });
+
+    testWidgets('the master toggle silences the snapshot key but never the transport keys', (
+      tester,
+    ) async {
+      final pb = playbackListener(options: shortcutsOff, isMaximized: true);
+      await tester.pumpWidget(
+        _appRoot(child: pb.widget, options: shortcutsOff),
+      );
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
+      await tester.pump();
+      expect(pb.log, isEmpty, reason: 'snapshot is a remappable action key');
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(
+        pb.log,
+        ['play', 'shift:-30', 'prevMotion', 'exitMaximize'],
+        reason: 'transport controls are inherent, not "shortcuts"',
+      );
+    });
+
+    testWidgets('leaving the tab unregisters the handler', (tester) async {
+      final pb = playbackListener();
+      await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.pump();
+      expect(pb.log, ['play']);
+
+      await tester.pumpWidget(_appRoot(child: const SizedBox.expand()));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.pump();
+      expect(pb.log, ['play'], reason: 'no second fire from a dead screen');
     });
   });
 }
