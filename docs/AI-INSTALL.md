@@ -123,6 +123,11 @@ scripts/setup-env.sh            # generates .env with strong random secrets
 # or: scripts/setup-env.sh --prompt   # to set the admin password interactively
 ```
 
+If the user already knows which disk footage goes on (Step 3), pass it now so the
+script preflights the real target instead of the `./_data` default:
+`MEDIA_HOST_PATH=/mnt/tank/crumb scripts/setup-env.sh`. **This step can exit 1**,
+on a storage-preflight failure or a missing bind-mounted config file; see Step 3.
+
 This writes a gitignored `.env` with a strong `POSTGRES_PASSWORD`, `JWT_SECRET`,
 and a **seeded admin account**. By default `setup-env.sh` generates a *memorable*
 admin passphrase (e.g. `IcyApples473`), **prints it once**, and stores it as
@@ -165,17 +170,22 @@ Set the media path in `.env` to the target disk:
 - `MEDIA_HOST_PATH`: host directory bind-mounted into the containers.
 - (Storage buckets live under it; the default live/archive paths are fine for most.)
 
-**Prefer setting it BEFORE Step 2**, so `setup-env.sh` prepares and preflights
-the real target instead of the `./_data` default:
+**Prefer setting it BEFORE Step 2**, so `setup-env.sh` preflights the real target
+instead of the `./_data` default:
 
 ```sh
 MEDIA_HOST_PATH=/mnt/tank/crumb scripts/setup-env.sh
 ```
 
-If you already ran Step 2, edit `MEDIA_HOST_PATH` in `.env` and re-run
-`MEDIA_HOST_PATH=<path> scripts/setup-env.sh --force` (this rotates the
-generated secrets, so capture the new admin password), or do the ownership and
-write check by hand as below.
+If you already ran Step 2, re-run it against the real path,
+`MEDIA_HOST_PATH=<path> scripts/setup-env.sh --force`. Do **not** hand-edit
+`MEDIA_HOST_PATH` first: `--force` rebuilds the whole file and the edit is
+discarded. **Only do this before the first `docker compose up -d`.** `--force`
+rotates `POSTGRES_PASSWORD`, `JWT_SECRET`, `GO2RTC_PASS` and the admin password,
+and Postgres only applies its password when the data volume is first
+initialised, so rotating it against a stack that has already run locks the api
+and recorder out of their own database. On a stack that is already up, set
+`MEDIA_HOST_PATH` by hand and do the ownership and write check yourself as below.
 
 **The recorder writes as uid 1001, and this is the failure that hurts.** If uid
 1001 cannot write to `MEDIA_HOST_PATH`, live view still works and **nothing is
@@ -188,18 +198,49 @@ mounts `/data` read-only. Catch it earlier anyway, `setup-env.sh` preflights it:
   block for NFS / SMB-CIFS / FUSE mounts, where `chown 1001:1001` on this host
   may do nothing because the server or the mount options decide ownership.
 - It **probes an actual uid-1001 write** (impersonating uid 1001 when run as
-  root, otherwise a container as `--user 1001`, otherwise reading the
-  directory's own mode) and **exits non-zero** when the answer is definitely no.
-  The admin password is still printed before it exits.
+  root, otherwise a container as `--user 1001` but only with an image already
+  cached on this host since it never pulls, otherwise reading the directory's
+  own mode) and **exits 1** when the answer is definitely no. The exit is the
+  last thing it does: `.env` is already written, complete and correct, and the
+  admin password has already been printed. The thing to fix is the host's
+  storage, **not** the `.env`, so do not "try again" with `--force`, that
+  rotates every generated secret.
 - It **warns** (does not fail) when free space is under 10 GiB.
+- It also **hard-fails early**, before the credentials are printed, if
+  `caddy/Caddyfile` or `go2rtc/go2rtc.yaml` is missing. Compose bind-mounts both
+  as files, and Docker would otherwise create a directory in their place and the
+  container would die with a confusing "not a directory" mount error. Restore the
+  file (`git checkout -- <path>`) and re-run.
 
-**Verify:** the path exists, is on the intended disk, and `setup-env.sh` exited
-0 with `storage preflight: uid 1001 CAN write to <path>`. If you set the path up
-by hand, confirm it yourself:
+**Verify:** the path exists, is on the intended disk, and the tail of
+`setup-env.sh` shows one of three verdicts. Two of them exit 0, so read the line,
+not just the exit code:
 
-```sh
-sudo -u '#1001' touch <MEDIA_HOST_PATH>/.crumb-write-test && sudo rm <MEDIA_HOST_PATH>/.crumb-write-test
-```
+- `storage preflight: uid 1001 CAN write to <path>`, exit 0. **Proceed.**
+- `storage preflight: could not determine whether uid 1001 can write to <path>`,
+  exit 0. This is the normal outcome of a non-root run on a host with no usable
+  Docker image to probe with. **Do not proceed on this alone**, confirm by hand:
+
+  ```sh
+  sudo -u '#1001' touch <MEDIA_HOST_PATH>/.crumb-write-test && sudo rm <MEDIA_HOST_PATH>/.crumb-write-test
+  ```
+
+- `storage preflight: uid 1001 CANNOT write to <path>`, **exit 1**. The install
+  is stopped on purpose: starting the stack from here looks completely healthy
+  and records nothing. Fix the storage, then re-run only the hand check above.
+  The script names the filesystem it found (`media filesystem: <type>`) and
+  prints this guidance itself:
+  - **Local disk:** `sudo chown -R 1001:1001 <MEDIA_HOST_PATH>`.
+  - **NFS:** chown to uid 1001 **on the NFS server**, or export with
+    `no_root_squash`. With root_squash, a chown run here does nothing.
+  - **SMB/CIFS:** mount with `uid=1001,gid=1001,file_mode=0775,dir_mode=0775`,
+    or map the share's user to uid 1001 on the NAS.
+  - **FUSE (Unraid `/mnt/user`, rclone, sshfs, MergerFS) and WSL2 or Docker
+    Desktop `drvfs`:** ownership comes from the mount options, not the disk, so
+    the fix belongs in the mount.
+
+  Per-platform detail:
+  `docs-site/docs/getting-started/platform-notes.md`.
 
 **Not a plain Debian/Ubuntu host?** NAS appliances (Synology, QNAP), Unraid user
 shares, unprivileged Proxmox LXC (uid shift), and Docker Desktop / WSL2 each
@@ -267,9 +308,10 @@ stable"; recovery is in `docs-site/docs/troubleshooting/index.md`.
 
 The compose file **requires** `GO2RTC_USER`/`GO2RTC_PASS` to be set, Step 2's
 `setup-env.sh` generates them, but if `.env` was hand-edited or copied from
-`.env.example` without filling them in, `docker compose up` fails fast with a
-`variable is not set` error rather than booting insecurely. Don't work around
-that error by inventing a value; re-run `scripts/setup-env.sh`.
+`.env.example` without filling them in, `docker compose up` fails fast with
+`required variable GO2RTC_USER is missing a value: GO2RTC_USER is required (run
+scripts/setup-env.sh)` rather than booting insecurely. Don't work around that
+error by inventing a value; re-run `scripts/setup-env.sh`.
 
 **Pick pull or build** (see Step 1's note and `docs/IMAGES.md`):
 
@@ -284,6 +326,15 @@ docker compose up -d
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
+Unpinned, `docker compose pull` tracks `latest`, whatever is newest on `main`.
+That is fine for evaluating Crumb; for anything the user will actually depend on,
+pin the release **before** the first `up`: set `CRUMB_VERSION=vX.Y.Z` in `.env`
+(see `docs/IMAGES.md`) so an upgrade becomes a deliberate act rather than
+whatever `pull` happened to fetch. Ask the user which they want; when in doubt,
+pin. The separate `pull` before `up -d` is not redundant: `up -d` fetches only
+images it does not already have, so the explicit `pull` is what refreshes an
+already-cached tag and surfaces a registry failure as its own error.
+
 Services and their published ports (the compose defaults are already LAN-sane;
 **do not loosen them**):
 
@@ -293,7 +344,7 @@ Services and their published ports (the compose defaults are already LAN-sane;
 | `caddy` | `${CRUMB_HTTPS_PORT:-8443}` | `0.0.0.0` (LAN) | Same API, over HTTPS (self-signed by default, see `docs/TLS.md`) |
 | `recorder` | `18554` | `0.0.0.0` (LAN) | RTSP restream for clients (the recorder embeds CrumbVMS's go2rtc restreamer; requires `GO2RTC_USER`/`GO2RTC_PASS` auth) |
 | `recorder` | `8556` (tcp+udp) | `0.0.0.0` (LAN) | WebRTC media (ICE) for live view (embedded go2rtc) |
-| `mosquitto` | `1883` | `127.0.0.1` only | MQTT broker, **profile-gated, NOT started by a plain `up -d`**; only for the Frigate integration when the user has no broker of their own (`docker compose --profile frigate up -d`) |
+| `mosquitto` | `1883` | `127.0.0.1` only | MQTT broker, **profile-gated, NOT started by a plain `up -d`**; only for the Frigate integration when the user has no broker of their own (`docker compose --profile frigate up -d`). Host-local bind, so a Frigate running on **another** host cannot reach it; widen the bind deliberately (`docs/COMPOSE.md`), not by reflex |
 | `postgres` | (none) | not published | internal only |
 
 There is **no separate `go2rtc` service**: the go2rtc restreamer binary runs
@@ -357,10 +408,17 @@ via `PUT /config/beta-terms`). Then:
    **"Keep at most"** (GB) and **"Keep at least"** (days). These write the default
    recording policy, so every camera added afterwards inherits them. The path is
    **preflighted live** (`POST /config/fs/check`): a green line confirms free
-   space, and the wizard **refuses to advance** if the folder is missing, isn't
-   writable by the recorder's uid, or reports zero free bytes, so a
-   full/unwritable disk can't silently record nothing. The same live check now
-   runs in **Settings → Storage** when you add or edit a location.
+   space, and the wizard **refuses to advance** on an `error` verdict, the folder
+   is missing or is not a folder, its parent does not exist, it sits outside the
+   recorder's media root, its ownership says the recorder's uid cannot write
+   there, or the disk reports zero free bytes. An amber `warn` ("can't confirm
+   the recorder can write here") is shown but does **not** block: the api mounts
+   `/data` read-only by design, so it infers writability from the folder's
+   ownership rather than proving it, and that inference cannot see through an
+   NFS, SMB, or FUSE mount whose server decides permissions. Step 3's
+   `setup-env.sh` preflight, which probes a real uid-1001 write, is the
+   authoritative check; this one is the second net. The same live check also runs
+   under **Storage** when you add or edit a location.
 4. **Find your cameras**, enter an IP range (pre-filled with the server's likely
    `/24`) and a **credential list**, add one username/password set per camera
    brand ("＋ Add another credential set"), then **Scan**. The sweep runs with the
@@ -375,30 +433,32 @@ via `PUT /config/beta-terms`). Then:
    thumbnail + resolution/codec/fps). There's also **＋ Add a camera by address**
    (offered on both the find and the select step) for a camera the scan didn't
    turn up, plus a per-camera **Rescan** to retry one that's since come online.
-6. **Review & add**, confirm the list and optionally pick a **group per
-   camera** (each group applies its own recording policy, e.g. an
-   "always record" group and a "motion only" group in the same batch; a
-   "set all to…" convenience and inline group creation are provided).
-   Committing adds each camera in turn with per-row ✓/✗ feedback. Streams
-   come online within a minute.
+6. **Review & add**, confirm the list and commit. The step states where the new
+   cameras will record ("New cameras record continuously to *<disk>*, keeping N
+   days / M GB", the default policy from step 3) and adds each camera in turn
+   with per-row ✓/✗ feedback; a name conflict offers a one-click retry under a
+   suffixed name. Streams come online within a minute. Grouping cameras is no
+   longer part of the wizard, do it afterwards under **Cameras** (or via
+   `POST /config/groups` + `PUT /config/groups/:id/members`, see 6b).
 7. **Object detection (optional)**, point CrumbVMS at an existing Frigate (go2rtc +
    HTTP API bases), with a **Test** button that probes both bases server-side
    (`POST /config/frigate/test-http` → per-target ✓/✕ + detail). Skip if they
    don't run Frigate, motion detection works without it. If the user has no
    MQTT broker for Frigate's events, the bundled one is profile-gated:
    `docker compose --profile frigate up -d` starts it (see the port table).
-8. **Motion decoding (optional)**, Auto / CPU / Intel-AMD iGPU (VAAPI) /
-   NVIDIA (NVDEC) for the motion-analysis decode. The step shows the recorder's
-   **real capability report** (render nodes / NVIDIA device); picking a hardware
-   backend whose device isn't mapped into the recorder container shows the exact
-   compose-overlay commands to fix it (see "Hardware-accelerated motion decode"
-   below). CPU/Auto are fine defaults, skipping is normal.
+8. **Motion decoding (optional)**, Server default / Auto / CPU / Intel-AMD iGPU
+   (VAAPI) / NVIDIA (NVDEC) for the motion-analysis decode. The step shows the
+   recorder's **real capability report** (render nodes / NVIDIA device); picking
+   a hardware backend whose device isn't mapped into the recorder container shows
+   the exact compose-overlay commands to fix it (see "Hardware-accelerated motion
+   decode" below). **Server default** is pre-selected and inherits the recorder's
+   `MOTION_HWACCEL`, which is CPU on a stock install; skipping is normal.
 9. **Notifications (optional)**, add one destination (ntfy / Pushover / webhook)
    with a **Save & send test** button. Full options (per-camera rules, quiet
-   hours, Discord/Slack/Telegram, system alerts) live in Settings → Notifications.
+   hours, Discord/Slack/Telegram, system alerts) live under **Notifications**.
 10. **Additional users (optional)**, list existing accounts and add users
     inline (username, password ≥ 8 chars, role). Roles control cameras +
-    capabilities; fine-grained control is Settings → Users & Security.
+    capabilities; fine-grained control is under **Users & security**.
 11. **Done.**
 
 You're finished; they take it from here. (Skipping the camera steps adds nothing:
@@ -414,7 +474,7 @@ capturing them into the searchable **LPR** tab. Each camera's **Engine**
 dropdown in the same section's per-camera table controls which source feeds it
 (**None** = LPR off for that camera; new cameras default to Frigate). No new services or env keys; it reuses the Frigate
 integration. A plate database is privacy-sensitive, so it stays opt-in, and
-viewing it needs the **View license plates** role capability (Settings → Users &
+viewing it needs the **View license plates** role capability (**Users &
 Security). Plate-read retention is independent of footage/storage retention.
 REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
@@ -435,10 +495,10 @@ To be **alerted** when a specific plate is seen, add it to the **watchlist** in
 the **LPR** tab (or `POST /lpr/watchlist {"plate":"7ABC123","label":"…"}`,
 admin-only). A watchlisted plate raises a **License-plate watchlist hit** alert
 routed over the same notification channels as every other alert: enable/tune it
-under Settings → Notifications → System alerts. No extra services or env keys.
+under **Notifications → System alerts**. No extra services or env keys.
 
 **After the wizard: Home Assistant (optional).** Also not a wizard step; it
-lives in the console under its own **Settings → Home Assistant** section
+lives in the console under its own **Home Assistant** section
 (connection config, a global overview of every linked entity across all
 cameras, and orphaned-link detection). OFF by default, fully self-hosted, footage never leaves
 Crumb. If the user runs Home
@@ -481,7 +541,11 @@ All wizard steps have API equivalents. Do them in order:
    discovery scan below. It's `null` when the console was reached by hostname.)
 3. **Storage + retention.** Confirm/adjust the disk via `GET`/`POST /config/storages`,
    optionally preflight the path first with `POST /config/fs/check` `{path}` →
-   `{status: "ok"|"warn"|"error", writable, free_bytes, total_bytes, message}`
+   `{status: "ok"|"warn"|"error", writable, free_bytes, total_bytes, message}`.
+   `writable` is three-state: `true` / `false` / **`null`**, and `null` is the
+   normal value on a stock install, because the api's `/data` mount is read-only
+   by design and writability was inferred from ownership instead. Branch on
+   `status`, never on `writable`
    (reject an `error`: not writable by the recorder's uid, a parent folder that
    doesn't exist, outside the media root, or zero free space),
    then point the default policy at it and set caps in ONE call:
@@ -554,7 +618,8 @@ All wizard steps have API equivalents. Do them in order:
    For an already-added ONVIF camera you can re-probe with
    `POST /config/cameras/:id/redetect`.
 7. **Motion decode backend (optional).** `PUT /config/server` with just
-   `motion_hwaccel` (`"auto"|"cpu"|"vaapi"|"cuda"`) and `motion_vaapi_device`
+   `motion_hwaccel` (`"auto"|"cpu"|"vaapi"|"cuda"`, or `""` for the container
+   default) and `motion_vaapi_device`
    (e.g. `"/dev/dri/renderD128"`, only meaningful for vaapi). The PUT **merges**:
    a key you omit is left exactly as stored, so you do not have to round-trip the
    whole row. A key sent as `""` is a deliberate **clear**, which resets that
@@ -564,7 +629,8 @@ All wizard steps have API equivalents. Do them in order:
    when they differ (e.g. the render node isn't mapped into the recorder
    container, see "Hardware-accelerated motion decode" below). `capabilities:
    null` means the recorder hasn't reported yet (older image / not booted),
-   not "no devices". Skipping this step entirely is fine: `auto` is the default.
+   not "no devices". Skipping this step entirely is fine: `cpu` is the default,
+   and it works on any host.
 8. **Notifications (optional).** `POST /notifications/channels`
    `{kind, name, config, camera_ids: [], include_snapshot: true, enabled: true,
    global: true}`, `kind` ∈ `ntfy|pushover|webhook|discord|slack|telegram`,
@@ -591,6 +657,18 @@ any host). To decode on hardware, the matching device must be **mapped into the
 recorder container**, Docker never lets a running container grant itself
 devices, so this is always a host-side compose change (Frigate has the same
 constraint).
+
+**`auto` is no longer a guess.** It used to ask only whether cuda was compiled
+into ffmpeg, which is true on every host running the published image, so on a
+GPU-less machine it chose NVDEC and every motion decoder died before its first
+frame. The recorder now probes for a real cuda device at startup
+(`ffmpeg -init_hw_device cuda`, once per process, cached, 15s deadline) and
+resolves `auto` to `cpu` when that fails, times out, or cannot start. Separately,
+whatever backend is chosen, a camera whose motion decode produces no frames is
+demoted to CPU for that worker's lifetime rather than relaunching the same
+failing flags, and the reason surfaces in `GET /config/decode-status`. An
+explicit `cuda`, `vaapi`, or `cpu` is never rewritten. So `auto` is safe, but
+naming the backend you actually have is still the clearer choice.
 
 **You are running on the host, so you CAN automate this**, it's the one place
 full automation is legitimate. The supported path is the committed helper:
@@ -704,12 +782,20 @@ CrumbVMS can notify the user when something breaks, via the admin **Notification
 panel (Discord / Slack / Pushover / Telegram / ntfy / webhook):
 
 - Add a **channel** (their destination).
-- The **System alerts**, `recorder_offline`, `camera_offline`,
-  `camera_stream_rejected`, `low_disk`, `backup_failed`,
-  `frigate_disconnected`, are rule-based and mostly **on by default**; they fire
+- The **System alerts** are rule-based and mostly **on by default**; they fire
   to the channel(s) when the recorder dies, a camera stops writing, a camera's
-  stream is refused outright, disk runs low, the backup goes stale, or Frigate
-  disconnects.
+  stream is refused outright, the recorder cannot write to the recording disk,
+  disk runs low, the backup goes stale, or Frigate disconnects. The full set is
+  `recorder_offline`, `camera_offline`, `camera_stream_rejected`,
+  `stream_no_segments`, `storage_unwritable`, `storage_persist_failed`,
+  `low_disk`, `premature_rollover`, `policy_over_cap`, `backup_failed`,
+  `frigate_disconnected`, `motion_detector_unhealthy`,
+  `motion_cache_unavailable`, `plate_watchlist_hit`, `update_available`
+  (`GET /notifications/system-alerts` lists them live).
+
+**`storage_unwritable` is the companion to Step 3's preflight.** It means the
+recorder cannot write to the recording disk, so live view works and nothing is
+being saved. If it fires, go back to Step 3's ownership check.
 
 **`camera_stream_rejected` is the one to read carefully.** It means Crumb's
 go2rtc refused to register that camera's stream at all, so the camera looks
@@ -752,7 +838,7 @@ Without it, an API outage is silent until someone notices a client won't connect
 tell the operator when a newer release exists, via `GET /updates/latest` and a
 toggle in the admin **Server** settings ("Enable update checks"). This is the
 **one opt-in exception** to the LAN-only/no-egress posture in Step 0: when
-enabled, the api periodically (at most a few times an hour, cached 6h) makes a
+enabled, the api makes a
 plain HTTPS `GET` to `api.github.com` for the latest `badbread/crumbvms`
 release tag, a version number, nothing else. No telemetry, no client
 identifiers, no counts are sent, and there's no download/auto-install, it is
@@ -823,6 +909,12 @@ and on any PR that touches the install surface. That turns "the install works"
 into a green check and stops this file from rotting against the compose / API
 surface. When you change something here, change the smoke script with it.
 
+Two known blind spots in that coverage, so you check them by hand: the smoke
+script runs `setup-env.sh` against a directory inside the runner's workspace, so
+it never exercises the storage preflight's `exit 1` path; and `caddy` carries no
+healthcheck, so Step 5's "every service `running`/`healthy`" will never show
+caddy as healthy and an agent can stall waiting for it.
+
 **This runbook MUST be updated in the same change that touches any of the
 install/config surface it describes.** If your PR/commit changes any of the
 following, re-read this file top to bottom and fix whatever it says, don't
@@ -839,7 +931,7 @@ leave it for a follow-up:
 - First-run flow, wizard steps (`admin.html` `WIZARD_ALL_STEPS`) or the
   underlying REST endpoints (`auth.rs`, `config_routes.rs`).
 - Backup/monitoring/remote-access defaults, the api's built-in DB backup job
-  (`services/api/src/db_backup.rs` + its `DB_BACKUP_*` env), the
+  (`services/api/src/db_backup.rs` + its `BACKUP_DIR` / `DB_BACKUP_*` env), the
   `backup-offsite` service, the notification/system-alerts surface, or
   TLS/Caddy behavior.
 - Motion-recording defaults, the recorder's tmpfs cache mount/size
@@ -866,4 +958,9 @@ Anchors this doc depends on (update here if they move):
 `GET|POST /config/users`, `GET /config/roles`,
 `PUT /config/setup-complete`, `docs/MOTION-RECORDING.md` (motion-mode RAM
 cache: `MOTION_CACHE_TMPFS_BYTES`, `MOTION_CACHE_DIR`, `MOTION_RECORDING_SHADOW`,
-`segments.motion_shadow_keep`).
+`segments.motion_shadow_keep`), `POST /auth/login`, `PUT /config/beta-terms`,
+`PUT /config/lpr`, `POST /config/lpr/rotate-token`, `POST /lpr/watchlist`,
+`PUT /config/ha`, `GET /updates/latest`, `PUT /config/update-check-enabled`,
+`PUT /notifications/rules[/{camera_id}]`, `GET /notifications/system-alerts`,
+`caddy/Caddyfile` (`CRUMB_HTTPS_PORT`), `docker-compose.override.example.yml`,
+`docs/COMPOSE.md`, `docs/IOS-LIVE-VIDEO.md`.

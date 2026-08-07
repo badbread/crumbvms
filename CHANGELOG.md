@@ -9,7 +9,7 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
-## [0.2.0] - 2026-08-03
+## [0.2.0] - UNRELEASED
 
 Where 0.1.1 hardened what was already there, 0.2.0 finishes a feature that had
 been half-built for two releases: Home Assistant. Crumb could show a linked
@@ -19,6 +19,13 @@ authoring layer end to end and made the badges interactive: tap a light to turn
 it on, drag a slider to dim it, read a sensor's real value and units off the
 frame. The other headline items are adaptive live-wall quality on every client
 and human-readable plate names in LPR.
+
+The back half of the cycle was a different kind of work. Two audit sweeps went
+looking for the class of bug where Crumb looks healthy and is not: an install
+whose media directory the recorder cannot write, a motion detector that picked a
+GPU that was never there, a camera whose stream go2rtc rejected while the console
+said it was added. Those are the fixes below that matter most, because none of
+them announced themselves.
 
 ### The Home Assistant overhaul
 
@@ -37,6 +44,30 @@ and human-readable plate names in LPR.
 - **Per-entity control config.** A link can require a confirmation tap before it
   actuates and can restrict which actions it exposes (#456), authored from the
   same console link editor that sets its icon and style (#457).
+- **The icon vocabulary grew by 23 slugs**, grill and smoker and landscape
+  lighting among them, added in genuine lockstep across the server validator, the
+  console, and all three clients (#482).
+- **Badges can be styled per state.** A link can carry a second background colour
+  used only while the entity is on (#493, migration 0076), authored in the
+  console with an on/off preview (#490) and rendered on desktop (#491), iOS
+  (#492), and Android (#489). Left unset, a placed badge looks exactly as it did
+  before.
+- **Pill geometry is authorable.** Badge width (auto, narrow, medium, wide, sized
+  as multiples of the pill's own height so all four renderers derive it
+  identically) and text alignment are now per-link settings (#534, migration
+  0078). Unset again means no change to a badge you have already placed. Android
+  pill labels also stopped overflowing their background, by measuring at the same
+  clamped font size they render at (#499).
+- **The desktop overlay editor was restructured** around a sticky top bar and a
+  badge-anchored popover, because the old floating panel covered the badge you
+  were editing (#495). Esc and ✕ are now cancel rather than an implicit save; an
+  edited session asks before it discards.
+- **A quick-toggle hides the on-video overlays** without unlinking anything:
+  desktop covers the wall and the maximized pane and binds it to `H` (#487), iOS
+  and Android cover fullscreen live (#486, #488). On Android, hiding also stands
+  the Home Assistant poll down.
+- Console link-picker labels now say what they add, and the stale "Motion tab"
+  copy is gone (#481).
 
 ### Interactive badges
 
@@ -51,6 +82,75 @@ and human-readable plate names in LPR.
   the server (#460) and surfaced on desktop (#461), iOS (#462), and Android
   (#463), with the detail card's icon color matched to the badge (#466, #467,
   #468).
+- **A control never claims a state it did not set.** The iOS value slider holds
+  at the value you committed until the poll agrees or a timeout elapses, instead
+  of snapping back mid-drag (#474), and a slider release that is cancelled at the
+  confirmation prompt or whose request fails now returns the thumb to the real
+  value rather than stranding it (#508). On a cover, the old behaviour could read
+  80% while the cover sat at 20%. In the same spirit, an iOS light or switch
+  reporting `unavailable` or `unknown` greys out like every other domain instead
+  of rendering a confident "Off" (#538).
+
+### An install that cannot silently record nothing
+
+- **Storage is preflighted before the stack ever starts.** `scripts/setup-env.sh`
+  now names the media directory's filesystem, actually tries to create a file
+  there as uid 1001 (the user the recorder runs as), warns when free space is
+  under 10 GiB, and prints the server-side fix for NFS, SMB, FUSE and the other
+  mounts that remap ownership. A definite failure ends the script with a non-zero
+  exit instead of letting you bring up a stack that records nothing while live
+  view, which touches no disk, looks perfectly healthy (#514). An inconclusive
+  answer still lets the install proceed and tells you what to check by hand.
+- **Hardware decode stopped guessing.** `MOTION_HWACCEL` now defaults to `cpu`
+  (#478 in the shipped config, #513 in the code and image defaults), because the
+  old `auto` only asked whether cuda was compiled into ffmpeg, which is true on
+  every host running the published image. On a GPU-less machine that meant every
+  motion decoder died before its first frame, forever. `auto` now probes a real
+  cuda device once at runtime and resolves to CPU when the probe fails, times
+  out, or cannot start, and any backend that produces no frames is demoted to CPU
+  for that camera instead of relaunching the same failing flags (#531). The
+  reason is reported in decode status and motion health rather than left for you
+  to infer.
+- **The console stopped re-pinning a decode backend you never chose.** Saving any
+  unrelated server setting used to coerce a blank hardware-decode field to
+  `auto`, quietly undoing the new default; blank now stays blank and means
+  "inherit the environment" (#536).
+- **A migration interrupted between apply and record no longer bricks the boot.**
+  Five already-shipped migrations used a bare `ADD CONSTRAINT`, so a boot killed
+  at the wrong moment re-ran the file into a duplicate-object error and neither
+  api nor recorder would start until the database was edited by hand. They are
+  re-appliable now, with a test that fails the build if a new migration
+  reintroduces the pattern (#513).
+- **First-run errors say what actually went wrong** (#532). The Home Assistant
+  and Frigate connection tests check the shape of the response instead of
+  accepting any 200, so a login page no longer reports Connected. The storage
+  check can finally tell read-only from healthy, which it could not before
+  because the api mounts media read-only and its write probe therefore always
+  failed. Saving a storage path that does not exist or cannot be written is
+  refused rather than accepted in silence. A wrong password says so instead of
+  "Session expired", a rate-limited request surfaces its retry window, and
+  ffmpeg's stderr is mapped to something readable with credentials redacted.
+
+### Recorder correctness
+
+Losing footage is the one unforgivable bug, so these two get their own heading.
+
+- **Reconcile can no longer wipe a storage's segment index when the disk is not
+  there.** The dangling-row pass deleted an index row whenever the file did not
+  stat, with nothing checking that the storage root was the real, mounted volume.
+  A present-but-empty root, an unmounted `noauto` disk, a dropped network mount, a
+  bind source Docker created for you, made every row look dangling, and one pass
+  could delete that storage's entire index. The bytes survived; the motion flags,
+  bounding boxes, durations, and clip and bookmark links did not. Two independent
+  guards now fail toward doing nothing: a marker file at the storage root, without
+  which the pass deletes nothing at all, and a per-storage circuit breaker that
+  latches when a single pass finds both more than 100 missing files and more than
+  half the rows missing (#515).
+- **The marker is written only after real footage lands.** As first shipped, the
+  recording path planted it as soon as the directory was created, which on the
+  exact failure the guard exists for wrote a false confirmation onto an empty
+  mountpoint. It now goes down on the first genuinely committed segment, the same
+  signal the boot-time seeding uses (#542).
 
 ### Added
 
@@ -68,6 +168,12 @@ and human-readable plate names in LPR.
   than failing silently (#415, #413).
 - An opt-out for the go2rtc RTSP restream's auth (`GO2RTC_AUTH=off`) for setups
   that terminate access control elsewhere (#417).
+- A **`camera_stream_rejected` alert** (#528, migration 0077), raised when go2rtc
+  refuses a camera's stream. It is on by default, ignores quiet hours, and
+  latches so one bad URL cannot spam the channel.
+- **`TESTING.md`**, a tester onboarding guide, plus a structured bug-report issue
+  form so a report arrives with the version, platform, and logs already in it
+  (#512).
 
 ### Changed
 
@@ -78,6 +184,21 @@ and human-readable plate names in LPR.
   upgrade: the server fills in default capability claims instead (#407), which
   retires the post-upgrade blank-thumbnail window that 0.1.1 listed as a known
   issue.
+- **`MOTION_HWACCEL` defaults to `cpu` on a new install** (#478, #513). An `.env`
+  written by 0.1.1 pins the value explicitly, so upgrading does not change your
+  setting; see "Upgrading from 0.1.1" below.
+- **`PUT /config/server` merges instead of replacing.** A partial body used to
+  clear every setting it did not mention. Omitted fields are now left alone and
+  an empty string clears a field back to its environment default (#533). The
+  console always sent complete bodies, so this is a fix for anything driving the
+  API directly.
+- **The first-run wizard no longer assigns cameras to a group.** The step existed
+  and worked, but groups are authoritative for policy and the wizard was the one
+  place you could set one without seeing what it inherited; it now happens in the
+  console, where the inheritance is visible (#510).
+- **Desktop `Esc` is scoped.** With the keyboard shortcuts actually reaching the
+  app again (#494, #496), `Esc` deliberately does not fire while a text field has
+  focus or a dialog is open.
 
 ### Fixed
 
@@ -90,11 +211,161 @@ and human-readable plate names in LPR.
   missing, instead of booting into a confusing state (#397).
 - Frame-back works in the desktop LPR plate popup (#392), and the A/B report
   carries the plate bounding box so crops line up (#393).
+- **A camera go2rtc rejects now tells you.** `PUT` of a stream only failed on a
+  5xx, so a 400, which registers nothing, was recorded as success: the camera
+  appeared added, no warning, no event, and the recorder reconnect-looped
+  forever. Registration is now confirmed by reading the stream back (#528), and
+  editing an existing camera's source URL goes through the same path, which it
+  did not before (#540). That edit fix also stops a rename leaving an orphaned
+  stream behind.
+- **No more false "motion detector unhealthy" on a main-only camera.** Motion
+  reads the sub-stream, so a camera without one has its pixel detector parked by
+  design, but the startup-armed timer alerted about it after every recorder
+  restart. That state is still reported as degraded and recording still fails
+  open; it just no longer arms an alert (#525). The Detection tab now warns at the
+  moment you tick pixel analysis on a camera that has no sub-stream (#527).
+- **Android plays cameras that are H.265 all the way down.** Media3's RTSP stack
+  cannot bring up H.265, and the old recovery was a single main-to-sub step, which
+  on an all-H.265 camera just swapped one undecodable stream for another. There is
+  now a fallback ladder ending at the server's on-demand H.264 transcode, ordered
+  differently for fullscreen and wall tiles and for metered connections, with the
+  transcode always last because it costs a real ffmpeg on the server (#529).
+- **Filling in only the Frigate go2rtc field stopped redirecting Frigate's HTTP
+  API.** The console was syncing a deprecated column to the go2rtc base, which
+  sent every Frigate snapshot and clip proxy at the wrong port; the two fields are
+  now one, clearly labelled (#518).
+- **The `_subv` repair stream is targeted rather than universal.** The video-only
+  sub restream that fixes H.264 SDPs missing their `fmtp` line for Media3 (#485)
+  is now registered only for the cameras whose sub-stream is positively detected
+  as broken (#501), and the detection is gated on the video codec so MJPEG
+  cameras, which have no `fmtp` by specification, are no longer mis-flagged
+  forever (#526).
+- **Desktop keyboard shortcuts fire again.** They had been inert in shipped
+  builds: the handlers sat below a focus node that permanently owned the route's
+  focused child, so nothing was ever dispatched to them. The live wall's snapshot,
+  maximize, fullscreen, and camera-number banks (#494) and Playback's transport
+  and frame-step keys (#496) all work. The maximized pane also keeps its
+  right-click menu while a stream is still connecting (#484).
+- Server discovery, the console, and the wizard: a `serverTz` crash outside the
+  wizard left the schedule panel empty and could persist a cleared archive
+  schedule, and Detection Save silently dropped painted zones (#510).
+
+### Security
+
+- **Scoped media tokens can no longer reach the rest of the API.** These are the
+  short-lived, narrow claims in `?token=` media URLs. A camera's stream endpoint,
+  which hands back RTSP URLs carrying the server's long-lived restreamer
+  credentials, sat where a media principal could reach it (#516). Rather than
+  patch that endpoint alone, the default was inverted: a media-scoped token is now
+  rejected everywhere, and exactly the ten media handlers that need it opt back in
+  (#543). A new endpoint is therefore safe by default. No client change was
+  needed; all four already authenticate these calls with the bearer session.
+- **`/auth` no longer carries the permissive CORS header.** It covered
+  unauthenticated bootstrap and login, which had no reason to be reachable
+  cross-origin (#516).
+- **`mqtts://` is refused instead of silently connecting in plaintext.** Both MQTT
+  clients used to strip the scheme and connect in the clear, so an operator who
+  configured `mqtts://` had broker credentials on the wire believing they were
+  encrypted. TLS is not implemented here; the URL is rejected at configuration
+  time, at test time, and at connect time, so the failure is loud (#530).
+- Dependency work cleared four `rustls-webpki` certificate-verification
+  advisories by dropping a transitive TLS stack from the MQTT client and bumping
+  rustls (#476).
+
+### Upgrading from 0.1.1
+
+An in-place upgrade from the v0.1.1 published images was tested end to end. It is
+a drop-in: `.env` needs no changes, the new migrations apply in a single pass on
+first boot, footage came through byte-identical, and logins, roles, policies, and
+the authenticated RTSP restream default were all intact afterwards.
+
+```bash
+git pull
+docker compose pull
+docker compose up -d
+```
+
+If you pinned `CRUMB_VERSION` in `.env`, set it to the new version before you
+pull. If you never set it, you are on `latest` and the pull is enough.
+
+- **Migrations run themselves.** First boot applies 0072 through 0078; there is
+  no manual step and no separate downtime beyond the container restart.
+- **No new required settings.** `GO2RTC_AUTH` is the only new key, and leaving it
+  unset keeps the secure default: the RTSP restream stays authenticated.
+- **`MOTION_HWACCEL` needs a decision, but not urgently.** A new install now
+  defaults to `cpu`. An `.env` generated by 0.1.1 contains an explicit
+  `MOTION_HWACCEL=auto`, so upgrading leaves you on `auto`, and that is fine:
+  `auto` no longer picks a GPU that is not there. It probes a real cuda device at
+  runtime and falls back to CPU when the probe fails, and a backend that decodes
+  nothing is demoted per camera. To adopt the new default anyway, set
+  `MOTION_HWACCEL=cpu` in `.env` and `docker compose up -d` the recorder, or leave
+  the console's hardware-decode field blank and set it there. If you have a GPU
+  you actually want used, name it (`cuda` or `vaapi`) rather than relying on
+  `auto`.
+- **Non-admin roles cannot control Home Assistant devices** until you grant them
+  the new `actuators` capability. Migration 0074 adds it default-off for every
+  existing role, so nobody silently gains the ability to unlock a door on upgrade.
+  Admins are unaffected.
+- **Motion health is a new surface.** Cameras that were quietly degraded before
+  will start reporting it. That is the feature working, not the upgrade breaking
+  something.
+- **Back the database up first** (see `docs/BACKUP.md`), as with any upgrade.
+- **Rolling back is reasoned, not tested.** The new migrations are additive, so
+  pinning the previous `CRUMB_VERSION` and running `docker compose up -d` should
+  bring 0.1.1 back up against the upgraded schema: you lose the new features, not
+  the footage. A downgrade was never actually executed, so treat that as an
+  argument, not a rehearsal, and take the backup.
 
 ### All merged changes
 
 Every pull request merged since 0.1.1, newest first:
 
+- fix(api): gate the credential/session/notification surface against scoped media tokens (#543)
+- fix(recorder): write the storage marker only after a committed segment, not at dir creation (#542)
+- fix(api): route a camera source-URL edit through reconnect so a go2rtc rejection surfaces (#540)
+- fix(ios): grey HA badge on unavailable/unknown light/switch instead of a confident Off (#538)
+- fix(web): blank decode backend stays blank instead of pinning 'auto' (#536)
+- feat(ha): pill badge width + text alignment across every renderer (#534)
+- fix(api): PUT /config/server merges instead of replacing the whole row (#533)
+- fix(console,api): first-run error-message quality pass (#532)
+- fix(api,recorder): reject mqtts:// instead of silently connecting in plaintext (#530)
+- fix(recorder): make MOTION_HWACCEL=auto probe a real cuda device and fall back to CPU when hardware decode fails (#531)
+- fix(android): walk a fallback ladder to the server transcode for all-H265 cameras (#529)
+- fix(api): surface go2rtc stream rejections; stop false camera_offline on newly added cameras (#528)
+- fix(admin): warn on the Detection tab when a camera has no sub-stream (#527)
+- fix(api): gate the _subv fmtp repair on the video codec (#526)
+- fix(recorder): no false motion_detector_unhealthy for a camera with no sub-stream (#525)
+- fix(api): require a full session for stream URLs, drop CORS from /auth (#516)
+- fix(api): stop the console writing the go2rtc base into the Frigate HTTP base (#518)
+- fix(recorder): guard the dangling-row pass against an unmounted storage (#515)
+- feat(install): preflight storage so an install cannot silently record nothing (#514)
+- fix(db,recorder): make ADD CONSTRAINT migrations re-appliable; default MOTION_HWACCEL to cpu in code (#513)
+- docs: add TESTING.md tester onboarding + convert bug report to an issue form (#512)
+- fix(console): serverTz crash outside the wizard, Detection Save dropping zones + grouped-camera edits, retire the wizard group step (#510)
+- fix(ios): never let the HA value slider assert a value that was not sent (#508)
+- docs: refresh screenshots and copy for the v0.2.0 release (#500)
+- perf(api): register `_subv` only for the cameras whose sub SDP is actually broken (#501)
+- feat(desktop): restructure the HA overlay editor around a top bar + badge popover (#495)
+- fix(desktop): make Playback's keyboard shortcuts actually fire (#496)
+- fix(desktop): make the live wall's keyboard shortcuts actually fire (#494)
+- feat(android): quick-toggle to hide on-video Home Assistant overlays (#488)
+- feat(desktop): global quick-toggle to hide all Home Assistant overlays (#487)
+- feat(desktop): render per-state HA badge backgrounds (bg_color_on) (#491)
+- feat(admin): author per-state HA badge background (bg_color_on) (#490)
+- feat(ha): expand canonical badge-icon vocabulary (grill/smoker/landscape + 20 more) (#482)
+- fix(android): scale HA pill badges like desktop so labels stop overflowing (#499)
+- feat(ha): per-state badge background contract (overlay_bg_color_on) (#493)
+- feat(ios): render per-state HA badge backgrounds (#492)
+- feat(ios): quick-toggle to hide Home Assistant overlays on live video (#486)
+- fix(desktop): keep the maximized pane's right-click menu available while a stream is connecting (#484)
+- feat(android): render per-state HA badge background color (#489)
+- fix(api,android): video-only `_subv` sub restream repairs H264 fmtp for Media3, scoped to Android (#485)
+- fix(admin): clarify HA entity-link picker labels + fix stale "Motion tab" copy (#481)
+- chore(release): v0.2.0 version bump + changelog + docs (#475)
+- fix(recorder): default MOTION_HWACCEL to cpu so motion works on GPU-less hosts (#478)
+- fix(deps,api,recorder): clear rustls-webpki cert-verify advisories + log/trim nits (#476)
+- fix(ios): hold the HA value slider at the committed value until the poll converges (#474)
+- fix(android): restore UTF-8 in LiveFullscreenScreen comment (#471)
 - fix(android): don't render HA entity popup inside the PiP window (#469) (#470)
 - feat(ios): match HA detail-card icon to the on-video badge color (#467)
 - fix(android): make the HA value slider usable + popup visuals match the badge (#442 Slice 1 follow-ups) (#468)
