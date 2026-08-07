@@ -8,6 +8,68 @@ revisit.
 
 ---
 
+## 2026-08-07, The plate report fetches the plate's history ONCE and filters it in the client; sighting images are downscaled in-client because the server derivative was never merged
+
+**Context.** The desktop single-plate PDF report shipped as a one-shot
+"Download PDF": pick a timezone, tick "include sighting history", and the file
+lands in a save dialog unseen. A real report from a live instance showed the
+gap, a plate with 27 sightings on one camera rendered 4 thumbnails under "Other
+sightings" and no list at all. Making the report useful as a handout means
+adding an occurrence table, a date range, a camera filter, an image-count
+control, operator notes, and a preview, which raises two questions: where the
+filtering happens, and how the file stays small enough to email.
+
+**Decision 1, ONE fetch on dialog open, all filtering client-side.** The
+builder pages `GET /plates?q=<plate>&match=exact` over the operator's cameras
+until `has_more` is false or a 2 000-read ceiling, keeps that list in memory,
+and derives everything from it: the live "N of M sightings match" summary, the
+camera filter's options, the dossier stats, and the occurrence table. Changing
+an option re-renders the PDF without touching the network. The window and
+camera filters are pure functions over that list
+(`plate_report_options.dart`), which is what makes them unit-testable. The
+ceiling is surfaced on the report itself rather than silently truncating.
+
+**Decision 2, sighting images are downscaled in the CLIENT before embedding.**
+Detection frames are stored at full camera resolution (~170 KB is typical) and
+the report draws a sighting thumbnail a couple of centimetres wide. Every
+embedded sighting image goes through `downscaleForReport` (longest edge 640 px,
+JPEG q72) on a background isolate. The subject read's own two images are left
+at full quality, they are the evidence. The image count is capped at 24 even
+for "all".
+
+**Rejected:**
+- **Re-querying the server on every option change.** Correct, and much worse:
+  a date-range or camera toggle would cost a round trip, the live summary
+  could not update as you type, and the printed list could disagree with the
+  printed window under a slow response. The client-side filter is re-applied
+  even though the window is also sent to the server, so the two can never
+  diverge.
+- **Asking the server for a downscaled derivative.** `GET
+  /events/:id/snapshot?w=N` and `GET /plates/:id/crop?tight=1` were proposed
+  under #394 for exactly this, but that PR was closed unmerged, so on `main`
+  both routes return the stored bytes verbatim. Client-side downscale is the
+  honest option today.
+- **Bundling a Unicode font.** The `pdf` package's built-in Helvetica/Courier
+  are Latin-1 only, so non-ASCII operator notes or camera names will not render
+  correctly. Shipping a TTF is a build-asset decision (golden rule 6) and is
+  left for its own change.
+- **A server-side report endpoint.** Composition stays in the client: the
+  report is a client feature with no other consumer, and moving it server-side
+  would mean the api reading media it deliberately mounts read-only.
+
+**Revisit triggers (any one):**
+- The `?w=` / `?tight=1` derivatives land on `main` (then fetch them instead of
+  downscaling locally, and drop `downscaleForReport` from the report path).
+- A plate routinely exceeds the 2 000-read fetch ceiling in practice (then page
+  lazily, or add a server-side aggregate).
+- Another client wants the same report (then the composition layer, which is
+  already a pure function of resolved inputs, is the thing to share, not the
+  dialog).
+- A non-ASCII locale reports garbled notes or camera names (then bundle a
+  Unicode font and accept the asset size).
+
+---
+
 ## 2026-08-06, HA badge pill layout: a four-value width mode in units of the badge HEIGHT (not free pixels, not a max-width)
 
 **Context.** Live testing of the v0.2.0 overlay editor (issue #497) turned up two
