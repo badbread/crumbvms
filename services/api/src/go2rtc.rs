@@ -432,21 +432,68 @@ struct StreamIndex {
     /// The stream names go2rtc currently has (the JSON object's keys).
     names: HashSet<String>,
     /// Per stream name, a DEFINITE verdict on its producer's video track:
-    /// `true` ⇒ the SDP advertises video with no `a=fmtp` (needs the `_subv`
-    /// repair), `false` ⇒ it has one. A name is ABSENT when no verdict could be
-    /// reached — no producer attached yet, no SDP, or no video section — which
-    /// callers must treat as "don't know", never as "broken".
+    /// `true` ⇒ the SDP advertises video with no `a=fmtp` for a codec that needs
+    /// one (needs the `_subv` repair), `false` ⇒ it has one. A name is ABSENT
+    /// when no verdict could be reached — no producer attached yet, no SDP, no
+    /// video section, or a codec that carries no out-of-band parameter sets
+    /// (MJPEG) — which callers must treat as "don't know", never as "broken".
     video_lacks_fmtp: std::collections::HashMap<String, bool>,
 }
 
-/// Does this SDP describe a video track with NO `a=fmtp` attribute?
+/// Does a video codec carry its parameter sets OUT OF BAND, i.e. in `a=fmtp`?
 ///
-/// `None` ⇒ no verdict (empty SDP, or no `m=video` section at all). `Some(true)`
+/// Only H.264 and H.265 do among the payloads cameras actually serve: their
+/// SPS/PPS (and VPS) ride in `sprop-parameter-sets` / `sprop-vps` and a decoder
+/// cannot start without them, which is why a missing `a=fmtp` breaks the stream
+/// (#483). RTP/JPEG (M-JPEG) is the counter-example that motivated this gate
+/// (#521): every JPEG frame is self-describing, RFC 2435 defines no format
+/// parameters at all, so a perfectly healthy MJPEG SDP never has an `a=fmtp` and
+/// remuxing it can never add one.
+///
+/// The name is the encoding name from `a=rtpmap`, compared case-insensitively
+/// (SDP encoding names are case-insensitive; cameras ship both `H265` and the
+/// `HEVC` spelling).
+fn video_codec_needs_fmtp(encoding_name: &str) -> bool {
+    matches!(
+        encoding_name.to_ascii_uppercase().as_str(),
+        "H264" | "H265" | "HEVC"
+    )
+}
+
+/// The encoding name from an `a=rtpmap:<pt> <encoding>/<clock>[/<params>]` line,
+/// or `None` if this is not an rtpmap line / has no encoding name.
+fn rtpmap_encoding_name(line: &str) -> Option<&str> {
+    // `a=rtpmap:` is matched case-insensitively, as the `a=fmtp:` scan is.
+    const PREFIX_LEN: usize = "a=rtpmap:".len();
+    if !line
+        .get(..PREFIX_LEN)
+        .is_some_and(|p| p.eq_ignore_ascii_case("a=rtpmap:"))
+    {
+        return None;
+    }
+    // Skip the payload type, then take the encoding name up to the `/clock`.
+    let (_pt, enc) = line[PREFIX_LEN..].split_once(char::is_whitespace)?;
+    let name = enc.trim_start().split('/').next().unwrap_or("").trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Does this SDP describe a video track that is BROKEN by a missing `a=fmtp`?
+///
+/// `None` ⇒ no verdict (empty SDP, no `m=video` section at all, or a video codec
+/// that does not carry parameter sets out of band — see below). `Some(true)`
 /// ⇒ the video track carries no `a=fmtp` line, which is exactly the condition
 /// that makes Android's Media3 RTSP client throw
 /// `IllegalArgumentException: missing attribute fmtp` and reconnect-loop the
 /// tile forever (#483). Such a stream has no out-of-band parameter sets at all
 /// (ffprobe on it reports "non-existing PPS 0 referenced / no frame!").
+///
+/// A missing `a=fmtp` is only evidence of breakage for codecs that are SUPPOSED
+/// to have one: the verdict is gated on the video track's `a=rtpmap` encoding
+/// name via [`video_codec_needs_fmtp`]. An MJPEG sub (`JPEG/90000`) legitimately
+/// has no fmtp, and flagging it bought a permanent per-camera ffmpeg remux that
+/// reproduced the same fmtp-less SDP while steering Android off the always-warm
+/// raw sub (#521). Unknown/absent codec ⇒ `None` (no repair), which
+/// [`resolve_needs_subv`] treats as "don't know", never as "broken".
 ///
 /// Attributes belong to the media section they follow, so this walks sections
 /// rather than scanning the whole SDP: a `a=fmtp` on the AUDIO track must not
@@ -457,6 +504,7 @@ fn sdp_video_lacks_fmtp(sdp: &str) -> Option<bool> {
     let mut in_video = false;
     let mut saw_video = false;
     let mut has_fmtp = false;
+    let mut needs_fmtp = false;
     for line in sdp.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(media) = line.strip_prefix("m=") {
@@ -469,9 +517,20 @@ fn sdp_video_lacks_fmtp(sdp: &str) -> Option<bool> {
             saw_video |= in_video;
         } else if in_video && line.to_ascii_lowercase().starts_with("a=fmtp:") {
             has_fmtp = true;
+        } else if in_video {
+            if let Some(enc) = rtpmap_encoding_name(line) {
+                needs_fmtp |= video_codec_needs_fmtp(enc);
+            }
         }
     }
-    saw_video.then_some(!has_fmtp)
+    if !saw_video {
+        return None;
+    }
+    if has_fmtp {
+        return Some(false);
+    }
+    // No fmtp: only a verdict for codecs that should have had one.
+    needs_fmtp.then_some(true)
 }
 
 /// Reach a verdict for one entry of go2rtc's `/api/streams` object.
@@ -1552,6 +1611,80 @@ mod tests {
         );
         // Session-level attributes before the first `m=` belong to no track.
         assert_eq!(sdp_video_lacks_fmtp("v=0\r\na=fmtp:96 stray\r\n"), None);
+    }
+
+    /// A healthy M-JPEG sub's real SDP (#521), IPs genericised. RTP/JPEG defines
+    /// no format parameters, so the absence of `a=fmtp` here is CORRECT, and the
+    /// `_subv` remux reproduces this SDP byte-for-byte fmtp-less.
+    const SDP_MJPEG: &str = "v=0\r\n\
+        o=- 1786058169509450 1 IN IP4 192.0.2.20\r\n\
+        t=0 0\r\n\
+        a=control:*\r\n\
+        m=video 0 RTP/AVP 96\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=rtpmap:96 JPEG/90000\r\n\
+        a=recvonly\r\n\
+        a=control:track1\r\n";
+
+    #[test]
+    fn sdp_verdict_is_unknown_for_codecs_without_parameter_sets() {
+        // MJPEG has nothing to put in an fmtp — flagging it bought a permanent
+        // per-camera ffmpeg remux that could not possibly help (#521).
+        assert_eq!(sdp_video_lacks_fmtp(SDP_MJPEG), None);
+        assert!(
+            !SDP_MJPEG.contains("a=fmtp:"),
+            "fixture must stay fmtp-less — that is the whole point",
+        );
+        // H264/H265 with no fmtp is still the #483 breakage, in either spelling.
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n"),
+            Some(true),
+        );
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H265/90000\r\n"),
+            Some(true),
+        );
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 hevc/90000\r\n"),
+            Some(true),
+        );
+        // ...and H264 WITH an fmtp stays healthy.
+        assert_eq!(
+            sdp_video_lacks_fmtp(
+                "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n\
+                 a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==\r\n"
+            ),
+            Some(false),
+        );
+        // An unrecognised / absent video codec is "don't know", not "broken":
+        // no repair is registered for a payload we cannot reason about.
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\r\nm=video 0 RTP/AVP 98\r\na=rtpmap:98 VP8/90000\r\n"),
+            None,
+        );
+        assert_eq!(
+            sdp_video_lacks_fmtp("v=0\r\nm=video 0 RTP/AVP 26\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn rtpmap_encoding_name_parses_the_codec() {
+        assert_eq!(rtpmap_encoding_name("a=rtpmap:96 H264/90000"), Some("H264"));
+        assert_eq!(rtpmap_encoding_name("A=RTPMAP:96 JPEG/90000"), Some("JPEG"));
+        // Optional /encoding-params tail (audio-style) and stray whitespace.
+        assert_eq!(
+            rtpmap_encoding_name("a=rtpmap:97 MPEG4-GENERIC/16000/1"),
+            Some("MPEG4-GENERIC"),
+        );
+        assert_eq!(
+            rtpmap_encoding_name("a=rtpmap:96  H265/90000"),
+            Some("H265")
+        );
+        // Not an rtpmap line, or malformed.
+        assert_eq!(rtpmap_encoding_name("a=control:track1"), None);
+        assert_eq!(rtpmap_encoding_name("a=rtpmap:96"), None);
+        assert_eq!(rtpmap_encoding_name(""), None);
     }
 
     #[test]

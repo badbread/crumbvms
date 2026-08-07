@@ -97,6 +97,70 @@ camera that was genuinely dead (the #519 case) was indistinguishable from noise.
 
 ---
 
+## 2026-08-06, Motion health: a structurally-disabled detector is unhealthy but NOT alert-worthy
+
+**Context.** Issue #523, found on the v0.1.1 → v0.2.0 upgrade test. The
+startup-armed unhealthy timer added in #411/#413 (so a detector that is dead
+*from boot* and never recovers still pages, after a VAAPI decoder died silently
+for five days) is armed unconditionally in `run_one_source`. A camera added with
+a main stream only (`source_sub_url` unset, which the self-service add flow
+allows) has its pixel detector deliberately parked by `run_pixel_diff_loop`
+("motion runs on the SUB stream only", correctness item 12) and reports
+unhealthy forever by design. So the timer fired ~`MOTION_UNHEALTHY_ALERT_SECS`
+after **every** recorder start, forever, on a camera that is working exactly as
+configured — recurring unactionable noise on the one channel whose whole purpose
+is to be trusted.
+
+**Decision.** Split "unhealthy" from "alert-worthy". A source that the camera's
+*configuration* makes permanently incapable of becoming healthy is
+**structurally disabled**: it keeps its unhealthy state (fail-open recording and
+the console's degraded-motion badge are both correct and stay exactly as they
+are — correctness items 19/26 are untouched), but no startup alert timer is
+armed for it, so no `motion_detector_unhealthy` event is ever written for that
+configuration. Today the one such condition is a pixel source on a camera with
+no sub-stream; Frigate and HA sources on the same camera are unaffected and
+still alert, because a main-only camera can be perfectly healthy on those.
+
+Second half: the three surfaces that described this state disagreed
+(`fallback_reason` said "camera has no sub-stream; motion analysis disabled",
+`motion_health_reason` said "pixel motion detection not delivering frames", the
+alert said "pixel motion detector never became healthy after startup"). The
+specific cause is now a single shared constant (`NO_SUB_STREAM_REASON`) used by
+the decode-status telemetry, the recorder log, and the persisted motion-health
+reason. More generally, `UnhealthyAlertGate` now remembers the reason string of
+the last UNHEALTHY transition and the aggregator prefers it over its generic
+"not delivering frames" wording — so the keyframes-only/long-GOP fail-open, which
+always logged an actionable cause, now surfaces that same cause to the operator.
+
+**Rejected:**
+- *Making the no-sub-stream branch report HEALTHY.* Directly violates
+  correctness item 26 (a detector is healthy only when it can produce a
+  keep/discard verdict) and would let a Motion-mode policy gate footage on a
+  detector that does not exist. Never.
+- *Suppressing the alert only for continuous-mode policies.* The alert is noise
+  in motion mode too: fail-open is already handling it correctly and there is
+  nothing the operator can do except add a sub-stream, which the console already
+  shows. Policy mode is also hot-editable, so gating an alert on it would make
+  the alert appear/disappear on an unrelated setting change.
+- *A distinct quieter event key (e.g. `motion_analysis_disabled`).* A new
+  event key means a new alert rule, new notification wiring, and a new row every
+  boot for a state that is already visible in the console badge and in
+  `/config/decode-status`. Nothing to page about; a level, not an edge.
+- *Threading a per-source reason through the health watch channel* (changing
+  `MotionHealthTx` from `watch<bool>` to a struct). That touches the fail-open
+  rail that `recording.rs` reads every segment, for a telemetry string. Parking
+  the reason on the alert gate (already passed to every `report_health` call)
+  keeps the safety rail byte-identical.
+
+**Revisit if:** a second structurally-disabled condition appears that operators
+*do* want paged (then `structural_disable_reason` grows a variant and the
+suppression becomes per-condition rather than blanket), or if operators report
+they wanted to be told a camera has no sub-stream at all — in which case the
+right surface is the camera-health/console list, not the recorder's unhealthy
+alert.
+
+---
+
 ## 2026-08-06, Media-token scope on `/cameras/:id/streams`: gate the endpoint on a full session now, defer per-request RTSP credentials
 
 **Context.** A scoped media token (`?token=`, `typ: "media"`, ~15 min, one
