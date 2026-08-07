@@ -43,7 +43,7 @@ enum HA {
     /// On/off/indeterminate edge, mirroring backend `edge_on`. Returns nil for
     /// anything not explicitly on or off (incl. unavailable/unknown/"").
     static func edgeOn(_ state: String) -> Bool? {
-        switch state.lowercased() {
+        switch state.trimmingCharacters(in: .whitespaces).lowercased() {
         case "on", "open", "detected", "true", "home", "motion", "occupied": return true
         case "off", "closed", "clear", "false", "not_home", "no_motion": return false
         default: return nil
@@ -115,16 +115,22 @@ enum HA {
         }
 
         // Indeterminate (unknown/unavailable/stale) → grey, honest state text.
-        // A numeric sensor ("72", "48") lands here too (its state is not an
-        // on/off edge), so this is where its unit_of_measurement is appended.
-        if stale || state == nil || (on == nil && domain != "light" && domain != "switch") {
+        // ANY domain whose live state is not an on/off edge lands here — an
+        // `unavailable`/`unknown`/empty light or switch is NEVER a confident
+        // "Off" (state-honesty invariant; matches Android `defaultVisual` and
+        // desktop `haVisualFor`, where `edgeOn(state) == null` greys the badge
+        // for every domain). A numeric sensor ("72", "48") lands here too (its
+        // state is not an on/off edge), so this is where its
+        // unit_of_measurement is appended.
+        if stale || state == nil || on == nil {
             let sym = baseSymbol(domain: domain, deviceClass: link.deviceClass, on: false)
             let text = raw.isEmpty ? "Unknown" : stateTextWithUnit(raw, unit: state?.unit)
             return HAVisual(symbol: overrideSymbol(link) ?? sym, color: grey, stateText: text, indeterminate: true, isOn: false)
         }
 
-        // Known reading.
-        let isOn = (on ?? (raw.lowercased() == "on"))
+        // Known reading — `on` is guaranteed non-nil here (nil already routed to
+        // the indeterminate branch above).
+        let isOn = on ?? false
         let base: HAVisual
         switch domain {
         case "light":
