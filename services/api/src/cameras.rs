@@ -36,7 +36,10 @@ use anyhow::Context as _;
 use crumb_common::db;
 
 use crate::{
-    auth_mw::AuthUser, dto::ViewerCameraDto, error::ApiError, go2rtc::resolve_bases,
+    auth_mw::{AuthUser, MediaOrFullUser},
+    dto::ViewerCameraDto,
+    error::ApiError,
+    go2rtc::resolve_bases,
     state::AppState,
 };
 
@@ -137,7 +140,10 @@ async fn list_visible_cameras(
 ///   body could not be read.  Detail is logged at `warn!`, not `error!`, so a
 ///   momentarily unavailable stream doesn't trip 5xx alerting.
 async fn get_camera_frame(
-    user: AuthUser,
+    // Media-read: browsers fetch this still with a scoped `?token=` (see
+    // MediaUrls in the clients / admin.html snapshot cache), so it opts into the
+    // media-capable extractor. Camera scope is still enforced below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(camera_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {

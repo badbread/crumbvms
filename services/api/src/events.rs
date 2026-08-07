@@ -36,7 +36,11 @@ use uuid::Uuid;
 
 use crumb_common::db;
 
-use crate::{auth_mw::AuthUser, error::ApiError, state::AppState};
+use crate::{
+    auth_mw::{AuthUser, MediaOrFullUser},
+    error::ApiError,
+    state::AppState,
+};
 
 /// Mount the authenticated JSON routes for detection events.
 ///
@@ -240,7 +244,10 @@ async fn get_events(
 /// - `404` — event does not exist or has no snapshot.
 /// - `502` — provider responded with an error.
 async fn get_event_snapshot(
-    user: AuthUser,
+    // Media-read: detection snapshots are fetched with a scoped `?token=`
+    // (Android eventSnapshotUrl, Plates tab). Accepts a scoped media token or a
+    // full session; camera scope is enforced fail-closed below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(event_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {

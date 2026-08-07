@@ -30,7 +30,11 @@ use uuid::Uuid;
 
 use crumb_common::{db, types::Segment};
 
-use crate::{auth_mw::AuthUser, error::ApiError, state::AppState};
+use crate::{
+    auth_mw::{AuthUser, MediaOrFullUser},
+    error::ApiError,
+    state::AppState,
+};
 
 /// Mount `GET /clips` (authenticated JSON route).
 pub fn json_routes() -> Router<AppState> {
@@ -623,7 +627,9 @@ pub struct MediaQuery {
 /// separately per quality, keyed by the window parameters so a settings change
 /// never serves a stale rendition.
 async fn get_clip_media(
-    user: AuthUser,
+    // Media-read: clip mp4 played via scoped `?token=` (clipVideoUrl / clips_api).
+    // Accepts a scoped media token or a full session; capability + scope below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(mq): Query<MediaQuery>,
@@ -819,7 +825,9 @@ fn not_modified_if_match(headers: &HeaderMap, etag: &str) -> Option<Response> {
 
 /// `GET /clip/{id}/thumbnail.jpg` — a single frame near the clip start.
 async fn get_clip_thumbnail(
-    user: AuthUser,
+    // Media-read: clip thumbnail fetched via scoped `?token=` (clipThumbUrl).
+    // Accepts a scoped media token or a full session; capability + scope below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,

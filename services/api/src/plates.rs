@@ -28,7 +28,7 @@ use crumb_common::{
 };
 
 use crate::{
-    auth_mw::{AdminUser, AuthUser},
+    auth_mw::{AdminUser, AuthUser, MediaOrFullUser},
     error::ApiError,
     state::AppState,
 };
@@ -290,7 +290,10 @@ async fn post_lpr_read(
 /// * `401` / `403` — auth failure / missing `view_plates`.
 /// * `404` — no such read (or out of scope), or the read has no crop.
 async fn get_plate_crop(
-    user: AuthUser,
+    // Media-read: the cropped plate JPEG is fetched with a scoped `?token=`
+    // (A/B benchmark + Plates report). Accepts a scoped media token or a full
+    // session; view_plates capability + camera scope are enforced below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response, ApiError> {

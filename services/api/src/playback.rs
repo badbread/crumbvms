@@ -57,7 +57,7 @@ use uuid::Uuid;
 use crumb_common::db;
 
 use crate::{
-    auth_mw::{AuthUser, FullSessionUser},
+    auth_mw::{AuthUser, FullSessionUser, MediaOrFullUser},
     dto::{
         AlignedPlaybackQuery, LiveStreamQuery, LiveStreamsResponse, PlaybackQuery, ResolvedSegment,
     },
@@ -136,7 +136,9 @@ fn live_proxy_client() -> &'static reqwest::Client {
 /// * `502` — the upstream go2rtc was unreachable or returned a non-2xx (other
 ///   than 404). Logged at `warn!` so a flapping go2rtc doesn't trip 5xx alerts.
 async fn live_stream_mp4(
-    user: AuthUser,
+    // Media-read: iOS plays live fMP4 via `?token=` (MediaUrls.swift). Accepts a
+    // scoped media token or a full session; camera scope enforced below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     AxumPath(camera_id): AxumPath<Uuid>,
     Query(q): Query<LiveStreamQuery>,
@@ -259,7 +261,9 @@ async fn live_stream_mp4(
 ///   sub stream.
 /// * `502` — the upstream go2rtc was unreachable or returned an error status.
 async fn live_webrtc(
-    user: AuthUser,
+    // Media-read: iOS posts the WebRTC offer via `?token=` (MediaUrls.swift).
+    // Accepts a scoped media token or a full session; camera scope enforced below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     AxumPath(camera_id): AxumPath<Uuid>,
     Query(q): Query<LiveStreamQuery>,
@@ -503,7 +507,10 @@ async fn play_aligned(
 /// * `404` — segment row not found in DB, or the file is missing on disk.
 /// * `500` — storage root cannot be canonicalised (misconfigured mount).
 async fn serve_segment(
-    user: AuthUser,
+    // Media-read: the recorded-segment bytes ExoPlayer/libmpv fetch via `?token=`
+    // (the `/segments/{id}` URL a ResolvedSegment points at). Accepts a scoped
+    // media token or a full session; playback capability + camera scope below.
+    MediaOrFullUser(user): MediaOrFullUser,
     State(state): State<AppState>,
     AxumPath(segment_id): AxumPath<Uuid>,
     req: Request,

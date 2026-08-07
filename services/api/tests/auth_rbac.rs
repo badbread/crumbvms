@@ -2243,3 +2243,302 @@ async fn old_shape_media_token_carries_no_capabilities() {
          must never grant more than it proves"
     );
 }
+
+// ─── media-token reachability enforced as a CLASS (audit 2026-08, #516 follow-up)
+//
+// A scoped media token (`?token=`, `typ:"media"`) is worth exactly "one camera's
+// bytes for ~15 minutes". PR #516 gated a single endpoint (`/cameras/:id/streams`)
+// against it; the audit found the same invariant was violated on a whole class of
+// routes that took the bare `AuthUser` extractor — anything whose response body or
+// side effect grants something broader or more durable than that. The fix inverts
+// the default: `AuthUser` now REFUSES media tokens, and only the audited
+// single-camera media-read surface opts back in via `MediaOrFullUser`. These tests
+// pin both halves: the credential/session/notification/mutation class rejects a
+// media token (403), while a full session still works AND the media-read surface
+// still accepts a media token (non-vacuous).
+
+/// POST with the credential carried in the `?token=` query (the only way a media
+/// token can be presented — it has no place in an `Authorization` header).
+fn post_query_token(uri: &str, body: &serde_json::Value) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// DELETE with the credential carried in the `?token=` query.
+fn delete_query_token(uri: &str) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+/// THE BLOCKER. `POST /auth/refresh` re-fetches the user row by `claims.sub` and
+/// mints a normal full-privilege login JWT (the user's real role, camera_ids and
+/// full expiry). Before the fix it took the bare `AuthUser` extractor, which
+/// accepted a media-token principal — so a single leaked `?token=` media claim
+/// could be traded for a full (admin) login session. It must now 403.
+#[tokio::test]
+async fn media_token_cannot_refresh_into_a_full_session() {
+    let fx = build_rbac_fixture().await;
+    // Minted by the ADMIN so a failure below can only be the media-token gate,
+    // never camera scoping.
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    // Pre-fix: this returned 200 with a brand-new full admin JWT in the body.
+    // Post-fix: the media-token principal is refused before the handler runs.
+    let denied = fx
+        .app
+        .send(post_query_token(
+            &format!("/auth/refresh?token={media}"),
+            &serde_json::json!({}),
+        ))
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT be redeemable for a full login session via /auth/refresh"
+    );
+
+    // Control (non-vacuous): a real full session still refreshes.
+    let ok = fx
+        .app
+        .send(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/refresh")
+                .header("authorization", format!("Bearer {}", fx.admin_token))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a full bearer session must still be able to refresh"
+    );
+}
+
+/// `GET /media-token` mints a fresh 900s media token. A media token must not be
+/// able to mint ANOTHER (media principals are unrevocable — `jti:None` — so
+/// self-minting is an unbounded renewal of an otherwise self-expiring credential).
+#[tokio::test]
+async fn media_token_cannot_mint_another_media_token() {
+    let fx = build_rbac_fixture().await;
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    let denied = fx
+        .app
+        .send(get(&format!(
+            "/media-token?camera={}&token={media}",
+            fx.cam_a
+        )))
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT mint another media token"
+    );
+    // Control: a full session still mints one (this is `mint_media_token` above,
+    // which already asserted 200 for the admin bearer path).
+}
+
+/// `POST /notifications/channels` creates a PERSISTENT webhook that exfiltrates
+/// snapshots and survives the token's expiry; it carries the minting user's
+/// user_id, and an omitted `camera_ids` fans out to all cameras the owner can
+/// access. A media token must not reach it.
+#[tokio::test]
+async fn media_token_cannot_create_notification_channel() {
+    let fx = build_rbac_fixture().await;
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    let denied = fx
+        .app
+        .send(post_query_token(
+            &format!("/notifications/channels?token={media}"),
+            &serde_json::json!({ "kind": "webhook", "name": "exfil", "config": {} }),
+        ))
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT create a persistent notification channel"
+    );
+
+    // Control (non-vacuous): a full admin session creates the channel.
+    let ok = fx
+        .app
+        .send(post_auth_json(
+            "/notifications/channels",
+            &fx.admin_token,
+            &serde_json::json!({ "kind": "webhook", "name": "legit", "config": {} }),
+        ))
+        .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::CREATED,
+        "a full session must still create a notification channel"
+    );
+}
+
+/// `POST /notifications/devices` registers a push device against the minting
+/// user's account. Reachable via the same media-token path as `create_channel`;
+/// must be refused.
+#[tokio::test]
+async fn media_token_cannot_register_a_push_device() {
+    let fx = build_rbac_fixture().await;
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    let denied = fx
+        .app
+        .send(post_query_token(
+            &format!("/notifications/devices?token={media}"),
+            &serde_json::json!({ "install_id": "attacker-install", "platform": "android" }),
+        ))
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT register a push device"
+    );
+
+    // Control: a full session registers fine.
+    let ok = fx
+        .app
+        .send(post_auth_json(
+            "/notifications/devices",
+            &fx.admin_token,
+            &serde_json::json!({ "install_id": "legit-install", "platform": "android" }),
+        ))
+        .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a full session must still register a push device"
+    );
+}
+
+/// The session-management surface: a media token must not read the minting
+/// user's session inventory (`GET /auth/sessions`) nor sign them out everywhere
+/// (`DELETE /auth/sessions/all`, `DELETE /auth/sessions/:jti`) — the latter is a
+/// denial-of-service during an incident.
+#[tokio::test]
+async fn media_token_cannot_touch_the_session_surface() {
+    let fx = build_rbac_fixture().await;
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    let list = fx
+        .app
+        .send(get(&format!("/auth/sessions?token={media}")))
+        .await;
+    assert_eq!(
+        list.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT list the minting user's sessions"
+    );
+
+    let revoke_all = fx
+        .app
+        .send(delete_query_token(&format!(
+            "/auth/sessions/all?token={media}"
+        )))
+        .await;
+    assert_eq!(
+        revoke_all.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT sign out all of the minting user's sessions"
+    );
+
+    // A random jti is fine: the extractor refuses the media principal before the
+    // handler ever looks the session up.
+    let revoke_one = fx
+        .app
+        .send(delete_query_token(&format!(
+            "/auth/sessions/{}?token={media}",
+            Uuid::new_v4()
+        )))
+        .await;
+    assert_eq!(
+        revoke_one.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT revoke an individual session"
+    );
+
+    // Control (non-vacuous): a full session reads its own inventory.
+    let ok = fx
+        .app
+        .send(get_auth("/auth/sessions", &fx.admin_token))
+        .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a full session must still list its own sessions"
+    );
+}
+
+/// A representative state-mutation route (`POST /views`) — the whole
+/// config/bookmarks/views/HA-mutation class now rejects a media token by
+/// default (it takes the bare `AuthUser` extractor, which refuses media tokens).
+#[tokio::test]
+async fn media_token_cannot_mutate_the_config_class() {
+    let fx = build_rbac_fixture().await;
+    let media = mint_media_token(&fx.app, &fx.admin_token, fx.cam_a).await;
+
+    let denied = fx
+        .app
+        .send(post_query_token(
+            &format!("/views?token={media}"),
+            &serde_json::json!({ "name": "attacker view", "layout": "2x2" }),
+        ))
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a media token must NOT create a saved view (config/state-mutation class)"
+    );
+
+    // Control: a full session creates the view.
+    let ok = fx
+        .app
+        .send(post_auth_json(
+            "/views",
+            &fx.admin_token,
+            &serde_json::json!({ "name": "legit view", "layout": "2x2" }),
+        ))
+        .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::CREATED,
+        "a full session must still create a saved view"
+    );
+}
+
+/// Non-vacuous, the other direction: inverting the `AuthUser` default must NOT
+/// break the media-read surface. A media token must still fetch the recorded
+/// bytes it is legitimately for (`/segments/:id`) via the `MediaOrFullUser`
+/// opt-in. (Only the byte-transparent `/segments/:id` is asserted 200 — it needs
+/// no transcode; the `low.mp4` sibling shares the same extractor and its auth
+/// fence is covered by `low_mp4_variant_enforces_camera_scope_like_segments`.)
+#[tokio::test]
+async fn media_token_still_reaches_the_media_read_surface() {
+    let fx = build_rbac_fixture().await;
+    let pool = fx.app.pool().clone();
+    let storage_id = seed_storage(&pool, fx.storage_root.path().to_str().unwrap()).await;
+    let seg = seed_segment_with_file(&pool, fx.cam_a, storage_id, fx.storage_root.path()).await;
+
+    let media = mint_media_token(&fx.app, &fx.viewer_token, fx.cam_a).await;
+
+    let full = fx
+        .app
+        .send(get(&format!("/segments/{seg}?token={media}")))
+        .await;
+    assert_eq!(
+        full.status(),
+        StatusCode::OK,
+        "a media token must STILL serve its own camera's segment bytes"
+    );
+}

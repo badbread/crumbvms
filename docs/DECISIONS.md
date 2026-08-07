@@ -715,6 +715,81 @@ proof, which would mean the one-off extractor gate is the wrong shape and a
 response-side rule is needed; or the permissive CORS layer is dropped from the
 remaining routes, at which point `cors.rs` and its control test collapse.
 
+> **Superseded in part 2026-08-07** — the fourth revisit trigger fired: the
+> media-token reachability rule is now enforced as a CLASS by inverting the
+> `AuthUser` default. See the entry immediately below.
+
+---
+
+## 2026-08-07, Media-token reachability is enforced as a CLASS: `AuthUser` rejects media tokens by default, media-read endpoints opt in via `MediaOrFullUser`
+
+**Context.** The 2026-08-06 entry above gated exactly one endpoint
+(`/cameras/:id/streams`) against scoped media tokens with a bespoke
+`FullSessionUser` extractor, and flagged as a revisit trigger "another endpoint
+turns up returning a credential broader than its caller's proof … a response-side
+rule is needed." A follow-up audit fired that trigger: the same invariant was
+violated across a whole class of routes still on the bare `AuthUser` extractor,
+which accepted a media-token principal. Confirmed reachable with a media token
+minted by an already-authenticated session:
+
+- `POST /auth/refresh` re-fetched the user by `claims.sub` and minted a full,
+  normal-privilege login JWT — a media token traded up to a full (admin) session.
+- `POST /notifications/channels` / `POST /notifications/devices` created a
+  persistent webhook / registered a device against the minting user, surviving
+  the token's expiry.
+- `GET /media-token` let a media token mint another (unbounded renewal; media
+  principals are unrevocable, `jti: None`).
+- `GET/DELETE /auth/sessions*` let a media token read and revoke the minting
+  user's sessions.
+
+The root cause was structural: the safe posture was applied **per endpoint**, so
+any new `AuthUser` route silently reopened the hole.
+
+**Decision.** Invert the default so the safe case is the one you get for free:
+
+- `auth_mw::AuthUser` — the DEFAULT extractor — now **rejects** a media-scoped
+  principal with 403. A new endpoint on `AuthUser` is therefore unreachable by a
+  media token without anyone remembering a rule.
+- A new `auth_mw::MediaOrFullUser` extractor accepts a media token **or** a full
+  session, and is applied to the audited single-camera media-read surface only:
+  `serve_segment`, `get_segment_low`, `serve_frame` (filmstrip), `get_camera_frame`,
+  `get_clip_media`, `get_clip_thumbnail`, `get_event_snapshot`, `get_plate_crop`,
+  `live_stream_mp4`, `live_webrtc`. Each was verified against all four clients'
+  media-URL builders (Android `MediaUrls.kt`, iOS `MediaUrls.swift`, desktop
+  `*_api.dart`, `admin.html`) as an endpoint a browser/media loader actually
+  fetches with `?token=`.
+- `FullSessionUser` is kept (still on `/cameras/:id/streams`) as a loud,
+  self-documenting marker; it is now behaviorally identical to `AuthUser`.
+
+Everything else that was on `AuthUser` — the entire `/auth/*`, `/media-token`,
+`/notifications/*`, `/config/*`, `/views`, `/bookmarks`, `/ha/*`, `/ptz`,
+`/timeline`, `/clips` (list), `/plates` (list), `/stats`, `/status` surface — is
+now full-session-only for free. Admin routes (`AdminUser`) were already safe (a
+media principal is `Viewer`).
+
+**Why not the response-side rule (a credential-scanner on responses).** That is
+the theoretically-complete fix the prior entry gestured at, but it needs a way to
+classify "this body contains a credential/long-lived URL" that does not exist,
+and it would not catch side-effecting mutations (device registration) at all.
+Reachability-by-extractor is the property that actually generalizes: a media
+token reaches only endpoints that opted in, and the opt-in list is short,
+enumerable, and reviewed.
+
+**Trade-offs accepted.** Missing a genuine media-read endpoint fails SAFE — it
+returns 403 to media tokens (a visible functional regression: a blank thumbnail),
+never a silent privilege hole. The client-fetch survey is the mitigation; the
+media-read opt-in set is asserted working in `auth_rbac.rs`
+(`media_token_still_reaches_the_media_read_surface`). Adding a future
+`MediaOrFullUser` endpoint is a security-review event, called out in
+`COMPONENT-MAP.md` row G.
+
+**Revisit triggers.** A new client feature fetches an existing full-session
+endpoint with `?token=` (means either that endpoint is genuinely media-read and
+should move to `MediaOrFullUser`, or the client should use a Bearer request);
+`#507` lands per-request RTSP credentials (then `/cameras/:id/streams` no longer
+needs the gate at all); or a media-read endpoint is found that returns more than
+one camera's bytes (it must leave `MediaOrFullUser`).
+
 ---
 
 ## 2026-08-06, Unmounted-storage guard: a marker FILE plus a circuit breaker, not a mountpoint heuristic
