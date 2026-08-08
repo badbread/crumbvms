@@ -8,6 +8,90 @@ revisit.
 
 ---
 
+## 2026-08-08, Boot storage seeding is PATH-idempotent (skip a name whose directory is already covered) + runtime name lookups fall back to path — supersedes #557's "detect, never fix"
+
+**Context.** `db::upsert_storage` is idempotent by NAME only
+(`INSERT … ON CONFLICT (name) DO UPDATE SET path`). The recorder seeds the two
+configured storages (`LIVE_STORAGE_NAME` / `ARCHIVE_STORAGE_NAME`, defaulting to
+the compose values `Live` / `Archive`) on every boot, and the `seed` binary does
+the same at container start. When an operator renames a storage in the console
+(`PUT /config/storages/{id}` — e.g. `Live` → `2TB NVMe`), no row carries the
+configured name any more, so the next boot's upsert-by-name INSERTs a SECOND,
+empty row for the same directory. On prod this produced two ghost rows
+(`Live` → `/data/live`, `Archive` → `/data/archive`) sitting next to the real
+`2TB NVMe` / `16TB Spinner` rows.
+
+PR #557 (`b70a311`, 2026-08-07) added `db::duplicate_path_under_other_name`
+as a *detector*: it WARNed at seed time and deliberately did nothing else, on the
+reasoning that a boot-time adopt-by-rename would undo a deliberate operator
+rename, and duplicate rows were "tolerated" because reconcile keys duplicates by
+root path. That entry's revisit trigger — "the duplicates actually materialize
+and confuse the operator" — has now fired. The ghost rows are also not fully
+inert: the recorder resolves several runtime defaults by config NAME
+(`archive.rs` free-space-floor fallback when a policy's `live_storage_id` is
+NULL; `reconcile.rs` live/archive stage labelling), so once the real rows are
+renamed those lookups miss and the code silently degrades (byte-cap floor,
+fewer disks labelled).
+
+**Decision.**
+
+- **Seed by path-idempotence, not by name alone.** Boot seeding
+  (`main.rs::seed_storages`) and `bin/seed.rs` now share ONE decision function,
+  `db::seed_storage_path_idempotent(pool, known, name, path)`:
+  1. a row named `name` exists → `upsert_storage` (retarget its path — the
+     supported "repoint a named storage via env" behavior, unchanged);
+  2. else a row already covers `path` under a DIFFERENT name → SKIP the insert
+     (log `info!`, never create a second row) and return the covering row;
+  3. else → insert (fresh install, unchanged).
+  The resolved row is folded into the in-pass `known` set, so a shared
+  `live == archive` directory now resolves to ONE row instead of two. The
+  operator's row is NEVER renamed or deleted (that could undo a deliberate
+  rename, or orphan real footage).
+- **Runtime name lookups fall back to path.** New `db::get_storage_by_path`
+  (deterministic: OLDEST `created_at` wins when a path is shared) and
+  `db::get_storage_by_name_or_path` (name first, then path). The two runtime
+  sites — `archive.rs` free-floor fallback and `reconcile.rs` live/archive
+  labelling — call the name-or-path variant, so a renamed install keeps full
+  behavior, and once the empty ghost rows are cleaned up the configured paths
+  still resolve to the real renamed rows.
+- `duplicate_path_under_other_name` is kept and promoted from detector to gate;
+  path comparison normalizes trailing slashes (`normalize_storage_path`).
+- **No migration, no `UNIQUE(path)`** — see rejected.
+
+**Rejected / not done.**
+
+- *Boot-time adopt-by-rename.* Still rejected, for #557's original reason:
+  `PUT /config/storages/{id}` is a deliberate operator action, and silently
+  renaming their row back on the next boot would fight them. Skipping the
+  duplicate insert achieves the goal (one row per directory) without mutating
+  their row.
+- *A `UNIQUE(path)` constraint.* Rejected: existing prod DBs already carry
+  duplicate paths (the very rows this fixes), so the migration would fail to
+  apply; and a shared `live == archive` layout expressed as two rows is legal
+  (`seed.rs` §6.5). The gate prevents NEW duplicates without breaking old DBs.
+- *Deleting the existing ghost rows in code.* Out of scope and unsafe to do at
+  boot. A referenced row can't be deleted anyway (`segments.storage_id` FK is
+  `ON DELETE RESTRICT`); the one-time cleanup of the two already-present empty
+  rows is a maintainer DB action, sequenced AFTER this deploys.
+
+**Tests.** `seed_is_path_idempotent_against_renamed_rows` (the exact #557
+scenario, run twice → still 2 rows, operator names untouched, no growth);
+`seed_fresh_db_creates_both_defaults`; `seed_retargets_existing_name_in_place`;
+`seed_shared_layout_yields_one_row`; `get_storage_by_path_prefers_oldest`
+(determinism + trailing-slash); `get_storage_by_name_or_path_falls_back_to_path`
+(the free-floor/labelling fallback); plus pure-function tests for
+`normalize_storage_path` and the trailing-slash-aware detector.
+
+**Revisit triggers.**
+
+- If a future need arises to actively MERGE duplicate storage rows (reassign
+  segments off a ghost row so it can be deleted), that belongs in an explicit,
+  guarded admin/maintenance operation — not the boot seed — and would get its
+  own entry.
+- If storages ever gain a real path-uniqueness requirement (e.g. per-path
+  accounting that duplicates would corrupt), reconsider `UNIQUE(path)` behind a
+  data-cleanup migration.
+
 ## 2026-08-07, Timeline motion-intensity is bucketed in SQL (GROUP BY over a `generate_series`-expanded range), not by fetching every segment to Rust
 
 **Context.** The desktop Playback/clip timeline "intensity ribbon" took roughly

@@ -1071,65 +1071,50 @@ impl RecorderSupervisor {
     /// requiring a separate `seed` run for storage rows.  Camera rows still
     /// require the `seed` binary.
     async fn seed_storages(&self) -> Result<()> {
+        // Seed the two named storage rows PATH-IDEMPOTENTLY: never INSERT a
+        // second row for a directory that already has a storage row under
+        // another name.
+        //
         // The `*_STORAGE_NAME` code defaults track docker-compose.yml (`Live` /
-        // `Archive`). A deployment that predates that and does NOT get the names
-        // from compose still has rows under the old defaults, so the upsert
-        // below would INSERT a second row for the same directory. That is
-        // tolerated (reconcile keys duplicates by root path) and loses no
-        // footage — existing segments keep their `storage_id` and the default
-        // policy keeps its `live_storage_id` — but it must not happen silently.
-        match db::list_storages(&self.pool).await {
-            Ok(existing) => {
-                let rows: Vec<(String, String)> =
-                    existing.into_iter().map(|s| (s.name, s.path)).collect();
-                for (name, path) in [
-                    (
-                        &self.config.live_storage_name,
-                        &self.config.live_storage_path,
-                    ),
-                    (
-                        &self.config.archive_storage_name,
-                        &self.config.archive_storage_path,
-                    ),
-                ] {
-                    if let Some(other) =
-                        db::duplicate_path_under_other_name(rows.iter().cloned(), name, path)
-                    {
-                        warn!(
-                            path = %path,
-                            existing_name = %other,
-                            configured_name = %name,
-                            "DUPLICATE STORAGE PATH: an existing storage row already points at \
-                             this path under a different name, so seeding the configured name \
-                             adds a SECOND row for the same directory. No footage is affected \
-                             (existing segments keep their storage). To merge them, either set \
-                             LIVE_STORAGE_NAME / ARCHIVE_STORAGE_NAME to the existing name, or \
-                             rename the existing storage in the console."
-                        );
-                    }
-                }
-            }
+        // `Archive`). An operator who renamed a storage via
+        // `PUT /config/storages/{id}` (e.g. "2TB NVMe") no longer has a row
+        // under the configured name, so a plain upsert-by-name would INSERT a
+        // second, empty row for the same directory on every boot (the duplicate
+        // reported in the console). We never rename or delete the operator's row
+        // (a boot-time rename would silently undo a deliberate console rename);
+        // we simply SKIP seeding a name whose path is already covered. The
+        // runtime name lookups fall back to path (`get_storage_by_name_or_path`)
+        // so a renamed install keeps full behavior. A genuinely-fresh install
+        // (no rows yet) still creates the defaults.
+        //
+        // No footage can be affected either way: existing segments keep their
+        // `storage_id`, the default policy keeps its `live_storage_id`, and
+        // `ensure_default_policy` wires the default policy by PATH (below).
+        let mut known: Vec<(String, String)> = match db::list_storages(&self.pool).await {
+            Ok(existing) => existing.into_iter().map(|s| (s.name, s.path)).collect(),
             Err(e) => {
-                // Advisory only — never block the seed (and therefore recording).
-                warn!(error = %e, "could not list storages to check for duplicate paths before seeding");
+                // Advisory only — never block the seed (and therefore
+                // recording). An empty view degrades to the fresh-install path
+                // (plain upsert-by-name), which upsert would merge anyway.
+                warn!(error = %e, "could not list storages before seeding; proceeding with upsert-by-name");
+                Vec::new()
             }
+        };
+
+        for (name, path) in [
+            (
+                &self.config.live_storage_name,
+                &self.config.live_storage_path,
+            ),
+            (
+                &self.config.archive_storage_name,
+                &self.config.archive_storage_path,
+            ),
+        ] {
+            db::seed_storage_path_idempotent(&self.pool, &mut known, name, path)
+                .await
+                .with_context(|| format!("seeding storage '{name}'"))?;
         }
-
-        db::upsert_storage(
-            &self.pool,
-            &self.config.live_storage_name,
-            &self.config.live_storage_path,
-        )
-        .await
-        .context("upserting live storage")?;
-
-        db::upsert_storage(
-            &self.pool,
-            &self.config.archive_storage_name,
-            &self.config.archive_storage_path,
-        )
-        .await
-        .context("upserting archive storage")?;
 
         info!(
             live    = %self.config.live_storage_name,
