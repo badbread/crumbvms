@@ -8,6 +8,66 @@ revisit.
 
 ---
 
+## 2026-08-07, Timeline motion-intensity is bucketed in SQL (GROUP BY over a `generate_series`-expanded range), not by fetching every segment to Rust
+
+**Context.** The desktop Playback/clip timeline "intensity ribbon" took roughly
+a minute to populate for a wide (30-day) window. `db::motion_intensity_buckets`
+and `motion_intensity_buckets_multi` fetched every `segments` row overlapping the
+window and bucketed them in a Rust loop; prod logged a single-camera 30-day
+request scanning ~302k rows. The value behind each bucket is the MAX
+`motion_score` (0..1 real) of any segment whose in-window overlap touches that
+bucket; because a segment can span several buckets, each row contributes to a
+half-open bucket *range* `[b0, b1)`, not a single bucket. The `timeline.rs`
+doc comment already named "future SQL-side bucketing" as the intended fix.
+
+**Decision.**
+
+- Bucket in Postgres. A CTE computes each segment's integer-millisecond in-window
+  offsets `[s_off, e_off)`, derives the bucket range `[b0, b1)`, expands it with
+  `LATERAL generate_series(b0, b1 - 1)`, and takes `MAX(motion_score)` per
+  `bucket` (single-camera) or per `(camera_id, bucket)` (batch). The DB returns
+  at most `n` (default 240, clamped 1..4096) rows instead of hundreds of
+  thousands; Rust fills the sparse result into a zero-initialised vec, so empty
+  buckets stay 0.0. The response shape (`IntensityResponse { buckets }` and the
+  batch map) is unchanged — no client change.
+- `span_ms` and `n` are passed as **bound parameters** (not recomputed in SQL) so
+  the divide/multiply/floor/ceil math is bit-identical to the former Rust loop.
+  Millisecond offsets are computed as `floor(round(extract(epoch …) * 1e6)/1000)`
+  — micros-then-round avoids the float dust that a naive `epoch*1000` floor hits
+  exactly on bucket boundaries.
+- No new index or migration: `segments (camera_id, start_ts)` (migration 0001,
+  `segments_camera_start`) already serves the sargable `WHERE`, and the existing
+  `start - MAX_SEGMENT_LEN` lower bound keeps the scan O(window).
+
+**Rejected / not done.**
+
+- *Keeping the Rust loop but capping rows / windowing on the client.* Rejected:
+  it moves the cost around rather than removing it, and the doc comment already
+  committed to SQL-side bucketing. The client already sends the right request.
+- *A precomputed per-bucket rollup table.* Rejected as premature: the indexed
+  index-range scan + aggregate is fast enough and adds no write-path surface (no
+  recorder-correctness risk). Revisit if intensity is still slow at much larger
+  scales.
+- *Touching the `/timeline` span-merge path.* Out of scope: merging contiguous
+  segments into spans is a different operation and inherently O(rows); its
+  large-scan WARN was rescoped, not removed.
+
+**Equivalence proof.** `motion_intensity_sql_matches_reference` keeps the old
+algorithm as an in-memory oracle and asserts the SQL output equals it, across
+bucket counts `{1,7,100,240,4096}`, for a fixture that hits: empty buckets, a
+segment starting exactly on a bucket boundary, a segment ending exactly at the
+window end (end-exclusive last bucket), multiple segments sharing one bucket
+(MAX wins), a before-window overlap, a sub-bucket segment, and a segment spanning
+many buckets — plus the multi-camera grouping. Hand-computed edge asserts pin the
+boundaries independently of the oracle.
+
+**Revisit triggers.**
+
+- Intensity latency regressions at far larger scale (many more cameras or far
+  longer retention) → consider a precomputed per-bucket rollup table.
+- If bucket semantics change (e.g. average instead of MAX, or event-count instead
+  of motion_score), update BOTH the SQL aggregate and the oracle in lockstep.
+
 ## 2026-08-07, Per-channel snapshot MODE with a capability gate; the plate crop is derived SERVER-SIDE via ffmpeg for notification delivery
 
 **Context.** A notification channel had a single `include_snapshot` bool that

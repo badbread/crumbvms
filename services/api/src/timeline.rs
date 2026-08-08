@@ -65,9 +65,15 @@ const DEFAULT_SPAN_LIMIT: usize = 2_000;
 /// response payload deterministically (audit Risk #4).
 const MAX_SPAN_LIMIT: usize = 10_000;
 
-/// If a single timeline query scans more than this many raw segments, log a WARN
-/// so operators can see when a window is large enough to merit tighter client
-/// windowing or future SQL-side bucketing.
+/// If the `/timeline` SPAN-MERGE query scans more than this many raw segments,
+/// log a WARN — that path still fetches every segment in the window to merge
+/// contiguous runs into spans, so it is O(rows) in the window.
+///
+/// The `/timeline/intensity[/batch]` endpoints no longer need this: SQL-side
+/// bucketing (`db::motion_intensity_buckets[_multi]`) now aggregates the window
+/// down to <= N rows in Postgres, so a wide (e.g. 30-day) intensity request is
+/// handled efficiently server-side instead of shipping hundreds of thousands of
+/// rows to Rust (the ribbon-population slowness this replaced).
 const SCAN_WARN_SEGMENTS: usize = 100_000;
 
 /// Max cameras accepted by `GET /timeline/intensity/batch`. A wall is a handful
@@ -298,7 +304,9 @@ async fn get_timeline(
             scanned = segments.len(),
             cameras = camera_ids.len(),
             window_hours = (q.end - q.start).num_hours(),
-            "large /timeline scan — consider tighter client windows (audit Risk #4)"
+            "large /timeline span-merge scan (audit Risk #4) — this is the \
+             contiguous-span endpoint, which is inherently O(rows); the intensity \
+             ribbon is SQL-bucketed and unaffected"
         );
     }
 
