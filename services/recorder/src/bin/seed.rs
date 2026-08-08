@@ -120,11 +120,29 @@ async fn main() -> Result<()> {
         .context("schema assertion: storages.name must have a UNIQUE constraint")?;
 
     // ── 1. Storage rows ────────────────────────────────────────────────────────
+    //
+    // Seed PATH-IDEMPOTENTLY: never INSERT a second row for a directory that
+    // already has a storage row under a different name (the operator-rename
+    // case — see `db::seed_storage_path_idempotent`, the ONE decision path
+    // shared with the recorder boot seed). `known` is threaded through so the
+    // archive seed sees a just-seeded live row (a shared live==archive directory
+    // then resolves to one row, not two).
 
-    let live_storage =
-        db::upsert_storage(&pool, &config.live_storage_name, &config.live_storage_path)
-            .await
-            .context("upserting live storage")?;
+    let mut known: Vec<(String, String)> = db::list_storages(&pool)
+        .await
+        .context("listing storages before seeding")?
+        .into_iter()
+        .map(|s| (s.name, s.path))
+        .collect();
+
+    let live_storage = db::seed_storage_path_idempotent(
+        &pool,
+        &mut known,
+        &config.live_storage_name,
+        &config.live_storage_path,
+    )
+    .await
+    .context("seeding live storage")?;
     info!(
         id   = %live_storage.id,
         name = %live_storage.name,
@@ -148,9 +166,10 @@ async fn main() -> Result<()> {
             (config.archive_storage_name.clone(), archive_path)
         };
 
-    let archive_storage = db::upsert_storage(&pool, &archive_name, &archive_path_effective)
-        .await
-        .context("upserting archive storage")?;
+    let archive_storage =
+        db::seed_storage_path_idempotent(&pool, &mut known, &archive_name, &archive_path_effective)
+            .await
+            .context("seeding archive storage")?;
     info!(
         id   = %archive_storage.id,
         name = %archive_storage.name,

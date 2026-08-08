@@ -2138,10 +2138,14 @@ pub async fn policy_size_eviction_sweep(
         // byte cap.
         let live_storage_for_floor: Option<Storage> = match policy.live_storage_id {
             Some(sid) => db::get_storage(pool, sid).await.ok().flatten(),
-            None => db::get_storage_by_name(pool, &config.live_storage_name)
-                .await
-                .ok()
-                .flatten(),
+            None => db::get_storage_by_name_or_path(
+                pool,
+                &config.live_storage_name,
+                &config.live_storage_path,
+            )
+            .await
+            .ok()
+            .flatten(),
         };
         // `deficit` is how many bytes we must free to get back above the floor;
         // 0 when above the floor or free space can't be read. The per-policy
