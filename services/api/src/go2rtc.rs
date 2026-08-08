@@ -91,7 +91,8 @@ pub(crate) fn subv_name(go2rtc_name: &str) -> String {
 /// `rtsp_mainv_url` from it — the two must never drift apart.
 ///
 /// Registered ONLY when `main_repair_transcode_enabled` is on AND the reconcile
-/// pass has detected the main lacks video `fmtp` (per-camera). See [`reconcile`].
+/// pass has detected that the SDP go2rtc SERVES for the main lacks video `fmtp`
+/// (per-camera — see [`stream_served_video_lacks_fmtp`]). See [`reconcile`].
 pub(crate) fn mainv_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_mainv")
 }
@@ -474,6 +475,13 @@ struct StreamIndex {
     /// video section, or a codec that carries no out-of-band parameter sets
     /// (MJPEG) — which callers must treat as "don't know", never as "broken".
     video_lacks_fmtp: std::collections::HashMap<String, bool>,
+    /// Per stream name, the SAME verdict as [`video_lacks_fmtp`] but read from the
+    /// SDP go2rtc SERVES to RTSP consumers instead of the producer's SDP. Used
+    /// ONLY for the `_mainv` main repair; `_subv` keeps using the producer side.
+    /// See [`stream_served_video_lacks_fmtp`] for why the main needs the served
+    /// side (an incomplete producer `a=fmtp` that go2rtc cannot re-emit) while the
+    /// sub does not (a sub is often un-consumed, so it has no served SDP at all).
+    video_lacks_fmtp_served: std::collections::HashMap<String, bool>,
 }
 
 /// Does a video codec carry its parameter sets OUT OF BAND, i.e. in `a=fmtp`?
@@ -584,6 +592,45 @@ fn stream_video_lacks_fmtp(entry: &serde_json::Value) -> Option<bool> {
         .find_map(sdp_video_lacks_fmtp)
 }
 
+/// Reach a verdict for one entry of go2rtc's `/api/streams` object, but from the
+/// SDP go2rtc SERVES to its RTSP consumers rather than the one it RECEIVES from
+/// the camera (that is [`stream_video_lacks_fmtp`]).
+///
+/// The two can disagree, and for the `_mainv` main repair only the SERVED side is
+/// correct. A camera can advertise an `a=fmtp` that is INCOMPLETE for its codec —
+/// the reference LPR camera (a Uniview) sends an H.265 main whose fmtp carries
+/// `sprop-sps` + `sprop-pps` but no `sprop-vps` — and go2rtc, unable to assemble a
+/// complete HEVC parameter set, then serves consumers an SDP with NO `a=fmtp` at
+/// all. The producer SDP looks healthy ([`sdp_video_lacks_fmtp`] sees the fmtp
+/// line and returns `Some(false)`), yet every RTSP client — Android's Media3
+/// included — gets the fmtp-less SERVED SDP and throws `missing attribute fmtp`.
+/// Detecting on the served SDP catches this class (any reason go2rtc drops the
+/// fmtp, not just missing VPS). Under the default record-from-main policy the
+/// recorder is a persistent RTSP consumer of the main, so a served SDP is
+/// reliably present; a main with no RTSP consumer (a record-from-sub policy, or an
+/// idle main) yields `None` (unknown), handled by [`resolve_needs_subv`]'s sticky
+/// rule — never a false "broken".
+///
+/// Only RTSP consumers count: that is the transport Crumb's clients use, and a
+/// WebRTC consumer negotiates a wholly different SDP that says nothing about the
+/// RTSP restream. First RTSP consumer that yields a verdict wins — they all see
+/// the same served track. `None` (no RTSP consumer attached yet, no SDP, no video
+/// section) is "don't know", handled by [`resolve_needs_subv`]'s sticky rule
+/// exactly like the producer side. Pure + unit-tested.
+fn stream_served_video_lacks_fmtp(entry: &serde_json::Value) -> Option<bool> {
+    entry
+        .get("consumers")?
+        .as_array()?
+        .iter()
+        .filter(|c| {
+            c.get("format_name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|f| f.eq_ignore_ascii_case("rtsp"))
+        })
+        .filter_map(|c| c.get("sdp")?.as_str())
+        .find_map(sdp_video_lacks_fmtp)
+}
+
 /// GET go2rtc's current stream index (`GET /api/streams`) — the names it has,
 /// plus the per-stream SDP verdict described on [`StreamIndex`].
 ///
@@ -645,6 +692,9 @@ fn index_from_streams(map: &serde_json::Map<String, serde_json::Value>) -> Strea
     for (name, entry) in map {
         if let Some(lacks) = stream_video_lacks_fmtp(entry) {
             idx.video_lacks_fmtp.insert(name.clone(), lacks);
+        }
+        if let Some(lacks) = stream_served_video_lacks_fmtp(entry) {
+            idx.video_lacks_fmtp_served.insert(name.clone(), lacks);
         }
     }
     idx
@@ -748,21 +798,35 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     //
     // Gated on `main_repair_transcode_enabled` (default off): the repair is a
     // full-res re-encode with real recorder CPU cost, so it is opt-in — off means
-    // the map stays empty and nothing changes for anyone. When on, it is still
-    // per-camera and detection-driven, exactly like `_subv`: a main is flagged
-    // only when its producer SDP advertises video with no `a=fmtp` (the condition
-    // that makes Media3 throw `missing attribute fmtp`). The main producer always
-    // has a consumer (the recorder records through go2rtc), so its SDP is reliably
-    // present in the index. `resolve_needs_subv` is reused for the same
-    // sticky-across-unknown semantics.
+    // the map stays empty and nothing changes for anyone. When on, it is
+    // per-camera and detection-driven — but unlike `_subv`, the verdict comes from
+    // the SDP go2rtc SERVES (`video_lacks_fmtp_served`), not the producer SDP.
+    // A main can advertise an INCOMPLETE `a=fmtp` (e.g. H.265 with sps+pps but no
+    // sprop-vps, the reference LPR camera) that looks healthy on the producer side
+    // yet leaves go2rtc serving consumers a fmtp-less SDP — the exact thing that
+    // makes Media3 throw `missing attribute fmtp`. See
+    // [`stream_served_video_lacks_fmtp`]. Under the default record-from-main
+    // policy the recorder is a persistent RTSP consumer of the main, so a served
+    // SDP is reliably present; a momentary gap — or a record-from-sub camera whose
+    // main has no RTSP consumer at all — yields `None`, handled by
+    // `resolve_needs_subv`'s sticky-across-unknown rule.
     let mut needs_mainv: std::collections::HashMap<&str, bool> =
         std::collections::HashMap::with_capacity(streams.len());
     for s in &streams {
+        let served_verdict = index.video_lacks_fmtp_served.get(&s.go2rtc_name).copied();
         let needed = main_repair_enabled
-            && resolve_needs_subv(
-                index.video_lacks_fmtp.get(&s.go2rtc_name).copied(),
-                state.mainv_needed(&s.go2rtc_name),
+            && resolve_needs_subv(served_verdict, state.mainv_needed(&s.go2rtc_name));
+        // Observability for the "enabled but silently does nothing" trap: the
+        // repair is on, yet this main has never yielded a served-SDP verdict (no
+        // RTSP consumer — an idle main, or a record-from-sub policy), so `_mainv`
+        // cannot be evaluated for it. Debug-level: it can be true every pass for a
+        // legitimately-idle main, so it must not spew at info.
+        if main_repair_enabled && served_verdict.is_none() && !needed {
+            tracing::debug!(
+                camera = %s.go2rtc_name,
+                "main-repair enabled but the main has no served-SDP verdict (no RTSP consumer — idle main or record-from-sub); _mainv cannot be evaluated"
             );
+        }
         needs_mainv.insert(s.go2rtc_name.as_str(), needed);
         state.set_mainv_needed(&s.go2rtc_name, needed);
     }
@@ -1925,6 +1989,120 @@ mod tests {
             "producers": [{ "url": "rtsp://cam/1" }, { "sdp": SDP_BROKEN }],
         });
         assert_eq!(stream_video_lacks_fmtp(&mixed), Some(true));
+    }
+
+    /// The reference LPR camera's real PRODUCER SDP (a Uniview), IP genericised.
+    /// Its H.265 video track HAS an `a=fmtp` — but only `sprop-sps`+`sprop-pps`,
+    /// no `sprop-vps`. That reads as HEALTHY on the producer side (a fmtp line is
+    /// present), which is exactly why producer-side detection never flagged it.
+    const SDP_LPR_PRODUCER_INCOMPLETE_FMTP: &str = "v=0\r\n\
+        o=- 1001 1 IN IP4 192.0.2.6\r\n\
+        s=VCP IPC Realtime stream\r\n\
+        m=video 0 RTP/AVP 108\r\n\
+        c=IN IP4 192.0.2.6\r\n\
+        a=control:rtsp://192.0.2.6/media/video1/video\r\n\
+        a=rtpmap:108 H265/90000\r\n\
+        a=fmtp:108 sprop-sps=QgEBAWAAAAMAsAAAAwAAAwB7oAPAgBDlja7ky/NwEBAQQAAA+gAAGGox; sprop-pps=RAHA8rA7JA==\r\n\
+        a=recvonly\r\n";
+
+    /// What go2rtc then SERVES to an RTSP consumer for that same LPR main: unable
+    /// to assemble a complete HEVC parameter set from the vps-less producer fmtp,
+    /// it emits the video track with NO `a=fmtp` at all — the exact SDP that makes
+    /// Media3 throw `missing attribute fmtp`. This is a real captured consumer SDP.
+    const SDP_LPR_SERVED_NO_FMTP: &str = "v=0\r\n\
+        o=- 1 1 IN IP4 0.0.0.0\r\n\
+        s=go2rtc/1.9.14\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        t=0 0\r\n\
+        m=video 0 RTP/AVP 96\r\n\
+        a=rtpmap:96 H265/90000\r\n\
+        a=recvonly\r\n\
+        a=control:trackID=0\r\n";
+
+    #[test]
+    fn served_verdict_catches_a_main_the_producer_verdict_misses() {
+        // The whole bug: producer HAS an fmtp (incomplete), served has NONE. Only
+        // the served side reflects what Media3 actually receives, so `_mainv` must
+        // key on it.
+        let lpr = serde_json::json!({
+            "producers": [{ "sdp": SDP_LPR_PRODUCER_INCOMPLETE_FMTP }],
+            "consumers": [{ "format_name": "rtsp", "sdp": SDP_LPR_SERVED_NO_FMTP }],
+        });
+        assert_eq!(
+            stream_video_lacks_fmtp(&lpr),
+            Some(false),
+            "producer fmtp line present ⇒ producer side looks healthy",
+        );
+        assert_eq!(
+            stream_served_video_lacks_fmtp(&lpr),
+            Some(true),
+            "served SDP has no video fmtp ⇒ this is what breaks Media3",
+        );
+    }
+
+    #[test]
+    fn served_verdict_only_trusts_rtsp_consumers() {
+        // A healthy H.265 main: the served SDP carries a full fmtp, so no repair.
+        let healthy_served = serde_json::json!({
+            "consumers": [{ "format_name": "rtsp", "sdp": SDP_HEALTHY }],
+        });
+        assert_eq!(stream_served_video_lacks_fmtp(&healthy_served), Some(false));
+
+        // A WebRTC consumer negotiates a wholly different SDP that says nothing
+        // about the RTSP restream, so it must be ignored — not treated as a
+        // verdict. With only a WebRTC consumer, the verdict is unknown.
+        let webrtc_only = serde_json::json!({
+            "consumers": [{ "format_name": "webrtc", "sdp": SDP_LPR_SERVED_NO_FMTP }],
+        });
+        assert_eq!(stream_served_video_lacks_fmtp(&webrtc_only), None);
+
+        // No consumer attached yet ⇒ unknown (sticky), never "broken".
+        assert_eq!(
+            stream_served_video_lacks_fmtp(&serde_json::json!({ "consumers": [] })),
+            None,
+        );
+        assert_eq!(stream_served_video_lacks_fmtp(&serde_json::json!({})), None);
+
+        // A WebRTC consumer BEFORE the rtsp one must be skipped, not consumed as
+        // the verdict — the rtsp consumer's SDP is the one that wins.
+        let webrtc_then_rtsp = serde_json::json!({
+            "consumers": [
+                { "format_name": "webrtc", "sdp": SDP_HEALTHY },
+                { "format_name": "rtsp", "sdp": SDP_LPR_SERVED_NO_FMTP },
+            ],
+        });
+        assert_eq!(
+            stream_served_video_lacks_fmtp(&webrtc_then_rtsp),
+            Some(true)
+        );
+
+        // A mid-handshake rtsp consumer (no `sdp` yet) is skipped in favour of the
+        // next rtsp consumer that has one.
+        let handshaking_then_ready = serde_json::json!({
+            "consumers": [
+                { "format_name": "rtsp" },
+                { "format_name": "rtsp", "sdp": SDP_LPR_SERVED_NO_FMTP },
+            ],
+        });
+        assert_eq!(
+            stream_served_video_lacks_fmtp(&handshaking_then_ready),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn index_carries_the_served_verdict_separately() {
+        // The LPR entry: producer verdict false (has fmtp), served verdict true
+        // (fmtp stripped). The two maps must not be conflated.
+        let body = serde_json::json!({
+            "lpr": {
+                "producers": [{ "sdp": SDP_LPR_PRODUCER_INCOMPLETE_FMTP }],
+                "consumers": [{ "format_name": "rtsp", "sdp": SDP_LPR_SERVED_NO_FMTP }],
+            },
+        });
+        let idx = index_from_streams(body.as_object().unwrap());
+        assert_eq!(idx.video_lacks_fmtp.get("lpr"), Some(&false));
+        assert_eq!(idx.video_lacks_fmtp_served.get("lpr"), Some(&true));
     }
 
     #[test]
