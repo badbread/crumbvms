@@ -6,28 +6,43 @@
 //! a [`ChannelMessage`], it formats and POSTs the outbound HTTP request to the
 //! appropriate service.
 //!
-//! # Supported kinds
+//! # Supported kinds and image capability
 //!
-//! | `kind`    | Delivery                                                       | Snapshot              |
-//! |-----------|----------------------------------------------------------------|-----------------------|
-//! | `discord` | POST webhook `payload_json` + multipart attachment             | upload (multipart)    |
-//! | `slack`   | POST incoming-webhook JSON `{text}`; link in text              | link-only (v1)        |
-//! | `pushover`| POST `api.pushover.net` multipart; `attachment` field          | upload (multipart)    |
-//! | `telegram`| POST `sendPhoto` multipart OR `sendMessage` JSON               | upload (multipart)    |
-//! | `ntfy`    | POST topic URL with body + headers; snapshot link when present | link-only (v1)        |
-//! | `webhook` | POST JSON body `{camera, kind, label, ts, web_url}`            | none (URL only)       |
+//! Each channel carries a [`SnapshotMode`] (`none`/`plate`/`vehicle`/`both`),
+//! but a provider can only deliver what its transport allows. The capability is
+//! the hard gate ([`provider_image_capability`]); the mode is the operator's
+//! preference within it.
+//!
+//! | `kind`    | Delivery                                                | Image capability            |
+//! |-----------|---------------------------------------------------------|-----------------------------|
+//! | `discord` | POST webhook `payload_json` + multipart `file[N]`       | **Multi** (plate+vehicle)   |
+//! | `telegram`| `sendPhoto` (1) / `sendMediaGroup` (2) / `sendMessage`  | **Multi** (plate+vehicle)   |
+//! | `pushover`| POST multipart; single `attachment` field              | **Single** (`both`→plate)   |
+//! | `ntfy`    | POST topic URL; file as body + `Filename`/`Message` hdr | **Single** (`both`→plate)   |
+//! | `slack`   | POST incoming-webhook JSON `{text}`; link in text       | **None** (no byte path)     |
+//! | `webhook` | POST JSON `{camera, kind, label, ts, web_url, ...}`     | **None** (JSON only)        |
+//!
+//! `slack` and `webhook` cannot carry raw image bytes: a Slack incoming webhook
+//! only accepts an `image_url` its servers must fetch (Crumb is LAN-only, so a
+//! LAN `web_url` is unreachable — a real file upload needs a bot token +
+//! `files.upload`, out of scope), and the generic webhook is a JSON contract by
+//! design. Both stay text/link-only regardless of the channel's mode.
 //!
 //! Returns `Err` on any non-2xx response or network failure so the engine can log
 //! `status='failed'`.  The caller is responsible for sending the notification
 //! WITHOUT an image when the snapshot fetch fails (never drop the alert).
 
+use std::process::Stdio;
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Context as _};
 use chrono::{DateTime, Utc};
 use reqwest::multipart;
 use serde_json::json;
+use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 
-use crumb_common::db::NotificationChannel;
+use crumb_common::db::{NotificationChannel, SnapshotMode};
 
 /// Hard cap on a snapshot body proxied/fetched from an upstream provider
 /// (go2rtc / Frigate). A JPEG frame is well under this; the cap exists purely so
@@ -85,8 +100,14 @@ pub struct ChannelMessage {
     /// Best-effort public deep-link to the playback view. `None` when no public
     /// URL is configured for this installation.
     pub web_url: Option<String>,
-    /// Live camera JPEG snapshot bytes, when available.
-    pub snapshot: Option<Vec<u8>>,
+    /// Full vehicle/detection frame JPEG bytes, when available. The legacy
+    /// "snapshot" — the whole frame a `vehicle`/`both` mode attaches, and the
+    /// defensive fallback for `plate` mode when no crop could be produced.
+    pub vehicle_snapshot: Option<Vec<u8>>,
+    /// Tight plate-crop JPEG bytes, when available (derived once per event from
+    /// the vehicle frame + `plate_bbox`, or a crumb-alpr stored crop). Attached
+    /// by `plate`/`both` modes where the provider can carry it.
+    pub plate_snapshot: Option<Vec<u8>>,
     /// `kind == "system"` only: the free-text detail string from
     /// `system_events.detail` (e.g. "camera X has written no new segment for
     /// 130s"), appended to the message body / exposed as the `%detail%` token.
@@ -176,6 +197,246 @@ impl ChannelMessage {
             .as_ref()
             .map(|tpl| crumb_common::alert_template::render(tpl, &self.token_map()))
     }
+
+    /// Resolve this channel's snapshot mode + the provider's image capability +
+    /// the images actually available into the ordered list of files to attach.
+    ///
+    /// Returns `(filename, bytes)` pairs (0, 1, or 2). The order is meaningful:
+    /// for a two-image provider in `both` mode the vehicle frame is first and
+    /// the plate crop second (the crop is the more informative of the two, but
+    /// the frame gives context). See [`plan_images`] for the full matrix.
+    fn images_for<'a>(&'a self, ch: &NotificationChannel) -> Vec<(&'static str, &'a [u8])> {
+        let cap = provider_image_capability(ch.kind.as_str());
+        plan_images(
+            ch.snapshot_mode,
+            cap,
+            self.vehicle_snapshot.is_some(),
+            self.plate_snapshot.is_some(),
+        )
+        .into_iter()
+        .filter_map(|src| match src {
+            ImgSource::Vehicle => self.vehicle_snapshot.as_deref().map(|b| ("vehicle.jpg", b)),
+            ImgSource::Plate => self.plate_snapshot.as_deref().map(|b| ("plate.jpg", b)),
+        })
+        .collect()
+    }
+}
+
+/// A provider's raw ability to carry image bytes over its transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageCap {
+    /// No byte path at all (Slack incoming-webhook, generic webhook) — the
+    /// channel is text/link-only no matter what mode is set.
+    None,
+    /// Exactly one image per message (Pushover attachment, ntfy body file).
+    Single,
+    /// Two or more images per message (Discord multipart, Telegram media group).
+    Multi,
+}
+
+/// Which stored image a planned attachment slot refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImgSource {
+    Vehicle,
+    Plate,
+}
+
+/// The image capability of a channel `kind`. Kept in lock-step with the admin
+/// console's `NOTIF_ATTACHES_SNAP`/mode-gating map (`admin.html`).
+pub(crate) fn provider_image_capability(kind: &str) -> ImageCap {
+    match kind {
+        "discord" | "telegram" => ImageCap::Multi,
+        "pushover" | "ntfy" => ImageCap::Single,
+        // slack: incoming webhooks have no byte upload path, and a LAN image_url
+        // is unreachable by Slack's servers. webhook: JSON contract by design.
+        _ => ImageCap::None,
+    }
+}
+
+/// Resolve `(mode, capability, available images)` into the ordered list of
+/// concrete images to attach. Pure and total (no I/O) so the whole matrix is
+/// unit-tested without a provider.
+///
+/// The fallbacks are deliberate:
+/// * `plate`/`both` with no plate crop falls back to the vehicle frame (never
+///   an error — a watchlist hit should still carry *an* image), and
+/// * a single-image provider in `both` mode sends the plate crop (more
+///   informative) when available, else the vehicle frame.
+pub(crate) fn plan_images(
+    mode: SnapshotMode,
+    cap: ImageCap,
+    have_vehicle: bool,
+    have_plate: bool,
+) -> Vec<ImgSource> {
+    if mode == SnapshotMode::None || cap == ImageCap::None {
+        return Vec::new();
+    }
+    let vehicle = have_vehicle.then_some(ImgSource::Vehicle);
+    let plate = have_plate.then_some(ImgSource::Plate);
+    match cap {
+        ImageCap::None => Vec::new(),
+        ImageCap::Single => match mode {
+            SnapshotMode::None => Vec::new(),
+            SnapshotMode::Vehicle => vehicle.into_iter().collect(),
+            // Plate crop preferred; vehicle frame is the fallback.
+            SnapshotMode::Plate | SnapshotMode::Both => plate.or(vehicle).into_iter().collect(),
+        },
+        ImageCap::Multi => match mode {
+            SnapshotMode::None => Vec::new(),
+            SnapshotMode::Vehicle => vehicle.into_iter().collect(),
+            SnapshotMode::Plate => plate.or(vehicle).into_iter().collect(),
+            // Both: vehicle first (context), plate second (detail); whichever is
+            // present. If only one exists, that one alone.
+            SnapshotMode::Both => vehicle.into_iter().chain(plate).collect(),
+        },
+    }
+}
+
+// ─── plate crop (server-side, via ffmpeg) ──────────────────────────────────────
+
+/// The ffmpeg binary path — jellyfin-ffmpeg symlinked by the api runtime image
+/// (the same binary `filmstrip.rs` uses for thumbnails). No new dependency: the
+/// api already shells out to ffmpeg for image work, and there is no in-process
+/// image crate in the tree.
+const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
+
+/// Resolve the ffmpeg binary: the jellyfin-ffmpeg symlink in the runtime image
+/// when present, else bare `ffmpeg` on `PATH` (dev boxes, CI). Keeping the
+/// fallback means the crop path also works outside the container image.
+fn ffmpeg_bin() -> &'static str {
+    if std::path::Path::new(FFMPEG_BIN).exists() {
+        FFMPEG_BIN
+    } else {
+        "ffmpeg"
+    }
+}
+
+/// Margin added around the plate box on every side, as a fraction of the box's
+/// own width/height, so the crop carries a little vehicle context and isn't a
+/// pixel-tight sliver.
+const PLATE_CROP_MARGIN: f64 = 0.4;
+
+/// Wall-clock cap on one crop (a single-frame transcode of an in-memory JPEG is
+/// sub-second; the cap only bounds a wedged ffmpeg).
+const PLATE_CROP_TIMEOUT_SECS: u64 = 8;
+
+/// Expand a normalized `[x, y, w, h]` plate box (fractions of the full frame,
+/// the shape stored in `system_events.meta.plate_bbox`) by [`PLATE_CROP_MARGIN`]
+/// and clamp it inside `[0, 1]`. Returns `None` for a degenerate box so the
+/// caller falls back to the vehicle frame rather than emitting an empty crop.
+pub(crate) fn plate_crop_rect(bbox: [f64; 4], margin: f64) -> Option<[f64; 4]> {
+    let [x, y, w, h] = bbox;
+    if !(w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let mx = w * margin;
+    let my = h * margin;
+    let nx = (x - mx).clamp(0.0, 1.0);
+    let ny = (y - my).clamp(0.0, 1.0);
+    let right = (x + w + mx).clamp(0.0, 1.0);
+    let bottom = (y + h + my).clamp(0.0, 1.0);
+    let nw = right - nx;
+    let nh = bottom - ny;
+    (nw > 0.0 && nh > 0.0).then_some([nx, ny, nw, nh])
+}
+
+/// Build the ffmpeg args to crop the normalized `rect` out of a JPEG read from
+/// stdin (`pipe:0`) and re-encode a single JPEG to stdout (`pipe:1`).
+///
+/// The crop rectangle is expressed against the input's own `iw`/`ih`, so we
+/// never need to know the frame's pixel dimensions. Width/height are additionally
+/// `min`-clamped against `iw-x`/`ih-y` (the `\,` escapes the comma so ffmpeg
+/// reads it as a function argument, not a filter separator) to defend against a
+/// sub-pixel rounding overrun on the right/bottom edge.
+pub(crate) fn plate_crop_ffmpeg_args(rect: [f64; 4]) -> Vec<String> {
+    let [x, y, w, h] = rect;
+    let vf = format!(
+        "crop=min(iw*{w:.6}\\,iw-iw*{x:.6}):min(ih*{h:.6}\\,ih-ih*{y:.6}):iw*{x:.6}:ih*{y:.6}"
+    );
+    vec![
+        "-y".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-i".to_owned(),
+        "pipe:0".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-an".to_owned(),
+        "-vf".to_owned(),
+        vf,
+        "-q:v".to_owned(),
+        "3".to_owned(),
+        "-f".to_owned(),
+        "mjpeg".to_owned(),
+        "pipe:1".to_owned(),
+    ]
+}
+
+/// Produce a tight plate-crop JPEG from an already-fetched vehicle-frame JPEG
+/// and a normalized `[x, y, w, h]` plate box.
+///
+/// Best-effort: any failure (degenerate box, ffmpeg missing/errors, empty or
+/// over-cap output) returns `None`, and the caller falls back to the vehicle
+/// frame — a watchlist alert is never dropped or errored over a crop miss. No
+/// extra network fetch: the vehicle bytes were already retrieved once per event.
+pub(crate) async fn crop_plate_jpeg(vehicle_jpeg: &[u8], bbox: [f64; 4]) -> Option<Vec<u8>> {
+    let rect = plate_crop_rect(bbox, PLATE_CROP_MARGIN)?;
+    let args = plate_crop_ffmpeg_args(rect);
+
+    let mut child = match tokio::process::Command::new(ffmpeg_bin())
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::debug!(error = %e, "plate crop: spawn ffmpeg failed");
+            return None;
+        }
+    };
+
+    // Feed the JPEG on a separate task so a full stdout pipe can't deadlock the
+    // write (classic pipe-buffer deadlock if we wrote stdin then read stdout).
+    let mut stdin = child.stdin.take()?;
+    let input = vehicle_jpeg.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(&input).await;
+        let _ = stdin.shutdown().await;
+    });
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(PLATE_CROP_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await;
+    let _ = writer.await;
+
+    let output = match output {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "plate crop: ffmpeg wait failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("plate crop: ffmpeg timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(status = ?output.status.code(), "plate crop: ffmpeg non-zero exit");
+        return None;
+    }
+    if output.stdout.is_empty() || output.stdout.len() > MAX_SNAPSHOT_BYTES {
+        tracing::debug!(
+            bytes = output.stdout.len(),
+            "plate crop: empty or over-cap output"
+        );
+        return None;
+    }
+    Some(output.stdout)
 }
 
 /// Coerce a JSON scalar to a token string. Objects/arrays/null are skipped
@@ -251,31 +512,32 @@ async fn dispatch_discord(
     let webhook_url = cfg_str(&ch.config, "webhook_url").context("discord config")?;
     let text = msg.text();
 
-    if ch.include_snapshot {
-        if let Some(bytes) = &msg.snapshot {
-            // Multipart: payload_json + snapshot attachment.
-            let payload = json!({ "content": text }).to_string();
-            let part_payload = multipart::Part::text(payload)
-                .mime_str("application/json")
-                .context("discord: mime payload_json")?;
-            let part_file = multipart::Part::bytes(bytes.clone())
-                .file_name("snapshot.jpg")
+    // Discord multipart carries multiple files (`file[0]`, `file[1]`), so `both`
+    // sends the vehicle frame AND the plate crop.
+    let images = msg.images_for(ch);
+    if !images.is_empty() {
+        let payload = json!({ "content": text }).to_string();
+        let part_payload = multipart::Part::text(payload)
+            .mime_str("application/json")
+            .context("discord: mime payload_json")?;
+        let mut form = multipart::Form::new().part("payload_json", part_payload);
+        for (i, (name, bytes)) in images.iter().enumerate() {
+            let part = multipart::Part::bytes(bytes.to_vec())
+                .file_name(*name)
                 .mime_str("image/jpeg")
                 .context("discord: mime snapshot")?;
-            let form = multipart::Form::new()
-                .part("payload_json", part_payload)
-                .part("file[0]", part_file);
-            let resp = http
-                .post(webhook_url)
-                .multipart(form)
-                .send()
-                .await
-                .context("discord: send multipart")?;
-            return assert_ok(resp, "discord").await;
+            form = form.part(format!("file[{i}]"), part);
         }
+        let resp = http
+            .post(webhook_url)
+            .multipart(form)
+            .send()
+            .await
+            .context("discord: send multipart")?;
+        return assert_ok(resp, "discord").await;
     }
 
-    // JSON-only (no snapshot).
+    // JSON-only (no image).
     let body = json!({ "content": text });
     let resp = http
         .post(webhook_url)
@@ -339,14 +601,14 @@ async fn dispatch_pushover(
             .text("url_title", "Open in Crumb");
     }
 
-    if ch.include_snapshot {
-        if let Some(bytes) = &msg.snapshot {
-            let part = multipart::Part::bytes(bytes.clone())
-                .file_name("snapshot.jpg")
-                .mime_str("image/jpeg")
-                .context("pushover: mime snapshot")?;
-            form = form.part("attachment", part);
-        }
+    // Pushover carries a single `attachment`; `both` therefore resolves to one
+    // image (the plate crop, when available — see `plan_images`).
+    if let Some((name, bytes)) = msg.images_for(ch).first() {
+        let part = multipart::Part::bytes(bytes.to_vec())
+            .file_name(*name)
+            .mime_str("image/jpeg")
+            .context("pushover: mime snapshot")?;
+        form = form.part("attachment", part);
     }
 
     let resp = http
@@ -369,25 +631,57 @@ async fn dispatch_telegram(
     let chat_id = cfg_str(&ch.config, "chat_id").context("telegram config")?;
     let caption = msg.text();
 
-    if ch.include_snapshot {
-        if let Some(bytes) = &msg.snapshot {
-            let url = format!("https://api.telegram.org/bot{bot_token}/sendPhoto");
-            let part = multipart::Part::bytes(bytes.clone())
-                .file_name("snapshot.jpg")
+    // Telegram: one photo → `sendPhoto`; two → `sendMediaGroup` (so `both` sends
+    // the vehicle frame AND the plate crop as an album); none → text below.
+    let images = msg.images_for(ch);
+    if images.len() == 1 {
+        let (name, bytes) = images[0];
+        let url = format!("https://api.telegram.org/bot{bot_token}/sendPhoto");
+        let part = multipart::Part::bytes(bytes.to_vec())
+            .file_name(name)
+            .mime_str("image/jpeg")
+            .context("telegram: mime snapshot")?;
+        let form = multipart::Form::new()
+            .text("chat_id", chat_id.to_owned())
+            .text("caption", caption)
+            .part("photo", part);
+        let resp = http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .context("telegram: sendPhoto")?;
+        return assert_ok(resp, "telegram").await;
+    }
+    if images.len() >= 2 {
+        // sendMediaGroup: a JSON `media` array referencing each attached file by
+        // `attach://<field>`; the caption rides on the first item only.
+        let url = format!("https://api.telegram.org/bot{bot_token}/sendMediaGroup");
+        let mut form = multipart::Form::new().text("chat_id", chat_id.to_owned());
+        let mut media = Vec::with_capacity(images.len());
+        for (i, (name, bytes)) in images.iter().enumerate() {
+            let mut item = json!({
+                "type": "photo",
+                "media": format!("attach://{name}"),
+            });
+            if i == 0 {
+                item["caption"] = json!(caption);
+            }
+            media.push(item);
+            let part = multipart::Part::bytes(bytes.to_vec())
+                .file_name(*name)
                 .mime_str("image/jpeg")
-                .context("telegram: mime snapshot")?;
-            let form = multipart::Form::new()
-                .text("chat_id", chat_id.to_owned())
-                .text("caption", caption)
-                .part("photo", part);
-            let resp = http
-                .post(&url)
-                .multipart(form)
-                .send()
-                .await
-                .context("telegram: sendPhoto")?;
-            return assert_ok(resp, "telegram").await;
+                .context("telegram: mime media")?;
+            form = form.part((*name).to_owned(), part);
         }
+        form = form.text("media", serde_json::Value::Array(media).to_string());
+        let resp = http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .context("telegram: sendMediaGroup")?;
+        return assert_ok(resp, "telegram").await;
     }
 
     // Text-only.
@@ -435,15 +729,29 @@ async fn dispatch_ntfy(
         .rendered_title()
         .unwrap_or_else(|| format!("Crumb – {}", msg.camera_name))
         .replace(['\r', '\n'], " ");
+
+    // ntfy carries a single attachment by sending the FILE as the request body
+    // with a `Filename` header (raw bytes; the topic server is LAN-reachable).
+    // When we do that the message text has to move from the body into the
+    // `Message` header, which — like `Title` — cannot hold a raw newline, so we
+    // flatten CR/LF to spaces (a minor, documented limitation of the image
+    // path). `both` resolves to one image (plate preferred).
+    let image = msg.images_for(ch).into_iter().next();
+
     let mut req = http
         .post(topic_url)
         .header("Title", title)
-        .header("Tags", tags)
-        .body(body_text);
-
+        .header("Tags", tags);
     if let Some(url) = &msg.web_url {
         req = req.header("Click", url.as_str());
     }
+    let req = match image {
+        Some((name, bytes)) => req
+            .header("Filename", name)
+            .header("Message", body_text.replace(['\r', '\n'], " "))
+            .body(bytes.to_vec()),
+        None => req.body(body_text),
+    };
 
     let resp = req.send().await.context("ntfy: send")?;
     assert_ok(resp, "ntfy").await
@@ -459,12 +767,17 @@ async fn dispatch_webhook(
     let url = cfg_str(&ch.config, "url").context("webhook config")?;
     // camera_id is not in ChannelMessage (by design — it's resolved by the engine
     // before calling dispatch). We include the camera name only here.
+    //
+    // The generic webhook is a JSON contract: it never carries raw image bytes.
+    // We do surface the channel's `snapshot_mode` so a consumer can decide
+    // whether to go fetch an image itself (via `web_url` / the media API).
     let body = json!({
-        "camera":   msg.camera_name,
-        "kind":     msg.kind,
-        "label":    msg.label,
-        "ts":       msg.ts,
-        "web_url":  msg.web_url,
+        "camera":        msg.camera_name,
+        "kind":          msg.kind,
+        "label":         msg.label,
+        "ts":            msg.ts,
+        "web_url":       msg.web_url,
+        "snapshot_mode": ch.snapshot_mode.as_str(),
     });
     let resp = http
         .post(url)
@@ -582,5 +895,234 @@ pub async fn fetch_snapshot(
             tracing::debug!(error = %e, "snapshot: request failed");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        crop_plate_jpeg, ffmpeg_bin, plan_images, plate_crop_ffmpeg_args, plate_crop_rect,
+        provider_image_capability, ImageCap, ImgSource,
+    };
+    use crumb_common::db::SnapshotMode;
+
+    // ── provider capability map (must match admin.html NOTIF_IMG_CAP) ──────────
+
+    #[test]
+    fn provider_capabilities_are_honest() {
+        assert_eq!(provider_image_capability("discord"), ImageCap::Multi);
+        assert_eq!(provider_image_capability("telegram"), ImageCap::Multi);
+        assert_eq!(provider_image_capability("pushover"), ImageCap::Single);
+        assert_eq!(provider_image_capability("ntfy"), ImageCap::Single);
+        // No byte path over these transports — must stay text/link-only.
+        assert_eq!(provider_image_capability("slack"), ImageCap::None);
+        assert_eq!(provider_image_capability("webhook"), ImageCap::None);
+        assert_eq!(provider_image_capability("unknown"), ImageCap::None);
+    }
+
+    // ── mode → image plan matrix ───────────────────────────────────────────────
+
+    #[test]
+    fn plan_none_mode_never_attaches() {
+        for cap in [ImageCap::None, ImageCap::Single, ImageCap::Multi] {
+            assert!(plan_images(SnapshotMode::None, cap, true, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn plan_no_byte_provider_never_attaches() {
+        for mode in [
+            SnapshotMode::Plate,
+            SnapshotMode::Vehicle,
+            SnapshotMode::Both,
+        ] {
+            assert!(plan_images(mode, ImageCap::None, true, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn plan_single_provider_picks_one() {
+        // vehicle → the frame.
+        assert_eq!(
+            plan_images(SnapshotMode::Vehicle, ImageCap::Single, true, true),
+            vec![ImgSource::Vehicle]
+        );
+        // plate → the crop when present.
+        assert_eq!(
+            plan_images(SnapshotMode::Plate, ImageCap::Single, true, true),
+            vec![ImgSource::Plate]
+        );
+        // both on a single-image provider → the plate crop (more informative).
+        assert_eq!(
+            plan_images(SnapshotMode::Both, ImageCap::Single, true, true),
+            vec![ImgSource::Plate]
+        );
+        // plate with no crop → falls back to the vehicle frame (never empty).
+        assert_eq!(
+            plan_images(SnapshotMode::Plate, ImageCap::Single, true, false),
+            vec![ImgSource::Vehicle]
+        );
+    }
+
+    #[test]
+    fn plan_multi_provider_both_sends_two() {
+        assert_eq!(
+            plan_images(SnapshotMode::Both, ImageCap::Multi, true, true),
+            vec![ImgSource::Vehicle, ImgSource::Plate]
+        );
+        // both with only the frame available → just the frame.
+        assert_eq!(
+            plan_images(SnapshotMode::Both, ImageCap::Multi, true, false),
+            vec![ImgSource::Vehicle]
+        );
+        // both with only the crop available → just the crop.
+        assert_eq!(
+            plan_images(SnapshotMode::Both, ImageCap::Multi, false, true),
+            vec![ImgSource::Plate]
+        );
+        // plate → crop; vehicle → frame.
+        assert_eq!(
+            plan_images(SnapshotMode::Plate, ImageCap::Multi, true, true),
+            vec![ImgSource::Plate]
+        );
+        assert_eq!(
+            plan_images(SnapshotMode::Vehicle, ImageCap::Multi, true, true),
+            vec![ImgSource::Vehicle]
+        );
+    }
+
+    #[test]
+    fn plan_is_empty_when_no_images_available() {
+        assert!(plan_images(SnapshotMode::Both, ImageCap::Multi, false, false).is_empty());
+        assert!(plan_images(SnapshotMode::Vehicle, ImageCap::Single, false, false).is_empty());
+    }
+
+    // ── crop geometry ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn crop_rect_expands_and_clamps() {
+        // Centered small box; a 0.4 margin (of the box size) grows each side.
+        let r = plate_crop_rect([0.40, 0.40, 0.20, 0.20], 0.4).expect("rect");
+        // mx = my = 0.08 → x=0.32, y=0.32, w=h=0.36.
+        assert!((r[0] - 0.32).abs() < 1e-9);
+        assert!((r[1] - 0.32).abs() < 1e-9);
+        assert!((r[2] - 0.36).abs() < 1e-9);
+        assert!((r[3] - 0.36).abs() < 1e-9);
+        // Always inside the frame.
+        assert!(r[0] + r[2] <= 1.0 + 1e-9);
+        assert!(r[1] + r[3] <= 1.0 + 1e-9);
+    }
+
+    #[test]
+    fn crop_rect_clamps_to_frame_edges() {
+        // Box hard against the top-left with a big margin must not go negative.
+        let r = plate_crop_rect([0.0, 0.0, 0.5, 0.5], 1.0).expect("rect");
+        assert!(r[0].abs() < 1e-9);
+        assert!(r[1].abs() < 1e-9);
+        assert!(r[0] + r[2] <= 1.0 + 1e-9);
+        assert!(r[1] + r[3] <= 1.0 + 1e-9);
+    }
+
+    #[test]
+    fn crop_rect_rejects_degenerate_box() {
+        assert!(plate_crop_rect([0.5, 0.5, 0.0, 0.2], 0.4).is_none());
+        assert!(plate_crop_rect([0.5, 0.5, 0.2, 0.0], 0.4).is_none());
+    }
+
+    #[test]
+    fn crop_ffmpeg_args_build_expected_filter() {
+        let args = plate_crop_ffmpeg_args([0.32, 0.32, 0.36, 0.36]);
+        // stdin/stdout piping + forced mjpeg muxer.
+        assert!(args.contains(&"pipe:0".to_owned()));
+        assert!(args.contains(&"pipe:1".to_owned()));
+        assert!(args.windows(2).any(|w| w == ["-f", "mjpeg"]));
+        // The crop filter expresses the rect against iw/ih (no pixel dims needed)
+        // and min-clamps width/height (escaped comma) against the right/bottom.
+        let vf = args
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| args[i + 1].clone())
+            .expect("-vf present");
+        assert!(vf.starts_with("crop=min(iw*0.360000\\,iw-iw*0.320000):"));
+        assert!(vf.contains("min(ih*0.360000\\,ih-ih*0.320000)"));
+        assert!(vf.ends_with(":iw*0.320000:ih*0.320000"));
+    }
+
+    // ── end-to-end crop via ffmpeg (skips when no ffmpeg is available) ─────────
+
+    /// Minimal baseline-JPEG SOF dimension reader (no image crate in the tree).
+    fn jpeg_dims(data: &[u8]) -> Option<(u16, u16)> {
+        let mut i = 2usize; // skip SOI (FFD8)
+        while i + 9 < data.len() {
+            if data[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = data[i + 1];
+            // SOF0..SOF15 carry the frame size, except DHT(C4)/JPG(C8)/DAC(CC).
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+            {
+                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]);
+                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]);
+                return Some((w, h));
+            }
+            let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            i += 2 + len;
+        }
+        None
+    }
+
+    /// Generate a solid-color JPEG of `w`x`h` via ffmpeg, or `None` if ffmpeg is
+    /// unavailable (so the caller can skip rather than fail the gate).
+    fn make_test_jpeg(w: u32, h: u32) -> Option<Vec<u8>> {
+        let out = std::process::Command::new(ffmpeg_bin())
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=red:s={w}x{h}"),
+                "-frames:v",
+                "1",
+                "-f",
+                "mjpeg",
+                "pipe:1",
+            ])
+            .output()
+            .ok()?;
+        (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
+    }
+
+    #[tokio::test]
+    async fn crop_produces_a_smaller_valid_jpeg_of_expected_size() {
+        let Some(src) = make_test_jpeg(200, 100) else {
+            eprintln!("skipping crop_produces_...: ffmpeg not available");
+            return;
+        };
+        assert_eq!(jpeg_dims(&src), Some((200, 100)), "synthetic source dims");
+
+        let bbox = [0.40, 0.40, 0.20, 0.20];
+        let rect = plate_crop_rect(bbox, 0.4).expect("rect");
+        let cropped = crop_plate_jpeg(&src, bbox)
+            .await
+            .expect("crop should succeed with ffmpeg present");
+
+        let (cw, ch) = jpeg_dims(&cropped).expect("cropped is a valid JPEG");
+        // Expected pixel size = round(frame * normalized crop), within ffmpeg's
+        // sub-pixel rounding of ±2px.
+        let want_w = (200.0 * rect[2]).round() as i32;
+        let want_h = (100.0 * rect[3]).round() as i32;
+        assert!(
+            (i32::from(cw) - want_w).abs() <= 2,
+            "cropped width {cw} not near expected {want_w}"
+        );
+        assert!(
+            (i32::from(ch) - want_h).abs() <= 2,
+            "cropped height {ch} not near expected {want_h}"
+        );
+        // A crop is strictly smaller than the full frame.
+        assert!(cw < 200 && ch < 100);
     }
 }

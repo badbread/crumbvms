@@ -1633,7 +1633,7 @@ async function wizardNotifyEnsure() {
   fields.forEach((f, i) => { config[f.id] = vals[i]; });
   const name = ((($('wz-nf-name') || {}).value) || st.name || ('My ' + (NOTIF_KIND_LABEL[st.kind] || st.kind) + ' alerts')).trim();
   st.name = name;
-  const payload = { kind: st.kind, name, config, camera_ids: [], include_snapshot: true, enabled: true, global: true };
+  const payload = { kind: st.kind, name, config, camera_ids: [], snapshot_mode: 'vehicle', enabled: true, global: true };
   if (st.id) {
     await api('/notifications/channels/' + encodeURIComponent(st.id), { method: 'PUT', body: JSON.stringify(payload) });
   } else {
@@ -10005,8 +10005,35 @@ const NOTIF_PROVIDER_FIELDS = {
   webhook:  [{ id:'url',         label:'URL',         type:'url',      hint:'Crumb will POST JSON: {camera, time, label, snapshot_url}.' }],
 };
 
-/* Which providers attach an actual snapshot image vs. a link. */
-const NOTIF_ATTACHES_SNAP = { discord:true, pushover:true, telegram:true };
+/* Per-provider image capability — the hard gate on which snapshot modes a
+   provider can actually deliver. Kept in lock-step with `provider_image_capability`
+   in channel_notify.rs.
+     'multi'  — carries two images (Discord multipart, Telegram media group):
+                offers none / plate / vehicle / both.
+     'single' — carries one image (Pushover attachment, ntfy body file):
+                offers none / plate / vehicle.
+     'none'   — no byte path at all (Slack incoming webhook, generic webhook):
+                text + link only, no image modes. */
+const NOTIF_IMG_CAP = {
+  discord:'multi', telegram:'multi', pushover:'single', ntfy:'single',
+  slack:'none', webhook:'none',
+};
+
+/* Human labels for the snapshot-mode selector (no em-dashes in copy). */
+const NOTIF_SNAP_MODE_LABEL = {
+  none:    'No image',
+  plate:   'Plate crop',
+  vehicle: 'Full vehicle frame',
+  both:    'Both (frame plus plate crop)',
+};
+
+/* The snapshot modes a given provider kind can actually deliver. */
+function notifSnapModes(kind) {
+  const cap = NOTIF_IMG_CAP[kind] || 'none';
+  if (cap === 'multi')  return ['none', 'plate', 'vehicle', 'both'];
+  if (cap === 'single') return ['none', 'plate', 'vehicle'];
+  return [];
+}
 
 /* Human-readable provider names. */
 const NOTIF_KIND_LABEL = {
@@ -10903,9 +10930,24 @@ function _renderConfigureForm(ch) {
     </div>`;
   }).join('');
 
-  const snapNote = NOTIF_ATTACHES_SNAP[kind]
-    ? 'This provider attaches the snapshot image directly to the notification.'
-    : 'This provider links to the snapshot rather than attaching it.';
+  const imgCap = NOTIF_IMG_CAP[kind] || 'none';
+  const snapNote =
+    imgCap === 'multi'  ? 'This provider can attach up to two images (the full vehicle frame and the plate crop).'
+  : imgCap === 'single' ? 'This provider attaches a single image. "Both" is not offered; pick the plate crop or the full frame.'
+  :                       'This provider delivers text and a link only. It cannot attach an image over its transport.';
+
+  /* Snapshot-mode selector, gated by the provider's real capability. For a
+     text/link-only provider (Slack, generic webhook) there is no image choice,
+     so we show the note alone and send no snapshot_mode (the stored value is
+     kept untouched). */
+  const curMode = (!isNew && ch.snapshot_mode) ? ch.snapshot_mode : 'vehicle';
+  const snapModes = notifSnapModes(kind);
+  const snapshotControl = snapModes.length
+    ? `<label class="field-label" style="margin-top:0">Attach snapshot ${infoHint(snapNote)}</label>
+       <select id="notif-f-snapshot-mode">
+         ${snapModes.map(m => `<option value="${esc(m)}" ${m===curMode?'selected':''}>${esc(NOTIF_SNAP_MODE_LABEL[m]||m)}</option>`).join('')}
+       </select>`
+    : '';
 
   return `<div class="inline-expander" style="margin-top:8px" id="notif-form-${esc(isNew?'__new__':ch.id)}">
     <div class="policy-section-title" style="margin-bottom:10px">
@@ -10931,10 +10973,7 @@ function _renderConfigureForm(ch) {
     <div class="policy-section" style="margin-top:10px">
       <div class="policy-section-title">Options</div>
       <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
-        <label class="chk">
-          <input type="checkbox" id="notif-f-snapshot" ${(!isNew && ch.include_snapshot)?'checked':(!isNew?'':'checked')} />
-          Include snapshot ${infoHint(snapNote)}
-        </label>
+        ${snapshotControl ? `<div>${snapshotControl}</div>` : ''}
         <label class="chk">
           <input type="checkbox" id="notif-f-enabled" ${(isNew||ch.enabled)?'checked':''} />
           Enabled
@@ -11133,11 +11172,16 @@ function _readConfigureForm(kind, isNew) {
   const camEls  = document.querySelectorAll('.notif-cam-chk:checked');
   const camera_ids = [...camEls].map(e => e.value);
 
+  /* Snapshot mode from the selector. Absent for text/link-only providers
+     (Slack, generic webhook), in which case we leave it undefined so the save
+     omits it and the stored value is untouched. */
+  const modeEl = $('notif-f-snapshot-mode');
+
   return {
     name:             name.trim(),
     kind,
     camera_ids,
-    include_snapshot: !!($('notif-f-snapshot') || {}).checked,
+    snapshot_mode:    modeEl ? modeEl.value : undefined,
     enabled:          !!($('notif-f-enabled')  || {}).checked,
     global:           !!($('notif-f-global')   || {}).checked,
     _config:          config,
@@ -11158,10 +11202,10 @@ async function notifSaveNew() {
     name:             body.name,
     config:           body._config,
     camera_ids:       body.camera_ids,
-    include_snapshot: body.include_snapshot,
     enabled:          body.enabled,
     global:           body.global,
   };
+  if (body.snapshot_mode !== undefined) payload.snapshot_mode = body.snapshot_mode;
 
   try {
     const created = await api('/notifications/channels', { method: 'POST', body: JSON.stringify(payload) });
@@ -11188,10 +11232,10 @@ async function notifSaveEdit(id) {
   const payload = {
     name:             body.name,
     camera_ids:       body.camera_ids,
-    include_snapshot: body.include_snapshot,
     enabled:          body.enabled,
     global:           body.global,
   };
+  if (body.snapshot_mode !== undefined) payload.snapshot_mode = body.snapshot_mode;
   if (body._anyNewSecrets) payload.config = body._config;
 
   try {

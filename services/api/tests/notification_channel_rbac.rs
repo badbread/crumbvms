@@ -154,7 +154,7 @@ async fn non_admin_channel_without_view_plates_gets_no_plate_watchlist_hit() {
             enabled: true,
             config: serde_json::json!({}),
             camera_ids: None, // all cameras the owner can access
-            include_snapshot: false,
+            snapshot_mode: db::SnapshotMode::None,
         },
     )
     .await
@@ -173,7 +173,7 @@ async fn non_admin_channel_without_view_plates_gets_no_plate_watchlist_hit() {
             enabled: true,
             config: serde_json::json!({}),
             camera_ids: None,
-            include_snapshot: false,
+            snapshot_mode: db::SnapshotMode::None,
         },
     )
     .await
