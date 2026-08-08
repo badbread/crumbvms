@@ -266,6 +266,25 @@ async fn list_rules(
     Ok(Json(rules))
 }
 
+/// Reject a quiet-hours value that is not a whole hour in `0..=23`.
+///
+/// Quiet-hours are whole-hour, server-local wall-clock values. Before this
+/// check a bad value (e.g. `2200` pasted as military time) was stored verbatim
+/// and only clamped at read time by [`in_quiet_hours`] (`clamp(0, 23)`), which
+/// turned `start=2200,end=700` into the zero-width window `23..23` — quiet
+/// hours then silently never fired. Rejecting at write time makes the failure
+/// visible instead of a stored no-op. `None` is always valid (means "unset").
+fn validate_quiet_hour(hour: Option<i32>, field: &str) -> Result<(), ApiError> {
+    if let Some(h) = hour {
+        if !(0..=23).contains(&h) {
+            return Err(ApiError::BadRequest(format!(
+                "{field} must be a whole hour in 0..=23 (server local time); got {h}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Shared logic for upserting a rule for `(user_id, camera_id)`.
 async fn do_upsert_rule(
     pool: &Pool,
@@ -279,6 +298,8 @@ async fn do_upsert_rule(
             "presence_mode must be 'off', 'away_only', or 'always'; got '{presence_mode}'"
         )));
     }
+    validate_quiet_hour(body.quiet_start_hour, "quiet_start_hour")?;
+    validate_quiet_hour(body.quiet_end_hour, "quiet_end_hour")?;
     let p = db::UpsertNotificationRuleParams {
         user_id,
         camera_id,
@@ -484,6 +505,12 @@ pub struct UpdateChannelRequest {
     pub snapshot_mode: Option<String>,
     /// Legacy snapshot toggle; used only when `snapshot_mode` is absent.
     pub include_snapshot: Option<bool>,
+    /// Admin-only global toggle. Omit to keep the stored owner; `true` → make
+    /// the channel global (`user_id = NULL`); `false` → claim ownership for the
+    /// caller. A non-admin supplying this field is rejected (403); create-time
+    /// `global` was already honored via `CreateChannelRequest`, but on edit this
+    /// field was previously dropped by serde, so the checkbox did nothing.
+    pub global: Option<bool>,
 }
 
 /// A channel row with secrets masked, safe for API responses.
@@ -494,6 +521,16 @@ pub struct UpdateChannelRequest {
 pub struct ChannelResponse {
     pub id: Uuid,
     pub user_id: Option<Uuid>,
+    /// `true` when the channel is global (no owner, `user_id IS NULL`). Kept as
+    /// an explicit field because the console renders the "Make available to all
+    /// users (global)" checkbox from it — deriving it client-side from
+    /// `user_id` is fragile (older clients read a missing field as unchecked).
+    pub global: bool,
+    /// Owner's username for admin attribution, or `None` for a global channel
+    /// (and always `None` in a non-admin listing, which only returns own
+    /// channels). Populated by the admin-scoped listing's join on `users`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_username: Option<String>,
     pub kind: String,
     pub name: String,
     pub enabled: bool,
@@ -515,6 +552,8 @@ impl ChannelResponse {
         let masked_config = channel_notify::mask_channel_config(&ch.config);
         Self {
             id: ch.id,
+            global: ch.user_id.is_none(),
+            owner_username: ch.owner_username,
             user_id: ch.user_id,
             kind: ch.kind,
             name: ch.name,
@@ -697,6 +736,20 @@ async fn update_channel(
         existing.snapshot_mode,
     )?;
 
+    // Global toggle is admin-only. Non-admins must not be able to promote a
+    // channel to global (a system-wide destination) or claim/relinquish
+    // ownership; reject rather than silently ignore so the behavior is honest.
+    let set_owner = match body.global {
+        None => None,
+        Some(_) if !user.is_admin() => {
+            return Err(ApiError::Forbidden(
+                "only admins may change a channel's global scope".to_owned(),
+            ));
+        }
+        Some(true) => Some(None), // → global (user_id = NULL)
+        Some(false) => Some(Some(user.user_id)), // → claim ownership
+    };
+
     let params = db::UpdateChannelParams {
         id,
         name: body
@@ -710,6 +763,7 @@ async fn update_channel(
         config: body.config, // None = keep stored
         camera_ids: body.camera_ids.or(existing.camera_ids),
         snapshot_mode,
+        set_owner,
     };
 
     let ch = db::update_notification_channel(state.pool(), &params)
@@ -866,6 +920,8 @@ async fn put_notification_settings(
     State(state): State<AppState>,
     Json(body): Json<NotificationSettingsResponse>,
 ) -> Result<Json<NotificationSettingsResponse>, ApiError> {
+    validate_quiet_hour(body.system_quiet_start_hour, "system_quiet_start_hour")?;
+    validate_quiet_hour(body.system_quiet_end_hour, "system_quiet_end_hour")?;
     db::set_notifications_enabled(state.pool(), body.enabled)
         .await
         .context("set_notifications_enabled")?;

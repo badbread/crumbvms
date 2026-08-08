@@ -99,6 +99,7 @@ class CameraMotionConfig {
     required this.motionAlgorithm,
     required this.motionSensitivity,
     required this.motionThreshold,
+    required this.groupId,
   });
 
   final String id;
@@ -113,6 +114,13 @@ class CameraMotionConfig {
   final String motionAlgorithm; // census|framediff|mog2|opticalflow|ensemble
   final String motionSensitivity; // "dynamic" | "manual" (from the resolved policy)
   final double? motionThreshold; // fraction 0..1 (from the resolved policy)
+
+  /// Group the camera belongs to, or null when ungrouped (`group_id` in
+  /// `CameraDto`). A grouped camera's motion sensitivity/threshold are owned by
+  /// the group's profile: the server rejects a per-camera policy fork for it
+  /// (`update_camera_policy`, config_routes.rs), so the tuner must gate those
+  /// controls up front. See [resolveMotionTunerGating].
+  final String? groupId;
 
   bool get hasSub => subUrl != null && subUrl!.isNotEmpty;
 
@@ -146,6 +154,7 @@ class CameraMotionConfig {
       motionSensitivity:
           (policy?['motion_sensitivity'] as String?) ?? 'dynamic',
       motionThreshold: (policy?['motion_threshold'] as num?)?.toDouble(),
+      groupId: j['group_id'] as String?,
     );
   }
 
@@ -156,6 +165,60 @@ class CameraMotionConfig {
     if (rawMask is! List) return false;
     return rawMask.any((r) => r is List && r.isNotEmpty && r[0] is List);
   }
+}
+
+/// Pure decision for the motion tuner: given a camera's group membership, which
+/// controls the group profile owns and the banner to show. Extracted so it can
+/// be unit-tested without a widget.
+///
+/// Only the **sensitivity** controls (Auto/Manual toggle + threshold slider)
+/// fork the per-camera POLICY (`PUT /config/cameras/{id}/policy`), which the
+/// server rejects for a grouped camera. The exclusion mask, authoring grid,
+/// live meter, and detector-source toggles are per-CAMERA fields
+/// (`PUT /config/cameras/{id}`) the group guard does not cover, so they stay
+/// editable in every case. This mirrors WU-B's `PolicySource.isGroupManaged`
+/// treatment on the dashboard so the two surfaces read consistently.
+class MotionTunerGating {
+  const MotionTunerGating({required this.sensitivityLocked, this.groupName});
+
+  /// True when the camera follows a group profile: the Auto/Manual toggle and
+  /// threshold slider must be disabled (a save would 400 server-side).
+  final bool sensitivityLocked;
+
+  /// Name of the owning group when [sensitivityLocked]; null when the name
+  /// could not be resolved (falls back to generic banner copy).
+  final String? groupName;
+
+  /// Inline banner copy for the Sensitivity block; null when not gated.
+  String? get sensitivityBanner {
+    if (!sensitivityLocked) return null;
+    final g = groupName;
+    if (g != null && g.isNotEmpty) {
+      return "Motion sensitivity follows group '$g' profile. Edit the group's "
+          'motion settings, or ungroup this camera to tune it individually.';
+    }
+    return "Motion sensitivity follows this camera's group profile. Edit the "
+        "group's motion settings, or ungroup this camera to tune it "
+        'individually.';
+  }
+}
+
+/// Decide whether the motion tuner's sensitivity controls must be gated for a
+/// camera, by group membership. [groupNamesById] maps group id -> name (from
+/// `listGroups()` in server_dashboard_api.dart, the same source WU-B uses); an
+/// unknown id still gates but falls back to generic banner copy.
+MotionTunerGating resolveMotionTunerGating(
+  String? groupId,
+  Map<String, String> groupNamesById,
+) {
+  if (groupId == null) {
+    return const MotionTunerGating(sensitivityLocked: false);
+  }
+  final name = groupNamesById[groupId];
+  return MotionTunerGating(
+    sensitivityLocked: true,
+    groupName: name != null && name.isNotEmpty ? name : null,
+  );
 }
 
 /// A partial-update body for `PUT /config/cameras/{id}` (`UpdateCameraRequest`,
