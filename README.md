@@ -14,6 +14,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/badbread/crumbvms/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/badbread/crumbvms/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/badbread/crumbvms/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/badbread/crumbvms?include_prereleases&label=release"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
   <img alt="Backend: Rust" src="https://img.shields.io/badge/backend-Rust-orange?logo=rust">
@@ -60,6 +62,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 - A per-camera **Data saver** stream (on-demand low-res transcode) for cheap remote or bandwidth-limited viewing
 - **Home Assistant entities on the live video, with live status.** Link a camera to its HA entities and drag each badge onto the frame where the thing actually is: the contact sensor on the front door, the light badge on the porch, the motion sensor over the driveway. Every badge shows live state right on the wall, updating as HA does
 - **Control Home Assistant from the badge.** Entities you mark as controls actuate right on the video: tap a light or switch to fire its action, open a small card for a cover or lock with more than one meaningful action, and drag a slider for brightness, blind position, or fan speed. Control is off by default and gated by its own permission. Works on desktop, Android, and iOS
+- **Alerts where you already are.** Motion and detection notifications to Discord, Slack, Telegram, Pushover, ntfy, or a generic webhook, snapshot attached where the service takes one, with per-camera rules, snoozes, and presence gating so it can stay quiet while you are home. Details at [docs.crumbvms.com/notifications](https://docs.crumbvms.com/notifications/)
 - **Real native clients, not a browser in a wrapper.** A Windows desktop app on libmpv, a native SwiftUI macOS app, and a native Android app, all purpose-built, which is what makes the live wall and frame-accurate H.265 scrubbing feel instant instead of a laggy web tab. The web admin console is there for when you just want a browser
 
 **Keep**
@@ -138,6 +141,9 @@ seat instead of a hobby dashboard, and honestly it is where most of the work goe
   <tr>
     <td width="50%"><img src=".github/media/users-rbac.png" alt="Role editor with per-camera access grants"><br><sub><b>RBAC</b>: custom roles with per-camera access grants.</sub></td>
     <td width="50%"><img src=".github/media/playback-timeline.png" alt="Multi-camera color-coded playback timeline"><br><sub><b>Timeline</b>: every camera's motion, color-coded, on one bar.</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src=".github/media/ptz-builder.png" alt="The on-video PTZ panel builder in edit mode, placing a pan/tilt wheel, zoom, focus, iris, and preset buttons over the live camera feed"><br><sub><b>PTZ panel builder</b>: build your own control layout over the live feed, a pan/tilt wheel, zoom, focus, iris, and your camera's presets, then size and place them how you like, per camera. Full ONVIF control.</sub></td>
   </tr>
 </table>
 
@@ -219,6 +225,11 @@ lights, blinds, and fans get a slider for brightness, position, and speed. Contr
 desktop, Android, and iOS, is off by default, and is gated by its own permission. If you have
 thoughts on how it should work,
 [open an issue](https://github.com/badbread/crumbvms/issues).
+
+<p align="center">
+  <img src=".github/media/ha-cycles.gif" width="80%" alt="Home Assistant entities being operated directly on the live camera video, their badges updating to the new state.">
+  <br><sub>Home Assistant entities, controlled right on the live video.</sub>
+</p>
 
 > [!IMPORTANT]
 > ## Looking for testers
@@ -453,12 +464,13 @@ For contributors working in this repo:
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
 - **Testing:** [TESTING.md](TESTING.md) (tester quickstart, what to test, how to report)
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) (ground rules for AI coding sessions)
+- **Security:** [SECURITY.md](SECURITY.md) (report vulnerabilities privately, never in a public issue)
 
 ```
 services/   # Rust backend: common (types, DB, migrations), api (axum + web admin at /admin), recorder
 apps/       # desktop-flutter (Flutter + libmpv), android (Kotlin/Compose), ios; desktop = retired Tauri client
 db/         # PostgreSQL migrations; the segment index is the single source of truth
-# (crumbvms.com lives in its own separate repo, not included here — see .gitignore)
+# (crumbvms.com lives in its own separate repo, not included here, see .gitignore)
 ```
 
 ## The itch this scratches
