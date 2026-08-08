@@ -597,6 +597,16 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// Playback so switching tabs keeps the same full-pane camera.
   String? _liveMaximizedId;
 
+  /// One-shot: the live-wall camera to re-maximize on the NEXT WallScreen build,
+  /// set in [_clearMinimized] when we un-minimize while the Live tab was showing
+  /// a maximized pane. The minimize placeholder swap tears the wall down and
+  /// restore rebuilds it with fresh players (#91), which otherwise dropped the
+  /// maximize back to the grid (the reported bug). Cleared right after the build
+  /// that consumes it, so an ordinary rebuild (Settings panel, config refresh)
+  /// or a later Live↔Playback tab switch does NOT spuriously re-maximize — the
+  /// re-open is scoped to the minimize→restore recovery alone.
+  String? _restoreLiveMaximizedId;
+
   /// Set from Clips' "View on timeline": open Playback scoped to this single
   /// camera (maximized), not the multi-window view. Cleared on manual tab nav.
   String? _playbackFocusCameraId;
@@ -743,7 +753,29 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// no-op unless we were actually showing the placeholder.
   void _clearMinimized() {
     if (!mounted || !_minimized) return;
-    setState(() => _minimized = false);
+    // If we were minimized while the Live tab had a maximized pane, carry that
+    // camera across the placeholder swap so the freshly-rebuilt wall re-opens on
+    // it instead of dropping to the grid. Scoped to the Live tab: Playback
+    // carries its own maximize via `initialMaximizedCameraId` already, and a
+    // stale `_liveMaximizedId` must not leak onto any other screen. The first
+    // "we're visible again" event wins — onWindowRestore, onWindowMaximize, or
+    // onWindowUnmaximize (which one fires depends on the pre-minimize window
+    // state, #128); the rest early-return on the `_minimized` guard, so the
+    // carry is captured exactly once regardless of the delivery path.
+    final carry = _index == _liveIndex ? _liveMaximizedId : null;
+    setState(() {
+      _minimized = false;
+      _restoreLiveMaximizedId = carry;
+    });
+    // One-shot: drop it after this frame's build (which rebuilds and re-inits
+    // the WallScreen that consumes it) so a later ordinary rebuild or tab switch
+    // doesn't re-apply a stale maximize. No setState needed — the value only
+    // matters at the wall's initState, already run by the post-frame point.
+    if (carry != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreLiveMaximizedId = null;
+      });
+    }
   }
 
   /// Esc while Playback is showing a clip-originated single-camera focus:
@@ -1417,6 +1449,11 @@ class _MainShellState extends State<MainShell> with WindowListener {
           fullscreen: widget.fullscreen,
           // Remember which pane is maximized so Playback can open on it.
           onMaximizedCameraChanged: (id) => _liveMaximizedId = id,
+          // Re-open on the pane that was maximized before a minimize→restore of
+          // the Live tab (the placeholder swap released its player and rebuilds
+          // the wall fresh, #91). Non-null only for that one build; a plain
+          // first build / tab switch passes null and opens on the grid.
+          initialMaximizedCameraId: _restoreLiveMaximizedId,
           // Perf/debug line → bottom status bar (not a floating wall overlay).
           statsSink: _wallStats,
           // The wall's /status poller detects config_version bumps; bubble that

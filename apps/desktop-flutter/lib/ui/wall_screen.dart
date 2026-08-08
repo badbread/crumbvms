@@ -72,6 +72,22 @@ void _disposePlayerDetached(Player? p) {
   if (p != null) unawaited(Future(() => p.dispose()));
 }
 
+/// Decide whether a host-provided [WallScreen.initialMaximizedCameraId] should
+/// re-open the wall maximized after a minimize→restore: only when it names a
+/// camera still present in [shown] (the enabled cameras the wall renders).
+/// Returns the camera to maximize, or null to stay on the grid (id null, or the
+/// camera was removed/disabled while minimized). Pure so the decision is unit
+/// tested headlessly — the window-event path that feeds the id needs on-hardware
+/// verification (see `main.dart`'s minimize/restore handlers).
+@visibleForTesting
+Camera? resolveInitialMaximize(String? id, List<Camera> shown) {
+  if (id == null) return null;
+  for (final c in shown) {
+    if (c.id == id) return c;
+  }
+  return null;
+}
+
 class WallScreen extends StatefulWidget {
   const WallScreen({
     super.key,
@@ -90,6 +106,7 @@ class WallScreen extends StatefulWidget {
     this.shortcuts,
     this.fullscreen,
     this.onMaximizedCameraChanged,
+    this.initialMaximizedCameraId,
     this.statsSink,
     this.onConfigChanged,
     this.onUnauthorized,
@@ -148,6 +165,17 @@ class WallScreen extends StatefulWidget {
   /// Reports which camera is currently maximized (full-pane) on the wall, or
   /// null when restored — so the host can carry that maximize into Playback.
   final ValueChanged<String?>? onMaximizedCameraChanged;
+
+  /// Open the wall already maximized on this camera (if it is still present and
+  /// enabled), instead of on the grid. The host sets this ONLY across a
+  /// minimize→restore of the Live tab: the minimize placeholder swap releases
+  /// every pane's player and rebuilds the wall fresh (#91), which otherwise
+  /// dropped a pane that was maximized before minimizing back to the grid. The
+  /// fresh players are re-created either way, so this re-enters the SAME
+  /// maximize path a user tap uses (via `initState`, post-first-frame) rather
+  /// than resurrecting the released pre-minimize controller. Null (the usual
+  /// case) → the wall opens on the grid.
+  final String? initialMaximizedCameraId;
 
   /// Sink for the perf/debug line (camera count + CPU/GPU/NVDEC/RSS). The host
   /// renders it in the bottom status bar on the Live tab instead of a floating
@@ -294,6 +322,25 @@ class _WallScreenState extends State<WallScreen> {
     // Feed carousel/hotspot resolution from the live-status motion signal.
     _liveStatus.addListener(_onLiveStatusTick);
     _applyViewSpecs();
+    // Re-open on a camera that was maximized before a minimize→restore of the
+    // Live tab (the host passes it only for that path). Deferred to
+    // post-first-frame so the tile GlobalKeys exist (warm-start handoff) and
+    // `_maximize`'s setState is legal outside build. Goes through the SAME
+    // maximize path a user tap uses so the pane, PTZ panel, HA overlay,
+    // warm-start, audio, and the report-to-host callback all initialize; if the
+    // camera is gone (removed/disabled while minimized) it falls back to the
+    // grid. No-op (null) on an ordinary first build.
+    final restoreCam =
+        resolveInitialMaximize(widget.initialMaximizedCameraId, _shown);
+    if (restoreCam != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // Re-check against the live list — a config refresh between build and
+        // this callback could have dropped the camera.
+        final cam = resolveInitialMaximize(restoreCam.id, _shown);
+        if (cam != null && _maximized == null) _maximize(cam);
+      });
+    }
   }
 
   @override
