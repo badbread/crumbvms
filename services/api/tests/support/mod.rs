@@ -192,6 +192,14 @@ fn ensure_env() {
     if std::env::var("JWT_EXPIRY_SECONDS").is_err() {
         std::env::set_var("JWT_EXPIRY_SECONDS", "86400");
     }
+    // Keep each test's pool SMALL. Every `#[tokio::test]` builds its own
+    // `AppState` (its own pool), and they run concurrently against ONE shared
+    // Postgres; at the stock code default (32) enough concurrent tests exhaust a
+    // stock `max_connections = 100` (a prior PR hit exactly this). A handful of
+    // connections is plenty — no test needs deep concurrency within itself.
+    if std::env::var("DB_POOL_SIZE").is_err() {
+        std::env::set_var("DB_POOL_SIZE", "4");
+    }
 }
 
 // Guards the migration run so it executes exactly once per test-binary

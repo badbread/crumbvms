@@ -640,7 +640,11 @@ All wizard steps have API equivalents. Do them in order:
    what the provider can carry: Discord/Telegram do `both`, Pushover/ntfy one
    image (`both` sends the plate crop), Slack/webhook are text/link only. The
    legacy `include_snapshot: true|false` still works (maps to `vehicle`/`none`).
-   Then prove it delivers:
+   `GET /notifications/channels` returns each channel with `global` (bool) and,
+   for an admin caller, every channel with `owner_username` (the owner, absent
+   for a global channel); an admin lists all channels, a non-admin only their
+   own. Quiet hours are whole hours 0..=23 (server local time); an out-of-range
+   value is rejected. Then prove it delivers:
    `POST /notifications/channels/{id}/test` → `{ok, error?}`. Per-camera rules
    and quiet hours are `PUT /notifications/rules[/{camera_id}]`.
 9. **Additional users (optional).** `GET /config/roles` for the role list

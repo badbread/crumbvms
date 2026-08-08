@@ -8,6 +8,82 @@ revisit.
 
 ---
 
+## 2026-08-08, Notifications pane: one shared modal for alert-text editing, whole-hour quiet-hours pickers validated 0..=23 server-side, admins see every channel
+
+**Context.** A Notifications-pane UX pass surfaced four issues. (1) The engine
+fans out to **every enabled channel regardless of owner**
+(`db::list_enabled_channels`), but the console's Destinations list called
+`list_notification_channels` scoped to the caller's own + global channels, so a
+channel created under a different account was invisible even to an admin — and
+two round-trip defects made the "global" checkbox cosmetic (`ChannelResponse`
+had no `global` field; `UpdateChannelRequest` silently dropped `global`).
+(2) The system-alerts table rendered a full per-row `<details>` "Customize alert
+text" block for all ~13 alerts — a wall of collapsibles. (3) Quiet hours were
+raw `type=number` inputs; a value like `2200` was stored verbatim and only
+clamped at read time (`in_quiet_hours` `clamp(0,23)`) to the zero-width window
+`23..23`, so quiet hours **silently never fired** — no server-side validation
+existed. (4) The Title field showed for every provider though only Pushover/ntfy
+consume a rendered title.
+
+**Decisions.**
+
+- **Admins list ALL channels with owner attribution.** `list_notification_channels`
+  now returns every channel for an admin (via `list_all_notification_channels`,
+  a `LEFT JOIN users`), each with `owner_username`; non-admin scope (own only)
+  is unchanged. `ChannelResponse` gained `global: bool` and `owner_username`, and
+  `UpdateChannelRequest`/`UpdateChannelParams` gained an admin-only owner toggle
+  (`global` → `user_id = NULL`/claim). A non-admin supplying `global` on update
+  is rejected (403), not silently ignored. **Rejected:** filtering the engine
+  fan-out by owner instead (that fan-out is correct — a global/foreign channel
+  is a real destination); leaving the console blind to foreign channels (the
+  reported bug).
+
+- **One shared modal (`#sysalert-editor-modal`) for alert-text editing**, opened
+  per alert from a compact "✎ Customize" row button (+ a "Customized" chip when
+  a template is set). The modal holds the message textarea, a conditional Title
+  field, a per-alert token legend (click-to-insert, with sample values), and a
+  live preview rendered as ONE generic notification-card (not per-provider
+  chrome); it saves via the existing per-alert PUT, decoupled from the row-toggle
+  bulk save. **Rejected:** the status-quo inline `<details>` per row (13× noise);
+  a per-row popover (positioning/collision math, and it clips inside the table's
+  overflow wrap). The `.modal-overlay` pattern already exists in `admin.html`,
+  works identically in the desktop WebView2 embed and any Android WebView (fixed
+  overlay, no anchoring), and gives room for legend + preview without inflating
+  the list.
+
+- **Whole-hour `<select>` quiet-hours pickers + server-side 0..=23 validation.**
+  Both quiet-hours pairs (per-user rules and system alerts) are now native
+  selects (`— off —` + 24 friendly 12-hour options), so an out-of-range or
+  minute value is unrepresentable, and the sections collapse into
+  `details.detail-section` with a live-state summary. The server rejects any
+  quiet-hours value outside `0..=23` (`do_upsert_rule`,
+  `put_notification_settings`) instead of storing junk; the engine-side clamp
+  stays as defense for any legacy rows, which the console renders as `— off —`
+  with a one-line "out of range, pick an hour" warning. **Rejected:** a
+  data-migration to scrub existing bad values (the clamp keeps them harmless and
+  the picker can't write a new bad one); free-text/military-time input (the
+  original bug surface).
+
+- **Title field only when a configured destination consumes it** (Pushover or
+  ntfy present), with the helper naming the actual destinations. A stored title
+  is left untouched when the field is hidden (the PUT omits `title_template` =
+  keep).
+
+**Trade-offs accepted.** The console now issues one extra `GET /auth/me` on the
+Notifications pane load to know the session's user id + admin flag (for owner
+attribution and gating the global checkbox). Quiet hours are whole-hour only
+(minutes were never representable in the old 0–23 inputs either). `owner_username`
+is display-only and populated solely by the admin listing's join, so every other
+channel query path leaves it `None`.
+
+**Revisit triggers.** A hosted/multi-tenant mode where "all channels" is too
+broad for an admin (scope the listing per tenant). Demand for sub-hour quiet
+windows (the picker + validation + `in_quiet_hours` would need a minute
+component). A second event type that carries an image (the preview's image-slot
+gate — currently `plate_watchlist_hit` only — generalizes).
+
+---
+
 ## 2026-08-07, Timeline motion-intensity is bucketed in SQL (GROUP BY over a `generate_series`-expanded range), not by fetching every segment to Rust
 
 **Context.** The desktop Playback/clip timeline "intensity ribbon" took roughly
