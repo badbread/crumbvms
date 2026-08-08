@@ -455,6 +455,12 @@ pub struct CreateChannelRequest {
     pub config: JsonValue,
     /// `None`/absent → all cameras the owner can access.
     pub camera_ids: Option<Vec<Uuid>>,
+    /// Snapshot attachment mode: `'none'|'plate'|'vehicle'|'both'`. When present
+    /// this wins; absent falls back to `include_snapshot` (legacy clients), then
+    /// to the default (`'vehicle'`).
+    pub snapshot_mode: Option<String>,
+    /// Legacy snapshot toggle (`true → vehicle`, `false → none`). Kept for
+    /// back-compat with clients that predate `snapshot_mode`.
     pub include_snapshot: Option<bool>,
     /// Admin-only: set to `true` to make the channel global (no owner).
     /// Ignored for non-Admin callers (the channel is always owned by the caller).
@@ -473,6 +479,10 @@ pub struct UpdateChannelRequest {
     /// Omit entirely to keep stored config (secret preservation).
     pub config: Option<JsonValue>,
     pub camera_ids: Option<Vec<Uuid>>,
+    /// Snapshot attachment mode. Omit to keep the stored mode. When present it
+    /// wins over `include_snapshot`.
+    pub snapshot_mode: Option<String>,
+    /// Legacy snapshot toggle; used only when `snapshot_mode` is absent.
     pub include_snapshot: Option<bool>,
 }
 
@@ -490,6 +500,11 @@ pub struct ChannelResponse {
     /// Config with secret string fields replaced by `"***"`.
     pub config: JsonValue,
     pub camera_ids: Option<Vec<Uuid>>,
+    /// Snapshot attachment mode (`'none'|'plate'|'vehicle'|'both'`) — the field
+    /// the console reads and writes.
+    pub snapshot_mode: String,
+    /// Legacy synced mirror of `snapshot_mode` (`mode != 'none'`), retained for
+    /// back-compat with older clients.
     pub include_snapshot: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -506,11 +521,36 @@ impl ChannelResponse {
             enabled: ch.enabled,
             config: masked_config,
             camera_ids: ch.camera_ids,
+            snapshot_mode: ch.snapshot_mode.as_str().to_owned(),
             include_snapshot: ch.include_snapshot,
             created_at: ch.created_at,
             updated_at: ch.updated_at,
         }
     }
+}
+
+/// Resolve the effective [`SnapshotMode`] for a create/update request.
+///
+/// Precedence: an explicit `snapshot_mode` wins (rejected as `BadRequest` if it
+/// is not one of the four known values); otherwise the legacy `include_snapshot`
+/// bool maps on (`true → vehicle`, `false → none`); otherwise `existing` (the
+/// stored mode on update, or the type default `vehicle` on create).
+fn resolve_snapshot_mode(
+    snapshot_mode: Option<&str>,
+    include_snapshot: Option<bool>,
+    existing: db::SnapshotMode,
+) -> Result<db::SnapshotMode, ApiError> {
+    if let Some(s) = snapshot_mode {
+        return db::SnapshotMode::parse(s).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "snapshot_mode must be one of none/plate/vehicle/both; got '{s}'"
+            ))
+        });
+    }
+    if let Some(b) = include_snapshot {
+        return Ok(db::SnapshotMode::from_legacy_bool(b));
+    }
+    Ok(existing)
 }
 
 // ─── channel endpoints ────────────────────────────────────────────────────────
@@ -561,6 +601,12 @@ async fn create_channel(
         Some(user.user_id)
     };
 
+    let snapshot_mode = resolve_snapshot_mode(
+        body.snapshot_mode.as_deref(),
+        body.include_snapshot,
+        db::SnapshotMode::default(),
+    )?;
+
     let p = db::CreateChannelParams {
         user_id: owner,
         kind: body.kind,
@@ -568,7 +614,7 @@ async fn create_channel(
         enabled: true,
         config: body.config,
         camera_ids: body.camera_ids,
-        include_snapshot: body.include_snapshot.unwrap_or(true),
+        snapshot_mode,
     };
     let ch = db::create_notification_channel(state.pool(), &p)
         .await
@@ -645,6 +691,12 @@ async fn update_channel(
     // grants (only checks a newly-supplied list; an absent list keeps existing).
     assert_camera_ids_in_scope(&user, body.camera_ids.as_deref())?;
 
+    let snapshot_mode = resolve_snapshot_mode(
+        body.snapshot_mode.as_deref(),
+        body.include_snapshot,
+        existing.snapshot_mode,
+    )?;
+
     let params = db::UpdateChannelParams {
         id,
         name: body
@@ -657,7 +709,7 @@ async fn update_channel(
         enabled: body.enabled.unwrap_or(existing.enabled),
         config: body.config, // None = keep stored
         camera_ids: body.camera_ids.or(existing.camera_ids),
-        include_snapshot: body.include_snapshot.unwrap_or(existing.include_snapshot),
+        snapshot_mode,
     };
 
     let ch = db::update_notification_channel(state.pool(), &params)
@@ -715,7 +767,7 @@ async fn test_channel(
     let snapshot = match ch
         .camera_ids
         .as_ref()
-        .filter(|_| ch.include_snapshot)
+        .filter(|_| ch.snapshot_mode.wants_image())
         .and_then(|ids| ids.first().copied())
     {
         Some(camera_id) => {
@@ -740,7 +792,9 @@ async fn test_channel(
         label: None,
         ts: Utc::now(),
         web_url: None,
-        snapshot,
+        vehicle_snapshot: snapshot,
+        // A test alert is a synthetic motion event: there is no plate to crop.
+        plate_snapshot: None,
         detail: None,
         template: None,
         title_template: None,
@@ -1579,8 +1633,13 @@ pub async fn run_notification_engine(
                     }
                 };
 
-                // Fetch snapshot once if any passing channel wants it.
-                let needs_snapshot = passing_channels.iter().any(|ch| ch.include_snapshot);
+                // Fetch snapshot once if any passing channel wants an image.
+                // Motion/detection events carry no plate box, so only the full
+                // frame is ever available here (a `plate`/`both` channel falls
+                // back to it inside the dispatch layer).
+                let needs_snapshot = passing_channels
+                    .iter()
+                    .any(|ch| ch.snapshot_mode.wants_image());
                 let snapshot: Option<Vec<u8>> = if needs_snapshot {
                     // We don't have AppState here (the engine task owns only the pool),
                     // so we fetch go2rtc bases from DB directly.
@@ -1637,11 +1696,12 @@ pub async fn run_notification_engine(
                         label: label_opt.clone(),
                         ts: event.ts,
                         web_url: None, // no public URL configured
-                        snapshot: if ch.include_snapshot {
+                        vehicle_snapshot: if ch.snapshot_mode.wants_image() {
                             snapshot.clone()
                         } else {
                             None
                         },
+                        plate_snapshot: None,
                         detail: None,
                         template: None,
                         title_template: None,
@@ -1780,6 +1840,32 @@ async fn fetch_provider_snapshot(
             None
         }
     }
+}
+
+/// Pull the `plate_read_id` (a crumb-alpr read's UUID) out of a
+/// `system_events.meta` object, if present. Written by the detection ingester
+/// for `plate_watchlist_hit` (migration 0079); used to prefer the engine's own
+/// stored plate crop over a re-cropped frame.
+fn meta_plate_read_id(meta: Option<&JsonValue>) -> Option<Uuid> {
+    meta?
+        .get("plate_read_id")
+        .and_then(JsonValue::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+/// Pull the normalized `plate_bbox` (`[x, y, w, h]` fractions of the full frame)
+/// out of a `system_events.meta` object. Written by the detection ingester for a
+/// watchlist hit; the input for a server-side plate crop of the vehicle frame.
+fn meta_plate_bbox(meta: Option<&JsonValue>) -> Option<[f64; 4]> {
+    let arr = meta?.get("plate_bbox")?.as_array()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0_f64; 4];
+    for (slot, v) in out.iter_mut().zip(arr) {
+        *slot = v.as_f64()?;
+    }
+    Some(out)
 }
 
 // `pub(crate)` (not private) purely so the RBAC-fan-out integration test can
@@ -1985,13 +2071,48 @@ pub(crate) async fn dispatch_system_events_tick(
         cooldown_map.insert(cooldown_key, Instant::now());
 
         // LPR watchlist hits carry a detection snapshot (the car+plate frame).
-        // Fetch it ONCE if any channel wants images; each channel then attaches
-        // it or not per its own `include_snapshot` toggle (the user's on/off).
-        let snapshot: Option<Vec<u8>> = match &event.snapshot_url {
-            Some(url) if enabled_channels.iter().any(|c| c.include_snapshot) => {
+        // Fetch the FULL frame ONCE if any channel wants an image; each channel
+        // then attaches the frame and/or the plate crop per its snapshot mode.
+        let vehicle_snapshot: Option<Vec<u8>> = match &event.snapshot_url {
+            Some(url)
+                if enabled_channels
+                    .iter()
+                    .any(|c| c.snapshot_mode.wants_image()) =>
+            {
                 fetch_provider_snapshot(pool, http_client, url).await
             }
             _ => None,
+        };
+
+        // Derive the tight plate crop ONCE, only if some channel wants it
+        // (`plate`/`both`). Preference:
+        //   1. a crumb-alpr read's stored `plate_reads.crop` (the engine's own
+        //      tight crop — better than re-cropping a downscaled frame), else
+        //   2. a server-side crop of the fetched vehicle frame by the normalized
+        //      `plate_bbox` from `system_events.meta` (works for Frigate reads,
+        //      which have no stored crop).
+        // No extra network fetch: the vehicle bytes were already retrieved above.
+        let plate_snapshot: Option<Vec<u8>> = if enabled_channels
+            .iter()
+            .any(|c| c.snapshot_mode.wants_plate())
+        {
+            let stored = match meta_plate_read_id(event.meta.as_ref()) {
+                Some(read_id) => db::get_plate_read_crop(pool, read_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|(_, crop)| crop),
+                None => None,
+            };
+            match stored {
+                Some(bytes) => Some(bytes),
+                None => match (&vehicle_snapshot, meta_plate_bbox(event.meta.as_ref())) {
+                    (Some(frame), Some(bbox)) => channel_notify::crop_plate_jpeg(frame, bbox).await,
+                    _ => None,
+                },
+            }
+        } else {
+            None
         };
 
         for ch in &enabled_channels {
@@ -2036,8 +2157,13 @@ pub(crate) async fn dispatch_system_events_tick(
                 label: Some(title.to_owned()),
                 ts: event.ts,
                 web_url: None,
-                snapshot: if ch.include_snapshot {
-                    snapshot.clone()
+                vehicle_snapshot: if ch.snapshot_mode.wants_image() {
+                    vehicle_snapshot.clone()
+                } else {
+                    None
+                },
+                plate_snapshot: if ch.snapshot_mode.wants_plate() {
+                    plate_snapshot.clone()
                 } else {
                     None
                 },

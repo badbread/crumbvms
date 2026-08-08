@@ -16,6 +16,16 @@ A channel is a destination: Discord, Slack, Telegram, ntfy, Pushover, or a
 plain webhook. Add a channel, then send a test notification to
 confirm it delivers before relying on it.
 
+### Snapshot images
+
+Each channel chooses what image an alert attaches: no image, the plate crop,
+the full vehicle frame, or both. What actually arrives depends on the
+provider. Discord and Telegram can carry both the frame and the plate crop.
+Pushover and ntfy carry a single image, so "both" sends the plate crop (the
+more useful of the two). Slack and the plain webhook cannot attach an image
+over their transport, so they send text and a link only; the console shows the
+choices a given provider can honor.
+
 ## Rules
 
 Per-camera rules control which cameras notify, and when, including quiet

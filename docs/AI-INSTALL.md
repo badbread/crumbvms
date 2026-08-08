@@ -632,10 +632,15 @@ All wizard steps have API equivalents. Do them in order:
    not "no devices". Skipping this step entirely is fine: `cpu` is the default,
    and it works on any host.
 8. **Notifications (optional).** `POST /notifications/channels`
-   `{kind, name, config, camera_ids: [], include_snapshot: true, enabled: true,
+   `{kind, name, config, camera_ids: [], snapshot_mode: "vehicle", enabled: true,
    global: true}`, `kind` ∈ `ntfy|pushover|webhook|discord|slack|telegram`,
    `config` holds the provider fields (ntfy: `{topic_url}`; pushover:
-   `{app_token, user_key}`; webhook: `{url}`). Then prove it delivers:
+   `{app_token, user_key}`; webhook: `{url}`). `snapshot_mode` (one of
+   `none|plate|vehicle|both`) chooses what image an alert attaches, capped by
+   what the provider can carry: Discord/Telegram do `both`, Pushover/ntfy one
+   image (`both` sends the plate crop), Slack/webhook are text/link only. The
+   legacy `include_snapshot: true|false` still works (maps to `vehicle`/`none`).
+   Then prove it delivers:
    `POST /notifications/channels/{id}/test` → `{ok, error?}`. Per-camera rules
    and quiet hours are `PUT /notifications/rules[/{camera_id}]`.
 9. **Additional users (optional).** `GET /config/roles` for the role list

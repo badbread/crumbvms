@@ -10834,6 +10834,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0079_alert_templates.sql",
         include_str!("../../../db/migrations/0079_alert_templates.sql"),
     ),
+    (
+        "0080_channel_snapshot_mode.sql",
+        include_str!("../../../db/migrations/0080_channel_snapshot_mode.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds
@@ -12008,6 +12012,164 @@ pub async fn resolve_user_grants(pool: &Pool, user_id: Uuid) -> Result<Option<Us
 /// The filter columns still exist in the DB but are no longer read by the engine
 /// or exposed through the REST API — they are left in place so the schema diff is
 /// additive and a future rollback is safe.
+/// Per-channel snapshot attachment mode (migration 0080).
+///
+/// The single source of truth for what image(s) a channel attaches. Each
+/// provider's dispatch is capability-gated against this (see `channel_notify`):
+/// a provider that cannot carry raw image bytes over its transport (Slack
+/// incoming-webhook, generic webhook) delivers text/link only regardless.
+///
+/// The legacy `include_snapshot bool` is kept as a synced mirror
+/// (`include_snapshot = mode != None`) so a rollback or an older reader still
+/// sees a consistent value; the engine reads `snapshot_mode`, not the bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotMode {
+    /// Never attach an image, even when one is available.
+    None,
+    /// Attach the tight plate crop only.
+    Plate,
+    /// Attach the full vehicle/detection frame (the legacy behaviour).
+    Vehicle,
+    /// Attach both where the provider can carry two images; where it can only
+    /// carry one, the plate crop wins (more informative).
+    Both,
+}
+
+impl Default for SnapshotMode {
+    /// Matches the historical `include_snapshot` default of `true` (a fresh
+    /// channel attaches the frame) so create-with-no-mode is behaviour-neutral.
+    fn default() -> Self {
+        Self::Vehicle
+    }
+}
+
+impl SnapshotMode {
+    /// The canonical DB / wire string (`'none'|'plate'|'vehicle'|'both'`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Plate => "plate",
+            Self::Vehicle => "vehicle",
+            Self::Both => "both",
+        }
+    }
+
+    /// Parse a wire/DB value. Unknown/legacy values fall back to `Vehicle`
+    /// (the "image on" default), never an error — the CHECK constraint already
+    /// bounds what can be stored, and a defensive fallback keeps a broken read
+    /// from silencing an alert's image entirely.
+    #[must_use]
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "none" => Self::None,
+            "plate" => Self::Plate,
+            "both" => Self::Both,
+            _ => Self::Vehicle,
+        }
+    }
+
+    /// Strict parse for operator input (returns `None` on an unknown value so a
+    /// bad API request is rejected rather than silently coerced).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "plate" => Some(Self::Plate),
+            "vehicle" => Some(Self::Vehicle),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Map the legacy `include_snapshot` bool onto a mode (`true → vehicle`,
+    /// `false → none`) — used for upgrade backfill and old-client requests.
+    #[must_use]
+    pub fn from_legacy_bool(b: bool) -> Self {
+        if b {
+            Self::Vehicle
+        } else {
+            Self::None
+        }
+    }
+
+    /// Whether this mode wants ANY image (so the vehicle frame is worth
+    /// fetching). `Plate` still wants the vehicle frame because the crop is
+    /// derived from it (and it is the defensive fallback when no crop exists).
+    #[must_use]
+    pub fn wants_image(self) -> bool {
+        self != Self::None
+    }
+
+    /// Whether this mode wants the tight plate crop (so it is worth deriving).
+    #[must_use]
+    pub fn wants_plate(self) -> bool {
+        matches!(self, Self::Plate | Self::Both)
+    }
+
+    /// The synced legacy `include_snapshot` mirror value for this mode.
+    #[must_use]
+    pub fn include_snapshot(self) -> bool {
+        self.wants_image()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_mode_tests {
+    use super::SnapshotMode;
+
+    #[test]
+    fn legacy_bool_backfill_matches_migration() {
+        // The 0080 backfill: include_snapshot = true → 'vehicle', false → 'none'.
+        assert_eq!(SnapshotMode::from_legacy_bool(true), SnapshotMode::Vehicle);
+        assert_eq!(SnapshotMode::from_legacy_bool(false), SnapshotMode::None);
+    }
+
+    #[test]
+    fn include_snapshot_mirror_is_consistent() {
+        // The synced legacy column: any image-bearing mode → true, none → false.
+        assert!(!SnapshotMode::None.include_snapshot());
+        assert!(SnapshotMode::Plate.include_snapshot());
+        assert!(SnapshotMode::Vehicle.include_snapshot());
+        assert!(SnapshotMode::Both.include_snapshot());
+    }
+
+    #[test]
+    fn str_round_trips() {
+        for m in [
+            SnapshotMode::None,
+            SnapshotMode::Plate,
+            SnapshotMode::Vehicle,
+            SnapshotMode::Both,
+        ] {
+            assert_eq!(SnapshotMode::parse(m.as_str()), Some(m));
+            assert_eq!(SnapshotMode::from_db(m.as_str()), m);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_but_from_db_defaults() {
+        assert_eq!(SnapshotMode::parse("bogus"), None);
+        // from_db never errors (CHECK-bounded column); defaults to the "image on"
+        // value so a broken read can't silence an alert's image.
+        assert_eq!(SnapshotMode::from_db("bogus"), SnapshotMode::Vehicle);
+    }
+
+    #[test]
+    fn wants_plate_only_for_plate_and_both() {
+        assert!(!SnapshotMode::None.wants_plate());
+        assert!(SnapshotMode::Plate.wants_plate());
+        assert!(!SnapshotMode::Vehicle.wants_plate());
+        assert!(SnapshotMode::Both.wants_plate());
+    }
+
+    #[test]
+    fn default_is_vehicle() {
+        assert_eq!(SnapshotMode::default(), SnapshotMode::Vehicle);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NotificationChannel {
     pub id: Uuid,
@@ -12022,7 +12184,12 @@ pub struct NotificationChannel {
     pub config: serde_json::Value,
     /// `None`/empty = all cameras the owner can access.
     pub camera_ids: Option<Vec<Uuid>>,
+    /// Legacy mirror of [`snapshot_mode`](Self::snapshot_mode)
+    /// (`mode != None`), kept in sync on write; the engine reads the mode.
     pub include_snapshot: bool,
+    /// Per-channel snapshot attachment mode (migration 0080) — the source of
+    /// truth read by the dispatch layer.
+    pub snapshot_mode: SnapshotMode,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -12037,6 +12204,7 @@ fn notification_channel_from_row(row: &tokio_postgres::Row) -> NotificationChann
         config: row.get("config"),
         camera_ids: row.get("camera_ids"),
         include_snapshot: row.get("include_snapshot"),
+        snapshot_mode: SnapshotMode::from_db(&row.get::<_, String>("snapshot_mode")),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -12050,7 +12218,7 @@ fn notification_channel_from_row(row: &tokio_postgres::Row) -> NotificationChann
 /// `notification_rules`.  The DB columns remain for schema backwards compatibility.
 const CHANNEL_COLS: &str = r"
     id, user_id, kind, name, enabled, config,
-    camera_ids, include_snapshot, created_at, updated_at
+    camera_ids, include_snapshot, snapshot_mode, created_at, updated_at
 ";
 
 /// Parameters for creating a notification channel.
@@ -12067,7 +12235,9 @@ pub struct CreateChannelParams {
     pub enabled: bool,
     pub config: serde_json::Value,
     pub camera_ids: Option<Vec<Uuid>>,
-    pub include_snapshot: bool,
+    /// Per-channel snapshot mode; the legacy `include_snapshot` column is written
+    /// as its synced mirror (`snapshot_mode.include_snapshot()`).
+    pub snapshot_mode: SnapshotMode,
 }
 
 /// Create a new notification channel row.
@@ -12085,8 +12255,8 @@ pub async fn create_notification_channel(
             &format!(
                 r"
                 INSERT INTO notification_channels
-                    (user_id, kind, name, enabled, config, camera_ids, include_snapshot)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (user_id, kind, name, enabled, config, camera_ids, include_snapshot, snapshot_mode)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING {CHANNEL_COLS}
                 "
             ),
@@ -12097,7 +12267,8 @@ pub async fn create_notification_channel(
                 &p.enabled,
                 &p.config,
                 &p.camera_ids,
-                &p.include_snapshot,
+                &p.snapshot_mode.include_snapshot(),
+                &p.snapshot_mode.as_str(),
             ],
         )
         .await
@@ -12187,7 +12358,10 @@ pub struct UpdateChannelParams {
     /// `None` → leave `config` column unchanged; `Some(v)` → replace it.
     pub config: Option<serde_json::Value>,
     pub camera_ids: Option<Vec<Uuid>>,
-    pub include_snapshot: bool,
+    /// Resolved snapshot mode (handler applies the "omitted → keep existing"
+    /// rule before building these params); the legacy `include_snapshot` column
+    /// is written as its synced mirror.
+    pub snapshot_mode: SnapshotMode,
 }
 
 /// Update a notification channel.
@@ -12215,6 +12389,7 @@ pub async fn update_notification_channel(
                     config           = CASE WHEN $4 THEN $5 ELSE config END,
                     camera_ids       = $6,
                     include_snapshot = $7,
+                    snapshot_mode    = $8,
                     updated_at       = now()
                 WHERE id = $1
                 RETURNING {CHANNEL_COLS}
@@ -12227,7 +12402,8 @@ pub async fn update_notification_channel(
                 &params.config.is_some(),
                 &params.config,
                 &params.camera_ids,
-                &params.include_snapshot,
+                &params.snapshot_mode.include_snapshot(),
+                &params.snapshot_mode.as_str(),
             ],
         )
         .await

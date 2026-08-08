@@ -8,6 +8,76 @@ revisit.
 
 ---
 
+## 2026-08-07, Per-channel snapshot MODE with a capability gate; the plate crop is derived SERVER-SIDE via ffmpeg for notification delivery
+
+**Context.** A notification channel had a single `include_snapshot` bool that
+attached the full vehicle frame, and only three providers actually sent an
+image. The ask (the second half of the customizable-alert feature): let each
+channel choose to attach the plate, the vehicle frame, both, or nothing, and
+extend image support to more providers where their transport genuinely allows
+it. PR #568 had just started writing `plate_bbox` (normalized `[x,y,w,h]`) and
+`plate_read_id` into `system_events.meta` for a watchlist hit, which makes a
+server-side crop of the vehicle frame possible for ALL plate reads (Frigate
+reads have no stored tight crop; only crumb-alpr does, in `plate_reads.crop`).
+
+**Decision.**
+
+- `notification_channels.snapshot_mode` (`'none'|'plate'|'vehicle'|'both'`,
+  migration `0080`, `db::SnapshotMode`) is the single source of truth. The
+  legacy `include_snapshot` bool is kept as a synced mirror (`mode != 'none'`,
+  written on every create/update) for rollback/older-reader safety but is no
+  longer read by the engine. The 0080 backfill (`true→'vehicle'`, `false→'none'`,
+  guarded by `WHERE snapshot_mode IS NULL` so a re-apply cannot clobber an
+  operator's choice) makes the upgrade behaviour-neutral.
+- The mode is capped by a per-provider **capability** the operator cannot
+  override (`channel_notify::provider_image_capability`, mirrored by
+  `admin.html`'s `NOTIF_IMG_CAP`): Discord and Telegram carry two images
+  (`both` = vehicle frame + plate crop, via multipart `file[N]` /
+  `sendMediaGroup`); Pushover and ntfy carry one (`both` degrades to the plate
+  crop — the more informative single image); Slack and the generic webhook carry
+  **none**.
+- The tight plate crop is produced **server-side**: prefer a crumb-alpr read's
+  stored `plate_reads.crop`, else crop the already-fetched vehicle frame by the
+  meta `plate_bbox` with `ffmpeg` (`crop=iw*…:ih*…`, no pixel dims needed),
+  derived at most once per event and only when some enabled channel wants
+  `plate`/`both`. No new image crate: the api already shells out to
+  jellyfin-ffmpeg for thumbnails (`filmstrip.rs`); there is no in-process image
+  crate in the tree, so adding one would have needed an issue (golden rule 6).
+
+**Rejected / not done.**
+
+- *Slack image attachment.* A Slack incoming webhook takes only an `image_url`
+  its own servers must fetch; Crumb is LAN-only, so a LAN `web_url` is
+  unreachable and there is no raw-byte path. A real file upload needs a bot
+  token + `files.upload` — out of scope. Slack stays text + link, honestly
+  labelled in the console (no image modes offered).
+- *Bytes over the generic webhook.* It is a JSON contract by design; it now
+  carries the channel's `snapshot_mode` so a consumer can go fetch an image
+  itself, but never raw bytes.
+- *Adding the `image` crate for the crop.* No such crate exists in the tree
+  (the `filmstrip` thumbnailer is an ffmpeg subprocess, not a crate), and it
+  would be a heavyweight new dependency. ffmpeg is already a hard runtime
+  dependency and the codebase's established image tool.
+
+**Not a contradiction of the 2026-08-07 "fix the client's decode, not the
+payload" entry (server-side derivatives for the Plates UI).** That decision
+rejected server-side crop derivatives for the *client* Plates report, where the
+bottleneck was the client's pure-Dart decode and the LAN transfer was already
+~1-2 ms — the client can decode natively, so a cold ffmpeg spawn per image lost.
+The notification path has **no client to decode**: an external provider needs
+the actual cropped bytes produced somewhere, and the only place is the server.
+It is derived once per event (not per row, not per channel) on a background,
+best-effort path, so the ~40 ms spawn is paid rarely and never blocks or drops
+an alert (any crop failure falls back to the vehicle frame).
+
+**Revisit if:** a provider gains a real multi-image or byte path we don't use
+(e.g. a first-class Slack bot integration with `files.upload` — then Slack could
+attach images); or plate crops are wanted on motion/detection alerts (today only
+`plate_watchlist_hit` carries a `plate_bbox`, so motion/detection channels set
+to `plate`/`both` fall back to the vehicle frame); or the per-event ffmpeg spawn
+shows up as load under a flood of watchlist hits (cache the crop on the
+`system_event`, or move it into the detection ingester at emit time).
+
 ## 2026-08-07, Alert-text templates: a `%token%` engine over per-`event_key` columns, NULL = built-in default, structured tokens via `system_events.meta`
 
 **Context.** Every system-alert notification was composed by one hardcoded
