@@ -132,6 +132,32 @@ extension ServerDashboardApi on CrumbApi {
         .toList(growable: false);
   }
 
+  /// GET /config/groups → camera groups (admin only). Returns a bare JSON array
+  /// of `CameraGroupDto`; the dashboard/motion-tuner use it to name the group a
+  /// camera belongs to (group-managed cameras cannot edit their own policy).
+  Future<List<CameraGroupSummary>> listGroups(Session s) async {
+    final resp = await _client(this).get(
+      Uri.parse('${s.base}/config/groups'),
+      headers: {'authorization': 'Bearer ${s.token}'},
+    );
+    if (resp.statusCode == 403) {
+      throw CrumbApiException(
+        'Administrator account required.',
+        statusCode: 403,
+      );
+    }
+    if (resp.statusCode != 200) {
+      throw CrumbApiException(
+        'Failed to load groups (HTTP ${resp.statusCode}).',
+        statusCode: resp.statusCode,
+      );
+    }
+    final list = jsonDecode(resp.body) as List<dynamic>;
+    return list
+        .map((e) => CameraGroupSummary.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
   /// GET /config/policy/default → the global default recording policy.
   Future<RecordingPolicy> getDefaultPolicy(Session s) =>
       _get(s, '/config/policy/default', RecordingPolicy.fromJson);

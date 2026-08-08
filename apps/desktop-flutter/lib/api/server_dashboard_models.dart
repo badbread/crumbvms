@@ -368,6 +368,87 @@ class CameraConfigSummary {
   bool get hasOwnPolicy => policyId != null;
 }
 
+/// A camera group summary from `GET /config/groups` (`CameraGroupDto`). The
+/// dashboard/motion-tuner only need identity + name to name the group a camera
+/// belongs to; `policy_id`/`camera_ids` are ignored here.
+class CameraGroupSummary {
+  CameraGroupSummary({required this.id, required this.name});
+
+  final String id;
+  final String name;
+
+  factory CameraGroupSummary.fromJson(Map<String, dynamic> j) =>
+      CameraGroupSummary(
+        id: j['id'] as String,
+        name: (j['name'] as String?) ?? '',
+      );
+}
+
+/// Where a camera's effective recording policy actually comes from. Under the
+/// ratified policy model `policy_id != null` no longer means "custom": a camera
+/// "on Default" and one pinned to a shared named policy both carry a non-null
+/// `policy_id`, and a grouped camera's settings come from its group profile.
+enum PolicySourceKind { group, defaultPolicy, named, custom }
+
+/// The resolved policy source + a human label for one camera. See
+/// [resolvePolicySource] for the precedence.
+class PolicySource {
+  const PolicySource(this.kind, {this.groupName, this.policyName});
+
+  final PolicySourceKind kind;
+  final String? groupName; // set when kind == group
+  final String? policyName; // set when kind == named
+
+  /// True when the camera's recording settings are owned by a group profile and
+  /// therefore must not be edited from the per-camera editor (the server 400s).
+  bool get isGroupManaged => kind == PolicySourceKind.group;
+
+  /// Short subtitle for the camera tile.
+  String get label {
+    switch (kind) {
+      case PolicySourceKind.group:
+        return groupName != null && groupName!.isNotEmpty
+            ? 'Group: $groupName'
+            : 'Group profile';
+      case PolicySourceKind.defaultPolicy:
+        return 'Default policy';
+      case PolicySourceKind.named:
+        return policyName != null && policyName!.isNotEmpty
+            ? 'Policy: $policyName'
+            : 'Named policy';
+      case PolicySourceKind.custom:
+        return 'Custom policy';
+    }
+  }
+}
+
+/// Decide how a camera's effective recording policy is sourced, by precedence:
+///   1. member of a group  -> `Group: <name>` (group profile owns the settings)
+///   2. resolved policy is the default -> `Default policy`
+///   3. resolved policy is a named policy -> `Policy: <name>`
+///   4. otherwise (anonymous per-camera fork) -> `Custom policy`
+///
+/// [groupNamesById] maps group id -> name (from `listGroups()`); an unknown id
+/// falls back to a generic "Group profile" label.
+PolicySource resolvePolicySource(
+  CameraConfigSummary camera,
+  Map<String, String> groupNamesById,
+) {
+  if (camera.groupId != null) {
+    return PolicySource(
+      PolicySourceKind.group,
+      groupName: groupNamesById[camera.groupId],
+    );
+  }
+  if (camera.policy.isDefault) {
+    return const PolicySource(PolicySourceKind.defaultPolicy);
+  }
+  if (camera.policy.name != null && camera.policy.name!.isNotEmpty) {
+    return PolicySource(PolicySourceKind.named, policyName: camera.policy.name);
+  }
+  return const PolicySource(PolicySourceKind.custom);
+}
+
 /// A partial update body for `PUT /config/policy/default` or
 /// `PUT /config/cameras/{id}/policy` (`UpdatePolicyRequest`, dto.rs).
 ///

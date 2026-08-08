@@ -223,6 +223,13 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
   double _thresholdPct = 0.30; // % of frame, 0.05..5
   String _sensitivity = 'dynamic'; // "dynamic" | "manual"
 
+  // Group gating: sensitivity/threshold are POLICY fields, and a grouped
+  // camera's policy is its group profile — the server rejects a per-camera
+  // fork for it. Gate those controls up front (banner + disabled) instead of
+  // letting the operator hit a raw 400 on save. The mask/grid/meter/sources
+  // are per-camera fields and stay editable regardless.
+  MotionTunerGating _gating = const MotionTunerGating(sensitivityLocked: false);
+
   // Detector sources.
   bool _pixelEnabled = true;
   bool _frigateEnabled = false;
@@ -262,6 +269,20 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
         widget.session,
         widget.camera.id,
       );
+      // Resolve the camera's group (if any) so the sensitivity controls can be
+      // gated before the operator edits. Best-effort: if the groups list can't
+      // be fetched we still gate a grouped camera (generic banner copy), and
+      // the server guard remains the backstop.
+      var groupNames = <String, String>{};
+      if (cfg.groupId != null) {
+        try {
+          final groups = await widget.api.listGroups(widget.session);
+          groupNames = {for (final g in groups) g.id: g.name};
+        } catch (_) {
+          /* non-fatal: gate with generic copy below */
+        }
+      }
+      _gating = resolveMotionTunerGating(cfg.groupId, groupNames);
       var gc = cfg.motionGridCols ?? 16;
       var gr = cfg.motionGridRows ?? 9;
       if (!kMotionTunerGridSizes.contains((gc, gr))) {
@@ -521,6 +542,20 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
       });
     } catch (e) {
       if (!mounted) return;
+      // Defense in depth: the controls are gated up front for a grouped camera,
+      // but if membership changed since load the server 400s here. Render the
+      // same friendly banner instead of the raw exception, and lock the
+      // controls so the next attempt can't repeat it.
+      if (e is CrumbApiException && e.statusCode == 400) {
+        setState(() {
+          _gating = MotionTunerGating(
+            sensitivityLocked: true,
+            groupName: _gating.groupName,
+          );
+          _error = _gating.sensitivityBanner;
+        });
+        return;
+      }
       setState(() => _error = 'Threshold save failed: $e');
     }
   }
@@ -729,11 +764,19 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
             'Sensitivity',
             style: Theme.of(context).textTheme.titleMedium,
           ),
+          // Grouped camera: sensitivity/threshold are owned by the group
+          // profile (the server 400s a per-camera fork), so surface that up
+          // front and disable the controls rather than let the save bounce.
+          if (_gating.sensitivityLocked) ...[
+            const SizedBox(height: 4),
+            _GroupGateBanner(text: _gating.sensitivityBanner ?? ''),
+            const SizedBox(height: 4),
+          ],
           Row(
             children: [
               Checkbox(
                 value: _sensitivity == 'dynamic',
-                onChanged: !_pixelEnabled
+                onChanged: (!_pixelEnabled || _gating.sensitivityLocked)
                     ? null
                     : (v) {
                         setState(
@@ -751,13 +794,19 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
                   max: 5,
                   divisions: 495,
                   label: '${_thresholdPct.toStringAsFixed(2)}%',
-                  onChanged: (_sensitivity == 'dynamic' || !_pixelEnabled)
+                  onChanged:
+                      (_sensitivity == 'dynamic' ||
+                          !_pixelEnabled ||
+                          _gating.sensitivityLocked)
                       ? null
                       : (v) => setState(() {
                           _thresholdPct = v;
                           _sensitivity = 'manual';
                         }),
-                  onChangeEnd: (_sensitivity == 'dynamic' || !_pixelEnabled)
+                  onChangeEnd:
+                      (_sensitivity == 'dynamic' ||
+                          !_pixelEnabled ||
+                          _gating.sensitivityLocked)
                       ? null
                       : (_) => _applyThreshold(),
                 ),
@@ -880,6 +929,41 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
             ],
           ),
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+}
+
+/// Inline notice shown in the Sensitivity block when the camera follows a
+/// group profile: the sensitivity/threshold controls are owned by the group,
+/// so they are disabled and this explains why (mirrors WU-B's group-managed
+/// treatment on the dashboard). Mask/meter/grid/source controls remain live.
+class _GroupGateBanner extends StatelessWidget {
+  const _GroupGateBanner({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.blueGrey.withValues(alpha: 0.5)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.info_outline, size: 18, color: Colors.white70),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(fontSize: 13, color: Colors.white70),
+            ),
+          ),
         ],
       ),
     );
