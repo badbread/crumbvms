@@ -484,11 +484,19 @@ pub async fn run_update_notifier(pool: Pool, cfg: ApiConfig) {
                      Release notes: {}",
                     release.notes_url
                 );
-                match crumb_common::db::insert_system_event(
+                // Structured tokens for alert-text templating (migration 0079).
+                let meta = serde_json::json!({
+                    "version": version,
+                    "current_version": server_version,
+                    "notes_url": release.notes_url,
+                });
+                match crumb_common::db::insert_system_event_full(
                     &pool,
                     UPDATE_AVAILABLE_EVENT_KEY,
                     None,
                     Some(&detail),
+                    None,
+                    Some(&meta),
                 )
                 .await
                 {

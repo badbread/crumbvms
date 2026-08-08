@@ -8,6 +8,59 @@ revisit.
 
 ---
 
+## 2026-08-07, Alert-text templates: a `%token%` engine over per-`event_key` columns, NULL = built-in default, structured tokens via `system_events.meta`
+
+**Context.** Every system-alert notification was composed by one hardcoded
+`format!` in `channel_notify::ChannelMessage::text()`. Operators asked to
+customize the wording (date/time placement, plate/free-space facts, their own
+phrasing) per alert type. The structured facts (plate, confidence, free %) were
+baked into the free-text `detail` string only, so a template could not reference
+them by name.
+
+**Decision.**
+- A small pure engine (`crumb_common::alert_template`) with `%token%` syntax. An
+  UNKNOWN token renders LITERALLY (`%typo%` stays visible) rather than blank, so
+  a mistake is obvious. No expression evaluation, no recursion into replacement
+  values, substitution from a fixed map only.
+- Templates live as nullable `message_template`/`title_template` columns on the
+  existing `system_alert_rules` (keyed by `event_key`), migration `0079`. `NULL`
+  means "use the built-in default" — so "Restore default" is simply clearing the
+  column to NULL. Built-in defaults are expressed as templates and rendered
+  through the same engine.
+- Structured tokens flow through a new nullable `system_events.meta` (jsonb),
+  populated at the emit sites (`db::insert_system_event_full`). Always-available
+  built-ins (`%camera%`, `%event%`, `%detail%`, `%date%`/`%time%`/`%datetime%`)
+  work for every alert type even when `meta` is NULL.
+- Rendered text is JSON-escaped for free: every provider body is built with
+  `serde_json::json!`, so quotes/newlines/braces in a template can never break or
+  inject into a payload (proven by a test). The ntfy title (an HTTP header)
+  additionally strips CR/LF.
+- Timezone: date/time render in UTC, matching the `ts` formatting the
+  notification path already used. No per-user timezone is invented here.
+
+**Rejected.**
+- *A general expression/handlebars-style language.* Overkill and an injection
+  surface; operators want placeholders, not logic.
+- *A single global template for all alert types.* Loses the per-type structured
+  tokens (a plate token is meaningless to a storage alert) and the per-type
+  default wording.
+- *Bypassing the engine for the default (keep the old `format!` when unset).*
+  Would mean the "default" shown to operators and the actual default could
+  drift; expressing the default AS a template keeps the editor's placeholder
+  honest. The one wrinkle accepted: the default message template reproduces the
+  legacy wording verbatim, INCLUDING its em-dash separator, to keep every
+  existing alert byte-identical by default (changing that separator is a
+  wording change the operator can now make, not one this change imposes).
+- *Rendering a custom title for every provider by default.* Pushover and ntfy
+  build different default titles today; a NULL `title_template` keeps each
+  provider's existing title so defaults never change. A set title applies to
+  both.
+
+**Revisit if:** per-user/local timezone lands (date/time tokens should honor it);
+motion/detection camera notifications (the separate `notification_rules` path)
+also need templating (they are out of scope here — this covers `system_events`
+only); or a provider needs structured (non-string) payload fields from tokens.
+
 ## 2026-08-07, The HA placement PUT stays a whole-object REPLACE, against the `PUT /config/server` merge convention (issue #552)
 
 **Context.** The v0.2.0 release-prep API audit flagged `PUT

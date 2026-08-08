@@ -929,11 +929,15 @@ async fn report_stream_rejection(
                 reason = %reason,
                 "go2rtc REJECTED this camera's stream — it will record nothing until the source is fixed"
             );
-            if let Err(e) = crumb_common::db::insert_system_event(
+            // Structured tokens for alert-text templating (migration 0079).
+            let meta = serde_json::json!({ "reason": reason });
+            if let Err(e) = crumb_common::db::insert_system_event_full(
                 state.pool(),
                 "camera_stream_rejected",
                 Some(s.id),
                 Some(&detail),
+                None,
+                Some(&meta),
             )
             .await
             {

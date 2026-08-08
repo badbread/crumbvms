@@ -21,6 +21,7 @@
 // so silence clippy's suggestion to implement the FromStr trait instead.
 #![allow(clippy::should_implement_trait)]
 
+pub mod alert_template;
 pub mod config;
 pub mod db;
 pub mod detection;

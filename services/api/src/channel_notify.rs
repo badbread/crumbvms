@@ -89,13 +89,69 @@ pub struct ChannelMessage {
     pub snapshot: Option<Vec<u8>>,
     /// `kind == "system"` only: the free-text detail string from
     /// `system_events.detail` (e.g. "camera X has written no new segment for
-    /// 130s"), appended to the message body.
+    /// 130s"), appended to the message body / exposed as the `%detail%` token.
     pub detail: Option<String>,
+    /// `kind == "system"` only: the resolved message-body template (operator
+    /// override or the built-in default), rendered by [`ChannelMessage::text`]
+    /// via `crumb_common::alert_template`. `None` for motion/detection (and as a
+    /// defensive fallback for system) keeps the legacy hardcoded wording.
+    pub template: Option<String>,
+    /// `kind == "system"` only: the operator's custom provider-title template.
+    /// `None` keeps each provider's existing default title construction
+    /// unchanged (so an unset title never alters current behaviour).
+    pub title_template: Option<String>,
+    /// `kind == "system"` only: the event's structured `meta` tokens (migration
+    /// 0079), merged UNDER the built-ins when rendering (a built-in like
+    /// `%camera%` can never be shadowed by a meta key).
+    pub meta: Option<serde_json::Value>,
 }
 
 impl ChannelMessage {
+    /// Build the `%token%` map for templating: the always-available built-ins
+    /// plus the event's structured `meta`. Built-ins are inserted LAST so a
+    /// meta key can never shadow `%camera%`/`%event%`/etc.
+    ///
+    /// Timezone: date/time render in UTC, matching the `ts` formatting the
+    /// notification path has always used. This is not a per-user local time; if
+    /// per-user timezone is ever added it belongs there, not baked in here.
+    fn token_map(&self) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        // Meta first (lowest priority) — flat object of scalar values only.
+        if let Some(serde_json::Value::Object(obj)) = &self.meta {
+            for (k, v) in obj {
+                if let Some(s) = json_scalar_to_string(v) {
+                    map.insert(k.clone(), s);
+                }
+            }
+        }
+        // Built-ins (win over any meta key of the same name).
+        map.insert("camera".to_owned(), self.camera_name.clone());
+        map.insert("date".to_owned(), self.ts.format("%Y-%m-%d").to_string());
+        map.insert("time".to_owned(), self.ts.format("%H:%M:%S").to_string());
+        map.insert(
+            "datetime".to_owned(),
+            self.ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        );
+        map.insert(
+            "event".to_owned(),
+            self.label
+                .clone()
+                .unwrap_or_else(|| "System alert".to_owned()),
+        );
+        map.insert("detail".to_owned(), self.detail.clone().unwrap_or_default());
+        map
+    }
+
     /// Human-readable one-liner suitable for all channel types.
+    ///
+    /// For a system alert with a resolved [`template`](Self::template) the text
+    /// is rendered via `crumb_common::alert_template` (operator-customizable).
+    /// Motion/detection — and a system event with no template (defensive) — use
+    /// the legacy hardcoded wording, unchanged.
     pub fn text(&self) -> String {
+        if let Some(tpl) = &self.template {
+            return crumb_common::alert_template::render(tpl, &self.token_map());
+        }
         let cam = &self.camera_name;
         let ts = self.ts.format("%Y-%m-%d %H:%M:%S UTC");
         if self.kind == "system" {
@@ -111,6 +167,26 @@ impl ChannelMessage {
             }
             _ => format!("[Crumb] Motion on {cam} at {ts}"),
         }
+    }
+
+    /// The operator's custom provider title, rendered, when a `title_template`
+    /// is set; otherwise `None` so the provider keeps its own default title.
+    pub fn rendered_title(&self) -> Option<String> {
+        self.title_template
+            .as_ref()
+            .map(|tpl| crumb_common::alert_template::render(tpl, &self.token_map()))
+    }
+}
+
+/// Coerce a JSON scalar to a token string. Objects/arrays/null are skipped
+/// (returns `None`) — `meta` is expected to be a flat scalar map, and this keeps
+/// a stray nested value from rendering as `[object]` noise in an alert.
+fn json_scalar_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -245,7 +321,9 @@ async fn dispatch_pushover(
     let app_token = cfg_str(&ch.config, "app_token").context("pushover config")?;
     let user_key = cfg_str(&ch.config, "user_key").context("pushover config")?;
 
-    let title = format!("Crumb – {}", msg.label.as_deref().unwrap_or(msg.kind));
+    let title = msg
+        .rendered_title()
+        .unwrap_or_else(|| format!("Crumb – {}", msg.label.as_deref().unwrap_or(msg.kind)));
     let message = msg.text();
 
     // Pushover requires multipart even without an attachment.
@@ -349,9 +427,17 @@ async fn dispatch_ntfy(
         _ => msg.kind.to_owned(),
     };
 
+    // A custom title template wins; otherwise keep the existing camera-name
+    // title. Strip CR/LF: the ntfy title rides in an HTTP header, and a newline
+    // from a rendered template would otherwise be rejected as an invalid header
+    // value (failing the whole dispatch).
+    let title = msg
+        .rendered_title()
+        .unwrap_or_else(|| format!("Crumb – {}", msg.camera_name))
+        .replace(['\r', '\n'], " ");
     let mut req = http
         .post(topic_url)
-        .header("Title", format!("Crumb – {}", msg.camera_name))
+        .header("Title", title)
         .header("Tags", tags)
         .body(body_text);
 

@@ -10830,6 +10830,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0078_ha_overlay_pill_layout.sql",
         include_str!("../../../db/migrations/0078_ha_overlay_pill_layout.sql"),
     ),
+    (
+        "0079_alert_templates.sql",
+        include_str!("../../../db/migrations/0079_alert_templates.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds
@@ -12382,6 +12386,15 @@ pub struct SystemAlertRule {
     /// window (footage-loss-critical events default to `true`).
     pub bypass_quiet_hours: bool,
     pub cooldown_secs: i32,
+    /// Operator-authored message-body template (`%token%` syntax, migration
+    /// 0079). `None` means "use the built-in default template for this
+    /// `event_key`" — clearing it back to `None` is the "Restore default"
+    /// action. Rendered by `crumb_common::alert_template`.
+    pub message_template: Option<String>,
+    /// Operator-authored provider-title template (`%token%` syntax, migration
+    /// 0079). `None` keeps each provider's existing default title construction
+    /// unchanged (so leaving it unset never alters current behaviour).
+    pub title_template: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -12393,12 +12406,13 @@ fn system_alert_rule_from_row(row: &tokio_postgres::Row) -> SystemAlertRule {
         threshold_fraction: row.get("threshold_fraction"),
         bypass_quiet_hours: row.get("bypass_quiet_hours"),
         cooldown_secs: row.get("cooldown_secs"),
+        message_template: row.get("message_template"),
+        title_template: row.get("title_template"),
         updated_at: row.get("updated_at"),
     }
 }
 
-const SYSTEM_ALERT_RULE_COLS: &str =
-    "event_key, enabled, threshold_secs, threshold_fraction, bypass_quiet_hours, cooldown_secs, updated_at";
+const SYSTEM_ALERT_RULE_COLS: &str = "event_key, enabled, threshold_secs, threshold_fraction, bypass_quiet_hours, cooldown_secs, message_template, title_template, updated_at";
 
 /// List all configured system-alert rules (one row per known `event_key`).
 ///
@@ -12450,6 +12464,10 @@ pub struct UpdateSystemAlertRuleParams {
     pub threshold_fraction: Option<Option<f32>>,
     pub bypass_quiet_hours: Option<bool>,
     pub cooldown_secs: Option<i32>,
+    /// Outer `None` = leave unchanged; `Some(None)` = clear to NULL (restore the
+    /// built-in default); `Some(Some(t))` = set the override.
+    pub message_template: Option<Option<String>>,
+    pub title_template: Option<Option<String>>,
 }
 
 /// Update one system-alert rule by `event_key`. Returns `None` if the key
@@ -12471,10 +12489,12 @@ pub async fn update_system_alert_rule(
                 r"
                 UPDATE system_alert_rules SET
                     enabled            = COALESCE($2, enabled),
-                    threshold_secs     = CASE WHEN $3 THEN $4 ELSE threshold_secs END,
-                    threshold_fraction = CASE WHEN $5 THEN $6 ELSE threshold_fraction END,
+                    threshold_secs     = CASE WHEN $3  THEN $4  ELSE threshold_secs END,
+                    threshold_fraction = CASE WHEN $5  THEN $6  ELSE threshold_fraction END,
                     bypass_quiet_hours = COALESCE($7, bypass_quiet_hours),
                     cooldown_secs      = COALESCE($8, cooldown_secs),
+                    message_template   = CASE WHEN $9  THEN $10 ELSE message_template END,
+                    title_template     = CASE WHEN $11 THEN $12 ELSE title_template END,
                     updated_at         = now()
                 WHERE event_key = $1
                 RETURNING {SYSTEM_ALERT_RULE_COLS}
@@ -12489,6 +12509,10 @@ pub async fn update_system_alert_rule(
                 &p.threshold_fraction.flatten(),
                 &p.bypass_quiet_hours,
                 &p.cooldown_secs,
+                &p.message_template.is_some(),
+                &p.message_template.clone().flatten(),
+                &p.title_template.is_some(),
+                &p.title_template.clone().flatten(),
             ],
         )
         .await
@@ -12509,6 +12533,14 @@ pub struct SystemEvent {
     /// Provider-relative snapshot path (migration 0055), set for
     /// `plate_watchlist_hit`; the notification engine resolves + attaches it.
     pub snapshot_url: Option<String>,
+    /// Structured, event-scoped tokens (migration 0079) for alert-text
+    /// templating — a flat JSON object of safe, non-secret values the emit site
+    /// can offer (e.g. `{"plate":"7ABC123","confidence":"90%"}`). `None` for
+    /// events that carry no structured extras; templates then rely on the
+    /// always-available built-ins (`%camera%`, `%event%`, `%detail%`, date/time)
+    /// only. Also carries the plate bbox / `plate_read_id` for a watchlist hit
+    /// so the snapshot-crop follow-up needs no second migration.
+    pub meta: Option<serde_json::Value>,
 }
 
 /// Record one system/health event occurrence. Called by the watchdogs in
@@ -12529,19 +12561,7 @@ pub async fn insert_system_event(
     camera_id: Option<Uuid>,
     detail: Option<&str>,
 ) -> Result<Uuid> {
-    let client = get_conn(pool).await?;
-    let row = client
-        .query_one(
-            r"
-            INSERT INTO system_events (event_key, camera_id, detail)
-            VALUES ($1, $2, $3)
-            RETURNING id
-            ",
-            &[&event_key, &camera_id, &detail],
-        )
-        .await
-        .context("insert_system_event")?;
-    Ok(row.get("id"))
+    insert_system_event_inner(pool, event_key, camera_id, detail, None, None).await
 }
 
 /// Like [`insert_system_event`] but also stores a provider-relative
@@ -12560,18 +12580,54 @@ pub async fn insert_system_event_with_snapshot(
     detail: Option<&str>,
     snapshot_url: Option<&str>,
 ) -> Result<Uuid> {
+    insert_system_event_inner(pool, event_key, camera_id, detail, snapshot_url, None).await
+}
+
+/// Superset insert that also stores the structured `meta` tokens (migration
+/// 0079) for alert-text templating, and optionally a `snapshot_url`. Emit sites
+/// that can offer structured facts (plate/name/confidence, free-space %, etc.)
+/// call this; [`insert_system_event`] and [`insert_system_event_with_snapshot`]
+/// delegate here with `meta = None`.
+///
+/// `meta` must be a flat JSON object of safe, non-secret, event-scoped values —
+/// it is exposed verbatim as `%token%` values in operator-authored templates, so
+/// never put a secret, credential, or arbitrary server state in it.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn insert_system_event_full(
+    pool: &Pool,
+    event_key: &str,
+    camera_id: Option<Uuid>,
+    detail: Option<&str>,
+    snapshot_url: Option<&str>,
+    meta: Option<&serde_json::Value>,
+) -> Result<Uuid> {
+    insert_system_event_inner(pool, event_key, camera_id, detail, snapshot_url, meta).await
+}
+
+/// Single INSERT path behind all `insert_system_event*` helpers.
+async fn insert_system_event_inner(
+    pool: &Pool,
+    event_key: &str,
+    camera_id: Option<Uuid>,
+    detail: Option<&str>,
+    snapshot_url: Option<&str>,
+    meta: Option<&serde_json::Value>,
+) -> Result<Uuid> {
     let client = get_conn(pool).await?;
     let row = client
         .query_one(
             r"
-            INSERT INTO system_events (event_key, camera_id, detail, snapshot_url)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO system_events (event_key, camera_id, detail, snapshot_url, meta)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             ",
-            &[&event_key, &camera_id, &detail, &snapshot_url],
+            &[&event_key, &camera_id, &detail, &snapshot_url, &meta],
         )
         .await
-        .context("insert_system_event_with_snapshot")?;
+        .context("insert_system_event")?;
     Ok(row.get("id"))
 }
 
@@ -12592,7 +12648,7 @@ pub async fn system_events_since(
     let rows = client
         .query(
             r"
-            SELECT id, event_key, camera_id, ts, detail, snapshot_url
+            SELECT id, event_key, camera_id, ts, detail, snapshot_url, meta
             FROM system_events
             WHERE ts > $1
             ORDER BY ts ASC
@@ -12611,6 +12667,7 @@ pub async fn system_events_since(
             ts: r.get("ts"),
             detail: r.get("detail"),
             snapshot_url: r.get("snapshot_url"),
+            meta: r.get("meta"),
         })
         .collect())
 }

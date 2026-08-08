@@ -792,6 +792,12 @@ panel (Discord / Slack / Pushover / Telegram / ntfy / webhook):
   `frigate_disconnected`, `motion_detector_unhealthy`,
   `motion_cache_unavailable`, `plate_watchlist_hit`, `update_available`
   (`GET /notifications/system-alerts` lists them live).
+- The **alert text is customizable per type** (optional): each system alert has
+  a message and title template under **Notifications → System alerts →
+  Customize alert text**, using `%token%` placeholders (`%camera%`, `%event%`,
+  `%detail%`, `%date%`/`%time%`/`%datetime%`, plus per-type tokens such as
+  `%plate%` or `%free_pct%` shown in the editor). Leaving a field blank uses the
+  built-in default, so this needs no setup. No new services, ports, or env keys.
 
 **`storage_unwritable` is the companion to Step 3's preflight.** It means the
 recorder cannot write to the recording disk, so live view works and nothing is
