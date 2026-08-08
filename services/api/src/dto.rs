@@ -1351,8 +1351,10 @@ pub struct LiveStreamsResponse {
     ///
     /// **Normally `None` — it is opt-in and the exception, not the rule.** Set only
     /// when the operator has enabled `MAIN_REPAIR_TRANSCODE_ENABLED` AND the
-    /// reconcile loop has POSITIVELY DETECTED that this camera's main advertises
-    /// video with no `a=fmtp` (see `go2rtc::sdp_video_lacks_fmtp`) — the condition
+    /// reconcile loop has POSITIVELY DETECTED that the SDP go2rtc SERVES for this
+    /// camera's main has no video `a=fmtp` (see
+    /// `go2rtc::stream_served_video_lacks_fmtp` — the served SDP, not the
+    /// producer's) — the condition
     /// that makes Media3's RTSP client throw `IllegalArgumentException: missing
     /// attribute fmtp`. A copy-remux would fix the fmtp but go2rtc then bundles the
     /// H.265 parameter sets into an RTP Aggregation Packet Media3 cannot

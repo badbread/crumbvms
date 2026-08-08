@@ -605,8 +605,11 @@ fn stream_video_lacks_fmtp(entry: &serde_json::Value) -> Option<bool> {
 /// line and returns `Some(false)`), yet every RTSP client — Android's Media3
 /// included — gets the fmtp-less SERVED SDP and throws `missing attribute fmtp`.
 /// Detecting on the served SDP catches this class (any reason go2rtc drops the
-/// fmtp, not just missing VPS); the main is always consumed by the recorder, so a
-/// served SDP is reliably present.
+/// fmtp, not just missing VPS). Under the default record-from-main policy the
+/// recorder is a persistent RTSP consumer of the main, so a served SDP is
+/// reliably present; a main with no RTSP consumer (a record-from-sub policy, or an
+/// idle main) yields `None` (unknown), handled by [`resolve_needs_subv`]'s sticky
+/// rule — never a false "broken".
 ///
 /// Only RTSP consumers count: that is the transport Crumb's clients use, and a
 /// WebRTC consumer negotiates a wholly different SDP that says nothing about the
@@ -802,17 +805,28 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     // sprop-vps, the reference LPR camera) that looks healthy on the producer side
     // yet leaves go2rtc serving consumers a fmtp-less SDP — the exact thing that
     // makes Media3 throw `missing attribute fmtp`. See
-    // [`stream_served_video_lacks_fmtp`]. The main is always consumed by the
-    // recorder, so a served SDP is reliably present; a momentary gap yields
-    // `None`, handled by `resolve_needs_subv`'s sticky-across-unknown rule.
+    // [`stream_served_video_lacks_fmtp`]. Under the default record-from-main
+    // policy the recorder is a persistent RTSP consumer of the main, so a served
+    // SDP is reliably present; a momentary gap — or a record-from-sub camera whose
+    // main has no RTSP consumer at all — yields `None`, handled by
+    // `resolve_needs_subv`'s sticky-across-unknown rule.
     let mut needs_mainv: std::collections::HashMap<&str, bool> =
         std::collections::HashMap::with_capacity(streams.len());
     for s in &streams {
+        let served_verdict = index.video_lacks_fmtp_served.get(&s.go2rtc_name).copied();
         let needed = main_repair_enabled
-            && resolve_needs_subv(
-                index.video_lacks_fmtp_served.get(&s.go2rtc_name).copied(),
-                state.mainv_needed(&s.go2rtc_name),
+            && resolve_needs_subv(served_verdict, state.mainv_needed(&s.go2rtc_name));
+        // Observability for the "enabled but silently does nothing" trap: the
+        // repair is on, yet this main has never yielded a served-SDP verdict (no
+        // RTSP consumer — an idle main, or a record-from-sub policy), so `_mainv`
+        // cannot be evaluated for it. Debug-level: it can be true every pass for a
+        // legitimately-idle main, so it must not spew at info.
+        if main_repair_enabled && served_verdict.is_none() && !needed {
+            tracing::debug!(
+                camera = %s.go2rtc_name,
+                "main-repair enabled but the main has no served-SDP verdict (no RTSP consumer — idle main or record-from-sub); _mainv cannot be evaluated"
             );
+        }
         needs_mainv.insert(s.go2rtc_name.as_str(), needed);
         state.set_mainv_needed(&s.go2rtc_name, needed);
     }
@@ -2048,6 +2062,32 @@ mod tests {
             None,
         );
         assert_eq!(stream_served_video_lacks_fmtp(&serde_json::json!({})), None);
+
+        // A WebRTC consumer BEFORE the rtsp one must be skipped, not consumed as
+        // the verdict — the rtsp consumer's SDP is the one that wins.
+        let webrtc_then_rtsp = serde_json::json!({
+            "consumers": [
+                { "format_name": "webrtc", "sdp": SDP_HEALTHY },
+                { "format_name": "rtsp", "sdp": SDP_LPR_SERVED_NO_FMTP },
+            ],
+        });
+        assert_eq!(
+            stream_served_video_lacks_fmtp(&webrtc_then_rtsp),
+            Some(true)
+        );
+
+        // A mid-handshake rtsp consumer (no `sdp` yet) is skipped in favour of the
+        // next rtsp consumer that has one.
+        let handshaking_then_ready = serde_json::json!({
+            "consumers": [
+                { "format_name": "rtsp" },
+                { "format_name": "rtsp", "sdp": SDP_LPR_SERVED_NO_FMTP },
+            ],
+        });
+        assert_eq!(
+            stream_served_video_lacks_fmtp(&handshaking_then_ready),
+            Some(true),
+        );
     }
 
     #[test]

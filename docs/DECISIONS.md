@@ -126,9 +126,15 @@ which is why they play. Earlier notes calling the raw main "no `a=fmtp`" were
 reading the served side; the producer side is the incomplete-fmtp case. **Fix:**
 detection now reads the SDP go2rtc SERVES to RTSP consumers
 (`stream_served_video_lacks_fmtp` → `StreamIndex::video_lacks_fmtp_served`), used
-for `_mainv` only; `_subv` keeps the producer side (a sub is often un-consumed
-and so has no served SDP). The main is always consumed by the recorder, so its
-served SDP is reliably present. The transcode decision itself is unchanged.
+for `_mainv` only; `_subv` stays producer-based (it demonstrably works for the
+known #483 H.264 class, and switching it risks the un-consumed-sub case). Under
+the default record-from-main policy the recorder is a persistent RTSP consumer of
+the main, so its served SDP is reliably present; a record-from-sub camera (or an
+idle main) has no RTSP consumer and stays unknown/unrepaired — a reconcile
+debug log flags "enabled but no served verdict" so that case is not silent.
+Follow-ups tracked separately: record-from-sub main-repair blindness, and the
+sub-side incomplete-fmtp class (an `a=fmtp` present but missing its parameter
+sets). The transcode decision itself is unchanged.
 
 ---
 

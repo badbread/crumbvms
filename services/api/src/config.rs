@@ -224,8 +224,10 @@ pub struct ApiConfig {
 
     /// `MAIN_REPAIR_TRANSCODE_ENABLED` -- register a per-camera `<name>_mainv`
     /// go2rtc stream: a FULL-RESOLUTION H.265->H.264 transcode of the camera's
-    /// MAIN, registered ONLY for a main the reconcile loop has detected publishes
-    /// video with no `a=fmtp` (see `go2rtc::sdp_video_lacks_fmtp`). Exposed to
+    /// MAIN, registered ONLY for a main the reconcile loop has detected go2rtc
+    /// SERVES with no video `a=fmtp` (see `go2rtc::stream_served_video_lacks_fmtp`
+    /// — the served SDP, not the producer's, since a main can have an incomplete
+    /// producer fmtp that go2rtc drops for consumers). Exposed to
     /// clients as `rtsp_mainv_url` so Android's Media3 gets a playable HD main for
     /// cameras whose real main it cannot bring up (`IllegalArgumentException:
     /// missing attribute fmtp`).
