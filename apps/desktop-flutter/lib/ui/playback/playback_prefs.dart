@@ -15,12 +15,14 @@
 
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Reads/writes the single "playback timeline zoom span" client preference
-/// (visible window duration in milliseconds).
+/// Reads/writes the small set of client-only Playback preferences: the
+/// timeline zoom span (visible window duration in ms) and the "solo the
+/// selected camera on the timeline" toggle.
 class PlaybackPrefs {
   PlaybackPrefs._();
 
   static const String _kSpanMs = 'crumb_playback_span_ms';
+  static const String _kSoloSelectedCamera = 'crumb_playback_solo_selected_cam';
 
   /// The last-used timeline span in ms, or null when the operator has never
   /// changed the zoom (callers fall back to the controller's default span).
@@ -40,6 +42,27 @@ class PlaybackPrefs {
     } catch (_) {
       /* best-effort persistence, same as the old client's try/catch around
          localStorage.setItem (app.js saveOptions()) */
+    }
+  }
+
+  /// Whether the timeline should show only the selected camera's motion, or
+  /// null when the operator has never toggled it (callers fall back to the
+  /// controller's default, all cameras stacked).
+  static Future<bool?> getSoloSelectedCamera() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_kSoloSelectedCamera);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> setSoloSelectedCamera(bool value) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kSoloSelectedCamera, value);
+    } catch (_) {
+      /* best-effort persistence, same as setSpanMs above */
     }
   }
 }
