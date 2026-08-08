@@ -12385,6 +12385,11 @@ pub struct NotificationChannel {
     pub snapshot_mode: SnapshotMode,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Username of the channel's owner, or `None` for a global channel. Only
+    /// populated by the admin-scoped [`list_all_notification_channels`] listing
+    /// (which joins `users`); every other query path leaves this `None` because
+    /// it is display-only owner attribution, not part of the channel identity.
+    pub owner_username: Option<String>,
 }
 
 fn notification_channel_from_row(row: &tokio_postgres::Row) -> NotificationChannel {
@@ -12400,6 +12405,7 @@ fn notification_channel_from_row(row: &tokio_postgres::Row) -> NotificationChann
         snapshot_mode: SnapshotMode::from_db(&row.get::<_, String>("snapshot_mode")),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        owner_username: None,
     }
 }
 
@@ -12471,9 +12477,14 @@ pub async fn create_notification_channel(
 
 /// List notification channels visible to `user_id`.
 ///
-/// Returns the caller's own channels plus global channels (`user_id IS NULL`).
-/// When `include_globals` is true (Admin callers should pass true so they also
-/// see global channels), global channels are included.
+/// * `is_admin == false` — returns only the caller's own channels (`user_id =
+///   $1`). Non-admins deliberately do not see global channels here (RBAC scope
+///   preserved from the original implementation).
+/// * `is_admin == true` — returns **every** channel via
+///   [`list_all_notification_channels`] with owner attribution, so an admin can
+///   see and manage a channel created under a different account (the engine
+///   fans out to every enabled channel regardless of owner, so a foreign-owned
+///   channel is a live destination the admin must be able to see).
 ///
 /// # Errors
 ///
@@ -12481,41 +12492,63 @@ pub async fn create_notification_channel(
 pub async fn list_notification_channels(
     pool: &Pool,
     user_id: Uuid,
-    include_globals: bool,
+    is_admin: bool,
 ) -> Result<Vec<NotificationChannel>> {
+    if is_admin {
+        return list_all_notification_channels(pool).await;
+    }
     let client = get_conn(pool).await?;
-    let rows = if include_globals {
-        client
-            .query(
-                &format!(
-                    r"
-                    SELECT {CHANNEL_COLS}
-                    FROM notification_channels
-                    WHERE user_id = $1 OR user_id IS NULL
-                    ORDER BY created_at
-                    "
-                ),
-                &[&user_id],
-            )
-            .await
-            .context("list_notification_channels (with globals)")?
-    } else {
-        client
-            .query(
-                &format!(
-                    r"
-                    SELECT {CHANNEL_COLS}
-                    FROM notification_channels
-                    WHERE user_id = $1
-                    ORDER BY created_at
-                    "
-                ),
-                &[&user_id],
-            )
-            .await
-            .context("list_notification_channels (own)")?
-    };
+    let rows = client
+        .query(
+            &format!(
+                r"
+                SELECT {CHANNEL_COLS}
+                FROM notification_channels
+                WHERE user_id = $1
+                ORDER BY created_at
+                "
+            ),
+            &[&user_id],
+        )
+        .await
+        .context("list_notification_channels (own)")?;
     Ok(rows.iter().map(notification_channel_from_row).collect())
+}
+
+/// List **all** notification channels (admin scope) with the owner's username
+/// joined in for attribution. A global channel (`user_id IS NULL`) has
+/// `owner_username = None`.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_all_notification_channels(pool: &Pool) -> Result<Vec<NotificationChannel>> {
+    let client = get_conn(pool).await?;
+    // Columns qualified with the `c.` alias because the join to `users` makes
+    // bare `id` ambiguous; `u.username` is exposed as `owner_username`.
+    let rows = client
+        .query(
+            r"
+            SELECT
+                c.id, c.user_id, c.kind, c.name, c.enabled, c.config,
+                c.camera_ids, c.include_snapshot, c.snapshot_mode,
+                c.created_at, c.updated_at, u.username AS owner_username
+            FROM notification_channels c
+            LEFT JOIN users u ON u.id = c.user_id
+            ORDER BY c.created_at
+            ",
+            &[],
+        )
+        .await
+        .context("list_all_notification_channels")?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let mut ch = notification_channel_from_row(row);
+            ch.owner_username = row.get("owner_username");
+            ch
+        })
+        .collect())
 }
 
 /// Fetch a single notification channel by id.
@@ -12555,6 +12588,10 @@ pub struct UpdateChannelParams {
     /// rule before building these params); the legacy `include_snapshot` column
     /// is written as its synced mirror.
     pub snapshot_mode: SnapshotMode,
+    /// Change the channel owner (global toggle), admin-only. `None` → leave
+    /// `user_id` unchanged; `Some(None)` → make the channel global
+    /// (`user_id = NULL`); `Some(Some(uid))` → claim ownership for `uid`.
+    pub set_owner: Option<Option<Uuid>>,
 }
 
 /// Update a notification channel.
@@ -12572,6 +12609,11 @@ pub async fn update_notification_channel(
     params: &UpdateChannelParams,
 ) -> Result<Option<NotificationChannel>> {
     let client = get_conn(pool).await?;
+    // `$9` guards the owner change: when false, `user_id` is left untouched.
+    // When true, `user_id` is set to `$10` (NULL for a global channel, or the
+    // claiming user's id). The inner Option flattens to a nullable Uuid param.
+    let set_owner = params.set_owner.is_some();
+    let new_owner: Option<Uuid> = params.set_owner.flatten();
     let opt = client
         .query_opt(
             &format!(
@@ -12583,6 +12625,7 @@ pub async fn update_notification_channel(
                     camera_ids       = $6,
                     include_snapshot = $7,
                     snapshot_mode    = $8,
+                    user_id          = CASE WHEN $9 THEN $10 ELSE user_id END,
                     updated_at       = now()
                 WHERE id = $1
                 RETURNING {CHANNEL_COLS}
@@ -12597,6 +12640,8 @@ pub async fn update_notification_channel(
                 &params.camera_ids,
                 &params.snapshot_mode.include_snapshot(),
                 &params.snapshot_mode.as_str(),
+                &set_owner,
+                &new_owner,
             ],
         )
         .await

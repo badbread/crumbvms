@@ -375,7 +375,10 @@ the migrations/first-run seed baked into `recorder`/`api` startup.
 start with a stock `up -d` (Step 8).
 
 **Verify:**
-- `docker compose ps`: all services `running`/`healthy`.
+- `docker compose ps`: every service `running`; `postgres`, `recorder`, and
+  `api` additionally report `healthy` once their healthchecks pass. `caddy` has
+  **no healthcheck**, it only ever shows plain `running`, so do not wait for it
+  to turn healthy.
 - `curl -fsS http://localhost:8080/health` → `200 OK` (it probes DB + recorder;
   503 means a component is still coming up. Wait and retry a few times).
 - `docker compose logs api recorder | grep -i migration` shows migrations
@@ -462,7 +465,7 @@ via `PUT /config/beta-terms`). Then:
 11. **Done.**
 
 You're finished; they take it from here. (Skipping the camera steps adds nothing:
-secure by default; steps 7–10 are all optional and skippable.)
+secure by default; steps 7-10 are all optional and skippable.)
 
 **After the wizard: License-plate recognition (optional).** Not a wizard step;
 everything LPR lives in the console's dedicated **LPR** section (left nav). OFF
@@ -475,7 +478,7 @@ dropdown in the same section's per-camera table controls which source feeds it
 (**None** = LPR off for that camera; new cameras default to Frigate). No new services or env keys; it reuses the Frigate
 integration. A plate database is privacy-sensitive, so it stays opt-in, and
 viewing it needs the **View license plates** role capability (**Users &
-Security). Plate-read retention is independent of footage/storage retention.
+security**). Plate-read retention is independent of footage/storage retention.
 REST-driven install: `PUT /config/lpr {"enabled":true,"retention_days":90}`.
 
 Alternatively (or for better accuracy than Frigate's native LPR) run Crumb's
@@ -577,7 +580,7 @@ All wizard steps have API equivalents. Do them in order:
    Big ranges hit a 60 s wall-clock cap (`truncated: true`), split into
    `/26`-sized chunks and call once per chunk (the web wizard does exactly this to
    drive its progress bar). A single IP (`"range": "198.51.100.50"`) works for a
-   per-device credential retry; pass `"timeout_ms"` (500–8000) to stretch the
+   per-device credential retry; pass `"timeout_ms"` (500-8000) to stretch the
    per-host budget for a single known-slow responder (e.g. Reolink).
 
    If a candidate's ONVIF `GetStreamUri` came back empty (or the camera isn't
@@ -640,7 +643,11 @@ All wizard steps have API equivalents. Do them in order:
    what the provider can carry: Discord/Telegram do `both`, Pushover/ntfy one
    image (`both` sends the plate crop), Slack/webhook are text/link only. The
    legacy `include_snapshot: true|false` still works (maps to `vehicle`/`none`).
-   Then prove it delivers:
+   `GET /notifications/channels` returns each channel with `global` (bool) and,
+   for an admin caller, every channel with `owner_username` (the owner, absent
+   for a global channel); an admin lists all channels, a non-admin only their
+   own. Quiet hours are whole hours 0..=23 (server local time); an out-of-range
+   value is rejected. Then prove it delivers:
    `POST /notifications/channels/{id}/test` → `{ok, error?}`. Per-camera rules
    and quiet hours are `PUT /notifications/rules[/{camera_id}]`.
 9. **Additional users (optional).** `GET /config/roles` for the role list
@@ -756,8 +763,10 @@ un-exportable data. The **api service itself runs a nightly `pg_dump`**
 fresh backup exists) with rotation into `DB_BACKUP_HOST_PATH` (default
 `./backups`), so a stock `docker compose up -d` is already taking backups,
 **as long as that directory is writable by uid 1001** (the api's user).
-`scripts/setup-env.sh` prepares the default dir; if backups were disabled
-with a permissions warning in `docker compose logs api`, run
+`scripts/setup-env.sh` prepares whatever `DB_BACKUP_HOST_PATH` points at
+(pass it up front, `DB_BACKUP_HOST_PATH=/mnt/nas/crumb-backups
+scripts/setup-env.sh`, exactly like `MEDIA_HOST_PATH` in Step 2); if backups
+were disabled with a permissions warning in `docker compose logs api`, run
 `sudo chown -R 1001:1001 <DB_BACKUP_HOST_PATH>` and `docker compose restart
 api`. (A failed/unwritable backup never takes the api down, it logs, raises
 the `backup_failed` alert, and carries on serving.)
@@ -819,7 +828,7 @@ the path (`%20` for each space) in the camera's source URL and save.
 
 **Suppress false alarms during planned maintenance.** Before a deliberate stack
 cutover or recorder restart, arm a **maintenance window** so the transient
-"no new segment" gap (go2rtc reconcile takes ~60–90 s on a normal restart)
+"no new segment" gap (go2rtc reconcile takes ~60-90 s on a normal restart)
 doesn't page anyone: `POST /config/maintenance {"minutes": 15}` (admin;
 `minutes: 0` disarms, `GET /config/maintenance` reads current state). While
 active, all system/health alerts are still recorded but not dispatched. Two
@@ -923,8 +932,8 @@ surface. When you change something here, change the smoke script with it.
 Two known blind spots in that coverage, so you check them by hand: the smoke
 script runs `setup-env.sh` against a directory inside the runner's workspace, so
 it never exercises the storage preflight's `exit 1` path; and `caddy` carries no
-healthcheck, so Step 5's "every service `running`/`healthy`" will never show
-caddy as healthy and an agent can stall waiting for it.
+healthcheck, so nothing ever asserts TLS actually serves (Step 5's Verify
+already tells an agent not to wait for caddy to turn `healthy`).
 
 **This runbook MUST be updated in the same change that touches any of the
 install/config surface it describes.** If your PR/commit changes any of the
