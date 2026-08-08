@@ -6973,6 +6973,13 @@ pub async fn motion_intensity_buckets(
     // `[b0, b1)`, `generate_series` expands that range, and the MAX `motion_score`
     // per bucket is taken in Postgres. Buckets the sparse result omits stay 0.0 from
     // the vec initializer above.
+    // `n` is bound TWICE, once per SQL type: `$6` as double precision for the
+    // bucket-index math `(offset/span)*n`, `$7` as int for the LEAST clamp and
+    // generate_series bound. A single placeholder can't serve both — Postgres
+    // infers one type per `$n` from its casts (here `$6::double precision` would
+    // win), and binding an i32 to a float8-inferred param fails at serialization
+    // ("cannot convert between the Rust type i32 and the Postgres type float8").
+    let n_f64 = n as f64;
     let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
     let client = get_conn(pool).await?;
     let rows = client
@@ -6999,7 +7006,7 @@ pub async fn motion_intensity_buckets(
                 SELECT
                     floor((s_off / $5::double precision) * $6::double precision)::int AS b0,
                     LEAST(
-                        $6::int,
+                        $7::int,
                         ceil((e_off / $5::double precision) * $6::double precision)::int
                     ) AS b1,
                     score
@@ -7010,7 +7017,7 @@ pub async fn motion_intensity_buckets(
             FROM ranged, LATERAL generate_series(b0, b1 - 1) AS bucket
             GROUP BY bucket
             ",
-            &[&camera_id, &start, &end, &lower_bound, &span_ms, &n_i32],
+            &[&camera_id, &start, &end, &lower_bound, &span_ms, &n_f64, &n_i32],
         )
         .await
         .context("motion_intensity_buckets")?;
@@ -7066,6 +7073,10 @@ pub async fn motion_intensity_buckets_multi(
     // The database returns at most `cameras * n` rows instead of every overlapping
     // segment on the wall. See `motion_intensity_buckets` for the parameter-binding
     // rationale that keeps the bucket math bit-identical to the reference loop.
+    // See `motion_intensity_buckets`: `n` is bound as both double precision
+    // ($6, for the bucket-index math) and int ($7, for the LEAST clamp) so
+    // neither cast forces a type mismatch on the other's binding.
+    let n_f64 = n as f64;
     let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
     let client = get_conn(pool).await?;
     let rows = client
@@ -7094,7 +7105,7 @@ pub async fn motion_intensity_buckets_multi(
                     camera_id,
                     floor((s_off / $5::double precision) * $6::double precision)::int AS b0,
                     LEAST(
-                        $6::int,
+                        $7::int,
                         ceil((e_off / $5::double precision) * $6::double precision)::int
                     ) AS b1,
                     score
@@ -7105,7 +7116,7 @@ pub async fn motion_intensity_buckets_multi(
             FROM ranged, LATERAL generate_series(b0, b1 - 1) AS bucket
             GROUP BY camera_id, bucket
             ",
-            &[&camera_ids, &start, &end, &lower_bound, &span_ms, &n_i32],
+            &[&camera_ids, &start, &end, &lower_bound, &span_ms, &n_f64, &n_i32],
         )
         .await
         .context("motion_intensity_buckets_multi")?;
@@ -13779,15 +13790,44 @@ mod tests {
     // `camera_id`, so a unique camera is complete isolation from any other
     // rows in the shared throwaway DB — no private schema, no teardown needed.
 
-    /// Build a size-8 pool at the raw (public-schema) URL and run migrations.
-    /// The pool needs headroom because `run_migrations` holds an advisory-lock
-    /// connection AND a work connection concurrently (a max_size of 2 would
-    /// deadlock itself).
+    /// Guards the one-time `run_migrations` call for this whole test binary.
+    ///
+    /// Every DB test here shares the `public` schema (data isolation is per-test
+    /// via freshly generated `camera_id`/policy/storage names — see the
+    /// isolation note above — not per-schema), so migrations only need to run
+    /// ONCE against the shared throwaway DB. The earlier version re-ran
+    /// `run_migrations` from EVERY test: under `cargo test`'s default
+    /// parallelism, N tests then piled up on the `run_migrations` advisory lock,
+    /// each holding a blocked connection while it waited its turn, which — as
+    /// the DB-test count grew — exhausted a stock Postgres (`max_connections =
+    /// 100`) and surfaced as `Connection reset by peer` / lock-timeout errors.
+    /// A `tokio::sync::Mutex`-guarded flag (held for the whole check-and-run,
+    /// exactly like `MIGRATE_ONCE` in `services/api/tests/support/mod.rs`) makes
+    /// only the FIRST caller migrate; everyone else skips straight to querying.
+    static MIGRATE_ONCE: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+
+    /// Build this test's OWN public-schema pool, ensuring the shared DB has been
+    /// migrated (once, binary-wide) first.
+    ///
+    /// The pool is deliberately per-test, NOT shared: each `#[tokio::test]` runs
+    /// on its own runtime, and deadpool spawns every connection's background
+    /// driver task on the runtime that first created it. A pool shared across
+    /// tests would hand a still-running test a connection whose driver died when
+    /// an earlier test's runtime was dropped — an intermittent
+    /// `Error { kind: Closed }`. A private pool keeps every connection's driver
+    /// on the runtime that will actually use it. Small size so N concurrent
+    /// tests stay well under `max_connections`; 8 leaves `run_migrations` (the
+    /// first caller only) the headroom it needs (advisory-lock connection PLUS a
+    /// work connection at once — a max_size of 2 would deadlock itself).
     async fn migrated_public_pool(url: &str) -> Pool {
         let pool = build_pool(url, 8).expect("build_pool (public)");
-        run_migrations(&pool)
-            .await
-            .expect("run_migrations (public schema)");
+        let mut done = MIGRATE_ONCE.lock().await;
+        if !*done {
+            run_migrations(&pool)
+                .await
+                .expect("run_migrations (public schema)");
+            *done = true;
+        }
         pool
     }
 
@@ -14499,9 +14539,13 @@ mod tests {
             (sec(-5), sec(5), 0.8),
             // exactly on a 1s-bucket boundary at 10s..20s.
             (sec(10), sec(20), 0.4),
-            // two segments sharing the 30s..31s region — MAX (0.6) must win.
+            // two segments overlapping within the 30s..31s region — MAX (0.6)
+            // must win. Their start_ts must DIFFER: the real schema's
+            // segments_uniq_cam_stream_start unique index forbids two rows with
+            // the same (camera_id, stream, start_ts), so a shared start (e.g.
+            // sec(30) == ms(30_000)) can never coexist and would fail the insert.
             (sec(30), sec(31), 0.2),
-            (ms(30_000), ms(30_500), 0.6),
+            (ms(30_200), ms(30_500), 0.6),
             // ends EXACTLY at the window end → last bucket, end-exclusive.
             (sec(99), sec(100), 0.9),
             // a sub-second segment that lands inside a single 1s bucket.
