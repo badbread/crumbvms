@@ -141,6 +141,25 @@ String fmtAgo(DateTime? t) {
   return '${d.inDays}d ago';
 }
 
+// ─── collapse-section summaries (settings-UX: collapse long secondary lists) ───
+// Long lists on the Server dashboard are collapsed by default; the header keeps
+// the at-a-glance counts so the summary is useful without expanding. Pure and
+// unit-tested in test/dashboard_collapse_summary_test.dart.
+
+/// Header for the collapsible "Per-camera policies" section on the Retention
+/// editor, e.g. "Per-camera policies (5)".
+String perCameraPoliciesSummary(int count) => 'Per-camera policies ($count)';
+
+/// Sub-header for the collapsible camera-status list on the Connection tab.
+/// Keeps the counts visible even while collapsed, e.g.
+/// "9 recording · 1 disabled" (the "disabled" clause is dropped when none are).
+String cameraStatusSummary(int total, int recording, int disabled) {
+  if (total == 0) return 'No cameras';
+  final parts = <String>['$recording recording'];
+  if (disabled > 0) parts.add('$disabled disabled');
+  return parts.join(' · ');
+}
+
 /// Generic "loading / error / content" wrapper matching this file's sections'
 /// common shape — avoids repeating the same three states in every section.
 class _AsyncSection<T> extends StatefulWidget {
@@ -266,46 +285,82 @@ class _ConnectionSection extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 12),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Cameras', style: Theme.of(context).textTheme.titleMedium),
-                    const SizedBox(height: 12),
-                    for (final c in status.cameras)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 3),
-                        child: Row(
-                          children: [
-                            Icon(
-                              c.recording ? Icons.fiber_manual_record : Icons.circle_outlined,
-                              size: 12,
-                              color: !c.enabled
-                                  ? Colors.grey
-                                  : (c.recording ? Colors.redAccent : Colors.grey),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(child: Text(c.name)),
-                            if (c.recentMotion)
-                              const Padding(
-                                padding: EdgeInsets.only(right: 8),
-                                child: Icon(Icons.directions_run, size: 14, color: Colors.amber),
+            // Collapsed by default: on a many-camera deployment this list
+            // dominates the tab and forces scroll. The header keeps the live
+            // counts so the at-a-glance value survives while collapsed.
+            Builder(
+              builder: (context) {
+                final recording =
+                    status.cameras.where((c) => c.enabled && c.recording).length;
+                final disabled = status.cameras.where((c) => !c.enabled).length;
+                return Card(
+                  child: Theme(
+                    data: Theme.of(context)
+                        .copyWith(dividerColor: Colors.transparent),
+                    child: ExpansionTile(
+                      key: const PageStorageKey('conn-cameras'),
+                      initiallyExpanded: false,
+                      tilePadding:
+                          const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                      childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                      title: Text(
+                        'Cameras (${status.cameras.length})',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      subtitle: status.cameras.isEmpty
+                          ? null
+                          : Text(
+                              cameraStatusSummary(
+                                status.cameras.length,
+                                recording,
+                                disabled,
                               ),
-                            Text(
-                              c.enabled
-                                  ? (c.recording ? 'recording' : 'idle')
-                                  : 'disabled',
                               style: Theme.of(context).textTheme.bodySmall,
                             ),
-                          ],
-                        ),
-                      ),
-                    if (status.cameras.isEmpty) const Text('No cameras.'),
-                  ],
-                ),
-              ),
+                      children: [
+                        for (final c in status.cameras)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 3),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  c.recording
+                                      ? Icons.fiber_manual_record
+                                      : Icons.circle_outlined,
+                                  size: 12,
+                                  color: !c.enabled
+                                      ? Colors.grey
+                                      : (c.recording
+                                          ? Colors.redAccent
+                                          : Colors.grey),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(child: Text(c.name)),
+                                if (c.recentMotion)
+                                  const Padding(
+                                    padding: EdgeInsets.only(right: 8),
+                                    child: Icon(Icons.directions_run,
+                                        size: 14, color: Colors.amber),
+                                  ),
+                                Text(
+                                  c.enabled
+                                      ? (c.recording ? 'recording' : 'idle')
+                                      : 'disabled',
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
+                              ],
+                            ),
+                          ),
+                        if (status.cameras.isEmpty)
+                          const Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text('No cameras.'),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              },
             ),
             const SizedBox(height: 12),
             Align(
@@ -853,16 +908,48 @@ class _PolicyEditorTabState extends State<_PolicyEditorTab> {
               },
             ),
             const SizedBox(height: 24),
-            Text('Per-camera policies', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            for (final cam in data.cameras)
-              _CameraPolicyTile(
-                api: widget.api,
-                session: widget.session,
-                camera: cam,
-                source: resolvePolicySource(cam, data.groupNames),
-                onSaved: _reload,
+            // Collapsed by default (settings-UX: collapse long secondary
+            // lists). A many-camera deployment otherwise renders every override
+            // fully expanded. The count summary shows how many are inside; each
+            // camera keeps its own tile with the policy-source label and the
+            // group-managed notice once expanded.
+            Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                key: const PageStorageKey('retention-per-camera'),
+                initiallyExpanded: false,
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: EdgeInsets.zero,
+                expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+                title: Text(
+                  perCameraPoliciesSummary(data.cameras.length),
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                subtitle: data.cameras.isEmpty
+                    ? null
+                    : Text(
+                        'Per-camera overrides, group profiles, and custom '
+                        'policies. Tap to expand.',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                children: [
+                  const SizedBox(height: 8),
+                  if (data.cameras.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text('No cameras.'),
+                    ),
+                  for (final cam in data.cameras)
+                    _CameraPolicyTile(
+                      api: widget.api,
+                      session: widget.session,
+                      camera: cam,
+                      source: resolvePolicySource(cam, data.groupNames),
+                      onSaved: _reload,
+                    ),
+                ],
               ),
+            ),
           ],
         );
       },
