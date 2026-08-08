@@ -2507,16 +2507,20 @@ mod tests {
                     );
                     CREATE UNIQUE INDEX segments_uniq_cam_stream_start
                         ON segments (camera_id, stream, start_ts);
-                    -- Mirror migration 0032: the reconcile storage guard
-                    -- (issue #504) raises a `storage_unwritable` system event
-                    -- when it refuses to prune a storage's index.
+                    -- Mirror migration 0032 plus the columns later migrations
+                    -- add to system_events, because the reconcile storage guard
+                    -- (issue #504) raises `storage_unwritable` through the shared
+                    -- insert helper, which writes snapshot_url (migration 0055)
+                    -- and meta (migration 0079) as well as the base columns.
                     CREATE TABLE system_events (
-                        id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                        event_key  text NOT NULL,
-                        camera_id  uuid,
-                        ts         timestamptz NOT NULL DEFAULT now(),
-                        detail     text,
-                        created_at timestamptz NOT NULL DEFAULT now()
+                        id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        event_key    text NOT NULL,
+                        camera_id    uuid,
+                        ts           timestamptz NOT NULL DEFAULT now(),
+                        detail       text,
+                        snapshot_url text,
+                        meta         jsonb,
+                        created_at   timestamptz NOT NULL DEFAULT now()
                     );
                     CREATE TABLE bookmarks (
                         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
