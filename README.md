@@ -14,6 +14,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/badbread/crumbvms/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/badbread/crumbvms/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/badbread/crumbvms/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/badbread/crumbvms?include_prereleases&label=release"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
   <img alt="Backend: Rust" src="https://img.shields.io/badge/backend-Rust-orange?logo=rust">
@@ -60,6 +62,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 - A per-camera **Data saver** stream (on-demand low-res transcode) for cheap remote or bandwidth-limited viewing
 - **Home Assistant entities on the live video, with live status.** Link a camera to its HA entities and drag each badge onto the frame where the thing actually is: the contact sensor on the front door, the light badge on the porch, the motion sensor over the driveway. Every badge shows live state right on the wall, updating as HA does
 - **Control Home Assistant from the badge.** Entities you mark as controls actuate right on the video: tap a light or switch to fire its action, open a small card for a cover or lock with more than one meaningful action, and drag a slider for brightness, blind position, or fan speed. Control is off by default and gated by its own permission. Works on desktop, Android, and iOS
+- **Alerts where you already are.** Motion and detection notifications to Discord, Slack, Telegram, Pushover, ntfy, or a generic webhook, snapshot attached where the service takes one, with per-camera rules, snoozes, and presence gating so it can stay quiet while you are home. Details at [docs.crumbvms.com/notifications](https://docs.crumbvms.com/notifications/)
 - **Real native clients, not a browser in a wrapper.** A Windows desktop app on libmpv, a native SwiftUI macOS app, and a native Android app, all purpose-built, which is what makes the live wall and frame-accurate H.265 scrubbing feel instant instead of a laggy web tab. The web admin console is there for when you just want a browser
 
 **Keep**
@@ -453,12 +456,13 @@ For contributors working in this repo:
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
 - **Testing:** [TESTING.md](TESTING.md) (tester quickstart, what to test, how to report)
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) (ground rules for AI coding sessions)
+- **Security:** [SECURITY.md](SECURITY.md) (report vulnerabilities privately, never in a public issue)
 
 ```
 services/   # Rust backend: common (types, DB, migrations), api (axum + web admin at /admin), recorder
 apps/       # desktop-flutter (Flutter + libmpv), android (Kotlin/Compose), ios; desktop = retired Tauri client
 db/         # PostgreSQL migrations; the segment index is the single source of truth
-# (crumbvms.com lives in its own separate repo, not included here — see .gitignore)
+# (crumbvms.com lives in its own separate repo, not included here, see .gitignore)
 ```
 
 ## The itch this scratches
