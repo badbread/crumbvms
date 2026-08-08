@@ -93,6 +93,45 @@ String fmtRetentionHours(double? hours) {
 
 String fmtPct(double? pct) => pct == null ? '—' : '${pct.round()}%';
 
+// ─── retention unit conversion (raw hours <-> hours/days editor) ──────────────
+// The backend stores retention in HOURS; the editor lets the operator work in
+// hours or whole days so they don't do day-math in their head (e.g. 336 -> 14
+// days). These are pure, testable, and unit-tested in
+// test/retention_units_test.dart.
+
+const retentionUnitHours = 'hours';
+const retentionUnitDays = 'days';
+
+/// The friendlier initial unit for showing a raw-hours retention: whole days
+/// when it divides evenly and is at least a day, else hours (336 -> days;
+/// 36 -> hours).
+String retentionInitialUnit(int hours) =>
+    (hours >= 24 && hours % 24 == 0) ? retentionUnitDays : retentionUnitHours;
+
+/// The numeric value to show in [unit] for a raw-hours retention.
+num retentionDisplayValue(int hours, String unit) =>
+    unit == retentionUnitDays ? hours / 24 : hours;
+
+/// Convert a typed [value] in [unit] back to whole hours (rounded).
+int retentionToHours(num value, String unit) =>
+    unit == retentionUnitDays ? (value * 24).round() : value.round();
+
+/// Format a display value without a trailing `.0` for whole numbers.
+String retentionValueField(num value) =>
+    value == value.roundToDouble() ? value.round().toString() : '$value';
+
+/// Live "= N days" / "= N h" helper showing the OTHER unit, so a hand-typed
+/// value stays self-explanatory ("14" days -> "= 336 h"; "336" hours ->
+/// "= 14 days"). Empty when the value is non-positive.
+String retentionHelperText(num value, String unit) {
+  final hours = retentionToHours(value, unit);
+  if (hours <= 0) return '';
+  if (unit == retentionUnitDays) return '= $hours h';
+  final days = hours / 24;
+  final s = hours % 24 == 0 ? '${hours ~/ 24}' : days.toStringAsFixed(1);
+  return '= $s ${s == '1' ? 'day' : 'days'}';
+}
+
 String fmtAgo(DateTime? t) {
   if (t == null) return '—';
   final d = DateTime.now().toUtc().difference(t.toUtc());
@@ -311,6 +350,13 @@ class _CameraStatsSection extends StatefulWidget {
 class _CameraStatsSectionState extends State<_CameraStatsSection> {
   _StatsCol _sortCol = _StatsCol.disk;
   bool _sortAsc = false;
+  final ScrollController _vCtrl = ScrollController();
+
+  @override
+  void dispose() {
+    _vCtrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -354,10 +400,15 @@ class _CameraStatsSectionState extends State<_CameraStatsSection> {
               ),
             ),
             Expanded(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DataTable(
-                  sortColumnIndex: _StatsCol.values.indexOf(_sortCol),
+              child: Scrollbar(
+                thumbVisibility: true,
+                controller: _vCtrl,
+                child: SingleChildScrollView(
+                  controller: _vCtrl,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: DataTable(
+                      sortColumnIndex: _StatsCol.values.indexOf(_sortCol),
                   sortAscending: _sortAsc,
                   columns: [
                     DataColumn(
@@ -415,6 +466,8 @@ class _CameraStatsSectionState extends State<_CameraStatsSection> {
                         ],
                       ),
                   ],
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -756,10 +809,14 @@ class _PolicyEditorTabState extends State<_PolicyEditorTab> {
     final results = await Future.wait([
       widget.api.getDefaultPolicy(widget.session),
       widget.api.listConfigCameras(widget.session),
+      widget.api.listGroups(widget.session),
     ]);
     return _EditorData(
       defaultPolicy: results[0] as RecordingPolicy,
       cameras: results[1] as List<CameraConfigSummary>,
+      groupNames: {
+        for (final g in results[2] as List<CameraGroupSummary>) g.id: g.name,
+      },
     );
   }
 
@@ -796,13 +853,14 @@ class _PolicyEditorTabState extends State<_PolicyEditorTab> {
               },
             ),
             const SizedBox(height: 24),
-            Text('Per-camera overrides', style: Theme.of(context).textTheme.titleMedium),
+            Text('Per-camera policies', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             for (final cam in data.cameras)
               _CameraPolicyTile(
                 api: widget.api,
                 session: widget.session,
                 camera: cam,
+                source: resolvePolicySource(cam, data.groupNames),
                 onSaved: _reload,
               ),
           ],
@@ -813,9 +871,16 @@ class _PolicyEditorTabState extends State<_PolicyEditorTab> {
 }
 
 class _EditorData {
-  _EditorData({required this.defaultPolicy, required this.cameras});
+  _EditorData({
+    required this.defaultPolicy,
+    required this.cameras,
+    required this.groupNames,
+  });
   final RecordingPolicy defaultPolicy;
   final List<CameraConfigSummary> cameras;
+
+  /// group id -> group name, for labeling group-managed cameras.
+  final Map<String, String> groupNames;
 }
 
 class _CameraPolicyTile extends StatelessWidget {
@@ -823,12 +888,14 @@ class _CameraPolicyTile extends StatelessWidget {
     required this.api,
     required this.session,
     required this.camera,
+    required this.source,
     required this.onSaved,
   });
 
   final CrumbApi api;
   final Session session;
   final CameraConfigSummary camera;
+  final PolicySource source;
   final VoidCallback onSaved;
 
   @override
@@ -838,26 +905,81 @@ class _CameraPolicyTile extends StatelessWidget {
       child: ExpansionTile(
         title: Text(camera.name),
         subtitle: Text(
-          camera.hasOwnPolicy
-              ? 'Custom policy'
-              : (camera.groupId != null
-                    ? 'Inherits from group'
-                    : 'Inherits from default'),
+          source.label,
           style: Theme.of(context).textTheme.bodySmall,
         ),
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: _PolicyEditorCard(
-              policy: camera.policy,
-              onSave: (patch) async {
-                await api.updateCameraPolicy(session, camera.id, patch);
-                onSaved();
-              },
-            ),
+            // A grouped camera's recording settings are owned by its group
+            // profile; the per-camera policy PUT would 400. Show a read-only
+            // summary + explanation instead of an editor that can only fail.
+            child: source.isGroupManaged
+                ? _GroupManagedNotice(
+                    policy: camera.policy,
+                    groupName: source.groupName,
+                  )
+                : _PolicyEditorCard(
+                    policy: camera.policy,
+                    onSave: (patch) async {
+                      await api.updateCameraPolicy(session, camera.id, patch);
+                      onSaved();
+                    },
+                  ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Read-only summary shown for a camera whose recording settings are managed by
+/// a group profile (editing them per-camera is rejected server-side).
+class _GroupManagedNotice extends StatelessWidget {
+  const _GroupManagedNotice({required this.policy, this.groupName});
+
+  final RecordingPolicy policy;
+  final String? groupName;
+
+  @override
+  Widget build(BuildContext context) {
+    final group = (groupName != null && groupName!.isNotEmpty)
+        ? groupName!
+        : 'its group';
+    final retention = fmtRetentionHours(policy.liveRetentionHours.toDouble());
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.group, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  "Recording settings are managed by group '$group'. "
+                  "Edit the group's profile, or ungroup the camera to "
+                  'customize.',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          'Mode: ${policy.mode} · Live retention: $retention'
+          "${policy.liveMaxBytes != null ? ' · Live cap: ${fmtBytes(policy.liveMaxBytes)}' : ''}",
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
     );
   }
 }
@@ -877,8 +999,17 @@ class _PolicyEditorCard extends StatefulWidget {
 
 class _PolicyEditorCardState extends State<_PolicyEditorCard> {
   late String _mode = widget.policy.mode;
-  late final TextEditingController _liveRetentionHours =
-      TextEditingController(text: widget.policy.liveRetentionHours.toString());
+  // Retention is stored in hours but edited in hours OR whole days (a bare
+  // "336" made the operator do day-math). Initial unit picks days when it
+  // divides evenly.
+  late String _retentionUnit = retentionInitialUnit(
+    widget.policy.liveRetentionHours,
+  );
+  late final TextEditingController _retentionValue = TextEditingController(
+    text: retentionValueField(
+      retentionDisplayValue(widget.policy.liveRetentionHours, _retentionUnit),
+    ),
+  );
   late final TextEditingController _liveMaxGb = TextEditingController(
     text: widget.policy.liveMaxBytes != null
         ? (widget.policy.liveMaxBytes! / 1e9).toStringAsFixed(1)
@@ -893,20 +1024,39 @@ class _PolicyEditorCardState extends State<_PolicyEditorCard> {
 
   @override
   void dispose() {
-    _liveRetentionHours.dispose();
+    _retentionValue.dispose();
     _liveMaxGb.dispose();
     _motionPre.dispose();
     _motionPost.dispose();
     super.dispose();
   }
 
+  /// Switch the retention unit while keeping the same real duration, e.g.
+  /// "14 days" -> "336 hours".
+  void _changeRetentionUnit(String unit) {
+    if (unit == _retentionUnit) return;
+    final val = double.tryParse(_retentionValue.text.trim());
+    setState(() {
+      if (val != null) {
+        final hours = retentionToHours(val, _retentionUnit);
+        _retentionValue.text = retentionValueField(
+          retentionDisplayValue(hours, unit),
+        );
+      }
+      _retentionUnit = unit;
+    });
+  }
+
   Future<void> _save() async {
     final patch = PolicyPatch();
     if (_mode != widget.policy.mode) patch.mode(_mode);
 
-    final hours = int.tryParse(_liveRetentionHours.text.trim());
-    if (hours != null && hours != widget.policy.liveRetentionHours) {
-      patch.liveRetentionHours(hours);
+    final retVal = double.tryParse(_retentionValue.text.trim());
+    if (retVal != null) {
+      final hours = retentionToHours(retVal, _retentionUnit);
+      if (hours != widget.policy.liveRetentionHours) {
+        patch.liveRetentionHours(hours);
+      }
     }
 
     final gbText = _liveMaxGb.text.trim();
@@ -961,16 +1111,44 @@ class _PolicyEditorCardState extends State<_PolicyEditorCard> {
         ),
         const SizedBox(height: 12),
         Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(
               child: TextField(
-                controller: _liveRetentionHours,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  labelText: 'Live retention (hours)',
-                  isDense: true,
-                  border: OutlineInputBorder(),
+                controller: _retentionValue,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
                 ),
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: 'Live retention',
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  helperText: retentionHelperText(
+                    double.tryParse(_retentionValue.text.trim()) ?? 0,
+                    _retentionUnit,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: DropdownButton<String>(
+                value: _retentionUnit,
+                onChanged: (u) {
+                  if (u != null) _changeRetentionUnit(u);
+                },
+                items: const [
+                  DropdownMenuItem(
+                    value: retentionUnitHours,
+                    child: Text('hours'),
+                  ),
+                  DropdownMenuItem(
+                    value: retentionUnitDays,
+                    child: Text('days'),
+                  ),
+                ],
               ),
             ),
             const SizedBox(width: 12),
