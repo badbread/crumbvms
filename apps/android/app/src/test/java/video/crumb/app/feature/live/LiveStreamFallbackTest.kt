@@ -128,14 +128,14 @@ class LiveStreamFallbackTest {
     }
 
     @Test
-    fun `fullscreen chain puts the repaired main right after the raw main`() {
+    fun `fullscreen chain puts the repaired main before the doomed raw main`() {
         val chain = streams(
             mainv = "rtsp://u:p@host:18554/drive_mainv",
             subv = "rtsp://u:p@host:18554/drive_subv",
         ).fullscreenStreamChain(metered = false)
         assertEquals(
             listOf(
-                StreamTier.MAIN, StreamTier.MAINV,
+                StreamTier.MAINV, StreamTier.MAIN,
                 StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE,
             ),
             chain,
@@ -145,20 +145,32 @@ class LiveStreamFallbackTest {
     }
 
     @Test
-    fun `metered fullscreen keeps the repaired main a last resort with the raw main`() {
+    fun `a camera with a repaired main starts on it, not the doomed raw main`() {
+        // The whole point of leading with mainv: the server only publishes it for a
+        // main it has proven unplayable here, so the first attach must be mainv and
+        // never waste a doomed connect on the raw main first.
+        val chain = streams(
+            mainv = "rtsp://u:p@host:18554/drive_mainv",
+            subv = "rtsp://u:p@host:18554/drive_subv",
+        ).fullscreenStreamChain(metered = false)
+        assertEquals(StreamTier.MAINV, startTier(chain, emptySet()))
+    }
+
+    @Test
+    fun `metered fullscreen keeps the repaired main a last resort ahead of the raw main`() {
         val chain = streams(mainv = "rtsp://u:p@host:18554/drive_mainv")
             .fullscreenStreamChain(metered = true)
         assertEquals(
-            listOf(StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAIN, StreamTier.MAINV),
+            listOf(StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAINV, StreamTier.MAIN),
             chain,
         )
     }
 
     @Test
-    fun `a no-sub camera puts the repaired main before the transcode on the wall`() {
+    fun `a no-sub camera puts the repaired main before the raw main on the wall`() {
         val chain = streams(mainv = "rtsp://u:p@host:18554/drive_mainv", sub = null)
             .wallStreamChain()
-        assertEquals(listOf(StreamTier.MAIN, StreamTier.MAINV, StreamTier.MOBILE), chain)
+        assertEquals(listOf(StreamTier.MAINV, StreamTier.MAIN, StreamTier.MOBILE), chain)
     }
 
     @Test
