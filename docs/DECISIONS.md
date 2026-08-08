@@ -84,6 +84,44 @@ gate — currently `plate_watchlist_hit` only — generalizes).
 
 ---
 
+## 2026-08-08, Home Assistant entity role labels in the camera editor are mode-aware (copy only)
+
+**Context.** The per-camera HA link editor (`admin.html`, `renderHaLinks` &c.)
+labeled the `motion` role "Motion (triggers recording)". That is only true on a
+camera whose recording policy is Motion-triggered. On a Continuous (24/7) camera
+a linked motion binary sensor never starts a recording — it feeds the additive
+multi-source motion stream (timeline events + notifications) only. The static
+label read as a contradiction on a 24/7 camera and confused the maintainer about
+how to add an HA entity at all.
+
+**Decision.**
+
+- The `motion` role's label and the picker/helper copy are derived from the open
+  camera's effective policy mode (`profileById(cam.policy_id) || cam.policy`,
+  the same source the storage tab and banner use), surfaced as
+  `HA_CAM_MOTION_MODE`. Motion-mode ⇒ "Motion sensor (triggers recording + marks
+  the timeline)"; Continuous ⇒ "Motion sensor (marks the timeline, can notify)".
+  The `sensor`/`actuator` labels are mode-independent.
+- This is **presentation only**. The stored roles remain `motion|sensor|actuator`,
+  `device_class` and the whole-list `PUT /cameras/:id/ha/links` contract are
+  unchanged; no migration, no schema, no server change. The same rework moved the
+  `device_class` box into the icon & style panel, replaced the three add buttons
+  with one "+ Add Home Assistant entity" + a role segment toggle, grouped rows by
+  role, and added a Save-links "Unsaved changes" indicator.
+
+**Rejected.** A single static label for all cameras (the status quo) — rejected
+because "triggers recording" is factually wrong on a Continuous camera and was
+the reported source of confusion. Encoding the behavior difference in the schema
+(e.g. a per-link "notify" flag) — rejected as out of scope; it is genuinely new
+data, flagged in the PR for a future decision, not built here.
+
+**Revisit if.** The motion role's server-side behavior stops depending on the
+camera's record mode (e.g. motion links always trigger recording, or never do),
+or a per-link notify/behavior toggle is added — at which point the copy should
+follow the new behavior and this entry is superseded.
+
+---
+
 ## 2026-08-07, Timeline motion-intensity is bucketed in SQL (GROUP BY over a `generate_series`-expanded range), not by fetching every segment to Rust
 
 **Context.** The desktop Playback/clip timeline "intensity ribbon" took roughly
