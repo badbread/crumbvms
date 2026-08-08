@@ -392,6 +392,14 @@ tbody tr.selected td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
 .modal-title{font-size:15px;font-weight:650;letter-spacing:-.01em;}
 .modal-close{background:transparent;border:none;color:var(--dim);font-size:20px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:4px;}
 .modal-close:hover{color:var(--text);background:var(--surface2);}
+/* ── Inline per-alert "customize text" affordance (system alerts table) ── */
+.sysalert-edit-icon{position:relative;background:transparent;border:1px solid var(--border2);color:var(--dim);font-size:13px;line-height:1;cursor:pointer;padding:3px 6px;border-radius:6px;flex:0 0 auto;}
+.sysalert-edit-icon:hover{color:var(--text);background:var(--surface2);border-color:var(--border);}
+.sysalert-edit-icon.open{color:var(--text);background:var(--surface2);border-color:var(--accent2);}
+.sysalert-edit-icon.customized{color:var(--accent2);border-color:var(--accent2);}
+.sysalert-edit-icon .dot{position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--accent2);border:1px solid var(--surface);}
+.sae-inline-panel{border:1px solid var(--border2);border-left:2px solid var(--accent2);border-radius:8px;background:var(--surface2);padding:12px 14px;margin:2px 0 6px;}
+.sae-inline-title{font-size:13px;font-weight:650;letter-spacing:-.01em;margin-bottom:10px;}
 .modal-actions{display:flex;gap:10px;margin-top:22px;justify-content:flex-end;}
 /* ── Group boxes (commercial-VMS fieldset/legend feel) ──
    Each section is a flat 1px-bordered panel; its small-caps label sits ON the
@@ -712,17 +720,6 @@ code{background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:12px
       <button class="modal-close" onclick="closeLprZones()">&times;</button>
     </div>
     <div id="lz-modal-body"></div>
-  </div>
-</div>
-
-<!-- ══ SYSTEM-ALERT TEXT EDITOR MODAL (message/title + token legend + preview) ══ -->
-<div id="sysalert-editor-modal" class="modal-overlay hidden">
-  <div class="modal-box">
-    <div class="modal-header">
-      <div class="modal-title" id="sae-modal-title">Customize alert text</div>
-      <button class="modal-close" onclick="sysAlertCloseEditor()">&times;</button>
-    </div>
-    <div id="sae-modal-body"></div>
   </div>
 </div>
 
@@ -10933,21 +10930,22 @@ function _renderSystemAlertsSection() {
         thresholdField = `<span class="card-hint" style="margin:0">—</span>`;
       }
       const k = r.event_key;
-      /* A "Customized" chip when either template override is set, so a modified
-         alert is visible at a glance without opening the editor. */
+      /* Small inline pencil next to "Bypass quiet hours" opens the alert-text
+         editor in place. A filled/accent state + dot flags a customized alert
+         at a glance, so the list stays clean (no per-row "Customize" row/chip). */
       const customized = (r.message_template != null || r.title_template != null);
-      const chip = customized
-        ? `<span style="font-size:10px;font-weight:600;color:var(--accent2);border:1px solid var(--border2);border-radius:10px;padding:1px 7px;white-space:nowrap">Customized</span>`
+      const isOpen = (SYS_ALERT_EDIT_KEY === r.event_key);
+      const iconCls = 'sysalert-edit-icon' + (customized ? ' customized' : '') + (isOpen ? ' open' : '');
+      const iconTitle = customized ? 'Customize alert text (customized)' : 'Customize alert text';
+      const editIcon = `<button type="button" class="${iconCls}" title="${iconTitle}" aria-label="${iconTitle}" aria-expanded="${isOpen ? 'true' : 'false'}" onclick="sysAlertToggleEditor('${esc(k)}')">✎${customized ? '<span class="dot"></span>' : ''}</button>`;
+      const editorRow = isOpen
+        ? `<tr class="sae-inline-row"><td colspan="4" style="padding:0 0 4px">${_sysAlertEditorBody(r.event_key)}</td></tr>`
         : '';
       return `
       <tr data-key="${esc(r.event_key)}">
         <td style="min-width:220px">
           <div style="font-weight:600;font-size:13px">${esc(meta.title)}</div>
           <div class="card-hint" style="margin-top:2px;max-width:360px">${esc(meta.desc)}</div>
-          <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
-            <button class="ghost xs" onclick="sysAlertOpenEditor('${esc(k)}')">✎ Customize</button>
-            ${chip}
-          </div>
         </td>
         <td>
           <label class="toggle-switch" style="transform:scale(0.85)">
@@ -10957,12 +10955,15 @@ function _renderSystemAlertsSection() {
         </td>
         <td style="white-space:nowrap">${thresholdField}</td>
         <td>
-          <label class="chk" style="font-size:12px" title="Fire even during quiet hours">
-            <input type="checkbox" class="sysalert-bypass" data-key="${esc(r.event_key)}" ${r.bypass_quiet_hours ? 'checked' : ''} />
-            Bypass quiet hours
-          </label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <label class="chk" style="font-size:12px" title="Fire even during quiet hours">
+              <input type="checkbox" class="sysalert-bypass" data-key="${esc(r.event_key)}" ${r.bypass_quiet_hours ? 'checked' : ''} />
+              Bypass quiet hours
+            </label>
+            ${editIcon}
+          </div>
         </td>
-      </tr>`;
+      </tr>${editorRow}`;
     }).join('');
 
   /* Quiet-hours window (system alerts) — whole-hour selects, collapsed. */
@@ -11059,12 +11060,12 @@ async function notifSaveSystemAlerts() {
   }
 }
 
-/* ── System-alert text editor (one shared modal) ──
-   Opened per alert from the "✎ Customize" row button. Contains the message
-   textarea, a conditional title field, a per-alert token legend, and a live
-   preview rendered as a generic notification card. Save issues the per-alert
-   PUT (only message_template/title_template), decoupled from the row-toggle
-   bulk "Save system alerts". */
+/* ── System-alert text editor (inline, expands under the alert's row) ──
+   Opened per alert from the small inline ✎ icon next to "Bypass quiet hours".
+   Contains the message textarea, a conditional title field, a per-alert token
+   legend, and a live preview rendered as a generic notification card. Save
+   issues the per-alert PUT (only message_template/title_template), decoupled
+   from the row-toggle bulk "Save system alerts". */
 let SAE_IMG_URL = null; /* fetched sample snapshot URL for the preview card, or null */
 
 /* True when the current message/title (as typed) would deliver an image for
@@ -11093,20 +11094,15 @@ const SAE_IMG_PLACEHOLDER =
     '<rect x="58" y="34" width="34" height="24" rx="3"/><circle cx="75" cy="46" r="7"/>' +
     '<rect x="96" y="39" width="10" height="14" rx="2"/></g></svg>');
 
-async function sysAlertOpenEditor(key) {
-  SYS_ALERT_EDIT_KEY = key;
+/* Build the inline editor panel (message textarea, conditional title, per-alert
+   token legend, live preview, actions). Rendered directly under the alert's row
+   by _renderSystemAlertsSection when this alert is the one open — no modal. */
+function _sysAlertEditorBody(key) {
   const meta = SYS_ALERT_META[key] || { title: key };
   const r = (NOTIF_SYS_ALERTS.find(x => x.event_key === key)) || {};
   const msgVal   = r.message_template != null ? r.message_template : '';
   const titleVal = r.title_template   != null ? r.title_template   : '';
   const titleRelevant = sysAlertTitleRelevant();
-
-  /* Fetch a sample snapshot once (only when an image would actually deliver);
-     the preview card reuses it across keystrokes with an SVG fallback. */
-  SAE_IMG_URL = null;
-  if (sysAlertImageWouldDeliver(key) && CAMS.length) {
-    try { SAE_IMG_URL = await snapshotUrl(CAMS[0].id); } catch { SAE_IMG_URL = null; }
-  }
 
   /* Token legend: %token% | sample value, clickable to insert at the caret. */
   const legendRows = _sysAlertTokens(key).map(t => {
@@ -11124,42 +11120,62 @@ async function sysAlertOpenEditor(key) {
       <div class="card-hint" style="margin-top:4px">Used by: ${esc(sysAlertTitleDestNames())}.</div>`
     : '';
 
-  $('sae-modal-title').textContent = 'Customize: ' + (meta.title || key);
-  $('sae-modal-body').innerHTML = `
-    <label class="field-label" style="margin-top:0">Message text</label>
-    <textarea id="sae-msg" rows="3" style="width:100%;font-family:inherit;resize:vertical"
-      placeholder="${esc(SYS_ALERT_DEFAULT_MSG_TPL)}"
-      oninput="sysAlertEditorPreview()">${esc(msgVal)}</textarea>
-    ${titleField}
+  return `
+    <div class="sae-inline-panel">
+      <div class="sae-inline-title">Customize: ${esc(meta.title || key)}</div>
+      <label class="field-label" style="margin-top:0">Message text</label>
+      <textarea id="sae-msg" rows="3" style="width:100%;font-family:inherit;resize:vertical"
+        placeholder="${esc(SYS_ALERT_DEFAULT_MSG_TPL)}"
+        oninput="sysAlertEditorPreview()">${esc(msgVal)}</textarea>
+      ${titleField}
 
-    <div class="policy-section" style="margin-top:12px">
-      <div class="policy-section-title">Tokens for this alert</div>
-      <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Times are UTC.</div>
-      <div class="table-wrap"><table style="font-size:12px"><tbody>${legendRows}</tbody></table></div>
-    </div>
+      <div class="policy-section" style="margin-top:12px">
+        <div class="policy-section-title">Tokens for this alert</div>
+        <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Times are UTC.</div>
+        <div class="table-wrap"><table style="font-size:12px"><tbody>${legendRows}</tbody></table></div>
+      </div>
 
-    <div class="policy-section" style="margin-top:12px">
-      <div class="policy-section-title">Preview</div>
-      <div id="sae-preview"></div>
-      <div class="card-hint" style="margin-top:6px">Delivery varies by provider; Discord and Telegram attach up to two images, Pushover and ntfy one, Slack and webhooks link only.</div>
-    </div>
+      <div class="policy-section" style="margin-top:12px">
+        <div class="policy-section-title">Preview</div>
+        <div id="sae-preview"></div>
+        <div class="card-hint" style="margin-top:6px">Delivery varies by provider; Discord and Telegram attach up to two images, Pushover and ntfy one, Slack and webhooks link only.</div>
+      </div>
 
-    <div class="modal-actions">
-      <button class="ghost sm" onclick="sysAlertEditorRestoreDefault()" style="margin-right:auto">Restore default</button>
-      <button class="ghost sm" onclick="sysAlertCloseEditor()">Cancel</button>
-      <button class="primary sm" onclick="sysAlertEditorSave()">Save</button>
-    </div>
-    <div id="sae-msg-line" class="form-msg"></div>`;
-
-  $('sysalert-editor-modal').classList.remove('hidden');
-  sysAlertEditorPreview();
+      <div class="modal-actions">
+        <button class="ghost sm" onclick="sysAlertEditorRestoreDefault()" style="margin-right:auto">Restore default</button>
+        <button class="ghost sm" onclick="sysAlertCloseEditor()">Close</button>
+        <button class="primary sm" onclick="sysAlertEditorSave()">Save</button>
+      </div>
+      <div id="sae-msg-line" class="form-msg"></div>
+    </div>`;
 }
 
+/* Toggle the inline editor for one alert. Opening another closes the previous
+   (only one open at a time, keeps the list clean). Re-renders the section so the
+   expander row appears/collapses, then lazily fetches the sample snapshot for
+   image-bearing alerts and re-previews. */
+async function sysAlertToggleEditor(key) {
+  const opening = (SYS_ALERT_EDIT_KEY !== key);
+  SYS_ALERT_EDIT_KEY = opening ? key : null;
+  SAE_IMG_URL = null;
+  const sec = $('notif-sysalerts-section');
+  if (sec) sec.innerHTML = _renderSystemAlertsSection();
+  if (!opening) return;
+  sysAlertEditorPreview();
+  /* Fetch a sample snapshot once (only when an image would actually deliver);
+     the preview card reuses it across keystrokes with an SVG fallback. */
+  if (sysAlertImageWouldDeliver(key) && CAMS.length) {
+    try { SAE_IMG_URL = await snapshotUrl(CAMS[0].id); } catch { SAE_IMG_URL = null; }
+    if (SYS_ALERT_EDIT_KEY === key) sysAlertEditorPreview();
+  }
+}
+
+/* Collapse the inline editor (re-renders the section without the expander row). */
 function sysAlertCloseEditor() {
-  const m = $('sysalert-editor-modal');
-  if (m) m.classList.add('hidden');
   SYS_ALERT_EDIT_KEY = null;
   SAE_IMG_URL = null;
+  const sec = $('notif-sysalerts-section');
+  if (sec) sec.innerHTML = _renderSystemAlertsSection();
 }
 
 /* Insert a %token% at the message textarea's caret (no execCommand). */
@@ -11241,15 +11257,14 @@ async function sysAlertEditorSave() {
 
   try {
     await api('/notifications/system-alerts/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(body) });
-    /* Reflect the change in the in-memory row so the "Customized" chip updates. */
+    /* Reflect the change in the in-memory row so the icon's customized state
+       updates when the section re-renders. */
     let row = NOTIF_SYS_ALERTS.find(x => x.event_key === key);
     if (!row) { row = { event_key: key }; NOTIF_SYS_ALERTS.push(row); }
     row.message_template = body.message_template;
     if ('title_template' in body) row.title_template = body.title_template;
     toast('Alert text saved.');
-    sysAlertCloseEditor();
-    const sec = $('notif-sysalerts-section');
-    if (sec) sec.innerHTML = _renderSystemAlertsSection();
+    sysAlertCloseEditor(); /* collapses the editor and re-renders the section */
   } catch (e) {
     if (line) { line.textContent = e.message; line.classList.add('err'); }
   }

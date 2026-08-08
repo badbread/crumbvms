@@ -8,7 +8,7 @@ revisit.
 
 ---
 
-## 2026-08-08, Notifications pane: one shared modal for alert-text editing, whole-hour quiet-hours pickers validated 0..=23 server-side, admins see every channel
+## 2026-08-08, Notifications pane: inline per-alert ✎ icon opens the alert-text editor in place, whole-hour quiet-hours pickers validated 0..=23 server-side, admins see every channel
 
 **Context.** A Notifications-pane UX pass surfaced four issues. (1) The engine
 fans out to **every enabled channel regardless of owner**
@@ -38,18 +38,26 @@ consume a rendered title.
   is a real destination); leaving the console blind to foreign channels (the
   reported bug).
 
-- **One shared modal (`#sysalert-editor-modal`) for alert-text editing**, opened
-  per alert from a compact "✎ Customize" row button (+ a "Customized" chip when
-  a template is set). The modal holds the message textarea, a conditional Title
-  field, a per-alert token legend (click-to-insert, with sample values), and a
-  live preview rendered as ONE generic notification-card (not per-provider
-  chrome); it saves via the existing per-alert PUT, decoupled from the row-toggle
-  bulk save. **Rejected:** the status-quo inline `<details>` per row (13× noise);
-  a per-row popover (positioning/collision math, and it clips inside the table's
-  overflow wrap). The `.modal-overlay` pattern already exists in `admin.html`,
-  works identically in the desktop WebView2 embed and any Android WebView (fixed
-  overlay, no anchoring), and gives room for legend + preview without inflating
-  the list.
+- **A small inline ✎ icon per alert opens the editor in place (no modal).** Each
+  system-alert row carries a compact pencil icon on its control row, inline right
+  next to "Bypass quiet hours"; clicking it expands the editor as a panel
+  directly under that row (`_sysAlertEditorBody` rendered into a `colspan` row by
+  `_renderSystemAlertsSection`; toggled via `sysAlertToggleEditor`, only one open
+  at a time). The icon itself carries the "customized" state (accent border + a
+  dot) when a template override is set, so no separate chip is needed and the
+  list reads as a clean list with a tiny icon per row. The panel holds the same
+  message textarea, conditional Title field, per-alert token legend
+  (click-to-insert, with sample values), live preview (ONE generic
+  notification-card, not per-provider chrome), Restore default, and it saves via
+  the existing per-alert PUT, decoupled from the row-toggle bulk save.
+  **Rejected:** a shared `.modal-overlay` dialog (the maintainer found a labeled
+  "Customize" button opening a separate modal too heavy for "just a little icon
+  to click"); the earlier status-quo inline `<details>` "Customize alert text"
+  row per alert (13× noise, a wall of collapsibles); a floating anchored popover
+  (positioning/collision math, and it clips inside the table's `overflow-x` wrap).
+  Inline expansion needs no anchoring and works identically in the desktop
+  WebView2 embed and any Android WebView. **NOTE:** this replaces the modal
+  affordance that the first cut of this PR shipped — do not "restore" the modal.
 
 - **Whole-hour `<select>` quiet-hours pickers + server-side 0..=23 validation.**
   Both quiet-hours pairs (per-user rules and system alerts) are now native
