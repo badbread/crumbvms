@@ -5205,6 +5205,8 @@ let HA_PICKER_SHOWALL = false;
 let HA_STYLE_OPEN = null;     // index of the HA_LINKS row whose icon/style editor is expanded
 let HA_CTRL_OPEN = null;      // index of the HA_LINKS row whose control-config editor is expanded
 let HA_STYLE_PREVIEW_ON = {}; // HA_LINKS index -> bool: which state (on/off) the style mockup is currently showing
+let HA_CAM_MOTION_MODE = false; // true when the open camera records on a Motion-triggered policy; drives mode-aware role copy
+let HA_DIRTY = false;         // true when the working set has whole-list edits not yet persisted by Save links
 // device_classes worth linking to a camera; the rest hide under "Other sensors".
 const HA_SENSOR_CLASSES = ['motion','occupancy','presence','moving','door','window','opening','garage_door'];
 
@@ -5600,6 +5602,13 @@ async function loadCameraHaLinks(camId) {
     HA_STYLE_OPEN = null;
     HA_CTRL_OPEN = null;
     HA_STYLE_PREVIEW_ON = {};
+    HA_DIRTY = false;
+    // Derive whether this camera records on a Motion-triggered policy so the role
+    // copy can drop "triggers recording" on a 24/7 (Continuous) camera. Same
+    // effective-policy source the storage tab / banner use (profileById || cam.policy).
+    const _cam = (typeof CAMS !== 'undefined' && CAMS) ? CAMS.find(x => x.id === camId) : null;
+    const _pol = _cam ? (profileById(_cam.policy_id) || _cam.policy) : null;
+    HA_CAM_MOTION_MODE = !!(_pol && _pol.mode === 'motion');
     const configured = !!(cfg && cfg.enabled && cfg.base_url && cfg.has_token);
     renderHaLinks(configured);
   } catch (e) {
@@ -5609,15 +5618,32 @@ async function loadCameraHaLinks(camId) {
 
 /* The three link roles an operator can pick per row. "Control" is the server's
    `actuator` role (an entity you can operate); the parenthetical spells that out
-   so it reads as controllable, not just another sensor. */
-const HA_ROLE_OPTS = [
-  ['motion', 'Motion (triggers recording)'],
-  ['sensor', 'Sensor (status only)'],
-  ['actuator', 'Control (operate)'],
-];
+   so it reads as controllable, not just another sensor. The motion role's copy is
+   mode-aware: on a Motion-triggered policy a linked binary sensor really does
+   trigger recording, but on a 24/7 (Continuous) camera it only feeds the timeline
+   and notifications, so the "triggers recording" wording is dropped there. */
+function haRoleOpts(isMotionMode) {
+  return [
+    ['motion', isMotionMode
+      ? 'Motion sensor (triggers recording + marks the timeline)'
+      : 'Motion sensor (marks the timeline, can notify)'],
+    ['sensor', 'Sensor reading (shows on the video, status only)'],
+    ['actuator', 'Control (operate from the video: lights, locks, covers)'],
+  ];
+}
+
+/* One-line description of a role, matching the select copy, for the picker and
+   the empty-state helper. Mode-aware for the motion role, same as haRoleOpts. */
+function haRoleHelp(role, isMotionMode) {
+  if (role === 'motion') return isMotionMode
+    ? 'Motion or contact binary sensors. Linking one adds a motion source that triggers recording and marks the timeline.'
+    : 'Motion or contact binary sensors. Linking one marks the timeline and can send notifications.';
+  if (role === 'sensor') return 'Numeric readings like temperature, power or humidity. Shown on the video, status only.';
+  return 'Anything you operate from the video: lights, switches, covers, locks, fans, sirens.';
+}
 
 function haRoleSelect(i, role) {
-  const opts = HA_ROLE_OPTS.map(([v, t]) =>
+  const opts = haRoleOpts(HA_CAM_MOTION_MODE).map(([v, t]) =>
     `<option value="${v}"${v === role ? ' selected' : ''}>${esc(t)}</option>`).join('');
   return `<select onchange="haSetRole(${i}, this.value)" title="How Crumb uses this entity" style="font-size:12px">${opts}</select>`;
 }
@@ -5629,7 +5655,13 @@ function renderHaLinks(configured) {
       '<button class="ghost sm" type="button" style="margin-top:8px" onclick="select(\'ha-root\')">Open Home Assistant</button>';
     return;
   }
-  const rows = HA_LINKS.map((l, i) => {
+  // One row for a single link, keyed by its REAL index into HA_LINKS so every
+  // handler (haSetRole/haSetLabel/haToggleStyle/removeHaLink/…) stays wired to the
+  // right entry even though rows are rendered grouped by role. The device_class
+  // box has moved into the Icon & style expander (it only sets binary_sensor
+  // glyphs), so the main row is: role | label | entity id | Icon & style |
+  // Controls (actuators only) | Remove.
+  const rowHtml = (l, i) => {
     const canStyle = l.id != null;
     const isActuator = l.role === 'actuator';
     return `
@@ -5637,28 +5669,43 @@ function renderHaLinks(configured) {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         ${haRoleSelect(i, l.role)}
         <input value="${esc(l.label || '')}" placeholder="${esc(l.entity_id)}" oninput="haSetLabel(${i}, this.value)" title="Display label" style="flex:1;min-width:140px;font-size:13px" />
-        <input list="ha-dev-classes" value="${esc(l.device_class || '')}" placeholder="class (optional)" oninput="haSetDeviceClass(${i}, this.value)" title="Optional. Only meaningful for binary_sensor entities; it sets the badge glyph. Auto-filled from Home Assistant when the entity reports one. Leave blank for lights, switches and covers, their icon comes from the domain or the Icon &amp; style override." style="width:120px;font-size:12px" />
         <span class="mono" style="color:var(--dim2);font-size:11px">${esc(l.entity_id)}</span>
-        <button class="ghost sm" onclick="haToggleStyle(${i})" ${canStyle ? '' : 'disabled'} title="${canStyle ? 'Badge icon, shape and color for this entity on the video wall' : 'Save links first to customize this entity\'s badge'}">${HA_STYLE_OPEN === i ? 'Hide style' : 'Icon &amp; style'}</button>
+        <button class="ghost sm" onclick="haToggleStyle(${i})" ${canStyle ? '' : 'disabled'} title="${canStyle ? 'Badge icon, class, shape and color for this entity on the video wall' : 'Save links first to customize this entity\'s badge'}">${HA_STYLE_OPEN === i ? 'Hide style' : 'Icon &amp; style'}</button>
         ${isActuator ? `<button class="ghost sm" onclick="haToggleCtrl(${i})" title="Confirmation + which actions this control allows">${HA_CTRL_OPEN === i ? 'Hide controls' : 'Controls'}</button>` : ''}
         <button class="ghost sm" onclick="removeHaLink(${i})">Remove</button>
       </div>
       ${HA_STYLE_OPEN === i ? haStylePanel(i, l) : ''}
       ${HA_CTRL_OPEN === i ? haCtrlPanel(i, l) : ''}
     </div>`;
-  }).join('') || '<div class="card-hint" style="margin:4px 0">No links yet.</div>';
+  };
+  // Group the rows under role headers in a stable order. Iterate HA_LINKS once so
+  // each row carries its real index; do NOT sort HA_LINKS in place (that would
+  // invalidate HA_STYLE_OPEN/HA_CTRL_OPEN indices while a panel is open).
+  const GROUPS = [
+    ['motion', 'Motion &amp; contact sensors'],
+    ['sensor', 'Sensor readings'],
+    ['actuator', 'Controls'],
+  ];
+  let rows;
+  if (!HA_LINKS.length) {
+    rows = '<div class="card-hint" style="margin:4px 0">Nothing linked yet. Add a motion sensor, a reading, or a control from Home Assistant.</div>';
+  } else {
+    rows = GROUPS.map(([role, title]) => {
+      const inRole = HA_LINKS.map((l, i) => [l, i]).filter(([l]) => l.role === role);
+      if (!inRole.length) return '';
+      return `<div style="margin-top:10px"><div style="font-size:11px;color:var(--dim2);text-transform:uppercase;letter-spacing:.04em">${title}</div>${inRole.map(([l, i]) => rowHtml(l, i)).join('')}</div>`;
+    }).join('');
+  }
+  const dirtyBadge = HA_DIRTY ? ' <span style="background:var(--warn);color:#000;border-radius:10px;padding:1px 7px;font-size:10px;font-weight:700;margin-left:6px">Unsaved changes</span>' : '';
+  // Datalist for the per-link class box, which now lives in each row's Icon & style expander.
   const devClassOpts = ['door', 'garage_door', 'window', 'opening', 'motion', 'occupancy', 'presence', 'vibration', 'moisture', 'smoke', 'gas', 'carbon_monoxide', 'lock']
     .map(c => `<option value="${c}"></option>`).join('');
   el.innerHTML = `
     <div>${rows}</div>
     <datalist id="ha-dev-classes">${devClassOpts}</datalist>
-    <div class="card-hint" style="margin-top:10px">The <b>class</b> box on each row is optional and only affects <code>binary_sensor</code> badge glyphs; it is auto-filled from Home Assistant. Leave it blank for lights, switches and covers.</div>
-    <div class="card-hint" style="margin-top:10px">Where does an entity go? <b>Motion sensor</b> = motion or contact binary sensors. <b>Sensor reading</b> = numeric readings (temperature, power, humidity). <b>Control</b> = anything you operate (lights, switches, covers, locks, fans, sirens).</div>
-    <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center">
-      <button class="ghost sm" onclick="haOpenPicker('motion')">+ Motion sensor</button>
-      <button class="ghost sm" onclick="haOpenPicker('sensor')">+ Sensor reading</button>
-      <button class="ghost sm" onclick="haOpenPicker('actuator')">+ Control (lights, switches, covers&hellip;)</button>
-      <button class="primary sm" onclick="saveHaLinks()" style="margin-left:auto">Save links</button>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
+      <button class="primary sm" onclick="haOpenPicker('motion')">+ Add Home Assistant entity</button>
+      <button id="ha-save-btn" class="${HA_DIRTY ? 'primary' : 'ghost'} sm" onclick="saveHaLinks()" style="margin-left:auto">Save links${dirtyBadge}</button>
     </div>
     <div id="ce-ha-picker"></div>
     <div id="ce-ha-msg" class="form-msg"></div>`;
@@ -5739,6 +5786,9 @@ function haStylePanel(i, l) {
       <div class="form-grid" style="min-width:170px">
         <label class="fg-label" style="margin-top:0">Icon</label>
         <div class="fg-ctl"><select onchange="haStyleSet(${i}, 'overlay_icon', this.value || null)">${iconOpts}</select></div>
+        <label class="fg-label" title="Optional. Only meaningful for binary_sensor entities; it sets the badge glyph when Icon is left on auto. Auto-filled from Home Assistant when the entity reports one.">Class</label>
+        <div class="fg-ctl"><input list="ha-dev-classes" value="${esc(l.device_class || '')}" placeholder="auto" oninput="haSetDeviceClass(${i}, this.value)" title="Optional binary_sensor device class; saved with Save links." style="width:130px;font-size:12px" /></div>
+        <div class="card-hint" style="grid-column:1/-1;margin:2px 0 0">Class only affects <code>binary_sensor</code> badge glyphs and saves with <b>Save links</b>. Leave blank for lights, switches and covers.</div>
         <label class="fg-label">Shape</label>
         <div class="fg-ctl">
           <select onchange="haStyleSet(${i}, 'overlay_shape', this.value)">
@@ -5882,7 +5932,7 @@ function haCtrlPanel(i, l) {
     </div>`;
 }
 
-function haSetRequireConfirm(i, v) { if (HA_LINKS[i]) HA_LINKS[i].require_confirm = v; }
+function haSetRequireConfirm(i, v) { if (HA_LINKS[i]) { HA_LINKS[i].require_confirm = v; haMarkDirty(); } }
 
 /* Unrestricted (allowed_actions === null) ⇒ every domain action is allowed
    (today's default). Turning restriction ON seeds the checkbox set with the
@@ -5894,21 +5944,38 @@ function haToggleRestrictActions(i, v) {
   const domain = (l.entity_id.split('.')[0] || '');
   const actions = HA_ACTION_ALLOWLIST_BY_DOMAIN[domain] || [];
   l.allowed_actions = v ? actions.slice() : null;
+  HA_DIRTY = true;
   renderHaLinks(true);
 }
 function haToggleAction(i, action, checked) {
   const l = HA_LINKS[i]; if (!l || !Array.isArray(l.allowed_actions)) return;
   if (checked) { if (!l.allowed_actions.includes(action)) l.allowed_actions.push(action); }
   else { l.allowed_actions = l.allowed_actions.filter(a => a !== action); }
+  haMarkDirty();
 }
 
-/* Row-edit handlers: mutate the working set in place WITHOUT re-rendering, so a
-   text input keeps focus while typing. The edited set is persisted by
+/* Mark the working set as having unsaved whole-list edits. Updates the Save
+   links button in place (no full re-render) so a text input keeps focus while
+   the "Unsaved changes" badge appears. renderHaLinks reflects HA_DIRTY too, so a
+   full re-render stays consistent. */
+function haMarkDirty() {
+  HA_DIRTY = true;
+  const btn = $('ha-save-btn');
+  if (btn && !btn.classList.contains('primary')) {
+    btn.classList.remove('ghost');
+    btn.classList.add('primary');
+    btn.innerHTML = 'Save links <span style="background:var(--warn);color:#000;border-radius:10px;padding:1px 7px;font-size:10px;font-weight:700;margin-left:6px">Unsaved changes</span>';
+  }
+}
+
+/* Row-edit handlers: mutate the working set in place. Text inputs (label, class)
+   do NOT re-render so they keep focus while typing; the role select DOES
+   re-render because a role change regroups the row. All are persisted by
    saveHaLinks(). Empty text collapses to null (label falls back to entity_id,
    device_class is genuinely unset). */
-function haSetRole(i, v) { if (HA_LINKS[i]) HA_LINKS[i].role = v; }
-function haSetLabel(i, v) { if (HA_LINKS[i]) HA_LINKS[i].label = v.trim() ? v : null; }
-function haSetDeviceClass(i, v) { if (HA_LINKS[i]) HA_LINKS[i].device_class = v.trim() ? v : null; }
+function haSetRole(i, v) { if (HA_LINKS[i]) { HA_LINKS[i].role = v; haMarkDirty(); renderHaLinks(true); } }
+function haSetLabel(i, v) { if (HA_LINKS[i]) { HA_LINKS[i].label = v.trim() ? v : null; haMarkDirty(); } }
+function haSetDeviceClass(i, v) { if (HA_LINKS[i]) { HA_LINKS[i].device_class = v.trim() ? v : null; haMarkDirty(); } }
 
 /* Reusable search + grouped entity picker (avoids a wall-of-entities select).
    Motion sensors: whitelist device_classes grouped first, rest under a collapsed
@@ -5924,14 +5991,30 @@ function haPickerDomain(role) {
   return 'controls';
 }
 
-async function haOpenPicker(role) {
-  HA_PICKER = role; HA_PICKER_SEARCH = ''; HA_PICKER_SHOWALL = false;
+/* Lazily fetch the entity list for a role's domain into HA_ENT_CACHE. Returns
+   false (and renders an inline error) if the fetch fails. */
+async function haEnsureDomain(role) {
   const domain = haPickerDomain(role);
   if (!HA_ENT_CACHE[domain]) {
     const box = $('ce-ha-picker'); if (box) box.innerHTML = '<div class="card-hint" style="margin-top:8px">Loading entities from Home Assistant&hellip;</div>';
     try { HA_ENT_CACHE[domain] = await api('/ha/entities?domain=' + domain); }
-    catch (e) { const b = $('ce-ha-picker'); if (b) b.innerHTML = `<div class="form-msg err" style="margin-top:8px">${esc((e && e.message) || 'Failed to load entities')}</div>`; return; }
+    catch (e) { const b = $('ce-ha-picker'); if (b) b.innerHTML = `<div class="form-msg err" style="margin-top:8px">${esc((e && e.message) || 'Failed to load entities')}</div>`; return false; }
   }
+  return true;
+}
+
+async function haOpenPicker(role) {
+  HA_PICKER = role; HA_PICKER_SEARCH = ''; HA_PICKER_SHOWALL = false;
+  if (!(await haEnsureDomain(role))) return;
+  renderHaPicker();
+}
+
+/* Switch which role the (already open) picker is adding, from the segment
+   toggle. Re-fetches the target domain's entities the first time it is needed. */
+async function haPickerSetRole(role) {
+  if (HA_PICKER === role) return;
+  HA_PICKER = role; HA_PICKER_SEARCH = ''; HA_PICKER_SHOWALL = false;
+  if (!(await haEnsureDomain(role))) return;
   renderHaPicker();
 }
 
@@ -5939,11 +6022,22 @@ function haClosePicker() { HA_PICKER = null; renderHaLinks(true); }
 function haPickerSearch(v) { HA_PICKER_SEARCH = v; renderHaResults(); }
 function haToggleShowAll() { HA_PICKER_SHOWALL = !HA_PICKER_SHOWALL; renderHaResults(); }
 
+/* Segment toggle mapping: the 3 buttons an operator sees vs the internal role. */
+const HA_PICKER_SEGMENTS = [
+  ['motion', 'Motion &amp; contact'],
+  ['sensor', 'Readings'],
+  ['actuator', 'Controls'],
+];
+
 function renderHaPicker() {
   const box = $('ce-ha-picker'); if (!box || !HA_PICKER) return;
   const kind = HA_PICKER === 'motion' ? 'sensors' : (HA_PICKER === 'sensor' ? 'values' : 'controls');
+  const seg = HA_PICKER_SEGMENTS.map(([r, t]) =>
+    `<button type="button" class="seg-btn ${HA_PICKER === r ? 'active' : ''}" style="font-size:12px" onclick="haPickerSetRole('${r}')">${t}</button>`).join('');
   box.innerHTML = `
     <div class="policy-section" style="margin-top:8px">
+      <div class="seg-toggle" role="group" aria-label="Entity role">${seg}</div>
+      <div class="card-hint" style="margin:6px 0 8px">${esc(haRoleHelp(HA_PICKER, HA_CAM_MOTION_MODE))}</div>
       <div style="display:flex;gap:8px;align-items:center">
         <input id="ha-pick-search" placeholder="Search ${kind}&hellip;" value="${esc(HA_PICKER_SEARCH)}" oninput="haPickerSearch(this.value)" style="flex:1" />
         <button class="ghost sm" onclick="haClosePicker()">Done</button>
@@ -6003,6 +6097,7 @@ function haPick(entity_id) {
     overlay_show_state: false, overlay_show_age: false, overlay_opacity: null, overlay_shape: null, overlay_bg_color: null, overlay_bg_color_on: null,
     overlay_pill_width: null, overlay_text_align: null, overlay_outline: false,
   });
+  HA_DIRTY = true;
   renderHaLinks(true);
 }
 
@@ -6011,6 +6106,7 @@ function removeHaLink(i) {
   HA_STYLE_OPEN = null;
   HA_CTRL_OPEN = null;
   HA_STYLE_PREVIEW_ON = {};
+  HA_DIRTY = true;
   renderHaLinks(true);
 }
 
@@ -6031,6 +6127,7 @@ async function saveHaLinks() {
     HA_STYLE_OPEN = null;
     HA_CTRL_OPEN = null;
     HA_STYLE_PREVIEW_ON = {};
+    HA_DIRTY = false;
     toast('Home Assistant links saved.');
     renderHaLinks(true);
   } catch (e) {
