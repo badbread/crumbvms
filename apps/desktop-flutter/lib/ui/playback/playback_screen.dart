@@ -1239,6 +1239,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _maximizedCameraId != null ? _audioPaneId(_maximizedCameraId!) : null,
       paneRecreated: false,
     );
+    // The timeline's "selected camera" is the maximized pane (else the picked
+    // tile), so maximizing/restoring must re-point it — this is what makes the
+    // solo view (and the prominent motion track) follow the focused camera.
+    _scheduleMotionRefresh();
     // Newly-active panes (e.g. the whole grid again after un-maximizing)
     // may not hold the right segment yet — force a resolve at the current
     // playhead for whichever set is now active. Pass the boundary model that

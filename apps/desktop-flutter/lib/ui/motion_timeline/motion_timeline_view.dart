@@ -456,9 +456,13 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     if (winDur <= 0 || _width <= 0) return null;
     final glyphY = widget.height - _TimelinePainter.covH - 1 - 8;
     if ((local.dy - glyphY).abs() > 9) return null; // not on the glyph row
+    final soloActive = widget.motion.isSoloActive;
+    final selCamId = widget.motion.selectedCameraId;
     DetectionEvent? best;
     double bestDx = 9; // px hit radius (glyphs are ~8px)
     for (final ev in widget.motion.detections) {
+      // Don't surface a hidden camera's event under the cursor in solo mode.
+      if (soloActive && ev.cameraId != selCamId) continue;
       final ms = ev.ts.millisecondsSinceEpoch;
       if (ms < winStart || ms > winEnd) continue;
       final x = ((ms - winStart) / winDur) * _width;
@@ -695,9 +699,13 @@ class _TimelinePainter extends CustomPainter {
     }
 
     // ── motion intensity (non-selected first, selected on top) ──────────────
+    // In solo mode `visible` collapses to just the selected camera; otherwise
+    // it is every loaded camera (today's stacked view). Filtering the "others"
+    // by it is what declutters the histogram.
     final selCamId = motion.selectedCameraId;
+    final visible = motion.visibleCameraIds.toSet();
     final others = motion.intensityByCam.entries
-        .where((e) => e.key != selCamId)
+        .where((e) => e.key != selCamId && visible.contains(e.key))
         .toList()
       ..sort((a, b) {
         final pa = a.value.buckets.isEmpty
@@ -719,10 +727,13 @@ class _TimelinePainter extends CustomPainter {
       _drawMotionStarts(canvas, selCamId!, msToX, motionTop);
     }
     // Highlight the span of any detection event the playhead is currently
-    // inside — drawn under the glyphs so the marker stays crisp on top.
-    _drawActiveEventSpans(
-        canvas, msToX, selCamId, motionTop, motionBottom, size.width);
-    _drawDetectionGlyphs(canvas, msToX, selCamId, motionBottom);
+    // inside — drawn under the glyphs so the marker stays crisp on top. In
+    // solo mode other cameras' detection glyphs/spans are hidden too so the
+    // whole strip is just the focused camera.
+    final soloActive = motion.isSoloActive;
+    _drawActiveEventSpans(canvas, msToX, selCamId, soloActive, motionTop,
+        motionBottom, size.width);
+    _drawDetectionGlyphs(canvas, msToX, selCamId, soloActive, motionBottom);
 
     // ── recording-coverage line (bottom): where footage exists ──────────────
     final recPaint = Paint()..color = recColor;
@@ -887,6 +898,7 @@ class _TimelinePainter extends CustomPainter {
     Canvas canvas,
     double Function(int) msToX,
     String? selCamId,
+    bool soloActive,
     double top,
     double bottom,
     double width,
@@ -896,6 +908,7 @@ class _TimelinePainter extends CustomPainter {
     final winStart = timeline.windowStart.millisecondsSinceEpoch;
     final winEnd = timeline.windowEnd.millisecondsSinceEpoch;
     for (final ev in motion.detections) {
+      if (soloActive && ev.cameraId != selCamId) continue;
       final endTs = ev.endTs;
       if (endTs == null) continue;
       final startMs = ev.ts.millisecondsSinceEpoch;
@@ -928,12 +941,14 @@ class _TimelinePainter extends CustomPainter {
     Canvas canvas,
     double Function(int) msToX,
     String? selCamId,
+    bool soloActive,
     double motionBottom,
   ) {
     if (motion.detections.isEmpty) return;
     final y = motionBottom - 8;
     double? lastX;
     for (final ev in motion.detections) {
+      if (soloActive && ev.cameraId != selCamId) continue;
       final ms = ev.ts.millisecondsSinceEpoch;
       if (ms < timeline.windowStart.millisecondsSinceEpoch ||
           ms > timeline.windowEnd.millisecondsSinceEpoch) {
@@ -1063,7 +1078,10 @@ class _TimelinePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _TimelinePainter old) =>
-      old.selectedCameraName != selectedCameraName || old.hoverX != hoverX;
+      old.selectedCameraName != selectedCameraName ||
+      old.hoverX != hoverX ||
+      old.motion.soloSelectedCamera != motion.soloSelectedCamera ||
+      old.motion.selectedCameraId != motion.selectedCameraId;
 }
 
 enum _Anchor { centerTop, leftBottom }

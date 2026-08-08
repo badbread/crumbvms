@@ -60,15 +60,24 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
         final detectionCams = widget.motion.detections
             .map((d) => d.cameraId)
             .toSet();
-        final entries = widget.motion.intensityByCam.entries
-            .where(
-              (e) =>
-                  e.value.buckets.any((b) => b >= kMotionAbsFloor) ||
-                  detectionCams.contains(e.key),
-            )
-            .map((e) => e.key)
-            .toList()
-          ..sort((a, b) => _nameFor(a).compareTo(_nameFor(b)));
+        final soloActive = widget.motion.isSoloActive;
+        final List<String> entries;
+        if (soloActive) {
+          // Timeline is collapsed to the selected camera, so the legend is too —
+          // a full legend here would imply every camera is still on the strip.
+          final sel = widget.motion.selectedCameraId;
+          entries = sel != null ? [sel] : const [];
+        } else {
+          entries = widget.motion.intensityByCam.entries
+              .where(
+                (e) =>
+                    e.value.buckets.any((b) => b >= kMotionAbsFloor) ||
+                    detectionCams.contains(e.key),
+              )
+              .map((e) => e.key)
+              .toList()
+            ..sort((a, b) => _nameFor(a).compareTo(_nameFor(b)));
+        }
         final shown = entries.take(kLegendCameraMax).toList();
         final extra = entries.length - shown.length;
         final hintColor = scheme.onSurfaceVariant.withValues(alpha: 0.55);
@@ -77,6 +86,13 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
           scrollDirection: Axis.horizontal,
           child: Row(
             children: [
+              _soloToggle(scheme),
+              Container(
+                width: 1,
+                height: 12,
+                margin: const EdgeInsets.symmetric(horizontal: 8),
+                color: scheme.outlineVariant,
+              ),
               for (final id in shown) _swatch(id, scheme),
               if (extra > 0)
                 Padding(
@@ -113,6 +129,34 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
           ),
         );
       },
+    );
+  }
+
+  /// Compact toggle that collapses the timeline histogram to just the selected
+  /// (focused) camera, or restores the full stacked view. Highlighted while
+  /// solo is on; its tooltip names what a click does.
+  Widget _soloToggle(ColorScheme scheme) {
+    final on = widget.motion.soloSelectedCamera;
+    return Tooltip(
+      message: on ? 'Show all cameras' : 'Show only the selected camera',
+      child: SizedBox(
+        width: 30,
+        height: 26,
+        child: IconButton(
+          padding: EdgeInsets.zero,
+          iconSize: 17,
+          visualDensity: VisualDensity.compact,
+          isSelected: on,
+          style: IconButton.styleFrom(
+            foregroundColor: on ? scheme.primary : scheme.onSurfaceVariant,
+            backgroundColor:
+                on ? scheme.primary.withValues(alpha: 0.16) : null,
+          ),
+          icon: Icon(on ? Icons.center_focus_strong : Icons.center_focus_weak),
+          onPressed: () =>
+              widget.motion.soloSelectedCamera = !widget.motion.soloSelectedCamera,
+        ),
+      ),
     );
   }
 

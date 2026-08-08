@@ -16,6 +16,7 @@ import 'package:flutter/foundation.dart';
 import '../../api/crumb_api.dart';
 import '../../api/models.dart';
 import '../../api/motion_timeline_api.dart';
+import '../playback/playback_prefs.dart';
 
 /// "Nice" motion-histogram bucket widths (ms), ported from
 /// PB_INTENSITY_BUCKET_MS. A width is picked from this fixed ladder (instead
@@ -52,8 +53,38 @@ int intensityBucketMs(int windowDurMs, double timelineWidthPx) {
   return kIntensityBucketLadderMs.last;
 }
 
+/// Which camera intensity tracks the timeline should render, given the solo
+/// toggle and the current selection. Pure so it can be unit-tested away from
+/// the painter:
+///
+///  * solo ON with a selected camera that has loaded data -> just that camera
+///    (the decluttered "only what I'm looking at" view);
+///  * solo ON but no selection, or a selection whose data is not loaded ->
+///    fall back to ALL cameras (never a misleading empty timeline);
+///  * solo OFF -> ALL cameras (today's default stacked behavior).
+///
+/// [allCameraIds] is the set of cameras that actually have loaded intensity
+/// data (i.e. `intensityByCam.keys`); the selection only wins when it is
+/// present there so an unloaded/absent selection degrades to the full set.
+List<String> visibleTimelineCameras({
+  required bool solo,
+  required String? selectedCameraId,
+  required Iterable<String> allCameraIds,
+}) {
+  final all = allCameraIds.toList();
+  if (solo && selectedCameraId != null && all.contains(selectedCameraId)) {
+    return [selectedCameraId];
+  }
+  return all;
+}
+
 class MotionTimelineController extends ChangeNotifier {
-  MotionTimelineController({required this.api, required this.session});
+  MotionTimelineController({required this.api, required this.session}) {
+    // Restore the persisted solo-camera preference (best-effort, async): the
+    // controller starts in the default (all cameras) and flips once the stored
+    // value loads, mirroring how the playback screen restores the zoom span.
+    unawaited(_loadSoloPref());
+  }
 
   final CrumbApi api;
 
@@ -81,6 +112,29 @@ class MotionTimelineController extends ChangeNotifier {
   /// The camera whose track is drawn prominent and whose prev/next-motion
   /// buttons operate.
   String? selectedCameraId;
+
+  /// When true, the timeline collapses to ONLY the selected camera's motion
+  /// (declutters the per-camera stacked histogram). Persisted across sessions
+  /// via [PlaybackPrefs]. Default false = all cameras stacked (legacy behavior).
+  bool _soloSelectedCamera = false;
+  bool get soloSelectedCamera => _soloSelectedCamera;
+
+  /// Flip the solo-camera view. Persists the new value (best-effort) and
+  /// notifies so the timeline + legend rebuild immediately.
+  set soloSelectedCamera(bool value) {
+    if (_soloSelectedCamera == value) return;
+    _soloSelectedCamera = value;
+    unawaited(PlaybackPrefs.setSoloSelectedCamera(value));
+    notifyListeners();
+  }
+
+  Future<void> _loadSoloPref() async {
+    final stored = await PlaybackPrefs.getSoloSelectedCamera();
+    if (stored != null && stored != _soloSelectedCamera) {
+      _soloSelectedCamera = stored;
+      notifyListeners();
+    }
+  }
 
   double timelineWidthPx = 480;
 
@@ -113,14 +167,40 @@ class MotionTimelineController extends ChangeNotifier {
     if (windowStartMs != null) this.windowStartMs = windowStartMs;
     if (windowEndMs != null) this.windowEndMs = windowEndMs;
     if (wallCameraIds != null) this.wallCameraIds = wallCameraIds;
+    // A changed selection must repaint the strip and the legend right away
+    // (which camera is prominent, and — in solo mode — which single track is
+    // shown), even when the window/data is unchanged and no refresh() fetch
+    // fires. The other fields only affect the next fetch, so they don't notify.
+    final selectionChanged =
+        selectedCameraId != null && selectedCameraId != this.selectedCameraId;
     if (selectedCameraId != null) this.selectedCameraId = selectedCameraId;
     if (timelineWidthPx != null && timelineWidthPx > 0) {
       this.timelineWidthPx = timelineWidthPx;
     }
+    if (selectionChanged) notifyListeners();
   }
 
   IntensityBuckets? get selectedIntensity =>
       selectedCameraId != null ? intensityByCam[selectedCameraId] : null;
+
+  /// The cameras whose tracks/glyphs the timeline should render right now,
+  /// honoring the solo toggle. Shared by the painter, the hover hint and the
+  /// legend so all three stay coherent. See [visibleTimelineCameras].
+  List<String> get visibleCameraIds => visibleTimelineCameras(
+        solo: _soloSelectedCamera,
+        selectedCameraId: selectedCameraId,
+        allCameraIds: intensityByCam.keys,
+      );
+
+  /// True when the timeline is currently collapsed to a single camera (solo on
+  /// AND that selection resolved to exactly one visible track). False whenever
+  /// solo fell back to the full set (no/absent selection).
+  bool get isSoloActive {
+    final vis = visibleCameraIds;
+    return _soloSelectedCamera &&
+        vis.length == 1 &&
+        vis.first == selectedCameraId;
+  }
 
   /// Fetch the intensity histogram for every camera in the wall grid (fanned
   /// out, latest-wins) plus object-detection events for the loaded window.
@@ -246,8 +326,12 @@ class MotionTimelineController extends ChangeNotifier {
   /// bucket color already resolvable via `cameraMotionColor`. Ported from
   /// pbMotionCamerasAt.
   List<String> camerasWithMotionAt(int ms) {
+    // In solo mode the hover hint reflects only the cameras actually drawn, so
+    // it never names a camera whose track was decluttered away.
+    final visible = visibleCameraIds.toSet();
     final out = <String>[];
     for (final entry in intensityByCam.entries) {
+      if (!visible.contains(entry.key)) continue;
       final i = entry.value.indexAt(ms);
       if (i != null && entry.value.buckets[i] >= kMotionAbsFloor) {
         out.add(entry.key);
