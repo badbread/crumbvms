@@ -1071,7 +1071,18 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     // conservative recording stage, exactly as before.
     let mut archive_storage_ids: HashSet<Uuid> = HashSet::new();
     let mut live_storage_ids: HashSet<Uuid> = HashSet::new();
-    match db::get_storage_by_name(&pool, &config.archive_storage_name).await {
+    // Resolve the configured defaults by NAME first, then fall back to PATH:
+    // an operator who renamed a storage in the console (or an install whose
+    // empty seed-duplicates were cleaned up) no longer has a row under the
+    // configured `*_STORAGE_NAME`, and a name-only lookup would leave the disk
+    // unlabelled (safe, but wrong). See `db::get_storage_by_name_or_path`.
+    match db::get_storage_by_name_or_path(
+        &pool,
+        &config.archive_storage_name,
+        &config.archive_storage_path,
+    )
+    .await
+    {
         Ok(opt) => {
             if let Some(s) = opt {
                 archive_storage_ids.insert(s.id);
@@ -1082,7 +1093,13 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             warn!(error = %e, "reconcile phase 2: cannot resolve archive-default storage");
         }
     }
-    match db::get_storage_by_name(&pool, &config.live_storage_name).await {
+    match db::get_storage_by_name_or_path(
+        &pool,
+        &config.live_storage_name,
+        &config.live_storage_path,
+    )
+    .await
+    {
         Ok(opt) => {
             if let Some(s) = opt {
                 live_storage_ids.insert(s.id);

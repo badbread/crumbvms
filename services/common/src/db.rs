@@ -279,13 +279,17 @@ pub async fn upsert_storage(pool: &Pool, name: &str, path: &str) -> Result<Stora
 ///
 /// Returns the existing row's name in that case, otherwise `None`.
 ///
-/// This is a *detector*, never a fixer. Adopting the existing row by renaming it
-/// was considered and rejected: `PUT /config/storages/{id}` lets an operator
-/// rename a storage deliberately, and a boot-time rename would silently undo
-/// that. Duplicate rows for one path are already a tolerated condition (the
-/// reconcile orphan pass keys on the storage ROOT PATH, not the id, precisely so
-/// duplicates cannot double-index or double-budget a disk), so the safe move is
-/// to say so loudly and let the operator merge them.
+/// This is a *gate*, not a fixer. Boot seeding (`seed_storages`, `bin/seed.rs`)
+/// consults it and, when it reports a clash, SKIPS the insert entirely so the
+/// duplicate row is never created in the first place. It still never *mutates*
+/// the operator's row: adopting the existing row by renaming it was considered
+/// and rejected, because `PUT /config/storages/{id}` lets an operator rename a
+/// storage deliberately and a boot-time rename would silently undo that.
+/// Duplicate rows for one path remain a tolerated condition on already-affected
+/// databases (the reconcile orphan pass keys on the storage ROOT PATH, not the
+/// id, so duplicates cannot double-index or double-budget a disk), and the
+/// runtime name lookups fall back to path (`get_storage_by_name_or_path`) so a
+/// renamed install keeps full behavior.
 ///
 /// # Examples
 ///
@@ -316,11 +320,136 @@ where
             // place, no new row, nothing to warn about.
             return None;
         }
-        if row_path == path && clash.is_none() {
+        if normalize_storage_path(&row_path) == normalize_storage_path(path) && clash.is_none() {
             clash = Some(row_name);
         }
     }
     clash
+}
+
+/// Normalize a storage root path for equality comparison: strip trailing
+/// slashes so `/data/live` and `/data/live/` compare equal. A path that is all
+/// slashes (e.g. `/`) is returned unchanged so a root path never collapses to
+/// the empty string.
+#[must_use]
+pub fn normalize_storage_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        path
+    } else {
+        trimmed
+    }
+}
+
+/// Fetch the storage row whose root PATH matches `path` (after trailing-slash
+/// normalization).
+///
+/// When several rows share a path (a tolerated duplicate condition on
+/// already-affected databases — see [`duplicate_path_under_other_name`]) the
+/// OLDEST by `created_at` wins, so resolution is deterministic and prefers the
+/// operator's original row over any later duplicate. Returns `None` when no row
+/// covers the path.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn get_storage_by_path(pool: &Pool, path: &str) -> Result<Option<Storage>> {
+    let want = normalize_storage_path(path);
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT id, name, path, total_bytes, icon, created_at FROM storages ORDER BY created_at",
+            &[],
+        )
+        .await
+        .context("get_storage_by_path")?;
+    Ok(rows
+        .iter()
+        .map(storage_from_row)
+        .find(|s| normalize_storage_path(&s.path) == want))
+}
+
+/// Resolve a storage by NAME first, then fall back to PATH.
+///
+/// The recorder resolves several runtime defaults by the configured
+/// `*_STORAGE_NAME` (the free-space-floor fallback in `archive.rs`, and
+/// reconcile's live/archive stage labelling). An operator who renamed a storage
+/// via `PUT /config/storages/{id}` no longer has a row under the configured
+/// name, so a name-only lookup returns `None` and the caller silently degrades
+/// (falls back to the byte cap / labels fewer disks). Falling back to the
+/// configured PATH recovers the real row — the rename never changes the path —
+/// and, once the empty seed-duplicates are cleaned up, keeps those paths
+/// resolving to the correct storage.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn get_storage_by_name_or_path(
+    pool: &Pool,
+    name: &str,
+    path: &str,
+) -> Result<Option<Storage>> {
+    if let Some(s) = get_storage_by_name(pool, name).await? {
+        return Ok(Some(s));
+    }
+    get_storage_by_path(pool, path).await
+}
+
+/// Seed one storage row PATH-IDEMPOTENTLY and return the resolved row.
+///
+/// The single decision path shared by the recorder boot seed
+/// (`main.rs::seed_storages`) and the `seed` binary, so both behave identically:
+///
+/// * a row named `name` already exists → [`upsert_storage`] (retarget its path,
+///   the supported "retarget a named storage via env" behavior);
+/// * else a row already covers `path` under a DIFFERENT name → SKIP the insert
+///   (never create a second, empty row for the same directory) and return that
+///   existing row;
+/// * else → insert (fresh install).
+///
+/// The resolved row is folded into `known` so a later call in the same seed pass
+/// (archive after live) sees it — a shared `live == archive` directory then
+/// resolves to ONE row, not two. This never renames or deletes the operator's
+/// row: a boot-time rename would silently undo a deliberate
+/// `PUT /config/storages/{id}` rename, and a delete could orphan real footage.
+/// No footage is ever affected — existing segments keep their `storage_id`, and
+/// the runtime name lookups fall back to path
+/// ([`get_storage_by_name_or_path`]).
+///
+/// # Errors
+///
+/// Returns an error if a database query fails.
+pub async fn seed_storage_path_idempotent(
+    pool: &Pool,
+    known: &mut Vec<(String, String)>,
+    name: &str,
+    path: &str,
+) -> Result<Storage> {
+    let resolved =
+        if let Some(other) = duplicate_path_under_other_name(known.iter().cloned(), name, path) {
+            tracing::info!(
+                path = %path,
+                existing_name = %other,
+                configured_name = %name,
+                "storage path already covered by an existing row under another name; not \
+                 seeding the configured name (it would duplicate the directory). Runtime \
+                 lookups resolve this path via the existing row."
+            );
+            match get_storage_by_path(pool, path).await? {
+                Some(s) => s,
+                // The covering row vanished between the snapshot and this lookup
+                // (an operator deletion racing the seed). Fall back to a plain
+                // upsert so seeding still completes; it stays idempotent.
+                None => upsert_storage(pool, name, path).await?,
+            }
+        } else {
+            upsert_storage(pool, name, path).await?
+        };
+    // Reflect the resolved row so the next call's gate sees it; drop any stale
+    // entry for the same name first (the retarget case updated its path).
+    known.retain(|(n, _)| n != &resolved.name);
+    known.push((resolved.name.clone(), resolved.path.clone()));
+    Ok(resolved)
 }
 
 /// Fetch a storage row by its UUID.
@@ -13015,6 +13144,284 @@ mod tests {
             duplicate_path_under_other_name(rows, "Archive", "/data/archive"),
             None,
         );
+    }
+
+    #[test]
+    fn normalize_storage_path_trims_trailing_slashes() {
+        assert_eq!(normalize_storage_path("/data/live"), "/data/live");
+        assert_eq!(normalize_storage_path("/data/live/"), "/data/live");
+        assert_eq!(normalize_storage_path("/data/live///"), "/data/live");
+        // A root / all-slash path never collapses to the empty string.
+        assert_eq!(normalize_storage_path("/"), "/");
+        assert_eq!(normalize_storage_path(""), "");
+    }
+
+    #[test]
+    fn duplicate_path_detector_ignores_a_trailing_slash() {
+        // A stored `/data/live/` and a configured `/data/live` are the same
+        // directory, so the gate must still fire (skip the duplicate insert).
+        let rows = vec![("2TB NVMe".to_owned(), "/data/live/".to_owned())];
+        assert_eq!(
+            duplicate_path_under_other_name(rows, "Live", "/data/live"),
+            Some("2TB NVMe".to_owned()),
+        );
+    }
+
+    // ── path-idempotent storage seeding (issue: duplicate Live/Archive rows) ──
+    //
+    // The DB-backed tests below prove `seed_storage_path_idempotent` (the ONE
+    // decision path shared by `main.rs::seed_storages` and `bin/seed.rs`) never
+    // creates a second storage row for a directory that already has one under a
+    // different name — the exact mechanism that spawned empty "Live"/"Archive"
+    // ghosts next to operator-renamed rows — while still creating the defaults
+    // on a fresh install and retargeting a same-named row's path.
+
+    /// Create just the `storages` table (schema-identical to migration 0001's
+    /// relevant columns) in the fixture schema.
+    async fn create_storages_table(pool: &Pool) {
+        get_conn(pool)
+            .await
+            .expect("get_conn")
+            .batch_execute(
+                r"
+                CREATE TABLE storages (
+                    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name        text NOT NULL UNIQUE,
+                    path        text NOT NULL,
+                    total_bytes bigint,
+                    icon        text,
+                    created_at  timestamptz NOT NULL DEFAULT now()
+                );
+                ",
+            )
+            .await
+            .expect("create storages table");
+    }
+
+    /// Run one full boot-shaped seed pass (live then archive), exactly as
+    /// `seed_storages` / `bin/seed.rs` do: snapshot the rows, then thread
+    /// `known` through the two `seed_storage_path_idempotent` calls.
+    async fn seed_pass(pool: &Pool, live: (&str, &str), archive: (&str, &str)) {
+        let mut known: Vec<(String, String)> = list_storages(pool)
+            .await
+            .expect("list_storages")
+            .into_iter()
+            .map(|s| (s.name, s.path))
+            .collect();
+        seed_storage_path_idempotent(pool, &mut known, live.0, live.1)
+            .await
+            .expect("seed live");
+        seed_storage_path_idempotent(pool, &mut known, archive.0, archive.1)
+            .await
+            .expect("seed archive");
+    }
+
+    /// The #557 scenario: the DB already has the operator-renamed rows
+    /// ("2TB NVMe" → /data/live, "16TB Spinner" → /data/archive). Seeding the
+    /// compose default names (Live/Archive) must NOT add duplicate rows, must
+    /// leave the operator's names untouched, and must be idempotent across
+    /// repeated boots.
+    #[tokio::test]
+    async fn seed_is_path_idempotent_against_renamed_rows() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        create_storages_table(&fx.pool).await;
+
+        // Operator's real, renamed rows.
+        upsert_storage(&fx.pool, "2TB NVMe", "/data/live")
+            .await
+            .expect("seed operator live row");
+        upsert_storage(&fx.pool, "16TB Spinner", "/data/archive")
+            .await
+            .expect("seed operator archive row");
+
+        // Two boots' worth of seeding with the compose defaults.
+        for _ in 0..2 {
+            seed_pass(
+                &fx.pool,
+                ("Live", "/data/live"),
+                ("Archive", "/data/archive"),
+            )
+            .await;
+        }
+
+        let all = list_storages(&fx.pool).await.expect("list");
+        assert_eq!(all.len(), 2, "no duplicate rows should be created");
+        let names: std::collections::HashSet<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains("2TB NVMe") && names.contains("16TB Spinner"),
+            "operator names must be untouched, got {names:?}",
+        );
+        assert!(
+            !names.contains("Live") && !names.contains("Archive"),
+            "no ghost default-named rows, got {names:?}",
+        );
+    }
+
+    /// A genuinely-fresh install still gets both default storage rows.
+    #[tokio::test]
+    async fn seed_fresh_db_creates_both_defaults() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        create_storages_table(&fx.pool).await;
+
+        seed_pass(
+            &fx.pool,
+            ("Live", "/data/live"),
+            ("Archive", "/data/archive"),
+        )
+        .await;
+
+        let all = list_storages(&fx.pool).await.expect("list");
+        assert_eq!(all.len(), 2, "fresh install seeds two rows");
+        let by_name: std::collections::HashMap<&str, &str> = all
+            .iter()
+            .map(|s| (s.name.as_str(), s.path.as_str()))
+            .collect();
+        assert_eq!(by_name.get("Live"), Some(&"/data/live"));
+        assert_eq!(by_name.get("Archive"), Some(&"/data/archive"));
+    }
+
+    /// A same-named row's path is still retargeted (the supported
+    /// "retarget a named storage via env" behavior), with no new row.
+    #[tokio::test]
+    async fn seed_retargets_existing_name_in_place() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        create_storages_table(&fx.pool).await;
+
+        upsert_storage(&fx.pool, "Live", "/data/old-disk")
+            .await
+            .expect("seed old-path Live row");
+
+        let mut known: Vec<(String, String)> = list_storages(&fx.pool)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|s| (s.name, s.path))
+            .collect();
+        let seeded = seed_storage_path_idempotent(&fx.pool, &mut known, "Live", "/data/live")
+            .await
+            .expect("seed");
+        assert_eq!(seeded.path, "/data/live", "path retargeted");
+
+        let all = list_storages(&fx.pool).await.expect("list");
+        assert_eq!(all.len(), 1, "retarget must not add a row");
+        assert_eq!(all[0].path, "/data/live");
+    }
+
+    /// A shared live == archive directory resolves to ONE row (the archive seed
+    /// is gated because the just-seeded live row already covers the path).
+    #[tokio::test]
+    async fn seed_shared_layout_yields_one_row() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        create_storages_table(&fx.pool).await;
+
+        seed_pass(&fx.pool, ("Live", "/data"), ("Archive", "/data")).await;
+
+        let all = list_storages(&fx.pool).await.expect("list");
+        assert_eq!(
+            all.len(),
+            1,
+            "shared layout must not duplicate the directory"
+        );
+        assert_eq!(all[0].name, "Live");
+    }
+
+    /// When several rows share a path, `get_storage_by_path` deterministically
+    /// returns the OLDEST by `created_at` (the operator's original, not a later
+    /// duplicate).
+    #[tokio::test]
+    async fn get_storage_by_path_prefers_oldest() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        create_storages_table(&fx.pool).await;
+
+        get_conn(&fx.pool)
+            .await
+            .expect("get_conn")
+            .batch_execute(
+                r"
+                INSERT INTO storages (name, path, created_at) VALUES
+                    ('Original', '/data/live', now() - interval '1 hour'),
+                    ('GhostDup', '/data/live', now());
+                ",
+            )
+            .await
+            .expect("insert two rows sharing a path");
+
+        let resolved = get_storage_by_path(&fx.pool, "/data/live")
+            .await
+            .expect("query")
+            .expect("a row covers the path");
+        assert_eq!(resolved.name, "Original", "oldest row wins");
+        // Trailing-slash normalization still resolves the same row.
+        let resolved2 = get_storage_by_path(&fx.pool, "/data/live/")
+            .await
+            .expect("query")
+            .expect("a row covers the path");
+        assert_eq!(resolved2.name, "Original");
+    }
+
+    /// The runtime free-floor / labelling fallback: `get_storage_by_name_or_path`
+    /// resolves by NAME first, then falls back to PATH — so a renamed install
+    /// (no row under the configured name) still resolves to the real row instead
+    /// of silently degrading.
+    #[tokio::test]
+    async fn get_storage_by_name_or_path_falls_back_to_path() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_schema(&url).await;
+        create_storages_table(&fx.pool).await;
+
+        // Renamed install: only "2TB NVMe" at /data/live exists; no "Live" row.
+        upsert_storage(&fx.pool, "2TB NVMe", "/data/live")
+            .await
+            .expect("seed renamed row");
+        assert!(
+            get_storage_by_name(&fx.pool, "Live")
+                .await
+                .expect("by name")
+                .is_none(),
+            "precondition: no row named Live",
+        );
+        let resolved = get_storage_by_name_or_path(&fx.pool, "Live", "/data/live")
+            .await
+            .expect("query")
+            .expect("path fallback resolves");
+        assert_eq!(
+            resolved.name, "2TB NVMe",
+            "resolves to the real row via path"
+        );
+
+        // NAME still wins when a row under the configured name exists, even if
+        // that row's path differs from the configured one.
+        upsert_storage(&fx.pool, "Live", "/data/somewhere-else")
+            .await
+            .expect("seed a same-named row");
+        let name_wins = get_storage_by_name_or_path(&fx.pool, "Live", "/data/live")
+            .await
+            .expect("query")
+            .expect("resolves");
+        assert_eq!(name_wins.name, "Live", "name lookup takes precedence");
     }
 
     #[test]
