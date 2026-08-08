@@ -392,6 +392,14 @@ tbody tr.selected td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
 .modal-title{font-size:15px;font-weight:650;letter-spacing:-.01em;}
 .modal-close{background:transparent;border:none;color:var(--dim);font-size:20px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:4px;}
 .modal-close:hover{color:var(--text);background:var(--surface2);}
+/* ── Inline per-alert "customize text" affordance (system alerts table) ── */
+.sysalert-edit-icon{position:relative;background:transparent;border:1px solid var(--border2);color:var(--dim);font-size:13px;line-height:1;cursor:pointer;padding:3px 6px;border-radius:6px;flex:0 0 auto;}
+.sysalert-edit-icon:hover{color:var(--text);background:var(--surface2);border-color:var(--border);}
+.sysalert-edit-icon.open{color:var(--text);background:var(--surface2);border-color:var(--accent2);}
+.sysalert-edit-icon.customized{color:var(--accent2);border-color:var(--accent2);}
+.sysalert-edit-icon .dot{position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--accent2);border:1px solid var(--surface);}
+.sae-inline-panel{border:1px solid var(--border2);border-left:2px solid var(--accent2);border-radius:8px;background:var(--surface2);padding:12px 14px;margin:2px 0 6px;}
+.sae-inline-title{font-size:13px;font-weight:650;letter-spacing:-.01em;margin-bottom:10px;}
 .modal-actions{display:flex;gap:10px;margin-top:22px;justify-content:flex-end;}
 /* ── Group boxes (commercial-VMS fieldset/legend feel) ──
    Each section is a flat 1px-bordered panel; its small-caps label sits ON the
@@ -7221,19 +7229,30 @@ function motionCacheGaugeHtml(st) {
       <div class="cap-bar-meta"><span>${fmtBytes(used)} used</span><span>${fmtBytes(g.free_bytes)} free of ${fmtBytes(total)}</span></div>
     </div>` : `<div class="card-hint" style="padding:2px 0">No cache telemetry yet.</div>`;
 
-  const rows = cams.map(c => `
+  const rows = cams.map(c => {
+    /* 0/0 is expected for a Motion camera that is actively persisting motion (its
+       ring is drained at motion start and stays empty through motion + post-roll)
+       or has fallen back to direct-to-storage — footage is safe in both. Flag it
+       with a tooltip rather than implying a fault. */
+    const ringLabel = c.ring_segments == null ? '—' : c.ring_segments + ' seg';
+    const ringTitle = (c.ring_segments === 0) ? ' title="0 is normal while motion is being persisted or just after an event"' : '';
+    const ago = fmtAgo(c.updated_at);
+    return `
     <div style="display:flex;align-items:center;gap:10px;padding:4px 0;border-bottom:1px solid var(--border);min-width:0">
       <span style="flex:0 0 170px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.camera_name)}">${esc(c.camera_name)}</span>
-      <span style="flex:0 0 90px;font-size:12px;color:var(--dim)">${c.ring_segments == null ? '—' : c.ring_segments + ' seg'}</span>
+      <span style="flex:0 0 90px;font-size:12px;color:var(--dim)"${ringTitle}>${esc(ringLabel)}</span>
       <span style="flex:0 0 90px;font-size:12px;color:var(--dim)">${c.ring_bytes == null ? '—' : fmtBytes(c.ring_bytes)}</span>
+      <span style="flex:0 0 90px;font-size:11px;color:var(--dim2);white-space:nowrap">${ago ? 'as of ' + esc(ago) : ''}</span>
       <span style="flex:1"></span>
       <span style="font-size:11px;color:var(--dim2);white-space:nowrap">${c.projected_ring_bytes != null ? 'projected ' + fmtBytes(c.projected_ring_bytes) : 'no estimate yet'}</span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   const table = cams.length ? `
     <div class="policy-section-title" style="margin-top:14px">Per-camera ring occupancy</div>
+    <div class="card-hint" style="margin:2px 0 6px">A Motion camera's ring empties while motion is being persisted; 0 seg / 0 B during or after an event is normal and loses no footage.</div>
     <div style="display:flex;gap:10px;padding:2px 0 4px;font-size:11px;color:var(--dim2)">
-      <span style="flex:0 0 170px">Camera</span><span style="flex:0 0 90px">Ring</span><span style="flex:0 0 90px">Ring size</span><span style="flex:1"></span><span>Projected</span>
+      <span style="flex:0 0 170px">Camera</span><span style="flex:0 0 90px">Ring</span><span style="flex:0 0 90px">Ring size</span><span style="flex:0 0 90px">Updated</span><span style="flex:1"></span><span>Projected</span>
     </div>
     ${rows}
     <div class="card-hint" style="margin-top:8px">Total projected across Motion cameras: <b>${esc(fmtBytes(st.total_projected_bytes))}</b></div>`
@@ -10026,6 +10045,9 @@ let NOTIF_ENABLED  = true;  /* master on/off from GET /notifications/settings   
 let NOTIF_SYS_QUIET_START = null; /* system-alerts global quiet hours, from /notifications/settings */
 let NOTIF_SYS_QUIET_END   = null;
 let NOTIF_SYS_ALERTS = [];  /* loaded array of system_alert_rules rows (P0-HEALTH-NOTIFY) */
+let NOTIF_ME_ID   = null;   /* current user's id, for channel owner attribution */
+let NOTIF_IS_ADMIN = false; /* current user is admin (governs the global toggle + all-channel list) */
+let SYS_ALERT_EDIT_KEY = null; /* event_key of the alert open in the system-alert editor modal */
 
 /* Human-readable title + short description for each system-alert event_key. */
 const SYS_ALERT_META = {
@@ -10088,6 +10110,54 @@ function _previewAlertTemplate(tpl, eventKey) {
 /* Valid token list (built-ins + this event's meta tokens) for the hint row. */
 function _sysAlertTokens(eventKey) {
   return SYS_ALERT_BUILTIN_TOKENS.concat(SYS_ALERT_META_TOKENS[eventKey] || []);
+}
+
+/* ── Quiet-hours whole-hour pickers (shared by rules + system alerts) ──
+   Native <select>s replace the old raw number inputs so an out-of-range value
+   (e.g. "2200" pasted as military time) is unrepresentable — that value used to
+   be stored verbatim and clamped to a zero-width window at read time, silently
+   disabling quiet hours. Whole hours only; minutes are not representable. */
+function hourLabel(h) {
+  const ap = h < 12 ? 'AM' : 'PM';
+  const h12 = (h % 12) === 0 ? 12 : (h % 12);
+  return `${h12}:00 ${ap}`;
+}
+/* Options for a quiet-hour select. `sel` is the stored 0..23 value or null.
+   First option is "— off —" (value ""). A stored value outside 0..23 selects
+   none (the caller shows a warning); it is never silently coerced to an hour. */
+function quietHourSelectOptions(sel) {
+  const valid = (typeof sel === 'number' && sel >= 0 && sel <= 23);
+  let out = `<option value=""${valid ? '' : ' selected'}>— off —</option>`;
+  for (let h = 0; h < 24; h++) {
+    out += `<option value="${h}"${valid && sel === h ? ' selected' : ''}>${hourLabel(h)}</option>`;
+  }
+  return out;
+}
+/* True when a stored quiet-hour value is present but out of the 0..23 range
+   (legacy bad data written before server-side validation existed). */
+function quietHourOutOfRange(v) {
+  return v != null && !(typeof v === 'number' && v >= 0 && v <= 23);
+}
+/* Human summary of a quiet-hours window for a collapsed <summary> line. */
+function quietHoursSummary(start, end) {
+  if (start == null || end == null || quietHourOutOfRange(start) || quietHourOutOfRange(end)) {
+    return 'off';
+  }
+  return `${hourLabel(start)} to ${hourLabel(end)}`;
+}
+
+/* Compact "as of Ns ago" from an ISO timestamp (motion-cache staleness). */
+function fmtAgo(iso) {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '';
+  let s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
 }
 
 /* Per-kind connection-field descriptors. */
@@ -10683,12 +10753,15 @@ async function renderNotifications() {
     </div>`;
 
   try {
-    const [channels, rules, settings, sysAlerts] = await Promise.all([
+    const [channels, rules, settings, sysAlerts, me] = await Promise.all([
       api('/notifications/channels').catch(() => []),
       api('/notifications/rules').catch(() => []),
       api('/notifications/settings').catch(() => ({ enabled: true })),
       api('/notifications/system-alerts').catch(() => []),
+      api('/auth/me').catch(() => null),
     ]);
+    NOTIF_ME_ID    = me ? me.id : null;
+    NOTIF_IS_ADMIN = !!(me && me.is_admin);
     NOTIF_CHANNELS = channels;
     NOTIF_RULES    = rules;
     NOTIF_ENABLED  = settings && settings.enabled !== false;
@@ -10723,6 +10796,18 @@ async function notifToggleMaster(checked) {
   }
 }
 
+/* Owner-attribution chip for a destination row. "Global" for an ownerless
+   channel, "Yours" when owned by this session's user, otherwise the owner's
+   username (so an admin sees a channel created under another account). The
+   server only sends owner_username in the admin (all-channels) listing. */
+function notifOwnerChipHtml(ch) {
+  let label, color;
+  if (ch.global) { label = 'Global'; color = 'var(--accent2)'; }
+  else if (NOTIF_ME_ID && ch.user_id === NOTIF_ME_ID) { label = 'Yours'; color = 'var(--dim)'; }
+  else { label = ch.owner_username ? ch.owner_username : 'Other user'; color = 'var(--warn)'; }
+  return `<span title="Owner" style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;color:${color};border:1px solid var(--border2);border-radius:10px;padding:1px 7px;white-space:nowrap">${esc(label)}</span>`;
+}
+
 function _renderNotificationsPane() {
   const kindOpts = Object.keys(NOTIF_PROVIDER_FIELDS)
     .map(k => `<option value="${k}" ${k===NOTIF_NEW_KIND?'selected':''}>${esc(NOTIF_KIND_LABEL[k])}</option>`)
@@ -10735,11 +10820,16 @@ function _renderNotificationsPane() {
         const kindLabel = NOTIF_KIND_LABEL[ch.kind] || ch.kind;
         const scopeNote = (ch.camera_ids && ch.camera_ids.length)
           ? `${ch.camera_ids.length} camera${ch.camera_ids.length!==1?'s':''}` : 'All cameras';
+        /* Owner attribution: Global (no owner), Yours (owned by this session's
+           user), or the owner's username — so an admin can tell a channel
+           created under another account apart from their own. */
+        const ownerChip = notifOwnerChipHtml(ch);
         return `
         <div class="notif-ch-row" id="notif-ch-row-${esc(ch.id)}">
           <div class="notif-ch-summary">
             <span style="font-size:11px;font-weight:600;color:var(--accent2);white-space:nowrap;min-width:60px">${esc(kindLabel)}</span>
             <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500">${esc(ch.name)}</span>
+            ${ownerChip}
             <span style="font-size:11px;font-weight:600;color:${ch.enabled?'var(--ok)':'var(--dim2)'};white-space:nowrap">${ch.enabled?'Enabled':'Disabled'}</span>
             <span style="font-size:12px;color:var(--dim);white-space:nowrap">${esc(scopeNote)}</span>
             <div class="td-actions" style="gap:5px">
@@ -10840,36 +10930,17 @@ function _renderSystemAlertsSection() {
         thresholdField = `<span class="card-hint" style="margin:0">—</span>`;
       }
       const k = r.event_key;
-      const tokenHint = _sysAlertTokens(k).map(t => '%' + t + '%').join('  ');
-      const msgVal = r.message_template != null ? r.message_template : '';
-      const titleVal = r.title_template != null ? r.title_template : '';
-      const previewSrc = msgVal !== '' ? msgVal : SYS_ALERT_DEFAULT_MSG_TPL;
-      const templateRow = `
-      <tr class="sysalert-tpl-row" data-key="${esc(k)}">
-        <td colspan="4" style="padding-top:0">
-          <details style="margin:0 0 4px 0">
-            <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Customize alert text</summary>
-            <div style="padding:8px 2px 4px">
-              <label class="field-label" style="margin-top:0">Message text</label>
-              <textarea class="sysalert-msg-tpl" data-key="${esc(k)}" rows="2" style="width:100%;font-family:inherit;resize:vertical"
-                placeholder="${esc(SYS_ALERT_DEFAULT_MSG_TPL)}"
-                oninput="sysAlertPreview('${esc(k)}')">${esc(msgVal)}</textarea>
-              <label class="field-label">Title (Pushover and ntfy only)</label>
-              <input type="text" class="sysalert-title-tpl" data-key="${esc(k)}" style="width:100%"
-                placeholder="Leave blank for the provider default (example: ${esc(SYS_ALERT_DEFAULT_TITLE_TPL)})"
-                value="${esc(titleVal)}" oninput="sysAlertPreview('${esc(k)}')" />
-              <div class="card-hint" style="margin-top:6px">
-                Tokens for this alert: <span style="font-family:monospace">${esc(tokenHint)}</span>.
-                An unknown token is left as-is so a typo is visible. Times are UTC.
-              </div>
-              <div class="card-hint" style="margin-top:4px">
-                Preview: <span class="sysalert-preview" data-key="${esc(k)}" style="font-family:monospace;color:var(--fg)">${esc(_previewAlertTemplate(previewSrc, k))}</span>
-              </div>
-              <button class="ghost sm" style="margin-top:6px" onclick="sysAlertRestoreDefault('${esc(k)}')">Restore default</button>
-            </div>
-          </details>
-        </td>
-      </tr>`;
+      /* Small inline pencil next to "Bypass quiet hours" opens the alert-text
+         editor in place. A filled/accent state + dot flags a customized alert
+         at a glance, so the list stays clean (no per-row "Customize" row/chip). */
+      const customized = (r.message_template != null || r.title_template != null);
+      const isOpen = (SYS_ALERT_EDIT_KEY === r.event_key);
+      const iconCls = 'sysalert-edit-icon' + (customized ? ' customized' : '') + (isOpen ? ' open' : '');
+      const iconTitle = customized ? 'Customize alert text (customized)' : 'Customize alert text';
+      const editIcon = `<button type="button" class="${iconCls}" title="${iconTitle}" aria-label="${iconTitle}" aria-expanded="${isOpen ? 'true' : 'false'}" onclick="sysAlertToggleEditor('${esc(k)}')">✎${customized ? '<span class="dot"></span>' : ''}</button>`;
+      const editorRow = isOpen
+        ? `<tr class="sae-inline-row"><td colspan="4" style="padding:0 0 4px">${_sysAlertEditorBody(r.event_key)}</td></tr>`
+        : '';
       return `
       <tr data-key="${esc(r.event_key)}">
         <td style="min-width:220px">
@@ -10884,13 +10955,22 @@ function _renderSystemAlertsSection() {
         </td>
         <td style="white-space:nowrap">${thresholdField}</td>
         <td>
-          <label class="chk" style="font-size:12px" title="Fire even during quiet hours">
-            <input type="checkbox" class="sysalert-bypass" data-key="${esc(r.event_key)}" ${r.bypass_quiet_hours ? 'checked' : ''} />
-            Bypass quiet hours
-          </label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <label class="chk" style="font-size:12px" title="Fire even during quiet hours">
+              <input type="checkbox" class="sysalert-bypass" data-key="${esc(r.event_key)}" ${r.bypass_quiet_hours ? 'checked' : ''} />
+              Bypass quiet hours
+            </label>
+            ${editIcon}
+          </div>
         </td>
-      </tr>${templateRow}`;
+      </tr>${editorRow}`;
     }).join('');
+
+  /* Quiet-hours window (system alerts) — whole-hour selects, collapsed. */
+  const badRange = quietHourOutOfRange(NOTIF_SYS_QUIET_START) || quietHourOutOfRange(NOTIF_SYS_QUIET_END);
+  const rangeWarn = badRange
+    ? `<div class="card-hint" style="color:var(--warn);margin-top:6px">A stored quiet-hours value is out of range (0–23) and is ignored. Pick an hour and save to fix it.</div>`
+    : '';
 
   return `
     <div class="rp-section-head" style="margin-bottom:8px">
@@ -10903,18 +10983,25 @@ function _renderSystemAlertsSection() {
       even during the quiet-hours window below (recommended for footage-loss-critical events).
     </div>
 
-    <div class="grid2" style="gap:8px 16px;margin-bottom:12px">
-      <div>
-        <label class="field-label" style="margin-top:0">Quiet hours start (0–23) ${infoHint('Applies only to system alerts that do NOT bypass quiet hours. Leave blank to disable.')}</label>
-        <input id="sysalert-quiet-start" type="number" min="0" max="23" placeholder="22"
-               value="${NOTIF_SYS_QUIET_START != null ? NOTIF_SYS_QUIET_START : ''}" />
+    <details class="detail-section" style="margin-bottom:12px">
+      <summary>
+        <span class="ds-chev">&#x25B6;</span>
+        <span class="ds-title">Quiet hours</span>
+        <span class="ds-glance">${esc(quietHoursSummary(NOTIF_SYS_QUIET_START, NOTIF_SYS_QUIET_END))}</span>
+      </summary>
+      <div class="ds-body" style="padding-top:8px">
+        <div class="card-hint" style="margin-bottom:8px">
+          Server local time. Applies only to system alerts that do NOT bypass quiet hours. Set both to "— off —" to disable.
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span style="font-size:13px">Quiet from</span>
+          <select id="sysalert-quiet-start" style="width:auto">${quietHourSelectOptions(NOTIF_SYS_QUIET_START)}</select>
+          <span style="font-size:13px">to</span>
+          <select id="sysalert-quiet-end" style="width:auto">${quietHourSelectOptions(NOTIF_SYS_QUIET_END)}</select>
+        </div>
+        ${rangeWarn}
       </div>
-      <div>
-        <label class="field-label" style="margin-top:0">Quiet hours end (0–23)</label>
-        <input id="sysalert-quiet-end" type="number" min="0" max="23" placeholder="7"
-               value="${NOTIF_SYS_QUIET_END != null ? NOTIF_SYS_QUIET_END : ''}" />
-      </div>
-    </div>
+    </details>
 
     <div class="table-wrap">
       <table>
@@ -10928,7 +11015,11 @@ function _renderSystemAlertsSection() {
 async function notifSaveSystemAlerts() {
   setMsg('notif-sysalerts-msg', '');
 
-  const rows = document.querySelectorAll('#notif-sysalerts-section tr[data-key]:not(.sysalert-tpl-row)');
+  // Row toggles + thresholds only. Alert-text templates are edited and saved
+  // independently through the per-alert editor modal (sysAlertEditorSave), so
+  // this bulk save no longer reads or sends message_template/title_template
+  // (absent fields = keep, per the all-optional PUT).
+  const rows = document.querySelectorAll('#notif-sysalerts-section tr[data-key]');
   const calls = [];
   rows.forEach(tr => {
     const key = tr.dataset.key;
@@ -10944,12 +11035,6 @@ async function notifSaveSystemAlerts() {
         body.threshold_fraction = raw !== '' ? (parseFloat(raw) / 100) : null;
       }
     }
-    // Alert-text templates (migration 0079). A blank field clears to null on the
-    // server = "use the built-in default" (one-click restore).
-    const msgEl   = document.querySelector('.sysalert-msg-tpl[data-key="' + CSS.escape(key) + '"]');
-    const titleEl = document.querySelector('.sysalert-title-tpl[data-key="' + CSS.escape(key) + '"]');
-    if (msgEl)   { const v = msgEl.value.trim();   body.message_template = v !== '' ? v : null; }
-    if (titleEl) { const v = titleEl.value.trim(); body.title_template   = v !== '' ? v : null; }
     calls.push(api('/notifications/system-alerts/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(body) }));
   });
 
@@ -10975,24 +11060,214 @@ async function notifSaveSystemAlerts() {
   }
 }
 
-/* Live-preview the message template for one alert type using sample token
-   values. Falls back to the default template when the field is blank. */
-function sysAlertPreview(key) {
-  const msgEl = document.querySelector('.sysalert-msg-tpl[data-key="' + CSS.escape(key) + '"]');
-  const out   = document.querySelector('.sysalert-preview[data-key="' + CSS.escape(key) + '"]');
-  if (!out) return;
-  const src = (msgEl && msgEl.value.trim() !== '') ? msgEl.value : SYS_ALERT_DEFAULT_MSG_TPL;
-  out.textContent = _previewAlertTemplate(src, key);
+/* ── System-alert text editor (inline, expands under the alert's row) ──
+   Opened per alert from the small inline ✎ icon next to "Bypass quiet hours".
+   Contains the message textarea, a conditional title field, a per-alert token
+   legend, and a live preview rendered as a generic notification card. Save
+   issues the per-alert PUT (only message_template/title_template), decoupled
+   from the row-toggle bulk "Save system alerts". */
+let SAE_IMG_URL = null; /* fetched sample snapshot URL for the preview card, or null */
+
+/* True when the current message/title (as typed) would deliver an image for
+   this alert: a channel must attach one AND the event type must carry one. */
+function sysAlertImageWouldDeliver(key) {
+  if (key !== 'plate_watchlist_hit') return false; // only this event carries an image today
+  return NOTIF_CHANNELS.some(ch =>
+    ch.snapshot_mode && ch.snapshot_mode !== 'none' && (NOTIF_IMG_CAP[ch.kind] || 'none') !== 'none');
+}
+/* True when a configured destination consumes the rendered title (Pushover/ntfy). */
+function sysAlertTitleRelevant() {
+  return NOTIF_CHANNELS.some(ch => ch.kind === 'pushover' || ch.kind === 'ntfy');
+}
+/* Names of the Pushover/ntfy destinations that would use the title. */
+function sysAlertTitleDestNames() {
+  const names = NOTIF_CHANNELS.filter(ch => ch.kind === 'pushover' || ch.kind === 'ntfy').map(ch => ch.name);
+  return names.length ? names.join(', ') : 'Pushover and ntfy';
+}
+/* Inline 16:9 gray placeholder (camera glyph) used when the sample snapshot
+   can't load — data URI so it needs no network. */
+const SAE_IMG_PLACEHOLDER =
+  'data:image/svg+xml;utf8,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90" viewBox="0 0 160 90">' +
+    '<rect width="160" height="90" fill="#3a3a3a"/>' +
+    '<g fill="none" stroke="#888" stroke-width="3">' +
+    '<rect x="58" y="34" width="34" height="24" rx="3"/><circle cx="75" cy="46" r="7"/>' +
+    '<rect x="96" y="39" width="10" height="14" rx="2"/></g></svg>');
+
+/* Build the inline editor panel (message textarea, conditional title, per-alert
+   token legend, live preview, actions). Rendered directly under the alert's row
+   by _renderSystemAlertsSection when this alert is the one open — no modal. */
+function _sysAlertEditorBody(key) {
+  const meta = SYS_ALERT_META[key] || { title: key };
+  const r = (NOTIF_SYS_ALERTS.find(x => x.event_key === key)) || {};
+  const msgVal   = r.message_template != null ? r.message_template : '';
+  const titleVal = r.title_template   != null ? r.title_template   : '';
+  const titleRelevant = sysAlertTitleRelevant();
+
+  /* Token legend: %token% | sample value, clickable to insert at the caret. */
+  const legendRows = _sysAlertTokens(key).map(t => {
+    const sample = (t === 'event') ? meta.title : (SYS_ALERT_TOKEN_SAMPLES[t] != null ? SYS_ALERT_TOKEN_SAMPLES[t] : '');
+    return `<tr class="sae-token-row" style="cursor:pointer" onclick="sysAlertEditorInsertToken('%${esc(t)}%')" title="Insert at cursor">
+      <td style="font-family:monospace;padding:2px 10px 2px 0;white-space:nowrap">%${esc(t)}%</td>
+      <td style="color:var(--dim);padding:2px 0">${esc(sample)}</td></tr>`;
+  }).join('');
+
+  const titleField = titleRelevant ? `
+      <label class="field-label">Title</label>
+      <input type="text" id="sae-title-input" style="width:100%"
+        placeholder="Leave blank for the provider default (example: ${esc(SYS_ALERT_DEFAULT_TITLE_TPL)})"
+        value="${esc(titleVal)}" oninput="sysAlertEditorPreview()" />
+      <div class="card-hint" style="margin-top:4px">Used by: ${esc(sysAlertTitleDestNames())}.</div>`
+    : '';
+
+  return `
+    <div class="sae-inline-panel">
+      <div class="sae-inline-title">Customize: ${esc(meta.title || key)}</div>
+      <label class="field-label" style="margin-top:0">Message text</label>
+      <textarea id="sae-msg" rows="3" style="width:100%;font-family:inherit;resize:vertical"
+        placeholder="${esc(SYS_ALERT_DEFAULT_MSG_TPL)}"
+        oninput="sysAlertEditorPreview()">${esc(msgVal)}</textarea>
+      ${titleField}
+
+      <div class="policy-section" style="margin-top:12px">
+        <div class="policy-section-title">Tokens for this alert</div>
+        <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Times are UTC.</div>
+        <div class="table-wrap"><table style="font-size:12px"><tbody>${legendRows}</tbody></table></div>
+      </div>
+
+      <div class="policy-section" style="margin-top:12px">
+        <div class="policy-section-title">Preview</div>
+        <div id="sae-preview"></div>
+        <div class="card-hint" style="margin-top:6px">Delivery varies by provider; Discord and Telegram attach up to two images, Pushover and ntfy one, Slack and webhooks link only.</div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="ghost sm" onclick="sysAlertEditorRestoreDefault()" style="margin-right:auto">Restore default</button>
+        <button class="ghost sm" onclick="sysAlertCloseEditor()">Close</button>
+        <button class="primary sm" onclick="sysAlertEditorSave()">Save</button>
+      </div>
+      <div id="sae-msg-line" class="form-msg"></div>
+    </div>`;
 }
 
-/* "Restore default": clear both template fields so the next save stores NULL,
-   which the server renders as the built-in default for this alert type. */
-function sysAlertRestoreDefault(key) {
-  const msgEl   = document.querySelector('.sysalert-msg-tpl[data-key="' + CSS.escape(key) + '"]');
-  const titleEl = document.querySelector('.sysalert-title-tpl[data-key="' + CSS.escape(key) + '"]');
-  if (msgEl)   msgEl.value = '';
-  if (titleEl) titleEl.value = '';
-  sysAlertPreview(key);
+/* Toggle the inline editor for one alert. Opening another closes the previous
+   (only one open at a time, keeps the list clean). Re-renders the section so the
+   expander row appears/collapses, then lazily fetches the sample snapshot for
+   image-bearing alerts and re-previews. */
+async function sysAlertToggleEditor(key) {
+  const opening = (SYS_ALERT_EDIT_KEY !== key);
+  SYS_ALERT_EDIT_KEY = opening ? key : null;
+  SAE_IMG_URL = null;
+  const sec = $('notif-sysalerts-section');
+  if (sec) sec.innerHTML = _renderSystemAlertsSection();
+  if (!opening) return;
+  sysAlertEditorPreview();
+  /* Fetch a sample snapshot once (only when an image would actually deliver);
+     the preview card reuses it across keystrokes with an SVG fallback. */
+  if (sysAlertImageWouldDeliver(key) && CAMS.length) {
+    try { SAE_IMG_URL = await snapshotUrl(CAMS[0].id); } catch { SAE_IMG_URL = null; }
+    if (SYS_ALERT_EDIT_KEY === key) sysAlertEditorPreview();
+  }
+}
+
+/* Collapse the inline editor (re-renders the section without the expander row). */
+function sysAlertCloseEditor() {
+  SYS_ALERT_EDIT_KEY = null;
+  SAE_IMG_URL = null;
+  const sec = $('notif-sysalerts-section');
+  if (sec) sec.innerHTML = _renderSystemAlertsSection();
+}
+
+/* Insert a %token% at the message textarea's caret (no execCommand). */
+function sysAlertEditorInsertToken(tok) {
+  const el = $('sae-msg');
+  if (!el) return;
+  const s = el.selectionStart != null ? el.selectionStart : el.value.length;
+  const e = el.selectionEnd   != null ? el.selectionEnd   : el.value.length;
+  el.value = el.value.slice(0, s) + tok + el.value.slice(e);
+  const caret = s + tok.length;
+  el.focus();
+  el.setSelectionRange(caret, caret);
+  sysAlertEditorPreview();
+}
+
+/* Render the live preview as a generic push-notification card. */
+function sysAlertEditorPreview() {
+  const key = SYS_ALERT_EDIT_KEY;
+  const out = $('sae-preview');
+  if (!key || !out) return;
+  const msgEl   = $('sae-msg');
+  const titleEl = $('sae-title-input');
+  const msgSrc   = (msgEl && msgEl.value.trim() !== '') ? msgEl.value : SYS_ALERT_DEFAULT_MSG_TPL;
+  const titleSrc = (titleEl && titleEl.value.trim() !== '') ? titleEl.value : SYS_ALERT_DEFAULT_TITLE_TPL;
+  const bodyText  = _previewAlertTemplate(msgSrc, key);
+  const titleText = _previewAlertTemplate(titleSrc, key);
+
+  const showImg = sysAlertImageWouldDeliver(key);
+  let imgHtml = '';
+  if (showImg) {
+    const src = SAE_IMG_URL || SAE_IMG_PLACEHOLDER;
+    imgHtml = `<img src="${esc(src)}" onerror="this.onerror=null;this.src='${SAE_IMG_PLACEHOLDER}'"
+      alt="" style="width:88px;height:50px;object-fit:cover;border-radius:6px;flex:0 0 auto" />`;
+  } else {
+    /* Distinguish "this alert never carries an image" from "an image-capable
+       destination just isn't configured" so the operator knows which to fix. */
+    const anyImgChannel = NOTIF_CHANNELS.some(ch => (NOTIF_IMG_CAP[ch.kind]||'none')!=='none' && ch.snapshot_mode && ch.snapshot_mode!=='none');
+    const why = (key === 'plate_watchlist_hit' && !anyImgChannel)
+      ? 'No destination attaches images'
+      : 'No image for this alert type';
+    imgHtml = `<span class="card-hint" style="margin:0;flex:0 0 auto;max-width:110px;text-align:right">${esc(why)}</span>`;
+  }
+
+  out.innerHTML = `
+    <div style="border:1px solid var(--border2);border-radius:10px;padding:10px 12px;background:var(--surface2);display:flex;gap:10px;align-items:flex-start">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);margin-bottom:4px">
+          <span style="width:8px;height:8px;border-radius:50%;background:var(--accent2);display:inline-block"></span>
+          <span style="font-weight:600">Crumb</span><span>now</span>
+        </div>
+        <div style="font-weight:650;font-size:13px;margin-bottom:2px">${esc(titleText)}</div>
+        <div style="font-size:12px;color:var(--fg);white-space:pre-wrap;word-break:break-word">${esc(bodyText)}</div>
+      </div>
+      ${imgHtml}
+    </div>`;
+}
+
+/* Clear both fields (next save stores NULL = built-in default) and re-preview. */
+function sysAlertEditorRestoreDefault() {
+  const msgEl = $('sae-msg'); if (msgEl) msgEl.value = '';
+  const titleEl = $('sae-title-input'); if (titleEl) titleEl.value = '';
+  sysAlertEditorPreview();
+}
+
+/* Save the per-alert templates via PUT, update the in-memory row + chip, close. */
+async function sysAlertEditorSave() {
+  const key = SYS_ALERT_EDIT_KEY;
+  if (!key) return;
+  const line = $('sae-msg-line');
+  if (line) line.textContent = '';
+  const msgEl   = $('sae-msg');
+  const titleEl = $('sae-title-input');
+  const body = {};
+  const msgVal = msgEl ? msgEl.value.trim() : '';
+  body.message_template = msgVal !== '' ? msgVal : null;
+  /* Only send title_template when the field is rendered (Pushover/ntfy present);
+     when hidden, omit it so a stored title is left untouched (absent = keep). */
+  if (titleEl) { const v = titleEl.value.trim(); body.title_template = v !== '' ? v : null; }
+
+  try {
+    await api('/notifications/system-alerts/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(body) });
+    /* Reflect the change in the in-memory row so the icon's customized state
+       updates when the section re-renders. */
+    let row = NOTIF_SYS_ALERTS.find(x => x.event_key === key);
+    if (!row) { row = { event_key: key }; NOTIF_SYS_ALERTS.push(row); }
+    row.message_template = body.message_template;
+    if ('title_template' in body) row.title_template = body.title_template;
+    toast('Alert text saved.');
+    sysAlertCloseEditor(); /* collapses the editor and re-renders the section */
+  } catch (e) {
+    if (line) { line.textContent = e.message; line.classList.add('err'); }
+  }
 }
 
 /* Render the Configure form, either for a new channel (ch=null, uses NOTIF_NEW_KIND)
@@ -11075,10 +11350,10 @@ function _renderConfigureForm(ch) {
           <input type="checkbox" id="notif-f-enabled" ${(isNew||ch.enabled)?'checked':''} />
           Enabled
         </label>
-        <label class="chk" id="notif-f-global-wrap">
+        ${NOTIF_IS_ADMIN ? `<label class="chk" id="notif-f-global-wrap">
           <input type="checkbox" id="notif-f-global" ${(!isNew && ch.global)?'checked':''} />
           Make available to all users (global)
-        </label>
+        </label>` : ''}
       </div>
     </div>
 
@@ -11162,33 +11437,44 @@ function _renderRulesSection() {
       </div>
     </div>
 
-    <div class="policy-section" style="margin-top:10px">
-      <div class="policy-section-title">Quiet hours ${infoHint('Both hours are inclusive (0–23 wall-clock). Leave blank to disable quiet hours.')}</div>
-      <div class="grid2" style="gap:6px 14px;margin-top:4px">
-        <div>
-          <label class="field-label" style="margin-top:0">Start hour (0–23)</label>
-          <input id="notif-quiet-start" type="number" min="0" max="23" placeholder="22"
-                 value="${def.quiet_start_hour != null ? def.quiet_start_hour : ''}" />
+    <details class="detail-section">
+      <summary>
+        <span class="ds-chev">&#x25B6;</span>
+        <span class="ds-title">Quiet hours</span>
+        <span class="ds-glance">${esc(quietHoursSummary(def.quiet_start_hour, def.quiet_end_hour))}</span>
+      </summary>
+      <div class="ds-body" style="padding-top:8px">
+        <div class="card-hint" style="margin-bottom:8px">
+          Server local time. Set both to "— off —" to disable quiet hours.
         </div>
-        <div>
-          <label class="field-label" style="margin-top:0">End hour (0–23)</label>
-          <input id="notif-quiet-end" type="number" min="0" max="23" placeholder="7"
-                 value="${def.quiet_end_hour != null ? def.quiet_end_hour : ''}" />
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span style="font-size:13px">Quiet from</span>
+          <select id="notif-quiet-start" style="width:auto">${quietHourSelectOptions(def.quiet_start_hour)}</select>
+          <span style="font-size:13px">to</span>
+          <select id="notif-quiet-end" style="width:auto">${quietHourSelectOptions(def.quiet_end_hour)}</select>
         </div>
+        ${(quietHourOutOfRange(def.quiet_start_hour) || quietHourOutOfRange(def.quiet_end_hour))
+          ? `<div class="card-hint" style="color:var(--warn);margin-top:6px">A stored quiet-hours value is out of range (0–23) and is ignored. Pick an hour and save to fix it.</div>` : ''}
       </div>
-    </div>
+    </details>
 
     ${CAMS.length ? `
-    <div class="policy-section" style="margin-top:10px">
-      <div class="policy-section-title">Per-camera overrides</div>
-      <div class="card-hint" style="margin-bottom:8px">"Default" inherits the mode set above. Only non-Default rows are saved.</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Camera</th><th style="width:130px">Mode</th></tr></thead>
-          <tbody>${camOverrideRows}</tbody>
-        </table>
+    <details class="detail-section">
+      <summary>
+        <span class="ds-chev">&#x25B6;</span>
+        <span class="ds-title">Per-camera overrides</span>
+        <span class="ds-glance">${(() => { const n = NOTIF_RULES.filter(r => r.camera_id && (r.presence_mode||'default')!=='default').length; return n ? `${n} set` : 'none set'; })()}</span>
+      </summary>
+      <div class="ds-body" style="padding-top:8px">
+        <div class="card-hint" style="margin-bottom:8px">"Default" inherits the mode set above. Only non-Default rows are saved.</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Camera</th><th style="width:130px">Mode</th></tr></thead>
+            <tbody>${camOverrideRows}</tbody>
+          </table>
+        </div>
       </div>
-    </div>` : ''}`;
+    </details>` : ''}`;
 }
 
 /* ── Open / close the Configure panel ── */
@@ -11274,13 +11560,18 @@ function _readConfigureForm(kind, isNew) {
      omits it and the stored value is untouched. */
   const modeEl = $('notif-f-snapshot-mode');
 
+  /* Global toggle is admin-only and only rendered for admins. When the checkbox
+     is absent (non-admin session) leave it undefined so the save omits it — the
+     server rejects a non-admin that supplies `global` on edit. */
+  const globalEl = $('notif-f-global');
+
   return {
     name:             name.trim(),
     kind,
     camera_ids,
     snapshot_mode:    modeEl ? modeEl.value : undefined,
     enabled:          !!($('notif-f-enabled')  || {}).checked,
-    global:           !!($('notif-f-global')   || {}).checked,
+    global:           globalEl ? !!globalEl.checked : undefined,
     _config:          config,
     _anyNewSecrets:   anyNew,
   };
@@ -11300,8 +11591,8 @@ async function notifSaveNew() {
     config:           body._config,
     camera_ids:       body.camera_ids,
     enabled:          body.enabled,
-    global:           body.global,
   };
+  if (body.global !== undefined) payload.global = body.global;
   if (body.snapshot_mode !== undefined) payload.snapshot_mode = body.snapshot_mode;
 
   try {
@@ -11330,8 +11621,8 @@ async function notifSaveEdit(id) {
     name:             body.name,
     camera_ids:       body.camera_ids,
     enabled:          body.enabled,
-    global:           body.global,
   };
+  if (body.global !== undefined) payload.global = body.global;
   if (body.snapshot_mode !== undefined) payload.snapshot_mode = body.snapshot_mode;
   if (body._anyNewSecrets) payload.config = body._config;
 
