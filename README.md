@@ -142,6 +142,9 @@ seat instead of a hobby dashboard, and honestly it is where most of the work goe
     <td width="50%"><img src=".github/media/users-rbac.png" alt="Role editor with per-camera access grants"><br><sub><b>RBAC</b>: custom roles with per-camera access grants.</sub></td>
     <td width="50%"><img src=".github/media/playback-timeline.png" alt="Multi-camera color-coded playback timeline"><br><sub><b>Timeline</b>: every camera's motion, color-coded, on one bar.</sub></td>
   </tr>
+  <tr>
+    <td colspan="2"><img src=".github/media/ptz-builder.png" alt="The on-video PTZ panel builder in edit mode, placing a pan/tilt wheel, zoom, focus, iris, and preset buttons over the live camera feed"><br><sub><b>PTZ panel builder</b>: build your own control layout over the live feed, a pan/tilt wheel, zoom, focus, iris, and your camera's presets, then size and place them how you like, per camera. Full ONVIF control.</sub></td>
+  </tr>
 </table>
 
 ## Already running Frigate or Home Assistant? Good. Keep them.
@@ -222,6 +225,11 @@ lights, blinds, and fans get a slider for brightness, position, and speed. Contr
 desktop, Android, and iOS, is off by default, and is gated by its own permission. If you have
 thoughts on how it should work,
 [open an issue](https://github.com/badbread/crumbvms/issues).
+
+<p align="center">
+  <img src=".github/media/ha-cycles.gif" width="80%" alt="Home Assistant entities being operated directly on the live camera video, their badges updating to the new state.">
+  <br><sub>Home Assistant entities, controlled right on the live video.</sub>
+</p>
 
 > [!IMPORTANT]
 > ## Looking for testers
