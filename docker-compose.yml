@@ -203,6 +203,7 @@ services:
       # value set in .env actually reaches the api (compose only passes listed keys).
       MOBILE_STREAM_ENABLED: ${MOBILE_STREAM_ENABLED:-}
       MOBILE_STREAM_WIDTH: ${MOBILE_STREAM_WIDTH:-}
+      MAIN_REPAIR_TRANSCODE_ENABLED: ${MAIN_REPAIR_TRANSCODE_ENABLED:-}
       SEGMENT_LOW_CACHE_MAX_BYTES: ${SEGMENT_LOW_CACHE_MAX_BYTES:-}
       EXPORT_CACHE_MAX_BYTES: ${EXPORT_CACHE_MAX_BYTES:-}
       # Behind the bundled Caddy (or any reverse proxy), set TRUST_PROXY=1 so the

@@ -1346,6 +1346,25 @@ pub struct LiveStreamsResponse {
     /// camera on this server; treat this response like any other
     /// authenticated, per-user payload (JWT/RBAC-gated, not further exposed).
     pub rtsp_main_url: String,
+    /// RTSP URL for the client-facing REPAIRED MAIN `<name>_mainv` — a full-res
+    /// H.265->H.264 **transcode** (unlike `rtsp_subv_url`, which is a copy).
+    ///
+    /// **Normally `None` — it is opt-in and the exception, not the rule.** Set only
+    /// when the operator has enabled `MAIN_REPAIR_TRANSCODE_ENABLED` AND the
+    /// reconcile loop has POSITIVELY DETECTED that this camera's main advertises
+    /// video with no `a=fmtp` (see `go2rtc::sdp_video_lacks_fmtp`) — the condition
+    /// that makes Media3's RTSP client throw `IllegalArgumentException: missing
+    /// attribute fmtp`. A copy-remux would fix the fmtp but go2rtc then bundles the
+    /// H.265 parameter sets into an RTP Aggregation Packet Media3 cannot
+    /// depacketize, so the repair must re-encode; that costs recorder CPU while a
+    /// consumer is attached, which is why it is off by default. Also `None` when
+    /// reconcile does not manage the camera (Frigate-served / legacy) and before
+    /// the first reconcile pass has reached a verdict.
+    ///
+    /// **Only Media3/ExoPlayer clients (Android) should use this**; it is the HD
+    /// rung tried right after `rtsp_main_url`. Same embedded-credential +
+    /// sensitivity note as `rtsp_main_url`.
+    pub rtsp_mainv_url: Option<String>,
     /// RTSP URL for the RAW sub stream `<name>_sub` (same credential note as
     /// `rtsp_main_url`). This is the always-warm restream: reconcile keeps one
     /// producer per camera running, so a consumer attaches to it immediately.

@@ -34,12 +34,14 @@ class LiveStreamFallbackTest {
 
     private fun streams(
         main: String? = "rtsp://u:p@host:18554/drive",
+        mainv: String? = null,
         sub: String? = "rtsp://u:p@host:18554/drive_sub",
         subv: String? = null,
         mobile: String? = "rtsp://u:p@host:18554/drive_mobile",
     ) = LiveStreamsResponse(
         cameraId = "8f14e45f-ceea-467a-9f3a-8f14e45fceea",
         rtspMainUrl = main ?: "rtsp://u:p@host:18554/drive",
+        rtspMainvUrl = mainv,
         rtspSubUrl = sub,
         rtspSubvUrl = subv,
         rtspMobileUrl = mobile,
@@ -123,6 +125,48 @@ class LiveStreamFallbackTest {
         val dup = "rtsp://u:p@host:18554/drive_sub"
         val chain = streams(sub = dup, subv = dup).wallStreamChain()
         assertEquals(listOf(StreamTier.SUBV, StreamTier.MOBILE), chain)
+    }
+
+    @Test
+    fun `fullscreen chain puts the repaired main right after the raw main`() {
+        val chain = streams(
+            mainv = "rtsp://u:p@host:18554/drive_mainv",
+            subv = "rtsp://u:p@host:18554/drive_subv",
+        ).fullscreenStreamChain(metered = false)
+        assertEquals(
+            listOf(
+                StreamTier.MAIN, StreamTier.MAINV,
+                StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE,
+            ),
+            chain,
+        )
+        // The repaired main is HD, so it must carry no SD badge.
+        assertNull(sdBadgeLabel(StreamTier.MAINV))
+    }
+
+    @Test
+    fun `metered fullscreen keeps the repaired main a last resort with the raw main`() {
+        val chain = streams(mainv = "rtsp://u:p@host:18554/drive_mainv")
+            .fullscreenStreamChain(metered = true)
+        assertEquals(
+            listOf(StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAIN, StreamTier.MAINV),
+            chain,
+        )
+    }
+
+    @Test
+    fun `a no-sub camera puts the repaired main before the transcode on the wall`() {
+        val chain = streams(mainv = "rtsp://u:p@host:18554/drive_mainv", sub = null)
+            .wallStreamChain()
+        assertEquals(listOf(StreamTier.MAIN, StreamTier.MAINV, StreamTier.MOBILE), chain)
+    }
+
+    @Test
+    fun `the repaired main rung is absent when the server does not publish one`() {
+        // The common case: mainv is null, so the rung is simply not in the ladder
+        // and every existing chain is unchanged.
+        assertFalse(StreamTier.MAINV in streams().fullscreenStreamChain(metered = false))
+        assertFalse(StreamTier.MAINV in streams().wallStreamChain())
     }
 
     // ── walking the ladder ────────────────────────────────────────────────────
@@ -268,6 +312,47 @@ class LiveStreamFallbackTest {
         // An ordinary IO failure carries no such signature.
         assertFalse(isUnplayableFailureDetail(failureDetail(java.net.SocketTimeoutException("read timed out"))))
         assertFalse(isUnplayableFailureDetail(null))
+    }
+
+    @Test
+    fun `the missing-fmtp failure steps down at once instead of waiting out the IO backoff`() {
+        // An LPR camera's H.265 MAIN advertises an SDP with no `a=fmtp`, so Media3's
+        // RTSP client throws IllegalArgumentException("missing attribute fmtp"). On
+        // the MAIN over RTSP it surfaces wrapped through RtspPlaybackException into a
+        // 2000 IO code (captured on device, #561), which the graduated threshold
+        // would otherwise retry ~30 s before escaping. The SDP is identical every
+        // attempt, so the signature must step it down on the FIRST failure.
+        val detail = failureDetail(
+            java.io.IOException(
+                "Source error",
+                IllegalArgumentException("missing attribute fmtp"),
+            ),
+        )
+        assertTrue(detail!!, isUnplayableFailureDetail(detail))
+        assertTrue(
+            shouldFallBackToNextTier(
+                hasNextTier = true,
+                everReady = false,
+                errorCode = 2000,
+                failureDetail = detail,
+                preFirstFrameFailures = 1,
+            ),
+        )
+        // Contrast: a generic 2000 IO failure with no such signature still has to
+        // repeat across the whole backoff curve before the rung is abandoned — the
+        // fmtp match must not have widened the codec-agnostic retry path (#560).
+        (1 until CODEC_AGNOSTIC_FAILURES_BEFORE_FALLBACK).forEach { n ->
+            assertFalse(
+                "generic IO failure $n must still retry",
+                shouldFallBackToNextTier(
+                    hasNextTier = true,
+                    everReady = false,
+                    errorCode = 2000,
+                    failureDetail = failureDetail(java.io.IOException("Source error")),
+                    preFirstFrameFailures = n,
+                ),
+            )
+        }
     }
 
     @Test
