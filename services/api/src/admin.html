@@ -9946,6 +9946,53 @@ const SYS_ALERT_META = {
   update_available:     { title: 'Crumb update available',             desc: 'A newer Crumb release is available on GitHub. Off by default and only fires when the update-available check is also enabled (Server → Update checks) — notify-only, no download or install. Fires once per new version.', unit: null },
 };
 
+/* ── Alert-text templating (migration 0079) ──
+   Built-in tokens are available on EVERY alert type; the per-event-key list
+   below adds the structured tokens THAT alert can offer (a plate token means
+   nothing to a storage alert, so the hints are scoped per type). Leaving a
+   template field blank uses the built-in default (one-click "Restore default").
+   The JS preview mirrors the server engine: an unknown %token% stays literal. */
+const SYS_ALERT_BUILTIN_TOKENS = ['camera', 'event', 'detail', 'date', 'time', 'datetime'];
+const SYS_ALERT_META_TOKENS = {
+  plate_watchlist_hit:    ['plate', 'name', 'confidence', 'zone'],
+  camera_offline:         ['signal', 'offline_secs', 'last_seen'],
+  low_disk:               ['storage', 'path', 'free_pct', 'free_bytes'],
+  policy_over_cap:        ['policy', 'stage', 'used_bytes', 'cap_bytes'],
+  camera_stream_rejected: ['reason'],
+  update_available:       ['version', 'current_version', 'notes_url'],
+};
+/* Default templates (shown as placeholders). The message default reproduces the
+   pre-templating wording; leaving the title blank keeps each provider's own
+   existing default title. */
+const SYS_ALERT_DEFAULT_MSG_TPL = '[Crumb] ⚠️ %event% — %detail% (at %datetime%)';
+const SYS_ALERT_DEFAULT_TITLE_TPL = 'Crumb: %event%';
+/* Sample token values used only for the live preview. */
+const SYS_ALERT_TOKEN_SAMPLES = {
+  camera: 'Front Door', detail: '(the alert detail text)',
+  date: '2026-01-02', time: '14:03:11', datetime: '2026-01-02 14:03:11 UTC',
+  plate: '7ABC123', name: "Mom's car", confidence: '90%', zone: 'driveway',
+  signal: 'RTP', offline_secs: '130', last_seen: 'never',
+  storage: 'Archive', path: '/data/archive', free_pct: '3.2%', free_bytes: '12000000000',
+  policy: 'Front cameras', stage: 'live', used_bytes: '5500000000', cap_bytes: '5000000000',
+  reason: 'source with spaces may be insecure',
+  version: 'v0.2.0', current_version: 'v0.1.9', notes_url: 'https://github.com/badbread/crumbvms/releases',
+};
+
+/* Render a template with sample values, mirroring the server engine: a known
+   %token% substitutes, an unknown one stays literal (so a typo is visible). */
+function _previewAlertTemplate(tpl, eventKey) {
+  const samples = Object.assign({}, SYS_ALERT_TOKEN_SAMPLES, {
+    event: (SYS_ALERT_META[eventKey] || { title: eventKey }).title,
+  });
+  return tpl.replace(/%([A-Za-z0-9_]+)%/g, (m, name) =>
+    Object.prototype.hasOwnProperty.call(samples, name) ? samples[name] : m);
+}
+
+/* Valid token list (built-ins + this event's meta tokens) for the hint row. */
+function _sysAlertTokens(eventKey) {
+  return SYS_ALERT_BUILTIN_TOKENS.concat(SYS_ALERT_META_TOKENS[eventKey] || []);
+}
+
 /* Per-kind connection-field descriptors. */
 const NOTIF_PROVIDER_FIELDS = {
   discord:  [{ id:'webhook_url', label:'Webhook URL', type:'url',      hint:'Settings → Integrations → Webhooks → Copy URL.' }],
@@ -10652,7 +10699,7 @@ function _renderNotificationsPane() {
 
 /* ── System alerts section (footage-loss-critical + health events) ── */
 function _renderSystemAlertsSection() {
-  const rows = (NOTIF_SYS_ALERTS.length ? NOTIF_SYS_ALERTS : Object.keys(SYS_ALERT_META).map(k => ({ event_key:k, enabled:true, threshold_secs:null, threshold_fraction:null, bypass_quiet_hours:false, cooldown_secs:900 })))
+  const rows = (NOTIF_SYS_ALERTS.length ? NOTIF_SYS_ALERTS : Object.keys(SYS_ALERT_META).map(k => ({ event_key:k, enabled:true, threshold_secs:null, threshold_fraction:null, bypass_quiet_hours:false, cooldown_secs:900, message_template:null, title_template:null })))
     .map(r => {
       const meta = SYS_ALERT_META[r.event_key] || { title: r.event_key, desc: '', unit: null };
       let thresholdField = '';
@@ -10668,6 +10715,37 @@ function _renderSystemAlertsSection() {
       } else {
         thresholdField = `<span class="card-hint" style="margin:0">—</span>`;
       }
+      const k = r.event_key;
+      const tokenHint = _sysAlertTokens(k).map(t => '%' + t + '%').join('  ');
+      const msgVal = r.message_template != null ? r.message_template : '';
+      const titleVal = r.title_template != null ? r.title_template : '';
+      const previewSrc = msgVal !== '' ? msgVal : SYS_ALERT_DEFAULT_MSG_TPL;
+      const templateRow = `
+      <tr class="sysalert-tpl-row" data-key="${esc(k)}">
+        <td colspan="4" style="padding-top:0">
+          <details style="margin:0 0 4px 0">
+            <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Customize alert text</summary>
+            <div style="padding:8px 2px 4px">
+              <label class="field-label" style="margin-top:0">Message text</label>
+              <textarea class="sysalert-msg-tpl" data-key="${esc(k)}" rows="2" style="width:100%;font-family:inherit;resize:vertical"
+                placeholder="${esc(SYS_ALERT_DEFAULT_MSG_TPL)}"
+                oninput="sysAlertPreview('${esc(k)}')">${esc(msgVal)}</textarea>
+              <label class="field-label">Title (Pushover and ntfy only)</label>
+              <input type="text" class="sysalert-title-tpl" data-key="${esc(k)}" style="width:100%"
+                placeholder="Leave blank for the provider default (example: ${esc(SYS_ALERT_DEFAULT_TITLE_TPL)})"
+                value="${esc(titleVal)}" oninput="sysAlertPreview('${esc(k)}')" />
+              <div class="card-hint" style="margin-top:6px">
+                Tokens for this alert: <span style="font-family:monospace">${esc(tokenHint)}</span>.
+                An unknown token is left as-is so a typo is visible. Times are UTC.
+              </div>
+              <div class="card-hint" style="margin-top:4px">
+                Preview: <span class="sysalert-preview" data-key="${esc(k)}" style="font-family:monospace;color:var(--fg)">${esc(_previewAlertTemplate(previewSrc, k))}</span>
+              </div>
+              <button class="ghost sm" style="margin-top:6px" onclick="sysAlertRestoreDefault('${esc(k)}')">Restore default</button>
+            </div>
+          </details>
+        </td>
+      </tr>`;
       return `
       <tr data-key="${esc(r.event_key)}">
         <td style="min-width:220px">
@@ -10687,7 +10765,7 @@ function _renderSystemAlertsSection() {
             Bypass quiet hours
           </label>
         </td>
-      </tr>`;
+      </tr>${templateRow}`;
     }).join('');
 
   return `
@@ -10726,7 +10804,7 @@ function _renderSystemAlertsSection() {
 async function notifSaveSystemAlerts() {
   setMsg('notif-sysalerts-msg', '');
 
-  const rows = document.querySelectorAll('#notif-sysalerts-section tr[data-key]');
+  const rows = document.querySelectorAll('#notif-sysalerts-section tr[data-key]:not(.sysalert-tpl-row)');
   const calls = [];
   rows.forEach(tr => {
     const key = tr.dataset.key;
@@ -10742,6 +10820,12 @@ async function notifSaveSystemAlerts() {
         body.threshold_fraction = raw !== '' ? (parseFloat(raw) / 100) : null;
       }
     }
+    // Alert-text templates (migration 0079). A blank field clears to null on the
+    // server = "use the built-in default" (one-click restore).
+    const msgEl   = document.querySelector('.sysalert-msg-tpl[data-key="' + CSS.escape(key) + '"]');
+    const titleEl = document.querySelector('.sysalert-title-tpl[data-key="' + CSS.escape(key) + '"]');
+    if (msgEl)   { const v = msgEl.value.trim();   body.message_template = v !== '' ? v : null; }
+    if (titleEl) { const v = titleEl.value.trim(); body.title_template   = v !== '' ? v : null; }
     calls.push(api('/notifications/system-alerts/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify(body) }));
   });
 
@@ -10765,6 +10849,26 @@ async function notifSaveSystemAlerts() {
   } catch (e) {
     setMsg('notif-sysalerts-msg', e.message, 'err');
   }
+}
+
+/* Live-preview the message template for one alert type using sample token
+   values. Falls back to the default template when the field is blank. */
+function sysAlertPreview(key) {
+  const msgEl = document.querySelector('.sysalert-msg-tpl[data-key="' + CSS.escape(key) + '"]');
+  const out   = document.querySelector('.sysalert-preview[data-key="' + CSS.escape(key) + '"]');
+  if (!out) return;
+  const src = (msgEl && msgEl.value.trim() !== '') ? msgEl.value : SYS_ALERT_DEFAULT_MSG_TPL;
+  out.textContent = _previewAlertTemplate(src, key);
+}
+
+/* "Restore default": clear both template fields so the next save stores NULL,
+   which the server renders as the built-in default for this alert type. */
+function sysAlertRestoreDefault(key) {
+  const msgEl   = document.querySelector('.sysalert-msg-tpl[data-key="' + CSS.escape(key) + '"]');
+  const titleEl = document.querySelector('.sysalert-title-tpl[data-key="' + CSS.escape(key) + '"]');
+  if (msgEl)   msgEl.value = '';
+  if (titleEl) titleEl.value = '';
+  sysAlertPreview(key);
 }
 
 /* Render the Configure form, either for a new channel (ch=null, uses NOTIF_NEW_KIND)

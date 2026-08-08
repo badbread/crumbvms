@@ -742,6 +742,9 @@ async fn test_channel(
         web_url: None,
         snapshot,
         detail: None,
+        template: None,
+        title_template: None,
+        meta: None,
     };
 
     match channel_notify::dispatch(&http, &ch, &msg).await {
@@ -852,6 +855,41 @@ pub struct UpdateSystemAlertRequest {
     pub threshold_fraction: Option<Option<f32>>,
     pub bypass_quiet_hours: Option<bool>,
     pub cooldown_secs: Option<i32>,
+    /// Custom message-body template. Absent = leave unchanged; `null` or a
+    /// blank/whitespace-only string = clear to NULL (restore the built-in
+    /// default); any other string = set the override (pure `%token%` text,
+    /// capped at `MAX_TEMPLATE_LEN`).
+    pub message_template: Option<Option<String>>,
+    /// Custom provider-title template. Same semantics as `message_template`;
+    /// NULL keeps each provider's existing default title.
+    pub title_template: Option<Option<String>>,
+}
+
+/// Normalize an incoming template field: trim, treat empty-after-trim as "clear
+/// to NULL / use default", and reject anything over the length cap. A template
+/// is pure `%token%` text — there is nothing executable to sanitize beyond the
+/// length bound; the render + JSON-escape layers make any content payload-safe.
+fn normalize_template_field(
+    field: Option<Option<String>>,
+) -> Result<Option<Option<String>>, ApiError> {
+    match field {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                // Blank = "restore default" (store NULL).
+                Ok(Some(None))
+            } else if trimmed.chars().count() > crumb_common::alert_template::MAX_TEMPLATE_LEN {
+                Err(ApiError::BadRequest(format!(
+                    "template too long (max {} characters)",
+                    crumb_common::alert_template::MAX_TEMPLATE_LEN
+                )))
+            } else {
+                Ok(Some(Some(trimmed.to_owned())))
+            }
+        }
+    }
 }
 
 /// `PUT /notifications/system-alerts/:event_key` — update one system-alert
@@ -872,6 +910,8 @@ async fn update_system_alert(
         threshold_fraction: body.threshold_fraction,
         bypass_quiet_hours: body.bypass_quiet_hours,
         cooldown_secs: body.cooldown_secs,
+        message_template: normalize_template_field(body.message_template)?,
+        title_template: normalize_template_field(body.title_template)?,
     };
     let rule = db::update_system_alert_rule(state.pool(), &event_key, &p)
         .await
@@ -1603,6 +1643,9 @@ pub async fn run_notification_engine(
                             None
                         },
                         detail: None,
+                        template: None,
+                        title_template: None,
+                        meta: None,
                     };
 
                     let (status, reason) = match channel_notify::dispatch(&http_client, ch, &msg)
@@ -1928,6 +1971,17 @@ pub(crate) async fn dispatch_system_events_tick(
         };
 
         let title = system_alert_title(&event.event_key);
+        // Resolve the message-body template: the operator's override when set,
+        // otherwise the built-in default (whose empty-detail branch is preserved
+        // so default wording stays byte-identical). Rendering itself happens in
+        // `ChannelMessage::text()`. `title_template` stays as-is (None keeps each
+        // provider's existing default title).
+        let has_detail = event.detail.as_deref().is_some_and(|d| !d.is_empty());
+        let message_template = crumb_common::alert_template::effective_message_template(
+            rule.message_template.as_deref(),
+            has_detail,
+        );
+        let title_template = rule.title_template.clone();
         cooldown_map.insert(cooldown_key, Instant::now());
 
         // LPR watchlist hits carry a detection snapshot (the car+plate frame).
@@ -1988,6 +2042,9 @@ pub(crate) async fn dispatch_system_events_tick(
                     None
                 },
                 detail: event.detail.clone(),
+                template: Some(message_template.clone()),
+                title_template: title_template.clone(),
+                meta: event.meta.clone(),
             };
 
             let (status, reason) = match channel_notify::dispatch(http_client, ch, &msg).await {
@@ -2174,6 +2231,7 @@ mod tests {
             ts: Utc::now(),
             detail: detail.map(ToOwned::to_owned),
             snapshot_url: None,
+            meta: None,
         }
     }
 

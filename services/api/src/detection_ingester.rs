@@ -23,10 +23,9 @@ use tracing::{info, warn};
 
 use crumb_common::{
     db::{
-        get_camera_lpr_config, get_lpr_settings, insert_system_event_with_snapshot,
-        is_plate_ignored, mark_plate_alerted, match_watchlist, normalize_plate,
-        upsert_detection_event, upsert_plate_read, UpsertDetectionEventParams,
-        UpsertPlateReadParams,
+        get_camera_lpr_config, get_lpr_settings, insert_system_event_full, is_plate_ignored,
+        mark_plate_alerted, match_watchlist, normalize_plate, upsert_detection_event,
+        upsert_plate_read, UpsertDetectionEventParams, UpsertPlateReadParams,
     },
     detection::NormalizedEvent,
 };
@@ -291,15 +290,35 @@ async fn maybe_alert_watchlist(
         plate = entry.plate
     );
 
+    // Structured tokens for alert-text templating (migration 0079). Safe,
+    // event-scoped values only. `plate_read_id` + `plate_bbox` are carried for
+    // the snapshot-crop follow-up (so it needs no second migration); they are
+    // not advertised as text tokens in the editor.
+    let mut meta = serde_json::Map::new();
+    meta.insert("plate".to_owned(), serde_json::json!(entry.plate));
+    if let Some(name) = entry.display_name.as_deref().filter(|l| !l.is_empty()) {
+        meta.insert("name".to_owned(), serde_json::json!(name));
+    }
+    meta.insert("confidence".to_owned(), serde_json::json!(conf));
+    if let Some(zone) = ev.zones.first() {
+        meta.insert("zone".to_owned(), serde_json::json!(zone));
+    }
+    meta.insert("plate_read_id".to_owned(), serde_json::json!(plate_read_id));
+    if let Some(bbox) = ev.plate_box {
+        meta.insert("plate_bbox".to_owned(), serde_json::json!(bbox));
+    }
+    let meta = serde_json::Value::Object(meta);
+
     // Carry the detection snapshot (the car+plate frame) so image-capable
     // notification channels can attach it — the notification engine resolves +
     // fetches it, gated by each channel's own `include_snapshot` toggle.
-    if let Err(e) = insert_system_event_with_snapshot(
+    if let Err(e) = insert_system_event_full(
         pool,
         "plate_watchlist_hit",
         Some(ev.camera_id),
         Some(&detail),
         ev.snapshot_url.as_deref(),
+        Some(&meta),
     )
     .await
     {

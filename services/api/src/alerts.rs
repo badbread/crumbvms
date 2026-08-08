@@ -824,8 +824,27 @@ async fn check_camera_offline(
                 ),
                 None => format!("camera \"{}\" has never reported a {signal}", cam.name),
             };
-            if let Err(e) =
-                db::insert_system_event(pool, "camera_offline", Some(cam.id), Some(&detail)).await
+            // Structured tokens for alert-text templating (migration 0079).
+            let mut meta = serde_json::Map::new();
+            meta.insert("signal".to_owned(), serde_json::json!(signal));
+            match age {
+                Some(a) => {
+                    meta.insert("offline_secs".to_owned(), serde_json::json!(a));
+                }
+                None => {
+                    meta.insert("last_seen".to_owned(), serde_json::json!("never"));
+                }
+            }
+            let meta = serde_json::Value::Object(meta);
+            if let Err(e) = db::insert_system_event_full(
+                pool,
+                "camera_offline",
+                Some(cam.id),
+                Some(&detail),
+                None,
+                Some(&meta),
+            )
+            .await
             {
                 tracing::warn!(error = %e, camera_id = %cam.id, "system-health: insert_system_event(camera_offline) failed");
             } else {
@@ -886,7 +905,23 @@ async fn check_low_disk(pool: &Pool, rule: Option<&db::SystemAlertRule>) {
                 free_frac * 100.0,
                 f64::from(floor) * 100.0
             );
-            if let Err(e) = db::insert_system_event(pool, "low_disk", None, Some(&detail)).await {
+            // Structured tokens for alert-text templating (migration 0079).
+            let meta = serde_json::json!({
+                "storage": storage.name,
+                "path": storage.path,
+                "free_pct": format!("{:.1}%", free_frac * 100.0),
+                "free_bytes": free,
+            });
+            if let Err(e) = db::insert_system_event_full(
+                pool,
+                "low_disk",
+                None,
+                Some(&detail),
+                None,
+                Some(&meta),
+            )
+            .await
+            {
                 tracing::warn!(error = %e, storage = %storage.name, "system-health: insert_system_event(low_disk) failed");
             }
         }
@@ -927,8 +962,21 @@ async fn check_policy_over_cap(pool: &Pool, rule: Option<&db::SystemAlertRule>) 
                     let detail = format!(
                         "policy \"{label}\" live footage {used} bytes over cap {cap} bytes"
                     );
-                    if let Err(e) =
-                        db::insert_system_event(pool, "policy_over_cap", None, Some(&detail)).await
+                    let meta = serde_json::json!({
+                        "policy": label,
+                        "stage": "live",
+                        "used_bytes": used,
+                        "cap_bytes": cap,
+                    });
+                    if let Err(e) = db::insert_system_event_full(
+                        pool,
+                        "policy_over_cap",
+                        None,
+                        Some(&detail),
+                        None,
+                        Some(&meta),
+                    )
+                    .await
                     {
                         tracing::warn!(error = %e, policy_id = %policy.id, "system-health: insert_system_event(policy_over_cap/live) failed");
                     }
@@ -949,9 +997,21 @@ async fn check_policy_over_cap(pool: &Pool, rule: Option<&db::SystemAlertRule>) 
                         let detail = format!(
                             "policy \"{label}\" archive footage {used} bytes over cap {cap} bytes"
                         );
-                        if let Err(e) =
-                            db::insert_system_event(pool, "policy_over_cap", None, Some(&detail))
-                                .await
+                        let meta = serde_json::json!({
+                            "policy": label,
+                            "stage": "archive",
+                            "used_bytes": used,
+                            "cap_bytes": cap,
+                        });
+                        if let Err(e) = db::insert_system_event_full(
+                            pool,
+                            "policy_over_cap",
+                            None,
+                            Some(&detail),
+                            None,
+                            Some(&meta),
+                        )
+                        .await
                         {
                             tracing::warn!(error = %e, policy_id = %policy.id, "system-health: insert_system_event(policy_over_cap/archive) failed");
                         }
