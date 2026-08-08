@@ -166,14 +166,10 @@ async fn main() -> Result<()> {
             (config.archive_storage_name.clone(), archive_path)
         };
 
-    let archive_storage = db::seed_storage_path_idempotent(
-        &pool,
-        &mut known,
-        &archive_name,
-        &archive_path_effective,
-    )
-    .await
-    .context("seeding archive storage")?;
+    let archive_storage =
+        db::seed_storage_path_idempotent(&pool, &mut known, &archive_name, &archive_path_effective)
+            .await
+            .context("seeding archive storage")?;
     info!(
         id   = %archive_storage.id,
         name = %archive_storage.name,

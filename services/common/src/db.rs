@@ -425,27 +425,26 @@ pub async fn seed_storage_path_idempotent(
     name: &str,
     path: &str,
 ) -> Result<Storage> {
-    let resolved = if let Some(other) =
-        duplicate_path_under_other_name(known.iter().cloned(), name, path)
-    {
-        tracing::info!(
-            path = %path,
-            existing_name = %other,
-            configured_name = %name,
-            "storage path already covered by an existing row under another name; not \
-             seeding the configured name (it would duplicate the directory). Runtime \
-             lookups resolve this path via the existing row."
-        );
-        match get_storage_by_path(pool, path).await? {
-            Some(s) => s,
-            // The covering row vanished between the snapshot and this lookup
-            // (an operator deletion racing the seed). Fall back to a plain
-            // upsert so seeding still completes; it stays idempotent.
-            None => upsert_storage(pool, name, path).await?,
-        }
-    } else {
-        upsert_storage(pool, name, path).await?
-    };
+    let resolved =
+        if let Some(other) = duplicate_path_under_other_name(known.iter().cloned(), name, path) {
+            tracing::info!(
+                path = %path,
+                existing_name = %other,
+                configured_name = %name,
+                "storage path already covered by an existing row under another name; not \
+                 seeding the configured name (it would duplicate the directory). Runtime \
+                 lookups resolve this path via the existing row."
+            );
+            match get_storage_by_path(pool, path).await? {
+                Some(s) => s,
+                // The covering row vanished between the snapshot and this lookup
+                // (an operator deletion racing the seed). Fall back to a plain
+                // upsert so seeding still completes; it stays idempotent.
+                None => upsert_storage(pool, name, path).await?,
+            }
+        } else {
+            upsert_storage(pool, name, path).await?
+        };
     // Reflect the resolved row so the next call's gate sees it; drop any stale
     // entry for the same name first (the retarget case updated its path).
     known.retain(|(n, _)| n != &resolved.name);
@@ -13196,13 +13195,17 @@ mod tests {
 
         // Two boots' worth of seeding with the compose defaults.
         for _ in 0..2 {
-            seed_pass(&fx.pool, ("Live", "/data/live"), ("Archive", "/data/archive")).await;
+            seed_pass(
+                &fx.pool,
+                ("Live", "/data/live"),
+                ("Archive", "/data/archive"),
+            )
+            .await;
         }
 
         let all = list_storages(&fx.pool).await.expect("list");
         assert_eq!(all.len(), 2, "no duplicate rows should be created");
-        let names: std::collections::HashSet<&str> =
-            all.iter().map(|s| s.name.as_str()).collect();
+        let names: std::collections::HashSet<&str> = all.iter().map(|s| s.name.as_str()).collect();
         assert!(
             names.contains("2TB NVMe") && names.contains("16TB Spinner"),
             "operator names must be untouched, got {names:?}",
@@ -13223,12 +13226,19 @@ mod tests {
         let fx = setup_schema(&url).await;
         create_storages_table(&fx.pool).await;
 
-        seed_pass(&fx.pool, ("Live", "/data/live"), ("Archive", "/data/archive")).await;
+        seed_pass(
+            &fx.pool,
+            ("Live", "/data/live"),
+            ("Archive", "/data/archive"),
+        )
+        .await;
 
         let all = list_storages(&fx.pool).await.expect("list");
         assert_eq!(all.len(), 2, "fresh install seeds two rows");
-        let by_name: std::collections::HashMap<&str, &str> =
-            all.iter().map(|s| (s.name.as_str(), s.path.as_str())).collect();
+        let by_name: std::collections::HashMap<&str, &str> = all
+            .iter()
+            .map(|s| (s.name.as_str(), s.path.as_str()))
+            .collect();
         assert_eq!(by_name.get("Live"), Some(&"/data/live"));
         assert_eq!(by_name.get("Archive"), Some(&"/data/archive"));
     }
@@ -13278,7 +13288,11 @@ mod tests {
         seed_pass(&fx.pool, ("Live", "/data"), ("Archive", "/data")).await;
 
         let all = list_storages(&fx.pool).await.expect("list");
-        assert_eq!(all.len(), 1, "shared layout must not duplicate the directory");
+        assert_eq!(
+            all.len(),
+            1,
+            "shared layout must not duplicate the directory"
+        );
         assert_eq!(all[0].name, "Live");
     }
 
@@ -13348,7 +13362,10 @@ mod tests {
             .await
             .expect("query")
             .expect("path fallback resolves");
-        assert_eq!(resolved.name, "2TB NVMe", "resolves to the real row via path");
+        assert_eq!(
+            resolved.name, "2TB NVMe",
+            "resolves to the real row via path"
+        );
 
         // NAME still wins when a row under the configured name exists, even if
         // that row's path differs from the configured one.
