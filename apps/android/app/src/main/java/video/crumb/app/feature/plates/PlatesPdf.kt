@@ -50,8 +50,10 @@ import kotlin.math.roundToInt
  *    first image falls back to the full snapshot, labeled "vehicle".
  *  - **Details**: `plate_raw`, source.
  *  - **Dossier** (optional): every sighting of this plate — total, distinct
- *    cameras, first/last seen, and a thumbnail strip captioned with each
- *    sighting's date/time.
+ *    cameras, first/last seen, a bounded thumbnail strip (pictures are capped for
+ *    memory/latency, and labeled as a sample), and a **full sighting log**: a
+ *    compact date/time + camera row for EVERY sighting the report holds, flowing
+ *    onto as many A4 pages as it takes (each with a running header and footer).
  *
  * Snapshots are loaded exactly like the on-screen `PlateThumb`: each read's
  * sibling detection-event JPEG via the scoped-token proxy
@@ -91,6 +93,16 @@ private const val DOSSIER_THUMB_TARGET_PX = 400
 
 /** Subdirectory of the app cache dir that `file_paths.xml` exposes via FileProvider. */
 private const val REPORTS_CACHE_SUBDIR = "reports"
+
+/**
+ * Full sighting-log layout (the textual, every-sighting section). Pictures are
+ * capped ([MAX_DOSSIER_THUMBS]) because each snapshot costs memory and latency,
+ * but the log lists EVERY sighting the report holds as a compact date/time +
+ * camera row, flowing onto as many A4 pages as it takes. These control that flow.
+ */
+private const val LOG_ROW_H = 13f
+private const val LOG_FOOTER_RESERVE = 22f
+private const val LOG_TIME_COL_W = 250f
 
 /**
  * Everything the report needs about one sighting. The network reads (watchlist
@@ -308,9 +320,45 @@ private fun drawReport(
         textSize = 10f
     }
 
+    val logRowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(0x33, 0x3b, 0x48)
+        textSize = 9.5f
+    }
+    val contTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(0x10, 0x18, 0x28)
+        textSize = 13f
+        isFakeBoldText = true
+    }
+    val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(0x8a, 0x93, 0xa2)
+        textSize = 8f
+    }
+    val footerRightPaint = Paint(footerPaint).apply { textAlign = Paint.Align.RIGHT }
+
     val contentLeft = MARGIN
     val contentRight = PAGE_W - MARGIN
     val contentWidth = contentRight - contentLeft
+    // Lowest baseline a log row may occupy before it must flow to the next page
+    // (leaves room for the footer). Shared by page 1 and every continuation page.
+    val pageBottom = PAGE_H - MARGIN - LOG_FOOTER_RESERVE
+
+    // Footer (divider + right-aligned page counter) drawn on every page once the
+    // total page count is known.
+    fun drawFooter(canvas: Canvas, pageNum: Int, totalPages: Int) {
+        val fy = PAGE_H - MARGIN + 2f
+        canvas.drawLine(contentLeft, fy - 10f, contentRight, fy - 10f, linePaint)
+        canvas.drawText("CrumbVMS plate report", contentLeft, fy, footerPaint)
+        canvas.drawText("Page $pageNum of $totalPages", contentRight, fy, footerRightPaint)
+    }
+
+    // Draw one sighting-log row (date/time in the left column, camera in the
+    // right column, clipped to fit) at [baselineY].
+    fun drawLogRow(canvas: Canvas, timeStr: String, cameraStr: String, baselineY: Float) {
+        canvas.drawText(timeStr, contentLeft, baselineY, logRowPaint)
+        val camMax = contentWidth - LOG_TIME_COL_W
+        val cam = ellipsizeToWidth(cameraStr, logRowPaint, camMax)
+        canvas.drawText(cam, contentLeft + LOG_TIME_COL_W, baselineY, logRowPaint)
+    }
 
     val info = PdfDocument.PageInfo.Builder(PAGE_W, PAGE_H, 1).create()
     val page = doc.startPage(info)
@@ -378,36 +426,41 @@ private fun drawReport(
     y += 6f
 
     // ── dossier ─────────────────────────────────────────────────────────────────
+    // Pictures stay capped (memory/latency), but EVERY sighting is listed in the
+    // full log below. When the log runs it draws its own footers and finishes all
+    // pages itself, so we don't double-finish page 1 in the tail.
+    var pagesFinished = false
     if (input.includeDossier) {
         c.drawLine(contentLeft, y, contentRight, y, linePaint)
         y += 14f
         c.drawText("SIGHTING HISTORY", contentLeft, y, headerPaint)
         y += 14f
-        val sightings = input.dossier
+        val sightings = sightingsNewestFirst(input.dossier)
         if (sightings.isEmpty()) {
             c.drawText("No other sightings of this plate in the selected cameras.", contentLeft, y, cellPaint)
             y += 14f
         } else {
             val distinctCams = sightings.map { it.cameraId }.distinct().size
-            val sortedTs = sightings.map { it.ts }.sortedBy {
-                runCatching { Instant.parse(it).toEpochMilli() }.getOrDefault(Long.MAX_VALUE)
-            }
-            val firstSeen = sortedTs.firstOrNull()?.let { fmtTs(it, tsFmt) } ?: "—"
-            val lastSeen = sortedTs.lastOrNull()?.let { fmtTs(it, tsFmt) } ?: "—"
-            val totalLabel = if (input.dossierTotal > sightings.size) {
-                "${input.dossierTotal} sightings (showing ${sightings.size})"
-            } else {
-                "${sightings.size} sighting${if (sightings.size == 1) "" else "s"}"
-            }
+            val firstSeen = sightings.lastOrNull()?.ts?.let { fmtTs(it, tsFmt) } ?: "—"
+            val lastSeen = sightings.firstOrNull()?.ts?.let { fmtTs(it, tsFmt) } ?: "—"
+            val totalLabel = sightingLogSummary(sightings.size, input.dossierTotal)
             c.drawText("$totalLabel · $distinctCams camera${if (distinctCams == 1) "" else "s"}", contentLeft, y, cellPaint)
             y += 14f
             c.drawText("First seen $firstSeen", contentLeft, y, cellPaint)
             y += 14f
             c.drawText("Last seen  $lastSeen", contentLeft, y, cellPaint)
             y += 16f
-            // Thumbnail strip (single bounded row), each captioned with its
-            // sighting's date/time in the report's timezone.
+            // ── pictures (capped) ──────────────────────────────────────────────
+            // A bounded thumbnail strip, clearly labeled as a sample: the full
+            // textual log below carries every sighting, so this stays small.
             if (dossierThumbs.isNotEmpty()) {
+                val stripLabel = if (dossierThumbs.size < sightings.size) {
+                    "IMAGES (first ${dossierThumbs.size} of ${sightings.size} sightings)"
+                } else {
+                    "IMAGES"
+                }
+                c.drawText(stripLabel, contentLeft, y, headerPaint)
+                y += 10f
                 val thumbTsFmt = DateTimeFormatter
                     .ofPattern("MMM d, HH:mm", Locale.US)
                     .withZone(input.zoneId)
@@ -427,10 +480,75 @@ private fun drawReport(
                 }
                 y += thumbH + 8f + 11f
             }
+
+            // ── full sighting log (text, every sighting), paginated ────────────
+            y += 6f
+            c.drawLine(contentLeft, y, contentRight, y, linePaint)
+            y += 14f
+            c.drawText("FULL SIGHTING LOG", contentLeft, y, headerPaint)
+            y += 14f
+            c.drawText(totalLabel, contentLeft, y, cellPaint)
+            y += 14f
+            c.drawText("DATE / TIME", contentLeft, y, metaLabelPaint)
+            c.drawText("CAMERA", contentLeft + LOG_TIME_COL_W, y, metaLabelPaint)
+            y += LOG_ROW_H
+            val rowsStartY1 = y
+
+            // Column headers repeat on each continuation page under a running
+            // title; keep this in sync with startLogContinuationPage below.
+            val laterRowsStartY = (MARGIN + 6f) + 14f + 14f + LOG_ROW_H
+            val firstCap = ((pageBottom - rowsStartY1) / LOG_ROW_H).toInt()
+            val laterCap = ((pageBottom - laterRowsStartY) / LOG_ROW_H).toInt()
+            val perPage = paginateSightingRows(sightings.size, firstCap, laterCap)
+            val totalPages = perPage.size
+
+            val plateTitle = read.plate.ifBlank { "plate" }
+            fun startLogContinuationPage(pageNum: Int): Pair<PdfDocument.Page, Canvas> {
+                val pInfo = PdfDocument.PageInfo.Builder(PAGE_W, PAGE_H, pageNum).create()
+                val pg = doc.startPage(pInfo)
+                val cc = pg.canvas
+                var yy = MARGIN + 6f
+                cc.drawText("License plate report: $plateTitle (sighting log continued)", contentLeft, yy, contTitlePaint)
+                yy += 14f
+                cc.drawLine(contentLeft, yy, contentRight, yy, linePaint)
+                yy += 14f
+                cc.drawText("DATE / TIME", contentLeft, yy, metaLabelPaint)
+                cc.drawText("CAMERA", contentLeft + LOG_TIME_COL_W, yy, metaLabelPaint)
+                yy += LOG_ROW_H
+                return pg to cc
+            }
+
+            var idx = 0
+            // Page 1 rows.
+            repeat(perPage.first()) {
+                val s = sightings[idx]
+                drawLogRow(c, fmtTs(s.ts, tsFmt), sightingCameraLabel(s.cameraId, input.cameraNames), y)
+                y += LOG_ROW_H
+                idx++
+            }
+            drawFooter(c, 1, totalPages)
+            doc.finishPage(page)
+            // Continuation pages.
+            for (p in 1 until perPage.size) {
+                val (pg, cc) = startLogContinuationPage(p + 1)
+                var yy = laterRowsStartY
+                repeat(perPage[p]) {
+                    val s = sightings[idx]
+                    drawLogRow(cc, fmtTs(s.ts, tsFmt), sightingCameraLabel(s.cameraId, input.cameraNames), yy)
+                    yy += LOG_ROW_H
+                    idx++
+                }
+                drawFooter(cc, p + 1, totalPages)
+                doc.finishPage(pg)
+            }
+            pagesFinished = true
         }
     }
 
-    doc.finishPage(page)
+    if (!pagesFinished) {
+        drawFooter(c, 1, 1)
+        doc.finishPage(page)
+    }
 }
 
 /** Draw [bmp] fit (aspect-preserved, centered) inside the box, on a placeholder
@@ -464,6 +582,74 @@ private fun fmtTs(iso: String, fmt: DateTimeFormatter): String =
 
 private fun confidenceLabel(confidence: Float?): String =
     if (confidence == null) "—" else "${(confidence * 100).roundToInt()}%"
+
+// ─── full sighting-log helpers (pure, unit-tested) ────────────────────────────
+
+/**
+ * Order [reads] newest-first for the log, tolerant of an unparseable timestamp
+ * (those sort to the end rather than throwing). Stable for equal instants.
+ */
+internal fun sightingsNewestFirst(reads: List<PlateRead>): List<PlateRead> =
+    reads.sortedByDescending {
+        runCatching { Instant.parse(it.ts).toEpochMilli() }.getOrDefault(Long.MIN_VALUE)
+    }
+
+/**
+ * Header line for the sighting log. [shown] is how many rows the report actually
+ * holds (the dossier list, capped at the fetch limit); [total] is the server's
+ * true match count. When the fetch cap hides some, we say so honestly rather than
+ * implying the list is complete.
+ */
+internal fun sightingLogSummary(shown: Int, total: Int): String {
+    val count = if (total > shown) total else shown
+    val base = "$count sighting${if (count == 1) "" else "s"}"
+    return if (total > shown && shown > 0) {
+        "$base (showing the $shown most recent)"
+    } else {
+        base
+    }
+}
+
+/** Camera label for a log row: the display name when known, else the raw id. */
+internal fun sightingCameraLabel(cameraId: String, cameraNames: Map<String, String>): String =
+    cameraNames[cameraId]?.takeIf { it.isNotBlank() } ?: cameraId
+
+/**
+ * Split [rowCount] log rows across pages: [firstPageCapacity] rows fit below the
+ * report body on page 1, [laterPageCapacity] on each continuation page. Returns
+ * the row count per page in order (empty when there are no rows). Capacities are
+ * clamped to at least 1 so a pathologically short page still makes progress (one
+ * row per page) instead of looping forever.
+ */
+internal fun paginateSightingRows(
+    rowCount: Int,
+    firstPageCapacity: Int,
+    laterPageCapacity: Int,
+): List<Int> {
+    if (rowCount <= 0) return emptyList()
+    val first = firstPageCapacity.coerceAtLeast(1)
+    val later = laterPageCapacity.coerceAtLeast(1)
+    val pages = ArrayList<Int>()
+    var remaining = rowCount
+    val onFirst = minOf(remaining, first)
+    pages.add(onFirst)
+    remaining -= onFirst
+    while (remaining > 0) {
+        val n = minOf(remaining, later)
+        pages.add(n)
+        remaining -= n
+    }
+    return pages
+}
+
+/** Truncate [text] with an ellipsis so it fits within [maxWidth] under [paint]. */
+private fun ellipsizeToWidth(text: String, paint: Paint, maxWidth: Float): String {
+    if (maxWidth <= 0f) return ""
+    if (paint.measureText(text) <= maxWidth) return text
+    var end = text.length
+    while (end > 0 && paint.measureText(text.substring(0, end) + "…") > maxWidth) end--
+    return if (end <= 0) "…" else text.substring(0, end) + "…"
+}
 
 // ─── watchlist / BOLO match (mirrors the server's fuzzy matcher) ──────────────
 

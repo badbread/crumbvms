@@ -1860,7 +1860,7 @@ private fun PlateReportDialog(
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Text(
-                            "Include a dossier of every sighting of this plate.",
+                            "List every sighting (date/time and camera). Pictures stay capped.",
                             color = TextSecondary,
                             style = MaterialTheme.typography.labelSmall,
                         )
