@@ -6962,38 +6962,74 @@ pub async fn motion_intensity_buckets(
     // (its duration is <= MAX_SEGMENT_LEN), so this drops zero rows and makes the
     // scan O(window).
     let lower_bound = start - MAX_SEGMENT_LEN;
+    // SQL-side bucketing (perf, issue tracked in PR): the database aggregates the
+    // window down to at most `n` rows instead of shipping every overlapping segment
+    // to Rust and looping row-by-row (a 30-day window scanned ~300k segments —
+    // minutes of latency). `span_ms` and `n` are passed as bound parameters so the
+    // bucket math is BIT-IDENTICAL to the former Rust loop (asserted by
+    // `motion_intensity_sql_matches_reference`): each segment's in-window overlap
+    // `[s_off, e_off)` (integer-millisecond offsets, matching
+    // `chrono::Duration::num_milliseconds`) maps to the half-open bucket range
+    // `[b0, b1)`, `generate_series` expands that range, and the MAX `motion_score`
+    // per bucket is taken in Postgres. Buckets the sparse result omits stay 0.0 from
+    // the vec initializer above.
+    // `n` is bound TWICE, once per SQL type: `$6` as double precision for the
+    // bucket-index math `(offset/span)*n`, `$7` as int for the LEAST clamp and
+    // generate_series bound. A single placeholder can't serve both — Postgres
+    // infers one type per `$n` from its casts (here `$6::double precision` would
+    // win), and binding an i32 to a float8-inferred param fails at serialization
+    // ("cannot convert between the Rust type i32 and the Postgres type float8").
+    let n_f64 = n as f64;
+    let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
     let client = get_conn(pool).await?;
     let rows = client
         .query(
             r"
-            SELECT start_ts, end_ts, COALESCE(motion_score, 0.0) AS motion_score
-            FROM segments
-            WHERE camera_id = $1
-              AND start_ts >= $4
-              AND start_ts < $3
-              AND end_ts   > $2
+            WITH seg AS (
+                SELECT
+                    GREATEST(
+                        0::double precision,
+                        floor(round(extract(epoch FROM (start_ts - $2::timestamptz)) * 1000000) / 1000.0)
+                    ) AS s_off,
+                    LEAST(
+                        $5::double precision,
+                        floor(round(extract(epoch FROM (end_ts - $2::timestamptz)) * 1000000) / 1000.0)
+                    ) AS e_off,
+                    COALESCE(motion_score, 0.0)::real AS score
+                FROM segments
+                WHERE camera_id = $1
+                  AND start_ts >= $4
+                  AND start_ts <  $3
+                  AND end_ts   >  $2
+            ),
+            ranged AS (
+                SELECT
+                    floor((s_off / $5::double precision) * $6::double precision)::int AS b0,
+                    LEAST(
+                        $7::int,
+                        ceil((e_off / $5::double precision) * $6::double precision)::int
+                    ) AS b1,
+                    score
+                FROM seg
+                WHERE e_off > s_off
+            )
+            SELECT bucket::int AS bucket, MAX(score)::real AS score
+            FROM ranged, LATERAL generate_series(b0, b1 - 1) AS bucket
+            GROUP BY bucket
             ",
-            &[&camera_id, &start, &end, &lower_bound],
+            &[&camera_id, &start, &end, &lower_bound, &span_ms, &n_f64, &n_i32],
         )
         .await
         .context("motion_intensity_buckets")?;
 
     for row in &rows {
-        let s: DateTime<Utc> = row.get("start_ts");
-        let e: DateTime<Utc> = row.get("end_ts");
-        let score: f32 = row.get("motion_score");
-        // Map the segment's overlap with [start,end) onto bucket indices.
-        let s_off = ((s - start).num_milliseconds() as f64).max(0.0);
-        let e_off = ((e - start).num_milliseconds() as f64).min(span_ms);
-        if e_off <= s_off {
-            continue;
-        }
-        let b0 = ((s_off / span_ms) * n as f64).floor() as usize;
-        let b1 = (((e_off / span_ms) * n as f64).ceil() as usize).min(n);
-        for bucket in &mut buckets[b0..b1] {
-            if score > *bucket {
-                *bucket = score;
-            }
+        let bucket: i32 = row.get("bucket");
+        let score: f32 = row.get("score");
+        if let Some(slot) = usize::try_from(bucket)
+            .ok()
+            .and_then(|b| buckets.get_mut(b))
+        {
+            *slot = score;
         }
     }
     Ok(buckets)
@@ -7032,18 +7068,55 @@ pub async fn motion_intensity_buckets_multi(
     // Same sargable lower bound as the single-camera query (audit P2 #11) —
     // O(window) not O(retention). See `motion_intensity_buckets`.
     let lower_bound = start - MAX_SEGMENT_LEN;
+    // SQL-side bucketing, grouped by (camera_id, bucket) in ONE query — identical
+    // math to `motion_intensity_buckets`, just fanned across the requested cameras.
+    // The database returns at most `cameras * n` rows instead of every overlapping
+    // segment on the wall. See `motion_intensity_buckets` for the parameter-binding
+    // rationale that keeps the bucket math bit-identical to the reference loop.
+    // See `motion_intensity_buckets`: `n` is bound as both double precision
+    // ($6, for the bucket-index math) and int ($7, for the LEAST clamp) so
+    // neither cast forces a type mismatch on the other's binding.
+    let n_f64 = n as f64;
+    let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
     let client = get_conn(pool).await?;
     let rows = client
         .query(
             r"
-            SELECT camera_id, start_ts, end_ts, COALESCE(motion_score, 0.0) AS motion_score
-            FROM segments
-            WHERE camera_id = ANY($1)
-              AND start_ts >= $4
-              AND start_ts < $3
-              AND end_ts   > $2
+            WITH seg AS (
+                SELECT
+                    camera_id,
+                    GREATEST(
+                        0::double precision,
+                        floor(round(extract(epoch FROM (start_ts - $2::timestamptz)) * 1000000) / 1000.0)
+                    ) AS s_off,
+                    LEAST(
+                        $5::double precision,
+                        floor(round(extract(epoch FROM (end_ts - $2::timestamptz)) * 1000000) / 1000.0)
+                    ) AS e_off,
+                    COALESCE(motion_score, 0.0)::real AS score
+                FROM segments
+                WHERE camera_id = ANY($1)
+                  AND start_ts >= $4
+                  AND start_ts <  $3
+                  AND end_ts   >  $2
+            ),
+            ranged AS (
+                SELECT
+                    camera_id,
+                    floor((s_off / $5::double precision) * $6::double precision)::int AS b0,
+                    LEAST(
+                        $7::int,
+                        ceil((e_off / $5::double precision) * $6::double precision)::int
+                    ) AS b1,
+                    score
+                FROM seg
+                WHERE e_off > s_off
+            )
+            SELECT camera_id, bucket::int AS bucket, MAX(score)::real AS score
+            FROM ranged, LATERAL generate_series(b0, b1 - 1) AS bucket
+            GROUP BY camera_id, bucket
             ",
-            &[&camera_ids, &start, &end, &lower_bound],
+            &[&camera_ids, &start, &end, &lower_bound, &span_ms, &n_f64, &n_i32],
         )
         .await
         .context("motion_intensity_buckets_multi")?;
@@ -7053,22 +7126,13 @@ pub async fn motion_intensity_buckets_multi(
         let Some(buckets) = out.get_mut(&cam) else {
             continue;
         };
-        let s: DateTime<Utc> = row.get("start_ts");
-        let e: DateTime<Utc> = row.get("end_ts");
-        let score: f32 = row.get("motion_score");
-        // Identical bucketing to `motion_intensity_buckets`: map the segment's
-        // overlap with [start,end) onto bucket indices and keep the MAX score.
-        let s_off = ((s - start).num_milliseconds() as f64).max(0.0);
-        let e_off = ((e - start).num_milliseconds() as f64).min(span_ms);
-        if e_off <= s_off {
-            continue;
-        }
-        let b0 = ((s_off / span_ms) * n as f64).floor() as usize;
-        let b1 = (((e_off / span_ms) * n as f64).ceil() as usize).min(n);
-        for bucket in &mut buckets[b0..b1] {
-            if score > *bucket {
-                *bucket = score;
-            }
+        let bucket: i32 = row.get("bucket");
+        let score: f32 = row.get("score");
+        if let Some(slot) = usize::try_from(bucket)
+            .ok()
+            .and_then(|b| buckets.get_mut(b))
+        {
+            *slot = score;
         }
     }
     Ok(out)
@@ -13726,15 +13790,44 @@ mod tests {
     // `camera_id`, so a unique camera is complete isolation from any other
     // rows in the shared throwaway DB — no private schema, no teardown needed.
 
-    /// Build a size-8 pool at the raw (public-schema) URL and run migrations.
-    /// The pool needs headroom because `run_migrations` holds an advisory-lock
-    /// connection AND a work connection concurrently (a max_size of 2 would
-    /// deadlock itself).
+    /// Guards the one-time `run_migrations` call for this whole test binary.
+    ///
+    /// Every DB test here shares the `public` schema (data isolation is per-test
+    /// via freshly generated `camera_id`/policy/storage names — see the
+    /// isolation note above — not per-schema), so migrations only need to run
+    /// ONCE against the shared throwaway DB. The earlier version re-ran
+    /// `run_migrations` from EVERY test: under `cargo test`'s default
+    /// parallelism, N tests then piled up on the `run_migrations` advisory lock,
+    /// each holding a blocked connection while it waited its turn, which — as
+    /// the DB-test count grew — exhausted a stock Postgres (`max_connections =
+    /// 100`) and surfaced as `Connection reset by peer` / lock-timeout errors.
+    /// A `tokio::sync::Mutex`-guarded flag (held for the whole check-and-run,
+    /// exactly like `MIGRATE_ONCE` in `services/api/tests/support/mod.rs`) makes
+    /// only the FIRST caller migrate; everyone else skips straight to querying.
+    static MIGRATE_ONCE: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+
+    /// Build this test's OWN public-schema pool, ensuring the shared DB has been
+    /// migrated (once, binary-wide) first.
+    ///
+    /// The pool is deliberately per-test, NOT shared: each `#[tokio::test]` runs
+    /// on its own runtime, and deadpool spawns every connection's background
+    /// driver task on the runtime that first created it. A pool shared across
+    /// tests would hand a still-running test a connection whose driver died when
+    /// an earlier test's runtime was dropped — an intermittent
+    /// `Error { kind: Closed }`. A private pool keeps every connection's driver
+    /// on the runtime that will actually use it. Small size so N concurrent
+    /// tests stay well under `max_connections`; 8 leaves `run_migrations` (the
+    /// first caller only) the headroom it needs (advisory-lock connection PLUS a
+    /// work connection at once — a max_size of 2 would deadlock itself).
     async fn migrated_public_pool(url: &str) -> Pool {
         let pool = build_pool(url, 8).expect("build_pool (public)");
-        run_migrations(&pool)
-            .await
-            .expect("run_migrations (public schema)");
+        let mut done = MIGRATE_ONCE.lock().await;
+        if !*done {
+            run_migrations(&pool)
+                .await
+                .expect("run_migrations (public schema)");
+            *done = true;
+        }
         pool
     }
 
@@ -14360,6 +14453,189 @@ mod tests {
             batch.get(&cam_empty).map(Vec::len),
             Some(n),
             "no-footage camera must still return an n-length array"
+        );
+    }
+
+    /// Reference ORACLE: the pre-SQL-bucketing algorithm (old query WHERE clause +
+    /// the old Rust row-by-row loop), computed in-memory from the raw fixture. The
+    /// SQL-side bucketing must reproduce this EXACTLY. Kept here (not in the shipping
+    /// path) purely as the equivalence yardstick for
+    /// `motion_intensity_sql_matches_reference`.
+    fn reference_intensity_buckets(
+        segs: &[(DateTime<Utc>, DateTime<Utc>, f32)],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        n: usize,
+    ) -> Vec<f32> {
+        let n = n.clamp(1, 4096);
+        let mut buckets = vec![0.0_f32; n];
+        if end <= start {
+            return buckets;
+        }
+        let span_ms = (end - start).num_milliseconds().max(1) as f64;
+        let lower_bound = start - MAX_SEGMENT_LEN;
+        for (s, e, score) in segs {
+            // Same predicate the SQL applies (sargable lower bound + overlap).
+            if !(*s >= lower_bound && *s < end && *e > start) {
+                continue;
+            }
+            let s_off = ((*s - start).num_milliseconds() as f64).max(0.0);
+            let e_off = ((*e - start).num_milliseconds() as f64).min(span_ms);
+            if e_off <= s_off {
+                continue;
+            }
+            let b0 = ((s_off / span_ms) * n as f64).floor() as usize;
+            let b1 = (((e_off / span_ms) * n as f64).ceil() as usize).min(n);
+            for bucket in &mut buckets[b0..b1] {
+                if *score > *bucket {
+                    *bucket = *score;
+                }
+            }
+        }
+        buckets
+    }
+
+    /// Equivalence proof for the SQL-side bucketing (perf rewrite): for a fixture
+    /// that deliberately hits every edge — empty buckets, a segment starting exactly
+    /// on a bucket boundary, a segment ending exactly at the window end (end-exclusive
+    /// last bucket), several segments sharing one bucket (MAX wins), a segment that
+    /// starts before the window and overlaps in, and segments spanning MANY buckets —
+    /// the DB output must equal the in-memory reference oracle for a spread of bucket
+    /// counts (including counts that make buckets sub-second, which stresses the
+    /// range-expansion and float rounding). Off-by-one on a bucket edge is the classic
+    /// bug here, so the boundary segments are checked both via the oracle and with
+    /// explicit hand-computed asserts. The multi-camera path is checked against the
+    /// same oracle per camera to prove the `(camera_id, bucket)` grouping.
+    #[tokio::test]
+    async fn motion_intensity_sql_matches_reference() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        let policy_id = insert_nondefault_policy(&pool).await;
+        let cam_a = seed_camera_for_test(&pool, policy_id).await;
+        let cam_b = seed_camera_for_test(&pool, policy_id).await;
+        let cam_empty = seed_camera_for_test(&pool, policy_id).await; // no segments
+        let storage_name = format!("test-storage-{}", Uuid::new_v4().simple());
+        let storage_id = create_storage(&pool, &storage_name, "/does/not/matter", None, None)
+            .await
+            .expect("create_storage")
+            .id;
+
+        // Window [base, base+100s). Millisecond-exact base so integer-ms offsets are
+        // unambiguous.
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let sec = |n: i64| base + chrono::Duration::seconds(n);
+        let ms = |n: i64| base + chrono::Duration::milliseconds(n);
+        let (start, end) = (sec(0), sec(100));
+
+        // cam_a fixture — each tuple is (start, end, motion_score).
+        let a: Vec<(DateTime<Utc>, DateTime<Utc>, f32)> = vec![
+            // starts 5s BEFORE the window, overlaps in (within MAX_SEGMENT_LEN=12s).
+            (sec(-5), sec(5), 0.8),
+            // exactly on a 1s-bucket boundary at 10s..20s.
+            (sec(10), sec(20), 0.4),
+            // two segments overlapping within the 30s..31s region — MAX (0.6)
+            // must win. Their start_ts must DIFFER: the real schema's
+            // segments_uniq_cam_stream_start unique index forbids two rows with
+            // the same (camera_id, stream, start_ts), so a shared start (e.g.
+            // sec(30) == ms(30_000)) can never coexist and would fail the insert.
+            (sec(30), sec(31), 0.2),
+            (ms(30_200), ms(30_500), 0.6),
+            // ends EXACTLY at the window end → last bucket, end-exclusive.
+            (sec(99), sec(100), 0.9),
+            // a sub-second segment that lands inside a single 1s bucket.
+            (ms(50_100), ms(50_400), 0.3),
+            // an hour before the window — the lower bound must exclude it entirely.
+            (sec(-3600), sec(-3595), 1.0),
+        ];
+        for (s, e, score) in &a {
+            insert_scored_segment(&pool, cam_a, storage_id, *s, *e, *score).await;
+        }
+
+        // cam_b fixture — a single wide segment that spans many buckets.
+        let b: Vec<(DateTime<Utc>, DateTime<Utc>, f32)> =
+            vec![(sec(20), sec(80), 0.7), (sec(80), sec(90), 0.5)];
+        for (s, e, score) in &b {
+            insert_scored_segment(&pool, cam_b, storage_id, *s, *e, *score).await;
+        }
+
+        // Compare across bucket counts: 1 (whole window), 100 (1s each — the boundary
+        // cases line up on integers), 240 (default), 7 (odd count → fractional bucket
+        // widths, stresses rounding), 4096 (max → many sub-bucket segments).
+        for &n in &[1usize, 7, 100, 240, 4096] {
+            let sql_a = motion_intensity_buckets(&pool, cam_a, start, end, n)
+                .await
+                .expect("motion_intensity_buckets cam_a");
+            assert_eq!(
+                sql_a,
+                reference_intensity_buckets(&a, start, end, n),
+                "single-camera SQL bucketing must equal the reference oracle (n={n})"
+            );
+
+            let sql_b = motion_intensity_buckets(&pool, cam_b, start, end, n)
+                .await
+                .expect("motion_intensity_buckets cam_b");
+            assert_eq!(
+                sql_b,
+                reference_intensity_buckets(&b, start, end, n),
+                "single-camera SQL bucketing must equal the reference oracle for the wide segment (n={n})"
+            );
+
+            // Multi-camera path: every camera must equal its own oracle, proving the
+            // (camera_id, bucket) grouping keeps cameras separate.
+            let batch =
+                motion_intensity_buckets_multi(&pool, &[cam_a, cam_b, cam_empty], start, end, n)
+                    .await
+                    .expect("motion_intensity_buckets_multi");
+            assert_eq!(
+                batch.get(&cam_a).cloned().unwrap_or_default(),
+                reference_intensity_buckets(&a, start, end, n),
+                "batched cam_a must equal the oracle (n={n})"
+            );
+            assert_eq!(
+                batch.get(&cam_b).cloned().unwrap_or_default(),
+                reference_intensity_buckets(&b, start, end, n),
+                "batched cam_b must equal the oracle (n={n})"
+            );
+            assert_eq!(
+                batch.get(&cam_empty).cloned().unwrap_or_default(),
+                vec![0.0_f32; n.clamp(1, 4096)],
+                "batched no-footage camera must be all zeros (n={n})"
+            );
+        }
+
+        // Explicit hand-computed spot checks at n=100 (1s buckets) to pin the edges
+        // independently of the oracle:
+        let g = motion_intensity_buckets(&pool, cam_a, start, end, 100)
+            .await
+            .expect("motion_intensity_buckets cam_a n=100");
+        assert!(
+            (g[0] - 0.8).abs() < 1e-6,
+            "before-window overlap lands in bucket 0"
+        );
+        assert!((g[4] - 0.8).abs() < 1e-6, "…and spans through bucket 4");
+        assert_eq!(g[5], 0.0, "gap after the first segment is empty");
+        assert!(
+            (g[10] - 0.4).abs() < 1e-6,
+            "boundary segment starts exactly at bucket 10"
+        );
+        assert!(
+            (g[19] - 0.4).abs() < 1e-6,
+            "…and ends end-exclusive at bucket 20 (last filled is 19)"
+        );
+        assert_eq!(g[20], 0.0, "bucket 20 is past the end-exclusive boundary");
+        assert!(
+            (g[30] - 0.6).abs() < 1e-6,
+            "overlapping segments in bucket 30 → MAX (0.6) wins"
+        );
+        assert!(
+            (g[99] - 0.9).abs() < 1e-6,
+            "segment ending exactly at window end fills the LAST bucket (99)"
         );
     }
 
