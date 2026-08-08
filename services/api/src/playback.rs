@@ -765,9 +765,11 @@ async fn live_streams(
     // The client-facing REPAIRED MAIN `<name>_mainv` — a full-res H.265->H.264
     // transcode the reconcile loop registers ONLY when the operator has enabled
     // the repair (`MAIN_REPAIR_TRANSCODE_ENABLED`) AND this camera's main was
-    // detected publishing video with no `a=fmtp` (`state.mainv_needed`, set from
-    // the producer SDP in `go2rtc::reconcile`). Unlike `_subv` this has to be a
-    // re-encode: a copy-remux fixes the fmtp but go2rtc then emits an RTP
+    // detected serving video with no `a=fmtp` (`state.mainv_needed`, set from the
+    // SDP go2rtc SERVES — not the producer SDP — in `go2rtc::reconcile`, because a
+    // main can have an incomplete producer fmtp that go2rtc then drops for
+    // consumers; see `go2rtc::stream_served_video_lacks_fmtp`). Unlike `_subv` this
+    // has to be a re-encode: a copy-remux fixes the fmtp but go2rtc then emits an RTP
     // Aggregation Packet for the H.265 parameter sets that Media3 cannot
     // depacketize, so only a transcode gives a main Android can actually play. It
     // is the HD rung the Android client tries right after the raw main; every

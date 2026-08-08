@@ -112,6 +112,24 @@ supports).
 - The server growing per-stream codec metadata (already a trigger on the ladder
   entry) ⇒ the client could pick `mainv` proactively instead of after a failure.
 
+**Correction (2026-08-08, later — on prod, live LPR).** The detection in the
+Decision above (reuse `sdp_video_lacks_fmtp` on the MAIN **producer** SDP) is
+WRONG for this camera and the repair never fired. Directly querying the running
+go2rtc showed the LPR main's **producer** SDP DOES carry an `a=fmtp:108` — but
+only `sprop-sps` + `sprop-pps`, **no `sprop-vps`**. go2rtc, unable to assemble a
+complete HEVC parameter set, then serves consumers an SDP with **no `a=fmtp` at
+all** (confirmed: the RTSP consumer SDP is `a=rtpmap:96 H265/90000` with no
+fmtp). So the producer verdict is `Some(false)` ("has fmtp") while the SERVED
+SDP is what actually breaks Media3. The three other H.265 mains
+(`frontyard`/`driveway`/`garage`) serve a complete `a=fmtp` *with* `sprop-vps`,
+which is why they play. Earlier notes calling the raw main "no `a=fmtp`" were
+reading the served side; the producer side is the incomplete-fmtp case. **Fix:**
+detection now reads the SDP go2rtc SERVES to RTSP consumers
+(`stream_served_video_lacks_fmtp` → `StreamIndex::video_lacks_fmtp_served`), used
+for `_mainv` only; `_subv` keeps the producer side (a sub is often un-consumed
+and so has no served SDP). The main is always consumed by the recorder, so its
+served SDP is reliably present. The transcode decision itself is unchanged.
+
 ---
 
 ## 2026-08-08, Boot storage seeding is PATH-idempotent (skip a name whose directory is already covered) + runtime name lookups fall back to path — supersedes #557's "detect, never fix"
