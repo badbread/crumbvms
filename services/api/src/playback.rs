@@ -762,6 +762,24 @@ async fn live_streams(
         &crumb_rtsp_authed,
     );
 
+    // The client-facing REPAIRED MAIN `<name>_mainv` — a full-res H.265->H.264
+    // transcode the reconcile loop registers ONLY when the operator has enabled
+    // the repair (`MAIN_REPAIR_TRANSCODE_ENABLED`) AND this camera's main was
+    // detected publishing video with no `a=fmtp` (`state.mainv_needed`, set from
+    // the producer SDP in `go2rtc::reconcile`). Unlike `_subv` this has to be a
+    // re-encode: a copy-remux fixes the fmtp but go2rtc then emits an RTP
+    // Aggregation Packet for the H.265 parameter sets that Media3 cannot
+    // depacketize, so only a transcode gives a main Android can actually play. It
+    // is the HD rung the Android client tries right after the raw main; every
+    // other client and every camera whose main is fine (or whose operator left the
+    // repair off) advertises `None` and is unaffected. Same lazy-spawn economics as
+    // `_subv`/`_mobile`: go2rtc runs the ffmpeg only while a consumer is attached.
+    let repaired_main_url = mainv_url(
+        crumb_managed && state.mainv_needed(&cam.go2rtc_name),
+        &cam.go2rtc_name,
+        &crumb_rtsp_authed,
+    );
+
     // WebRTC signaling now goes through the AUTHENTICATED API proxy
     // (`POST /live/{camera_id}/webrtc?stream=main|sub`), NOT directly at
     // go2rtc's REST API — go2rtc's :1984 has no LAN host-publish (see
@@ -802,6 +820,7 @@ async fn live_streams(
         webrtc_main_url,
         webrtc_sub_url,
         rtsp_main_url,
+        rtsp_mainv_url: repaired_main_url,
         rtsp_sub_url,
         rtsp_subv_url: video_only_sub_url,
         rtsp_mobile_url,
@@ -850,6 +869,27 @@ fn subv_url(
             "{}/{}",
             crumb_rtsp_authed.trim_end_matches('/'),
             crate::go2rtc::subv_name(go2rtc_name)
+        )
+    })
+}
+
+/// Build the client-facing REPAIRED MAIN URL (`<name>_mainv`), or `None` when the
+/// repair is not registered for this camera.
+///
+/// `registered` is the caller's answer to "does this `_mainv` stream actually
+/// exist in go2rtc right now" — reconcile manages the camera, the operator has
+/// enabled `MAIN_REPAIR_TRANSCODE_ENABLED`, AND reconcile has positively flagged
+/// the main as missing fmtp. Every camera has a main, so (unlike [`subv_url`])
+/// there is no has-sub gate; the `registered` flag carries the whole decision.
+///
+/// See the `rtsp_mainv_url` block in [`live_streams`] for why the repair has to be
+/// a transcode rather than the cheaper `_subv`-style copy. Pure + unit-tested.
+fn mainv_url(registered: bool, go2rtc_name: &str, crumb_rtsp_authed: &str) -> Option<String> {
+    registered.then(|| {
+        format!(
+            "{}/{}",
+            crumb_rtsp_authed.trim_end_matches('/'),
+            crate::go2rtc::mainv_name(go2rtc_name)
         )
     })
 }
@@ -1187,6 +1227,50 @@ mod tests {
         ] {
             assert_eq!(
                 subv_url(managed && needed, Some("famroom_sub"), "famroom", BASE).as_deref(),
+                want,
+                "managed={managed} needed={needed}",
+            );
+        }
+    }
+
+    // ── repaired main (`_mainv`) selection (LPR H.265 / missing-fmtp) ─────────
+
+    /// `rtsp_mainv_url` is present ONLY for a camera reconcile has flagged and
+    /// registered a `_mainv` for. `registered` folds together Crumb-managed, the
+    /// operator's opt-in, and "detected as missing fmtp"; the handler passes
+    /// `crumb_managed && state.mainv_needed(name)`. Unlike `_subv` there is no
+    /// has-sub gate — every camera has a main.
+    #[test]
+    fn rtsp_mainv_url_present_only_when_registered() {
+        assert_eq!(
+            mainv_url(true, "lpr", BASE).as_deref(),
+            Some("rtsp://u:p@host:18554/lpr_mainv"),
+        );
+        // A trailing slash on the base must not double up.
+        assert_eq!(
+            mainv_url(true, "lpr", "rtsp://u:p@host:18554/").as_deref(),
+            Some("rtsp://u:p@host:18554/lpr_mainv"),
+        );
+        // Clean URL: no go2rtc query string, same reason as `_subv`.
+        assert!(!mainv_url(true, "lpr", BASE).unwrap().contains('?'));
+        // Not registered ⇒ absent, so the client keeps its normal ladder.
+        assert_eq!(mainv_url(false, "lpr", BASE), None);
+    }
+
+    /// The gate the handler actually computes: `crumb_managed && mainv_needed`
+    /// (the latter already implies the operator's `MAIN_REPAIR_TRANSCODE_ENABLED`,
+    /// since reconcile only sets the flag when the feature is on). A healthy or
+    /// unmanaged camera advertises no `_mainv` and its ladder is unchanged.
+    #[test]
+    fn rtsp_mainv_url_is_gated_on_managed_and_needed() {
+        for (managed, needed, want) in [
+            (true, true, Some("rtsp://u:p@host:18554/lpr_mainv")),
+            (true, false, None),
+            (false, true, None),
+            (false, false, None),
+        ] {
+            assert_eq!(
+                mainv_url(managed && needed, "lpr", BASE).as_deref(),
                 want,
                 "managed={managed} needed={needed}",
             );

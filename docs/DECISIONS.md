@@ -8,6 +8,112 @@ revisit.
 
 ---
 
+## 2026-08-08, A main whose SDP lacks `fmtp` is repaired for Android by an OPT-IN H.265->H.264 transcode (`_mainv`), not the `_subv`-style copy — because a copy-remux reintroduces an AP Media3 can't read
+
+**Context.** Some cameras (verified: a Uniview H.265 LPR main) publish their main
+over RTSP with an SDP whose video track carries no `a=fmtp` / no
+`sprop-parameter-sets` — the parameter sets ship only in-band. Android's Media3
+RTSP client requires `fmtp` and rejects the DESCRIBE outright with
+`IllegalArgumentException: missing attribute fmtp`, so the main never brings up a
+frame. `CrumbLiveFallback` logging (#561) captured exactly this on the LPR main:
+`errorCode=2000/retryable ... detail="... IllegalArgumentException: missing
+attribute fmtp <- RtspPlaybackException: missing attribute fmtp"`. Recording,
+motion, desktop (libmpv) and web are all unaffected — ffmpeg recovers the in-band
+sets. This is the same failure class as the H.264 `_subv` repair (#483/#501), now
+seen on an H.265 MAIN.
+
+The obvious fix was to mirror `_subv`: register `ffmpeg:<name>#video=copy` as a
+`<name>_mainv` and hand Android that. **Empirically it does not work for H.265**,
+and the reason is the whole point of this entry.
+
+**Empirical finding (2026-08-08, against the real LPR stream via the recorder's
+embedded go2rtc; ffprobe + tshark RTP capture over loopback).**
+
+- The raw `lpr` main SDP has `a=rtpmap:96 H265/90000` and **no `a=fmtp`** — the
+  confirmed Media3 blocker. Its native go2rtc packetization is **AP-free** (399 FU
+  fragments + single-NAL parameter sets, zero aggregation packets), i.e. it would
+  be Media3-playable *if only it had fmtp*.
+- A known-good 4K H.265 main (`driveway`, which plays full-HD on the same phone) is
+  likewise AP-free — confirming native restreams don't aggregate.
+- A **copy-remux** (`ffmpeg:lpr#video=copy`) DOES restore `a=fmtp:96
+  sprop-vps/sps/pps=...` — but go2rtc then emits, at every keyframe, an HEVC RTP
+  **Aggregation Packet (payload type 48)** bundling VPS+SPS+PPS+SEI (measured: 2 APs
+  across 2 keyframes, alongside 1824 FU). Media3's `RtpH265Reader` has never
+  implemented AP depacketization (androidx/media#1008) and throws
+  `processAggregationPacket` on the first one — which is the keyframe it needs to
+  start. So the copy-remux only trades the `missing attribute fmtp` rejection for a
+  `processAggregationPacket` crash. The AP is introduced by the `ffmpeg:` republish
+  path, not present in the native restream.
+
+Conclusion: for H.265, an SDP-only repair is not achievable through go2rtc's
+copy-remux idiom. The only repair that yields a main Media3 can decode is a
+**re-encode to H.264** (H.264 RTP from go2rtc uses STAP-A/FU-A that Media3 fully
+supports).
+
+**Decision.**
+
+- Two independent fixes, in one change:
+  1. **Client (ships on, free):** add `missing attribute fmtp` to
+     `LiveStreamFallback`'s deterministic step-down signatures (next to
+     `processAggregationPacket`). The error is identical on every retry, so the LPR
+     main now steps down to the H.264 sub (SD) on the FIRST failure instead of
+     waiting out ~5 IO-coded retries (~30 s). Narrow by design — matched on the
+     exception-chain message, not by widening any error *code* to step down (that
+     would reintroduce #560's eager-SD).
+  2. **Server (opt-in, default OFF):** a per-camera, detection-driven repaired main
+     `<name>_mainv`, advertised as `rtsp_mainv_url` and tried by Android right after
+     the raw main (`main -> mainv -> subv -> sub -> mobile`). It is a **full-res
+     H.265->H.264 transcode**, gated behind `MAIN_REPAIR_TRANSCODE_ENABLED` because
+     it costs real recorder CPU (a libx264 encode) for as long as an Android
+     fullscreen viewer is attached (go2rtc spawns it lazily, so idle cost is zero).
+     Detection reuses `sdp_video_lacks_fmtp` on the MAIN producer (always warm — the
+     recorder consumes the main through go2rtc), sticky across an unknown verdict,
+     exactly like `_subv`.
+- The recommended fix for an operator who can reach the camera remains the free
+  one: set the camera's main to H.264 in its own UI. The transcode is for cameras
+  that can't, and the client fast-step-down means even with everything off the
+  camera is watchable in SD immediately.
+
+**Rejected:**
+
+- **Mirror `_subv` with `ffmpeg:<name>#video=copy` for the main (cheap, no CPU).**
+  This is what a reader of the `_subv` code would reach for first. Proven not to
+  work for H.265 above: the copy-remux reintroduces a parameter-set Aggregation
+  Packet Media3 can't depacketize. Kept off the table with an empirical citation so
+  the next session doesn't re-try it.
+- **Enable the transcode by default / for every fmtp-less main.** A full-res
+  libx264 encode is not free; silently turning it on would tax the recorder for a
+  minority of cameras. Opt-in + per-camera detection keeps the cost where the
+  operator chose to pay it.
+- **A hardware (NVENC/VAAPI) transcode to cut CPU.** Attractive on this host (it
+  has an iGPU + an RTX 4000) but out of scope here, and VAAPI on this deployment is
+  already fragile (render-node reorder incidents). Left as a future option below.
+- **Do nothing server-side, rely on the client fast-step-down alone.** Enough for
+  "watchable" (instant SD), but the maintainer specifically wanted an HD path that
+  isn't "nuclear"; this provides it without imposing the cost.
+
+**Trades knowingly accepted.**
+
+- With the repair off (default), an fmtp-less H.265 main is SD on Android (the
+  H.264 sub) — same as before, only now instant.
+- With it on, that camera's fullscreen Android view costs one full-res libx264
+  process on the recorder while watched.
+- `_mainv` is a TRANSCODE while `_subv` is a COPY, an intentional asymmetry the
+  code and tests call out (`mainv_src_is_a_transcode_not_a_copy`).
+
+**Revisit triggers.**
+
+- Media3 shipping HEVC RTP Aggregation-Packet support (androidx/media#1008) ⇒ the
+  cheap `#video=copy` `_mainv` would then work; switch to it and drop the transcode.
+- go2rtc gaining a way to republish a native (single-NAL/FU, AP-free) HEVC restream
+  *with* a synthesized `fmtp` ⇒ same, an SDP-only repair becomes possible.
+- Operators enabling the transcode at scale and hitting recorder CPU limits ⇒ wire
+  a hardware-encoder path (`#hardware`/NVENC) behind the same flag.
+- The server growing per-stream codec metadata (already a trigger on the ladder
+  entry) ⇒ the client could pick `mainv` proactively instead of after a failure.
+
+---
+
 ## 2026-08-08, Home Assistant entity role labels in the camera editor are mode-aware (copy only)
 
 **Context.** The per-camera HA link editor (`admin.html`, `renderHaLinks` &c.)

@@ -23,7 +23,7 @@
       "streams": {
         "main": {
           "codec": "H265",
-          "notes": "Full-range (yuvj420p), RTP aggregation-packet packetization, and a 'PPS id out of range' bitstream quirk. Benign to ffmpeg (server ingest, recording, desktop, and web are unaffected); rejected by strict RTSP HEVC readers."
+          "notes": "The RTSP SDP advertises the H265 video track with NO 'a=fmtp' (no sprop-vps/sps/pps) — the parameter sets ship only in-band. Android's Media3 RTSP client requires fmtp and rejects the DESCRIBE with 'IllegalArgumentException: missing attribute fmtp' (confirmed on-device 2026-08-08). Also full-range (yuvj420p) with a 'PPS id out of range' bitstream quirk. All benign to ffmpeg, so server ingest, recording, desktop, and web are unaffected."
         },
         "sub": {
           "codec": "H264",
@@ -44,18 +44,19 @@
         {
           "summary": "Android fullscreen HD live falls back to SD",
           "affects": ["android"],
-          "detail": "The H265 main uses RTP aggregation packets plus a 'PPS id out of range' bitstream quirk that Android's RTSP HEVC path (Media3/ExoPlayer) cannot handle, so fullscreen live silently drops to the H264 sub and shows an 'SD' badge. It is specific to this camera's stream, not to H265 in general: clean 4K H265 mains from other cameras play full HD on the same phone. Server ingest, recording, desktop, and web are all unaffected because ffmpeg tolerates the quirk. iOS is untested."
+          "detail": "The confirmed blocker is the missing 'a=fmtp' in the H265 main's SDP: Media3's RTSP client throws 'missing attribute fmtp' at DESCRIBE, before any video decodes, and the tile drops to the H264 sub with an 'SD' badge. It is specific to this camera's stream, not to H265 in general: clean 4K H265 mains from other cameras play full HD on the same phone. Note the H264 '_subv' fmtp repair (an ffmpeg copy that recovers the parameter sets) does NOT translate to this H265 main: a copy-remux restores fmtp but go2rtc then bundles the VPS/SPS/PPS/SEI into an RTP Aggregation Packet at each keyframe, which Media3's RtpH265Reader cannot depacketize (androidx/media#1008) — so the copy only trades the fmtp rejection for a 'processAggregationPacket' crash (verified by packet capture 2026-08-08). Only a full-res H265->H264 transcode ('_mainv', opt-in via MAIN_REPAIR_TRANSCODE_ENABLED) yields an HD main this device can play. Server ingest, recording, desktop, and web are all unaffected."
         }
       ],
       "recommended_settings": [
-        "For phone HD live: set the Main stream codec to H264 in the camera web UI (Setup > Video > Encoding).",
-        "Leave the Sub stream on H264 (the default).",
+        "For phone HD live: set the Main stream codec to H264 in the camera web UI (Setup > Video > Encoding). This is the cheapest fix and avoids any server transcode.",
+        "Alternatively, enable MAIN_REPAIR_TRANSCODE_ENABLED on the server for an opt-in, per-camera H265->H264 transcode of the main (costs recorder CPU while an Android viewer is fullscreen).",
+        "Leave the Sub stream on H264 (the default); Android steps down to it (SD) automatically and now does so instantly on the deterministic fmtp error.",
         "Keep the keyframe (I-frame) interval near 1 second (the default) so the stream starts quickly."
       ],
       "tested": {
         "by": "badbread",
-        "date": "2026-07-10",
-        "method": "ffprobe on the go2rtc restream plus on-device Android playback; make/model via ONVIF GetDeviceInformation"
+        "date": "2026-08-08",
+        "method": "ffprobe + RTP packet capture (tshark) on the go2rtc restream and copy-remux, on-device Android playback (Media3 1.4.1), and CrumbLiveFallback logging (#561); make/model via ONVIF GetDeviceInformation"
       },
       "references": [
         "https://github.com/androidx/media/issues/1008",

@@ -86,6 +86,16 @@ pub(crate) fn subv_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_subv")
 }
 
+/// The go2rtc stream name for a camera's CLIENT-facing REPAIRED MAIN
+/// (`<name>_mainv`). `pub(crate)` because `playback.rs` builds the client
+/// `rtsp_mainv_url` from it — the two must never drift apart.
+///
+/// Registered ONLY when `main_repair_transcode_enabled` is on AND the reconcile
+/// pass has detected the main lacks video `fmtp` (per-camera). See [`reconcile`].
+pub(crate) fn mainv_name(go2rtc_name: &str) -> String {
+    format!("{go2rtc_name}_mainv")
+}
+
 /// The go2rtc stream name for a camera's on-demand MOBILE transcode.
 fn mobile_name(go2rtc_name: &str) -> String {
     format!("{go2rtc_name}_mobile")
@@ -125,6 +135,32 @@ fn mobile_name(go2rtc_name: &str) -> String {
 /// `_subv` `PATCH`es in place exactly like `_mobile`. Pure + unit-tested.
 fn subv_src(sub_stream: &str) -> String {
     format!("ffmpeg:{sub_stream}#video=copy")
+}
+
+/// Build the go2rtc source for a camera's `<name>_mainv` — the client-facing
+/// REPAIRED MAIN the Android live client plays for a camera whose real main
+/// Media3 cannot bring up (`IllegalArgumentException: missing attribute fmtp`).
+///
+/// It reads the EXISTING `<name>` main stream by name (go2rtc's documented
+/// restream-and-transcode form), so it shares that stream's single producer and
+/// adds no extra camera session; go2rtc only spawns the ffmpeg process while a
+/// consumer is attached, so an idle `_mainv` costs nothing.
+///
+/// **This is a TRANSCODE (`#video=h264`), not a copy — and that difference is the
+/// whole point.** The obvious cheaper mirror of [`subv_src`]
+/// (`ffmpeg:<name>#video=copy`) does fix the missing `fmtp` (the copy re-extracts
+/// the H.265 parameter sets so go2rtc republishes `sprop-vps/sps/pps`), but go2rtc
+/// then bundles those parameter sets into an RTP **Aggregation Packet** at every
+/// keyframe, and Media3's `RtpH265Reader` has never implemented AP depacketization
+/// (androidx/media#1008) — so the copy-remux only trades the fmtp rejection for a
+/// `processAggregationPacket` crash. Verified on a real LPR H.265 stream
+/// (2026-08-08): the raw main and a copy-remux both stay unplayable on Media3;
+/// only re-encoding to H.264 produces a main this device can decode. No `#width`,
+/// so the transcode stays at the source resolution (this is the HD rung); `#audio=aac`
+/// keeps audio in a form an RTSP client can play, as [`mobile_src`] does.
+/// Pure + unit-tested.
+fn mainv_src(main_stream: &str) -> String {
+    format!("ffmpeg:{main_stream}#video=h264#audio=aac")
 }
 
 /// Build the go2rtc source for a camera's `<name>_mobile` transcode. It reads
@@ -706,6 +742,32 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
 
     let mobile_enabled = state.config().mobile_stream_enabled;
     let mobile_width = state.config().mobile_stream_width;
+    let main_repair_enabled = state.config().main_repair_transcode_enabled;
+
+    // Which cameras actually need the REPAIRED-MAIN `_mainv` transcode, this pass.
+    //
+    // Gated on `main_repair_transcode_enabled` (default off): the repair is a
+    // full-res re-encode with real recorder CPU cost, so it is opt-in — off means
+    // the map stays empty and nothing changes for anyone. When on, it is still
+    // per-camera and detection-driven, exactly like `_subv`: a main is flagged
+    // only when its producer SDP advertises video with no `a=fmtp` (the condition
+    // that makes Media3 throw `missing attribute fmtp`). The main producer always
+    // has a consumer (the recorder records through go2rtc), so its SDP is reliably
+    // present in the index. `resolve_needs_subv` is reused for the same
+    // sticky-across-unknown semantics.
+    let mut needs_mainv: std::collections::HashMap<&str, bool> =
+        std::collections::HashMap::with_capacity(streams.len());
+    for s in &streams {
+        let needed = main_repair_enabled
+            && resolve_needs_subv(
+                index.video_lacks_fmtp.get(&s.go2rtc_name).copied(),
+                state.mainv_needed(&s.go2rtc_name),
+            );
+        needs_mainv.insert(s.go2rtc_name.as_str(), needed);
+        state.set_mainv_needed(&s.go2rtc_name, needed);
+    }
+    // Forget cameras that no longer exist (deleted between passes).
+    state.retain_mainv_needed(&streams.iter().map(|s| s.go2rtc_name.clone()).collect());
 
     // Which cameras actually need the video-only `_subv` repair, this pass.
     //
@@ -764,6 +826,13 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
                 .unwrap_or(false)
             {
                 names.push(subv_name(&s.go2rtc_name));
+            }
+            if needs_mainv
+                .get(s.go2rtc_name.as_str())
+                .copied()
+                .unwrap_or(false)
+            {
+                names.push(mainv_name(&s.go2rtc_name));
             }
             if mobile_enabled {
                 names.push(mobile_name(&s.go2rtc_name));
@@ -847,6 +916,40 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
                 );
             } else {
                 tracing::info!(stream = %subv, "go2rtc: sub no longer needs the fmtp repair; removed");
+            }
+        }
+        // The client-facing REPAIRED MAIN (`_mainv`), a full-res H.265->H.264
+        // transcode registered ONLY when the operator opted the repair in AND this
+        // camera's main was detected publishing video with no `a=fmtp`. Kept in
+        // lockstep with `playback.rs`'s `rtsp_mainv_url` for the same reason as
+        // `_subv`: a stale `_mainv` left registered would let the client advertise
+        // a stream we no longer maintain. Deleted the moment it stops being needed
+        // (repair disabled, firmware fix, or camera swap behind the same row).
+        let mainv = mainv_name(&s.go2rtc_name);
+        if needs_mainv
+            .get(s.go2rtc_name.as_str())
+            .copied()
+            .unwrap_or(false)
+        {
+            apply_stream_logged(
+                &c,
+                api_base,
+                &mainv,
+                &mainv_src(&s.go2rtc_name),
+                existing,
+                &managed,
+                auth,
+            )
+            .await;
+        } else if existing.contains(&mainv) {
+            if let Err(e) = delete_stream(&c, api_base, &mainv, auth).await {
+                tracing::warn!(
+                    stream = %mainv,
+                    error = %crumb_common::redact::redact_url_credentials(&format!("{e:#}")),
+                    "go2rtc: dropping no-longer-needed repaired main failed (will retry)"
+                );
+            } else {
+                tracing::info!(stream = %mainv, "go2rtc: main no longer needs the fmtp repair; removed");
             }
         }
         // On-demand mobile transcode: source the SUB stream when the camera has
@@ -1039,6 +1142,9 @@ pub async fn remove(state: &AppState, go2rtc_name: &str) -> Result<()> {
     // Best-effort: drop the video-only client sub too (a no-op if the camera
     // never had a sub — go2rtc DELETE tolerates a missing name).
     let _ = delete_stream(&c, api_base, &subv_name(go2rtc_name), auth).await;
+    // Best-effort: drop the repaired-main transcode too (a no-op if it was never
+    // registered — go2rtc DELETE tolerates a missing name).
+    let _ = delete_stream(&c, api_base, &mainv_name(go2rtc_name), auth).await;
     // Best-effort: drop the mobile transcode too (a no-op if it was never
     // registered — go2rtc DELETE tolerates a missing name).
     let _ = delete_stream(&c, api_base, &mobile_name(go2rtc_name), auth).await;
@@ -1079,6 +1185,11 @@ pub async fn reconnect(state: &AppState, go2rtc_name: &str) -> Result<()> {
     // with it (its ffmpeg reader is bound to the old `_sub` object otherwise).
     if let Err(e) = delete_stream(&c, api_base, &subv_name(go2rtc_name), auth).await {
         tracing::warn!(go2rtc_name, error = %format!("{e:#}"), "reconnect: DELETE video-only sub stream failed (ignoring)");
+    }
+    // The repaired main is derived from `<name>`, so it must be re-dialled with it
+    // (its ffmpeg reader is bound to the old main object otherwise).
+    if let Err(e) = delete_stream(&c, api_base, &mainv_name(go2rtc_name), auth).await {
+        tracing::warn!(go2rtc_name, error = %format!("{e:#}"), "reconnect: DELETE repaired-main stream failed (ignoring)");
     }
     // Drop the mobile transcode too, so a source-URL change re-derives it fresh
     // (its input stream name is unchanged, but symmetry with reconcile's PUT-all
@@ -1894,6 +2005,43 @@ mod tests {
             "rtsp://127.0.0.1:8554/famroom_sub?video",
             &managed
         ));
+    }
+
+    // ── repaired main (`_mainv`) transcode (LPR H.265 / missing-fmtp) ────────
+
+    #[test]
+    fn mainv_name_and_src_shapes() {
+        assert_eq!(mainv_name("lpr"), "lpr_mainv");
+        // Sources the MAIN stream by name (shares its producer).
+        assert_eq!(mainv_src("lpr"), "ffmpeg:lpr#video=h264#audio=aac");
+    }
+
+    #[test]
+    fn mainv_src_is_a_transcode_not_a_copy() {
+        // The critical difference from `_subv`, verified empirically (2026-08-08):
+        // a copy-remux of an H.265 main fixes the fmtp but go2rtc then emits an RTP
+        // Aggregation Packet for the parameter sets that Media3 cannot depacketize,
+        // so the repaired main MUST re-encode to H.264 to be playable on Android.
+        let src = mainv_src("lpr");
+        assert!(src.contains("#video=h264"), "must re-encode to h264: {src}");
+        assert!(!src.contains("#video=copy"), "must not be a copy: {src}");
+        // Full resolution: no width cap (this is the HD rung, unlike `_mobile`).
+        assert!(
+            !src.contains("#width"),
+            "must stay at source resolution: {src}"
+        );
+    }
+
+    #[test]
+    fn mainv_src_is_never_an_rtsp_alias_collision() {
+        // Like `_subv`/`_mobile`, an `ffmpeg:` source can never trip the PATCH
+        // alias guard, so `_mainv` PATCHes in place rather than forcing PUT.
+        let managed = names(&["lpr", "lpr_sub", "lpr_mainv"]);
+        assert!(!is_patch_alias_collision(&mainv_src("lpr"), &managed));
+        assert_eq!(
+            choose_verb(true, &mainv_src("lpr"), &managed),
+            StreamVerb::Patch
+        );
     }
 
     // ── choose_verb (create-vs-patch fan-out fix) ───────────────────────────

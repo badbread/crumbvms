@@ -33,6 +33,18 @@ enum class StreamTier {
     MAIN,
 
     /**
+     * The server's repaired full-resolution main (`rtsp_mainv_url`, `<name>_mainv`):
+     * a per-camera H.265->H.264 **transcode** the server registers only for a main
+     * it has detected publishes video with no `a=fmtp`, and only when the operator
+     * has opted the repair in (it costs recorder CPU). Unlike [SUBV] this is a
+     * re-encode, not a copy: a copy-remux of an H.265 main fixes the SDP but go2rtc
+     * then bundles the parameter sets into an RTP Aggregation Packet Media3 cannot
+     * depacketize, so only a transcode yields a main this device can actually play.
+     * Full resolution, so it carries no SD badge. Normally `null`.
+     */
+    MAINV,
+
+    /**
      * The server's video-only sub restream (`rtsp_subv_url`, `<name>_subv`): the
      * raw sub run through an ffmpeg **copy** so go2rtc republishes a proper
      * `fmtp` (#483). Same codec as [SUB] — it repairs SDP, not the bitstream.
@@ -55,6 +67,7 @@ enum class StreamTier {
 /** The URL for [tier], or `null` when this camera does not expose that rung. */
 fun LiveStreamsResponse.urlForTier(tier: StreamTier): String? = when (tier) {
     StreamTier.MAIN -> rtspMainUrl
+    StreamTier.MAINV -> rtspMainvUrl
     StreamTier.SUBV -> rtspSubvUrl
     StreamTier.SUB -> rtspSubUrl
     StreamTier.MOBILE -> rtspMobileUrl
@@ -76,29 +89,32 @@ private fun LiveStreamsResponse.chainOf(vararg order: StreamTier): List<StreamTi
  * The wall is low-res by design (N tiles, N decoders), so a camera with a sub
  * starts on it and never escalates to the main's bitrate: `subv → sub → mobile`.
  * A camera with no sub at all keeps today's behaviour of playing the main, with
- * the transcode as its one fallback: `main → mobile`.
+ * the repaired main (when the server publishes one) and the transcode as its
+ * fallbacks: `main → mainv → mobile`.
  */
 fun LiveStreamsResponse.wallStreamChain(): List<StreamTier> =
     if (subStreamUrl() != null) {
         chainOf(StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE)
     } else {
-        chainOf(StreamTier.MAIN, StreamTier.MOBILE)
+        chainOf(StreamTier.MAIN, StreamTier.MAINV, StreamTier.MOBILE)
     }
 
 /**
  * Fallback ladder for **fullscreen live**.
  *
  * Off a metered link fullscreen is the one place HD is worth it, so it starts on
- * the main and walks down: `main → subv → sub → mobile`. On a metered link the
- * data-saver order applies (unchanged from before: low-res first, the transcode
- * when the camera has no sub), with the main kept as the last resort so a broken
- * sub still leaves something to watch rather than a spinner.
+ * the main and walks down: `main → mainv → subv → sub → mobile`. The repaired main
+ * (`mainv`) sits right after the raw main so a camera whose main is unplayable for
+ * a fmtp/packetization reason gets HD from the server-side repair before dropping
+ * to an SD rung. On a metered link the data-saver order applies (low-res first, the
+ * transcode when the camera has no sub), with both HD mains kept as the last
+ * resort so a broken sub still leaves something to watch rather than a spinner.
  */
 fun LiveStreamsResponse.fullscreenStreamChain(metered: Boolean): List<StreamTier> =
     if (metered) {
-        chainOf(StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAIN)
+        chainOf(StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAIN, StreamTier.MAINV)
     } else {
-        chainOf(StreamTier.MAIN, StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE)
+        chainOf(StreamTier.MAIN, StreamTier.MAINV, StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE)
     }
 
 /**
@@ -174,19 +190,32 @@ fun isCodecAgnosticError(errorCode: Int): Boolean =
  * Substrings that identify a failure Media3 will hit **every single time** on this
  * stream, from the exception chain rather than the error code.
  *
- * The one that matters today is `RtpH265Reader`'s
- * `UnsupportedOperationException("need to implement processAggregationPacket")`,
- * verified present in the pinned `media3-exoplayer-rtsp:1.4.1`. RFC 7798 §4.4.2
- * Aggregation Packets pack several SMALL NALs into one RTP packet, and Media3 has
- * never implemented that path (androidx/media#1008). It is thrown from inside the
- * loader, so it reaches the app wrapped in an `IOException` and arrives with an
- * IO error code that looks exactly like a network problem — which is precisely
- * why the code alone is not enough to classify it.
+ * Two matter today, both thrown from inside the RTSP loader, so both reach the app
+ * wrapped in an `IOException` and arrive with an IO error code that looks exactly
+ * like a network problem — which is precisely why the code alone is not enough to
+ * classify either:
+ *
+ * - `processAggregationPacket`: `RtpH265Reader`'s
+ *   `UnsupportedOperationException("need to implement processAggregationPacket")`,
+ *   verified present in the pinned `media3-exoplayer-rtsp:1.4.1`. RFC 7798 §4.4.2
+ *   Aggregation Packets pack several SMALL NALs into one RTP packet, and Media3 has
+ *   never implemented that path (androidx/media#1008).
+ * - `missing attribute fmtp`: the RTSP client rejects an SDP whose media track has
+ *   no `a=fmtp` line (an H264/H265 track with no out-of-band parameter sets), the
+ *   `IllegalArgumentException` #483 is about. Depending on where it surfaces this
+ *   can arrive as a `1004 FAILED_RUNTIME_CHECK` (already an unplayable format code)
+ *   OR — as seen on an LPR camera's H.265 MAIN over RTSP — wrapped through
+ *   `RtspPlaybackException` into a `2000` IO code, which the graduated threshold
+ *   would otherwise retry ~30 s before giving up. The SDP does not change between
+ *   attempts, so it is deterministic; the signature makes the step-down immediate
+ *   regardless of the code it happens to wear. NB the server-side `_subv`/`_mainv`
+ *   fmtp repair fixes only cameras it manages and detects — this is the client's
+ *   backstop for the rest.
  *
  * This is a *narrow* list on purpose: a signature here means "step down now, do
  * not retry", so only failures that are structurally deterministic belong in it.
  */
-private val UNPLAYABLE_FAILURE_SIGNATURES = listOf("processAggregationPacket")
+private val UNPLAYABLE_FAILURE_SIGNATURES = listOf("processAggregationPacket", "missing attribute fmtp")
 
 /**
  * True when a failure's [detail] (see [failureDetail]) names a deterministic,
@@ -369,7 +398,8 @@ fun attachLogLine(
  * fact the device is watching a server-side re-encode (#524).
  */
 fun sdBadgeLabel(tier: StreamTier?): String? = when (tier) {
-    null, StreamTier.MAIN -> null
+    // MAINV is a full-resolution repaired main — HD, so no badge, like MAIN.
+    null, StreamTier.MAIN, StreamTier.MAINV -> null
     StreamTier.SUBV, StreamTier.SUB -> "SD · tap for HD"
     StreamTier.MOBILE -> "SD transcode · tap for HD"
 }

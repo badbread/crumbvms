@@ -222,6 +222,27 @@ pub struct ApiConfig {
     /// transcode; height is derived to preserve aspect. Default: `640`.
     pub mobile_stream_width: u32,
 
+    /// `MAIN_REPAIR_TRANSCODE_ENABLED` -- register a per-camera `<name>_mainv`
+    /// go2rtc stream: a FULL-RESOLUTION H.265->H.264 transcode of the camera's
+    /// MAIN, registered ONLY for a main the reconcile loop has detected publishes
+    /// video with no `a=fmtp` (see `go2rtc::sdp_video_lacks_fmtp`). Exposed to
+    /// clients as `rtsp_mainv_url` so Android's Media3 gets a playable HD main for
+    /// cameras whose real main it cannot bring up (`IllegalArgumentException:
+    /// missing attribute fmtp`).
+    ///
+    /// **Default: `false`, and deliberately so.** Unlike `<name>_subv` (a cheap
+    /// ffmpeg *copy* that only re-extracts the SDP parameter sets), this MUST be a
+    /// re-encode: a copy-remux of an H.265 main fixes the fmtp but go2rtc then
+    /// bundles the parameter sets into an RTP Aggregation Packet Media3 cannot
+    /// depacketize (verified on a real LPR stream, 2026-08-08), so only a transcode
+    /// yields a main this device can actually play. A full-res libx264 encode costs
+    /// a real CPU slice on the recorder host for as long as a fullscreen consumer
+    /// is attached (go2rtc pulls it lazily, so idle cost is still zero). It is
+    /// therefore opt-in: leave it off and Android steps the broken main down to the
+    /// H.264 sub (SD) exactly as before; turn it on to trade recorder CPU for HD on
+    /// the affected cameras. See `docs/DECISIONS.md`.
+    pub main_repair_transcode_enabled: bool,
+
     /// `THUMB_EXTRACT_MAX_CONCURRENCY` -- max concurrent on-demand thumbnail
     /// ffmpeg extractions (the filmstrip scrubber). Each cache miss spawns one
     /// single-frame ffmpeg; a fast multi-camera scrub would otherwise spawn a
@@ -453,6 +474,7 @@ impl ApiConfig {
             export_cache_max_bytes: parse_env("EXPORT_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
             mobile_stream_enabled: parse_env("MOBILE_STREAM_ENABLED", true)?,
             mobile_stream_width: parse_env("MOBILE_STREAM_WIDTH", 640_u32)?.max(160),
+            main_repair_transcode_enabled: parse_env("MAIN_REPAIR_TRANSCODE_ENABLED", false)?,
             thumb_extract_max_concurrency: parse_env(
                 "THUMB_EXTRACT_MAX_CONCURRENCY",
                 default_thumb_concurrency(),

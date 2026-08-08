@@ -185,6 +185,7 @@ are sized for a phone on a slow link.
 |---|---|---|
 | `MOBILE_STREAM_ENABLED` | `true` | the on-demand H.264 transcode that mobile clients fall back to when a camera's own streams won't decode on the device, notably a camera that is H.265 all the way down. Turning it off saves server CPU and costs those cameras live view on Android |
 | `MOBILE_STREAM_WIDTH` | `640` | transcode width in pixels, floored at 160 |
+| `MAIN_REPAIR_TRANSCODE_ENABLED` | `false` | opt-in, per-camera full-resolution H.265 to H.264 transcode of a main stream whose SDP has no `fmtp` attribute. Android's video player rejects such a main ("missing attribute fmtp", seen on some Uniview LPR cameras) and otherwise steps down to the H.264 sub in SD. Leave it off and those cameras play in SD on Android; turn it on to get HD, at the cost of recorder CPU while an Android viewer is watching that camera fullscreen. A cheaper copy-only repair does not work for this case, which is why it is a real re-encode and off by default. The cheapest fix of all, when the camera allows it, is to set the camera's main stream to H.264 in its own web UI |
 | `SEGMENT_LOW_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | size budget for the cache of low-resolution playback segments |
 
 ## Database backup

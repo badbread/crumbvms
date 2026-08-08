@@ -304,6 +304,21 @@ data class LiveStreamsResponse(
     @SerialName("webrtc_main_url") val webrtcMainUrl: String? = null,
     @SerialName("webrtc_sub_url") val webrtcSubUrl: String? = null,
     @SerialName("rtsp_main_url") val rtspMainUrl: String,
+    /**
+     * Repaired full-resolution main (`<name>_mainv`): a per-camera H.265->H.264
+     * **transcode** the server registers only for a main it detected publishes
+     * video with no `a=fmtp`, and only when the operator opts the repair in (it
+     * costs recorder CPU). Media3's RTSP client rejects a fmtp-less SDP with
+     * `IllegalArgumentException: missing attribute fmtp`; a copy-remux would fix
+     * that but go2rtc then bundles the H.265 parameter sets into an RTP Aggregation
+     * Packet Media3 cannot depacketize, so the repair has to be a transcode. Full
+     * resolution (no SD badge), tried right after [rtspMainUrl].
+     *
+     * Normally `null`: the camera's main is fine, the operator has not enabled the
+     * repair, the camera is unmanaged (Frigate-served / legacy), or the server
+     * predates the field — in every case the client just skips this rung.
+     */
+    @SerialName("rtsp_mainv_url") val rtspMainvUrl: String? = null,
     @SerialName("rtsp_sub_url") val rtspSubUrl: String? = null,
     /**
      * Video-only sub restream (`<name>_subv`): the raw sub run through an ffmpeg

@@ -178,6 +178,18 @@ struct Inner {
     /// falls back to the raw sub and is no worse off than before #483.
     subv_needed: DashMap<String, ()>,
 
+    /// Cameras (by `go2rtc_name`) whose MAIN stream needs the `_mainv` repair —
+    /// the reconcile pass read the main producer's SDP out of `GET /api/streams`
+    /// and found a video track with no `a=fmtp` (see `go2rtc::sdp_video_lacks_fmtp`).
+    /// `DashMap<_, ()>` used as a concurrent set, exactly like
+    /// [`subv_needed`](Inner::subv_needed), and sticky across an unknown verdict
+    /// for the same reason. In-memory / no migration for the same reason too: it is
+    /// a runtime property of go2rtc's current answer, not operator configuration.
+    /// Only ever populated when `main_repair_transcode_enabled` is on; empty
+    /// otherwise, so a client sees no `rtsp_mainv_url` and behaves exactly as
+    /// before this feature.
+    mainv_needed: DashMap<String, ()>,
+
     /// Cameras (by `go2rtc_name`) whose stream go2rtc is currently REJECTING —
     /// the reconcile pass tried to create the stream, go2rtc answered a
     /// non-success status, and a confirming `GET /api/streams` showed the
@@ -313,6 +325,7 @@ impl AppState {
             clip_inflight: DashMap::new(),
             go2rtc_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             subv_needed: DashMap::new(),
+            mainv_needed: DashMap::new(),
             stream_rejected: DashMap::new(),
             thumb_semaphore,
             thumb_inflight: DashMap::new(),
@@ -539,6 +552,33 @@ impl AppState {
     /// cannot pin memory or resurface if its `go2rtc_name` is later reused.
     pub fn retain_subv_needed(&self, live: &std::collections::HashSet<String>) {
         self.0.subv_needed.retain(|name, ()| live.contains(name));
+    }
+
+    // ── `_mainv` repair flags (LPR H.265 main / missing-fmtp) ──────────────────
+
+    /// Does this camera's MAIN stream need the `_mainv` repair transcode? See the
+    /// field docs on [`mainv_needed`](Inner::mainv_needed). `false` for anything
+    /// the reconcile pass has not positively flagged, including a cold start and
+    /// every camera when `main_repair_transcode_enabled` is off.
+    #[inline]
+    pub fn mainv_needed(&self, go2rtc_name: &str) -> bool {
+        self.0.mainv_needed.contains_key(go2rtc_name)
+    }
+
+    /// Record this pass's verdict for one camera. Idempotent, so the reconcile
+    /// pass can call it unconditionally every time.
+    pub fn set_mainv_needed(&self, go2rtc_name: &str, needed: bool) {
+        if needed {
+            self.0.mainv_needed.insert(go2rtc_name.to_owned(), ());
+        } else {
+            self.0.mainv_needed.remove(go2rtc_name);
+        }
+    }
+
+    /// Drop flags for cameras that no longer exist, so a deleted camera's entry
+    /// cannot pin memory or resurface if its `go2rtc_name` is later reused.
+    pub fn retain_mainv_needed(&self, live: &std::collections::HashSet<String>) {
+        self.0.mainv_needed.retain(|name, ()| live.contains(name));
     }
 
     // ── go2rtc stream-rejection latch (issue #519) ────────────────────────────
