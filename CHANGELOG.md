@@ -9,7 +9,7 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
-## [0.2.0] - UNRELEASED
+## [0.2.0] - 2026-08-09
 
 Where 0.1.1 hardened what was already there, 0.2.0 finishes a feature that had
 been half-built for two releases: Home Assistant. Crumb could show a linked
