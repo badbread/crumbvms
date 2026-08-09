@@ -88,33 +88,39 @@ private fun LiveStreamsResponse.chainOf(vararg order: StreamTier): List<StreamTi
  *
  * The wall is low-res by design (N tiles, N decoders), so a camera with a sub
  * starts on it and never escalates to the main's bitrate: `subv → sub → mobile`.
- * A camera with no sub at all keeps today's behaviour of playing the main, with
- * the repaired main (when the server publishes one) and the transcode as its
- * fallbacks: `main → mainv → mobile`.
+ * A camera with no sub at all plays the main. When the server publishes a
+ * repaired main (`mainv`) it is tried FIRST — its presence means the raw main is
+ * unplayable here, so leading with the raw main would just be a doomed connect —
+ * then the raw main, then the transcode: `mainv → main → mobile`. With no repair
+ * `mainv` is absent and this is the unchanged `main → mobile`.
  */
 fun LiveStreamsResponse.wallStreamChain(): List<StreamTier> =
     if (subStreamUrl() != null) {
         chainOf(StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE)
     } else {
-        chainOf(StreamTier.MAIN, StreamTier.MAINV, StreamTier.MOBILE)
+        chainOf(StreamTier.MAINV, StreamTier.MAIN, StreamTier.MOBILE)
     }
 
 /**
  * Fallback ladder for **fullscreen live**.
  *
  * Off a metered link fullscreen is the one place HD is worth it, so it starts on
- * the main and walks down: `main → mainv → subv → sub → mobile`. The repaired main
- * (`mainv`) sits right after the raw main so a camera whose main is unplayable for
- * a fmtp/packetization reason gets HD from the server-side repair before dropping
- * to an SD rung. On a metered link the data-saver order applies (low-res first, the
- * transcode when the camera has no sub), with both HD mains kept as the last
- * resort so a broken sub still leaves something to watch rather than a spinner.
+ * the HD main and walks down: `mainv → main → subv → sub → mobile`. The repaired
+ * main (`mainv`) sits BEFORE the raw main, not after it: the server publishes
+ * `mainv` ONLY for a main it has positively detected this device cannot play
+ * (missing served `fmtp`), so trying the raw main first would be a guaranteed
+ * doomed connect on every open — the LPR startup lag. Leading with `mainv` gets HD
+ * straight away and never loses a main that would have worked (a camera with no
+ * repair has no `mainv` rung and starts on the raw main exactly as before). On a
+ * metered link the data-saver order applies (low-res first, the transcode when the
+ * camera has no sub), with both HD mains kept as the last resort — `mainv` still
+ * ahead of the doomed raw main — so a broken sub still leaves something to watch.
  */
 fun LiveStreamsResponse.fullscreenStreamChain(metered: Boolean): List<StreamTier> =
     if (metered) {
-        chainOf(StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAIN, StreamTier.MAINV)
+        chainOf(StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE, StreamTier.MAINV, StreamTier.MAIN)
     } else {
-        chainOf(StreamTier.MAIN, StreamTier.MAINV, StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE)
+        chainOf(StreamTier.MAINV, StreamTier.MAIN, StreamTier.SUBV, StreamTier.SUB, StreamTier.MOBILE)
     }
 
 /**
