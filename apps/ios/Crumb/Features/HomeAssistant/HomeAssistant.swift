@@ -307,6 +307,8 @@ extension HA {
             return [HAAction("turn_on", "Activate", "film")]
         case "script":
             return [HAAction("turn_on", "Run", "play.fill")]
+        case "automation":
+            return [HAAction("trigger", "Trigger", "bolt.fill")]
         default:
             return []
         }
@@ -351,6 +353,7 @@ extension HA {
         case "light", "switch", "fan", "siren": return "toggle"
         case "button", "input_button": return "press"
         case "scene", "script": return "turn_on"
+        case "automation": return "trigger"
         default: return nil
         }
     }

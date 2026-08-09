@@ -13,6 +13,7 @@
 //   lock                       -> lock / unlock
 //   button, input_button       -> press
 //   scene, script              -> turn_on
+//   automation                 -> trigger
 //
 // Anything else (binary_sensor, sensor, an unknown domain from a newer HA)
 // yields NO actions, so the card stays read-only exactly as it is today.
@@ -126,6 +127,13 @@ const List<HaControlAction> _kScriptActions = [
   HaControlAction(action: 'turn_on', label: 'Run', icon: Icons.play_arrow),
 ];
 
+/// automation — HA's service is `automation.trigger`, which fires the
+/// automation's actions immediately (skipping its trigger conditions). "Trigger"
+/// is what it reads as on the badge.
+const List<HaControlAction> _kAutomationActions = [
+  HaControlAction(action: 'trigger', label: 'Trigger', icon: Icons.bolt),
+];
+
 /// The actions the server will accept for an entity in [domain]; empty for
 /// every domain that has no control path (the card then renders read-only).
 List<HaControlAction> haActionsForDomain(String domain) {
@@ -146,6 +154,8 @@ List<HaControlAction> haActionsForDomain(String domain) {
       return _kSceneActions;
     case 'script':
       return _kScriptActions;
+    case 'automation':
+      return _kAutomationActions;
     default:
       return const [];
   }
@@ -182,6 +192,7 @@ List<HaControlAction> haAllActionsForDomain(String domain) {
 ///   light / switch / fan / siren -> toggle
 ///   button / input_button        -> press
 ///   scene / script               -> turn_on (activate / run)
+///   automation                   -> trigger
 ///
 /// Unknown/read-only domains (binary_sensor, sensor, a newer HA domain) return
 /// null: no guessed actuation, the badge stays read-only.
@@ -199,6 +210,8 @@ HaControlAction? haPrimaryAction(String domain) {
       return _kSceneActions.first;
     case 'script':
       return _kScriptActions.first;
+    case 'automation':
+      return _kAutomationActions.first;
     default:
       return null;
   }
