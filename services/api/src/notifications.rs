@@ -813,16 +813,20 @@ async fn test_channel(
         .build()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build reqwest client: {e}")))?;
 
-    // Fetch a live snapshot if the channel wants one AND is scoped to at least
-    // one camera. With no cameras there's nothing to snapshot — the old code
-    // fell back to `Uuid::nil()`, which just drove a guaranteed DB miss (and, on
-    // a broader lookup, risked resolving an unrelated camera). Send the test
-    // without an image instead.
+    // Fetch a live snapshot only if the channel wants one AND is scoped to at
+    // least one camera the OWNER can still reach. Camera grants can be revoked
+    // after a channel is created, so re-filter the channel's cameras through the
+    // caller's current access before picking one (the engine fan-out re-resolves
+    // grants every tick; this manual test path must do the same). With none left
+    // there is nothing to snapshot: the old code fell back to `Uuid::nil()`,
+    // which drove a guaranteed DB miss and, on a broader lookup, risked resolving
+    // an unrelated camera. Send the test without an image instead.
     let snapshot = match ch
         .camera_ids
         .as_ref()
         .filter(|_| ch.snapshot_mode.wants_image())
-        .and_then(|ids| ids.first().copied())
+        .map(|ids| user.filter_camera_ids(ids))
+        .and_then(|allowed| allowed.first().copied())
     {
         Some(camera_id) => {
             let b = resolve_bases(&state).await;
