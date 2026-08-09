@@ -541,7 +541,10 @@ All wizard steps have API equivalents. Do them in order:
    with empty strings for fields you are not changing.)
    (`GET /auth/setup-status` returns a suggested address derived from the request,
    plus `suggested_scan_range`, the server's own `/24`, a good default for the
-   discovery scan below. It's `null` when the console was reached by hostname.)
+   discovery scan below. It's `null` when the console was reached by hostname, and
+   it echoes back `localhost` when you call it from the host itself, so on a
+   headless install set `server_address` to the LAN IP or hostname your phone and
+   desktop apps will actually reach, not whatever this suggests.)
 3. **Storage + retention.** Confirm/adjust the disk via `GET`/`POST /config/storages`,
    optionally preflight the path first with `POST /config/fs/check` `{path}` →
    `{status: "ok"|"warn"|"error", writable, free_bytes, total_bytes, message}`.
