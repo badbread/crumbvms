@@ -75,6 +75,8 @@ pub mod ffprobe;
 pub mod filmstrip;
 #[path = "../../src/go2rtc.rs"]
 pub mod go2rtc;
+#[path = "../../src/ha.rs"]
+pub mod ha;
 #[path = "../../src/plates.rs"]
 pub mod plates;
 #[path = "../../src/playback.rs"]
@@ -371,6 +373,8 @@ pub fn test_router() -> Router<AppState> {
         //    auth-invariant walk covers every route, not just the RBAC subset. --
         .merge(cameras::json_routes())
         .merge(cameras::routes())
+        // Home Assistant config/links/states + the actuator control endpoint.
+        .merge(ha::routes())
         .merge(views::routes())
         .merge(bookmarks::routes())
         .merge(timeline::routes())
@@ -455,9 +459,19 @@ pub async fn seed_admin(pool: &Pool) -> SeededUser {
 /// capabilities (defaults to a generous "can do everything a viewer can do"
 /// set — playback/clips/export/ptz all `true` — so scope-denial tests are
 /// unambiguously about camera scope, not a missing capability).
+///
+/// `actuators` is the ONE capability left `false` here: it is deny-by-default
+/// and moves physical hardware, so tests that need it opt in explicitly via
+/// [`seed_viewer_role_with_caps`]. That also keeps the "a plain viewer cannot
+/// actuate" assertion honest.
 pub async fn seed_viewer_role(pool: &Pool, camera_ids: &[Uuid]) -> Uuid {
-    let name = unique("role");
-    let caps = Capabilities {
+    seed_viewer_role_with_caps(pool, camera_ids, generous_viewer_caps()).await
+}
+
+/// The generous viewer capability set [`seed_viewer_role`] uses (everything a
+/// viewer can hold except `actuators`).
+pub fn generous_viewer_caps() -> Capabilities {
+    Capabilities {
         export: true,
         playback: true,
         clips: true,
@@ -465,7 +479,17 @@ pub async fn seed_viewer_role(pool: &Pool, camera_ids: &[Uuid]) -> Uuid {
         bookmarks: crumb_common::types::BookmarkScope::All,
         manage_views: true,
         view_plates: true,
-    };
+        actuators: false,
+    }
+}
+
+/// Create a viewer role scoped to `camera_ids` with an explicit capability set.
+pub async fn seed_viewer_role_with_caps(
+    pool: &Pool,
+    camera_ids: &[Uuid],
+    caps: Capabilities,
+) -> Uuid {
+    let name = unique("role");
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await
         .expect("create_role (viewer)");
@@ -512,6 +536,7 @@ pub async fn seed_viewer_with_bookmark_scope(
         bookmarks: scope,
         manage_views: true,
         view_plates: true,
+        actuators: false,
     };
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await

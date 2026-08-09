@@ -903,7 +903,7 @@ async fn run_export_job(
         let cam_base_pct = (cam_idx * 100 / n_cameras).min(99) as u8;
         // Per-camera progress slice; at least 1% so we always make forward progress.
         #[allow(clippy::cast_possible_truncation)]
-        let cam_range_pct = (100 / n_cameras).max(1).min(100) as u8;
+        let cam_range_pct = (100 / n_cameras).clamp(1, 100) as u8;
 
         if let Some(stderr_pipe) = stderr {
             tokio::spawn(async move {
@@ -1346,7 +1346,7 @@ async fn run_batch_export_job(
         #[allow(clippy::cast_possible_truncation)]
         let cam_base_pct = (idx * 100 / n).min(99) as u8;
         #[allow(clippy::cast_possible_truncation)]
-        let cam_range_pct = (100 / n).max(1).min(100) as u8;
+        let cam_range_pct = (100 / n).clamp(1, 100) as u8;
         let seq = idx + 1;
         let cam_short: String = camera_id
             .to_string()

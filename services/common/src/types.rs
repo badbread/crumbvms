@@ -1132,6 +1132,14 @@ pub struct Capabilities {
     /// `false` (absent ⇒ denied) — a role must be granted it explicitly.
     #[serde(default)]
     pub view_plates: bool,
+    /// Actuate devices linked to a camera (`POST /cameras/:id/ha/action`, and
+    /// the planned Reolink actuators). This is the only capability that moves
+    /// PHYSICAL hardware, locks, garage doors, sirens, so it defaults to
+    /// `false` (absent ⇒ denied) and must be granted explicitly. Seeing a
+    /// camera, and even seeing its linked entities' state, never implies being
+    /// able to operate them.
+    #[serde(default)]
+    pub actuators: bool,
 }
 
 /// Serde default for capability fields that should read as granted (not the
@@ -1153,6 +1161,7 @@ impl Capabilities {
             bookmarks: BookmarkScope::All,
             manage_views: true,
             view_plates: true,
+            actuators: true,
         }
     }
 }

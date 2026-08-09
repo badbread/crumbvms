@@ -1033,6 +1033,7 @@ async fn seed_viewer_no_plates(pool: &deadpool_postgres::Pool, cameras: &[Uuid])
         bookmarks: BookmarkScope::Own,
         manage_views: true,
         view_plates: false,
+        actuators: false,
     };
     let role = crumb_common::db::create_role(pool, &unique("noplates-role"), &caps, cameras)
         .await
