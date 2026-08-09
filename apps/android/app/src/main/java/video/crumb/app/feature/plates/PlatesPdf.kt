@@ -394,7 +394,10 @@ private fun drawReport(
         textAlign = Paint.Align.RIGHT
     }
     c.drawText("Confidence ${confidenceLabel(read.confidence)}", contentRight, y + 14f, confPaint)
-    y += 34f
+    // The plate baseline sits at y + 26 in the 34pt face, so its descenders reach
+    // ~y + 34. Advance clear of that (plus a comfortable gap) before the date/time
+    // line so the small subtitle never rides up into the big plate glyphs.
+    y += 52f
     val cameraName = input.cameraNames[read.cameraId] ?: "(unknown camera)"
     c.drawText(fmtTs(read.ts, tsFmt), contentLeft, y, cellPaint)
     y += 14f
