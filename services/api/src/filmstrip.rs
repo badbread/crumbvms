@@ -132,7 +132,9 @@ async fn list_filmstrip(
     Path(camera_id): Path<Uuid>,
     Query(q): Query<FilmstripQuery>,
 ) -> Result<Json<FilmstripResponse>, ApiError> {
-    // Enforce camera access.
+    // Recorded-footage thumbnails: gate on the playback capability, like
+    // /timeline, /play, and /segments, then enforce the per-camera scope.
+    user.require_playback()?;
     user.assert_camera_access(camera_id)?;
 
     if q.start >= q.end {
@@ -223,7 +225,9 @@ async fn serve_frame(
 ) -> Result<impl IntoResponse, ApiError> {
     use tokio_util::io::ReaderStream;
 
-    // Camera access check.
+    // Capability + scope, identical to serve_segment / get_segment_low: the
+    // scoped media token carries the caller's real playback capability.
+    user.require_playback()?;
     user.assert_camera_access(camera_id)?;
 
     // Snap the requested timestamp to a fixed global grid so arbitrary scrub

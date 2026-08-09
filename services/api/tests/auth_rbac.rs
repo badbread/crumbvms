@@ -2051,6 +2051,42 @@ async fn live_fmp4_allows_role_without_playback_capability() {
 }
 
 #[tokio::test]
+async fn filmstrip_requires_the_playback_capability() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+
+    // A live-only role (playback:false) scoped to the camera can watch live but
+    // must NOT reach recorded-footage scrub thumbnails, matching /timeline,
+    // /play, and /segments.
+    let live_only = seed_viewer_caps(&app, &[cam], mk_caps(false, false, false)).await;
+    let lo_token = login(&app, &live_only.username, &live_only.password).await;
+    // Valid time params so extraction passes and the request reaches the
+    // capability check in the handler body (both routes require them).
+    let list_path = format!("/filmstrip/{cam}?start=2026-08-08T00:00:00Z&end=2026-08-08T01:00:00Z");
+    let frame_path = format!("/filmstrip/{cam}/frame?ts=2026-08-08T00:00:00Z");
+    for path in [list_path.as_str(), frame_path.as_str()] {
+        let resp = app.send(get_auth(path, &lo_token)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "filmstrip must enforce the playback capability ({path})"
+        );
+    }
+
+    // Contrast: a role WITH playback (still scoped to the camera) gets past the
+    // capability gate. Thumbnails may 404 for lack of footage in tests, so the
+    // assertion is only that it is NOT the 403 capability denial.
+    let with_pb = seed_viewer_caps(&app, &[cam], mk_caps(true, false, false)).await;
+    let pb_token = login(&app, &with_pb.username, &with_pb.password).await;
+    let resp = app.send(get_auth(&list_path, &pb_token)).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a role with the playback capability must pass the filmstrip cap gate"
+    );
+}
+
+#[tokio::test]
 async fn plate_clip_authorized_by_view_plates_without_clips_capability() {
     let app = TestApp::new().await;
     let cam = seed_camera(app.pool()).await;
