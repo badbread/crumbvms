@@ -424,7 +424,8 @@ fi
 # instead of assuming, and fail the run when the answer is definitely no.
 # Platform-by-platform notes: docs-site/docs/getting-started/platform-notes.md.
 STORAGE_PREFLIGHT_FAILED=0
-FREE_SPACE_FLOOR_KIB=10485760   # 10 GiB
+FREE_SPACE_FLOOR_KIB=10485760   # 10 GiB (below this: a strong warning)
+ADVISORY_SPACE_KIB=52428800     # 50 GiB (below this but above the floor: a gentle "small for an NVR" note)
 
 # Filesystem type of the mount holding $1. Empty = could not determine (that is
 # a "skip the check", never a failure). GNU stat first, then df -T, then mount.
@@ -563,6 +564,12 @@ if [[ -d "${MEDIA_DIR_HOST}" ]]; then
       log "      Cameras eat terabytes. Point MEDIA_HOST_PATH at a real disk, or set"
       log "      retention low enough that this fills predictably rather than by surprise:"
       log "        MEDIA_HOST_PATH=/mnt/<disk>/crumb scripts/setup-env.sh --force"
+    elif [[ "${MEDIA_FREE_KIB}" -lt "${ADVISORY_SPACE_KIB}" ]]; then
+      log "storage preflight: $(( MEDIA_FREE_KIB / 1048576 )) GiB free at ${MEDIA_DIR_HOST}, which is on"
+      log "      the small side for continuous recording. A single HD camera can use tens of GiB"
+      log "      per day; Crumb evicts oldest footage to stay above its free-space floor, but"
+      log "      plan retention (or point MEDIA_HOST_PATH at a larger disk) so it fills"
+      log "      predictably rather than by surprise."
     else
       log "storage preflight: $(( MEDIA_FREE_KIB / 1048576 )) GiB free at ${MEDIA_DIR_HOST}"
     fi
@@ -655,4 +662,4 @@ if [[ "${STORAGE_PREFLIGHT_FAILED}" -eq 1 ]]; then
   exit 1
 fi
 
-log "NEXT: 'docker compose up -d', then open http://<host>:8080/admin and sign in with the above."
+log "NEXT: 'docker compose pull && docker compose up -d', then open http://<host>:8080/admin and sign in with the above."

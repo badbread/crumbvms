@@ -357,6 +357,10 @@ That is the whole install. A few options if you want them:
   to Docker? This is the hands-off path.
 - **Use native apps** instead of the browser (Windows/macOS desktop, Android). See the
   [client install guide](docs/CLIENTS.md).
+- **Prefer HTTPS?** Caddy also serves the console at `https://<your-server-ip>:8443/admin`, but
+  with an internal self-signed certificate, so your browser warns on the first visit until you
+  trust the CA. Plain `http://<your-server-ip>:8080` on a trusted LAN is fine; for real TLS see
+  [docs/TLS.md](docs/TLS.md).
 - **Build from source** instead of pulling images (you are developing Crumb, running
   air-gapped, or on a fork that has not published images):
   `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`
