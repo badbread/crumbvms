@@ -317,6 +317,12 @@ but "watchable" often meant the SD sub-stream. This cycle finished the job.
 - **Frigate ingest is no longer dead by default.** The MQTT packet limit was too
   small for Frigate's event payloads; it was raised so events actually arrive
   (#559).
+- **Android landscape polish.** The playback back arrow no longer floats in the
+  centre of the video, it sits top-left; the quality chip shows "A" instead of a
+  truncated "AUT" in the compact landscape bar; and the single-camera view now
+  labels which camera is loaded without adding a top bar (#604).
+- **The license-plate PDF report no longer runs into its own heading.** The large
+  plate number and the date-time line beneath it now have a clear gap (#603).
 
 ### Security
 
@@ -336,6 +342,11 @@ but "watchable" often meant the SD sub-stream. This cycle finished the job.
   configured `mqtts://` had broker credentials on the wire believing they were
   encrypted. TLS is not implemented here; the URL is rejected at configuration
   time, at test time, and at connect time, so the failure is loud (#530).
+- **Two footage and snapshot routes were tightened to match the capability
+  model.** The filmstrip scrub-thumbnail endpoints now require the `playback`
+  capability, like `/timeline`, `/play`, and `/segments`, and the notification
+  channel-test path re-checks the owner's current camera grant before it fetches a
+  snapshot, the same re-resolve the alert engine already does each tick (#602).
 - Dependency work cleared four `rustls-webpki` certificate-verification
   advisories by dropping a transitive TLS stack from the MQTT client and bumping
   rustls (#476).
@@ -392,6 +403,9 @@ pull. If you never set it, you are on `latest` and the pull is enough.
 
 Every pull request merged since 0.1.1, newest first:
 
+- fix(android): landscape single-camera UI polish (back-arrow, Auto label, camera name) (#604)
+- fix(clients): space the plate-report heading off the date-time line (#603)
+- fix(api): gate filmstrip on the playback capability; scope channel-test to current grants (#602)
 - docs(cameras): sharpen the Uniview LPR compatibility entry to the precise fmtp root cause (#596)
 - fix(android): try the repaired main (mainv) before the doomed raw main (#594)
 - fix(api): flag the _mainv repair from the SERVED SDP, not the producer (#592)
