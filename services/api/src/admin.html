@@ -49,6 +49,25 @@ input::placeholder{color:var(--dim2);}
 select{appearance:none;-webkit-appearance:none;padding-right:30px;
   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2398a2ad' stroke-width='2.5'><path d='M6 9l6 6 6-6'/></svg>");
   background-repeat:no-repeat;background-position:right 10px center;}
+/* Embedded-webview <select> popup fallback. The desktop client hosts this console
+   in a composited webview that cannot paint the OS-drawn native <select> popup,
+   so clicking a dropdown does nothing. embedSelect (see script) intercepts the
+   click when body.embedded is set and renders this DOM list instead. In a real
+   browser the shim never activates and native selects stay native. Above modals
+   (z 100) and toasts (z 200) so it works inside the wizard/editor dialogs too. */
+.embed-select-pop{position:fixed;z-index:9000;background:var(--surface2);
+  border:1px solid var(--border2);border-radius:var(--radius);box-shadow:var(--shadow-lg);
+  max-height:min(320px,60vh);overflow-y:auto;padding:4px;font:inherit;color:var(--text);
+  -webkit-user-select:none;user-select:none;}
+.embed-select-opt{padding:7px 10px;border-radius:var(--radius);cursor:pointer;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;line-height:1.3;}
+.embed-select-opt:hover{background:var(--accent-soft);}
+.embed-select-opt.active{background:var(--accent-soft);box-shadow:inset 0 0 0 1px var(--accent-dim);}
+.embed-select-opt[aria-selected="true"]{color:var(--accent);font-weight:600;}
+.embed-select-opt.disabled{opacity:.4;cursor:default;background:none;box-shadow:none;}
+.embed-select-grp{padding:6px 10px 3px;font-size:11px;letter-spacing:.4px;
+  text-transform:uppercase;color:var(--dim2);}
+.embed-select-grp+.embed-select-opt{margin-top:0;}
 /* Segmented two-state toggle (used where a native <select> popup is unreliable
    in the embedded webview, and a 2-option control reads better as a toggle). */
 .seg-toggle{display:inline-flex;border:1px solid var(--border2);border-radius:var(--radius);overflow:hidden;}
@@ -11846,6 +11865,160 @@ function renderSnapshot(c) {
     }
   }
 })();
+/* ── Embedded-webview <select> popup shim ──
+   The desktop client embeds this console in a composited webview that cannot
+   display the OS-drawn native <select> popup, so every dropdown here is dead
+   (clicking does nothing). This installs ONE delegated interceptor on document
+   that, only when the console is embedded (body.embedded, set by bootSSO from
+   ?embedded=1 / #embed=1 — the same isEmbedded() signal the rest of the file
+   uses), replaces the broken native popup with a DOM overlay listing the same
+   <option>s. The real <select> stays in the DOM (its closed state paints fine
+   and holds the value); we only replace the popup. Choosing an option sets the
+   option as selected and fires a real bubbling change event, so every existing
+   onchange= handler and .value read keeps working with zero per-select changes.
+   Delegation means dynamically-added selects (camera editor, notifications,
+   wizard) are covered for free. In a normal browser isEmbedded() is false and
+   this whole shim is inert — native selects stay native. */
+(function embedSelectShim() {
+  let pop = null;        // the open overlay element, or null
+  let curSel = null;     // the <select> the overlay is bound to
+  let rows = [];         // [{el, opt}] selectable rows, in order
+  let activeIdx = -1;    // keyboard-highlighted row index
+
+  const closePop = () => {
+    if (pop) { pop.remove(); pop = null; }
+    curSel = null; rows = []; activeIdx = -1;
+  };
+
+  const setActive = i => {
+    if (activeIdx >= 0 && rows[activeIdx]) rows[activeIdx].el.classList.remove('active');
+    activeIdx = i;
+    if (activeIdx >= 0 && rows[activeIdx]) {
+      const el = rows[activeIdx].el;
+      el.classList.add('active');
+      el.scrollIntoView({ block: 'nearest' });
+    }
+  };
+
+  const commit = opt => {
+    const sel = curSel;
+    closePop();
+    if (!sel || !opt || opt.disabled) return;
+    // Setting the option element selected is duplicate-value safe (sel.value=…
+    // would pick the first match). Only fire change when it actually moved.
+    if (!opt.selected) {
+      opt.selected = true;
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  };
+
+  const openPop = sel => {
+    closePop();
+    curSel = sel;
+    pop = document.createElement('div');
+    pop.className = 'embed-select-pop';
+    rows = [];
+    const selectedOpt = sel.options[sel.selectedIndex] || null;
+
+    const addOption = opt => {
+      const row = document.createElement('div');
+      row.className = 'embed-select-opt' + (opt.disabled ? ' disabled' : '');
+      row.textContent = opt.textContent || opt.value || '';
+      if (opt === selectedOpt) row.setAttribute('aria-selected', 'true');
+      if (!opt.disabled) {
+        const idx = rows.length;
+        // mousedown (not click) so the choice lands before the outside-close
+        // handler runs; preventDefault keeps focus off the row.
+        row.addEventListener('mousedown', e => { e.preventDefault(); commit(opt); });
+        row.addEventListener('mouseenter', () => setActive(idx));
+        rows.push({ el: row, opt });
+      }
+      pop.appendChild(row);
+    };
+
+    // Walk children so <optgroup> labels render even though sel.options flattens
+    // them away. No selects in this file use optgroup today, but it's cheap.
+    for (const node of sel.children) {
+      if (node.tagName === 'OPTGROUP') {
+        const g = document.createElement('div');
+        g.className = 'embed-select-grp';
+        g.textContent = node.label || '';
+        pop.appendChild(g);
+        for (const o of node.children) if (o.tagName === 'OPTION') addOption(o);
+      } else if (node.tagName === 'OPTION') {
+        addOption(node);
+      }
+    }
+
+    document.body.appendChild(pop);
+
+    // Position under the control (fixed coords from its rect), flipping above
+    // when there isn't room below, and clamping into the viewport.
+    const r = sel.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    pop.style.minWidth = r.width + 'px';
+    pop.style.maxWidth = Math.max(160, vw - 16) + 'px';
+    const ph = pop.offsetHeight;
+    let top = r.bottom + 2;
+    if (top + ph > vh - 8 && r.top - 2 - ph > 8) top = r.top - 2 - ph;
+    top = Math.max(8, Math.min(top, vh - ph - 8));
+    let left = r.left;
+    const pw = pop.offsetWidth;
+    if (left + pw > vw - 8) left = Math.max(8, vw - pw - 8);
+    pop.style.top = top + 'px';
+    pop.style.left = left + 'px';
+
+    // Highlight the current value for keyboard nav.
+    const selIdx = rows.findIndex(x => x.opt === selectedOpt);
+    setActive(selIdx >= 0 ? selIdx : (rows.length ? 0 : -1));
+  };
+
+  const targetSelect = e => {
+    if (!isEmbedded()) return null;
+    const el = e.target instanceof Element ? e.target.closest('select') : null;
+    return el && !el.disabled ? el : null;
+  };
+
+  // Capture-phase mousedown: open/close the overlay and, crucially,
+  // preventDefault so the dead native popup never fires.
+  document.addEventListener('mousedown', e => {
+    if (pop && e.target instanceof Element && e.target.closest('.embed-select-pop')) return;
+    const sel = targetSelect(e);
+    if (sel) {
+      e.preventDefault();
+      if (curSel === sel) closePop(); else openPop(sel);
+      return;
+    }
+    if (pop) closePop();
+  }, true);
+
+  // Keyboard: open on a focused select, and navigate/commit/close when open.
+  document.addEventListener('keydown', e => {
+    if (pop) {
+      if (e.key === 'Escape') { e.preventDefault(); closePop(); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); if (rows.length) setActive((activeIdx + 1) % rows.length); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); if (rows.length) setActive((activeIdx - 1 + rows.length) % rows.length); }
+      else if (e.key === 'Enter' || e.key === 'Tab') { if (activeIdx >= 0 && rows[activeIdx]) { e.preventDefault(); commit(rows[activeIdx].opt); } else closePop(); }
+      return;
+    }
+    const sel = targetSelect(e);
+    if (sel && (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault();
+      openPop(sel);
+    }
+  }, true);
+
+  // Any scroll outside the overlay, or a resize, invalidates its position.
+  document.addEventListener('scroll', e => {
+    if (!pop) return;
+    if (e.target instanceof Element && e.target.closest('.embed-select-pop')) return;
+    closePop();
+  }, true);
+  window.addEventListener('resize', closePop);
+})();
+
 $('lg-pass') && $('lg-pass').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 $('bootstrap-pass2') && $('bootstrap-pass2').addEventListener('keydown', e => { if (e.key === 'Enter') bootstrapAdmin(); });
 
