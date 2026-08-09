@@ -323,6 +323,17 @@ but "watchable" often meant the SD sub-stream. This cycle finished the job.
   labels which camera is loaded without adding a top bar (#604).
 - **The license-plate PDF report no longer runs into its own heading.** The large
   plate number and the date-time line beneath it now have a clear gap (#603).
+- **Dropdowns work in the desktop app's embedded console.** The composited webview
+  the desktop uses to embed the web console cannot paint a native `<select>`
+  popup, so Server-settings dropdowns did nothing there. An embed-only shim now
+  renders the options as a DOM list and writes the choice back through the normal
+  change event; the browser console is untouched (#608).
+- **The Android multi-camera playback wall batches its motion-intensity requests**
+  instead of firing one per camera, so scrubbing a large wall no longer trips the
+  server's rate limiter, bringing Android in line with desktop and iOS (#607).
+- **The install script warns on a small storage disk, not just a nearly-full one,**
+  and its next-step hint matches the README's two commands, plus a set of
+  install-doc corrections surfaced by a fresh-install audit (#606).
 
 ### Security
 
@@ -403,6 +414,10 @@ pull. If you never set it, you are on `latest` and the pull is enough.
 
 Every pull request merged since 0.1.1, newest first:
 
+- fix(admin): DOM dropdown fallback so selects work in the desktop webview embed (#608)
+- fix(android): batch the multi-camera playback-wall timeline intensity (#607)
+- fix(install): close the four fresh-install-audit findings (#606)
+- ci(release): block a release tag whose versions do not match the tag (#605)
 - fix(android): landscape single-camera UI polish (back-arrow, Auto label, camera name) (#604)
 - fix(clients): space the plate-report heading off the date-time line (#603)
 - fix(api): gate filmstrip on the playback capability; scope channel-test to current grants (#602)
