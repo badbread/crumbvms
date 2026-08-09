@@ -49,7 +49,7 @@ async fn seed_links(
     let mut tuples: Vec<db::HaLinkInsert> = Vec::new();
     for (i, (entity, role)) in links.iter().enumerate() {
         let order = i32::try_from(i).unwrap_or(0);
-        // Default control config (migration 0075): no confirm, no action
+        // Default control config (migration 0073): no confirm, no action
         // restriction — today's behavior.
         tuples.push((
             (*entity).to_owned(),
@@ -67,7 +67,7 @@ async fn seed_links(
 }
 
 /// Seed a single actuator link with an explicit `allowed_actions` restriction
-/// (migration 0075) so the server-side enforcement can be exercised end to end.
+/// (migration 0073) so the server-side enforcement can be exercised end to end.
 async fn seed_link_with_allowed_actions(
     pool: &deadpool_postgres::Pool,
     camera_id: Uuid,
@@ -372,7 +372,7 @@ async fn camera_links_payload_carries_the_fields_clients_need() {
     // the long-standing `id`.
     assert!(link["link_id"].is_string());
     assert_eq!(link["link_id"], link["id"]);
-    // Per-link control config (migration 0075) is exposed for clients to honor;
+    // Per-link control config (migration 0073) is exposed for clients to honor;
     // an unset link reports today's defaults: no confirm, no action restriction.
     assert_eq!(link["require_confirm"], false);
     assert!(link["allowed_actions"].is_null());

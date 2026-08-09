@@ -279,13 +279,13 @@ pub struct CameraHaLink {
     /// Draw a white outline + drop shadow so the badge pops on a busy scene
     /// (migration 0062; default false).
     pub overlay_outline: bool,
-    /// Per-link control config (migration 0075, issue #440). When true, every
+    /// Per-link control config (migration 0073, issue #440). When true, every
     /// client prompts a confirmation before firing ANY action on this link (a
     /// UX gate, on top of the hardcoded cover/lock safety confirm). NOT enforced
     /// server-side; `allowed_actions` is what the action endpoint enforces.
     /// Default false ⇒ today's behavior.
     pub require_confirm: bool,
-    /// Per-link control config (migration 0075, issue #440). `Some(list)`
+    /// Per-link control config (migration 0073, issue #440). `Some(list)`
     /// restricts `POST /cameras/:id/ha/action` to exactly these action words
     /// (server-ENFORCED, in addition to the domain allowlist); `None` ⇒ every
     /// action in the entity's domain allowlist is permitted (today's behavior).

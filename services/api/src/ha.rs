@@ -160,7 +160,7 @@ fn validate_link_role(entity_id: &str, role: &str) -> Result<(), String> {
     }
 }
 
-/// Validate a link's authored `allowed_actions` (migration 0075, issue #440) at
+/// Validate a link's authored `allowed_actions` (migration 0073, issue #440) at
 /// write time: every entry MUST be a valid action for the entity's own HA
 /// domain, i.e. present in [`HA_ACTION_ALLOWLIST`] for that domain. An entry
 /// that could never fire (wrong domain, garbage word) is a silent
@@ -184,7 +184,7 @@ fn validate_allowed_actions(entity_id: &str, allowed: &[String]) -> Result<(), S
 }
 
 /// Whether `action` is permitted by a link's `allowed_actions` restriction
-/// (migration 0075, issue #440). `None` ⇒ unrestricted: every action the domain
+/// (migration 0073, issue #440). `None` ⇒ unrestricted: every action the domain
 /// allowlist already permits is allowed (today's behavior). `Some(list)` ⇒ the
 /// action must ALSO appear in `list`. This is the server-side enforcement
 /// `post_action` applies AFTER the domain allowlist check, so a viewer cannot
@@ -334,13 +334,13 @@ struct HaLinkDto {
     overlay_bg_color: Option<String>,
     /// White outline + drop shadow (migration 0062; default false).
     overlay_outline: bool,
-    /// Per-link control config (migration 0075, issue #440). `require_confirm`
+    /// Per-link control config (migration 0073, issue #440). `require_confirm`
     /// tells every client to prompt a confirmation before firing ANY action on
     /// this link (on top of the hardcoded cover/lock safety confirm). Additive
     /// and always present; an older client that does not know the field ignores
     /// it and behaves exactly as today (default false).
     require_confirm: bool,
-    /// Per-link control config (migration 0075, issue #440). When non-null, the
+    /// Per-link control config (migration 0073, issue #440). When non-null, the
     /// client presents ONLY these actions (intersected with the domain's action
     /// set) AND the server refuses anything outside it (see `post_action`).
     /// `null` ⇒ every domain action is offered/allowed (today's behavior). Older
@@ -591,11 +591,11 @@ struct HaLinkInput {
     label: Option<String>,
     #[serde(default)]
     sort_order: i32,
-    /// Per-link control config (migration 0075, issue #440). Omitted ⇒ false
+    /// Per-link control config (migration 0073, issue #440). Omitted ⇒ false
     /// (today's behavior). A client-side confirm gate; not server-enforced.
     #[serde(default)]
     require_confirm: bool,
-    /// Per-link control config (migration 0075, issue #440). Omitted / `null` ⇒
+    /// Per-link control config (migration 0073, issue #440). Omitted / `null` ⇒
     /// every domain action is allowed (today's behavior). When present, each
     /// entry is validated against the entity domain's allowlist at write time
     /// and `post_action` refuses anything outside it.
@@ -731,7 +731,7 @@ async fn put_links(
         validate_link_role(l.entity_id.trim(), &l.role).map_err(ApiError::BadRequest)?;
         // allowed_actions entries must be real actions for the entity's domain,
         // else the restriction is nonsense the operator can never satisfy
-        // (migration 0075, issue #440).
+        // (migration 0073, issue #440).
         if let Some(allowed) = &l.allowed_actions {
             validate_allowed_actions(l.entity_id.trim(), allowed).map_err(ApiError::BadRequest)?;
         }
@@ -1010,7 +1010,7 @@ async fn audit_actuation(
 /// 4. the action is allowlisted for the domain of the link's stored entity —
 ///    else 400.
 /// 5. the action is permitted by the link's own `allowed_actions` restriction
-///    (migration 0075, issue #440) — else 403. `null` ⇒ unrestricted.
+///    (migration 0073, issue #440) — else 403. `null` ⇒ unrestricted.
 ///
 /// Returns `{"ok": true}` on an HA 2xx. No state is returned: clients converge
 /// on the existing 3s `GET /ha/states` poll, so there is one source of truth for
@@ -1070,7 +1070,7 @@ async fn post_action(
         }));
     };
 
-    // 5. per-link allowed_actions restriction (migration 0075, issue #440). The
+    // 5. per-link allowed_actions restriction (migration 0073, issue #440). The
     //    domain allowlist above says the action is possible for this KIND of
     //    entity; this narrows it to what the operator authored for THIS link. A
     //    non-null list that omits the action is a real server-side denial (403),
@@ -1660,7 +1660,7 @@ mod tests {
         assert!(!canonical_icon("lightbulb2")); // near-miss of a real slug.
     }
 
-    // ─── per-link control config (migration 0075, issue #440) ────────────────
+    // ─── per-link control config (migration 0073, issue #440) ────────────────
 
     #[test]
     fn allowed_actions_enforcement_null_allows_all_and_list_restricts() {

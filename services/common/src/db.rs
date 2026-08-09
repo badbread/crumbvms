@@ -1729,7 +1729,7 @@ pub async fn get_camera_ha_link(
 /// One camera↔HA link to persist: `(entity_id, role, device_class, label,
 /// sort_order, require_confirm, allowed_actions)`. `id` is server-assigned.
 /// `require_confirm` + `allowed_actions` are the per-link control config
-/// (migration 0075); a `None` `allowed_actions` means "every domain action".
+/// (migration 0073); a `None` `allowed_actions` means "every domain action".
 pub type HaLinkInsert = (
     String,
     String,
@@ -10448,8 +10448,8 @@ static MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../../db/migrations/0072_role_actuators_capability.sql"),
     ),
     (
-        "0075_ha_link_control_config.sql",
-        include_str!("../../../db/migrations/0075_ha_link_control_config.sql"),
+        "0073_ha_link_control_config.sql",
+        include_str!("../../../db/migrations/0073_ha_link_control_config.sql"),
     ),
 ];
 
