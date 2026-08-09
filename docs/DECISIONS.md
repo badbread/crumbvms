@@ -136,6 +136,16 @@ Follow-ups tracked separately: record-from-sub main-repair blindness, and the
 sub-side incomplete-fmtp class (an `a=fmtp` present but missing its parameter
 sets). The transcode decision itself is unchanged.
 
+**Correction (#594, later).** The Decision above has Android try `mainv` right
+after the raw main (`main -> mainv -> subv -> sub -> mobile`). That order cost
+every LPR camera a doomed connect to the raw main on each fullscreen open (the
+startup lag called out elsewhere in this entry). `LiveStreamFallback.kt` now
+tries `mainv` FIRST when the server has published it: fullscreen
+`mainv -> main -> subv -> sub -> mobile`, wall no-sub `mainv -> main -> mobile`.
+A camera with no repair published has no `mainv` rung and is unaffected,
+`main -> ...` exactly as before. `docs/COMPONENT-MAP.md`'s ladder entries are
+kept in step with this reorder.
+
 ---
 
 ## 2026-08-08, Boot storage seeding is PATH-idempotent (skip a name whose directory is already covered) + runtime name lookups fall back to path — supersedes #557's "detect, never fix"

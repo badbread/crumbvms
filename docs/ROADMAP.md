@@ -21,9 +21,22 @@ Effort is engineering size, not priority. Decisions for the maintainer are calle
 
 A rules engine living in the always-on API turns motion, detection, and health signals into per-camera, scheduled, cooldown-gated notifications delivered via ntfy / webhook / email plus an in-app channel, with no mandatory cloud and no hard Frigate dependency, it works for any operator running their own server.
 
+> **Update (0.2.0): the MVP shipped, via a different mechanism than planned
+> below.** The Phase A rules engine, evaluators, dispatchers, and admin
+> console section all exist. The Phase B/D "native Crumb push on Android"
+> plan did not: instead of a WorkManager poll or FCM, mobile delivery rides
+> on the channel dispatchers themselves (ntfy, Pushover, Telegram, Discord,
+> Slack, generic webhook), each of which already solves push on the phone, so
+> no first-party push client was needed. No client (Android, iOS, desktop)
+> registers a `/notifications/devices` entry or consumes `/notifications` for
+> local notifications; that surface exists in the API but nothing calls it
+> yet. See "Where we are today" below and the phase checklist.
+
 #### Where we are today
 
-Alerting is a single hardcoded webhook watchdog. `services/api/src/alerts.rs` (`run_heartbeat_watchdog`) is the only notifier: when `ALERT_WEBHOOK_URL` is set it polls `recorder_heartbeat` every 30s and POSTs a `{content,text}` (Discord/Slack-shaped) payload once on stale (>60s) and once on recovery, via a single `alerted` latch. It is wired in `services/api/src/main.rs:365-374`; the config field `alert_webhook_url` is in `services/api/src/config.rs:122-127`. There are no rules, no per-camera scoping, no history, and no person/disk/camera-offline alerts.
+Alerting is a full engine, not a watchdog. `services/api/src/notifications.rs` (1891+ lines, doc-commented with a route table) owns device registration, per-camera and default rules, quiet hours, snooze/presence gating, a `notifications/log` history, and CRUD for third-party channels; `run_notification_engine` (spawned in `main.rs`, ~line 685) polls `events` every 3s, fans out to registered devices, evaluates rule gates (per-camera override → user default → system default), and dispatches to every enabled channel via `services/api/src/channel_notify.rs`. Channels are DB rows (`notification_channels`, migration 0015, extended by 0079/0080), not env config: **Discord, Slack, Pushover, Telegram, ntfy, and generic webhook** are all live dispatch targets, each capability-gated on what it can carry (image attachment, single vs. multi-image) and each with its own `SnapshotMode` (none/plate/vehicle/both, migration 0080). Alert text is customizable per system-alert type (#568), and system-health evaluators for `camera_offline` and `low_disk` already exist in `services/api/src/alerts.rs` alongside the detection-event and motion sources below. The 0.2.0 release rebuilt the console's Notifications pane around named channels, an inline alert-text editor, and quiet hours (#583, migrations 0079-0080).
+
+The one thing that did **not** converge: `services/api/src/alerts.rs` (`run_heartbeat_watchdog`) still runs as a separate, simpler opt-in path, when `ALERT_WEBHOOK_URL` is set it polls `recorder_heartbeat` every 30s and POSTs a `{content,text}` payload directly, independent of the rule engine and channel model above. It was never folded into a seeded default rule as the original plan proposed.
 
 The event sources a real engine needs already exist:
 
@@ -47,14 +60,14 @@ The hardest constraint is mobile push without mandatory FCM. The clean answer fo
 
 Phase A, MVP: engine + history + one default channel (L)
 
-- [ ] Add tables via `ensure_*` (idempotent, mirror `main.rs`): `notification_rules` (camera_id NULL=all, event_type, severity, schedule jsonb, zones text[], min_score, cooldown_secs, enabled, per-rule channel set) and `notifications` (history: rule_id, camera_id, event_type, ts, title, body, snapshot_url, dedup_key, per-channel delivery status) (M)
-- [ ] Define internal `CrumbEvent{kind,camera_id,severity,ts,payload}` + a tokio mpsc bus in the API (S)
-- [ ] Refactor `alerts.rs` heartbeat watchdog into a `recorder_down` evaluator that emits `CrumbEvent` instead of POSTing directly (keep the stale/recovery latch) (S)
-- [ ] Add evaluators: detection-event (tap the ingester channel or poll `events`), camera-offline (stateful watchdog over `camera_last_segment` with hysteresis + recovery), disk-threshold (statvfs % high-water from status.rs logic) (M)
-- [ ] Rules engine: per-event filter by camera × type × schedule(TZ) × zone × min_score × cooldown; write a `notifications` row; dispatch (M)
-- [ ] Dispatchers: generalize the proven `{content,text}` webhook + add an ntfy publisher (HTTP POST to topic; title/priority/click/attach snapshot) (M)
-- [ ] Admin console: a Notifications section in `admin.html` to CRUD rules + view recent history (M)
-- [ ] Config: `NTFY_BASE_URL`/`NTFY_TOPIC`/`NTFY_TOKEN`, `SMTP_*`; keep `ALERT_WEBHOOK_URL` backward-compatible as a seeded default rule (S)
+- [x] Tables: `notification_rules` and channel/history tables shipped (`notification_channels` migration 0015, extended 0079/0080; `notification_log`), via numbered migrations rather than the `ensure_*` pattern (M)
+- [ ] Define internal `CrumbEvent{kind,camera_id,severity,ts,payload}` + a tokio mpsc bus in the API, superseded, the shipped engine polls `events` every 3s directly instead of running an internal bus (S)
+- [ ] Refactor `alerts.rs` heartbeat watchdog into a `recorder_down` evaluator that emits `CrumbEvent` instead of POSTing directly (keep the stale/recovery latch), not done, it still runs as a separate opt-in path (S)
+- [x] Evaluators: detection-event, camera-offline, disk-threshold (`low_disk`) all shipped in `alerts.rs` / `notifications.rs` (M)
+- [x] Rules engine: per-camera/default rules, quiet hours, min-score, cooldown, presence gating; dispatch via channels (M)
+- [x] Dispatchers: shipped, and exceeded the plan, webhook, ntfy, Discord, Slack, Pushover, and Telegram are all live channel types (`channel_notify.rs`) (M)
+- [x] Admin console: the Notifications pane in `admin.html`, rebuilt in 0.2.0 around named channels + an alert-text editor + quiet hours (#583) (M)
+- [ ] Config: `NTFY_BASE_URL`/`NTFY_TOPIC`/`NTFY_TOKEN`, `SMTP_*` env vars, superseded, channels are DB rows configured in the admin console instead of env vars. `ALERT_WEBHOOK_URL` was NOT folded into a seeded default rule, it remains a separate legacy path (S)
 
 Phase B, In-app Crumb push (Android, no FCM) (M)
 
@@ -66,8 +79,8 @@ Phase B, In-app Crumb push (Android, no FCM) (M)
 Phase C, More channels + richer rules (M)
 
 - [ ] SMTP email dispatcher with snapshot attachment (proxy via the existing `/events/{id}/snapshot`) (M)
-- [ ] Pushover + Telegram dispatchers (generic HTTP, thin) (S)
-- [ ] Per-rule quiet hours, severity→priority mapping, snooze/ack from the notification, digest/rollup to fight bursts (M)
+- [x] Pushover + Telegram dispatchers (generic HTTP, thin) (S)
+- [ ] Per-rule quiet hours (shipped), severity→priority mapping, snooze/ack from the notification (snooze shipped, ack not confirmed), digest/rollup to fight bursts (M)
 - [ ] Zone-aware nuisance-suppression presets for the common tree/street outdoor-camera cases (S)
 
 Phase D, Native sub-second motion + optional FCM (M)
@@ -174,15 +187,15 @@ Ship Crumb as prebuilt public Docker images (deploy-by-pull + an offline tarball
 
 #### Where we are today
 
-The build infrastructure is roughly 70% there; the gap is wiring + signing + an offline path + clients-in-CI, not new architecture.
+Backend deploy-by-pull and signed Android releases are shipped. What's left is the desktop signed installer (superseded to Flutter, see above, and still unsigned) and the air-gapped offline tarball; neither needs new architecture, both are wiring.
 
 Backend: `services/api/Dockerfile` and `services/recorder/Dockerfile` are two-stage builds whose runtime stage is `debian:bookworm-slim` + jellyfin-ffmpeg + a single `COPY --from=builder` compiled binary. `docker-compose.yml` already parameterizes images as `${CRUMB_IMAGE_PREFIX:-crumbvms}/<svc>:${CRUMB_VERSION:-local}`, so the same file builds locally (default `local`) or pulls by tag from a registry. `.env.example` documents the deploy-by-pull toggle. `docs/RELEASE.md` specifies the versioned-image/rollback flow; `docs/IMAGES.md` the publishing "owner seam". Workspace license is `AGPL-3.0-or-later` (LICENSE + NOTICE at the repo root). (The `web/` Next.js app an earlier revision of this section covered was removed, the admin console ships inside the api image.)
 
-CI (build-but-don't-push today): `.github/workflows/ci.yml` runs fmt/clippy/build/test, then builds the service images and tags via docker/metadata-action (`sha-<short>`, `latest` on main, `v*` on tag). Push is gated on a `vars.REGISTRY` that is unset, so the `images` job builds-and-validates only and never pushes. No registry is wired yet.
+CI, registry wired and public: `.github/workflows/ci.yml` runs fmt/clippy/build/test, then builds the service images and tags via docker/metadata-action (`sha-<short>`, `latest` on main, `v*` on tag), pushing to GHCR whenever the `vars.REGISTRY` repo variable is set and the event isn't a PR. It is set: `docker-compose.yml`'s default `CRUMB_IMAGE_PREFIX` is `ghcr.io/badbread/crumbvms`, the same value `.env.example` documents, and the packages are public, `docker compose pull` works from a clean machine with no login.
 
 Desktop (two real gaps): `apps/desktop/src-tauri/tauri.conf.json` has `bundle.active:true, targets:"all"` (will produce NSIS+MSI on Windows) but NO `bundle.windows` signing block. CRITICAL: the app loads `libmpv-2.dll` from next-to-the-exe at runtime, and that DLL is not in the repo and not in `bundle.resources`, an installer built today ships an app that can't play video. No desktop bundle has been built here. CI does not build the desktop.
 
-Android (signing not wired): the release buildType has R8 `isMinifyEnabled=true` + `isShrinkResources=true` + proguard, but no `signingConfigs{}`, no keystore, and a hardcoded `versionCode=1`/`versionName="0.1.0"`. Only a debug APK is produced today. CI does not build the APK.
+Android, signed releases shipped: the release buildType has R8 `isMinifyEnabled=true` + `isShrinkResources=true` + proguard, and a conditional `signingConfigs{}` that activates when a keystore is available (`app/build.gradle.kts`), never breaking a plain debug build when it isn't. `.github/workflows/android-release.yml` builds `assembleRelease` on a version tag, signs it from a base64 keystore CI secret, verifies the signature, and uploads the signed APK plus its SHA-256 checksum to the GitHub Release. Versioning is no longer hardcoded: `apps/android/version.properties` drives `versionCode`/`versionName` and is bumped as part of the release-prep commit (currently `VERSION_CODE=5`, `VERSION_NAME=0.2.0`).
 
 #### Where we are going
 
@@ -200,10 +213,10 @@ Phase 0, Decisions (prereqs) (S)
 
 Phase 1, Backend deploy-by-pull (M)
 
-- [ ] Set CI repo/org var `REGISTRY=ghcr.io/crumbvms`; mark packages PUBLIC (flips the existing `images` job to push, no rewrite) (S)
-- [ ] Cut the first `v0.1.0` git tag; confirm CI pushes recorder/api images tagged v0.1.0 + sha (S)
-- [ ] Verify the stock `docker compose pull && docker compose up -d` path from a clean machine with NO registry auth (S)
-- [ ] Pin third-party images (postgres:16-alpine, eclipse-mosquitto:2, alexxit/go2rtc) by digest in the shipped compose (S)
+- [x] Set CI repo/org var `REGISTRY`, packages PUBLIC (shipped as `ghcr.io/badbread/crumbvms`, not the originally proposed `crumbvms` org) (S)
+- [x] Cut the first git tag; CI pushes recorder/api images (past v0.1.0, currently at 0.2.0) (S)
+- [x] Verify the stock `docker compose pull && docker compose up -d` path from a clean machine with NO registry auth (S)
+- [ ] Pin third-party images (postgres:16-alpine, eclipse-mosquitto:2, alexxit/go2rtc) by digest in the shipped compose, still by tag, not digest (S)
 
 Phase 2, Air-gapped (offline tarball) (S)
 
@@ -222,10 +235,10 @@ Phase 3, Desktop self-contained + signed installer (M)
 
 Phase 4, Android signed sideload APK (S)
 
-- [ ] Add release `signingConfigs{}` in `app/build.gradle.kts`; store the keystore as a base64 CI secret (never in repo) (S)
-- [ ] Replace hardcoded `versionCode=1` with a CI-injected monotonic build number (S)
-- [ ] Add a CI `android` job → signed release APK (R8 already on) (S)
-- [ ] Publish the APK via GitHub Releases; document install + the Unknown-Sources step; evaluate F-Droid later (S)
+- [x] Add release `signingConfigs{}` in `app/build.gradle.kts`; store the keystore as a base64 CI secret (never in repo) (S)
+- [x] Replace the hardcoded version with a real one, shipped as a committed `version.properties` bumped per release, not a CI-injected monotonic counter (S)
+- [x] Add a CI `android` job (`android-release.yml`) → signed release APK (R8 already on) (S)
+- [x] Publish the APK via GitHub Releases with a SHA-256 checksum; F-Droid not evaluated (S)
 
 Phase 5, Unified release pipeline + user docs (M)
 

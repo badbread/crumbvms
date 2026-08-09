@@ -44,7 +44,12 @@ admin password in the console after first login.
   compose edit; the recorder creates the subdir on first write.
 
 Then do the post-install hardening:
-- Install the backup cron (`docs/OPS-BACKUP-RECOVERY.md`).
+- Nothing to install for backups: the api runs a nightly `pg_dump` on its own,
+  on by default (see `docs/BACKUP.md`). Confirm a dump has actually landed
+  rather than assuming it's working. Only set up the manual
+  `scripts/backup-db.sh` cron (`docs/OPS-BACKUP-RECOVERY.md`) if you want
+  supplemental, ad-hoc dumps, e.g. pushed straight to a NAS the api's bind
+  mount doesn't reach, running both is harmless.
 - Enable the pre-commit secret guard if this is a working clone (below).
 - Run a tested-restore drill before going live.
 
@@ -71,15 +76,16 @@ hook that blocks committing it.**
 ```bash
 scripts/setup-env.sh                  # generate secrets + seed an admin; prints the passphrase
 scripts/setup-env.sh --prompt         # set your own admin password interactively
-scripts/setup-env.sh --print          # also echo the passphrase to stdout after writing
 scripts/setup-env.sh --force          # ROTATE: overwrite an existing .env
 ```
 
 It refuses to clobber an existing `.env` without `--force`, so it's safe to
-re-run. Rotating `JWT_SECRET` invalidates outstanding tokens (users re-login);
-rotating `POSTGRES_PASSWORD` requires also updating the role in Postgres
-(`ALTER ROLE crumb PASSWORD '...'`), for the bundled DB the simplest path is
-a fresh init or an explicit `ALTER ROLE`.
+re-run. The admin passphrase only prints to the terminal once, at generation
+time; if you miss it, it's still sitting in plaintext in `.env` as
+`SEED_ADMIN_PASSWORD` until you rotate it. Rotating `JWT_SECRET` invalidates
+outstanding tokens (users re-login); rotating `POSTGRES_PASSWORD` requires
+also updating the role in Postgres (`ALTER ROLE crumb PASSWORD '...'`), for
+the bundled DB the simplest path is a fresh init or an explicit `ALTER ROLE`.
 
 ### Keep secrets out of git
 
@@ -95,11 +101,12 @@ a fresh init or an explicit `ALTER ROLE`.
 ### The DB_POOL_SIZE knob
 
 `api` and `recorder` read `DB_POOL_SIZE` (an integer; default **32** in code).
-It's left **unset** in `docker-compose.yml` so the code default applies (note:
-there's no ready-made line to uncomment, so add `DB_POOL_SIZE` to `.env` and wire
-it into the api/recorder `environment:` blocks to override). For real camera
-counts, size it for concurrent load, roughly **2 × cameras + 10** (e.g. 42 for
-16 cameras, 74 for 32). Undersizing it causes pool-saturation hangs under load.
+The stock `docker-compose.yml` already forwards it to both containers, and
+`.env.example` carries a commented `DB_POOL_SIZE=42` line, so raising it is
+just setting the value in `.env` and restarting both containers, no compose
+edit needed. For real camera counts, size it for concurrent load, roughly
+**2 × cameras + 10** (e.g. 42 for 16 cameras, 74 for 32). Undersizing it
+causes pool-saturation hangs under load.
 
 ---
 

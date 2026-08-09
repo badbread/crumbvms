@@ -20,10 +20,13 @@ key in `.env`, restart the affected container, done. No
 the admin console, the console value (stored in the database) wins over the
 env default; that's flagged in the notes.
 
-Every secret-bearing key also answers to a `_FILE` twin (`JWT_SECRET_FILE`,
-`GO2RTC_PASS_FILE`, and the rest) holding a path to read the value from, for
-Docker secrets. Only `HA_TOKEN_FILE` gets its own row below, because the others
-are mechanical; see [Secrets](/configuration/secrets) for the list.
+Most secret-bearing keys also answer to a `_FILE` twin (`DATABASE_URL_FILE`,
+`JWT_SECRET_FILE`, `SEED_ADMIN_PASSWORD_FILE`, `HA_TOKEN_FILE`) holding a path
+to read the value from, for Docker secrets. `GO2RTC_USER`/`GO2RTC_PASS` are the
+exception: the embedded go2rtc restreamer expands them straight from the
+process environment and compose requires the plain vars, so those two don't
+support `_FILE`. Only `HA_TOKEN_FILE` gets its own row below, because the
+others are mechanical; see [Secrets](/configuration/secrets) for the list.
 
 ## Time zone
 
@@ -69,6 +72,7 @@ console's Server & streaming settings, that value wins.
 | Key | Default | Notes |
 |---|---|---|
 | `SEGMENT_SECONDS` | `4` | 2 to 6 seconds; short segments mean near-instant seek |
+| `SEGMENT_RECEIPT_TIMEOUT_SECS` | `90` | stall watchdog: how long a worker waits for the next segment before it reconnects. Raise it for a long-GOP camera whose keyframe interval exceeds the default. Clamped to `[20, 3600]`; unset or unparseable falls back to the default rather than erroring. |
 
 ## Recorder internals
 

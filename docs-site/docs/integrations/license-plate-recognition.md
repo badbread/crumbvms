@@ -126,6 +126,24 @@ draw them in the LPR section's per-camera zone editor over a live snapshot.
   OCR flip on one of those can never push a real watchlisted plate over the
   budget, which is the behavior I want (I'd rather never miss an alert).
 
+## Naming a plate
+
+A plate is a string of characters until you tell Crumb otherwise. From the
+Plates tab (web console, desktop, Android, and iOS) you can give any plate a
+human-readable name, "Jason's truck", "Mail carrier", whatever tells you at a
+glance what you're looking at. Naming is admin-only and is a separate action
+from watchlisting: you can name a plate without watchlisting it, watchlist a
+plate without naming it, or do both. Once set, the name shows wherever that
+plate appears, reads, watchlist, and the plate detail, with the raw plate
+number still legible underneath so you're never guessing what was actually
+read. Clearing the name falls back to a watchlist label if one exists, then to
+the raw plate.
+
+**Copy a plate number** to the clipboard straight from a reads row, a
+watchlist row, or the plate detail, on the web console, desktop, Android, and
+iOS, so you can hand it off (a call to the front gate, a note to a neighbor)
+without retyping it.
+
 ## Searching and retention
 
 Search the read database with `GET /plates` (exact, prefix, contains, or fuzzy
