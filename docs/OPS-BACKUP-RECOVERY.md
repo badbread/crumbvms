@@ -7,6 +7,15 @@ it** (see the pre-deployment checklist at the bottom).
 Commands assume the stack lives at `/opt/crumb/app` (the compose project
 root, where `docker-compose.yml` and `.env` live). Adjust paths to your install.
 
+> **Automated backups already run out of the box.** The api ships a built-in
+> nightly `pg_dump` job, on by default, with its own rotation and failure
+> alerting, see `docs/BACKUP.md`. You do not need to set up the manual
+> `scripts/backup-db.sh` cron below just to have backups happening; this
+> runbook's script and cron are the supplemental, ad-hoc path (custom
+> schedule, dumps pushed somewhere the api's bind mount doesn't reach, etc.),
+> not the thing that makes backups exist in the first place. Running both is
+> harmless, they just produce two sets of dumps.
+
 ---
 
 ## Why the database is the thing you must back up

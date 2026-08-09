@@ -50,7 +50,7 @@ images.)
 
 This one was tested end to end as an in-place upgrade from the published
 v0.1.1 images. It is a drop-in: `.env` needs no changes, the new migrations
-(0072 through 0078) apply in a single pass on first boot, footage came
+(0072 through 0080) apply in a single pass on first boot, footage came
 through byte-identical, and logins, roles, policies, and the authenticated
 RTSP restream default were all intact afterwards. Four things are worth
 knowing before you run it.

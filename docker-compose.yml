@@ -74,6 +74,7 @@ services:
       ARCHIVE_STORAGE_PATH: ${ARCHIVE_STORAGE_PATH:-/data/archive}
       ARCHIVE_STORAGE_NAME: "${ARCHIVE_STORAGE_NAME:-Archive}"
       SEGMENT_SECONDS: ${SEGMENT_SECONDS:-4}
+      SEGMENT_RECEIPT_TIMEOUT_SECS: ${SEGMENT_RECEIPT_TIMEOUT_SECS:-}   # stall watchdog before a worker reconnects; empty = default 90s, clamped to [20, 3600]
       MOTION_HWACCEL: ${MOTION_HWACCEL:-cpu}             # 'cpu' works on any host (software motion decode); set vaapi/cuda/auto for a GPU (overlays) or via the admin decode-backend setting
       MAX_GPU_DECODE_SESSIONS: ${MAX_GPU_DECODE_SESSIONS:-4}
       CONFIG_POLL_SECONDS: ${CONFIG_POLL_SECONDS:-30}
