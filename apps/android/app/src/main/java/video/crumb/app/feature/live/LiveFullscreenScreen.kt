@@ -933,6 +933,29 @@ fun LiveFullscreenScreen(
             }
         }
 
+        // Camera-name indicator (bottom-left, semi-transparent). A minimal, non-
+        // intrusive cue for which camera is on screen that never consumes a top bar;
+        // it shares the chrome's non-PiP visibility and sits clear of the bottom-
+        // centre PTZ wheel. Hidden in PiP (video only).
+        if (!inPip) {
+            cameraNames[currentCameraId]?.takeIf { it.isNotBlank() }?.let { name ->
+                Text(
+                    text = name,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(12.dp)
+                        .background(
+                            color = Color.Black.copy(alpha = 0.55f),
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+            }
+        }
+
         // Motion-now badge (top-start, offset past back button): red running-person,
         // commercial-VMS-style. Moved from TopCenter to avoid overlap with the top-right
         // controls row on PTZ cameras.
