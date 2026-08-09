@@ -18,7 +18,11 @@ authoring those links was a thin, awkward surface. This cycle rebuilt the
 authoring layer end to end and made the badges interactive: tap a light to turn
 it on, drag a slider to dim it, read a sensor's real value and units off the
 frame. The other headline items are adaptive live-wall quality on every client
-and human-readable plate names in LPR.
+and human-readable plate names in LPR. Later in the cycle three more landed:
+a camera whose main stream a phone cannot decode now gets a fast, on-demand HD
+repair instead of a permanent SD fallback, the console's notifications surface
+was redesigned around named channels, and LPR plates gained real tooling, copy
+a plate, name it, and pull a report that lists every sighting.
 
 The back half of the cycle was a different kind of work. Two audit sweeps went
 looking for the class of bug where Crumb looks healthy and is not: an install
@@ -152,6 +156,37 @@ Losing footage is the one unforgivable bug, so these two get their own heading.
   mountpoint. It now goes down on the first genuinely committed segment, the same
   signal the boot-time seeding uses (#542).
 
+### HD live on a phone
+
+The 0.2.0 fallback ladder (#529) kept an all-H.265 camera watchable on Android,
+but "watchable" often meant the SD sub-stream. This cycle finished the job.
+
+- **The ladder stopped being trigger-happy.** Android used to step down on any
+  playback error, including a transient network or IO blip, so a momentary
+  hiccup could park a perfectly decodable camera at low resolution. It now steps
+  down only on a real, deterministic playback failure (#561).
+- **A main the phone's decoder rejects can now be repaired in HD.** An opt-in,
+  per-camera, on-demand server-side transcode of the main from H.265 to H.264
+  gives the phone an HD stream it can actually play (#591). Detection reads the
+  SDP go2rtc actually serves to clients rather than the camera's own producer
+  SDP, so a camera that advertises `fmtp` but has it dropped downstream, the
+  reference Uniview LPR among them (its `fmtp` is missing sprop-vps), is
+  correctly flagged and repaired (#592). The client reaches for the repaired
+  main first, so fullscreen starts fast instead of stalling on the doomed raw
+  main (#594). The Uniview LPR compatibility entry was sharpened to that precise
+  root cause (#596).
+
+### Notifications, redesigned
+
+- **The console Notifications pane was rebuilt** around named channels, an
+  inline alert-text editor, and quiet hours (#583, migrations 0079 and 0080).
+- **Alert text is yours to write.** Every system-alert type's text is
+  customizable, so the message that reaches your phone can say what you would
+  have said (#568).
+- **Snapshots are chosen per channel.** Each channel carries its own snapshot
+  mode, none, plate, vehicle, or both, gated on what that channel can actually
+  deliver (#572).
+
 ### Added
 
 - **Adaptive live-wall quality** on every client: the wall steps stream quality
@@ -161,6 +196,17 @@ Losing footage is the one unforgivable bug, so these two get their own heading.
 - **Human-readable plate names in LPR.** A plate you have named shows that name
   wherever the plate appears (reads, watchlist, and detail), with the raw plate
   still legible underneath (#418, and the clients #419, #420, #421).
+- **Plate tooling that treats a plate as a thing you work with.** Copy a plate
+  number to the clipboard from the web console and Android (#549), iOS (#548),
+  and desktop (#551), and name a plate straight from the Plates tab, distinct
+  from watchlisting it (#548, #551). The plate report grew up too: desktop
+  previews it in-app with real options, including listing every occurrence
+  (#554), and Android can Open it, Save it to Downloads, or Share it (#563), and
+  now lists every sighting rather than only the capped thumbnails (#565). Engine
+  Benchmark plate crops decode via the engine codec instead of pure Dart, for
+  speed (#545).
+- **A timeline toggle that solos the selected camera's motion** on desktop, so
+  one camera's activity stays legible against everything else's (#574).
 - An **admin-only scrubbed diagnostics bundle** on the server, the counterpart
   to the desktop diagnostics added in 0.1.1 (#385).
 - **Motion-detector-down** state is now surfaced in decode-status and the admin
@@ -199,6 +245,15 @@ Losing footage is the one unforgivable bug, so these two get their own heading.
 - **Desktop `Esc` is scoped.** With the keyboard shortcuts actually reaching the
   app again (#494, #496), `Esc` deliberately does not fire while a text field has
   focus or a dialog is open.
+- **The camera editor's Home Assistant entity entry is mode-aware** instead of
+  one field pretending to fit every case (#579).
+- **The Server dashboard reads more honestly.** Retention is shown in days
+  rather than hours, policy-source labels say where a value actually comes from,
+  and the Cameras tab scrolls (#581); long lists collapse by default so the page
+  stays navigable on a big install (#589).
+- **`docs/AI-INSTALL.md` was brought back in sync** with the current compose
+  files and scripts, so the runbook once again matches what a fresh install
+  actually does (#577).
 
 ### Fixed
 
@@ -249,6 +304,19 @@ Losing footage is the one unforgivable bug, so these two get their own heading.
 - Server discovery, the console, and the wizard: a `serverTz` crash outside the
   wizard left the schedule panel empty and could persist a cleared archive
   schedule, and Detection Save silently dropped painted zones (#510).
+- **The timeline scrubber populates fast on a long history.** Motion intensity
+  is bucketed in SQL instead of scanning every row, which had turned the
+  scrubber populate into a multi-second wait (#576).
+- **Storage seeding no longer creates duplicate ghost rows.** Seeding is
+  path-idempotent, with name-to-path lookups, so a re-seed finds the storage it
+  already made instead of inventing a twin (#585).
+- The motion tuner's sensitivity control no longer errors when switching a
+  grouped camera from auto to manual (#587).
+- A maximized live camera on desktop stays maximized across minimize and
+  restore, instead of quietly returning to the wall (#570).
+- **Frigate ingest is no longer dead by default.** The MQTT packet limit was too
+  small for Frigate's event payloads; it was raised so events actually arrive
+  (#559).
 
 ### Security
 
@@ -288,10 +356,14 @@ docker compose up -d
 If you pinned `CRUMB_VERSION` in `.env`, set it to the new version before you
 pull. If you never set it, you are on `latest` and the pull is enough.
 
-- **Migrations run themselves.** First boot applies 0072 through 0078; there is
+- **Migrations run themselves.** First boot applies 0072 through 0080; there is
   no manual step and no separate downtime beyond the container restart.
 - **No new required settings.** `GO2RTC_AUTH` is the only new key, and leaving it
   unset keeps the secure default: the RTSP restream stays authenticated.
+- **The redesigned Notifications pane needs nothing from you.** Migrations 0079
+  and 0080 are additive; existing notification settings carry over, and the new
+  alert-text and per-channel snapshot options sit at their defaults until you
+  set them.
 - **`MOTION_HWACCEL` needs a decision, but not urgently.** A new install now
   defaults to `cpu`. An `.env` generated by 0.1.1 contains an explicit
   `MOTION_HWACCEL=auto`, so upgrading leaves you on `auto`, and that is fine:
@@ -320,6 +392,35 @@ pull. If you never set it, you are on `latest` and the pull is enough.
 
 Every pull request merged since 0.1.1, newest first:
 
+- docs(cameras): sharpen the Uniview LPR compatibility entry to the precise fmtp root cause (#596)
+- fix(android): try the repaired main (mainv) before the doomed raw main (#594)
+- fix(api): flag the _mainv repair from the SERVED SDP, not the producer (#592)
+- fix(android): fast step-down + opt-in HD repair for a main with no fmtp (#591)
+- fix(desktop): collapse long Server-dashboard lists by default (#589)
+- fix(desktop): gate motion-tuner sensitivity for grouped cameras (#587)
+- fix(recorder): path-idempotent storage seeding + name->path lookups (#585)
+- feat(notifications): redesign the console Notifications pane (channels, alert-text editor, quiet hours) (#583)
+- fix(desktop): retention days unit, accurate policy-source labels, scrollable Cameras tab (#581)
+- feat(admin): mode-aware HA entity entry rework in the camera editor (#579)
+- docs(install): fix AI-INSTALL drift against current compose and scripts (#577)
+- perf(timeline): bucket motion intensity in SQL instead of scanning every row (#576)
+- feat(desktop): timeline toggle to solo the selected camera's motion (#574)
+- feat(notify): per-channel snapshot mode (none/plate/vehicle/both), capability-gated (#572)
+- fix(desktop): keep a maximized live camera maximized across minimize/restore (#570)
+- feat(notify): customizable alert text across all system-alert types (#568)
+- docs(readme): v0.2.0 release audit touch-ups (#566)
+- fix(android): list every plate sighting in the report, not just the capped thumbnails (#565)
+- feat(android): offer Open / Save to Downloads / Share for LPR plate reports (#563)
+- fix(android): only step down the live fallback ladder on real playback failure (#561)
+- fix(frigate): raise the MQTT packet limit so Frigate ingest is not dead by default (#559)
+- fix: correct release-prep copy defects and code/compose config drift (#557)
+- docs(api): pin the HA placement PUT as a whole-object replace (#555)
+- feat(desktop): preview the plate report in-app, and give it real options (#554)
+- feat(desktop): copy a plate to the clipboard, and name a plate from the Plates tab (#551)
+- feat(lpr): copy the plate number to the clipboard (web console + Android) (#549)
+- feat(ios): copy a plate number, and name a plate, from the Plates tab (#548)
+- perf(desktop): Engine Benchmark plate crops decode via the engine codec, not pure-Dart (#545)
+- docs: bring the release documentation current for v0.2.0 (#544)
 - fix(api): gate the credential/session/notification surface against scoped media tokens (#543)
 - fix(recorder): write the storage marker only after a committed segment, not at dir creation (#542)
 - fix(api): route a camera source-URL edit through reconnect so a go2rtc rejection surfaces (#540)
