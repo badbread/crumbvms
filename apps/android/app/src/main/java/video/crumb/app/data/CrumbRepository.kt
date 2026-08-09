@@ -11,7 +11,19 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import retrofit2.HttpException
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.SSLHandshakeException
+
+/**
+ * Max cameras accepted by `GET /timeline/intensity/batch` per request — must
+ * match the server's `MAX_INTENSITY_BATCH` (services/api/src/timeline.rs),
+ * which 400s above this. The multi-camera playback wall can exceed it (e.g.
+ * "All Cameras"), so [CrumbRepository.timelineIntensityCombined] splits into
+ * chunks of this size, mirroring the desktop
+ * (`apps/desktop-flutter/lib/api/motion_timeline_api.dart`) and iOS
+ * (`apps/ios/Crumb/Features/Playback/PlaybackViewModel.swift`) clients (#599).
+ */
+private const val MAX_INTENSITY_BATCH = 64
 
 /**
  * Like [runCatching] but re-throws [CancellationException] instead of capturing
@@ -46,6 +58,15 @@ class CrumbRepository(private val container: AppContainer) {
 
     private val api: CrumbApi get() = container.api
     val store: SecureStore get() = container.store
+
+    /**
+     * Server base URLs whose API 404'd `/timeline/intensity/batch` — i.e. older
+     * than the batch endpoint. Keyed by base (not a lone flag) so switching to a
+     * different, newer server later in the same process isn't wrongly demoted
+     * to the per-camera fallback (#599). Thread-safe: reads/writes can happen
+     * from concurrent scrub-triggered loads.
+     */
+    private val batchUnsupportedBases = ConcurrentHashMap.newKeySet<String>()
 
     fun mediaUrls(): MediaUrls = container.mediaUrls()
 
@@ -176,28 +197,88 @@ class CrumbRepository(private val container: AppContainer) {
     /** Combined motion histogram across MANY cameras: the per-bucket MAX of each
      *  camera's intensity, so a multi-camera wall timeline shows "the busiest
      *  camera at that moment" and only goes quiet when EVERY camera is quiet.
-     *  Fetches each camera in parallel; a camera that errors contributes nothing
-     *  (no bar) rather than failing the whole overlay. */
+     *  Uses the batched `/timeline/intensity/batch` endpoint (chunked, #599)
+     *  rather than one request per camera; a camera that errors contributes
+     *  nothing (no bar) rather than failing the whole overlay. */
     suspend fun timelineIntensityCombined(
         cameraIds: List<String>,
         startIso: String,
         endIso: String,
         buckets: Int = 240,
     ): Result<List<Float>> = runCatchingCancellable {
-        coroutineScope {
-            val perCamera = cameraIds.map { id ->
+        val byId = fetchIntensityBatched(cameraIds, startIso, endIso, buckets)
+        combineIntensityMax(byId.values, buckets)
+    }
+
+    /**
+     * Fetch per-camera intensity buckets for [cameraIds] via the batched
+     * `GET /timeline/intensity/batch`, split into <=[MAX_INTENSITY_BATCH]-camera
+     * chunks (the server 400s above that; a large "All Cameras" wall can exceed
+     * it). This replaces the old N-simultaneous-requests-per-scrub fan-out that
+     * tripped the server's shared rate limiter (#599).
+     *
+     * Falls back to the pre-batch per-camera fan-out ([fetchIntensityPerCamera])
+     * on 404 (server predates the batch route) or 400 (unexpected rejection,
+     * e.g. a stricter cap on that server), and remembers a 404 per server base so
+     * later loads skip the doomed batch attempt for the rest of the session —
+     * mirrors the desktop (`motion_timeline_api.dart`) and iOS
+     * (`PlaybackViewModel.swift`) clients. Any other per-chunk failure (network
+     * blip, 5xx) just leaves that chunk's cameras out of the map rather than
+     * failing the whole load, matching the old per-camera error tolerance.
+     */
+    private suspend fun fetchIntensityBatched(
+        cameraIds: List<String>,
+        startIso: String,
+        endIso: String,
+        buckets: Int,
+    ): Map<String, List<Float>> {
+        val base = store.serverUrl
+        if (base in batchUnsupportedBases) {
+            return fetchIntensityPerCamera(cameraIds, startIso, endIso, buckets)
+        }
+        val merged = mutableMapOf<String, List<Float>>()
+        for (chunk in cameraIds.chunked(MAX_INTENSITY_BATCH)) {
+            try {
+                merged.putAll(
+                    api.timelineIntensityBatch(chunk.joinToString(","), startIso, endIso, buckets).cameras,
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: HttpException) {
+                if (e.code() == 404 || e.code() == 400) {
+                    if (e.code() == 404) batchUnsupportedBases.add(base)
+                    // Older/incompatible server: fall back to the per-camera fan-out
+                    // for every requested camera, not just the remaining chunks.
+                    return fetchIntensityPerCamera(cameraIds, startIso, endIso, buckets)
+                }
+                // Any other HTTP failure is transient for this chunk only; leave
+                // its cameras out of the map and keep going.
+            } catch (e: IOException) {
+                // Network failure for this chunk only; same tolerance as above.
+            }
+        }
+        return merged
+    }
+
+    /** Pre-batch per-camera fan-out — the fallback for a server older than the
+     *  batch route (or one that unexpectedly rejects it). One request per
+     *  camera, in parallel, same as before #599; a camera that errors
+     *  contributes nothing rather than failing the whole overlay. */
+    private suspend fun fetchIntensityPerCamera(
+        cameraIds: List<String>,
+        startIso: String,
+        endIso: String,
+        buckets: Int,
+    ): Map<String, List<Float>> = coroutineScope {
+        cameraIds
+            .map { id ->
                 async {
-                    runCatchingCancellable { api.timelineIntensity(id, startIso, endIso, buckets).buckets }
+                    id to runCatchingCancellable { api.timelineIntensity(id, startIso, endIso, buckets).buckets }
                         .getOrDefault(emptyList())
                 }
-            }.awaitAll()
-            val combined = FloatArray(buckets)
-            for (cam in perCamera) {
-                val n = minOf(cam.size, buckets)
-                for (i in 0 until n) if (cam[i] > combined[i]) combined[i] = cam[i]
             }
-            combined.asList()
-        }
+            .awaitAll()
+            .toMap()
     }
 
     suspend fun resolveSegment(cameraId: String, tsIso: String, stream: String = "main"): Result<ResolvedSegment> =
@@ -509,6 +590,23 @@ class CrumbRepository(private val container: AppContainer) {
      */
     suspend fun updatesLatest(refresh: Boolean = false): Result<UpdateCheckResponse> =
         runCatchingCancellable { api.updatesLatest(if (refresh) "1" else null) }
+}
+
+/**
+ * Per-bucket MAX across a set of per-camera intensity arrays, sized to
+ * [buckets]. Pulled out of [CrumbRepository.timelineIntensityCombined] as a
+ * pure function so the merge math (the part most likely to regress) is
+ * testable without standing up the full [CrumbRepository]/[AppContainer]
+ * dependency chain (#599). A camera's array shorter than [buckets] (e.g. an
+ * error-tolerant fallback entry) contributes only over its own length.
+ */
+internal fun combineIntensityMax(perCamera: Collection<List<Float>>, buckets: Int): List<Float> {
+    val combined = FloatArray(buckets)
+    for (cam in perCamera) {
+        val n = minOf(cam.size, buckets)
+        for (i in 0 until n) if (cam[i] > combined[i]) combined[i] = cam[i]
+    }
+    return combined.asList()
 }
 
 /**

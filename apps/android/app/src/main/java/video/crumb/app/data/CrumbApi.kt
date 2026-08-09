@@ -81,6 +81,23 @@ interface CrumbApi {
     ): IntensityResponse
 
     /**
+     * Batched form of [timelineIntensity]: one request for many cameras instead
+     * of one per camera (#599). Drives the multi-camera playback wall's combined
+     * motion overlay, which previously fired N parallel per-camera requests on
+     * every scrub re-center and tripped the server's shared rate limiter. The
+     * server caps `camera_ids` at `MAX_INTENSITY_BATCH` (services/api/src/timeline.rs,
+     * currently 64) and 400s above it; a server predating this route 404s. See
+     * [CrumbRepository.timelineIntensityCombined] for the chunking + fallback.
+     */
+    @GET("timeline/intensity/batch")
+    suspend fun timelineIntensityBatch(
+        @Query("camera_ids") cameraIds: String,
+        @Query("start") start: String,
+        @Query("end") end: String,
+        @Query("buckets") buckets: Int = 240,
+    ): IntensityBatchResponse
+
+    /**
      * The leading edge of the next/previous merged motion EVENT relative to
      * [from], searched across ALL recorded history (server-side; same
      * semantics as the desktop client's primary path). Viewer-scoped: returns

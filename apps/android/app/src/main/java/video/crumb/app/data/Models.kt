@@ -273,6 +273,19 @@ data class IntensityResponse(
 )
 
 /**
+ * Response for `GET /timeline/intensity/batch` — the multi-camera form of
+ * [IntensityResponse]: one [IntensityResponse.buckets]-shaped array per
+ * requested camera, keyed by camera id (#599). Every requested camera is
+ * present in [cameras] (all-zero buckets for one with no footage or outside
+ * the caller's scope), so the caller gets a complete map in one request
+ * instead of N. Mirrors the desktop/iOS clients' `IntensityBatchResponse`.
+ */
+@Serializable
+data class IntensityBatchResponse(
+    val cameras: Map<String, List<Float>> = emptyMap(),
+)
+
+/**
  * Wire envelope for `GET /timeline/motion` — the leading edge of the next/
  * previous merged motion event relative to a reference time, searched across
  * ALL recorded history. `start == null` means there is no event that way.
