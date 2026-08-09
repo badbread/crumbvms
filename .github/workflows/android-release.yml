@@ -46,8 +46,20 @@ permissions:
   contents: write   # to create/update the GitHub Release and upload the APK
 
 jobs:
+  # Guard: a vX.Y.Z tag whose baked-in versions disagree with the tag must never
+  # ship. Runs on every release workflow; the build job below `needs:` it, so a
+  # mismatch blocks the release before anything is built. No-op on non-tag refs.
+  verify-versions:
+    name: verify versions match the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: All version surfaces must equal the release tag
+        run: bash scripts/release/check-versions.sh
+
   build-and-sign:
     name: build + sign release APK
+    needs: verify-versions
     # Signing a release APK needs the keystore secrets (see the header). Until
     # they're configured, gate the job off via the ANDROID_RELEASE_ENABLED repo
     # variable so a v* tag doesn't fail — it skips cleanly. Set the variable to

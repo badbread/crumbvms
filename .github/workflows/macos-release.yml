@@ -24,8 +24,19 @@ permissions:
   contents: write   # attach the app zip to the GitHub Release (tag builds)
 
 jobs:
+  # Guard: block the release if any version surface disagrees with the tag.
+  # No-op on non-tag refs (workflow_dispatch). See scripts/release/check-versions.sh.
+  verify-versions:
+    name: verify versions match the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: All version surfaces must equal the release tag
+        run: bash scripts/release/check-versions.sh
+
   build:
     name: build macOS app
+    needs: verify-versions
     runs-on: macos-latest
     defaults:
       run:
