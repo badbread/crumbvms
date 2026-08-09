@@ -5,6 +5,7 @@ package video.crumb.app.feature.playback
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -162,6 +163,19 @@ object PlaybackQuality {
         FULL -> "HD"
         DATA_SAVER -> "SD"
         else -> "AUTO"
+    }
+
+    /**
+     * Even shorter chip text for the CONSTRAINED landscape transport row, where the
+     * chip is a fixed ~30dp [IconButton] and a 4-char label like "AUTO" truncates to
+     * "AUT". "HD"/"SD" already fit; Auto collapses to a single "A" (maintainer's call
+     * — don't try to fit the whole word in the compact bar). Portrait's app-bar chip
+     * sizes to its content and keeps the full [short] labels. (#262)
+     */
+    fun shortCompact(current: String): String = when (current) {
+        FULL -> "HD"
+        DATA_SAVER -> "SD"
+        else -> "A"
     }
 }
 
@@ -914,19 +928,47 @@ fun PlaybackScreen(
                 }
 
                 // Landscape: top app bar is hidden, so float Back over the video
-                // (Snapshot/Bookmark live in the bottom transport bar below).
+                // (Snapshot/Bookmark live in the bottom transport bar below). The
+                // alignment lives on a wrapper Box, NOT on the IconButton inside
+                // HintTooltip: HintTooltip wraps its content in the tooltip's own
+                // (wrap-content) Box, so a `.align` on the inner button aligns it
+                // within THAT box and the tooltip box itself falls to the video
+                // Box's `contentAlignment = Center` — which floated the arrow dead
+                // centre over the footage. Aligning the wrapper pins it top-left.
                 if (isLandscape) {
-                    HintTooltip("Back to live") {
-                        IconButton(
-                            onClick = onBack,
-                            modifier = Modifier.align(Alignment.TopStart).padding(2.dp),
-                        ) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back",
-                                tint = Color.White,
-                            )
+                    Box(modifier = Modifier.align(Alignment.TopStart).padding(2.dp)) {
+                        HintTooltip("Back to live") {
+                            IconButton(onClick = onBack) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "Back",
+                                    tint = Color.White,
+                                )
+                            }
                         }
+                    }
+                }
+                // Landscape: the top app bar (which carries the camera name in
+                // portrait) is hidden, so show which camera is loaded as a small,
+                // semi-transparent label in the BOTTOM-LEFT corner of the video —
+                // minimal, never a top bar, and clear of the top-left Back arrow and
+                // the bottom transport. Portrait already names the camera in the bar.
+                if (isLandscape) {
+                    state.cameraName?.takeIf { it.isNotBlank() }?.let { name ->
+                        Text(
+                            text = name,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color.White,
+                            maxLines = 1,
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(8.dp)
+                                .background(
+                                    color = Color.Black.copy(alpha = 0.55f),
+                                    shape = RoundedCornerShape(6.dp),
+                                )
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
                     }
                 }
                 // (Audio toggle: portrait → top app bar actions; landscape → inline
@@ -1272,8 +1314,12 @@ private fun PlaybackControls(
                     HintTooltip(PlaybackQuality.label(quality)) {
                         IconButton(onClick = cycle, modifier = Modifier.size(ctlSize)) {
                             Text(
-                                text = PlaybackQuality.short(quality),
+                                // Compact label — a fixed 30dp box truncates "AUTO"
+                                // to "AUT"; shortCompact renders "A" for Auto instead.
+                                text = PlaybackQuality.shortCompact(quality),
                                 color = if (quality == PlaybackQuality.AUTO) Color.White else TealAccent,
+                                maxLines = 1,
+                                softWrap = false,
                             )
                         }
                     }
