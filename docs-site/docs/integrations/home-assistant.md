@@ -22,19 +22,20 @@ Three things work today:
 - **Per-badge styling.** Icon, shape, color, size, opacity, outline, and pinned
   captions.
 
-One honest limitation up front: **badge control is not shipped yet.** Tapping a
-badge shows you the entity's state in a read-only card. It does not toggle
-anything. You can link lights, switches, and scenes and watch them, but Crumb
-does not call an HA service today, so a light badge is a status light, not a
-switch. The plumbing (an `actuator` role, an `actuators` permission) is reserved
-for the control phase, and it isn't wired.
+**Badge control is shipped.** Tapping a controllable badge acts on the device: a
+light, switch, fan, or siren toggles in a single tap; a scene activates, a script
+runs, and an automation triggers; a cover or lock opens a small card with its
+actions behind a confirm step (a stray click on a wall of tiles must never unlock
+a door). It is gated by a dedicated, **off-by-default `actuators` permission** on
+the role, so seeing a camera, or a badge's live state, never implies being able
+to operate it. Read-only entities (a sensor, a door contact) still just show
+their state.
 
 ## Connect Crumb to Home Assistant
 
 You need a base URL and a long-lived access token. Make the token from a
-**dedicated non-admin HA user**: the integration only reads state and (later)
-calls services, and a non-admin token is enough for both, which was confirmed on
-live HA hardware. Configure it in the console under **Detection & clips** (the
+**dedicated non-admin HA user**: the integration reads state and calls services,
+and a non-admin token is enough for both, which was confirmed on live HA hardware. Configure it in the console under **Detection & clips** (the
 same panel as Frigate). It stays dormant until you enable it.
 
 The token is write-only from Crumb's side: it's stored in a single `ha_config`
@@ -59,13 +60,13 @@ pickers:
   device classes first (motion, occupancy, presence, moving, door, window,
   opening, garage door) and tucks the rest under a show-all toggle, so nothing is
   unreachable.
-- **Controls** are `light`, `switch`, and `scene` entities. You can link and
-  display these today; you cannot actuate them yet (see the note above).
+- **Controls** are the actuator domains: `light`, `switch`, `fan`, `siren`,
+  `cover`, `lock`, `button`, `input_button`, `scene`, `script`, and `automation`.
+  Link one and, with the `actuators` permission, tap its badge to operate it.
 
 The entity's device class is captured at link time and drives the badge glyph
-without re-querying HA. What you can't link today: numeric `sensor` entities like
-temperature and humidity, and the `lock` domain directly (a lock exposed as a
-`binary_sensor` works).
+without re-querying HA. Numeric `sensor` entities (temperature, humidity, power,
+and the like) are linkable too and render their value with units.
 
 ## Home Assistant as a recording trigger
 
@@ -94,9 +95,10 @@ from `GET /ha/states` on a short cache.
 State honesty is built in: an unknown, unavailable, or stale entity renders grey
 and dimmed, **never** as "closed" or "off". A badge that looked closed on a dead
 HA connection would be the overlay version of the footage-loss bug, so it's
-treated the same way. Tapping a badge opens a read-only card with the friendly
-name, current state, a relative "N ago", the raw entity id, and a stale note when
-it applies.
+treated the same way. Tapping a **read-only** badge (a sensor) opens a card with
+the friendly name, current state, a relative "N ago", the raw entity id, and a
+stale note when it applies. Tapping a **controllable** badge acts on it directly,
+or, for a cover or lock, opens a card with its actions and a confirm step.
 
 ## Customize a badge
 
