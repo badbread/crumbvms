@@ -120,6 +120,7 @@ fun haPrimaryAction(domain: String): String? = when (domain) {
     "light", "switch", "fan", "siren" -> "toggle"
     "button", "input_button" -> "press"
     "scene", "script" -> "turn_on"
+    "automation" -> "trigger"
     else -> null
 }
 
@@ -188,6 +189,7 @@ fun haFullActions(domain: String): List<HaAction> = when (domain) {
     "button", "input_button" -> listOf(HaAction("press", "Press"))
     "scene" -> listOf(HaAction("turn_on", "Activate"))
     "script" -> listOf(HaAction("turn_on", "Run"))
+    "automation" -> listOf(HaAction("trigger", "Trigger"))
     else -> emptyList()
 }
 

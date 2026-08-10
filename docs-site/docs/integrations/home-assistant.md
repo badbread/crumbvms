@@ -21,8 +21,9 @@ What works today:
 - **Live entity badges pinned on the video**, with an icon, shape, color, size,
   and opacity you choose per entity.
 - **Control from the badge.** Entities linked with the **Control** role, lights,
-  switches, fans, sirens, covers, locks, buttons, scenes, and scripts, can be
-  operated right from the badge: tap a simple device to fire its action, or open
+  switches, fans, sirens, covers, locks, buttons, scenes, scripts, and
+  automations, can be operated right from the badge: tap a simple device to fire
+  its action (an automation triggers, a scene activates, a script runs), or open
   a small action card for a device like a cover or lock that has more than one
   meaningful action.
 - **A Home Assistant hub** in the console: connection settings, every linked
@@ -93,8 +94,8 @@ picker scoped to the domains that role accepts:
   detail card can show, for example, `72°F` instead of a bare number.
 - The **Control** picker searches every domain Crumb can actuate: `light`,
   `switch`, `fan`, `siren`, `cover`, `lock`, `button`, `input_button`, `scene`,
-  and `script`, grouped by domain. If you are looking for a switch or a light,
-  this is the button; they are not in the sensor pickers.
+  `script`, and `automation`, grouped by domain. If you are looking for a switch
+  or a light, this is the button; they are not in the sensor pickers.
 
 Every picker has a search box, and an entity already linked under that role
 shows as "(linked)" instead of being hidden. Nothing is saved until you hit
