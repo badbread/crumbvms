@@ -126,6 +126,7 @@ const HA_ACTION_ALLOWLIST: &[(&str, &[HaActionSpec])] = &[
     ("input_button", &[spec("press")]),
     ("scene", &[spec("turn_on")]),
     ("script", &[spec("turn_on")]),
+    ("automation", &[spec("trigger")]),
 ];
 
 /// The kind of numeric value an action carries. Kept as an enum (not a bare
@@ -410,7 +411,8 @@ struct EntitiesQuery {
     /// A single HA domain (e.g. `binary_sensor`, `sensor`, `light`, `cover`), or
     /// one of the role aliases: `controls` (every actuatable domain from
     /// `HA_ACTION_ALLOWLIST`: light, switch, fan, siren, cover, lock, button,
-    /// `input_button`, scene, script) or `sensors` (numeric `sensor`). Omitted ⇒
+    /// `input_button`, scene, script, automation) or `sensors` (numeric
+    /// `sensor`). Omitted ⇒
     /// the union of all of the above (motion binary sensors + numeric sensors +
     /// every controllable domain).
     domain: Option<String>,
@@ -1013,8 +1015,8 @@ async fn get_entities(
     let s = effective_settings(&state).await?;
     let domains: Vec<&str> = match q.domain.as_deref() {
         // Actuator role: every domain the action endpoint can drive (light,
-        // switch, fan, siren, cover, lock, button, input_button, scene, script),
-        // derived from the allowlist so the two can never diverge.
+        // switch, fan, siren, cover, lock, button, input_button, scene, script,
+        // automation), derived from the allowlist so the two can never diverge.
         Some("controls") => control_domains(),
         // Numeric-sensor role (temperature/humidity/... display links).
         Some("sensors") => vec!["sensor"],
@@ -1934,6 +1936,7 @@ mod tests {
             ("input_button", &["press"]),
             ("scene", &["turn_on"]),
             ("script", &["turn_on"]),
+            ("automation", &["trigger"]),
         ];
         for (domain, actions) in allowed {
             for action in *actions {
