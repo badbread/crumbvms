@@ -483,10 +483,21 @@ pub struct CreateChannelRequest {
     /// Legacy snapshot toggle (`true → vehicle`, `false → none`). Kept for
     /// back-compat with clients that predate `snapshot_mode`.
     pub include_snapshot: Option<bool>,
+    /// Whether the channel starts enabled. Absent → `true`, so legacy clients and
+    /// the "leave it on" default are unchanged; sending `false` (an operator
+    /// unchecking **Enabled** on the create form) is now honored (#600).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Admin-only: set to `true` to make the channel global (no owner).
     /// Ignored for non-Admin callers (the channel is always owned by the caller).
     #[serde(default)]
     pub global: bool,
+}
+
+/// serde default for [`CreateChannelRequest::enabled`]: a channel is enabled
+/// unless the create payload explicitly says otherwise.
+fn default_true() -> bool {
+    true
 }
 
 /// `PUT /notifications/channels/:id` body.
@@ -650,7 +661,7 @@ async fn create_channel(
         user_id: owner,
         kind: body.kind,
         name: body.name.trim().to_owned(),
-        enabled: true,
+        enabled: body.enabled,
         config: body.config,
         camera_ids: body.camera_ids,
         snapshot_mode,
