@@ -260,6 +260,68 @@ async fn admin_can_toggle_global_and_it_round_trips() {
     );
 }
 
+/// #600: unchecking **Enabled** on the CREATE form must produce a disabled
+/// channel. `CreateChannelRequest` had no `enabled` field, so serde dropped it
+/// and create hardcoded `enabled: true`. Now the field is honored on create, and
+/// an absent `enabled` still defaults to true (legacy clients are unchanged).
+#[tokio::test]
+async fn create_honors_enabled_false_and_defaults_true() {
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+
+    // enabled:false on create -> the channel is created disabled.
+    let create = serde_json::json!({
+        "kind": "webhook",
+        "name": unique("disabled-ch"),
+        "config": {},
+        "enabled": false,
+    });
+    let resp = app
+        .send(post_auth_json("/notifications/channels", &token, &create))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = into_json(resp).await;
+    assert_eq!(
+        created["enabled"].as_bool(),
+        Some(false),
+        "enabled:false on create must be honored (#600), not forced true"
+    );
+    let disabled_id = created["id"].as_str().expect("id").to_owned();
+
+    // Absent enabled -> defaults to true (the common case / legacy clients).
+    let create_default =
+        serde_json::json!({ "kind": "webhook", "name": unique("default-ch"), "config": {} });
+    let resp = app
+        .send(post_auth_json(
+            "/notifications/channels",
+            &token,
+            &create_default,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created_default = into_json(resp).await;
+    assert_eq!(
+        created_default["enabled"].as_bool(),
+        Some(true),
+        "an absent enabled still defaults to true"
+    );
+
+    // The disabled channel stays disabled across a reload.
+    let list = into_json(app.send(get_auth("/notifications/channels", &token)).await).await;
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"].as_str() == Some(disabled_id.as_str()))
+        .expect("channel present");
+    assert_eq!(
+        row["enabled"].as_bool(),
+        Some(false),
+        "disabled-on-create persisted across a reload"
+    );
+}
+
 #[tokio::test]
 async fn non_admin_cannot_toggle_global() {
     let app = TestApp::new().await;
