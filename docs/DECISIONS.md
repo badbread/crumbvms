@@ -8,6 +8,31 @@ revisit.
 
 ---
 
+## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
+
+**Context.** #442 introduced value-setting HA controls. Light dimming
+(`set_brightness`), cover position (`set_position`), and fan speed (`set_speed`)
+shipped in v0.2.0 and actuate from the on-video badge, gated by the `actuators`
+capability. The issue also listed a thermostat/climate setpoint
+(`climate.set_temperature`).
+
+**Decision.** The `climate` domain is deliberately NOT in the action allowlist
+(`HA_ACTION_ALLOWLIST`, `services/api/src/ha.rs`); a unit test asserts
+`climate.set_temperature` stays rejected. A camera view is a security-monitoring
+surface, not a thermostat UI, and setpoint control would add a per-entity
+min/max/step/unit contract across every client for something the operator can
+already do in Home Assistant itself. #442 was closed as complete on the three
+delivered value controls.
+
+**Rejected:** adding `climate` control (the "Slice 2" once sketched in an
+HA-management plan). Owner decision, 2026-08-10.
+
+**Revisit if:** the maintainer wants HVAC control on the video wall and will own
+the setpoint min/max/step/unit UI across all clients. Until then, keep `climate`
+out of the allowlist.
+
+---
+
 ## 2026-08-08, A main whose SDP lacks `fmtp` is repaired for Android by an OPT-IN H.265->H.264 transcode (`_mainv`), not the `_subv`-style copy — because a copy-remux reintroduces an AP Media3 can't read
 
 **Context.** Some cameras (verified: a Uniview H.265 LPR main) publish their main
