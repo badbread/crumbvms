@@ -682,6 +682,26 @@ fn resolve_needs_subv(verdict: Option<bool>, previously_needed: bool) -> bool {
     verdict.unwrap_or(previously_needed)
 }
 
+/// Combine the SERVED-SDP verdict (authoritative when present — it is the exact
+/// SDP an RTSP client receives) with the PRODUCER verdict as a POSITIVE-ONLY
+/// fallback, for a stream with no RTSP consumer this pass (a record-from-sub
+/// main, an idle stream, a sub consumed only over WebRTC).
+///
+/// * `served` present ⇒ it wins outright. It is what the client actually gets, so
+///   it is the truth for whether the client needs the repair.
+/// * `served` `None` ⇒ fall back to the producer, but ONLY when the producer is
+///   ITSELF positively fmtp-less (`Some(true)`). A healthy-LOOKING producer
+///   (`Some(false)`) must NEVER flip a stream to "fine": go2rtc can serve a
+///   fmtp-less SDP from a producer whose own `a=fmtp` is present-but-incomplete
+///   (the #592 bug — producer `Some(false)`, served `Some(true)`), so trusting a
+///   `Some(false)` producer is exactly the lie #592 removed.
+/// * neither side knows ⇒ `None`, preserving [`resolve_needs_subv`]'s sticky rule.
+///
+/// Pure + unit-tested (#593).
+fn combine_fmtp_verdict(served: Option<bool>, producer: Option<bool>) -> Option<bool> {
+    served.or(producer.filter(|&lacks| lacks))
+}
+
 /// Build a [`StreamIndex`] from go2rtc's `/api/streams` object (pure — split out
 /// so the parse is unit-testable against captured payloads without a go2rtc).
 fn index_from_streams(map: &serde_json::Map<String, serde_json::Value>) -> StreamIndex {
@@ -799,32 +819,42 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     // Gated on `main_repair_transcode_enabled` (default off): the repair is a
     // full-res re-encode with real recorder CPU cost, so it is opt-in — off means
     // the map stays empty and nothing changes for anyone. When on, it is
-    // per-camera and detection-driven — but unlike `_subv`, the verdict comes from
-    // the SDP go2rtc SERVES (`video_lacks_fmtp_served`), not the producer SDP.
+    // per-camera and detection-driven. The verdict is SERVED-FIRST (the SDP go2rtc
+    // SERVES, `video_lacks_fmtp_served`) with a POSITIVE-ONLY producer fallback
+    // (`video_lacks_fmtp`) via [`combine_fmtp_verdict`] (#593).
     // A main can advertise an INCOMPLETE `a=fmtp` (e.g. H.265 with sps+pps but no
     // sprop-vps, the reference LPR camera) that looks healthy on the producer side
     // yet leaves go2rtc serving consumers a fmtp-less SDP — the exact thing that
     // makes Media3 throw `missing attribute fmtp`. See
     // [`stream_served_video_lacks_fmtp`]. Under the default record-from-main
     // policy the recorder is a persistent RTSP consumer of the main, so a served
-    // SDP is reliably present; a momentary gap — or a record-from-sub camera whose
-    // main has no RTSP consumer at all — yields `None`, handled by
-    // `resolve_needs_subv`'s sticky-across-unknown rule.
+    // SDP is reliably present; a record-from-sub camera whose main has no RTSP
+    // consumer at all falls back to the producer verdict but flags ONLY if that
+    // producer POSITIVELY lacks fmtp (a `Some(false)` never un-flags — the #592
+    // lie). When neither side knows, `None` is handled by `resolve_needs_subv`'s
+    // sticky-across-unknown rule.
     let mut needs_mainv: std::collections::HashMap<&str, bool> =
         std::collections::HashMap::with_capacity(streams.len());
     for s in &streams {
+        // Served-first, producer-fallback-positive-only (#593): the served SDP is
+        // authoritative when a consumer is attached; when it is not (a
+        // record-from-sub main has no persistent RTSP consumer), a producer that
+        // ITSELF positively lacks fmtp still flags the repair. A `Some(false)`
+        // producer never un-flags — see [`combine_fmtp_verdict`].
         let served_verdict = index.video_lacks_fmtp_served.get(&s.go2rtc_name).copied();
-        let needed = main_repair_enabled
-            && resolve_needs_subv(served_verdict, state.mainv_needed(&s.go2rtc_name));
+        let producer_verdict = index.video_lacks_fmtp.get(&s.go2rtc_name).copied();
+        let verdict = combine_fmtp_verdict(served_verdict, producer_verdict);
+        let needed =
+            main_repair_enabled && resolve_needs_subv(verdict, state.mainv_needed(&s.go2rtc_name));
         // Observability for the "enabled but silently does nothing" trap: the
-        // repair is on, yet this main has never yielded a served-SDP verdict (no
-        // RTSP consumer — an idle main, or a record-from-sub policy), so `_mainv`
-        // cannot be evaluated for it. Debug-level: it can be true every pass for a
-        // legitimately-idle main, so it must not spew at info.
-        if main_repair_enabled && served_verdict.is_none() && !needed {
+        // repair is on, yet this main yields NO verdict from either side (no RTSP
+        // consumer for a served SDP, and the producer SDP does not positively lack
+        // fmtp), so `_mainv` cannot be evaluated for it. Debug-level: it can be
+        // true every pass for a legitimately-idle main, so it must not spew at info.
+        if main_repair_enabled && verdict.is_none() && !needed {
             tracing::debug!(
                 camera = %s.go2rtc_name,
-                "main-repair enabled but the main has no served-SDP verdict (no RTSP consumer — idle main or record-from-sub); _mainv cannot be evaluated"
+                "main-repair enabled but this main has no fmtp verdict (no RTSP consumer for a served SDP, and the producer SDP does not positively lack fmtp); _mainv cannot be evaluated"
             );
         }
         needs_mainv.insert(s.go2rtc_name.as_str(), needed);
@@ -855,14 +885,19 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             .source_sub_url
             .as_deref()
             .is_some_and(|u| !u.trim().is_empty());
-        let needed = has_sub
-            && resolve_needs_subv(
-                index
-                    .video_lacks_fmtp
-                    .get(&sub_name(&s.go2rtc_name))
-                    .copied(),
-                state.subv_needed(&s.go2rtc_name),
-            );
+        // Served-first, producer-fallback-positive-only (#593): a sub whose
+        // producer advertises a present-but-incomplete `a=fmtp` looks healthy on
+        // the producer side, yet go2rtc serves consumers a broken SDP — the same
+        // class #592 found on the main, which producer-only detection misses. The
+        // served verdict (pixel-motion keeps most subs continuously consumed)
+        // catches it; the producer-positive fallback keeps the #483 H.264 class,
+        // and any sub with no consumer this pass, working exactly as before.
+        let sub = sub_name(&s.go2rtc_name);
+        let sub_verdict = combine_fmtp_verdict(
+            index.video_lacks_fmtp_served.get(&sub).copied(),
+            index.video_lacks_fmtp.get(&sub).copied(),
+        );
+        let needed = has_sub && resolve_needs_subv(sub_verdict, state.subv_needed(&s.go2rtc_name));
         needs_subv.insert(s.go2rtc_name.as_str(), needed);
         state.set_subv_needed(&s.go2rtc_name, needed);
     }
@@ -2103,6 +2138,34 @@ mod tests {
         let idx = index_from_streams(body.as_object().unwrap());
         assert_eq!(idx.video_lacks_fmtp.get("lpr"), Some(&false));
         assert_eq!(idx.video_lacks_fmtp_served.get("lpr"), Some(&true));
+    }
+
+    #[test]
+    fn combine_verdict_is_served_first_producer_positive_only() {
+        // Served present ⇒ it wins outright, in BOTH directions: it is the exact
+        // SDP the client receives, so it is the truth about the client's need.
+        assert_eq!(combine_fmtp_verdict(Some(true), None), Some(true));
+        assert_eq!(combine_fmtp_verdict(Some(false), None), Some(false));
+        // The #592 invariant: whenever a served verdict exists it is authoritative,
+        // so a healthy-LOOKING producer never overturns a served "broken", and a
+        // broken producer never overturns a served "fine".
+        assert_eq!(combine_fmtp_verdict(Some(true), Some(false)), Some(true));
+        assert_eq!(combine_fmtp_verdict(Some(false), Some(true)), Some(false));
+
+        // No served verdict (a record-from-sub main, an idle stream, a WebRTC-only
+        // sub): fall back to the producer, but POSITIVE-ONLY.
+        assert_eq!(
+            combine_fmtp_verdict(None, Some(true)),
+            Some(true),
+            "#593: a genuinely fmtp-less producer still flags when no consumer is attached"
+        );
+        assert_eq!(
+            combine_fmtp_verdict(None, Some(false)),
+            None,
+            "a healthy-LOOKING producer must NOT un-flag (the #592 lie); stays unknown"
+        );
+        // Neither side knows ⇒ unknown, so `resolve_needs_subv`'s sticky rule holds.
+        assert_eq!(combine_fmtp_verdict(None, None), None);
     }
 
     #[test]
