@@ -766,6 +766,7 @@ fun LiveFullscreenScreen(
             ZoomableVideoSurface(
                 modifier = Modifier.fillMaxSize(),
                 suppressPan = ptzVisible,
+                inPip = inPip,
                 onSwipeCamera = { dir ->
                     if (cameraIds.size > 1) {
                         CameraNav.next(cameraIds, currentCameraId, dir)?.let {

@@ -10,6 +10,7 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -127,6 +128,7 @@ fun rememberZoomableSurfaceState(): ZoomableSurfaceState = remember { ZoomableSu
 fun ZoomableVideoSurface(
     modifier: Modifier = Modifier,
     suppressPan: Boolean = false,
+    inPip: Boolean = false,
     onSwipeCamera: ((Int) -> Unit)? = null,
     onTransformChange: ((ViewTransform) -> Unit)? = null,
     state: ZoomableSurfaceState = rememberZoomableSurfaceState(),
@@ -150,6 +152,20 @@ fun ZoomableVideoSurface(
         transformCb.value?.invoke(
             ViewTransform(scale = zoom, offsetX = offset.x, offsetY = offset.y),
         )
+    }
+
+    // Reset the digital zoom when entering Picture-in-Picture (#614). The zoom is a
+    // graphicsLayer transform on the TextureView (scaleX/Y = zoom, translation =
+    // -offset * zoom, with `offset` clamped to the FULLSCREEN size); in the tiny PiP
+    // window that scale+pan maps the content off-viewport and the PiP renders black.
+    // At 1x/no-pan the transform is identity, so PiP shows the full frame — the
+    // known-good zoomed-out case. Exiting PiP leaves it at 1x; the operator re-zooms.
+    LaunchedEffect(inPip) {
+        if (inPip && (zoom != 1f || offset != Offset.Zero)) {
+            zoom = 1f
+            offset = Offset.Zero
+            report()
+        }
     }
 
     Box(
