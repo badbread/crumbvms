@@ -147,11 +147,14 @@ async fn get_segment_low(
 /// (rather than `-c copy`) yields a clean, continuous AAC track within the
 /// segment. Cameras with no audio track simply produce no audio (aac is a no-op).
 async fn generate_low_file(state: &AppState, src: &FsPath, out: &FsPath) -> Result<(), ApiError> {
-    let _permit = state
-        .clip_gen_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("clip-gen semaphore closed: {e}")))?;
+    // Bounded: at saturation the caller gets 503 + Retry-After rather than
+    // parking on the queue with the connection held open.
+    let _permit = crate::media_limits::acquire_bounded(
+        &state.clip_gen_semaphore(),
+        crate::media_limits::CLIP_GEN_WAIT,
+        "low-bitrate transcode",
+    )
+    .await?;
     // Another request may have produced it while we waited for the permit.
     if tokio::fs::metadata(out).await.is_ok() {
         return Ok(());

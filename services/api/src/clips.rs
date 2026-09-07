@@ -955,11 +955,14 @@ async fn generate_clip_file(
     out: &FsPath,
     preview: bool,
 ) -> Result<(), ApiError> {
-    let _permit = state
-        .clip_gen_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("clip-gen semaphore closed: {e}")))?;
+    // Bounded: at saturation the caller gets 503 + Retry-After rather than
+    // queueing behind every transcode ahead of it with no answer.
+    let _permit = crate::media_limits::acquire_bounded(
+        &state.clip_gen_semaphore(),
+        crate::media_limits::CLIP_GEN_WAIT,
+        "clip transcode",
+    )
+    .await?;
     // Another request may have produced it while we waited for the permit.
     if tokio::fs::metadata(out).await.is_ok() {
         return Ok(());
@@ -1085,11 +1088,14 @@ async fn generate_thumbnail(
 ) -> Result<(), ApiError> {
     // Bound total concurrent ffmpeg fan-out with the same permit the clip.mp4 and
     // low-stream transcodes use, so a cold thumbnail grid can't spawn-storm.
-    let _permit = state
-        .clip_gen_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("clip-gen semaphore closed: {e}")))?;
+    // Bounded wait: a saturated queue answers 503 + Retry-After, and the grid
+    // shows a placeholder and retries, rather than hanging on an open request.
+    let _permit = crate::media_limits::acquire_bounded(
+        &state.clip_gen_semaphore(),
+        crate::media_limits::CLIP_GEN_WAIT,
+        "clip thumbnail",
+    )
+    .await?;
     let pool = state.pool();
     let storage_paths = db::storage_path_map(pool)
         .await

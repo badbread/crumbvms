@@ -134,6 +134,23 @@ struct Inner {
     /// Permit count = `config.thumb_extract_max_concurrency`.
     thumb_semaphore: Arc<Semaphore>,
 
+    /// Bounds concurrent `GET /cameras/{id}/frame.jpg` fetches from go2rtc. The
+    /// low-bandwidth walls on Android and iOS poll one still per tile per
+    /// second, and a request against a camera that is down holds its slot for
+    /// the whole retry ladder, so the proxy needs its own bound rather than an
+    /// unbounded fan-out. Permit count = `config.frame_proxy_max_concurrency`.
+    frame_semaphore: Arc<Semaphore>,
+
+    /// Cameras whose live still could not be fetched recently, as a monotonic
+    /// deadline: while `Instant::now() < deadline` the still proxy takes its
+    /// fast path (one quick attempt instead of the full cold-start retry
+    /// ladder), so a wall of tiles pointed at a camera that is down fails in
+    /// well under a second per poll instead of holding a permit for the ladder.
+    /// A successful fetch clears the entry, so a camera that comes back is
+    /// served normally on the very next poll. Memory-only and self-healing: a
+    /// restart just means the first poll after it pays the full ladder again.
+    frame_unavailable_until: DashMap<Uuid, Instant>,
+
     /// Per-key in-flight locks for thumbnail extraction (singleflight). Keyed by
     /// the final cache path; a request serializes on its key so two concurrent
     /// misses on the same slot (e.g. the Phase 1 background writer racing an
@@ -303,6 +320,7 @@ impl AppState {
         let play_semaphore = Arc::new(Semaphore::new(config.playback_max_concurrency));
         let clip_gen_semaphore = Arc::new(Semaphore::new(config.clip_gen_max_concurrency));
         let thumb_semaphore = Arc::new(Semaphore::new(config.thumb_extract_max_concurrency));
+        let frame_semaphore = Arc::new(Semaphore::new(config.frame_proxy_max_concurrency));
 
         // Health-alert maintenance window (issue #46). Off by default; an
         // optional `MAINTENANCE_UNTIL` env (unix seconds) lets a deployment
@@ -328,6 +346,8 @@ impl AppState {
             mainv_needed: DashMap::new(),
             stream_rejected: DashMap::new(),
             thumb_semaphore,
+            frame_semaphore,
+            frame_unavailable_until: DashMap::new(),
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
@@ -482,6 +502,45 @@ impl AppState {
     #[inline]
     pub fn thumb_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.0.thumb_semaphore)
+    }
+
+    /// Clone the live-still proxy concurrency semaphore handle (cheap `Arc`
+    /// clone). Used by `GET /cameras/{id}/frame.jpg` to cap concurrent go2rtc
+    /// still fetches.
+    #[inline]
+    pub fn frame_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.0.frame_semaphore)
+    }
+
+    /// Whether `camera_id`'s live still is currently latched as unavailable, so
+    /// the proxy should take its single-attempt fast path. See
+    /// [`frame_unavailable_until`](Inner::frame_unavailable_until).
+    #[inline]
+    pub fn frame_recently_unavailable(&self, camera_id: Uuid) -> bool {
+        self.0
+            .frame_unavailable_until
+            .get(&camera_id)
+            .is_some_and(|until| Instant::now() < *until)
+    }
+
+    /// Latch `camera_id`'s live still as unavailable for `ttl`. Called when a
+    /// still fetch exhausts its attempts.
+    pub fn mark_frame_unavailable(&self, camera_id: Uuid, ttl: Duration) {
+        // Cheap unbounded-growth guard: entries are one per camera, but a
+        // pathological id churn would still be capped.
+        if self.0.frame_unavailable_until.len() > 4096 {
+            self.0.frame_unavailable_until.clear();
+        }
+        self.0
+            .frame_unavailable_until
+            .insert(camera_id, Instant::now() + ttl);
+    }
+
+    /// Clear `camera_id`'s unavailable latch after a successful still fetch, so
+    /// a camera that comes back is served the normal way on the next poll.
+    #[inline]
+    pub fn clear_frame_unavailable(&self, camera_id: Uuid) {
+        self.0.frame_unavailable_until.remove(&camera_id);
     }
 
     /// Get (or create) the singleflight lock for a thumbnail cache key. Callers

@@ -82,6 +82,93 @@ const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
 /// Upper bound on clips in a single batch export job (guards ffmpeg fan-out).
 const MAX_BATCH_ITEMS: usize = 50;
 
+/// Upper bound on DISTINCT cameras in a single `POST /export` job.
+///
+/// Both export routes fan out to one sequential ffmpeg run per unit of work, so
+/// they get the same ceiling: `/export/batch` counts clips, `/export` counts
+/// cameras. 50 is far beyond any real evidence export (the largest reference
+/// install has eleven cameras) while still refusing a list that would keep the
+/// single job slot busy for hours.
+const MAX_EXPORT_CAMERAS: usize = 50;
+
+/// Floor on the per-camera ffmpeg wall-clock budget, so a short export still
+/// gets a sane allowance for spin-up, seeking, and a slow disk.
+const EXPORT_FFMPEG_TIMEOUT_FLOOR_SECS: u64 = 600;
+
+/// Wall-clock allowance per second of requested range. 4x realtime is very
+/// forgiving even for a burn-in re-encode; anything slower than that is a wedged
+/// child, not a busy one.
+const EXPORT_FFMPEG_TIMEOUT_FACTOR: u64 = 4;
+
+/// Absolute ceiling on the per-camera ffmpeg budget, whatever the range. Without
+/// it a maximum-range job could hold its slot for days.
+const EXPORT_FFMPEG_TIMEOUT_CEILING_SECS: u64 = 24 * 60 * 60;
+
+/// Wall-clock budget for ONE camera's ffmpeg run over a `range_secs` window.
+///
+/// A child that neither exits nor gets dropped (a read wedged on a stalled
+/// mount, say) used to leave the job `Running` forever, which permanently
+/// consumed one of `EXPORT_MAX_CONCURRENT` slots: after enough of them every
+/// `POST /export` returned 429 until the api was restarted. Bounding the wait
+/// turns that into a `Failed` job with a stored error, which frees the slot and
+/// tells the operator what happened.
+fn export_ffmpeg_timeout(range_secs: i64) -> std::time::Duration {
+    let range = u64::try_from(range_secs.max(0)).unwrap_or(u64::MAX);
+    let scaled = range
+        .saturating_mul(EXPORT_FFMPEG_TIMEOUT_FACTOR)
+        .max(EXPORT_FFMPEG_TIMEOUT_FLOOR_SECS)
+        .min(EXPORT_FFMPEG_TIMEOUT_CEILING_SECS);
+    std::time::Duration::from_secs(scaled)
+}
+
+/// Validate a `POST /export` request's camera list and time range, returning the
+/// cameras to actually export: sorted and de-duplicated.
+///
+/// De-duplication is the load-bearing part. `AuthUser::filter_camera_ids` is a
+/// scope filter, NOT a dedup (for an admin it returns the list verbatim), so a
+/// body repeating one camera N times used to run N sequential full-range ffmpeg
+/// jobs, all writing the SAME `{camera_id}.{ext}` output with `-y`, and all
+/// counted as ONE job against `EXPORT_MAX_CONCURRENT`. Collapsing duplicates
+/// here makes the work proportional to what the caller can actually receive.
+///
+/// Kept pure (no state, no DB) so the caps are unit-testable.
+fn validate_export_cameras_and_range(
+    camera_ids: &[Uuid],
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    max_range_seconds: i64,
+) -> Result<Vec<Uuid>, ApiError> {
+    if camera_ids.is_empty() {
+        return Err(ApiError::BadRequest(
+            "camera_ids must contain at least one camera".to_owned(),
+        ));
+    }
+    if start >= end {
+        return Err(ApiError::BadRequest(
+            "start must be strictly before end".to_owned(),
+        ));
+    }
+
+    let range_seconds = (end - start).num_seconds();
+    if range_seconds > max_range_seconds {
+        return Err(ApiError::BadRequest(format!(
+            "export range too large: {range_seconds} seconds requested, max {max_range_seconds} \
+             (raise EXPORT_MAX_RANGE_SECONDS to allow longer exports)"
+        )));
+    }
+
+    let mut distinct = camera_ids.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() > MAX_EXPORT_CAMERAS {
+        return Err(ApiError::BadRequest(format!(
+            "too many cameras in one export ({} requested, max {MAX_EXPORT_CAMERAS})",
+            distinct.len()
+        )));
+    }
+    Ok(distinct)
+}
+
 // ─── route registry ───────────────────────────────────────────────────────────
 
 /// Mount export routes onto the root router.
@@ -120,32 +207,25 @@ async fn create_export(
     user.require_export()?;
 
     // ── validate ──────────────────────────────────────────────────────────────
-    if body.camera_ids.is_empty() {
-        return Err(ApiError::BadRequest(
-            "camera_ids must contain at least one camera".to_owned(),
-        ));
-    }
-    if body.start >= body.end {
-        return Err(ApiError::BadRequest(
-            "start must be strictly before end".to_owned(),
-        ));
-    }
+    // Bounds the request BEFORE any work is allocated: non-empty, ordered,
+    // within EXPORT_MAX_RANGE_SECONDS, and at most MAX_EXPORT_CAMERAS DISTINCT
+    // cameras. Returns the de-duplicated camera list.
+    let effective_ids = validate_export_cameras_and_range(
+        &body.camera_ids,
+        body.start,
+        body.end,
+        state.config().export_max_range_seconds,
+    )?;
 
     // Scope: ALL-OR-NOTHING. Reject if ANY requested camera is outside the
     // caller's assigned list, matching /export/batch (create_batch_export) and
     // the archive download — a caller never gets a silently-narrowed partial
     // export they didn't ask for.
-    if let Some(denied) = body
-        .camera_ids
-        .iter()
-        .find(|c| !user.can_access_camera(**c))
-    {
+    if let Some(denied) = effective_ids.iter().find(|c| !user.can_access_camera(**c)) {
         return Err(ApiError::Forbidden(format!(
             "camera {denied} is not in your assigned camera list"
         )));
     }
-    // All accessible now; filter still runs to dedup.
-    let effective_ids = user.filter_camera_ids(&body.camera_ids);
 
     // ── concurrency cap ───────────────────────────────────────────────────────
     // Bound unbounded ffmpeg spawning: refuse new work when too many jobs are
@@ -669,14 +749,23 @@ enum WaitOutcome {
     Finished(std::io::Result<std::process::ExitStatus>),
     /// The cancel token fired; the child was killed + reaped.
     Cancelled,
+    /// The per-camera wall-clock budget elapsed; the child was killed + reaped.
+    /// Carries the budget so the caller can name it in the stored job error.
+    TimedOut(std::time::Duration),
 }
 
-/// Await an ffmpeg `child` while watching `token`. On cancel, SIGKILL + reap the
-/// child (so no zombie) and return [`WaitOutcome::Cancelled`]. This interrupts a
-/// long single-camera encode promptly, not just between cameras.
+/// Await an ffmpeg `child` while watching `token` and a wall-clock `budget`.
+///
+/// On cancel, SIGKILL + reap the child (so no zombie) and return
+/// [`WaitOutcome::Cancelled`]; this interrupts a long single-camera encode
+/// promptly, not just between cameras. On budget expiry, likewise kill + reap
+/// and return [`WaitOutcome::TimedOut`] so the caller can FAIL the job — a
+/// wedged child must never leave a job `Running` forever, because that
+/// permanently consumes one of `EXPORT_MAX_CONCURRENT` slots.
 async fn wait_or_cancel(
     child: &mut tokio::process::Child,
     token: &CancellationToken,
+    budget: std::time::Duration,
 ) -> WaitOutcome {
     tokio::select! {
         res = child.wait() => WaitOutcome::Finished(res),
@@ -684,6 +773,10 @@ async fn wait_or_cancel(
             // `kill()` sends SIGKILL AND reaps the child (awaits its exit).
             let _ = child.kill().await;
             WaitOutcome::Cancelled
+        }
+        () = tokio::time::sleep(budget) => {
+            let _ = child.kill().await;
+            WaitOutcome::TimedOut(budget)
         }
     }
 }
@@ -760,6 +853,8 @@ async fn run_export_job(
     // Pre-compute codec args (same for every camera in the job).
     let codec = build_codec_args(burn_timestamp, include_audio, &video_codec, &container);
     let ext = codec.ext;
+    // Per-camera wall-clock budget, derived from the requested range.
+    let ffmpeg_budget = export_ffmpeg_timeout((end - start).num_seconds());
 
     for (cam_idx, &camera_id) in camera_ids.iter().enumerate() {
         info!(
@@ -878,10 +973,13 @@ async fn run_export_job(
         args.push(output_path.to_string_lossy().into_owned());
 
         // ── e. spawn ffmpeg ───────────────────────────────────────────────────
+        // kill_on_drop reaps the child if this worker task is ever dropped, so a
+        // half-finished encode can't outlive the job that owns it.
         let mut child = match Command::new(FFMPEG_BIN)
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
@@ -919,9 +1017,20 @@ async fn run_export_job(
             });
         }
 
-        let exit_status = match wait_or_cancel(&mut child, &cancel).await {
+        let exit_status = match wait_or_cancel(&mut child, &cancel, ffmpeg_budget).await {
             WaitOutcome::Cancelled => {
                 cancel_job(&state, job_id, &export_dir).await;
+                return;
+            }
+            WaitOutcome::TimedOut(budget) => {
+                fail_job(
+                    &state,
+                    job_id,
+                    format!(
+                        "ffmpeg for camera {camera_id} exceeded its {} s budget and was stopped",
+                        budget.as_secs()
+                    ),
+                );
                 return;
             }
             WaitOutcome::Finished(Ok(s)) => s,
@@ -1089,6 +1198,9 @@ async fn create_batch_export(
     }
 
     // Validate + scope every item up front (fail the whole request on a bad one).
+    // Each item is one ffmpeg run, so each gets the same per-range cap as a
+    // single-camera export.
+    let max_range_seconds = state.config().export_max_range_seconds;
     let mut items: Vec<(Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> =
         Vec::with_capacity(body.items.len());
     for it in &body.items {
@@ -1096,6 +1208,13 @@ async fn create_batch_export(
             return Err(ApiError::BadRequest(
                 "each clip's start must be strictly before its end".to_owned(),
             ));
+        }
+        let range_seconds = (it.end - it.start).num_seconds();
+        if range_seconds > max_range_seconds {
+            return Err(ApiError::BadRequest(format!(
+                "clip range too large: {range_seconds} seconds requested, max \
+                 {max_range_seconds} (raise EXPORT_MAX_RANGE_SECONDS to allow longer exports)"
+            )));
         }
         user.assert_camera_access(it.camera_id)?;
         items.push((it.camera_id, it.start, it.end));
@@ -1266,10 +1385,13 @@ async fn export_one_clip(
     args.extend(["-progress".to_owned(), "pipe:2".to_owned()]);
     args.push(output_path.to_string_lossy().into_owned());
 
+    // kill_on_drop reaps the child if this worker task is ever dropped, so a
+    // half-finished encode can't outlive the job that owns it.
     let mut child = Command::new(FFMPEG_BIN)
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn ffmpeg for {camera_id}: {e}"))?;
 
@@ -1288,8 +1410,20 @@ async fn export_one_clip(
         });
     }
 
-    let exit_status = match wait_or_cancel(&mut child, token).await {
+    let exit_status = match wait_or_cancel(
+        &mut child,
+        token,
+        export_ffmpeg_timeout((end - start).num_seconds()),
+    )
+    .await
+    {
         WaitOutcome::Cancelled => return Ok(ClipStep::Cancelled),
+        WaitOutcome::TimedOut(budget) => {
+            return Err(format!(
+                "ffmpeg for camera {camera_id} exceeded its {} s budget and was stopped",
+                budget.as_secs()
+            ))
+        }
         WaitOutcome::Finished(Ok(s)) => s,
         WaitOutcome::Finished(Err(e)) => return Err(format!("wait ffmpeg for {camera_id}: {e}")),
     };
@@ -1606,7 +1740,8 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel(); // already cancelled → take the cancel branch immediately
 
-        let outcome = wait_or_cancel(&mut child, &token).await;
+        let outcome =
+            wait_or_cancel(&mut child, &token, std::time::Duration::from_secs(600)).await;
         assert!(matches!(outcome, WaitOutcome::Cancelled));
 
         // Dead AND reaped: try_wait returns Some(exit status), no error/zombie.
@@ -1621,8 +1756,132 @@ mod tests {
             .spawn()
             .expect("spawn true");
         let token = CancellationToken::new(); // not cancelled
-        let outcome = wait_or_cancel(&mut child, &token).await;
+        let outcome =
+            wait_or_cancel(&mut child, &token, std::time::Duration::from_secs(600)).await;
         assert!(matches!(outcome, WaitOutcome::Finished(Ok(s)) if s.success()));
+    }
+
+    /// A child that never exits must be KILLED and REAPED when its wall-clock
+    /// budget elapses, and reported as `TimedOut` so the job fails with a stored
+    /// error instead of sitting `Running` forever and burning a concurrency slot.
+    #[tokio::test]
+    async fn budget_expiry_kills_reaps_and_reports_timeout() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep stand-in for ffmpeg");
+        let token = CancellationToken::new(); // not cancelled
+
+        let outcome =
+            wait_or_cancel(&mut child, &token, std::time::Duration::from_millis(150)).await;
+        assert!(
+            matches!(outcome, WaitOutcome::TimedOut(_)),
+            "a child that outlives its budget must report TimedOut"
+        );
+        let reaped = child.try_wait().expect("try_wait should not error");
+        assert!(reaped.is_some(), "ffmpeg child was not reaped after timeout");
+    }
+
+    // ── per-camera ffmpeg budget ────────────────────────────────────────────────
+
+    #[test]
+    fn export_ffmpeg_budget_is_floored_scaled_and_capped() {
+        // Short range → the floor, so a 10 s clip still gets spin-up room.
+        assert_eq!(
+            export_ffmpeg_timeout(10).as_secs(),
+            EXPORT_FFMPEG_TIMEOUT_FLOOR_SECS
+        );
+        // Mid range → 4x realtime.
+        assert_eq!(export_ffmpeg_timeout(3600).as_secs(), 3600 * 4);
+        // Maximum range → the absolute ceiling, never unbounded.
+        assert_eq!(
+            export_ffmpeg_timeout(i64::MAX).as_secs(),
+            EXPORT_FFMPEG_TIMEOUT_CEILING_SECS
+        );
+        // Nonsense input is still finite.
+        assert_eq!(
+            export_ffmpeg_timeout(-5).as_secs(),
+            EXPORT_FFMPEG_TIMEOUT_FLOOR_SECS
+        );
+    }
+
+    // ── POST /export validation ─────────────────────────────────────────────────
+
+    /// Helper: a valid one-hour window.
+    fn one_hour() -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+        let start = Utc::now();
+        (start, start + chrono::Duration::hours(1))
+    }
+
+    #[test]
+    fn export_validation_dedups_and_sorts_the_camera_list() {
+        let (start, end) = one_hour();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        // The shape that used to run N sequential full-range ffmpeg jobs writing
+        // the SAME output file, all counted as ONE job against the concurrency
+        // cap: one camera repeated many times.
+        let requested = vec![b, a, b, a, b, b, b, b];
+        let out = validate_export_cameras_and_range(&requested, start, end, 86_400)
+            .expect("a duplicated but in-range list is valid");
+        assert_eq!(out, vec![a, b], "duplicates collapse; order is stable");
+    }
+
+    #[test]
+    fn export_validation_rejects_an_over_long_range() {
+        let start = Utc::now();
+        let end = start + chrono::Duration::seconds(86_401);
+        let err = validate_export_cameras_and_range(&[Uuid::from_u128(1)], start, end, 86_400)
+            .expect_err("a range past the cap must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            err.to_string().contains("range too large"),
+            "message should say why: {err}"
+        );
+        // Exactly at the cap is fine (the bound is inclusive).
+        validate_export_cameras_and_range(
+            &[Uuid::from_u128(1)],
+            start,
+            start + chrono::Duration::seconds(86_400),
+            86_400,
+        )
+        .expect("a range exactly at the cap is allowed");
+    }
+
+    #[test]
+    fn export_validation_rejects_too_many_distinct_cameras() {
+        let (start, end) = one_hour();
+        let too_many: Vec<Uuid> = (0..=u128::try_from(MAX_EXPORT_CAMERAS).unwrap())
+            .map(Uuid::from_u128)
+            .collect();
+        let err = validate_export_cameras_and_range(&too_many, start, end, 86_400)
+            .expect_err("more distinct cameras than the cap must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        // The cap counts DISTINCT cameras, so a long list of duplicates passes.
+        let mut duplicated = vec![Uuid::from_u128(7); MAX_EXPORT_CAMERAS * 4];
+        duplicated.push(Uuid::from_u128(8));
+        let out = validate_export_cameras_and_range(&duplicated, start, end, 86_400)
+            .expect("duplicates do not count against the camera cap");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn export_validation_rejects_empty_and_inverted_ranges() {
+        let (start, end) = one_hour();
+        assert_eq!(
+            validate_export_cameras_and_range(&[], start, end, 86_400)
+                .expect_err("empty camera list")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_export_cameras_and_range(&[Uuid::from_u128(1)], end, start, 86_400)
+                .expect_err("inverted range")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     // ── build_codec_args audio handling ─────────────────────────────────────────

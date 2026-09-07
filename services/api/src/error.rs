@@ -75,6 +75,15 @@ pub enum ApiError {
     #[error("internal server error")]
     Internal(#[source] anyhow::Error),
 
+    // ── 503 ──────────────────────────────────────────────────────────────────
+    /// A bounded server resource (a media work semaphore) was still full after
+    /// the caller's bounded wait. Renders 503 plus `Retry-After: <secs>` so the
+    /// client backs off and retries instead of holding a connection open in an
+    /// unbounded queue. Distinct from 429 (`TooManyRequestsRetry`), which means
+    /// "you personally sent too much"; this means "the server is busy".
+    #[error("service unavailable: {message}")]
+    ServiceUnavailableRetry { message: String, retry_after: u64 },
+
     // ── 502 ──────────────────────────────────────────────────────────────────
     /// An upstream dependency (e.g. go2rtc, behind the live MSE proxy) was
     /// unreachable or returned an error.  Detail is logged at `warn!` (not
@@ -99,6 +108,7 @@ impl ApiError {
             }
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::ServiceUnavailableRetry { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -114,6 +124,7 @@ impl ApiError {
             Self::TooManyRequests(_) | Self::TooManyRequestsRetry { .. } => "Too Many Requests",
             Self::Internal(_) => "Internal Server Error",
             Self::BadGateway(_) => "Bad Gateway",
+            Self::ServiceUnavailableRetry { .. } => "Service Unavailable",
         }
     }
 }
@@ -154,9 +165,15 @@ impl IntoResponse for ApiError {
 
         let mut response = (status, body).into_response();
 
-        // 429 backoff hint: attach `Retry-After: <secs>` so a well-behaved
-        // client (or the login UI) knows how long to wait (issue #127).
-        if let Self::TooManyRequestsRetry { retry_after, .. } = &self {
+        // 429/503 backoff hint: attach `Retry-After: <secs>` so a well-behaved
+        // client (or the login UI) knows how long to wait (issue #127, and the
+        // bounded media-work acquires in `media_limits`).
+        let retry_hint = match &self {
+            Self::TooManyRequestsRetry { retry_after, .. }
+            | Self::ServiceUnavailableRetry { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        };
+        if let Some(retry_after) = retry_hint {
             if let Ok(val) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
                 response
                     .headers_mut()
