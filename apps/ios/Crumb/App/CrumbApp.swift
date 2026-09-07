@@ -41,7 +41,7 @@ struct RootView: View {
     @State private var isLocked = false
     #if os(iOS)
     /// Shown (opaque, no re-auth challenge) whenever the scene stops being
-    /// `.active` — purely so the app-switcher snapshot (captured around the
+    /// `.active`, purely so the app-switcher snapshot (captured around the
     /// `.inactive`/`.background` transition, before `.background` itself
     /// actually fires) can't show live camera content. Deliberately NOT tied
     /// to `settings.biometricLockEnabled`: the cover is about what the system
