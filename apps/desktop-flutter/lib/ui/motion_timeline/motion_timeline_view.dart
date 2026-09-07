@@ -22,6 +22,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
 import '../../api/models.dart';
+import '../../api/bookmarks_api.dart';
 import '../../api/motion_timeline_api.dart';
 import '../live_status/detection_icons.dart';
 import '../playback/playback_timeline_controller.dart';
@@ -439,6 +440,9 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
   /// glyph, a detail chip (what + WHERE it was detected); otherwise the
   /// "which cameras had motion here" chip.
   Widget _buildHover(Offset local, double width) {
+    // Bookmark markers sit on top (band top), so they win the hit-test.
+    final bm = _bookmarkNear(local);
+    if (bm != null) return _buildBookmarkOverlay(local, width, bm);
     final det = _detectionNear(local);
     if (det != null) return _buildDetectionOverlay(local, width, det);
     return _buildHoverOverlay(local, width);
@@ -475,12 +479,103 @@ class _MotionTimelineViewState extends State<MotionTimelineView> {
     return best;
   }
 
+  /// The bookmark whose marker sits under [local], or null (#616). Mirrors the
+  /// painter's placement: a downward triangle at the top of the motion band
+  /// (`y ∈ [motionTop, motionTop + 10]`, `motionTop = rulerH + 1`).
+  Bookmark? _bookmarkNear(Offset local) {
+    final t = widget.timeline;
+    final winStart = t.windowStart.millisecondsSinceEpoch;
+    final winEnd = t.windowEnd.millisecondsSinceEpoch;
+    final winDur = winEnd - winStart;
+    if (winDur <= 0 || _width <= 0) return null;
+    const motionTop = _TimelinePainter.rulerH + 1;
+    if (local.dy < motionTop - 2 || local.dy > motionTop + 12) return null;
+    final soloActive = widget.motion.isSoloActive;
+    final selCamId = widget.motion.selectedCameraId;
+    Bookmark? best;
+    double bestDx = 7; // px hit radius (marker half-width is 5)
+    for (final bm in widget.motion.bookmarks) {
+      if (soloActive && bm.cameraId != selCamId) continue;
+      final ms = bm.ts.millisecondsSinceEpoch;
+      if (ms < winStart || ms > winEnd) continue;
+      final x = ((ms - winStart) / winDur) * _width;
+      final dx = (x - local.dx).abs();
+      if (dx <= bestDx) {
+        bestDx = dx;
+        best = bm;
+      }
+    }
+    return best;
+  }
+
   static String _titleCase(String s) =>
       s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
 
   /// Detail chip for a hovered detection glyph: icon + label, the zone(s) where
   /// it was detected (Frigate zones) plus the camera, confidence, and time.
   /// Answers the operator's "where was the person detected?" at a glance.
+  /// Detail chip for a hovered bookmark marker (#616): the note (or "Bookmark"),
+  /// the camera, and the bookmarked time. Same chip shape as detections.
+  Widget _buildBookmarkOverlay(Offset local, double width, Bookmark bm) {
+    const gold = _TimelinePainter.bookmarkColor;
+    final note = (bm.description ?? '').trim();
+    final title = note.isEmpty ? 'Bookmark' : note;
+    final ts = bm.ts.toLocal();
+    String p2(int v) => v.toString().padLeft(2, '0');
+    final time = '${p2(ts.hour)}:${p2(ts.minute)}:${p2(ts.second)}';
+    const chipW = 220.0;
+    final left = (local.dx - chipW / 2).clamp(
+      0.0,
+      (width - chipW).clamp(0.0, double.infinity),
+    );
+    return Positioned(
+      left: left,
+      top: 0,
+      child: IgnorePointer(
+        child: Container(
+          width: chipW,
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.9),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: gold.withValues(alpha: 0.7)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.bookmark, size: 13, color: gold),
+                  const SizedBox(width: 5),
+                  Flexible(
+                    child: Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              Text(
+                '${_nameFor(bm.cameraId)} · $time',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white70, fontSize: 10),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildDetectionOverlay(Offset local, double width, DetectionEvent det) {
     final spec = detectionIconFor(det.iconKey);
     final label = det.label.isEmpty ? det.iconKey : det.label;
@@ -652,6 +747,8 @@ class _TimelinePainter extends CustomPainter {
   static const Color futureDim = Color(0x73000000);
   static const Color laneLabel = Color(0x59FFFFFF);
   static const Color selColor = Color(0xFFE8A33D);
+  /// Saved-bookmark markers — the same gold Android uses (`TimelineColors.bookmark`).
+  static const Color bookmarkColor = Color(0xFFF5C518);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -734,6 +831,8 @@ class _TimelinePainter extends CustomPainter {
     _drawActiveEventSpans(canvas, msToX, selCamId, soloActive, motionTop,
         motionBottom, size.width);
     _drawDetectionGlyphs(canvas, msToX, selCamId, soloActive, motionBottom);
+    // Bookmarks last so the gold markers stay crisp on top of everything (#616).
+    _drawBookmarkMarkers(canvas, msToX, selCamId, soloActive, motionTop);
 
     // ── recording-coverage line (bottom): where footage exists ──────────────
     final recPaint = Paint()..color = recColor;
@@ -937,6 +1036,46 @@ class _TimelinePainter extends CustomPainter {
 
   /// Frigate detection markers: the actual type icon on a dark disc + ring,
   /// just above the coverage line, collision-thinned.
+  /// Saved-bookmark markers (#616): a gold downward triangle at the TOP of the
+  /// motion band, the same glyph Android (`CenteredTimeline` 2c) and iOS
+  /// (`CenteredTimelineView` 2c) draw, with a dark halo so it reads against
+  /// bright motion bars. Hidden cameras' bookmarks are skipped in solo mode,
+  /// exactly like detection glyphs; the selected camera's are drawn prominent.
+  void _drawBookmarkMarkers(
+    Canvas canvas,
+    double Function(int) msToX,
+    String? selCamId,
+    bool soloActive,
+    double motionTop,
+  ) {
+    if (motion.bookmarks.isEmpty) return;
+    final winStart = timeline.windowStart.millisecondsSinceEpoch;
+    final winEnd = timeline.windowEnd.millisecondsSinceEpoch;
+    final halo = Paint()
+      ..color = const Color(0xE60A0E16)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5;
+    final tri = Path();
+    for (final bm in motion.bookmarks) {
+      if (soloActive && bm.cameraId != selCamId) continue;
+      final ms = bm.ts.millisecondsSinceEpoch;
+      if (ms < winStart || ms > winEnd) continue;
+      final x = msToX(ms);
+      final prominent = selCamId == null || bm.cameraId == selCamId;
+      tri
+        ..reset()
+        ..moveTo(x, motionTop + 10) // apex, pointing down into the band
+        ..lineTo(x - 5, motionTop)
+        ..lineTo(x + 5, motionTop)
+        ..close();
+      canvas.drawPath(tri, halo);
+      canvas.drawPath(
+        tri,
+        Paint()..color = bookmarkColor.withValues(alpha: prominent ? 1.0 : 0.6),
+      );
+    }
+  }
+
   void _drawDetectionGlyphs(
     Canvas canvas,
     double Function(int) msToX,
