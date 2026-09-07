@@ -8,6 +8,71 @@ revisit.
 
 ---
 
+## 2026-09-07, Session validity is a positive cached lookup per `jti`, not a cached revoked-set alone; per-user camera grants are read from the user row
+
+**Context.** `sessions` (migration 0033) made a token revocable, and the
+`AuthUser` extractor checked it against an in-memory set of REVOKED `jti`s
+refreshed on write. That set answers "was this session signed out". It cannot
+answer "was this ever a session at all", and `sessions.user_id` is
+`ON DELETE CASCADE`, so removing an account made its rows disappear rather than
+be flagged. A token for a removed account therefore read as "not revoked" and
+kept working for the rest of its `exp`, which for a remembered mobile login is
+years. Separately, a user's per-user camera grants were baked into the token at
+login and unioned with the role's cameras at request time, so editing them did
+nothing until that user signed in again.
+
+**Decision.** The extractor now resolves each `jti` POSITIVELY: a small
+`AppState` cache maps `jti` to "session row present and not revoked, plus the
+owning user's `users.camera_ids`", populated by one joined query on a miss and
+cleared on any user change. An unknown `jti` is resolved against the DB then and
+there, never assumed either way, and the resolved grants replace
+`claims.camera_ids` in the role-union. A login token with no `jti` is refused
+outright (the table predates the first public release, so no supported client
+holds one). The existing revoked-set cache is kept as the fast path for
+revocation; the new cache answers existence.
+
+**Rejected:**
+
+- *Caching the LIVE set instead.* A session minted a millisecond ago on another
+  API replica would not be in this replica's set until the TTL lapsed, so a user
+  who just signed in would be spuriously signed out. A false 401 right after
+  login is worse than a revoke that lands a few seconds late.
+- *Querying `sessions` on every request.* Correct but puts a DB round trip on
+  the hot path of every authenticated request, including the media reads a video
+  wall issues continuously. The repo's established pattern (`roles_cache`,
+  `revoked_jtis`) is cache-the-truth, refresh-on-write.
+- *Also ending sessions when only the extra-cameras list changes.* Once the
+  grants are read from the row on each request, the new set is in force on that
+  user's very next request, so signing them out adds nothing but disruption
+  (a viewer loses their wall because an admin granted them one more camera).
+  A password or role change still ends every session: those replace the
+  credential or what the account may do.
+- *Keeping the opt-in "reject legacy `jti`-less tokens" switch* the 0033
+  migration sketched. There are no legacy tokens to keep working, and a
+  configurable switch for "accept credentials that can never be signed out" is a
+  setting nobody should choose.
+
+**Trades knowingly accepted:**
+
+- A cold `jti` costs one query, so a burst of first-time-seen sessions (an API
+  restart with many clients reconnecting) costs one query each, once.
+- Across replicas, a user edit made on another replica lands within the cache
+  TTL rather than instantly; a revoke still lands within the shorter revocation
+  TTL. Single-process installs (the norm) see both immediately.
+- A scoped media token minted just before an account was removed keeps working
+  for the rest of its short life. It is one camera, media bytes only, minutes,
+  which is the property the media token was designed around.
+- A supplied password always counts as a change, even if it is the same string:
+  hashes are salted, so old and new are never comparable.
+
+**Revisit if:** an install runs enough distinct concurrent sessions that the
+per-`jti` cache is a memory or miss-rate problem (then key the cache by user and
+carry a session generation counter), or Crumb grows a real multi-replica
+deployment story where cache TTLs are too coarse (then push invalidation between
+replicas, for example over the existing DB with a notify channel).
+
+---
+
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
 
 **Context.** #442 introduced value-setting HA controls. Light dimming

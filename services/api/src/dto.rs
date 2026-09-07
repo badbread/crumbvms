@@ -57,9 +57,11 @@ pub struct Claims {
     /// Role — `"admin"` or `"viewer"`. Legacy mirror of the assigned role's
     /// `is_admin`; the `AdminUser` gate still reads this.
     pub role: String,
-    /// LEGACY camera scope baked into the token. Superseded by the role's cameras,
-    /// which the auth extractor resolves from `role_id`. Kept for back-compat with
-    /// tokens issued before RBAC and as a fallback when a role can't be resolved.
+    /// LEGACY camera scope baked into the token, kept in the wire format so a
+    /// token minted by one server version still decodes on another. It is no
+    /// longer READ when authenticating: the caller's per-user camera grants are
+    /// resolved from the user row on each request (see `auth_mw`), so removing a
+    /// grant takes effect immediately rather than at the user's next login.
     pub camera_ids: Vec<String>,
     /// Assigned permission-role id (the source of truth for capabilities + camera
     /// scope). `None` on legacy tokens issued before RBAC. `#[serde(default)]` so
@@ -68,10 +70,10 @@ pub struct Claims {
     pub role_id: Option<String>,
     /// Session id (JWT ID) — a UUID that ties this token to a revocable `sessions`
     /// row (migration 0033). The `AuthUser` extractor rejects the token if this
-    /// `jti` is revoked. `None` on legacy tokens minted before P0-SESSIONS:
-    /// `#[serde(default)]` keeps those deserializing, and the extractor treats a
-    /// `jti`-less token as "legacy, not revocable" (unchanged behaviour) unless
-    /// the owner opts into rejecting legacy tokens.
+    /// `jti` is revoked or its session row is gone. `#[serde(default)]` so a
+    /// token without one still DESERIALIZES, but the extractor then refuses it:
+    /// every token any released client has held carries a `jti`, and a token
+    /// without one could never be signed out.
     #[serde(default)]
     pub jti: Option<String>,
 }
