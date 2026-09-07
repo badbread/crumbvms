@@ -397,12 +397,15 @@ data class ExportOutputFile(
     @SerialName("camera_id") val cameraId: String,
     @SerialName("download_url") val downloadUrl: String,
     @SerialName("size_bytes") val sizeBytes: Long,
+    /** Basename of the file on disk, including the real extension (e.g. `.mkv`
+     *  or `crumb_export.zip`). May be blank on old persisted jobs. */
+    @SerialName("filename") val filename: String = "",
 )
 
 @Serializable
 data class ExportJob(
     val id: String,
-    /** "queued" | "running" | "done" | "failed". */
+    /** "queued" | "running" | "done" | "failed" | "cancelled". */
     val status: String,
     @SerialName("camera_ids") val cameraIds: List<String> = emptyList(),
     val start: String,
@@ -413,7 +416,8 @@ data class ExportJob(
 ) {
     val isDone: Boolean get() = status.equals("done", ignoreCase = true)
     val isFailed: Boolean get() = status.equals("failed", ignoreCase = true)
-    val isTerminal: Boolean get() = isDone || isFailed
+    val isCancelled: Boolean get() = status.equals("cancelled", ignoreCase = true)
+    val isTerminal: Boolean get() = isDone || isFailed || isCancelled
 }
 
 // ─── filmstrip ───────────────────────────────────────────────────────────────
