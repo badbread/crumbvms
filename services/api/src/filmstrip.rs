@@ -609,7 +609,10 @@ mod tests {
     fn quantize_thumb_width_snaps_to_a_bucket_and_clamps() {
         // Out of range in both directions clamps to the ladder's ends.
         assert_eq!(quantize_thumb_width(0), THUMB_WIDTH_BUCKETS[0]);
-        assert_eq!(quantize_thumb_width(THUMB_MIN_WIDTH), THUMB_WIDTH_BUCKETS[0]);
+        assert_eq!(
+            quantize_thumb_width(THUMB_MIN_WIDTH),
+            THUMB_WIDTH_BUCKETS[0]
+        );
         assert_eq!(quantize_thumb_width(u32::MAX), THUMB_MAX_WIDTH);
 
         // Nearest wins.

@@ -582,12 +582,13 @@ async fn main() -> anyhow::Result<()> {
     // OUTSIDE both timeouts (the 30 s JSON one and the media one). It still
     // takes the media rate-limit bucket, and it is admin-gated by its handler's
     // AuthUser extractor.
-    let heavy_routes = Router::new()
-        .merge(stats::heavy_routes())
-        .layer(axum::middleware::from_fn_with_state(
-            media_rate_limiter.clone(),
-            rate_limit::rate_limit_mw,
-        ));
+    let heavy_routes =
+        Router::new()
+            .merge(stats::heavy_routes())
+            .layer(axum::middleware::from_fn_with_state(
+                media_rate_limiter.clone(),
+                rate_limit::rate_limit_mw,
+            ));
 
     // CORS covers the first argument and deliberately NOT the second (`/auth`).
     // Layers that must cover everything (tracing) go outside the call.
