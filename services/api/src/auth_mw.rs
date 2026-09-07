@@ -102,10 +102,12 @@ pub struct AuthUser {
     pub capabilities: Capabilities,
     /// Assigned permission-role id, if any (surfaced to clients via `/auth/me`).
     pub role_id: Option<Uuid>,
-    /// Session id (`jti`) this request authenticated with, if the token carried
-    /// one (P0-SESSIONS). `None` for legacy pre-session tokens and for scoped
-    /// media tokens. Lets `/auth/refresh` rotate and `/auth/sessions` mark the
-    /// current session without re-parsing the JWT.
+    /// Session id (`jti`) this request authenticated with (P0-SESSIONS).
+    /// Always `Some` for a full session: a login token without a `jti` is
+    /// refused outright, and one whose session row is gone is refused too.
+    /// `None` only for scoped media tokens, which are not sessions. Lets
+    /// `/auth/refresh` rotate and `/auth/sessions` mark the current session
+    /// without re-parsing the JWT.
     pub jti: Option<Uuid>,
     /// `true` when this principal came from a scoped short-lived **media token**
     /// (`?token=`, `typ: "media"`) rather than a full login JWT.
@@ -362,13 +364,18 @@ impl AuthUser {
         }
 
         // ── 2b. revocation check (P0-SESSIONS) ────────────────────────────
-        // A token carrying a `jti` is a revocable session (minted at/after
-        // P0-SESSIONS). If that jti has been revoked ("sign out this / all
-        // devices", or an admin cutting a stolen phone), reject it now even
-        // though the signature + exp are still valid. Legacy tokens without a
-        // jti are not revocable and pass unchanged (see the migration's
-        // back-compat note; an owner-opt-in flag can tighten this later).
-        let jti: Option<Uuid> = match claims.jti.as_deref() {
+        // A token carrying a `jti` is a revocable session. If that jti has been
+        // revoked ("sign out this / all devices", or an admin cutting a stolen
+        // phone), reject it now even though the signature + exp are still valid.
+        //
+        // A full login token with NO `jti` is refused outright. The `sessions`
+        // table (migration 0033) predates the first public release, so every
+        // token any supported client has ever held carries one; a jti-less token
+        // is therefore either forged or from a pre-release build, and honouring
+        // it would mean honouring a credential that can never be signed out.
+        // Scoped media tokens are a different `typ` and returned earlier, in
+        // `try_media_token`, so they are unaffected by this.
+        let jti: Uuid = match claims.jti.as_deref() {
             Some(jti_str) => {
                 let jti = jti_str.parse::<Uuid>().map_err(|_| {
                     ApiError::Unauthorized("token jti is not a valid UUID".to_owned())
@@ -378,9 +385,13 @@ impl AuthUser {
                         "this session has been signed out".to_owned(),
                     ));
                 }
-                Some(jti)
+                jti
             }
-            None => None,
+            None => {
+                return Err(ApiError::Unauthorized(
+                    "token carries no session id; sign in again".to_owned(),
+                ));
+            }
         };
 
         // ── 3. parse sub → user_id ────────────────────────────────────────
@@ -389,19 +400,29 @@ impl AuthUser {
             .parse::<Uuid>()
             .map_err(|_| ApiError::Unauthorized("token sub is not a valid UUID".to_owned()))?;
 
-        // ── 4. parse the legacy role + camera scope from the token ─────────
+        // ── 3b. the session must still exist ──────────────────────────────
+        // Revocation alone is not enough: `sessions.user_id` cascades on delete,
+        // so removing an account makes its session rows VANISH rather than get
+        // flagged revoked, and a "not revoked" test then reads as "fine" for a
+        // token belonging to a user who no longer exists. Resolve the jti
+        // positively instead. The same lookup returns the owning user's per-user
+        // camera grants, read from the row rather than trusted from the token's
+        // claims, so an admin adding or removing a user's extra cameras takes
+        // effect on that user's next request. Cached per jti in `AppState`, so
+        // the warm path costs no DB round trip; a DB failure surfaces as a 5xx
+        // (not a 401) so a transient blip never reads as "signed out".
+        let user_camera_ids = state
+            .resolve_session(jti, user_id)
+            .await
+            .map_err(ApiError::Internal)?
+            .ok_or_else(|| {
+                ApiError::Unauthorized("this session is no longer valid; sign in again".to_owned())
+            })?;
+
+        // ── 4. parse the legacy role from the token ───────────────────────
         let legacy_role = UserRole::from_str(&claims.role).ok_or_else(|| {
             ApiError::Unauthorized(format!("unknown role '{}' in token", claims.role))
         })?;
-        let legacy_camera_ids = claims
-            .camera_ids
-            .iter()
-            .map(|s| {
-                s.parse::<Uuid>().map_err(|_| {
-                    ApiError::Unauthorized(format!("camera_id '{s}' in token is not a valid UUID"))
-                })
-            })
-            .collect::<Result<Vec<Uuid>, ApiError>>()?;
 
         // ── 5. parse role_id (RBAC) ───────────────────────────────────────
         let role_id = claims
@@ -416,9 +437,11 @@ impl AuthUser {
 
         // ── 6. resolve effective role → caps + cameras ────────────────────
         // Prefer the assigned role (source of truth, resolved through the cached
-        // roles map so admin edits apply immediately). Fall back to the token's
-        // legacy scope with conservative caps when there's no role_id (pre-RBAC
-        // token) or the role was deleted out from under a live token.
+        // roles map so admin edits apply immediately). Fall back to the user's
+        // own camera grants with conservative caps when there's no role_id
+        // (pre-RBAC token) or the role was deleted out from under a live token.
+        // Union semantics are unchanged; only the source of the per-user half
+        // moved, from the token's claims to the user row (step 3b).
         let (role, camera_ids, capabilities) = match role_id {
             Some(rid) => match state.role_by_id(rid).await {
                 Some(r) => {
@@ -431,10 +454,10 @@ impl AuthUser {
                         Vec::new()
                     } else {
                         // Effective cameras = the role's cameras UNION the user's own
-                        // per-user assignment (carried in the token's camera_ids), so a
+                        // per-user assignment (read live from the user row), so a
                         // viewer can be granted extra cameras without a bespoke role.
                         let mut c = r.camera_ids.clone();
-                        for id in &legacy_camera_ids {
+                        for id in &user_camera_ids {
                             if !c.contains(id) {
                                 c.push(*id);
                             }
@@ -443,9 +466,9 @@ impl AuthUser {
                     };
                     (eff_role, cams, r.effective_caps())
                 }
-                None => (legacy_role, legacy_camera_ids, fallback_caps(legacy_role)),
+                None => (legacy_role, user_camera_ids, fallback_caps(legacy_role)),
             },
-            None => (legacy_role, legacy_camera_ids, fallback_caps(legacy_role)),
+            None => (legacy_role, user_camera_ids, fallback_caps(legacy_role)),
         };
 
         Ok(AuthUser {
@@ -454,7 +477,7 @@ impl AuthUser {
             camera_ids,
             capabilities,
             role_id,
-            jti,
+            jti: Some(jti),
             // Reached only via a full login JWT (Bearer header, or ?token= on
             // the explicitly-permissive export-download routes). The scoped
             // media-token path returns earlier, in `try_media_token`.

@@ -14,9 +14,12 @@
 -- Design:
 --   * One row per issued access token (login mints a `jti`; `/auth/refresh`
 --     mints a fresh `jti` and a new row, so refresh rotates the session id).
---   * `revoked_at IS NOT NULL` ⇒ the token is dead. The `AuthUser` extractor
---     consults a small in-memory revocation cache (see `state.rs`) so the check
---     is not a per-request DB round-trip; the cache is refreshed on any revoke.
+--   * `revoked_at IS NOT NULL` ⇒ the token is dead, and so is a token whose row
+--     is ABSENT (deleting a user cascades their rows away). The `AuthUser`
+--     extractor consults small in-memory caches (see `state.rs`) so neither
+--     check is a per-request DB round-trip; they are refreshed on any revoke or
+--     user change, and an unknown `jti` is resolved against the DB on the spot
+--     so a token minted a moment ago is never spuriously rejected.
 --   * `expires_at` lets a housekeeping sweep prune long-dead rows (the table is
 --     otherwise unbounded for the 10-year tokens). Pruning is best-effort and
 --     NOT required for correctness — an expired token is already rejected by the
@@ -24,13 +27,13 @@
 --   * `last_seen_at` is updated opportunistically (best-effort, throttled) so the
 --     "your sessions" UI can show device activity; it is not on the hot auth path.
 --
--- Back-compat: tokens issued BEFORE this migration carry no `jti` claim and thus
--- have no session row. The extractor treats a `jti`-less token as "legacy, not
--- revocable" and lets it through on signature+exp alone (unchanged behaviour) —
--- so deploying this does NOT force a global re-login. An OPTIONAL admin action
--- ("revoke all pre-existing sessions") can invalidate those legacy tokens by
--- switching the extractor to reject `jti`-less tokens; that switch is a config
--- flag / server-setting, left to the owner (see RELEASE-PLAN P0-SESSIONS).
+-- Back-compat: this table predates the first public release, so every token any
+-- released client has ever held carries a `jti` and has a row here. The
+-- extractor therefore REQUIRES both: a token with no `jti`, or one whose row is
+-- gone, is refused. (The originally-planned opt-in "reject legacy tokens" switch
+-- was dropped as unnecessary — there are no legacy tokens to keep working, and a
+-- token that can never be signed out is exactly what this table exists to
+-- prevent.)
 --
 -- Fully idempotent (IF NOT EXISTS) so it is safe to (re-)apply on a long-lived
 -- database, matching every other migration here.

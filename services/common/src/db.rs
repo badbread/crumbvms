@@ -5545,6 +5545,47 @@ pub async fn list_revoked_jtis(pool: &Pool) -> Result<Vec<Uuid>> {
     Ok(rows.iter().map(|r| r.get("jti")).collect())
 }
 
+/// Resolve a `jti` to a **live** session and return the owning user's per-user
+/// camera grants (`users.camera_ids`) in one round trip.
+///
+/// `Ok(None)` means "this token is no longer a session": the row was never
+/// created, belongs to a different user than the token's `sub`, was revoked, or
+/// went away with its owner (`sessions.user_id` is `ON DELETE CASCADE`). The
+/// auth extractor treats every one of those the same way, a 401.
+///
+/// The per-user camera grants ride along because the extractor needs them on
+/// the same request and they are the one part of the principal that used to be
+/// trusted from the token's own claims: reading them from the row here means an
+/// admin adding or removing a user's extra cameras takes effect on that user's
+/// next request rather than at their next login. Both results are cached by the
+/// caller (`AppState`), so this is not a per-request query.
+pub async fn resolve_live_session(
+    pool: &Pool,
+    jti: Uuid,
+    user_id: Uuid,
+) -> Result<Option<Vec<Uuid>>> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt(
+            r"
+            SELECT u.camera_ids
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.jti = $1 AND s.user_id = $2 AND s.revoked_at IS NULL
+            ",
+            &[&jti, &user_id],
+        )
+        .await
+        .context("resolve_live_session")?;
+    let Some(row) = opt else {
+        return Ok(None);
+    };
+    let camera_ids_json: serde_json::Value = row.get("camera_ids");
+    let camera_ids: Vec<Uuid> = serde_json::from_value(camera_ids_json)
+        .context("resolve_live_session: deserialise camera_ids")?;
+    Ok(Some(camera_ids))
+}
+
 /// Revoke a single session by `jti`, but only if it belongs to `user_id`
 /// (self-service revoke) — pass `None` for `user_id` to allow an admin to
 /// revoke any session. Returns the number of rows affected (0 ⇒ not found / not
@@ -5584,6 +5625,25 @@ pub async fn revoke_all_sessions_for_user(pool: &Pool, user_id: Uuid) -> Result<
         )
         .await
         .context("revoke_all_sessions_for_user")?;
+    Ok(n)
+}
+
+/// Revoke all of a user's active sessions EXCEPT one, identified by `keep`.
+///
+/// Used when an administrator edits their OWN account: the edit still ends every
+/// other signed-in device, but the request that made the change keeps working,
+/// so changing your own password does not throw you out of the console
+/// mid-edit. Returns the number revoked.
+pub async fn revoke_other_sessions_for_user(pool: &Pool, user_id: Uuid, keep: Uuid) -> Result<u64> {
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE user_id = $1 AND jti <> $2 AND revoked_at IS NULL",
+            &[&user_id, &keep],
+        )
+        .await
+        .context("revoke_other_sessions_for_user")?;
     Ok(n)
 }
 
