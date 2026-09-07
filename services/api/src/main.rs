@@ -467,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
     // high-frequency by nature (a low-bandwidth wall polls one still per tile
     // per second; scrubbing fires filmstrip frames in bursts of dozens), so this
     // is sized with roughly a 6x margin over the busiest real client rather than
-    // as a tight throttle — see `media_limits` for the arithmetic. It is keyed
+    // as a tight throttle, see `media_limits` for the arithmetic. It is keyed
     // exactly like the JSON bucket (TCP peer IP, or the first `X-Forwarded-For`
     // hop under `TRUST_PROXY`).
     let media_rate_limiter = rate_limit::RateLimiter::new(
@@ -549,7 +549,7 @@ async fn main() -> anyhow::Result<()> {
     // download, an export archive, and an open-ended live `stream.mp4` all
     // return their headers immediately and stream afterwards, so none of them
     // can be cut. What it does bound is the routes that produce something before
-    // answering — the on-demand clip and low-bitrate transcodes — which is
+    // answering, the on-demand clip and low-bitrate transcodes, which is
     // exactly the case that could otherwise hang a request indefinitely.
     let media_layers = |r: Router<AppState>| {
         r.layer(TimeoutLayer::with_status_code(

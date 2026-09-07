@@ -761,7 +761,7 @@ enum WaitOutcome {
 /// On cancel, SIGKILL + reap the child (so no zombie) and return
 /// [`WaitOutcome::Cancelled`]; this interrupts a long single-camera encode
 /// promptly, not just between cameras. On budget expiry, likewise kill + reap
-/// and return [`WaitOutcome::TimedOut`] so the caller can FAIL the job — a
+/// and return [`WaitOutcome::TimedOut`] so the caller can FAIL the job. A
 /// wedged child must never leave a job `Running` forever, because that
 /// permanently consumes one of `EXPORT_MAX_CONCURRENT` slots.
 async fn wait_or_cancel(

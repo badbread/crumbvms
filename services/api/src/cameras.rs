@@ -180,7 +180,7 @@ async fn list_visible_cameras(
 /// * `502` — go2rtc was unreachable, returned a non-2xx status, or the frame
 ///   body could not be read.  Detail is logged at `warn!`, not `error!`, so a
 ///   momentarily unavailable stream doesn't trip 5xx alerting.
-/// * `503` — the still proxy is saturated; retry after the `Retry-After` hint.
+/// * `503`, the still proxy is saturated; retry after the `Retry-After` hint.
 async fn get_camera_frame(
     // Media-read: browsers fetch this still with a scoped `?token=` (see
     // MediaUrls in the clients / admin.html snapshot cache), so it opts into the
