@@ -12054,8 +12054,9 @@ $('bootstrap-pass2') && $('bootstrap-pass2').addEventListener('keydown', e => { 
    successful login resumes the wizard too when setup is incomplete. */
 (async function boot() {
   // A #handoff= code is redeemed asynchronously by bootSSO; wait for it so the
-  // decision below sees the resulting session.
-  await SSO_READY;
+  // decision below sees the resulting session. Never let that step stop the
+  // console from rendering: the worst case is the normal login form.
+  try { await SSO_READY; } catch (_) { /* fall through to the boot decision */ }
   let status = null;
   try { status = await fetch('/auth/setup-status').then(res => res.ok ? res.json() : null); } catch (_) { /* fall through */ }
   if (status && status.needs_bootstrap) { openWizard(status); return; }
