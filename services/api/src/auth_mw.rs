@@ -493,9 +493,7 @@ impl FromRequestParts<AppState> for MediaOrFullUser {
     ) -> Result<Self, Self::Rejection> {
         // Same authentication as the default extractor, but a media-scoped
         // principal is ACCEPTED here (this is the media-read surface).
-        Ok(MediaOrFullUser(
-            AuthUser::authenticate(parts, state).await?,
-        ))
+        Ok(MediaOrFullUser(AuthUser::authenticate(parts, state).await?))
     }
 }
 
