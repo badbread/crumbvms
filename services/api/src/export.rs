@@ -114,10 +114,12 @@ const EXPORT_FFMPEG_TIMEOUT_CEILING_SECS: u64 = 24 * 60 * 60;
 /// tells the operator what happened.
 fn export_ffmpeg_timeout(range_secs: i64) -> std::time::Duration {
     let range = u64::try_from(range_secs.max(0)).unwrap_or(u64::MAX);
-    let scaled = range
-        .saturating_mul(EXPORT_FFMPEG_TIMEOUT_FACTOR)
-        .max(EXPORT_FFMPEG_TIMEOUT_FLOOR_SECS)
-        .min(EXPORT_FFMPEG_TIMEOUT_CEILING_SECS);
+    // The floor is a compile-time constant below the ceiling, so `clamp` cannot
+    // panic here.
+    let scaled = range.saturating_mul(EXPORT_FFMPEG_TIMEOUT_FACTOR).clamp(
+        EXPORT_FFMPEG_TIMEOUT_FLOOR_SECS,
+        EXPORT_FFMPEG_TIMEOUT_CEILING_SECS,
+    );
     std::time::Duration::from_secs(scaled)
 }
 
