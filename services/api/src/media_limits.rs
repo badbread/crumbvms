@@ -97,9 +97,9 @@ pub const MEDIA_RATE_REFILL_PER_SEC: f64 = 240.0;
 /// live `stream.mp4`: those all return their headers immediately and stream
 /// afterwards. What it does bound is the media routes that *produce* something
 /// before answering, the longest being an on-demand clip or low-bitrate
-/// transcode: 120 s of ffmpeg plus a 15 s [`CLIP_GEN_WAIT`]. 180 s clears that
-/// with slack and still guarantees every media request terminates.
-pub const MEDIA_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+/// transcode: 120 s of ffmpeg plus a 15 s [`CLIP_GEN_WAIT`]. Three minutes
+/// clears that with slack and still guarantees every media request terminates.
+pub const MEDIA_RESPONSE_TIMEOUT: Duration = Duration::from_mins(3);
 
 // ─── bounded acquire ──────────────────────────────────────────────────────────
 

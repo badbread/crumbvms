@@ -1742,7 +1742,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel(); // already cancelled → take the cancel branch immediately
 
-        let outcome = wait_or_cancel(&mut child, &token, std::time::Duration::from_secs(600)).await;
+        let outcome = wait_or_cancel(&mut child, &token, std::time::Duration::from_mins(10)).await;
         assert!(matches!(outcome, WaitOutcome::Cancelled));
 
         // Dead AND reaped: try_wait returns Some(exit status), no error/zombie.
@@ -1757,7 +1757,7 @@ mod tests {
             .spawn()
             .expect("spawn true");
         let token = CancellationToken::new(); // not cancelled
-        let outcome = wait_or_cancel(&mut child, &token, std::time::Duration::from_secs(600)).await;
+        let outcome = wait_or_cancel(&mut child, &token, std::time::Duration::from_mins(10)).await;
         assert!(matches!(outcome, WaitOutcome::Finished(Ok(s)) if s.success()));
     }
 
