@@ -8,6 +8,66 @@ revisit.
 
 ---
 
+## 2026-09-07, The app-switcher cover is unconditional on mobile, and Android hides the recents snapshot without a permanently secure window
+
+**Context.** The operating system takes a picture of the app as it leaves the
+foreground and shows it on the task switcher, so whatever camera was on screen
+stays visible to whoever picks the device up next. iOS already had an opaque
+cover for this (`RootView.privacyShieldVisible`), but it was drawn only when the
+opt-in biometric lock was on, and that setting defaults to off. Android had
+nothing.
+
+**Decision, iOS.** The cover is now drawn for any signed-in session whenever the
+scene stops being `.active`, independent of `biometricLockEnabled`. The two
+concerns are separate: the cover is about what the system snapshot records, the
+lock is about who may resume the session. The lock keeps gating only the Face ID
+/ passcode challenge, and `.inactive` still never triggers that challenge, since
+`.inactive` also fires on harmless momentary interruptions (Control Center, an
+incoming-call banner, a system alert).
+
+**Decision, Android.** API 33+ calls `Activity.setRecentsScreenshotEnabled(false)`
+once in `onCreate`. Below 33 the window is made secure in `onPause` and cleared
+again in `onResume`, so it is secure only across the transition during which the
+snapshot is taken. Picture-in-Picture is exempt from the pre-33 path (a secure
+window would render the floating video window blank), and the flag is cleared
+again in `onPictureInPictureModeChanged` because entering PiP is asynchronous
+and `onPause` can run before the activity reports itself as being in PiP. The
+per-API-level decision lives in `RecentsPrivacy` so it is unit-testable.
+
+**Rejected: a permanently secure Android window** (`FLAG_SECURE` set once in
+`onCreate`). It is the simplest and strongest option and it is what most
+guidance suggests, but it also disables ordinary screenshots and screen
+recording of the app. The maintainer records screenshots and screen captures of
+the Android client for documentation and for the site, and an operator
+photographing an incident off their own phone is a legitimate use. Blocking that
+to protect a preview the operator can also protect by closing the app was judged
+the wrong trade.
+
+**Rejected: a macOS occlusion or resign-active cover.** macOS has no task
+switcher preview of this kind, and a video wall on a second monitor is meant to
+stay readable while another app has focus. macOS behavior is unchanged.
+
+**Trades knowingly accepted:**
+
+- Below API 33 the flag toggles on every pause, which includes pauses that are
+  not "leaving the app" (a system permission dialog, the biometric prompt). The
+  effect is invisible: the flag is cleared again on the next resume.
+- Below API 33, leaving the app straight into PiP can still put a video frame on
+  the recents card, because that path is deliberately exempt. API 33+ devices
+  use the dedicated switch and are unaffected.
+- The iOS cover now appears for users who never asked for a lock. It is a plain
+  opaque background with no interaction, so the only cost is a brief flat colour
+  during multitasking.
+
+**Revisit if:** Android ever gains a pre-33-compatible recents-only switch (it
+will not, but a support library shim would count), or if the minimum supported
+API rises to 33, at which point the `FLAG_SECURE` fallback and `RecentsPrivacy`
+can both be deleted. Also revisit if operators report that the PiP exemption
+matters on old devices, in which case the pre-33 path can drop PiP entirely
+(auto-enter off below 33) instead of exempting it.
+
+---
+
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
 
 **Context.** #442 introduced value-setting HA controls. Light dimming

@@ -8,6 +8,7 @@ import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.util.Rational
+import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -66,6 +67,26 @@ class MainActivity : FragmentActivity() {
         super.onStop()
     }
 
+    // Pre-33 recents fallback (see [RecentsPrivacy]): the recents snapshot is
+    // captured as the activity leaves the foreground, so the window only has to
+    // be secure across that transition. Skipped when the pause is a PiP
+    // transition, which would blank the floating video window.
+    override fun onPause() {
+        super.onPause()
+        if (RecentsPrivacy.secureOnPause(Build.VERSION.SDK_INT, isInPictureInPictureMode)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
+
+    // Back in the foreground: drop the flag again so the operator can take
+    // screenshots and screen recordings of the app as usual.
+    override fun onResume() {
+        super.onResume()
+        if (RecentsPrivacy.usesSecureWindowFallback(Build.VERSION.SDK_INT)) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         // A background stint long enough for keep-alive sockets to have died
@@ -94,6 +115,13 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep camera video out of the recents / app-switcher card. API 33+ has
+        // a switch for exactly that, which leaves ordinary foreground
+        // screenshots and screen recording alone. Older releases fall back to
+        // the onPause/onResume secure-window toggle below (see [RecentsPrivacy]).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            setRecentsScreenshotEnabled(false)
+        }
         setContent {
             CrumbTheme {
                 CompositionLocalProvider(LocalPipController provides pipController) {
@@ -148,6 +176,14 @@ class MainActivity : FragmentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         inPipState.value = isInPictureInPictureMode
+        // Entering PiP is asynchronous, so onPause can run before the activity
+        // reports itself as being in PiP. Clear the pre-33 secure flag here too,
+        // otherwise the floating window would render blank.
+        if (isInPictureInPictureMode &&
+            RecentsPrivacy.usesSecureWindowFallback(Build.VERSION.SDK_INT)
+        ) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
     }
 }
 
