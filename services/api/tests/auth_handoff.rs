@@ -179,7 +179,10 @@ async fn handoff_code_exchanges_for_a_working_session() {
         .await;
     assert_eq!(resp.status(), StatusCode::OK, "minting a handoff code");
     let body = body_json(resp).await;
-    let code = body["code"].as_str().expect("code in the response").to_owned();
+    let code = body["code"]
+        .as_str()
+        .expect("code in the response")
+        .to_owned();
     assert!(code.len() >= 32, "the code must not be guessable: {code}");
     assert!(
         body["expires_in"].as_u64().unwrap_or(0) > 0,
@@ -323,7 +326,11 @@ async fn a_media_token_cannot_mint_a_handoff_code() {
             &viewer_token,
         ))
         .await;
-    assert_eq!(resp.status(), StatusCode::OK, "minting a scoped media token");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "minting a scoped media token"
+    );
     let media_token = body_json(resp).await["token"]
         .as_str()
         .expect("token in the media-token response")
