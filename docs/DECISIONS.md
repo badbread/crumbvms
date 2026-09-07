@@ -8,6 +8,57 @@ revisit.
 
 ---
 
+## 2026-09-07, Camera source URLs mask their password on read; sending the mask back means "keep it"
+
+**Context.** A camera's `source_url` / `source_sub_url` carry the camera's own
+`user:pass@` credentials inline, because that is what go2rtc dials.
+`onvif_password` has been write-only since the distributability work (never
+copied into a DTO, blank on `PUT` keeps the stored value), but the two source
+URLs were returned verbatim by `GET /config/cameras`, so every admin session,
+and anything that logged or cached that response, held the camera passwords in
+clear.
+
+**Decision.** `camera_to_dto` masks the userinfo password with a fixed string
+(`crumb_common::redact::CREDENTIAL_MASK`, `********`) and adds
+`source_has_credentials` / `source_sub_has_credentials` so a client can say
+"there is a stored password" without holding it. `PUT /config/cameras/{id}`
+resolves a submitted URL against the stored one: a password equal to the mask
+means keep the stored credential, anything else is taken literally and replaces
+it. The rest of the submitted URL always wins, so an operator can change the
+host or path while leaving the masked password alone. The masking and unmasking
+live in `services/common/src/redact.rs` next to the log-redaction helpers, which
+already own the `scheme://user:pass@host` parsing rule.
+
+**Why a mask inside the URL rather than a separate password field.** The URL is
+one text field the operator types, pastes and edits as a whole; splitting the
+credential out would mean a different editing model in the console and a
+migration of the stored shape. The mask keeps the field a URL, keeps
+copy-paste-and-edit working, and reuses the read/write contract `onvif_password`
+already established.
+
+**Trade-offs accepted:** a camera whose real password is literally `********`
+cannot be distinguished from the mask, so a `PUT` would keep the stored value
+rather than set that password. The API also cannot tell "keep" from "set to the
+same value", which is the same limitation the blank-keeps-it ONVIF password
+field has. The console shows a hint under the stream fields when credentials are
+stored.
+
+**Unaffected by design:** the recorder and the go2rtc reconcile loop read
+`source_url` from the database (`db::list_camera_streams`), never from a DTO, so
+the restream keeps dialling the real credentials.
+
+**Rejected:** omitting the URLs entirely from the DTO (the console needs to show
+and edit them); returning them only to a narrower role (there is no role above
+admin); a per-request "reveal" endpoint (adds a way to read the password back
+out, which is the thing being removed).
+
+**Revisit if:** a client ever needs the real source URL for something other than
+editing, or the console moves to a structured stream editor with its own
+password field, at which point the mask can be dropped in favour of a write-only
+field.
+
+---
+
 ## 2026-09-07, Login backoff is keyed on (account, client), not on the account alone
 
 **Context.** Issue #127 added a repeated-failure backoff to `POST /auth/login`:

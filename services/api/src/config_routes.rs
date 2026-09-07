@@ -120,6 +120,7 @@ use uuid::Uuid;
 
 use crumb_common::{
     db::{self, CreateCameraParams, PolicyFields},
+    redact,
     types::{
         Camera, CameraGroup, MotionSensitivity, RecordStream, RecordingMode, RecordingPolicy,
         ServerSettings, Storage, User, UserRole,
@@ -1200,6 +1201,15 @@ async fn update_camera(
         Some(inner) => inner,
         None => existing.source_sub_url.clone(),
     });
+    // GET masks the userinfo password, so a console that reads a camera and PUTs
+    // it back submits the mask. That means "keep the stored credential": splice
+    // it back in before anything downstream (validation of the change, the DB
+    // write, the go2rtc sync decision) sees the value. Any other password is
+    // taken literally, which is how one is changed.
+    let source_url =
+        source_url.map(|u| redact::unmask_url_password(&u, existing.source_url.as_deref()));
+    let source_sub_url = source_sub_url
+        .map(|u| redact::unmask_url_password(&u, existing.source_sub_url.as_deref()));
 
     // Guard: a Crumb-managed camera (source_url set) derives its re-stream name
     // from go2rtc_name; an empty go2rtc_name would yield main_url="" / sub_url="_sub"
@@ -4069,8 +4079,12 @@ async fn redetect_camera(
     // Re-read to return the authoritative post-update DTO.
     let updated = require_camera(state.pool(), id).await?;
     Ok(Json(RedetectResponse {
-        source_url: credentialed_source_url,
-        source_sub_url: credentialed_source_sub_url,
+        // Masked like the camera DTO's own copy: the console uses these only to
+        // say whether a sub stream was found, never to re-submit them.
+        source_url: redact::mask_url_password(&credentialed_source_url),
+        source_sub_url: credentialed_source_sub_url
+            .as_deref()
+            .map(redact::mask_url_password),
         ptz_supported: r.ptz_supported,
         camera: camera_to_dto(updated),
     }))
@@ -4702,6 +4716,15 @@ fn camera_to_dto(c: Camera) -> CameraDto {
     // onvif_has_password: true when a non-empty password is stored. The password
     // itself is NEVER copied into the DTO (write-only field per spec C10).
     let onvif_has_password = c.onvif_password.as_deref().is_some_and(|p| !p.is_empty());
+    // Camera source URLs carry their credentials inline. The password is masked
+    // on the way out (the rest of the URL is verbatim, so the operator still
+    // recognises and can edit it); sending the mask back on PUT keeps the stored
+    // credential. Same contract as onvif_password, expressed inside the URL.
+    let source_has_credentials = c.source_url.as_deref().is_some_and(redact::url_has_password);
+    let source_sub_has_credentials = c
+        .source_sub_url
+        .as_deref()
+        .is_some_and(redact::url_has_password);
     CameraDto {
         id: c.id,
         name: c.name,
@@ -4709,8 +4732,10 @@ fn camera_to_dto(c: Camera) -> CameraDto {
         go2rtc_name: c.go2rtc_name,
         main_url: c.main_url,
         sub_url: c.sub_url,
-        source_url: c.source_url,
-        source_sub_url: c.source_sub_url,
+        source_url: c.source_url.as_deref().map(redact::mask_url_password),
+        source_sub_url: c.source_sub_url.as_deref().map(redact::mask_url_password),
+        source_has_credentials,
+        source_sub_has_credentials,
         policy_id: c.policy_id,
         group_id: c.group_id,
         policy,

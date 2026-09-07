@@ -617,7 +617,18 @@ All wizard steps have API equivalents. Do them in order:
    Treat one failure as non-fatal and continue; a **409 Conflict** means the
    `name`/stream is already taken, retry with a suffixed name. Re-running is safe:
    skip any IP already present in `GET /config/cameras` (match on `onvif_host` or
-   the host part of `source_url`). To group them, `POST /config/groups` `{name}`
+   the host part of `source_url`).
+
+   > **Reading a camera back.** `GET /config/cameras` returns `source_url` /
+   > `source_sub_url` with the password replaced by `********`; the username,
+   > host, port and path are verbatim, and `source_has_credentials` /
+   > `source_sub_has_credentials` tell you whether one is stored. On
+   > `PUT /config/cameras/:id`, sending a URL whose password is still `********`
+   > keeps the stored credential (so a read-modify-write of any other field is
+   > safe); sending a different password replaces it. Same rule as
+   > `onvif_password`, which is never returned at all.
+
+   To group them, `POST /config/groups` `{name}`
    then `PUT /config/groups/:id/members` `{camera_ids}` after the loop, one
    PUT per group (cameras can go in different groups, e.g. always-record vs
    motion-only; members = the group's existing ids ∪ the new ids).
