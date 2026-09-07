@@ -499,16 +499,17 @@ pub async fn seed_admin(pool: &Pool) -> SeededUser {
 /// set — playback/clips/export/ptz all `true` — so scope-denial tests are
 /// unambiguously about camera scope, not a missing capability).
 ///
-/// `actuators` is the ONE capability left `false` here: it is deny-by-default
-/// and moves physical hardware, so tests that need it opt in explicitly via
+/// `actuators` and `manage_channels` are the capabilities left `false` here:
+/// both are deny-by-default (one moves physical hardware, the other creates a
+/// standing outbound destination), so tests that need them opt in explicitly via
 /// [`seed_viewer_role_with_caps`]. That also keeps the "a plain viewer cannot
-/// actuate" assertion honest.
+/// actuate / cannot manage destinations" assertions honest.
 pub async fn seed_viewer_role(pool: &Pool, camera_ids: &[Uuid]) -> Uuid {
     seed_viewer_role_with_caps(pool, camera_ids, generous_viewer_caps()).await
 }
 
 /// The generous viewer capability set [`seed_viewer_role`] uses (everything a
-/// viewer can hold except `actuators`).
+/// viewer can hold except `actuators` and `manage_channels`).
 pub fn generous_viewer_caps() -> Capabilities {
     Capabilities {
         export: true,
@@ -519,6 +520,7 @@ pub fn generous_viewer_caps() -> Capabilities {
         manage_views: true,
         view_plates: true,
         actuators: false,
+        manage_channels: false,
     }
 }
 
@@ -576,6 +578,7 @@ pub async fn seed_viewer_with_bookmark_scope(
         manage_views: true,
         view_plates: true,
         actuators: false,
+        manage_channels: false,
     };
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await

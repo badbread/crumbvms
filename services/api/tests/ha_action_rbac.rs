@@ -36,6 +36,7 @@ fn caps_with_actuators() -> Capabilities {
         manage_views: true,
         view_plates: false,
         actuators: true,
+        manage_channels: false,
     }
 }
 

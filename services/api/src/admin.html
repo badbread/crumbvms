@@ -9869,7 +9869,7 @@ async function delUser(id) {
    ROLES, list / create / edit / delete
    REST: GET/POST /config/roles  ·  GET/PUT/DELETE /config/roles/:id
    Role shape: { id, name, is_admin, capabilities:{export,playback,clips,ptz,
-                 manage_views,bookmarks,view_plates,actuators},
+                 manage_views,bookmarks,view_plates,actuators,manage_channels},
                  camera_ids:[uuid], created_at }
 ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -9882,6 +9882,7 @@ const ROLE_CAP_FIELDS = [
   { key: 'manage_views', label: 'Manage views',   hint: 'Create, edit and delete saved live-wall views.' },
   { key: 'view_plates',  label: 'View license plates', hint: 'Sensitive: see recognised license-plate reads and search the plate database for this role’s cameras.' },
   { key: 'actuators',    label: 'Control linked devices (locks, covers, switches) - default off', hint: 'Sensitive: operate PHYSICAL devices linked to this role’s cameras, garage doors, locks, lights, sirens. Off by default; seeing a camera never implies being able to work its devices.' },
+  { key: 'manage_channels', label: 'Manage notification destinations - default off', hint: 'Add, edit, delete and test-send notification destinations (Discord, Slack, Telegram, ntfy, Pushover, webhook). Off by default; a destination tells the server to send alerts, with snapshot images, to a host you choose. Seeing existing destinations in the list is not affected.' },
 ];
 
 /** Build the capability checkboxes + bookmarks selector for a role form. pfx = field prefix. */
@@ -10066,6 +10067,7 @@ let NOTIF_SYS_QUIET_END   = null;
 let NOTIF_SYS_ALERTS = [];  /* loaded array of system_alert_rules rows (P0-HEALTH-NOTIFY) */
 let NOTIF_ME_ID   = null;   /* current user's id, for channel owner attribution */
 let NOTIF_IS_ADMIN = false; /* current user is admin (governs the global toggle + all-channel list) */
+let NOTIF_CAN_MANAGE = false; /* admin, or a role with manage_channels: may add/edit/test/remove destinations */
 let SYS_ALERT_EDIT_KEY = null; /* event_key of the alert open in the system-alert editor modal */
 
 /* Human-readable title + short description for each system-alert event_key. */
@@ -10781,6 +10783,7 @@ async function renderNotifications() {
     ]);
     NOTIF_ME_ID    = me ? me.id : null;
     NOTIF_IS_ADMIN = !!(me && me.is_admin);
+    NOTIF_CAN_MANAGE = !!(me && (me.is_admin || (me.capabilities && me.capabilities.manage_channels)));
     NOTIF_CHANNELS = channels;
     NOTIF_RULES    = rules;
     NOTIF_ENABLED  = settings && settings.enabled !== false;
@@ -10852,9 +10855,10 @@ function _renderNotificationsPane() {
             <span style="font-size:11px;font-weight:600;color:${ch.enabled?'var(--ok)':'var(--dim2)'};white-space:nowrap">${ch.enabled?'Enabled':'Disabled'}</span>
             <span style="font-size:12px;color:var(--dim);white-space:nowrap">${esc(scopeNote)}</span>
             <div class="td-actions" style="gap:5px">
+              ${NOTIF_CAN_MANAGE ? `
               <button class="ghost xs" onclick="notifOpenConfigure('${esc(ch.id)}')">${isOpen?'Close':'Configure'}</button>
               <button class="ghost xs" id="notif-test-btn-${esc(ch.id)}" onclick="notifTestChannel('${esc(ch.id)}')">Test</button>
-              <button class="danger-ghost xs" onclick="notifRemoveChannel('${esc(ch.id)}')">Remove</button>
+              <button class="danger-ghost xs" onclick="notifRemoveChannel('${esc(ch.id)}')">Remove</button>` : ''}
             </div>
           </div>
           <div id="notif-cfg-${esc(ch.id)}" class="${isOpen?'':'hidden'}">${isOpen ? _renderConfigureForm(ch) : ''}</div>
@@ -10897,13 +10901,15 @@ function _renderNotificationsPane() {
         or a Pushover push). Add as many as you like; each can cover all cameras or a subset.
       </div>
 
-      <!-- Add-destination row -->
+      <!-- Add-destination row (only for admins and roles with manage_channels) -->
+      ${NOTIF_CAN_MANAGE ? `
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
         <select id="notif-new-kind" style="width:auto" onchange="NOTIF_NEW_KIND=this.value">
           ${kindOpts}
         </select>
         <button class="primary sm" onclick="notifOpenConfigure('__new__')">Add destination</button>
-      </div>
+      </div>` : `
+      <div class="info-note" style="margin-bottom:12px">Your role can see destinations but not change them. Ask an administrator for the "Manage notification destinations" permission.</div>`}
 
       <!-- New-channel configure form (hidden until Add is clicked) -->
       <div id="notif-cfg-__new__" class="${NOTIF_OPEN_CH==='__new__'?'':'hidden'}">${NOTIF_OPEN_CH==='__new__'?_renderConfigureForm(null):''}

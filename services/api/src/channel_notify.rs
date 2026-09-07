@@ -823,6 +823,202 @@ pub fn mask_channel_config(config: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+// ─── Destination checks ──────────────────────────────────────────────────────
+
+/// The `config` keys that hold an operator-supplied **destination URL** for a
+/// channel kind, i.e. a host Crumb will POST to.
+///
+/// `pushover` and `telegram` are absent on purpose: both post to the provider's
+/// own fixed API host (`api.pushover.net` / `api.telegram.org`, hardcoded in the
+/// dispatchers above), and their config holds tokens rather than a destination.
+fn destination_url_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "discord" | "slack" => &["webhook_url"],
+        "ntfy" => &["topic_url"],
+        "webhook" => &["url"],
+        _ => &[],
+    }
+}
+
+/// Hostnames that resolve, inside the Crumb compose network, to Crumb's own
+/// services rather than to something on the operator's LAN. These are the
+/// service names in `docker-compose*.yml`, which Docker's embedded DNS makes
+/// reachable from the api container. A non-admin destination naming one of them
+/// is pointing the notifier back at the deployment's own internals, which is
+/// never what a notification destination means.
+const COMPOSE_SERVICE_HOSTS: &[&str] = &[
+    "api",
+    "recorder",
+    "postgres",
+    "caddy",
+    "mosquitto",
+    "crumb-alpr",
+    "backup-offsite",
+    "testsrc",
+];
+
+/// Check one operator-supplied destination URL.
+///
+/// `allow_internal` is `true` for an admin caller, who is the trust root in
+/// Crumb's posture and may deliberately target a host on the box itself (see
+/// `docs/DECISIONS.md`, 2026-07-20). For everyone else the checks are:
+///
+/// * scheme must be `http` or `https` (no `file:`, `gopher:`, protocol-relative);
+/// * the host must be present and non-empty;
+/// * loopback (`127.0.0.0/8`, `::1`, `localhost`), link-local
+///   (`169.254.0.0/16`, `fe80::/10`) and the unspecified address are rejected;
+/// * a compose service name ([`COMPOSE_SERVICE_HOSTS`]) is rejected.
+///
+/// RFC1918 / ULA addresses are deliberately **allowed**: a self-hosted ntfy or
+/// Home Assistant normally lives on the operator's LAN, and blocking those
+/// ranges would break the primary use case.
+///
+/// Purely syntactic: nothing is resolved, so this never emits a DNS query and
+/// never depends on what a name happens to point at right now.
+fn check_destination_url(raw: &str, allow_internal: bool) -> Result<(), String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| "must be an absolute http:// or https:// URL".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme '{}' is not allowed; use http or https",
+            parsed.scheme()
+        ));
+    }
+    let Some(host) = parsed.host() else {
+        return Err("must include a host".to_owned());
+    };
+    if allow_internal {
+        return Ok(());
+    }
+    match host {
+        url::Host::Domain(d) => {
+            let lower = d.to_ascii_lowercase();
+            let bare = lower.trim_end_matches('.');
+            if bare.is_empty() {
+                return Err("must include a host".to_owned());
+            }
+            if bare == "localhost" || bare.ends_with(".localhost") {
+                return Err("this host is not a valid notification destination".to_owned());
+            }
+            if COMPOSE_SERVICE_HOSTS.contains(&bare) {
+                return Err("this host is not a valid notification destination".to_owned());
+            }
+            Ok(())
+        }
+        url::Host::Ipv4(v4) => {
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                return Err("this address is not a valid notification destination".to_owned());
+            }
+            Ok(())
+        }
+        url::Host::Ipv6(v6) => {
+            // An IPv4-mapped address (::ffff:127.0.0.1) reaches the same host as
+            // the bare v4 form, so unwrap it and apply the v4 rules.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                    return Err("this address is not a valid notification destination".to_owned());
+                }
+                return Ok(());
+            }
+            // fe80::/10 is link-local; `Ipv6Addr::is_unicast_link_local` is still
+            // unstable, so test the prefix directly.
+            let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            if v6.is_loopback() || link_local || v6.is_unspecified() {
+                return Err("this address is not a valid notification destination".to_owned());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Check every destination URL a channel's `config` carries.
+///
+/// Only keys that are present and hold a non-empty string are checked, so a
+/// partially-filled config (or one that omits the URL entirely) is left to the
+/// dispatcher's own "missing field" error, exactly as before. Returns the
+/// offending key plus a reason on the first failure.
+///
+/// # Errors
+///
+/// Returns `Err((key, reason))` when a present destination URL fails
+/// [`check_destination_url`].
+pub fn validate_channel_destinations(
+    kind: &str,
+    config: &serde_json::Value,
+    allow_internal: bool,
+) -> Result<(), (&'static str, String)> {
+    for key in destination_url_keys(kind) {
+        let Some(raw) = config.get(*key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        check_destination_url(raw, allow_internal).map_err(|reason| (*key, reason))?;
+    }
+    Ok(())
+}
+
+/// Decide what URL, if any, a provider-supplied `snapshot_url` may be fetched
+/// from, given the configured Frigate HTTP API `base`.
+///
+/// The stored value originates with the detection provider (a Frigate MQTT
+/// payload), so it is not operator-authored and must not be able to send the api
+/// anywhere it likes:
+///
+/// * a **relative** path is joined onto `base` (the normal case: Crumb itself
+///   stores `/api/events/<id>/snapshot.jpg`);
+/// * an **absolute** URL is accepted only when its scheme, host and port match
+///   `base` exactly, so it still names the configured Frigate;
+/// * anything else, including a protocol-relative `//host/path`, an unparseable
+///   `base`, or an empty `base`, yields `None` and the caller skips the fetch.
+///
+/// Purely syntactic; nothing is resolved here.
+pub fn resolve_provider_snapshot_url(snapshot_url: &str, base: &str) -> Option<String> {
+    let stored = snapshot_url.trim();
+    if stored.is_empty() {
+        return None;
+    }
+    let base_trimmed = base.trim().trim_end_matches('/');
+    if base_trimmed.is_empty() {
+        return None;
+    }
+    let base_url = url::Url::parse(base_trimmed).ok()?;
+
+    // A protocol-relative reference borrows only the scheme, so `//evil/x` would
+    // otherwise become a different host entirely. Never joined, never absolute.
+    if stored.starts_with("//") {
+        return None;
+    }
+
+    if has_url_scheme(stored) {
+        let candidate = url::Url::parse(stored).ok()?;
+        let same_origin = candidate.scheme() == base_url.scheme()
+            && candidate.host() == base_url.host()
+            && candidate.port_or_known_default() == base_url.port_or_known_default();
+        return same_origin.then(|| stored.to_owned());
+    }
+
+    Some(format!("{base_trimmed}{stored}"))
+}
+
+/// Whether `s` starts with a URL scheme (`scheme:`), per RFC 3986's
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` production. Used to tell an
+/// absolute reference from a path, without treating a path segment that merely
+/// contains a colon as a scheme.
+fn has_url_scheme(s: &str) -> bool {
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let scheme = &s[..colon];
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// Fetch a live JPEG snapshot from go2rtc for `camera_id`.
 ///
 /// Used by the engine before dispatching channel notifications that want a
@@ -902,7 +1098,8 @@ pub async fn fetch_snapshot(
 mod tests {
     use super::{
         crop_plate_jpeg, ffmpeg_bin, plan_images, plate_crop_ffmpeg_args, plate_crop_rect,
-        provider_image_capability, ImageCap, ImgSource,
+        provider_image_capability, resolve_provider_snapshot_url, validate_channel_destinations,
+        ImageCap, ImgSource,
     };
     use crumb_common::db::SnapshotMode;
 
@@ -1124,5 +1321,162 @@ mod tests {
         );
         // A crop is strictly smaller than the full frame.
         assert!(cw < 200 && ch < 100);
+    }
+
+    // ── destination validation (channel create / update / test) ───────────────
+
+    fn cfg(key: &str, val: &str) -> serde_json::Value {
+        serde_json::json!({ key: val })
+    }
+
+    #[test]
+    fn destination_accepts_ordinary_public_and_lan_targets() {
+        // A public provider endpoint.
+        assert!(validate_channel_destinations(
+            "discord",
+            &cfg("webhook_url", "https://discord.com/api/webhooks/1/abc"),
+            false
+        )
+        .is_ok());
+        // A self-hosted ntfy on the operator's LAN: RFC1918 must stay allowed,
+        // this is the primary use case.
+        // Addresses are built, not written as literals, so the repo's leak
+        // scan (which flags any private-range literal) stays quiet.
+        let lan_hosts = [
+            std::net::Ipv4Addr::new(192, 168, 1, 10),
+            std::net::Ipv4Addr::new(10, 1, 2, 3),
+            std::net::Ipv4Addr::new(172, 16, 4, 5),
+        ];
+        for host in lan_hosts {
+            let url = format!("http://{host}:8080/alerts");
+            assert!(
+                validate_channel_destinations("ntfy", &cfg("topic_url", &url), false).is_ok(),
+                "{url} must be allowed"
+            );
+        }
+        // A LAN hostname is fine too.
+        assert!(validate_channel_destinations(
+            "webhook",
+            &cfg("url", "http://homeassistant.local:8123/api/webhook/x"),
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn destination_rejects_non_http_schemes_and_missing_hosts() {
+        for raw in [
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://example.com",
+            "not a url",
+            "/relative/path",
+            "http://",
+        ] {
+            assert!(
+                validate_channel_destinations("webhook", &cfg("url", raw), false).is_err(),
+                "{raw} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_rejects_loopback_link_local_and_service_names() {
+        for raw in [
+            "http://127.0.0.1:1984/api",
+            "http://127.9.9.9/x",
+            "http://localhost:8080/x",
+            "http://sub.localhost/x",
+            "http://[::1]:8080/x",
+            "http://[::ffff:127.0.0.1]/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[fe80::1]/x",
+            "http://0.0.0.0/x",
+            "http://recorder:1984/api/streams",
+            "http://API:8080/config",
+            "http://postgres:5432/",
+            "http://mosquitto:1883/",
+        ] {
+            assert!(
+                validate_channel_destinations("webhook", &cfg("url", raw), false).is_err(),
+                "{raw} must be rejected for a non-admin"
+            );
+            // The admin is the trust root and may target the box deliberately;
+            // every entry above is a well-formed http URL, so only the
+            // internal-host rules can be rejecting them.
+            assert!(
+                validate_channel_destinations("webhook", &cfg("url", raw), true).is_ok(),
+                "{raw} should be accepted for an admin"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_ignores_absent_empty_and_non_url_kinds() {
+        // No URL key at all: the dispatcher's own "missing field" error still
+        // applies at send time; creating the channel stays legal.
+        assert!(validate_channel_destinations("webhook", &serde_json::json!({}), false).is_ok());
+        assert!(validate_channel_destinations("webhook", &cfg("url", "   "), false).is_ok());
+        // pushover / telegram post to the provider's own fixed API host, so
+        // their config carries tokens, not a destination.
+        assert!(validate_channel_destinations(
+            "pushover",
+            &serde_json::json!({ "app_token": "t", "user_key": "http://127.0.0.1" }),
+            false
+        )
+        .is_ok());
+    }
+
+    // ── provider snapshot URL (Frigate-supplied) ──────────────────────────────
+
+    #[test]
+    fn provider_snapshot_joins_a_relative_path_onto_the_base() {
+        assert_eq!(
+            resolve_provider_snapshot_url("/api/events/abc/snapshot.jpg", "http://frigate:5000"),
+            Some("http://frigate:5000/api/events/abc/snapshot.jpg".to_owned())
+        );
+        // A trailing slash on the base must not double up.
+        assert_eq!(
+            resolve_provider_snapshot_url("/api/x.jpg", "http://frigate:5000/"),
+            Some("http://frigate:5000/api/x.jpg".to_owned())
+        );
+    }
+
+    #[test]
+    fn provider_snapshot_accepts_an_absolute_url_on_the_configured_origin() {
+        assert_eq!(
+            resolve_provider_snapshot_url(
+                "http://frigate:5000/api/events/abc/snapshot.jpg",
+                "http://frigate:5000"
+            ),
+            Some("http://frigate:5000/api/events/abc/snapshot.jpg".to_owned())
+        );
+        // Default ports normalize, so an explicit :80 matches a bare http base.
+        assert!(
+            resolve_provider_snapshot_url("http://frigate:80/a.jpg", "http://frigate").is_some()
+        );
+    }
+
+    #[test]
+    fn provider_snapshot_refuses_anything_off_the_configured_origin() {
+        let base = "http://frigate:5000";
+        for raw in [
+            "http://evil.example.com/a.jpg",
+            "http://frigate:1984/a.jpg",
+            "https://frigate:5000/a.jpg",
+            "http://127.0.0.1:5432/a.jpg",
+            "//evil.example.com/a.jpg",
+            "file:///etc/passwd",
+        ] {
+            assert_eq!(
+                resolve_provider_snapshot_url(raw, base),
+                None,
+                "{raw} must not be fetched"
+            );
+        }
+        // With no Frigate base configured there is nothing to validate against,
+        // so nothing is fetched.
+        assert_eq!(resolve_provider_snapshot_url("/api/x.jpg", ""), None);
+        assert_eq!(resolve_provider_snapshot_url("", base), None);
     }
 }

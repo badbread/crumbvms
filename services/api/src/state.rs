@@ -48,6 +48,22 @@ const LOGIN_BACKOFF_CAP_SECS: u64 = 900;
 /// entries no longer in backoff are dropped (an active block is always kept).
 const LOGIN_FAILURES_MAX_ENTRIES: usize = 10_000;
 
+/// Channel test-fires one user may trigger per [`CHANNEL_TEST_WINDOW_SECS`].
+/// `POST /notifications/channels/:id/test` sends a real outbound request (with
+/// a live snapshot attached), so it is the one channel route that does work on
+/// demand rather than on the engine's schedule. Six per minute is far above what
+/// "save, then check it arrived" needs and far below anything useful as a
+/// repeater.
+const CHANNEL_TEST_LIMIT: u32 = 6;
+
+/// Length of the fixed window the [`CHANNEL_TEST_LIMIT`] applies over.
+const CHANNEL_TEST_WINDOW_SECS: u64 = 60;
+
+/// Prune the channel-test counter map once it exceeds this many distinct users,
+/// so it cannot grow without bound. Only entries whose window has already
+/// expired are dropped.
+const CHANNEL_TEST_MAX_ENTRIES: usize = 10_000;
+
 /// Backoff duration (seconds) for `failures` consecutive login failures, or
 /// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
 /// `min(cap, base * 2^(failures - threshold))` — exponential, clamped. Pure and
@@ -76,6 +92,15 @@ pub struct HaStatesCache {
     pub fetched_at: Instant,
     /// Raw HA `/api/states` array.
     pub states: Arc<Vec<serde_json::Value>>,
+}
+
+/// Per-user fixed-window counter for `POST /notifications/channels/:id/test`.
+#[derive(Clone, Copy)]
+struct TestWindow {
+    /// When the current window started (monotonic).
+    started: Instant,
+    /// Test-fires counted inside it.
+    hits: u32,
 }
 
 /// Per-username failed-login state for the brute-force backoff (issue #127).
@@ -256,6 +281,11 @@ struct Inner {
     /// shared per-IP request bucket, not a replacement.
     login_failures: DashMap<String, FailState>,
 
+    /// Per-user fixed-window counter for the channel test-fire endpoint. Keyed
+    /// by `users.id`. Memory-only (no table/migration) for the same reason as
+    /// `login_failures`: a restart clears it, which only ever RELAXES the limit.
+    channel_test_hits: DashMap<Uuid, TestWindow>,
+
     /// Demand-driven cache behind `GET /ha/states` (issue #170). `None` until
     /// the first request. The `tokio::sync::Mutex` makes a refresh single-flight:
     /// concurrent callers on a stale cache collapse to one HA `/api/states`
@@ -334,6 +364,7 @@ impl AppState {
             revoked_jtis_loaded_at: AtomicI64::new(0),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
+            channel_test_hits: DashMap::new(),
             ha_states: tokio::sync::Mutex::new(None),
             event_tx: OnceLock::new(),
         }))
@@ -697,6 +728,53 @@ impl AppState {
     /// counter (and their next fat-finger starts from zero again).
     pub fn record_login_success(&self, username: &str) {
         self.0.login_failures.remove(username);
+    }
+
+    // ── per-user channel test-fire window ─────────────────────────────────────
+
+    /// Count one `POST /notifications/channels/:id/test` for `user_id`.
+    ///
+    /// Returns `Ok(())` when the call is within [`CHANNEL_TEST_LIMIT`] for the
+    /// current [`CHANNEL_TEST_WINDOW_SECS`] window, or `Err(retry_after_secs)`
+    /// (always ≥ 1) when it is over, for the handler's 429 + `Retry-After`. The
+    /// window is fixed, not sliding: the first call after an expired window
+    /// starts a fresh one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the seconds to wait when the caller is over the limit.
+    pub fn count_channel_test(&self, user_id: Uuid) -> Result<(), u64> {
+        let now = Instant::now();
+        let window = Duration::from_secs(CHANNEL_TEST_WINDOW_SECS);
+
+        // Bound memory: drop entries whose window has already elapsed.
+        if self.0.channel_test_hits.len() > CHANNEL_TEST_MAX_ENTRIES {
+            self.0
+                .channel_test_hits
+                .retain(|_, w| now.duration_since(w.started) < window);
+        }
+
+        let mut entry = self
+            .0
+            .channel_test_hits
+            .entry(user_id)
+            .or_insert(TestWindow {
+                started: now,
+                hits: 0,
+            });
+        let elapsed = now.duration_since(entry.started);
+        if elapsed >= window {
+            entry.started = now;
+            entry.hits = 1;
+            return Ok(());
+        }
+        if entry.hits >= CHANNEL_TEST_LIMIT {
+            // Round any sub-second remainder up so a blocked caller never sees
+            // `Retry-After: 0`.
+            return Err(window.saturating_sub(elapsed).as_secs().max(1));
+        }
+        entry.hits += 1;
+        Ok(())
     }
 }
 
