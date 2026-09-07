@@ -14,6 +14,23 @@
 //! `src/` modules, so these drive the actual handlers and read the actual row
 //! back out of the database.
 
+// The harness (`mod support`) `#[path]`-includes the real `src/` modules, which
+// clippy re-lints in this test binary; mirror auth_rbac.rs's allow-set so the
+// production code is judged under the same policy, not a stricter one.
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::option_option)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::format_push_string)]
+
 mod support;
 
 use axum::http::StatusCode;
@@ -23,7 +40,9 @@ use uuid::Uuid;
 use crumb_common::db;
 use crumb_common::redact::CREDENTIAL_MASK;
 
-use support::{login, seed_admin, unique, TestApp};
+// Glob so support's `pub mod auth_mw`/`state`/… re-export into the crate root,
+// where the `#[path]`-included source resolves them as `crate::…`.
+use support::*;
 
 const MAIN_PASSWORD: &str = "hunter2-main";
 const SUB_PASSWORD: &str = "hunter2-sub";

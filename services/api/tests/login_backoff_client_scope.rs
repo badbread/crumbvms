@@ -14,6 +14,23 @@
 //! `src/` modules, so these drive the actual `auth::login` handler and the
 //! actual `AppState` counters.
 
+// The harness (`mod support`) `#[path]`-includes the real `src/` modules, which
+// clippy re-lints in this test binary; mirror auth_rbac.rs's allow-set so the
+// production code is judged under the same policy, not a stricter one.
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::option_option)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::format_push_string)]
+
 mod support;
 
 use std::net::SocketAddr;
@@ -21,7 +38,9 @@ use std::net::SocketAddr;
 use axum::extract::ConnectInfo;
 use axum::http::StatusCode;
 
-use support::{login_body, seed_admin, TestApp};
+// Glob so support's `pub mod auth_mw`/`state`/… re-export into the crate root,
+// where the `#[path]`-included source resolves them as `crate::…`.
+use support::*;
 
 const CLIENT_A: &str = "198.51.100.11:51000";
 const CLIENT_B: &str = "203.0.113.22:51000";
@@ -94,7 +113,7 @@ async fn counters_are_tracked_per_client_pair() {
     // The same invariant at the state layer, without the HTTP round trip, so a
     // failure here points straight at the counter rather than at routing.
     let app = TestApp::new().await;
-    let username = support::unique("backoff-user");
+    let username = unique("backoff-user");
 
     for _ in 0..5 {
         app.state.record_login_failure(&username, "198.51.100.11");
