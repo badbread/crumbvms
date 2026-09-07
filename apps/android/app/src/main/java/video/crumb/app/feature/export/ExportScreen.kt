@@ -665,6 +665,7 @@ private fun jobStatusLabel(job: ExportJob?): String = when {
     job == null -> "Queuing export…"
     job.isDone -> "Done"
     job.isFailed -> "Failed"
+    job.isCancelled -> "Cancelled"
     job.status.equals("running", ignoreCase = true) -> "Processing…"
     else -> "Queued…"
 }
@@ -832,6 +833,27 @@ private const val EXPORT_CACHE_SUBDIR = "exports"
 private const val DOWNLOAD_SUBDIR = "CrumbVMS"
 
 /**
+ * Extension (without the dot, lowercased) to save an export output under, taken
+ * from the server-reported basename in [ExportOutputFile.filename]. The server
+ * may hand back `.mkv` (no-transcode passthrough) or a whole-job `.zip`, not
+ * just `.mp4` - saving everything as `.mp4` produced an unplayable/corrupt-looking
+ * file whenever the real container differed. Falls back to "mp4" only when the
+ * server didn't report a filename (old persisted jobs).
+ */
+private fun exportFileExtension(outputFile: ExportOutputFile): String {
+    val name = outputFile.filename
+    val dot = name.lastIndexOf('.')
+    return if (dot in 0 until name.length - 1) name.substring(dot + 1).lowercase() else "mp4"
+}
+
+/** MIME type matching [exportFileExtension]'s output, for MediaStore/share intents. */
+private fun exportMimeType(extension: String): String = when (extension.lowercase()) {
+    "mkv" -> "video/x-matroska"
+    "zip" -> "application/zip"
+    else -> "video/mp4"
+}
+
+/**
  * #134: Save one export output file to the device's **public Downloads** so it's
  * user-findable (Files app, other apps) and not silently purged like the
  * app-private cache the Share path uses.
@@ -867,8 +889,9 @@ private suspend fun saveExportToDownloads(
             val absoluteUrl = "$base$path"
 
             val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val extension = exportFileExtension(outputFile)
             // Timestamp so repeated downloads don't collide / silently overwrite.
-            val fileName = "crumb-export-$safeId-${System.currentTimeMillis()}.mp4"
+            val fileName = "crumb-export-$safeId-${System.currentTimeMillis()}.$extension"
 
             val request = Request.Builder().url(absoluteUrl).build()
             client.newCall(request).execute().use { response ->
@@ -877,7 +900,7 @@ private suspend fun saveExportToDownloads(
                 }
                 val body = response.body ?: error("Empty response body")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    writeToMediaStoreDownloads(context, fileName, body.byteStream())
+                    writeToMediaStoreDownloads(context, fileName, exportMimeType(extension), body.byteStream())
                 } else {
                     writeToLegacyDownloads(fileName, body.byteStream())
                 }
@@ -899,12 +922,13 @@ private suspend fun saveExportToDownloads(
 private fun writeToMediaStoreDownloads(
     context: Context,
     fileName: String,
+    mimeType: String,
     input: InputStream,
 ): String {
     val resolver = context.contentResolver
     val values = ContentValues().apply {
         put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-        put(MediaStore.Downloads.MIME_TYPE, "video/mp4")
+        put(MediaStore.Downloads.MIME_TYPE, mimeType)
         put(
             MediaStore.Downloads.RELATIVE_PATH,
             Environment.DIRECTORY_DOWNLOADS + "/" + DOWNLOAD_SUBDIR,
@@ -977,7 +1001,7 @@ private suspend fun downloadExportFileToCache(
             val absoluteUrl = "$base$path"
 
             val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-            val fileName = "crumb-export-$safeId.mp4"
+            val fileName = "crumb-export-$safeId.${exportFileExtension(outputFile)}"
             val exportDir = File(context.cacheDir, EXPORT_CACHE_SUBDIR).apply { mkdirs() }
             val destFile = File(exportDir, fileName)
 
@@ -1011,7 +1035,7 @@ private fun shareLocalFile(context: Context, file: File) {
         val authority = "${context.packageName}.fileprovider"
         val uri = FileProvider.getUriForFile(context, authority, file)
         val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "video/mp4"
+            type = exportMimeType(file.extension)
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             putExtra(Intent.EXTRA_SUBJECT, "CrumbVMS Export")
