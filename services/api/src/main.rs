@@ -101,6 +101,7 @@ mod plates;
 mod playback;
 mod ptz;
 mod rate_limit;
+mod response_headers;
 mod roles;
 mod scrub_settings;
 mod segment_low;
@@ -545,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
 
     // CORS covers the first argument and deliberately NOT the second (`/auth`).
     // Layers that must cover everything (tracing) go outside the call.
-    let app = cors::compose(
+    let app = response_headers::with_site_headers(cors::compose(
         Router::new()
             // Health check — no auth, no tracing noise.  Returns 200 OK when DB
             // responds and the recorder heartbeat is fresh; 503 otherwise so
@@ -555,13 +556,18 @@ async fn main() -> anyhow::Result<()> {
             .route("/version", get(version))
             // Server-served admin console (the page itself is public; it signs in to
             // the API via /auth and drives the admin-only /config endpoints).
-            .route("/admin", get(serve_admin))
+            // The console document (and only it) carries a Content-Security-Policy
+            // describing exactly what that one page loads — see response_headers.rs.
+            .route(
+                "/admin",
+                get(serve_admin).layer(response_headers::admin_csp_layer()),
+            )
             // Prometheus metrics — no auth (no secrets), no rate limit (scraper).
             .merge(metrics::routes())
             .merge(json_routes)
             .merge(media_routes),
         auth_routes,
-    )
+    ))
     // Layers applied outermost-first (LIFO evaluation order in tower).
     .layer(TraceLayer::new_for_http())
     .with_state(state.clone());

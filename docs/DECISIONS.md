@@ -8,6 +8,55 @@ revisit.
 
 ---
 
+## 2026-09-07, Response headers: two site-wide headers everywhere, a Content-Security-Policy on the `/admin` document only
+
+**Context.** The api sent no `X-Content-Type-Options`, no `Referrer-Policy`, and
+no `Content-Security-Policy` on any response. The admin console
+(`services/api/src/admin.html`) is one `include_str!`-embedded page whose entire
+network surface is same-origin: every `fetch()` is a relative path, the icon set
+is inline SVG (Lucide path data embedded, not hotlinked), and the only non-`'self'`
+image sources are `data:` (inline placeholder glyphs) and `blob:` (snapshot
+frames from `URL.createObjectURL`). It has no `<iframe>`, no `<base>`, no
+`<form>`, no `WebSocket`/`EventSource`/`Worker`, and one inline `<script>`.
+
+**Decision.** `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`
+are set on every response by a `tower_http::set_header` layer applied outermost
+in `main.rs` (so it also covers the `/auth` subtree, which is merged outside the
+CORS layer). The `Content-Security-Policy` is attached to the `/admin` route
+only, not to JSON or media responses, whose consumers are native clients and for
+which a document policy means nothing. The policy and both helpers live in
+`services/api/src/response_headers.rs` with a test that asserts the wiring.
+
+**Trade-off accepted:** the policy carries `'unsafe-inline'` for `script-src` and
+`style-src`, because the console is deliberately a single self-contained file
+with one inline script and inline `style=` attributes throughout. Nonces or
+hashes would mean changing how the page is assembled and served, which is a much
+larger change than this one; the policy still pins every load origin to `'self'`
+(plus `data:`/`blob:` images) and sets `base-uri 'none'`, `object-src 'none'`,
+`form-action 'self'`, `frame-ancestors 'self'`.
+
+`frame-ancestors 'self'` is safe for the desktop client: it navigates a native
+WebView2 to `/admin` as a top-level document (`apps/desktop-flutter/lib/ui/
+admin_console/admin_console_screen.dart`), not in an `<iframe>` as the retired
+Tauri client did.
+
+**Also noted, deliberately unchanged:** `admin.html` keeps its bearer token in
+`localStorage`. Moving it to a cookie or in-memory-only store changes the whole
+sign-in/refresh flow and every client that deep-links into the console with
+`#token=`; it is out of scope here.
+
+**Rejected:** a single global CSP covering the JSON/media routes (meaningless
+for native clients, and one more thing to keep in step with the media surface);
+nonce/hash-based `script-src` (needs the console to stop being one static
+`include_str!` file).
+
+**Revisit if:** the console ever gains an external asset, an `<iframe>`, a
+`WebSocket`, or a cross-origin `fetch()` (all four would need a directive
+widened, and the widening should be argued here first), or if the console is
+split into separate served assets, at which point `'unsafe-inline'` can go.
+
+---
+
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
 
 **Context.** #442 introduced value-setting HA controls. Light dimming
