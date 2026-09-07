@@ -8,6 +8,51 @@ revisit.
 
 ---
 
+## 2026-09-07, The api refuses to start on the placeholder database password, and every `_FILE` twin wins over its plain variable
+
+**Context.** Three inconsistencies in how secrets were read and documented:
+
+* `db.rs`'s `ha_env` read `HA_TOKEN` first and only fell back to
+  `HA_TOKEN_FILE`, the reverse of `config::secret_env`, which every other secret
+  goes through. An operator who mounted a Docker secret while a stale plain
+  value sat in `.env` silently got the stale one, and the docs-site already said
+  `HA_TOKEN_FILE` was "read in preference to `HA_TOKEN`".
+* The docs-site said `GO2RTC_USER`/`GO2RTC_PASS` "don't support `_FILE`". The
+  api routes both through `require_secret`, which does read the `_FILE` twin.
+  What is actually true is narrower: the embedded go2rtc restreamer expands the
+  plain variables from the process environment, so the plain form has to be set
+  regardless.
+* `.env.example` and `docker-compose.yml` ship `POSTGRES_PASSWORD=change-me` and
+  a matching `DATABASE_URL`. `JWT_SECRET` and `GO2RTC_PASS` both refuse their
+  documented placeholder at startup; the database password did not.
+
+**Decision.** `ha_env` calls `secret_env("HA_TOKEN")`, so the file wins like
+everywhere else. The two docs pages now describe the `GO2RTC_*` situation
+accurately. And `ApiConfig::from_env` refuses to start when `DATABASE_URL`'s
+userinfo password is one of the documented placeholders (`change-me`,
+`changeme`, case-insensitively), with an error naming the fix, including the
+part that trips people up: a changed `POSTGRES_PASSWORD` does not re-initialize
+an existing Postgres data volume, so the password has to be changed in the
+database too.
+
+**Trade-off accepted:** this is a startup-breaking change for an install that
+is currently running on the placeholder. That is the point, and it matches what
+`JWT_SECRET` and `GO2RTC_PASS` have always done; the error says exactly what to
+do. Only exact placeholder matches are refused, so a real password that happens
+to begin with `change-me` still starts.
+
+**Rejected:** warning instead of refusing (a warning in a log nobody reads is
+how the value survives to production, and the two adjacent secrets already set
+the refuse precedent); a generic weak-password check (arbitrary, and Crumb has
+no business grading operator passwords, only rejecting the one it shipped
+itself).
+
+**Revisit if:** a deployment shape appears where the api legitimately cannot
+know the real password, e.g. an external connection broker, in which case the
+check should key on the password being *absent* rather than a value list.
+
+---
+
 ## 2026-09-07, Camera source URLs mask their password on read; sending the mask back means "keep it"
 
 **Context.** A camera's `source_url` / `source_sub_url` carry the camera's own

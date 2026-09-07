@@ -22,12 +22,15 @@ env default; that's flagged in the notes.
 
 Most secret-bearing keys also answer to a `_FILE` twin (`DATABASE_URL_FILE`,
 `JWT_SECRET_FILE`, `SEED_ADMIN_PASSWORD_FILE`, `METRICS_TOKEN_FILE`,
-`HA_TOKEN_FILE`) holding a path to read the value from, for Docker secrets.
-`GO2RTC_USER`/`GO2RTC_PASS` are the exception: the embedded go2rtc restreamer
-expands them straight from the process environment and compose requires the
-plain vars, so those two don't support `_FILE`. Only `HA_TOKEN_FILE` and
-`METRICS_TOKEN_FILE` get their own rows below, because the others are
-mechanical; see [Secrets](/configuration/secrets) for the list.
+`HA_TOKEN_FILE`) holding a path to read the value from, for Docker secrets. The
+`_FILE` twin is read in preference to the plain variable, so a mounted secret
+always wins over a stale value left in `.env`. `GO2RTC_USER`/`GO2RTC_PASS` are a
+partial exception: the api does read `GO2RTC_USER_FILE`/`GO2RTC_PASS_FILE`, but
+the embedded go2rtc restreamer expands the plain variables straight from the
+process environment and compose requires them, so the plain form has to be set
+regardless and the `_FILE` twin buys you nothing on its own. Only
+`HA_TOKEN_FILE` and `METRICS_TOKEN_FILE` get their own rows below, because the
+others are mechanical; see [Secrets](/configuration/secrets) for the list.
 
 ## Time zone
 

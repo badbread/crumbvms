@@ -1628,17 +1628,19 @@ fn ha_settings_from_row(row: &tokio_postgres::Row) -> HaSettings {
 /// Read-time env fallback for the HA connection: `HA_BASE_URL` and
 /// `HA_TOKEN` / `HA_TOKEN_FILE`. Applied only when the DB fields are empty (DB
 /// wins), mirroring the config-precedence convention.
+///
+/// The token goes through [`crate::config::secret_env`], the same helper every
+/// other secret uses, so `HA_TOKEN_FILE` is read in preference to `HA_TOKEN`
+/// (this read used to prefer the plain variable, the reverse of every other
+/// `_FILE` pair and of what the documentation promised: an operator who mounted
+/// a Docker secret AND had a stale plain value in `.env` silently got the stale
+/// one).
 fn ha_env() -> (String, Option<String>) {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let base_url = env("HA_BASE_URL").unwrap_or_default();
-    let token = env("HA_TOKEN").or_else(|| {
-        env("HA_TOKEN_FILE").and_then(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        })
-    });
+    let base_url = std::env::var("HA_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_default();
+    let token = crate::config::secret_env("HA_TOKEN").filter(|v| !v.trim().is_empty());
     (base_url, token)
 }
 

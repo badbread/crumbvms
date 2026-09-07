@@ -116,10 +116,12 @@ provision a fresh database (you lose the segment index, so restore a
   `SEED_ADMIN_PASSWORD_FILE`, `METRICS_TOKEN_FILE`,
   `HA_TOKEN_FILE`). Point one at a Docker-secret
   path and Crumb reads the file, keeping the plaintext value out of the
-  process environment and `.env`. `GO2RTC_USER`/`GO2RTC_PASS` don't support
-  this convention: the embedded go2rtc restreamer expands them straight from
-  the process environment, and compose requires the plain vars, so those two
-  stay as regular `.env` values. See `scripts/setup-secrets.sh` and
+  process environment and `.env`. The `_FILE` twin always wins over the plain
+  variable. `GO2RTC_USER`/`GO2RTC_PASS` are a partial exception: the api does
+  read `GO2RTC_USER_FILE`/`GO2RTC_PASS_FILE`, but the embedded go2rtc
+  restreamer expands the plain variables straight from the process
+  environment and compose requires them, so those two have to stay as regular
+  `.env` values regardless. See `scripts/setup-secrets.sh` and
   `docker-compose.secrets.example.yml`.
 
 ## If you hand-edit `.env` instead of using the script

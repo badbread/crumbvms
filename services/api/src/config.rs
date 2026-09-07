@@ -425,6 +425,20 @@ impl ApiConfig {
         // DATABASE_URL and JWT_SECRET are secrets → support the `_FILE`
         // convention (Docker secrets) in addition to plaintext env (Risk #9).
         let database_url = require_secret("DATABASE_URL")?;
+        // Same backstop as JWT_SECRET and GO2RTC_PASS below: refuse to start on
+        // the placeholder password `.env.example` ships. setup-env.sh generates a
+        // strong one, so this only fires if someone hand-wrote the example value
+        // into .env and never replaced it.
+        anyhow::ensure!(
+            !database_url_has_placeholder_password(&database_url),
+            "DATABASE_URL still carries the placeholder database password from \
+             .env.example. Generate a real one (openssl rand -hex 32), set both \
+             POSTGRES_PASSWORD and DATABASE_URL to it, or let scripts/setup-env.sh \
+             create them. If the database already exists with the placeholder, \
+             change it in Postgres first \
+             (ALTER USER <user> WITH PASSWORD '<new>';) — a new POSTGRES_PASSWORD \
+             does not re-initialize an existing data volume"
+        );
         let jwt_secret = require_secret("JWT_SECRET")?;
         anyhow::ensure!(
             jwt_secret.len() >= 32,
@@ -580,6 +594,21 @@ where
 /// survives `.env` + docker-compose substitution unmangled. Raw `ONVIF_CONFIG`
 /// is still accepted as a fallback for local/dev use.
 ///
+/// The placeholder values shipped as "fill this in" markers in `.env.example`
+/// and the manual-setup docs. A running install must never carry one.
+const PLACEHOLDER_SECRETS: [&str; 2] = ["change-me", "changeme"];
+
+/// `true` when `database_url`'s userinfo password is one of the documented
+/// placeholders. A URL with no password (peer/trust auth, or a `.pgpass` file)
+/// is not a placeholder and passes.
+fn database_url_has_placeholder_password(database_url: &str) -> bool {
+    crumb_common::redact::url_password(database_url).is_some_and(|pw| {
+        PLACEHOLDER_SECRETS
+            .iter()
+            .any(|p| pw.eq_ignore_ascii_case(p))
+    })
+}
+
 /// Returns an empty map when neither var is set or both are empty (not an
 /// error). Returns an error when a present value can't be decoded/parsed.
 fn parse_onvif_config() -> Result<HashMap<String, OnvifCameraConfig>> {
@@ -610,7 +639,39 @@ fn parse_onvif_config() -> Result<HashMap<String, OnvifCameraConfig>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env, DEFAULT_EXPORT_DIR};
+    use super::{database_url_has_placeholder_password, parse_env, DEFAULT_EXPORT_DIR};
+
+    #[test]
+    fn placeholder_database_password_is_recognised() {
+        assert!(database_url_has_placeholder_password(
+            "postgresql://crumb:change-me@postgres:5432/crumb"
+        ));
+        // The .env.example spelling, case-insensitively, and the run-together
+        // variant the older manual docs used.
+        assert!(database_url_has_placeholder_password(
+            "postgresql://crumb:CHANGE-ME@postgres:5432/crumb"
+        ));
+        assert!(database_url_has_placeholder_password(
+            "postgresql://crumb:changeme@postgres:5432/crumb"
+        ));
+    }
+
+    #[test]
+    fn a_real_database_password_passes() {
+        assert!(!database_url_has_placeholder_password(
+            "postgresql://crumb:8f3c1d0a9b7e4f6a2c5d8e1f0a3b6c9d@postgres:5432/crumb"
+        ));
+        // A password that merely CONTAINS the placeholder is a real password.
+        assert!(!database_url_has_placeholder_password(
+            "postgresql://crumb:change-me-later-9f3a@postgres:5432/crumb"
+        ));
+        // No password at all (peer/trust auth, or a .pgpass file) is not a
+        // placeholder and must not stop startup.
+        assert!(!database_url_has_placeholder_password(
+            "postgresql://crumb@postgres:5432/crumb"
+        ));
+        assert!(!database_url_has_placeholder_password("not a url"));
+    }
 
     /// #249: compose forwards keys as `${VAR:-}`, so an unset key arrives as an
     /// empty string. The api's `parse_env` must treat that as "use the default",

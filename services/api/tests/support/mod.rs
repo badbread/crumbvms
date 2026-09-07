@@ -141,10 +141,14 @@ use crumb_common::{
 use crate::support::state::AppState;
 
 /// Default local Postgres URL used when neither `TEST_DATABASE_URL` nor
-/// `DATABASE_URL` is set — matches the `.env.example` throwaway dev creds so
-/// `docker run -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=change-me -e
-/// POSTGRES_DB=crumb -p 5432:5432 postgres:16-alpine` just works.
-const DEFAULT_TEST_DB_URL: &str = "postgresql://crumb:change-me@127.0.0.1:5432/crumb";
+/// `DATABASE_URL` is set, so `docker run -e POSTGRES_USER=crumb -e
+/// POSTGRES_PASSWORD=crumb-dev -e POSTGRES_DB=crumb -p 5432:5432
+/// postgres:16-alpine` just works.
+///
+/// Deliberately NOT the `change-me` placeholder `.env.example` ships: the api's
+/// `ApiConfig::from_env` refuses to start on that value, so a harness default
+/// carrying it would fail every test the moment `DATABASE_URL` was unset.
+const DEFAULT_TEST_DB_URL: &str = "postgresql://crumb:crumb-dev@127.0.0.1:5432/crumb";
 
 /// A unique-enough per-process counter so parallel tests get distinct
 /// usernames/camera names even when called within the same millisecond.
@@ -250,7 +254,7 @@ pub async fn test_state() -> AppState {
                 "cannot connect to test Postgres at {:?}: {e}\n\
                  Start one first, e.g.:\n\
                  docker run --rm -d --name crumb-test-pg \\\n  \
-                 -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=crumb \\\n  \
+                 -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=crumb-dev -e POSTGRES_DB=crumb \\\n  \
                  -p 5432:5432 postgres:16-alpine",
                 cfg.database_url
             )
