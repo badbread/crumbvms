@@ -349,6 +349,64 @@ fn scrub_secrets(text: &str, database_url: &str) -> String {
     out
 }
 
+/// Split a Postgres connection URL into the connection string `pg_dump` is
+/// given on its command line and the password to hand it out of band.
+///
+/// A process's command line is readable by other processes on the host
+/// (`/proc/<pid>/cmdline`), so the password must not travel in argv. Its
+/// environment is not readable the same way, and `PGPASSWORD` is libpq's own
+/// documented channel for exactly this. The returned URL keeps the username,
+/// host, port, database and any query parameters, with only the password
+/// removed.
+///
+/// Returns `(url_without_password, password)`. The password is
+/// percent-DECODED, because `PGPASSWORD` carries the literal value while the
+/// URL carries an encoded one. A URL that does not parse, or that carries no
+/// password, is returned unchanged with `None` (the pool already connected
+/// with it, so a parse failure here is theoretical).
+fn split_db_password(database_url: &str) -> (String, Option<String>) {
+    let Ok(mut u) = url::Url::parse(database_url) else {
+        return (database_url.to_owned(), None);
+    };
+    let Some(password) = u.password().filter(|p| !p.is_empty()).map(percent_decode_lossy) else {
+        // Nothing to move out of argv: hand back the caller's own string rather
+        // than a re-serialized one.
+        return (database_url.to_owned(), None);
+    };
+    if u.set_password(None).is_err() {
+        // Cannot-happen for a URL with an authority (which is the only shape
+        // that HAS a password); keep the original rather than emit a URL we
+        // did not fully rewrite.
+        return (database_url.to_owned(), None);
+    }
+    (u.to_string(), Some(password))
+}
+
+/// Percent-decode `s`, leaving any malformed `%` escape as the literal text it
+/// already is (a password may legitimately contain a bare `%`). Bytes are
+/// reassembled before the UTF-8 conversion so a multi-byte character split
+/// across escapes decodes correctly.
+fn percent_decode_lossy(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                // hi/lo are single hex digits, so hi*16+lo is always <= 255.
+                out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
@@ -384,12 +442,20 @@ impl BackupJob {
         let final_path = daily.join(format!("{}-{stamp}.sql.gz", self.db));
         let tmp_path = daily.join(format!("{}-{stamp}.sql.gz.partial", self.db));
 
-        let output = tokio::process::Command::new("pg_dump")
-            .args(PG_DUMP_ARGS)
+        // The connection string goes on the command line, the password does
+        // not: argv is readable by other processes on the host, the process
+        // environment is not, and PGPASSWORD is libpq's channel for this.
+        let (dsn, password) = split_db_password(&self.database_url);
+        let mut cmd = tokio::process::Command::new("pg_dump");
+        cmd.args(PG_DUMP_ARGS)
             .arg("--dbname")
-            .arg(&self.database_url)
+            .arg(&dsn)
             .arg("-f")
-            .arg(&tmp_path)
+            .arg(&tmp_path);
+        if let Some(password) = &password {
+            cmd.env("PGPASSWORD", password);
+        }
+        let output = cmd
             .kill_on_drop(true)
             .output()
             .await
@@ -635,6 +701,52 @@ mod tests {
 
     fn v(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn split_db_password_strips_the_password_and_keeps_everything_else() {
+        let (dsn, pw) = split_db_password("postgresql://crumb:s3cret@postgres:5432/crumb");
+        assert_eq!(pw.as_deref(), Some("s3cret"));
+        assert!(!dsn.contains("s3cret"), "password left in the DSN: {dsn}");
+        assert!(dsn.starts_with("postgresql://crumb@postgres:5432/crumb"), "{dsn}");
+    }
+
+    #[test]
+    fn split_db_password_decodes_at_and_percent() {
+        // A password containing '@' or '%' must be percent-encoded in the URL;
+        // PGPASSWORD needs the literal value, so the split decodes it.
+        let (dsn, pw) = split_db_password("postgresql://crumb:p%40ss%25word@db.internal:5432/crumb");
+        assert_eq!(pw.as_deref(), Some("p@ss%word"));
+        assert!(!dsn.contains("p%40ss"), "password left in the DSN: {dsn}");
+        assert!(dsn.contains("crumb@db.internal:5432"), "{dsn}");
+    }
+
+    #[test]
+    fn split_db_password_preserves_query_parameters() {
+        let (dsn, pw) =
+            split_db_password("postgresql://crumb:pw@postgres:5432/crumb?sslmode=require");
+        assert_eq!(pw.as_deref(), Some("pw"));
+        assert!(dsn.ends_with("/crumb?sslmode=require"), "{dsn}");
+    }
+
+    #[test]
+    fn split_db_password_passes_through_urls_without_one() {
+        // No password (peer/trust auth or a .pgpass file) and an unparseable
+        // value both come back untouched with nothing to put in the env.
+        let no_pw = "postgresql://crumb@postgres:5432/crumb";
+        assert_eq!(split_db_password(no_pw), (no_pw.to_owned(), None));
+        let junk = "not a url";
+        assert_eq!(split_db_password(junk), (junk.to_owned(), None));
+    }
+
+    #[test]
+    fn percent_decode_leaves_malformed_escapes_alone() {
+        assert_eq!(percent_decode_lossy("plain"), "plain");
+        assert_eq!(percent_decode_lossy("a%zzb"), "a%zzb");
+        assert_eq!(percent_decode_lossy("trailing%"), "trailing%");
+        assert_eq!(percent_decode_lossy("trailing%4"), "trailing%4");
+        // Multi-byte UTF-8 split across two escapes.
+        assert_eq!(percent_decode_lossy("%C3%A9"), "é");
     }
 
     #[test]
