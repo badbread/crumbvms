@@ -417,6 +417,19 @@ class CrumbRepository(private val container: AppContainer) {
     suspend fun exportStatus(jobId: String): Result<ExportJob> = runCatchingCancellable { api.exportStatus(jobId) }
 
     /**
+     * Cancel a queued/running export job (`DELETE /export/{job_id}`).
+     *
+     * The endpoint answers `204 No Content`, so the response body carries nothing;
+     * an unsuccessful status is turned into a failure here rather than silently
+     * reported as a cancel that never happened.
+     */
+    suspend fun cancelExport(jobId: String): Result<Unit> = runCatchingCancellable {
+        val response = api.cancelExport(jobId)
+        if (!response.isSuccessful) error("Server returned HTTP ${response.code()}")
+        Unit
+    }
+
+    /**
      * Fetch detection events for one camera over a time window.
      *
      * Non-fatal: returns [Result.success] with an empty list when the detection

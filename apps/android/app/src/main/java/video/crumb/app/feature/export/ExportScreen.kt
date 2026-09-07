@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -25,7 +26,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -76,6 +79,7 @@ import video.crumb.app.data.Network
 import video.crumb.app.di.AppContainer
 import video.crumb.app.di.appContainer
 import video.crumb.app.ui.HintTooltip
+import video.crumb.app.ui.JumpToDateTimeDialog
 import video.crumb.app.ui.Time
 import video.crumb.app.ui.theme.BlueAccent
 import video.crumb.app.ui.theme.DangerRed
@@ -92,14 +96,35 @@ import java.time.Instant
  * Export screen: lets the operator pick cameras, a time window, and burn-in
  * preference, then submits an export job and polls it to completion. Completed
  * output files can be downloaded to the device or shared as a URL.
+ *
+ * The screen can be SEEDED by its entry point so it opens on what the operator
+ * was already looking at: single-camera playback hands over the camera plus the
+ * in/out bracket it marked on the timeline (or the hour ending at the playhead),
+ * and the playback wall hands over the hour ending at its scrub cursor.
+ *
+ * @param onBack Called when the user taps the back arrow.
+ * @param seedCameraId Camera to pre-select; blank pre-selects nothing.
+ * @param seedStartMs Clip-window start (epoch-millis); ≤ 0 keeps the default window.
+ * @param seedEndMs Clip-window end (epoch-millis); ≤ 0 keeps the default window.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExportScreen(onBack: () -> Unit) {
+fun ExportScreen(
+    onBack: () -> Unit,
+    seedCameraId: String = "",
+    seedStartMs: Long = 0L,
+    seedEndMs: Long = 0L,
+) {
     val container = appContainer()
     val vm: ExportViewModel = viewModel(
+        // Keyed on the seed so navigating in with a DIFFERENT camera/window gets a
+        // ViewModel carrying that seed, instead of silently reusing the previous
+        // screen's state (a retained VM ignores constructor args).
+        key = "export:$seedCameraId:$seedStartMs:$seedEndMs",
         factory = viewModelFactory {
-            initializer { ExportViewModel(container.repository) }
+            initializer {
+                ExportViewModel(container.repository, seedCameraId, seedStartMs, seedEndMs)
+            }
         },
     )
     val state by vm.state.collectAsStateWithLifecycle()
@@ -161,6 +186,7 @@ fun ExportScreen(onBack: () -> Unit) {
                 endMs = state.endMs,
                 onStartChange = vm::setStart,
                 onEndChange = vm::setEnd,
+                onQuickRange = vm::applyQuickRange,
                 disabled = state.polling || state.submitting,
             )
 
@@ -180,7 +206,8 @@ fun ExportScreen(onBack: () -> Unit) {
             // state.submitting covers the gap between tapping Create and the POST
             // round-trip resolving (before state.polling itself flips true) — closes
             // a fast-double-tap window that could otherwise submit two export jobs.
-            val canSubmit = state.selectedCameraIds.isNotEmpty() && !state.polling && !state.submitting
+            val canSubmit = state.selectedCameraIds.isNotEmpty() && state.rangeValid &&
+                !state.polling && !state.submitting
             Button(
                 onClick = vm::createExport,
                 enabled = canSubmit,
@@ -192,7 +219,7 @@ fun ExportScreen(onBack: () -> Unit) {
             // ─── job progress + results ──────────────────────────────────────
             val job = state.job
             val jobError = state.jobError
-            if (state.polling || job != null || jobError != null) {
+            if (state.polling || job != null || jobError != null || state.notice != null) {
                 HorizontalDivider(color = NavySurfaceVariant)
                 SectionHeader("Job Status")
                 JobStatusSection(
@@ -200,6 +227,9 @@ fun ExportScreen(onBack: () -> Unit) {
                     polling = state.polling,
                     job = job,
                     jobError = jobError,
+                    notice = state.notice,
+                    cancelling = state.cancelling,
+                    onCancel = vm::cancelExport,
                     snackbarHostState = snackbarHostState,
                 )
             }
@@ -336,15 +366,19 @@ private fun CameraCheckRow(
     }
 }
 
-// ─── time range stepper ───────────────────────────────────────────────────────
+// ─── time range ───────────────────────────────────────────────────────────────
 
 /**
- * Simple +/- minute steppers for start and end times. Each press moves the
- * boundary by [STEP_MINUTES] minutes. The field shows the device-local time via
- * [Time.dateTime] so the operator sees a human-readable value at a glance.
+ * Clip-window editor: a precise start and end field, quick "Last N minutes"
+ * chips, and a one-SECOND nudge stepper on each boundary.
  *
- * Keeping the implementation self-contained avoids a DatePickerDialog dependency
- * and remains compilable on minSdk 26.
+ * This replaces the old one-minute +/- steppers, which were the only way to move
+ * a boundary and so made a second-accurate window impossible to express even
+ * though the server accepts fractional seconds. Tapping a field opens
+ * [JumpToDateTimeDialog] (`preserveSeconds = true`, so a seeded selection keeps
+ * its seconds through an edit of the date or the hour/minute), and the nudge
+ * buttons trim the boundary a second at a time. The chips mirror the desktop
+ * export builder's Last 1m / 5m / 10m / 15m.
  */
 @Composable
 private fun TimeRangeSection(
@@ -352,41 +386,70 @@ private fun TimeRangeSection(
     endMs: Long,
     onStartChange: (Long) -> Unit,
     onEndChange: (Long) -> Unit,
+    onQuickRange: (Int) -> Unit,
     disabled: Boolean,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        TimeStepperRow(
+        TimeBoundaryRow(
             label = "Start",
             epochMs = startMs,
             onChange = onStartChange,
             disabled = disabled,
         )
-        TimeStepperRow(
+        TimeBoundaryRow(
             label = "End",
             epochMs = endMs,
             onChange = onEndChange,
             disabled = disabled,
         )
-        val durationSec = (endMs - startMs) / 1_000L
-        val durationStr = formatDuration(durationSec)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ExportRange.QUICK_RANGE_MINUTES.forEach { minutes ->
+                AssistChip(
+                    onClick = { onQuickRange(minutes) },
+                    enabled = !disabled,
+                    label = { Text("Last ${minutes}m", style = MaterialTheme.typography.labelMedium) },
+                )
+            }
+        }
         Text(
-            text = "Duration: $durationStr",
+            text = "Duration: ${ExportRange.durationLabel(startMs, endMs)}",
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
         )
     }
 }
 
+/**
+ * One clip boundary: a tappable, second-accurate value that opens the date+time
+ * picker, flanked by a one-second nudge in each direction.
+ */
 @Composable
-private fun TimeStepperRow(
+private fun TimeBoundaryRow(
     label: String,
     epochMs: Long,
     onChange: (Long) -> Unit,
     disabled: Boolean,
 ) {
-    val instant = Instant.ofEpochMilli(epochMs)
-    val displayText = Time.dateTime(instant)
-    val stepMs = STEP_MINUTES * 60_000L
+    var showPicker by remember { mutableStateOf(false) }
+
+    if (showPicker) {
+        JumpToDateTimeDialog(
+            initialMs = epochMs,
+            onDismiss = { showPicker = false },
+            onPicked = { picked ->
+                showPicker = false
+                onChange(picked)
+            },
+            // The M3 time step only offers hours and minutes; carry the seconds of
+            // the current boundary through so a second-accurate selection isn't
+            // silently rounded off by opening the picker.
+            preserveSeconds = true,
+            title = "$label time",
+        )
+    }
 
     Card(
         colors = CardDefaults.cardColors(containerColor = NavySurface),
@@ -403,43 +466,49 @@ private fun TimeStepperRow(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                OutlinedButton(
-                    onClick = { onChange(epochMs - stepMs) },
-                    enabled = !disabled,
-                    modifier = Modifier.size(width = 48.dp, height = 36.dp),
-                ) {
-                    Text("-", style = MaterialTheme.typography.labelLarge)
+                HintTooltip("One second earlier") {
+                    OutlinedButton(
+                        onClick = { onChange(epochMs - ExportRange.NUDGE_STEP_MS) },
+                        enabled = !disabled,
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(width = 44.dp, height = 36.dp),
+                    ) {
+                        Text("-1s", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
-                Text(
-                    text = displayText,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.weight(1f),
-                )
-                OutlinedButton(
-                    onClick = { onChange(epochMs + stepMs) },
+                TextButton(
+                    onClick = { showPicker = true },
                     enabled = !disabled,
-                    modifier = Modifier.size(width = 48.dp, height = 36.dp),
+                    modifier = Modifier.weight(1f),
                 ) {
-                    Text("+", style = MaterialTheme.typography.labelLarge)
+                    Icon(
+                        imageVector = Icons.Filled.Schedule,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .size(16.dp),
+                    )
+                    Text(
+                        text = Time.dateTime(Instant.ofEpochMilli(epochMs)),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                HintTooltip("One second later") {
+                    OutlinedButton(
+                        onClick = { onChange(epochMs + ExportRange.NUDGE_STEP_MS) },
+                        enabled = !disabled,
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(width = 44.dp, height = 36.dp),
+                    ) {
+                        Text("+1s", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
         }
     }
 }
-
-private fun formatDuration(totalSec: Long): String {
-    val h = totalSec / 3600
-    val m = (totalSec % 3600) / 60
-    val s = totalSec % 60
-    return when {
-        h > 0 -> "${h}h ${m}m ${s}s"
-        m > 0 -> "${m}m ${s}s"
-        else -> "${s}s"
-    }
-}
-
-private const val STEP_MINUTES = 1L
 
 // ─── burn-timestamp switch ────────────────────────────────────────────────────
 
@@ -488,12 +557,16 @@ private fun JobStatusSection(
     polling: Boolean,
     job: ExportJob?,
     jobError: String?,
+    notice: String?,
+    cancelling: Boolean,
+    onCancel: () -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
 
         // Progress bar — shown while polling or while job is non-terminal
-        if (polling || (job != null && !job.isTerminal)) {
+        val running = polling || (job != null && !job.isTerminal)
+        if (running) {
             val progress = job?.progressPct?.let { it / 100f } ?: 0f
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(
@@ -530,12 +603,42 @@ private fun JobStatusSection(
             }
         }
 
+        // Cancel a queued/running job (DELETE /export/{job_id}) — the server aborts
+        // ffmpeg and removes the partial output, so nothing half-written is left on
+        // the box. Only offered while the job can still be stopped.
+        if (running) {
+            OutlinedButton(
+                onClick = onCancel,
+                enabled = !cancelling,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (cancelling) {
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .size(16.dp),
+                        strokeWidth = 2.dp,
+                    )
+                }
+                Text(if (cancelling) "Cancelling..." else "Cancel export")
+            }
+        }
+
         // Error message (job failure or network blip during polling)
         if (jobError != null) {
             Text(
                 text = jobError,
                 style = MaterialTheme.typography.bodyMedium,
                 color = DangerRed,
+            )
+        }
+
+        // Neutral status line (e.g. a deliberate cancel) — not a failure, so not red.
+        if (notice != null) {
+            Text(
+                text = notice,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
             )
         }
 
@@ -562,6 +665,7 @@ private fun jobStatusLabel(job: ExportJob?): String = when {
     job == null -> "Queuing export…"
     job.isDone -> "Done"
     job.isFailed -> "Failed"
+    job.isCancelled -> "Cancelled"
     job.status.equals("running", ignoreCase = true) -> "Processing…"
     else -> "Queued…"
 }
@@ -729,6 +833,27 @@ private const val EXPORT_CACHE_SUBDIR = "exports"
 private const val DOWNLOAD_SUBDIR = "CrumbVMS"
 
 /**
+ * Extension (without the dot, lowercased) to save an export output under, taken
+ * from the server-reported basename in [ExportOutputFile.filename]. The server
+ * may hand back `.mkv` (no-transcode passthrough) or a whole-job `.zip`, not
+ * just `.mp4` - saving everything as `.mp4` produced an unplayable/corrupt-looking
+ * file whenever the real container differed. Falls back to "mp4" only when the
+ * server didn't report a filename (old persisted jobs).
+ */
+private fun exportFileExtension(outputFile: ExportOutputFile): String {
+    val name = outputFile.filename
+    val dot = name.lastIndexOf('.')
+    return if (dot in 0 until name.length - 1) name.substring(dot + 1).lowercase() else "mp4"
+}
+
+/** MIME type matching [exportFileExtension]'s output, for MediaStore/share intents. */
+private fun exportMimeType(extension: String): String = when (extension.lowercase()) {
+    "mkv" -> "video/x-matroska"
+    "zip" -> "application/zip"
+    else -> "video/mp4"
+}
+
+/**
  * #134: Save one export output file to the device's **public Downloads** so it's
  * user-findable (Files app, other apps) and not silently purged like the
  * app-private cache the Share path uses.
@@ -764,8 +889,9 @@ private suspend fun saveExportToDownloads(
             val absoluteUrl = "$base$path"
 
             val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val extension = exportFileExtension(outputFile)
             // Timestamp so repeated downloads don't collide / silently overwrite.
-            val fileName = "crumb-export-$safeId-${System.currentTimeMillis()}.mp4"
+            val fileName = "crumb-export-$safeId-${System.currentTimeMillis()}.$extension"
 
             val request = Request.Builder().url(absoluteUrl).build()
             client.newCall(request).execute().use { response ->
@@ -774,7 +900,7 @@ private suspend fun saveExportToDownloads(
                 }
                 val body = response.body ?: error("Empty response body")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    writeToMediaStoreDownloads(context, fileName, body.byteStream())
+                    writeToMediaStoreDownloads(context, fileName, exportMimeType(extension), body.byteStream())
                 } else {
                     writeToLegacyDownloads(fileName, body.byteStream())
                 }
@@ -796,12 +922,13 @@ private suspend fun saveExportToDownloads(
 private fun writeToMediaStoreDownloads(
     context: Context,
     fileName: String,
+    mimeType: String,
     input: InputStream,
 ): String {
     val resolver = context.contentResolver
     val values = ContentValues().apply {
         put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-        put(MediaStore.Downloads.MIME_TYPE, "video/mp4")
+        put(MediaStore.Downloads.MIME_TYPE, mimeType)
         put(
             MediaStore.Downloads.RELATIVE_PATH,
             Environment.DIRECTORY_DOWNLOADS + "/" + DOWNLOAD_SUBDIR,
@@ -874,7 +1001,7 @@ private suspend fun downloadExportFileToCache(
             val absoluteUrl = "$base$path"
 
             val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-            val fileName = "crumb-export-$safeId.mp4"
+            val fileName = "crumb-export-$safeId.${exportFileExtension(outputFile)}"
             val exportDir = File(context.cacheDir, EXPORT_CACHE_SUBDIR).apply { mkdirs() }
             val destFile = File(exportDir, fileName)
 
@@ -908,7 +1035,7 @@ private fun shareLocalFile(context: Context, file: File) {
         val authority = "${context.packageName}.fileprovider"
         val uri = FileProvider.getUriForFile(context, authority, file)
         val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "video/mp4"
+            type = exportMimeType(file.extension)
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             putExtra(Intent.EXTRA_SUBJECT, "CrumbVMS Export")

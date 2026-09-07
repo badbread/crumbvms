@@ -37,6 +37,12 @@ import java.util.TimeZone
  * @param initialMs Pre-selects this instant in both steps.
  * @param onDismiss Cancelled / dismissed without choosing.
  * @param onPicked  Called once with the combined date+time as epoch-millis.
+ * @param preserveSeconds Carry the seconds (and milliseconds) of [initialMs]
+ *   through to the result instead of truncating to the minute. The M3 time step
+ *   only offers hours and minutes, so an export boundary picked from a
+ *   second-accurate selection would otherwise silently lose its seconds. Off by
+ *   default: jumping the playhead to a whole minute is the desired behaviour there.
+ * @param title Heading for the time step.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -44,6 +50,8 @@ fun JumpToDateTimeDialog(
     initialMs: Long,
     onDismiss: () -> Unit,
     onPicked: (Long) -> Unit,
+    preserveSeconds: Boolean = false,
+    title: String = "Jump to time",
 ) {
     val initCal = remember(initialMs) { Calendar.getInstance().apply { timeInMillis = initialMs } }
     var pickingTime by rememberSaveable { mutableStateOf(false) }
@@ -70,7 +78,7 @@ fun JumpToDateTimeDialog(
     } else {
         AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text("Jump to time") },
+            title = { Text(title) },
             text = {
                 Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     TimeInput(state = timeState)
@@ -90,9 +98,12 @@ fun JumpToDateTimeDialog(
                             utc.get(Calendar.DAY_OF_MONTH),
                             timeState.hour,
                             timeState.minute,
-                            0,
+                            if (preserveSeconds) initCal.get(Calendar.SECOND) else 0,
                         )
-                        set(Calendar.MILLISECOND, 0)
+                        set(
+                            Calendar.MILLISECOND,
+                            if (preserveSeconds) initCal.get(Calendar.MILLISECOND) else 0,
+                        )
                     }.timeInMillis
                     onPicked(target)
                 }) { Text("Go") }

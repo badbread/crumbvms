@@ -25,7 +25,10 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.DirectionsRun
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FirstPage
 import androidx.compose.material.icons.filled.LastPage
 import androidx.compose.material.icons.filled.MoreVert
@@ -111,11 +114,13 @@ import video.crumb.app.ui.player.PlayerSurface
 import video.crumb.app.ui.player.ViewTransform
 import video.crumb.app.ui.player.ZoomableVideoSurface
 import video.crumb.app.ui.player.rememberZoomableSurfaceState
+import video.crumb.app.feature.export.ExportRange
 import video.crumb.app.feature.live.rememberIsMetered
 import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.NavySurface
 import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
+import video.crumb.app.ui.theme.TimelineColors
 import java.time.Instant
 
 /**
@@ -205,6 +210,9 @@ object PlaybackQuality {
  *   set when entered from the playback wall scrubbed to a past moment. ≤ 0 → open
  *   at the camera's latest footage (the standard behaviour).
  * @param onBack Called when the user taps the back arrow.
+ * @param onOpenExport Opens the Export screen seeded with `(cameraId, startMs, endMs)`.
+ *   Null hides every export affordance on this screen (a caller that has nowhere to
+ *   navigate); the capability gate is applied on top of it.
  */
 @OptIn(ExperimentalMaterial3Api::class, UnstableApi::class)
 @Composable
@@ -212,6 +220,7 @@ fun PlaybackScreen(
     initialCameraId: String,
     initialTimeMs: Long = 0L,
     onBack: () -> Unit,
+    onOpenExport: ((String, Long, Long) -> Unit)? = null,
 ) {
     val container = appContainer()
     val repo = container.repository
@@ -689,6 +698,15 @@ fun PlaybackScreen(
         showBookmarkDialog = true
     }
 
+    // Export hand-off: only offered when this account may export AND the host gave
+    // us somewhere to navigate. Carries the in/out bracket when one is marked,
+    // otherwise the hour ending at the playhead (PlaybackViewModel.exportRange).
+    val canExport = (store.isAdmin || store.capabilities.export) && onOpenExport != null
+    val onExportRange: () -> Unit = {
+        val (startMs, endMs) = vm.exportRange()
+        onOpenExport?.invoke(cameraId, startMs, endMs)
+    }
+
     // In landscape the phone is short: a fixed top app bar + bottom transport eat
     // most of the height, leaving the video SMALLER than in portrait. So in
     // landscape we drop the top app bar (Back/Snapshot/Bookmark float over the
@@ -986,6 +1004,18 @@ fun PlaybackScreen(
                 // longer a separate landscape row (that made the bar too tall) — in
                 // landscape they ride along ON the transport row itself; in portrait
                 // they live in the top app bar.
+                // Export-selection bar (mirrors the desktop client's bar): shows the
+                // marked window's start, end and exact duration with Clear and
+                // "Export selection". Only present while a usable bracket exists.
+                if (state.hasExportSelection) {
+                    ExportSelectionBar(
+                        startMs = minOf(state.exportSelStartMs!!, state.exportSelEndMs!!),
+                        endMs = maxOf(state.exportSelStartMs!!, state.exportSelEndMs!!),
+                        canExport = canExport,
+                        onClear = { vm.clearExportSelection() },
+                        onExport = onExportRange,
+                    )
+                }
                 Spacer(Modifier.height(if (isLandscape) 2.dp else 6.dp))
                 PlaybackControls(
                     playing = state.playing,
@@ -1026,6 +1056,19 @@ fun PlaybackScreen(
                     // jump-to-time, speed) collapse into a 3-dot overflow menu. In
                     // landscape they ride inline on the (taller-width) transport row.
                     useOverflowMenu = !isLandscape,
+                    // In/out marking lives with the other secondary actions: touch
+                    // has no Shift+drag, so the bracket is placed at the playhead
+                    // from here and fine-tuned by dragging its handles.
+                    onMarkIn = { vm.markExportIn() },
+                    onMarkOut = { vm.markExportOut() },
+                    onClearSelection = if (state.exportSelStartMs != null ||
+                        state.exportSelEndMs != null
+                    ) {
+                        { vm.clearExportSelection() }
+                    } else {
+                        null
+                    },
+                    onExport = if (canExport) onExportRange else null,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 8.dp),
@@ -1043,6 +1086,10 @@ fun PlaybackScreen(
                     onScrub = { ts -> vm.onScrub(ts) },
                     onScrubEnd = { ts -> vm.onScrubEnd(ts) },
                     onSpanChange = { sp -> vm.setVisibleSpan(sp) },
+                    exportSelStartMs = state.exportSelStartMs,
+                    exportSelEndMs = state.exportSelEndMs,
+                    onSetExportStart = { ts -> vm.setExportEdge(isStart = true, epochMs = ts) },
+                    onSetExportEnd = { ts -> vm.setExportEdge(isStart = false, epochMs = ts) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(if (isLandscape) 40.dp else 72.dp)
@@ -1084,6 +1131,78 @@ fun PlaybackScreen(
 }
 
 /**
+ * The "Export selection" bar, shown under the video whenever an in/out bracket is
+ * marked. Mirrors the desktop client's bar: the exact start and end (local time,
+ * to the second) plus the duration, a Clear, and an Export action that hands the
+ * range to the Export screen.
+ *
+ * The end time drops its date when the range stays inside one day, so the common
+ * case reads as `09/06 14:03:12 → 14:05:40 (2m 28s)` rather than repeating it.
+ */
+@Composable
+private fun ExportSelectionBar(
+    startMs: Long,
+    endMs: Long,
+    canExport: Boolean,
+    onClear: () -> Unit,
+    onExport: () -> Unit,
+) {
+    val startInstant = Instant.ofEpochMilli(startMs)
+    val endInstant = Instant.ofEpochMilli(endMs)
+    val sameDay = remember(startMs / 1000, endMs / 1000) {
+        Time.date(startInstant) == Time.date(endInstant)
+    }
+    val startLabel = Time.dateTime(startInstant)
+    val endLabel = if (sameDay) Time.clock(endInstant) else Time.dateTime(endInstant)
+    val durationLabel = ExportRange.durationLabel(startMs, endMs)
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(ExportBarBackground)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.Default.ContentCut,
+            contentDescription = null,
+            tint = TimelineColors.exportHandle,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "$startLabel  →  $endLabel  ($durationLabel)",
+            style = MaterialTheme.typography.labelMedium,
+            color = Color.White,
+            maxLines = 1,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onClear) { Text("Clear") }
+        Spacer(Modifier.width(4.dp))
+        Button(
+            onClick = onExport,
+            enabled = canExport,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = TimelineColors.exportHandle,
+                contentColor = Color.Black,
+            ),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Default.Download,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(4.dp))
+            Text("Export", style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+/** Muted amber ground for the export-selection bar (matches the desktop's `0xFF2A2410`). */
+private val ExportBarBackground = Color(0xFF2A2410)
+
+/**
  * Row of playback transport controls.
  *
  * PRIMARY controls are always inline: go-to-first, frame step back, prev-motion,
@@ -1121,6 +1240,14 @@ private fun PlaybackControls(
     // too. null hides it (portrait uses the app bar chip).
     quality: String = PlaybackQuality.AUTO,
     onCycleQuality: (() -> Unit)? = null,
+    // Export in/out marking. Touch has no Shift+drag, so the bracket is placed at
+    // the playhead from here (then fine-tuned by dragging its handles on the
+    // timeline). onClearSelection is null while nothing is marked; onExport is
+    // null when this account may not export.
+    onMarkIn: (() -> Unit)? = null,
+    onMarkOut: (() -> Unit)? = null,
+    onClearSelection: (() -> Unit)? = null,
+    onExport: (() -> Unit)? = null,
 ) {
     // Landscape is vertically cramped, so the transport runs a notch smaller there
     // (this is what "shrinks the play/pause bar"). Portrait keeps its roomier sizes.
@@ -1229,6 +1356,13 @@ private fun PlaybackControls(
                         leadingIcon = { Icon(Icons.Default.Schedule, contentDescription = null) },
                         onClick = { menuOpen = false; launchJumpPicker() },
                     )
+                    ExportMarkMenuItems(
+                        onMarkIn = onMarkIn,
+                        onMarkOut = onMarkOut,
+                        onClearSelection = onClearSelection,
+                        onExport = onExport,
+                        onChosen = { menuOpen = false },
+                    )
                     // Speed — a small inline radio-ish list inside the menu (each speed
                     // is its own item; the current one is bold/accented).
                     Box1pxMenuDivider()
@@ -1298,6 +1432,43 @@ private fun PlaybackControls(
             // Jump-to-date-and-time button — DatePicker → TimePicker.
             SmallControl(Icons.Default.Schedule, "Jump to date & time", ctlSize, ctlIcon, launchJumpPicker)
 
+            // Export in/out marking — its own small menu here (landscape hides the
+            // 3-dot overflow that carries these items in portrait).
+            if (onMarkIn != null || onMarkOut != null) {
+                Box {
+                    var markMenuOpen by remember { mutableStateOf(false) }
+                    HintTooltip("Mark for export") {
+                        IconButton(
+                            onClick = { markMenuOpen = true },
+                            modifier = Modifier.size(ctlSize),
+                        ) {
+                            Icon(
+                                Icons.Default.ContentCut,
+                                contentDescription = "Mark for export",
+                                tint = if (onClearSelection != null) {
+                                    TimelineColors.exportHandle
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                modifier = Modifier.size(ctlIcon),
+                            )
+                        }
+                    }
+                    DropdownMenu(
+                        expanded = markMenuOpen,
+                        onDismissRequest = { markMenuOpen = false },
+                    ) {
+                        ExportMarkMenuItems(
+                            onMarkIn = onMarkIn,
+                            onMarkOut = onMarkOut,
+                            onClearSelection = onClearSelection,
+                            onExport = onExport,
+                            onChosen = { markMenuOpen = false },
+                        )
+                    }
+                }
+            }
+
             // Snapshot + Bookmark share this transport row in landscape (the app bar
             // is hidden there). In portrait they live in the overflow menu above.
             if (onSnapshot != null || onBookmark != null || onToggleAudio != null || onCycleQuality != null) {
@@ -1340,6 +1511,53 @@ private fun PlaybackControls(
                 }
             }
         }
+    }
+}
+
+/**
+ * The export in/out items shared by the portrait overflow menu and the landscape
+ * "mark for export" menu, so the two can never drift.
+ *
+ * "Set in point" / "Set out point" place the bracket at the playhead (the touch
+ * stand-in for the desktop's Shift+drag); the timeline handles then fine-tune it.
+ * Clear appears only while something is marked, Export only when the account may
+ * export.
+ */
+@Composable
+private fun ExportMarkMenuItems(
+    onMarkIn: (() -> Unit)?,
+    onMarkOut: (() -> Unit)?,
+    onClearSelection: (() -> Unit)?,
+    onExport: (() -> Unit)?,
+    onChosen: () -> Unit,
+) {
+    onMarkIn?.let { cb ->
+        DropdownMenuItem(
+            text = { Text("Set in point") },
+            leadingIcon = { Icon(Icons.Default.ContentCut, contentDescription = null) },
+            onClick = { onChosen(); cb() },
+        )
+    }
+    onMarkOut?.let { cb ->
+        DropdownMenuItem(
+            text = { Text("Set out point") },
+            leadingIcon = { Icon(Icons.Default.ContentCut, contentDescription = null) },
+            onClick = { onChosen(); cb() },
+        )
+    }
+    onClearSelection?.let { cb ->
+        DropdownMenuItem(
+            text = { Text("Clear selection") },
+            leadingIcon = { Icon(Icons.Default.Clear, contentDescription = null) },
+            onClick = { onChosen(); cb() },
+        )
+    }
+    onExport?.let { cb ->
+        DropdownMenuItem(
+            text = { Text("Export...") },
+            leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
+            onClick = { onChosen(); cb() },
+        )
     }
 }
 

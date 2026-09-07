@@ -122,7 +122,9 @@ private const val WALL_MAX_SPAN_MS = WALL_WINDOW_HOURS * 3600_000L
  *   another tab that happens to be under Playback on the back stack).
  * @param onOpenPlayback Called with `(cameraId, startMs)`; `startMs ≤ 0` means
  *   "open at the camera's latest footage".
- * @param onOpenExport Opens the Export screen (export lives under Playback).
+ * @param onOpenExport Opens the Export screen (export lives under Playback), passing
+ *   the wall's current scrub cursor (epoch-millis, `0` when parked at Latest) so
+ *   the export window can be seeded with the moment being reviewed.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -130,7 +132,7 @@ fun PlaybackWallScreen(
     onOpenLive: () -> Unit,
     onOpenPlayback: (String, Long) -> Unit,
     onOpenBookmarks: () -> Unit,
-    onOpenExport: () -> Unit,
+    onOpenExport: (Long) -> Unit,
     onOpenClips: () -> Unit = {},
     onOpenPlates: () -> Unit = {},
 ) {
@@ -355,7 +357,7 @@ fun PlaybackWallScreen(
                     }
                     if (caps.export || store.isAdmin) {
                         HintTooltip("Export footage") {
-                            IconButton(onClick = onOpenExport) {
+                            IconButton(onClick = { onOpenExport(if (atLatest) 0L else cursorMs) }) {
                                 Icon(Icons.Default.Download, contentDescription = "Export footage")
                             }
                         }

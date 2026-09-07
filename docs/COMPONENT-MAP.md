@@ -292,7 +292,7 @@ is not. The web admin console doubles as the desktop's management surface
 | Live wall / viewing | live section | wall builder, carousels, hotspot, PTZ tiles | `live/` | `Live/` |
 | Playback + timeline | playback section | timeline, scrub, prefetch, zoom | `playback/` | `Playback/` |
 | Clips | clips section | clips view | `clips/` | `Clips/` |
-| Export | export section | export list | `export/` | `Export/` |
+| Export | export section | export list; timeline Shift+drag selection → "Export selection" bar | `export/` (single-shot window; in/out bracket on `playback/CenteredTimeline.kt` + seeded `Routes.export(...)`; batch list still deferred, issue #617) | `Export/` (batch list) |
 | Bookmarks | bookmarks UI | bookmark UI | `AddBookmarkDialog.kt` (in `ui/`) | `Bookmarks/` |
 | PTZ / imaging | camera controls | on-video PTZ panel (customizable) | `live/` player controls | `Live/` |
 | Motion tuner | tuner section | inline tuner | `tuner/` | `Tuner/` |
