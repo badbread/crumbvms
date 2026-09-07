@@ -201,7 +201,7 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | The file | `services/api/src/admin.html` | One file, inline script, `include_str!`: rebuild the api image/binary to see changes. Some tools misdetect it as binary (`grep -a`) |
 | Conventions | `esc()` on all interpolation, `api()` for fetches, every `on*=` handler defined, semantic colors, settings-UX principles (sticky header, collapsible, live-preview, tab persistence) | |
 | Syntax check | `node --check` on the extracted script block | Cheapest smoke test for an 8800-line file |
-| Desktop embed | desktop embeds `/admin#token=...&embed=1`; verify the change renders in the embedded WebView too | The console is also a desktop surface |
+| Desktop embed | desktop embeds `/admin#token=...&embed=1` in its own WebView, and opens `/admin#handoff=<single-use code>` in an external browser (`docs/DECISIONS.md` 2026-09-07); verify the change renders in the embedded WebView too | The console is also a desktop surface |
 | Wizard | if onboarding changed: `docs/AI-INSTALL.md` section 6a must match what the wizard actually asks | Golden rule 5 |
 
 ### I. Install, compose, env, secret, or image change (golden rule 5)

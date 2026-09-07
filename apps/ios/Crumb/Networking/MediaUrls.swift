@@ -16,7 +16,6 @@ struct MediaUrls {
     static let scrubThumbWidth = 480
 
     let serverUrl: String
-    let token: String?
     /// Per-camera scoped media-token cache (P0-SESSIONS), owned by
     /// `AppContainer` and shared by every `MediaUrls` value it hands out.
     /// `Optional` only so a bare `MediaUrls` can still be constructed (e.g. a
@@ -24,27 +23,13 @@ struct MediaUrls {
     /// returns `nil` in that case, matching "token mint failed".
     let tokenCache: MediaTokenCache?
 
-    /// Full-JWT-authed URL — for endpoints that are NOT single-camera-scoped
-    /// (export batch downloads, which can span multiple cameras and the
-    /// archive pseudo-camera) or non-media API calls. Do NOT use this for
-    /// per-camera media (frame/segment/clip/filmstrip) — use `scopedURL`.
-    func authed(_ pathOrUrl: String) -> URL? {
-        let absolute = toAbsolute(pathOrUrl)
-        guard var components = URLComponents(string: absolute) else { return URL(string: absolute) }
-        if let token, !token.isEmpty {
-            var items = components.queryItems ?? []
-            items.append(URLQueryItem(name: "token", value: token))
-            components.queryItems = items
-        }
-        return components.url
-    }
-
     /// Camera-scoped media URL carrying a short-lived (~15 min) `?token=` minted
     /// via `GET /media-token?camera=<cameraId>` (cached/refreshed/deduped by
-    /// `MediaTokenCache`), instead of the full login JWT. This is the
-    /// migrated replacement for `authed(_:)` on every per-camera media
-    /// endpoint (live stream proxy, recorded segment, filmstrip/scrub frame,
-    /// clip thumbnail/video, camera snapshot).
+    /// `MediaTokenCache`), instead of the full login JWT. Every per-camera
+    /// media endpoint goes through here (live stream proxy, recorded segment,
+    /// filmstrip/scrub frame, clip thumbnail/video, camera snapshot); the
+    /// non-scoped export downloads use an `Authorization` header instead (see
+    /// `CrumbAPI.exportDownloadRequest`), so no URL here carries a login token.
     ///
     /// Returns `nil` if the token mint fails (offline, camera access revoked,
     /// session expired — the 401 path already routes through

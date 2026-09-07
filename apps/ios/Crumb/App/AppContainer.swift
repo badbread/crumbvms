@@ -119,6 +119,6 @@ final class AppContainer: ObservableObject {
     }
 
     func mediaUrls() -> MediaUrls {
-        MediaUrls(serverUrl: store.serverUrl, token: store.token, tokenCache: mediaTokens)
+        MediaUrls(serverUrl: store.serverUrl, tokenCache: mediaTokens)
     }
 }

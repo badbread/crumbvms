@@ -8,6 +8,55 @@ revisit.
 
 ---
 
+## 2026-09-07, Opening the web console in an external browser uses a single-use handoff code, not the desktop client's session token
+
+**Context.** The desktop client can show the server's web admin console two
+ways: embedded in its own WebView, and "Open in browser", which hands the URL to
+whatever browser the OS launches. Both used the same URL shape,
+`/admin#token=<session token>&embed=1`, which `admin.html`'s `bootSSO` reads and
+persists like a login. That is fine for the embedded WebView, which is this
+client's own process, but "Open in browser" crosses a process boundary: the
+token then lives in a browser's history, its profile storage, and within reach
+of whatever extensions the operator has installed, for as long as the session
+lasts.
+
+**Decision.** The embedded WebView keeps `#token=`. "Open in browser" instead
+calls `POST /auth/handoff` (full session required, a scoped media token is
+refused), gets back a single-use code that expires in about a minute, and opens
+`/admin#handoff=<code>`. The console posts the code to
+`POST /auth/handoff/exchange`, which consumes it exactly once and mints the
+browser its OWN session: its own `jti`, its own `sessions` row, normal (not
+"remember me") expiry, so it is listed under "your sessions" and every sign-out
+path reaches it. Codes are held in memory only, bound to the issuing user and
+session; an expired, unknown, reused, or signed-out code is a 401 and the
+console falls through to its normal login form.
+
+**Rejected:**
+
+- *Keep passing the session token in the fragment.* Cheapest, and the fragment
+  never reaches the server, but the credential still lands in browser history
+  and profile storage under a different security boundary than the client that
+  owns it.
+- *Open the console with no credential at all.* Safest and free, but the
+  operator is asked to type their password again to reach a console they are
+  already signed in to on the same machine, which is exactly the friction the
+  handoff exists to remove.
+- *Persist codes in Postgres.* Rejected as unnecessary machinery: a code lives
+  for seconds, and losing the map on a restart only costs a second click.
+
+**Trades knowingly accepted:** codes are per-process, so an install running
+several API replicas behind a load balancer can have the exchange land on a
+replica that never saw the code (the operator clicks again, or the browser shows
+the login form). The browser's session is not the client's session, so signing
+out in one does not sign out the other; both are visible and revocable under
+"your sessions".
+
+**Revisit if:** Crumb starts supporting multiple API replicas behind a shared
+load balancer as a documented deployment, at which point the code store moves to
+Postgres (or a shared cache) with the same single-use semantics.
+
+---
+
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
 
 **Context.** #442 introduced value-setting HA controls. Light dimming

@@ -48,6 +48,12 @@ const LOGIN_BACKOFF_CAP_SECS: u64 = 900;
 /// entries no longer in backoff are dropped (an active block is always kept).
 const LOGIN_FAILURES_MAX_ENTRIES: usize = 10_000;
 
+/// Prune the console-handoff map once it exceeds this many outstanding codes.
+/// Codes live for seconds and are consumed on first use, so a healthy install
+/// holds a handful; the cap only bounds a pathological caller that mints codes
+/// it never redeems. Only already-expired entries are dropped.
+const HANDOFF_MAX_ENTRIES: usize = 1_000;
+
 /// Backoff duration (seconds) for `failures` consecutive login failures, or
 /// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
 /// `min(cap, base * 2^(failures - threshold))` — exponential, clamped. Pure and
@@ -86,6 +92,19 @@ struct FailState {
     /// Instant until which new attempts for this username are rejected. A value
     /// at/before `now` means "not currently blocked".
     blocked_until: Instant,
+}
+
+/// One outstanding console-handoff code (see [`AppState::issue_handoff_code`]).
+#[derive(Clone, Copy)]
+struct HandoffEntry {
+    /// The user the code was minted for.
+    user_id: Uuid,
+    /// The `jti` of the session that asked for the code, when it has one
+    /// (pre-P0-SESSIONS tokens do not). The exchange rejects a code whose
+    /// originating session has since been signed out.
+    jti: Option<Uuid>,
+    /// Instant after which the code is no longer redeemable.
+    expires_at: Instant,
 }
 
 /// Inner state, heap-allocated once and reference-counted.
@@ -256,6 +275,12 @@ struct Inner {
     /// shared per-IP request bucket, not a replacement.
     login_failures: DashMap<String, FailState>,
 
+    /// Outstanding single-use console-handoff codes, keyed by the code itself.
+    /// Memory-only and deliberately so: a code is valid for seconds, and losing
+    /// the map on restart only means the operator clicks "Open in browser"
+    /// again (the fail-safe direction).
+    handoff_codes: DashMap<String, HandoffEntry>,
+
     /// Demand-driven cache behind `GET /ha/states` (issue #170). `None` until
     /// the first request. The `tokio::sync::Mutex` makes a refresh single-flight:
     /// concurrent callers on a stale cache collapse to one HA `/api/states`
@@ -334,6 +359,7 @@ impl AppState {
             revoked_jtis_loaded_at: AtomicI64::new(0),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
+            handoff_codes: DashMap::new(),
             ha_states: tokio::sync::Mutex::new(None),
             event_tx: OnceLock::new(),
         }))
@@ -697,6 +723,52 @@ impl AppState {
     /// counter (and their next fat-finger starts from zero again).
     pub fn record_login_success(&self, username: &str) {
         self.0.login_failures.remove(username);
+    }
+
+    // ── console handoff codes ─────────────────────────────────────────────────
+
+    /// Mint a single-use handoff code for `user_id` (issued by the session
+    /// identified by `jti`, when it has one) and remember it for `ttl`.
+    ///
+    /// The code is ~30 bytes of OS-CSPRNG entropy rendered as lowercase hex, so
+    /// it is URL-safe without escaping. Callers hand it to a browser in a URL
+    /// fragment; the browser trades it for a real session at
+    /// `POST /auth/handoff/exchange`.
+    ///
+    /// `ttl` is a parameter rather than a constant so tests can drive the
+    /// expiry path without sleeping for the production window.
+    pub fn issue_handoff_code(&self, user_id: Uuid, jti: Option<Uuid>, ttl: Duration) -> String {
+        let now = Instant::now();
+
+        // Bound memory: drop codes that can no longer be redeemed anyway.
+        if self.0.handoff_codes.len() > HANDOFF_MAX_ENTRIES {
+            self.0.handoff_codes.retain(|_, e| e.expires_at > now);
+        }
+
+        // Two v4 UUIDs, hex-rendered: `Uuid::new_v4` draws from the OS CSPRNG
+        // (getrandom), and using it keeps this dependency-free.
+        let code = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.0.handoff_codes.insert(
+            code.clone(),
+            HandoffEntry {
+                user_id,
+                jti,
+                expires_at: now + ttl,
+            },
+        );
+        code
+    }
+
+    /// Redeem a handoff code, returning the user id and the issuing session's
+    /// `jti` on success. The entry is removed whether or not it was still
+    /// valid, so a code is usable at most once; an expired or unknown code
+    /// yields `None`.
+    pub fn consume_handoff_code(&self, code: &str) -> Option<(Uuid, Option<Uuid>)> {
+        let (_, entry) = self.0.handoff_codes.remove(code)?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some((entry.user_id, entry.jti))
     }
 }
 
