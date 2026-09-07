@@ -8,6 +8,43 @@ revisit.
 
 ---
 
+## 2026-09-07, Login backoff is keyed on (account, client), not on the account alone
+
+**Context.** Issue #127 added a repeated-failure backoff to `POST /auth/login`:
+five consecutive failures for a username, then 429 + `Retry-After` with an
+exponential window capped at 15 minutes. The counter was keyed on the username
+only, so anyone who could reach the login endpoint and knew (or guessed) a
+username could keep its owner out for as long as they kept failing, from
+anywhere.
+
+**Decision.** The counter key is now `username + \u{1f} + client`, where
+`client` comes from `rate_limit::client_key` — the same derivation the per-client
+request bucket uses, so both honour `TRUST_PROXY` identically and can never
+drift. Thresholds, the exponential schedule, the cap, the map-pruning bound and
+the 429 + `Retry-After` shape are all unchanged. A success clears only the
+client that succeeded. The per-client request bucket stays the global limiter on
+top, unchanged.
+
+**Trade-off accepted:** guessing distributed across many clients is slowed by
+the request bucket rather than by this counter. That is the correct division of
+labour: an account-wide lock is a denial-of-service control handed to whoever
+wants to use it, and the account's owner is the one who pays.
+
+`ConnectInfo` is extracted as an `Option` in the login handler, so a router
+driven without `into_make_service_with_connect_info` (a test harness) still
+serves logins, with every such request sharing one `"unknown-peer"` key.
+
+**Rejected:** keeping the account-wide key with an operator allowlist (more
+configuration, same failure mode by default); dropping the per-account counter
+entirely and relying on the request bucket (loses the per-account signal, and
+the bucket is deliberately generous for normal JSON traffic).
+
+**Revisit if:** Crumb ever grows an account-lockout policy an operator actually
+asks for (compliance-driven), in which case it should be an explicit, opt-in
+setting with an admin unlock, not an implicit side effect of failure counting.
+
+---
+
 ## 2026-09-07, Response headers: two site-wide headers everywhere, a Content-Security-Policy on the `/admin` document only
 
 **Context.** The api sent no `X-Content-Type-Options`, no `Referrer-Policy`, and

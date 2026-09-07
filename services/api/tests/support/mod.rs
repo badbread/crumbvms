@@ -87,6 +87,11 @@ pub mod plates;
 pub mod playback;
 #[path = "../../src/ptz.rs"]
 pub mod ptz;
+// `auth::login` derives its (account, client) backoff key with the SAME helper
+// the request bucket uses, so the real `rate_limit.rs` is part of the auth
+// surface this harness compiles.
+#[path = "../../src/rate_limit.rs"]
+pub mod rate_limit;
 #[path = "../../src/roles.rs"]
 pub mod roles;
 #[path = "../../src/scrub_settings.rs"]

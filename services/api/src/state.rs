@@ -28,9 +28,9 @@ use crate::dto::ExportJob;
 /// seconds.
 const REVOCATION_CACHE_TTL_SECS: i64 = 15;
 
-/// Consecutive failed logins for one username tolerated before the per-username
-/// backoff engages (issue #127). Below this, every attempt is let through to the
-/// normal credential check; at/above it, attempts are rejected with 429 until
+/// Consecutive failed logins for one account, from one client, tolerated before
+/// the backoff engages (issue #127). Below this, every attempt is let through to
+/// the normal credential check; at/above it, attempts are rejected with 429 until
 /// the backoff elapses.
 const LOGIN_FAIL_THRESHOLD: u32 = 5;
 
@@ -38,15 +38,31 @@ const LOGIN_FAIL_THRESHOLD: u32 = 5;
 /// it doubles for each additional failure (see [`login_backoff_secs`]).
 const LOGIN_BACKOFF_BASE_SECS: u64 = 2;
 
-/// Hard cap (seconds) on the per-username backoff — the exponential growth is
-/// clamped here so a sustained attack settles at a fixed 15-minute block rather
-/// than growing without bound.
+/// Hard cap (seconds) on the backoff — the exponential growth is clamped here
+/// so sustained guessing settles at a fixed 15-minute block rather than growing
+/// without bound.
 const LOGIN_BACKOFF_CAP_SECS: u64 = 900;
 
-/// Prune the login-failure map once it exceeds this many distinct usernames, so
-/// an attacker spraying random usernames cannot grow it without bound. Only
+/// Prune the login-failure map once it exceeds this many distinct keys, so a
+/// flood of random usernames (or clients) cannot grow it without bound. Only
 /// entries no longer in backoff are dropped (an active block is always kept).
 const LOGIN_FAILURES_MAX_ENTRIES: usize = 10_000;
+
+/// Separator between the username and the client key in a login-failure map
+/// key. ASCII unit separator: it cannot occur in a client key (an IP string)
+/// and, being a control character, is not something a username can smuggle in
+/// to collide with another account's bucket.
+const LOGIN_KEY_SEP: char = '\u{1f}';
+
+/// The login-failure map key for one (account, client) pair.
+///
+/// Keying on BOTH is what makes the backoff a per-client brake rather than an
+/// account-wide one: repeated failures from one client no longer stop the
+/// account's real owner signing in from their own machine. The per-client
+/// request bucket in `rate_limit.rs` remains the global limiter on top.
+fn login_key(username: &str, client: &str) -> String {
+    format!("{username}{LOGIN_KEY_SEP}{client}")
+}
 
 /// Backoff duration (seconds) for `failures` consecutive login failures, or
 /// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
@@ -78,12 +94,12 @@ pub struct HaStatesCache {
     pub states: Arc<Vec<serde_json::Value>>,
 }
 
-/// Per-username failed-login state for the brute-force backoff (issue #127).
+/// Failed-login state for one (account, client) pair (issue #127).
 #[derive(Clone, Copy)]
 struct FailState {
     /// Consecutive failed logins since the last success/reset.
     failures: u32,
-    /// Instant until which new attempts for this username are rejected. A value
+    /// Instant until which new attempts for this pair are rejected. A value
     /// at/before `now` means "not currently blocked".
     blocked_until: Instant,
 }
@@ -643,15 +659,19 @@ impl AppState {
         self.0.maintenance_until.load(Ordering::Relaxed)
     }
 
-    // ── per-username login backoff (issue #127) ───────────────────────────────
+    // ── login backoff, keyed on (account, client) (issue #127) ────────────────
 
-    /// If `username` is currently within its failed-login backoff window, return
-    /// `Some(retry_after_secs)` (always ≥ 1 while blocked); otherwise `None`.
-    /// The login handler calls this FIRST and, on `Some`, rejects with 429 +
-    /// `Retry-After` before any DB lookup or password verification.
-    pub fn login_retry_after(&self, username: &str) -> Option<u64> {
+    /// If this `username`/`client` pair is currently within its failed-login
+    /// backoff window, return `Some(retry_after_secs)` (always ≥ 1 while
+    /// blocked); otherwise `None`. The login handler calls this FIRST and, on
+    /// `Some`, rejects with 429 + `Retry-After` before any DB lookup or password
+    /// verification.
+    ///
+    /// `client` comes from `rate_limit::client_key`, so it honours `TRUST_PROXY`
+    /// exactly as the request bucket does.
+    pub fn login_retry_after(&self, username: &str, client: &str) -> Option<u64> {
         let now = Instant::now();
-        let st = self.0.login_failures.get(username)?;
+        let st = self.0.login_failures.get(&login_key(username, client))?;
         if st.blocked_until <= now {
             return None;
         }
@@ -665,14 +685,16 @@ impl AppState {
         )
     }
 
-    /// Record one failed login for `username`, incrementing its consecutive
-    /// failure count and (once past the threshold) stamping/extending the
-    /// backoff window. Cheap, synchronous, lock-free per entry.
-    pub fn record_login_failure(&self, username: &str) {
+    /// Record one failed login for the `username`/`client` pair, incrementing
+    /// its consecutive failure count and (once past the threshold)
+    /// stamping/extending the backoff window. Cheap, synchronous, lock-free per
+    /// entry.
+    pub fn record_login_failure(&self, username: &str, client: &str) {
         let now = Instant::now();
 
-        // Bound memory against username-spray: once large, drop entries that are
-        // no longer blocked (an active block is always retained).
+        // Bound memory against a spray of random usernames (or clients): once
+        // large, drop entries that are no longer blocked (an active block is
+        // always retained).
         if self.0.login_failures.len() > LOGIN_FAILURES_MAX_ENTRIES {
             self.0.login_failures.retain(|_, st| st.blocked_until > now);
         }
@@ -684,7 +706,7 @@ impl AppState {
         let mut entry = self
             .0
             .login_failures
-            .entry(username.to_owned())
+            .entry(login_key(username, client))
             .or_insert(fresh);
         entry.failures = entry.failures.saturating_add(1);
         if let Some(secs) = login_backoff_secs(entry.failures) {
@@ -692,11 +714,13 @@ impl AppState {
         }
     }
 
-    /// Clear any failed-login state for `username` after a successful login, so
-    /// a legitimate user who eventually gets their password right resets the
-    /// counter (and their next fat-finger starts from zero again).
-    pub fn record_login_success(&self, username: &str) {
-        self.0.login_failures.remove(username);
+    /// Clear any failed-login state for the `username`/`client` pair after a
+    /// successful login, so a legitimate user who eventually gets their password
+    /// right resets the counter (and their next fat-finger starts from zero
+    /// again). Only this client's counter is cleared; a different client's
+    /// accumulated failures for the same account stand on their own.
+    pub fn record_login_success(&self, username: &str, client: &str) {
+        self.0.login_failures.remove(&login_key(username, client));
     }
 }
 
@@ -711,9 +735,39 @@ pub fn maintenance_active_at(until: i64, now: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        login_backoff_secs, maintenance_active_at, LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS,
-        LOGIN_FAIL_THRESHOLD,
+        login_backoff_secs, login_key, maintenance_active_at, LOGIN_BACKOFF_BASE_SECS,
+        LOGIN_BACKOFF_CAP_SECS, LOGIN_FAIL_THRESHOLD,
     };
+
+    #[test]
+    fn login_key_separates_clients_for_the_same_account() {
+        // The whole point of the composite key: one account seen from two
+        // clients occupies two independent buckets, so failures from one can
+        // never block the other.
+        assert_ne!(
+            login_key("operator", "198.51.100.7"),
+            login_key("operator", "203.0.113.9")
+        );
+        // ... and the same pair always maps to the same bucket.
+        assert_eq!(
+            login_key("operator", "198.51.100.7"),
+            login_key("operator", "198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn login_key_does_not_collide_across_accounts() {
+        // Two different accounts never share a bucket, including the awkward
+        // case of a username that itself contains the separator.
+        assert_ne!(
+            login_key("operator\u{1f}198.51.100.7", "203.0.113.9"),
+            login_key("operator", "198.51.100.7")
+        );
+        assert_ne!(
+            login_key("operator", "198.51.100.7"),
+            login_key("operator2", "198.51.100.7")
+        );
+    }
 
     #[test]
     fn login_backoff_none_below_threshold() {

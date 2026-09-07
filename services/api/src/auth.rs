@@ -54,7 +54,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -660,6 +660,9 @@ async fn admin_revoke_user_sessions(
 async fn login(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    // Optional so a router driven without `into_make_service_with_connect_info`
+    // (a test harness) still serves logins; those all share one client key.
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     // ── input validation ──────────────────────────────────────────────────────
@@ -671,14 +674,24 @@ async fn login(
     }
     let username = body.username.trim();
 
-    // ── per-username brute-force backoff (issue #127) ─────────────────────────
-    // If this username is already in backoff (too many recent consecutive
-    // failures), reject with 429 + Retry-After BEFORE any DB lookup or argon2
-    // verify. Keyed by the submitted username whether or not it exists, so the
-    // limiter leaks no account-existence signal, and we never sleep — the
-    // connection is freed immediately. This is IN ADDITION to the shared per-IP
-    // request bucket applied as a layer, not a replacement.
-    if let Some(retry_after) = state.login_retry_after(username) {
+    // ── repeated-failure backoff (issue #127) ─────────────────────────────────
+    // Keyed on (submitted username, client), so a run of failures slows THAT
+    // client's attempts at THAT account without locking the account itself: its
+    // owner can still sign in from their own machine. If the pair is already in
+    // backoff, reject with 429 + Retry-After BEFORE any DB lookup or argon2
+    // verify. The key is the submitted username whether or not it exists, so
+    // the limiter leaks no account-existence signal, and we never sleep, the
+    // connection is freed immediately. This is IN ADDITION to the shared
+    // per-client request bucket applied as a layer, not a replacement.
+    //
+    // `client` is derived by the SAME function the request bucket uses, so both
+    // honour TRUST_PROXY identically (`rate_limit.rs` module docs).
+    let client = crate::rate_limit::client_key(
+        crate::rate_limit::trust_proxy_from_env(),
+        &headers,
+        peer.map(|ConnectInfo(addr)| addr),
+    );
+    if let Some(retry_after) = state.login_retry_after(username, &client) {
         return Err(ApiError::TooManyRequestsRetry {
             message: "too many failed login attempts; try again later".to_owned(),
             retry_after,
@@ -702,17 +715,18 @@ async fn login(
     };
 
     if !valid {
-        // Count this failure toward the per-username backoff (issue #127). The
-        // response stays a plain 401 — the backoff only changes the NEXT
-        // attempt's outcome once the threshold is crossed.
-        state.record_login_failure(username);
+        // Count this failure toward this (account, client) pair's backoff
+        // (issue #127). The response stays a plain 401 — the backoff only
+        // changes the NEXT attempt's outcome once the threshold is crossed.
+        state.record_login_failure(username, &client);
         return Err(ApiError::Unauthorized(
             "invalid username or password".to_owned(),
         ));
     }
 
-    // Successful auth clears any accumulated failure count for this username.
-    state.record_login_success(username);
+    // Successful auth clears this client's accumulated failure count for the
+    // account.
+    state.record_login_success(username, &client);
 
     // `user` is Some(_) iff `valid` is true — unwrap is safe here.
     let user = user.expect("user is Some when valid");

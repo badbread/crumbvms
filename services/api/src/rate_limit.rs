@@ -40,7 +40,7 @@ use std::time::Instant;
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -57,6 +57,38 @@ use serde_json::json;
 /// the hot path and makes the policy explicit and observable in logs.
 pub fn trust_proxy_from_env() -> bool {
     std::env::var("TRUST_PROXY").is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// The client identity one request is attributed to.
+///
+/// - `trust_proxy` false (default) → the TCP peer IP, which is unforgeable.
+/// - `trust_proxy` true → the first `X-Forwarded-For` hop when present, else
+///   the peer IP.
+///
+/// `peer` is an `Option` because callers other than the middleware (the
+/// `/auth/login` handler, which keys its own per-account backoff on the same
+/// value) may run in contexts with no `ConnectInfo` extension, e.g. a router
+/// driven directly in a test. Those fall back to a single shared
+/// `"unknown-peer"` bucket rather than silently keying on nothing.
+///
+/// This is the ONE place the client key is derived, so the limiter and the
+/// login backoff can never drift apart on `TRUST_PROXY` handling.
+#[must_use]
+pub fn client_key(trust_proxy: bool, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let peer_key = || {
+        peer.map_or_else(|| "unknown-peer".to_owned(), |p| p.ip().to_string())
+    };
+    if trust_proxy {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(peer_key)
+    } else {
+        peer_key()
+    }
 }
 
 /// Shared token-bucket rate limiter.
@@ -133,19 +165,7 @@ pub async fn rate_limit_mw(
     req: Request,
     next: Next,
 ) -> Response {
-    let key = if limiter.trust_proxy {
-        // Trust mode: try to read the real client IP from XFF.
-        req.headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| peer.ip().to_string())
-    } else {
-        // Default (no proxy trust): use the TCP peer address directly.
-        peer.ip().to_string()
-    };
+    let key = client_key(limiter.trust_proxy, req.headers(), Some(peer));
 
     if limiter.check(&key) {
         next.run(req).await
