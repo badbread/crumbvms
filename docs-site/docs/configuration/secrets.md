@@ -113,7 +113,8 @@ provision a fresh database (you lose the segment index, so restore a
   old one immediately, so update any running worker with the new value.
 - Secrets that support it can come from a file instead of the environment
   via the `_FILE` convention (`DATABASE_URL_FILE`, `JWT_SECRET_FILE`,
-  `SEED_ADMIN_PASSWORD_FILE`, `HA_TOKEN_FILE`). Point one at a Docker-secret
+  `SEED_ADMIN_PASSWORD_FILE`, `METRICS_TOKEN_FILE`,
+  `HA_TOKEN_FILE`). Point one at a Docker-secret
   path and Crumb reads the file, keeping the plaintext value out of the
   process environment and `.env`. `GO2RTC_USER`/`GO2RTC_PASS` don't support
   this convention: the embedded go2rtc restreamer expands them straight from

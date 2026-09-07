@@ -43,6 +43,7 @@
 //! /cameras/:id/ptz          → ptz.rs
 //! /cameras/:id/frame.jpg    → cameras.rs
 //! /health                   → inline (no auth — DB+heartbeat probe, 503 if degraded)
+//! /metrics                  → metrics.rs (admin session or METRICS_TOKEN)
 //! ```
 
 #![warn(clippy::pedantic)]
@@ -562,7 +563,8 @@ async fn main() -> anyhow::Result<()> {
                 "/admin",
                 get(serve_admin).layer(response_headers::admin_csp_layer()),
             )
-            // Prometheus metrics — no auth (no secrets), no rate limit (scraper).
+            // Prometheus metrics — admin session or METRICS_TOKEN (see
+            // metrics.rs); no rate limit, a scraper polls on a fixed interval.
             .merge(metrics::routes())
             .merge(json_routes)
             .merge(media_routes),

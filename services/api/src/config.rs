@@ -352,6 +352,19 @@ pub struct ApiConfig {
     /// recovery. Empty/unset disables alerting (no-op watchdog).
     pub alert_webhook_url: Option<String>,
 
+    // -- monitoring ----------------------------------------------------------
+    /// `METRICS_TOKEN` (or `METRICS_TOKEN_FILE`) -- optional shared token that
+    /// authorizes `GET /metrics` without a login session, for a Prometheus
+    /// scraper that has no Crumb account. Send it as
+    /// `Authorization: Bearer <token>` (Prometheus: `bearer_token` /
+    /// `bearer_token_file` in the `scrape_config`).
+    ///
+    /// Unset (the default) means `/metrics` is reachable only with an admin
+    /// session, exactly like the rest of `/config` and `/stats`. `/health` and
+    /// `/version` stay open either way, because clients probe them before they
+    /// have a token.
+    pub metrics_token: Option<String>,
+
     // -- update-available check (issue #7) -----------------------------------
     /// `UPDATE_CHECK_ENABLED` -- env fallback for the update-available check
     /// (`GET /updates/latest`, `services/api/src/updates.rs`). Only consulted
@@ -491,6 +504,10 @@ impl ApiConfig {
             thumb_cache_dir: optional_env("THUMB_CACHE_DIR", ""),
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
+            // Secret: supports METRICS_TOKEN_FILE (Docker secret) too.
+            metrics_token: crumb_common::config::secret_env("METRICS_TOKEN")
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty()),
             update_check_enabled: parse_env("UPDATE_CHECK_ENABLED", false)?,
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),
             // Secret: supports SEED_ADMIN_PASSWORD_FILE (Docker secret) too.

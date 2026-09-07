@@ -633,6 +633,50 @@ impl FromRequestParts<AppState> for AdminUser {
     }
 }
 
+// ─── MetricsAuth ──────────────────────────────────────────────────────────────
+
+/// Extractor gating `GET /metrics` (`crate::metrics`).
+///
+/// Accepts either of two `Authorization: Bearer …` credentials:
+///
+/// * the configured **`METRICS_TOKEN`** (`METRICS_TOKEN_FILE` also works), a
+///   shared token for a Prometheus scraper that has no Crumb account; or
+/// * a normal **admin session** JWT, so an operator can read the endpoint with
+///   the token they already hold.
+///
+/// The token branch is tried first and only when one is configured, so an
+/// install that never sets `METRICS_TOKEN` behaves exactly like any other
+/// admin-gated endpoint: 401 without a valid token, 403 for a valid non-admin
+/// session. `METRICS_TOKEN` is an opaque bearer credential the operator
+/// generated, so this is a plain equality check, not a password verification.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsAuth;
+
+#[async_trait]
+impl FromRequestParts<AppState> for MetricsAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(expected) = state.config().metrics_token.as_deref() {
+            let presented = parts
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| h.strip_prefix("Bearer "))
+                .map(str::trim);
+            if presented == Some(expected) {
+                return Ok(Self);
+            }
+        }
+        AdminUser::from_request_parts(parts, state)
+            .await
+            .map(|_| Self)
+    }
+}
+
 /// Try to interpret `token` as a scoped, short-lived media token (P0-SESSIONS).
 ///
 /// Returns a single-camera [`AuthUser`] on success, or `None` if the token is

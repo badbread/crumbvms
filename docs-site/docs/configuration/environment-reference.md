@@ -21,12 +21,13 @@ the admin console, the console value (stored in the database) wins over the
 env default; that's flagged in the notes.
 
 Most secret-bearing keys also answer to a `_FILE` twin (`DATABASE_URL_FILE`,
-`JWT_SECRET_FILE`, `SEED_ADMIN_PASSWORD_FILE`, `HA_TOKEN_FILE`) holding a path
-to read the value from, for Docker secrets. `GO2RTC_USER`/`GO2RTC_PASS` are the
-exception: the embedded go2rtc restreamer expands them straight from the
-process environment and compose requires the plain vars, so those two don't
-support `_FILE`. Only `HA_TOKEN_FILE` gets its own row below, because the
-others are mechanical; see [Secrets](/configuration/secrets) for the list.
+`JWT_SECRET_FILE`, `SEED_ADMIN_PASSWORD_FILE`, `METRICS_TOKEN_FILE`,
+`HA_TOKEN_FILE`) holding a path to read the value from, for Docker secrets.
+`GO2RTC_USER`/`GO2RTC_PASS` are the exception: the embedded go2rtc restreamer
+expands them straight from the process environment and compose requires the
+plain vars, so those two don't support `_FILE`. Only `HA_TOKEN_FILE` and
+`METRICS_TOKEN_FILE` get their own rows below, because the others are
+mechanical; see [Secrets](/configuration/secrets) for the list.
 
 ## Time zone
 
@@ -222,6 +223,19 @@ See [Backups](/configuration/backups) for the full picture.
 | `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MOTION_UNHEALTHY_ALERT_SECS` | `180` | how long a camera's motion detector must stay *continuously* unhealthy before the recorder raises a system alert. This is alert hysteresis for flaky cameras that blip and self-heal; it delays only the alert, never the fail-open recording safety rail. A camera added with a main stream only (no sub-stream) never raises this alert at all: pixel motion needs the sub-stream, so that camera records continuously by design rather than being broken. |
+
+## Monitoring
+
+`GET /metrics` serves the API's own gauges in the Prometheus text format (database pool
+saturation, export jobs by status, recorder heartbeat age, active cameras, uptime, build
+info). It requires an `Authorization: Bearer` credential: an admin session token always
+works, and `METRICS_TOKEN` gives a scraper that has no Crumb account its own. `/health`
+and `/version` stay open, so an uptime check needs no credential.
+
+| Key | Default | Notes |
+|---|---|---|
+| `METRICS_TOKEN` | empty | a shared token that authorizes `GET /metrics` on its own, sent as `Authorization: Bearer <token>`. In Prometheus this is `bearer_token` (or `bearer_token_file`) in the `scrape_config`. Generate one with `openssl rand -hex 32`. Empty means only an admin session can read `/metrics`. |
+| `METRICS_TOKEN_FILE` | empty | path to a Docker-secret file holding the token, e.g. `/run/secrets/metrics_token`; read in preference to `METRICS_TOKEN` |
 
 ## ONVIF (PTZ, presets, focus)
 

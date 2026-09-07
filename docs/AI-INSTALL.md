@@ -868,6 +868,33 @@ For that, add a small **external uptime check** hitting
 healthchecks.io, or a one-line cron that curls `/health` and alerts on failure.
 Without it, an API outage is silent until someone notices a client won't connect.
 
+**Prometheus scraping (optional).** `GET /metrics` exposes the API's own gauges
+in the Prometheus text format: DB pool saturation, export jobs by status,
+recorder heartbeat age, active cameras, uptime, build info. It is **not open**,
+it takes an `Authorization: Bearer` credential, either an admin session token or
+a dedicated scrape token:
+
+```bash
+# Generate one and put it in .env (then: docker compose up -d api)
+openssl rand -hex 32
+# METRICS_TOKEN=<the generated value>
+#   or METRICS_TOKEN_FILE=/run/secrets/metrics_token for a Docker secret
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: crumb
+    bearer_token: "<the same value>"   # or: bearer_token_file: /etc/prometheus/crumb-token
+    static_configs:
+      - targets: ["<host>:8080"]
+```
+
+Leave `METRICS_TOKEN` unset and `/metrics` is readable only with an admin
+session, which is the right default if nothing scrapes it. `/health` and
+`/version` stay open either way, so the external uptime check above needs no
+credential.
+
 **Update notifications (optional, off by default; issue #7).** CrumbVMS can
 tell the operator when a newer release exists, via `GET /updates/latest` and a
 toggle in the admin **Server** settings ("Enable update checks"). This is the
