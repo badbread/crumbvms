@@ -2364,6 +2364,45 @@ useful for diagnosing why a camera URL failed, and the reader is the admin.
 
 Tracked privately as advisory GHSA-v7q8-gj2q-gffw.
 
+**Addendum (2026-09-07), notification channels:** the first revisit trigger above
+fired. Notification channels were reachable by any authenticated caller, so the
+outbound destination was not admin-set the way the probe targets are: any viewer
+could create a channel and have the server POST alerts, with snapshot images
+attached, to a host of their choosing. Two changes bring that surface back inside
+the accepted model.
+
+*Channel management is a permission.* Creating, updating, deleting and
+test-firing a channel now needs the `manage_channels` role capability (migration
+0081; admins imply it, it is off by default on every existing and new non-admin
+role, and a scoped media token never carries it). Listing one's own channels is
+unchanged, and existing channels keep delivering regardless of their owner's
+capabilities: only management moved. **Rejected:** gating on `AdminUser` alone,
+which would have been simpler but takes a legitimate operator task away from
+every non-admin role for good; and gating delivery as well as management, which
+would silently stop alerts on upgrade.
+
+*Destinations are checked syntactically.* For a non-admin caller the stored URL
+must be `http`/`https` with a non-empty host, and may not name loopback
+(`127.0.0.0/8`, `::1`, `localhost`), link-local (`169.254.0.0/16`, `fe80::/10`),
+the unspecified address, or a compose service name. Admins stay exempt, matching
+the decision above. **Rejected:** resolving the host at validation time, which
+buys little (the name can resolve differently later) and makes saving a channel
+depend on DNS being up; and blocking RFC1918 / ULA addresses, which would break
+the primary use case, a self-hosted ntfy or Home Assistant on the operator's own
+LAN. The test-fire endpoint, the one channel route that sends on demand, is
+additionally rate-limited per user (429 + `Retry-After`).
+
+Separately, a provider-supplied `snapshot_url` (written from a Frigate MQTT
+payload, not by an operator) is now only fetched when it is a relative path or
+sits on the configured Frigate base's own origin. **Rejected:** trusting any
+absolute URL the provider sends, which was the previous behavior and made the
+fetch target depend on whatever reaches the broker.
+
+**Additional revisit triggers:** a provider legitimately needs a destination on
+a host the syntactic check rejects (then the exemption belongs in the check, not
+in a bypass); or channel management needs to be delegated more finely than one
+capability.
+
 ## 2026-07-19, iOS/macOS v0.1.0 parity: HA overlays + LPR are read-only on mobile; client-side logic ported verbatim from the server
 
 **Context.** The iOS/macOS SwiftUI client was catching up to a large batch of

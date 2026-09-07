@@ -194,6 +194,15 @@ impl AuthUser {
     pub fn can_actuators(&self) -> bool {
         self.is_admin() || self.capabilities.actuators
     }
+    /// Manage third-party notification channels (create/update/delete/test).
+    /// Deny-by-default: a role must be granted `manage_channels` explicitly, and
+    /// a scoped media principal never carries it (see
+    /// [`media_capabilities_from_claims`]). Listing one's own channels is NOT
+    /// gated by this.
+    #[inline]
+    pub fn can_manage_channels(&self) -> bool {
+        self.is_admin() || self.capabilities.manage_channels
+    }
     /// Effective bookmark visibility (admins see all).
     #[inline]
     pub fn bookmarks_scope(&self) -> BookmarkScope {
@@ -240,6 +249,9 @@ impl AuthUser {
     pub fn require_actuators(&self) -> Result<(), ApiError> {
         Self::require(self.can_actuators(), "controlling linked devices")
     }
+    pub fn require_manage_channels(&self) -> Result<(), ApiError> {
+        Self::require(self.can_manage_channels(), "managing notification channels")
+    }
 }
 
 /// Conservative capabilities for a token that carries no resolvable role
@@ -257,6 +269,7 @@ fn fallback_caps(role: UserRole) -> Capabilities {
             manage_views: true,
             view_plates: false,
             actuators: false,
+            manage_channels: false,
         },
     }
 }
@@ -692,7 +705,9 @@ fn try_media_token(token: &str, state: &AppState) -> Option<AuthUser> {
 /// [`MediaClaims`]. `export`/`playback`/`clips`/`view_plates` come straight from
 /// the token (the minting user's real capabilities — never widened); the rest
 /// (ptz, actuators, bookmark, view-management) are always denied, since a media
-/// token is only ever used to fetch media. `view_plates` is carried because
+/// token is only ever used to fetch media. `manage_channels` is likewise never
+/// carried: a channel outlives the ~15-minute token, so a media credential must
+/// not be able to create or retarget one. `view_plates` is carried because
 /// plate crops (`GET /events/{id}/snapshot` crumb-alpr fallback and
 /// `GET /plates/{id}/crop`) require it and clients fetch them with a media
 /// token. `actuators` is deliberately NOT a media claim and hardcoded `false`
@@ -709,6 +724,7 @@ fn media_capabilities_from_claims(claims: &MediaClaims) -> Capabilities {
         actuators: false,
         bookmarks: BookmarkScope::None,
         manage_views: false,
+        manage_channels: false,
     }
 }
 
@@ -767,6 +783,10 @@ mod media_cap_tests {
             !caps.actuators,
             "a media token must never be able to operate a physical device"
         );
+        assert!(
+            !caps.manage_channels,
+            "a media token must never be able to manage a notification channel"
+        );
     }
 
     #[test]
@@ -776,7 +796,8 @@ mod media_cap_tests {
         // must survive, or plate crops fetched with the token render blank.
         let caps = media_capabilities_from_claims(&claims(true, true, true, true));
         assert!(caps.export && caps.playback && caps.clips && caps.view_plates);
-        // ...but still never the device-control capability.
+        // ...but still never the device-control or channel-management ones.
         assert!(!caps.actuators);
+        assert!(!caps.manage_channels);
     }
 }

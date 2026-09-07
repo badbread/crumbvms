@@ -11031,6 +11031,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "0080_channel_snapshot_mode.sql",
         include_str!("../../../db/migrations/0080_channel_snapshot_mode.sql"),
     ),
+    (
+        "0081_role_manage_channels_capability.sql",
+        include_str!("../../../db/migrations/0081_role_manage_channels_capability.sql"),
+    ),
 ];
 
 /// The actual migration-application body, run while [`run_migrations`] holds

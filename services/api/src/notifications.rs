@@ -18,10 +18,10 @@
 //! | `POST`   | `/presence`                       | Bearer        | Set device or user presence         |
 //! | `GET`    | `/notifications/log`              | Bearer        | Recent notification log rows        |
 //! | `GET`    | `/notifications/channels`         | Bearer        | List caller's channels (+ globals)  |
-//! | `POST`   | `/notifications/channels`         | Bearer        | Create a channel                    |
-//! | `PUT`    | `/notifications/channels/{id}`    | Bearer        | Update a channel                    |
-//! | `DELETE` | `/notifications/channels/{id}`    | Bearer        | Delete a channel                    |
-//! | `POST`   | `/notifications/channels/{id}/test` | Bearer      | Test-fire a channel                 |
+//! | `POST`   | `/notifications/channels`         | Bearer + `manage_channels` | Create a channel       |
+//! | `PUT`    | `/notifications/channels/{id}`    | Bearer + `manage_channels` | Update a channel       |
+//! | `DELETE` | `/notifications/channels/{id}`    | Bearer + `manage_channels` | Delete a channel       |
+//! | `POST`   | `/notifications/channels/{id}/test` | Bearer + `manage_channels` | Test-fire a channel  |
 //! | `GET`    | `/notifications/settings`           | Bearer       | Global notification on/off flag     |
 //! | `PUT`    | `/notifications/settings`           | Bearer Admin | Toggle global notifications         |
 //!
@@ -35,6 +35,19 @@
 //! Channel gate behaviour is driven by the owner's `notification_rules` (per-camera
 //! override → user default → system default), including presence gating.  Global
 //! channels (no owner) use system defaults and are never presence-gated.
+//!
+//! # Who may manage a channel
+//!
+//! A channel is a standing instruction for the server to send alerts, with
+//! snapshot images attached, to an operator-chosen host, so creating, editing,
+//! deleting and test-firing one needs the `manage_channels` role capability
+//! (admins imply it; it is off by default on every other role, and a scoped
+//! media token never carries it). Listing one's own channels is unchanged, and
+//! channels that already exist keep delivering regardless of their owner's
+//! capabilities: only management is gated.
+//!
+//! Destinations supplied on create/update/test are checked syntactically by
+//! [`channel_notify::validate_channel_destinations`] for a non-admin caller.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -623,11 +636,14 @@ async fn list_channels(
 }
 
 /// `POST /notifications/channels` — create a notification channel.
+///
+/// Requires the `manage_channels` capability (admins imply it).
 async fn create_channel(
     user: AuthUser,
     State(state): State<AppState>,
     Json(body): Json<CreateChannelRequest>,
 ) -> Result<(StatusCode, Json<ChannelResponse>), ApiError> {
+    user.require_manage_channels()?;
     if !matches!(
         body.kind.as_str(),
         "discord" | "slack" | "pushover" | "telegram" | "ntfy" | "webhook"
@@ -643,6 +659,8 @@ async fn create_channel(
 
     // P0-5: a non-admin may not scope a channel to cameras outside their grants.
     assert_camera_ids_in_scope(&user, body.camera_ids.as_deref())?;
+
+    assert_destinations_allowed(&user, &body.kind, &body.config)?;
 
     // Only Admins may create global channels (user_id = NULL).
     let owner = if body.global && matches!(user.role, UserRole::Admin) {
@@ -704,6 +722,24 @@ fn assert_camera_ids_in_scope(
     Ok(())
 }
 
+/// Reject a destination URL that names the Crumb deployment's own internals
+/// rather than somewhere a notification could usefully go.
+///
+/// Admins are exempt: in Crumb's ratified posture the admin is the trust root
+/// and owns the box, and pointing a webhook at a host on it can be deliberate
+/// (`docs/DECISIONS.md`, 2026-07-20). For everyone else the check is syntactic
+/// only, so nothing is resolved and LAN (RFC1918) destinations, the normal home
+/// for a self-hosted ntfy or Home Assistant, stay allowed. See
+/// [`channel_notify::validate_channel_destinations`] for the exact rules.
+fn assert_destinations_allowed(
+    user: &AuthUser,
+    kind: &str,
+    config: &JsonValue,
+) -> Result<(), ApiError> {
+    channel_notify::validate_channel_destinations(kind, config, user.is_admin())
+        .map_err(|(key, reason)| ApiError::BadRequest(format!("channel config '{key}': {reason}")))
+}
+
 /// Resolve a channel and assert the caller owns it (or is Admin).
 ///
 /// Returns `NotFound` when no row exists, `Forbidden` when owned by another user.
@@ -729,17 +765,26 @@ async fn resolve_owned_channel(
 }
 
 /// `PUT /notifications/channels/:id` — update a channel.
+///
+/// Requires the `manage_channels` capability (admins imply it).
 async fn update_channel(
     user: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateChannelRequest>,
 ) -> Result<Json<ChannelResponse>, ApiError> {
+    user.require_manage_channels()?;
     let existing = resolve_owned_channel(state.pool(), id, &user).await?;
 
     // P0-5: a non-admin may not widen a channel's camera scope beyond their
     // grants (only checks a newly-supplied list; an absent list keeps existing).
     assert_camera_ids_in_scope(&user, body.camera_ids.as_deref())?;
+
+    // Only a newly-supplied config is checked; an absent one keeps the stored
+    // destination untouched, so an edit of the name alone can't fail on it.
+    if let Some(cfg) = &body.config {
+        assert_destinations_allowed(&user, &existing.kind, cfg)?;
+    }
 
     let snapshot_mode = resolve_snapshot_mode(
         body.snapshot_mode.as_deref(),
@@ -787,11 +832,14 @@ async fn update_channel(
 }
 
 /// `DELETE /notifications/channels/:id` — delete a channel.
+///
+/// Requires the `manage_channels` capability (admins imply it).
 async fn delete_channel_handler(
     user: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_manage_channels()?;
     // Ownership check — also confirms the row exists.
     resolve_owned_channel(state.pool(), id, &user).await?;
 
@@ -812,12 +860,27 @@ async fn delete_channel_handler(
 /// Builds a synthetic [`ChannelMessage`] (with a live snapshot when
 /// `include_snapshot` is true) and calls [`channel_notify::dispatch`].
 /// Returns `{"ok": true}` on success or `{"ok": false, "error": "..."}` on failure.
+///
+/// Requires the `manage_channels` capability (admins imply it). This is the one
+/// channel route that sends an outbound request on demand rather than on the
+/// engine's schedule, so it is additionally rate-limited per user (429 +
+/// `Retry-After`), and the stored destination is re-checked here: a row created
+/// before the destination rules existed must not become a way around them.
 async fn test_channel(
     user: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_manage_channels()?;
     let ch = resolve_owned_channel(state.pool(), id, &user).await?;
+    assert_destinations_allowed(&user, &ch.kind, &ch.config)?;
+
+    if let Err(retry_after) = state.count_channel_test(user.user_id) {
+        return Err(ApiError::TooManyRequestsRetry {
+            message: "too many channel tests; wait a moment and try again".to_owned(),
+            retry_after,
+        });
+    }
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -1864,32 +1927,37 @@ const NO_CAMERA_COOLDOWN_KEY: Uuid = Uuid::nil();
 ///
 /// Resolves a provider-relative path against the Frigate HTTP API base from the
 /// DB (server settings' `frigate_http_api_base`, then legacy `frigate_api_base`,
-/// then the Frigate integration row's `api_base`); an absolute `http(s)://` URL
-/// is fetched as-is. Best-effort: any miss (no base configured, non-2xx, network
-/// error) returns `None` and the alert simply goes out without an image — never
-/// an error. Mirrors the resolution in `events.rs::get_event_snapshot` (minus
-/// the env fallback, which this background path can't reach).
+/// then the Frigate integration row's `api_base`); an absolute URL is fetched
+/// only when it sits on that same base origin (see
+/// [`channel_notify::resolve_provider_snapshot_url`]). Best-effort: any miss (no
+/// base configured, an off-origin URL, non-2xx, network error) returns `None`
+/// and the alert simply goes out without an image — never an error. Mirrors the
+/// resolution in `events.rs::get_event_snapshot` (minus the env fallback, which
+/// this background path can't reach).
 async fn fetch_provider_snapshot(
     pool: &Pool,
     http_client: &reqwest::Client,
     snapshot_url: &str,
 ) -> Option<Vec<u8>> {
-    let full_url = if snapshot_url.starts_with("http://") || snapshot_url.starts_with("https://") {
-        snapshot_url.to_owned()
-    } else {
-        let base = match db::get_server_settings(pool).await {
-            Ok(Some(s)) if !s.frigate_http_api_base.trim().is_empty() => {
-                Some(s.frigate_http_api_base)
-            }
-            Ok(Some(s)) if !s.frigate_api_base.trim().is_empty() => Some(s.frigate_api_base),
-            _ => db::get_frigate_settings(pool)
-                .await
-                .ok()
-                .flatten()
-                .map(|f| f.api_base)
-                .filter(|v| !v.trim().is_empty()),
-        }?;
-        format!("{}{}", base.trim_end_matches('/'), snapshot_url)
+    let base = match db::get_server_settings(pool).await {
+        Ok(Some(s)) if !s.frigate_http_api_base.trim().is_empty() => Some(s.frigate_http_api_base),
+        Ok(Some(s)) if !s.frigate_api_base.trim().is_empty() => Some(s.frigate_api_base),
+        _ => db::get_frigate_settings(pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|f| f.api_base)
+            .filter(|v| !v.trim().is_empty()),
+    }?;
+    // The stored value comes from the detection provider, not the operator, so
+    // it only ever names the configured Frigate: a relative path is joined onto
+    // the base, an absolute URL must sit on the base's own origin.
+    let Some(full_url) = channel_notify::resolve_provider_snapshot_url(snapshot_url, &base) else {
+        tracing::debug!(
+            "lpr alert snapshot: stored snapshot_url is not on the configured Frigate base, \
+             skipping the fetch"
+        );
+        return None;
     };
     match http_client.get(&full_url).send().await {
         Ok(resp) if resp.status().is_success() => {

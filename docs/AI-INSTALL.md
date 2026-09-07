@@ -653,6 +653,14 @@ All wizard steps have API equivalents. Do them in order:
    value is rejected. Then prove it delivers:
    `POST /notifications/channels/{id}/test` → `{ok, error?}`. Per-camera rules
    and quiet hours are `PUT /notifications/rules[/{camera_id}]`.
+   Creating, updating, deleting and test-firing a channel needs the
+   `manage_channels` role capability; an admin token always has it, and the
+   console's role editor grants it to a non-admin role (off by default). For a
+   non-admin caller the destination URL must be `http`/`https` with a real host
+   and may not name loopback, link-local, or a compose service name (`api`,
+   `recorder`, `postgres`, ...); LAN addresses are fine. `.../test` is
+   rate-limited per user and answers `429` with `Retry-After` past six per
+   minute.
 9. **Additional users (optional).** `GET /config/roles` for the role list
    (entries carry `id`, `name`, `is_admin`), then per user
    `POST /config/users` `{username, password, role: "viewer", role_id: "<uuid>"}`

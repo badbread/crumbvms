@@ -1194,6 +1194,16 @@ pub struct Capabilities {
     /// able to operate them.
     #[serde(default)]
     pub actuators: bool,
+    /// Create, edit, delete and test-fire third-party notification **channels**
+    /// (Discord/Slack/Telegram/ntfy/Pushover/webhook destinations). A channel is
+    /// a standing instruction for the server to send alerts, with snapshot
+    /// images attached, to an operator-chosen host, so managing one is an
+    /// operator task rather than a per-viewer preference. Defaults to `false`
+    /// (absent ⇒ denied) and must be granted explicitly; admin roles bypass
+    /// capabilities entirely. Reading one's own channel list is not gated by
+    /// this.
+    #[serde(default)]
+    pub manage_channels: bool,
 }
 
 /// Serde default for capability fields that should read as granted (not the
@@ -1216,6 +1226,7 @@ impl Capabilities {
             manage_views: true,
             view_plates: true,
             actuators: true,
+            manage_channels: true,
         }
     }
 }
@@ -1296,6 +1307,10 @@ mod tests {
         assert!(!caps.clips);
         assert!(!caps.ptz);
         assert_eq!(caps.bookmarks, BookmarkScope::None);
+        // A role row persisted before the channel-management capability existed
+        // must read as NOT granted, so an upgrade never hands an existing role a
+        // permission its operator did not choose.
+        assert!(!caps.manage_channels);
     }
 
     /// An explicit `manage_views: false` in the stored jsonb is still honoured —

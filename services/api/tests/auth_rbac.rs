@@ -1034,6 +1034,7 @@ async fn seed_viewer_no_plates(pool: &deadpool_postgres::Pool, cameras: &[Uuid])
         manage_views: true,
         view_plates: false,
         actuators: false,
+        manage_channels: false,
     };
     let role = crumb_common::db::create_role(pool, &unique("noplates-role"), &caps, cameras)
         .await
@@ -2005,6 +2006,7 @@ fn mk_caps(playback: bool, clips: bool, view_plates: bool) -> crumb_common::type
         manage_views: false,
         view_plates,
         actuators: false,
+        manage_channels: false,
     }
 }
 
