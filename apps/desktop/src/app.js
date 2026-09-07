@@ -10173,12 +10173,13 @@ function exportFmtOffset(ms) {
 }
 
 /**
- * Build the absolute, authed download URL for an output_file entry.
+ * Build the absolute download URL for an output_file entry.
  * The spec says download_url is relative (e.g. "/export/<job>/files/<cam>").
+ * No token in the URL: the export download routes authenticate from the
+ * Authorization header, which both download paths below send.
  */
 function exportAbsoluteUrl(relUrl) {
-  const sep = relUrl.includes('?') ? '&' : '?';
-  return state.server + relUrl + sep + 'token=' + encodeURIComponent(state.token);
+  return state.server + relUrl;
 }
 
 /**
@@ -10709,16 +10710,16 @@ async function exportDownloadFiles(outputFiles, startMs) {
     if (destDir) {
       // Stream straight to the chosen folder via the Rust saver (no browser download).
       try {
-        await invoke('save_export_file', { url: absUrl, destDir, filename });
+        await invoke('save_export_file', { url: absUrl, token: state.token, destDir, filename });
         downloaded++;
       } catch (e) {
         lastErr = e;
         console.warn('save_export_file failed:', e);
       }
     } else {
-      // Default: blob download into the browser Downloads folder. Authenticate via
-      // the Authorization header (not just the URL's ?token=) so this download
-      // doesn't depend on the token-in-URL escape hatch.
+      // Default: blob download into the browser Downloads folder. Authenticate
+      // via the Authorization header, which is the only credential the export
+      // download routes accept.
       try {
         const res = await fetchWithTimeout(absUrl, { headers: authHeaders() });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -10733,9 +10734,9 @@ async function exportDownloadFiles(outputFiles, startMs) {
         setTimeout(() => { URL.revokeObjectURL(objectUrl); document.body.removeChild(a); }, 2000);
         downloaded++;
       } catch (blobErr) {
-        // No window.open() fallback here: that would hand a `?token=` download
-        // URL out of the app (a new browser window/tab, outside our control) —
-        // an auth escape hatch we don't want. Surface the failure instead.
+        // No window.open() fallback here: a browser window outside this app
+        // cannot send the Authorization header, so it would just 401. Surface
+        // the failure instead.
         console.warn('blob download failed:', blobErr);
         lastErr = blobErr;
       }

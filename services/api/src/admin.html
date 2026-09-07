@@ -11832,13 +11832,23 @@ function renderSnapshot(c) {
 }
 
 /* ── Boot ── */
-// SSO from an embedding host (the Crumb Client). The host loads
-//   /admin#token=<jwt>&embed=1
-// so the operator who's already signed into the desktop doesn't re-authenticate
-// here. Adopt the token, persist it like a normal login, then SCRUB the hash so
-// the credential never lingers in the address bar or history. embed=1 also drops
-// our own topbar/sign-out (the host owns that chrome).
-(function bootSSO() {
+// SSO from an embedding host (the Crumb Client). Two shapes, both fragments
+// (never query params, since fragments aren't sent to the server or logged):
+//   /admin#token=<jwt>&embed=1   the host's own EMBEDDED webview, same process
+//   /admin#handoff=<code>        a real browser the host launched for us
+// The embedded webview shares the host's process, so it simply passes its
+// session token. "Open in browser" crosses a process boundary into a browser's
+// history and profile storage, so it passes a single-use, short-lived code
+// instead and we trade it here for our OWN session via POST
+// /auth/handoff/exchange. Either way we persist the result like a normal login
+// and SCRUB the hash so nothing lingers in the address bar or history; embed=1
+// also drops our own topbar/sign-out (the host owns that chrome).
+//
+// Async because of the exchange: `boot()` at the bottom of this file awaits
+// SSO_READY before deciding between the app and the login screen. A failed
+// exchange (expired, already used, restarted server) leaves TOKEN empty and
+// falls through to the normal login form.
+const SSO_READY = (async function bootSSO() {
   // Chrome-less embed via query param (item #4): the desktop client's webview
   // loads /admin?embedded=1 so the console drops its own topbar (brand, back /
   // sign-out chrome) — the host draws that chrome, and doubling it up gave two
@@ -11857,11 +11867,27 @@ function renderSnapshot(c) {
   if (h.length > 1 && !h.startsWith('#/')) {
     const p = new URLSearchParams(h.slice(1));
     const t = p.get('token');
+    const handoff = p.get('handoff');
     if (t) { TOKEN = t; localStorage.setItem('crumb_admin_token', TOKEN); }
     if (p.get('embed') === '1') document.body.classList.add('embedded');
-    if (t || p.has('embed')) {
+    if (t || handoff || p.has('embed')) {
       try { history.replaceState(null, '', location.pathname + location.search); }
       catch { location.hash = ''; }
+    }
+    // Scrubbed first, redeemed second: the code is single-use and short-lived,
+    // so it must not survive in the address bar even for the exchange round-trip.
+    if (!t && handoff) {
+      try {
+        const res = await fetch('/auth/handoff/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: handoff }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.token) { TOKEN = data.token; localStorage.setItem('crumb_admin_token', TOKEN); }
+        }
+      } catch { /* offline or server restarted: fall through to the login form */ }
     }
   }
 })();
@@ -12027,6 +12053,9 @@ $('bootstrap-pass2') && $('bootstrap-pass2').addEventListener('keydown', e => { 
    wizard if first-run setup was never finished. Otherwise show the login; a
    successful login resumes the wizard too when setup is incomplete. */
 (async function boot() {
+  // A #handoff= code is redeemed asynchronously by bootSSO; wait for it so the
+  // decision below sees the resulting session.
+  await SSO_READY;
   let status = null;
   try { status = await fetch('/auth/setup-status').then(res => res.ok ? res.json() : null); } catch (_) { /* fall through */ }
   if (status && status.needs_bootstrap) { openWizard(status); return; }

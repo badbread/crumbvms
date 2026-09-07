@@ -262,21 +262,15 @@ fn fallback_caps(role: UserRole) -> Capabilities {
 }
 
 impl AuthUser {
-    /// Shared authentication core for the [`AuthUser`] (fail-closed) and
-    /// [`ExportDownloadUser`] (permissive) extractors.
+    /// Shared authentication core for the [`AuthUser`] (default) and
+    /// [`MediaOrFullUser`] (media-read) extractors.
     ///
-    /// `allow_full_jwt_via_query` is the fail-closed boundary (audit
-    /// 2026-07-05 #2): a full login JWT presented via `?token=` puts a login
-    /// credential in a URL (proxy/access logs, browser history), so it is
-    /// REJECTED by default and accepted only on the multi-camera export
-    /// download routes (via [`ExportDownloadUser`]) until they move to a scoped
-    /// export token / `Authorization` header. A valid scoped media token via
-    /// `?token=` is always accepted, regardless of this flag.
-    async fn authenticate(
-        parts: &mut Parts,
-        state: &AppState,
-        allow_full_jwt_via_query: bool,
-    ) -> Result<AuthUser, ApiError> {
+    /// A full login JWT presented via `?token=` puts a login credential in a
+    /// URL (proxy/access logs, browser history) and is REJECTED on every route
+    /// (audit 2026-07-05 #2). A valid scoped media token via `?token=` is
+    /// accepted here and turned into a single-camera principal, which the
+    /// default extractor then refuses and [`MediaOrFullUser`] admits.
+    async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<AuthUser, ApiError> {
         // ── 1. extract the token: prefer Authorization: Bearer, else ?token= ──
         // The query-param fallback lets browser <video>/<img>/<a download>
         // elements — which cannot set an Authorization header — authenticate to
@@ -312,9 +306,9 @@ impl AuthUser {
         // Only from `?token=` (a media token has no place in an API Bearer
         // header). If the token is a valid media token we build a principal
         // scoped to exactly its one camera and return — the media handlers'
-        // existing `assert_camera_access` then permits only that camera. A
-        // full JWT arriving via `?token=` (legacy media clients) still works:
-        // media-token decode fails and we fall through to the full-JWT path.
+        // existing `assert_camera_access` then permits only that camera.
+        // Anything else in `?token=` is refused below rather than falling
+        // through to the full-JWT path.
         if from_query {
             if let Some(user) = try_media_token(&token, state) {
                 return Ok(user);
@@ -322,17 +316,14 @@ impl AuthUser {
             // ── fail-closed boundary (audit 2026-07-05 #2) ────────────────
             // The token arrived via ?token= but is NOT a scoped media token, so
             // it is a full login JWT (or garbage). A login credential in a URL
-            // query can leak into proxy/access logs and browser history. Reject
-            // it on every route EXCEPT the export download routes, which opt in
-            // via `ExportDownloadUser` until they move to a scoped export token.
-            if !allow_full_jwt_via_query {
-                return Err(ApiError::Unauthorized(
-                    "a login token in a ?token= query parameter is not accepted on this route; \
-                     mint a scoped media token (GET /media-token) or use an Authorization: \
-                     Bearer header"
-                        .to_owned(),
-                ));
-            }
+            // query can leak into proxy/access logs and browser history, so it
+            // is rejected on EVERY route. The export downloads were the last
+            // exception; every client now sends them an Authorization header.
+            return Err(ApiError::Unauthorized(
+                "a login token in a ?token= query parameter is not accepted; mint a scoped \
+                 media token (GET /media-token) or use an Authorization: Bearer header"
+                    .to_owned(),
+            ));
         }
 
         // ── 2. decode + verify signature and expiry ───────────────────────
@@ -344,24 +335,7 @@ impl AuthUser {
 
         let claims = token_data.claims;
 
-        // ── 2a. legacy full-JWT-via-?token= (permissive routes only) ──────
-        // Only reachable when `allow_full_jwt_via_query` is true — the
-        // fail-closed check above already rejected a full-JWT-via-?token= on
-        // every other route. `debug!` (not `warn!`) because one permissive
-        // caller — the web-console camera snapshot — polls frequently and would
-        // flood the logs; the permissive routes are explicit + documented (see
-        // [`LegacyQueryTokenUser`]), and an *unknown* caller gets the loud 401
-        // from the branch above.
-        if from_query {
-            tracing::debug!(
-                sub = %claims.sub,
-                "full login JWT accepted via ?token= on a legacy permissive route — migrate \
-                 this caller to a scoped media token or an Authorization: Bearer header \
-                 (audit 2026-07-05 #2)"
-            );
-        }
-
-        // ── 2b. revocation check (P0-SESSIONS) ────────────────────────────
+        // ── 2a. revocation check (P0-SESSIONS) ────────────────────────────
         // A token carrying a `jti` is a revocable session (minted at/after
         // P0-SESSIONS). If that jti has been revoked ("sign out this / all
         // devices", or an admin cutting a stolen phone), reject it now even
@@ -455,9 +429,9 @@ impl AuthUser {
             capabilities,
             role_id,
             jti,
-            // Reached only via a full login JWT (Bearer header, or ?token= on
-            // the explicitly-permissive export-download routes). The scoped
-            // media-token path returns earlier, in `try_media_token`.
+            // Reached only via a full login JWT in an Authorization header.
+            // The scoped media-token path returns earlier, in
+            // `try_media_token`.
             media_scoped: false,
         })
     }
@@ -482,7 +456,7 @@ impl FromRequestParts<AppState> for AuthUser {
         // extractor then refuses (safe-by-default; audit 2026-08 follow-up to
         // #516). A genuine media-read endpoint opts back in via
         // [`MediaOrFullUser`]. Bearer-header sessions always pass.
-        let user = AuthUser::authenticate(parts, state, false).await?;
+        let user = AuthUser::authenticate(parts, state).await?;
         if user.media_scoped {
             return Err(ApiError::Forbidden(MEDIA_TOKEN_REJECTED.to_owned()));
         }
@@ -520,36 +494,7 @@ impl FromRequestParts<AppState> for MediaOrFullUser {
         // Same authentication as the default extractor, but a media-scoped
         // principal is ACCEPTED here (this is the media-read surface).
         Ok(MediaOrFullUser(
-            AuthUser::authenticate(parts, state, false).await?,
-        ))
-    }
-}
-
-/// Auth extractor for the export **download** routes, which still accept a full
-/// login JWT via `?token=` pending an export-scoped token.
-///
-/// Identical to [`AuthUser`] except it does NOT fail-close the
-/// full-JWT-via-`?token=` path. Only the export downloads use it (audit
-/// 2026-07-05 #2): a multi-camera archive has no single-camera scoped media
-/// token, and a browser `<a download>` link can't set an `Authorization` header.
-/// (The web-console camera snapshot was migrated to a scoped media token, so
-/// `/cameras/:id/frame.jpg` is now the fail-closed [`AuthUser`].)
-///
-/// Every OTHER media route (segments, playback, filmstrip, clips, camera
-/// snapshot) rejects the full-JWT-via-`?token=` path. Do not widen this
-/// extractor's use without migrating the corresponding client first.
-pub struct LegacyQueryTokenUser(pub AuthUser);
-
-#[async_trait]
-impl FromRequestParts<AppState> for LegacyQueryTokenUser {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(LegacyQueryTokenUser(
-            AuthUser::authenticate(parts, state, true).await?,
+            AuthUser::authenticate(parts, state).await?,
         ))
     }
 }

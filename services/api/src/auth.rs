@@ -14,6 +14,8 @@
 //! | `POST`   | `/auth/login`              | none        | Verify credentials; issue JWT            |
 //! | `POST`   | `/auth/refresh`            | Bearer      | Re-issue a fresh token for a valid one   |
 //! | `GET`    | `/auth/me`                 | Bearer      | Return the caller's own profile          |
+//! | `POST`   | `/auth/handoff`            | Bearer      | Mint a single-use console-handoff code   |
+//! | `POST`   | `/auth/handoff/exchange`   | the code    | Trade that code for a new session token  |
 //!
 //! User management (create / update / delete / list users) lives exclusively at
 //! `/config/users` in `config_routes.rs`, which enforces the last-admin guard.
@@ -71,7 +73,7 @@ use crumb_common::{
 };
 
 use crate::{
-    auth_mw::{AdminUser, AuthUser, MEDIA_TOKEN_TYP},
+    auth_mw::{AdminUser, AuthUser, FullSessionUser, MEDIA_TOKEN_TYP},
     dto::{
         Claims, LoginRequest, LoginResponse, MeResponse, MediaClaims, MediaTokenResponse,
         SessionDto,
@@ -485,6 +487,9 @@ pub fn routes() -> Router<AppState> {
             axum::routing::delete(revoke_all_my_sessions),
         )
         .route("/sessions/:jti", axum::routing::delete(revoke_my_session))
+        // ── console handoff to an external browser ─────────────────────────
+        .route("/handoff", post(create_handoff))
+        .route("/handoff/exchange", post(exchange_handoff))
         // Admin: sign out every device of an arbitrary user (e.g. a stolen
         // phone reported by a household member).
         .route(
@@ -559,6 +564,113 @@ async fn media_token(
         camera_id: q.camera,
         expires_at: exp,
     }))
+}
+
+// ── console handoff to an external browser ────────────────────────────────────
+
+/// Lifetime of a console-handoff code. Long enough for the OS to start the
+/// operator's browser and for that browser to load `/admin` and post the
+/// exchange, short enough that a code that never gets redeemed is dead almost
+/// immediately. Codes are single-use on top of this.
+const HANDOFF_EXPIRY_SECONDS: u64 = 60;
+
+/// Request body for `POST /auth/handoff/exchange`.
+///
+/// Kept private to this module, like [`BootstrapRequest`] (api-routes owns
+/// `dto.rs`; this module avoids touching that file for its own request shapes).
+#[derive(Debug, Deserialize)]
+struct HandoffExchangeRequest {
+    code: String,
+}
+
+/// `POST /auth/handoff`
+///
+/// Mint a single-use, ~1 minute code that a *separate* process (the desktop
+/// client's "Open in browser") can put in the console URL's fragment in place
+/// of the operator's own session token. The browser trades the code for its own
+/// session at [`exchange_handoff`], so the desktop's token never crosses the
+/// process boundary into a browser's history, profile storage, or extensions.
+///
+/// Requires a full login session ([`FullSessionUser`]): a scoped media token
+/// must never be tradeable for a console session.
+///
+/// # Errors
+///
+/// - `401`: not authenticated.
+/// - `403`: a scoped media token was presented.
+async fn create_handoff(
+    FullSessionUser(user): FullSessionUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let code = state.issue_handoff_code(
+        user.user_id,
+        user.jti,
+        std::time::Duration::from_secs(HANDOFF_EXPIRY_SECONDS),
+    );
+    Ok(Json(
+        json!({ "code": code, "expires_in": HANDOFF_EXPIRY_SECONDS }),
+    ))
+}
+
+/// `POST /auth/handoff/exchange`
+///
+/// Redeem a code from [`create_handoff`] for a NEW session token belonging to
+/// the same user. Unauthenticated by necessity (the caller is a fresh browser
+/// with no credentials of its own); the code IS the one-time credential, and it
+/// is consumed on the first attempt whether or not that attempt succeeds.
+///
+/// The result is an ordinary session: its own `jti`, its own `sessions` row,
+/// normal expiry, so it appears in "your sessions" and every sign-out path
+/// reaches it. The long-lived "remember me" expiry stays login-only, matching
+/// [`refresh`].
+///
+/// # Errors
+///
+/// - `401`: the code is unknown, already redeemed, expired, or the session
+///   that minted it has since been signed out.
+/// - `404`: the user was deleted after the code was minted.
+/// - `500`: database or signing error.
+async fn exchange_handoff(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<HandoffExchangeRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    // One message for every failure mode: which one it was tells an unknown
+    // caller something, and tells the operator nothing they can act on.
+    let invalid = || ApiError::Unauthorized("this console link is no longer valid".to_owned());
+
+    let Some((user_id, jti)) = state.consume_handoff_code(body.code.trim()) else {
+        return Err(invalid());
+    };
+
+    // A code can outlive its issuing session in the seconds between a sign-out
+    // and the exchange. Honour the sign-out rather than hand back a fresh one.
+    if let Some(jti) = jti {
+        if state.is_jti_revoked(jti).await {
+            return Err(invalid());
+        }
+    }
+
+    let db_user = db::get_user_by_id(state.pool(), user_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("user {user_id} not found")))?;
+
+    tracing::info!(
+        user_id  = %db_user.id,
+        username = %db_user.username,
+        "console handoff redeemed"
+    );
+
+    mint_token(
+        &state,
+        &db_user,
+        false,
+        device_label(&headers).as_deref(),
+        client_ip(&headers).as_deref(),
+    )
+    .await
+    .map(Json)
 }
 
 // ── session management handlers (P0-SESSIONS) ──────────────────────────────────
