@@ -222,7 +222,10 @@ async fn changing_extra_cameras_applies_on_the_next_request() {
 
     // Before: cam_b is out of scope.
     let denied = app
-        .send(get_auth(&format!("/cameras/{cam_b}/streams"), &viewer_token))
+        .send(get_auth(
+            &format!("/cameras/{cam_b}/streams"),
+            &viewer_token,
+        ))
         .await;
     assert_eq!(
         denied.status(),
@@ -241,9 +244,17 @@ async fn changing_extra_cameras_applies_on_the_next_request() {
     assert_eq!(resp.status(), StatusCode::OK, "extra camera granted");
 
     // Same token, no re-login: the grant is live.
-    assert_session_alive(&app, &viewer_token, "an extra-cameras edit is not a sign-out").await;
+    assert_session_alive(
+        &app,
+        &viewer_token,
+        "an extra-cameras edit is not a sign-out",
+    )
+    .await;
     let granted = app
-        .send(get_auth(&format!("/cameras/{cam_b}/streams"), &viewer_token))
+        .send(get_auth(
+            &format!("/cameras/{cam_b}/streams"),
+            &viewer_token,
+        ))
         .await;
     assert_eq!(
         granted.status(),
@@ -263,7 +274,10 @@ async fn changing_extra_cameras_applies_on_the_next_request() {
     assert_eq!(resp.status(), StatusCode::OK, "extra camera withdrawn");
 
     let revoked = app
-        .send(get_auth(&format!("/cameras/{cam_b}/streams"), &viewer_token))
+        .send(get_auth(
+            &format!("/cameras/{cam_b}/streams"),
+            &viewer_token,
+        ))
         .await;
     assert_eq!(
         revoked.status(),
@@ -272,7 +286,10 @@ async fn changing_extra_cameras_applies_on_the_next_request() {
     );
     // The role's own camera is untouched: union semantics are unchanged.
     let still_ok = app
-        .send(get_auth(&format!("/cameras/{cam_a}/streams"), &viewer_token))
+        .send(get_auth(
+            &format!("/cameras/{cam_a}/streams"),
+            &viewer_token,
+        ))
         .await;
     assert_eq!(
         still_ok.status(),

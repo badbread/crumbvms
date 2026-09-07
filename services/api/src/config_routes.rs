@@ -3049,7 +3049,11 @@ async fn update_user(
         // Self-edit exception: keep the session this request came in on, so an
         // admin changing their own password stays signed in here while every
         // other device of theirs is signed out.
-        let keep = if admin.0.user_id == id { admin.0.jti } else { None };
+        let keep = if admin.0.user_id == id {
+            admin.0.jti
+        } else {
+            None
+        };
         let revoked = match keep {
             Some(jti) => db::revoke_other_sessions_for_user(state.pool(), id, jti)
                 .await
