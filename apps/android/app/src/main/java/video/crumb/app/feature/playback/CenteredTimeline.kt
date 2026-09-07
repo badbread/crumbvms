@@ -100,6 +100,14 @@ private val ICON_DISC = Color(0xF21A1C22)   // near-opaque dark disc directly be
  * @param onScrub Called continuously with the new playhead time.
  * @param onScrubEnd Called once on release with the final playhead time.
  * @param onSpanChange Called when a pinch changes the visible span.
+ * @param exportSelStartMs Raw IN edge of the export bracket (epoch-millis), or null
+ *   when nothing is marked. Edges are stored as the operator placed them and only
+ *   ordered when drawn, mirroring the desktop selection model.
+ * @param exportSelEndMs Raw OUT edge of the export bracket, or null.
+ * @param onSetExportStart Called while dragging the IN handle. Null (with
+ *   [onSetExportEnd]) disables edge-dragging entirely, which is what the
+ *   multi-camera playback wall wants.
+ * @param onSetExportEnd Called while dragging the OUT handle.
  */
 @Composable
 fun CenteredTimeline(
@@ -117,6 +125,10 @@ fun CenteredTimeline(
     onScrub: (Long) -> Unit,
     onScrubEnd: (Long) -> Unit,
     onSpanChange: (Long) -> Unit,
+    exportSelStartMs: Long? = null,
+    exportSelEndMs: Long? = null,
+    onSetExportStart: ((Long) -> Unit)? = null,
+    onSetExportEnd: ((Long) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val textMeasurer = rememberTextMeasurer()
@@ -127,6 +139,11 @@ fun CenteredTimeline(
     // Latest values readable inside the (Unit-keyed) gesture loop.
     val playhead = rememberUpdatedState(playheadMs)
     val span = rememberUpdatedState(spanMs)
+    // Export bracket, likewise readable from the gesture loop without re-keying it.
+    val selStart = rememberUpdatedState(exportSelStartMs)
+    val selEnd = rememberUpdatedState(exportSelEndMs)
+    val setSelStart = rememberUpdatedState(onSetExportStart)
+    val setSelEnd = rememberUpdatedState(onSetExportEnd)
 
     // Detection-event glyphs, drawn on the timeline tinted per type (created here
     // in composable scope; the Canvas draws them via VectorPainter.draw).
@@ -169,8 +186,64 @@ fun CenteredTimeline(
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(Unit) {
+                    // Touch grab radius for an export handle. Desktop uses 7 px
+                    // against a mouse cursor; a fingertip needs a wider target, so
+                    // this is expressed in dp and converted per-device.
+                    val grabPx = 16.dp.toPx()
                     awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
+                        val down = awaitFirstDown(requireUnconsumed = false)
+
+                        // Time under an x offset for the CURRENT window. Only valid
+                        // while the playhead is NOT moving, which is exactly the
+                        // export-handle drag (it never scrubs).
+                        fun timeAt(x: Float): Long {
+                            val w = size.width.toFloat()
+                            if (w <= 0f) return playhead.value
+                            val frac = (x / w).coerceIn(0f, 1f)
+                            return playhead.value - span.value / 2 +
+                                (frac * span.value).roundToLong()
+                        }
+
+                        // Which export edge (if any) the finger landed on. Nearest
+                        // wins when the two handles overlap; mirrors iOS
+                        // `exportEdge(near:)`.
+                        val edgeSetter: ((Long) -> Unit)? = run {
+                            val s = selStart.value
+                            val e = selEnd.value
+                            val setS = setSelStart.value
+                            val setE = setSelEnd.value
+                            val w = size.width.toFloat()
+                            if (s == null || e == null || setS == null || setE == null ||
+                                w <= 0f || span.value <= 0L
+                            ) {
+                                return@run null
+                            }
+                            val visStart = playhead.value - span.value / 2
+                            fun xOf(ts: Long): Float =
+                                ((ts - visStart).toFloat() / span.value.toFloat()) * w
+                            val dS = abs(xOf(s) - down.position.x)
+                            val dE = abs(xOf(e) - down.position.x)
+                            if (minOf(dS, dE) > grabPx) null else if (dS <= dE) setS else setE
+                        }
+
+                        if (edgeSetter != null) {
+                            // Handle drag: resize the bracket instead of scrubbing.
+                            // The playhead stays exactly where it is, so nothing but
+                            // the marked edge moves.
+                            val nowMs = System.currentTimeMillis()
+                            edgeSetter(timeAt(down.position.x).coerceIn(0L, nowMs))
+                            down.consume()
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                event.changes.firstOrNull { it.pressed }?.let { change ->
+                                    edgeSetter(timeAt(change.position.x).coerceIn(0L, nowMs))
+                                }
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                if (event.changes.none { it.pressed }) break
+                            }
+                            return@awaitEachGesture
+                        }
+
                         onScrubStart()
                         var acc = playhead.value
                         var sp = span.value
@@ -371,6 +444,34 @@ fun CenteredTimeline(
                                 colorFilter = ColorFilter.tint(lerp(color, Color.White, 0.2f)),
                             )
                         }
+                    }
+                }
+            }
+
+            // 2e. Export in/out bracket — a translucent amber wash over the marked
+            // region with a solid amber handle at each edge (the same "mark for
+            // export" region the desktop and iOS clients draw). Edges are ordered
+            // here, not in state, so dragging one past the other is harmless.
+            val selA = exportSelStartMs
+            val selB = exportSelEndMs
+            if (selA != null && selB != null) {
+                val a = minOf(selA, selB)
+                val b = maxOf(selA, selB)
+                if (b >= visStart && a <= visEnd) {
+                    val xa = xOf(a).coerceIn(0f, w)
+                    val xb = xOf(b).coerceIn(0f, w)
+                    drawRect(
+                        color = TimelineColors.exportFill,
+                        topLeft = Offset(xa, bandTop),
+                        size = Size((xb - xa).coerceAtLeast(1f), bandH),
+                    )
+                    for (hx in listOf(xOf(a), xOf(b))) {
+                        if (hx < 0f || hx > w) continue
+                        drawRect(
+                            color = TimelineColors.exportHandle,
+                            topLeft = Offset(hx - 1.5f, bandTop - 6f),
+                            size = Size(3f, bandH + 12f),
+                        )
                     }
                 }
             }

@@ -39,6 +39,9 @@ import java.time.Instant
  *   a fast double-tap on Create before the first response lands could submit two
  *   export jobs (the guard in [ExportViewModel.createExport] checked [polling] too
  *   late to catch it).
+ * @property cancelling True while a `DELETE /export/{job_id}` is in flight.
+ * @property notice A neutral, non-error status line (e.g. "Export cancelled.").
+ *   Kept apart from [jobError] so a deliberate cancel isn't shown in danger red.
  */
 data class ExportUiState(
     val loadingCameras: Boolean = true,
@@ -52,20 +55,54 @@ data class ExportUiState(
     val jobError: String? = null,
     val polling: Boolean = false,
     val submitting: Boolean = false,
-)
+    val cancelling: Boolean = false,
+    val notice: String? = null,
+) {
+    /** True when the current window is one the server will accept (`start` < `end`). */
+    val rangeValid: Boolean get() = ExportRange.isValid(startMs, endMs)
+}
 
 /**
  * ViewModel for the Export screen.
  *
  * Loads cameras, manages clip-range selection, submits the export job, and
  * polls for completion. Also provides per-output authenticated download URLs.
+ *
+ * @param seedCameraId Camera to pre-select (blank = none). Applied before the
+ *   camera list arrives, so it survives the load.
+ * @param seedStartMs Clip-window start to pre-fill (epoch-millis; ≤ 0 = keep the
+ *   screen's own default).
+ * @param seedEndMs Clip-window end to pre-fill (epoch-millis; ≤ 0 = keep the default).
  */
-class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
+class ExportViewModel(
+    private val repo: CrumbRepository,
+    seedCameraId: String = "",
+    seedStartMs: Long = 0L,
+    seedEndMs: Long = 0L,
+) : ViewModel() {
 
-    private val _state = MutableStateFlow(ExportUiState())
+    private val _state = MutableStateFlow(
+        ExportUiState().let { base ->
+            val seeded = if (seedStartMs > 0L && seedEndMs > 0L &&
+                ExportRange.isValid(seedStartMs, seedEndMs)
+            ) {
+                base.copy(startMs = seedStartMs, endMs = seedEndMs)
+            } else {
+                base
+            }
+            if (seedCameraId.isNotBlank()) {
+                seeded.copy(selectedCameraIds = setOf(seedCameraId))
+            } else {
+                seeded
+            }
+        },
+    )
     val state: StateFlow<ExportUiState> = _state.asStateFlow()
 
     private var pollJob: Job? = null
+
+    /** Id of the job currently being polled, kept so Cancel works after a poll blip. */
+    private var activeJobId: String? = null
 
     init {
         loadCameras()
@@ -108,17 +145,31 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
     fun setStart(epochMs: Long) {
         _state.update { s ->
             // Clamp: start must be before end
-            val clamped = minOf(epochMs, s.endMs - 1_000L)
-            s.copy(startMs = clamped)
+            s.copy(startMs = ExportRange.clampStart(epochMs, s.endMs))
         }
     }
 
     fun setEnd(epochMs: Long) {
         _state.update { s ->
             // Clamp: end must be after start
-            val clamped = maxOf(epochMs, s.startMs + 1_000L)
-            s.copy(endMs = clamped)
+            s.copy(endMs = ExportRange.clampEnd(epochMs, s.startMs))
         }
+    }
+
+    /**
+     * Set both boundaries at once (quick-range chips, or a seeded hand-off). The
+     * pair is ordered and widened to the minimum the server accepts, so a chip can
+     * never produce an inverted or zero-length window.
+     */
+    fun setRange(startEpochMs: Long, endEpochMs: Long) {
+        val (a, b) = ExportRange.normalize(startEpochMs, endEpochMs)
+        _state.update { it.copy(startMs = a, endMs = ExportRange.clampEnd(b, a)) }
+    }
+
+    /** Apply a "Last N minutes" quick range ending now. */
+    fun applyQuickRange(minutes: Int) {
+        val (start, end) = ExportRange.quickRange(Instant.now().toEpochMilli(), minutes)
+        setRange(start, end)
     }
 
     fun setBurn(enabled: Boolean) {
@@ -130,6 +181,7 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
     fun createExport() {
         val s = _state.value
         if (s.selectedCameraIds.isEmpty()) return
+        if (!s.rangeValid) return // the server rejects start >= end; don't spend a round-trip
         if (s.polling || s.submitting) return // already running or already in flight
         // Set synchronously, BEFORE the coroutine launch, so a fast double-tap on
         // Create can't slip a second submit in during the POST round-trip (polling
@@ -141,7 +193,8 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
 
         viewModelScope.launch {
             // Reset any previous job state before submitting.
-            _state.update { it.copy(job = null, jobError = null, polling = false) }
+            activeJobId = null
+            _state.update { it.copy(job = null, jobError = null, notice = null, polling = false) }
 
             repo.createExport(
                 cameraIds = s.selectedCameraIds.toList(),
@@ -149,11 +202,47 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
                 endIso = endIso,
                 burn = s.burn,
             ).onSuccess { response ->
+                activeJobId = response.jobId
                 _state.update { it.copy(polling = true, submitting = false) }
                 startPolling(response.jobId)
             }.onFailure { t ->
                 _state.update { it.copy(jobError = t.toUserMessage(), submitting = false) }
             }
+        }
+    }
+
+    /**
+     * Cancel the job currently being polled (`DELETE /export/{job_id}`). The server
+     * aborts ffmpeg and cleans the partial output up; cancelling a job that has
+     * already finished is an idempotent success, so a race with completion is safe.
+     *
+     * Polling stops locally on success and the job card is cleared back to a plain
+     * "Export cancelled." notice rather than a red failure.
+     */
+    fun cancelExport() {
+        val jobId = activeJobId ?: _state.value.job?.id ?: return
+        if (_state.value.cancelling) return
+        _state.update { it.copy(cancelling = true) }
+        viewModelScope.launch {
+            repo.cancelExport(jobId)
+                .onSuccess {
+                    pollJob?.cancel()
+                    pollJob = null
+                    activeJobId = null
+                    _state.update {
+                        it.copy(
+                            cancelling = false,
+                            polling = false,
+                            submitting = false,
+                            job = null,
+                            jobError = null,
+                            notice = "Export cancelled.",
+                        )
+                    }
+                }
+                .onFailure { t ->
+                    _state.update { it.copy(cancelling = false, jobError = t.toUserMessage()) }
+                }
         }
     }
 
@@ -172,9 +261,17 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
                     .onSuccess { job ->
                         failStreak = 0
                         _state.update { it.copy(job = job, jobError = null) }
-                        if (job.isTerminal) {
+                        // A job cancelled server-side (by this client, another
+                        // session, or the operator's own DELETE) is terminal too —
+                        // without this the poll loop would spin forever on it.
+                        if (job.isTerminal || job.looksCancelled) {
+                            activeJobId = null
                             _state.update { it.copy(polling = false) }
-                            if (job.isFailed) {
+                            if (job.looksCancelled) {
+                                _state.update {
+                                    it.copy(job = null, notice = "Export cancelled.")
+                                }
+                            } else if (job.isFailed) {
                                 _state.update {
                                     it.copy(jobError = job.error ?: "Export failed.")
                                 }
@@ -201,3 +298,13 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
         private const val POLL_INTERVAL_MS = 1_500L
     }
 }
+
+/**
+ * Whether the server reports this job as cancelled.
+ *
+ * Read off [ExportJob.status] here rather than assuming a model-level flag, so
+ * this compiles against the current [ExportJob] and stays correct once a
+ * dedicated `isCancelled` property lands alongside `isTerminal`.
+ */
+private val ExportJob.looksCancelled: Boolean
+    get() = status.equals("cancelled", ignoreCase = true)
