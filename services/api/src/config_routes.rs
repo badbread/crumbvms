@@ -1208,8 +1208,8 @@ async fn update_camera(
     // taken literally, which is how one is changed.
     let source_url =
         source_url.map(|u| redact::unmask_url_password(&u, existing.source_url.as_deref()));
-    let source_sub_url = source_sub_url
-        .map(|u| redact::unmask_url_password(&u, existing.source_sub_url.as_deref()));
+    let source_sub_url =
+        source_sub_url.map(|u| redact::unmask_url_password(&u, existing.source_sub_url.as_deref()));
 
     // Guard: a Crumb-managed camera (source_url set) derives its re-stream name
     // from go2rtc_name; an empty go2rtc_name would yield main_url="" / sub_url="_sub"
@@ -4720,7 +4720,10 @@ fn camera_to_dto(c: Camera) -> CameraDto {
     // on the way out (the rest of the URL is verbatim, so the operator still
     // recognises and can edit it); sending the mask back on PUT keeps the stored
     // credential. Same contract as onvif_password, expressed inside the URL.
-    let source_has_credentials = c.source_url.as_deref().is_some_and(redact::url_has_password);
+    let source_has_credentials = c
+        .source_url
+        .as_deref()
+        .is_some_and(redact::url_has_password);
     let source_sub_has_credentials = c
         .source_sub_url
         .as_deref()

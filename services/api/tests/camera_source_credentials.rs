@@ -144,7 +144,10 @@ async fn get_masks_the_password_and_flags_that_one_is_stored() {
     // Everything but the password is verbatim, so the operator still recognises
     // and can edit the URL.
     assert!(main.starts_with("rtsp://cam-operator:"), "{main}");
-    assert!(main.ends_with("@198.51.100.9:554/Streaming/Channels/101"), "{main}");
+    assert!(
+        main.ends_with("@198.51.100.9:554/Streaming/Channels/101"),
+        "{main}"
+    );
 
     assert_eq!(dto["source_has_credentials"], serde_json::json!(true));
     assert_eq!(dto["source_sub_has_credentials"], serde_json::json!(true));
@@ -202,7 +205,10 @@ async fn putting_the_masked_url_back_keeps_the_stored_credentials() {
     let (main, sub) = stored_sources(app.pool(), id).await;
     assert_eq!(main, main_url_with(MAIN_PASSWORD));
     assert_eq!(sub, sub_url_with(SUB_PASSWORD));
-    assert!(!main.contains(CREDENTIAL_MASK), "the mask was stored: {main}");
+    assert!(
+        !main.contains(CREDENTIAL_MASK),
+        "the mask was stored: {main}"
+    );
     assert!(!sub.contains(CREDENTIAL_MASK), "the mask was stored: {sub}");
 }
 

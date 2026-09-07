@@ -45,7 +45,6 @@ pub const ADMIN_CSP: &str = "default-src 'self'; \
 /// headers. Apply this outermost, so it covers the `/auth` subtree (which is
 /// deliberately merged outside the CORS layer, see `cors::compose`) as well as
 /// the rest of the API.
-#[must_use]
 pub fn with_site_headers<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,

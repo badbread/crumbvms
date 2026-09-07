@@ -59,9 +59,7 @@ async fn metrics_app() -> TestApp {
 }
 
 async fn scrape(app: &TestApp, authorization: Option<&str>) -> StatusCode {
-    let mut req = axum::http::Request::builder()
-        .method("GET")
-        .uri("/metrics");
+    let mut req = axum::http::Request::builder().method("GET").uri("/metrics");
     if let Some(value) = authorization {
         req = req.header("authorization", value);
     }

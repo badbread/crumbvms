@@ -368,7 +368,11 @@ fn split_db_password(database_url: &str) -> (String, Option<String>) {
     let Ok(mut u) = url::Url::parse(database_url) else {
         return (database_url.to_owned(), None);
     };
-    let Some(password) = u.password().filter(|p| !p.is_empty()).map(percent_decode_lossy) else {
+    let Some(password) = u
+        .password()
+        .filter(|p| !p.is_empty())
+        .map(percent_decode_lossy)
+    else {
         // Nothing to move out of argv: hand back the caller's own string rather
         // than a re-serialized one.
         return (database_url.to_owned(), None);
@@ -455,15 +459,9 @@ impl BackupJob {
         if let Some(password) = &password {
             cmd.env("PGPASSWORD", password);
         }
-        let output = cmd
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to spawn pg_dump (postgresql-client missing from image?): {e}"
-                )
-            })?;
+        let output = cmd.kill_on_drop(true).output().await.map_err(|e| {
+            anyhow::anyhow!("failed to spawn pg_dump (postgresql-client missing from image?): {e}")
+        })?;
 
         if !output.status.success() {
             let stderr =
@@ -708,14 +706,18 @@ mod tests {
         let (dsn, pw) = split_db_password("postgresql://crumb:s3cret@postgres:5432/crumb");
         assert_eq!(pw.as_deref(), Some("s3cret"));
         assert!(!dsn.contains("s3cret"), "password left in the DSN: {dsn}");
-        assert!(dsn.starts_with("postgresql://crumb@postgres:5432/crumb"), "{dsn}");
+        assert!(
+            dsn.starts_with("postgresql://crumb@postgres:5432/crumb"),
+            "{dsn}"
+        );
     }
 
     #[test]
     fn split_db_password_decodes_at_and_percent() {
         // A password containing '@' or '%' must be percent-encoded in the URL;
         // PGPASSWORD needs the literal value, so the split decodes it.
-        let (dsn, pw) = split_db_password("postgresql://crumb:p%40ss%25word@db.internal:5432/crumb");
+        let (dsn, pw) =
+            split_db_password("postgresql://crumb:p%40ss%25word@db.internal:5432/crumb");
         assert_eq!(pw.as_deref(), Some("p@ss%word"));
         assert!(!dsn.contains("p%40ss"), "password left in the DSN: {dsn}");
         assert!(dsn.contains("crumb@db.internal:5432"), "{dsn}");

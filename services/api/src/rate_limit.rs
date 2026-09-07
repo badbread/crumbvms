@@ -75,9 +75,7 @@ pub fn trust_proxy_from_env() -> bool {
 /// login backoff can never drift apart on `TRUST_PROXY` handling.
 #[must_use]
 pub fn client_key(trust_proxy: bool, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    let peer_key = || {
-        peer.map_or_else(|| "unknown-peer".to_owned(), |p| p.ip().to_string())
-    };
+    let peer_key = || peer.map_or_else(|| "unknown-peer".to_owned(), |p| p.ip().to_string());
     if trust_proxy {
         headers
             .get("x-forwarded-for")

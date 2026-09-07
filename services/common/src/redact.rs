@@ -88,7 +88,9 @@ fn password_span(s: &str) -> Option<(usize, usize)> {
 /// it appears in the URL.
 #[must_use]
 pub fn url_password(s: &str) -> Option<&str> {
-    password_span(s).and_then(|(a, b)| s.get(a..b)).filter(|p| !p.is_empty())
+    password_span(s)
+        .and_then(|(a, b)| s.get(a..b))
+        .filter(|p| !p.is_empty())
 }
 
 /// `true` when `s` carries a non-empty userinfo password.
@@ -185,7 +187,8 @@ mod mask_tests {
 
     #[test]
     fn editing_the_host_around_the_mask_keeps_the_password() {
-        let edited = format!("rtsp://admin:{CREDENTIAL_MASK}@198.51.100.40:554/Streaming/Channels/102");
+        let edited =
+            format!("rtsp://admin:{CREDENTIAL_MASK}@198.51.100.40:554/Streaming/Channels/102");
         assert_eq!(
             unmask_url_password(&edited, Some(STORED)),
             "rtsp://admin:hunter2@198.51.100.40:554/Streaming/Channels/102"
