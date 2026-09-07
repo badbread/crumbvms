@@ -180,6 +180,16 @@ pub struct ApiConfig {
     /// camera). Default: `2`.
     pub export_max_concurrent: usize,
 
+    /// `EXPORT_MAX_RANGE_SECONDS` -- longest `[start, end]` window a single
+    /// export job may request, per camera.
+    ///
+    /// A job runs one ffmpeg per camera over the whole window, so an unbounded
+    /// range is an unbounded amount of work and output for one request.
+    /// Default: `86400` (a full day of one camera), which is well beyond any
+    /// realistic evidence export while still refusing "year 1000 to 9999".
+    /// Raise it if a deployment genuinely exports multi-day ranges.
+    pub export_max_range_seconds: i64,
+
     /// `CLIP_GEN_MAX_CONCURRENCY` -- max simultaneous on-demand clip transcodes
     /// (the Clips tab). Each play streams one libx264 ffmpeg, paced by the
     /// client's read; the permit is held for the play's lifetime, so this caps
@@ -254,6 +264,18 @@ pub struct ApiConfig {
     /// the recorder while a big box isn't throttled to a fixed handful. Override
     /// to taste.
     pub thumb_extract_max_concurrency: usize,
+
+    /// `FRAME_PROXY_MAX_CONCURRENCY` -- max simultaneous `GET
+    /// /cameras/{id}/frame.jpg` fetches from go2rtc.
+    ///
+    /// The still proxy is network-bound, not CPU-bound (it forwards one JPEG),
+    /// but a request against a camera that is down can hold its slot for the
+    /// whole retry ladder, so it needs a bound of its own rather than sharing
+    /// the CPU-sized thumbnail semaphore. Sized for the low-bandwidth walls that
+    /// drive it: a 16-tile wall polling once a second at ~150 ms per fetch is
+    /// about 3 concurrent, with all 16 tiles able to fire at the same instant.
+    /// Default: one per CPU core, clamped to `[8, 32]`.
+    pub frame_proxy_max_concurrency: usize,
 
     /// `THUMB_CACHE_MAX_BYTES` -- soft byte budget for the filmstrip thumbnail
     /// cache (`{export_dir}/.thumbs`). A periodic sweeper evicts oldest-by-mtime
@@ -467,6 +489,7 @@ impl ApiConfig {
             export_dir: optional_env("EXPORT_DIR", DEFAULT_EXPORT_DIR),
             export_ttl_seconds: parse_env("EXPORT_TTL_SECONDS", 86_400_u64)?,
             export_max_concurrent: parse_env("EXPORT_MAX_CONCURRENT", 2usize)?.max(1),
+            export_max_range_seconds: parse_env("EXPORT_MAX_RANGE_SECONDS", 86_400_i64)?.max(1),
             clip_gen_max_concurrency: parse_env("CLIP_GEN_MAX_CONCURRENCY", 4usize)?.max(1),
             clip_cache_max_bytes: parse_env("CLIP_CACHE_MAX_BYTES", 10_737_418_240_u64)?,
             segment_low_cache_max_bytes: parse_env(
@@ -480,6 +503,11 @@ impl ApiConfig {
             thumb_extract_max_concurrency: parse_env(
                 "THUMB_EXTRACT_MAX_CONCURRENCY",
                 default_thumb_concurrency(),
+            )?
+            .max(1),
+            frame_proxy_max_concurrency: parse_env(
+                "FRAME_PROXY_MAX_CONCURRENCY",
+                default_frame_proxy_concurrency(),
             )?
             .max(1),
             thumb_cache_max_bytes: parse_env("THUMB_CACHE_MAX_BYTES", 21_474_836_480_u64)?,
@@ -530,6 +558,15 @@ fn optional_env_opt(key: &str) -> Option<String> {
 fn default_thumb_concurrency() -> usize {
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     (cores / 2).clamp(2, 12)
+}
+
+/// Default concurrency for the live-still proxy. Network-bound rather than
+/// CPU-bound, so it gets a higher floor than [`default_thumb_concurrency`]: one
+/// slot per core, clamped to `[8, 32]`, which keeps a 16-tile low-bandwidth wall
+/// from ever queueing on a healthy install.
+fn default_frame_proxy_concurrency() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    cores.clamp(8, 32)
 }
 
 fn parse_env<T>(key: &str, default: T) -> Result<T>

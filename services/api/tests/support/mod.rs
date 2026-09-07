@@ -81,6 +81,8 @@ pub mod filmstrip;
 pub mod go2rtc;
 #[path = "../../src/ha.rs"]
 pub mod ha;
+#[path = "../../src/media_limits.rs"]
+pub mod media_limits;
 #[path = "../../src/plates.rs"]
 pub mod plates;
 #[path = "../../src/playback.rs"]

@@ -8,6 +8,107 @@ revisit.
 
 ---
 
+## 2026-09-07, Media routes: bounded waits answering 503, not unbounded queues
+
+**Context.** Every expensive media path (clip and low-bitrate transcodes, the
+filmstrip's single-frame extractions, and now the live-still proxy) gates its
+work behind a shared semaphore. Those acquires were plain
+`acquire_owned().await`, an unbounded queue: once the permits were gone, further
+requests parked indefinitely, holding a connection and never answering. The
+media router also carried neither a request timeout nor a rate limit, both of
+which the JSON routes have had since #17.
+
+**Decision.** Every media semaphore acquire goes through one helper
+(`services/api/src/media_limits.rs::acquire_bounded`) that gives up after a
+per-call-site budget and returns `503` plus `Retry-After`. The media router
+gains its own, much larger rate-limit bucket (burst 1200, 240/s sustained,
+roughly 6x the busiest real client) and a 180 s time-to-response bound.
+
+**Why a timeout is safe over streaming media.** `tower_http`'s `TimeoutLayer`
+bounds only the handler future; response bodies have a separate
+`ResponseBodyTimeoutLayer` that is deliberately not used. Segment downloads,
+export archives, and the open-ended live `stream.mp4` all return headers
+immediately and stream afterwards, so none of them can be cut. The one route
+that legitimately produces for minutes before answering, the on-demand
+DB-vs-disk size verification walk, is mounted outside the timeout for exactly
+that reason.
+
+**Rejected: making the clients wait longer.** Raising the permit counts or the
+wait budgets keeps the failure mode (a request that never answers) and only
+moves the threshold. The clients already treat a failed media fetch as "keep the
+placeholder, poll again", so "busy, retry shortly" is both truthful and the
+behaviour they already handle.
+
+**Rejected: a per-user or per-camera semaphore instead of a global one.** It
+would give fairer degradation, but it multiplies the tuning surface and the
+memory footprint for a system whose realistic worst case is a handful of
+operators. Revisit if a deployment reports one client starving others despite
+the bounded waits.
+
+**Trades knowingly accepted.** Under genuine saturation a scrub thumbnail or a
+wall tile now fails fast instead of eventually arriving; that is the intended
+swap. A camera whose still cannot be fetched is latched for 10 s so subsequent
+polls skip the cold-start retry ladder, which means a camera coming back can be
+up to 10 s late to serve its first still.
+
+**Revisit if:** operators report 503s on the media routes during normal use
+(the budgets or permit counts are too tight), or a deployment large enough to
+need per-principal fairness appears.
+
+---
+
+## 2026-09-07, Filmstrip widths snap to a fixed ladder; export requests are capped
+
+**Context.** The thumbnail width was clamped to 48..640 but otherwise free, and
+it is part of the on-disk cache key, so 593 distinct widths for one instant meant
+593 ffmpeg runs and 593 cache files for what is visually one frame. Separately,
+`POST /export` validated only `start < end`: nothing capped the window, the
+camera count, or duplicates in the camera list, and `filter_camera_ids` is a
+scope filter rather than a de-duplicator (for an admin it returns the list
+verbatim), so `[X, X, X, ...]` ran N sequential full-range encodes all writing
+the same output file with `-y`, counted as one job against
+`EXPORT_MAX_CONCURRENT`.
+
+**Decision.**
+
+- Widths clamp and then snap to `80/160/320/480/640` (nearest, ties down). The
+  buckets are chosen so every width the shipped clients ask for lands on itself:
+  160 (Android and desktop scrub lists), 320 (the Android playback wall), 480
+  (the iOS scrub still, the desktop preview frame, and the `THUMB_PREGEN_WIDTH`
+  default), so no existing or pre-generated cache entry is invalidated.
+- `POST /export` sorts and de-duplicates the camera list, caps it at 50 distinct
+  cameras (the same ceiling `/export/batch` puts on clips, since both fan out to
+  one sequential encode per unit of work), and caps the window with a new
+  `EXPORT_MAX_RANGE_SECONDS` (default 86400, a full day of one camera).
+- Each per-camera encode gets a wall-clock budget derived from the range
+  (4x realtime, floored at 10 minutes, capped at 24 hours) and `kill_on_drop`.
+  A child that wedges now fails the job with a stored error instead of leaving
+  it `Running` forever, which used to consume an `EXPORT_MAX_CONCURRENT` slot
+  permanently until the api was restarted.
+
+**Rejected: quantizing by rounding to a multiple (say 32 px).** It bounds the
+key space too, but it does not guarantee the clients' existing widths are
+fixed points, so the whole warm thumbnail cache (including anything
+pre-generated at 480) would be re-rendered at neighbouring keys on upgrade.
+
+**Rejected: de-duplicating inside `filter_camera_ids`.** That function is the
+RBAC scope filter used by several handlers, including ones that rely on
+comparing the filtered length to the input length to detect a partial-scope
+request. Making it also dedup would silently change those comparisons.
+
+**Rejected: a stall watchdog on ffmpeg progress instead of a wall-clock
+budget.** More precise (it would catch a wedged child in seconds rather than
+hours) and the progress parsing already exists, but it is a larger change to
+the export worker than the failure mode warrants right now.
+
+**Revisit if:** a deployment genuinely exports multi-day ranges and finds the
+default cap or the derived encode budget too tight (both are configurable; the
+budget is not), or if per-camera export throughput makes the 4x realtime factor
+the binding constraint, at which point the stall watchdog becomes the better
+mechanism.
+
+---
+
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
 
 **Context.** #442 introduced value-setting HA controls. Light dimming

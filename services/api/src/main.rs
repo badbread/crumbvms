@@ -95,6 +95,7 @@ mod ffprobe;
 mod filmstrip;
 mod go2rtc;
 mod ha;
+mod media_limits;
 mod metrics;
 mod notifications;
 mod plates;
@@ -462,6 +463,18 @@ async fn main() -> anyhow::Result<()> {
     // touching high-frequency media serving.
     let rate_limiter = rate_limit::RateLimiter::new(240, 4.0);
 
+    // Second, much larger bucket for the media routes. Media serving is
+    // high-frequency by nature (a low-bandwidth wall polls one still per tile
+    // per second; scrubbing fires filmstrip frames in bursts of dozens), so this
+    // is sized with roughly a 6x margin over the busiest real client rather than
+    // as a tight throttle, see `media_limits` for the arithmetic. It is keyed
+    // exactly like the JSON bucket (TCP peer IP, or the first `X-Forwarded-For`
+    // hop under `TRUST_PROXY`).
+    let media_rate_limiter = rate_limit::RateLimiter::new(
+        media_limits::MEDIA_RATE_BURST,
+        media_limits::MEDIA_RATE_REFILL_PER_SEC,
+    );
+
     // JSON/API routes get gzip + a 30s request timeout (bounds DB-heavy endpoints
     // like /timeline + fails slow clients fast). MEDIA routes (segment/video
     // serving, export file downloads, filmstrip JPEGs) are deliberately EXCLUDED:
@@ -526,22 +539,56 @@ async fn main() -> anyhow::Result<()> {
             .merge(updates::routes()),
     );
 
-    let media_routes = Router::new()
-        .merge(playback::routes())
-        .merge(segment_low::routes())
-        .merge(export::routes())
-        .merge(filmstrip::routes())
-        // On-demand DB-vs-disk size verification: a filesystem walk that can run
-        // long on a large archive, so it lives here (no 30 s timeout) not in
-        // json_routes. Admin-gated by its handler's AuthUser extractor.
-        .merge(stats::heavy_routes())
-        // Per-camera JPEG still proxy (authenticated, no gzip, no timeout).
-        .merge(cameras::routes())
-        // Detection snapshot proxy (authenticated via AuthUser — Bearer or a
-        // scoped ?token=; no gzip, no timeout).
-        .merge(events::media_routes())
-        // Clip media: generated clip.mp4 + thumbnail.jpg (authenticated; ?token= ok).
-        .merge(clips::media_routes());
+    // Media routes get their own (much larger) rate-limit bucket plus a
+    // time-to-response bound. Still NO gzip: it would break 206 range requests
+    // and waste CPU on already-compressed video.
+    //
+    // The timeout is safe over streaming media because `tower_http`'s
+    // `TimeoutLayer` bounds only the handler future, NOT the response body
+    // (body deadlines are a separate `ResponseBodyTimeoutLayer`). A segment
+    // download, an export archive, and an open-ended live `stream.mp4` all
+    // return their headers immediately and stream afterwards, so none of them
+    // can be cut. What it does bound is the routes that produce something before
+    // answering, the on-demand clip and low-bitrate transcodes, which is
+    // exactly the case that could otherwise hang a request indefinitely.
+    let media_layers = |r: Router<AppState>| {
+        r.layer(TimeoutLayer::with_status_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            media_limits::MEDIA_RESPONSE_TIMEOUT,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            media_rate_limiter.clone(),
+            rate_limit::rate_limit_mw,
+        ))
+    };
+
+    let media_routes = media_layers(
+        Router::new()
+            .merge(playback::routes())
+            .merge(segment_low::routes())
+            .merge(export::routes())
+            .merge(filmstrip::routes())
+            // Per-camera JPEG still proxy (authenticated, no gzip).
+            .merge(cameras::routes())
+            // Detection snapshot proxy (authenticated via AuthUser — Bearer or a
+            // scoped ?token=; no gzip).
+            .merge(events::media_routes())
+            // Clip media: generated clip.mp4 + thumbnail.jpg (authenticated; ?token= ok).
+            .merge(clips::media_routes()),
+    );
+
+    // On-demand DB-vs-disk size verification: a filesystem walk that can
+    // legitimately run for minutes on a large archive, so it is deliberately
+    // OUTSIDE both timeouts (the 30 s JSON one and the media one). It still
+    // takes the media rate-limit bucket, and it is admin-gated by its handler's
+    // AuthUser extractor.
+    let heavy_routes =
+        Router::new()
+            .merge(stats::heavy_routes())
+            .layer(axum::middleware::from_fn_with_state(
+                media_rate_limiter.clone(),
+                rate_limit::rate_limit_mw,
+            ));
 
     // CORS covers the first argument and deliberately NOT the second (`/auth`).
     // Layers that must cover everything (tracing) go outside the call.
@@ -559,7 +606,8 @@ async fn main() -> anyhow::Result<()> {
             // Prometheus metrics — no auth (no secrets), no rate limit (scraper).
             .merge(metrics::routes())
             .merge(json_routes)
-            .merge(media_routes),
+            .merge(media_routes)
+            .merge(heavy_routes),
         auth_routes,
     )
     // Layers applied outermost-first (LIFO evaluation order in tower).
@@ -989,25 +1037,39 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
 /// the total exceeds `max_bytes`. Complements the age-based TTL sweep in
 /// [`export_ttl_sweeper`]: age caps how long output lingers, this caps how much
 /// accumulates within a TTL window so a burst of large exports can't fill the
-/// disk. A `Running` job is never touched.
+/// disk.
+///
+/// A `Queued`/`Running` job is never *evicted* (its files are still being
+/// written), but its bytes ARE counted against the budget: they are on the same
+/// disk, and ignoring them let the real total sit above `max_bytes` for as long
+/// as jobs kept running. Counting them just makes the sweeper free more finished
+/// output to make room, which is the intended behaviour.
 async fn sweep_export_budget(state: &AppState, max_bytes: u64) {
     let export_root = state.config().export_dir.clone();
-    // Snapshot finished jobs with their creation time and on-disk size.
+    // Snapshot finished jobs with their creation time and on-disk size, and
+    // separately total up what the in-flight jobs are already occupying.
     let mut finished: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>, u64)> = Vec::new();
+    let mut active_bytes: u64 = 0;
     for entry in state.export_jobs() {
         let job = entry.value();
-        if !matches!(
+        let dir = std::path::Path::new(&export_root).join(entry.key().to_string());
+        let size = dir_size_bytes(&dir).await;
+        if matches!(
             job.status,
             dto::ExportStatus::Done | dto::ExportStatus::Failed | dto::ExportStatus::Cancelled
         ) {
-            continue; // never evict a running job
+            finished.push((*entry.key(), job.created_at, size));
+        } else {
+            active_bytes = active_bytes.saturating_add(size);
         }
-        let dir = std::path::Path::new(&export_root).join(entry.key().to_string());
-        let size = dir_size_bytes(&dir).await;
-        finished.push((*entry.key(), job.created_at, size));
     }
 
-    for job_id in plan_export_evictions(finished, max_bytes) {
+    // Shrink the budget the finished jobs get to share by what the in-flight
+    // ones already hold. Saturating to zero means "evict everything finished",
+    // which is the right answer when the live jobs alone are over budget.
+    let finished_budget = max_bytes.saturating_sub(active_bytes);
+
+    for job_id in plan_export_evictions(finished, finished_budget) {
         let dir = std::path::Path::new(&export_root).join(job_id.to_string());
         let removed = match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => true,
