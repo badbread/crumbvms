@@ -215,9 +215,11 @@ pub(crate) fn fmt_date(ts: DateTime<Utc>, style: TimeStyle) -> String {
 pub(crate) fn fmt_time(ts: DateTime<Utc>, style: TimeStyle) -> String {
     match style {
         TimeStyle::Discord => format!("<t:{}:t>", ts.timestamp()),
-        TimeStyle::Slack(tz) => {
-            slack_date(ts, "{time}", &ts.with_timezone(&tz).format("%H:%M:%S").to_string())
-        }
+        TimeStyle::Slack(tz) => slack_date(
+            ts,
+            "{time}",
+            &ts.with_timezone(&tz).format("%H:%M:%S").to_string(),
+        ),
         TimeStyle::Zone(tz) => ts.with_timezone(&tz).format("%H:%M:%S").to_string(),
     }
 }
@@ -1088,7 +1090,10 @@ mod tests {
             map["datetime"],
             "<!date^1768504445^{date_short_pretty} at {time}|2026-01-15 11:14:05 PST>"
         );
-        assert_eq!(map["date"], "<!date^1768504445^{date_short_pretty}|2026-01-15>");
+        assert_eq!(
+            map["date"],
+            "<!date^1768504445^{date_short_pretty}|2026-01-15>"
+        );
         assert_eq!(map["time"], "<!date^1768504445^{time}|11:14:05>");
     }
 
@@ -1115,7 +1120,10 @@ mod tests {
     fn zone_text_renders_in_the_carried_server_zone() {
         let msg = msg_at(at("2026-07-16T02:30:00Z"), LA);
         let text = msg.text_for(time_style_for("ntfy", msg.tz));
-        assert_eq!(text, "[Crumb] Motion on Driveway at 2026-07-15 19:30:00 PDT");
+        assert_eq!(
+            text,
+            "[Crumb] Motion on Driveway at 2026-07-15 19:30:00 PDT"
+        );
     }
 
     #[test]
@@ -1125,7 +1133,10 @@ mod tests {
         msg.kind = "system";
         msg.label = Some("Recorder offline".to_owned());
         msg.template = Some("%event% at %datetime%".to_owned());
-        assert_eq!(msg.text_for(TimeStyle::Discord), "Recorder offline at <t:1768504445:f>");
+        assert_eq!(
+            msg.text_for(TimeStyle::Discord),
+            "Recorder offline at <t:1768504445:f>"
+        );
         assert_eq!(
             msg.text_for(TimeStyle::Zone(LA)),
             "Recorder offline at 2026-01-15 11:14:05 PST"
