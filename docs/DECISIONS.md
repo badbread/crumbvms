@@ -8,6 +8,55 @@ revisit.
 
 ---
 
+## 2026-09-08, Notification times are rendered PER PROVIDER: client-localized markup for Discord and Slack, the server's `TZ` for everyone else
+
+**Context.** Every channel message formatted the event timestamp in UTC with a
+literal "UTC" suffix, in `ChannelMessage::token_map`/`text`. On a phone hours
+away from UTC the alert reads as the wrong time at a glance (issue #628). Stored
+timestamps are UTC and stay that way; the question was only what the outbound
+text should say.
+
+**Decision.** The timestamp style is chosen from the destination's `kind`
+(`channel_notify::TimeStyle`, picked by `time_style_for`). Discord gets
+`<t:UNIX:f>` / `<t:UNIX:t>` / `<t:UNIX:d>`, Slack gets
+`<!date^UNIX^{tokens}|fallback>` with a server-zone fallback string; both are
+markup those providers' own clients resolve against the *viewer's* zone, so one
+alert reads correctly for every recipient regardless of where they are. ntfy,
+Pushover, Telegram, the generic webhook, and any future kind render
+`%Y-%m-%d %H:%M:%S %Z` in the server's `TZ` (resolved once at startup into
+`ApiConfig::server_tz` via `crumb_common::config::server_tz`, threaded into the
+notification engine the same way the go2rtc credentials already are). The
+`%date%`/`%time%`/`%datetime%` template tokens follow the same style, so a
+custom template needs no per-provider variants. The generic webhook's JSON `ts`
+stays a raw UTC instant: it is a machine contract.
+
+**Rejected:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Keep UTC everywhere | Rejected: the reported bug. |
+| 2 | Server `TZ` for every provider, no markup | Rejected: correct for the operator at home, still wrong for anyone reading in another zone, and Discord/Slack already solve that for free. |
+| 3 | A per-user or per-channel timezone setting | Rejected for now: a new setting, a new column, and new console UI to reproduce what the two markup-capable providers do by themselves, for the providers where it would matter least. |
+| 4 | Convert the stored `ts` on write | Rejected outright: the database stays UTC. Recorder and retention correctness depend on it. |
+
+**Trades knowingly accepted:**
+
+- The Discord and Slack messages now contain provider-specific markup, so the
+  raw text is less readable if it is ever inspected outside those clients
+  (Slack's fallback covers this; Discord's does not).
+- The admin console's alert-text preview can only show one style; it shows the
+  server-zone rendering and says so.
+- An operator who never sets `TZ` gets `UTC`, matching the documented
+  `.env.example` contract ("if unset the default is UTC, NOT any local zone").
+
+**Revisit if:** operators in mixed-zone households ask for per-recipient times
+on the non-markup providers (then option 3, hung off the notification rule, not
+off `ChannelMessage`), or a new channel kind arrives that has its own
+client-side timestamp markup (add a `TimeStyle` variant; do not special-case it
+in a dispatcher).
+
+---
+
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
 
 **Context.** #442 introduced value-setting HA controls. Light dimming

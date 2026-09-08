@@ -198,6 +198,7 @@ async fn non_admin_channel_without_view_plates_gets_no_plate_watchlist_hit() {
         &mut seen,
         &mut cooldown,
         &maint,
+        chrono_tz::Tz::UTC,
     )
     .await;
 
