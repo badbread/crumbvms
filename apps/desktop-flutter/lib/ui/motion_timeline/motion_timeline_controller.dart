@@ -13,6 +13,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
+import '../../api/bookmarks_api.dart';
 import '../../api/crumb_api.dart';
 import '../../api/models.dart';
 import '../../api/motion_timeline_api.dart';
@@ -141,6 +142,10 @@ class MotionTimelineController extends ChangeNotifier {
   final Map<String, IntensityBuckets> intensityByCam = {};
   List<DetectionEvent> detections = const [];
 
+  /// Bookmarks on the loaded cameras (#616) — painted as gold markers at the
+  /// top of the strip, matching Android/iOS. The painter clips to the window.
+  List<Bookmark> bookmarks = const [];
+
   bool loading = false;
   String? error;
 
@@ -226,6 +231,7 @@ class MotionTimelineController extends ChangeNotifier {
     if (camIds.isEmpty) {
       intensityByCam.clear();
       detections = const [];
+      bookmarks = const [];
       _fetchingSig = null;
       _loadedSig = null;
       notifyListeners();
@@ -281,6 +287,21 @@ class MotionTimelineController extends ChangeNotifier {
       // Motion events are already rendered as the intensity ribbon; showing
       // each as a glyph too would flood the row. Object detections only.
       detections = events.where((e) => e.iconKey.isNotEmpty && e.iconKey != 'motion').toList();
+
+      // Bookmarks (#616): gold markers on the strip, parity with Android/iOS.
+      // The server filters bookmarks by camera only (no time range) and they
+      // are sparse, so fetch the caller's full set once and keep those on the
+      // loaded cameras; the painter clips to the visible window. Guarded on its
+      // own so a bookmarks failure (e.g. the platform-wide toggle is off) can
+      // never blank the intensity/detection data that just loaded.
+      try {
+        final all = await api.listBookmarks(session);
+        if (mySeq != _seq) return;
+        bookmarks = all.where((b) => camIds.contains(b.cameraId)).toList();
+      } catch (_) {
+        if (mySeq != _seq) return;
+        bookmarks = const [];
+      }
 
       // Record what's now loaded and clear the in-flight marker. Superseded
       // fetches returned above without touching these, so the newest fetch owns
