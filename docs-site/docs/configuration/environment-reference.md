@@ -32,7 +32,7 @@ others are mechanical; see [Secrets](/configuration/secrets) for the list.
 
 | Key | Default | Notes |
 |---|---|---|
-| `TZ` | `UTC` | Local wall-clock for the whole stack: quiet hours, the nightly DB backup schedule (`DB_BACKUP_SCHEDULE`), the offsite-sync cron, and every log timestamp. Set an IANA name like `America/Los_Angeles` or `Europe/Berlin`. `setup-env.sh` detects the host's zone and writes it; if it can't, the compose default is `UTC` (not any local zone), so the clock is at least predictable. |
+| `TZ` | `UTC` | Local wall-clock for the whole stack: quiet hours, the nightly DB backup schedule (`DB_BACKUP_SCHEDULE`), the offsite-sync cron, every log timestamp, and the event times in notifications sent to providers that cannot localize them themselves (ntfy, Pushover, Telegram, the generic webhook; Discord and Slack render in each viewer's own zone instead). Set an IANA name like `America/Los_Angeles` or `Europe/Berlin`. `setup-env.sh` detects the host's zone and writes it; if it can't, the compose default is `UTC` (not any local zone), so the clock is at least predictable. |
 | `RECORDER_TZ` | inherits `TZ` | IANA zone the recorder's per-camera archive-schedule cron runs in. Unset or empty means it inherits `TZ` above, which is what you want; set it only to run archive schedules in a different zone than the rest of the stack. A value that fails to parse is logged loudly and falls back rather than stopping the recorder. |
 
 ## PostgreSQL

@@ -868,6 +868,7 @@ async fn test_channel(
         template: None,
         title_template: None,
         meta: None,
+        tz: state.config().server_tz,
     };
 
     match channel_notify::dispatch(&http, &ch, &msg).await {
@@ -1099,11 +1100,16 @@ const ENGINE_BATCH: i64 = 200;
 /// engine task owns only a `Pool` (not `AppState`/`ApiConfig`), so the
 /// credentials are threaded in explicitly from `main.rs` rather than cloning
 /// the whole config.
+///
+/// `server_tz` is the server's local wall-clock zone (`ApiConfig::server_tz`,
+/// resolved once from `TZ`), threaded in the same way. Alerts sent to providers
+/// with no client-side timestamp markup render their times in it.
 pub async fn run_notification_engine(
     pool: Pool,
     go2rtc_user: String,
     go2rtc_pass: String,
     maintenance_until: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    server_tz: chrono_tz::Tz,
 ) {
     // Initialise to "now" so we don't replay history on startup.
     let mut last_ts: DateTime<Utc> = Utc::now();
@@ -1156,6 +1162,7 @@ pub async fn run_notification_engine(
             &mut sys_seen_ids,
             &mut sys_cooldown_map,
             &maintenance_until,
+            server_tz,
         )
         .await;
 
@@ -1777,6 +1784,7 @@ pub async fn run_notification_engine(
                         template: None,
                         title_template: None,
                         meta: None,
+                        tz: server_tz,
                     };
 
                     let (status, reason) = match channel_notify::dispatch(&http_client, ch, &msg)
@@ -1942,6 +1950,10 @@ fn meta_plate_bbox(meta: Option<&JsonValue>) -> Option<[f64; 4]> {
 // `pub(crate)` (not private) purely so the RBAC-fan-out integration test can
 // drive a single tick directly — it stays crate-internal (no public API
 // surface; the api is a binary-only crate).
+//
+// `server_tz` is the zone alerts render their times in for providers with no
+// client-side timestamp markup; it is passed in rather than read from the
+// environment so a test can pin it.
 pub(crate) async fn dispatch_system_events_tick(
     pool: &Pool,
     http_client: &reqwest::Client,
@@ -1949,6 +1961,7 @@ pub(crate) async fn dispatch_system_events_tick(
     seen_ids: &mut std::collections::HashSet<Uuid>,
     cooldown_map: &mut HashMap<(String, Uuid), Instant>,
     maintenance_until: &std::sync::atomic::AtomicI64,
+    server_tz: chrono_tz::Tz,
 ) {
     let events = match db::system_events_since(pool, *last_ts, ENGINE_BATCH).await {
         Ok(e) => e,
@@ -2242,6 +2255,7 @@ pub(crate) async fn dispatch_system_events_tick(
                 template: Some(message_template.clone()),
                 title_template: title_template.clone(),
                 meta: event.meta.clone(),
+                tz: server_tz,
             };
 
             let (status, reason) = match channel_notify::dispatch(http_client, ch, &msg).await {

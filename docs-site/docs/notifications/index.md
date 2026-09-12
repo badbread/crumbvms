@@ -26,6 +26,18 @@ more useful of the two). Slack and the plain webhook cannot attach an image
 over their transport, so they send text and a link only; the console shows the
 choices a given provider can honor.
 
+### Times in alerts
+
+Discord and Slack understand timestamp markup that their own apps render in
+whoever is reading's timezone, so a Crumb alert opened on a phone abroad still
+shows the right local time. Crumb uses it for those two. ntfy, Pushover,
+Telegram and the plain webhook have no equivalent, so their alerts show the
+server's timezone (the `TZ` setting, the same one quiet hours and the nightly
+backup use) with the zone abbreviation on the end, for example
+`2026-01-15 11:14:05 PST`. The `%date%`, `%time%` and `%datetime%` tokens in a
+custom alert template follow exactly the same rule, per destination. Recorded
+event times themselves are always stored in UTC; only the display changes.
+
 ## Rules
 
 Per-camera rules control which cameras notify, and when, including quiet
