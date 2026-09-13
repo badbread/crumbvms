@@ -35,6 +35,13 @@ object TimelineColors {
     val grid = Color(0xFF33363F)           // hour/tick gridlines
     val bookmark = Color(0xFFF5C518)       // saved-bookmark markers (gold)
 
+    // Export in/out bracket ("mark for export"). Same amber family as the
+    // playhead, so the selection reads as an operator mark rather than data:
+    // a translucent fill for the region and a solid handle at each edge.
+    // Matches the iOS client's TLColors.exportFill / exportHandle.
+    val exportFill = Color(0x38E8A33D)     // ~22% amber wash over the selected region
+    val exportHandle = Color(0xFFE8A33D)   // solid amber edge handles
+
     // Detection-event icon colors (per icon_key, mirroring desktop + web clients).
     val eventPerson = Color(0xFF34AADC)    // blue circle
     val eventVehicle = Color(0xFFFF9500)   // amber square

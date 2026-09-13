@@ -12,6 +12,7 @@ import video.crumb.app.data.CrumbRepository
 import video.crumb.app.data.isNotFound
 import video.crumb.app.data.runCatchingCancellable
 import video.crumb.app.data.toUserMessage
+import video.crumb.app.feature.export.ExportRange
 import video.crumb.app.ui.Time
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -126,7 +127,26 @@ data class PlaybackUiState(
      * events exist. The timeline icon layer is invisible when this list is empty.
      */
     val detectionEvents: List<DetectionEvent> = emptyList(),
-)
+    /**
+     * Raw IN edge of the export bracket ("mark for export"), epoch-millis, or null
+     * when nothing is marked. Held exactly as the operator placed it and ordered
+     * only when read ([ExportRange.normalize]) so dragging one handle past the
+     * other never swaps which handle the finger is holding — the same model the
+     * desktop timeline controller and the iOS timeline use.
+     */
+    val exportSelStartMs: Long? = null,
+    /** Raw OUT edge of the export bracket, epoch-millis, or null. */
+    val exportSelEndMs: Long? = null,
+) {
+    /** True once BOTH edges are marked and the range is long enough to export. */
+    val hasExportSelection: Boolean
+        get() {
+            val s = exportSelStartMs ?: return false
+            val e = exportSelEndMs ?: return false
+            val (a, b) = ExportRange.normalize(s, e)
+            return ExportRange.isValid(a, b)
+        }
+}
 
 private val SPEED_STEPS = listOf(0.5f, 1f, 2f, 4f, 8f)
 private const val DEFAULT_WINDOW_HOURS = 6L
@@ -1128,6 +1148,48 @@ class PlaybackViewModel(
     /** Clear a transient error so the UI can retry. */
     fun clearError() {
         _state.update { it.copy(error = null) }
+    }
+
+    // ─── export in/out bracket ──────────────────────────────────────────────
+
+    /**
+     * Place one edge of the export bracket. The missing edge is seeded from the
+     * playhead so a range is visible as soon as the first mark lands, and a mark
+     * is clamped to "now" because there is no footage in the future. Mirrors the
+     * desktop `pbSetExportEdge` and iOS `setExportEdge`.
+     */
+    fun setExportEdge(isStart: Boolean, epochMs: Long) {
+        _state.update { s ->
+            val (start, end) = ExportRange.setEdge(
+                currentStart = s.exportSelStartMs,
+                currentEnd = s.exportSelEndMs,
+                isStart = isStart,
+                ms = epochMs,
+                playheadMs = s.playheadMs,
+                nowMs = Instant.now().toEpochMilli(),
+            )
+            s.copy(exportSelStartMs = start, exportSelEndMs = end)
+        }
+    }
+
+    /** Mark IN at the current playhead (touch equivalent of the desktop shift-drag). */
+    fun markExportIn() = setExportEdge(isStart = true, epochMs = _state.value.playheadMs)
+
+    /** Mark OUT at the current playhead. */
+    fun markExportOut() = setExportEdge(isStart = false, epochMs = _state.value.playheadMs)
+
+    fun clearExportSelection() {
+        _state.update { it.copy(exportSelStartMs = null, exportSelEndMs = null) }
+    }
+
+    /**
+     * The range an Export hand-off should carry: the bracketed selection when one
+     * exists, otherwise the hour ending at the playhead (the prior default, and
+     * what iOS `exportRange()` falls back to).
+     */
+    fun exportRange(): Pair<Long, Long> {
+        val s = _state.value
+        return ExportRange.forExport(s.exportSelStartMs, s.exportSelEndMs, s.playheadMs)
     }
 
     override fun onCleared() {

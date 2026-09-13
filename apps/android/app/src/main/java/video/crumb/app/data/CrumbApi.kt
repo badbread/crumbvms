@@ -181,6 +181,14 @@ interface CrumbApi {
     suspend fun exportStatus(@Path("job_id") jobId: String): ExportJob
 
     /**
+     * Cancel a queued/running export job. The server aborts ffmpeg, cleans the
+     * partial output up, and answers `204 No Content`; cancelling an already
+     * terminal job is an idempotent success, so this never needs a status guard.
+     */
+    @DELETE("export/{job_id}")
+    suspend fun cancelExport(@Path("job_id") jobId: String): Response<Unit>
+
+    /**
      * Fetch detection events for one or more cameras over a time window.
      *
      * Returns an empty [DetectionEventsResponse] when the detection plugin is

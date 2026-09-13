@@ -39,6 +39,7 @@ import video.crumb.app.feature.auth.LoginScreen
 import video.crumb.app.feature.auth.biometricAvailability
 import video.crumb.app.feature.auth.showBiometricPrompt
 import video.crumb.app.feature.clips.ClipsScreen
+import video.crumb.app.feature.export.ExportRange
 import video.crumb.app.feature.export.ExportScreen
 import video.crumb.app.feature.live.LiveFullscreenScreen
 import video.crumb.app.feature.live.LiveScreen
@@ -307,8 +308,16 @@ private fun CrumbNavHost() {
                     )
                 },
                 onOpenBookmarks = { navController.navigate(Routes.BOOKMARKS) },
-                onOpenExport = {
-                    if (store.isAdmin || caps.export) navController.navigate(Routes.EXPORT)
+                // Seed Export with the wall's current time: the hour ending at the
+                // scrub cursor (or at "now" when the wall is parked at Latest). The
+                // wall has no single focused camera, so nothing is pre-selected.
+                onOpenExport = { cursorMs ->
+                    if (store.isAdmin || caps.export) {
+                        val end = if (cursorMs > 0L) cursorMs else System.currentTimeMillis()
+                        navController.navigate(
+                            Routes.export(startMs = end - ExportRange.FALLBACK_WINDOW_MS, endMs = end),
+                        )
+                    }
                 },
                 onOpenClips = {
                     if (store.isAdmin || caps.clips) navigateTab(Routes.CLIPS)
@@ -346,11 +355,39 @@ private fun CrumbNavHost() {
                 initialCameraId = cameraId,
                 initialTimeMs = startMs,
                 onBack = { navController.popBackStack() },
+                // Hand the marked in/out bracket (or the hour ending at the
+                // playhead) to Export, pre-filled with the camera being reviewed.
+                onOpenExport = { camId, exportStartMs, exportEndMs ->
+                    navController.navigate(Routes.export(camId, exportStartMs, exportEndMs))
+                },
             )
         }
 
-        composable(Routes.EXPORT) {
-            ExportScreen(onBack = { navController.popBackStack() })
+        // Export, optionally seeded with a camera + clip window by the entry point
+        // (playback's in/out bracket, or the playback wall's scrub cursor).
+        composable(
+            route = Routes.EXPORT,
+            arguments = listOf(
+                navArgument(Routes.ARG_CAMERA_ID) {
+                    type = NavType.StringType
+                    defaultValue = ""
+                },
+                navArgument(Routes.ARG_START_MS) {
+                    type = NavType.LongType
+                    defaultValue = 0L
+                },
+                navArgument(Routes.ARG_END_MS) {
+                    type = NavType.LongType
+                    defaultValue = 0L
+                },
+            ),
+        ) { entry ->
+            ExportScreen(
+                seedCameraId = entry.arguments?.getString(Routes.ARG_CAMERA_ID).orEmpty(),
+                seedStartMs = entry.arguments?.getLong(Routes.ARG_START_MS) ?: 0L,
+                seedEndMs = entry.arguments?.getLong(Routes.ARG_END_MS) ?: 0L,
+                onBack = { navController.popBackStack() },
+            )
         }
 
         // Clips tab — a thumbnail grid of detection + motion clips with tap-to-play.
