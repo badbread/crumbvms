@@ -535,6 +535,12 @@ All wizard steps have API equivalents. Do them in order:
    gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
 2. **Server address.** `PUT /config/server` with the host's **LAN** address
    (`server_address`, `crumb_rtsp_base`, …). Use the LAN IP, never a public one.
+   `crumb_rtsp_base` is **client-facing only**: it is the address native desktop
+   and phone apps are told to pull streams from, so it must be reachable from
+   those devices. The recorder does not use it, it dials its own embedded go2rtc
+   at `rtsp://127.0.0.1:8554` (issue #630; `CRUMB_GO2RTC_LOOPBACK_PORT` if you
+   changed `rtsp.listen` in `go2rtc/go2rtc.yaml`), so you cannot break recording
+   with this field.
    The PUT merges: send only the keys you are setting, and every other column
    keeps its stored value. (Sending a key as `""` is an explicit clear that falls
    the setting back to its container-environment default, so do not pad the body

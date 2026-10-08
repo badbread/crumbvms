@@ -10015,6 +10015,50 @@ pub fn inject_rtsp_credentials(base: &str, user: &str, pass: &str) -> String {
 ///   (MSE/WebRTC/frame-proxy, port :1984), seeded from `GO2RTC_API_BASE`.
 /// * `frigate_http_api` — the Frigate HTTP detection API (events/snapshots,
 ///   port :5000), seeded from `FRIGATE_API_BASE`.
+/// Which process is running the `server_settings` bootstrap (issue #630).
+///
+/// `ensure_server_settings_table` backfills every EMPTY column from the running
+/// process's env on EVERY start, and the api and the recorder both embed it.
+/// `crumb_rtsp_base` is the one column where that is wrong: the column means
+/// "the address native clients are given", while the recorder's
+/// `CRUMB_GO2RTC_RTSP_BASE` means "where the recorder dials go2rtc" (loopback,
+/// `rtsp://localhost:8554` in the shipped compose). They are different facts
+/// that only share a name, so the first recorder restart after the column was
+/// emptied used to write loopback into it, and every camera on every client
+/// went to "Reconnecting" while recorded playback kept working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSeedRole {
+    /// The api: the process that hands `crumb_rtsp_base` to native clients, so
+    /// its env value for that column is a client-facing fallback.
+    Api,
+    /// The recorder: its `CRUMB_GO2RTC_RTSP_BASE` is an internal dial address
+    /// and never seeds the client-facing column.
+    Recorder,
+}
+
+/// What this process may seed into `server_settings.crumb_rtsp_base`.
+///
+/// Returns `""` (seed nothing, leaving the column at whatever it already holds)
+/// when the running process is the recorder, or when the candidate value is a
+/// loopback address: handing a client `rtsp://localhost:8554` points it at
+/// ITSELF. Only a routable, client-facing value is ever seeded.
+///
+/// A fresh install still ends up with a working value: the first-run wizard
+/// suggests one from the `Host` header the operator reached the console on
+/// (`/auth/setup-status` → `suggested_rtsp_base`) and writes it through
+/// `PUT /config/server`, which is unaffected by this function.
+#[must_use]
+pub fn client_rtsp_base_seed(role: SettingsSeedRole, candidate: &str) -> String {
+    if role == SettingsSeedRole::Recorder {
+        return String::new();
+    }
+    let v = candidate.trim();
+    if v.is_empty() || crate::rtsp_base::host_is_loopback(v) {
+        return String::new();
+    }
+    v.to_owned()
+}
+
 fn server_settings_env_seed() -> (String, String, String, String, String, String, String) {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     let crumb_rtsp = env("CRUMB_GO2RTC_RTSP_BASE").unwrap_or_default();
@@ -10094,7 +10138,7 @@ fn server_settings_from_row(row: &tokio_postgres::Row) -> ServerSettings {
 /// # Errors
 ///
 /// Returns an error if the DDL or UPSERT fails.
-pub async fn ensure_server_settings_table(pool: &Pool) -> Result<()> {
+pub async fn ensure_server_settings_table(pool: &Pool, role: SettingsSeedRole) -> Result<()> {
     let client = get_conn(pool).await?;
     // Create table and the two new split-columns from 0014 if absent.  This is a
     // best-effort shim: migrations may not have run yet on this boot, so we add
@@ -10127,13 +10171,27 @@ pub async fn ensure_server_settings_table(pool: &Pool) -> Result<()> {
 
     let (
         server_address,
-        crumb_rtsp,
+        crumb_rtsp_env,
         crumb_api,
         frigate_rtsp,
         frigate_api,
         frigate_go2rtc_api,
         frigate_http_api,
     ) = server_settings_env_seed();
+
+    // #630: `crumb_rtsp_base` is client-facing, so only the api may seed it, and
+    // only with a routable address. Everything else about this bootstrap is
+    // unchanged.
+    let crumb_rtsp = client_rtsp_base_seed(role, &crumb_rtsp_env);
+    if crumb_rtsp.is_empty() && !crumb_rtsp_env.trim().is_empty() {
+        tracing::debug!(
+            ?role,
+            candidate = %crate::redact::redact_url_credentials(crumb_rtsp_env.trim()),
+            "not seeding server_settings.crumb_rtsp_base from CRUMB_GO2RTC_RTSP_BASE: that \
+             column is the address native clients are given, this value is an internal dial \
+             address"
+        );
+    }
 
     // UPSERT with COALESCE-on-empty: INSERT the row if absent; if it already
     // exists (e.g. inserted by migration 0012 with all-empty fields), update
@@ -10154,7 +10212,20 @@ pub async fn ensure_server_settings_table(pool: &Pool) -> Result<()> {
                 frigate_rtsp_base      = CASE WHEN server_settings.frigate_rtsp_base      = '' THEN EXCLUDED.frigate_rtsp_base      ELSE server_settings.frigate_rtsp_base      END,
                 frigate_api_base       = CASE WHEN server_settings.frigate_api_base       = '' THEN EXCLUDED.frigate_api_base       ELSE server_settings.frigate_api_base       END,
                 frigate_go2rtc_api_base = CASE WHEN server_settings.frigate_go2rtc_api_base = '' THEN EXCLUDED.frigate_go2rtc_api_base ELSE server_settings.frigate_go2rtc_api_base END,
-                frigate_http_api_base  = CASE WHEN server_settings.frigate_http_api_base  = '' THEN EXCLUDED.frigate_http_api_base  ELSE server_settings.frigate_http_api_base  END
+                frigate_http_api_base  = CASE WHEN server_settings.frigate_http_api_base  = '' THEN EXCLUDED.frigate_http_api_base  ELSE server_settings.frigate_http_api_base  END,
+                updated_at             = now()
+            -- #630: only rewrite the row when this backfill actually changes
+            -- something, so `updated_at` stays honest. Without this the upsert
+            -- ran on every process start, left `updated_at` at its old value,
+            -- and a row that had been rewritten minutes ago still showed a
+            -- timestamp from weeks earlier.
+            WHERE (server_settings.server_address          = '' AND EXCLUDED.server_address          <> '')
+               OR (server_settings.crumb_rtsp_base         = '' AND EXCLUDED.crumb_rtsp_base         <> '')
+               OR (server_settings.crumb_api_base          = '' AND EXCLUDED.crumb_api_base          <> '')
+               OR (server_settings.frigate_rtsp_base       = '' AND EXCLUDED.frigate_rtsp_base       <> '')
+               OR (server_settings.frigate_api_base        = '' AND EXCLUDED.frigate_api_base        <> '')
+               OR (server_settings.frigate_go2rtc_api_base = '' AND EXCLUDED.frigate_go2rtc_api_base <> '')
+               OR (server_settings.frigate_http_api_base   = '' AND EXCLUDED.frigate_http_api_base   <> '')
             ",
             &[
                 &server_address,
@@ -13089,6 +13160,51 @@ pub async fn system_events_since(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #630: the client-facing column is never seeded with a dial address ──
+
+    /// The durability bug: the recorder's `CRUMB_GO2RTC_RTSP_BASE` is loopback
+    /// in the shipped compose, and the bootstrap wrote it into the column the
+    /// api hands to clients on the first recorder restart after the column was
+    /// emptied. The recorder now seeds nothing there.
+    #[test]
+    fn recorder_never_seeds_the_client_facing_rtsp_base() {
+        for candidate in [
+            "rtsp://localhost:8554",   // the shipped recorder default
+            "rtsp://192.0.2.50:18554", // an operator "seatbelt" value
+            "",
+        ] {
+            assert_eq!(
+                client_rtsp_base_seed(SettingsSeedRole::Recorder, candidate),
+                "",
+                "the recorder must not seed crumb_rtsp_base from `{candidate}`"
+            );
+        }
+    }
+
+    /// The api still carries an env-configured, client-reachable value over, so
+    /// an existing install that relies on the env seed keeps working.
+    #[test]
+    fn api_seeds_a_routable_client_facing_rtsp_base() {
+        assert_eq!(
+            client_rtsp_base_seed(SettingsSeedRole::Api, "rtsp://192.0.2.50:18554"),
+            "rtsp://192.0.2.50:18554"
+        );
+        // Surrounding whitespace is trimmed, not treated as a value.
+        assert_eq!(client_rtsp_base_seed(SettingsSeedRole::Api, "   "), "");
+    }
+
+    /// Belt and braces: even from the api, a loopback candidate is refused. A
+    /// client handed `rtsp://localhost:8554` dials itself.
+    #[test]
+    fn a_loopback_candidate_is_never_seeded_by_either_role() {
+        for role in [SettingsSeedRole::Api, SettingsSeedRole::Recorder] {
+            for candidate in ["rtsp://localhost:8554", "rtsp://127.0.0.1:8554", "rtsp://[::1]:8554"]
+            {
+                assert_eq!(client_rtsp_base_seed(role, candidate), "");
+            }
+        }
+    }
 
     /// The `*_STORAGE_NAME` code defaults were realigned onto the compose
     /// values (`Live` / `Archive`). On a compose install nothing changes, but a

@@ -8,6 +8,96 @@ revisit.
 
 ---
 
+## 2026-10-08, `server_settings.crumb_rtsp_base` is CLIENT-FACING ONLY; the recorder dials its embedded go2rtc over loopback, and the bootstrap no longer seeds that column from the recorder's env
+
+**Context.** One column was serving two audiences that need different values
+(issue #630). The api hands `crumb_rtsp_base` to native clients, so it has to be
+an address a phone can dial. The recorder read the same column for its own
+ffmpeg workers, and go2rtc is embedded in the recorder container, so every
+camera byte left the container through the host's published RTSP port and came
+back in through the bridge NAT: measured at roughly 1.74 TB/day of container
+`eth0` against about 1.08 TB/day of real ingest, with `lo` essentially idle. The
+shipped `go2rtc/go2rtc.yaml` already claimed the recorder connected over
+loopback and rode go2rtc's loopback auth exemption. It did not.
+
+The configuration-only workaround (leave the column empty so each consumer falls
+back to its own env) held for 25 days and then failed on a host reboot:
+`ensure_server_settings_table` runs on every process start in BOTH services and
+backfills any empty column from that process's env, and the recorder's
+`CRUMB_GO2RTC_RTSP_BASE` is `rtsp://localhost:8554` in the shipped compose. The
+recorder therefore wrote loopback into the client-facing column, every camera on
+every client showed "Reconnecting", and recorded playback kept working, which
+reads like a client bug.
+
+**Decision.** Split the two audiences in code, in three parts.
+
+1. The recorder's base resolution moved to `crumb_common::rtsp_base`. When
+   go2rtc is embedded (`GO2RTC_EMBEDDED` is anything but `false`, the default)
+   the crumb base is `rtsp://127.0.0.1:<port>` and
+   `server_settings.crumb_rtsp_base` is ignored entirely, operator-set or not.
+   The port is `DEFAULT_EMBEDDED_RTSP_PORT` (8554, what the shipped
+   `go2rtc.yaml` binds), overridable with `CRUMB_GO2RTC_LOOPBACK_PORT`. With
+   `GO2RTC_EMBEDDED=false` the existing order stands: the DB column, then
+   `CRUMB_GO2RTC_RTSP_BASE`, then `GO2RTC_RTSP_BASE`. The `GO2RTC_EMBEDDED`
+   parse now lives once, in `crumb_common::config::go2rtc_embedded`, shared with
+   the supervisor in `go2rtc_embed.rs`, so the two can never disagree.
+2. That module is the ONLY recorder-side resolver. `recording.rs` and
+   `motion.rs` had each grown a copy and they had diverged: the motion copy fell
+   straight back to `GO2RTC_RTSP_BASE`, the FRIGATE base on a split install, so
+   with the column empty a Crumb-served camera's motion sub-stream was opened
+   against Frigate's go2rtc.
+3. `ensure_server_settings_table` takes a `SettingsSeedRole`. The recorder never
+   seeds `crumb_rtsp_base`, and even from the api a loopback candidate is
+   refused, because a client handed `rtsp://localhost:8554` dials itself. Every
+   other column still seeds from either process exactly as before. A fresh
+   install is unaffected: the first-run wizard suggests the value from the Host
+   header (`/auth/setup-status` → `suggested_rtsp_base`) and writes it through
+   `PUT /config/server`.
+
+The bootstrap upsert also gained `updated_at = now()` plus a `WHERE` clause that
+fires only when the backfill actually changes a column. Before, the row was
+rewritten on every process start while `updated_at` stayed put, so a value
+written minutes ago still showed a timestamp from weeks earlier. Now an
+untouched row is genuinely untouched and a changed row says when.
+
+**Rejected:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Find one value that works for both audiences | Rejected: none exists. An address a phone can reach is never the address the recorder should dial for a restreamer inside its own container. |
+| 2 | A second DB column for the recorder's base | Rejected: a schema change, a new admin field, and a new way to misconfigure recording, to express a value that is derivable with certainty whenever go2rtc is embedded. |
+| 3 | Rename the recorder's env var (for example `CRUMB_GO2RTC_DIAL_BASE`) so the two facts stop sharing a name | Rejected for now: after part 1 the recorder ignores that var on the default path entirely, so the collision is moot in practice, and renaming would silently strip the escape hatch from an existing `GO2RTC_EMBEDDED=false` install that already sets it. If the var ever grows a third meaning, revisit. |
+| 4 | Parse the port out of `go2rtc/go2rtc.yaml`'s `rtsp.listen` | Rejected: `crumb-common` would have to read a recorder-container path and hand-parse YAML whose values can be `${VAR}` placeholders, and a parse failure would land on the recording path. A documented constant plus an override cannot fail that way. |
+| 5 | Derive the loopback port from `CRUMB_GO2RTC_RTSP_BASE` instead of a new var | Rejected, and it is the dangerous option: the issue recommends operators pin that var to the client-reachable address as a seatbelt, which carries the HOST-published port (18554), and nothing listens on 18554 inside the container. That would stop recording rather than waste bandwidth. |
+| 6 | Change the non-embedded order to env-before-column, as the issue's suggested fix lists | Not taken: that is not today's order, and the repo-wide precedence is that an admin-set DB value wins over env with an empty value falling back to env. The escape hatch is intact either way, so the behavior-preserving order was kept. |
+| 7 | Keep the hairpin and only fix the documentation | Rejected: doubling container network I/O for the whole fleet, continuously, also makes capacity planning from container graphs impossible and leaves recording dependent on the host address staying reachable from inside the container. |
+
+**Trades knowingly accepted:**
+
+- An install that leaves `GO2RTC_EMBEDDED` at its default while actually running
+  go2rtc elsewhere now dials loopback and finds nothing. That install was
+  already running a second, Crumb-supervised go2rtc in the recorder container;
+  the fix is the documented `GO2RTC_EMBEDDED=false`.
+- An operator who changes `rtsp.listen` in `go2rtc.yaml` must also set
+  `CRUMB_GO2RTC_LOOPBACK_PORT`. The default is the shipped port, and both places
+  now say so.
+- On a compose install where the api's `CRUMB_GO2RTC_RTSP_BASE` is empty, the
+  client-facing column is no longer pre-seeded with anything, so it stays empty
+  until the wizard (or `PUT /config/server`) sets it. It used to be pre-seeded
+  with the recorder's loopback value, which was worse than empty.
+- The recorder's RTSP connection to its own go2rtc is now exempt from auth
+  (go2rtc exempts true loopback peers). Credential injection is unchanged on
+  that path, the credentials are simply ignored, and nothing about how clients
+  authenticate moved.
+
+**Revisit if:** go2rtc gains a way to express "this listener is internal only"
+that Crumb could consume directly, or the recorder ever needs to reach a
+restreamer in a sibling container on the compose network while
+`GO2RTC_EMBEDDED` is still true (then the posture needs a third state, not a
+reinterpretation of the column).
+
+---
+
 ## 2026-09-08, Notification times are rendered PER PROVIDER: client-localized markup for Discord and Slack, the server's `TZ` for everyone else
 
 **Context.** Every channel message formatted the event timestamp in UTC with a

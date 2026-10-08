@@ -58,7 +58,11 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       # Stream bases are fallbacks; the live values come from admin "Server & streaming" settings.
+      # Only used when GO2RTC_EMBEDDED=false. With go2rtc embedded (the default)
+      # the recorder dials rtsp://127.0.0.1:8554 regardless (#630); override that
+      # port with CRUMB_GO2RTC_LOOPBACK_PORT if you edit go2rtc/go2rtc.yaml.
       CRUMB_GO2RTC_RTSP_BASE: ${CRUMB_GO2RTC_RTSP_BASE:-rtsp://localhost:8554}
+      CRUMB_GO2RTC_LOOPBACK_PORT: ${CRUMB_GO2RTC_LOOPBACK_PORT:-}  # only if you changed go2rtc.yaml's rtsp.listen
       CRUMB_GO2RTC_API_BASE: ${CRUMB_GO2RTC_API_BASE:-http://localhost:1984}
       GO2RTC_USER: ${GO2RTC_USER:?GO2RTC_USER is required (run scripts/setup-env.sh)}
       GO2RTC_PASS: ${GO2RTC_PASS:?GO2RTC_PASS is required (run scripts/setup-env.sh)}
@@ -141,6 +145,9 @@ services:
       JWT_EXPIRY_SECONDS: ${JWT_EXPIRY_SECONDS:-86400}
       API_BIND: ${API_BIND:-0.0.0.0:8080}
       CRUMB_GO2RTC_API_BASE: ${CRUMB_GO2RTC_API_BASE:-http://recorder:1984}   # embedded go2rtc REST (internal)
+      # Client-facing fallback: the address native apps are told to pull from
+      # when server_settings.crumb_rtsp_base is empty. The admin console's value
+      # wins over this.
       CRUMB_GO2RTC_RTSP_BASE: ${CRUMB_GO2RTC_RTSP_BASE:-}
       GO2RTC_RTSP_BASE: ${GO2RTC_RTSP_BASE:-}
       GO2RTC_API_BASE: ${GO2RTC_API_BASE:-}

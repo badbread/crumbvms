@@ -202,7 +202,14 @@ async fn main() -> anyhow::Result<()> {
     // ── server/streaming settings singleton ───────────────────────────────────
     // Ensures the `server_settings` row (id=1) exists, seeded from env vars on
     // first creation.  After that the DB is authoritative.
-    if let Err(e) = crumb_common::db::ensure_server_settings_table(&pool).await {
+    // #630: the api seeds the client-facing `crumb_rtsp_base`; the recorder
+    // (whose env value for it is an internal dial address) does not.
+    if let Err(e) = crumb_common::db::ensure_server_settings_table(
+        &pool,
+        crumb_common::db::SettingsSeedRole::Api,
+    )
+    .await
+    {
         tracing::warn!(
             error = %e,
             "ensure_server_settings_table failed (Server & streaming settings may be unavailable)"
