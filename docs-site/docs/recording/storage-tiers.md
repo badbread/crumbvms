@@ -24,6 +24,18 @@ is accepted as long as its parent is a reachable directory. The recorder
 creates the directory (and the per-camera subdirectories under it) on its
 first write.
 
+Each location needs its own folder. A path that is the same folder as another
+location, sits inside another location's folder, or contains one (for example
+the media root itself, or an archive folder inside the live folder) is
+refused, because the two locations would see each other's recordings as stray
+files. Sibling folders such as `/data/live` and `/data/archive` are fine.
+
+Once a location holds recordings its folder can no longer be edited:
+recordings are stored relative to that folder, so changing it would make them
+disappear from playback. To move footage to a different disk, add the new
+folder as a separate location and use **Change storage…** on the recording
+profile, which copies and verifies every recording before switching it over.
+
 ## How footage moves between tiers
 
 When a policy has an archive tier configured, footage moves there on the

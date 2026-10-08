@@ -2154,6 +2154,12 @@ async fn create_storage(
     // Validate the path: must exist and be a directory.
     validate_storage_path(&body.path)?;
 
+    // And it must not share a folder tree with any existing location.
+    let existing = db::list_storages(state.pool())
+        .await
+        .context("list_storages")?;
+    check_storage_path_overlap(&body.path, &existing, None)?;
+
     // Optional media-glyph override (display only): validate if given, else NULL
     // (the glyph infers from the name).
     let icon = match body.icon.as_deref().map(str::trim) {
@@ -2190,6 +2196,19 @@ async fn get_storage(
 }
 
 /// `PUT /config/storages/{id}` — partial update of a storage row.
+///
+/// A PATH CHANGE is refused while the storage holds indexed segments (audit
+/// R11). Segment rows store their path RELATIVE to the storage root, so
+/// repointing the root silently resolves every existing recording under the new
+/// folder: playback 404s at once, the bytes stay behind in a folder no storage
+/// owns (never retained, evicted or adopted), and the recorder's index sweeps
+/// start deleting the rows as dangling. Moving footage is what the per-policy
+/// "Change storage" drain is for (copy, verify, flip each row, then delete the
+/// source). We refuse rather than accept a path change when the new folder
+/// "looks like" a copy (sampling its newest files), because a partial copy
+/// would pass any sample and lose the unsampled rows; refusing cannot lose
+/// footage. A path that only differs lexically (a trailing `/`) is not a
+/// change and is left as stored.
 async fn update_storage(
     _admin: AdminUser,
     State(state): State<AppState>,
@@ -2197,11 +2216,42 @@ async fn update_storage(
     Json(body): Json<UpdateStorageRequest>,
 ) -> Result<Json<StorageDto>, ApiError> {
     // Verify the row exists.
-    let _ = require_storage(state.pool(), id).await?;
+    let current = require_storage(state.pool(), id).await?;
 
-    // If a new path is provided, validate it.
-    if let Some(ref path) = body.path {
-        validate_storage_path(path)?;
+    // The console always sends the path, changed or not; only a real change is
+    // validated and guarded.
+    let path_change: Option<&str> = body
+        .path
+        .as_deref()
+        .filter(|p| !storage_paths_lexically_equal(p, &current.path));
+
+    if let Some(new_path) = path_change {
+        let client = state.pool().get().await.context("db pool get")?;
+        let seg_cnt: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::bigint AS cnt FROM segments WHERE storage_id = $1",
+                &[&id],
+            )
+            .await
+            .context("count segments on storage")?
+            .get("cnt");
+        drop(client);
+        if seg_cnt > 0 {
+            return Err(ApiError::Conflict(format!(
+                "\"{}\" holds {seg_cnt} recording{}, stored relative to its folder, so its \
+                 folder can't be changed: the recordings would disappear from playback and \
+                 could be dropped from the index. To move footage to another disk, add the \
+                 new folder as a separate location and use \"Change storage…\" on the \
+                 recording profile.",
+                current.name,
+                if seg_cnt == 1 { "" } else { "s" },
+            )));
+        }
+        validate_storage_path(new_path)?;
+        let existing = db::list_storages(state.pool())
+            .await
+            .context("list_storages")?;
+        check_storage_path_overlap(new_path, &existing, Some(id))?;
     }
 
     // icon: Option<Option<String>>. Omitted = keep; Some(None)/Some(Some("")) =
@@ -2229,7 +2279,7 @@ async fn update_storage(
         state.pool(),
         id,
         body.name.as_deref(),
-        body.path.as_deref(),
+        path_change,
         body.total_bytes,
         icon.as_ref().map(std::option::Option::as_deref),
     )
@@ -5182,6 +5232,98 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Lexical normal form of a storage path: trimmed, `.` dropped, `..` resolved
+/// by popping, trailing separators dropped. No filesystem access.
+fn lexical_storage_path(path: &str) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in std::path::Path::new(path.trim()).components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when two storage paths name the same folder without resolving
+/// anything on disk (`/data/live` and `/data/live/` are the same path).
+fn storage_paths_lexically_equal(a: &str, b: &str) -> bool {
+    lexical_storage_path(a) == lexical_storage_path(b)
+}
+
+/// Canonical form of a storage path for overlap checks: the deepest existing
+/// ancestor is resolved through symlinks and the not-yet-created remainder is
+/// re-appended, so `/data/link/x` and `/data/real/x` compare equal when `link`
+/// points at `real`. Falls back to the lexical form when nothing resolves.
+fn canonical_storage_path(path: &str) -> std::path::PathBuf {
+    let lexical = lexical_storage_path(path);
+    let mut existing = lexical.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(&existing) {
+            for part in tail.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        match (
+            existing.file_name().map(std::ffi::OsStr::to_os_string),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => return lexical,
+        }
+    }
+}
+
+/// Refuse a storage path that is the same folder as, lies inside, or contains
+/// another storage's folder (audit R1). `exclude` is the storage being edited.
+///
+/// Segment rows are keyed by `(storage, path relative to its root)`. When two
+/// roots overlap, every file of the inner storage also sits under the outer
+/// one with a different relative path, so the recorder's maintenance walk of
+/// the outer root sees the inner storage's footage as files nobody indexed.
+/// The recorder now refuses to touch such files as well; this keeps new
+/// overlaps from being configured at all. Compared on canonical paths so a
+/// symlink cannot hide an overlap.
+fn check_storage_path_overlap(
+    candidate: &str,
+    existing: &[Storage],
+    exclude: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let cand = canonical_storage_path(candidate);
+    for other in existing {
+        if Some(other.id) == exclude {
+            continue;
+        }
+        let other_path = canonical_storage_path(&other.path);
+        let relation = if cand == other_path {
+            "is the same folder as"
+        } else if cand.starts_with(&other_path) {
+            "is inside the folder of"
+        } else if other_path.starts_with(&cand) {
+            "contains the folder of"
+        } else {
+            continue;
+        };
+        return Err(ApiError::Conflict(format!(
+            "'{}' {relation} the storage location \"{}\" ('{}'). Each location needs its \
+             own folder that neither contains nor sits inside another location's folder; \
+             a sibling folder works (for example '/data/disk2' next to '/data/live').",
+            candidate.trim(),
+            other.name,
+            other.path,
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a storage path.
 ///
 /// Rules (spec §4.4, FINAL version):
@@ -5704,5 +5846,119 @@ mod plan_camera_sync_tests {
             plan_camera_sync(None, None, "front", None, None, "front"),
             CameraSync::Nothing
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_path_overlap_tests {
+    use super::*;
+
+    fn storage(name: &str, path: &str) -> Storage {
+        Storage {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            total_bytes: None,
+            icon: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn conflict(r: &Result<(), ApiError>) -> bool {
+        matches!(r, Err(ApiError::Conflict(_)))
+    }
+
+    /// Audit R1: the same folder, an ancestor (e.g. the media root itself), and
+    /// a subfolder of an existing location are all refused.
+    #[test]
+    fn equal_ancestor_and_descendant_paths_are_refused() {
+        let live = storage("Live", "/srv/crumb-test-media/live");
+        let existing = vec![live];
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/live",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/live/",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/live/archive",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/./live/../live/x",
+            &existing,
+            None
+        )));
+    }
+
+    /// Siblings, and names that merely share a string prefix, are fine.
+    #[test]
+    fn sibling_and_prefix_named_paths_are_accepted() {
+        let existing = vec![
+            storage("Live", "/srv/crumb-test-media/live"),
+            storage("Archive", "/srv/crumb-test-media/archive"),
+        ];
+        assert!(check_storage_path_overlap("/srv/crumb-test-media/disk2", &existing, None).is_ok());
+        assert!(check_storage_path_overlap("/srv/crumb-test-media/live2", &existing, None).is_ok());
+        assert!(
+            check_storage_path_overlap("/srv/crumb-test-media/live-archive", &existing, None)
+                .is_ok()
+        );
+    }
+
+    /// The storage being edited is not compared against itself.
+    #[test]
+    fn the_edited_storage_is_excluded() {
+        let live = storage("Live", "/srv/crumb-test-media/live");
+        let id = live.id;
+        let existing = vec![live];
+        assert!(
+            check_storage_path_overlap("/srv/crumb-test-media/live", &existing, Some(id)).is_ok()
+        );
+    }
+
+    /// A symlink cannot hide an overlap: a path through a link to an existing
+    /// location's folder is that folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_into_another_location_is_refused() {
+        let base = std::env::temp_dir().join(format!("crumb-overlap-{}", Uuid::new_v4().simple()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let existing = vec![storage("Live", real.to_str().expect("utf8"))];
+        let through_link = link.join("sub");
+        let refused = conflict(&check_storage_path_overlap(
+            through_link.to_str().expect("utf8"),
+            &existing,
+            None,
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            refused,
+            "a path through a symlink into a location must be refused"
+        );
+    }
+
+    #[test]
+    fn lexical_equality_ignores_trailing_separators_and_dots() {
+        assert!(storage_paths_lexically_equal("/data/live", "/data/live/"));
+        assert!(storage_paths_lexically_equal(
+            " /data/./live ",
+            "/data/live"
+        ));
+        assert!(!storage_paths_lexically_equal("/data/live", "/data/live2"));
     }
 }
