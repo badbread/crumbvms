@@ -4325,7 +4325,11 @@ mod tests {
         };
         assert_eq!(
             nested_of("/m"),
-            vec![PathBuf::from("/m/live"), PathBuf::from("/m/live/archive")]
+            vec![
+                PathBuf::from("/m/live"),
+                PathBuf::from("/m/live/archive"),
+                PathBuf::from("/m/live2")
+            ]
         );
         assert_eq!(nested_of("/m/live"), vec![PathBuf::from("/m/live/archive")]);
         assert!(nested_of("/m/live/archive").is_empty());
