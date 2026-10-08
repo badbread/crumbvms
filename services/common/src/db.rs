@@ -6090,6 +6090,82 @@ pub async fn create_bookmark(
     Ok(bookmark_from_row(&row))
 }
 
+/// Insert a PROTECTED bookmark unless `created_by` already holds
+/// `max_protected` active protected bookmarks (`protect_until > now()`).
+///
+/// Returns `Ok(None)` when the cap is reached (nothing inserted). The count and
+/// the insert run in one transaction under a per-user advisory lock so
+/// concurrent requests cannot race past the cap.
+///
+/// # Errors
+/// Returns an error if the transaction or query fails.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_protected_bookmark_capped(
+    pool: &Pool,
+    camera_id: Uuid,
+    ts: DateTime<Utc>,
+    description: Option<&str>,
+    created_by: Uuid,
+    protect_until: DateTime<Utc>,
+    protect_start: DateTime<Utc>,
+    protect_end: DateTime<Utc>,
+    max_protected: i64,
+) -> Result<Option<Bookmark>> {
+    let mut client = get_conn(pool).await?;
+    let tx = client
+        .transaction()
+        .await
+        .context("create_protected_bookmark_capped: begin")?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('bookmark_protect:' || $1::text))",
+        &[&created_by.to_string()],
+    )
+    .await
+    .context("create_protected_bookmark_capped: lock")?;
+    let active: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM bookmarks WHERE created_by = $1 AND protect_until > now()",
+            &[&created_by],
+        )
+        .await
+        .context("create_protected_bookmark_capped: count")?
+        .get(0);
+    if active >= max_protected {
+        return Ok(None);
+    }
+    let row = tx
+        .query_one(
+            r"
+            WITH ins AS (
+                INSERT INTO bookmarks
+                    (camera_id, ts, description, created_by,
+                     protect_until, protect_start_ts, protect_end_ts)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, camera_id, ts, description, protect_until,
+                          protect_start_ts, protect_end_ts, created_at
+            )
+            SELECT ins.id, ins.camera_id, c.name AS camera_name, ins.ts, ins.description,
+                   ins.protect_until, ins.protect_start_ts, ins.protect_end_ts, ins.created_at
+            FROM ins LEFT JOIN cameras c ON c.id = ins.camera_id
+            ",
+            &[
+                &camera_id,
+                &ts,
+                &description,
+                &created_by,
+                &protect_until,
+                &protect_start,
+                &protect_end,
+            ],
+        )
+        .await
+        .context("create_protected_bookmark_capped: insert")?;
+    tx.commit()
+        .await
+        .context("create_protected_bookmark_capped: commit")?;
+    Ok(Some(bookmark_from_row(&row)))
+}
+
 /// Update a bookmark's description (NULL clears it). Returns the updated row, or
 /// `None` if no bookmark has that id.
 ///
@@ -8552,7 +8628,23 @@ pub struct DetectionEventRow {
     /// `None` otherwise.
     pub snapshot_url: Option<String>,
     pub source_id: Option<String>,
+    /// `true` when the event carries a recognized license plate (plate-labelled
+    /// event, or a Frigate/crumb-alpr payload with a recognized plate). Callers
+    /// without the `view_plates` capability must not be shown `sub_label` for
+    /// such rows (it commonly holds the plate string).
+    pub has_plate: bool,
 }
+
+/// SQL boolean expression (over the `events` columns) that is true when an
+/// event row carries a recognized plate. Used to redact `sub_label` for callers
+/// without `view_plates` and to select rows for the LPR retention prune.
+const EVENT_HAS_PLATE_SQL: &str = r"COALESCE(
+    label = 'license_plate'
+    OR jsonb_typeof(raw #> '{after,recognized_license_plate}') IN ('array', 'string')
+    OR jsonb_typeof(raw #> '{data,recognized_license_plate}') IN ('array', 'string')
+    OR jsonb_typeof(raw -> 'recognized_license_plate') IN ('array', 'string')
+    OR jsonb_typeof(raw -> 'plate') = 'string',
+    false)";
 
 /// Return detection events for the given cameras in `[start, end)` with
 /// optional label filtering and pagination.
@@ -8596,15 +8688,19 @@ pub async fn list_detection_events(
 
         let rows = client
             .query(
-                r"SELECT id, camera_id, ts, end_ts, label, sub_label,
+                format!(
+                    r"SELECT id, camera_id, ts, end_ts, label, sub_label,
                          COALESCE(score, 0.0) AS score,
-                         top_score, zones, snapshot_url, source_id
+                         top_score, zones, snapshot_url, source_id,
+                         {EVENT_HAS_PLATE_SQL} AS has_plate
                   FROM events
                   WHERE camera_id = ANY($1)
                     AND ts >= $2 AND ts < $3
                     AND label = ANY($4::text[])
                   ORDER BY ts DESC
-                  LIMIT $5 OFFSET $6",
+                  LIMIT $5 OFFSET $6"
+                )
+                .as_str(),
                 &[&q.camera_ids, &q.start, &q.end, labels, &q.limit, &q.offset],
             )
             .await
@@ -8627,14 +8723,18 @@ pub async fn list_detection_events(
 
         let rows = client
             .query(
-                r"SELECT id, camera_id, ts, end_ts, label, sub_label,
+                format!(
+                    r"SELECT id, camera_id, ts, end_ts, label, sub_label,
                          COALESCE(score, 0.0) AS score,
-                         top_score, zones, snapshot_url, source_id
+                         top_score, zones, snapshot_url, source_id,
+                         {EVENT_HAS_PLATE_SQL} AS has_plate
                   FROM events
                   WHERE camera_id = ANY($1)
                     AND ts >= $2 AND ts < $3
                   ORDER BY ts DESC
-                  LIMIT $4 OFFSET $5",
+                  LIMIT $4 OFFSET $5"
+                )
+                .as_str(),
                 &[&q.camera_ids, &q.start, &q.end, &q.limit, &q.offset],
             )
             .await
@@ -8670,6 +8770,7 @@ pub async fn list_detection_events(
                 zones: row.get("zones"),
                 snapshot_url: crumb_snapshot_url,
                 source_id: row.get("source_id"),
+                has_plate: row.get("has_plate"),
             }
         })
         .collect();
@@ -9581,7 +9682,51 @@ pub async fn prune_plate_reads(pool: &Pool, cutoff: DateTime<Utc>) -> Result<u64
         .execute("DELETE FROM plate_reads WHERE ts < $1", &[&cutoff])
         .await
         .context("prune_plate_reads")?;
+    drop(client);
+    // The sibling `events` rows carry the same plate strings (`sub_label`, raw
+    // payload); age them out on the same retention. Best-effort: a failure here
+    // is logged and never fails the plate-read prune.
+    if let Err(e) = prune_plate_events(pool, cutoff).await {
+        tracing::warn!("plate-bearing events prune failed: {e:#}");
+    }
     Ok(n)
+}
+
+/// Remove plate data from `events` older than `cutoff` (the LPR retention
+/// applied to the detection-event store): plate-labelled events are deleted
+/// (`plate_reads.event_id` is `ON DELETE SET NULL`); other events that carry a
+/// recognized plate (e.g. a car) are kept but have `sub_label` and the plate
+/// fields of the raw payload cleared. Returns `(deleted, scrubbed)`.
+///
+/// # Errors
+///
+/// Returns an error if either statement fails.
+pub async fn prune_plate_events(pool: &Pool, cutoff: DateTime<Utc>) -> Result<(u64, u64)> {
+    let client = get_conn(pool).await?;
+    let deleted = client
+        .execute(
+            "DELETE FROM events WHERE ts < $1 AND label = 'license_plate'",
+            &[&cutoff],
+        )
+        .await
+        .context("prune_plate_events: delete")?;
+    let scrubbed = client
+        .execute(
+            format!(
+                r"UPDATE events
+                  SET sub_label = NULL,
+                      raw = raw #- '{{after,recognized_license_plate}}'
+                                #- '{{data,recognized_license_plate}}'
+                                #- '{{recognized_license_plate}}'
+                                #- '{{plate}}'
+                  WHERE ts < $1 AND {EVENT_HAS_PLATE_SQL}"
+            )
+            .as_str(),
+            &[&cutoff],
+        )
+        .await
+        .context("prune_plate_events: scrub")?;
+    Ok((deleted, scrubbed))
 }
 
 /// Plate-search mode for [`list_plate_reads`].
@@ -11030,6 +11175,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0080_channel_snapshot_mode.sql",
         include_str!("../../../db/migrations/0080_channel_snapshot_mode.sql"),
+    ),
+    (
+        "0082_events_ts_index.sql",
+        include_str!("../../../db/migrations/0082_events_ts_index.sql"),
     ),
 ];
 

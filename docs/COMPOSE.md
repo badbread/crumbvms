@@ -192,7 +192,9 @@ page itself, `/auth/login`, and the first-run
   (Home Assistant) and `DB_POOL_SIZE` as the recorder; `MAINTENANCE_UNTIL`
   (unix seconds) suppresses low-disk/camera-offline alerts during planned
   maintenance; `CAMERA_OFFLINE_BOOT_GRACE_SECS` is the grace period before
-  offline alerts fire after boot (empty = default 180); and the `THUMB_*` set
+  offline alerts fire after boot (empty = default 180);
+  `BOOKMARK_MAX_PROTECTED_PER_USER` caps a non-admin user's active protected
+  bookmarks (empty = default 50, `0` = unlimited); and the `THUMB_*` set
   tunes the timeline thumbnail cache and pre-generation (cache dir, size cap,
   TTL, extract concurrency and timeout, widths, pre-gen toggle and lookback).
   All default sensibly when unset; see [`.env.example`](../.env.example).

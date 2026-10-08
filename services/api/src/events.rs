@@ -129,6 +129,20 @@ pub struct EventsResponse {
 
 // ── handlers ──────────────────────────────────────────────────────────────────
 
+/// Drop an event's `sub_label` when the event carries a recognized plate and the
+/// caller lacks the `view_plates` capability.
+fn redact_sub_label(
+    sub_label: Option<String>,
+    has_plate: bool,
+    can_view_plates: bool,
+) -> Option<String> {
+    if has_plate && !can_view_plates {
+        None
+    } else {
+        sub_label
+    }
+}
+
 /// `GET /events?camera_ids=<csv>&start=<iso>&end=<iso>[&labels=<csv>][&limit=N][&offset=N]`
 ///
 /// Returns detection events for the requested cameras within `[start, end)`.
@@ -195,6 +209,9 @@ async fn get_events(
     let has_more = offset.saturating_add(rows.len() as i64) < total;
 
     // ── 5. map to DTOs ────────────────────────────────────────────────────────
+    // Plate strings ride `sub_label`; they are gated behind `view_plates` on
+    // every other plate surface, so callers without it get `null` here.
+    let can_view_plates = user.can_view_plates();
     let events: Vec<DetectionEventDto> = rows
         .into_iter()
         .map(|row| DetectionEventDto {
@@ -204,7 +221,7 @@ async fn get_events(
             end_ts: row.end_ts,
             label: row.label,
             icon_key: row.icon_key,
-            sub_label: row.sub_label,
+            sub_label: redact_sub_label(row.sub_label, row.has_plate, can_view_plates),
             score: row.score,
             top_score: row.top_score.unwrap_or(row.score),
             zones: row.zones.unwrap_or_default(),
@@ -401,4 +418,22 @@ fn parse_uuid_csv(csv: &str) -> Result<Vec<Uuid>, ApiError> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_sub_label;
+
+    #[test]
+    fn plate_events_lose_sub_label_without_view_plates() {
+        let s = Some("7ABC123".to_owned());
+        assert_eq!(redact_sub_label(s.clone(), true, false), None);
+        assert_eq!(redact_sub_label(s.clone(), true, true), s);
+        // Non-plate events keep their sub_label (e.g. a recognized person).
+        assert_eq!(
+            redact_sub_label(Some("Alex".to_owned()), false, false),
+            Some("Alex".to_owned())
+        );
+        assert_eq!(redact_sub_label(None, true, false), None);
+    }
 }
