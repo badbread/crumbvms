@@ -36,9 +36,14 @@
 //! go2rtc is embedded INSIDE the recorder container (see
 //! `services/recorder/src/go2rtc_embed.rs`), so a `docker restart` of the
 //! recorder — independent of this api process, which keeps running — silently
-//! empties go2rtc's stream table. Recording can't resume until this api
-//! re-PUTs the streams, so how fast we NOTICE the drop is what determines the
-//! footage gap.
+//! empties go2rtc's stream table. Before R10, recording could not resume until
+//! this api re-PUT the streams, so how fast we NOTICED the drop determined the
+//! footage gap. The recorder now also creates its own recording streams (the
+//! main and the `_sub`) when they are missing
+//! (`services/recorder/src/stream_registry.rs`, create-only, built by the same
+//! `crumb_common::go2rtc_streams` builder this pass uses), so recording no
+//! longer waits on this loop. This loop still owns every derived stream, all
+//! source updates (PATCH) and all removals.
 //!
 //! An earlier version of this loop only checked go2rtc's stream count right
 //! after each full reconcile pass, and sped up subsequent passes when short —
@@ -61,6 +66,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crumb_common::go2rtc_streams::{recording_streams, sub_name};
+
 use crate::state::AppState;
 
 /// Short-timeout client for the local go2rtc container API.
@@ -69,11 +76,6 @@ fn client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(5))
         .build()
         .context("build go2rtc client")
-}
-
-/// The go2rtc stream name for a camera's SUB stream.
-fn sub_name(go2rtc_name: &str) -> String {
-    format!("{go2rtc_name}_sub")
 }
 
 /// The go2rtc stream name for a camera's CLIENT-facing, VIDEO-ONLY sub restream
@@ -947,37 +949,29 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
         // camera, through the `camera_stream_rejected` latch below.
         let mut rejection: Option<String> = None;
 
+        // R10: the main + sub definitions come from `crumb_common::go2rtc_streams`,
+        // the SAME builder the recorder's create-if-missing fallback uses, so the
+        // two writers can never disagree about a recording stream's source.
+        let rec = recording_streams(s);
         if let Err(e) = apply_stream(
             &c,
             api_base,
-            &s.go2rtc_name,
-            &s.source_url,
+            &rec.main.name,
+            &rec.main.src,
             existing,
             &managed,
             auth,
         )
         .await
         {
-            rejection = rejection.or_else(|| classify_apply_error("main", &s.go2rtc_name, &e));
+            rejection = rejection.or_else(|| classify_apply_error("main", &rec.main.name, &e));
         }
-        let has_sub = s
-            .source_sub_url
-            .as_deref()
-            .is_some_and(|u| !u.trim().is_empty());
-        if has_sub {
-            let sub = sub_name(&s.go2rtc_name);
-            if let Err(e) = apply_stream(
-                &c,
-                api_base,
-                &sub,
-                s.source_sub_url.as_deref().unwrap_or_default(),
-                existing,
-                &managed,
-                auth,
-            )
-            .await
+        let has_sub = rec.sub.is_some();
+        if let Some(sub) = &rec.sub {
+            if let Err(e) =
+                apply_stream(&c, api_base, &sub.name, &sub.src, existing, &managed, auth).await
             {
-                rejection = rejection.or_else(|| classify_apply_error("sub", &sub, &e));
+                rejection = rejection.or_else(|| classify_apply_error("sub", &sub.name, &e));
             }
         }
         report_stream_rejection(state, s, rejection).await;
@@ -2431,5 +2425,49 @@ mod tests {
             22,
             Duration::from_secs(5)
         ));
+    }
+
+    /// R10: the recording streams this pass applies must be byte-identical to
+    /// the ones the recorder's create-if-missing fallback registers, or the two
+    /// writers would keep replacing each other's stream. The recorder's
+    /// `stream_registry` tests pin the SAME rows to the SAME literal
+    /// definitions, so a change on either side fails one of them.
+    #[test]
+    fn recording_stream_definitions_match_the_recorder_golden_table() {
+        let row = |name: &str, main: &str, sub: Option<&str>| crumb_common::db::CameraStream {
+            id: uuid::Uuid::nil(),
+            name: name.to_owned(),
+            go2rtc_name: name.to_owned(),
+            source_url: main.to_owned(),
+            source_sub_url: sub.map(str::to_owned),
+        };
+        let rows = [
+            row(
+                "driveway",
+                "rtsp://u:p%40ss@192.0.2.10:554/Streaming/Channels/101",
+                Some("rtsp://u:p%40ss@192.0.2.10:554/Streaming/Channels/102"),
+            ),
+            row("porch", "rtsp://192.0.2.11/s0", Some("   ")),
+            row("yard", "rtsp://192.0.2.12/main?x=1&y=2", None),
+        ];
+        let got: Vec<(String, String)> = rows
+            .iter()
+            .flat_map(|r| recording_streams(r).into_specs())
+            .map(|s| (s.name, s.src))
+            .collect();
+        let want = [
+            (
+                "driveway",
+                "rtsp://u:p%40ss@192.0.2.10:554/Streaming/Channels/101",
+            ),
+            (
+                "driveway_sub",
+                "rtsp://u:p%40ss@192.0.2.10:554/Streaming/Channels/102",
+            ),
+            ("porch", "rtsp://192.0.2.11/s0"),
+            ("yard", "rtsp://192.0.2.12/main?x=1&y=2"),
+        ]
+        .map(|(n, s)| (n.to_owned(), s.to_owned()));
+        assert_eq!(got, want);
     }
 }

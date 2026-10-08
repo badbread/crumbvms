@@ -70,6 +70,10 @@ recorder, and later the API) must satisfy these *by construction*.
     notices.
 12. **Recording is `-c copy` (zero decode). Motion runs on the SUB stream only.** Streams
     come from Crumb's own embedded go2rtc restreamer (run by the recorder), not an external one.
+    Recording must not depend on the api being up: the recorder creates any missing recording
+    stream (main + `_sub`) in its own go2rtc before and while recording (`stream_registry.rs`),
+    create-only, from the same `crumb_common::go2rtc_streams` builder the api uses. Never let it
+    re-`PUT`/`PATCH` an existing stream, that is the api's job.
 
 ## DB / seed
 13. **Seed is idempotent.** `storages` needs `UNIQUE(name)` (+ `ON CONFLICT`) or a
