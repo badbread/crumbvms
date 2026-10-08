@@ -928,6 +928,41 @@ pub async fn insert_segment_if_absent(
     Ok(row.map(|r| r.get(0)))
 }
 
+/// Sample the relative paths of the NEWEST indexed segments on one storage
+/// whose `start_ts` is before `before`.
+///
+/// Used by the recorder's RECORDING path before it writes a storage's
+/// confirmation marker (audit R9): passing the recorder's process start as
+/// `before` excludes everything this process recorded itself, so footage
+/// written onto an empty mountpoint cannot vouch for that mountpoint. Only the
+/// storage's earlier history can.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_recent_segment_paths_for_storage_before(
+    pool: &Pool,
+    storage_id: Uuid,
+    before: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT path
+            FROM segments
+            WHERE storage_id = $1 AND start_ts < $2
+            ORDER BY start_ts DESC
+            LIMIT $3
+            ",
+            &[&storage_id, &before, &limit],
+        )
+        .await
+        .context("list_recent_segment_paths_for_storage_before")?;
+    Ok(rows.iter().map(|r| r.get::<_, String>("path")).collect())
+}
+
 /// Stamp `has_motion = true` on a segment.
 ///
 /// Called by `recording.rs` when a `MotionSignal` overlaps a segment's time

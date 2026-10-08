@@ -322,6 +322,34 @@ const FRAME_STALL_TIMEOUT_SECS: u64 = 12;
 /// only when stall has a blind spot.
 const FRAME_RECEIPT_TIMEOUT_SECS: u64 = 15;
 
+/// Stuck-session guard: how long a CONNECTED pixel session may go without a
+/// keep/discard verdict (still in warm-up, or failing open on a duplicate-frame
+/// "long GOP" window) before it is torn down and reconnected.
+///
+/// The frame watchdogs above only catch a session that stops delivering
+/// frames. A session that keeps delivering frames the detector cannot use (a
+/// decoder that went bad after the camera rebooted underneath it, for
+/// example, emitting mostly duplicates) feeds both watchdogs forever, so
+/// before this guard such a camera failed open until the recorder restarted:
+/// in production three cameras recorded continuously for 18 days after one
+/// unhealthy episode each, and a restart (a fresh ffmpeg session) fixed all of
+/// them within a minute. The first dwell comfortably covers warm-up
+/// (`WARMUP_FRAMES` at `MOTION_ANALYSIS_FPS`, about 12 s) plus one
+/// `GOP_DEGRADE_WINDOW_FRAMES` window; consecutive stuck sessions double it up
+/// to [`STUCK_SESSION_DWELL_MAX_SECS`], so a camera whose sub-stream is
+/// genuinely keyframes-only is re-tried every half hour, indefinitely, rather
+/// than reconnect-spun.
+const STUCK_SESSION_DWELL_BASE_SECS: u64 = 120;
+/// Cap for [`STUCK_SESSION_DWELL_BASE_SECS`]'s doubling.
+const STUCK_SESSION_DWELL_MAX_SECS: u64 = 1800;
+
+/// While a source stays unhealthy, re-raise its `motion_detector_unhealthy`
+/// alert this often after the first one. A single alert is easy to miss, and a
+/// camera that fails open records continuously until someone acts. The alert
+/// rule's own cooldown (900 s, migration 0038) is shorter, so every repeat
+/// reaches the notification channels.
+const UNHEALTHY_REALERT_INTERVAL_SECS: u64 = 4 * 3600;
+
 // ─── global NVDEC semaphore ───────────────────────────────────────────────────
 
 /// Global `Arc<Semaphore>` capping concurrent NVDEC decode sessions.
@@ -1342,7 +1370,9 @@ async fn emit_unhealthy_alert(pool: &Pool, camera_id: uuid::Uuid, reason: &str) 
     }
 }
 
-/// Spawn the one-shot hysteresis timer for a single unhealthy episode.
+/// Spawn the hysteresis timer for a single unhealthy episode. After the first
+/// alert it keeps re-alerting every [`UNHEALTHY_REALERT_INTERVAL_SECS`] while
+/// the episode lasts (see [`run_unhealthy_alert_episode`]).
 ///
 /// Sleeps `alert_after_secs`, then re-checks — in order — that (a) the gate's
 /// generation hasn't moved on (a RECOVERED, or a later UNHEALTHY episode, has
@@ -1377,34 +1407,103 @@ fn spawn_unhealthy_alert_timer(
     alert_after_secs: u64,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(alert_after_secs)).await;
-
-        // The generation check IS the "already alerted / superseded" guard
-        // for this scheme: if a RECOVERED (or a newer UNHEALTHY episode)
-        // happened while we slept, `current_generation` has moved past
-        // `my_generation` and this episode must be treated as already
-        // resolved — feed that into the same pure decision fn the unit tests
-        // exercise directly, rather than duplicating the boolean logic here.
-        let current_generation = gate.generation.load(std::sync::atomic::Ordering::SeqCst);
-        let superseded = current_generation != my_generation;
-        let still_unhealthy = !*health_tx.borrow();
-        // We just slept exactly `alert_after_secs`, so "elapsed" is trivially
-        // `alert_after_secs` here — the real-world elapsed-time check already
-        // happened via the sleep; `should_emit_unhealthy_alert` still gives
-        // the single source of truth for the boundary/already-alerted logic
-        // so the production path and the unit tests agree on the same rule.
-        let should_emit = still_unhealthy
-            && should_emit_unhealthy_alert(alert_after_secs, alert_after_secs, superseded);
-        if !should_emit {
-            return; // recovered (or a newer episode started) before the threshold — no alert.
-        }
-        warn!(
-            camera_id = %camera_id,
-            secs = alert_after_secs,
-            "motion detector still unhealthy past alert threshold ({reason}); emitting alert"
-        );
-        emit_unhealthy_alert(&pool, camera_id, &reason).await;
+        run_unhealthy_alert_episode(
+            &gate,
+            my_generation,
+            alert_after_secs,
+            std::time::Duration::from_secs(UNHEALTHY_REALERT_INTERVAL_SECS),
+            // (still unhealthy, nobody listening any more). `is_closed` means
+            // every receiver is gone: the worker that owned this health watch
+            // was torn down (config change, camera removed), so a repeat would
+            // page about a worker that no longer exists.
+            || (!*health_tx.borrow(), health_tx.is_closed()),
+            |n| {
+                let pool = pool.clone();
+                let reason = if n == 1 {
+                    reason.clone()
+                } else {
+                    format!(
+                        "{reason} (still unhealthy; repeat alert {n}, every {}h)",
+                        UNHEALTHY_REALERT_INTERVAL_SECS / 3600
+                    )
+                };
+                async move {
+                    warn!(
+                        camera_id = %camera_id,
+                        alert = n,
+                        "motion detector still unhealthy past alert threshold ({reason}); emitting alert"
+                    );
+                    emit_unhealthy_alert(&pool, camera_id, &reason).await;
+                }
+            },
+        )
+        .await;
     });
+}
+
+/// One unhealthy episode's alert schedule, split out of
+/// [`spawn_unhealthy_alert_timer`] so the timing is testable without a DB.
+///
+/// Sleeps `alert_after_secs`, then emits the first alert under exactly the old
+/// rule ([`should_emit_unhealthy_alert`]: not superseded AND still unhealthy).
+/// It then re-emits every `repeat_every` for as long as
+/// [`should_repeat_unhealthy_alert`] holds: same episode (no RECOVERED and no
+/// newer episode bumped the generation), still unhealthy, and the worker's
+/// health watch still has a listener. Before this, an episode alerted exactly
+/// once however long it lasted. `emit` receives the 1-based alert number.
+async fn run_unhealthy_alert_episode<S, E, Fut>(
+    gate: &UnhealthyAlertGate,
+    my_generation: u64,
+    alert_after_secs: u64,
+    repeat_every: std::time::Duration,
+    state: S,
+    mut emit: E,
+) where
+    S: Fn() -> (bool, bool),
+    E: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    tokio::time::sleep(std::time::Duration::from_secs(alert_after_secs)).await;
+
+    // The generation check IS the "already alerted / superseded" guard for
+    // this scheme: if a RECOVERED (or a newer UNHEALTHY episode) happened while
+    // we slept, `current_generation` has moved past `my_generation` and this
+    // episode must be treated as already resolved: feed that into the same
+    // pure decision fn the unit tests exercise directly, rather than
+    // duplicating the boolean logic here.
+    let superseded = gate.generation.load(std::sync::atomic::Ordering::SeqCst) != my_generation;
+    let (still_unhealthy, _closed) = state();
+    // We just slept exactly `alert_after_secs`, so "elapsed" is trivially
+    // `alert_after_secs` here; the real-world elapsed-time check already
+    // happened via the sleep; `should_emit_unhealthy_alert` still gives the
+    // single source of truth for the boundary/already-alerted logic so the
+    // production path and the unit tests agree on the same rule.
+    if !(still_unhealthy
+        && should_emit_unhealthy_alert(alert_after_secs, alert_after_secs, superseded))
+    {
+        return; // recovered (or a newer episode started) before the threshold: no alert.
+    }
+    let mut n: u32 = 1;
+    emit(n).await;
+
+    loop {
+        tokio::time::sleep(repeat_every).await;
+        let superseded = gate.generation.load(std::sync::atomic::Ordering::SeqCst) != my_generation;
+        let (still_unhealthy, closed) = state();
+        if !should_repeat_unhealthy_alert(superseded, still_unhealthy, closed) {
+            return;
+        }
+        n = n.saturating_add(1);
+        emit(n).await;
+    }
+}
+
+/// Pure decision for a REPEAT `motion_detector_unhealthy` alert: the episode
+/// is still the current one, the source is still unhealthy, and the worker
+/// that owns the health watch is still alive.
+#[must_use]
+fn should_repeat_unhealthy_alert(superseded: bool, still_unhealthy: bool, closed: bool) -> bool {
+    !superseded && still_unhealthy && !closed
 }
 
 /// Pure decision used by [`spawn_unhealthy_alert_timer`] (factored out for
@@ -1500,6 +1599,51 @@ fn long_gop_degraded(dup_frames: u64, window_frames: u64) -> bool {
         return false;
     }
     dup_frames.saturating_mul(100) >= window_frames.saturating_mul(GOP_DEGRADE_DUP_PCT)
+}
+
+/// Dwell before the stuck-session guard reconnects, given how many sessions in
+/// a row it has already ended: 120 s, 240 s, 480 s ... capped at 30 min.
+#[must_use]
+fn stuck_session_dwell(consecutive_stuck: u32) -> std::time::Duration {
+    let shift = consecutive_stuck.min(16);
+    std::time::Duration::from_secs(
+        STUCK_SESSION_DWELL_BASE_SECS
+            .saturating_mul(1u64 << shift)
+            .min(STUCK_SESSION_DWELL_MAX_SECS),
+    )
+}
+
+/// Tracks how long the CURRENT pixel session has been connected without a
+/// verdict (see [`STUCK_SESSION_DWELL_BASE_SECS`]). A session starts
+/// unhealthy (warm-up), [`Self::note_healthy`] clears the clock, and
+/// [`Self::note_unhealthy`] starts it again (keeping the earliest instant) when
+/// the session falls back to failing open while still connected.
+#[derive(Debug)]
+struct StuckSessionGuard {
+    unhealthy_since: Option<std::time::Instant>,
+    dwell: std::time::Duration,
+}
+
+impl StuckSessionGuard {
+    fn new(now: std::time::Instant, consecutive_stuck: u32) -> Self {
+        Self {
+            unhealthy_since: Some(now),
+            dwell: stuck_session_dwell(consecutive_stuck),
+        }
+    }
+
+    fn note_healthy(&mut self) {
+        self.unhealthy_since = None;
+    }
+
+    fn note_unhealthy(&mut self, now: std::time::Instant) {
+        self.unhealthy_since.get_or_insert(now);
+    }
+
+    fn should_reconnect(&self, now: std::time::Instant) -> bool {
+        self.unhealthy_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= self.dwell)
+    }
 }
 
 // ─── public entry point ───────────────────────────────────────────────────────
@@ -1851,6 +1995,11 @@ async fn run_one_source(
     // a supervisor respawn all give the hardware another chance.
     let mut hw_state = HwDecodeFallback::default();
 
+    // Consecutive pixel sessions the stuck-session guard has ended (worker
+    // lifetime, so its dwell backs off across reconnects); reset the moment a
+    // session reaches a verdict.
+    let mut stuck_sessions: u32 = 0;
+
     loop {
         if cancel.is_cancelled() {
             break;
@@ -1868,6 +2017,7 @@ async fn run_one_source(
                     &alert_gate,
                     alert_after_secs,
                     &mut hw_state,
+                    &mut stuck_sessions,
                 )
                 .await
             }
@@ -2338,6 +2488,7 @@ async fn run_pixel_diff_loop(
     alert_gate: &Arc<UnhealthyAlertGate>,
     alert_after_secs: u64,
     hw_state: &mut HwDecodeFallback,
+    stuck_sessions: &mut u32,
 ) -> Result<()> {
     // Fail-open: every (re)entry into this function is a fresh connection
     // attempt — mark unhealthy up front so a camera stuck cycling through
@@ -2847,9 +2998,18 @@ async fn run_pixel_diff_loop(
     // genuine cancellation — the two share the same clean-up path but differ in
     // the return value (EOF must force a reconnect, cancellation must not).
     let mut stream_ended = false;
+    // Stuck-session guard: a connected session that never reaches (or loses) a
+    // verdict is ended and reconnected, see `STUCK_SESSION_DWELL_BASE_SECS`.
+    let mut stuck_guard = StuckSessionGuard::new(std::time::Instant::now(), *stuck_sessions);
+    let mut stuck_reconnect = false;
     loop {
         // Check cancellation before every frame read (correctness item 6).
         if cancel.is_cancelled() {
+            break;
+        }
+
+        if stuck_guard.should_reconnect(std::time::Instant::now()) {
+            stuck_reconnect = true;
             break;
         }
 
@@ -2972,6 +3132,7 @@ async fn run_pixel_diff_loop(
             gop_window_dups = 0;
         }
         if gop_degraded {
+            stuck_guard.note_unhealthy(std::time::Instant::now());
             report_health(
                 health_tx,
                 pool,
@@ -2995,6 +3156,8 @@ async fn run_pixel_diff_loop(
         // item 19). Cheap to call every frame; `report_health` no-ops after
         // the first transition since the value no longer changes.
         if pixel_verdict_capable(frames_seen) {
+            stuck_guard.note_healthy();
+            *stuck_sessions = 0;
             report_health(
                 health_tx,
                 pool,
@@ -3348,6 +3511,25 @@ async fn run_pixel_diff_loop(
     // old code returned Ok(()) here, which run() treated as "cancelled cleanly"
     // and exited the task permanently — motion stayed dead for that camera until
     // the recorder restarted (prod 2026-06-17: Front Door + Backdoor).
+    if stuck_reconnect && !cancel.is_cancelled() {
+        *stuck_sessions = stuck_sessions.saturating_add(1);
+        let reason = format!(
+            "sub-stream connected but no usable frames for {}s; reconnecting",
+            stuck_guard.dwell.as_secs()
+        );
+        warn!(
+            camera_id = %camera.id,
+            dwell_s = stuck_guard.dwell.as_secs(),
+            consecutive = *stuck_sessions,
+            frames_seen,
+            "motion: session never reached a verdict; tearing it down and reconnecting"
+        );
+        // Name the cause on the health surfaces (no transition here: the
+        // source is already unhealthy, so `report_health` would be a no-op).
+        alert_gate.note_unhealthy_cause(&reason);
+        return Err(anyhow::anyhow!("motion {reason}"));
+    }
+
     if stream_ended && !cancel.is_cancelled() {
         return Err(anyhow::anyhow!(
             "motion sub-stream ended (ffmpeg EOF); forcing reconnect"
@@ -4868,6 +5050,259 @@ mod tests {
             !should_emit_unhealthy_alert(180, 180, superseded),
             "a source that recovered must not emit the startup alert"
         );
+    }
+
+    // ── repeat unhealthy alert + in-process recovery (prod: 18-day fail-open) ─────
+
+    #[test]
+    fn repeat_alert_only_while_same_episode_unhealthy_and_listened_to() {
+        assert!(should_repeat_unhealthy_alert(false, true, false));
+        assert!(
+            !should_repeat_unhealthy_alert(true, true, false),
+            "recovered or newer episode"
+        );
+        assert!(
+            !should_repeat_unhealthy_alert(false, false, false),
+            "healthy again"
+        );
+        assert!(
+            !should_repeat_unhealthy_alert(false, true, true),
+            "worker torn down"
+        );
+    }
+
+    /// Drives the real episode schedule with a short repeat interval: alerts
+    /// keep coming while unhealthy, then stop as soon as a RECOVERED bumps the
+    /// gate generation.
+    #[tokio::test]
+    async fn unhealthy_alert_repeats_until_recovery() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+        let gate = UnhealthyAlertGate::new();
+        let generation = gate.generation.load(SeqCst);
+        let unhealthy = Arc::new(AtomicBool::new(true));
+        let emitted = Arc::new(AtomicU32::new(0));
+        let task = {
+            let gate = Arc::clone(&gate);
+            let unhealthy = Arc::clone(&unhealthy);
+            let emitted = Arc::clone(&emitted);
+            tokio::spawn(async move {
+                run_unhealthy_alert_episode(
+                    &gate,
+                    generation,
+                    0,
+                    std::time::Duration::from_millis(20),
+                    || (unhealthy.load(SeqCst), false),
+                    |n| {
+                        let emitted = Arc::clone(&emitted);
+                        async move {
+                            assert_eq!(emitted.fetch_add(1, SeqCst) + 1, n, "alerts are numbered");
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            emitted.load(SeqCst) >= 3,
+            "a sustained episode must keep re-alerting, got {}",
+            emitted.load(SeqCst)
+        );
+        // RECOVERED: report_health bumps the generation and flips healthy.
+        gate.generation.fetch_add(1, SeqCst);
+        unhealthy.store(false, SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("the episode ends after recovery")
+            .expect("episode task");
+        let after = emitted.load(SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(emitted.load(SeqCst), after, "no alert after recovery");
+    }
+
+    /// A worker torn down mid-episode (its health watch has no listener left)
+    /// stops re-alerting even though nothing ever reported RECOVERED.
+    #[tokio::test]
+    async fn unhealthy_alert_repeats_stop_when_worker_is_gone() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let gate = UnhealthyAlertGate::new();
+        let generation = gate.generation.load(SeqCst);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let emitted = Arc::new(AtomicU32::new(0));
+        let task = {
+            let gate = Arc::clone(&gate);
+            let emitted = Arc::clone(&emitted);
+            tokio::spawn(async move {
+                run_unhealthy_alert_episode(
+                    &gate,
+                    generation,
+                    0,
+                    std::time::Duration::from_millis(20),
+                    || (!*tx.borrow(), tx.is_closed()),
+                    |_| {
+                        let emitted = Arc::clone(&emitted);
+                        async move {
+                            emitted.fetch_add(1, SeqCst);
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+        assert!(emitted.load(SeqCst) >= 2);
+        drop(rx); // worker teardown drops the only receiver
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("the episode ends once nobody listens")
+            .expect("episode task");
+    }
+
+    /// A blip that recovers before the first threshold never alerts at all
+    /// (the original hysteresis, unchanged by the repeat loop).
+    #[tokio::test]
+    async fn unhealthy_alert_episode_recovered_before_threshold_never_emits() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let gate = UnhealthyAlertGate::new();
+        let generation = gate.generation.load(SeqCst);
+        gate.generation.fetch_add(1, SeqCst); // RECOVERED before the timer matured
+        let emitted = AtomicU32::new(0);
+        run_unhealthy_alert_episode(
+            &gate,
+            generation,
+            0,
+            std::time::Duration::from_millis(5),
+            || (false, false),
+            |_| {
+                emitted.fetch_add(1, SeqCst);
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(emitted.load(SeqCst), 0);
+    }
+
+    /// The recovery TRANSITION itself: a source that went unhealthy flips the
+    /// watch back to healthy on its next verdict-capable frame, and that flip
+    /// bumps the gate generation, which is what retires the repeating alert.
+    #[tokio::test]
+    async fn report_health_recovery_transition_retires_the_episode() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let pool = crumb_common::db::build_pool("postgres://crumb:x@127.0.0.1:9/crumb", 1)
+            .expect("pool builds lazily");
+        let gate = UnhealthyAlertGate::new();
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        let cam = uuid::Uuid::new_v4();
+
+        report_health(
+            &tx,
+            &pool,
+            cam,
+            false,
+            "frame-stall watchdog fired",
+            &gate,
+            3600,
+        )
+        .await;
+        assert!(
+            !*rx.borrow(),
+            "unhealthy flips the fail-open signal at once"
+        );
+        let episode = gate.generation.load(SeqCst);
+        assert_eq!(
+            gate.last_unhealthy_reason().as_deref(),
+            Some("frame-stall watchdog fired")
+        );
+
+        // Reconnect attempts while still down are not transitions.
+        report_health(&tx, &pool, cam, false, "(re)connecting", &gate, 3600).await;
+        assert_eq!(
+            gate.generation.load(SeqCst),
+            episode,
+            "no new episode while still down"
+        );
+
+        report_health(
+            &tx,
+            &pool,
+            cam,
+            true,
+            "analysing frames (warm-up complete)",
+            &gate,
+            3600,
+        )
+        .await;
+        assert!(
+            *rx.borrow(),
+            "a verdict-capable session flips back to healthy"
+        );
+        let superseded = gate.generation.load(SeqCst) != episode;
+        assert!(superseded, "recovery supersedes the episode");
+        assert!(!should_repeat_unhealthy_alert(superseded, false, false));
+    }
+
+    #[test]
+    fn stuck_session_dwell_backs_off_and_caps() {
+        assert_eq!(
+            stuck_session_dwell(0).as_secs(),
+            STUCK_SESSION_DWELL_BASE_SECS
+        );
+        assert_eq!(
+            stuck_session_dwell(1).as_secs(),
+            2 * STUCK_SESSION_DWELL_BASE_SECS
+        );
+        assert_eq!(
+            stuck_session_dwell(2).as_secs(),
+            4 * STUCK_SESSION_DWELL_BASE_SECS
+        );
+        assert_eq!(
+            stuck_session_dwell(50).as_secs(),
+            STUCK_SESSION_DWELL_MAX_SECS
+        );
+        assert_eq!(
+            stuck_session_dwell(u32::MAX).as_secs(),
+            STUCK_SESSION_DWELL_MAX_SECS
+        );
+        // Warm-up plus one long-GOP window always fits inside the first dwell.
+        let warmup_and_window =
+            (WARMUP_FRAMES + GOP_DEGRADE_WINDOW_FRAMES) / u64::from(MOTION_ANALYSIS_FPS);
+        assert!(warmup_and_window * 2 < STUCK_SESSION_DWELL_BASE_SECS);
+    }
+
+    /// The in-process recovery path: a connected session that keeps failing
+    /// open (duplicate-frame window) is torn down after the dwell, so the
+    /// worker reconnects instead of failing open until a restart.
+    #[test]
+    fn stuck_session_guard_reconnects_a_connected_but_unhealthy_session() {
+        let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        let mut g = StuckSessionGuard::new(t0, 0);
+        let dwell = stuck_session_dwell(0);
+
+        // Warm-up that never completes: reconnect once the dwell passes.
+        assert!(!g.should_reconnect(t0 + secs(30)));
+        assert!(g.should_reconnect(t0 + dwell));
+
+        // A session that reached a verdict is left alone for good.
+        g.note_healthy();
+        assert!(!g.should_reconnect(t0 + secs(100_000)));
+
+        // ...until it falls back to failing open while still connected: the
+        // clock starts at that moment, not at session start.
+        let degraded_at = t0 + secs(1_000);
+        g.note_unhealthy(degraded_at);
+        g.note_unhealthy(degraded_at + secs(50)); // keeps the earliest instant
+        assert!(!g.should_reconnect(degraded_at + dwell - secs(1)));
+        assert!(g.should_reconnect(degraded_at + dwell));
+
+        // Recovering inside the window cancels the pending reconnect.
+        g.note_healthy();
+        assert!(!g.should_reconnect(degraded_at + dwell * 10));
+
+        // A later session after consecutive stuck ones waits longer.
+        let later = StuckSessionGuard::new(t0, 3);
+        assert!(!later.should_reconnect(t0 + dwell));
+        assert!(later.should_reconnect(t0 + stuck_session_dwell(3)));
     }
 
     #[test]

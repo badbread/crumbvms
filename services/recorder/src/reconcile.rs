@@ -215,7 +215,7 @@ static TRIPPED_STORAGE_ROOTS: std::sync::LazyLock<std::sync::Mutex<HashSet<Strin
 /// True when this storage root's breaker tripped earlier in this process.
 ///
 /// A poisoned lock reads as "latched" (skip + alarm), the safe direction.
-fn storage_breaker_latched(storage_root: &str) -> bool {
+pub(crate) fn storage_breaker_latched(storage_root: &str) -> bool {
     TRIPPED_STORAGE_ROOTS
         .lock()
         .map_or(true, |set| set.contains(storage_root))
@@ -269,7 +269,7 @@ fn storage_marker_path(storage_root: &Path) -> PathBuf {
 ///
 /// Any error (missing, unreadable, root itself gone) reads as ABSENT, which is
 /// the safe direction: absent means "skip this storage's deletions and alarm".
-async fn storage_marker_present(storage_root: &Path) -> bool {
+pub(crate) async fn storage_marker_present(storage_root: &Path) -> bool {
     tokio::fs::metadata(storage_marker_path(storage_root))
         .await
         .is_ok()
