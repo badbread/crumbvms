@@ -36,6 +36,7 @@ import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_controller.dart';
 import 'package:crumb_desktop/ui/ha_overlay/ha_overlay_layer.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/hotkeys/ha_overlay_hotkey.dart';
+import 'package:crumb_desktop/ui/live/load_retry.dart';
 import 'package:crumb_desktop/ui/live/pane_watchdog.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_badges.dart';
 import 'package:crumb_desktop/ui/live_status/live_status_controller.dart';
@@ -1232,6 +1233,19 @@ class _WallTileState extends State<_WallTile> {
   /// bails instead of clobbering [_pending] with the wrong camera.
   int _loadGen = 0;
 
+  /// Retries a failed INITIAL stream load with backoff (the stall watchdog only
+  /// exists once a player has been adopted, so without this a tile whose first
+  /// `/cameras/:id/streams` fetch failed stayed dead until remounted).
+  final LoadRetry _loadRetry = LoadRetry();
+
+  void _scheduleLoadRetry() {
+    if (!mounted) return;
+    _loadRetry.schedule(() {
+      if (!mounted || _player != null) return;
+      unawaited(_load());
+    });
+  }
+
   /// A replacement player mid stream-swap (main/sub change): it decodes in
   /// the background while the old player keeps rendering, and [_onFirstFrame]
   /// promotes it once it has a real frame — so a stream switch never blanks
@@ -1461,6 +1475,7 @@ class _WallTileState extends State<_WallTile> {
       _videoW = null;
       _videoH = null;
     });
+    _loadRetry.reset();
     unawaited(_load());
     unawaited(_loadHaLinks());
   }
@@ -1497,6 +1512,7 @@ class _WallTileState extends State<_WallTile> {
           streams.preferredForWall;
       if (url == null) {
         setState(() => _error = 'no stream');
+        if (_player == null) _scheduleLoadRetry();
         return;
       }
       final player = Player();
@@ -1584,6 +1600,7 @@ class _WallTileState extends State<_WallTile> {
         if (w != null && w > 0) _onFirstFrame(player, controller);
       }
       spawned = null; // ownership handed off — the catch must not dispose it
+      _loadRetry.reset();
     } catch (e) {
       // cameraStreams's own 401/403 never reached SessionController — a
       // bearer JWT expiring/being revoked while the user stays on Live never
@@ -1592,6 +1609,12 @@ class _WallTileState extends State<_WallTile> {
           (e.statusCode == 401 || e.statusCode == 403)) {
         widget.onUnauthorized?.call();
       }
+      // A failed INITIAL load (no player yet, so no stall watchdog) retries
+      // with backoff, never giving up. A 403 means this camera is outside the
+      // user's grant, which retrying cannot fix; a 401 retries so the tile
+      // recovers once the re-auth prompt succeeds.
+      final denied = e is CrumbApiException && e.statusCode == 403;
+      if (gen == _loadGen && _player == null && !denied) _scheduleLoadRetry();
       // A Player created before open() failed is orphaned; dispose it so its
       // native mpv handle isn't leaked on a failed initial load (#132). On the
       // success path spawned is nulled above once the pane adopts the player
@@ -1952,6 +1975,7 @@ class _WallTileState extends State<_WallTile> {
   void dispose() {
     widget.adaptive?.removeListener(_onAdaptiveChanged);
     widget.adaptive?.dropTile(_paneId);
+    _loadRetry.dispose();
     _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
     widget.audio?.unregisterPane(_paneId);
@@ -2386,6 +2410,19 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
   /// `_WallTileState._loadGen`.
   int _loadGen = 0;
 
+  /// Retries a failed INITIAL stream load with backoff (the stall watchdog only
+  /// exists once a player has been adopted, so without this a tile whose first
+  /// `/cameras/:id/streams` fetch failed stayed dead until remounted).
+  final LoadRetry _loadRetry = LoadRetry();
+
+  void _scheduleLoadRetry() {
+    if (!mounted) return;
+    _loadRetry.schedule(() {
+      if (!mounted || _player != null) return;
+      unawaited(_load());
+    });
+  }
+
   /// True once this pane's own (main-stream) player has decoded a frame —
   /// until then the warm-start controller (if any) covers the wait.
   bool _firstFrame = false;
@@ -2690,6 +2727,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
           : (streams.rtspMain ?? streams.preferredForWall);
       if (url == null) {
         setState(() => _error = 'no stream');
+        _scheduleLoadRetry();
         return;
       }
       final player = Player();
@@ -2766,6 +2804,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
         _controller = controller;
       });
       spawned = null; // ownership handed off — the catch must not dispose it
+      _loadRetry.reset();
     } catch (e) {
       // cameraStreams's own 401/403 never reached SessionController — a
       // bearer JWT expiring/being revoked while the user stays on Live never
@@ -2774,6 +2813,12 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
           (e.statusCode == 401 || e.statusCode == 403)) {
         widget.onUnauthorized?.call();
       }
+      // A failed INITIAL load (no player yet, so no stall watchdog) retries
+      // with backoff, never giving up. A 403 means this camera is outside the
+      // user's grant, which retrying cannot fix; a 401 retries so the tile
+      // recovers once the re-auth prompt succeeds.
+      final denied = e is CrumbApiException && e.statusCode == 403;
+      if (gen == _loadGen && _player == null && !denied) _scheduleLoadRetry();
       // A Player created before open() failed is orphaned; dispose it so its
       // native mpv handle isn't leaked on a failed initial load (#132). On the
       // success path spawned is nulled above (after _player/_controller adopt
@@ -3007,6 +3052,7 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
 
   @override
   void dispose() {
+    _loadRetry.dispose();
     _watchdog?.dispose();
     widget.ptzPanel?.removeListener(_onPtzPanelChanged);
     widget.haOverlay?.editor.removeListener(_onHaOverlayChanged);
