@@ -13199,8 +13199,11 @@ mod tests {
     #[test]
     fn a_loopback_candidate_is_never_seeded_by_either_role() {
         for role in [SettingsSeedRole::Api, SettingsSeedRole::Recorder] {
-            for candidate in ["rtsp://localhost:8554", "rtsp://127.0.0.1:8554", "rtsp://[::1]:8554"]
-            {
+            for candidate in [
+                "rtsp://localhost:8554",
+                "rtsp://127.0.0.1:8554",
+                "rtsp://[::1]:8554",
+            ] {
                 assert_eq!(client_rtsp_base_seed(role, candidate), "");
             }
         }
