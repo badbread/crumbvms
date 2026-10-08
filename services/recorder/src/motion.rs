@@ -2880,6 +2880,173 @@ async fn run_pixel_diff_loop(
     let stderr_handle =
         tokio::spawn(async move { drain_motion_stderr(stderr, camera_id_log, launched_hw).await });
 
+    // ── 7./8. Frame session ───────────────────────────────────────────────────
+    let end = analyse_frame_stream(
+        &mut stdout,
+        camera,
+        pool,
+        motion_tx,
+        health_tx,
+        cancel,
+        alert_gate,
+        alert_after_secs,
+        height,
+        stuck_sessions,
+        FrameTimeouts::PRODUCTION,
+    )
+    .await;
+    let frames_seen = end.frames_seen;
+
+    // ── 9. Shutdown clean-up (correctness items 5 & 6) ───────────────────────
+    //
+    // Kill the child immediately; do NOT wait for more output.
+    if let Err(e) = child.kill().await {
+        // kill() returns Err when the process already exited — that is fine.
+        debug!(
+            camera_id = %camera.id,
+            error     = %e,
+            "motion ffmpeg kill (process may have already exited)"
+        );
+    }
+
+    // A watchdog or read error ends the session here (any event in progress
+    // was already closed by `analyse_frame_stream`); the outer loop backs off
+    // and reconnects. Like before, these exits do not feed the hardware-decode
+    // verdict below.
+    if let Some(e) = end.error {
+        return Err(e);
+    }
+
+    // Wait for the stderr drain task (exits when stderr pipe closes).
+    let drain = stderr_handle.await.unwrap_or_default();
+
+    // Reap the child process.
+    let _ = child.wait().await;
+
+    // ── 9. Hardware-decode runtime verdict (issue #479) ───────────────────────
+    //
+    // The child is gone; `frames_seen` is now the honest answer to "did this
+    // hardware backend actually decode anything". A backend that produced no
+    // frames — with a recognised init-failure signature, or repeatedly — demotes
+    // this camera to CPU decode for the rest of the worker's life, so the outer
+    // back-off reconnect stops relaunching the same failing flags forever (the
+    // second half of the bug: `auto` picked cuda, and nothing ever un-picked it).
+    //
+    // Skipped on cancellation: a worker torn down before its first frame has not
+    // demonstrated anything about the hardware.
+    if !cancel.is_cancelled() {
+        if let Some(reason) =
+            hw_state.note_attempt(launched_hw, frames_seen, drain.init_failure.as_deref())
+        {
+            error!(
+                camera_id = %camera.id,
+                requested = config.motion_hwaccel.as_str(),
+                reason    = %reason,
+                "motion hardware decode is not working for this camera; switching this camera's \
+                 motion decode to CPU on the next reconnect (recording is unaffected — it never \
+                 decodes)"
+            );
+            // Name the specific cause on the health surfaces. The detector is
+            // already unhealthy here (no frames were decoded), so `report_health`
+            // would no-op without publishing a cause; record it directly on the
+            // gate the aggregator reads (issue #523's mechanism), and refresh the
+            // decode-status row so the console explains the switch immediately
+            // instead of only after the next connect.
+            alert_gate.note_unhealthy_cause(&reason);
+            report_decode_status(
+                pool,
+                camera.id,
+                config.motion_hwaccel.as_str(),
+                "cpu",
+                Some(&reason),
+            )
+            .await;
+        }
+    }
+
+    // If the loop ended because the sub-stream CLOSED (ffmpeg EOF) rather than a
+    // real cancellation, return Err so the outer run() applies back-off and
+    // RECONNECTS. An RTSP drop or transient ffmpeg exit closes stdout → EOF; the
+    // old code returned Ok(()) here, which run() treated as "cancelled cleanly"
+    // and exited the task permanently — motion stayed dead for that camera until
+    // the recorder restarted (prod 2026-06-17: Front Door + Backdoor).
+    if end.stuck_reconnect && !cancel.is_cancelled() {
+        *stuck_sessions = stuck_sessions.saturating_add(1);
+        let reason = format!(
+            "sub-stream connected but no usable frames for {}s; reconnecting",
+            end.stuck_dwell.as_secs()
+        );
+        warn!(
+            camera_id = %camera.id,
+            dwell_s = end.stuck_dwell.as_secs(),
+            consecutive = *stuck_sessions,
+            frames_seen,
+            "motion: session never reached a verdict; tearing it down and reconnecting"
+        );
+        // Name the cause on the health surfaces (no transition here: the
+        // source is already unhealthy, so `report_health` would be a no-op).
+        alert_gate.note_unhealthy_cause(&reason);
+        return Err(anyhow::anyhow!("motion {reason}"));
+    }
+
+    if end.stream_ended && !cancel.is_cancelled() {
+        return Err(anyhow::anyhow!(
+            "motion sub-stream ended (ffmpeg EOF); forcing reconnect"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Watchdog deadlines for one frame session. Production uses
+/// [`FrameTimeouts::PRODUCTION`]; tests shorten them.
+#[derive(Debug, Clone, Copy)]
+struct FrameTimeouts {
+    /// Per-read stall watchdog (`FRAME_STALL_TIMEOUT_SECS`).
+    stall: std::time::Duration,
+    /// Frame-receipt watchdog (`FRAME_RECEIPT_TIMEOUT_SECS`).
+    receipt: std::time::Duration,
+}
+
+impl FrameTimeouts {
+    const PRODUCTION: Self = Self {
+        stall: std::time::Duration::from_secs(FRAME_STALL_TIMEOUT_SECS),
+        receipt: std::time::Duration::from_secs(FRAME_RECEIPT_TIMEOUT_SECS),
+    };
+}
+
+/// How one frame session ended.
+#[derive(Debug)]
+struct FrameSessionEnd {
+    frames_seen: u64,
+    /// ffmpeg closed stdout (EOF).
+    stream_ended: bool,
+    /// The stuck-session guard ended the session.
+    stuck_reconnect: bool,
+    stuck_dwell: std::time::Duration,
+    /// A watchdog fired or the read failed; the caller reconnects.
+    error: Option<anyhow::Error>,
+}
+
+/// Analyse raw gray frames from `stdout` until the session ends (cancel, EOF,
+/// a watchdog, a read error, or the stuck-session guard). Split out of
+/// [`run_pixel_diff_loop`] so a stall-then-resume sequence is testable without
+/// ffmpeg. Whatever ends the session, an event still in progress gets its
+/// synthetic STOP before this returns.
+#[allow(clippy::too_many_arguments)]
+async fn analyse_frame_stream<R: tokio::io::AsyncRead + Unpin>(
+    stdout: &mut R,
+    camera: &Camera,
+    pool: &Pool,
+    motion_tx: &MotionTx,
+    health_tx: &MotionHealthTx,
+    cancel: &CancellationToken,
+    alert_gate: &Arc<UnhealthyAlertGate>,
+    alert_after_secs: u64,
+    height: u32,
+    stuck_sessions: &mut u32,
+    timeouts: FrameTimeouts,
+) -> FrameSessionEnd {
     // ── 7. Initialise per-loop state ──────────────────────────────────────────
     let w = MOTION_FRAME_WIDTH as usize;
     let h = height as usize;
@@ -3002,6 +3169,10 @@ async fn run_pixel_diff_loop(
     // verdict is ended and reconnected, see `STUCK_SESSION_DWELL_BASE_SECS`.
     let mut stuck_guard = StuckSessionGuard::new(std::time::Instant::now(), *stuck_sessions);
     let mut stuck_reconnect = false;
+    // Set by every watchdog / read-error exit below. Those used to `return`
+    // straight out of the loop, which skipped the synthetic STOP for an event
+    // in progress (see the end of this function).
+    let mut error: Option<anyhow::Error> = None;
     loop {
         // Check cancellation before every frame read (correctness item 6).
         if cancel.is_cancelled() {
@@ -3020,7 +3191,7 @@ async fn run_pixel_diff_loop(
         // fresh or live-reconfig-restarted worker that stalls before decoding
         // frame #1 (gap #2).  The stall watchdog below fires first in the common
         // case (12 s < 15 s); this is a backstop for the edge case.
-        if last_frame_decoded.elapsed().as_secs() >= FRAME_RECEIPT_TIMEOUT_SECS {
+        if last_frame_decoded.elapsed() >= timeouts.receipt {
             report_health(
                 health_tx,
                 pool,
@@ -3031,10 +3202,11 @@ async fn run_pixel_diff_loop(
                 alert_after_secs,
             )
             .await;
-            return Err(anyhow::anyhow!(
+            error = Some(anyhow::anyhow!(
                 "motion sub-stream receipt timeout: no decoded frame for {}s; forcing reconnect",
-                FRAME_RECEIPT_TIMEOUT_SECS
+                timeouts.receipt.as_secs()
             ));
+            break;
         }
 
         // Read one full frame — or break if the token fires. The read is wrapped
@@ -3044,11 +3216,15 @@ async fn run_pixel_diff_loop(
         // back-off and RECONNECT — which a silent stall never triggers on its own.
         let frame_ready = tokio::select! {
             r = tokio::time::timeout(
-                std::time::Duration::from_secs(FRAME_STALL_TIMEOUT_SECS),
-                read_exact_frame(&mut stdout, &mut curr_frame),
+                timeouts.stall,
+                read_exact_frame(&mut *stdout, &mut curr_frame),
             ) => {
                 match r {
-                    Ok(inner) => inner.context("reading motion frame from ffmpeg stdout")?,
+                    Ok(Ok(ready)) => ready,
+                    Ok(Err(e)) => {
+                        error = Some(e.context("reading motion frame from ffmpeg stdout"));
+                        break;
+                    }
                     Err(_elapsed) => {
                         report_health(
                             health_tx,
@@ -3060,10 +3236,11 @@ async fn run_pixel_diff_loop(
                             alert_after_secs,
                         )
                         .await;
-                        return Err(anyhow::anyhow!(
+                        error = Some(anyhow::anyhow!(
                             "motion sub-stream stalled: no frame for {}s; forcing reconnect",
-                            FRAME_STALL_TIMEOUT_SECS
+                            timeouts.stall.as_secs()
                         ));
+                        break;
                     }
                 }
             }
@@ -3427,20 +3604,16 @@ async fn run_pixel_diff_loop(
         );
     }
 
-    // ── 9. Shutdown clean-up (correctness items 5 & 6) ───────────────────────
-    //
-    // Kill the child immediately; do NOT wait for more output.
-    if let Err(e) = child.kill().await {
-        // kill() returns Err when the process already exited — that is fine.
-        debug!(
-            camera_id = %camera.id,
-            error     = %e,
-            "motion ffmpeg kill (process may have already exited)"
-        );
-    }
-
-    // If motion was in-progress when we cancelled, emit a synthetic STOP so
-    // recording.rs can close out the event and write the correct end timestamp.
+    // If motion was in progress when the session ended, for ANY reason, emit a
+    // synthetic STOP so recording.rs can close out the event and write the
+    // correct end timestamp. This must cover the watchdog and read-error exits
+    // too: a START whose STOP never arrives stays open in the recording task's
+    // `MotionUnion` (deliberately no time-based expiry, correctness item 25),
+    // which pins a Motion-mode camera's buffer in Recording and keeps every
+    // segment until the worker is rebuilt. That is the production 18-day
+    // "fail-open": a camera reboot is a large scene change (a START) followed
+    // by a dead stream (frame-stall watchdog), the detector reconnected and
+    // went healthy again, and the stranded START kept every segment.
     if motion_state == MotionState::Active {
         if let Some(started_at) = motion_started_at {
             emit_pixel_signal(
@@ -3458,85 +3631,13 @@ async fn run_pixel_diff_loop(
         }
     }
 
-    // Wait for the stderr drain task (exits when stderr pipe closes).
-    let drain = stderr_handle.await.unwrap_or_default();
-
-    // Reap the child process.
-    let _ = child.wait().await;
-
-    // ── 9. Hardware-decode runtime verdict (issue #479) ───────────────────────
-    //
-    // The child is gone; `frames_seen` is now the honest answer to "did this
-    // hardware backend actually decode anything". A backend that produced no
-    // frames — with a recognised init-failure signature, or repeatedly — demotes
-    // this camera to CPU decode for the rest of the worker's life, so the outer
-    // back-off reconnect stops relaunching the same failing flags forever (the
-    // second half of the bug: `auto` picked cuda, and nothing ever un-picked it).
-    //
-    // Skipped on cancellation: a worker torn down before its first frame has not
-    // demonstrated anything about the hardware.
-    if !cancel.is_cancelled() {
-        if let Some(reason) =
-            hw_state.note_attempt(launched_hw, frames_seen, drain.init_failure.as_deref())
-        {
-            error!(
-                camera_id = %camera.id,
-                requested = config.motion_hwaccel.as_str(),
-                reason    = %reason,
-                "motion hardware decode is not working for this camera; switching this camera's \
-                 motion decode to CPU on the next reconnect (recording is unaffected — it never \
-                 decodes)"
-            );
-            // Name the specific cause on the health surfaces. The detector is
-            // already unhealthy here (no frames were decoded), so `report_health`
-            // would no-op without publishing a cause; record it directly on the
-            // gate the aggregator reads (issue #523's mechanism), and refresh the
-            // decode-status row so the console explains the switch immediately
-            // instead of only after the next connect.
-            alert_gate.note_unhealthy_cause(&reason);
-            report_decode_status(
-                pool,
-                camera.id,
-                config.motion_hwaccel.as_str(),
-                "cpu",
-                Some(&reason),
-            )
-            .await;
-        }
+    FrameSessionEnd {
+        frames_seen,
+        stream_ended,
+        stuck_reconnect,
+        stuck_dwell: stuck_guard.dwell,
+        error,
     }
-
-    // If the loop ended because the sub-stream CLOSED (ffmpeg EOF) rather than a
-    // real cancellation, return Err so the outer run() applies back-off and
-    // RECONNECTS. An RTSP drop or transient ffmpeg exit closes stdout → EOF; the
-    // old code returned Ok(()) here, which run() treated as "cancelled cleanly"
-    // and exited the task permanently — motion stayed dead for that camera until
-    // the recorder restarted (prod 2026-06-17: Front Door + Backdoor).
-    if stuck_reconnect && !cancel.is_cancelled() {
-        *stuck_sessions = stuck_sessions.saturating_add(1);
-        let reason = format!(
-            "sub-stream connected but no usable frames for {}s; reconnecting",
-            stuck_guard.dwell.as_secs()
-        );
-        warn!(
-            camera_id = %camera.id,
-            dwell_s = stuck_guard.dwell.as_secs(),
-            consecutive = *stuck_sessions,
-            frames_seen,
-            "motion: session never reached a verdict; tearing it down and reconnecting"
-        );
-        // Name the cause on the health surfaces (no transition here: the
-        // source is already unhealthy, so `report_health` would be a no-op).
-        alert_gate.note_unhealthy_cause(&reason);
-        return Err(anyhow::anyhow!("motion {reason}"));
-    }
-
-    if stream_ended && !cancel.is_cancelled() {
-        return Err(anyhow::anyhow!(
-            "motion sub-stream ended (ffmpeg EOF); forcing reconnect"
-        ));
-    }
-
-    Ok(())
 }
 
 // ─── geometry probe ───────────────────────────────────────────────────────────
@@ -5185,6 +5286,195 @@ mod tests {
     /// The recovery TRANSITION itself: a source that went unhealthy flips the
     /// watch back to healthy on its next verdict-capable frame, and that flip
     /// bumps the gate generation, which is what retires the repeating alert.
+    /// A Motion-mode camera for frame-session tests, built without a DB: the
+    /// simple frame-diff detector and a manual floor so a moving square is a
+    /// deterministic motion event.
+    fn stall_test_camera(id: uuid::Uuid) -> Camera {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": "stall test camera",
+            "enabled": true,
+            "go2rtc_name": format!("stall_{}", id.simple()),
+            "main_url": "stall_main",
+            "sub_url": "stall_sub",
+            "policy": {
+                "id": uuid::Uuid::new_v4(),
+                "is_default": false,
+                "origin": "operator",
+                "mode": "motion",
+                "live_retention_hours": 48,
+                "archive_enabled": false,
+                "motion_pre_seconds": 5,
+                "motion_post_seconds": 10,
+                "motion_sensitivity": "manual",
+                "motion_threshold": 0.002,
+                "motion_keyframes_only": false,
+                "record_stream": "main",
+                "record_audio": true
+            },
+            "onvif_motion": false,
+            "motion_source": "pixel",
+            "motion_pixel_enabled": true,
+            "motion_frigate_enabled": false,
+            "motion_ha_enabled": false,
+            "motion_algorithm": "framediff",
+            "created_at": "2026-01-01T00:00:00Z",
+            "served_by": "crumb",
+            "ptz_control_enabled": false
+        }))
+        .expect("test camera deserializes")
+    }
+
+    /// `count` gray frames (320 x 180): low sensor-like noise (never an exact
+    /// duplicate), plus, when `square` is set, a bright 40 px square moving
+    /// 16 px per frame.
+    fn stall_test_frames(count: usize, square: bool, seed: &mut u32) -> Vec<u8> {
+        let (w, h) = (
+            MOTION_FRAME_WIDTH as usize,
+            MOTION_FRAME_HEIGHT_FALLBACK as usize,
+        );
+        let mut out = Vec::with_capacity(count * w * h);
+        for f in 0..count {
+            for y in 0..h {
+                for x in 0..w {
+                    *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    let mut v = 100 + ((*seed >> 16) % 8) as u8;
+                    let sx = 10 + (f * 16) % (w - 60);
+                    if square && (60..100).contains(&y) && (sx..sx + 40).contains(&x) {
+                        v = 250;
+                    }
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// Production evidence: three Motion-mode cameras logged
+    /// `motion_detector_unhealthy` = "frame-stall watchdog fired" once and then
+    /// kept every segment for 18 days, until a restart. This drives that exact
+    /// sequence through the real frame session: frames, a motion START, the
+    /// sub-stream stalls (watchdog), then a reconnected session whose frames
+    /// resume. Asserts the in-process recovery: the stall closes the open event
+    /// with a STOP (so the recording task's motion union does not stay open and
+    /// pin the camera's buffer in Recording), health goes false on the stall,
+    /// and the next session flips health back to healthy.
+    #[tokio::test]
+    async fn frame_stall_then_resume_recovers_in_process_and_closes_the_event() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::AsyncWriteExt;
+
+        let cam_id = uuid::Uuid::new_v4();
+        let camera = stall_test_camera(cam_id);
+        let pool = crumb_common::db::build_pool("postgres://crumb:x@127.0.0.1:9/crumb", 1)
+            .expect("pool builds lazily");
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel(64);
+        let motion_tx = crate::MotionTx::new(raw_tx, cam_id);
+        let (health_tx, health_rx) = tokio::sync::watch::channel(false);
+        let gate = UnhealthyAlertGate::new();
+        let cancel = CancellationToken::new();
+        let mut stuck = 0u32;
+        let timeouts = FrameTimeouts {
+            stall: std::time::Duration::from_millis(400),
+            receipt: std::time::Duration::from_secs(5),
+        };
+        let mut seed = 7u32;
+
+        // Session 1: warm-up, then motion, then the stream goes silent while the
+        // socket stays open (the camera rebooting under go2rtc).
+        let mut frames = stall_test_frames(WARMUP_FRAMES as usize + 10, false, &mut seed);
+        frames.extend(stall_test_frames(20, true, &mut seed));
+        let (mut reader, mut writer) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            writer.write_all(&frames).await.expect("feed frames");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await; // stall, not EOF
+            drop(writer);
+        });
+        let end = analyse_frame_stream(
+            &mut reader,
+            &camera,
+            &pool,
+            &motion_tx,
+            &health_tx,
+            &cancel,
+            &gate,
+            3600,
+            MOTION_FRAME_HEIGHT_FALLBACK,
+            &mut stuck,
+            timeouts,
+        )
+        .await;
+        feeder.abort();
+        let err = end
+            .error
+            .expect("the stall watchdog ends the session")
+            .to_string();
+        assert!(err.contains("stalled"), "unexpected session end: {err}");
+        assert!(
+            !*health_rx.borrow(),
+            "a stall fails the source open at once"
+        );
+        assert_eq!(
+            gate.last_unhealthy_reason().as_deref(),
+            Some("frame-stall watchdog fired")
+        );
+        let episode = gate.generation.load(SeqCst);
+
+        // The recording task's view: fold every signal the session sent.
+        let mut union = crate::recording::MotionUnion::default();
+        let mut started = false;
+        let mut closed = false;
+        while let Ok(sig) = raw_rx.try_recv() {
+            if let Some(edge) = union.fold(&sig) {
+                if edge.stopped_at.is_none() {
+                    started = true;
+                } else {
+                    closed = true;
+                }
+            }
+        }
+        assert!(started, "the moving square must have opened a motion event");
+        assert!(
+            closed,
+            "the stall must close the open event; a stranded START keeps the camera \
+             recording everything until the worker restarts"
+        );
+
+        // Session 2 (the reconnect): frames resume, the detector warms up and
+        // reports healthy again in-process; then ffmpeg exits (EOF).
+        let frames = stall_test_frames(WARMUP_FRAMES as usize + 10, false, &mut seed);
+        let (mut reader, mut writer) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            writer.write_all(&frames).await.expect("feed frames");
+        });
+        let end = analyse_frame_stream(
+            &mut reader,
+            &camera,
+            &pool,
+            &motion_tx,
+            &health_tx,
+            &cancel,
+            &gate,
+            3600,
+            MOTION_FRAME_HEIGHT_FALLBACK,
+            &mut stuck,
+            timeouts,
+        )
+        .await;
+        feeder.await.expect("feeder");
+        assert!(end.error.is_none(), "a clean EOF is not a watchdog error");
+        assert!(end.stream_ended);
+        assert!(
+            *health_rx.borrow(),
+            "resumed frames recover health in-process"
+        );
+        assert_ne!(
+            gate.generation.load(SeqCst),
+            episode,
+            "recovery supersedes the stall episode, retiring its repeat alerts"
+        );
+    }
+
     #[tokio::test]
     async fn report_health_recovery_transition_retires_the_episode() {
         use std::sync::atomic::Ordering::SeqCst;

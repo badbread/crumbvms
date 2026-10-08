@@ -8,20 +8,26 @@ revisit.
 
 ---
 
-## 2026-10-08, Motion recovery and persist safety: stuck sessions reconnect, unhealthy alerts repeat, failed persists retry, the recording path confirms a root from earlier history
+## 2026-10-08, Motion recovery and persist safety: every session end closes its event, stuck sessions reconnect, unhealthy alerts repeat, failed persists retry, the recording path confirms a root from earlier history
 
-**Context.** Three production cameras raised `motion_detector_unhealthy` once
-each on one night, failed open, and recorded continuously for 18 days until a
-recorder restart. The pixel source's frame watchdogs only end a session that
-stops delivering frames; a session that keeps delivering frames the detector
-cannot use (warm-up never completing, or a duplicate-frame "long GOP" window)
-was never replaced, and the alert fired once per episode. Separately, audit R8:
+**Context.** Three production Motion-mode cameras raised
+`motion_detector_unhealthy` ("frame-stall watchdog fired") once each on one
+night and then kept every segment for 18 days until a recorder restart. The
+frame-stall watchdog `return`ed out of the frame loop past the synthetic STOP
+for an in-progress event; the detector reconnected and recovered, but the
+stranded START kept the recording task's motion union open, so the buffer
+stayed in Recording. The alert fired once per episode. Separately, a session
+that keeps delivering frames the detector cannot use is never replaced by the
+watchdogs. Audit R8:
 a kept motion segment whose copy into storage failed was dropped from the ring
 and later deleted by the reconnect sweep. Audit R9: the recording path wrote
 the storage marker after any committed segment, so recording onto an empty
 mountpoint confirmed that mountpoint.
 
 **Decision.**
+- Every pixel session exit (cancel, EOF, either watchdog, read error, stuck
+  guard) emits the STOP for an event in progress. The recording side keeps its
+  no-expiry rule: the source that opened an event closes it.
 - A pixel session connected for 120 s without a verdict is torn down and
   reconnected; the dwell doubles per consecutive stuck session up to 30 min and
   resets on the first verdict. Reconnects continue indefinitely.
@@ -39,6 +45,7 @@ mountpoint confirmed that mountpoint.
 
 | # | Option | Verdict |
 |---|--------|---------|
+| 0 | Expire stale open keys in `MotionUnion` (or clear the union when a source recovers) | Rejected: item 25 already rejects a blind expiry (it would cut a second source's genuinely long event); closing at the source fixes the cause instead. |
 | 1 | Reconnect the moment the long-GOP check trips | Rejected: a camera whose sub-stream is keyframes-only by design would reconnect-spin; the doubling dwell bounds that to one retry per 30 min. |
 | 2 | Re-alert on every reconnect or at the rule cooldown (15 min) | Rejected: noisy for a known-degraded camera; 4 h keeps it visible without paging all night. |
 | 3 | Give up on a failed persist after N attempts | Rejected: the cache file is the only copy; a storage outage of any length must not turn into lost footage. |

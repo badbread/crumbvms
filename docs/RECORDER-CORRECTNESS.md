@@ -113,14 +113,20 @@ recorder, and later the API) must satisfy these *by construction*.
     surprise. The fallback itself is unchanged and safe, footage is never lost, only the
     disk-saving benefit of Motion mode is temporarily suspended, this item only requires
     that it also be *visible*.
-    Fail-open must also END on its own. A pixel session that stays connected but never
-    reaches a verdict (still in warm-up, or failing open on a duplicate-frame "long GOP"
-    window) keeps feeding the frame watchdogs, so nothing used to replace it; three
-    production cameras failed open for 18 days until a recorder restart gave them a fresh
-    ffmpeg session. The stuck-session guard (`motion.rs` `StuckSessionGuard`) ends such a
-    session after 120 s without a verdict, doubling per consecutive stuck session up to
-    30 min, and reconnects indefinitely (connection errors keep their own 1 to 30 s
-    backoff). While a source stays unhealthy its `motion_detector_unhealthy` alert
+    Fail-open must also END on its own. **Every way a motion session ends closes the
+    event it has open**: the pixel frame session (`analyse_frame_stream`) emits the
+    synthetic STOP for an in-progress event on the watchdog and read-error exits too,
+    not only on cancel/EOF. Before, the frame-stall watchdog `return`ed past that STOP:
+    a camera reboot is a big scene change (START) followed by a dead stream (stall), the
+    detector reconnected and went healthy again, but the stranded START stayed open in
+    the recording task's `MotionUnion` (no time-based expiry, item 25), pinning the
+    buffer in Recording. Three production Motion-mode cameras kept every segment for 18
+    days that way until a restart rebuilt their workers. Guarded by
+    `frame_stall_then_resume_recovers_in_process_and_closes_the_event`. Separately, a
+    session that stays connected but never reaches a verdict (warm-up never completing,
+    or a duplicate-frame "long GOP" window) keeps feeding the frame watchdogs; the
+    stuck-session guard (`StuckSessionGuard`) ends it after 120 s, doubling per
+    consecutive stuck session up to 30 min. While a source stays unhealthy its `motion_detector_unhealthy` alert
     re-fires every 4 h (`UNHEALTHY_REALERT_INTERVAL_SECS`), stopping on RECOVERED or when
     the worker that owns the episode is torn down.
 20. **Spill never drops a buffered segment.** If the tmpfs cache nears its configured size
