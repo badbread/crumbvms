@@ -8,6 +8,72 @@ revisit.
 
 ---
 
+## 2026-10-08, Eviction under a full or missing disk: the archive tier gets its own floor, failing moves fall back to deleting live footage on the low disk, and sweeps never prune or write on an unconfirmed storage
+
+**Context.** Audit findings R2 to R7 against `services/recorder/src/archive.rs`:
+a full archive disk on its own filesystem made every move fail and the live
+eviction loop `break`, so the live disk filled and recording stopped on every
+camera of the policy; the retention and eviction sweeps deleted index rows for
+missing files with no marker or breaker check (the issue #504 failure through a
+second door); archive moves and the "Change storage" drain wrote into an
+unmounted mountpoint; the live retention sweep's single shortest-retention
+cutoff let long-retention footage fill the oldest-first batch, so a short
+retention was never enforced; protected-bookmark bytes counted toward byte caps
+they could never be evicted from; and archive-off floor eviction deleted footage
+on other disks and credited it against a deficit it never freed.
+
+**Decision.**
+
+- The archive filesystem has its own free-space floor (global `MIN_FREE_*`
+  thresholds), run per archive-enabled policy before the cron move: the oldest
+  unprotected archive footage on that filesystem rolls over. With the live floor
+  in deficit and archive moves failing for a systemic reason (or the
+  destination refused), the sweep deletes the oldest live segment on the deficit
+  filesystem rather than stopping; cap-only pressure still keeps the footage. A
+  full or read-only archive destination raises `storage_unwritable`.
+- Every missing-file row prune in the sweeps goes through one guard (marker
+  present, breaker not latched, a sweep-local breaker with reconcile's
+  thresholds); otherwise the row is kept. A missing file never credits a deficit.
+- Archive moves and drains require a confirmed destination: marker present, or
+  no segment ever indexed under that path (a new disk, which gets the marker
+  after the first committed move).
+- Live retention applies each camera's own cutoff in SQL.
+- Byte caps compare against unprotected bytes, and a cap-driven delete never
+  touches footage younger than one hour.
+- Archive-off floor eviction only considers and credits footage on the deficit
+  filesystem.
+
+**Rejected.**
+
+- *Stop archive moves while the archive disk is below its floor, without
+  deleting archive footage.* Keeps old archive footage, but the live tier then
+  fills with nothing to move into, which is the original failure. Rolling the
+  oldest footage over is what any NVR does on a full disk.
+- *A new dedicated alert key for "archive full" and for "protected footage
+  exceeds the cap".* Needs a seeded rule plus console and notification
+  surfaces; `storage_unwritable` already means "the recorder cannot write to
+  this storage". The protected-share condition is a log warning for now.
+- *An index on `segments(storage_id)` for the destination history check.* A
+  non-concurrent index build on a large `segments` table at boot blocks
+  inserts; the check only runs when the marker is absent, which after the first
+  committed move is never.
+- *Skip the per-camera SQL cutoff and loop per retention value instead.* Same
+  effect with more queries; the view already exposes the retention per camera.
+
+**Trade-offs accepted.** An archive tier configured with "keep indefinitely"
+now loses its oldest footage when its disk reaches the floor (before, the disk
+filled and live recording eventually stopped). On a shared live/archive
+filesystem the archive floor deletes the oldest archive footage before the live
+rescue touches live footage. A policy whose protected footage is large can use
+more disk than its byte cap (the free-space floor still guards the disk). A
+storage that lost its marker keeps stale rows until an operator restores the
+marker (an empty file is enough).
+
+**Revisit triggers.** Operators wanting a "never roll archive footage" mode
+(would need an explicit, loud stop-recording or stop-archiving choice); a
+dedicated alert surface for storage health landing in the console; reports of
+the history check being slow on very large indexes.
+
 ## 2026-09-08, Notification times are rendered PER PROVIDER: client-localized markup for Discord and Slack, the server's `TZ` for everyone else
 
 **Context.** Every channel message formatted the event timestamp in UTC with a

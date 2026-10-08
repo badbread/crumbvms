@@ -194,6 +194,21 @@ recorder, and later the API) must satisfy these *by construction*.
     `ARCHIVE_GUARD` (8), and a `premature_rollover` event fires so the loss is
     visible. See `docs/DECISIONS.md` (2026-07-12).
 
+    The same rescue also applies when archive moves are failing for a systemic
+    reason (archive disk full or read-only, or the destination is not confirmed,
+    item 35): while the live floor is in deficit, the oldest live segment ON THE
+    DEFICIT FILESYSTEM is deleted instead of breaking out of the loop, and
+    `storage_unwritable` fires. Cap-only pressure still never deletes un-archived
+    footage. The ARCHIVE filesystem has its own floor (`archive_floor_sweep`,
+    global `MIN_FREE_*` thresholds) that rolls the oldest unprotected archive
+    footage over before the cron move runs, so a full archive disk cannot wedge
+    the live tier. With archiving OFF, floor eviction only considers and only
+    credits footage on the deficit filesystem; footage on other disks is left to
+    the byte cap. Byte caps compare against UNPROTECTED bytes (protected footage
+    is never evictable, so counting it made the cap delete every new segment),
+    and a cap-driven delete never touches footage younger than one hour. See
+    `docs/DECISIONS.md` (2026-10-08).
+
 ## fail-open across every seam (extends item 19)
 25. **Fail-open state survives reconnect and stays consistent through an unhealthy
     window.** `MotionBuffer`/`MotionUnion`/`pending_signals` are worker-lifetime
@@ -332,3 +347,28 @@ recorder, and later the API) must satisfy these *by construction*.
     `a_false_marker_below_the_breaker_floor_prunes_the_whole_small_index`. See
     `docs/DECISIONS.md` (2026-08-06, and the 2026-08-07 follow-up) for the
     rejected mountpoint heuristics and why the marker is written post-commit.
+
+35. **The retention and eviction sweeps obey the same storage confirmation, and
+    nothing writes footage into an unconfirmed destination.** Every
+    "file is missing, so delete the row" decision in `archive.rs` (live and
+    archive retention, size eviction, max-retention, the archive floor) goes
+    through `DanglingGuard`: the row is KEPT unless the segment's storage root
+    carries the marker, its reconcile breaker is not latched, and the sweep has
+    not seen a mass-missing pattern on that root (same 100-row / 50 % shape,
+    latched for the process lifetime). A missing file never credits a
+    free-space deficit. Archive moves (cron and eviction) and the "Change
+    storage" drain refuse a destination whose root lacks the marker while
+    footage is indexed under its path (an unmounted disk), raise
+    `storage_unwritable`, and keep the source; a destination with no indexed
+    history is accepted and gets its marker after the first committed move.
+    The live retention sweep applies each camera's own retention cutoff in SQL,
+    so a long-retention camera cannot fill the oldest-first batch and stall a
+    shorter one. Guarded by the `size_eviction_integration` tests
+    `eviction_keeps_dangling_rows_on_unconfirmed_storage`,
+    `unconfirmed_archive_destination_is_never_written`,
+    `change_storage_drain_refuses_unconfirmed_target`,
+    `live_retention_enforces_each_cameras_own_window`,
+    `floor_eviction_archive_off_only_deletes_on_the_low_disk`,
+    `protected_bytes_do_not_drive_cap_eviction_of_new_footage`,
+    `archive_floor_rolls_oldest_archive_footage_over` and
+    `failing_archive_moves_do_not_wedge_the_live_floor`.

@@ -287,6 +287,521 @@ fn credit_move_against_deficit(deficit: i64, seg_bytes: i64, src_on_floor_fs: bo
     (deficit - seg_bytes).max(0)
 }
 
+// ─── sweep safety helpers (storage confirmation, accounting, candidates) ─────
+
+/// Cap-driven DELETES never touch footage younger than this (R5). A byte cap
+/// that protected footage (or a tiny cap) can never satisfy must not degrade
+/// into "delete every new segment a minute after it is recorded": the cap may
+/// then be overshot by up to this much footage, while the free-space floor
+/// (which has no age limit) still guards the physical disk.
+const CAP_EVICTION_MIN_AGE_SECS: i64 = 3600;
+
+/// Missing-file breaker for the retention and eviction sweeps (R3). Same shape
+/// and thresholds as the reconcile dangling-row breaker
+/// (`reconcile::DANGLING_BREAKER_MIN_MISSING` / `_MISSING_PCT`, correctness item
+/// 34): row pruning on a storage root stops once more than this many of the
+/// rows a sweep touched there are missing ...
+const SWEEP_BREAKER_MIN_MISSING: u64 = 100;
+/// ... AND more than this percentage of them are.
+const SWEEP_BREAKER_MISSING_PCT: u64 = 50;
+
+/// Storage roots whose sweep breaker tripped in this process. Latched for the
+/// process lifetime, like the reconcile breaker: a sweep runs every tick, so a
+/// per-sweep bound alone would still drain the index 100 rows per minute. A
+/// false latch only leaves genuinely dangling rows for the reconcile pass
+/// (which checks every row of the storage) to prune.
+static SWEEP_TRIPPED_ROOTS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// True when the sweep breaker for `root` tripped earlier in this process. A
+/// poisoned lock reads as latched (skip), the safe direction.
+fn sweep_breaker_latched(root: &str) -> bool {
+    SWEEP_TRIPPED_ROOTS
+        .lock()
+        .map_or(true, |set| set.contains(root))
+}
+
+fn latch_sweep_breaker(root: &str) {
+    if let Ok(mut set) = SWEEP_TRIPPED_ROOTS.lock() {
+        set.insert(root.to_owned());
+    }
+}
+
+/// Pure breaker decision (unit-tested): both the absolute floor and the
+/// percentage must be exceeded.
+fn sweep_breaker_tripped(missing: u64, checked: u64) -> bool {
+    missing > SWEEP_BREAKER_MIN_MISSING
+        && missing.saturating_mul(100) > checked.saturating_mul(SWEEP_BREAKER_MISSING_PCT)
+}
+
+/// Raise the operator-visible `storage_unwritable` event (seeded by migration
+/// 0056, 900 s cooldown) for a sweep-side storage problem. Best-effort.
+async fn raise_storage_event(pool: &Pool, detail: &str) {
+    if let Err(e) = db::insert_system_event(pool, "storage_unwritable", None, Some(detail)).await {
+        warn!(error = %e, "failed to record storage_unwritable system event");
+    }
+}
+
+/// Per-root tally for ONE sweep.
+#[derive(Default)]
+struct RootTally {
+    /// Marker presence, read once per sweep on first need.
+    marker: Option<bool>,
+    checked: u64,
+    missing: u64,
+    alarmed: bool,
+}
+
+/// Gate on every "file is missing, so delete its index row" decision made by
+/// the retention and eviction sweeps (R3, correctness item 34).
+///
+/// "The file is missing" only proves the row is stale when we are looking at
+/// the real disk. A storage whose root lacks the `.crumb-storage` marker (an
+/// unmounted disk, Docker's empty bind source) or whose breaker is latched is
+/// not confirmable, so its rows are KEPT. On a confirmed root, a mass-missing
+/// pattern trips the same breaker shape reconcile uses. Never fails toward
+/// delete.
+#[derive(Default)]
+struct DanglingGuard {
+    roots: std::collections::HashMap<String, RootTally>,
+}
+
+impl DanglingGuard {
+    /// Record a row on `root` whose file was present (counts toward `checked`).
+    fn note_present(&mut self, root: &str) {
+        self.roots.entry(root.to_owned()).or_default().checked += 1;
+    }
+
+    /// A row on `root` points at a missing file. Returns `true` only when the
+    /// row may be pruned.
+    async fn may_prune_missing(&mut self, pool: &Pool, root: &str) -> bool {
+        let latched =
+            crate::reconcile::storage_breaker_latched(root) || sweep_breaker_latched(root);
+        let tally = self.roots.entry(root.to_owned()).or_default();
+        tally.checked += 1;
+        tally.missing += 1;
+        if tally.marker.is_none() {
+            tally.marker = Some(crate::reconcile::storage_marker_present(Path::new(root)).await);
+        }
+        let refusal = if latched {
+            Some("its missing-file breaker is latched")
+        } else if tally.marker == Some(false) {
+            Some("its .crumb-storage marker is absent (not mounted, or not the real disk)")
+        } else if sweep_breaker_tripped(tally.missing, tally.checked) {
+            latch_sweep_breaker(root);
+            Some("too many of its segment files are missing (breaker tripped)")
+        } else {
+            None
+        };
+        let Some(reason) = refusal else {
+            return true;
+        };
+        if !tally.alarmed {
+            tally.alarmed = true;
+            let detail = format!(
+                "Storage {root}: retention/eviction found segment files missing but kept their \
+                 index rows because {reason}. Check that the disk is mounted."
+            );
+            error!(storage = %root, reason, "sweep: refusing to prune index rows for missing files");
+            raise_storage_event(pool, &detail).await;
+        }
+        false
+    }
+}
+
+/// What [`delete_segment_file_then_row`] actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOutcome {
+    /// The file was removed (real bytes freed) and then its row.
+    Deleted,
+    /// The file was already gone on a confirmed storage; the stale row was
+    /// pruned. No bytes were freed.
+    DanglingPruned,
+    /// The file was missing on an unconfirmed storage; the row was KEPT.
+    DanglingKept,
+}
+
+/// True when an error chain carries a "destination is full or read-only"
+/// I/O error (ENOSPC, EDQUOT, EROFS).
+fn is_storage_full_or_readonly(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull
+                    | std::io::ErrorKind::ReadOnlyFilesystem
+                    | std::io::ErrorKind::QuotaExceeded
+            ) {
+                return true;
+            }
+            #[cfg(unix)]
+            {
+                matches!(
+                    io.raw_os_error(),
+                    Some(libc::ENOSPC | libc::EDQUOT | libc::EROFS)
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        })
+    })
+}
+
+/// True when any segment row (either stage) is indexed under a storage whose
+/// path is `path`. Keyed by PATH, not id, because two storage rows can point
+/// at one directory.
+async fn storage_path_has_history(pool: &Pool, path: &str) -> Result<bool> {
+    let client = db::get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            SELECT EXISTS (
+                SELECT 1 FROM segments s
+                JOIN storages st ON st.id = s.storage_id
+                WHERE st.path = $1
+            ) AS has
+            ",
+            &[&path],
+        )
+        .await
+        .context("storage_path_has_history")?;
+    Ok(row.get("has"))
+}
+
+/// May the recorder WRITE footage into `storage` (archive move or "Change
+/// storage" drain destination)? (R7)
+///
+/// Yes when its root carries the `.crumb-storage` marker and its breaker is not
+/// latched. A root WITHOUT the marker is accepted only while no segment has
+/// ever been indexed under that path (a brand-new disk; the first committed
+/// write then plants the marker). A destination that has indexed footage but no
+/// marker is "not the real disk" (an unmounted mountpoint): writing there would
+/// hide the moved footage under the mount once the disk comes back.
+async fn destination_confirmed(pool: &Pool, storage: &Storage) -> Result<bool> {
+    if crate::reconcile::storage_breaker_latched(&storage.path)
+        || sweep_breaker_latched(&storage.path)
+    {
+        return Ok(false);
+    }
+    if crate::reconcile::storage_marker_present(Path::new(&storage.path)).await {
+        return Ok(true);
+    }
+    Ok(!storage_path_has_history(pool, &storage.path).await?)
+}
+
+/// Log + alert for a refused destination. Returns the alert text.
+async fn report_unconfirmed_destination(pool: &Pool, storage: &Storage, what: &str) -> String {
+    let detail = format!(
+        "Storage '{}' ({}) is not confirmed as the real disk (its .crumb-storage marker is \
+         missing although footage is indexed there, or its breaker is latched); {what} into it \
+         was refused and the source footage kept. Check that the disk is mounted.",
+        storage.name, storage.path
+    );
+    error!(storage = %storage.path, what, "refusing to write footage into an unconfirmed storage");
+    raise_storage_event(pool, &detail).await;
+    detail
+}
+
+/// Memoized `same_filesystem(a, b)` keyed by the storage id `a` belongs to.
+async fn on_fs_cached(
+    cache: &mut std::collections::HashMap<Uuid, bool>,
+    storage_id: Uuid,
+    a: &Path,
+    b: &Path,
+) -> bool {
+    if let Some(v) = cache.get(&storage_id) {
+        return *v;
+    }
+    let v = same_filesystem(a, b).await;
+    cache.insert(storage_id, v);
+    v
+}
+
+/// Ids of every storage row whose root lives on the same filesystem as `root`.
+async fn storage_ids_on_filesystem(pool: &Pool, root: &Path) -> Result<Vec<Uuid>> {
+    let mut ids = Vec::new();
+    for s in db::list_storages(pool).await.context("list_storages")? {
+        if same_filesystem(Path::new(&s.path), root).await {
+            ids.push(s.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Map a segment row from this module's own queries (same projection as the
+/// db.rs segment reads; no motion columns, none are needed to move or delete).
+fn segment_from_sweep_row(row: &tokio_postgres::Row) -> Result<Segment> {
+    let stage_str: String = row.get("stage");
+    let stage = SegmentStage::from_str(&stage_str)
+        .with_context(|| format!("unknown segment stage '{stage_str}'"))?;
+    let stream_str: String = row.get("stream");
+    let stream = crumb_common::types::SegmentStream::from_str(&stream_str)
+        .with_context(|| format!("unknown segment stream '{stream_str}'"))?;
+    Ok(Segment {
+        id: row.get("id"),
+        camera_id: row.get("camera_id"),
+        storage_id: row.get("storage_id"),
+        stage,
+        path: row.get("path"),
+        stream,
+        start_ts: row.get("start_ts"),
+        end_ts: row.get("end_ts"),
+        duration_ms: row.get("duration_ms"),
+        has_motion: row.get("has_motion"),
+        size_bytes: row.get("size_bytes"),
+        motion_bbox: None,
+    })
+}
+
+/// Oldest-first segments of a policy in `stages`, restricted to `storage_ids`.
+/// Skips segments under an active protected bookmark (the same guard as every
+/// other eviction query). Used by the floor-driven paths so they only consider
+/// footage on the disk actually being freed (R6, and the archive floor).
+async fn list_policy_segments_on_storages_oldest_first(
+    pool: &Pool,
+    policy_id: Uuid,
+    stages: &[&str],
+    storage_ids: &[Uuid],
+    limit: i64,
+) -> Result<Vec<Segment>> {
+    let client = db::get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT s.id, s.camera_id, s.storage_id, s.stage, s.path,
+                   s.stream, s.start_ts, s.end_ts, s.duration_ms,
+                   s.has_motion, s.size_bytes
+            FROM segments s
+            JOIN v_camera_effective_policy v ON v.c_id = s.camera_id
+            WHERE s.stage = ANY($1)
+              AND v.p_id = $2
+              AND s.storage_id = ANY($3)
+              AND NOT EXISTS (
+                  SELECT 1 FROM bookmarks bk
+                  WHERE bk.camera_id = s.camera_id
+                    AND bk.protect_until > now()
+                    AND bk.protect_start_ts <= s.end_ts
+                    AND bk.protect_end_ts   >= s.start_ts
+              )
+            ORDER BY s.start_ts ASC
+            LIMIT $4
+            ",
+            &[&stages, &policy_id, &storage_ids, &limit],
+        )
+        .await
+        .context("list_policy_segments_on_storages_oldest_first")?;
+    rows.iter().map(segment_from_sweep_row).collect()
+}
+
+/// `(total, unprotected)` bytes of a policy's segments in `stages` (R5).
+///
+/// The byte caps are compared against the UNPROTECTED total: footage under an
+/// active protected bookmark can never be evicted (every candidate query
+/// excludes it), so counting it toward the cap made a policy whose protected
+/// footage alone exceeds the cap delete every new segment forever.
+async fn policy_bytes_split(pool: &Pool, policy_id: Uuid, stages: &[&str]) -> Result<(i64, i64)> {
+    let client = db::get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            SELECT COALESCE(SUM(s.size_bytes), 0)::bigint AS total,
+                   COALESCE(SUM(s.size_bytes) FILTER (WHERE NOT EXISTS (
+                       SELECT 1 FROM bookmarks bk
+                       WHERE bk.camera_id = s.camera_id
+                         AND bk.protect_until > now()
+                         AND bk.protect_start_ts <= s.end_ts
+                         AND bk.protect_end_ts   >= s.start_ts
+                   )), 0)::bigint AS unprotected
+            FROM segments s
+            JOIN v_camera_effective_policy v ON v.c_id = s.camera_id
+            WHERE s.stage = ANY($1)
+              AND v.p_id = $2
+            ",
+            &[&stages, &policy_id],
+        )
+        .await
+        .context("policy_bytes_split")?;
+    Ok((row.get("total"), row.get("unprotected")))
+}
+
+/// Warn when protected footage is more than half of a policy's byte cap: the
+/// cap no longer bounds the disk usage the operator planned for.
+fn warn_if_protected_dominates(
+    policy: &RecordingPolicy,
+    tier: &str,
+    cap: Option<i64>,
+    total: i64,
+    unprotected: i64,
+) {
+    let Some(cap) = cap.filter(|c| *c > 0) else {
+        return;
+    };
+    let protected = total.saturating_sub(unprotected);
+    if protected.saturating_mul(2) > cap {
+        warn!(
+            policy_id = %policy.id,
+            tier,
+            protected_bytes = protected,
+            cap_bytes = cap,
+            "protected-bookmark footage exceeds half of this policy's byte cap; it is not \
+             evictable and is not counted toward the cap, so disk usage can exceed the cap"
+        );
+    }
+}
+
+/// Live segments past their OWN camera's live retention, oldest-first (R4).
+///
+/// The per-camera cutoff is in SQL (`v.p_live_retention_hours`), so every
+/// returned row is actually eligible. The previous shape (one cutoff at the
+/// SHORTEST retention, then a Rust-side per-camera skip) let the oldest
+/// `LIMIT` rows be long-retention footage still inside its window, so a
+/// short-retention camera's expired rows were never reached. Archive-enabled
+/// cameras are excluded (correctness item 7), protected bookmarks are skipped,
+/// and a non-positive retention never matches.
+async fn list_expired_live_segments(
+    pool: &Pool,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<Segment>> {
+    let client = db::get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT s.id, s.camera_id, s.storage_id, s.stage, s.path,
+                   s.stream, s.start_ts, s.end_ts, s.duration_ms,
+                   s.has_motion, s.size_bytes
+            FROM segments s
+            JOIN v_camera_effective_policy v ON v.c_id = s.camera_id
+            WHERE s.stage = 'live'
+              AND v.p_archive_enabled = false
+              AND v.p_live_retention_hours > 0
+              AND s.start_ts < $1 - make_interval(hours => v.p_live_retention_hours)
+              AND NOT EXISTS (
+                  SELECT 1 FROM bookmarks bk
+                  WHERE bk.camera_id = s.camera_id
+                    AND bk.protect_until > now()
+                    AND bk.protect_start_ts <= s.end_ts
+                    AND bk.protect_end_ts   >= s.start_ts
+              )
+            ORDER BY s.start_ts
+            LIMIT $2
+            ",
+            &[&now, &limit],
+        )
+        .await
+        .context("list_expired_live_segments")?;
+    rows.iter().map(segment_from_sweep_row).collect()
+}
+
+// ─── archive-tier free-space floor (R2) ──────────────────────────────────────
+
+/// Keep the ARCHIVE filesystem above the free-space floor by deleting the
+/// policy's oldest archive-stage segments that live on it.
+///
+/// Without this an archive disk that filled up (no `archive_max_bytes`, or a
+/// cap larger than the disk) made every archive move fail; the live disk then
+/// crossed its own floor with nothing it could move, and recording stopped on
+/// every camera of the policy. Rolling the oldest archive footage over keeps
+/// the archive tier writable, so live footage keeps flowing into it.
+///
+/// Uses the global `MIN_FREE_FRACTION` / `MIN_FREE_BYTES` floor (the per-policy
+/// overrides are live-tier settings). Oldest-first, protected bookmarks
+/// excluded, file-then-row (item 10), missing files gated by [`DanglingGuard`],
+/// only segments whose storage is on the archive filesystem, serialized on
+/// [`ARCHIVE_GUARD`] per sub-batch, and a `premature_rollover` event for each
+/// segment deleted before its archive retention. Runs before the cron move
+/// each tick.
+pub async fn archive_floor_sweep(pool: &Pool, policy: &RecordingPolicy) -> Result<()> {
+    archive_floor_sweep_with(pool, policy, None).await
+}
+
+/// [`archive_floor_sweep`] with an explicit fractional floor, so tests can
+/// force a deficit deterministically.
+async fn archive_floor_sweep_with(
+    pool: &Pool,
+    policy: &RecordingPolicy,
+    frac_override: Option<f32>,
+) -> Result<()> {
+    if !policy.archive_enabled {
+        return Ok(());
+    }
+    let Some(archive_id) = policy.archive_storage_id else {
+        return Ok(());
+    };
+    let Some(archive) = db::get_storage(pool, archive_id).await? else {
+        return Ok(());
+    };
+    let mut deficit = match below_free_floor_for_policy(&archive.path, frac_override, None) {
+        Some((true, d)) => d,
+        _ => return Ok(()),
+    };
+    let archive_root = Path::new(&archive.path);
+    let ids = storage_ids_on_filesystem(pool, archive_root).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let candidates = list_policy_segments_on_storages_oldest_first(
+        pool,
+        policy.id,
+        &["archive"],
+        &ids,
+        EVICTION_BATCH_LIMIT,
+    )
+    .await?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    warn!(
+        policy_id = %policy.id,
+        archive = %archive.path,
+        free_deficit_bytes = deficit,
+        candidates = candidates.len(),
+        "archive free-space floor: archive disk is low; deleting oldest archive footage"
+    );
+    let archive_hours = archive_drain_retention_hours(policy).unwrap_or(0);
+    let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
+        std::collections::HashMap::new();
+    let mut guard = DanglingGuard::default();
+    let mut _archive_guard = Some(ARCHIVE_GUARD.lock().await);
+    let mut since_yield = 0usize;
+    for seg in &candidates {
+        if deficit <= 0 {
+            break;
+        }
+        if since_yield >= ARCHIVE_MOVE_BATCH {
+            since_yield = 0;
+            _archive_guard = None;
+            tokio::task::yield_now().await;
+            _archive_guard = Some(ARCHIVE_GUARD.lock().await);
+        }
+        since_yield += 1;
+        match delete_segment_file_then_row(pool, seg, &mut storage_cache, &mut guard).await {
+            Ok(DeleteOutcome::Deleted) => {
+                deficit -= seg.size_bytes;
+                emit_premature_rollover_if_early(
+                    pool,
+                    seg,
+                    archive_hours,
+                    "archive free-space floor eviction",
+                )
+                .await;
+            }
+            Ok(DeleteOutcome::DanglingPruned | DeleteOutcome::DanglingKept) => {}
+            Err(e) => {
+                error!(
+                    policy_id = %policy.id,
+                    segment_id = %seg.id,
+                    error = %e,
+                    "archive free-space floor: failed to delete archive segment"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── scheduler entry point ────────────────────────────────────────────────────
 
 /// Run the archive scheduler loop until `cancel` is triggered.
@@ -368,6 +883,31 @@ async fn tick(
 
     let now = Utc::now();
 
+    // Distinct effective policies (one entry per policy id; Camera.policy is
+    // already the resolved effective policy). Shared by the archive floor
+    // below and the size-cap / max-retention sweeps at the end of the tick.
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut distinct_policies: Vec<RecordingPolicy> = Vec::new();
+    for camera in &cameras {
+        if seen.insert(camera.policy.id) {
+            distinct_policies.push(camera.policy.clone());
+        }
+    }
+
+    // ── Archive-tier free-space floor (R2) ────────────────────────────────────
+    // Before any move is attempted: keep each archive disk writable by rolling
+    // its oldest archive footage over, so a full archive disk can never wedge
+    // the live tier behind failing moves.
+    for policy in distinct_policies.iter().filter(|p| p.archive_enabled) {
+        if let Err(e) = archive_floor_sweep(pool, policy).await {
+            error!(
+                policy_id = %policy.id,
+                error     = %e,
+                "archive free-space floor sweep failed for policy"
+            );
+        }
+    }
+
     // One shared wall-time budget for ALL of this tick's cron-archive moves
     // (issue #80): however many cameras fire at once, the tick spends at most
     // this long moving segments before yielding back to retention / the
@@ -405,17 +945,6 @@ async fn tick(
     // on archive_enabled inside the sweep. Runs AFTER the cron loop so the bulk
     // time-move happens first and caps then trim any residual.
     {
-        // Collect the first RecordingPolicy seen for each distinct policy id.
-        // Camera.policy is already the resolved effective policy; clone it once
-        // per unique id.
-        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        let mut distinct_policies: Vec<RecordingPolicy> = Vec::new();
-        for camera in &cameras {
-            if seen.insert(camera.policy.id) {
-                distinct_policies.push(camera.policy.clone());
-            }
-        }
-
         for policy in &distinct_policies {
             if let Err(e) = policy_size_eviction_sweep(pool, config, policy).await {
                 error!(
@@ -682,6 +1211,17 @@ async fn archive_camera_bounded(
         .context("fetching archive storage")?
         .with_context(|| format!("archive storage {archive_storage_id} not found"))?;
 
+    // ── R7: never write into an unconfirmed destination ──────────────────────
+    // An archive disk that is not mounted leaves an empty mountpoint; moving
+    // footage there hides it under the mount once the disk returns. Refuse
+    // (sources kept) and alert; the next cron fire retries.
+    if !destination_confirmed(pool, &archive_storage).await? {
+        let detail =
+            report_unconfirmed_destination(pool, &archive_storage, "the scheduled archive move")
+                .await;
+        anyhow::bail!(detail);
+    }
+
     // ── select segments eligible for archiving ────────────────────────────────
 
     let cutoff = Utc::now() - Duration::hours(i64::from(camera.policy.live_retention_hours));
@@ -725,7 +1265,12 @@ async fn archive_camera_bounded(
     // Index of the first UNPROCESSED segment; everything past it at the end of
     // the run is the deferred backlog.
     let mut next = 0usize;
-    while next < segments.len() && std::time::Instant::now() < deadline {
+    // The archive destination ran out of space or went read-only (R2): stop
+    // this run (the rest is deferred, so the next tick retries after the
+    // archive floor has freed space) instead of failing every remaining move.
+    let mut destination_full = false;
+    let mut marker_ensured = false;
+    while next < segments.len() && std::time::Instant::now() < deadline && !destination_full {
         // Serialize ONE bounded batch against any other archive operation
         // (see ARCHIVE_GUARD) — per batch, not per run (issue #80). The guard
         // drops at the end of this iteration, letting concurrent guard-takers
@@ -740,7 +1285,7 @@ async fn archive_camera_bounded(
             }
             let seg = &segments[next];
             next += 1;
-            if archive_one_segment(
+            match archive_one_segment(
                 pool,
                 camera,
                 seg,
@@ -750,9 +1295,28 @@ async fn archive_camera_bounded(
             )
             .await
             {
-                archived += 1;
-            } else {
-                failed += 1;
+                Ok(()) => {
+                    archived += 1;
+                    // A real indexed segment now sits on the destination:
+                    // confirm it for the storage guards (idempotent).
+                    if !marker_ensured {
+                        marker_ensured = true;
+                        crate::reconcile::ensure_storage_marker(archive_root).await;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    if is_storage_full_or_readonly(&e) {
+                        destination_full = true;
+                        let detail = format!(
+                            "Archive storage '{}' ({}) is full or read-only; archive moves \
+                             stopped and the live footage was kept: {e:#}",
+                            archive_storage.name, archive_storage.path
+                        );
+                        raise_storage_event(pool, &detail).await;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -851,8 +1415,8 @@ async fn list_live_segments_for_archive_limited(
 /// Archive ONE segment for [`archive_camera`]: resolve its OWN source storage
 /// (per-segment — a policy's live storage can be repointed and older footage
 /// still lives on the previous disk), run the crash-ordered move, and log the
-/// outcome. Returns `true` on success, `false` on a (logged) per-segment
-/// failure; the caller only tallies.
+/// outcome. Returns the (already logged) error on a per-segment failure so the
+/// caller can tell a full or read-only destination from a one-off failure.
 async fn archive_one_segment(
     pool: &Pool,
     camera: &Camera,
@@ -860,7 +1424,7 @@ async fn archive_one_segment(
     archive_root: &Path,
     archive_storage_id: Uuid,
     storage_cache: &mut std::collections::HashMap<Uuid, Storage>,
-) -> bool {
+) -> Result<()> {
     let src_storage = match resolve_storage(pool, storage_cache, seg.storage_id).await {
         Ok(s) => s,
         Err(e) => {
@@ -871,7 +1435,7 @@ async fn archive_one_segment(
                 error      = %e,
                 "failed to resolve segment storage for archive; skipping"
             );
-            return false;
+            return Err(e);
         }
     };
     let src_root = Path::new(&src_storage.path);
@@ -883,7 +1447,7 @@ async fn archive_one_segment(
                 src        = %seg.path,
                 "segment archived"
             );
-            true
+            Ok(())
         }
         Err(e) => {
             error!(
@@ -892,7 +1456,7 @@ async fn archive_one_segment(
                 error      = %e,
                 "failed to archive segment; skipping"
             );
-            false
+            Err(e)
         }
     }
 }
@@ -1297,6 +1861,15 @@ pub async fn run_storage_migration(pool: &Pool, mig: &StorageMigration) -> Resul
             break; // fully drained
         }
 
+        // R7: the destination must be the real disk before anything is written
+        // there. Checked per batch, since a mount can drop mid-drain. A refusal
+        // fails the job with the reason; every source is still in place.
+        if !destination_confirmed(pool, &to).await? {
+            let detail =
+                report_unconfirmed_destination(pool, &to, "the \"Change storage\" drain").await;
+            anyhow::bail!(detail);
+        }
+
         // Pre-create the batch's DISTINCT destination directories once (deduped) so
         // the concurrent copies don't each mkdir, and so we can fsync the (few)
         // dirs once at the end rather than once per file.
@@ -1401,6 +1974,9 @@ pub async fn run_storage_migration(pool: &Pool, mig: &StorageMigration) -> Resul
         }
 
         if moved > 0 {
+            // Indexed footage now sits on the target: confirm it for the
+            // storage guards (idempotent; never rewrites an existing marker).
+            crate::reconcile::ensure_storage_marker(to_root.as_path()).await;
             db::add_migration_progress(pool, mig.id, moved, bytes)
                 .await
                 .context("update migration progress")?;
@@ -1648,29 +2224,23 @@ fn archive_relative_path(
 /// Delete live-stage segments older than retention for non-archive cameras.
 ///
 /// **Correctness item 7** is enforced both at the SQL level (the
-/// [`db::list_live_segments_older_than`] query joins on `archive_enabled =
-/// false`) *and* here as a defence-in-depth guard.  The archiver owns deletion
-/// of archive-enabled cameras' segments.
+/// [`list_expired_live_segments`] query requires `archive_enabled = false`)
+/// *and* here as a defence-in-depth guard.  The archiver owns deletion of
+/// archive-enabled cameras' segments.
 ///
 /// **Correctness item 10**: file is removed first; the index row is deleted
-/// only on filesystem success.
+/// only on filesystem success. A missing file only prunes its row when the
+/// storage is confirmable ([`DanglingGuard`], item 34).
 ///
-/// # Per-camera retention
+/// # Per-camera retention (R4)
 ///
-/// Each camera has its own `live_retention_hours` policy field.  Since the
-/// `list_live_segments_older_than` DB accessor accepts a single cutoff
-/// timestamp (not a per-camera cutoff), we use the following strategy:
-///
-/// 1. Load all enabled cameras; build a map `camera_id → live_retention_hours`
-///    for non-archive cameras.
-/// 2. Pass a generous cutoff to the DB (the minimum retention among all
-///    non-archive cameras) — this returns only segments that *could* be
-///    eligible.
-/// 3. For each returned segment, cross-check against the camera's own
-///    `live_retention_hours` before deleting.
-///
-/// This ensures we never delete footage that is still within a camera's own
-/// retention window.
+/// The query applies each camera's OWN `live_retention_hours` cutoff, so the
+/// oldest-first, batch-limited listing contains only rows that really are
+/// expired and every tick makes progress. (One shared cutoff at the shortest
+/// retention let long-retention footage still inside its window fill the
+/// whole batch, so a short-retention camera kept footage for about as long as
+/// the longest retention on the recorder.) The per-camera map below is kept
+/// as a defence-in-depth cross-check.
 ///
 /// # Errors
 ///
@@ -1688,10 +2258,7 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
         .context("list_cameras_all for retention sweep")?;
 
     // Build map: camera_id -> live_retention_hours for non-archive cameras.
-    // Also determine the minimum retention across non-archive cameras so we
-    // can use it as the DB query cutoff (see doc comment above).
     let mut retention_map: std::collections::HashMap<Uuid, i32> = std::collections::HashMap::new();
-    let mut min_retention_hours: i32 = i32::MAX;
 
     for cam in &cameras {
         if !cam.policy.archive_enabled {
@@ -1700,7 +2267,8 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
             // `*h > 0` and `max_retention_sweep`'s `d > 0` guards: the API
             // rejects non-positive values, but a hand-edited DB row of 0 would
             // otherwise delete ALL live footage of archive-off cameras within
-            // one tick. Skip = retain (the safe direction), loudly.
+            // one tick. Skip = retain (the safe direction), loudly. The query
+            // carries the same `> 0` guard.
             if h <= 0 {
                 warn!(
                     camera_id = %cam.id,
@@ -1710,9 +2278,6 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
                 continue;
             }
             retention_map.insert(cam.id, h);
-            if h < min_retention_hours {
-                min_retention_hours = h;
-            }
         }
     }
 
@@ -1721,27 +2286,13 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // The DB cutoff is the oldest possible eligible segment: now minus the
-    // shortest live retention among non-archive cameras.  Segments older than
-    // this could be eligible for at least one camera; the per-segment check
-    // below filters out segments that are still within their own camera's
-    // window.
-    let db_cutoff = now - Duration::hours(i64::from(min_retention_hours));
-
-    // Fetch segments eligible for deletion.  The db accessor already filters
-    // out archive-enabled cameras (correctness item 7).
-    //
     // Batch-limited (oldest-first) to [`MAX_RETENTION_BATCH_LIMIT`]: without a
     // cap, shortening a camera's retention or a long recorder downtime would
     // materialise MILLIONS of `Segment` rows into one `Vec` and OOM a small box
-    // (Pi/NUC). The query orders oldest-first, so a capped batch always makes
-    // forward progress and the sweep converges over its ~60s ticks — the same
-    // convergence-over-ticks pattern the reconcile, size-eviction, and
-    // max-retention sweeps already use.
-    let segments =
-        db::list_live_segments_older_than(pool, db_cutoff, Some(MAX_RETENTION_BATCH_LIMIT))
-            .await
-            .context("list_live_segments_older_than")?;
+    // (Pi/NUC). Every returned row is past its own camera's cutoff, so a
+    // capped batch always makes forward progress and the sweep converges over
+    // its ~60s ticks.
+    let segments = list_expired_live_segments(pool, now, MAX_RETENTION_BATCH_LIMIT).await?;
 
     if segments.is_empty() {
         return Ok(());
@@ -1753,6 +2304,7 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
     // carries storage_id; we resolve and cache storage rows to avoid N+1 queries.
     let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
         std::collections::HashMap::new();
+    let mut guard = DanglingGuard::default();
 
     for seg in &segments {
         // Defence-in-depth: double-check stage is 'live' (correctness item 7).
@@ -1765,9 +2317,8 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
             continue;
         }
 
-        // Per-camera retention cross-check: even though we queried with the
-        // minimum retention cutoff, a segment might belong to a camera with
-        // a longer retention window and therefore not yet be eligible.
+        // Per-camera retention cross-check (defence in depth; the query has
+        // already applied each camera's own cutoff).
         if let Some(&cam_retention_hours) = retention_map.get(&seg.camera_id) {
             let cam_cutoff = now - Duration::hours(i64::from(cam_retention_hours));
             if seg.start_ts >= cam_cutoff {
@@ -1776,7 +2327,7 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
             }
         } else {
             // The segment belongs to a camera not in our retention map. Since
-            // the map now covers disabled cameras too (#279), this means the
+            // the map covers disabled cameras too (#279), this means the
             // camera is archive-enabled (its live footage is the cron move's
             // to handle) or was deleted since the list. (Correctness item 7
             // defence-in-depth.)
@@ -1788,59 +2339,15 @@ pub async fn live_retention_sweep(pool: &Pool, _config: &Config) -> Result<()> {
             continue;
         }
 
-        // Resolve storage row (cached).
-        let storage = match resolve_storage(pool, &mut storage_cache, seg.storage_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    segment_id = %seg.id,
-                    storage_id = %seg.storage_id,
-                    error      = %e,
-                    "live_retention_sweep: could not resolve storage; skipping segment"
-                );
-                continue;
-            }
-        };
-
-        let abs_path = Path::new(&storage.path).join(&seg.path);
-
-        // ── Step 1: delete the file ───────────────────────────────────────────
-        match tokio::fs::remove_file(&abs_path).await {
-            Ok(()) => {
-                debug!(
-                    segment_id = %seg.id,
-                    path       = %abs_path.display(),
-                    "live retention: file deleted"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File already gone (e.g. manual cleanup or prior crash).
-                // Proceed to delete the row so the index is consistent.
-                warn!(
-                    segment_id = %seg.id,
-                    path       = %abs_path.display(),
-                    "live retention: file not found; cleaning up dangling row"
-                );
-            }
-            Err(e) => {
-                error!(
-                    segment_id = %seg.id,
-                    path       = %abs_path.display(),
-                    error      = %e,
-                    "live retention: failed to delete file; skipping row deletion"
-                );
-                // Do NOT delete the row — the file might still be there.
-                // (correctness item 10)
-                continue;
-            }
-        }
-
-        // ── Step 2: delete the index row ─────────────────────────────────────
-        if let Err(e) = db::delete_segment_row(pool, seg.id).await {
+        // File first, then row (item 10); a missing file only prunes its row
+        // on a confirmed storage (item 34).
+        if let Err(e) =
+            delete_segment_file_then_row(pool, seg, &mut storage_cache, &mut guard).await
+        {
             error!(
                 segment_id = %seg.id,
                 error      = %e,
-                "live retention: failed to delete segment row"
+                "live retention: failed to delete segment; leaving it in place"
             );
         }
     }
@@ -1966,6 +2473,7 @@ pub async fn archive_retention_sweep(pool: &Pool, _config: &Config, camera: &Cam
 
     let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
         std::collections::HashMap::new();
+    let mut guard = DanglingGuard::default();
 
     for seg in &segments {
         // Defence-in-depth: only process archive-stage rows here.
@@ -1978,54 +2486,15 @@ pub async fn archive_retention_sweep(pool: &Pool, _config: &Config, camera: &Cam
             continue;
         }
 
-        let storage = match resolve_storage(pool, &mut storage_cache, seg.storage_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    segment_id = %seg.id,
-                    storage_id = %seg.storage_id,
-                    error      = %e,
-                    "archive retention: could not resolve storage; skipping segment"
-                );
-                continue;
-            }
-        };
-
-        let abs_path = Path::new(&storage.path).join(&seg.path);
-
-        // ── Step 1: delete the file ───────────────────────────────────────────
-        match tokio::fs::remove_file(&abs_path).await {
-            Ok(()) => {
-                debug!(
-                    segment_id = %seg.id,
-                    path       = %abs_path.display(),
-                    "archive retention: file deleted"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
-                    segment_id = %seg.id,
-                    path       = %abs_path.display(),
-                    "archive retention: file not found; cleaning dangling row"
-                );
-            }
-            Err(e) => {
-                error!(
-                    segment_id = %seg.id,
-                    path       = %abs_path.display(),
-                    error      = %e,
-                    "archive retention: failed to delete file; skipping row deletion"
-                );
-                continue; // correctness item 10
-            }
-        }
-
-        // ── Step 2: delete the index row ─────────────────────────────────────
-        if let Err(e) = db::delete_segment_row(pool, seg.id).await {
+        // File first, then row (item 10); a missing file only prunes its row
+        // on a confirmed storage (item 34).
+        if let Err(e) =
+            delete_segment_file_then_row(pool, seg, &mut storage_cache, &mut guard).await
+        {
             error!(
                 segment_id = %seg.id,
                 error      = %e,
-                "archive retention: failed to delete segment row"
+                "archive retention: failed to delete segment; leaving it in place"
             );
         }
     }
@@ -2063,21 +2532,42 @@ pub async fn archive_retention_sweep(pool: &Pool, _config: &Config, camera: &Cam
 /// leaving footage in place rather than deleting un-archived footage.
 ///
 /// **One deliberate, narrow exception — the ENOSPC rescue.** When the
-/// free-space FLOOR is in DEFICIT *and* the archive destination is on the SAME
-/// filesystem as the segment's own storage ([`same_filesystem`]; the default
-/// compose layout puts `/data/archive` beside live `/data`), an archive move
-/// frees ZERO bytes: pre-fix the sweep "moved" the oldest live footage in
-/// place every tick, the deficit read as satisfied, and the disk filled to
-/// 100% until ffmpeg hit ENOSPC and recording halted on EVERY camera — losing
-/// all future footage. In exactly that state the deficit-driven portion of
-/// the sweep DELETES the oldest segments instead (file-then-row, item 10, via
-/// the shared helper; protected bookmarks are still excluded by the candidate
-/// query; each disposal is still done under [`ARCHIVE_GUARD`], now re-acquired
-/// per [`ARCHIVE_MOVE_BATCH`] sub-batch rather than pinned for the whole run —
-/// issue #144 item 4), and emits
-/// `premature_rollover` so the loss is loud. Cap-only pressure (no floor
-/// deficit) still MOVES as before — the exception applies only while real
-/// bytes must be freed and a move cannot free them.
+/// free-space FLOOR is in DEFICIT, a disposal must free real bytes on the
+/// deficit disk. The deficit-driven portion of the sweep therefore DELETES the
+/// oldest live segment instead of moving it, and only when that segment lives
+/// on the deficit filesystem, in two cases:
+///
+/// * the archive destination is on the SAME filesystem as the segment's own
+///   storage ([`same_filesystem`]; the default compose layout puts
+///   `/data/archive` beside live `/data`), so a move frees ZERO bytes. Pre-fix
+///   the sweep "moved" the oldest live footage in place every tick, the
+///   deficit read as satisfied, and the disk filled to 100% until ffmpeg hit
+///   ENOSPC and recording halted on EVERY camera;
+/// * archive moves are failing for a systemic reason (the archive disk is
+///   full or read-only, or it is not confirmed as the real disk; R2, R7).
+///   Breaking out of the loop there left the live disk to fill up and stop
+///   recording on every camera of the policy. Losing the oldest unarchived
+///   footage is the lesser loss, and it is loud (`storage_unwritable` +
+///   `premature_rollover`).
+///
+/// Both are file-then-row (item 10) via the shared helper; protected bookmarks
+/// are still excluded by the candidate query; each disposal is still done
+/// under [`ARCHIVE_GUARD`], re-acquired per [`ARCHIVE_MOVE_BATCH`] sub-batch
+/// rather than pinned for the whole run (issue #144 item 4). Cap-only pressure
+/// (no floor deficit) never deletes un-archived footage: a failing move then
+/// stops the tick with the footage in place.
+///
+/// # Accounting (R3, R5, R6)
+///
+/// * The caps are compared against UNPROTECTED bytes: protected footage can
+///   never be evicted, so counting it made the sweep delete every new segment
+///   once protected footage alone exceeded the cap. A cap-driven DELETE also
+///   never touches footage younger than [`CAP_EVICTION_MIN_AGE_SECS`].
+/// * A floor-driven delete (archive off) only considers footage whose storage
+///   is on the deficit filesystem, and only a real file delete there credits
+///   the deficit. Cap-driven eviction keeps the any-stage, any-disk order.
+/// * A missing file never credits the deficit, and its row is only pruned
+///   when the storage is confirmable ([`DanglingGuard`]).
 ///
 /// `used` is computed once via `SUM` at entry, then decremented by
 /// `seg.size_bytes` after each disposal so the loop stops exactly at the cap
@@ -2100,10 +2590,7 @@ pub async fn policy_size_eviction_sweep(
     // concurrent guard-holder that disposes of a candidate during our yield just
     // makes our later disposal a source-gone no-op (dangling-row cleanup), and a
     // slightly stale `used`/`deficit` self-corrects on the next tick.
-    // Underscore-prefixed: held purely for its RAII lock effect (never read), and
-    // re-bound below to cycle the lock — the prefix keeps the unused-binding lint
-    // quiet while `Drop` still releases the guard on every re-bind and at return.
-    let mut _archive_guard = Some(ARCHIVE_GUARD.lock().await);
+    let mut archive_guard = Some(ARCHIVE_GUARD.lock().await);
     let mut since_guard_yield: usize = 0;
     let policy_label: &str = policy.name.as_deref().unwrap_or("<unnamed>");
 
@@ -2117,15 +2604,20 @@ pub async fn policy_size_eviction_sweep(
     // AND (if a cap exists) under cap.
     {
         let cap_opt = policy.live_max_bytes.filter(|c| *c > 0);
-        let mut used = db::policy_stage_bytes(pool, policy.id, SegmentStage::Live).await?;
         // Archive OFF → the live cap is the ONLY budget, so it must also account for
         // any residual stage=archive footage (archive turned off after footage was
         // archived). Otherwise that footage is uncapped and un-evictable, and a full
         // disk would evict recent LIVE footage while the orphan persists. No-op for
         // policies that never archived (archive bytes = 0).
-        if !policy.archive_enabled {
-            used += db::policy_stage_bytes(pool, policy.id, SegmentStage::Archive).await?;
-        }
+        //
+        // `used` counts UNPROTECTED bytes only (R5): see the doc comment above.
+        let stages: &[&str] = if policy.archive_enabled {
+            &["live"]
+        } else {
+            &["live", "archive"]
+        };
+        let (total_bytes, mut used) = policy_bytes_split(pool, policy.id, stages).await?;
+        warn_if_protected_dominates(policy, "live", cap_opt, total_bytes, used);
 
         // Resolve the live storage path to read free space (independent of whether
         // archiving is on). Resolve EXACTLY the way recording.rs does: the policy's
@@ -2220,89 +2712,82 @@ pub async fn policy_size_eviction_sweep(
             let proceed_live = !policy.archive_enabled || archive_target.is_some();
 
             if proceed_live {
-                // Pull only the OLDEST batch (audit P1 #9): the sweep consumes the
-                // oldest prefix; if still over cap / below floor next tick re-queries.
-                // Archive ON: evict only live-stage (the oldest live is MOVED to
-                // archive). Archive OFF: evict the oldest footage regardless of stage
-                // so residual stage=archive segments are reclaimed alongside live
-                // (one shared budget), oldest-first. Both queries skip protected
-                // bookmarks. For a policy that never archived, the any-stage query
-                // returns the same rows as the live-only one (no archive segments).
-                let live = if policy.archive_enabled {
-                    db::list_policy_segments_oldest_first(
+                let floor_root: Option<&Path> = live_storage_for_floor
+                    .as_ref()
+                    .map(|s| Path::new(s.path.as_str()));
+                let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
+                    std::collections::HashMap::new();
+                let mut guard = DanglingGuard::default();
+                let cap_min_age_cutoff = Utc::now() - Duration::seconds(CAP_EVICTION_MIN_AGE_SECS);
+
+                if let Some((_live_storage, archive_storage)) = &archive_target {
+                    // ── ARCHIVE ON: MOVE oldest live → archive ─────────────────
+                    let archive_root = Path::new(&archive_storage.path);
+                    // R7: never move into an unconfirmed destination. A refused
+                    // destination counts as "moves are failing" for the rescue.
+                    let mut moves_blocked = false;
+                    if !destination_confirmed(pool, archive_storage).await? {
+                        report_unconfirmed_destination(
+                            pool,
+                            archive_storage,
+                            "a size/free-space eviction move",
+                        )
+                        .await;
+                        moves_blocked = true;
+                    }
+                    let mut marker_ensured = false;
+                    let mut move_failure_alerted = false;
+
+                    // Pull only the OLDEST batch (audit P1 #9): the sweep consumes the
+                    // oldest prefix; if still over cap / below floor next tick re-queries.
+                    // Live-stage only (the oldest live is MOVED to archive); skips
+                    // protected bookmarks.
+                    let live = db::list_policy_segments_oldest_first(
                         pool,
                         policy.id,
                         SegmentStage::Live,
                         Some(EVICTION_BATCH_LIMIT),
                     )
-                    .await?
-                } else {
-                    db::list_policy_segments_oldest_first_any_stage(
-                        pool,
-                        policy.id,
-                        Some(EVICTION_BATCH_LIMIT),
-                    )
-                    .await?
-                };
-                info!(
-                    policy_id   = %policy.id,
-                    policy_name = %policy_label,
-                    used_bytes  = used,
-                    cap_bytes   = ?cap_opt,
-                    free_deficit_bytes = deficit,
-                    candidates  = live.len(),
-                    archiving   = policy.archive_enabled,
-                    "size eviction: live footage over cap or below free-space floor; evicting oldest-first"
-                );
-                let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
-                    std::collections::HashMap::new();
-                // Memoized per-source-storage answers for the ENOSPC-rescue
-                // exception (see the SAFETY INVARIANT above), keyed by the
-                // segment's own storage id (the archive root and the floor root
-                // are both fixed for the whole sweep):
-                //   same_fs_cache       — does the segment share the ARCHIVE fs
-                //                          (so a move would free nothing)?
-                //   same_fs_floor_cache — does the segment share the FLOOR fs
-                //                          (the disk actually in deficit)?
-                // The delete rescue requires BOTH: deleting a segment that is
-                // NOT on the deficit disk frees zero bytes there yet destroys it
-                // permanently (a repointed-storage config), so those fall
-                // through to the normal footage-preserving MOVE instead.
-                let mut same_fs_cache: std::collections::HashMap<Uuid, bool> =
-                    std::collections::HashMap::new();
-                let mut same_fs_floor_cache: std::collections::HashMap<Uuid, bool> =
-                    std::collections::HashMap::new();
-                let floor_root: Option<&Path> = live_storage_for_floor
-                    .as_ref()
-                    .map(|s| Path::new(s.path.as_str()));
-                for seg in &live {
-                    // Item 4: release + re-acquire ARCHIVE_GUARD every
-                    // ARCHIVE_MOVE_BATCH disposals so the guard/scheduler tick is
-                    // not pinned for the whole (up to EVICTION_BATCH_LIMIT) run.
-                    if since_guard_yield >= ARCHIVE_MOVE_BATCH {
-                        since_guard_yield = 0;
-                        _archive_guard = None; // release the guard
-                        tokio::task::yield_now().await;
-                        _archive_guard = Some(ARCHIVE_GUARD.lock().await);
-                    }
-                    since_guard_yield += 1;
-                    // Stop once BOTH conditions are satisfied: under the live TARGET
-                    // (cap - spill, if a cap exists) AND the free-space deficit
-                    // (already padded by spill when below floor) is cleared. With
-                    // spill==0 the target is the cap and the deficit is unpadded, so
-                    // this is the original stop condition.
-                    let still_over_cap = live_target.map(|t| used > t).unwrap_or(false);
-                    let still_below_floor = deficit > 0;
-                    if !still_over_cap && !still_below_floor {
-                        break;
-                    }
-                    if let Some((_live_storage, archive_storage)) = &archive_target {
-                        // MOVE oldest live → archive. Resolve the source from the
-                        // SEGMENT'S OWN storage (per-segment), NOT the policy's live
-                        // storage — footage can live on a different disk than the
-                        // policy currently points at (e.g. after a live_storage change),
-                        // and resolving per-policy here would look in the wrong place
-                        // and dangling-delete real footage's index rows.
+                    .await?;
+                    info!(
+                        policy_id   = %policy.id,
+                        policy_name = %policy_label,
+                        used_bytes  = used,
+                        cap_bytes   = ?cap_opt,
+                        free_deficit_bytes = deficit,
+                        candidates  = live.len(),
+                        archiving   = true,
+                        moves_blocked,
+                        "size eviction: live footage over cap or below free-space floor; evicting oldest-first"
+                    );
+                    // Memoized per-source-storage answers, keyed by the segment's
+                    // own storage id (the archive root and the floor root are both
+                    // fixed for the whole sweep):
+                    //   same_fs_cache:       does the segment share the ARCHIVE fs
+                    //                          (so a move would free nothing)?
+                    //   same_fs_floor_cache: does the segment share the FLOOR fs
+                    //                          (the disk actually in deficit)?
+                    // A rescue delete always requires the FLOOR fs: deleting a
+                    // segment that is NOT on the deficit disk frees zero bytes there
+                    // yet destroys it permanently (a repointed-storage config).
+                    let mut same_fs_cache: std::collections::HashMap<Uuid, bool> =
+                        std::collections::HashMap::new();
+                    let mut same_fs_floor_cache: std::collections::HashMap<Uuid, bool> =
+                        std::collections::HashMap::new();
+                    for seg in &live {
+                        maybe_yield_archive_guard(&mut archive_guard, &mut since_guard_yield).await;
+                        // Stop once BOTH conditions are satisfied: under the live TARGET
+                        // (cap - spill, if a cap exists) AND the free-space deficit
+                        // (already padded by spill when below floor) is cleared.
+                        let still_over_cap = live_target.map(|t| used > t).unwrap_or(false);
+                        let still_below_floor = deficit > 0;
+                        if !still_over_cap && !still_below_floor {
+                            break;
+                        }
+                        // Resolve the source from the SEGMENT'S OWN storage
+                        // (per-segment), NOT the policy's live storage: footage can
+                        // live on a different disk than the policy currently points
+                        // at (e.g. after a live_storage change).
                         let src_storage = match resolve_storage(
                             pool,
                             &mut storage_cache,
@@ -2322,84 +2807,53 @@ pub async fn policy_size_eviction_sweep(
                             }
                         };
                         let src_root = Path::new(&src_storage.path);
-                        let archive_root = Path::new(&archive_storage.path);
 
-                        // ── ENOSPC RESCUE (SAFETY INVARIANT exception above) ──
-                        // While the free-space floor is in DEFICIT, the disposal
-                        // must reduce USED bytes on the physical disk. An archive
-                        // move onto the SAME filesystem frees nothing (default
-                        // compose layout: /data/archive on the live disk) — the
-                        // pre-fix sweep "moved" oldest live footage in place every
-                        // tick until the disk hit 100% and ffmpeg ENOSPC-halted
-                        // recording on every camera. Delete oldest-first instead,
-                        // exactly like the archive-off arm (file-then-row, item
-                        // 10; protected bookmarks already excluded by the query).
-                        let move_frees_nothing = if still_below_floor {
-                            // (a) segment shares the ARCHIVE fs → a move frees
-                            //     nothing on it.
-                            let shares_archive = match same_fs_cache.get(&src_storage.id).copied() {
-                                Some(v) => v,
-                                None => {
-                                    let v = same_filesystem(src_root, archive_root).await;
-                                    same_fs_cache.insert(src_storage.id, v);
-                                    v
-                                }
-                            };
-                            // (b) AND the segment lives on the FLOOR fs (the disk
-                            //     actually in deficit) — otherwise deleting it
-                            //     frees zero bytes on the deficit disk while
-                            //     destroying footage permanently. Only checked
-                            //     when (a) already holds and the floor storage is
-                            //     known (it is, whenever still_below_floor).
-                            let shares_floor = match (shares_archive, floor_root) {
-                                (true, Some(fr)) => {
-                                    match same_fs_floor_cache.get(&src_storage.id).copied() {
-                                        Some(v) => v,
-                                        None => {
-                                            let v = same_filesystem(src_root, fr).await;
-                                            same_fs_floor_cache.insert(src_storage.id, v);
-                                            v
-                                        }
-                                    }
-                                }
-                                _ => false,
-                            };
-                            shares_archive && shares_floor
-                        } else {
-                            false
-                        };
-                        if move_frees_nothing {
-                            match delete_segment_file_then_row(pool, seg, &mut storage_cache).await
-                            {
-                                Ok(()) => {
-                                    used -= seg.size_bytes;
-                                    deficit = (deficit - seg.size_bytes).max(0);
-                                    warn!(
-                                        policy_id  = %policy.id,
-                                        segment_id = %seg.id,
-                                        "free-space floor: archive shares the live \
-                                         filesystem, so a move would free nothing; \
-                                         deleted oldest live segment to free real bytes"
-                                    );
-                                    emit_premature_rollover_if_early(
-                                        pool,
-                                        seg,
-                                        policy.live_retention_hours,
-                                        "free-space floor eviction (archive on same filesystem)",
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        policy_id  = %policy.id,
-                                        segment_id = %seg.id,
-                                        error      = %e,
-                                        "free-space floor: failed to delete over-floor \
-                                         live segment"
-                                    );
-                                }
+                        // Is the segment on the disk that is actually in deficit?
+                        let on_floor_fs = match floor_root {
+                            Some(fr) if still_below_floor => {
+                                on_fs_cached(&mut same_fs_floor_cache, src_storage.id, src_root, fr)
+                                    .await
                             }
+                            _ => false,
+                        };
+
+                        // ── ENOSPC RESCUE (see the doc comment above) ──
+                        let rescue = on_floor_fs
+                            && (moves_blocked
+                                || on_fs_cached(
+                                    &mut same_fs_cache,
+                                    src_storage.id,
+                                    src_root,
+                                    archive_root,
+                                )
+                                .await);
+                        if rescue {
+                            let reason = if moves_blocked {
+                                "free-space floor eviction (archive moves failing)"
+                            } else {
+                                "free-space floor eviction (archive on same filesystem)"
+                            };
+                            floor_rescue_delete(
+                                pool,
+                                policy,
+                                seg,
+                                reason,
+                                &mut storage_cache,
+                                &mut guard,
+                                &mut used,
+                                &mut deficit,
+                            )
+                            .await;
                             continue;
+                        }
+                        if moves_blocked {
+                            if still_below_floor {
+                                // Off the deficit disk: deleting it would free
+                                // nothing there. Keep it and look further.
+                                continue;
+                            }
+                            // Cap-only pressure: never delete un-archived footage.
+                            break;
                         }
 
                         match move_segment_to_archive(
@@ -2413,41 +2867,27 @@ pub async fn policy_size_eviction_sweep(
                         {
                             Ok(()) => {
                                 used -= seg.size_bytes;
+                                guard.note_present(&src_storage.path);
                                 // Deficit accounting (#278): a move helps the floor
                                 // ONLY when the source bytes lived on the floor
-                                // (deficit) filesystem. The old comment claimed a
-                                // floor-deficit move "only reaches here when the
-                                // archive is a DIFFERENT filesystem" — untrue for a
-                                // repointed storage: the policy's oldest footage can
-                                // sit on another disk entirely (or share the archive
-                                // fs while the floor fs is elsewhere), in which case
-                                // the move frees ZERO bytes on the deficit disk.
-                                // Crediting it anyway "cleared" the deficit on paper
-                                // each tick while the real disk kept filling toward
-                                // the ffmpeg ENOSPC halt the floor exists to prevent.
+                                // (deficit) filesystem. For a repointed storage the
+                                // policy's oldest footage can sit on another disk
+                                // entirely (or share the archive fs while the floor
+                                // fs is elsewhere), in which case the move frees
+                                // ZERO bytes on the deficit disk. Crediting it anyway
+                                // "cleared" the deficit on paper each tick while the
+                                // real disk kept filling toward the ffmpeg ENOSPC
+                                // halt the floor exists to prevent.
                                 if deficit > 0 {
-                                    let src_on_floor_fs = match floor_root {
-                                        Some(fr) => {
-                                            match same_fs_floor_cache.get(&src_storage.id).copied()
-                                            {
-                                                Some(v) => v,
-                                                None => {
-                                                    let v = same_filesystem(src_root, fr).await;
-                                                    same_fs_floor_cache.insert(src_storage.id, v);
-                                                    v
-                                                }
-                                            }
-                                        }
-                                        // No floor storage resolved → nothing to
-                                        // credit against (deficit only arises with
-                                        // a known floor fs).
-                                        None => false,
-                                    };
                                     deficit = credit_move_against_deficit(
                                         deficit,
                                         seg.size_bytes,
-                                        src_on_floor_fs,
+                                        on_floor_fs,
                                     );
+                                }
+                                if !marker_ensured {
+                                    marker_ensured = true;
+                                    crate::reconcile::ensure_storage_marker(archive_root).await;
                                 }
                                 debug!(
                                     policy_id  = %policy.id,
@@ -2459,33 +2899,35 @@ pub async fn policy_size_eviction_sweep(
                                 // Distinguish a DANGLING ROW (the source file is
                                 // already gone) from a SYSTEMIC failure (e.g. archive
                                 // disk full). A missing source is per-segment, not
-                                // systemic: clean the stale index row and keep going,
-                                // so a single dangling row at the oldest position can't
-                                // wedge the entire sweep (which would let live grow
-                                // unbounded past the cap). A real IO failure WILL hit
-                                // every remaining segment too, so we stop the tick.
+                                // systemic: clean the stale index row (only on a
+                                // confirmed storage, R3) and keep going, so a single
+                                // dangling row at the oldest position can't wedge the
+                                // entire sweep.
                                 let src_abs = src_root.join(&seg.path);
                                 let src_gone =
                                     !tokio::fs::try_exists(&src_abs).await.unwrap_or(true);
                                 if src_gone {
-                                    warn!(
-                                        policy_id  = %policy.id,
-                                        segment_id = %seg.id,
-                                        path       = %src_abs.display(),
-                                        "size eviction: live source file missing; \
-                                         deleting dangling row and continuing"
-                                    );
-                                    if let Err(de) = db::delete_segment_row(pool, seg.id).await {
-                                        error!(
+                                    if guard.may_prune_missing(pool, &src_storage.path).await {
+                                        warn!(
                                             policy_id  = %policy.id,
                                             segment_id = %seg.id,
-                                            error      = %de,
-                                            "size eviction: failed to delete dangling \
-                                             row; stopping tick"
+                                            path       = %src_abs.display(),
+                                            "size eviction: live source file missing; \
+                                             deleting dangling row and continuing"
                                         );
-                                        break;
+                                        if let Err(de) = db::delete_segment_row(pool, seg.id).await
+                                        {
+                                            error!(
+                                                policy_id  = %policy.id,
+                                                segment_id = %seg.id,
+                                                error      = %de,
+                                                "size eviction: failed to delete dangling \
+                                                 row; stopping tick"
+                                            );
+                                            break;
+                                        }
+                                        used -= seg.size_bytes;
                                     }
-                                    used -= seg.size_bytes;
                                     continue;
                                 }
                                 error!(
@@ -2496,39 +2938,170 @@ pub async fn policy_size_eviction_sweep(
                                      segment; leaving in place"
                                 );
                                 // Source still present → a real IO failure (e.g. archive
-                                // disk full) will hit every remaining segment too — stop
-                                // this tick and retry next tick rather than spam-failing
-                                // the whole over-cap set.
+                                // disk full or read-only) will hit every remaining move
+                                // too. Alert once and stop moving for this tick.
+                                if !move_failure_alerted {
+                                    move_failure_alerted = true;
+                                    let kind = if is_storage_full_or_readonly(&e) {
+                                        "is full or read-only"
+                                    } else {
+                                        "refused a move"
+                                    };
+                                    let detail = format!(
+                                        "Archive storage '{}' ({}) {kind}; live footage could \
+                                         not be archived: {e:#}",
+                                        archive_storage.name, archive_storage.path
+                                    );
+                                    raise_storage_event(pool, &detail).await;
+                                }
+                                moves_blocked = true;
+                                if on_floor_fs {
+                                    // R2: the live disk is in deficit and cannot be
+                                    // relieved by moving; free real bytes now.
+                                    floor_rescue_delete(
+                                        pool,
+                                        policy,
+                                        seg,
+                                        "free-space floor eviction (archive moves failing)",
+                                        &mut storage_cache,
+                                        &mut guard,
+                                        &mut used,
+                                        &mut deficit,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                if still_below_floor {
+                                    continue;
+                                }
+                                // Cap-only pressure: keep the footage, retry next tick.
                                 break;
                             }
                         }
-                    } else {
-                        // Archive disabled → safe to DELETE oldest live (file
-                        // then row, correctness item 10; NotFound-tolerant).
-                        match delete_segment_file_then_row(pool, seg, &mut storage_cache).await {
-                            Ok(()) => {
-                                used -= seg.size_bytes;
-                                deficit = (deficit - seg.size_bytes).max(0);
-                                debug!(
-                                    policy_id  = %policy.id,
-                                    segment_id = %seg.id,
-                                    "size eviction: live segment deleted (archive off)"
-                                );
-                                emit_premature_rollover_if_early(
+                    }
+                } else {
+                    // ── ARCHIVE OFF: DELETE oldest (file then row, item 10) ────
+                    //
+                    // Phase A (floor-driven, R6): only footage whose storage is on
+                    // the deficit filesystem can free bytes there. Deleting the
+                    // policy's oldest footage on ANOTHER disk (a "Change storage"
+                    // drain in progress, residual archive footage on a separate
+                    // archive disk) destroyed it and freed nothing.
+                    if deficit > 0 {
+                        if let Some(fr) = floor_root {
+                            let ids = storage_ids_on_filesystem(pool, fr).await?;
+                            let candidates = if ids.is_empty() {
+                                Vec::new()
+                            } else {
+                                list_policy_segments_on_storages_oldest_first(
                                     pool,
+                                    policy.id,
+                                    &["live", "archive"],
+                                    &ids,
+                                    EVICTION_BATCH_LIMIT,
+                                )
+                                .await?
+                            };
+                            info!(
+                                policy_id   = %policy.id,
+                                policy_name = %policy_label,
+                                free_deficit_bytes = deficit,
+                                candidates  = candidates.len(),
+                                "size eviction: live disk below free-space floor; deleting \
+                                 oldest footage on that disk (archive off)"
+                            );
+                            for seg in &candidates {
+                                maybe_yield_archive_guard(
+                                    &mut archive_guard,
+                                    &mut since_guard_yield,
+                                )
+                                .await;
+                                if deficit <= 0 {
+                                    break;
+                                }
+                                floor_rescue_delete(
+                                    pool,
+                                    policy,
                                     seg,
-                                    policy.live_retention_hours,
-                                    "live cap/free-space eviction (archive off)",
+                                    "free-space floor eviction (archive off)",
+                                    &mut storage_cache,
+                                    &mut guard,
+                                    &mut used,
+                                    &mut deficit,
                                 )
                                 .await;
                             }
-                            Err(e) => {
-                                error!(
-                                    policy_id  = %policy.id,
-                                    segment_id = %seg.id,
-                                    error      = %e,
-                                    "size eviction: failed to delete over-cap live segment"
+                        }
+                    }
+
+                    // Phase B (cap-driven): the policy's oldest footage regardless
+                    // of stage or disk (residual stage=archive shares the live
+                    // budget), down to the target, never younger than
+                    // CAP_EVICTION_MIN_AGE_SECS.
+                    if let Some(target) = live_target.filter(|t| used > *t) {
+                        let candidates = db::list_policy_segments_oldest_first_any_stage(
+                            pool,
+                            policy.id,
+                            Some(EVICTION_BATCH_LIMIT),
+                        )
+                        .await?;
+                        info!(
+                            policy_id   = %policy.id,
+                            policy_name = %policy_label,
+                            used_bytes  = used,
+                            cap_bytes   = ?cap_opt,
+                            candidates  = candidates.len(),
+                            "size eviction: live footage over cap; deleting oldest-first (archive off)"
+                        );
+                        for seg in &candidates {
+                            maybe_yield_archive_guard(&mut archive_guard, &mut since_guard_yield)
+                                .await;
+                            if used <= target {
+                                break;
+                            }
+                            if seg.start_ts >= cap_min_age_cutoff {
+                                info!(
+                                    policy_id = %policy.id,
+                                    used_bytes = used,
+                                    target_bytes = target,
+                                    "size eviction: reached footage younger than the minimum \
+                                     cap-eviction age; leaving the policy over its cap"
                                 );
+                                break;
+                            }
+                            match delete_segment_file_then_row(
+                                pool,
+                                seg,
+                                &mut storage_cache,
+                                &mut guard,
+                            )
+                            .await
+                            {
+                                Ok(DeleteOutcome::Deleted) => {
+                                    used -= seg.size_bytes;
+                                    debug!(
+                                        policy_id  = %policy.id,
+                                        segment_id = %seg.id,
+                                        "size eviction: live segment deleted (archive off)"
+                                    );
+                                    emit_premature_rollover_if_early(
+                                        pool,
+                                        seg,
+                                        policy.live_retention_hours,
+                                        "live cap eviction (archive off)",
+                                    )
+                                    .await;
+                                }
+                                Ok(DeleteOutcome::DanglingPruned) => used -= seg.size_bytes,
+                                Ok(DeleteOutcome::DanglingKept) => {}
+                                Err(e) => {
+                                    error!(
+                                        policy_id  = %policy.id,
+                                        segment_id = %seg.id,
+                                        error      = %e,
+                                        "size eviction: failed to delete over-cap live segment"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2540,7 +3113,9 @@ pub async fn policy_size_eviction_sweep(
     // ── ARCHIVE over-cap ───────────────────────────────────────────────────────
     if let Some(cap) = policy.archive_max_bytes {
         if cap > 0 && policy.archive_enabled {
-            let mut used = db::policy_stage_bytes(pool, policy.id, SegmentStage::Archive).await?;
+            // UNPROTECTED archive bytes (R5).
+            let (arch_total, mut used) = policy_bytes_split(pool, policy.id, &["archive"]).await?;
+            warn_if_protected_dominates(policy, "archive", Some(cap), arch_total, used);
             // Shared spill knob (same column the live branch uses): the TRIGGER is
             // still `used > cap`, but once fired we drain to `cap - spill` so archive
             // eviction also batches. spill==0 ⇒ target==cap ⇒ today's behaviour.
@@ -2574,20 +3149,21 @@ pub async fn policy_size_eviction_sweep(
                 );
                 let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
                     std::collections::HashMap::new();
+                let mut guard = DanglingGuard::default();
+                let cap_min_age_cutoff = Utc::now() - Duration::seconds(CAP_EVICTION_MIN_AGE_SECS);
                 for seg in &arch {
                     // Item 4: same per-batch guard release as the live loop above.
-                    if since_guard_yield >= ARCHIVE_MOVE_BATCH {
-                        since_guard_yield = 0;
-                        _archive_guard = None; // release the guard
-                        tokio::task::yield_now().await;
-                        _archive_guard = Some(ARCHIVE_GUARD.lock().await);
-                    }
-                    since_guard_yield += 1;
+                    maybe_yield_archive_guard(&mut archive_guard, &mut since_guard_yield).await;
                     if used <= arch_target {
                         break;
                     }
-                    match delete_segment_file_then_row(pool, seg, &mut storage_cache).await {
-                        Ok(()) => {
+                    if seg.start_ts >= cap_min_age_cutoff {
+                        break;
+                    }
+                    match delete_segment_file_then_row(pool, seg, &mut storage_cache, &mut guard)
+                        .await
+                    {
+                        Ok(DeleteOutcome::Deleted) => {
                             used -= seg.size_bytes;
                             debug!(
                                 policy_id  = %policy.id,
@@ -2604,6 +3180,8 @@ pub async fn policy_size_eviction_sweep(
                                 .await;
                             }
                         }
+                        Ok(DeleteOutcome::DanglingPruned) => used -= seg.size_bytes,
+                        Ok(DeleteOutcome::DanglingKept) => {}
                         Err(e) => {
                             error!(
                                 policy_id  = %policy.id,
@@ -2619,6 +3197,62 @@ pub async fn policy_size_eviction_sweep(
     }
 
     Ok(())
+}
+
+/// Release and re-acquire [`ARCHIVE_GUARD`] every [`ARCHIVE_MOVE_BATCH`]
+/// disposals (issue #144 item 4), so one long sweep cannot pin the guard and
+/// the scheduler tick.
+async fn maybe_yield_archive_guard(
+    held: &mut Option<tokio::sync::MutexGuard<'static, ()>>,
+    since: &mut usize,
+) {
+    if *since >= ARCHIVE_MOVE_BATCH {
+        *since = 0;
+        *held = None; // release the guard
+        tokio::task::yield_now().await;
+        *held = Some(ARCHIVE_GUARD.lock().await);
+    }
+    *since += 1;
+}
+
+/// One floor-driven delete (the ENOSPC rescue): file then row via the shared
+/// helper; only a real file delete credits the free-space deficit, a pruned
+/// dangling row only lowers `used`, and a kept row changes nothing. The caller
+/// has already established that `seg` lives on the deficit filesystem.
+#[allow(clippy::too_many_arguments)]
+async fn floor_rescue_delete(
+    pool: &Pool,
+    policy: &RecordingPolicy,
+    seg: &Segment,
+    reason: &str,
+    storage_cache: &mut std::collections::HashMap<Uuid, Storage>,
+    guard: &mut DanglingGuard,
+    used: &mut i64,
+    deficit: &mut i64,
+) {
+    match delete_segment_file_then_row(pool, seg, storage_cache, guard).await {
+        Ok(DeleteOutcome::Deleted) => {
+            *used -= seg.size_bytes;
+            *deficit = (*deficit - seg.size_bytes).max(0);
+            warn!(
+                policy_id  = %policy.id,
+                segment_id = %seg.id,
+                reason,
+                "free-space floor: deleted oldest segment on the low disk to free real bytes"
+            );
+            emit_premature_rollover_if_early(pool, seg, policy.live_retention_hours, reason).await;
+        }
+        Ok(DeleteOutcome::DanglingPruned) => *used -= seg.size_bytes,
+        Ok(DeleteOutcome::DanglingKept) => {}
+        Err(e) => {
+            error!(
+                policy_id  = %policy.id,
+                segment_id = %seg.id,
+                error      = %e,
+                "free-space floor: failed to delete segment"
+            );
+        }
+    }
 }
 
 // ─── absolute max-retention sweep (data-minimization ceiling) ─────────────────
@@ -2713,9 +3347,12 @@ pub async fn max_retention_sweep(
 
     let mut storage_cache: std::collections::HashMap<Uuid, Storage> =
         std::collections::HashMap::new();
+    let mut guard = DanglingGuard::default();
 
     for seg in &segments {
-        if let Err(e) = delete_segment_file_then_row(pool, seg, &mut storage_cache).await {
+        if let Err(e) =
+            delete_segment_file_then_row(pool, seg, &mut storage_cache, &mut guard).await
+        {
             // A real IO failure (not a tolerated NotFound) — log and move on so a
             // single stuck file can't block the rest of the cap. Retried next tick.
             error!(
@@ -2769,24 +3406,42 @@ async fn resolve_archive_dirs_for_policy(
 }
 
 /// Delete a segment's file then its index row (correctness item 10: file first,
-/// row only on filesystem success; `NotFound` is tolerated so a dangling row is
-/// still cleaned up). Shared by the size-eviction delete branches.
+/// row only on filesystem success). Shared by every retention and eviction
+/// sweep.
+///
+/// A `NotFound` file prunes the (dangling) row ONLY when `guard` confirms the
+/// segment's storage (marker present, breaker not latched, no mass-missing
+/// pattern; R3 / item 34); otherwise the row is kept. The returned
+/// [`DeleteOutcome`] tells the caller whether real bytes were freed.
 async fn delete_segment_file_then_row(
     pool: &Pool,
     seg: &Segment,
     storage_cache: &mut std::collections::HashMap<Uuid, Storage>,
-) -> Result<()> {
+    guard: &mut DanglingGuard,
+) -> Result<DeleteOutcome> {
     let storage = resolve_storage(pool, storage_cache, seg.storage_id).await?;
     let abs_path = Path::new(&storage.path).join(&seg.path);
 
-    match tokio::fs::remove_file(&abs_path).await {
-        Ok(()) => {}
+    let outcome = match tokio::fs::remove_file(&abs_path).await {
+        Ok(()) => {
+            guard.note_present(&storage.path);
+            DeleteOutcome::Deleted
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !guard.may_prune_missing(pool, &storage.path).await {
+                debug!(
+                    segment_id = %seg.id,
+                    path       = %abs_path.display(),
+                    "sweep: file not found on an unconfirmed storage; keeping its row"
+                );
+                return Ok(DeleteOutcome::DanglingKept);
+            }
             warn!(
                 segment_id = %seg.id,
                 path       = %abs_path.display(),
-                "size eviction: file not found; cleaning dangling row"
+                "sweep: file not found; cleaning dangling row"
             );
+            DeleteOutcome::DanglingPruned
         }
         Err(e) => {
             // Do NOT delete the row — the file might still be there (item 10).
@@ -2794,12 +3449,12 @@ async fn delete_segment_file_then_row(
                 anyhow::Error::new(e).context(format!("remove_file {}", abs_path.display()))
             );
         }
-    }
+    };
 
     db::delete_segment_row(pool, seg.id)
         .await
         .context("delete_segment_row")?;
-    Ok(())
+    Ok(outcome)
 }
 
 // ─── shared helpers ───────────────────────────────────────────────────────────
@@ -3089,6 +3744,48 @@ mod tests {
         // A path that does not exist → statvfs fails → None (skip the floor).
         let result = below_free_floor("/this/path/does/not/exist/crumb-test-xyz");
         assert!(result.is_none());
+    }
+
+    /// R3: the sweep breaker mirrors reconcile's shape, more than 100 missing
+    /// AND a strict majority of the rows touched on that root.
+    #[test]
+    fn sweep_breaker_needs_floor_and_majority() {
+        assert!(!sweep_breaker_tripped(0, 0));
+        assert!(
+            !sweep_breaker_tripped(100, 100),
+            "at the floor, not above it"
+        );
+        assert!(sweep_breaker_tripped(101, 101));
+        assert!(sweep_breaker_tripped(101, 201));
+        assert!(
+            !sweep_breaker_tripped(101, 202),
+            "exactly half is not a majority"
+        );
+        assert!(
+            !sweep_breaker_tripped(150, 10_000),
+            "a few genuinely missing files on a big storage keep pruning"
+        );
+    }
+
+    /// R2: a full or read-only archive destination is recognised through the
+    /// anyhow context layers the move adds.
+    #[test]
+    fn storage_full_or_readonly_is_detected_through_context() {
+        let full = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("write dst /archive/x.mp4")
+            .context("copy /live/x.mp4 -> /archive/x.mp4");
+        assert!(is_storage_full_or_readonly(&full));
+        let missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("open src /live/x.mp4");
+        assert!(!is_storage_full_or_readonly(&missing));
+        let plain = anyhow::anyhow!("archive checksum mismatch");
+        assert!(!is_storage_full_or_readonly(&plain));
+        #[cfg(unix)]
+        {
+            let rofs = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EROFS))
+                .context("create dst");
+            assert!(is_storage_full_or_readonly(&rofs));
+        }
     }
 
     // ── archive copy checksum (audit P2 #7) ──────────────────────────────────
@@ -3686,6 +4383,12 @@ mod tests {
             )
             .await
             .expect("upsert archive storage");
+            // Both test roots stand for real, mounted disks: plant the storage
+            // marker the recorder writes after its first committed segment, so
+            // the storage guards (R3/R7) treat them as confirmed. Tests of the
+            // unconfirmed (unmounted) shape remove it.
+            crate::reconcile::ensure_storage_marker(live_dir.path()).await;
+            crate::reconcile::ensure_storage_marker(archive_dir.path()).await;
 
             // 5. Policy (caps/archive set by the caller) + camera.
             let camera_id;
@@ -4685,8 +5388,10 @@ mod tests {
                 .await
                 .expect("sweep ok");
 
-            // 4×100 = 400 over a 250 cap. d0 is protected → skipped; the sweep evicts
-            // d1 then d2 (→ 200, under cap). d0 + d3 survive.
+            // 4×100 = 400 on disk, but d0 is protected: it is neither evictable
+            // nor counted toward the cap (R5), so the UNPROTECTED total is 300
+            // over a 250 cap. The sweep evicts d1 (→ 200, under cap). d0, d2
+            // and d3 survive.
             assert!(
                 fx._live_dir.path().join("d0.mp4").exists(),
                 "protected oldest segment must survive eviction"
@@ -4696,8 +5401,8 @@ mod tests {
                 "d1 should be evicted"
             );
             assert!(
-                !fx._live_dir.path().join("d2.mp4").exists(),
-                "d2 should be evicted"
+                fx._live_dir.path().join("d2.mp4").exists(),
+                "d2 should be kept (protected bytes do not count toward the cap)"
             );
             assert!(
                 fx._live_dir.path().join("d3.mp4").exists(),
@@ -4960,6 +5665,9 @@ mod tests {
             )
             .await
             .expect("upsert archive storage");
+            // Confirmed (mounted) storages by default, as in `setup`.
+            crate::reconcile::ensure_storage_marker(live_dir.path()).await;
+            crate::reconcile::ensure_storage_marker(archive_dir.path()).await;
 
             let (policy_id, camera_a_id, camera_b_id) = {
                 let client = pool.get().await.expect("conn");
@@ -5370,11 +6078,8 @@ mod tests {
                 "a shared-fs floor deficit must never archive-move (0 bytes freed)"
             );
             // And the archive directory really received nothing.
-            let mut entries = tokio::fs::read_dir(fx._archive_dir.path())
-                .await
-                .expect("read archive dir");
             assert!(
-                entries.next_entry().await.expect("read entry").is_none(),
+                archive_dir_footage(fx._archive_dir.path()).await.is_empty(),
                 "no files may land on the archive dir during a shared-fs floor rescue"
             );
         }
@@ -6139,6 +6844,769 @@ mod tests {
                 .unwrap();
             assert_eq!(arch, 100, "protected archive segment survives the drain");
             assert!(ap.join("protected.mp4").exists(), "protected file kept");
+        }
+
+        // ── audit 55 R2-R7: eviction and retention safety ──────────────────────
+
+        /// Every `.mp4` under `dir` (recursively). The storage marker and other
+        /// non-footage files are ignored.
+        async fn archive_dir_footage(dir: &std::path::Path) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                let Ok(mut rd) = tokio::fs::read_dir(&d).await else {
+                    continue;
+                };
+                while let Ok(Some(e)) = rd.next_entry().await {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().is_some_and(|x| x == "mp4") {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        }
+
+        /// A fractional floor strictly above the current free fraction of the
+        /// filesystem holding `path`, so the floor deterministically fires.
+        /// `None` when statvfs is unavailable.
+        fn firing_floor_frac(path: &std::path::Path) -> Option<f32> {
+            let (free, total) = fs_free_and_total(path.to_str()?)?;
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let frac = (((free as f64 / total as f64) + 1.0) / 2.0) as f32;
+            (0.0..1.0).contains(&frac).then_some(frac)
+        }
+
+        async fn set_live_floor(pool: &Pool, policy_id: Uuid, frac: f32, abs: i64) {
+            pool.get()
+                .await
+                .expect("conn")
+                .execute(
+                    "UPDATE recording_policies \
+                     SET live_min_free_pct = $2, live_min_free_bytes = $3 WHERE id = $1",
+                    &[&policy_id, &frac, &abs],
+                )
+                .await
+                .expect("set live floor");
+        }
+
+        async fn segment_row_exists(pool: &Pool, rel: &str) -> bool {
+            pool.get()
+                .await
+                .expect("conn")
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM segments WHERE path = $1)",
+                    &[&rel],
+                )
+                .await
+                .expect("exists")
+                .get(0)
+        }
+
+        /// R4: a camera with a long retention must not stall a shorter
+        /// retention behind the oldest-first batch limit. More than one batch
+        /// of camera A's footage sits inside A's 30-day window and is older
+        /// than camera B's expired footage; B's must still be deleted.
+        #[tokio::test]
+        async fn live_retention_enforces_each_cameras_own_window() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup_policy(&url, None, None, false).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            let live_path = fx._live_dir.path().to_path_buf();
+
+            let a_rows = i32::try_from(MAX_RETENTION_BATCH_LIMIT).expect("fits") + 100;
+            {
+                let client = fx.pool.get().await.expect("conn");
+                client
+                    .execute(
+                        "UPDATE recording_policies SET live_retention_hours = 720 WHERE id = $1",
+                        &[&fx.policy_id],
+                    )
+                    .await
+                    .expect("long retention");
+                let short: Uuid = client
+                    .query_one(
+                        "INSERT INTO recording_policies \
+                             (name, live_storage_id, live_retention_hours, archive_enabled) \
+                         VALUES ('Short', $1, 24, false) RETURNING id",
+                        &[&fx.live_storage_id],
+                    )
+                    .await
+                    .expect("short policy")
+                    .get(0);
+                client
+                    .execute(
+                        "UPDATE cameras SET policy_id = $2 WHERE id = $1",
+                        &[&fx.camera_b_id, &short],
+                    )
+                    .await
+                    .expect("pin camera b");
+                // Index rows only: camera A's footage must never be touched.
+                let a_start = Utc::now() - Duration::days(3);
+                client
+                    .execute(
+                        "INSERT INTO segments (camera_id, storage_id, stage, path, stream, \
+                             start_ts, end_ts, duration_ms, size_bytes) \
+                         SELECT $1, $2, 'live', 'a/' || g || '.mp4', 'main', \
+                             $3 + g * interval '4 seconds', \
+                             $3 + (g + 1) * interval '4 seconds', 4000, 100 \
+                         FROM generate_series(0, $4::int - 1) g",
+                        &[&fx.camera_a_id, &fx.live_storage_id, &a_start, &a_rows],
+                    )
+                    .await
+                    .expect("camera a rows");
+            }
+            let b_old = Utc::now() - Duration::days(2);
+            for i in 0..2 {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_b_id,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("b{i}.mp4"),
+                    b_old + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+            add_segment_for(
+                &fx.pool,
+                fx.camera_b_id,
+                fx.live_storage_id,
+                &live_path,
+                SegmentStage::Live,
+                "b_recent.mp4",
+                Utc::now() - Duration::hours(1),
+                100,
+            )
+            .await;
+
+            live_retention_sweep(&fx.pool, &config)
+                .await
+                .expect("sweep ok");
+
+            for rel in ["b0.mp4", "b1.mp4"] {
+                assert!(!live_path.join(rel).exists(), "{rel}: expired file deleted");
+                assert!(
+                    !segment_row_exists(&fx.pool, rel).await,
+                    "{rel}: row deleted"
+                );
+            }
+            assert!(
+                live_path.join("b_recent.mp4").exists(),
+                "in-window footage kept"
+            );
+            let a_left: i64 = fx
+                .pool
+                .get()
+                .await
+                .expect("conn")
+                .query_one(
+                    "SELECT count(*) FROM segments WHERE camera_id = $1",
+                    &[&fx.camera_a_id],
+                )
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(
+                a_left,
+                i64::from(a_rows),
+                "camera A's in-window footage untouched"
+            );
+        }
+
+        /// R3: on a storage whose marker is absent (an unmounted disk), a
+        /// missing file must NOT delete its index row; real files there are
+        /// still evicted, and the cap is not credited for the kept row.
+        #[tokio::test]
+        async fn eviction_keeps_dangling_rows_on_unconfirmed_storage() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup(&url, Some(250), None, false).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            let live_path = fx._live_dir.path().to_path_buf();
+            let t0 = Utc::now() - Duration::hours(10);
+            for i in 0..4 {
+                add_segment(
+                    &fx,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("u{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+            tokio::fs::remove_file(live_path.join(crate::reconcile::STORAGE_MARKER_FILENAME))
+                .await
+                .expect("remove marker");
+            tokio::fs::remove_file(live_path.join("u0.mp4"))
+                .await
+                .expect("rm u0");
+
+            let camera = load_camera(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &camera.policy)
+                .await
+                .expect("sweep ok");
+
+            assert!(
+                segment_row_exists(&fx.pool, "u0.mp4").await,
+                "a missing file on an unconfirmed storage keeps its index row"
+            );
+            for rel in ["u1.mp4", "u2.mp4"] {
+                assert!(!live_path.join(rel).exists(), "{rel} evicted");
+                assert!(
+                    !segment_row_exists(&fx.pool, rel).await,
+                    "{rel} row removed"
+                );
+            }
+            assert!(live_path.join("u3.mp4").exists(), "u3 kept (under cap)");
+
+            // The retention sweep applies the same gate.
+            {
+                let client = fx.pool.get().await.expect("conn");
+                client
+                    .execute(
+                        "UPDATE recording_policies SET live_retention_hours = 1",
+                        &[],
+                    )
+                    .await
+                    .expect("short retention");
+            }
+            live_retention_sweep(&fx.pool, &config)
+                .await
+                .expect("retention ok");
+            assert!(
+                segment_row_exists(&fx.pool, "u0.mp4").await,
+                "retention keeps the row of a missing file on an unconfirmed storage"
+            );
+            assert!(
+                !live_path.join("u3.mp4").exists(),
+                "expired real file deleted"
+            );
+        }
+
+        /// R6: with archiving off, free-space floor eviction only deletes
+        /// footage on the disk that is actually low. Older footage on another
+        /// filesystem is kept (deleting it would free nothing there).
+        #[tokio::test]
+        async fn floor_eviction_archive_off_only_deletes_on_the_low_disk() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let shm = std::path::Path::new("/dev/shm");
+            if !shm.is_dir() {
+                eprintln!("skipping: no /dev/shm for a second filesystem");
+                return;
+            }
+            let Ok(other) = tempfile::Builder::new()
+                .prefix("crumb-other")
+                .tempdir_in(shm)
+            else {
+                eprintln!("skipping: cannot create a dir on /dev/shm");
+                return;
+            };
+            let fx = setup_policy(&url, None, None, false).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            let live_path = fx._live_dir.path().to_path_buf();
+            if same_filesystem(other.path(), &live_path).await {
+                eprintln!("skipping: /dev/shm shares the temp filesystem");
+                return;
+            }
+            let Some(frac) = firing_floor_frac(&live_path) else {
+                eprintln!("skipping: statvfs unavailable");
+                return;
+            };
+            crate::reconcile::ensure_storage_marker(other.path()).await;
+            let other_storage = db::upsert_storage(
+                &fx.pool,
+                "test-other-fs",
+                other.path().to_str().expect("utf8"),
+            )
+            .await
+            .expect("other storage");
+            set_live_floor(&fx.pool, fx.policy_id, frac, 0).await;
+
+            // The OLDEST footage is on the other disk (e.g. a drain in progress).
+            let t0 = Utc::now() - Duration::hours(20);
+            for i in 0..2 {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_a_id,
+                    other_storage.id,
+                    other.path(),
+                    SegmentStage::Live,
+                    &format!("other{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+            for i in 0..2 {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_a_id,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("low{i}.mp4"),
+                    t0 + Duration::hours(5) + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+
+            let policy = load_policy(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &policy)
+                .await
+                .expect("sweep ok");
+
+            for i in 0..2 {
+                let rel = format!("other{i}.mp4");
+                assert!(
+                    other.path().join(&rel).exists(),
+                    "{rel} on the other disk kept"
+                );
+                assert!(segment_row_exists(&fx.pool, &rel).await, "{rel} row kept");
+                let rel = format!("low{i}.mp4");
+                assert!(
+                    !live_path.join(&rel).exists(),
+                    "{rel} on the low disk deleted"
+                );
+            }
+        }
+
+        /// R5: protected footage neither counts toward the byte cap nor lets
+        /// cap eviction reach footage younger than the minimum age.
+        #[tokio::test]
+        async fn protected_bytes_do_not_drive_cap_eviction_of_new_footage() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup(&url, Some(250), None, false).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            let live_path = fx._live_dir.path().to_path_buf();
+            let t0 = Utc::now() - Duration::hours(10);
+            for i in 0..3 {
+                add_segment(
+                    &fx,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("p{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+            for i in 0..2 {
+                add_segment(
+                    &fx,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("n{i}.mp4"),
+                    t0 + Duration::minutes(10 + i),
+                    100,
+                )
+                .await;
+            }
+            db::create_bookmark(
+                &fx.pool,
+                fx.camera_id,
+                t0,
+                Some("incident"),
+                None,
+                Some(Utc::now() + Duration::days(1)),
+                Some(t0 - Duration::seconds(5)),
+                Some(t0 + Duration::minutes(2) + Duration::seconds(5)),
+            )
+            .await
+            .expect("protected bookmark");
+
+            // 500 B on disk, 300 B protected: the 200 B unprotected total is
+            // under the 250 B cap, so nothing may be evicted.
+            let camera = load_camera(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &camera.policy)
+                .await
+                .expect("sweep ok");
+            for rel in ["p0.mp4", "p1.mp4", "p2.mp4", "n0.mp4", "n1.mp4"] {
+                assert!(live_path.join(rel).exists(), "{rel} kept");
+            }
+
+            // Shrink the cap below what the unprotected footage can satisfy and
+            // add a fresh segment: old unprotected footage goes, the fresh one
+            // stays (minimum cap-eviction age).
+            add_segment(
+                &fx,
+                fx.live_storage_id,
+                &live_path,
+                SegmentStage::Live,
+                "fresh.mp4",
+                Utc::now() - Duration::minutes(5),
+                100,
+            )
+            .await;
+            fx.pool
+                .get()
+                .await
+                .expect("conn")
+                .execute("UPDATE recording_policies SET live_max_bytes = 50", &[])
+                .await
+                .expect("shrink cap");
+            let camera = load_camera(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &camera.policy)
+                .await
+                .expect("sweep ok");
+            assert!(
+                !live_path.join("n0.mp4").exists(),
+                "old unprotected n0 evicted"
+            );
+            assert!(
+                !live_path.join("n1.mp4").exists(),
+                "old unprotected n1 evicted"
+            );
+            assert!(
+                live_path.join("fresh.mp4").exists(),
+                "fresh footage never cap-evicted"
+            );
+            for rel in ["p0.mp4", "p1.mp4", "p2.mp4"] {
+                assert!(live_path.join(rel).exists(), "{rel} protected");
+            }
+        }
+
+        /// R2: the archive tier has its own free-space floor that rolls the
+        /// oldest unprotected archive footage over, leaving live footage alone.
+        #[tokio::test]
+        async fn archive_floor_rolls_oldest_archive_footage_over() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup_policy(&url, None, None, true).await;
+            let archive_path = fx._archive_dir.path().to_path_buf();
+            let live_path = fx._live_dir.path().to_path_buf();
+            let Some(frac) = firing_floor_frac(&archive_path) else {
+                eprintln!("skipping: statvfs unavailable");
+                return;
+            };
+            let t0 = Utc::now() - Duration::hours(100);
+            for i in 0..3 {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_a_id,
+                    fx.archive_storage_id,
+                    &archive_path,
+                    SegmentStage::Archive,
+                    &format!("a{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+            add_segment_for(
+                &fx.pool,
+                fx.camera_a_id,
+                fx.live_storage_id,
+                &live_path,
+                SegmentStage::Live,
+                "l0.mp4",
+                Utc::now() - Duration::hours(1),
+                100,
+            )
+            .await;
+            db::create_bookmark(
+                &fx.pool,
+                fx.camera_a_id,
+                t0,
+                Some("keep"),
+                None,
+                Some(Utc::now() + Duration::days(1)),
+                Some(t0 - Duration::seconds(5)),
+                Some(t0 + Duration::seconds(5)),
+            )
+            .await
+            .expect("protected bookmark");
+
+            let policy = load_policy(&fx).await;
+            archive_floor_sweep_with(&fx.pool, &policy, Some(frac))
+                .await
+                .expect("archive floor ok");
+
+            assert!(
+                archive_path.join("a0.mp4").exists(),
+                "protected archive kept"
+            );
+            for rel in ["a1.mp4", "a2.mp4"] {
+                assert!(!archive_path.join(rel).exists(), "{rel} rolled over");
+                assert!(
+                    !segment_row_exists(&fx.pool, rel).await,
+                    "{rel} row removed"
+                );
+            }
+            assert!(live_path.join("l0.mp4").exists(), "live footage untouched");
+        }
+
+        /// R2: archive moves failing with the source present (here the archive
+        /// root cannot be created) must not wedge the live tier. Cap-only
+        /// pressure keeps the footage; a live free-space deficit deletes the
+        /// oldest live footage instead of leaving the disk to fill.
+        #[tokio::test]
+        async fn failing_archive_moves_do_not_wedge_the_live_floor() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup_policy(&url, Some(250), None, true).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            let live_path = fx._live_dir.path().to_path_buf();
+            let Some(frac) = firing_floor_frac(&live_path) else {
+                eprintln!("skipping: statvfs unavailable");
+                return;
+            };
+            let blocker = fx._archive_dir.path().join("blocker");
+            tokio::fs::write(&blocker, b"x")
+                .await
+                .expect("blocker file");
+            let bad_root = blocker.join("archive");
+            fx.pool
+                .get()
+                .await
+                .expect("conn")
+                .execute(
+                    "UPDATE storages SET path = $2 WHERE id = $1",
+                    &[&fx.archive_storage_id, &bad_root.to_str().expect("utf8")],
+                )
+                .await
+                .expect("repoint archive");
+            let t0 = Utc::now() - Duration::hours(10);
+            for i in 0..4 {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_a_id,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("m{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+
+            // (1) Over the cap, no floor deficit: the move fails, footage stays.
+            set_live_floor(&fx.pool, fx.policy_id, 0.0, 0).await;
+            let policy = load_policy(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &policy)
+                .await
+                .expect("sweep ok");
+            for i in 0..4 {
+                assert!(
+                    live_path.join(format!("m{i}.mp4")).exists(),
+                    "m{i} kept (cap only)"
+                );
+            }
+
+            // (2) Live disk below its floor: the failing moves must not stop
+            //     the rescue; the oldest live footage is deleted.
+            set_live_floor(&fx.pool, fx.policy_id, frac, 0).await;
+            let policy = load_policy(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &policy)
+                .await
+                .expect("sweep ok");
+            for i in 0..4 {
+                let rel = format!("m{i}.mp4");
+                assert!(
+                    !live_path.join(&rel).exists(),
+                    "{rel} deleted by the floor rescue"
+                );
+                assert!(
+                    !segment_row_exists(&fx.pool, &rel).await,
+                    "{rel} row removed"
+                );
+            }
+        }
+
+        /// R7: an archive storage with indexed footage but no marker is an
+        /// unmounted disk. Neither the eviction move nor the cron move may
+        /// write into it; the live footage stays where it is.
+        #[tokio::test]
+        async fn unconfirmed_archive_destination_is_never_written() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup_policy(&url, Some(250), None, true).await;
+            std::env::set_var("DATABASE_URL", "unused://");
+            let config = Config::from_env().expect("config");
+            let live_path = fx._live_dir.path().to_path_buf();
+            let archive_path = fx._archive_dir.path().to_path_buf();
+            set_live_floor(&fx.pool, fx.policy_id, 0.0, 0).await;
+
+            // Indexed archive footage whose file is not visible: the real disk
+            // is not mounted, and the mountpoint carries no marker.
+            add_segment_for(
+                &fx.pool,
+                fx.camera_a_id,
+                fx.archive_storage_id,
+                &archive_path,
+                SegmentStage::Archive,
+                "hist.mp4",
+                Utc::now() - Duration::days(30),
+                100,
+            )
+            .await;
+            tokio::fs::remove_file(archive_path.join("hist.mp4"))
+                .await
+                .expect("hide hist");
+            tokio::fs::remove_file(archive_path.join(crate::reconcile::STORAGE_MARKER_FILENAME))
+                .await
+                .expect("remove archive marker");
+
+            let t0 = Utc::now() - Duration::hours(100);
+            for i in 0..4 {
+                add_segment_for(
+                    &fx.pool,
+                    fx.camera_a_id,
+                    fx.live_storage_id,
+                    &live_path,
+                    SegmentStage::Live,
+                    &format!("v{i}.mp4"),
+                    t0 + Duration::minutes(i),
+                    100,
+                )
+                .await;
+            }
+
+            let policy = load_policy(&fx).await;
+            policy_size_eviction_sweep(&fx.pool, &config, &policy)
+                .await
+                .expect("sweep ok");
+            let cam = db::get_camera(&fx.pool, fx.camera_a_id)
+                .await
+                .expect("get_camera")
+                .expect("camera");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            assert!(
+                archive_camera(&fx.pool, &config, &cam, deadline)
+                    .await
+                    .is_err(),
+                "the cron move refuses an unconfirmed destination"
+            );
+
+            for i in 0..4 {
+                assert!(
+                    live_path.join(format!("v{i}.mp4")).exists(),
+                    "v{i} kept on live"
+                );
+            }
+            let live_bytes = db::policy_stage_bytes(&fx.pool, fx.policy_id, SegmentStage::Live)
+                .await
+                .expect("live bytes");
+            assert_eq!(live_bytes, 400, "every live row still live");
+            assert!(
+                archive_dir_footage(&archive_path).await.is_empty(),
+                "nothing written into the unconfirmed archive root"
+            );
+            assert!(
+                segment_row_exists(&fx.pool, "hist.mp4").await,
+                "the unmounted disk's index row is kept"
+            );
+        }
+
+        /// R7: a "Change storage" drain refuses a target that has indexed
+        /// footage but no marker (an unmounted disk); every source stays put.
+        #[tokio::test]
+        async fn change_storage_drain_refuses_unconfirmed_target() {
+            let Some(url) = test_db_url() else {
+                eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+                return;
+            };
+            let fx = setup(&url, None, None, false).await;
+            db::ensure_storage_migrations_table(&fx.pool)
+                .await
+                .expect("ensure migrations table");
+            let start = Utc::now() - Duration::hours(2);
+            let rel = format!("{}/2026/06/21/c.mp4", fx.camera_id);
+            add_segment(
+                &fx,
+                fx.live_storage_id,
+                fx._live_dir.path(),
+                SegmentStage::Live,
+                &rel,
+                start,
+                4096,
+            )
+            .await;
+            // History on the target, but its file and marker are not visible.
+            add_segment(
+                &fx,
+                fx.archive_storage_id,
+                fx._archive_dir.path(),
+                SegmentStage::Archive,
+                "old.mp4",
+                start - Duration::days(10),
+                100,
+            )
+            .await;
+            tokio::fs::remove_file(fx._archive_dir.path().join("old.mp4"))
+                .await
+                .expect("hide old");
+            tokio::fs::remove_file(
+                fx._archive_dir
+                    .path()
+                    .join(crate::reconcile::STORAGE_MARKER_FILENAME),
+            )
+            .await
+            .expect("remove target marker");
+
+            let policy_id = default_policy_id(&fx).await;
+            let mig = db::create_storage_migration(
+                &fx.pool,
+                policy_id,
+                fx.live_storage_id,
+                fx.archive_storage_id,
+                1,
+            )
+            .await
+            .expect("create migration");
+            db::set_migration_status(&fx.pool, mig.id, "running", None)
+                .await
+                .expect("set running");
+
+            assert!(
+                run_storage_migration(&fx.pool, &mig).await.is_err(),
+                "drain into an unconfirmed target must be refused"
+            );
+            assert!(fx._live_dir.path().join(&rel).exists(), "source kept");
+            assert!(
+                !fx._archive_dir.path().join(&rel).exists(),
+                "nothing written to the target"
+            );
+            let segs = db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+                .await
+                .unwrap();
+            assert!(
+                segs.iter()
+                    .any(|s| s.path == rel && s.storage_id == fx.live_storage_id),
+                "row still on the source storage"
+            );
         }
 
         /// Insert a camera with an optional direct policy; returns its id.
