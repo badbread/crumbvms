@@ -12,6 +12,7 @@ import video.crumb.app.data.toUserMessage
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -137,6 +138,9 @@ class LiveViewModel(
 
     /** Reload cameras and re-resolve all RTSP URLs. Safe to call from the UI. */
     fun refresh() {
+        // A full reload supersedes any per-camera initial-fetch retries in flight.
+        streamRetryJobs.values.forEach { it.cancel() }
+        streamRetryJobs.clear()
         viewModelScope.launch {
             _uiState.update {
                 it.copy(loading = true, connecting = null, error = null, isViewerRestricted = false)
@@ -157,6 +161,9 @@ class LiveViewModel(
                         viewModelScope.launch { repo.prewarmMediaToken(cam.id) }
                     }
                     val streams = resolveStreams(enabledCameras)
+                    // A camera whose /streams call failed is absent from the map and
+                    // would render "No stream" forever; retry those with backoff.
+                    retryMissingStreams(enabledCameras.filter { it.id !in streams })
                     _uiState.update {
                         it.copy(
                             loading = false,
@@ -287,10 +294,71 @@ class LiveViewModel(
         }
     }
 
+    // Per-camera stream re-resolution state. viewModelScope runs on the main
+    // dispatcher, so these are only ever touched from the main thread.
+    private val streamRetryJobs = mutableMapOf<String, Job>()
+    private val streamRefreshInFlight = mutableSetOf<String>()
+    private val lastStreamRefreshMs = mutableMapOf<String, Long>()
+
+    /**
+     * Re-fetch one camera's `/streams` and swap it into the state when it changed
+     * (A1). Called by a tile after repeated reconnect failures, when it is tapped
+     * on "No stream", and when it comes back from the background: the URL cached
+     * at wall load may have stopped resolving (changed restream address or
+     * credential, a `_subv`/`_mainv` name that no longer exists). An unchanged
+     * answer is not written, so a healthy tile's player is never re-keyed.
+     * Throttled per camera and de-duplicated while a fetch is in flight.
+     */
+    fun refreshStreams(cameraId: String) {
+        val now = System.currentTimeMillis()
+        if (!streamRefreshAllowed(lastStreamRefreshMs[cameraId], now)) return
+        if (!streamRefreshInFlight.add(cameraId)) return
+        lastStreamRefreshMs[cameraId] = now
+        viewModelScope.launch {
+            try {
+                repo.liveStreams(cameraId).onSuccess { fresh -> storeStreams(cameraId, fresh) }
+            } finally {
+                streamRefreshInFlight.remove(cameraId)
+            }
+        }
+    }
+
+    private fun storeStreams(cameraId: String, fresh: LiveStreamsResponse) {
+        _uiState.update { st ->
+            if (st.streams[cameraId] == fresh) st else st.copy(streams = st.streams + (cameraId to fresh))
+        }
+    }
+
+    /**
+     * Keep retrying the initial `/streams` fetch, with backoff, for cameras that
+     * failed it at wall load (A1), until it succeeds, answers with a definite 4xx,
+     * or the wall is reloaded.
+     */
+    private fun retryMissingStreams(missing: List<CameraDto>) {
+        missing.forEach { cam ->
+            streamRetryJobs[cam.id]?.cancel()
+            streamRetryJobs[cam.id] = viewModelScope.launch {
+                var attempt = 0
+                while (true) {
+                    delay(streamFetchRetryDelayMs(attempt))
+                    attempt += 1
+                    val result = repo.liveStreams(cam.id)
+                    val fresh = result.getOrNull()
+                    if (fresh != null) {
+                        storeStreams(cam.id, fresh)
+                        return@launch
+                    }
+                    val code = (result.exceptionOrNull() as? HttpException)?.code()
+                    if (!isRetryableStreamFailure(code)) return@launch
+                }
+            }
+        }
+    }
+
     /**
      * Concurrently fetch [LiveStreamsResponse] for each camera. Individual
-     * failures are silently dropped — the tile will show an error state on its
-     * own if its URL is missing.
+     * failures are dropped from the result (the tile shows "No stream" and
+     * [retryMissingStreams] keeps trying in the background).
      */
     private suspend fun resolveStreams(
         cameras: List<CameraDto>,

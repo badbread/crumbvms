@@ -484,6 +484,18 @@ fun LiveFullscreenScreen(
             if (!isOnline) {
                 isReconnecting = true
                 playerError = false
+                // Always leave a retry behind (A2): the connectivity-regained effect
+                // only fires on an offline-to-online flip. After a short wait,
+                // re-prepare if the player is still down; `attempt` is untouched.
+                reconnectJob = scope.launch {
+                    delay(OFFLINE_PARK_RETRY_MS)
+                    if (player.playerError != null || player.playbackState == Player.STATE_IDLE) {
+                        val source = MediaFactory.rtspSource(url)
+                        player.setMediaSource(source)
+                        player.prepare()
+                        player.playWhenReady = true
+                    }
+                }
                 return
             }
             // ── H265 / unplayable-stream fallback ladder (#524) ─────────────────

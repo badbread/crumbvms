@@ -714,6 +714,7 @@ fun LiveScreen(
                                     LiveCameraTile(
                                         camera = cam,
                                         streams = state.streams[cam.id],
+                                        onRefreshStreams = { vm.refreshStreams(cam.id) },
                                         onClick = { onTileClick(cam.id) },
                                         mediaUrls = mediaUrls,
                                         motion = motionCams.contains(cam.id),
