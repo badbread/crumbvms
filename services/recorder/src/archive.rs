@@ -677,7 +677,7 @@ async fn list_expired_live_segments(
             WHERE s.stage = 'live'
               AND v.p_archive_enabled = false
               AND v.p_live_retention_hours > 0
-              AND s.start_ts < $1 - make_interval(hours => v.p_live_retention_hours)
+              AND s.start_ts < $1::timestamptz - make_interval(hours => v.p_live_retention_hours)
               AND NOT EXISTS (
                   SELECT 1 FROM bookmarks bk
                   WHERE bk.camera_id = s.camera_id
@@ -6954,8 +6954,8 @@ mod tests {
                         "INSERT INTO segments (camera_id, storage_id, stage, path, stream, \
                              start_ts, end_ts, duration_ms, size_bytes) \
                          SELECT $1, $2, 'live', 'a/' || g || '.mp4', 'main', \
-                             $3 + g * interval '4 seconds', \
-                             $3 + (g + 1) * interval '4 seconds', 4000, 100 \
+                             $3::timestamptz + g * interval '4 seconds', \
+                             $3::timestamptz + (g + 1) * interval '4 seconds', 4000, 100 \
                          FROM generate_series(0, $4::int - 1) g",
                         &[&fx.camera_a_id, &fx.live_storage_id, &a_start, &a_rows],
                     )
