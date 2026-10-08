@@ -10002,19 +10002,6 @@ pub fn inject_rtsp_credentials(base: &str, user: &str, pass: &str) -> String {
 
 // ─── server_settings singleton ────────────────────────────────────────────────
 
-/// Seeds for the `server_settings` singleton row, read from environment variables.
-///
-/// The tuple fields are: `(server_address, crumb_rtsp, crumb_api, frigate_rtsp,
-/// frigate_api_legacy, frigate_go2rtc_api, frigate_http_api)`.
-///
-/// * `frigate_api_legacy` — the old single-field seed (kept for the legacy
-///   `frigate_api_base` column), sourced from `FRIGATE_API_BASE` first, then
-///   `GO2RTC_API_BASE`.  This produced the conflation bug (#11); retained for
-///   back-compat with the column.
-/// * `frigate_go2rtc_api` — the go2rtc REST side of an external Frigate
-///   (MSE/WebRTC/frame-proxy, port :1984), seeded from `GO2RTC_API_BASE`.
-/// * `frigate_http_api` — the Frigate HTTP detection API (events/snapshots,
-///   port :5000), seeded from `FRIGATE_API_BASE`.
 /// Which process is running the `server_settings` bootstrap (issue #630).
 ///
 /// `ensure_server_settings_table` backfills every EMPTY column from the running
@@ -10059,6 +10046,19 @@ pub fn client_rtsp_base_seed(role: SettingsSeedRole, candidate: &str) -> String 
     v.to_owned()
 }
 
+/// Seeds for the `server_settings` singleton row, read from environment variables.
+///
+/// The tuple fields are: `(server_address, crumb_rtsp, crumb_api, frigate_rtsp,
+/// frigate_api_legacy, frigate_go2rtc_api, frigate_http_api)`.
+///
+/// * `frigate_api_legacy` — the old single-field seed (kept for the legacy
+///   `frigate_api_base` column), sourced from `FRIGATE_API_BASE` first, then
+///   `GO2RTC_API_BASE`.  This produced the conflation bug (#11); retained for
+///   back-compat with the column.
+/// * `frigate_go2rtc_api` — the go2rtc REST side of an external Frigate
+///   (MSE/WebRTC/frame-proxy, port :1984), seeded from `GO2RTC_API_BASE`.
+/// * `frigate_http_api` — the Frigate HTTP detection API (events/snapshots,
+///   port :5000), seeded from `FRIGATE_API_BASE`.
 fn server_settings_env_seed() -> (String, String, String, String, String, String, String) {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     let crumb_rtsp = env("CRUMB_GO2RTC_RTSP_BASE").unwrap_or_default();
