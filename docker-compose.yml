@@ -63,7 +63,11 @@ services:
       # port with CRUMB_GO2RTC_LOOPBACK_PORT if you edit go2rtc/go2rtc.yaml.
       CRUMB_GO2RTC_RTSP_BASE: ${CRUMB_GO2RTC_RTSP_BASE:-rtsp://localhost:8554}
       CRUMB_GO2RTC_LOOPBACK_PORT: ${CRUMB_GO2RTC_LOOPBACK_PORT:-}  # only if you changed go2rtc.yaml's rtsp.listen
-      CRUMB_GO2RTC_API_BASE: ${CRUMB_GO2RTC_API_BASE:-http://localhost:1984}
+      # No CRUMB_GO2RTC_API_BASE here on purpose (#630): nothing in the recorder
+      # talks to go2rtc's REST API, the api owns the reconcile loop. The only
+      # thing the recorder's copy ever did was get backfilled into
+      # server_settings.crumb_api_base, which the api then dialed as localhost
+      # inside its OWN container.
       GO2RTC_USER: ${GO2RTC_USER:?GO2RTC_USER is required (run scripts/setup-env.sh)}
       GO2RTC_PASS: ${GO2RTC_PASS:?GO2RTC_PASS is required (run scripts/setup-env.sh)}
       GO2RTC_EMBEDDED: ${GO2RTC_EMBEDDED:-true}          # false only if you run an external restreamer

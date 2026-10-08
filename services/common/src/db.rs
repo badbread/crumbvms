@@ -10006,21 +10006,42 @@ pub fn inject_rtsp_credentials(base: &str, user: &str, pass: &str) -> String {
 ///
 /// `ensure_server_settings_table` backfills every EMPTY column from the running
 /// process's env on EVERY start, and the api and the recorder both embed it.
-/// `crumb_rtsp_base` is the one column where that is wrong: the column means
-/// "the address native clients are given", while the recorder's
-/// `CRUMB_GO2RTC_RTSP_BASE` means "where the recorder dials go2rtc" (loopback,
-/// `rtsp://localhost:8554` in the shipped compose). They are different facts
-/// that only share a name, so the first recorder restart after the column was
-/// emptied used to write loopback into it, and every camera on every client
-/// went to "Reconnecting" while recorded playback kept working.
+/// The two `crumb_*` base columns are where that is wrong. Both describe what
+/// the API or its clients should use, and both are seeded from an env var that
+/// describes the RECORDER's own view of go2rtc:
+///
+/// * `crumb_rtsp_base` is the address native clients are given, while the
+///   recorder's `CRUMB_GO2RTC_RTSP_BASE` is where the recorder dials go2rtc
+///   (`rtsp://localhost:8554` in the shipped compose). The first recorder
+///   restart after the column was emptied used to write loopback into it, and
+///   every camera on every client went to "Reconnecting" while recorded
+///   playback kept working.
+/// * `crumb_api_base` is the go2rtc REST base the API proxies iOS/macOS live
+///   (MSE and WebRTC signaling), `frame.jpg` snapshots and notification images
+///   through, while the recorder's `CRUMB_GO2RTC_API_BASE` is
+///   `http://localhost:1984` in the shipped compose, which inside the api
+///   container has nothing listening. Nothing in the recorder reads that key
+///   except this backfill.
+///
+/// So the recorder seeds neither column. Every other column still seeds from
+/// either process exactly as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSeedRole {
-    /// The api: the process that hands `crumb_rtsp_base` to native clients, so
-    /// its env value for that column is a client-facing fallback.
+    /// The api: the process that consumes `crumb_api_base` and hands
+    /// `crumb_rtsp_base` to native clients, so its env values for those
+    /// columns are the right fallbacks for them.
     Api,
-    /// The recorder: its `CRUMB_GO2RTC_RTSP_BASE` is an internal dial address
-    /// and never seeds the client-facing column.
+    /// The recorder: its `CRUMB_GO2RTC_*_BASE` values describe its own view of
+    /// go2rtc and never seed either column.
     Recorder,
+}
+
+impl SettingsSeedRole {
+    /// Whether this process may seed the `crumb_*` base columns at all.
+    #[must_use]
+    const fn seeds_crumb_bases(self) -> bool {
+        matches!(self, Self::Api)
+    }
 }
 
 /// What this process may seed into `server_settings.crumb_rtsp_base`.
@@ -10036,7 +10057,7 @@ pub enum SettingsSeedRole {
 /// `PUT /config/server`, which is unaffected by this function.
 #[must_use]
 pub fn client_rtsp_base_seed(role: SettingsSeedRole, candidate: &str) -> String {
-    if role == SettingsSeedRole::Recorder {
+    if !role.seeds_crumb_bases() {
         return String::new();
     }
     let v = candidate.trim();
@@ -10044,6 +10065,25 @@ pub fn client_rtsp_base_seed(role: SettingsSeedRole, candidate: &str) -> String 
         return String::new();
     }
     v.to_owned()
+}
+
+/// What this process may seed into `server_settings.crumb_api_base`.
+///
+/// Returns `""` when the running process is the recorder: that column is the
+/// go2rtc REST base the API proxies MSE, WebRTC signaling, `frame.jpg` and
+/// notification images through, and the recorder's `CRUMB_GO2RTC_API_BASE` is
+/// its own loopback view of go2rtc. Nothing in the recorder reads that key.
+///
+/// There is no loopback guard here, unlike [`client_rtsp_base_seed`]: this base
+/// is dialed by the api PROCESS, not by a client, so `http://localhost:1984` is
+/// a legitimate value on a single-host install where the api and go2rtc share a
+/// network namespace. It is simply never the RECORDER's value to supply.
+#[must_use]
+pub fn crumb_api_base_seed(role: SettingsSeedRole, candidate: &str) -> String {
+    if !role.seeds_crumb_bases() {
+        return String::new();
+    }
+    candidate.trim().to_owned()
 }
 
 /// Seeds for the `server_settings` singleton row, read from environment variables.
@@ -10172,25 +10212,44 @@ pub async fn ensure_server_settings_table(pool: &Pool, role: SettingsSeedRole) -
     let (
         server_address,
         crumb_rtsp_env,
-        crumb_api,
+        crumb_api_env,
         frigate_rtsp,
         frigate_api,
         frigate_go2rtc_api,
         frigate_http_api,
     ) = server_settings_env_seed();
 
-    // #630: `crumb_rtsp_base` is client-facing, so only the api may seed it, and
-    // only with a routable address. Everything else about this bootstrap is
+    // #630: both `crumb_*` base columns describe what the API or its clients
+    // should use, so only the api may seed them (and the client-facing RTSP base
+    // only with a routable address). Everything else about this bootstrap is
     // unchanged.
     let crumb_rtsp = client_rtsp_base_seed(role, &crumb_rtsp_env);
-    if crumb_rtsp.is_empty() && !crumb_rtsp_env.trim().is_empty() {
-        tracing::debug!(
-            ?role,
-            candidate = %crate::redact::redact_url_credentials(crumb_rtsp_env.trim()),
-            "not seeding server_settings.crumb_rtsp_base from CRUMB_GO2RTC_RTSP_BASE: that \
-             column is the address native clients are given, this value is an internal dial \
-             address"
-        );
+    let crumb_api = crumb_api_base_seed(role, &crumb_api_env);
+    for (key, column, candidate, seed) in [
+        (
+            "CRUMB_GO2RTC_RTSP_BASE",
+            "crumb_rtsp_base",
+            &crumb_rtsp_env,
+            &crumb_rtsp,
+        ),
+        (
+            "CRUMB_GO2RTC_API_BASE",
+            "crumb_api_base",
+            &crumb_api_env,
+            &crumb_api,
+        ),
+    ] {
+        if seed.is_empty() && !candidate.trim().is_empty() {
+            tracing::debug!(
+                ?role,
+                env_key = key,
+                column,
+                candidate = %crate::redact::redact_url_credentials(candidate.trim()),
+                "not seeding this server_settings column from this env var: the column says \
+                 what the API or its clients should use, the value describes the recorder's \
+                 own view of go2rtc"
+            );
+        }
     }
 
     // UPSERT with COALESCE-on-empty: INSERT the row if absent; if it already
@@ -13180,6 +13239,42 @@ mod tests {
                 "the recorder must not seed crumb_rtsp_base from `{candidate}`"
             );
         }
+    }
+
+    /// The same for `crumb_api_base`: the recorder's compose default is
+    /// `http://localhost:1984`, nothing in the recorder reads that key, and the
+    /// api proxies iOS/macOS live, `frame.jpg` and notification images through
+    /// the column. Poisoning it leaves recording healthy and those paths dead.
+    #[test]
+    fn recorder_never_seeds_the_crumb_api_base() {
+        for candidate in [
+            "http://localhost:1984", // the shipped recorder default
+            "http://192.0.2.50:1984",
+            "",
+        ] {
+            assert_eq!(
+                crumb_api_base_seed(SettingsSeedRole::Recorder, candidate),
+                "",
+                "the recorder must not seed crumb_api_base from `{candidate}`"
+            );
+        }
+    }
+
+    /// The api still seeds `crumb_api_base`, including a loopback value: that
+    /// base is dialed by the api process itself, so on a single-host install
+    /// `http://localhost:1984` is correct. There is deliberately no loopback
+    /// guard on this column.
+    #[test]
+    fn api_seeds_the_crumb_api_base_including_loopback() {
+        assert_eq!(
+            crumb_api_base_seed(SettingsSeedRole::Api, "http://recorder:1984"),
+            "http://recorder:1984"
+        );
+        assert_eq!(
+            crumb_api_base_seed(SettingsSeedRole::Api, "http://localhost:1984"),
+            "http://localhost:1984"
+        );
+        assert_eq!(crumb_api_base_seed(SettingsSeedRole::Api, "   "), "");
     }
 
     /// The api still carries an env-configured, client-reachable value over, so

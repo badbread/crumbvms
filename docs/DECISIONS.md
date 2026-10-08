@@ -8,7 +8,7 @@ revisit.
 
 ---
 
-## 2026-10-08, `server_settings.crumb_rtsp_base` is CLIENT-FACING ONLY; the recorder dials its embedded go2rtc over loopback, and the bootstrap no longer seeds that column from the recorder's env
+## 2026-10-08, `server_settings.crumb_rtsp_base` is CLIENT-FACING ONLY; the recorder dials its embedded go2rtc over loopback, and the bootstrap no longer seeds either `crumb_*` base column from the recorder's env
 
 **Context.** One column was serving two audiences that need different values
 (issue #630). The api hands `crumb_rtsp_base` to native clients, so it has to be
@@ -46,13 +46,28 @@ reads like a client bug.
    straight back to `GO2RTC_RTSP_BASE`, the FRIGATE base on a split install, so
    with the column empty a Crumb-served camera's motion sub-stream was opened
    against Frigate's go2rtc.
-3. `ensure_server_settings_table` takes a `SettingsSeedRole`. The recorder never
-   seeds `crumb_rtsp_base`, and even from the api a loopback candidate is
-   refused, because a client handed `rtsp://localhost:8554` dials itself. Every
-   other column still seeds from either process exactly as before. A fresh
-   install is unaffected: the first-run wizard suggests the value from the Host
-   header (`/auth/setup-status` → `suggested_rtsp_base`) and writes it through
+3. `ensure_server_settings_table` takes a `SettingsSeedRole`. The recorder
+   seeds NEITHER `crumb_*` base column, and for `crumb_rtsp_base` even an
+   api-role loopback candidate is refused, because a client handed
+   `rtsp://localhost:8554` dials itself. Every other column still seeds from
+   either process exactly as before. A fresh install is unaffected: the
+   first-run wizard suggests the value from the Host header
+   (`/auth/setup-status` → `suggested_rtsp_base`) and writes it through
    `PUT /config/server`.
+
+   `crumb_api_base` is the same defect in the same upsert, found while auditing
+   this one. It is the go2rtc REST base the api proxies iOS/macOS live (MSE and
+   WebRTC signaling), `frame.jpg` snapshots and notification images through, and
+   the recorder's compose default was `CRUMB_GO2RTC_API_BASE=http://localhost:1984`
+   while nothing in the recorder reads that key at all. If the recorder won the
+   boot race with the column empty, the api ended up dialing `localhost:1984`
+   inside its OWN container, where nothing listens: live and snapshots die on
+   those paths, recording keeps working, and the install looks healthy. The
+   recorder's copy is also gone from the stock compose, so the trap has no
+   source there any more. There is deliberately no loopback guard on this
+   column: it is dialed by the api PROCESS, so `http://localhost:1984` is
+   legitimate on a single-host install, it is simply never the recorder's value
+   to supply.
 
 The bootstrap upsert also gained `updated_at = now()` plus a `WHERE` clause that
 fires only when the backfill actually changes a column. Before, the row was
@@ -85,6 +100,10 @@ untouched row is genuinely untouched and a changed row says when.
   client-facing column is no longer pre-seeded with anything, so it stays empty
   until the wizard (or `PUT /config/server`) sets it. It used to be pre-seeded
   with the recorder's loopback value, which was worse than empty.
+- `crumb_api_base` on a stock compose install is likewise no longer pre-seeded
+  by whichever process booted first. Empty falls back to the api's own
+  `CRUMB_GO2RTC_API_BASE`, which compose sets to `http://recorder:1984`, so the
+  effective value is unchanged and it is now the api's env that decides it.
 - The recorder's RTSP connection to its own go2rtc is now exempt from auth
   (go2rtc exempts true loopback peers). Credential injection is unchanged on
   that path, the credentials are simply ignored, and nothing about how clients
