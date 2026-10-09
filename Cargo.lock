@@ -621,6 +621,7 @@ dependencies = [
  "deadpool-postgres",
  "libc",
  "nvml-wrapper",
+ "reqwest",
  "rumqttc",
  "serde",
  "serde_json",

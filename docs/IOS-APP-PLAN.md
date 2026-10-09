@@ -91,10 +91,12 @@ apps/ios/Crumb/
 - **Auth:** JWT in **Keychain** (`KeychainStore`); `Authorization: Bearer` on every authenticated
   API call. A 401 clears the session (`KeychainStore.clearSession()`), which `AppContainer`
   observes to flip back to `LoginView`.
-- **Media auth:** segment bytes, filmstrip frames, event snapshots, export downloads are tokened
-  URLs (`?token=`) fetched via the ephemeral `.crumbMedia` `URLSession` (never the disk-cached
-  `.shared` session, so the token never touches disk), `AVPlayer`/`AsyncImage`-equivalent
-  (`TokenedAsyncImage`) call sites can't set an `Authorization` header.
+- **Media auth:** segment bytes, filmstrip frames, and event snapshots are scoped-token URLs
+  (`?token=`) fetched via the ephemeral `.crumbMedia` `URLSession` (never the disk-cached
+  `.shared` session, so the token never touches disk), because `AVPlayer`/`AsyncImage`-equivalent
+  (`TokenedAsyncImage`) call sites can't set an `Authorization` header. Export downloads are not
+  single-camera scoped and are fetched with an `Authorization` header instead
+  (`CrumbAPI.exportDownloadRequest`), then shared as a local file.
 - **Server URL** is user-entered and editable in Settings; **LAN auto-discovery**
   (`ServerDiscovery.swift`) scans the device's /24 for `GET /health` matching the
   `"service":"crumb-api"` fingerprint (a unicast TCP scan, not mDNS, the API runs in a bridged

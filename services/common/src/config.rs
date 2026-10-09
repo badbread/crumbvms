@@ -543,6 +543,49 @@ pub fn go2rtc_rtsp_auth_enabled_env() -> bool {
     go2rtc_rtsp_auth_enabled(env::var("GO2RTC_AUTH").ok().as_deref())
 }
 
+// ── embedded go2rtc posture (issue #630) ──────────────────────────────────────
+
+/// Explicit opt-out token for `GO2RTC_EMBEDDED`. Only this exact value (case-
+/// insensitive, surrounding whitespace ignored) tells Crumb that go2rtc runs
+/// somewhere other than the recorder's own container.
+pub const GO2RTC_EMBEDDED_OFF_TOKEN: &str = "false";
+
+/// Whether Crumb's own go2rtc restreamer runs EMBEDDED in the recorder
+/// container (the shipped default).
+///
+/// Two places need this answer and they must never disagree: the supervisor
+/// that spawns the child process (`services/recorder/src/go2rtc_embed.rs`) and
+/// the recorder's RTSP base resolution
+/// ([`crate::rtsp_base::resolve_recorder_bases`]), which dials the embedded
+/// instance over loopback instead of back in through the host (#630). So the
+/// flag is parsed exactly once, here.
+///
+/// Embedded by default: unset, empty and any unrecognized value all mean
+/// embedded, matching the original parse in `go2rtc_embed::spawn`.
+///
+/// # Examples
+///
+/// ```
+/// use crumb_common::config::go2rtc_embedded;
+/// assert!(go2rtc_embedded(None));              // unset → embedded
+/// assert!(go2rtc_embedded(Some("")));          // empty → embedded
+/// assert!(go2rtc_embedded(Some("true")));
+/// assert!(go2rtc_embedded(Some("nonsense")));  // typo  → embedded
+/// assert!(!go2rtc_embedded(Some("false")));
+/// assert!(!go2rtc_embedded(Some("  FALSE ")));  // trimmed/case
+/// ```
+#[must_use]
+pub fn go2rtc_embedded(raw: Option<&str>) -> bool {
+    !matches!(raw, Some(v) if v.trim().eq_ignore_ascii_case(GO2RTC_EMBEDDED_OFF_TOKEN))
+}
+
+/// Read the [`go2rtc_embedded`] posture from the process environment
+/// (`GO2RTC_EMBEDDED`).
+#[must_use]
+pub fn go2rtc_embedded_env() -> bool {
+    go2rtc_embedded(env::var("GO2RTC_EMBEDDED").ok().as_deref())
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Read a secret from `{key}_FILE` (a file path — e.g. a Docker secret mounted

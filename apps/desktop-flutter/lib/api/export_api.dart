@@ -13,12 +13,11 @@
 //   GET    /media-token?camera=<id>                -> scoped short-lived token
 //
 // The export create/poll/cancel/download routes are authenticated with the
-// bearer JWT (Authorization header) exactly like the rest of CrumbApi — the
-// old Tauri client kept those on the full-JWT pattern deliberately (see
-// apps/desktop/src/app.js:1954-1956, and `LegacyQueryTokenUser` in
-// services/api/src/auth_mw.rs) because a multi-camera archive has no single
-// scoped camera and there's no browser <a download> element here forcing a
-// URL-embedded token. The filmstrip PREVIEW frames, however, are per-camera
+// bearer JWT (Authorization header) exactly like the rest of CrumbApi: a
+// multi-camera archive has no single scoped camera, and every client fetches
+// the bytes itself rather than handing a URL to a browser <a download>
+// element, so the server accepts the header only (services/api/src/export.rs).
+// The filmstrip PREVIEW frames, however, are per-camera
 // media and MUST use the short-lived `?token=` media claim (golden rule 1,
 // never the bearer JWT) — this file mints and caches those via GET
 // /media-token, mirroring apps/desktop/src/app.js's getMediaToken/-cache.

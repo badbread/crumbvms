@@ -1464,9 +1464,12 @@ async fn pick_export_folder() -> Option<String> {
     Some(canon.to_string_lossy().into_owned())
 }
 
-/// Stream an exported clip (its authed `?token=` download URL) straight to a
-/// chosen folder, bypassing the browser Downloads path. Returns the written
-/// file path on success.
+/// Stream an exported clip straight to a chosen folder, bypassing the browser
+/// Downloads path. Returns the written file path on success.
+///
+/// `token` is the caller's session token, sent as an `Authorization: Bearer`
+/// header: the export download routes take the header only, never a `?token=`
+/// query (a login token in a URL lands in the server's access log).
 ///
 /// `dest_dir` is validated against the folder [`pick_export_folder`] actually
 /// returned last (rather than trusted as-is) — the webview only ever ROUND-TRIPS
@@ -1476,6 +1479,7 @@ async fn pick_export_folder() -> Option<String> {
 #[tauri::command]
 async fn save_export_file(
     url: String,
+    token: String,
     dest_dir: String,
     filename: String,
 ) -> Result<String, String> {
@@ -1514,6 +1518,7 @@ async fn save_export_file(
 
     let mut resp = HTTP
         .get(&url)
+        .bearer_auth(&token)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
