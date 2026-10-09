@@ -6,6 +6,7 @@
 //! fields) and `Send + Sync + 'static` so it satisfies axum's handler bounds
 //! automatically.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -28,9 +29,25 @@ use crate::dto::ExportJob;
 /// seconds.
 const REVOCATION_CACHE_TTL_SECS: i64 = 15;
 
-/// Consecutive failed logins for one username tolerated before the per-username
-/// backoff engages (issue #127). Below this, every attempt is let through to the
-/// normal credential check; at/above it, attempts are rejected with 429 until
+/// How long one `jti`'s resolved session state (does the row still exist, and
+/// what per-user camera grants does its owner hold) may be trusted before it is
+/// re-read from the DB. Unlike the revoked set, this cache is *positive*: an
+/// unknown `jti` is resolved against the DB there and then, so a token minted a
+/// millisecond ago on another API replica is never spuriously rejected. The TTL
+/// therefore only bounds how long a change made by ANOTHER replica (a user
+/// edit, an account removal) can go unnoticed here; a change made on THIS
+/// process clears the cache synchronously.
+const SESSION_CACHE_TTL_SECS: i64 = 30;
+
+/// Cap on the session cache. One entry per `jti` seen recently, so this is
+/// bounded by real sessions in normal use; the cap only matters if a caller
+/// replays many distinct signed tokens. Cleared wholesale when exceeded (the
+/// next request for each live session simply re-resolves).
+const SESSION_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Consecutive failed logins for one account, from one client, tolerated before
+/// the backoff engages (issue #127). Below this, every attempt is let through to
+/// the normal credential check; at/above it, attempts are rejected with 429 until
 /// the backoff elapses.
 const LOGIN_FAIL_THRESHOLD: u32 = 5;
 
@@ -38,13 +55,13 @@ const LOGIN_FAIL_THRESHOLD: u32 = 5;
 /// it doubles for each additional failure (see [`login_backoff_secs`]).
 const LOGIN_BACKOFF_BASE_SECS: u64 = 2;
 
-/// Hard cap (seconds) on the per-username backoff — the exponential growth is
-/// clamped here so a sustained attack settles at a fixed 15-minute block rather
-/// than growing without bound.
+/// Hard cap (seconds) on the backoff — the exponential growth is clamped here
+/// so sustained guessing settles at a fixed 15-minute block rather than growing
+/// without bound.
 const LOGIN_BACKOFF_CAP_SECS: u64 = 900;
 
-/// Prune the login-failure map once it exceeds this many distinct usernames, so
-/// an attacker spraying random usernames cannot grow it without bound. Only
+/// Prune the login-failure map once it exceeds this many distinct keys, so a
+/// flood of random usernames (or clients) cannot grow it without bound. Only
 /// entries no longer in backoff are dropped (an active block is always kept).
 const LOGIN_FAILURES_MAX_ENTRIES: usize = 10_000;
 
@@ -64,6 +81,28 @@ const CHANNEL_TEST_WINDOW_SECS: u64 = 60;
 /// expired are dropped.
 const CHANNEL_TEST_MAX_ENTRIES: usize = 10_000;
 
+/// Separator between the username and the client key in a login-failure map
+/// key. ASCII unit separator: it cannot occur in a client key (an IP string)
+/// and, being a control character, is not something a username can smuggle in
+/// to collide with another account's bucket.
+const LOGIN_KEY_SEP: char = '\u{1f}';
+
+/// The login-failure map key for one (account, client) pair.
+///
+/// Keying on BOTH is what makes the backoff a per-client brake rather than an
+/// account-wide one: repeated failures from one client no longer stop the
+/// account's real owner signing in from their own machine. The per-client
+/// request bucket in `rate_limit.rs` remains the global limiter on top.
+fn login_key(username: &str, client: &str) -> String {
+    format!("{username}{LOGIN_KEY_SEP}{client}")
+}
+
+/// Prune the console-handoff map once it exceeds this many outstanding codes.
+/// Codes live for seconds and are consumed on first use, so a healthy install
+/// holds a handful; the cap only bounds a pathological caller that mints codes
+/// it never redeems. Only already-expired entries are dropped.
+const HANDOFF_MAX_ENTRIES: usize = 1_000;
+
 /// Backoff duration (seconds) for `failures` consecutive login failures, or
 /// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
 /// `min(cap, base * 2^(failures - threshold))` — exponential, clamped. Pure and
@@ -78,6 +117,68 @@ fn login_backoff_secs(failures: u32) -> Option<u64> {
     let factor = 1_u64.checked_shl(steps).unwrap_or(u64::MAX);
     let secs = LOGIN_BACKOFF_BASE_SECS.saturating_mul(factor);
     Some(secs.min(LOGIN_BACKOFF_CAP_SECS))
+}
+
+/// Account-wide ceiling: this many failed logins for one username, from any
+/// mix of clients, within [`ACCOUNT_FAIL_WINDOW`] puts the whole account under
+/// a backoff. One client cannot reach it on its own: its per-(account, client)
+/// backoff (5 free attempts, then waits of 2, 4, 8, ... s) admits at most 13
+/// failures in any 15 minutes, so 30 takes at least three client addresses
+/// each failing as fast as their own backoff allows.
+const ACCOUNT_FAIL_CEILING: usize = 30;
+
+/// The sliding window [`ACCOUNT_FAIL_CEILING`] is counted over.
+const ACCOUNT_FAIL_WINDOW: Duration = Duration::from_mins(15);
+
+/// First account-wide backoff (seconds) once the ceiling is reached; it doubles
+/// for every further failure while the account is under pressure, clamped to
+/// [`LOGIN_BACKOFF_CAP_SECS`] (see [`account_backoff_secs`]).
+const ACCOUNT_BACKOFF_BASE_SECS: u64 = 30;
+
+/// An account under pressure returns to normal once this long passes with no
+/// failed attempt (rejected 429s are not attempts). Twice the backoff cap, so
+/// sitting out one capped block does not by itself reset the escalation.
+const ACCOUNT_QUIET_RESET: Duration = Duration::from_mins(30);
+
+/// Account-wide backoff (seconds) for the `strikes`-th failure recorded while
+/// the account is over its ceiling (`strikes >= 1`):
+/// `min(cap, base * 2^(strikes - 1))`. Pure, for unit testing.
+fn account_backoff_secs(strikes: u32) -> u64 {
+    let factor = 1_u64
+        .checked_shl(strikes.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    ACCOUNT_BACKOFF_BASE_SECS
+        .saturating_mul(factor)
+        .min(LOGIN_BACKOFF_CAP_SECS)
+}
+
+/// Account-wide failed-login state for one username (all clients together).
+struct AccountFailState {
+    /// Times of the most recent failures, oldest first, at most
+    /// [`ACCOUNT_FAIL_CEILING`] of them.
+    recent: VecDeque<Instant>,
+    /// Failures recorded while over the ceiling; drives the escalation. `0`
+    /// means the account is not under pressure.
+    strikes: u32,
+    /// Instant until which every attempt on this account is rejected.
+    blocked_until: Instant,
+}
+
+impl AccountFailState {
+    fn last_failure(&self) -> Option<Instant> {
+        self.recent.back().copied()
+    }
+
+    /// Whether the ceiling's worth of failures all fall inside the window.
+    fn over_ceiling(&self) -> bool {
+        self.recent.len() >= ACCOUNT_FAIL_CEILING
+            && match (self.recent.front(), self.recent.back()) {
+                (Some(first), Some(last)) => {
+                    last.saturating_duration_since(*first) <= ACCOUNT_FAIL_WINDOW
+                }
+                _ => false,
+            }
+    }
 }
 
 /// Cached Home Assistant `/api/states` snapshot backing `GET /ha/states`
@@ -103,14 +204,27 @@ struct TestWindow {
     hits: u32,
 }
 
-/// Per-username failed-login state for the brute-force backoff (issue #127).
+/// Failed-login state for one (account, client) pair (issue #127).
 #[derive(Clone, Copy)]
 struct FailState {
     /// Consecutive failed logins since the last success/reset.
     failures: u32,
-    /// Instant until which new attempts for this username are rejected. A value
+    /// Instant until which new attempts for this pair are rejected. A value
     /// at/before `now` means "not currently blocked".
     blocked_until: Instant,
+}
+
+/// One outstanding console-handoff code (see [`AppState::issue_handoff_code`]).
+#[derive(Clone, Copy)]
+struct HandoffEntry {
+    /// The user the code was minted for.
+    user_id: Uuid,
+    /// The `jti` of the session that asked for the code, when it has one
+    /// (pre-P0-SESSIONS tokens do not). The exchange rejects a code whose
+    /// originating session has since been signed out.
+    jti: Option<Uuid>,
+    /// Instant after which the code is no longer redeemable.
+    expires_at: Instant,
 }
 
 /// Inner state, heap-allocated once and reference-counted.
@@ -158,6 +272,18 @@ struct Inner {
     /// once; without a cap each miss spawns a single-frame ffmpeg, a spawn storm.
     /// Permit count = `config.thumb_extract_max_concurrency`.
     thumb_semaphore: Arc<Semaphore>,
+
+    /// Bounds concurrent `GET /cameras/{id}/frame.jpg` fetches from go2rtc. The
+    /// low-bandwidth walls on Android and iOS poll one still per tile per
+    /// second, and a request against a camera that is down holds its slot for
+    /// the whole retry ladder, so the proxy needs its own bound rather than an
+    /// unbounded fan-out. Permit count = `config.frame_proxy_max_concurrency`.
+    frame_semaphore: Arc<Semaphore>,
+
+    /// Cameras whose live still could not be fetched recently. See
+    /// [`FrameLatch`]. Memory-only and self-healing: a restart just means the
+    /// first poll after it pays the full ladder again.
+    frame_unavailable: FrameLatch,
 
     /// Per-key in-flight locks for thumbnail extraction (singleflight). Keyed by
     /// the final cache path; a request serializes on its key so two concurrent
@@ -259,6 +385,25 @@ struct Inner {
     /// against `REVOCATION_CACHE_TTL_SECS` to decide when to re-read.
     revoked_jtis_loaded_at: AtomicI64,
 
+    /// In-memory cache of resolved session state, keyed by `jti`. The value is
+    /// `(grants, checked_at_unix)` where `grants` is `Some(camera_ids)` for a
+    /// session whose row still exists and is not revoked (carrying the owning
+    /// user's per-user camera grants, read from the row rather than trusted from
+    /// the token) and `None` for a session that is gone.
+    ///
+    /// This is the positive counterpart to `revoked_jtis`. That set answers "was
+    /// this session signed out", which cannot answer "did this session's row
+    /// ever exist" — a deleted user's rows vanish through
+    /// `sessions.user_id ON DELETE CASCADE`, so their still-signed token read as
+    /// "not revoked" and kept working. A `jti` missing from this cache is
+    /// resolved against the DB on the spot (never assumed live and never assumed
+    /// dead), so a token minted moments ago, here or on another replica, is
+    /// accepted immediately; after that first resolution the check is a
+    /// lock-free `DashMap` lookup. Entries are dropped wholesale whenever a user
+    /// row changes (see [`AppState::invalidate_session_cache`]), the same
+    /// refresh-on-write discipline `roles_cache` and `revoked_jtis` follow.
+    session_cache: DashMap<Uuid, (Option<Vec<Uuid>>, i64)>,
+
     /// Health-alert maintenance window (issue #46). Unix-seconds timestamp
     /// until which operational HEALTH/system alerts (camera offline, recorder
     /// down, low disk, Frigate disconnect, backup failed) are SUPPRESSED —
@@ -285,6 +430,23 @@ struct Inner {
     /// by `users.id`. Memory-only (no table/migration) for the same reason as
     /// `login_failures`: a restart clears it, which only ever RELAXES the limit.
     channel_test_hits: DashMap<Uuid, TestWindow>,
+
+    /// Account-wide failed-login ceiling, keyed on the submitted username alone
+    /// (see [`ACCOUNT_FAIL_CEILING`]). The per-(account, client) counter above
+    /// keeps one noisy client from locking the owner out; this one caps the
+    /// total guessing rate against an account however many client addresses
+    /// the attempts come from. Memory-only, same as `login_failures`.
+    login_account_failures: DashMap<String, AccountFailState>,
+
+    /// Which TCP peers may name the client in `X-Forwarded-For`
+    /// (`TRUST_PROXY` + `TRUSTED_PROXIES`). Shared with the request limiter so
+    /// both attribute a request to the same client.
+    proxy_trust: Arc<crate::rate_limit::ProxyTrust>,
+    /// Outstanding single-use console-handoff codes, keyed by the code itself.
+    /// Memory-only and deliberately so: a code is valid for seconds, and losing
+    /// the map on restart only means the operator clicks "Open in browser"
+    /// again (the fail-safe direction).
+    handoff_codes: DashMap<String, HandoffEntry>,
 
     /// Demand-driven cache behind `GET /ha/states` (issue #170). `None` until
     /// the first request. The `tokio::sync::Mutex` makes a refresh single-flight:
@@ -333,6 +495,7 @@ impl AppState {
         let play_semaphore = Arc::new(Semaphore::new(config.playback_max_concurrency));
         let clip_gen_semaphore = Arc::new(Semaphore::new(config.clip_gen_max_concurrency));
         let thumb_semaphore = Arc::new(Semaphore::new(config.thumb_extract_max_concurrency));
+        let frame_semaphore = Arc::new(Semaphore::new(config.frame_proxy_max_concurrency));
 
         // Health-alert maintenance window (issue #46). Off by default; an
         // optional `MAINTENANCE_UNTIL` env (unix seconds) lets a deployment
@@ -342,6 +505,11 @@ impl AppState {
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(0);
+
+        let proxy_trust = Arc::new(crate::rate_limit::ProxyTrust::new(
+            config.trust_proxy,
+            &config.trusted_proxies,
+        ));
 
         Self(Arc::new(Inner {
             pool,
@@ -358,13 +526,19 @@ impl AppState {
             mainv_needed: DashMap::new(),
             stream_rejected: DashMap::new(),
             thumb_semaphore,
+            frame_semaphore,
+            frame_unavailable: FrameLatch::default(),
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
+            session_cache: DashMap::new(),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
             channel_test_hits: DashMap::new(),
+            login_account_failures: DashMap::new(),
+            proxy_trust,
+            handoff_codes: DashMap::new(),
             ha_states: tokio::sync::Mutex::new(None),
             event_tx: OnceLock::new(),
         }))
@@ -456,6 +630,51 @@ impl AppState {
         self.0.revoked_jtis.contains_key(&jti)
     }
 
+    // ── session cache (liveness + per-user camera grants) ─────────────────────
+
+    /// Resolve a session `jti` to the owning user's per-user camera grants, or
+    /// `None` when the session no longer exists (removed account, pruned row, a
+    /// `jti` that never had a row, or one belonging to a different user).
+    ///
+    /// Cached per `jti` for [`SESSION_CACHE_TTL_SECS`]; a miss costs exactly one
+    /// query, so the common warm path adds no DB round trip. Both outcomes are
+    /// cached, so a client looping on a dead token does not re-query every time.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a DB failure rather than guessing. The caller turns that into
+    /// a 5xx, never a 401: a transient database blip must not look like "you
+    /// have been signed out" to a client that would then discard its token.
+    pub async fn resolve_session(
+        &self,
+        jti: Uuid,
+        user_id: Uuid,
+    ) -> anyhow::Result<Option<Vec<Uuid>>> {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(entry) = self.0.session_cache.get(&jti) {
+            let (grants, checked_at) = entry.value();
+            if now - *checked_at < SESSION_CACHE_TTL_SECS {
+                return Ok(grants.clone());
+            }
+        }
+        let grants = crumb_common::db::resolve_live_session(self.pool(), jti, user_id).await?;
+        // Bound memory against a caller replaying many distinct signed tokens.
+        if self.0.session_cache.len() > SESSION_CACHE_MAX_ENTRIES {
+            self.0.session_cache.clear();
+        }
+        self.0.session_cache.insert(jti, (grants.clone(), now));
+        Ok(grants)
+    }
+
+    /// Drop every cached session so the next request re-reads liveness and the
+    /// per-user camera grants from the DB. Call after any change to a user row
+    /// (edit, removal) or after revoking sessions, so the change lands on that
+    /// user's very next request instead of waiting out the TTL.
+    #[inline]
+    pub fn invalidate_session_cache(&self) {
+        self.0.session_cache.clear();
+    }
+
     /// Borrow the database connection pool.
     #[inline]
     pub fn pool(&self) -> &Pool {
@@ -513,6 +732,40 @@ impl AppState {
     #[inline]
     pub fn thumb_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.0.thumb_semaphore)
+    }
+
+    /// Clone the live-still proxy concurrency semaphore handle (cheap `Arc`
+    /// clone). Used by `GET /cameras/{id}/frame.jpg` to cap concurrent go2rtc
+    /// still fetches.
+    #[inline]
+    pub fn frame_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.0.frame_semaphore)
+    }
+
+    /// Decide how the still proxy should fetch `camera_id`'s live still. See
+    /// [`FrameLatch::attempt_at`].
+    #[inline]
+    pub fn frame_attempt(&self, camera_id: Uuid, ttl: Duration) -> FrameAttempt {
+        self.0
+            .frame_unavailable
+            .attempt_at(camera_id, ttl, Instant::now())
+    }
+
+    /// Latch `camera_id`'s live still as unavailable for `ttl`. Call it only
+    /// when a FULL retry ladder exhausted its attempts, never from the
+    /// single-attempt path (see [`FrameLatch`]).
+    #[inline]
+    pub fn mark_frame_unavailable(&self, camera_id: Uuid, ttl: Duration) {
+        self.0
+            .frame_unavailable
+            .mark_at(camera_id, ttl, Instant::now());
+    }
+
+    /// Clear `camera_id`'s unavailable latch after a successful still fetch, so
+    /// a camera that comes back is served the normal way on the next poll.
+    #[inline]
+    pub fn clear_frame_unavailable(&self, camera_id: Uuid) {
+        self.0.frame_unavailable.clear(camera_id);
     }
 
     /// Get (or create) the singleflight lock for a thumbnail cache key. Callers
@@ -674,36 +927,59 @@ impl AppState {
         self.0.maintenance_until.load(Ordering::Relaxed)
     }
 
-    // ── per-username login backoff (issue #127) ───────────────────────────────
+    // ── login backoff, keyed on (account, client) (issue #127) ────────────────
 
-    /// If `username` is currently within its failed-login backoff window, return
-    /// `Some(retry_after_secs)` (always ≥ 1 while blocked); otherwise `None`.
-    /// The login handler calls this FIRST and, on `Some`, rejects with 429 +
-    /// `Retry-After` before any DB lookup or password verification.
-    pub fn login_retry_after(&self, username: &str) -> Option<u64> {
+    /// If this `username`/`client` pair is currently within its failed-login
+    /// backoff window, return `Some(retry_after_secs)` (always ≥ 1 while
+    /// blocked); otherwise `None`. The login handler calls this FIRST and, on
+    /// `Some`, rejects with 429 + `Retry-After` before any DB lookup or password
+    /// verification.
+    ///
+    /// `client` comes from `rate_limit::client_key`, so it honours `TRUST_PROXY`
+    /// exactly as the request bucket does.
+    ///
+    /// Two brakes apply, and the longer wait wins: the (account, client) pair's
+    /// own backoff, and the account-wide one that engages once the account
+    /// passes [`ACCOUNT_FAIL_CEILING`] failures from any mix of clients.
+    pub fn login_retry_after(&self, username: &str, client: &str) -> Option<u64> {
         let now = Instant::now();
-        let st = self.0.login_failures.get(username)?;
-        if st.blocked_until <= now {
+        let pair = self
+            .0
+            .login_failures
+            .get(&login_key(username, client))
+            .map(|st| st.blocked_until);
+        let account = self
+            .0
+            .login_account_failures
+            .get(username)
+            .map(|st| st.blocked_until);
+        let until = pair.into_iter().chain(account).max()?;
+        if until <= now {
             return None;
         }
         // Round any sub-second remainder up to 1 so a still-blocked attempt never
         // advertises `Retry-After: 0`.
-        Some(
-            st.blocked_until
-                .saturating_duration_since(now)
-                .as_secs()
-                .max(1),
-        )
+        Some(until.saturating_duration_since(now).as_secs().max(1))
     }
 
-    /// Record one failed login for `username`, incrementing its consecutive
-    /// failure count and (once past the threshold) stamping/extending the
-    /// backoff window. Cheap, synchronous, lock-free per entry.
-    pub fn record_login_failure(&self, username: &str) {
+    /// The shared client-attribution policy (`TRUST_PROXY` +
+    /// `TRUSTED_PROXIES`). The login handler and the request limiter both
+    /// derive the client through it.
+    #[inline]
+    pub fn proxy_trust(&self) -> &Arc<crate::rate_limit::ProxyTrust> {
+        &self.0.proxy_trust
+    }
+
+    /// Record one failed login for the `username`/`client` pair, incrementing
+    /// its consecutive failure count and (once past the threshold)
+    /// stamping/extending the backoff window. Cheap, synchronous, lock-free per
+    /// entry.
+    pub fn record_login_failure(&self, username: &str, client: &str) {
         let now = Instant::now();
 
-        // Bound memory against username-spray: once large, drop entries that are
-        // no longer blocked (an active block is always retained).
+        // Bound memory against a spray of random usernames (or clients): once
+        // large, drop entries that are no longer blocked (an active block is
+        // always retained).
         if self.0.login_failures.len() > LOGIN_FAILURES_MAX_ENTRIES {
             self.0.login_failures.retain(|_, st| st.blocked_until > now);
         }
@@ -715,19 +991,116 @@ impl AppState {
         let mut entry = self
             .0
             .login_failures
-            .entry(username.to_owned())
+            .entry(login_key(username, client))
             .or_insert(fresh);
         entry.failures = entry.failures.saturating_add(1);
         if let Some(secs) = login_backoff_secs(entry.failures) {
             entry.blocked_until = now + Duration::from_secs(secs);
         }
+        drop(entry);
+
+        self.record_account_failure(username, now);
     }
 
-    /// Clear any failed-login state for `username` after a successful login, so
-    /// a legitimate user who eventually gets their password right resets the
-    /// counter (and their next fat-finger starts from zero again).
-    pub fn record_login_success(&self, username: &str) {
-        self.0.login_failures.remove(username);
+    /// Count one failure toward the account-wide ceiling for `username`, and
+    /// stamp the account backoff once it is over. Called for every failure,
+    /// whichever client it came from.
+    fn record_account_failure(&self, username: &str, now: Instant) {
+        // Same memory bound as the per-pair map: when large, keep only accounts
+        // that are blocked or still under pressure. Dropping a partial count
+        // only ever relaxes the brake.
+        if self.0.login_account_failures.len() > LOGIN_FAILURES_MAX_ENTRIES {
+            self.0.login_account_failures.retain(|_, st| {
+                st.blocked_until > now
+                    || (st.strikes > 0
+                        && st.last_failure().is_some_and(|t| {
+                            now.saturating_duration_since(t) < ACCOUNT_QUIET_RESET
+                        }))
+            });
+        }
+
+        let mut st = self
+            .0
+            .login_account_failures
+            .entry(username.to_owned())
+            .or_insert_with(|| AccountFailState {
+                recent: VecDeque::with_capacity(ACCOUNT_FAIL_CEILING),
+                strikes: 0,
+                blocked_until: now,
+            });
+        // A long enough quiet spell ends the pressure and the history with it.
+        if st
+            .last_failure()
+            .is_some_and(|t| now.saturating_duration_since(t) >= ACCOUNT_QUIET_RESET)
+        {
+            st.recent.clear();
+            st.strikes = 0;
+        }
+        st.recent.push_back(now);
+        while st.recent.len() > ACCOUNT_FAIL_CEILING {
+            st.recent.pop_front();
+        }
+        if st.strikes > 0 || st.over_ceiling() {
+            st.strikes = st.strikes.saturating_add(1);
+            st.blocked_until = now + Duration::from_secs(account_backoff_secs(st.strikes));
+        }
+    }
+
+    /// Clear any failed-login state for the `username`/`client` pair after a
+    /// successful login, so a legitimate user who eventually gets their password
+    /// right resets the counter (and their next fat-finger starts from zero
+    /// again). Only this client's counter is cleared; a different client's
+    /// accumulated failures for the same account stand on their own, and so
+    /// does the account-wide count (it decays with time, not with a success,
+    /// so one successful sign-in does not hand anyone a fresh allowance).
+    pub fn record_login_success(&self, username: &str, client: &str) {
+        self.0.login_failures.remove(&login_key(username, client));
+    }
+
+    // ── console handoff codes ─────────────────────────────────────────────────
+
+    /// Mint a single-use handoff code for `user_id` (issued by the session
+    /// identified by `jti`, when it has one) and remember it for `ttl`.
+    ///
+    /// The code is ~30 bytes of OS-CSPRNG entropy rendered as lowercase hex, so
+    /// it is URL-safe without escaping. Callers hand it to a browser in a URL
+    /// fragment; the browser trades it for a real session at
+    /// `POST /auth/handoff/exchange`.
+    ///
+    /// `ttl` is a parameter rather than a constant so tests can drive the
+    /// expiry path without sleeping for the production window.
+    pub fn issue_handoff_code(&self, user_id: Uuid, jti: Option<Uuid>, ttl: Duration) -> String {
+        let now = Instant::now();
+
+        // Bound memory: drop codes that can no longer be redeemed anyway.
+        if self.0.handoff_codes.len() > HANDOFF_MAX_ENTRIES {
+            self.0.handoff_codes.retain(|_, e| e.expires_at > now);
+        }
+
+        // Two v4 UUIDs, hex-rendered: `Uuid::new_v4` draws from the OS CSPRNG
+        // (getrandom), and using it keeps this dependency-free.
+        let code = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.0.handoff_codes.insert(
+            code.clone(),
+            HandoffEntry {
+                user_id,
+                jti,
+                expires_at: now + ttl,
+            },
+        );
+        code
+    }
+
+    /// Redeem a handoff code, returning the user id and the issuing session's
+    /// `jti` on success. The entry is removed whether or not it was still
+    /// valid, so a code is usable at most once; an expired or unknown code
+    /// yields `None`.
+    pub fn consume_handoff_code(&self, code: &str) -> Option<(Uuid, Option<Uuid>)> {
+        let (_, entry) = self.0.handoff_codes.remove(code)?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some((entry.user_id, entry.jti))
     }
 
     // ── per-user channel test-fire window ─────────────────────────────────────
@@ -786,12 +1159,238 @@ pub fn maintenance_active_at(until: i64, now: i64) -> bool {
     until > 0 && now < until
 }
 
+/// How the live-still proxy should fetch a camera's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAttempt {
+    /// The full cold-start retry ladder. Only a failed attempt of this kind may
+    /// arm the latch.
+    Full,
+    /// One attempt, no inter-attempt sleeps. Its failure leaves the latch alone.
+    Single,
+}
+
+/// Per-camera "last full fetch failed" latch for the live-still proxy, as a
+/// monotonic deadline per camera.
+///
+/// While the deadline is in the future the proxy makes a single attempt instead
+/// of the full ladder, so a wall of tiles pointed at a camera that is down does
+/// not hold a permit for the whole ladder on every poll. Rules that keep a slow
+/// but healthy camera from getting stuck:
+///
+/// * only a failed FULL ladder arms the latch; a failed single attempt never
+///   extends it, so the deadline is reached no matter how often the wall polls;
+/// * once the deadline passes, the next request gets [`FrameAttempt::Full`] and
+///   claims the probe by re-arming the deadline, so concurrent polls stay on the
+///   single attempt while one request proves recovery;
+/// * a success on any path clears the entry.
+#[derive(Default)]
+pub struct FrameLatch {
+    until: DashMap<Uuid, Instant>,
+}
+
+impl FrameLatch {
+    /// Decide how to fetch `camera_id`'s still at time `now`.
+    pub fn attempt_at(&self, camera_id: Uuid, ttl: Duration, now: Instant) -> FrameAttempt {
+        let Some(mut entry) = self.until.get_mut(&camera_id) else {
+            return FrameAttempt::Full;
+        };
+        if now < *entry {
+            return FrameAttempt::Single;
+        }
+        // Expired: this request is the probe. Hold the window for `ttl` so the
+        // other polls keep the cheap path until the probe reports back.
+        *entry = now + ttl;
+        FrameAttempt::Full
+    }
+
+    /// Latch `camera_id` as unavailable until `now + ttl`.
+    pub fn mark_at(&self, camera_id: Uuid, ttl: Duration, now: Instant) {
+        // Cheap unbounded-growth guard: entries are one per camera, but a
+        // pathological id churn would still be capped.
+        if self.until.len() > 4096 {
+            self.until.clear();
+        }
+        self.until.insert(camera_id, now + ttl);
+    }
+
+    /// Drop the latch for `camera_id` after a successful fetch.
+    pub fn clear(&self, camera_id: Uuid) {
+        self.until.remove(&camera_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        login_backoff_secs, maintenance_active_at, LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS,
-        LOGIN_FAIL_THRESHOLD,
+        account_backoff_secs, login_backoff_secs, login_key, maintenance_active_at, FrameAttempt,
+        FrameLatch, ACCOUNT_BACKOFF_BASE_SECS, ACCOUNT_FAIL_CEILING, ACCOUNT_FAIL_WINDOW,
+        LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS, LOGIN_FAIL_THRESHOLD,
     };
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// Simulate the still proxy against a camera whose frames take `latency` to
+    /// arrive after it was last "cold", with the per-attempt timeouts the
+    /// handler uses (`single_timeout` for the single path, `full_timeout` per
+    /// full-ladder attempt, 4 attempts). Returns true when the request succeeds.
+    fn request(
+        latch: &FrameLatch,
+        id: Uuid,
+        ttl: Duration,
+        now: Instant,
+        latency: Duration,
+        single_timeout: Duration,
+        full_timeout: Duration,
+    ) -> bool {
+        match latch.attempt_at(id, ttl, now) {
+            FrameAttempt::Full => {
+                // Every ladder attempt waits the same latency, so it succeeds
+                // iff the latency fits one attempt's timeout.
+                if latency <= full_timeout {
+                    latch.clear(id);
+                    true
+                } else {
+                    latch.mark_at(id, ttl, now);
+                    false
+                }
+            }
+            FrameAttempt::Single => {
+                if latency <= single_timeout {
+                    latch.clear(id);
+                    true
+                } else {
+                    // Deliberately no mark_at: a single-attempt failure must
+                    // not extend the latch.
+                    false
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_latch_slow_camera_recovers_within_one_window_when_polled_every_second() {
+        let latch = FrameLatch::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        // Second 0: the camera is down, the full ladder fails and arms the latch.
+        assert!(!request(
+            &latch,
+            id,
+            ttl,
+            at(0),
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+            Duration::from_secs(5)
+        ));
+
+        // From then on the camera is slow (3 s to a frame) but healthy. The
+        // single path times out at 2 s, as the old fast path did; the wall polls
+        // every second. It must be served again no later than one window later.
+        let mut recovered_at = None;
+        for s in 1..=12 {
+            if request(
+                &latch,
+                id,
+                ttl,
+                at(s),
+                Duration::from_secs(3),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ) {
+                recovered_at = Some(s);
+                break;
+            }
+        }
+        let recovered_at = recovered_at.expect("slow camera never recovered");
+        assert!(recovered_at <= 10, "recovered too late: {recovered_at}s");
+        assert_eq!(recovered_at, 10, "probe runs exactly when the window ends");
+        // And it stays served normally afterwards.
+        assert_eq!(latch.attempt_at(id, ttl, at(11)), FrameAttempt::Full);
+    }
+
+    #[test]
+    fn frame_latch_single_failure_does_not_extend_and_probe_is_claimed_once() {
+        let latch = FrameLatch::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        latch.mark_at(id, ttl, at(0));
+        assert_eq!(latch.attempt_at(id, ttl, at(5)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(9)), FrameAttempt::Single);
+        // Window over: exactly one caller gets the full ladder, the rest stay on
+        // the single attempt while the probe runs.
+        assert_eq!(latch.attempt_at(id, ttl, at(10)), FrameAttempt::Full);
+        assert_eq!(latch.attempt_at(id, ttl, at(10)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(11)), FrameAttempt::Single);
+        // A failed probe re-arms for a fresh window; a successful one clears it.
+        latch.mark_at(id, ttl, at(14));
+        assert_eq!(latch.attempt_at(id, ttl, at(23)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(24)), FrameAttempt::Full);
+        latch.clear(id);
+        assert_eq!(latch.attempt_at(id, ttl, at(25)), FrameAttempt::Full);
+        assert_eq!(latch.attempt_at(id, ttl, at(25)), FrameAttempt::Full);
+    }
+
+    #[test]
+    fn account_backoff_doubles_from_base_and_caps() {
+        assert_eq!(account_backoff_secs(1), ACCOUNT_BACKOFF_BASE_SECS);
+        assert_eq!(account_backoff_secs(2), ACCOUNT_BACKOFF_BASE_SECS * 2);
+        assert_eq!(account_backoff_secs(3), ACCOUNT_BACKOFF_BASE_SECS * 4);
+        assert_eq!(account_backoff_secs(6), LOGIN_BACKOFF_CAP_SECS);
+        assert_eq!(account_backoff_secs(u32::MAX), LOGIN_BACKOFF_CAP_SECS);
+    }
+
+    #[test]
+    fn one_client_alone_cannot_reach_the_account_ceiling_in_a_window() {
+        // Replay the per-pair schedule: each failure lands the moment the
+        // previous backoff lapses. Count how many fit in one account window.
+        let window = ACCOUNT_FAIL_WINDOW.as_secs();
+        let mut t = 0_u64;
+        let mut failures = 0_u32;
+        while t <= window {
+            failures += 1;
+            t += login_backoff_secs(failures).unwrap_or(0);
+        }
+        assert!(
+            usize::try_from(failures).unwrap() < ACCOUNT_FAIL_CEILING,
+            "one client fits {failures} failures in a window; the ceiling must stay above that"
+        );
+    }
+
+    #[test]
+    fn login_key_separates_clients_for_the_same_account() {
+        // The whole point of the composite key: one account seen from two
+        // clients occupies two independent buckets, so failures from one can
+        // never block the other.
+        assert_ne!(
+            login_key("operator", "198.51.100.7"),
+            login_key("operator", "203.0.113.9")
+        );
+        // ... and the same pair always maps to the same bucket.
+        assert_eq!(
+            login_key("operator", "198.51.100.7"),
+            login_key("operator", "198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn login_key_does_not_collide_across_accounts() {
+        // Two different accounts never share a bucket, including the awkward
+        // case of a username that itself contains the separator.
+        assert_ne!(
+            login_key("operator\u{1f}198.51.100.7", "203.0.113.9"),
+            login_key("operator", "198.51.100.7")
+        );
+        assert_ne!(
+            login_key("operator", "198.51.100.7"),
+            login_key("operator2", "198.51.100.7")
+        );
+    }
 
     #[test]
     fn login_backoff_none_below_threshold() {

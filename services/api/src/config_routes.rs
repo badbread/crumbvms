@@ -120,6 +120,7 @@ use uuid::Uuid;
 
 use crumb_common::{
     db::{self, CreateCameraParams, PolicyFields},
+    redact,
     types::{
         Camera, CameraGroup, MotionSensitivity, RecordStream, RecordingMode, RecordingPolicy,
         ServerSettings, Storage, User, UserRole,
@@ -1200,6 +1201,15 @@ async fn update_camera(
         Some(inner) => inner,
         None => existing.source_sub_url.clone(),
     });
+    // GET masks the userinfo password, so a console that reads a camera and PUTs
+    // it back submits the mask. That means "keep the stored credential": splice
+    // it back in before anything downstream (validation of the change, the DB
+    // write, the go2rtc sync decision) sees the value. Any other password is
+    // taken literally, which is how one is changed.
+    let source_url =
+        source_url.map(|u| redact::unmask_url_password(&u, existing.source_url.as_deref()));
+    let source_sub_url =
+        source_sub_url.map(|u| redact::unmask_url_password(&u, existing.source_sub_url.as_deref()));
 
     // Guard: a Crumb-managed camera (source_url set) derives its re-stream name
     // from go2rtc_name; an empty go2rtc_name would yield main_url="" / sub_url="_sub"
@@ -2920,8 +2930,22 @@ async fn get_user(
 ///
 /// If `password` is provided it is re-hashed.  If `role` changes from viewer to
 /// admin, `camera_ids` is cleared automatically.
+///
+/// # Sessions
+///
+/// Changing what this account IS — its password, or the role that decides what
+/// it may do — ends that account's signed-in devices, so the change reaches the
+/// phone in someone's pocket rather than waiting out a token that can live for
+/// years. A no-op save changes nothing and signs nobody out. An admin editing
+/// their OWN account keeps the session making the request, so changing your own
+/// password does not eject you from the console mid-edit.
+///
+/// Changing only the user's extra cameras does NOT end their sessions: those
+/// grants are read from the user row on every request, so the new set is in
+/// force on that user's very next request either way, and there is nothing to be
+/// gained by making them sign in again.
 async fn update_user(
-    _admin: AdminUser,
+    admin: AdminUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUserRequest>,
@@ -3015,11 +3039,53 @@ async fn update_user(
         }
     })?;
 
+    // ── keep signed-in devices in step with the account ───────────────────────
+    // A password change replaces the credential; a role change replaces what the
+    // account may do. Either must reach every device already holding a token for
+    // it, so revoke this user's sessions when one of them actually changed.
+    //
+    // "Actually changed" is compared against the row we read before the write,
+    // so a save that alters nothing (the console re-PUTs the whole form) signs
+    // nobody out. A supplied password always counts: it is hashed with a fresh
+    // salt, so the stored hashes of the old and new password are never
+    // comparable, and an admin who typed a password into the box meant to set
+    // one. The extra-cameras list is deliberately NOT in this set (see the
+    // handler docs).
+    let password_changed = new_hash.is_some();
+    let role_changed = new_role.is_some_and(|r| r != existing.role);
+    let role_id_changed = role_id_to_set.is_some_and(|rid| Some(rid) != existing.role_id);
+
+    if password_changed || role_changed || role_id_changed {
+        // Self-edit exception: keep the session this request came in on, so an
+        // admin changing their own password stays signed in here while every
+        // other device of theirs is signed out.
+        let keep = if admin.0.user_id == id {
+            admin.0.jti
+        } else {
+            None
+        };
+        let revoked = match keep {
+            Some(jti) => db::revoke_other_sessions_for_user(state.pool(), id, jti)
+                .await
+                .context("revoke_other_sessions_for_user")?,
+            None => db::revoke_all_sessions_for_user(state.pool(), id)
+                .await
+                .context("revoke_all_sessions_for_user")?,
+        };
+        state.refresh_revoked_jtis().await;
+        tracing::info!(user_id = %id, revoked, "sessions ended after a user change");
+    }
+    // Any user edit can move the per-user camera grants, which the auth
+    // extractor caches per session; drop the cache so the next request re-reads.
+    state.invalidate_session_cache();
+
     tracing::info!(user_id = %id, "user updated");
     Ok(Json(user_to_dto(user)))
 }
 
 /// `DELETE /config/users/{id}` — delete a user.
+///
+/// Removing the account also ends every device it was signed in on, immediately.
 async fn delete_user(
     _admin: AdminUser,
     State(state): State<AppState>,
@@ -3043,11 +3109,26 @@ async fn delete_user(
         }
     }
 
+    // Revoke every session BEFORE the row goes. `sessions.user_id` cascades on
+    // delete, so the rows are about to disappear; revoking first means the
+    // in-memory revocation set picks them up on the refresh below and this
+    // process refuses those tokens from the very next request, without waiting
+    // to notice that the rows are missing.
+    let revoked = db::revoke_all_sessions_for_user(state.pool(), id)
+        .await
+        .context("revoke_all_sessions_for_user")?;
+    // Refresh while the rows still exist, so the revoked set actually observes
+    // them; a moment later they are gone and the session lookup refuses those
+    // tokens on its own.
+    state.refresh_revoked_jtis().await;
+
     db::delete_user(state.pool(), id)
         .await
         .context("delete_user")?;
 
-    tracing::info!(user_id = %id, "user deleted");
+    state.invalidate_session_cache();
+
+    tracing::info!(user_id = %id, revoked, "user deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4069,8 +4150,12 @@ async fn redetect_camera(
     // Re-read to return the authoritative post-update DTO.
     let updated = require_camera(state.pool(), id).await?;
     Ok(Json(RedetectResponse {
-        source_url: credentialed_source_url,
-        source_sub_url: credentialed_source_sub_url,
+        // Masked like the camera DTO's own copy: the console uses these only to
+        // say whether a sub stream was found, never to re-submit them.
+        source_url: redact::mask_url_password(&credentialed_source_url),
+        source_sub_url: credentialed_source_sub_url
+            .as_deref()
+            .map(redact::mask_url_password),
         ptz_supported: r.ptz_supported,
         camera: camera_to_dto(updated),
     }))
@@ -4702,6 +4787,18 @@ fn camera_to_dto(c: Camera) -> CameraDto {
     // onvif_has_password: true when a non-empty password is stored. The password
     // itself is NEVER copied into the DTO (write-only field per spec C10).
     let onvif_has_password = c.onvif_password.as_deref().is_some_and(|p| !p.is_empty());
+    // Camera source URLs carry their credentials inline. The password is masked
+    // on the way out (the rest of the URL is verbatim, so the operator still
+    // recognises and can edit it); sending the mask back on PUT keeps the stored
+    // credential. Same contract as onvif_password, expressed inside the URL.
+    let source_has_credentials = c
+        .source_url
+        .as_deref()
+        .is_some_and(redact::url_has_password);
+    let source_sub_has_credentials = c
+        .source_sub_url
+        .as_deref()
+        .is_some_and(redact::url_has_password);
     CameraDto {
         id: c.id,
         name: c.name,
@@ -4709,8 +4806,10 @@ fn camera_to_dto(c: Camera) -> CameraDto {
         go2rtc_name: c.go2rtc_name,
         main_url: c.main_url,
         sub_url: c.sub_url,
-        source_url: c.source_url,
-        source_sub_url: c.source_sub_url,
+        source_url: c.source_url.as_deref().map(redact::mask_url_password),
+        source_sub_url: c.source_sub_url.as_deref().map(redact::mask_url_password),
+        source_has_credentials,
+        source_sub_has_credentials,
         policy_id: c.policy_id,
         group_id: c.group_id,
         policy,

@@ -4968,6 +4968,9 @@ function renderCamInfoTab(c) {
           <button class="ghost sm" onclick="testCameraStream('${c.id}','sub')">Test</button>
         </div>
       </div>
+      ${(c.source_has_credentials || c.source_sub_has_credentials)
+        ? '<div class="card-hint" style="margin:8px 0 0 2px">The camera password in these URLs is hidden behind <code>********</code>. Leave it in place to keep the stored password; type a new one over it to change it.</div>'
+        : ''}
     </div>
 
     <div class="policy-section">
@@ -9776,6 +9779,7 @@ function renderUser(id) {
       </div>
       <div class="rp-head-actions">
         <button class="primary" onclick="saveUser('${u.id}')">Save</button>
+        <button class="ghost" onclick="signOutUser('${esc(u.id)}')" title="End this account's signed-in sessions on every device">Sign out everywhere</button>
         <button class="danger-ghost" onclick="delUser('${esc(u.id)}')" ${isLastAdmin?'disabled title="Cannot remove the last administrator"':''}>Remove</button>
       </div>
     </div>
@@ -9789,6 +9793,7 @@ function renderUser(id) {
         ${userRoleOptions(u.role_id, u.role === 'admin')}
       </select>
       <div class="card-hint" style="margin-top:4px">Capabilities and the role's base cameras come from the role. <a href="#" onclick="event.preventDefault();newRole()">Add a role</a> for fine-grained permissions. You can also grant this user extra cameras below.</div>
+      <div class="card-hint" style="margin-top:4px">Setting a new password or changing the role signs this account out on its other devices. Use <b>Sign out everywhere</b> to end every session now, for example if a phone was lost.</div>
       ${cameraAccessUI('ue', u.camera_ids || [])}
       ${isLastAdmin?'<div class="info-note" style="margin-top:10px">This is the only administrator. Create another admin before you can remove or demote this account.</div>':''}
       <div id="ue-msg" class="form-msg"></div>
@@ -9839,6 +9844,29 @@ async function saveUser(id) {
     renderUser(id);
   } catch (e) { setMsg('ue-msg', e.message, 'err'); }
 }
+/* ── SIGN OUT EVERYWHERE: end every session this account holds ──────────────
+   DELETE /auth/users/:id/sessions (admin-gated). Every device holding a token
+   for this account is signed out at once; they can sign back in with the same
+   password unless it was also changed. Signing YOURSELF out here ends this
+   console session too, so say so before doing it. */
+async function signOutUser(id) {
+  const u = USERS.find(x => x.id === id);
+  const name = u ? u.username : id;
+  const me = await api('/auth/me').catch(() => null);
+  const warn = (me && me.id === id)
+    ? `Sign out every device for "${name}"? That includes this console, you will have to sign in again.`
+    : `Sign out every device for "${name}"?`;
+  if (!confirm(warn)) return;
+  try {
+    const r = await api('/auth/users/' + encodeURIComponent(id) + '/sessions', { method: 'DELETE' });
+    const n = (r && typeof r.revoked === 'number') ? r.revoked : 0;
+    toast(n === 1 ? `Signed out 1 session for "${name}".` : `Signed out ${n} sessions for "${name}".`);
+  } catch (e) {
+    setMsg('ue-msg', e.message, 'err');
+    toast(e.message, 'err', 5000);
+  }
+}
+
 /* ── REMOVE: user (refuse removing the last administrator; show API reason) ── */
 async function delUser(id) {
   // Resolve the name from the loaded model by UUID (avoids passing admin-set
@@ -10109,7 +10137,7 @@ const SYS_ALERT_DEFAULT_TITLE_TPL = 'Crumb: %event%';
 /* Sample token values used only for the live preview. */
 const SYS_ALERT_TOKEN_SAMPLES = {
   camera: 'Front Door', detail: '(the alert detail text)',
-  date: '2026-01-02', time: '14:03:11', datetime: '2026-01-02 14:03:11 UTC',
+  date: '2026-01-02', time: '14:03:11', datetime: '2026-01-02 14:03:11',
   plate: '7ABC123', name: "Mom's car", confidence: '90%', zone: 'driveway',
   signal: 'RTP', offline_secs: '130', last_seen: 'never',
   storage: 'Archive', path: '/data/archive', free_pct: '3.2%', free_bytes: '12000000000',
@@ -10118,10 +10146,23 @@ const SYS_ALERT_TOKEN_SAMPLES = {
   version: 'v0.2.0', current_version: 'v0.1.9', notes_url: 'https://github.com/badbread/crumbvms/releases',
 };
 
+/* Sample values with the time tokens stamped in the SERVER's zone, which is
+   what ntfy, Pushover, Telegram and webhook alerts actually render (Discord and
+   Slack instead get markup their own clients localize per viewer, which no
+   preview can show). Falls back to a zone-less sample when the server zone is
+   unknown, rather than asserting one. */
+function _sysAlertTokenSamples() {
+  const zone = serverTzLabel();
+  const suffix = (zone && zone !== 'server time') ? ' ' + zone : '';
+  return Object.assign({}, SYS_ALERT_TOKEN_SAMPLES, {
+    datetime: SYS_ALERT_TOKEN_SAMPLES.datetime + suffix,
+  });
+}
+
 /* Render a template with sample values, mirroring the server engine: a known
    %token% substitutes, an unknown one stays literal (so a typo is visible). */
 function _previewAlertTemplate(tpl, eventKey) {
-  const samples = Object.assign({}, SYS_ALERT_TOKEN_SAMPLES, {
+  const samples = Object.assign({}, _sysAlertTokenSamples(), {
     event: (SYS_ALERT_META[eventKey] || { title: eventKey }).title,
   });
   return tpl.replace(/%([A-Za-z0-9_]+)%/g, (m, name) =>
@@ -11130,8 +11171,9 @@ function _sysAlertEditorBody(key) {
   const titleRelevant = sysAlertTitleRelevant();
 
   /* Token legend: %token% | sample value, clickable to insert at the caret. */
+  const tokenSamples = _sysAlertTokenSamples();
   const legendRows = _sysAlertTokens(key).map(t => {
-    const sample = (t === 'event') ? meta.title : (SYS_ALERT_TOKEN_SAMPLES[t] != null ? SYS_ALERT_TOKEN_SAMPLES[t] : '');
+    const sample = (t === 'event') ? meta.title : (tokenSamples[t] != null ? tokenSamples[t] : '');
     return `<tr class="sae-token-row" style="cursor:pointer" onclick="sysAlertEditorInsertToken('%${esc(t)}%')" title="Insert at cursor">
       <td style="font-family:monospace;padding:2px 10px 2px 0;white-space:nowrap">%${esc(t)}%</td>
       <td style="color:var(--dim);padding:2px 0">${esc(sample)}</td></tr>`;
@@ -11156,7 +11198,7 @@ function _sysAlertEditorBody(key) {
 
       <div class="policy-section" style="margin-top:12px">
         <div class="policy-section-title">Tokens for this alert</div>
-        <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Times are UTC.</div>
+        <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Discord and Slack alerts show %date%, %time% and %datetime% in each viewer's own timezone; every other provider shows them in the server's timezone (${esc(serverTzLabel())}).</div>
         <div class="table-wrap"><table style="font-size:12px"><tbody>${legendRows}</tbody></table></div>
       </div>
 
@@ -11838,13 +11880,23 @@ function renderSnapshot(c) {
 }
 
 /* ── Boot ── */
-// SSO from an embedding host (the Crumb Client). The host loads
-//   /admin#token=<jwt>&embed=1
-// so the operator who's already signed into the desktop doesn't re-authenticate
-// here. Adopt the token, persist it like a normal login, then SCRUB the hash so
-// the credential never lingers in the address bar or history. embed=1 also drops
-// our own topbar/sign-out (the host owns that chrome).
-(function bootSSO() {
+// SSO from an embedding host (the Crumb Client). Two shapes, both fragments
+// (never query params, since fragments aren't sent to the server or logged):
+//   /admin#token=<jwt>&embed=1   the host's own EMBEDDED webview, same process
+//   /admin#handoff=<code>        a real browser the host launched for us
+// The embedded webview shares the host's process, so it simply passes its
+// session token. "Open in browser" crosses a process boundary into a browser's
+// history and profile storage, so it passes a single-use, short-lived code
+// instead and we trade it here for our OWN session via POST
+// /auth/handoff/exchange. Either way we persist the result like a normal login
+// and SCRUB the hash so nothing lingers in the address bar or history; embed=1
+// also drops our own topbar/sign-out (the host owns that chrome).
+//
+// Async because of the exchange: `boot()` at the bottom of this file awaits
+// SSO_READY before deciding between the app and the login screen. A failed
+// exchange (expired, already used, restarted server) leaves TOKEN empty and
+// falls through to the normal login form.
+const SSO_READY = (async function bootSSO() {
   // Chrome-less embed via query param (item #4): the desktop client's webview
   // loads /admin?embedded=1 so the console drops its own topbar (brand, back /
   // sign-out chrome) — the host draws that chrome, and doubling it up gave two
@@ -11863,11 +11915,27 @@ function renderSnapshot(c) {
   if (h.length > 1 && !h.startsWith('#/')) {
     const p = new URLSearchParams(h.slice(1));
     const t = p.get('token');
+    const handoff = p.get('handoff');
     if (t) { TOKEN = t; localStorage.setItem('crumb_admin_token', TOKEN); }
     if (p.get('embed') === '1') document.body.classList.add('embedded');
-    if (t || p.has('embed')) {
+    if (t || handoff || p.has('embed')) {
       try { history.replaceState(null, '', location.pathname + location.search); }
       catch { location.hash = ''; }
+    }
+    // Scrubbed first, redeemed second: the code is single-use and short-lived,
+    // so it must not survive in the address bar even for the exchange round-trip.
+    if (!t && handoff) {
+      try {
+        const res = await fetch('/auth/handoff/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: handoff }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.token) { TOKEN = data.token; localStorage.setItem('crumb_admin_token', TOKEN); }
+        }
+      } catch { /* offline or server restarted: fall through to the login form */ }
     }
   }
 })();
@@ -12033,6 +12101,10 @@ $('bootstrap-pass2') && $('bootstrap-pass2').addEventListener('keydown', e => { 
    wizard if first-run setup was never finished. Otherwise show the login; a
    successful login resumes the wizard too when setup is incomplete. */
 (async function boot() {
+  // A #handoff= code is redeemed asynchronously by bootSSO; wait for it so the
+  // decision below sees the resulting session. Never let that step stop the
+  // console from rendering: the worst case is the normal login form.
+  try { await SSO_READY; } catch (_) { /* fall through to the boot decision */ }
   let status = null;
   try { status = await fetch('/auth/setup-status').then(res => res.ok ? res.json() : null); } catch (_) { /* fall through */ }
   if (status && status.needs_bootstrap) { openWizard(status); return; }
