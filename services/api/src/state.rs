@@ -878,7 +878,7 @@ mod tests {
             id,
             ttl,
             at(0),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_secs(2),
             Duration::from_secs(5)
         ));
