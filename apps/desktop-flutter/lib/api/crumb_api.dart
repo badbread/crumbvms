@@ -71,6 +71,39 @@ class CrumbApi {
     );
   }
 
+  /// The `jti` (session id) claim of a bearer JWT, or null when the token is
+  /// not a readable JWT. Read only to name the server-side session row; the
+  /// signature is not checked here (the server does that).
+  static String? sessionIdOf(String token) {
+    final parts = token.split('.');
+    if (parts.length != 3) return null;
+    try {
+      final payload = utf8.decode(base64Url.decode(base64Url.normalize(parts[1])));
+      final jti = (jsonDecode(payload) as Map<String, dynamic>)['jti'];
+      return jti is String && jti.isNotEmpty ? jti : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// DELETE /auth/sessions/:jti: revoke THIS client's own session on the server
+  /// (sign-out), so a copy of its token left anywhere stops working. Best
+  /// effort: returns false (never throws) when the token carries no session id
+  /// or the server is unreachable, so sign-out itself is never blocked.
+  Future<bool> revokeCurrentSession(Session s) async {
+    final jti = sessionIdOf(s.token);
+    if (jti == null) return false;
+    try {
+      final resp = await _http.delete(
+        Uri.parse('${s.base}/auth/sessions/$jti'),
+        headers: {'authorization': 'Bearer ${s.token}'},
+      );
+      return resp.statusCode == 200 || resp.statusCode == 204;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// GET /cameras → the viewer-visible camera list.
   Future<List<Camera>> listCameras(Session s) async {
     final resp = await _http.get(

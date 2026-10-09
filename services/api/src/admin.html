@@ -796,7 +796,10 @@ code{background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:12px
 /* ═══════════════════════════════════════════════════════════════════════════
    GLOBALS & UTILITIES  (auth + fetch layer preserved verbatim)
 ═══════════════════════════════════════════════════════════════════════════ */
-let TOKEN = localStorage.getItem('crumb_admin_token') || '';
+/* Embedded in the desktop client the bearer token is kept in sessionStorage only, so it never lands in the shared WebView2 profile. */
+const TOKEN_STORE = new URLSearchParams(location.search).get('embedded') === '1' ? sessionStorage : localStorage;
+if (TOKEN_STORE !== localStorage) { try { localStorage.removeItem('crumb_admin_token'); } catch {} }
+let TOKEN = TOKEN_STORE.getItem('crumb_admin_token') || '';
 let CAMS = [], STORAGES = [], POLICIES = [], DEFAULT_POLICY = null, GROUPS = [], USERS = [], ROLES = [];
 /* Server settings last fetched, so the Detection & clips and Server panes can
    each send a COMPLETE /config/server body while editing only their own subset
@@ -1163,7 +1166,7 @@ async function login() {
   try {
     const data = await api('/auth/login', { method: 'POST', body: JSON.stringify({ username: $('lg-user').value, password: $('lg-pass').value }) });
     TOKEN = data.token;
-    localStorage.setItem('crumb_admin_token', TOKEN);
+    TOKEN_STORE.setItem('crumb_admin_token', TOKEN);
     await afterAuth();
   } catch (e) { $('lg-err').textContent = signInErrorText(e); }
 }
@@ -1192,7 +1195,7 @@ async function afterAuth() {
   enterApp();
 }
 function logout() {
-  TOKEN = ''; localStorage.removeItem('crumb_admin_token');
+  TOKEN = ''; localStorage.removeItem('crumb_admin_token'); TOKEN_STORE.removeItem('crumb_admin_token');
   for (const k in _mediaTok) delete _mediaTok[k]; // drop scoped media tokens too
   $('app').classList.add('hidden');
   $('bootstrap-screen').classList.add('hidden');
@@ -1215,7 +1218,7 @@ async function bootstrapAdmin() {
   try {
     const data = await api('/auth/bootstrap', { method: 'POST', body: JSON.stringify({ username, password }) });
     TOKEN = data.token;
-    localStorage.setItem('crumb_admin_token', TOKEN);
+    TOKEN_STORE.setItem('crumb_admin_token', TOKEN);
     $('bootstrap-screen').classList.add('hidden');
     enterApp();
   } catch (e) {
@@ -2958,7 +2961,7 @@ async function wizardSave(key) {
     if (p.length < 8) { wizardMsg('Password must be at least 8 characters.'); return false; }
     if (p !== p2) { wizardMsg('Passwords do not match.'); return false; }
     const data = await api('/auth/bootstrap', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
-    TOKEN = data.token; localStorage.setItem('crumb_admin_token', TOKEN);
+    TOKEN = data.token; TOKEN_STORE.setItem('crumb_admin_token', TOKEN);
     try { WZ.server = noteServerTz(await api('/config/server')); } catch { WZ.server = {}; }
     return true;
   }
@@ -11916,7 +11919,7 @@ const SSO_READY = (async function bootSSO() {
     const p = new URLSearchParams(h.slice(1));
     const t = p.get('token');
     const handoff = p.get('handoff');
-    if (t) { TOKEN = t; localStorage.setItem('crumb_admin_token', TOKEN); }
+    if (t) { TOKEN = t; TOKEN_STORE.setItem('crumb_admin_token', TOKEN); }
     if (p.get('embed') === '1') document.body.classList.add('embedded');
     if (t || handoff || p.has('embed')) {
       try { history.replaceState(null, '', location.pathname + location.search); }
@@ -11933,7 +11936,7 @@ const SSO_READY = (async function bootSSO() {
         });
         if (res.ok) {
           const data = await res.json();
-          if (data && data.token) { TOKEN = data.token; localStorage.setItem('crumb_admin_token', TOKEN); }
+          if (data && data.token) { TOKEN = data.token; TOKEN_STORE.setItem('crumb_admin_token', TOKEN); }
         }
       } catch { /* offline or server restarted: fall through to the login form */ }
     }

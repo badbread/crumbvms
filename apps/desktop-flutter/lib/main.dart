@@ -32,6 +32,7 @@ import 'package:crumb_desktop/services/diagnostics_service.dart';
 import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/perf_grid.dart';
 import 'package:crumb_desktop/session/session_controller.dart';
+import 'package:crumb_desktop/session/session_resume.dart';
 import 'package:crumb_desktop/src/rust/api/host.dart';
 import 'package:crumb_desktop/src/rust/api/secret.dart';
 import 'package:crumb_desktop/src/rust/frb_generated.dart';
@@ -42,6 +43,7 @@ import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
 import 'package:crumb_desktop/state/stream_prefs.dart';
 import 'package:crumb_desktop/ui/admin_console/admin_console_screen.dart';
+import 'package:crumb_desktop/ui/admin_console/console_storage_wipe.dart';
 import 'package:crumb_desktop/ui/bookmarks/bookmarks_screen.dart';
 import 'package:crumb_desktop/ui/clips/clips_screen.dart';
 import 'package:crumb_desktop/ui/export/export_builder_dialog.dart'
@@ -70,6 +72,7 @@ import 'package:crumb_desktop/ui/settings/settings_window.dart';
 import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
 import 'package:crumb_desktop/ui/updates/update_banner.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
+import 'package:crumb_desktop/ui/waiting_for_server_screen.dart';
 import 'package:crumb_desktop/ui/wall_screen.dart';
 
 /// Run modes (default = the real client: login then live wall):
@@ -147,12 +150,6 @@ Future<void> main() async {
   );
 }
 
-/// Launch-restore retry policy: how many times to re-attempt the token-
-/// validating `/cameras` fetch on a transient (non-auth) failure, and the base
-/// backoff between attempts (grows linearly per attempt).
-const _restoreMaxRetries = 4;
-const _restoreRetryBaseDelay = Duration(milliseconds: 1500);
-
 /// The real desktop client: login → live wall. Restores a DPAPI-persisted
 /// session on launch (so the user isn't asked to log in every time) and swaps
 /// between the login and wall screens.
@@ -168,6 +165,10 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   Session? _session;
   List<Camera> _cameras = const [];
   bool _restoring = true; // trying a saved session on launch
+  // A stored session exists but the server has not answered yet: shown as a
+  // "waiting for server" screen while the resume loop keeps retrying.
+  Session? _waitingSession;
+  bool _restoreAbandoned = false;
 
   // ── Session-scoped plumbing (created on login, torn down on logout) ──
   SessionController? _sessionController;
@@ -240,10 +241,11 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   ///
   /// The saved session is discarded ONLY on an actual auth rejection
   /// (401/403 — the token is expired/revoked). A transient failure at launch
-  /// (server still booting, DNS blip, timeout) must NOT wipe a still-valid
-  /// session and force a needless re-login (#146): those are retried with
-  /// backoff, and if the server stays unreachable we drop to the login screen
-  /// WITHOUT clearing the stored session, so the next launch can resume it.
+  /// (server still booting after a power cut, DNS blip, timeout) must NOT wipe
+  /// a still-valid session or drop to the login form (#146): the resume loop
+  /// ([resumeStoredSession]) retries with capped backoff indefinitely, shows a
+  /// "waiting for server" screen after the first few quick attempts, and
+  /// resumes the wall by itself as soon as the server answers.
   Future<void> _restore() async {
     String? saved;
     try {
@@ -266,36 +268,52 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
       if (mounted) setState(() => _restoring = false);
       return;
     }
-    for (var attempt = 0; ; attempt++) {
-      try {
-        final cameras = await _api.listCameras(session); // validates the token
+    final result = await resumeStoredSession(
+      session: session,
+      fetchCameras: _api.listCameras, // validates the token
+      isActive: () => mounted && !_restoreAbandoned,
+      onWaiting: (_) {
+        // Server still unreachable after the quick attempts: swap the spinner
+        // for the "waiting for server" screen. The loop keeps retrying.
         if (mounted) {
           setState(() {
-            _startSession(session, cameras);
+            _waitingSession = session;
             _restoring = false;
           });
         }
-        return;
-      } on CrumbApiException catch (e) {
-        if (e.statusCode == 401 || e.statusCode == 403) {
-          await clearSession(); // token genuinely rejected — start clean
-          if (mounted) setState(() => _restoring = false);
-          return;
+      },
+    );
+    if (!mounted) return;
+    switch (result.outcome) {
+      case ResumeOutcome.resumed:
+        setState(() {
+          _waitingSession = null;
+          _startSession(session, result.cameras ?? const []);
+          _restoring = false;
+        });
+      case ResumeOutcome.rejected:
+        await clearSession(); // token genuinely rejected: start clean
+        if (mounted) {
+          setState(() {
+            _waitingSession = null;
+            _restoring = false;
+          });
         }
-        // Any other server error (5xx, etc.) is treated as transient.
-      } catch (_) {
-        // Network/timeout/parse — transient; keep the session and retry.
-      }
-      if (!mounted) return;
-      if (attempt >= _restoreMaxRetries) {
-        // Server unreachable, but the token was never rejected — leave the
-        // stored session intact and fall back to login.
-        setState(() => _restoring = false);
-        return;
-      }
-      await Future<void>.delayed(_restoreRetryBaseDelay * (attempt + 1));
-      if (!mounted) return;
+      case ResumeOutcome.abandoned:
+        // The operator chose to sign in as someone else; the stored session
+        // is left in place until a new login overwrites it.
+        break;
     }
+  }
+
+  /// "Sign in as someone else" from the waiting screen: stop retrying the
+  /// stored session and show the login form.
+  void _abandonRestore() {
+    setState(() {
+      _restoreAbandoned = true;
+      _waitingSession = null;
+      _restoring = false;
+    });
   }
 
   /// Stand up all session-scoped plumbing: 401 re-auth controller, scoped
@@ -403,10 +421,21 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   }
 
   Future<void> _onLogout() async {
+    // The session being signed out, captured before teardown: the server-side
+    // revoke and the console-storage wipe below run after the UI has already
+    // moved to the login screen.
+    final ending = _sessionController?.session ?? _session;
     try {
       await clearSession();
     } catch (_) {
       /* ignore */
+    }
+    if (ending != null) {
+      // Best effort, never blocks or fails sign-out: end the server-side
+      // session so a copy of the long-lived token stops working, and clear
+      // whatever the embedded console's WebView2 profile may have stored.
+      unawaited(_api.revokeCurrentSession(ending));
+      unawaited(wipeConsoleStorage(ending.base));
     }
     _teardownSession();
     // Never strand the OS window in fullscreen at the login screen.
@@ -437,6 +466,11 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     final mediaTokens = _mediaTokens;
     if (_restoring) {
       home = const Scaffold(body: Center(child: CircularProgressIndicator()));
+    } else if (_waitingSession != null && _session == null) {
+      home = WaitingForServerScreen(
+        hostLabel: WaitingForServerScreen.hostLabelFor(_waitingSession!.base),
+        onSignInAsSomeoneElse: _abandonRestore,
+      );
     } else if (_session == null || controller == null || mediaTokens == null) {
       home = LoginScreen(api: _api, onLoggedIn: _onLoggedIn);
     } else {
