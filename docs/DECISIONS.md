@@ -8,6 +8,221 @@ revisit.
 
 ---
 
+## 2026-09-08, Notification times are rendered PER PROVIDER: client-localized markup for Discord and Slack, the server's `TZ` for everyone else
+
+**Context.** Every channel message formatted the event timestamp in UTC with a
+literal "UTC" suffix, in `ChannelMessage::token_map`/`text`. On a phone hours
+away from UTC the alert reads as the wrong time at a glance (issue #628). Stored
+timestamps are UTC and stay that way; the question was only what the outbound
+text should say.
+
+**Decision.** The timestamp style is chosen from the destination's `kind`
+(`channel_notify::TimeStyle`, picked by `time_style_for`). Discord gets
+`<t:UNIX:f>` / `<t:UNIX:t>` / `<t:UNIX:d>`, Slack gets
+`<!date^UNIX^{tokens}|fallback>` with a server-zone fallback string; both are
+markup those providers' own clients resolve against the *viewer's* zone, so one
+alert reads correctly for every recipient regardless of where they are. ntfy,
+Pushover, Telegram, the generic webhook, and any future kind render
+`%Y-%m-%d %H:%M:%S %Z` in the server's `TZ` (resolved once at startup into
+`ApiConfig::server_tz` via `crumb_common::config::server_tz`, threaded into the
+notification engine the same way the go2rtc credentials already are). The
+`%date%`/`%time%`/`%datetime%` template tokens follow the same style, so a
+custom template needs no per-provider variants. The generic webhook's JSON `ts`
+stays a raw UTC instant: it is a machine contract.
+
+**Rejected:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Keep UTC everywhere | Rejected: the reported bug. |
+| 2 | Server `TZ` for every provider, no markup | Rejected: correct for the operator at home, still wrong for anyone reading in another zone, and Discord/Slack already solve that for free. |
+| 3 | A per-user or per-channel timezone setting | Rejected for now: a new setting, a new column, and new console UI to reproduce what the two markup-capable providers do by themselves, for the providers where it would matter least. |
+| 4 | Convert the stored `ts` on write | Rejected outright: the database stays UTC. Recorder and retention correctness depend on it. |
+
+**Trades knowingly accepted:**
+
+- The Discord and Slack messages now contain provider-specific markup, so the
+  raw text is less readable if it is ever inspected outside those clients
+  (Slack's fallback covers this; Discord's does not).
+- The admin console's alert-text preview can only show one style; it shows the
+  server-zone rendering and says so.
+- An operator who never sets `TZ` gets `UTC`, matching the documented
+  `.env.example` contract ("if unset the default is UTC, NOT any local zone").
+
+**Revisit if:** operators in mixed-zone households ask for per-recipient times
+on the non-markup providers (then option 3, hung off the notification rule, not
+off `ChannelMessage`), or a new channel kind arrives that has its own
+client-side timestamp markup (add a `TimeStyle` variant; do not special-case it
+in a dispatcher).
+
+## 2026-09-07, The app-switcher cover is unconditional on mobile, and Android hides the recents snapshot without a permanently secure window
+
+**Context.** The operating system takes a picture of the app as it leaves the
+foreground and shows it on the task switcher, so whatever camera was on screen
+stays visible to whoever picks the device up next. iOS already had an opaque
+cover for this (`RootView.privacyShieldVisible`), but it was drawn only when the
+opt-in biometric lock was on, and that setting defaults to off. Android had
+nothing.
+
+**Decision, iOS.** The cover is now drawn for any signed-in session whenever the
+scene stops being `.active`, independent of `biometricLockEnabled`. The two
+concerns are separate: the cover is about what the system snapshot records, the
+lock is about who may resume the session. The lock keeps gating only the Face ID
+/ passcode challenge, and `.inactive` still never triggers that challenge, since
+`.inactive` also fires on harmless momentary interruptions (Control Center, an
+incoming-call banner, a system alert).
+
+**Decision, Android.** API 33+ calls `Activity.setRecentsScreenshotEnabled(false)`
+once in `onCreate`. Below 33 the window is made secure in `onPause` and cleared
+again in `onResume`, so it is secure only across the transition during which the
+snapshot is taken. Picture-in-Picture is exempt from the pre-33 path (a secure
+window would render the floating video window blank), and the flag is cleared
+again in `onPictureInPictureModeChanged` because entering PiP is asynchronous
+and `onPause` can run before the activity reports itself as being in PiP. The
+per-API-level decision lives in `RecentsPrivacy` so it is unit-testable.
+
+**Rejected: a permanently secure Android window** (`FLAG_SECURE` set once in
+`onCreate`). It is the simplest and strongest option and it is what most
+guidance suggests, but it also disables ordinary screenshots and screen
+recording of the app. The maintainer records screenshots and screen captures of
+the Android client for documentation and for the site, and an operator
+photographing an incident off their own phone is a legitimate use. Blocking that
+to protect a preview the operator can also protect by closing the app was judged
+the wrong trade.
+
+**Rejected: a macOS occlusion or resign-active cover.** macOS has no task
+switcher preview of this kind, and a video wall on a second monitor is meant to
+stay readable while another app has focus. macOS behavior is unchanged.
+
+**Trades knowingly accepted:**
+
+- Below API 33 the flag toggles on every pause, which includes pauses that are
+  not "leaving the app" (a system permission dialog, the biometric prompt). The
+  effect is invisible: the flag is cleared again on the next resume.
+- Below API 33, leaving the app straight into PiP can still put a video frame on
+  the recents card, because that path is deliberately exempt. API 33+ devices
+  use the dedicated switch and are unaffected.
+- The iOS cover now appears for users who never asked for a lock. It is a plain
+  opaque background with no interaction, so the only cost is a brief flat colour
+  during multitasking.
+
+**Revisit if:** Android ever gains a pre-33-compatible recents-only switch (it
+will not, but a support library shim would count), or if the minimum supported
+API rises to 33, at which point the `FLAG_SECURE` fallback and `RecentsPrivacy`
+can both be deleted. Also revisit if operators report that the PiP exemption
+matters on old devices, in which case the pre-33 path can drop PiP entirely
+(auto-enter off below 33) instead of exempting it.
+
+## 2026-09-07, Session validity is a positive cached lookup per `jti`, not a cached revoked-set alone; per-user camera grants are read from the user row
+
+**Context.** `sessions` (migration 0033) made a token revocable, and the
+`AuthUser` extractor checked it against an in-memory set of REVOKED `jti`s
+refreshed on write. That set answers "was this session signed out". It cannot
+answer "was this ever a session at all", and `sessions.user_id` is
+`ON DELETE CASCADE`, so removing an account made its rows disappear rather than
+be flagged. A token for a removed account therefore read as "not revoked" and
+kept working for the rest of its `exp`, which for a remembered mobile login is
+years. Separately, a user's per-user camera grants were baked into the token at
+login and unioned with the role's cameras at request time, so editing them did
+nothing until that user signed in again.
+
+**Decision.** The extractor now resolves each `jti` POSITIVELY: a small
+`AppState` cache maps `jti` to "session row present and not revoked, plus the
+owning user's `users.camera_ids`", populated by one joined query on a miss and
+cleared on any user change. An unknown `jti` is resolved against the DB then and
+there, never assumed either way, and the resolved grants replace
+`claims.camera_ids` in the role-union. A login token with no `jti` is refused
+outright (the table predates the first public release, so no supported client
+holds one). The existing revoked-set cache is kept as the fast path for
+revocation; the new cache answers existence.
+
+**Rejected:**
+
+- *Caching the LIVE set instead.* A session minted a millisecond ago on another
+  API replica would not be in this replica's set until the TTL lapsed, so a user
+  who just signed in would be spuriously signed out. A false 401 right after
+  login is worse than a revoke that lands a few seconds late.
+- *Querying `sessions` on every request.* Correct but puts a DB round trip on
+  the hot path of every authenticated request, including the media reads a video
+  wall issues continuously. The repo's established pattern (`roles_cache`,
+  `revoked_jtis`) is cache-the-truth, refresh-on-write.
+- *Also ending sessions when only the extra-cameras list changes.* Once the
+  grants are read from the row on each request, the new set is in force on that
+  user's very next request, so signing them out adds nothing but disruption
+  (a viewer loses their wall because an admin granted them one more camera).
+  A password or role change still ends every session: those replace the
+  credential or what the account may do.
+- *Keeping the opt-in "reject legacy `jti`-less tokens" switch* the 0033
+  migration sketched. There are no legacy tokens to keep working, and a
+  configurable switch for "accept credentials that can never be signed out" is a
+  setting nobody should choose.
+
+**Trades knowingly accepted:**
+
+- A cold `jti` costs one query, so a burst of first-time-seen sessions (an API
+  restart with many clients reconnecting) costs one query each, once.
+- Across replicas, a user edit made on another replica lands within the cache
+  TTL rather than instantly; a revoke still lands within the shorter revocation
+  TTL. Single-process installs (the norm) see both immediately.
+- A scoped media token minted just before an account was removed keeps working
+  for the rest of its short life. It is one camera, media bytes only, minutes,
+  which is the property the media token was designed around.
+- A supplied password always counts as a change, even if it is the same string:
+  hashes are salted, so old and new are never comparable.
+
+**Revisit if:** an install runs enough distinct concurrent sessions that the
+per-`jti` cache is a memory or miss-rate problem (then key the cache by user and
+carry a session generation counter), or Crumb grows a real multi-replica
+deployment story where cache TTLs are too coarse (then push invalidation between
+replicas, for example over the existing DB with a notify channel).
+
+## 2026-09-07, Opening the web console in an external browser uses a single-use handoff code, not the desktop client's session token
+
+**Context.** The desktop client can show the server's web admin console two
+ways: embedded in its own WebView, and "Open in browser", which hands the URL to
+whatever browser the OS launches. Both used the same URL shape,
+`/admin#token=<session token>&embed=1`, which `admin.html`'s `bootSSO` reads and
+persists like a login. That is fine for the embedded WebView, which is this
+client's own process, but "Open in browser" crosses a process boundary: the
+token then lives in a browser's history, its profile storage, and within reach
+of whatever extensions the operator has installed, for as long as the session
+lasts.
+
+**Decision.** The embedded WebView keeps `#token=`. "Open in browser" instead
+calls `POST /auth/handoff` (full session required, a scoped media token is
+refused), gets back a single-use code that expires in about a minute, and opens
+`/admin#handoff=<code>`. The console posts the code to
+`POST /auth/handoff/exchange`, which consumes it exactly once and mints the
+browser its OWN session: its own `jti`, its own `sessions` row, normal (not
+"remember me") expiry, so it is listed under "your sessions" and every sign-out
+path reaches it. Codes are held in memory only, bound to the issuing user and
+session; an expired, unknown, reused, or signed-out code is a 401 and the
+console falls through to its normal login form.
+
+**Rejected:**
+
+- *Keep passing the session token in the fragment.* Cheapest, and the fragment
+  never reaches the server, but the credential still lands in browser history
+  and profile storage under a different security boundary than the client that
+  owns it.
+- *Open the console with no credential at all.* Safest and free, but the
+  operator is asked to type their password again to reach a console they are
+  already signed in to on the same machine, which is exactly the friction the
+  handoff exists to remove.
+- *Persist codes in Postgres.* Rejected as unnecessary machinery: a code lives
+  for seconds, and losing the map on a restart only costs a second click.
+
+**Trades knowingly accepted:** codes are per-process, so an install running
+several API replicas behind a load balancer can have the exchange land on a
+replica that never saw the code (the operator clicks again, or the browser shows
+the login form). The browser's session is not the client's session, so signing
+out in one does not sign out the other; both are visible and revocable under
+"your sessions".
+
+**Revisit if:** Crumb starts supporting multiple API replicas behind a shared
+load balancer as a documented deployment, at which point the code store moves to
+Postgres (or a shared cache) with the same single-use semantics.
+
 ## 2026-09-07, Media routes: bounded waits answering 503, not unbounded queues
 
 **Context.** Every expensive media path (clip and low-bitrate transcodes, the

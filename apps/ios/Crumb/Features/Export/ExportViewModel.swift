@@ -436,9 +436,9 @@ final class ExportViewModel: ObservableObject {
     }
 
     /// [iOS] C1 fix: download an export output file to a local temp file via an
-    /// AUTHENTICATED request (`URLSession.crumbMedia`, token in the URL query —
-    /// same server-side auth scheme as every other media endpoint, but the fetch
-    /// itself never lands in the on-disk URL cache), then hand `UIActivityViewController`
+    /// AUTHENTICATED request (`URLSession.crumbMedia`, session token in the
+    /// `Authorization` header, and the ephemeral session keeps the fetch out of
+    /// the on-disk URL cache), then hand `UIActivityViewController`
     /// the local `fileURL`. Previously the raw `?token=<JWT>` URL was handed
     /// straight to the share sheet, which could leak the token to whatever
     /// destination (Mail, Messages, a third-party app, iCloud Drive, AirDrop...)
@@ -461,10 +461,7 @@ final class ExportViewModel: ObservableObject {
     /// Downloads one output file to a fresh temp file, returning its local URL.
     /// Shared by C1 (iOS share sheet) and C2 (macOS save-panel) call sites.
     func downloadToTemp(_ file: ExportOutputFile) async throws -> URL {
-        guard let remote = container.mediaUrls().authed(file.downloadUrl) else {
-            throw URLError(.badURL)
-        }
-        var req = URLRequest(url: remote)
+        var req = try container.api.exportDownloadRequest(file.downloadUrl)
         req.timeoutInterval = 300   // exports can be large; give the download room
         // `.download(for:)` streams the response straight to a temp file instead
         // of buffering it in memory like `.data(for:)` did — a batch export is

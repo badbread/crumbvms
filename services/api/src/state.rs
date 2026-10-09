@@ -28,6 +28,22 @@ use crate::dto::ExportJob;
 /// seconds.
 const REVOCATION_CACHE_TTL_SECS: i64 = 15;
 
+/// How long one `jti`'s resolved session state (does the row still exist, and
+/// what per-user camera grants does its owner hold) may be trusted before it is
+/// re-read from the DB. Unlike the revoked set, this cache is *positive*: an
+/// unknown `jti` is resolved against the DB there and then, so a token minted a
+/// millisecond ago on another API replica is never spuriously rejected. The TTL
+/// therefore only bounds how long a change made by ANOTHER replica (a user
+/// edit, an account removal) can go unnoticed here; a change made on THIS
+/// process clears the cache synchronously.
+const SESSION_CACHE_TTL_SECS: i64 = 30;
+
+/// Cap on the session cache. One entry per `jti` seen recently, so this is
+/// bounded by real sessions in normal use; the cap only matters if a caller
+/// replays many distinct signed tokens. Cleared wholesale when exceeded (the
+/// next request for each live session simply re-resolves).
+const SESSION_CACHE_MAX_ENTRIES: usize = 10_000;
+
 /// Consecutive failed logins for one username tolerated before the per-username
 /// backoff engages (issue #127). Below this, every attempt is let through to the
 /// normal credential check; at/above it, attempts are rejected with 429 until
@@ -47,6 +63,12 @@ const LOGIN_BACKOFF_CAP_SECS: u64 = 900;
 /// an attacker spraying random usernames cannot grow it without bound. Only
 /// entries no longer in backoff are dropped (an active block is always kept).
 const LOGIN_FAILURES_MAX_ENTRIES: usize = 10_000;
+
+/// Prune the console-handoff map once it exceeds this many outstanding codes.
+/// Codes live for seconds and are consumed on first use, so a healthy install
+/// holds a handful; the cap only bounds a pathological caller that mints codes
+/// it never redeems. Only already-expired entries are dropped.
+const HANDOFF_MAX_ENTRIES: usize = 1_000;
 
 /// Backoff duration (seconds) for `failures` consecutive login failures, or
 /// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
@@ -86,6 +108,19 @@ struct FailState {
     /// Instant until which new attempts for this username are rejected. A value
     /// at/before `now` means "not currently blocked".
     blocked_until: Instant,
+}
+
+/// One outstanding console-handoff code (see [`AppState::issue_handoff_code`]).
+#[derive(Clone, Copy)]
+struct HandoffEntry {
+    /// The user the code was minted for.
+    user_id: Uuid,
+    /// The `jti` of the session that asked for the code, when it has one
+    /// (pre-P0-SESSIONS tokens do not). The exchange rejects a code whose
+    /// originating session has since been signed out.
+    jti: Option<Uuid>,
+    /// Instant after which the code is no longer redeemable.
+    expires_at: Instant,
 }
 
 /// Inner state, heap-allocated once and reference-counted.
@@ -246,6 +281,25 @@ struct Inner {
     /// against `REVOCATION_CACHE_TTL_SECS` to decide when to re-read.
     revoked_jtis_loaded_at: AtomicI64,
 
+    /// In-memory cache of resolved session state, keyed by `jti`. The value is
+    /// `(grants, checked_at_unix)` where `grants` is `Some(camera_ids)` for a
+    /// session whose row still exists and is not revoked (carrying the owning
+    /// user's per-user camera grants, read from the row rather than trusted from
+    /// the token) and `None` for a session that is gone.
+    ///
+    /// This is the positive counterpart to `revoked_jtis`. That set answers "was
+    /// this session signed out", which cannot answer "did this session's row
+    /// ever exist" — a deleted user's rows vanish through
+    /// `sessions.user_id ON DELETE CASCADE`, so their still-signed token read as
+    /// "not revoked" and kept working. A `jti` missing from this cache is
+    /// resolved against the DB on the spot (never assumed live and never assumed
+    /// dead), so a token minted moments ago, here or on another replica, is
+    /// accepted immediately; after that first resolution the check is a
+    /// lock-free `DashMap` lookup. Entries are dropped wholesale whenever a user
+    /// row changes (see [`AppState::invalidate_session_cache`]), the same
+    /// refresh-on-write discipline `roles_cache` and `revoked_jtis` follow.
+    session_cache: DashMap<Uuid, (Option<Vec<Uuid>>, i64)>,
+
     /// Health-alert maintenance window (issue #46). Unix-seconds timestamp
     /// until which operational HEALTH/system alerts (camera offline, recorder
     /// down, low disk, Frigate disconnect, backup failed) are SUPPRESSED —
@@ -267,6 +321,12 @@ struct Inner {
     /// state can never lock a legitimate user out. This is IN ADDITION to the
     /// shared per-IP request bucket, not a replacement.
     login_failures: DashMap<String, FailState>,
+
+    /// Outstanding single-use console-handoff codes, keyed by the code itself.
+    /// Memory-only and deliberately so: a code is valid for seconds, and losing
+    /// the map on restart only means the operator clicks "Open in browser"
+    /// again (the fail-safe direction).
+    handoff_codes: DashMap<String, HandoffEntry>,
 
     /// Demand-driven cache behind `GET /ha/states` (issue #170). `None` until
     /// the first request. The `tokio::sync::Mutex` makes a refresh single-flight:
@@ -347,8 +407,10 @@ impl AppState {
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
+            session_cache: DashMap::new(),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
+            handoff_codes: DashMap::new(),
             ha_states: tokio::sync::Mutex::new(None),
             event_tx: OnceLock::new(),
         }))
@@ -438,6 +500,51 @@ impl AppState {
             self.refresh_revoked_jtis().await;
         }
         self.0.revoked_jtis.contains_key(&jti)
+    }
+
+    // ── session cache (liveness + per-user camera grants) ─────────────────────
+
+    /// Resolve a session `jti` to the owning user's per-user camera grants, or
+    /// `None` when the session no longer exists (removed account, pruned row, a
+    /// `jti` that never had a row, or one belonging to a different user).
+    ///
+    /// Cached per `jti` for [`SESSION_CACHE_TTL_SECS`]; a miss costs exactly one
+    /// query, so the common warm path adds no DB round trip. Both outcomes are
+    /// cached, so a client looping on a dead token does not re-query every time.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a DB failure rather than guessing. The caller turns that into
+    /// a 5xx, never a 401: a transient database blip must not look like "you
+    /// have been signed out" to a client that would then discard its token.
+    pub async fn resolve_session(
+        &self,
+        jti: Uuid,
+        user_id: Uuid,
+    ) -> anyhow::Result<Option<Vec<Uuid>>> {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(entry) = self.0.session_cache.get(&jti) {
+            let (grants, checked_at) = entry.value();
+            if now - *checked_at < SESSION_CACHE_TTL_SECS {
+                return Ok(grants.clone());
+            }
+        }
+        let grants = crumb_common::db::resolve_live_session(self.pool(), jti, user_id).await?;
+        // Bound memory against a caller replaying many distinct signed tokens.
+        if self.0.session_cache.len() > SESSION_CACHE_MAX_ENTRIES {
+            self.0.session_cache.clear();
+        }
+        self.0.session_cache.insert(jti, (grants.clone(), now));
+        Ok(grants)
+    }
+
+    /// Drop every cached session so the next request re-reads liveness and the
+    /// per-user camera grants from the DB. Call after any change to a user row
+    /// (edit, removal) or after revoking sessions, so the change lands on that
+    /// user's very next request instead of waiting out the TTL.
+    #[inline]
+    pub fn invalidate_session_cache(&self) {
+        self.0.session_cache.clear();
     }
 
     /// Borrow the database connection pool.
@@ -746,6 +853,52 @@ impl AppState {
     /// counter (and their next fat-finger starts from zero again).
     pub fn record_login_success(&self, username: &str) {
         self.0.login_failures.remove(username);
+    }
+
+    // ── console handoff codes ─────────────────────────────────────────────────
+
+    /// Mint a single-use handoff code for `user_id` (issued by the session
+    /// identified by `jti`, when it has one) and remember it for `ttl`.
+    ///
+    /// The code is ~30 bytes of OS-CSPRNG entropy rendered as lowercase hex, so
+    /// it is URL-safe without escaping. Callers hand it to a browser in a URL
+    /// fragment; the browser trades it for a real session at
+    /// `POST /auth/handoff/exchange`.
+    ///
+    /// `ttl` is a parameter rather than a constant so tests can drive the
+    /// expiry path without sleeping for the production window.
+    pub fn issue_handoff_code(&self, user_id: Uuid, jti: Option<Uuid>, ttl: Duration) -> String {
+        let now = Instant::now();
+
+        // Bound memory: drop codes that can no longer be redeemed anyway.
+        if self.0.handoff_codes.len() > HANDOFF_MAX_ENTRIES {
+            self.0.handoff_codes.retain(|_, e| e.expires_at > now);
+        }
+
+        // Two v4 UUIDs, hex-rendered: `Uuid::new_v4` draws from the OS CSPRNG
+        // (getrandom), and using it keeps this dependency-free.
+        let code = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.0.handoff_codes.insert(
+            code.clone(),
+            HandoffEntry {
+                user_id,
+                jti,
+                expires_at: now + ttl,
+            },
+        );
+        code
+    }
+
+    /// Redeem a handoff code, returning the user id and the issuing session's
+    /// `jti` on success. The entry is removed whether or not it was still
+    /// valid, so a code is usable at most once; an expired or unknown code
+    /// yields `None`.
+    pub fn consume_handoff_code(&self, code: &str) -> Option<(Uuid, Option<Uuid>)> {
+        let (_, entry) = self.0.handoff_codes.remove(code)?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some((entry.user_id, entry.jti))
     }
 }
 
