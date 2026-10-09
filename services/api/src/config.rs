@@ -389,6 +389,17 @@ pub struct ApiConfig {
     /// Missing or empty `ONVIF_CONFIG` is **not** an error -- the service
     /// starts normally; `POST /cameras/:id/ptz` returns 404 for every camera.
     pub onvif_cameras: HashMap<String, OnvifCameraConfig>,
+
+    // -- locale -------------------------------------------------------------
+    /// `TZ` -- the server's local wall-clock zone (IANA name), resolved once at
+    /// startup by [`crumb_common::config::server_tz`].
+    ///
+    /// Used to render notification times for providers that have no
+    /// client-side timestamp markup (ntfy, Pushover, Telegram, the generic
+    /// webhook), and as the fallback text inside Slack's markup. Discord and
+    /// Slack render in each viewer's own zone instead, so this value does not
+    /// apply there. Default: `UTC` when unset or unparseable.
+    pub server_tz: chrono_tz::Tz,
 }
 
 impl ApiConfig {
@@ -497,6 +508,7 @@ impl ApiConfig {
             seed_admin_password: crumb_common::config::secret_env("SEED_ADMIN_PASSWORD")
                 .unwrap_or_default(),
             onvif_cameras,
+            server_tz: crumb_common::config::server_tz(),
         })
     }
 }

@@ -594,11 +594,24 @@ fn parse_tz_env(key: &str, default: &str) -> chrono_tz::Tz {
             tracing::error!(
                 "env var '{key}' = '{raw}' is not a valid IANA timezone \
                  (e.g. 'America/Los_Angeles'); falling back to '{fallback}' — \
-                 the archive cron will run in that zone"
+                 schedules and rendered wall-clock times will use that zone"
             );
             fallback
         }
     }
+}
+
+/// The server's local wall-clock zone: the `TZ` env var (IANA name), `UTC` when
+/// it is unset, empty, or unparseable.
+///
+/// This is the one zone the whole stack calls "local": quiet hours, the nightly
+/// database backup schedule, log timestamps, and the notification text rendered
+/// for providers that have no client-side timestamp markup. Resolving it in one
+/// place keeps those from drifting apart. Compose forwards `TZ` to every
+/// service, and `scripts/setup-env.sh` writes the host's zone into it.
+#[must_use]
+pub fn server_tz() -> chrono_tz::Tz {
+    parse_tz_env("TZ", "UTC")
 }
 
 fn optional_env(key: &str, default: &str) -> String {
