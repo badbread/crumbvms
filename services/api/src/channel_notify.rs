@@ -28,6 +28,16 @@
 //! `files.upload`, out of scope), and the generic webhook is a JSON contract by
 //! design. Both stay text/link-only regardless of the channel's mode.
 //!
+//! # Timestamps
+//!
+//! Event timestamps are stored and carried in UTC and only *rendered* per
+//! provider ([`TimeStyle`]): Discord gets `<t:UNIX:f>` markup and Slack gets
+//! `<!date^UNIX^…|fallback>` markup, both of which those clients resolve in the
+//! viewer's own zone, so one alert reads correctly on a phone anywhere. Every
+//! other provider gets plain text in the server's configured zone (`TZ`) with
+//! the zone abbreviation attached. The generic webhook's JSON `ts` is a machine
+//! contract and stays a raw UTC instant.
+//!
 //! Returns `Err` on any non-2xx response or network failure so the engine can log
 //! `status='failed'`.  The caller is responsible for sending the notification
 //! WITHOUT an image when the snapshot fetch fails (never drop the alert).
@@ -37,6 +47,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use reqwest::multipart;
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
@@ -125,6 +136,92 @@ pub struct ChannelMessage {
     /// 0079), merged UNDER the built-ins when rendering (a built-in like
     /// `%camera%` can never be shadowed by a meta key).
     pub meta: Option<serde_json::Value>,
+    /// The server's local wall-clock zone (`TZ`), resolved once at startup into
+    /// [`ApiConfig::server_tz`](crate::config::ApiConfig::server_tz) and carried
+    /// here so dispatch never re-reads the environment. Used for providers with
+    /// no client-side timestamp markup, and for the fallback text inside
+    /// Slack's markup. See [`TimeStyle`].
+    pub tz: Tz,
+}
+
+/// How one provider wants an event timestamp rendered.
+///
+/// Stored timestamps stay UTC; only the rendering differs. Discord and Slack
+/// both accept markup their clients resolve against the *viewer's* own zone, so
+/// one alert reads correctly on a phone in any country. Everyone else gets
+/// plain text in the server's configured zone, with the zone abbreviation shown
+/// so the reading is never ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeStyle {
+    /// Discord `<t:UNIX:f|t|d>` markup, rendered in the viewer's local zone.
+    Discord,
+    /// Slack `<!date^UNIX^tokens|fallback>` markup, rendered in the viewer's
+    /// local zone; the carried zone renders the fallback text Slack shows when
+    /// it cannot resolve the markup.
+    Slack(Tz),
+    /// Plain wall-clock text in a fixed zone (the server's `TZ`).
+    Zone(Tz),
+}
+
+/// Pick the [`TimeStyle`] for a channel `kind`. Unknown kinds fall to the
+/// server zone, which is always readable text.
+pub(crate) fn time_style_for(kind: &str, tz: Tz) -> TimeStyle {
+    match kind {
+        "discord" => TimeStyle::Discord,
+        "slack" => TimeStyle::Slack(tz),
+        _ => TimeStyle::Zone(tz),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS ZZZ` in `tz` (the zone abbreviation makes the reading
+/// unambiguous).
+fn zone_datetime(ts: DateTime<Utc>, tz: Tz) -> String {
+    ts.with_timezone(&tz)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
+/// Slack's date markup. Slack renders `tokens` in the viewer's own zone and
+/// falls back to `fallback` when it cannot (search results, some exports).
+fn slack_date(ts: DateTime<Utc>, tokens: &str, fallback: &str) -> String {
+    format!("<!date^{}^{tokens}|{fallback}>", ts.timestamp())
+}
+
+/// Render `ts` as a full date and time in `style`.
+pub(crate) fn fmt_datetime(ts: DateTime<Utc>, style: TimeStyle) -> String {
+    match style {
+        TimeStyle::Discord => format!("<t:{}:f>", ts.timestamp()),
+        TimeStyle::Slack(tz) => {
+            slack_date(ts, "{date_short_pretty} at {time}", &zone_datetime(ts, tz))
+        }
+        TimeStyle::Zone(tz) => zone_datetime(ts, tz),
+    }
+}
+
+/// Render the date part of `ts` in `style`.
+pub(crate) fn fmt_date(ts: DateTime<Utc>, style: TimeStyle) -> String {
+    match style {
+        TimeStyle::Discord => format!("<t:{}:d>", ts.timestamp()),
+        TimeStyle::Slack(tz) => slack_date(
+            ts,
+            "{date_short_pretty}",
+            &ts.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+        ),
+        TimeStyle::Zone(tz) => ts.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+    }
+}
+
+/// Render the time-of-day part of `ts` in `style`.
+pub(crate) fn fmt_time(ts: DateTime<Utc>, style: TimeStyle) -> String {
+    match style {
+        TimeStyle::Discord => format!("<t:{}:t>", ts.timestamp()),
+        TimeStyle::Slack(tz) => slack_date(
+            ts,
+            "{time}",
+            &ts.with_timezone(&tz).format("%H:%M:%S").to_string(),
+        ),
+        TimeStyle::Zone(tz) => ts.with_timezone(&tz).format("%H:%M:%S").to_string(),
+    }
 }
 
 impl ChannelMessage {
@@ -132,10 +229,13 @@ impl ChannelMessage {
     /// plus the event's structured `meta`. Built-ins are inserted LAST so a
     /// meta key can never shadow `%camera%`/`%event%`/etc.
     ///
-    /// Timezone: date/time render in UTC, matching the `ts` formatting the
-    /// notification path has always used. This is not a per-user local time; if
-    /// per-user timezone is ever added it belongs there, not baked in here.
-    fn token_map(&self) -> std::collections::BTreeMap<String, String> {
+    /// Timezone: `%date%`/`%time%`/`%datetime%` render in `style`, which the
+    /// caller derives from the destination provider ([`time_style_for`]).
+    /// Discord and Slack get markup their clients resolve in the viewer's own
+    /// zone; everyone else gets the server's `TZ` wall clock. The stored `ts`
+    /// stays UTC either way. This is still not a per-user timezone; if one is
+    /// ever added it belongs in the style, not baked in here.
+    fn token_map_for(&self, style: TimeStyle) -> std::collections::BTreeMap<String, String> {
         let mut map = std::collections::BTreeMap::new();
         // Meta first (lowest priority) — flat object of scalar values only.
         if let Some(serde_json::Value::Object(obj)) = &self.meta {
@@ -147,12 +247,9 @@ impl ChannelMessage {
         }
         // Built-ins (win over any meta key of the same name).
         map.insert("camera".to_owned(), self.camera_name.clone());
-        map.insert("date".to_owned(), self.ts.format("%Y-%m-%d").to_string());
-        map.insert("time".to_owned(), self.ts.format("%H:%M:%S").to_string());
-        map.insert(
-            "datetime".to_owned(),
-            self.ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        );
+        map.insert("date".to_owned(), fmt_date(self.ts, style));
+        map.insert("time".to_owned(), fmt_time(self.ts, style));
+        map.insert("datetime".to_owned(), fmt_datetime(self.ts, style));
         map.insert(
             "event".to_owned(),
             self.label
@@ -163,18 +260,18 @@ impl ChannelMessage {
         map
     }
 
-    /// Human-readable one-liner suitable for all channel types.
+    /// Human-readable one-liner rendered for one provider's [`TimeStyle`].
     ///
     /// For a system alert with a resolved [`template`](Self::template) the text
     /// is rendered via `crumb_common::alert_template` (operator-customizable).
     /// Motion/detection — and a system event with no template (defensive) — use
-    /// the legacy hardcoded wording, unchanged.
-    pub fn text(&self) -> String {
+    /// the legacy hardcoded wording, with the timestamp in `style`.
+    pub(crate) fn text_for(&self, style: TimeStyle) -> String {
         if let Some(tpl) = &self.template {
-            return crumb_common::alert_template::render(tpl, &self.token_map());
+            return crumb_common::alert_template::render(tpl, &self.token_map_for(style));
         }
         let cam = &self.camera_name;
-        let ts = self.ts.format("%Y-%m-%d %H:%M:%S UTC");
+        let ts = fmt_datetime(self.ts, style);
         if self.kind == "system" {
             let title = self.label.as_deref().unwrap_or("System alert");
             return match &self.detail {
@@ -190,12 +287,13 @@ impl ChannelMessage {
         }
     }
 
-    /// The operator's custom provider title, rendered, when a `title_template`
-    /// is set; otherwise `None` so the provider keeps its own default title.
-    pub fn rendered_title(&self) -> Option<String> {
+    /// The operator's custom provider title, rendered for one provider's
+    /// [`TimeStyle`], when a `title_template` is set; otherwise `None` so the
+    /// provider keeps its own default title.
+    pub(crate) fn rendered_title_for(&self, style: TimeStyle) -> Option<String> {
         self.title_template
             .as_ref()
-            .map(|tpl| crumb_common::alert_template::render(tpl, &self.token_map()))
+            .map(|tpl| crumb_common::alert_template::render(tpl, &self.token_map_for(style)))
     }
 
     /// Resolve this channel's snapshot mode + the provider's image capability +
@@ -467,12 +565,15 @@ pub async fn dispatch(
     ch: &NotificationChannel,
     msg: &ChannelMessage,
 ) -> anyhow::Result<()> {
+    // Timestamps are rendered per provider: markup where the provider's own
+    // clients can localize it, the server's zone everywhere else.
+    let style = time_style_for(ch.kind.as_str(), msg.tz);
     match ch.kind.as_str() {
-        "discord" => dispatch_discord(http, ch, msg).await,
-        "slack" => dispatch_slack(http, ch, msg).await,
-        "pushover" => dispatch_pushover(http, ch, msg).await,
-        "telegram" => dispatch_telegram(http, ch, msg).await,
-        "ntfy" => dispatch_ntfy(http, ch, msg).await,
+        "discord" => dispatch_discord(http, ch, msg, style).await,
+        "slack" => dispatch_slack(http, ch, msg, style).await,
+        "pushover" => dispatch_pushover(http, ch, msg, style).await,
+        "telegram" => dispatch_telegram(http, ch, msg, style).await,
+        "ntfy" => dispatch_ntfy(http, ch, msg, style).await,
         "webhook" => dispatch_webhook(http, ch, msg).await,
         other => bail!("unknown channel kind '{other}'"),
     }
@@ -508,9 +609,13 @@ async fn dispatch_discord(
     http: &reqwest::Client,
     ch: &NotificationChannel,
     msg: &ChannelMessage,
+    style: TimeStyle,
 ) -> anyhow::Result<()> {
     let webhook_url = cfg_str(&ch.config, "webhook_url").context("discord config")?;
-    let text = msg.text();
+    // `content` renders Discord markup, so the `<t:…>` timestamps in this text
+    // show in each viewer's own zone. (An embed `title` would not render it;
+    // this path has no embed.)
+    let text = msg.text_for(style);
 
     // Discord multipart carries multiple files (`file[0]`, `file[1]`), so `both`
     // sends the vehicle frame AND the plate crop.
@@ -554,11 +659,14 @@ async fn dispatch_slack(
     http: &reqwest::Client,
     ch: &NotificationChannel,
     msg: &ChannelMessage,
+    style: TimeStyle,
 ) -> anyhow::Result<()> {
     let webhook_url = cfg_str(&ch.config, "webhook_url").context("slack config")?;
     // Incoming webhooks don't support file uploads. Include the web_url in the
     // text for now (v1); a block-kit attachment image_url is a v2 improvement.
-    let mut text = msg.text();
+    // The top-level `text` field renders Slack's `<!date^…>` markup, so the
+    // timestamps show in each viewer's own zone.
+    let mut text = msg.text_for(style);
     if let Some(url) = &msg.web_url {
         text.push(' ');
         text.push_str(url);
@@ -579,14 +687,15 @@ async fn dispatch_pushover(
     http: &reqwest::Client,
     ch: &NotificationChannel,
     msg: &ChannelMessage,
+    style: TimeStyle,
 ) -> anyhow::Result<()> {
     let app_token = cfg_str(&ch.config, "app_token").context("pushover config")?;
     let user_key = cfg_str(&ch.config, "user_key").context("pushover config")?;
 
     let title = msg
-        .rendered_title()
+        .rendered_title_for(style)
         .unwrap_or_else(|| format!("Crumb – {}", msg.label.as_deref().unwrap_or(msg.kind)));
-    let message = msg.text();
+    let message = msg.text_for(style);
 
     // Pushover requires multipart even without an attachment.
     let mut form = multipart::Form::new()
@@ -626,10 +735,11 @@ async fn dispatch_telegram(
     http: &reqwest::Client,
     ch: &NotificationChannel,
     msg: &ChannelMessage,
+    style: TimeStyle,
 ) -> anyhow::Result<()> {
     let bot_token = cfg_str(&ch.config, "bot_token").context("telegram config")?;
     let chat_id = cfg_str(&ch.config, "chat_id").context("telegram config")?;
-    let caption = msg.text();
+    let caption = msg.text_for(style);
 
     // Telegram: one photo → `sendPhoto`; two → `sendMediaGroup` (so `both` sends
     // the vehicle frame AND the plate crop as an album); none → text below.
@@ -712,9 +822,10 @@ async fn dispatch_ntfy(
     http: &reqwest::Client,
     ch: &NotificationChannel,
     msg: &ChannelMessage,
+    style: TimeStyle,
 ) -> anyhow::Result<()> {
     let topic_url = cfg_str(&ch.config, "topic_url").context("ntfy config")?;
-    let body_text = msg.text();
+    let body_text = msg.text_for(style);
     // Tags: the kind and optionally the label.
     let tags = match &msg.label {
         Some(lbl) if msg.kind == "detection" => format!("{},{lbl}", msg.kind),
@@ -726,7 +837,7 @@ async fn dispatch_ntfy(
     // from a rendered template would otherwise be rejected as an invalid header
     // value (failing the whole dispatch).
     let title = msg
-        .rendered_title()
+        .rendered_title_for(style)
         .unwrap_or_else(|| format!("Crumb – {}", msg.camera_name))
         .replace(['\r', '\n'], " ");
 
@@ -771,6 +882,10 @@ async fn dispatch_webhook(
     // The generic webhook is a JSON contract: it never carries raw image bytes.
     // We do surface the channel's `snapshot_mode` so a consumer can decide
     // whether to go fetch an image itself (via `web_url` / the media API).
+    //
+    // `ts` stays a raw UTC instant here on purpose: this is machine-readable
+    // output, and a consumer localizes it however it likes. The human-readable
+    // wall-clock rendering is for the text-carrying providers.
     let body = json!({
         "camera":        msg.camera_name,
         "kind":          msg.kind,
@@ -902,9 +1017,136 @@ pub async fn fetch_snapshot(
 mod tests {
     use super::{
         crop_plate_jpeg, ffmpeg_bin, plan_images, plate_crop_ffmpeg_args, plate_crop_rect,
-        provider_image_capability, ImageCap, ImgSource,
+        provider_image_capability, time_style_for, ChannelMessage, ImageCap, ImgSource, TimeStyle,
     };
+    use chrono::{DateTime, Utc};
+    use chrono_tz::Tz;
     use crumb_common::db::SnapshotMode;
+
+    // ── time rendering ─────────────────────────────────────────────────────────
+
+    /// Los Angeles: `America/Los_Angeles`, the zone the DST cases below use.
+    const LA: Tz = Tz::America__Los_Angeles;
+
+    /// A fixed instant, parsed from RFC 3339. Tests never read the process
+    /// environment: every zone is passed in explicitly.
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc)
+    }
+
+    fn msg_at(ts: DateTime<Utc>, tz: Tz) -> ChannelMessage {
+        ChannelMessage {
+            camera_name: "Driveway".to_owned(),
+            kind: "motion",
+            label: None,
+            ts,
+            web_url: None,
+            vehicle_snapshot: None,
+            plate_snapshot: None,
+            detail: None,
+            template: None,
+            title_template: None,
+            meta: None,
+            tz,
+        }
+    }
+
+    #[test]
+    fn style_is_chosen_per_provider() {
+        assert_eq!(time_style_for("discord", LA), TimeStyle::Discord);
+        assert_eq!(time_style_for("slack", LA), TimeStyle::Slack(LA));
+        for kind in ["ntfy", "pushover", "telegram", "webhook", "unknown"] {
+            assert_eq!(time_style_for(kind, LA), TimeStyle::Zone(LA));
+        }
+    }
+
+    #[test]
+    fn discord_tokens_use_discord_timestamp_markup() {
+        // 2026-01-15T19:14:05Z = 1768504445 unix seconds.
+        let ts = at("2026-01-15T19:14:05Z");
+        assert_eq!(ts.timestamp(), 1_768_504_445);
+        let map = msg_at(ts, LA).token_map_for(TimeStyle::Discord);
+        assert_eq!(map["datetime"], "<t:1768504445:f>");
+        assert_eq!(map["time"], "<t:1768504445:t>");
+        assert_eq!(map["date"], "<t:1768504445:d>");
+    }
+
+    #[test]
+    fn discord_legacy_text_uses_discord_timestamp_markup() {
+        let ts = at("2026-01-15T19:14:05Z");
+        let text = msg_at(ts, LA).text_for(TimeStyle::Discord);
+        assert_eq!(text, "[Crumb] Motion on Driveway at <t:1768504445:f>");
+    }
+
+    #[test]
+    fn slack_tokens_use_slack_date_markup_with_a_server_zone_fallback() {
+        let ts = at("2026-01-15T19:14:05Z");
+        let map = msg_at(ts, LA).token_map_for(TimeStyle::Slack(LA));
+        // Slack renders the tokens in the viewer's zone; the text after `|` is
+        // the fallback, which is the server-zone rendering.
+        assert_eq!(
+            map["datetime"],
+            "<!date^1768504445^{date_short_pretty} at {time}|2026-01-15 11:14:05 PST>"
+        );
+        assert_eq!(
+            map["date"],
+            "<!date^1768504445^{date_short_pretty}|2026-01-15>"
+        );
+        assert_eq!(map["time"], "<!date^1768504445^{time}|11:14:05>");
+    }
+
+    #[test]
+    fn zone_tokens_render_local_wall_clock_in_winter() {
+        // 19:14:05 UTC in January is 11:14:05 PST (UTC-8).
+        let map = msg_at(at("2026-01-15T19:14:05Z"), LA).token_map_for(TimeStyle::Zone(LA));
+        assert_eq!(map["datetime"], "2026-01-15 11:14:05 PST");
+        assert_eq!(map["date"], "2026-01-15");
+        assert_eq!(map["time"], "11:14:05");
+    }
+
+    #[test]
+    fn zone_tokens_render_local_wall_clock_in_summer() {
+        // 02:30:00 UTC on 2026-07-16 is 19:30:00 PDT (UTC-7) on the 15th — DST
+        // shifts both the clock and the calendar date.
+        let map = msg_at(at("2026-07-16T02:30:00Z"), LA).token_map_for(TimeStyle::Zone(LA));
+        assert_eq!(map["datetime"], "2026-07-15 19:30:00 PDT");
+        assert_eq!(map["date"], "2026-07-15");
+        assert_eq!(map["time"], "19:30:00");
+    }
+
+    #[test]
+    fn zone_text_renders_in_the_carried_server_zone() {
+        let msg = msg_at(at("2026-07-16T02:30:00Z"), LA);
+        let text = msg.text_for(time_style_for("ntfy", msg.tz));
+        assert_eq!(
+            text,
+            "[Crumb] Motion on Driveway at 2026-07-15 19:30:00 PDT"
+        );
+    }
+
+    #[test]
+    fn templates_render_the_same_tokens_per_style() {
+        let ts = at("2026-01-15T19:14:05Z");
+        let mut msg = msg_at(ts, LA);
+        msg.kind = "system";
+        msg.label = Some("Recorder offline".to_owned());
+        msg.template = Some("%event% at %datetime%".to_owned());
+        assert_eq!(
+            msg.text_for(TimeStyle::Discord),
+            "Recorder offline at <t:1768504445:f>"
+        );
+        assert_eq!(
+            msg.text_for(TimeStyle::Zone(LA)),
+            "Recorder offline at 2026-01-15 11:14:05 PST"
+        );
+        // A UTC server keeps the pre-existing wording, suffix included.
+        assert_eq!(
+            msg.text_for(TimeStyle::Zone(Tz::UTC)),
+            "Recorder offline at 2026-01-15 19:14:05 UTC"
+        );
+    }
 
     // ── provider capability map (must match admin.html NOTIF_IMG_CAP) ──────────
 

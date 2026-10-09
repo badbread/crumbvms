@@ -8,6 +8,111 @@ revisit.
 
 ---
 
+## 2026-09-08, Notification times are rendered PER PROVIDER: client-localized markup for Discord and Slack, the server's `TZ` for everyone else
+
+**Context.** Every channel message formatted the event timestamp in UTC with a
+literal "UTC" suffix, in `ChannelMessage::token_map`/`text`. On a phone hours
+away from UTC the alert reads as the wrong time at a glance (issue #628). Stored
+timestamps are UTC and stay that way; the question was only what the outbound
+text should say.
+
+**Decision.** The timestamp style is chosen from the destination's `kind`
+(`channel_notify::TimeStyle`, picked by `time_style_for`). Discord gets
+`<t:UNIX:f>` / `<t:UNIX:t>` / `<t:UNIX:d>`, Slack gets
+`<!date^UNIX^{tokens}|fallback>` with a server-zone fallback string; both are
+markup those providers' own clients resolve against the *viewer's* zone, so one
+alert reads correctly for every recipient regardless of where they are. ntfy,
+Pushover, Telegram, the generic webhook, and any future kind render
+`%Y-%m-%d %H:%M:%S %Z` in the server's `TZ` (resolved once at startup into
+`ApiConfig::server_tz` via `crumb_common::config::server_tz`, threaded into the
+notification engine the same way the go2rtc credentials already are). The
+`%date%`/`%time%`/`%datetime%` template tokens follow the same style, so a
+custom template needs no per-provider variants. The generic webhook's JSON `ts`
+stays a raw UTC instant: it is a machine contract.
+
+**Rejected:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Keep UTC everywhere | Rejected: the reported bug. |
+| 2 | Server `TZ` for every provider, no markup | Rejected: correct for the operator at home, still wrong for anyone reading in another zone, and Discord/Slack already solve that for free. |
+| 3 | A per-user or per-channel timezone setting | Rejected for now: a new setting, a new column, and new console UI to reproduce what the two markup-capable providers do by themselves, for the providers where it would matter least. |
+| 4 | Convert the stored `ts` on write | Rejected outright: the database stays UTC. Recorder and retention correctness depend on it. |
+
+**Trades knowingly accepted:**
+
+- The Discord and Slack messages now contain provider-specific markup, so the
+  raw text is less readable if it is ever inspected outside those clients
+  (Slack's fallback covers this; Discord's does not).
+- The admin console's alert-text preview can only show one style; it shows the
+  server-zone rendering and says so.
+- An operator who never sets `TZ` gets `UTC`, matching the documented
+  `.env.example` contract ("if unset the default is UTC, NOT any local zone").
+
+**Revisit if:** operators in mixed-zone households ask for per-recipient times
+on the non-markup providers (then option 3, hung off the notification rule, not
+off `ChannelMessage`), or a new channel kind arrives that has its own
+client-side timestamp markup (add a `TimeStyle` variant; do not special-case it
+in a dispatcher).
+
+## 2026-09-07, The app-switcher cover is unconditional on mobile, and Android hides the recents snapshot without a permanently secure window
+
+**Context.** The operating system takes a picture of the app as it leaves the
+foreground and shows it on the task switcher, so whatever camera was on screen
+stays visible to whoever picks the device up next. iOS already had an opaque
+cover for this (`RootView.privacyShieldVisible`), but it was drawn only when the
+opt-in biometric lock was on, and that setting defaults to off. Android had
+nothing.
+
+**Decision, iOS.** The cover is now drawn for any signed-in session whenever the
+scene stops being `.active`, independent of `biometricLockEnabled`. The two
+concerns are separate: the cover is about what the system snapshot records, the
+lock is about who may resume the session. The lock keeps gating only the Face ID
+/ passcode challenge, and `.inactive` still never triggers that challenge, since
+`.inactive` also fires on harmless momentary interruptions (Control Center, an
+incoming-call banner, a system alert).
+
+**Decision, Android.** API 33+ calls `Activity.setRecentsScreenshotEnabled(false)`
+once in `onCreate`. Below 33 the window is made secure in `onPause` and cleared
+again in `onResume`, so it is secure only across the transition during which the
+snapshot is taken. Picture-in-Picture is exempt from the pre-33 path (a secure
+window would render the floating video window blank), and the flag is cleared
+again in `onPictureInPictureModeChanged` because entering PiP is asynchronous
+and `onPause` can run before the activity reports itself as being in PiP. The
+per-API-level decision lives in `RecentsPrivacy` so it is unit-testable.
+
+**Rejected: a permanently secure Android window** (`FLAG_SECURE` set once in
+`onCreate`). It is the simplest and strongest option and it is what most
+guidance suggests, but it also disables ordinary screenshots and screen
+recording of the app. The maintainer records screenshots and screen captures of
+the Android client for documentation and for the site, and an operator
+photographing an incident off their own phone is a legitimate use. Blocking that
+to protect a preview the operator can also protect by closing the app was judged
+the wrong trade.
+
+**Rejected: a macOS occlusion or resign-active cover.** macOS has no task
+switcher preview of this kind, and a video wall on a second monitor is meant to
+stay readable while another app has focus. macOS behavior is unchanged.
+
+**Trades knowingly accepted:**
+
+- Below API 33 the flag toggles on every pause, which includes pauses that are
+  not "leaving the app" (a system permission dialog, the biometric prompt). The
+  effect is invisible: the flag is cleared again on the next resume.
+- Below API 33, leaving the app straight into PiP can still put a video frame on
+  the recents card, because that path is deliberately exempt. API 33+ devices
+  use the dedicated switch and are unaffected.
+- The iOS cover now appears for users who never asked for a lock. It is a plain
+  opaque background with no interaction, so the only cost is a brief flat colour
+  during multitasking.
+
+**Revisit if:** Android ever gains a pre-33-compatible recents-only switch (it
+will not, but a support library shim would count), or if the minimum supported
+API rises to 33, at which point the `FLAG_SECURE` fallback and `RecentsPrivacy`
+can both be deleted. Also revisit if operators report that the PiP exemption
+matters on old devices, in which case the pre-33 path can drop PiP entirely
+(auto-enter off below 33) instead of exempting it.
+
 ## 2026-09-07, Session validity is a positive cached lookup per `jti`, not a cached revoked-set alone; per-user camera grants are read from the user row
 
 **Context.** `sessions` (migration 0033) made a token revocable, and the

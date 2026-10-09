@@ -815,6 +815,13 @@ panel (Discord / Slack / Pushover / Telegram / ntfy / webhook):
   `%detail%`, `%date%`/`%time%`/`%datetime%`, plus per-type tokens such as
   `%plate%` or `%free_pct%` shown in the editor). Leaving a field blank uses the
   built-in default, so this needs no setup. No new services, ports, or env keys.
+- **Alert times follow the destination.** Discord and Slack alerts carry those
+  providers' own timestamp markup, so each viewer's client shows the event time
+  in their own timezone. ntfy, Pushover, Telegram and the generic webhook have
+  no such markup, so their times (and the `%date%`/`%time%`/`%datetime%` tokens)
+  render in the server's `TZ` with the zone abbreviation attached. Stored event
+  timestamps stay UTC; only the display changes. The generic webhook's JSON
+  `ts` field is a machine contract and stays a raw UTC instant.
 
 **`storage_unwritable` is the companion to Step 3's preflight.** It means the
 recorder cannot write to the recording disk, so live view works and nothing is
