@@ -11470,6 +11470,8 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0081_role_manage_channels_capability.sql",
         include_str!("../../../db/migrations/0081_role_manage_channels_capability.sql"),
+    ),
+    (
         "0082_events_ts_index.sql",
         include_str!("../../../db/migrations/0082_events_ts_index.sql"),
     ),
