@@ -10,6 +10,7 @@
 //! | [`types`] | Domain types mirroring the PostgreSQL schema exactly. |
 //! | [`config`] | Environment-variable driven [`Config`](config::Config). |
 //! | [`db`] | deadpool-postgres pool creation and typed query accessors. |
+//! | [`rtsp_base`] | Recorder-side RTSP base resolution (the #630 audience split). |
 //! | [`icons`] | Shared storage/camera glyph resolution (override → name/type). |
 //! | [`logging`] | Global tracing subscriber initialisation. |
 //! | [`mqtt`] | MQTT URL guards shared by the api + recorder MQTT clients. |
@@ -33,6 +34,7 @@ pub mod logging;
 pub mod lpr_ab;
 pub mod mqtt;
 pub mod redact;
+pub mod rtsp_base;
 pub mod types;
 
 // ── flat re-exports for ergonomic use in services/recorder ───────────────────

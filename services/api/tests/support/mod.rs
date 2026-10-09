@@ -81,12 +81,19 @@ pub mod filmstrip;
 pub mod go2rtc;
 #[path = "../../src/ha.rs"]
 pub mod ha;
+#[path = "../../src/media_limits.rs"]
+pub mod media_limits;
 #[path = "../../src/plates.rs"]
 pub mod plates;
 #[path = "../../src/playback.rs"]
 pub mod playback;
 #[path = "../../src/ptz.rs"]
 pub mod ptz;
+// `auth::login` derives its (account, client) backoff key with the SAME helper
+// the request bucket uses, so the real `rate_limit.rs` is part of the auth
+// surface this harness compiles.
+#[path = "../../src/rate_limit.rs"]
+pub mod rate_limit;
 #[path = "../../src/roles.rs"]
 pub mod roles;
 #[path = "../../src/scrub_settings.rs"]
@@ -136,10 +143,14 @@ use crumb_common::{
 use crate::support::state::AppState;
 
 /// Default local Postgres URL used when neither `TEST_DATABASE_URL` nor
-/// `DATABASE_URL` is set — matches the `.env.example` throwaway dev creds so
-/// `docker run -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=change-me -e
-/// POSTGRES_DB=crumb -p 5432:5432 postgres:16-alpine` just works.
-const DEFAULT_TEST_DB_URL: &str = "postgresql://crumb:change-me@127.0.0.1:5432/crumb";
+/// `DATABASE_URL` is set, so `docker run -e POSTGRES_USER=crumb -e
+/// POSTGRES_PASSWORD=crumb-dev -e POSTGRES_DB=crumb -p 5432:5432
+/// postgres:16-alpine` just works.
+///
+/// Deliberately NOT the `change-me` placeholder `.env.example` ships: the api's
+/// `ApiConfig::from_env` refuses to start on that value, so a harness default
+/// carrying it would fail every test the moment `DATABASE_URL` was unset.
+const DEFAULT_TEST_DB_URL: &str = "postgresql://crumb:crumb-dev@127.0.0.1:5432/crumb";
 
 /// A unique-enough per-process counter so parallel tests get distinct
 /// usernames/camera names even when called within the same millisecond.
@@ -232,8 +243,15 @@ pub static SERVER_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 /// `schema_migrations`, so this is also safe if called from multiple test
 /// binaries hitting the same DB).
 pub async fn test_state() -> AppState {
+    test_state_with(|_| {}).await
+}
+
+/// [`test_state`] with a hook to adjust the config first (for settings a test
+/// must not set through process-wide env vars, e.g. `TRUST_PROXY`).
+pub async fn test_state_with(adjust: impl FnOnce(&mut config::ApiConfig)) -> AppState {
     ensure_env();
-    let cfg = config::ApiConfig::from_env().expect("ApiConfig::from_env (test env)");
+    let mut cfg = config::ApiConfig::from_env().expect("ApiConfig::from_env (test env)");
+    adjust(&mut cfg);
     let pool: Pool =
         db::build_pool(&cfg.database_url, cfg.db_pool_size).expect("build_pool (test DB)");
 
@@ -245,7 +263,7 @@ pub async fn test_state() -> AppState {
                 "cannot connect to test Postgres at {:?}: {e}\n\
                  Start one first, e.g.:\n\
                  docker run --rm -d --name crumb-test-pg \\\n  \
-                 -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=crumb \\\n  \
+                 -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=crumb-dev -e POSTGRES_DB=crumb \\\n  \
                  -p 5432:5432 postgres:16-alpine",
                 cfg.database_url
             )
@@ -430,6 +448,13 @@ impl TestApp {
         Self { state, router }
     }
 
+    /// Variant built from an adjusted config (see [`test_state_with`]).
+    pub async fn new_with_config(adjust: impl FnOnce(&mut config::ApiConfig)) -> Self {
+        let state = test_state_with(adjust).await;
+        let router = test_router().with_state(state.clone());
+        Self { state, router }
+    }
+
     /// Variant whose router carries the production CORS composition
     /// ([`cors_test_router`]). Used by the `/auth` CORS carve-out tests.
     pub async fn new_with_cors() -> Self {
@@ -499,16 +524,17 @@ pub async fn seed_admin(pool: &Pool) -> SeededUser {
 /// set — playback/clips/export/ptz all `true` — so scope-denial tests are
 /// unambiguously about camera scope, not a missing capability).
 ///
-/// `actuators` is the ONE capability left `false` here: it is deny-by-default
-/// and moves physical hardware, so tests that need it opt in explicitly via
+/// `actuators` and `manage_channels` are the capabilities left `false` here:
+/// both are deny-by-default (one moves physical hardware, the other creates a
+/// standing outbound destination), so tests that need them opt in explicitly via
 /// [`seed_viewer_role_with_caps`]. That also keeps the "a plain viewer cannot
-/// actuate" assertion honest.
+/// actuate / cannot manage destinations" assertions honest.
 pub async fn seed_viewer_role(pool: &Pool, camera_ids: &[Uuid]) -> Uuid {
     seed_viewer_role_with_caps(pool, camera_ids, generous_viewer_caps()).await
 }
 
 /// The generous viewer capability set [`seed_viewer_role`] uses (everything a
-/// viewer can hold except `actuators`).
+/// viewer can hold except `actuators` and `manage_channels`).
 pub fn generous_viewer_caps() -> Capabilities {
     Capabilities {
         export: true,
@@ -519,6 +545,7 @@ pub fn generous_viewer_caps() -> Capabilities {
         manage_views: true,
         view_plates: true,
         actuators: false,
+        manage_channels: false,
     }
 }
 
@@ -576,6 +603,7 @@ pub async fn seed_viewer_with_bookmark_scope(
         manage_views: true,
         view_plates: true,
         actuators: false,
+        manage_channels: false,
     };
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await

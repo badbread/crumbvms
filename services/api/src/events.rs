@@ -303,51 +303,66 @@ async fn get_event_snapshot(
     //   3. frigate_config.api_base                 — Frigate integration settings row
     //   4. FRIGATE_API_BASE env                    — final legacy fallback
     // No hardcoded IPs; all paths lead through admin-editable DB values or env.
-    let full_url = if provider_url.starts_with("http://") || provider_url.starts_with("https://") {
-        provider_url
-    } else {
-        // Try server_settings first (the unified streaming-settings table).
-        // Prefer the new `frigate_http_api_base` field; fall back to legacy
-        // `frigate_api_base` when the new field is empty (pre-0014 row).
-        let base_from_settings = crumb_common::db::get_server_settings(state.pool())
+    //
+    // The stored value comes from the detection provider (a Frigate MQTT
+    // payload), not from an operator, so it is only ever used to name the
+    // configured Frigate: a relative path is joined onto the base, and an
+    // absolute URL is fetched only when its scheme, host and port match the base
+    // (see `channel_notify::resolve_provider_snapshot_url`). Anything else is
+    // not fetched at all.
+    //
+    // Try server_settings first (the unified streaming-settings table).
+    // Prefer the new `frigate_http_api_base` field; fall back to legacy
+    // `frigate_api_base` when the new field is empty (pre-0014 row).
+    let base_from_settings = crumb_common::db::get_server_settings(state.pool())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            // New field (migration 0014) takes priority — it points specifically
+            // at Frigate's HTTP API (:5000).  If empty, fall back to the legacy
+            // unified field which also pointed at Frigate HTTP in old installs.
+            let http_api = s.frigate_http_api_base;
+            if http_api.trim().is_empty() {
+                let legacy = s.frigate_api_base;
+                if legacy.trim().is_empty() {
+                    None
+                } else {
+                    Some(legacy)
+                }
+            } else {
+                Some(http_api)
+            }
+        });
+
+    // Then try the Frigate integration settings row.
+    let base_from_frigate = if base_from_settings.is_none() {
+        db::get_frigate_settings(state.pool())
             .await
             .ok()
             .flatten()
-            .and_then(|s| {
-                // New field (migration 0014) takes priority — it points specifically
-                // at Frigate's HTTP API (:5000).  If empty, fall back to the legacy
-                // unified field which also pointed at Frigate HTTP in old installs.
-                let http_api = s.frigate_http_api_base;
-                if http_api.trim().is_empty() {
-                    let legacy = s.frigate_api_base;
-                    if legacy.trim().is_empty() {
-                        None
-                    } else {
-                        Some(legacy)
-                    }
-                } else {
-                    Some(http_api)
-                }
-            });
+            .map(|f| f.api_base)
+            .filter(|v| !v.trim().is_empty())
+    } else {
+        None
+    };
 
-        // Then try the Frigate integration settings row.
-        let base_from_frigate = if base_from_settings.is_none() {
-            db::get_frigate_settings(state.pool())
-                .await
-                .ok()
-                .flatten()
-                .map(|f| f.api_base)
-                .filter(|v| !v.trim().is_empty())
-        } else {
-            None
-        };
+    // Final fallback: FRIGATE_API_BASE env (legacy; empty by default in new installs).
+    let base = base_from_settings
+        .or(base_from_frigate)
+        .unwrap_or_else(|| state.config().frigate_api_base.clone());
 
-        // Final fallback: FRIGATE_API_BASE env (legacy; empty by default in new installs).
-        let base = base_from_settings
-            .or(base_from_frigate)
-            .unwrap_or_else(|| state.config().frigate_api_base.clone());
-        let base = base.trim_end_matches('/');
-        format!("{base}{provider_url}")
+    let Some(full_url) = crate::channel_notify::resolve_provider_snapshot_url(&provider_url, &base)
+    else {
+        tracing::debug!(
+            %event_id,
+            "event snapshot: stored snapshot_url is not on the configured Frigate base, \
+             not fetching"
+        );
+        return Err(ApiError::NotFound(format!(
+            "event {event_id} snapshot is unavailable: no Frigate HTTP API base is configured, \
+             or the stored snapshot URL does not point at it"
+        )));
     };
 
     // Fetch from provider.

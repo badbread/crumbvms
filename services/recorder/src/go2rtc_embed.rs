@@ -66,13 +66,14 @@ enum RunEnd {
 /// Spawn the embedded go2rtc supervisor task, if enabled and installable.
 ///
 /// Returns `None` (after one loud warning where appropriate) when the feature
-/// is disabled via `GO2RTC_EMBEDDED=false` or the binary/config is absent —
-/// the recorder proceeds either way.
+/// is disabled via `GO2RTC_EMBEDDED=false`
+/// ([`crumb_common::config::go2rtc_embedded_env`]) or the binary/config is absent.
+/// The recorder proceeds either way.
 pub fn spawn(shutdown: CancellationToken) -> Option<tokio::task::JoinHandle<()>> {
-    let enabled = std::env::var("GO2RTC_EMBEDDED")
-        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    if !enabled {
+    // One predicate, shared with the recorder's RTSP base resolution (#630):
+    // the supervisor and the resolver must never disagree about whether go2rtc
+    // is embedded in this container.
+    if !crumb_common::config::go2rtc_embedded_env() {
         info!("embedded go2rtc disabled (GO2RTC_EMBEDDED=false); not spawning");
         return None;
     }
