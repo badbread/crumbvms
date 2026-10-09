@@ -1124,9 +1124,10 @@ pub async fn fetch_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_channel_http_client, crop_plate_jpeg, dispatch, ffmpeg_bin, plan_images, plate_crop_ffmpeg_args, plate_crop_rect,
-        provider_image_capability, resolve_provider_snapshot_url, validate_channel_destinations,
-        ChannelMessage, ImageCap, ImgSource,
+        build_channel_http_client, crop_plate_jpeg, dispatch, ffmpeg_bin, plan_images,
+        plate_crop_ffmpeg_args, plate_crop_rect, provider_image_capability,
+        resolve_provider_snapshot_url, validate_channel_destinations, ChannelMessage, ImageCap,
+        ImgSource,
     };
     use crumb_common::db::{NotificationChannel, SnapshotMode};
 
@@ -1376,7 +1377,9 @@ mod tests {
             }
         });
 
-        let bouncer = TcpListener::bind("127.0.0.1:0").await.expect("bind bouncer");
+        let bouncer = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bouncer");
         let bounce_addr = bouncer.local_addr().expect("bouncer addr");
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = bouncer.accept().await {
@@ -1426,7 +1429,11 @@ mod tests {
         assert!(text.contains("redirect"), "unexpected error: {text}");
         // Give a (wrongly) followed request time to land before asserting.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "redirect target was contacted"
+        );
     }
 
     // ── destination validation (channel create / update / test) ───────────────
