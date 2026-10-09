@@ -10107,7 +10107,7 @@ const SYS_ALERT_DEFAULT_TITLE_TPL = 'Crumb: %event%';
 /* Sample token values used only for the live preview. */
 const SYS_ALERT_TOKEN_SAMPLES = {
   camera: 'Front Door', detail: '(the alert detail text)',
-  date: '2026-01-02', time: '14:03:11', datetime: '2026-01-02 14:03:11 UTC',
+  date: '2026-01-02', time: '14:03:11', datetime: '2026-01-02 14:03:11',
   plate: '7ABC123', name: "Mom's car", confidence: '90%', zone: 'driveway',
   signal: 'RTP', offline_secs: '130', last_seen: 'never',
   storage: 'Archive', path: '/data/archive', free_pct: '3.2%', free_bytes: '12000000000',
@@ -10116,10 +10116,23 @@ const SYS_ALERT_TOKEN_SAMPLES = {
   version: 'v0.2.0', current_version: 'v0.1.9', notes_url: 'https://github.com/badbread/crumbvms/releases',
 };
 
+/* Sample values with the time tokens stamped in the SERVER's zone, which is
+   what ntfy, Pushover, Telegram and webhook alerts actually render (Discord and
+   Slack instead get markup their own clients localize per viewer, which no
+   preview can show). Falls back to a zone-less sample when the server zone is
+   unknown, rather than asserting one. */
+function _sysAlertTokenSamples() {
+  const zone = serverTzLabel();
+  const suffix = (zone && zone !== 'server time') ? ' ' + zone : '';
+  return Object.assign({}, SYS_ALERT_TOKEN_SAMPLES, {
+    datetime: SYS_ALERT_TOKEN_SAMPLES.datetime + suffix,
+  });
+}
+
 /* Render a template with sample values, mirroring the server engine: a known
    %token% substitutes, an unknown one stays literal (so a typo is visible). */
 function _previewAlertTemplate(tpl, eventKey) {
-  const samples = Object.assign({}, SYS_ALERT_TOKEN_SAMPLES, {
+  const samples = Object.assign({}, _sysAlertTokenSamples(), {
     event: (SYS_ALERT_META[eventKey] || { title: eventKey }).title,
   });
   return tpl.replace(/%([A-Za-z0-9_]+)%/g, (m, name) =>
@@ -11124,8 +11137,9 @@ function _sysAlertEditorBody(key) {
   const titleRelevant = sysAlertTitleRelevant();
 
   /* Token legend: %token% | sample value, clickable to insert at the caret. */
+  const tokenSamples = _sysAlertTokenSamples();
   const legendRows = _sysAlertTokens(key).map(t => {
-    const sample = (t === 'event') ? meta.title : (SYS_ALERT_TOKEN_SAMPLES[t] != null ? SYS_ALERT_TOKEN_SAMPLES[t] : '');
+    const sample = (t === 'event') ? meta.title : (tokenSamples[t] != null ? tokenSamples[t] : '');
     return `<tr class="sae-token-row" style="cursor:pointer" onclick="sysAlertEditorInsertToken('%${esc(t)}%')" title="Insert at cursor">
       <td style="font-family:monospace;padding:2px 10px 2px 0;white-space:nowrap">%${esc(t)}%</td>
       <td style="color:var(--dim);padding:2px 0">${esc(sample)}</td></tr>`;
@@ -11150,7 +11164,7 @@ function _sysAlertEditorBody(key) {
 
       <div class="policy-section" style="margin-top:12px">
         <div class="policy-section-title">Tokens for this alert</div>
-        <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Times are UTC.</div>
+        <div class="card-hint" style="margin-bottom:6px">Click a token to insert it. An unknown token is left as-is so a typo is visible. Discord and Slack alerts show %date%, %time% and %datetime% in each viewer's own timezone; every other provider shows them in the server's timezone (${esc(serverTzLabel())}).</div>
         <div class="table-wrap"><table style="font-size:12px"><tbody>${legendRows}</tbody></table></div>
       </div>
 

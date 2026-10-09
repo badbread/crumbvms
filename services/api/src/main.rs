@@ -677,6 +677,9 @@ async fn main() -> anyhow::Result<()> {
         // credentials for its snapshot fetch; it owns only a Pool, not AppState.
         let go2rtc_user = cfg.go2rtc_user.clone();
         let go2rtc_pass = cfg.go2rtc_pass.clone();
+        // Same reason for the server's wall-clock zone: alerts to providers with
+        // no client-side timestamp markup render their times in it.
+        let server_tz = cfg.server_tz;
         // Health-alert maintenance window (issue #46): shared handle so
         // `POST /config/maintenance` can suppress the engine's health-alert
         // dispatch for a planned-maintenance window.
@@ -687,6 +690,7 @@ async fn main() -> anyhow::Result<()> {
                 go2rtc_user,
                 go2rtc_pass,
                 maintenance_until,
+                server_tz,
             )
             .await;
         });
