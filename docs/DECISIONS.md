@@ -8,6 +8,48 @@ revisit.
 
 ---
 
+## 2026-10-08, Storage path edits: refuse a path change on a storage that holds segments; refuse overlapping storage roots
+
+**Context.** Segment rows store their path relative to the storage root. The
+console let an operator edit a storage's folder freely, which silently
+re-resolved every existing recording under the new folder: playback broke at
+once, the bytes stayed behind in a folder no storage owned, and the recorder's
+sweeps began deleting the rows as dangling (audit R11). Separately, nothing
+stopped two storages from overlapping (a storage at the media root, or an
+archive folder inside the live folder), and reconcile's orphan walk of the
+outer root then quarantined, and two weeks later deleted, the nested storage's
+footage (audit R1).
+
+**Decision.** `PUT /config/storages/{id}` refuses (`409`) a path change while
+the storage has any indexed segments, and points the operator at "Change
+storage" (the per-policy drain that copies, verifies, flips each row, then
+deletes the source). A path that differs only lexically (trailing `/`, `.`) is
+not a change and is not written. `POST` and `PUT` both refuse a folder that
+equals, contains, or lies inside another storage's folder, compared on
+canonical paths. The recorder enforces the same ownership on its side
+(RECORDER-CORRECTNESS item 35), so rows that predate the api check are safe too.
+
+**Rejected:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 1 | Allow the change when the new folder already holds the storage's newest indexed files (the operator moved the data) | Rejected: a sample proves only that the sampled files moved. A partial copy passes, and every unsampled row then resolves to nothing and is pruned. Refusing cannot lose footage. |
+| 2 | A `force` flag on the PUT | Rejected for now: it re-opens exactly the silent-loss path, and the console would need UI to explain it. The drain covers the legitimate need. |
+| 3 | Rewrite every row's path on a path change | Rejected: rows are already relative; the problem is that the BYTES did not move. Only a copy-verify-flip move is safe. |
+| 4 | Allow exact-duplicate storage paths on create | Rejected: nothing in the product needs a second row for one folder (existing duplicates keep working; the recorder groups them by canonical path). |
+
+**Trade-offs accepted.** An operator who really did move a disk's contents to a
+new mountpoint must either mount it at the old path or move the footage with
+the drain. That is slower than a one-field edit, and it is the price of never
+silently hiding recordings.
+
+**Revisit if:** operators report a real need to repoint a storage in place
+(for example after a hardware swap) that mounting at the old path cannot meet;
+then design an explicit, verified "relocate" action that checks every row, not
+a sample.
+
+---
+
 ## 2026-10-08, Motion recovery and persist safety: every session end closes its event, stuck sessions reconnect, unhealthy alerts repeat, failed persists retry, the recording path confirms a root from earlier history
 
 **Context.** Three production Motion-mode cameras raised

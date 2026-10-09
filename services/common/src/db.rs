@@ -3140,6 +3140,70 @@ pub async fn list_recent_segment_paths_for_storage(
     Ok(rows.iter().map(|r| r.get::<_, String>("path")).collect())
 }
 
+/// Relative paths of one camera's segment rows on a set of storage rows, with
+/// `start_ts` inside `[from, to]`.
+///
+/// Used by the recorder's reconcile orphan walk, which compares ONE directory's
+/// files at a time against the index instead of holding every indexed path in
+/// memory (audit F2 / R15). Segment filenames encode their `start_ts`, so the
+/// caller brackets a directory's files by their parsed timestamps; the
+/// `(camera_id, start_ts)` index serves the lookup. `storage_ids` carries every
+/// storage row that resolves to the same on-disk root (duplicate rows for one
+/// path are legal and segments may reference any of them).
+pub async fn list_segment_paths_for_camera_range(
+    pool: &Pool,
+    camera_id: Uuid,
+    storage_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<String>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT path
+            FROM segments
+            WHERE camera_id = $1
+              AND storage_id = ANY($2)
+              AND start_ts >= $3
+              AND start_ts <= $4
+            ",
+            &[&camera_id, &storage_ids, &from, &to],
+        )
+        .await
+        .context("list_segment_paths_for_camera_range")?;
+    Ok(rows.iter().map(|r| r.get::<_, String>("path")).collect())
+}
+
+/// True when some segment row of `camera_id` on one of `storage_ids` has
+/// exactly this relative `path`.
+///
+/// The reconcile orphan walk's last check before it quarantines a file whose
+/// name it cannot parse: a file a row references is never moved. Scoped by
+/// camera so it rides the `(camera_id, ...)` indexes; only reached for rare
+/// unparseable names, never per file.
+pub async fn segment_path_indexed_for_camera(
+    pool: &Pool,
+    camera_id: Uuid,
+    storage_ids: &[Uuid],
+    path: &str,
+) -> Result<bool> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            SELECT EXISTS (
+                SELECT 1 FROM segments
+                WHERE camera_id = $1 AND storage_id = ANY($2) AND path = $3
+            )
+            ",
+            &[&camera_id, &storage_ids, &path],
+        )
+        .await
+        .context("segment_path_indexed_for_camera")?;
+    Ok(row.get::<_, bool>(0))
+}
+
 /// Create a new storage row.
 ///
 /// Returns the created [`Storage`].  Errors on `name` uniqueness violation.

@@ -272,7 +272,7 @@ recorder, and later the API) must satisfy these *by construction*.
     quarantined, and purged within one reconcile pass). The prune deletes only
     regular files, inside the canonicalized `_quarantine/` subtree, strictly
     older than `quarantine_retention_days` counted from entry; `0` disables it;
-    `walk_storage` never descends `_quarantine/`. **`-rN` collision-loser
+    the orphan walk (`reconcile::orphan_pass`) never descends `_quarantine/`. **`-rN` collision-loser
     files are exempt at any age** — they are real footage ratified "never
     deleted" (2026-07-14 decision); quarantine is their terminal parking spot
     and deleting them stays a manual operator action.
@@ -366,3 +366,37 @@ recorder, and later the API) must satisfy these *by construction*.
     `a_false_marker_below_the_breaker_floor_prunes_the_whole_small_index`. See
     `docs/DECISIONS.md` (2026-08-06, and the 2026-08-07 follow-up) for the
     rejected mountpoint heuristics and why the marker is written post-commit.
+
+## storage roots own their footage (2026-10-08)
+35. **No storage's footage may be touched through another storage's root, and a
+    storage's folder may not move out from under its index.** Segment rows are
+    keyed by `(storage, path relative to the root)`, so a file is only
+    recognisable as indexed from its own root.
+    - **The orphan walk stays in its own lane.** It never descends into a
+      directory that is another storage's root (compared on canonical paths),
+      never adopts or quarantines a file under one, and only ever considers the
+      recorder's own `<camera uuid>/...` layout: a top-level folder that is not
+      a camera UUID, or an `.mp4` directly in the root, is left alone
+      (`OrphanOutcome::Foreign`), never quarantined. Before this, a storage at
+      the media root (or an archive inside the live folder) made the walk move
+      every nested file to `_quarantine/`, and the prune deleted it two weeks
+      later. A file whose name cannot be parsed is quarantined only after an
+      exact lookup confirms no row references it.
+    - **The api refuses overlapping roots.** Creating or repointing a storage at
+      a folder that equals, contains, or lies inside another storage's folder is
+      a `409` (canonical comparison, so a symlink cannot hide it).
+    - **The api refuses to repoint a storage that holds segments.** Rows are
+      relative to the root, so a path edit hides every recording and invites the
+      sweeps to delete their rows. Moving footage is the "Change storage" drain's
+      job (item 32). A path that only differs lexically is not a change.
+    - **Bounded memory.** The orphan walk compares one directory at a time
+      against that camera's rows in that directory's timestamp range (chunks of
+      `ORPHAN_LOOKUP_CHUNK`); it never builds a set of every indexed path, and
+      all of a pass's filesystem calls share one `FsPacer` budget. The marker,
+      breaker, in-flight and sub-floor gates are unchanged.
+
+    Guarded by `reconcile::tests::nested_storage_footage_is_never_quarantined_by_an_outer_root`,
+    `try_index_orphan_treats_non_camera_layout_as_foreign`,
+    `unparseable_name_is_quarantined_only_when_no_row_references_it`,
+    `chunked_orphan_walk_recognises_every_indexed_file`, and the api's
+    `storage_path_overlap_tests` plus the `storage_path_guard` integration suite.

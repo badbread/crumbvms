@@ -53,7 +53,7 @@
 //! parse.  Ambiguous cases go to `_quarantine/` for operator review.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -127,7 +127,7 @@ pub(crate) const SUB_FLOOR_BYTES: u64 = 512;
 /// contain it.  That is what a "does the root exist?" check (which the orphan
 /// pass has, and which the dangling pass lacked) can never distinguish.
 ///
-/// It is a dotfile, so the `.mp4`-only [`walk_storage`] never sees it.  It is
+/// It is a dotfile, so the `.mp4`-only orphan walk ([`orphan_pass`]) never sees it.  It is
 /// written ONLY when the recorder can positively confirm the storage — see
 /// [`ensure_storage_marker`] (called from the recording path AFTER a real segment
 /// has been written and indexed under the root, never at directory-creation time)
@@ -546,9 +546,12 @@ async fn run_periodic(pool: Pool, config: Config, shutdown: CancellationToken) {
 ///
 /// KEYSET-PAGINATED (audit P2 #12): the dangling-row pass streams the `segments`
 /// table one [`db::RECONCILE_PAGE_SIZE`] page at a time, processing and dropping
-/// each page, so peak RSS is `O(page)` not `O(total rows)`. The orphan pass's
-/// `indexed_paths` set (storage_id + path only) is built in the same paginated
-/// scan — much smaller than the full `Vec<Segment>` the old code held.
+/// each page, so peak RSS is `O(page)` not `O(total rows)`. The orphan pass no
+/// longer builds a set of every indexed path either (audit F2 / R15: that set
+/// grew with retained history, about 1.5 GiB at 3M rows): it walks one
+/// directory at a time and asks the index only about that directory's files
+/// ([`orphan_pass`]). Both passes draw from one [`FsPacer`] so a pass cannot
+/// monopolise the recording disks.
 async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken) {
     info!("reconcile phase 2: starting background pass (dangling rows + orphan indexing)");
 
@@ -556,6 +559,10 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     //    bound in-flight skips + duration plausibility ─────────────────────────
     let segment_len = Duration::seconds(i64::from(config.segment_seconds));
     let twice_segment = Duration::seconds(i64::from(config.segment_seconds) * 2);
+
+    // One filesystem budget for the whole pass: every dangling-row stat and
+    // every orphan-walk directory entry draws from it (audit F2 / R15).
+    let mut pacer = FsPacer::new(FS_OPS_RATE_HZ);
 
     // ── storage markers (issue #504) ─────────────────────────────────────────
     //
@@ -572,13 +579,13 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     // SHORTER than the row claims, repair size_bytes (audit GAP 3 / P1 #8 — so
     // reconcile can SEE truncation instead of trusting a stale larger size).
     //
-    // We also accumulate the indexed-path set for the orphan pass as we go, so we
-    // never hold the whole table in memory at once.
+    // Each page is processed and dropped, so the pass never holds the whole
+    // table in memory. The orphan pass below queries the index per directory
+    // instead of reusing anything accumulated here.
 
     let mut storage_cache: HashMap<Uuid, String> = HashMap::new();
     let mut dangling_count = 0u64;
     let mut size_repaired_count = 0u64;
-    let mut indexed_paths: HashSet<(String, String)> = HashSet::new();
     // Unmounted-storage guard state, one entry per storage ROOT PATH (issue
     // #504). Built lazily as rows are walked; lives for exactly one pass.
     let mut storage_guards: HashMap<String, StorageGuard> = HashMap::new();
@@ -644,14 +651,6 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
                 },
             };
 
-            // Record this row's (storage ROOT PATH, rel path) for the orphan pass.
-            // Key by the storage PATH, NOT its id: prod has DUPLICATE storage rows
-            // for the same /data/live and /data/archive paths (e.g. "2TB NVMe" vs
-            // "Live"); segments may reference either, and reconcile looks the
-            // storage up by config NAME — keying by id made every file on the
-            // other duplicate row look like an orphan (510k false orphans).
-            indexed_paths.insert((storage_path.replace('\\', "/"), seg.path.replace('\\', "/")));
-
             // ── UNMOUNTED-STORAGE GUARD, layer 1: the marker (issue #504) ────
             //
             // Everything below this point can DELETE this row. A storage root
@@ -661,9 +660,9 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             // storage's entire segment index. Without the marker we cannot tell
             // "the real disk, whose footage is gone" from "not the real disk",
             // so we refuse to touch ANY row on that storage this pass and raise
-            // a loud alarm. Note this runs AFTER `indexed_paths` above, so the
-            // orphan pass still knows these paths are indexed and can never
-            // treat them as adoptable orphans.
+            // a loud alarm. The orphan pass reads the index directly, so these
+            // rows still count as indexed there and their files can never be
+            // treated as adoptable orphans.
             if !storage_guards.contains_key(&storage_path) {
                 // A breaker that tripped earlier in this process keeps pruning
                 // off for this root until a human has looked (see
@@ -724,6 +723,7 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
                 g.checked += 1;
             }
 
+            pacer.step().await;
             match tokio::fs::metadata(&abs_path).await {
                 Ok(meta) => {
                     // IN-FLIGHT GATE (same guard the orphan pass uses below): if the
@@ -1031,26 +1031,232 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
 
     // ── orphan-file pass ─────────────────────────────────────────────────────
     //
-    // Walk EVERY storage root (A1b), not just the two config-NAME defaults. A
-    // segment's physical location is owned by its storage_id, and footage can live
-    // on any per-policy disk; scanning only the default live/archive disks left
-    // footage on a non-default disk un-adopted and un-dangling-checked. We resolve
-    // every `storages` row and walk all of them.
-    //
-    // For each .mp4 file found, check whether a segment row references it. If not,
-    // try to index it (conservatively — see `try_index_orphan`); if we cannot
-    // parse the filename, quarantine it.
-    //
-    // `indexed_paths` was accumulated during the paginated dangling pass above.
+    // Walk every storage root (A1b) and adopt the `.mp4` files no segment row
+    // references (or quarantine genuine junk). [`orphan_pass`] compares one
+    // directory at a time against the index, so its memory does not grow with
+    // retained history, and it never walks into, adopts from, or quarantines
+    // out of another storage's root (audit R1).
+    let Some((scan_roots, orphans)) = orphan_pass(
+        &pool,
+        &config,
+        &shutdown,
+        &mut pacer,
+        segment_len,
+        twice_segment,
+    )
+    .await
+    else {
+        return;
+    };
 
-    let all_storages = match db::list_storages(&pool)
+    info!(
+        dangling_deleted = dangling_count,
+        orphan_indexed = orphans.indexed,
+        orphan_quarantined = orphans.quarantined,
+        total_orphans_found = orphans.found,
+        non_camera_entries_skipped = orphans.foreign_skipped,
+        "reconcile phase 2 complete"
+    );
+
+    // ── quarantine retention prune ───────────────────────────────────────────
+    //
+    // The reconcile passes above MOVE unindexable junk into `_quarantine/` but
+    // nothing ever cleans it, so it grows unbounded (prod reached 110 GB / 36k
+    // files in a month before a manual purge). Auto-purge quarantine files older
+    // than the operator-configured retention. This is the ONLY code that ever
+    // deletes from `_quarantine/`; the orphan walk deliberately skips that dir
+    // (see [`orphan_pass`]), so nothing here races the adoption logic.
+    //
+    // `0` DISABLES the prune (keep-forever opt-out); a read error skips the prune
+    // this pass rather than guessing a retention. See `prune_quarantine` for the
+    // deletion guards that keep this bounded to aged quarantine files only.
+    let retention_days = match db::get_quarantine_retention_days(&pool).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "reconcile phase 2: cannot read quarantine retention; skipping prune this pass");
+            0
+        }
+    };
+    if retention_days > 0 {
+        // Prod can carry DUPLICATE storage rows for the same on-disk path; the
+        // scan roots are already grouped by canonical path, so each
+        // `_quarantine/` is pruned once.
+        let mut pruned_files = 0u64;
+        let mut pruned_bytes = 0u64;
+        for sr in &scan_roots {
+            if shutdown.is_cancelled() {
+                warn!("reconcile phase 2: shutdown requested; stopping quarantine prune");
+                break;
+            }
+            let (files, bytes) = prune_quarantine(&sr.root, retention_days).await;
+            pruned_files += files;
+            pruned_bytes += bytes;
+        }
+        info!(
+            files = pruned_files,
+            bytes = pruned_bytes,
+            retention_days,
+            "reconcile phase 2: quarantine retention prune complete"
+        );
+    }
+}
+
+// ─── orphan pass (bounded memory, storage-ownership aware) ───────────────────
+
+/// How many of one directory's files are compared against the index per query.
+///
+/// The walk sorts a directory's files by the timestamp in their names and asks
+/// the index for that camera's rows between the first and last of each chunk,
+/// so the working set is one chunk of paths, not the whole index (audit F2).
+const ORPHAN_LOOKUP_CHUNK: usize = 2_000;
+
+/// Slack added on both sides of a chunk's timestamp range when querying the
+/// index. A segment row's `start_ts` is parsed from its filename, so the match
+/// is exact in practice; the slack only absorbs clock or rounding oddities.
+const ORPHAN_LOOKUP_MARGIN_SECS: i64 = 3_600;
+
+/// Default ceiling on filesystem operations per second for one reconcile pass
+/// (dangling-row stats plus orphan-walk directory entries).
+///
+/// Reconcile shares the recording disks with every camera's ffmpeg. Unpaced, a
+/// pass issued one `stat` per index row and read every directory entry back to
+/// back: millions of calls every interval on a large install. At 5,000/s a
+/// 3M-row install's stat sweep takes about ten minutes; a small install never
+/// notices.
+const FS_OPS_RATE_HZ: u64 = 5_000;
+
+/// Length of one [`FsPacer`] budget window.
+const FS_PACER_WINDOW_MS: u64 = 50;
+
+/// Token-bucket pacer for reconcile's filesystem calls: at most `burst`
+/// operations per [`FS_PACER_WINDOW_MS`] window, which is `rate_hz` per second.
+struct FsPacer {
+    interval: tokio::time::Interval,
+    burst: u64,
+    used: u64,
+}
+
+impl FsPacer {
+    fn new(rate_hz: u64) -> Self {
+        let period = tokio::time::Duration::from_millis(FS_PACER_WINDOW_MS);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        // A slow window (a long stat) must not be "made up" by a burst later.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            interval,
+            burst: (rate_hz.saturating_mul(FS_PACER_WINDOW_MS) / 1_000).max(1),
+            used: 0,
+        }
+    }
+
+    /// Account for one filesystem operation, sleeping until the next window
+    /// when this window's budget is spent.
+    async fn step(&mut self) {
+        if self.used >= self.burst {
+            self.interval.tick().await;
+            self.used = 0;
+        }
+        self.used += 1;
+    }
+}
+
+/// One physical storage root for the orphan walk.
+///
+/// Every `storages` row whose path resolves to the same directory is grouped
+/// here: prod can carry DUPLICATE rows for one path, segments may reference any
+/// of them, and keying by row id once made every file on the other duplicate
+/// look like an orphan (510k false orphans).
+struct ScanRoot {
+    /// The root as configured on the first row (joins and quarantine use it).
+    root: PathBuf,
+    /// The root with symlinks resolved, for overlap checks against other roots.
+    canonical: PathBuf,
+    /// Every storage row id at this root.
+    storage_ids: Vec<Uuid>,
+    /// The row a newly adopted orphan is attached to (first in list order, the
+    /// same row the old per-row walk adopted under).
+    adopt_storage_id: Uuid,
+    /// The stage a newly adopted orphan is labelled with (see the labelling
+    /// note in [`scan_roots_for_orphan_pass`]).
+    stage: SegmentStage,
+}
+
+/// Lexically normalise a path: drop `.` components, resolve `..` by popping,
+/// and drop trailing separators. Used only when the path cannot be
+/// canonicalised (it does not exist), in which case it holds no files anyway.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonical form of a storage root: symlinks resolved when it exists, the
+/// lexical normal form otherwise.
+async fn canonical_root(p: &Path) -> PathBuf {
+    match tokio::fs::canonicalize(p).await {
+        Ok(c) => c,
+        Err(_) => lexical_normalize(p),
+    }
+}
+
+/// Group `(storage id, configured path, canonical path, stage)` rows into
+/// physical scan roots, preserving list order (the first row at a root is the
+/// one orphans are adopted under).
+fn group_scan_roots(rows: Vec<(Uuid, PathBuf, PathBuf, SegmentStage)>) -> Vec<ScanRoot> {
+    let mut roots: Vec<ScanRoot> = Vec::new();
+    for (id, root, canonical, stage) in rows {
+        if let Some(existing) = roots.iter_mut().find(|r| r.canonical == canonical) {
+            existing.storage_ids.push(id);
+        } else {
+            roots.push(ScanRoot {
+                root,
+                canonical,
+                storage_ids: vec![id],
+                adopt_storage_id: id,
+                stage,
+            });
+        }
+    }
+    roots
+}
+
+/// The canonical roots of every OTHER storage that lies strictly inside
+/// `roots[idx]` (audit R1).
+///
+/// The walk of `roots[idx]` never descends into these and never adopts or
+/// quarantines a file under them: that footage belongs to the nested storage,
+/// whose rows are keyed by ITS root, so from the outer root every one of its
+/// files would look like an unindexed orphan.
+fn nested_roots(roots: &[ScanRoot], idx: usize) -> Vec<PathBuf> {
+    let me = &roots[idx].canonical;
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| *i != idx && r.canonical != *me && r.canonical.starts_with(me))
+        .map(|(_, r)| r.canonical.clone())
+        .collect()
+}
+
+/// Resolve every storage row into a [`ScanRoot`], labelling each with the stage
+/// an orphan adopted there should carry. `None` when the storage list cannot be
+/// read (the orphan pass is skipped this time).
+async fn scan_roots_for_orphan_pass(pool: &Pool, config: &Config) -> Option<Vec<ScanRoot>> {
+    let all_storages = match db::list_storages(pool)
         .await
         .context("listing storages for reconciliation")
     {
         Ok(v) => v,
         Err(e) => {
             error!(error = %e, "reconcile phase 2: cannot list storages; aborting orphan pass");
-            return;
+            return None;
         }
     };
 
@@ -1077,7 +1283,7 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
     // configured `*_STORAGE_NAME`, and a name-only lookup would leave the disk
     // unlabelled (safe, but wrong). See `db::get_storage_by_name_or_path`.
     match db::get_storage_by_name_or_path(
-        &pool,
+        pool,
         &config.archive_storage_name,
         &config.archive_storage_path,
     )
@@ -1094,7 +1300,7 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
         }
     }
     match db::get_storage_by_name_or_path(
-        &pool,
+        pool,
         &config.live_storage_name,
         &config.live_storage_path,
     )
@@ -1109,7 +1315,7 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
             warn!(error = %e, "reconcile phase 2: cannot resolve live-default storage");
         }
     }
-    match db::list_policies(&pool).await {
+    match db::list_policies(pool).await {
         Ok(policies) => {
             for p in &policies {
                 if let Some(id) = p.archive_storage_id {
@@ -1126,263 +1332,449 @@ async fn run_background(pool: Pool, config: Config, shutdown: CancellationToken)
         }
     }
 
-    let storages_to_scan: Vec<(Uuid, PathBuf, SegmentStage)> = all_storages
-        .into_iter()
-        .map(|s| {
-            let is_archive_dest =
-                archive_storage_ids.contains(&s.id) && !live_storage_ids.contains(&s.id);
-            let stage = if is_archive_dest {
-                SegmentStage::Archive
-            } else {
-                SegmentStage::Live
-            };
-            (s.id, PathBuf::from(&s.path), stage)
-        })
-        .collect();
-
-    // Collect ALL orphan paths first (filesystem walk), then rate-limit the
-    // DB inserts.  This keeps the walk phase self-contained and makes the
-    // progress log meaningful (we know the total before starting inserts).
-    struct OrphanEntry {
-        abs_path: PathBuf,
-        storage_id: Uuid,
-        storage_root: PathBuf,
-        rel_path: String,
-        stage: SegmentStage,
+    let mut rows: Vec<(Uuid, PathBuf, PathBuf, SegmentStage)> =
+        Vec::with_capacity(all_storages.len());
+    for s in all_storages {
+        let is_archive_dest =
+            archive_storage_ids.contains(&s.id) && !live_storage_ids.contains(&s.id);
+        let stage = if is_archive_dest {
+            SegmentStage::Archive
+        } else {
+            SegmentStage::Live
+        };
+        let root = PathBuf::from(&s.path);
+        let canonical = canonical_root(&root).await;
+        rows.push((s.id, root, canonical, stage));
     }
+    Some(group_scan_roots(rows))
+}
 
-    let mut orphan_entries: Vec<OrphanEntry> = Vec::new();
-    let mut orphan_quarantined = 0u64;
+/// Counters for one orphan pass.
+#[derive(Debug, Default)]
+struct OrphanStats {
+    /// Settled files with no index row that were offered for adoption.
+    found: u64,
+    /// Of those, newly indexed.
+    indexed: u64,
+    /// Of those, moved to `_quarantine/`.
+    quarantined: u64,
+    /// Entries the walk refused to look into or touch because they are not in
+    /// the recorder's own `<camera uuid>/...` layout, or belong to another
+    /// storage's root.
+    foreign_skipped: u64,
+}
 
-    for (storage_id, storage_root, stage) in &storages_to_scan {
+/// Per-pass state for the orphan walk.
+struct OrphanWalk<'a> {
+    pool: &'a Pool,
+    shutdown: &'a CancellationToken,
+    pacer: &'a mut FsPacer,
+    /// Adoption rate limit ([`ORPHAN_INSERT_RATE_HZ`]).
+    adopt_rate: tokio::time::Interval,
+    segment_len: Duration,
+    twice_segment: Duration,
+    stats: OrphanStats,
+}
+
+/// The orphan-file pass: walk every storage root and adopt (or quarantine)
+/// `.mp4` files that no segment row references.
+///
+/// # Bounded memory (audit F2 / R15)
+///
+/// The pass used to hold a set of EVERY indexed `(root, path)` plus a list of
+/// EVERY `.mp4` on disk at once, which grew with retained history (1.46 GiB at
+/// about 3M rows against a 4 GiB container limit). Now it walks one directory
+/// at a time, sorts that directory's files by the timestamp in their names, and
+/// asks the index only for that camera's rows in that time range on this root
+/// (`(camera_id, start_ts)` index). The working set is one chunk of one
+/// directory. Directory entries and the dangling stats share one [`FsPacer`].
+///
+/// # Storage ownership (audit R1)
+///
+/// * Only the recorder's own layout is considered: a top-level directory whose
+///   name is not a camera UUID, and any `.mp4` directly in the root, are skipped
+///   (never quarantined). Only the recorder's layout is known to be junk when
+///   unparseable.
+/// * The walk never descends into a directory that is itself another storage's
+///   root, and never adopts or quarantines a file under one.
+///
+/// Every other gate is unchanged: the in-flight mtime gate, the sub-floor
+/// reject, conservative `ON CONFLICT DO NOTHING` adoption, and the
+/// already-indexed outcome that never quarantines real footage.
+///
+/// Returns `None` when shutdown interrupted the pass or the storage list could
+/// not be read; otherwise the scan roots (for the quarantine prune) and counts.
+async fn orphan_pass(
+    pool: &Pool,
+    config: &Config,
+    shutdown: &CancellationToken,
+    pacer: &mut FsPacer,
+    segment_len: Duration,
+    twice_segment: Duration,
+) -> Option<(Vec<ScanRoot>, OrphanStats)> {
+    let scan_roots = scan_roots_for_orphan_pass(pool, config).await?;
+
+    // One adoption token per insert at ORPHAN_INSERT_RATE_HZ; the first tick
+    // resolves immediately so the first insert does not wait a full interval.
+    let insert_period = tokio::time::Duration::from_millis(1_000 / orphan_insert_rate_hz());
+    let mut adopt_rate = tokio::time::interval(insert_period);
+    adopt_rate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut walk = OrphanWalk {
+        pool,
+        shutdown,
+        pacer,
+        adopt_rate,
+        segment_len,
+        twice_segment,
+        stats: OrphanStats::default(),
+    };
+
+    for idx in 0..scan_roots.len() {
         if shutdown.is_cancelled() {
             warn!("reconcile phase 2: shutdown requested; aborting storage walk");
-            return;
+            return None;
         }
-
-        if tokio::fs::metadata(storage_root).await.is_err() {
-            debug!(root = %storage_root.display(), "storage root does not exist or is inaccessible; skipping walk");
+        let sr = &scan_roots[idx];
+        if tokio::fs::metadata(&sr.root).await.is_err() {
+            debug!(root = %sr.root.display(), "storage root does not exist or is inaccessible; skipping walk");
             continue;
         }
-
-        let mp4_files = match walk_storage(storage_root).await {
-            Ok(files) => files,
-            Err(e) => {
-                error!(root = %storage_root.display(), error = %e, "failed to walk storage; skipping");
-                continue;
-            }
-        };
-
+        let nested = nested_roots(&scan_roots, idx);
+        if !nested.is_empty() {
+            warn!(
+                storage_root = %sr.root.display(),
+                nested = ?nested,
+                "reconcile phase 2: other storage roots lie inside this one; they are skipped by this walk (overlapping storage paths should be separated)"
+            );
+        }
         info!(
-            storage_root = %storage_root.display(),
-            stage = %stage.as_str(),
-            file_count = mp4_files.len(),
+            storage_root = %sr.root.display(),
+            stage = %sr.stage.as_str(),
             "reconcile phase 2: walking storage for orphan detection"
         );
+        if !walk.walk_root(sr, &nested).await {
+            warn!(
+                indexed = walk.stats.indexed,
+                "reconcile phase 2: shutdown requested; stopping orphan indexing"
+            );
+            return None;
+        }
+    }
 
-        for abs_path in mp4_files {
-            let rel_path = match abs_path.strip_prefix(storage_root) {
-                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-                Err(_) => {
-                    warn!(path = %abs_path.display(), "could not strip storage prefix; skipping");
+    Some((scan_roots, walk.stats))
+}
+
+impl OrphanWalk<'_> {
+    /// Walk one scan root. Returns `false` when shutdown interrupted it.
+    async fn walk_root(&mut self, sr: &ScanRoot, nested: &[PathBuf]) -> bool {
+        // (directory, camera id of the camera directory it lies in; None = root)
+        let mut stack: Vec<(PathBuf, Option<Uuid>)> = vec![(sr.root.clone(), None)];
+
+        while let Some((dir, camera)) = stack.pop() {
+            if self.shutdown.is_cancelled() {
+                return false;
+            }
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(e) => {
+                    warn!(dir = %dir.display(), error = %e, "cannot read directory during storage walk; skipping");
                     continue;
                 }
             };
 
-            if indexed_paths.contains(&(
-                storage_root.to_string_lossy().replace('\\', "/"),
-                rel_path.clone(),
-            )) {
-                debug!(path = %rel_path, "file already indexed; skipping");
-                continue;
-            }
+            // This directory's .mp4 files only; subdirectories go on the stack.
+            let mut files: Vec<PathBuf> = Vec::new();
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(dir = %dir.display(), error = %e, "error reading directory entry; skipping");
+                        break;
+                    }
+                };
+                self.pacer.step().await;
 
-            // IN-FLIGHT GATE (audit GAP 5 / P0 #3): the orphan walk races live
-            // camera workers on every boot. A file whose mtime is within
-            // 2×segment_seconds of NOW is almost certainly one ffmpeg is STILL
-            // writing — indexing it produced the prod 28-byte ftyp-only rows.
-            // Skip it; the recorder's own boundary insert (or a later reconcile)
-            // will index it once it is complete. A FUTURE mtime beyond one
-            // segment length of clock slop is implausible, not "recent" — see
-            // [`mtime_in_flight`] — and must not gate the file forever.
-            match tokio::fs::metadata(&abs_path).await {
-                Ok(meta) => {
-                    if let Ok(mtime) = meta.modified() {
-                        let mtime_utc: DateTime<Utc> = mtime.into();
-                        if mtime_in_flight(Utc::now(), mtime_utc, segment_len, twice_segment) {
-                            debug!(
-                                path = %rel_path,
-                                "orphan file modified too recently (in-flight); skipping this boot"
-                            );
+                let path = entry.path();
+                let file_type = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
+                        continue;
+                    }
+                };
+
+                if file_type.is_dir() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    // Never re-walk already quarantined files.
+                    if name == "_quarantine" {
+                        debug!(path = %path.display(), "skipping _quarantine directory");
+                        continue;
+                    }
+                    // Never descend into another storage's root (audit R1).
+                    // Symlinked directories are not followed, so the canonical
+                    // form of a subdirectory is the canonical root plus its
+                    // relative path.
+                    if let Ok(rel) = path.strip_prefix(&sr.root) {
+                        let canon = sr.canonical.join(rel);
+                        if nested.contains(&canon) {
+                            info!(path = %path.display(), "directory is another storage's root; not walking it from this storage");
+                            self.stats.foreign_skipped += 1;
                             continue;
                         }
                     }
+                    match camera {
+                        Some(cam) => stack.push((path, Some(cam))),
+                        None => match name.parse::<Uuid>() {
+                            Ok(cam) => stack.push((path, Some(cam))),
+                            Err(_) => {
+                                // Not the recorder's `<camera uuid>/...` layout:
+                                // someone else's data. Leave it alone (audit R1).
+                                debug!(path = %path.display(), "top-level directory is not a camera directory; not scanned");
+                                self.stats.foreign_skipped += 1;
+                            }
+                        },
+                    }
+                } else if file_type.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+                {
+                    if camera.is_some() {
+                        files.push(path);
+                    } else {
+                        debug!(path = %path.display(), "file directly in the storage root is not in a camera directory; not touched");
+                        self.stats.foreign_skipped += 1;
+                    }
                 }
-                Err(e) => {
-                    debug!(path = %rel_path, error = %e, "cannot stat orphan candidate; skipping");
-                    continue;
-                }
+                // Symlinks are intentionally ignored.
             }
 
-            info!(
-                path  = %rel_path,
-                stage = %stage.as_str(),
-                "reconcile phase 2: found orphan file"
-            );
-
-            orphan_entries.push(OrphanEntry {
-                abs_path,
-                storage_id: *storage_id,
-                storage_root: storage_root.clone(),
-                rel_path,
-                stage: *stage,
-            });
+            if let Some(camera_id) = camera {
+                if !files.is_empty() && !self.check_dir_files(sr, nested, camera_id, files).await {
+                    return false;
+                }
+            }
         }
+        true
     }
 
-    // ── rate-limited DB insert loop ──────────────────────────────────────────
+    /// Compare one directory's files against the index and offer the
+    /// unindexed ones for adoption. Returns `false` on shutdown.
+    async fn check_dir_files(
+        &mut self,
+        sr: &ScanRoot,
+        nested: &[PathBuf],
+        camera_id: Uuid,
+        files: Vec<PathBuf>,
+    ) -> bool {
+        let mut dated: Vec<(DateTime<Utc>, PathBuf)> = Vec::with_capacity(files.len());
+        let mut undated: Vec<PathBuf> = Vec::new();
+        for f in files {
+            let name = f
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match crate::recording::parse_segment_timestamp(&name) {
+                Ok(ts) => dated.push((ts, f)),
+                Err(_) => undated.push(f),
+            }
+        }
+        dated.sort_by_key(|(ts, _)| *ts);
 
-    let total_orphans = orphan_entries.len() as u64;
-    info!(
-        total = total_orphans,
-        "reconcile phase 2: beginning rate-limited orphan indexing"
-    );
+        let margin = Duration::seconds(ORPHAN_LOOKUP_MARGIN_SECS);
+        for chunk in dated.chunks(ORPHAN_LOOKUP_CHUNK) {
+            let (Some((first, _)), Some((last, _))) = (chunk.first(), chunk.last()) else {
+                continue;
+            };
+            let indexed: HashSet<String> = match db::list_segment_paths_for_camera_range(
+                self.pool,
+                camera_id,
+                &sr.storage_ids,
+                *first - margin,
+                *last + margin,
+            )
+            .await
+            {
+                Ok(v) => v.into_iter().map(|p| p.replace('\\', "/")).collect(),
+                Err(e) => {
+                    // Without the index answer nothing here can be judged an
+                    // orphan; skip the chunk (never quarantine blind).
+                    error!(camera_id = %camera_id, error = %e, "reconcile phase 2: cannot read the index for an orphan-walk chunk; skipping it this pass");
+                    continue;
+                }
+            };
+            for (_, abs_path) in chunk {
+                let Some(rel) = rel_path_under(&sr.root, abs_path) else {
+                    continue;
+                };
+                if indexed.contains(&rel) {
+                    continue;
+                }
+                if !self
+                    .offer_orphan(sr, nested, camera_id, abs_path, &rel, true)
+                    .await
+                {
+                    return false;
+                }
+            }
+        }
+        for abs_path in &undated {
+            let Some(rel) = rel_path_under(&sr.root, abs_path) else {
+                continue;
+            };
+            if !self
+                .offer_orphan(sr, nested, camera_id, abs_path, &rel, false)
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
 
-    // One tick per insert at ORPHAN_INSERT_RATE_HZ; start immediately so the
-    // first insert does not wait a full interval.
-    let insert_period = tokio::time::Duration::from_millis(1_000 / orphan_insert_rate_hz());
-    let mut rate_interval = tokio::time::interval(insert_period);
-    rate_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut orphan_indexed = 0u64;
-
-    for entry in orphan_entries {
-        // Honour shutdown.
-        if shutdown.is_cancelled() {
-            warn!(
-                indexed = orphan_indexed,
-                remaining = total_orphans.saturating_sub(orphan_indexed),
-                "reconcile phase 2: shutdown requested; stopping orphan indexing"
-            );
-            return;
+    /// Adopt (or quarantine) one file the index does not reference.
+    ///
+    /// `range_checked` is true when the per-chunk index query already proved no
+    /// row on this root has this path; otherwise (an unparseable name) the exact
+    /// path is looked up before anything is moved. Returns `false` on shutdown.
+    async fn offer_orphan(
+        &mut self,
+        sr: &ScanRoot,
+        nested: &[PathBuf],
+        camera_id: Uuid,
+        abs_path: &Path,
+        rel_path: &str,
+        range_checked: bool,
+    ) -> bool {
+        // Never adopt or quarantine a file under another storage's root (audit
+        // R1). The walk already refuses to enter those; this is the per-file net.
+        let canon = sr.canonical.join(rel_path);
+        if nested.iter().any(|n| canon.starts_with(n)) {
+            debug!(path = %abs_path.display(), "file lies under another storage's root; not touched");
+            self.stats.foreign_skipped += 1;
+            return true;
         }
 
-        // Wait for the rate-limit token (first tick resolves immediately).
-        rate_interval.tick().await;
+        // IN-FLIGHT GATE (audit GAP 5 / P0 #3): the orphan walk races live
+        // camera workers. A file whose mtime is within 2×segment_seconds of NOW
+        // is almost certainly one ffmpeg is STILL writing; indexing it produced
+        // the prod 28-byte ftyp-only rows. Skip it; the recorder's own boundary
+        // insert (or a later reconcile) indexes it once it is complete. A FUTURE
+        // mtime beyond one segment length of clock slop is implausible, not
+        // "recent" (see [`mtime_in_flight`]), and must not gate the file forever.
+        match tokio::fs::metadata(abs_path).await {
+            Ok(meta) => {
+                if let Ok(mtime) = meta.modified() {
+                    let mtime_utc: DateTime<Utc> = mtime.into();
+                    if mtime_in_flight(Utc::now(), mtime_utc, self.segment_len, self.twice_segment)
+                    {
+                        debug!(path = %rel_path, "orphan file modified too recently (in-flight); skipping this pass");
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(path = %rel_path, error = %e, "cannot stat orphan candidate; skipping");
+                return true;
+            }
+        }
+
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+
+        info!(path = %rel_path, stage = %sr.stage.as_str(), "reconcile phase 2: found orphan file");
+        self.stats.found += 1;
+
+        // Wait for the adoption rate-limit token (first tick resolves at once).
+        self.adopt_rate.tick().await;
 
         match try_index_orphan(
-            &pool,
-            &entry.abs_path,
-            &entry.storage_root,
-            entry.storage_id,
-            &entry.rel_path,
-            &entry.stage,
-            segment_len,
-            twice_segment,
+            self.pool,
+            abs_path,
+            &sr.root,
+            sr.adopt_storage_id,
+            rel_path,
+            &sr.stage,
+            self.segment_len,
+            self.twice_segment,
         )
         .await
         {
             Ok(OrphanOutcome::Indexed) => {
-                orphan_indexed += 1;
-                // Progress log every ORPHAN_PROGRESS_INTERVAL indexed.
-                if orphan_indexed.is_multiple_of(ORPHAN_PROGRESS_INTERVAL) {
+                self.stats.indexed += 1;
+                if self.stats.indexed.is_multiple_of(ORPHAN_PROGRESS_INTERVAL) {
                     info!(
-                        indexed = orphan_indexed,
-                        remaining = total_orphans.saturating_sub(orphan_indexed),
+                        indexed = self.stats.indexed,
+                        found = self.stats.found,
                         "reconcile phase 2: orphan indexing progress"
                     );
                 }
             }
             Ok(OrphanOutcome::AlreadyIndexed) => {
-                // A row already exists at this key — this is real,
-                // already-indexed footage (often the recorder's own
-                // freshly-written segment), NOT junk. Do NOT quarantine it
-                // (this is the fix for the footage-loss bug: quarantining
-                // here orphaned the valid row, and the next pass deleted the
-                // row as "dangling" once the file was gone).
-                debug!(
-                    path = %entry.abs_path.display(),
-                    "reconcile phase 2: orphan key already indexed; leaving file in place"
-                );
+                // A row already exists at this key: real, already-indexed
+                // footage (often the recorder's own freshly written segment),
+                // NOT junk. Never quarantine it (the footage-loss fix:
+                // quarantining here orphaned the valid row, and the next pass
+                // deleted the row as dangling once the file was gone).
+                debug!(path = %abs_path.display(), "reconcile phase 2: orphan key already indexed; leaving file in place");
+            }
+            Ok(OrphanOutcome::Foreign) => {
+                debug!(path = %abs_path.display(), "reconcile phase 2: file is not in the recorder's camera layout; leaving it in place");
+                self.stats.foreign_skipped += 1;
             }
             Ok(OrphanOutcome::NotIndexable) => {
-                // Genuinely unindexable junk — quarantine.
-                warn!(
-                    path = %entry.abs_path.display(),
-                    "reconcile phase 2: orphan file not indexable; quarantining"
-                );
-                if let Err(e) = quarantine_file(&entry.abs_path, &entry.storage_root).await {
-                    error!(
-                        path  = %entry.abs_path.display(),
-                        error = %e,
-                        "failed to quarantine orphan file"
-                    );
+                if !range_checked {
+                    // An unparseable name was never compared against the index.
+                    // A file a row references is never moved.
+                    match db::segment_path_indexed_for_camera(
+                        self.pool,
+                        camera_id,
+                        &sr.storage_ids,
+                        rel_path,
+                    )
+                    .await
+                    {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            debug!(path = %abs_path.display(), "unparseable file name is referenced by a segment row; leaving it in place");
+                            return true;
+                        }
+                        Err(e) => {
+                            warn!(path = %abs_path.display(), error = %e, "cannot confirm the file is unindexed; not quarantining it this pass");
+                            return true;
+                        }
+                    }
+                }
+                // Genuinely unindexable junk in the recorder's own layout.
+                warn!(path = %abs_path.display(), "reconcile phase 2: orphan file not indexable; quarantining");
+                if let Err(e) = quarantine_file(abs_path, &sr.root).await {
+                    error!(path = %abs_path.display(), error = %e, "failed to quarantine orphan file");
                 } else {
-                    orphan_quarantined += 1;
+                    self.stats.quarantined += 1;
                 }
             }
             Err(e) => {
-                error!(
-                    path  = %entry.abs_path.display(),
-                    error = %e,
-                    "error while trying to index orphan file; skipping"
-                );
+                error!(path = %abs_path.display(), error = %e, "error while trying to index orphan file; skipping");
             }
         }
+        true
     }
+}
 
-    info!(
-        dangling_deleted = dangling_count,
-        orphan_indexed = orphan_indexed,
-        orphan_quarantined = orphan_quarantined,
-        total_orphans_found = total_orphans,
-        "reconcile phase 2 complete"
-    );
-
-    // ── quarantine retention prune ───────────────────────────────────────────
-    //
-    // The reconcile passes above MOVE unindexable junk into `_quarantine/` but
-    // nothing ever cleans it, so it grows unbounded (prod reached 110 GB / 36k
-    // files in a month before a manual purge). Auto-purge quarantine files older
-    // than the operator-configured retention. This is the ONLY code that ever
-    // deletes from `_quarantine/`; the orphan walk deliberately skips that dir
-    // (see `walk_storage`), so nothing here races the adoption logic.
-    //
-    // `0` DISABLES the prune (keep-forever opt-out); a read error skips the prune
-    // this pass rather than guessing a retention. See `prune_quarantine` for the
-    // deletion guards that keep this bounded to aged quarantine files only.
-    let retention_days = match db::get_quarantine_retention_days(&pool).await {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(error = %e, "reconcile phase 2: cannot read quarantine retention; skipping prune this pass");
-            0
+/// `abs_path` relative to `root`, with `/` separators (the index's form).
+fn rel_path_under(root: &Path, abs_path: &Path) -> Option<String> {
+    match abs_path.strip_prefix(root) {
+        Ok(rel) => Some(rel.to_string_lossy().replace('\\', "/")),
+        Err(_) => {
+            warn!(path = %abs_path.display(), "could not strip storage prefix; skipping");
+            None
         }
-    };
-    if retention_days > 0 {
-        // Prod can carry DUPLICATE storage rows for the same on-disk path (see
-        // the orphan pass's note); pruning the same `_quarantine/` twice is
-        // harmless but noisy, so dedupe roots first.
-        let mut seen_roots: HashSet<PathBuf> = HashSet::new();
-        let mut pruned_files = 0u64;
-        let mut pruned_bytes = 0u64;
-        for (_id, storage_root, _stage) in &storages_to_scan {
-            if shutdown.is_cancelled() {
-                warn!("reconcile phase 2: shutdown requested; stopping quarantine prune");
-                break;
-            }
-            if !seen_roots.insert(storage_root.clone()) {
-                continue;
-            }
-            let (files, bytes) = prune_quarantine(storage_root, retention_days).await;
-            pruned_files += files;
-            pruned_bytes += bytes;
-        }
-        info!(
-            files = pruned_files,
-            bytes = pruned_bytes,
-            retention_days,
-            "reconcile phase 2: quarantine retention prune complete"
-        );
     }
 }
 
@@ -1427,6 +1819,12 @@ enum OrphanOutcome {
     /// The file is genuinely unindexable (unparseable name, unknown camera,
     /// below the sub-floor, etc). Safe to quarantine.
     NotIndexable,
+    /// The file is not in the recorder's `<camera uuid>/...` layout (its first
+    /// path component is not a camera UUID). Only the recorder's own layout is
+    /// known to be junk when unindexable, so this is left in place, never
+    /// quarantined (audit R1: a nested or overlapping storage's footage looks
+    /// exactly like this from the outer root).
+    Foreign,
 }
 
 /// In-flight gate shared by the ORPHAN pass and the DANGLING-ROW pass: `true`
@@ -1461,9 +1859,10 @@ fn mtime_in_flight(
 ///
 /// Returns [`OrphanOutcome::Indexed`] if a new row was inserted,
 /// [`OrphanOutcome::AlreadyIndexed`] if a row already exists at this key (the
-/// file must NOT be quarantined), [`OrphanOutcome::NotIndexable`] if the file
-/// is genuine junk (caller should quarantine), or `Err` on a database /
-/// filesystem error.
+/// file must NOT be quarantined), [`OrphanOutcome::Foreign`] if the file is not
+/// in the recorder's camera layout (left alone), [`OrphanOutcome::NotIndexable`]
+/// if the file is genuine junk (caller should quarantine), or `Err` on a
+/// database / filesystem error.
 ///
 /// `segment_len` is the nominal segment length (the `end_ts` fallback);
 /// `max_segment_len` (2×) is the mtime plausibility window only.
@@ -1481,6 +1880,34 @@ async fn try_index_orphan(
     segment_len: Duration,
     max_segment_len: Duration,
 ) -> Result<OrphanOutcome> {
+    // Extract camera_id from the path: storage_root/camera_id/YYYY/MM/DD/file.
+    // The first component after the storage root is the camera_id. This runs
+    // BEFORE the filename parse so a file outside the recorder's layout is
+    // always `Foreign` (left alone), never `NotIndexable` (quarantined).
+    let rel = match abs_path.strip_prefix(storage_root) {
+        Ok(r) => r,
+        Err(_) => return Ok(OrphanOutcome::Foreign),
+    };
+
+    // A file directly in the root has a single component (its own name); it
+    // is not in a camera directory either.
+    let mut components = rel.components();
+    let camera_id_str = match (components.next(), components.next()) {
+        (Some(c), Some(_)) => c.as_os_str().to_string_lossy().into_owned(),
+        _ => {
+            debug!(path = %rel_path, "orphan file not in a camera directory; leaving it alone");
+            return Ok(OrphanOutcome::Foreign);
+        }
+    };
+
+    let camera_id: Uuid = match camera_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            debug!(dir = %camera_id_str, "first directory component is not a camera UUID; leaving it alone");
+            return Ok(OrphanOutcome::Foreign);
+        }
+    };
+
     // Parse the segment start timestamp from the filename.
     let filename = abs_path
         .file_name()
@@ -1491,30 +1918,6 @@ async fn try_index_orphan(
         Ok(ts) => ts,
         Err(_) => {
             debug!(filename = %filename, "cannot parse timestamp from filename");
-            return Ok(OrphanOutcome::NotIndexable);
-        }
-    };
-
-    // Extract camera_id from the path: storage_root/camera_id/YYYY/MM/DD/file.
-    // The first component after the storage root is the camera_id.
-    let rel = match abs_path.strip_prefix(storage_root) {
-        Ok(r) => r,
-        Err(_) => return Ok(OrphanOutcome::NotIndexable),
-    };
-
-    let mut components = rel.components();
-    let camera_id_str = match components.next() {
-        Some(c) => c.as_os_str().to_string_lossy().into_owned(),
-        None => {
-            debug!(path = %rel_path, "orphan file not in expected directory structure");
-            return Ok(OrphanOutcome::NotIndexable);
-        }
-    };
-
-    let camera_id: Uuid = match camera_id_str.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            debug!(dir = %camera_id_str, "first directory component is not a UUID; not indexable");
             return Ok(OrphanOutcome::NotIndexable);
         }
     };
@@ -1985,79 +2388,6 @@ async fn prune_quarantine(storage_root: &Path, retention_days: i64) -> (u64, u64
     }
 
     (files_deleted, bytes_deleted)
-}
-
-// ─── walk_storage ────────────────────────────────────────────────────────────
-
-/// Walk a storage root directory and return all `.mp4` file paths.
-///
-/// Does not recurse into `_quarantine/` to avoid re-quarantining already
-/// quarantined files.
-///
-/// Implemented with an explicit stack (no external walkdir dependency) using
-/// `tokio::fs::read_dir` for async-safe directory traversal.
-///
-/// # Errors
-///
-/// Returns an error if the root directory cannot be read.
-pub async fn walk_storage(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut results: Vec<PathBuf> = Vec::new();
-    // Stack of directories to visit.
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(rd) => rd,
-            Err(e) => {
-                warn!(dir = %dir.display(), error = %e, "cannot read directory during storage walk; skipping");
-                continue;
-            }
-        };
-
-        loop {
-            let entry = match entries.next_entry().await {
-                Ok(Some(e)) => e,
-                Ok(None) => break,
-                Err(e) => {
-                    warn!(dir = %dir.display(), error = %e, "error reading directory entry; skipping");
-                    break;
-                }
-            };
-
-            let path = entry.path();
-
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
-                    continue;
-                }
-            };
-
-            if file_type.is_dir() {
-                // Skip the quarantine directory.
-                if path
-                    .file_name()
-                    .map(|n| n == "_quarantine")
-                    .unwrap_or(false)
-                {
-                    debug!(path = %path.display(), "skipping _quarantine directory");
-                    continue;
-                }
-                stack.push(path);
-            } else if file_type.is_file()
-                && path
-                    .extension()
-                    .map(|e| e.eq_ignore_ascii_case("mp4"))
-                    .unwrap_or(false)
-            {
-                results.push(path);
-            }
-            // Symlinks are intentionally ignored.
-        }
-    }
-
-    Ok(results)
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────────────
@@ -3954,5 +4284,398 @@ mod tests {
         })
         .await
         .expect("set_mtime join");
+    }
+
+    // ── audit R1 / F2: storage ownership and bounded-memory orphan walk ─────
+
+    /// Grouping keeps duplicate rows for one folder together (first row adopts),
+    /// and each root learns exactly which OTHER roots lie inside it.
+    #[test]
+    fn scan_roots_group_duplicates_and_find_nested_roots() {
+        let (a, b, c, d, e) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let row = |id: Uuid, p: &str| (id, PathBuf::from(p), PathBuf::from(p), SegmentStage::Live);
+        let roots = group_scan_roots(vec![
+            row(a, "/m/live"),
+            row(b, "/m/live"),
+            row(c, "/m"),
+            row(d, "/m/live/archive"),
+            row(e, "/m/live2"),
+        ]);
+        assert_eq!(roots.len(), 4, "the duplicate /m/live rows share one root");
+        assert_eq!(roots[0].storage_ids, vec![a, b]);
+        assert_eq!(
+            roots[0].adopt_storage_id, a,
+            "first row in list order adopts"
+        );
+
+        let nested_of = |p: &str| {
+            let idx = roots
+                .iter()
+                .position(|r| r.canonical == Path::new(p))
+                .expect("root");
+            let mut n = nested_roots(&roots, idx);
+            n.sort();
+            n
+        };
+        assert_eq!(
+            nested_of("/m"),
+            vec![
+                PathBuf::from("/m/live"),
+                PathBuf::from("/m/live/archive"),
+                PathBuf::from("/m/live2")
+            ]
+        );
+        assert_eq!(nested_of("/m/live"), vec![PathBuf::from("/m/live/archive")]);
+        assert!(nested_of("/m/live/archive").is_empty());
+        assert!(
+            nested_of("/m/live2").is_empty(),
+            "a name sharing a string prefix is not nested"
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_drops_dots_and_trailing_separators() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/./b/")),
+            PathBuf::from("/a/b")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+    }
+
+    /// The pacer allows `rate_hz` operations per second: 450 steps at 2,000/s
+    /// (100 per 50 ms window) must take at least four windows.
+    #[tokio::test]
+    async fn fs_pacer_bounds_the_operation_rate() {
+        let mut pacer = FsPacer::new(2_000);
+        let started = std::time::Instant::now();
+        for _ in 0..450 {
+            pacer.step().await;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(190),
+            "450 ops at 2000/s must be paced over at least 4 windows, took {elapsed:?}"
+        );
+    }
+
+    /// A file outside the recorder's `<camera uuid>/...` layout is FOREIGN (left
+    /// alone), never NotIndexable (quarantined), even when its name does not
+    /// parse. Decided before any database access.
+    #[tokio::test]
+    async fn try_index_orphan_treats_non_camera_layout_as_foreign() {
+        let pool = crumb_common::db::build_pool("postgres://nobody@127.0.0.1:1/none", 1)
+            .expect("lazy pool");
+        let root = Path::new("/media-root");
+        let seg = Duration::seconds(4);
+        for rel in [
+            "live/0b6e1c39-0000-4000-8000-000000000000/20260101T000000Z.mp4",
+            "archive/20260101T000000Z.mp4",
+            "20260101T000000Z.mp4",
+            "not-a-camera/garbage.mp4",
+        ] {
+            let outcome = try_index_orphan(
+                &pool,
+                &root.join(rel),
+                root,
+                Uuid::new_v4(),
+                rel,
+                &SegmentStage::Live,
+                seg,
+                seg * 2,
+            )
+            .await
+            .expect("no database access for a foreign path");
+            assert_eq!(outcome, OrphanOutcome::Foreign, "{rel}");
+        }
+    }
+
+    /// AUDIT R1 (Critical): a storage whose root CONTAINS other storages' roots
+    /// (an admin added the media root itself, or put archive in a subfolder of
+    /// live) must never quarantine the nested storages' footage. Pre-fix the walk
+    /// of the outer root saw `live/<cam>/X.mp4`, failed to parse `live` as a
+    /// camera id, and moved every settled file into `_quarantine/`, from where
+    /// the prune deleted it after 14 days.
+    #[tokio::test]
+    async fn nested_storage_footage_is_never_quarantined_by_an_outer_root() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+        let cam = fx.camera_id.to_string();
+
+        let outer = tempfile::Builder::new()
+            .prefix("crumb-recon-outer")
+            .tempdir()
+            .expect("outer tmp");
+        let outer_path = outer.path().to_path_buf();
+        let inner_path = outer_path.join("live");
+        let nested_archive_path = inner_path.join("archive");
+        tokio::fs::create_dir_all(inner_path.join(&cam))
+            .await
+            .expect("mkdir inner cam");
+        tokio::fs::create_dir_all(nested_archive_path.join(&cam))
+            .await
+            .expect("mkdir nested archive cam");
+
+        let p = |x: &Path| x.to_str().expect("utf8").to_owned();
+        crumb_common::db::upsert_storage(&fx.pool, "Outer", &p(&outer_path))
+            .await
+            .expect("outer storage");
+        let inner = crumb_common::db::upsert_storage(&fx.pool, "Inner", &p(&inner_path))
+            .await
+            .expect("inner storage");
+        let nested_archive =
+            crumb_common::db::upsert_storage(&fx.pool, "Inner Archive", &p(&nested_archive_path))
+                .await
+                .expect("nested archive storage");
+
+        async fn seg_file(path: &Path) {
+            tokio::fs::write(path, vec![0u8; 4096])
+                .await
+                .expect("write segment");
+            backdate(path, 3600).await;
+        }
+        let index =
+            |storage_id: Uuid, name: &str, start: &str| crumb_common::db::InsertSegmentParams {
+                camera_id: fx.camera_id,
+                storage_id,
+                stage: SegmentStage::Live,
+                path: format!("{cam}/{name}"),
+                stream: SegmentStream::Main,
+                start_ts: start.parse().expect("start"),
+                end_ts: start.parse::<DateTime<Utc>>().expect("start") + Duration::seconds(4),
+                duration_ms: 4000,
+                has_motion: true,
+                motion_score: 0.5,
+                size_bytes: 4096,
+                motion_bbox: None,
+            };
+
+        // Indexed footage on the inner storage and on the storage nested in it.
+        let inner_seg = inner_path.join(&cam).join("20260101T000000Z.mp4");
+        seg_file(&inner_seg).await;
+        crumb_common::db::insert_segment(
+            &fx.pool,
+            &index(inner.id, "20260101T000000Z.mp4", "2026-01-01T00:00:00Z"),
+        )
+        .await
+        .expect("inner row");
+        let archive_seg = nested_archive_path.join(&cam).join("20260101T000008Z.mp4");
+        seg_file(&archive_seg).await;
+        crumb_common::db::insert_segment(
+            &fx.pool,
+            &index(
+                nested_archive.id,
+                "20260101T000008Z.mp4",
+                "2026-01-01T00:00:08Z",
+            ),
+        )
+        .await
+        .expect("nested archive row");
+
+        // A genuine orphan of the inner storage: adopted THERE, not quarantined
+        // from the outer root.
+        let inner_orphan = inner_path.join(&cam).join("20260101T000004Z.mp4");
+        seg_file(&inner_orphan).await;
+
+        // Files outside the recorder's layout on the outer root: left alone.
+        tokio::fs::create_dir_all(outer_path.join("not-a-camera"))
+            .await
+            .expect("mkdir foreign");
+        let foreign_dir_file = outer_path.join("not-a-camera").join("20260101T000012Z.mp4");
+        seg_file(&foreign_dir_file).await;
+        let root_file = outer_path.join("20260101T000016Z.mp4");
+        seg_file(&root_file).await;
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        for f in [
+            &inner_seg,
+            &archive_seg,
+            &inner_orphan,
+            &foreign_dir_file,
+            &root_file,
+        ] {
+            assert!(f.exists(), "{} must stay where it is", f.display());
+        }
+        assert!(
+            !outer_path.join("_quarantine").exists(),
+            "the outer root must quarantine nothing"
+        );
+        assert!(
+            !inner_path.join("_quarantine").exists(),
+            "the inner root must not quarantine the storage nested inside it"
+        );
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            3,
+            "two indexed rows plus the adopted orphan: {rows:?}"
+        );
+        let adopted = rows
+            .iter()
+            .find(|r| r.path == format!("{cam}/20260101T000004Z.mp4"))
+            .expect("orphan adopted");
+        assert_eq!(
+            adopted.storage_id, inner.id,
+            "the orphan belongs to the inner storage"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.storage_id == nested_archive.id && r.path.ends_with("000008Z.mp4")),
+            "the nested storage's row is untouched"
+        );
+    }
+
+    /// An unparseable file name in a camera directory is junk only when no row
+    /// references it: the referenced one stays, the unreferenced one is still
+    /// quarantined exactly as before.
+    #[tokio::test]
+    async fn unparseable_name_is_quarantined_only_when_no_row_references_it() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+        let cam_dir = fx.live_path.join(fx.camera_id.to_string());
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
+            .await
+            .expect("live")
+            .expect("live exists");
+
+        let referenced = cam_dir.join("kept-by-a-row.mp4");
+        let junk = cam_dir.join("garbage.mp4");
+        for f in [&referenced, &junk] {
+            tokio::fs::write(f, vec![0u8; 4096]).await.expect("write");
+            backdate(f, 3600).await;
+        }
+        let start: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().expect("ts");
+        crumb_common::db::insert_segment(
+            &fx.pool,
+            &crumb_common::db::InsertSegmentParams {
+                camera_id: fx.camera_id,
+                storage_id: live.id,
+                stage: SegmentStage::Live,
+                path: format!("{}/kept-by-a-row.mp4", fx.camera_id),
+                stream: SegmentStream::Main,
+                start_ts: start,
+                end_ts: start + Duration::seconds(4),
+                duration_ms: 4000,
+                has_motion: false,
+                motion_score: 0.0,
+                size_bytes: 4096,
+                motion_bbox: None,
+            },
+        )
+        .await
+        .expect("row");
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        assert!(
+            referenced.exists(),
+            "a file a row references is never quarantined"
+        );
+        assert!(!junk.exists(), "unreferenced junk is still quarantined");
+        assert!(fx
+            .live_path
+            .join("_quarantine")
+            .join(fx.camera_id.to_string())
+            .join("garbage.mp4")
+            .exists());
+    }
+
+    /// AUDIT F2 / R15: the orphan walk compares a directory against the index
+    /// in timestamp-bounded chunks instead of one global set. A directory larger
+    /// than one chunk must still recognise every indexed file: the rows here are
+    /// labelled `sub` while the camera records `main`, so any file wrongly
+    /// treated as an orphan would be adopted as a SECOND (main) row and show up
+    /// in the count.
+    #[tokio::test]
+    async fn chunked_orphan_walk_recognises_every_indexed_file() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fx = setup_reconcile(&url).await;
+        let config = recon_config();
+        let cam = fx.camera_id.to_string();
+        let cam_dir = fx.live_path.join(&cam);
+        tokio::fs::create_dir_all(&cam_dir)
+            .await
+            .expect("mkdir cam");
+        let live = crumb_common::db::get_storage_by_name(&fx.pool, "Live")
+            .await
+            .expect("live")
+            .expect("live exists");
+
+        let n = ORPHAN_LOOKUP_CHUNK + 500;
+        let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().expect("base");
+        let mut paths: Vec<String> = Vec::with_capacity(n);
+        let mut starts: Vec<DateTime<Utc>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let ts = base + Duration::seconds(4 * i as i64);
+            let name = ts.format("%Y%m%dT%H%M%SZ.mp4").to_string();
+            let f = cam_dir.join(&name);
+            tokio::fs::write(&f, vec![0u8; 600]).await.expect("write");
+            backdate(&f, 3600).await;
+            paths.push(format!("{cam}/{name}"));
+            starts.push(ts);
+        }
+        {
+            let client = fx.pool.get().await.expect("conn");
+            client
+                .execute(
+                    "INSERT INTO segments
+                        (camera_id, storage_id, stage, path, stream, start_ts, end_ts,
+                         duration_ms, size_bytes)
+                     SELECT $1::uuid, $2::uuid, 'live', u.p, 'sub', u.t, u.t + interval '4 seconds', 4000, 600
+                     FROM unnest($3::text[], $4::timestamptz[]) AS u(p, t)",
+                    &[&fx.camera_id, &live.id, &paths, &starts],
+                )
+                .await
+                .expect("bulk insert");
+        }
+        // One genuine orphan just past the last indexed file.
+        let ts = base + Duration::seconds(4 * n as i64);
+        let orphan_name = ts.format("%Y%m%dT%H%M%SZ.mp4").to_string();
+        let orphan = cam_dir.join(&orphan_name);
+        tokio::fs::write(&orphan, vec![0u8; 600])
+            .await
+            .expect("write orphan");
+        backdate(&orphan, 3600).await;
+
+        run_background(fx.pool.clone(), config, CancellationToken::new()).await;
+
+        let rows = crumb_common::db::list_all_segments_for_camera(&fx.pool, fx.camera_id)
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            n + 1,
+            "every indexed file recognised, only the real orphan adopted"
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.path == format!("{cam}/{orphan_name}")));
+        assert!(!fx.live_path.join("_quarantine").exists());
     }
 }
