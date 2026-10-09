@@ -22,11 +22,11 @@ import video.crumb.app.di.appContainer
  *
  * Backed by [ConnectivityManager.registerNetworkCallback] rather than the
  * deprecated CONNECTIVITY_ACTION broadcast, and rather than polling — a single
- * process-wide callback per subscriber, "online" defined as "has a validated
- * default network with INTERNET capability." That's a slightly stricter bar than
- * "has any network" (e.g. a captive portal or an AP with no uplink reads as
- * offline), which is what we want: a tile shouldn't burn its reconnect budget
- * attempting RTSP over a link that can't actually reach the server.
+ * process-wide callback per subscriber, "online" defined as "has a connected
+ * default network" (Wi-Fi, Ethernet or INTERNET-capable). Android's Internet
+ * validation is deliberately NOT required: the NVR is normally on the LAN and
+ * reachable without any WAN, so an AP with no uplink must still reconnect tiles.
+ * Only "no network at all" parks reconnects.
  *
  * [rememberIsOnline] is a Composable [State] for driving reconnect gating from
  * inside a tile/screen. It registers/unregisters the callback across the
@@ -36,13 +36,20 @@ import video.crumb.app.di.appContainer
  * left holding a live callback for no reason).
  */
 object NetworkConnectivityObserver {
-    /** Best-effort synchronous online check (validated default network w/ INTERNET). */
+    /**
+     * Best-effort synchronous online check: a connected default network. Android's
+     * Internet-validation flag is NOT required (see [networkCountsAsOnline]), so a
+     * LAN with no WAN still counts and live tiles keep reconnecting to the NVR.
+     */
     fun isOnlineNow(context: Context): Boolean {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
         val network = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(network) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        return networkCountsAsOnline(
+            hasInternetCapability = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+            isLanTransport = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+        )
     }
 
     /**
@@ -84,7 +91,7 @@ class NetworkStatusObserver(context: Context) {
     private val cm = appContext.getSystemService(ConnectivityManager::class.java)
 
     private val _online = MutableStateFlow(NetworkConnectivityObserver.isOnlineNow(appContext))
-    /** Validated default network with INTERNET (see [NetworkConnectivityObserver.isOnlineNow]). */
+    /** Connected default network (see [NetworkConnectivityObserver.isOnlineNow]). */
     val online: StateFlow<Boolean> = _online.asStateFlow()
 
     private val _metered = MutableStateFlow(NetworkConnectivityObserver.isMeteredNow(appContext))
