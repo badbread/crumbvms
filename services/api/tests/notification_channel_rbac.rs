@@ -260,6 +260,7 @@ async fn non_admin_channel_without_view_plates_gets_no_plate_watchlist_hit() {
     notifications::dispatch_system_events_tick(
         pool,
         &http,
+        &http,
         &mut last_ts,
         &mut seen,
         &mut cooldown,
@@ -443,6 +444,7 @@ async fn internal_destinations_are_refused_for_a_non_admin_and_allowed_for_an_ad
         "http://[::1]:8080/x",
         "http://169.254.169.254/latest/meta-data",
         "http://recorder:1984/api/streams",
+        "http://go2rtc:1984/api/streams",
         "http://postgres:5432/",
         "file:///etc/passwd",
     ] {
@@ -494,6 +496,19 @@ async fn internal_destinations_are_refused_for_a_non_admin_and_allowed_for_an_ad
         as_admin.status(),
         StatusCode::CREATED,
         "an admin may point a destination at the box itself"
+    );
+
+    let go2rtc_as_admin = app
+        .send(post_auth_json(
+            "/notifications/channels",
+            &admin_token,
+            &create_body(&unique("admin-go2rtc"), "http://go2rtc:1984/api/streams"),
+        ))
+        .await;
+    assert_eq!(
+        go2rtc_as_admin.status(),
+        StatusCode::CREATED,
+        "an admin may name the go2rtc alias"
     );
 
     // The same rule applies on update, not just on create.

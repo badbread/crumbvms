@@ -489,11 +489,36 @@ fn cfg_str<'a>(config: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a s
         .ok_or_else(|| anyhow!("channel config missing or empty '{key}' field"))
 }
 
+/// Build the HTTP client used to deliver channel notifications (the engine
+/// fan-out and the channel test-fire).
+///
+/// Redirects are never followed. The destination check
+/// ([`validate_channel_destinations`]) runs on the URL as stored, so a
+/// redirect (a 307/308 keeps the POST body) could move the request to a host
+/// the check would have refused. Webhook providers answer directly, so a 3xx is
+/// reported as a delivery failure by [`assert_ok`] instead. Use this client
+/// only for channel delivery; snapshot and other fetches keep their own.
+///
+/// # Errors
+///
+/// Returns the builder error if the client cannot be constructed.
+pub fn build_channel_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Assert a response is 2xx; return `Err` with the status otherwise.
 async fn assert_ok(resp: reqwest::Response, label: &str) -> anyhow::Result<()> {
     let status = resp.status();
     if status.is_success() {
         return Ok(());
+    }
+    if status.is_redirection() {
+        bail!(
+            "{label}: HTTP {status}: the destination redirected; redirects are not followed, use the final URL"
+        );
     }
     let body = resp
         .text()
@@ -842,13 +867,15 @@ fn destination_url_keys(kind: &str) -> &'static [&'static str] {
 
 /// Hostnames that resolve, inside the Crumb compose network, to Crumb's own
 /// services rather than to something on the operator's LAN. These are the
-/// service names in `docker-compose*.yml`, which Docker's embedded DNS makes
+/// service names and network aliases (`go2rtc`, the back-compat alias of the
+/// recorder) in `docker-compose*.yml`, which Docker's embedded DNS makes
 /// reachable from the api container. A non-admin destination naming one of them
 /// is pointing the notifier back at the deployment's own internals, which is
 /// never what a notification destination means.
 const COMPOSE_SERVICE_HOSTS: &[&str] = &[
     "api",
     "recorder",
+    "go2rtc",
     "postgres",
     "caddy",
     "mosquitto",
@@ -1097,11 +1124,11 @@ pub async fn fetch_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        crop_plate_jpeg, ffmpeg_bin, plan_images, plate_crop_ffmpeg_args, plate_crop_rect,
+        build_channel_http_client, crop_plate_jpeg, dispatch, ffmpeg_bin, plan_images, plate_crop_ffmpeg_args, plate_crop_rect,
         provider_image_capability, resolve_provider_snapshot_url, validate_channel_destinations,
-        ImageCap, ImgSource,
+        ChannelMessage, ImageCap, ImgSource,
     };
-    use crumb_common::db::SnapshotMode;
+    use crumb_common::db::{NotificationChannel, SnapshotMode};
 
     // ── provider capability map (must match admin.html NOTIF_IMG_CAP) ──────────
 
@@ -1323,6 +1350,85 @@ mod tests {
         assert!(cw < 200 && ch < 100);
     }
 
+    // ── redirects are not followed on channel delivery ─────────────────────────
+
+    /// A destination that answers 307 is not followed (the second listener is
+    /// never contacted) and the dispatch reports a failure.
+    #[tokio::test]
+    async fn channel_delivery_does_not_follow_redirects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_addr = target.local_addr().expect("target addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_t = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = target.accept().await {
+                hits_t.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let bouncer = TcpListener::bind("127.0.0.1:0").await.expect("bind bouncer");
+        let bounce_addr = bouncer.local_addr().expect("bouncer addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = bouncer.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let ch = NotificationChannel {
+            id: uuid::Uuid::nil(),
+            user_id: Some(uuid::Uuid::nil()),
+            kind: "webhook".to_owned(),
+            name: "t".to_owned(),
+            enabled: true,
+            config: serde_json::json!({ "url": format!("http://{bounce_addr}/hook") }),
+            camera_ids: None,
+            include_snapshot: false,
+            snapshot_mode: SnapshotMode::None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            owner_username: None,
+        };
+        let msg = ChannelMessage {
+            camera_name: "Test Camera".to_owned(),
+            kind: "motion",
+            label: None,
+            ts: chrono::Utc::now(),
+            web_url: None,
+            vehicle_snapshot: None,
+            plate_snapshot: None,
+            detail: None,
+            template: None,
+            title_template: None,
+            meta: None,
+        };
+
+        let client = build_channel_http_client().expect("client");
+        let err = dispatch(&client, &ch, &msg)
+            .await
+            .expect_err("a redirect must be reported as a failure");
+        let text = err.to_string();
+        assert!(text.contains("307"), "unexpected error: {text}");
+        assert!(text.contains("redirect"), "unexpected error: {text}");
+        // Give a (wrongly) followed request time to land before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+    }
+
     // ── destination validation (channel create / update / test) ───────────────
 
     fn cfg(key: &str, val: &str) -> serde_json::Value {
@@ -1393,6 +1499,8 @@ mod tests {
             "http://[fe80::1]/x",
             "http://0.0.0.0/x",
             "http://recorder:1984/api/streams",
+            "http://go2rtc:1984/api/streams",
+            "http://GO2RTC.:1984/api/streams",
             "http://API:8080/config",
             "http://postgres:5432/",
             "http://mosquitto:1883/",

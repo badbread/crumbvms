@@ -882,9 +882,13 @@ async fn test_channel(
         });
     }
 
+    // Snapshot fetches below use `http`; delivery uses `deliver_http`, which does
+    // not follow redirects (see `channel_notify::build_channel_http_client`).
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("build reqwest client: {e}")))?;
+    let deliver_http = channel_notify::build_channel_http_client()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build reqwest client: {e}")))?;
 
     // Fetch a live snapshot only if the channel wants one AND is scoped to at
@@ -933,7 +937,7 @@ async fn test_channel(
         meta: None,
     };
 
-    match channel_notify::dispatch(&http, &ch, &msg).await {
+    match channel_notify::dispatch(&deliver_http, &ch, &msg).await {
         Ok(()) => {
             tracing::info!(channel_id = %id, kind = %ch.kind, "test notification sent");
             Ok(Json(serde_json::json!({ "ok": true })))
@@ -1199,6 +1203,9 @@ pub async fn run_notification_engine(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
+    // Separate client for channel delivery: it must not follow redirects. The
+    // shared client above also fetches snapshots, which keep default behavior.
+    let deliver_http = channel_notify::build_channel_http_client().unwrap_or_default();
 
     let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(ENGINE_POLL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1215,6 +1222,7 @@ pub async fn run_notification_engine(
         dispatch_system_events_tick(
             &pool,
             &http_client,
+            &deliver_http,
             &mut sys_last_ts,
             &mut sys_seen_ids,
             &mut sys_cooldown_map,
@@ -1842,7 +1850,7 @@ pub async fn run_notification_engine(
                         meta: None,
                     };
 
-                    let (status, reason) = match channel_notify::dispatch(&http_client, ch, &msg)
+                    let (status, reason) = match channel_notify::dispatch(&deliver_http, ch, &msg)
                         .await
                     {
                         Ok(()) => {
@@ -2013,6 +2021,7 @@ fn meta_plate_bbox(meta: Option<&JsonValue>) -> Option<[f64; 4]> {
 pub(crate) async fn dispatch_system_events_tick(
     pool: &Pool,
     http_client: &reqwest::Client,
+    deliver_http: &reqwest::Client,
     last_ts: &mut DateTime<Utc>,
     seen_ids: &mut std::collections::HashSet<Uuid>,
     cooldown_map: &mut HashMap<(String, Uuid), Instant>,
@@ -2312,7 +2321,7 @@ pub(crate) async fn dispatch_system_events_tick(
                 meta: event.meta.clone(),
             };
 
-            let (status, reason) = match channel_notify::dispatch(http_client, ch, &msg).await {
+            let (status, reason) = match channel_notify::dispatch(deliver_http, ch, &msg).await {
                 Ok(()) => {
                     tracing::info!(channel_id = %ch.id, event_key = %event.event_key, "system alert dispatched");
                     ("sent", None)
