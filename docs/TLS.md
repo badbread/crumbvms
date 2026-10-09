@@ -89,9 +89,13 @@ warning above only applies if you point a **browser** at the HTTPS port.
 - **Rate limiting behind the proxy:** with clients coming through Caddy, the
   API sees every request from Caddy's container IP, so the login rate limiter
   shares one bucket across all HTTPS users. Set `TRUST_PROXY=1` in `.env` and
-  the limiter keys on the client IP from `X-Forwarded-For` (which Caddy sets)
-  instead. Leave it unset when clients hit `:8080` directly, trusting a header
-  that any direct client can forge would let an attacker dodge the limiter.
+  the limiter and sign-in backoff key on the client IP from `X-Forwarded-For`
+  (which Caddy sets) instead. The header is only believed on requests whose
+  TCP peer is listed in `TRUSTED_PROXIES`, which defaults to `caddy` (the
+  bundled service, looked up by name), so clients that still use `:8080`
+  directly are keyed on their own address and cannot pick a different one by
+  sending the header themselves. If you put your own proxy in front instead,
+  set `TRUSTED_PROXIES` to its address as the api sees it.
 
 ## Going HTTPS-only
 

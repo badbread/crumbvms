@@ -325,7 +325,14 @@ async fn create_honors_enabled_false_and_defaults_true() {
 #[tokio::test]
 async fn non_admin_cannot_toggle_global() {
     let app = TestApp::new().await;
-    let viewer = seed_viewer(app.pool(), &[]).await;
+    // A viewer allowed to manage their own channels, so the rejection below is
+    // about the global scope specifically and not about `manage_channels`.
+    let caps = crumb_common::types::Capabilities {
+        manage_channels: true,
+        ..generous_viewer_caps()
+    };
+    let role_id = seed_viewer_role_with_caps(app.pool(), &[], caps).await;
+    let viewer = seed_viewer_user(app.pool(), role_id).await;
     let token = login(&app, &viewer.username, &viewer.password).await;
 
     // Viewer creates their own channel (global is hidden for them; server

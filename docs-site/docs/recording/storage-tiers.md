@@ -24,6 +24,18 @@ is accepted as long as its parent is a reachable directory. The recorder
 creates the directory (and the per-camera subdirectories under it) on its
 first write.
 
+Each location needs its own folder. A path that is the same folder as another
+location, sits inside another location's folder, or contains one (for example
+the media root itself, or an archive folder inside the live folder) is
+refused, because the two locations would see each other's recordings as stray
+files. Sibling folders such as `/data/live` and `/data/archive` are fine.
+
+Once a location holds recordings its folder can no longer be edited:
+recordings are stored relative to that folder, so changing it would make them
+disappear from playback. To move footage to a different disk, add the new
+folder as a separate location and use **Change storage…** on the recording
+profile, which copies and verifies every recording before switching it over.
+
 ## How footage moves between tiers
 
 When a policy has an archive tier configured, footage moves there on the
@@ -36,6 +48,13 @@ stage, then delete the source. A reader only ever sees the old location or
 the new one, never a half-moved state, and startup reconciliation scans
 both live and archive storage so an interruption partway through a move
 gets picked back up rather than leaving orphaned or dangling data behind.
+
+Crumb only moves footage onto a disk it can confirm is the real one. If an
+archive disk (or the target of a "Change storage") already holds footage but
+is not mounted, the move is refused, the footage stays where it is, and the
+storage alert fires. The retention and eviction sweeps follow the same rule:
+when a disk looks empty because it is not mounted, they leave its index
+alone instead of forgetting the footage on it.
 
 ## Free-space headroom (and the always-on floor)
 
@@ -53,7 +72,20 @@ keep headroom in reserve:
   own live disk. When
   free space drops below that floor, eviction kicks in early: the oldest
   footage is moved to archive if the policy has an archive tier, or deleted
-  if it doesn't, until the headroom is back.
+  if it doesn't, until the headroom is back. Only footage on the disk that is
+  actually low is deleted for this; older footage on another disk is left
+  alone, since deleting it would not free any space where it is needed.
+- **The archive disk has the same floor.** When the archive disk runs low,
+  its oldest footage is deleted to make room, so archiving keeps working. If
+  archive moves fail anyway (the archive disk is full of protected footage,
+  read-only, or not mounted) while the live disk is low, the oldest live
+  footage is deleted instead of moved, and the storage alert fires. Recording
+  never stops because the archive is full.
+
+Footage protected by a bookmark is never deleted by eviction, and it does
+not count toward a policy's size cap, so heavy protection can push a
+policy's disk use above its cap. A size cap also never deletes footage less
+than an hour old.
 
 Crumb never refuses to record because a disk is full. It always resolves
 pressure by freeing space, never by dropping incoming footage.

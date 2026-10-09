@@ -168,9 +168,11 @@ the sqlx connection pool (empty = the code default).
 
 Serves the HTTP API and the web admin console at `/admin` on `:8080`. Every
 protected endpoint requires a JWT; the open (unauthenticated) endpoints are
-`/health`, `/version`, `/metrics` (Prometheus scrape, no secrets), the `/admin`
-page itself, `/auth/login`, and the first-run
-`/auth/needs-bootstrap` + `/auth/setup-status` + `/auth/bootstrap`.
+`/health`, `/version`, the `/admin` page itself, `/auth/login`, and the
+first-run `/auth/needs-bootstrap` + `/auth/setup-status` + `/auth/bootstrap`.
+`/metrics` (the Prometheus scrape) takes either an admin session or the
+optional `METRICS_TOKEN` / `METRICS_TOKEN_FILE`, sent as
+`Authorization: Bearer <token>`.
 
 - Mounts the **same media root read-only** (`/data:ro`) — the api only reads
   recorded files; the recorder owns writes. Storage paths added in the UI must
@@ -192,7 +194,9 @@ page itself, `/auth/login`, and the first-run
   (Home Assistant) and `DB_POOL_SIZE` as the recorder; `MAINTENANCE_UNTIL`
   (unix seconds) suppresses low-disk/camera-offline alerts during planned
   maintenance; `CAMERA_OFFLINE_BOOT_GRACE_SECS` is the grace period before
-  offline alerts fire after boot (empty = default 180); and the `THUMB_*` set
+  offline alerts fire after boot (empty = default 180);
+  `BOOKMARK_MAX_PROTECTED_PER_USER` caps a non-admin user's active protected
+  bookmarks (empty = default 50, `0` = unlimited); and the `THUMB_*` set
   tunes the timeline thumbnail cache and pre-generation (cache dir, size cap,
   TTL, extract concurrency and timeout, widths, pre-gen toggle and lookback).
   All default sensibly when unset; see [`.env.example`](../.env.example).

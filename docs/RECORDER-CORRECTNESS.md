@@ -70,6 +70,10 @@ recorder, and later the API) must satisfy these *by construction*.
     notices.
 12. **Recording is `-c copy` (zero decode). Motion runs on the SUB stream only.** Streams
     come from Crumb's own embedded go2rtc restreamer (run by the recorder), not an external one.
+    Recording must not depend on the api being up: the recorder creates any missing recording
+    stream (main + `_sub`) in its own go2rtc before and while recording (`stream_registry.rs`),
+    create-only, from the same `crumb_common::go2rtc_streams` builder the api uses. Never let it
+    re-`PUT`/`PATCH` an existing stream, that is the api's job.
 
 ## DB / seed
 13. **Seed is idempotent.** `storages` needs `UNIQUE(name)` (+ `ON CONFLICT`) or a
@@ -113,12 +117,36 @@ recorder, and later the API) must satisfy these *by construction*.
     surprise. The fallback itself is unchanged and safe, footage is never lost, only the
     disk-saving benefit of Motion mode is temporarily suspended, this item only requires
     that it also be *visible*.
+    Fail-open must also END on its own. **Every way a motion session ends closes the
+    event it has open**: the pixel frame session (`analyse_frame_stream`) emits the
+    synthetic STOP for an in-progress event on the watchdog and read-error exits too,
+    not only on cancel/EOF. Before, the frame-stall watchdog `return`ed past that STOP:
+    a camera reboot is a big scene change (START) followed by a dead stream (stall), the
+    detector reconnected and went healthy again, but the stranded START stayed open in
+    the recording task's `MotionUnion` (no time-based expiry, item 25), pinning the
+    buffer in Recording. Three production Motion-mode cameras kept every segment for 18
+    days that way until a restart rebuilt their workers. Guarded by
+    `frame_stall_then_resume_recovers_in_process_and_closes_the_event`. Separately, a
+    session that stays connected but never reaches a verdict (warm-up never completing,
+    or a duplicate-frame "long GOP" window) keeps feeding the frame watchdogs; the
+    stuck-session guard (`StuckSessionGuard`) ends it after 120 s, doubling per
+    consecutive stuck session up to 30 min. While a source stays unhealthy its `motion_detector_unhealthy` alert
+    re-fires every 4 h (`UNHEALTHY_REALERT_INTERVAL_SECS`), stopping on RECOVERED or when
+    the worker that owns the episode is torn down.
 20. **Spill never drops a buffered segment.** If the tmpfs cache nears its configured size
     (`MOTION_CACHE_TMPFS_BYTES`), the correct response is to persist the OLDEST buffered
     segments to disk (freeing cache space the same way a normal keep-verdict would), never
     to evict/delete a cached segment that hasn't been through a keep/discard decision.
     Cache pressure is allowed to change *when* a segment is written; it must never change
-    *whether* it survives.
+    *whether* it survives. The same holds when a keep verdict's copy into storage FAILS
+    (EIO, EROFS, ENOSPC): the cache file is the only copy, so it goes into a per-camera,
+    process-wide retry queue (`recording.rs` `persist_cached_or_queue`), is retried on
+    later segment boundaries with backoff (5 s doubling to 5 min) for as long as the file
+    exists, and is part of the R1 reconnect sweep's keep-set, so neither an ffmpeg
+    reconnect nor a worker respawn can delete it (audit R8). Only a cache file that has
+    already vanished is given up on, with an error log and a `storage_persist_failed`
+    event for that segment. Guarded by
+    `failed_persist_survives_the_reconnect_sweep_and_is_retried`.
 21. **The RAM cache is not a durability boundary for anything already persisted.** Once a
     segment has cleared the ordering in #17 it is on disk and indexed, a crash, container
     restart, or tmpfs wipe afterward must not be able to touch it. Only segments still
@@ -194,6 +222,21 @@ recorder, and later the API) must satisfy these *by construction*.
     `ARCHIVE_GUARD` (8), and a `premature_rollover` event fires so the loss is
     visible. See `docs/DECISIONS.md` (2026-07-12).
 
+    The same rescue also applies when archive moves are failing for a systemic
+    reason (archive disk full or read-only, or the destination is not confirmed,
+    item 35): while the live floor is in deficit, the oldest live segment ON THE
+    DEFICIT FILESYSTEM is deleted instead of breaking out of the loop, and
+    `storage_unwritable` fires. Cap-only pressure still never deletes un-archived
+    footage. The ARCHIVE filesystem has its own floor (`archive_floor_sweep`,
+    global `MIN_FREE_*` thresholds) that rolls the oldest unprotected archive
+    footage over before the cron move runs, so a full archive disk cannot wedge
+    the live tier. With archiving OFF, floor eviction only considers and only
+    credits footage on the deficit filesystem; footage on other disks is left to
+    the byte cap. Byte caps compare against UNPROTECTED bytes (protected footage
+    is never evictable, so counting it made the cap delete every new segment),
+    and a cap-driven delete never touches footage younger than one hour. See
+    `docs/DECISIONS.md` (2026-10-08).
+
 ## fail-open across every seam (extends item 19)
 25. **Fail-open state survives reconnect and stays consistent through an unhealthy
     window.** `MotionBuffer`/`MotionUnion`/`pending_signals` are worker-lifetime
@@ -244,7 +287,7 @@ recorder, and later the API) must satisfy these *by construction*.
     quarantined, and purged within one reconcile pass). The prune deletes only
     regular files, inside the canonicalized `_quarantine/` subtree, strictly
     older than `quarantine_retention_days` counted from entry; `0` disables it;
-    `walk_storage` never descends `_quarantine/`. **`-rN` collision-loser
+    the orphan walk (`reconcile::orphan_pass`) never descends `_quarantine/`. **`-rN` collision-loser
     files are exempt at any age** — they are real footage ratified "never
     deleted" (2026-07-14 decision); quarantine is their terminal parking spot
     and deleting them stays a manual operator action.
@@ -293,7 +336,13 @@ recorder, and later the API) must satisfy these *by construction*.
     - **Marker.** The recorder writes `<storage_root>/.crumb-storage` when it
       can positively confirm a storage — from the recording path
       (`index_segment`) only AFTER a real ≥floor segment is fsync'd on disk AND
-      committed to the index under that root, and from a boot/heal pass that
+      committed to the index under that root, AND (audit R9) only if the
+      storage has no indexed segments from before this recorder process
+      started, or at least one of its newest such segments is present under
+      the root (`confirm_and_write_storage_marker`). Without that second
+      condition, a disk that failed to mount was confirmed by the very first
+      segment recorded onto its empty mountpoint. A refused root is re-checked
+      at most once a minute. And from a boot/heal pass that
       requires at least one of the storage's newest INDEXED segment files to
       really be present under the root. Both writers share ONE rule: a marker
       means a real indexed segment is present. It is deliberately NOT written at
@@ -332,3 +381,62 @@ recorder, and later the API) must satisfy these *by construction*.
     `a_false_marker_below_the_breaker_floor_prunes_the_whole_small_index`. See
     `docs/DECISIONS.md` (2026-08-06, and the 2026-08-07 follow-up) for the
     rejected mountpoint heuristics and why the marker is written post-commit.
+
+## storage roots own their footage (2026-10-08)
+35. **No storage's footage may be touched through another storage's root, and a
+    storage's folder may not move out from under its index.** Segment rows are
+    keyed by `(storage, path relative to the root)`, so a file is only
+    recognisable as indexed from its own root.
+    - **The orphan walk stays in its own lane.** It never descends into a
+      directory that is another storage's root (compared on canonical paths),
+      never adopts or quarantines a file under one, and only ever considers the
+      recorder's own `<camera uuid>/...` layout: a top-level folder that is not
+      a camera UUID, or an `.mp4` directly in the root, is left alone
+      (`OrphanOutcome::Foreign`), never quarantined. Before this, a storage at
+      the media root (or an archive inside the live folder) made the walk move
+      every nested file to `_quarantine/`, and the prune deleted it two weeks
+      later. A file whose name cannot be parsed is quarantined only after an
+      exact lookup confirms no row references it.
+    - **The api refuses overlapping roots.** Creating or repointing a storage at
+      a folder that equals, contains, or lies inside another storage's folder is
+      a `409` (canonical comparison, so a symlink cannot hide it).
+    - **The api refuses to repoint a storage that holds segments.** Rows are
+      relative to the root, so a path edit hides every recording and invites the
+      sweeps to delete their rows. Moving footage is the "Change storage" drain's
+      job (item 32). A path that only differs lexically is not a change.
+    - **Bounded memory.** The orphan walk compares one directory at a time
+      against that camera's rows in that directory's timestamp range (chunks of
+      `ORPHAN_LOOKUP_CHUNK`); it never builds a set of every indexed path, and
+      all of a pass's filesystem calls share one `FsPacer` budget. The marker,
+      breaker, in-flight and sub-floor gates are unchanged.
+
+    Guarded by `reconcile::tests::nested_storage_footage_is_never_quarantined_by_an_outer_root`,
+    `try_index_orphan_treats_non_camera_layout_as_foreign`,
+    `unparseable_name_is_quarantined_only_when_no_row_references_it`,
+    `chunked_orphan_walk_recognises_every_indexed_file`, and the api's
+    `storage_path_overlap_tests` plus the `storage_path_guard` integration suite.
+
+36. **The retention and eviction sweeps obey the same storage confirmation, and
+    nothing writes footage into an unconfirmed destination.** Every
+    "file is missing, so delete the row" decision in `archive.rs` (live and
+    archive retention, size eviction, max-retention, the archive floor) goes
+    through `DanglingGuard`: the row is KEPT unless the segment's storage root
+    carries the marker, its reconcile breaker is not latched, and the sweep has
+    not seen a mass-missing pattern on that root (same 100-row / 50 % shape,
+    latched for the process lifetime). A missing file never credits a
+    free-space deficit. Archive moves (cron and eviction) and the "Change
+    storage" drain refuse a destination whose root lacks the marker while
+    footage is indexed under its path (an unmounted disk), raise
+    `storage_unwritable`, and keep the source; a destination with no indexed
+    history is accepted and gets its marker after the first committed move.
+    The live retention sweep applies each camera's own retention cutoff in SQL,
+    so a long-retention camera cannot fill the oldest-first batch and stall a
+    shorter one. Guarded by the `size_eviction_integration` tests
+    `eviction_keeps_dangling_rows_on_unconfirmed_storage`,
+    `unconfirmed_archive_destination_is_never_written`,
+    `change_storage_drain_refuses_unconfirmed_target`,
+    `live_retention_enforces_each_cameras_own_window`,
+    `floor_eviction_archive_off_only_deletes_on_the_low_disk`,
+    `protected_bytes_do_not_drive_cap_eviction_of_new_footage`,
+    `archive_floor_rolls_oldest_archive_footage_over` and
+    `failing_archive_moves_do_not_wedge_the_live_floor`.

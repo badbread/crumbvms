@@ -33,12 +33,16 @@ rtsp:
   # P0-GO2RTC lighter lockdown: RTSP (:8554, published to the LAN as 18554)
   # REQUIRES auth so anonymous LAN clients can't open a stream by guessing the
   # camera name. go2rtc unconditionally exempts true loopback TCP connections
-  # (no local_auth-equivalent toggle exists for RTSP in 1.9.x) — with go2rtc
-  # embedded in the recorder container, the recorder's OWN ffmpeg connects over
-  # loopback and rides that exemption (its embedded credentials are simply
-  # ignored); every off-container caller still authenticates. Clients connect
-  # with rtsp://<user>:<pass>@<host>:18554/<name> — the API embeds these
-  # credentials into the URLs it hands out via GET /cameras/{id}/streams.
+  # (no local_auth-equivalent toggle exists for RTSP in 1.9.x). With go2rtc
+  # embedded in the recorder container, the recorder's OWN ffmpeg dials
+  # rtsp://127.0.0.1:8554 and rides that exemption (its injected credentials are
+  # simply ignored); every off-container caller still authenticates. That is
+  # true as of issue #630: before that fix the recorder used the client-facing
+  # server_settings.crumb_rtsp_base and hairpinned through the host's published
+  # port, authenticating on every connection. If you change the port below, set
+  # CRUMB_GO2RTC_LOOPBACK_PORT to match. Clients connect with
+  # rtsp://<user>:<pass>@<host>:18554/<name>: the API embeds these credentials
+  # into the URLs it hands out via GET /cameras/{id}/streams.
   username: "${GO2RTC_USER}"
   password: "${GO2RTC_PASS}"
 

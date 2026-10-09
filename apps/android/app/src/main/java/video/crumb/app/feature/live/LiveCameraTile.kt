@@ -146,6 +146,12 @@ fun LiveCameraTile(
      * Wired only on the live RTSP path; a no-op by default.
      */
     onDroppedFrames: (Int, Long) -> Unit = { _, _ -> },
+    /**
+     * Asks the wall to re-fetch this camera's `/streams` (A1): after repeated
+     * reconnect failures, on "No stream" tap, and on return from the background.
+     * The ViewModel throttles it and only publishes a changed answer.
+     */
+    onRefreshStreams: () -> Unit = {},
 ) {
     // Either the user-selected wall-wide low-bandwidth mode OR a system-shed tile
     // renders the still-frame path instead of an RTSP decoder.
@@ -182,6 +188,7 @@ fun LiveCameraTile(
                 mediaUrls = mediaUrls,
                 onStall = onStall,
                 onDroppedFrames = onDroppedFrames,
+                onRefreshStreams = onRefreshStreams,
             )
         }
 
@@ -308,6 +315,7 @@ private fun LiveRtspContent(
     mediaUrls: MediaUrls?,
     onStall: () -> Unit,
     onDroppedFrames: (Int, Long) -> Unit = { _, _ -> },
+    onRefreshStreams: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -382,6 +390,7 @@ private fun LiveRtspContent(
 
     // Capture onStall in state so the watchdog closure always sees the latest.
     val onStallState = rememberUpdatedState(onStall)
+    val onRefreshStreamsState = rememberUpdatedState(onRefreshStreams)
 
     // Bumped to force a fresh `remember(rtspUrl, playerGeneration)` player instance
     // without changing rtspUrl itself. Used for tap-to-retry (#2): bumping it
@@ -474,6 +483,20 @@ private fun LiveRtspContent(
             if (!isOnline) {
                 isReconnecting = true
                 hasError = false
+                // Always leave a retry behind (A2): the connectivity-regained effect
+                // below only fires on an offline-to-online flip, and the online flag
+                // is a heuristic that can stay false on a working link. After a short
+                // wait, re-prepare if the player is still down. This does not touch
+                // `attempt`, so a long outage cannot exhaust the fast budget.
+                reconnectJob = scope.launch {
+                    delay(OFFLINE_PARK_RETRY_MS)
+                    if (player.playerError != null || player.playbackState == Player.STATE_IDLE) {
+                        val source = MediaFactory.rtspSource(rtspUrl)
+                        player.setMediaSource(source)
+                        player.prepare()
+                        player.playWhenReady = true
+                    }
+                }.also { trackPlayerJob(it) }
                 return false
             }
             // ── H265 / unplayable-stream fallback ladder (#524) ──────────────────
@@ -535,6 +558,10 @@ private fun LiveRtspContent(
                 (BASE_BACKOFF_MS shl attempt).coerceAtMost(MAX_BACKOFF_MS)
             }
             attempt += 1
+            // The URL this tile keeps dialing may be stale (changed address or
+            // credential, restream name gone). After a few failures in a row, ask
+            // for a fresh /streams; a changed answer re-keys the player below.
+            if (shouldRefreshStreams(attempt)) onRefreshStreamsState.value()
             isReconnecting = attempt < MAX_RECONNECT_ATTEMPTS
             // Surface the hard-error overlay once the fast budget is exhausted, but
             // keep retrying underneath at the slow cadence (attempt keeps climbing
@@ -793,6 +820,8 @@ private fun LiveRtspContent(
                     if (tileReleased) {
                         playerGeneration += 1
                         tileReleased = false
+                        // The URL may have changed while backgrounded (A1).
+                        onRefreshStreamsState.value()
                     }
                 }
                 else -> Unit
@@ -896,7 +925,11 @@ private fun LiveRtspContent(
                 noUrl = rtspUrl == null,
                 onRetry = if (rtspUrl != null) {
                     { playerGeneration += 1 }
-                } else null,
+                } else {
+                    // "No stream": the /streams fetch failed or came back empty, so
+                    // retrying means fetching it again (A1).
+                    { onRefreshStreamsState.value() }
+                },
             )
         }
     }

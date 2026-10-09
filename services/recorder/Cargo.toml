@@ -57,6 +57,9 @@ libc = "0.2"
 rumqttc = { workspace = true }
 # Decode FRIGATE_MQTT_PASSWORD_B64 (survives compose `$`-escaping); matches the API.
 base64 = "0.22"
+# R10: register recording streams in the embedded go2rtc's loopback REST API.
+# Same version + features crumb-common already uses, so no new crates.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 # Throwaway temp dirs for the size-eviction integration test (opt-in, gated on

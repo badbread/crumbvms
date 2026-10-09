@@ -9,9 +9,20 @@
 //! "operators are blind" fix: a scraper (or even `curl`) can now see pool
 //! saturation and a dead recorder before they cause data loss.
 //!
-//! Unauthenticated by design (standard for Prometheus scrape targets); the body
-//! contains no secrets, only counts/gauges. Keep it on the internal network /
-//! behind the reverse proxy.
+//! ## Who may scrape it
+//!
+//! Two callers are accepted, both over `Authorization: Bearer …`:
+//!
+//! * an **admin session** (the same JWT the console and clients use), so an
+//!   operator can `curl` it with the token they already have; and
+//! * the optional **`METRICS_TOKEN`** (or `METRICS_TOKEN_FILE`), a shared
+//!   token for a Prometheus scraper that has no Crumb account. In Prometheus,
+//!   `bearer_token` / `bearer_token_file` in the `scrape_config`.
+//!
+//! With `METRICS_TOKEN` unset (the default) only the admin session works. A
+//! valid non-admin session is refused with 403, the same as the rest of the
+//! admin surface. `/health` and `/version` are deliberately NOT gated: clients
+//! and container healthchecks probe them before any token exists.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -21,6 +32,7 @@ use axum::{extract::State, http::header, response::IntoResponse, routing::get, R
 
 use crumb_common::db;
 
+use crate::auth_mw::MetricsAuth;
 use crate::dto::ExportStatus;
 use crate::state::AppState;
 
@@ -43,7 +55,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 #[allow(clippy::cast_possible_wrap)]
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+async fn metrics(_auth: MetricsAuth, State(state): State<AppState>) -> impl IntoResponse {
     let mut out = String::with_capacity(1536);
 
     // ── build info ─────────────────────────────────────────────────────────
