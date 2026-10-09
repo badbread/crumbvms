@@ -275,6 +275,51 @@ async fn a_handoff_code_is_single_use() {
 }
 
 #[tokio::test]
+async fn a_handoff_code_dies_with_its_issuing_session() {
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+
+    let resp = app
+        .send(post_auth_json(
+            "/auth/handoff",
+            &token,
+            &serde_json::json!({}),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK, "minting a handoff code");
+    let code = body_json(resp).await["code"]
+        .as_str()
+        .expect("code in the response")
+        .to_owned();
+
+    // The client that minted the code signs out before the browser redeems it.
+    let resp = app
+        .send(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/auth/sessions/all")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK, "sign out all devices");
+
+    let resp = app
+        .send(post_json(
+            "/auth/handoff/exchange",
+            &serde_json::json!({ "code": code }),
+        ))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a code must not outlive the session that minted it"
+    );
+}
+
+#[tokio::test]
 async fn an_expired_handoff_code_is_rejected() {
     let app = TestApp::new().await;
     let admin = seed_admin(app.pool()).await;

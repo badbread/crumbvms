@@ -645,10 +645,24 @@ async fn exchange_handoff(
 
     // A code can outlive its issuing session in the seconds between a sign-out
     // and the exchange. Honour the sign-out rather than hand back a fresh one.
-    if let Some(jti) = jti {
-        if state.is_jti_revoked(jti).await {
-            return Err(invalid());
-        }
+    // This is the same check the request extractor applies: the fast revoked
+    // set first, then the positive session lookup, so a session that is gone
+    // for any reason cannot be traded for a new one. Every full session carries
+    // a jti, so a code without one is refused. A database error is a 5xx, never
+    // a silent pass.
+    let Some(jti) = jti else {
+        return Err(invalid());
+    };
+    if state.is_jti_revoked(jti).await {
+        return Err(invalid());
+    }
+    if state
+        .resolve_session(jti, user_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .is_none()
+    {
+        return Err(invalid());
     }
 
     let db_user = db::get_user_by_id(state.pool(), user_id)
