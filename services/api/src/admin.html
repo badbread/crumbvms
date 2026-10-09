@@ -9776,6 +9776,7 @@ function renderUser(id) {
       </div>
       <div class="rp-head-actions">
         <button class="primary" onclick="saveUser('${u.id}')">Save</button>
+        <button class="ghost" onclick="signOutUser('${esc(u.id)}')" title="End this account's signed-in sessions on every device">Sign out everywhere</button>
         <button class="danger-ghost" onclick="delUser('${esc(u.id)}')" ${isLastAdmin?'disabled title="Cannot remove the last administrator"':''}>Remove</button>
       </div>
     </div>
@@ -9789,6 +9790,7 @@ function renderUser(id) {
         ${userRoleOptions(u.role_id, u.role === 'admin')}
       </select>
       <div class="card-hint" style="margin-top:4px">Capabilities and the role's base cameras come from the role. <a href="#" onclick="event.preventDefault();newRole()">Add a role</a> for fine-grained permissions. You can also grant this user extra cameras below.</div>
+      <div class="card-hint" style="margin-top:4px">Setting a new password or changing the role signs this account out on its other devices. Use <b>Sign out everywhere</b> to end every session now, for example if a phone was lost.</div>
       ${cameraAccessUI('ue', u.camera_ids || [])}
       ${isLastAdmin?'<div class="info-note" style="margin-top:10px">This is the only administrator. Create another admin before you can remove or demote this account.</div>':''}
       <div id="ue-msg" class="form-msg"></div>
@@ -9839,6 +9841,29 @@ async function saveUser(id) {
     renderUser(id);
   } catch (e) { setMsg('ue-msg', e.message, 'err'); }
 }
+/* ── SIGN OUT EVERYWHERE: end every session this account holds ──────────────
+   DELETE /auth/users/:id/sessions (admin-gated). Every device holding a token
+   for this account is signed out at once; they can sign back in with the same
+   password unless it was also changed. Signing YOURSELF out here ends this
+   console session too, so say so before doing it. */
+async function signOutUser(id) {
+  const u = USERS.find(x => x.id === id);
+  const name = u ? u.username : id;
+  const me = await api('/auth/me').catch(() => null);
+  const warn = (me && me.id === id)
+    ? `Sign out every device for "${name}"? That includes this console, you will have to sign in again.`
+    : `Sign out every device for "${name}"?`;
+  if (!confirm(warn)) return;
+  try {
+    const r = await api('/auth/users/' + encodeURIComponent(id) + '/sessions', { method: 'DELETE' });
+    const n = (r && typeof r.revoked === 'number') ? r.revoked : 0;
+    toast(n === 1 ? `Signed out 1 session for "${name}".` : `Signed out ${n} sessions for "${name}".`);
+  } catch (e) {
+    setMsg('ue-msg', e.message, 'err');
+    toast(e.message, 'err', 5000);
+  }
+}
+
 /* ── REMOVE: user (refuse removing the last administrator; show API reason) ── */
 async function delUser(id) {
   // Resolve the name from the loaded model by UUID (avoids passing admin-set
