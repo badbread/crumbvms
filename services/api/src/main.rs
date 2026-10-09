@@ -43,6 +43,7 @@
 //! /cameras/:id/ptz          → ptz.rs
 //! /cameras/:id/frame.jpg    → cameras.rs
 //! /health                   → inline (no auth — DB+heartbeat probe, 503 if degraded)
+//! /metrics                  → metrics.rs (admin session or METRICS_TOKEN)
 //! ```
 
 #![warn(clippy::pedantic)]
@@ -102,6 +103,7 @@ mod plates;
 mod playback;
 mod ptz;
 mod rate_limit;
+mod response_headers;
 mod roles;
 mod scrub_settings;
 mod segment_low;
@@ -461,18 +463,26 @@ async fn main() -> anyhow::Result<()> {
     // Per-client rate limiter for the JSON routes (generous: burst 240, ~4/s
     // sustained). Protects auth/timeline/status/config from abuse without
     // touching high-frequency media serving.
-    let rate_limiter = rate_limit::RateLimiter::new(240, 4.0);
+    //
+    // Client attribution (TRUST_PROXY + TRUSTED_PROXIES) is shared with the
+    // login backoff via AppState. Resolve any hostname entries (the default is
+    // the bundled `caddy`) before serving, then keep them current.
+    state.proxy_trust().refresh().await;
+    state.proxy_trust().spawn_refresh();
+    let rate_limiter = rate_limit::RateLimiter::new(240, 4.0, state.proxy_trust().clone());
 
     // Second, much larger bucket for the media routes. Media serving is
     // high-frequency by nature (a low-bandwidth wall polls one still per tile
     // per second; scrubbing fires filmstrip frames in bursts of dozens), so this
     // is sized with roughly a 6x margin over the busiest real client rather than
     // as a tight throttle, see `media_limits` for the arithmetic. It is keyed
-    // exactly like the JSON bucket (TCP peer IP, or the first `X-Forwarded-For`
-    // hop under `TRUST_PROXY`).
+    // exactly like the JSON bucket, through the same shared `ProxyTrust`: the
+    // TCP peer, or the right-most untrusted `X-Forwarded-For` hop only when the
+    // peer is a trusted proxy, so a forged header cannot dodge this limit either.
     let media_rate_limiter = rate_limit::RateLimiter::new(
         media_limits::MEDIA_RATE_BURST,
         media_limits::MEDIA_RATE_REFILL_PER_SEC,
+        state.proxy_trust().clone(),
     );
 
     // JSON/API routes get gzip + a 30s request timeout (bounds DB-heavy endpoints
@@ -592,7 +602,7 @@ async fn main() -> anyhow::Result<()> {
 
     // CORS covers the first argument and deliberately NOT the second (`/auth`).
     // Layers that must cover everything (tracing) go outside the call.
-    let app = cors::compose(
+    let app = response_headers::with_site_headers(cors::compose(
         Router::new()
             // Health check — no auth, no tracing noise.  Returns 200 OK when DB
             // responds and the recorder heartbeat is fresh; 503 otherwise so
@@ -602,14 +612,20 @@ async fn main() -> anyhow::Result<()> {
             .route("/version", get(version))
             // Server-served admin console (the page itself is public; it signs in to
             // the API via /auth and drives the admin-only /config endpoints).
-            .route("/admin", get(serve_admin))
-            // Prometheus metrics — no auth (no secrets), no rate limit (scraper).
+            // The console document (and only it) carries a Content-Security-Policy
+            // describing exactly what that one page loads — see response_headers.rs.
+            .route(
+                "/admin",
+                get(serve_admin).layer(response_headers::admin_csp_layer()),
+            )
+            // Prometheus metrics — admin session or METRICS_TOKEN (see
+            // metrics.rs); no rate limit, a scraper polls on a fixed interval.
             .merge(metrics::routes())
             .merge(json_routes)
             .merge(media_routes)
             .merge(heavy_routes),
         auth_routes,
-    )
+    ))
     // Layers applied outermost-first (LIFO evaluation order in tower).
     .layer(TraceLayer::new_for_http())
     .with_state(state.clone());

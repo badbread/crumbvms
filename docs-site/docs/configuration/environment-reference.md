@@ -21,11 +21,15 @@ the admin console, the console value (stored in the database) wins over the
 env default; that's flagged in the notes.
 
 Most secret-bearing keys also answer to a `_FILE` twin (`DATABASE_URL_FILE`,
-`JWT_SECRET_FILE`, `SEED_ADMIN_PASSWORD_FILE`, `HA_TOKEN_FILE`) holding a path
-to read the value from, for Docker secrets. `GO2RTC_USER`/`GO2RTC_PASS` are the
-exception: the embedded go2rtc restreamer expands them straight from the
-process environment and compose requires the plain vars, so those two don't
-support `_FILE`. Only `HA_TOKEN_FILE` gets its own row below, because the
+`JWT_SECRET_FILE`, `SEED_ADMIN_PASSWORD_FILE`, `METRICS_TOKEN_FILE`,
+`HA_TOKEN_FILE`) holding a path to read the value from, for Docker secrets. The
+`_FILE` twin is read in preference to the plain variable, so a mounted secret
+always wins over a stale value left in `.env`. `GO2RTC_USER`/`GO2RTC_PASS` are a
+partial exception: the api does read `GO2RTC_USER_FILE`/`GO2RTC_PASS_FILE`, but
+the embedded go2rtc restreamer expands the plain variables straight from the
+process environment and compose requires them, so the plain form has to be set
+regardless and the `_FILE` twin buys you nothing on its own. Only
+`HA_TOKEN_FILE` and `METRICS_TOKEN_FILE` get their own rows below, because the
 others are mechanical; see [Secrets](/configuration/secrets) for the list.
 
 ## Time zone
@@ -172,7 +176,8 @@ See [Hardware decode](/configuration/hardware-decode) for enabling this.
 |---|---|---|
 | `API_BIND` | `0.0.0.0:8080` | Leave this at `0.0.0.0:8080`. Docker already gates host exposure through the compose `ports:` mapping. Setting `127.0.0.1:8080` here does **not** lock the API to the host, it binds container-local, so the published port answers nothing while the healthcheck still passes: a silently dead API. To restrict the API to localhost, change the compose port mapping to `"127.0.0.1:8080:8080"` instead. |
 | `CRUMB_HTTPS_PORT` | `8443` | the port the bundled Caddy serves HTTPS on. Read by Caddy, not by Crumb, and used on **both** sides of the compose port mapping because the Caddyfile binds the templated port; changing it needs the caddy container recreated, not just restarted. The api's plain `:8080` is unaffected. See [TLS](/configuration/tls) |
-| `TRUST_PROXY` | unset (off) | tells the api to take the client address from the first hop of `X-Forwarded-For` instead of the TCP peer, for rate-limiting purposes only. Set it when the api sits behind a reverse proxy, including the bundled Caddy: without it every HTTPS request keys on the proxy's container IP, so all your HTTPS users share one rate-limit bucket. Do **not** set it when the api is reachable directly, because then a client can forge its own bucket key. This is a set/unset flag, not a boolean: any non-empty value turns it **on**, including `TRUST_PROXY=false`. Read once at startup, so restart the api after changing it. |
+| `TRUST_PROXY` | unset (off) | tells the api to take the client address from `X-Forwarded-For` instead of the TCP peer, for rate limiting and the sign-in backoff. Set it when the api sits behind a reverse proxy, including the bundled Caddy: without it every HTTPS request keys on the proxy's container IP, so all your HTTPS users share one rate-limit bucket. The header is only read on requests that arrive **from a proxy listed in `TRUSTED_PROXIES`**; anything that reaches the api directly (for example on `:8080`) is keyed on its own address, whatever it sends. The api uses the right-most address in the header that is not itself a trusted proxy, which is the one your proxy added. This is a set/unset flag, not a boolean: any non-empty value turns it **on**, including `TRUST_PROXY=false`. Read once at startup, so restart the api after changing it. |
+| `TRUSTED_PROXIES` | `caddy` | which proxies may name the client when `TRUST_PROXY` is on: a comma-separated list of IP addresses, CIDR ranges (`192.0.2.0/24`) or hostnames. The default is the bundled Caddy's service name, so the stock HTTPS setup needs nothing here. Hostnames are looked up at startup and every 30 seconds, so a recreated Caddy container is picked up on its new address. Set it only when you run your own proxy, to that proxy's address as the api sees it. Keep the list tight: every address on it can choose the client address the api records. Read once at startup. |
 
 ## Export
 
@@ -227,6 +232,19 @@ See [Backups](/configuration/backups) for the full picture.
 | `CAMERA_OFFLINE_BOOT_GRACE_SECS` | `180` | holds camera-offline alerts for this long after a recorder restart. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MAINTENANCE_UNTIL` | empty | unix-seconds timestamp to pre-arm a maintenance window at boot. Forwarded by the stock `docker-compose.yml`; set it in `.env` and restart the api container. |
 | `MOTION_UNHEALTHY_ALERT_SECS` | `180` | how long a camera's motion detector must stay *continuously* unhealthy before the recorder raises a system alert. This is alert hysteresis for flaky cameras that blip and self-heal; it delays only the alert, never the fail-open recording safety rail. A camera added with a main stream only (no sub-stream) never raises this alert at all: pixel motion needs the sub-stream, so that camera records continuously by design rather than being broken. |
+
+## Monitoring
+
+`GET /metrics` serves the API's own gauges in the Prometheus text format (database pool
+saturation, export jobs by status, recorder heartbeat age, active cameras, uptime, build
+info). It requires an `Authorization: Bearer` credential: an admin session token always
+works, and `METRICS_TOKEN` gives a scraper that has no Crumb account its own. `/health`
+and `/version` stay open, so an uptime check needs no credential.
+
+| Key | Default | Notes |
+|---|---|---|
+| `METRICS_TOKEN` | empty | a shared token that authorizes `GET /metrics` on its own, sent as `Authorization: Bearer <token>`. In Prometheus this is `bearer_token` (or `bearer_token_file`) in the `scrape_config`. Generate one with `openssl rand -hex 32`. Empty means only an admin session can read `/metrics`. |
+| `METRICS_TOKEN_FILE` | empty | path to a Docker-secret file holding the token, e.g. `/run/secrets/metrics_token`; read in preference to `METRICS_TOKEN` |
 
 ## ONVIF (PTZ, presets, focus)
 

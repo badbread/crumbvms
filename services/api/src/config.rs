@@ -55,6 +55,18 @@ pub struct ApiConfig {
     /// Default: `0.0.0.0:8080`
     pub bind_addr: SocketAddr,
 
+    /// `TRUST_PROXY` -- set/unset flag (any non-empty value turns it on). When
+    /// on, `X-Forwarded-For` names the client for rate limiting and the login
+    /// backoff, but ONLY on requests whose TCP peer is in `trusted_proxies`.
+    /// Default: off (always key on the TCP peer). See `rate_limit.rs`.
+    pub trust_proxy: bool,
+
+    /// `TRUSTED_PROXIES` -- comma-separated IPs, CIDR blocks or hostnames of
+    /// the reverse proxies allowed to supply `X-Forwarded-For` when
+    /// `trust_proxy` is on. Hostnames are re-resolved every 30 s. Empty means
+    /// `caddy`, the bundled proxy's compose service name.
+    pub trusted_proxies: String,
+
     // -- auth ---------------------------------------------------------------
     /// `JWT_SECRET` -- HMAC-SHA256 signing key for JWT tokens.
     ///
@@ -374,6 +386,19 @@ pub struct ApiConfig {
     /// recovery. Empty/unset disables alerting (no-op watchdog).
     pub alert_webhook_url: Option<String>,
 
+    // -- monitoring ----------------------------------------------------------
+    /// `METRICS_TOKEN` (or `METRICS_TOKEN_FILE`) -- optional shared token that
+    /// authorizes `GET /metrics` without a login session, for a Prometheus
+    /// scraper that has no Crumb account. Send it as
+    /// `Authorization: Bearer <token>` (Prometheus: `bearer_token` /
+    /// `bearer_token_file` in the `scrape_config`).
+    ///
+    /// Unset (the default) means `/metrics` is reachable only with an admin
+    /// session, exactly like the rest of `/config` and `/stats`. `/health` and
+    /// `/version` stay open either way, because clients probe them before they
+    /// have a token.
+    pub metrics_token: Option<String>,
+
     // -- update-available check (issue #7) -----------------------------------
     /// `UPDATE_CHECK_ENABLED` -- env fallback for the update-available check
     /// (`GET /updates/latest`, `services/api/src/updates.rs`). Only consulted
@@ -445,6 +470,20 @@ impl ApiConfig {
         // DATABASE_URL and JWT_SECRET are secrets → support the `_FILE`
         // convention (Docker secrets) in addition to plaintext env (Risk #9).
         let database_url = require_secret("DATABASE_URL")?;
+        // Same backstop as JWT_SECRET and GO2RTC_PASS below: refuse to start on
+        // the placeholder password `.env.example` ships. setup-env.sh generates a
+        // strong one, so this only fires if someone hand-wrote the example value
+        // into .env and never replaced it.
+        anyhow::ensure!(
+            !database_url_has_placeholder_password(&database_url),
+            "DATABASE_URL still carries the placeholder database password from \
+             .env.example. Generate a real one (openssl rand -hex 32), set both \
+             POSTGRES_PASSWORD and DATABASE_URL to it, or let scripts/setup-env.sh \
+             create them. If the database already exists with the placeholder, \
+             change it in Postgres first \
+             (ALTER USER <user> WITH PASSWORD '<new>';) — a new POSTGRES_PASSWORD \
+             does not re-initialize an existing data volume"
+        );
         let jwt_secret = require_secret("JWT_SECRET")?;
         anyhow::ensure!(
             jwt_secret.len() >= 32,
@@ -485,6 +524,8 @@ impl ApiConfig {
             db_pool_size: parse_env("DB_POOL_SIZE", 32)?,
             playback_max_concurrency: parse_env("PLAYBACK_MAX_CONCURRENCY", 8usize)?.max(1),
             bind_addr,
+            trust_proxy: crate::rate_limit::trust_proxy_from_env(),
+            trusted_proxies: optional_env("TRUSTED_PROXIES", ""),
             jwt_secret,
             jwt_expiry_seconds: parse_env("JWT_EXPIRY_SECONDS", 86_400_u64)?,
             live_storage_path: optional_env("LIVE_STORAGE_PATH", "/data/live"),
@@ -530,6 +571,10 @@ impl ApiConfig {
             thumb_cache_dir: optional_env("THUMB_CACHE_DIR", ""),
             frigate_api_base: optional_env("FRIGATE_API_BASE", ""),
             alert_webhook_url: optional_env_opt("ALERT_WEBHOOK_URL"),
+            // Secret: supports METRICS_TOKEN_FILE (Docker secret) too.
+            metrics_token: crumb_common::config::secret_env("METRICS_TOKEN")
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty()),
             update_check_enabled: parse_env("UPDATE_CHECK_ENABLED", false)?,
             seed_admin_username: optional_env("SEED_ADMIN_USERNAME", "admin"),
             // Secret: supports SEED_ADMIN_PASSWORD_FILE (Docker secret) too.
@@ -612,6 +657,21 @@ where
 /// survives `.env` + docker-compose substitution unmangled. Raw `ONVIF_CONFIG`
 /// is still accepted as a fallback for local/dev use.
 ///
+/// The placeholder values shipped as "fill this in" markers in `.env.example`
+/// and the manual-setup docs. A running install must never carry one.
+const PLACEHOLDER_SECRETS: [&str; 2] = ["change-me", "changeme"];
+
+/// `true` when `database_url`'s userinfo password is one of the documented
+/// placeholders. A URL with no password (peer/trust auth, or a `.pgpass` file)
+/// is not a placeholder and passes.
+fn database_url_has_placeholder_password(database_url: &str) -> bool {
+    crumb_common::redact::url_password(database_url).is_some_and(|pw| {
+        PLACEHOLDER_SECRETS
+            .iter()
+            .any(|p| pw.eq_ignore_ascii_case(p))
+    })
+}
+
 /// Returns an empty map when neither var is set or both are empty (not an
 /// error). Returns an error when a present value can't be decoded/parsed.
 fn parse_onvif_config() -> Result<HashMap<String, OnvifCameraConfig>> {
@@ -642,7 +702,39 @@ fn parse_onvif_config() -> Result<HashMap<String, OnvifCameraConfig>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env, DEFAULT_EXPORT_DIR};
+    use super::{database_url_has_placeholder_password, parse_env, DEFAULT_EXPORT_DIR};
+
+    #[test]
+    fn placeholder_database_password_is_recognised() {
+        assert!(database_url_has_placeholder_password(
+            "postgresql://crumb:change-me@postgres:5432/crumb"
+        ));
+        // The .env.example spelling, case-insensitively, and the run-together
+        // variant the older manual docs used.
+        assert!(database_url_has_placeholder_password(
+            "postgresql://crumb:CHANGE-ME@postgres:5432/crumb"
+        ));
+        assert!(database_url_has_placeholder_password(
+            "postgresql://crumb:changeme@postgres:5432/crumb"
+        ));
+    }
+
+    #[test]
+    fn a_real_database_password_passes() {
+        assert!(!database_url_has_placeholder_password(
+            "postgresql://crumb:8f3c1d0a9b7e4f6a2c5d8e1f0a3b6c9d@postgres:5432/crumb"
+        ));
+        // A password that merely CONTAINS the placeholder is a real password.
+        assert!(!database_url_has_placeholder_password(
+            "postgresql://crumb:change-me-later-9f3a@postgres:5432/crumb"
+        ));
+        // No password at all (peer/trust auth, or a .pgpass file) is not a
+        // placeholder and must not stop startup.
+        assert!(!database_url_has_placeholder_password(
+            "postgresql://crumb@postgres:5432/crumb"
+        ));
+        assert!(!database_url_has_placeholder_password("not a url"));
+    }
 
     /// #249: compose forwards keys as `${VAR:-}`, so an unset key arrives as an
     /// empty string. The api's `parse_env` must treat that as "use the default",

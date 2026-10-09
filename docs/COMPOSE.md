@@ -168,9 +168,11 @@ the sqlx connection pool (empty = the code default).
 
 Serves the HTTP API and the web admin console at `/admin` on `:8080`. Every
 protected endpoint requires a JWT; the open (unauthenticated) endpoints are
-`/health`, `/version`, `/metrics` (Prometheus scrape, no secrets), the `/admin`
-page itself, `/auth/login`, and the first-run
-`/auth/needs-bootstrap` + `/auth/setup-status` + `/auth/bootstrap`.
+`/health`, `/version`, the `/admin` page itself, `/auth/login`, and the
+first-run `/auth/needs-bootstrap` + `/auth/setup-status` + `/auth/bootstrap`.
+`/metrics` (the Prometheus scrape) takes either an admin session or the
+optional `METRICS_TOKEN` / `METRICS_TOKEN_FILE`, sent as
+`Authorization: Bearer <token>`.
 
 - Mounts the **same media root read-only** (`/data:ro`) — the api only reads
   recorded files; the recorder owns writes. Storage paths added in the UI must

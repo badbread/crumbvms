@@ -22,7 +22,7 @@
 //!
 //! ```sh
 //! docker run --rm -d --name crumb-test-pg \
-//!   -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=crumb \
+//!   -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=crumb-dev -e POSTGRES_DB=crumb \
 //!   -p 5432:5432 postgres:16-alpine
 //! cargo test -p crumb-api --test auth_rbac
 //! ```

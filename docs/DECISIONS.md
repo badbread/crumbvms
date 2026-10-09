@@ -324,6 +324,210 @@ budget is not), or if per-camera export throughput makes the 4x realtime factor
 the binding constraint, at which point the stall watchdog becomes the better
 mechanism.
 
+## 2026-09-07, The api refuses to start on the placeholder database password, and every `_FILE` twin wins over its plain variable
+
+**Context.** Three inconsistencies in how secrets were read and documented:
+
+* `db.rs`'s `ha_env` read `HA_TOKEN` first and only fell back to
+  `HA_TOKEN_FILE`, the reverse of `config::secret_env`, which every other secret
+  goes through. An operator who mounted a Docker secret while a stale plain
+  value sat in `.env` silently got the stale one, and the docs-site already said
+  `HA_TOKEN_FILE` was "read in preference to `HA_TOKEN`".
+* The docs-site said `GO2RTC_USER`/`GO2RTC_PASS` "don't support `_FILE`". The
+  api routes both through `require_secret`, which does read the `_FILE` twin.
+  What is actually true is narrower: the embedded go2rtc restreamer expands the
+  plain variables from the process environment, so the plain form has to be set
+  regardless.
+* `.env.example` and `docker-compose.yml` ship `POSTGRES_PASSWORD=change-me` and
+  a matching `DATABASE_URL`. `JWT_SECRET` and `GO2RTC_PASS` both refuse their
+  documented placeholder at startup; the database password did not.
+
+**Decision.** `ha_env` calls `secret_env("HA_TOKEN")`, so the file wins like
+everywhere else. The two docs pages now describe the `GO2RTC_*` situation
+accurately. And `ApiConfig::from_env` refuses to start when `DATABASE_URL`'s
+userinfo password is one of the documented placeholders (`change-me`,
+`changeme`, case-insensitively), with an error naming the fix, including the
+part that trips people up: a changed `POSTGRES_PASSWORD` does not re-initialize
+an existing Postgres data volume, so the password has to be changed in the
+database too.
+
+**Trade-off accepted:** this is a startup-breaking change for an install that
+is currently running on the placeholder. That is the point, and it matches what
+`JWT_SECRET` and `GO2RTC_PASS` have always done; the error says exactly what to
+do. Only exact placeholder matches are refused, so a real password that happens
+to begin with `change-me` still starts.
+
+**Rejected:** warning instead of refusing (a warning in a log nobody reads is
+how the value survives to production, and the two adjacent secrets already set
+the refuse precedent); a generic weak-password check (arbitrary, and Crumb has
+no business grading operator passwords, only rejecting the one it shipped
+itself).
+
+**Revisit if:** a deployment shape appears where the api legitimately cannot
+know the real password, e.g. an external connection broker, in which case the
+check should key on the password being *absent* rather than a value list.
+
+---
+
+## 2026-09-07, Camera source URLs mask their password on read; sending the mask back means "keep it"
+
+**Context.** A camera's `source_url` / `source_sub_url` carry the camera's own
+`user:pass@` credentials inline, because that is what go2rtc dials.
+`onvif_password` has been write-only since the distributability work (never
+copied into a DTO, blank on `PUT` keeps the stored value), but the two source
+URLs were returned verbatim by `GET /config/cameras`, so every admin session,
+and anything that logged or cached that response, held the camera passwords in
+clear.
+
+**Decision.** `camera_to_dto` masks the userinfo password with a fixed string
+(`crumb_common::redact::CREDENTIAL_MASK`, `********`) and adds
+`source_has_credentials` / `source_sub_has_credentials` so a client can say
+"there is a stored password" without holding it. `PUT /config/cameras/{id}`
+resolves a submitted URL against the stored one: a password equal to the mask
+means keep the stored credential, anything else is taken literally and replaces
+it. The rest of the submitted URL always wins, so an operator can change the
+host or path while leaving the masked password alone. The masking and unmasking
+live in `services/common/src/redact.rs` next to the log-redaction helpers, which
+already own the `scheme://user:pass@host` parsing rule.
+
+**Why a mask inside the URL rather than a separate password field.** The URL is
+one text field the operator types, pastes and edits as a whole; splitting the
+credential out would mean a different editing model in the console and a
+migration of the stored shape. The mask keeps the field a URL, keeps
+copy-paste-and-edit working, and reuses the read/write contract `onvif_password`
+already established.
+
+**Trade-offs accepted:** a camera whose real password is literally `********`
+cannot be distinguished from the mask, so a `PUT` would keep the stored value
+rather than set that password. The API also cannot tell "keep" from "set to the
+same value", which is the same limitation the blank-keeps-it ONVIF password
+field has. The console shows a hint under the stream fields when credentials are
+stored.
+
+**Unaffected by design:** the recorder and the go2rtc reconcile loop read
+`source_url` from the database (`db::list_camera_streams`), never from a DTO, so
+the restream keeps dialling the real credentials.
+
+**Rejected:** omitting the URLs entirely from the DTO (the console needs to show
+and edit them); returning them only to a narrower role (there is no role above
+admin); a per-request "reveal" endpoint (adds a way to read the password back
+out, which is the thing being removed).
+
+**Revisit if:** a client ever needs the real source URL for something other than
+editing, or the console moves to a structured stream editor with its own
+password field, at which point the mask can be dropped in favour of a write-only
+field.
+
+---
+
+## 2026-09-07, Login backoff is keyed on (account, client), not on the account alone
+
+**Context.** Issue #127 added a repeated-failure backoff to `POST /auth/login`:
+five consecutive failures for a username, then 429 + `Retry-After` with an
+exponential window capped at 15 minutes. The counter was keyed on the username
+only, so anyone who could reach the login endpoint and knew (or guessed) a
+username could keep its owner out for as long as they kept failing, from
+anywhere.
+
+**Decision.** The counter key is now `username + \u{1f} + client`, where
+`client` comes from `rate_limit::client_key` — the same derivation the per-client
+request bucket uses, so both honour `TRUST_PROXY` identically and can never
+drift. Thresholds, the exponential schedule, the cap, the map-pruning bound and
+the 429 + `Retry-After` shape are all unchanged. A success clears only the
+client that succeeded. The per-client request bucket stays the global limiter on
+top, unchanged.
+
+Two further rules keep the per-client key from being something a client can
+choose:
+
+- **Proxy trust is per peer.** With `TRUST_PROXY` on, `X-Forwarded-For` is read
+  only when the TCP peer is in `TRUSTED_PROXIES` (IPs, CIDRs or hostnames,
+  default `caddy`, re-resolved every 30 s). The client is the right-most hop
+  that is not itself a trusted proxy, i.e. the entry the proxy appended, never
+  the client-supplied left-most one. Anything that reaches the published
+  `:8080` directly is keyed on its TCP peer whatever it sends. Previously the
+  first hop was taken from any peer, so a direct client could pick a new key
+  per request.
+- **An account-wide ceiling sits on top.** 30 failures for one username within
+  a sliding 15 minutes, from any mix of clients, put the whole account into a
+  backoff of 30 s that doubles per further failure up to the same 15-minute
+  cap, until 30 minutes pass with no failure. One client cannot reach it
+  alone: its own backoff (5 free, then 2, 4, 8, ... s) admits at most 13
+  failures in 15 minutes. A success does not clear the account count.
+
+**Trade-off accepted:** someone able to fail from three or more addresses at
+full speed can still make the owner wait (up to 15 minutes per failure while
+they keep going). That is the price of a brake that address rotation cannot
+dodge, and it takes far more than one noisy client to trigger.
+
+**Rejected (proxy trust):** trusting the Docker bridge range by default (on
+some setups host-local and published-port traffic arrives from the bridge
+gateway, so it would trust direct clients); a fixed Caddy address in compose
+(needs a pinned subnet that can collide with existing networks); honouring the
+left-most hop (client-controlled).
+
+`ConnectInfo` is extracted as an `Option` in the login handler, so a router
+driven without `into_make_service_with_connect_info` (a test harness) still
+serves logins, with every such request sharing one `"unknown-peer"` key.
+
+**Rejected:** keeping the account-wide key with an operator allowlist (more
+configuration, same failure mode by default); dropping the per-account counter
+entirely and relying on the request bucket (loses the per-account signal, and
+the bucket is deliberately generous for normal JSON traffic).
+
+**Revisit if:** Crumb ever grows an account-lockout policy an operator actually
+asks for (compliance-driven), in which case it should be an explicit, opt-in
+setting with an admin unlock, not an implicit side effect of failure counting.
+
+---
+
+## 2026-09-07, Response headers: two site-wide headers everywhere, a Content-Security-Policy on the `/admin` document only
+
+**Context.** The api sent no `X-Content-Type-Options`, no `Referrer-Policy`, and
+no `Content-Security-Policy` on any response. The admin console
+(`services/api/src/admin.html`) is one `include_str!`-embedded page whose entire
+network surface is same-origin: every `fetch()` is a relative path, the icon set
+is inline SVG (Lucide path data embedded, not hotlinked), and the only non-`'self'`
+image sources are `data:` (inline placeholder glyphs) and `blob:` (snapshot
+frames from `URL.createObjectURL`). It has no `<iframe>`, no `<base>`, no
+`<form>`, no `WebSocket`/`EventSource`/`Worker`, and one inline `<script>`.
+
+**Decision.** `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`
+are set on every response by a `tower_http::set_header` layer applied outermost
+in `main.rs` (so it also covers the `/auth` subtree, which is merged outside the
+CORS layer). The `Content-Security-Policy` is attached to the `/admin` route
+only, not to JSON or media responses, whose consumers are native clients and for
+which a document policy means nothing. The policy and both helpers live in
+`services/api/src/response_headers.rs` with a test that asserts the wiring.
+
+**Trade-off accepted:** the policy carries `'unsafe-inline'` for `script-src` and
+`style-src`, because the console is deliberately a single self-contained file
+with one inline script and inline `style=` attributes throughout. Nonces or
+hashes would mean changing how the page is assembled and served, which is a much
+larger change than this one; the policy still pins every load origin to `'self'`
+(plus `data:`/`blob:` images) and sets `base-uri 'none'`, `object-src 'none'`,
+`form-action 'self'`, `frame-ancestors 'self'`.
+
+`frame-ancestors 'self'` is safe for the desktop client: it navigates a native
+WebView2 to `/admin` as a top-level document (`apps/desktop-flutter/lib/ui/
+admin_console/admin_console_screen.dart`), not in an `<iframe>` as the retired
+Tauri client did.
+
+**Also noted, deliberately unchanged:** `admin.html` keeps its bearer token in
+`localStorage`. Moving it to a cookie or in-memory-only store changes the whole
+sign-in/refresh flow and every client that deep-links into the console with
+`#token=`; it is out of scope here.
+
+**Rejected:** a single global CSP covering the JSON/media routes (meaningless
+for native clients, and one more thing to keep in step with the media surface);
+nonce/hash-based `script-src` (needs the console to stop being one static
+`include_str!` file).
+
+**Revisit if:** the console ever gains an external asset, an `<iframe>`, a
+`WebSocket`, or a cross-origin `fetch()` (all four would need a directive
+widened, and the widening should be argued here first), or if the console is
+split into separate served assets, at which point `'unsafe-inline'` can go.
+
 ---
 
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope

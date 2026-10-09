@@ -4968,6 +4968,9 @@ function renderCamInfoTab(c) {
           <button class="ghost sm" onclick="testCameraStream('${c.id}','sub')">Test</button>
         </div>
       </div>
+      ${(c.source_has_credentials || c.source_sub_has_credentials)
+        ? '<div class="card-hint" style="margin:8px 0 0 2px">The camera password in these URLs is hidden behind <code>********</code>. Leave it in place to keep the stored password; type a new one over it to change it.</div>'
+        : ''}
     </div>
 
     <div class="policy-section">
