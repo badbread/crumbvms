@@ -27,7 +27,7 @@ use crumb_common::{
         mark_plate_alerted, match_watchlist, normalize_plate, upsert_detection_event,
         upsert_plate_read, UpsertDetectionEventParams, UpsertPlateReadParams,
     },
-    detection::NormalizedEvent,
+    detection::{DetectionLabel, NormalizedEvent},
 };
 
 /// Run the detection-event ingester loop.
@@ -40,7 +40,41 @@ use crumb_common::{
 pub async fn run(mut rx: mpsc::Receiver<NormalizedEvent>, pool: Pool) {
     info!("detection ingester: started");
 
-    while let Some(ev) = rx.recv().await {
+    while let Some(mut ev) = rx.recv().await {
+        // Ignore-list BEFORE the events write: a plate on an `ignore` entry must
+        // not land in `events.sub_label`/`raw` either (the later plate-read path
+        // only guards `plate_reads`).
+        let mut plate_suppressed = false;
+        if let Some(plate) = ev.plate_string() {
+            let normalized = normalize_plate(&plate);
+            if !normalized.is_empty() {
+                let fuzz = match get_lpr_settings(&pool).await {
+                    Ok(Some(cfg)) => Ok(cfg.watchlist_fuzz),
+                    Ok(None) => Ok(0.0),
+                    Err(e) => Err(e),
+                };
+                let check = match fuzz {
+                    Ok(f) => is_plate_ignored(&pool, &normalized, f).await,
+                    Err(e) => Err(e),
+                };
+                let decision = ignore_decision(&check);
+                if let Err(e) = &check {
+                    warn!(error = %e, camera = %ev.camera_id, "detection ingester: ignore-list check failed (fail-closed)");
+                }
+                match pre_write_action(&decision, ev.label == DetectionLabel::LicensePlate) {
+                    PreWrite::Write => {}
+                    PreWrite::Scrub => {
+                        scrub_plate(&mut ev);
+                        plate_suppressed = true;
+                    }
+                    PreWrite::DropEvent => {
+                        tracing::debug!(camera = %ev.camera_id, "detection ingester: plate event dropped before write (ignore-list / fail-closed)");
+                        continue;
+                    }
+                }
+            }
+        }
+
         let params = UpsertDetectionEventParams {
             camera_id: ev.camera_id,
             start_ts: ev.start_ts,
@@ -69,8 +103,10 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedEvent>, pool: Pool) {
                 );
                 // LPR: if this event carries a plate and capture is enabled,
                 // record it in the plate-domain store beside the events row.
-                if let Some(plate) = ev.plate_string() {
-                    maybe_record_plate(&pool, &ev, id, &plate).await;
+                if !plate_suppressed {
+                    if let Some(plate) = ev.plate_string() {
+                        maybe_record_plate(&pool, &ev, id, &plate).await;
+                    }
                 }
             }
             Err(e) => {
@@ -111,6 +147,58 @@ fn ignore_decision(check: &anyhow::Result<bool>) -> IgnoreDecision {
         Ok(true) => IgnoreDecision::Drop,
         Ok(false) => IgnoreDecision::Store,
         Err(_) => IgnoreDecision::Skip,
+    }
+}
+
+/// What to do with an event carrying a plate, before the `events` write.
+#[derive(Debug, PartialEq, Eq)]
+enum PreWrite {
+    /// Not ignored: write the event unchanged.
+    Write,
+    /// Ignored (or check failed) on a non-plate event such as a car: keep the
+    /// detection but strip the plate data.
+    Scrub,
+    /// Ignored (or check failed) on a plate-labelled event: write nothing.
+    DropEvent,
+}
+
+/// Map the ignore-list decision to the pre-write action. `Skip` (check failed)
+/// fails closed exactly like `Drop`.
+fn pre_write_action(decision: &IgnoreDecision, plate_labelled: bool) -> PreWrite {
+    match decision {
+        IgnoreDecision::Store => PreWrite::Write,
+        IgnoreDecision::Drop | IgnoreDecision::Skip => {
+            if plate_labelled {
+                PreWrite::DropEvent
+            } else {
+                PreWrite::Scrub
+            }
+        }
+    }
+}
+
+/// Remove every plate string from a non-plate event before it is stored.
+fn scrub_plate(ev: &mut NormalizedEvent) {
+    ev.recognized_plate = None;
+    ev.sub_label = None;
+    ev.plate_confidence = None;
+    ev.plate_box = None;
+    ev.plate_crop = None;
+    strip_plate_from_raw(&mut ev.raw);
+}
+
+/// Delete the recognized-plate keys from a raw provider payload.
+fn strip_plate_from_raw(raw: &mut serde_json::Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("recognized_license_plate");
+        obj.remove("recognized_license_plate_score");
+        obj.remove("plate");
+        for key in ["after", "before", "data"] {
+            if let Some(inner) = obj.get_mut(key).and_then(serde_json::Value::as_object_mut) {
+                inner.remove("recognized_license_plate");
+                inner.remove("recognized_license_plate_score");
+            }
+        }
     }
 }
 
@@ -336,7 +424,9 @@ async fn maybe_alert_watchlist(
 
 #[cfg(test)]
 mod tests {
-    use super::{ignore_decision, IgnoreDecision};
+    use super::{
+        ignore_decision, pre_write_action, strip_plate_from_raw, IgnoreDecision, PreWrite,
+    };
 
     #[test]
     fn ignore_decision_stores_when_not_ignored() {
@@ -355,5 +445,49 @@ mod tests {
         let err: anyhow::Result<bool> = Err(anyhow::anyhow!("connection reset"));
         assert_eq!(ignore_decision(&err), IgnoreDecision::Skip);
         assert_ne!(ignore_decision(&err), IgnoreDecision::Store);
+    }
+
+    #[test]
+    fn ignored_plate_event_is_not_written_but_car_event_is_scrubbed() {
+        assert_eq!(
+            pre_write_action(&IgnoreDecision::Drop, true),
+            PreWrite::DropEvent
+        );
+        assert_eq!(
+            pre_write_action(&IgnoreDecision::Drop, false),
+            PreWrite::Scrub
+        );
+        // Fail closed: a failed ignore check behaves like an ignored plate.
+        assert_eq!(
+            pre_write_action(&IgnoreDecision::Skip, true),
+            PreWrite::DropEvent
+        );
+        assert_eq!(
+            pre_write_action(&IgnoreDecision::Skip, false),
+            PreWrite::Scrub
+        );
+        assert_eq!(
+            pre_write_action(&IgnoreDecision::Store, true),
+            PreWrite::Write
+        );
+        assert_eq!(
+            pre_write_action(&IgnoreDecision::Store, false),
+            PreWrite::Write
+        );
+    }
+
+    #[test]
+    fn strip_plate_removes_nested_and_top_level_keys() {
+        let mut raw = serde_json::json!({
+            "plate": "7ABC123",
+            "after": { "id": "e1", "recognized_license_plate": ["7ABC123", 0.9] },
+            "data": { "recognized_license_plate": "7ABC123" },
+            "label": "car"
+        });
+        strip_plate_from_raw(&mut raw);
+        assert_eq!(
+            raw,
+            serde_json::json!({ "after": { "id": "e1" }, "data": {}, "label": "car" })
+        );
     }
 }

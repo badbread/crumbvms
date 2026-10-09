@@ -204,6 +204,7 @@ services:
       DB_POOL_SIZE: ${DB_POOL_SIZE:-}                   # sqlx pool size (empty = default 32)
       MAINTENANCE_UNTIL: ${MAINTENANCE_UNTIL:-}         # unix seconds; suppress low-disk/offline alerts during planned maintenance
       CAMERA_OFFLINE_BOOT_GRACE_SECS: ${CAMERA_OFFLINE_BOOT_GRACE_SECS:-}   # grace before offline alerts after boot (empty = default 180)
+      BOOKMARK_MAX_PROTECTED_PER_USER: ${BOOKMARK_MAX_PROTECTED_PER_USER:-}   # cap on a non-admin user's active protected bookmarks (empty = default 50, 0 = unlimited)
       # Thumbnail cache + pregen tuning (all optional; empty = built-in default). (#229)
       # NB: THUMB_EXTRACT_TIMEOUT_SECS / _INTERVAL_SECS / _MAX_ATTEMPTS / _MAX_WIDTH
       # / _MIN_WIDTH / _NEAR_BLACK_LUMA are compile-time consts, NOT env-read — they
