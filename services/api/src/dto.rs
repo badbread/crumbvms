@@ -57,9 +57,11 @@ pub struct Claims {
     /// Role — `"admin"` or `"viewer"`. Legacy mirror of the assigned role's
     /// `is_admin`; the `AdminUser` gate still reads this.
     pub role: String,
-    /// LEGACY camera scope baked into the token. Superseded by the role's cameras,
-    /// which the auth extractor resolves from `role_id`. Kept for back-compat with
-    /// tokens issued before RBAC and as a fallback when a role can't be resolved.
+    /// LEGACY camera scope baked into the token, kept in the wire format so a
+    /// token minted by one server version still decodes on another. It is no
+    /// longer READ when authenticating: the caller's per-user camera grants are
+    /// resolved from the user row on each request (see `auth_mw`), so removing a
+    /// grant takes effect immediately rather than at the user's next login.
     pub camera_ids: Vec<String>,
     /// Assigned permission-role id (the source of truth for capabilities + camera
     /// scope). `None` on legacy tokens issued before RBAC. `#[serde(default)]` so
@@ -68,10 +70,10 @@ pub struct Claims {
     pub role_id: Option<String>,
     /// Session id (JWT ID) — a UUID that ties this token to a revocable `sessions`
     /// row (migration 0033). The `AuthUser` extractor rejects the token if this
-    /// `jti` is revoked. `None` on legacy tokens minted before P0-SESSIONS:
-    /// `#[serde(default)]` keeps those deserializing, and the extractor treats a
-    /// `jti`-less token as "legacy, not revocable" (unchanged behaviour) unless
-    /// the owner opts into rejecting legacy tokens.
+    /// `jti` is revoked or its session row is gone. `#[serde(default)]` so a
+    /// token without one still DESERIALIZES, but the extractor then refuses it:
+    /// every token any released client has held carries a `jti`, and a token
+    /// without one could never be signed out.
     #[serde(default)]
     pub jti: Option<String>,
 }
@@ -286,10 +288,24 @@ pub struct CameraDto {
     pub go2rtc_name: String,
     pub main_url: String,
     pub sub_url: Option<String>,
-    /// Raw camera RTSP source — set for Crumb-managed cameras (the API owns their
+    /// Camera RTSP source — set for Crumb-managed cameras (the API owns their
     /// go2rtc stream). `None` for legacy/externally-configured streams.
+    ///
+    /// The userinfo password is replaced with `crumb_common::redact::CREDENTIAL_MASK`
+    /// on the way out; the username, host, port, path and query are verbatim.
+    /// Sending the masked value back on `PUT /config/cameras/{id}` keeps the
+    /// stored credential (see `source_has_credentials`); sending a different
+    /// password replaces it. Same read/write contract as `onvif_password`, only
+    /// expressed inside the URL because that is how the operator edits it.
     pub source_url: Option<String>,
+    /// Sub-stream source, masked the same way as `source_url`.
     pub source_sub_url: Option<String>,
+    /// `true` when a password is stored in `source_url` (so the value above is a
+    /// masked one and a client should present it as "keep the existing
+    /// credential unless you type a new one").
+    pub source_has_credentials: bool,
+    /// The same, for `source_sub_url`.
+    pub source_sub_has_credentials: bool,
     /// The camera's OWN direct recording policy id, or `null` when it inherits
     /// (from its group, else the global default). The UI uses this together with
     /// `group_id` to render "Inherit from group X" vs an explicit named policy.
@@ -1201,9 +1217,11 @@ pub struct MotionCacheStatusDto {
 /// updated camera DTO.
 #[derive(Debug, Serialize)]
 pub struct RedetectResponse {
-    /// The raw RTSP main-stream URI returned by ONVIF `GetStreamUri`.
+    /// The RTSP main-stream URI returned by ONVIF `GetStreamUri`, with the
+    /// injected userinfo password masked exactly as in [`CameraDto`].
     pub source_url: String,
-    /// The raw RTSP sub-stream URI, if the camera exposes a second profile.
+    /// The RTSP sub-stream URI, if the camera exposes a second profile; masked
+    /// the same way.
     pub source_sub_url: Option<String>,
     /// Whether ONVIF `GetServices` reported a PTZ `XAddr` (i.e. this camera
     /// supports PTZ control via ONVIF). `false` when the probe failed or the

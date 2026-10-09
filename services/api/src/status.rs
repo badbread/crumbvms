@@ -12,7 +12,8 @@
 //!
 //! ## Storage free space
 //!
-//! For each storage row, we call `db::storage_used_bytes` to get the
+//! For each storage row, we call `db::storage_used_bytes` (cached for 30 s,
+//! since it is a full `SUM` over the storage's segments) to get the
 //! segment-index tracked usage.  Free disk space is queried via the POSIX
 //! `statvfs` syscall through `libc` — this works on read-only mounts and
 //! requires no extra crate beyond `libc` which is already present as a
@@ -30,9 +31,16 @@
 //! The recorder does not yet write a heartbeat to Postgres.  Returns `None`
 //! until the recorder team adds a `heartbeats` table in a future migration.
 
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
 use axum::{extract::State, routing::get, Json, Router};
 use tokio::task::JoinSet;
 use tracing::warn;
+use uuid::Uuid;
 
 use crumb_common::{
     db,
@@ -55,6 +63,73 @@ const HEALTH_STALENESS_SECS: i64 = 15;
 /// considered to have motion "right now".  ~2 × the max segment length so the
 /// live indicator clears within a segment or two after motion stops.
 const MOTION_FRESHNESS_SECS: i64 = 12;
+
+/// How long a storage's `used_bytes` figure is reused. The figure is a
+/// `SUM(size_bytes)` over every segment row of the storage, far too heavy to
+/// recompute on every 2 to 3 s admin `/status` poll; the consumers (dashboard,
+/// recording alerts, admin console) display it and tolerate a short lag.
+const USED_BYTES_TTL: Duration = Duration::from_secs(30);
+
+/// Per-key value cache with a fixed time-to-live.
+struct TtlCache<K, V> {
+    ttl: Duration,
+    entries: HashMap<K, (Instant, V)>,
+}
+
+impl<K: std::hash::Hash + Eq, V: Copy> TtlCache<K, V> {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The cached value for `key`, if present and not older than the TTL at `now`.
+    fn get(&self, key: &K, now: Instant) -> Option<V> {
+        self.entries
+            .get(key)
+            .filter(|(at, _)| now.saturating_duration_since(*at) < self.ttl)
+            .map(|(_, v)| *v)
+    }
+
+    fn put(&mut self, key: K, value: V, now: Instant) {
+        self.entries.insert(key, (now, value));
+    }
+}
+
+static USED_BYTES_CACHE: OnceLock<Mutex<TtlCache<Uuid, i64>>> = OnceLock::new();
+
+fn used_bytes_cache() -> &'static Mutex<TtlCache<Uuid, i64>> {
+    USED_BYTES_CACHE.get_or_init(|| Mutex::new(TtlCache::new(USED_BYTES_TTL)))
+}
+
+/// `db::storage_used_bytes` behind a short TTL cache. A failed query returns 0
+/// (as before) and is not cached.
+async fn cached_storage_used_bytes(pool: &deadpool_postgres::Pool, storage_id: Uuid) -> i64 {
+    if let Some(v) = used_bytes_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&storage_id, Instant::now()))
+    {
+        return v;
+    }
+    match db::storage_used_bytes(pool, storage_id).await {
+        Ok(v) => {
+            if let Ok(mut c) = used_bytes_cache().lock() {
+                c.put(storage_id, v, Instant::now());
+            }
+            v
+        }
+        Err(e) => {
+            warn!(
+                storage_id = %storage_id,
+                error = %e,
+                "failed to query storage_used_bytes"
+            );
+            0
+        }
+    }
+}
 
 /// Mount status routes onto the root router.
 pub fn routes() -> Router<AppState> {
@@ -82,16 +157,7 @@ async fn system_status(
     let mut storage_entries: Vec<StorageStatusEntry> = Vec::with_capacity(storages.len());
 
     for storage in &storages {
-        let used_bytes = db::storage_used_bytes(pool, storage.id)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(
-                    storage_id = %storage.id,
-                    error = %e,
-                    "failed to query storage_used_bytes"
-                );
-                0
-            });
+        let used_bytes = cached_storage_used_bytes(pool, storage.id).await;
 
         let (fs_total_bytes, free_bytes) = match statvfs_bytes(&storage.path) {
             Some((total, free)) => (Some(total), Some(free)),
@@ -268,5 +334,23 @@ fn statvfs_bytes(path: &str) -> Option<(i64, i64)> {
         // Non-Unix build (e.g. cross-compilation checks on Windows CI).
         let _ = path;
         None
+    }
+}
+
+#[cfg(test)]
+mod used_bytes_cache_tests {
+    use super::*;
+
+    #[test]
+    fn value_is_reused_within_ttl_and_expires_after() {
+        let t0 = Instant::now();
+        let mut c: TtlCache<u8, i64> = TtlCache::new(Duration::from_secs(30));
+        assert_eq!(c.get(&1, t0), None);
+        c.put(1, 42, t0);
+        assert_eq!(c.get(&1, t0 + Duration::from_secs(29)), Some(42));
+        assert_eq!(c.get(&1, t0 + Duration::from_secs(30)), None);
+        assert_eq!(c.get(&2, t0), None);
+        c.put(1, 43, t0 + Duration::from_secs(31));
+        assert_eq!(c.get(&1, t0 + Duration::from_secs(32)), Some(43));
     }
 }

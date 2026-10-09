@@ -72,6 +72,7 @@ mod reconcile;
 mod recording;
 mod resource_stats;
 mod source_health;
+mod stream_registry;
 
 // ─── channel types (exported for implementers) ────────────────────────────────
 
@@ -1358,7 +1359,10 @@ async fn main() -> Result<()> {
     if let Err(e) = db::ensure_segments_indexes(&pool).await {
         error!(error = %e, "ensure_segments_indexes failed; unique/covering indexes may be absent");
     }
-    if let Err(e) = db::ensure_server_settings_table(&pool).await {
+    // #630: SettingsSeedRole::Recorder means this process never seeds the
+    // client-facing `crumb_rtsp_base` from its own `CRUMB_GO2RTC_RTSP_BASE`,
+    // which is the loopback address it dials go2rtc on.
+    if let Err(e) = db::ensure_server_settings_table(&pool, db::SettingsSeedRole::Recorder).await {
         error!(error = %e, "ensure_server_settings_table failed; server_settings singleton may be absent");
     }
 
@@ -1446,8 +1450,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    // R10: make sure the embedded go2rtc has every camera's recording streams
+    // BEFORE the workers start, and keep checking while they run, so recording
+    // does not depend on the api being up. Create-only, never fights the api's
+    // reconcile; a no-op unless this process runs the embedded go2rtc
+    // (GO2RTC_EMBEDDED=false registers nothing). See stream_registry.rs.
+    let registry_handle = stream_registry::start(
+        go2rtc_handle.is_some(),
+        pool.clone(),
+        config.go2rtc_user.clone(),
+        config.go2rtc_pass.clone(),
+        shutdown.clone(),
+    )
+    .await;
+
     let mut supervisor = RecorderSupervisor::new(pool, config, shutdown);
     supervisor.run().await?;
+
+    if let Some(h) = registry_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), h).await;
+    }
 
     // Stop the embedded go2rtc supervisor (it SIGTERMs the child, SIGKILL after
     // a bound). The shutdown token is already cancelled when run() returns, so

@@ -57,6 +57,55 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
+// ─── protected-bookmark limits ────────────────────────────────────────────────
+
+/// Default cap on a non-admin user's simultaneously active protected bookmarks
+/// (`BOOKMARK_MAX_PROTECTED_PER_USER` overrides; `0` disables the cap).
+const DEFAULT_MAX_PROTECTED_PER_USER: i64 = 50;
+
+/// A bookmark `ts` may be at most this far ahead of the server clock (client
+/// clock skew allowance). Anything later is rejected: a protected window that
+/// reaches into footage not yet recorded would pin it against every eviction path.
+const MAX_FUTURE_SKEW_SECS: i64 = 300;
+
+/// Upper bound on the total protected window (pre + post seconds). When a request
+/// exceeds it, both sides are scaled down proportionally.
+const MAX_PROTECT_WINDOW_SECS: i64 = 3600;
+
+/// Parse the per-user cap. Unset/blank/malformed/negative falls back to the
+/// default; `0` means unlimited.
+fn parse_max_protected(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(DEFAULT_MAX_PROTECTED_PER_USER)
+}
+
+fn max_protected_per_user() -> i64 {
+    parse_max_protected(
+        std::env::var("BOOKMARK_MAX_PROTECTED_PER_USER")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// `true` when `ts` is further ahead of `now` than the skew allowance.
+fn ts_too_far_in_future(ts: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    ts > now + chrono::Duration::seconds(MAX_FUTURE_SKEW_SECS)
+}
+
+/// Clamp the protected window: each side to 0..=3600 s, then scale both down
+/// proportionally if their sum exceeds [`MAX_PROTECT_WINDOW_SECS`].
+fn clamp_protect_window(pre: i64, post: i64) -> (i64, i64) {
+    let pre = pre.clamp(0, 3600);
+    let post = post.clamp(0, 3600);
+    let total = pre + post;
+    if total <= MAX_PROTECT_WINDOW_SECS {
+        return (pre, post);
+    }
+    let pre_scaled = pre * MAX_PROTECT_WINDOW_SECS / total;
+    (pre_scaled, MAX_PROTECT_WINDOW_SECS - pre_scaled)
+}
+
 // ─── request DTOs ─────────────────────────────────────────────────────────────
 
 /// Optional `?camera_id=` filter on `GET /bookmarks`.
@@ -76,7 +125,8 @@ pub struct CreateBookmarkRequest {
     /// Protected retention: keep the clip around the moment from auto-archive/
     /// delete for this many days (clamped 1..30). Absent/0/null = not protected.
     pub protect_days: Option<i64>,
-    /// Seconds of footage to protect BEFORE the moment (clamped 0..3600; default 60).
+    /// Seconds of footage to protect BEFORE the moment (clamped 0..3600; default 60;
+    /// the pre+post total is capped at 3600 s).
     pub protect_pre_seconds: Option<i64>,
     /// Seconds of footage to protect AFTER the moment (clamped 0..3600; default 300).
     pub protect_post_seconds: Option<i64>,
@@ -178,6 +228,11 @@ async fn create_bookmark(
     let ts = DateTime::parse_from_rfc3339(body.ts.trim())
         .map_err(|_| ApiError::BadRequest(format!("ts must be RFC-3339, got '{}'", body.ts)))?
         .with_timezone(&Utc);
+    if ts_too_far_in_future(ts, Utc::now()) {
+        return Err(ApiError::BadRequest(
+            "ts must not be in the future".to_owned(),
+        ));
+    }
     // Normalise a blank/whitespace note to NULL.
     let desc = body
         .description
@@ -186,33 +241,66 @@ async fn create_bookmark(
         .filter(|s| !s.is_empty());
 
     // Protected retention: when protect_days > 0, keep the clip [ts-pre, ts+post]
-    // from auto-archive/delete until now()+days. Clamp days 1..30, pre/post 0..3600.
-    let (protect_until, protect_start, protect_end) = match body.protect_days {
+    // from auto-archive/delete until now()+days. Clamp days 1..30, window <= 1 h.
+    let bm = match body.protect_days {
         Some(d) if d > 0 => {
             let days = d.clamp(1, 30);
-            let pre = body.protect_pre_seconds.unwrap_or(60).clamp(0, 3600);
-            let post = body.protect_post_seconds.unwrap_or(300).clamp(0, 3600);
-            (
-                Some(Utc::now() + chrono::Duration::days(days)),
-                Some(ts - chrono::Duration::seconds(pre)),
-                Some(ts + chrono::Duration::seconds(post)),
-            )
+            let (pre, post) = clamp_protect_window(
+                body.protect_pre_seconds.unwrap_or(60),
+                body.protect_post_seconds.unwrap_or(300),
+            );
+            let protect_until = Utc::now() + chrono::Duration::days(days);
+            let protect_start = ts - chrono::Duration::seconds(pre);
+            let protect_end = ts + chrono::Duration::seconds(post);
+            // Admins are exempt from the count cap; `0` disables it.
+            let cap = max_protected_per_user();
+            if user.is_admin() || cap == 0 {
+                db::create_bookmark(
+                    state.pool(),
+                    body.camera_id,
+                    ts,
+                    desc,
+                    Some(user.user_id),
+                    Some(protect_until),
+                    Some(protect_start),
+                    Some(protect_end),
+                )
+                .await
+                .context("create_bookmark")?
+            } else {
+                db::create_protected_bookmark_capped(
+                    state.pool(),
+                    body.camera_id,
+                    ts,
+                    desc,
+                    user.user_id,
+                    protect_until,
+                    protect_start,
+                    protect_end,
+                    cap,
+                )
+                .await
+                .context("create_protected_bookmark_capped")?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "protected bookmark limit reached ({cap}); remove or let expire an                          existing protected bookmark first"
+                    ))
+                })?
+            }
         }
-        _ => (None, None, None),
+        _ => db::create_bookmark(
+            state.pool(),
+            body.camera_id,
+            ts,
+            desc,
+            Some(user.user_id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .context("create_bookmark")?,
     };
-
-    let bm = db::create_bookmark(
-        state.pool(),
-        body.camera_id,
-        ts,
-        desc,
-        Some(user.user_id),
-        protect_until,
-        protect_start,
-        protect_end,
-    )
-    .await
-    .context("create_bookmark")?;
 
     tracing::info!(bookmark_id = %bm.id, camera_id = %bm.camera_id, "bookmark created");
     Ok((StatusCode::CREATED, Json(bm)))
@@ -301,4 +389,56 @@ async fn check_bookmark_access(user: &AuthUser, pool: &Pool, id: Uuid) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_parsing_defaults_and_overrides() {
+        assert_eq!(parse_max_protected(None), DEFAULT_MAX_PROTECTED_PER_USER);
+        assert_eq!(
+            parse_max_protected(Some("")),
+            DEFAULT_MAX_PROTECTED_PER_USER
+        );
+        assert_eq!(
+            parse_max_protected(Some("abc")),
+            DEFAULT_MAX_PROTECTED_PER_USER
+        );
+        assert_eq!(
+            parse_max_protected(Some("-3")),
+            DEFAULT_MAX_PROTECTED_PER_USER
+        );
+        assert_eq!(parse_max_protected(Some(" 7 ")), 7);
+        assert_eq!(parse_max_protected(Some("0")), 0);
+    }
+
+    #[test]
+    fn future_ts_allows_small_skew_only() {
+        let now = Utc::now();
+        assert!(!ts_too_far_in_future(now, now));
+        assert!(!ts_too_far_in_future(now - chrono::Duration::days(3), now));
+        assert!(!ts_too_far_in_future(
+            now + chrono::Duration::seconds(MAX_FUTURE_SKEW_SECS),
+            now
+        ));
+        assert!(ts_too_far_in_future(
+            now + chrono::Duration::seconds(MAX_FUTURE_SKEW_SECS + 1),
+            now
+        ));
+        assert!(ts_too_far_in_future(now + chrono::Duration::hours(2), now));
+    }
+
+    #[test]
+    fn window_is_capped_and_proportional() {
+        assert_eq!(clamp_protect_window(60, 300), (60, 300));
+        assert_eq!(clamp_protect_window(-5, 99_999), (0, 3600));
+        assert_eq!(clamp_protect_window(3600, 3600), (1800, 1800));
+        let (pre, post) = clamp_protect_window(3600, 0);
+        assert_eq!((pre, post), (3600, 0));
+        let (pre, post) = clamp_protect_window(3000, 1000);
+        assert!(pre + post <= MAX_PROTECT_WINDOW_SECS);
+        assert!(pre > post);
+    }
 }
