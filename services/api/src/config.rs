@@ -55,6 +55,18 @@ pub struct ApiConfig {
     /// Default: `0.0.0.0:8080`
     pub bind_addr: SocketAddr,
 
+    /// `TRUST_PROXY` -- set/unset flag (any non-empty value turns it on). When
+    /// on, `X-Forwarded-For` names the client for rate limiting and the login
+    /// backoff, but ONLY on requests whose TCP peer is in `trusted_proxies`.
+    /// Default: off (always key on the TCP peer). See `rate_limit.rs`.
+    pub trust_proxy: bool,
+
+    /// `TRUSTED_PROXIES` -- comma-separated IPs, CIDR blocks or hostnames of
+    /// the reverse proxies allowed to supply `X-Forwarded-For` when
+    /// `trust_proxy` is on. Hostnames are re-resolved every 30 s. Empty means
+    /// `caddy`, the bundled proxy's compose service name.
+    pub trusted_proxies: String,
+
     // -- auth ---------------------------------------------------------------
     /// `JWT_SECRET` -- HMAC-SHA256 signing key for JWT tokens.
     ///
@@ -479,6 +491,8 @@ impl ApiConfig {
             db_pool_size: parse_env("DB_POOL_SIZE", 32)?,
             playback_max_concurrency: parse_env("PLAYBACK_MAX_CONCURRENCY", 8usize)?.max(1),
             bind_addr,
+            trust_proxy: crate::rate_limit::trust_proxy_from_env(),
+            trusted_proxies: optional_env("TRUSTED_PROXIES", ""),
             jwt_secret,
             jwt_expiry_seconds: parse_env("JWT_EXPIRY_SECONDS", 86_400_u64)?,
             live_storage_path: optional_env("LIVE_STORAGE_PATH", "/data/live"),

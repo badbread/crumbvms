@@ -121,10 +121,34 @@ the 429 + `Retry-After` shape are all unchanged. A success clears only the
 client that succeeded. The per-client request bucket stays the global limiter on
 top, unchanged.
 
-**Trade-off accepted:** guessing distributed across many clients is slowed by
-the request bucket rather than by this counter. That is the correct division of
-labour: an account-wide lock is a denial-of-service control handed to whoever
-wants to use it, and the account's owner is the one who pays.
+Two further rules keep the per-client key from being something a client can
+choose:
+
+- **Proxy trust is per peer.** With `TRUST_PROXY` on, `X-Forwarded-For` is read
+  only when the TCP peer is in `TRUSTED_PROXIES` (IPs, CIDRs or hostnames,
+  default `caddy`, re-resolved every 30 s). The client is the right-most hop
+  that is not itself a trusted proxy, i.e. the entry the proxy appended, never
+  the client-supplied left-most one. Anything that reaches the published
+  `:8080` directly is keyed on its TCP peer whatever it sends. Previously the
+  first hop was taken from any peer, so a direct client could pick a new key
+  per request.
+- **An account-wide ceiling sits on top.** 30 failures for one username within
+  a sliding 15 minutes, from any mix of clients, put the whole account into a
+  backoff of 30 s that doubles per further failure up to the same 15-minute
+  cap, until 30 minutes pass with no failure. One client cannot reach it
+  alone: its own backoff (5 free, then 2, 4, 8, ... s) admits at most 13
+  failures in 15 minutes. A success does not clear the account count.
+
+**Trade-off accepted:** someone able to fail from three or more addresses at
+full speed can still make the owner wait (up to 15 minutes per failure while
+they keep going). That is the price of a brake that address rotation cannot
+dodge, and it takes far more than one noisy client to trigger.
+
+**Rejected (proxy trust):** trusting the Docker bridge range by default (on
+some setups host-local and published-port traffic arrives from the bridge
+gateway, so it would trust direct clients); a fixed Caddy address in compose
+(needs a pinned subnet that can collide with existing networks); honouring the
+left-most hop (client-controlled).
 
 `ConnectInfo` is extracted as an `Option` in the login handler, so a router
 driven without `into_make_service_with_connect_info` (a test harness) still

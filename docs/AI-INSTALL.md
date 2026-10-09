@@ -347,6 +347,15 @@ Services and their published ports (the compose defaults are already LAN-sane;
 | `mosquitto` | `1883` | `127.0.0.1` only | MQTT broker, **profile-gated, NOT started by a plain `up -d`**; only for the Frigate integration when the user has no broker of their own (`docker compose --profile frigate up -d`). Host-local bind, so a Frigate running on **another** host cannot reach it; widen the bind deliberately (`docs/COMPOSE.md`), not by reflex |
 | `postgres` | (none) | not published | internal only |
 
+If the user will reach Crumb through the bundled Caddy (HTTPS), set
+`TRUST_PROXY=1` in `.env` so rate limiting and the sign-in backoff see each
+client's own address rather than Caddy's. Leave `TRUSTED_PROXIES` empty: it
+defaults to `caddy`, and `X-Forwarded-For` is only read from that peer, so
+clients still on `:8080` cannot forge it. Only for a proxy of the user's own,
+set `TRUSTED_PROXIES` to that proxy's address as the api sees it, never to a
+whole LAN range. Verify: `docker compose logs api | grep "rate limiter"` shows
+`TRUST_PROXY=1` when it is on.
+
 There is **no separate `go2rtc` service**: the go2rtc restreamer binary runs
 *inside* the recorder container, spawned + supervised by the recorder process.
 Its REST/API port (`1984`) is **not published to the host at all**, the `api`

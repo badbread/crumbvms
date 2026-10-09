@@ -241,8 +241,15 @@ pub static SERVER_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 /// `schema_migrations`, so this is also safe if called from multiple test
 /// binaries hitting the same DB).
 pub async fn test_state() -> AppState {
+    test_state_with(|_| {}).await
+}
+
+/// [`test_state`] with a hook to adjust the config first (for settings a test
+/// must not set through process-wide env vars, e.g. `TRUST_PROXY`).
+pub async fn test_state_with(adjust: impl FnOnce(&mut config::ApiConfig)) -> AppState {
     ensure_env();
-    let cfg = config::ApiConfig::from_env().expect("ApiConfig::from_env (test env)");
+    let mut cfg = config::ApiConfig::from_env().expect("ApiConfig::from_env (test env)");
+    adjust(&mut cfg);
     let pool: Pool =
         db::build_pool(&cfg.database_url, cfg.db_pool_size).expect("build_pool (test DB)");
 
@@ -435,6 +442,13 @@ pub struct TestApp {
 impl TestApp {
     pub async fn new() -> Self {
         let state = test_state().await;
+        let router = test_router().with_state(state.clone());
+        Self { state, router }
+    }
+
+    /// Variant built from an adjusted config (see [`test_state_with`]).
+    pub async fn new_with_config(adjust: impl FnOnce(&mut config::ApiConfig)) -> Self {
+        let state = test_state_with(adjust).await;
         let router = test_router().with_state(state.clone());
         Self { state, router }
     }

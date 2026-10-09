@@ -462,7 +462,13 @@ async fn main() -> anyhow::Result<()> {
     // Per-client rate limiter for the JSON routes (generous: burst 240, ~4/s
     // sustained). Protects auth/timeline/status/config from abuse without
     // touching high-frequency media serving.
-    let rate_limiter = rate_limit::RateLimiter::new(240, 4.0);
+    //
+    // Client attribution (TRUST_PROXY + TRUSTED_PROXIES) is shared with the
+    // login backoff via AppState. Resolve any hostname entries (the default is
+    // the bundled `caddy`) before serving, then keep them current.
+    state.proxy_trust().refresh().await;
+    state.proxy_trust().spawn_refresh();
+    let rate_limiter = rate_limit::RateLimiter::new(240, 4.0, state.proxy_trust().clone());
 
     // JSON/API routes get gzip + a 30s request timeout (bounds DB-heavy endpoints
     // like /timeline + fails slow clients fast). MEDIA routes (segment/video

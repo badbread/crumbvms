@@ -213,10 +213,14 @@ services:
       SEGMENT_LOW_CACHE_MAX_BYTES: ${SEGMENT_LOW_CACHE_MAX_BYTES:-}
       EXPORT_CACHE_MAX_BYTES: ${EXPORT_CACHE_MAX_BYTES:-}
       # Behind the bundled Caddy (or any reverse proxy), set TRUST_PROXY=1 so the
-      # rate limiter keys on the client IP from X-Forwarded-For instead of the
-      # proxy's own address (one bucket for ALL HTTPS users otherwise). Leave
-      # empty when clients hit :8080 directly. (#241, docs/TLS.md)
+      # rate limiter and login backoff key on the client IP from X-Forwarded-For
+      # instead of the proxy's own address (one bucket for ALL HTTPS users
+      # otherwise). The header is only read on requests whose TCP peer is in
+      # TRUSTED_PROXIES (IPs, CIDRs or hostnames; empty = `caddy`, the bundled
+      # proxy), so a client hitting :8080 directly is still keyed on its own
+      # address. (#241, docs/TLS.md)
       TRUST_PROXY: ${TRUST_PROXY:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     volumes:
       - ${MEDIA_HOST_PATH:-./_data}:/data:ro            # same media root as recorder, READ-ONLY (api never writes footage)
       - crumb_exports:/exports

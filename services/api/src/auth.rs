@@ -675,19 +675,24 @@ async fn login(
     let username = body.username.trim();
 
     // ── repeated-failure backoff (issue #127) ─────────────────────────────────
-    // Keyed on (submitted username, client), so a run of failures slows THAT
-    // client's attempts at THAT account without locking the account itself: its
-    // owner can still sign in from their own machine. If the pair is already in
-    // backoff, reject with 429 + Retry-After BEFORE any DB lookup or argon2
-    // verify. The key is the submitted username whether or not it exists, so
-    // the limiter leaks no account-existence signal, and we never sleep, the
-    // connection is freed immediately. This is IN ADDITION to the shared
-    // per-client request bucket applied as a layer, not a replacement.
+    // Two brakes, both checked here BEFORE any DB lookup or argon2 verify:
+    //   * per (submitted username, client): a run of failures slows THAT
+    //     client's attempts at THAT account without locking the account, so
+    //     its owner can still sign in from their own machine;
+    //   * per account, across all clients: a higher ceiling that caps the
+    //     total guessing rate however many client addresses are used
+    //     (`state.rs`, ACCOUNT_FAIL_CEILING).
+    // Either one in effect rejects with 429 + Retry-After. Keys use the
+    // submitted username whether or not it exists, so the limiter leaks no
+    // account-existence signal, and we never sleep, the connection is freed
+    // immediately. This is IN ADDITION to the shared per-client request bucket
+    // applied as a layer, not a replacement.
     //
-    // `client` is derived by the SAME function the request bucket uses, so both
-    // honour TRUST_PROXY identically (`rate_limit.rs` module docs).
+    // `client` is derived by the SAME function and the SAME proxy-trust policy
+    // the request bucket uses: X-Forwarded-For counts only when the TCP peer is
+    // a configured trusted proxy (`rate_limit.rs` module docs).
     let client = crate::rate_limit::client_key(
-        crate::rate_limit::trust_proxy_from_env(),
+        state.proxy_trust(),
         &headers,
         peer.map(|ConnectInfo(addr)| addr),
     );
