@@ -2030,6 +2030,9 @@ fn meta_plate_bbox(meta: Option<&JsonValue>) -> Option<[f64; 4]> {
 // `server_tz` is the zone alerts render their times in for providers with no
 // client-side timestamp markup; it is passed in rather than read from the
 // environment so a test can pin it.
+// Eight parameters since the no-redirect delivery client (#624) and the server
+// time zone (#629) each added one; the repo allows this lint case by case.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_system_events_tick(
     pool: &Pool,
     http_client: &reqwest::Client,
