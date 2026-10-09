@@ -2554,7 +2554,11 @@ async fn run_pixel_diff_loop(
             return Ok(());
         }
     };
-    let (crumb_rtsp_base, frigate_rtsp_base) = resolve_rtsp_bases_motion(pool, config).await;
+    // One resolver for both recorder paths (#630): this call site used to
+    // have its own copy that fell back to the FRIGATE base for a
+    // Crumb-served camera.
+    let (crumb_rtsp_base, frigate_rtsp_base) =
+        crumb_common::rtsp_base::resolve_recorder_rtsp_bases(pool, config).await;
     // P0-GO2RTC (lighter lockdown): go2rtc's RTSP listener now requires auth for
     // non-loopback callers (the motion worker's connection crosses the Docker
     // bridge network). Only inject into the CRUMB base — frigate_rtsp_base is a
@@ -5026,35 +5030,6 @@ pub(crate) fn should_process_frame(
 #[cfg(test)] // legacy-parity / boundary reference, exercised only by the unit tests
 pub(crate) fn frame_receipt_deadline_exceeded(elapsed_secs: u64) -> bool {
     elapsed_secs >= FRAME_RECEIPT_TIMEOUT_SECS
-}
-
-// ─── base URL resolution ──────────────────────────────────────────────────────
-
-/// Resolve the RTSP base URLs for the motion sub-stream (§6.3 / O3).
-///
-/// Reads `server_settings` from the DB; falls back to `config.go2rtc_rtsp_base`
-/// for both crumb and frigate when the table is absent or a field is empty.
-/// This mirrors the same logic in `recording.rs::resolve_rtsp_bases`.
-async fn resolve_rtsp_bases_motion(pool: &Pool, config: &Config) -> (String, String) {
-    match crumb_common::db::get_server_settings(pool).await {
-        Ok(Some(s)) => {
-            let crumb = if s.crumb_rtsp_base.trim().is_empty() {
-                config.go2rtc_rtsp_base.clone()
-            } else {
-                s.crumb_rtsp_base
-            };
-            let frigate = if s.frigate_rtsp_base.trim().is_empty() {
-                config.go2rtc_rtsp_base.clone()
-            } else {
-                s.frigate_rtsp_base
-            };
-            (crumb, frigate)
-        }
-        Ok(None) | Err(_) => (
-            config.go2rtc_rtsp_base.clone(),
-            config.go2rtc_rtsp_base.clone(),
-        ),
-    }
 }
 
 // ─── unit tests ───────────────────────────────────────────────────────────────

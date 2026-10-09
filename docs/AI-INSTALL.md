@@ -347,6 +347,15 @@ Services and their published ports (the compose defaults are already LAN-sane;
 | `mosquitto` | `1883` | `127.0.0.1` only | MQTT broker, **profile-gated, NOT started by a plain `up -d`**; only for the Frigate integration when the user has no broker of their own (`docker compose --profile frigate up -d`). Host-local bind, so a Frigate running on **another** host cannot reach it; widen the bind deliberately (`docs/COMPOSE.md`), not by reflex |
 | `postgres` | (none) | not published | internal only |
 
+If the user will reach Crumb through the bundled Caddy (HTTPS), set
+`TRUST_PROXY=1` in `.env` so rate limiting and the sign-in backoff see each
+client's own address rather than Caddy's. Leave `TRUSTED_PROXIES` empty: it
+defaults to `caddy`, and `X-Forwarded-For` is only read from that peer, so
+clients still on `:8080` cannot forge it. Only for a proxy of the user's own,
+set `TRUSTED_PROXIES` to that proxy's address as the api sees it, never to a
+whole LAN range. Verify: `docker compose logs api | grep "rate limiter"` shows
+`TRUST_PROXY=1` when it is on.
+
 There is **no separate `go2rtc` service**: the go2rtc restreamer binary runs
 *inside* the recorder container, spawned + supervised by the recorder process.
 Its REST/API port (`1984`) is **not published to the host at all**, the `api`
@@ -535,6 +544,12 @@ All wizard steps have API equivalents. Do them in order:
    gate; `GET /auth/setup-status` reports `beta_terms_accepted`).
 2. **Server address.** `PUT /config/server` with the host's **LAN** address
    (`server_address`, `crumb_rtsp_base`, …). Use the LAN IP, never a public one.
+   `crumb_rtsp_base` is **client-facing only**: it is the address native desktop
+   and phone apps are told to pull streams from, so it must be reachable from
+   those devices. The recorder does not use it, it dials its own embedded go2rtc
+   at `rtsp://127.0.0.1:8554` (issue #630; `CRUMB_GO2RTC_LOOPBACK_PORT` if you
+   changed `rtsp.listen` in `go2rtc/go2rtc.yaml`), so you cannot break recording
+   with this field.
    The PUT merges: send only the keys you are setting, and every other column
    keeps its stored value. (Sending a key as `""` is an explicit clear that falls
    the setting back to its container-environment default, so do not pad the body
@@ -617,7 +632,18 @@ All wizard steps have API equivalents. Do them in order:
    Treat one failure as non-fatal and continue; a **409 Conflict** means the
    `name`/stream is already taken, retry with a suffixed name. Re-running is safe:
    skip any IP already present in `GET /config/cameras` (match on `onvif_host` or
-   the host part of `source_url`). To group them, `POST /config/groups` `{name}`
+   the host part of `source_url`).
+
+   > **Reading a camera back.** `GET /config/cameras` returns `source_url` /
+   > `source_sub_url` with the password replaced by `********`; the username,
+   > host, port and path are verbatim, and `source_has_credentials` /
+   > `source_sub_has_credentials` tell you whether one is stored. On
+   > `PUT /config/cameras/:id`, sending a URL whose password is still `********`
+   > keeps the stored credential (so a read-modify-write of any other field is
+   > safe); sending a different password replaces it. Same rule as
+   > `onvif_password`, which is never returned at all.
+
+   To group them, `POST /config/groups` `{name}`
    then `PUT /config/groups/:id/members` `{camera_ids}` after the loop, one
    PUT per group (cameras can go in different groups, e.g. always-record vs
    motion-only; members = the group's existing ids ∪ the new ids).
@@ -653,6 +679,14 @@ All wizard steps have API equivalents. Do them in order:
    value is rejected. Then prove it delivers:
    `POST /notifications/channels/{id}/test` → `{ok, error?}`. Per-camera rules
    and quiet hours are `PUT /notifications/rules[/{camera_id}]`.
+   Creating, updating, deleting and test-firing a channel needs the
+   `manage_channels` role capability; an admin token always has it, and the
+   console's role editor grants it to a non-admin role (off by default). For a
+   non-admin caller the destination URL must be `http`/`https` with a real host
+   and may not name loopback, link-local, or a compose service name (`api`,
+   `recorder`, `postgres`, ...); LAN addresses are fine. `.../test` is
+   rate-limited per user and answers `429` with `Retry-After` past six per
+   minute.
 9. **Additional users (optional).** `GET /config/roles` for the role list
    (entries carry `id`, `name`, `is_admin`), then per user
    `POST /config/users` `{username, password, role: "viewer", role_id: "<uuid>"}`
@@ -863,6 +897,33 @@ For that, add a small **external uptime check** hitting
 `http://<host>:8080/health` from a *different* machine, Uptime Kuma,
 healthchecks.io, or a one-line cron that curls `/health` and alerts on failure.
 Without it, an API outage is silent until someone notices a client won't connect.
+
+**Prometheus scraping (optional).** `GET /metrics` exposes the API's own gauges
+in the Prometheus text format: DB pool saturation, export jobs by status,
+recorder heartbeat age, active cameras, uptime, build info. It is **not open**,
+it takes an `Authorization: Bearer` credential, either an admin session token or
+a dedicated scrape token:
+
+```bash
+# Generate one and put it in .env (then: docker compose up -d api)
+openssl rand -hex 32
+# METRICS_TOKEN=<the generated value>
+#   or METRICS_TOKEN_FILE=/run/secrets/metrics_token for a Docker secret
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: crumb
+    bearer_token: "<the same value>"   # or: bearer_token_file: /etc/prometheus/crumb-token
+    static_configs:
+      - targets: ["<host>:8080"]
+```
+
+Leave `METRICS_TOKEN` unset and `/metrics` is readable only with an admin
+session, which is the right default if nothing scrapes it. `/health` and
+`/version` stay open either way, so the external uptime check above needs no
+credential.
 
 **Update notifications (optional, off by default; issue #7).** CrumbVMS can
 tell the operator when a newer release exists, via `GET /updates/latest` and a

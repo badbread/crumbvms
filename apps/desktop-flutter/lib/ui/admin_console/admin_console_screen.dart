@@ -11,6 +11,9 @@
 // old client's `invoke('open_url', { url })` fallback (apps/desktop/src-tauri/
 // src/lib.rs ~line 1317) for operators who'd rather use their real browser
 // (bookmarks, extensions, a second monitor, etc.) or if WebView2 isn't usable.
+// That path hands the browser a single-use handoff code instead of this
+// client's token (see `adminConsoleBrowserUrl`); only the in-process webview
+// gets the token itself.
 //
 // NOTE (integration): this file assumes the `webview_windows` and
 // `url_launcher` packages are added to pubspec.yaml — see this feature's
@@ -109,11 +112,21 @@ class _AdminConsoleScreenState extends State<AdminConsoleScreen> {
   }
 
   Future<void> _openInBrowser() async {
-    // A real browser tab has no Flutter shell header, so let the console keep
-    // its own chrome there.
-    final uri = Uri.parse(adminConsoleUrl(widget.session, embedded: false));
+    // A browser is a different process with its own history and profile
+    // storage, so it gets a single-use handoff code rather than this client's
+    // session token; the console trades the code for its own session on load.
+    // A null URL means the server declined or is unreachable.
+    final url = await adminConsoleBrowserUrl(widget.session);
+    if (!mounted) return;
+    if (url == null) {
+      _showLaunchFailure();
+      return;
+    }
     try {
-      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      final ok = await launchUrl(
+        Uri.parse(url),
+        mode: LaunchMode.externalApplication,
+      );
       if (!ok && mounted) _showLaunchFailure();
     } catch (_) {
       if (mounted) _showLaunchFailure();

@@ -10,10 +10,12 @@
 //! | [`types`] | Domain types mirroring the PostgreSQL schema exactly. |
 //! | [`config`] | Environment-variable driven [`Config`](config::Config). |
 //! | [`db`] | deadpool-postgres pool creation and typed query accessors. |
+//! | [`rtsp_base`] | Recorder-side RTSP base resolution (the #630 audience split). |
 //! | [`icons`] | Shared storage/camera glyph resolution (override → name/type). |
 //! | [`logging`] | Global tracing subscriber initialisation. |
 //! | [`mqtt`] | MQTT URL guards shared by the api + recorder MQTT clients. |
 //! | [`detection`] | Pluggable detection-event framework ([`DetectionSource`] trait + types). |
+//! | [`go2rtc_streams`] | The go2rtc recording-stream definitions shared by the api and recorder. |
 
 // Several enums expose an inherent `from_str(&str) -> Option<Self>` that parses a
 // wire/DB token into the enum. This is a deliberate, readable convention (it
@@ -25,12 +27,14 @@ pub mod alert_template;
 pub mod config;
 pub mod db;
 pub mod detection;
+pub mod go2rtc_streams;
 pub mod ha;
 pub mod icons;
 pub mod logging;
 pub mod lpr_ab;
 pub mod mqtt;
 pub mod redact;
+pub mod rtsp_base;
 pub mod types;
 
 // ── flat re-exports for ergonomic use in services/recorder ───────────────────

@@ -1156,11 +1156,14 @@ async fn run_ffmpeg_loop(
     // for cameras added or migrated via 0012. Legacy rows keep full absolute URLs
     // (they contain "://") and are passed through unchanged by `resolve_stream_url`.
     //
-    // Base resolution: read server_settings from DB (the operator-filled table);
-    // fall back to the `go2rtc_rtsp_base` env value for BOTH crumb and frigate
-    // on a single-host prototype where the operator hasn't filled Server Settings.
-    // This is the documented single-host fallback (see §6.3 decision note).
-    let (crumb_rtsp_base, frigate_rtsp_base) = resolve_rtsp_bases(pool, config).await;
+    // Base resolution lives in `crumb_common::rtsp_base` and is shared with the
+    // motion worker (#630). With go2rtc embedded in this container (the
+    // default) the crumb base is loopback and the client-facing
+    // `server_settings.crumb_rtsp_base` is ignored; with
+    // `GO2RTC_EMBEDDED=false` it is the DB column, then
+    // `CRUMB_GO2RTC_RTSP_BASE`, then `GO2RTC_RTSP_BASE`.
+    let (crumb_rtsp_base, frigate_rtsp_base) =
+        crumb_common::rtsp_base::resolve_recorder_rtsp_bases(pool, config).await;
     // P0-GO2RTC (lighter lockdown): go2rtc's RTSP listener now requires auth for
     // non-loopback callers, which the recorder's connection is (it crosses the
     // Docker bridge network by service name / LAN address). Only inject into the
@@ -2108,56 +2111,6 @@ async fn report_motion_cache_status(
                 error = %e,
                 "motion-cache per-camera status upsert failed (telemetry only)"
             );
-        }
-    }
-}
-
-// ─── base URL resolution ──────────────────────────────────────────────────────
-
-/// Resolve the RTSP base URLs for Crumb's restreamer and for an external
-/// Frigate go2rtc instance.
-///
-/// Resolution order (§6.3):
-/// 1. `server_settings` table (operator-filled via the admin UI / API).
-/// 2. Per-source env fallback when the DB row is empty:
-///    - crumb base  → `config.crumb_go2rtc_rtsp_base` then `config.go2rtc_rtsp_base` (#20)
-///    - frigate base → `config.go2rtc_rtsp_base`
-///
-/// The crumb-specific env var (`CRUMB_GO2RTC_RTSP_BASE`) lets a fresh install
-/// wire the crumb restreamer without touching the admin UI, acting as a
-/// defense-in-depth fallback for finding #1 (empty server_settings on fresh
-/// install). It is tried FIRST; `GO2RTC_RTSP_BASE` is the final backstop so a
-/// single-host prototype that sets only the generic var still works.
-///
-/// Returns `(crumb_rtsp_base, frigate_rtsp_base)`.
-async fn resolve_rtsp_bases(pool: &Pool, config: &Config) -> (String, String) {
-    // Env-level crumb fallback: prefer the crumb-specific var, then the
-    // generic go2rtc base (#20 — previously the crumb base always fell back to
-    // `go2rtc_rtsp_base`, which is the Frigate-side base on most deployments,
-    // so crumb cameras resolved to the wrong host on a split install).
-    let env_crumb_base = if !config.crumb_go2rtc_rtsp_base.trim().is_empty() {
-        config.crumb_go2rtc_rtsp_base.clone()
-    } else {
-        config.go2rtc_rtsp_base.clone()
-    };
-
-    match db::get_server_settings(pool).await {
-        Ok(Some(s)) => {
-            let crumb = if s.crumb_rtsp_base.trim().is_empty() {
-                env_crumb_base
-            } else {
-                s.crumb_rtsp_base
-            };
-            let frigate = if s.frigate_rtsp_base.trim().is_empty() {
-                config.go2rtc_rtsp_base.clone()
-            } else {
-                s.frigate_rtsp_base
-            };
-            (crumb, frigate)
-        }
-        Ok(None) | Err(_) => {
-            // server_settings table absent or unreachable — fall back to env.
-            (env_crumb_base, config.go2rtc_rtsp_base.clone())
         }
     }
 }

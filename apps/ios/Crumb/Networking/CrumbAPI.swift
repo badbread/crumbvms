@@ -163,6 +163,30 @@ final class CrumbAPI {
         try await get("export/\(jobId)")
     }
 
+    /// Builds an authenticated `URLRequest` for one export output file
+    /// (`/export/{job}/files/{camera}` or `/export/{job}/archive`).
+    ///
+    /// An export can span several cameras, so there is no scoped media token
+    /// that fits it; the session token travels in the `Authorization` header
+    /// instead, never in the URL, where it would land in the server's access
+    /// log and anywhere the URL is later handed. The caller drives the fetch
+    /// itself (`URLSession.download(for:)`) and shares the resulting LOCAL file.
+    ///
+    /// `pathOrUrl` is the server-relative `download_url` from the job status
+    /// (an absolute URL is passed through unchanged).
+    func exportDownloadRequest(_ pathOrUrl: String) throws -> URLRequest {
+        let url: URL
+        if pathOrUrl.hasPrefix("http://") || pathOrUrl.hasPrefix("https://") {
+            guard let absolute = URL(string: pathOrUrl) else { throw APIError.invalidURL }
+            url = absolute
+        } else {
+            url = try buildURL(pathOrUrl.hasPrefix("/") ? String(pathOrUrl.dropFirst()) : pathOrUrl)
+        }
+        var request = URLRequest(url: url)
+        addAuth(&request)
+        return request
+    }
+
     /// Cancel a running/queued export (DELETE /export/{id}; 204, idempotent).
     func cancelExport(jobId: String) async throws {
         let _: EmptyResponse = try await delete("export/\(jobId)")
