@@ -1660,6 +1660,7 @@ mod tests {
             template: None,
             title_template: None,
             meta: None,
+            tz: Tz::UTC,
         };
 
         let client = build_channel_http_client().expect("client");
