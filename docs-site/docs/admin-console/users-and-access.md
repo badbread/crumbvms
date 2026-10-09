@@ -68,3 +68,16 @@ and will be held to exactly that boundary.
 
 Because access is enforced by the server, not the app, a scoped user stays scoped
 no matter which client they use or how they connect.
+
+## Signing devices out
+
+Signed-in devices stay in step with the account. Give someone a new password, or
+change their role, and every device they were signed in on is signed out; they
+sign back in with the new details. Remove the account and its devices lose access
+straight away. Changing only which extra cameras a person has is different: they
+stay signed in, and the new camera list applies to their very next request.
+
+There is also a **Sign out everywhere** button in each user's editor, for when
+you want to end every session for that account without changing anything else, a
+lost phone being the usual reason. If you use it on your own account you will be
+signed out of the console too.

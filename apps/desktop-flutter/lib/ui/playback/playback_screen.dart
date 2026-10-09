@@ -710,7 +710,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   /// Bookmark the current moment on the selected camera (opens the dialog).
   Future<void> _addBookmark() async {
-    await showAddBookmarkDialog(
+    final added = await showAddBookmarkDialog(
       context,
       api: widget.api,
       session: widget.session,
@@ -718,6 +718,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       cameras: _cameras,
       at: _timeline.playhead,
     );
+    // A new bookmark should show up on the timeline right away, not on the
+    // next periodic re-fetch (#616).
+    if (added != null && mounted) await _motion.refresh(force: true);
   }
 
   /// Hand the Shift+drag selection off to the Export tab as a pre-filled clip.

@@ -29,6 +29,22 @@ use crate::dto::ExportJob;
 /// seconds.
 const REVOCATION_CACHE_TTL_SECS: i64 = 15;
 
+/// How long one `jti`'s resolved session state (does the row still exist, and
+/// what per-user camera grants does its owner hold) may be trusted before it is
+/// re-read from the DB. Unlike the revoked set, this cache is *positive*: an
+/// unknown `jti` is resolved against the DB there and then, so a token minted a
+/// millisecond ago on another API replica is never spuriously rejected. The TTL
+/// therefore only bounds how long a change made by ANOTHER replica (a user
+/// edit, an account removal) can go unnoticed here; a change made on THIS
+/// process clears the cache synchronously.
+const SESSION_CACHE_TTL_SECS: i64 = 30;
+
+/// Cap on the session cache. One entry per `jti` seen recently, so this is
+/// bounded by real sessions in normal use; the cap only matters if a caller
+/// replays many distinct signed tokens. Cleared wholesale when exceeded (the
+/// next request for each live session simply re-resolves).
+const SESSION_CACHE_MAX_ENTRIES: usize = 10_000;
+
 /// Consecutive failed logins for one account, from one client, tolerated before
 /// the backoff engages (issue #127). Below this, every attempt is let through to
 /// the normal credential check; at/above it, attempts are rejected with 429 until
@@ -64,6 +80,12 @@ const LOGIN_KEY_SEP: char = '\u{1f}';
 fn login_key(username: &str, client: &str) -> String {
     format!("{username}{LOGIN_KEY_SEP}{client}")
 }
+
+/// Prune the console-handoff map once it exceeds this many outstanding codes.
+/// Codes live for seconds and are consumed on first use, so a healthy install
+/// holds a handful; the cap only bounds a pathological caller that mints codes
+/// it never redeems. Only already-expired entries are dropped.
+const HANDOFF_MAX_ENTRIES: usize = 1_000;
 
 /// Backoff duration (seconds) for `failures` consecutive login failures, or
 /// `None` while still under [`LOGIN_FAIL_THRESHOLD`]. The engaged value is
@@ -167,6 +189,19 @@ struct FailState {
     blocked_until: Instant,
 }
 
+/// One outstanding console-handoff code (see [`AppState::issue_handoff_code`]).
+#[derive(Clone, Copy)]
+struct HandoffEntry {
+    /// The user the code was minted for.
+    user_id: Uuid,
+    /// The `jti` of the session that asked for the code, when it has one
+    /// (pre-P0-SESSIONS tokens do not). The exchange rejects a code whose
+    /// originating session has since been signed out.
+    jti: Option<Uuid>,
+    /// Instant after which the code is no longer redeemable.
+    expires_at: Instant,
+}
+
 /// Inner state, heap-allocated once and reference-counted.
 struct Inner {
     /// Deadpool-postgres connection pool.  Shared with the recorder's schema.
@@ -212,6 +247,18 @@ struct Inner {
     /// once; without a cap each miss spawns a single-frame ffmpeg, a spawn storm.
     /// Permit count = `config.thumb_extract_max_concurrency`.
     thumb_semaphore: Arc<Semaphore>,
+
+    /// Bounds concurrent `GET /cameras/{id}/frame.jpg` fetches from go2rtc. The
+    /// low-bandwidth walls on Android and iOS poll one still per tile per
+    /// second, and a request against a camera that is down holds its slot for
+    /// the whole retry ladder, so the proxy needs its own bound rather than an
+    /// unbounded fan-out. Permit count = `config.frame_proxy_max_concurrency`.
+    frame_semaphore: Arc<Semaphore>,
+
+    /// Cameras whose live still could not be fetched recently. See
+    /// [`FrameLatch`]. Memory-only and self-healing: a restart just means the
+    /// first poll after it pays the full ladder again.
+    frame_unavailable: FrameLatch,
 
     /// Per-key in-flight locks for thumbnail extraction (singleflight). Keyed by
     /// the final cache path; a request serializes on its key so two concurrent
@@ -313,6 +360,25 @@ struct Inner {
     /// against `REVOCATION_CACHE_TTL_SECS` to decide when to re-read.
     revoked_jtis_loaded_at: AtomicI64,
 
+    /// In-memory cache of resolved session state, keyed by `jti`. The value is
+    /// `(grants, checked_at_unix)` where `grants` is `Some(camera_ids)` for a
+    /// session whose row still exists and is not revoked (carrying the owning
+    /// user's per-user camera grants, read from the row rather than trusted from
+    /// the token) and `None` for a session that is gone.
+    ///
+    /// This is the positive counterpart to `revoked_jtis`. That set answers "was
+    /// this session signed out", which cannot answer "did this session's row
+    /// ever exist" — a deleted user's rows vanish through
+    /// `sessions.user_id ON DELETE CASCADE`, so their still-signed token read as
+    /// "not revoked" and kept working. A `jti` missing from this cache is
+    /// resolved against the DB on the spot (never assumed live and never assumed
+    /// dead), so a token minted moments ago, here or on another replica, is
+    /// accepted immediately; after that first resolution the check is a
+    /// lock-free `DashMap` lookup. Entries are dropped wholesale whenever a user
+    /// row changes (see [`AppState::invalidate_session_cache`]), the same
+    /// refresh-on-write discipline `roles_cache` and `revoked_jtis` follow.
+    session_cache: DashMap<Uuid, (Option<Vec<Uuid>>, i64)>,
+
     /// Health-alert maintenance window (issue #46). Unix-seconds timestamp
     /// until which operational HEALTH/system alerts (camera offline, recorder
     /// down, low disk, Frigate disconnect, backup failed) are SUPPRESSED —
@@ -346,6 +412,11 @@ struct Inner {
     /// (`TRUST_PROXY` + `TRUSTED_PROXIES`). Shared with the request limiter so
     /// both attribute a request to the same client.
     proxy_trust: Arc<crate::rate_limit::ProxyTrust>,
+    /// Outstanding single-use console-handoff codes, keyed by the code itself.
+    /// Memory-only and deliberately so: a code is valid for seconds, and losing
+    /// the map on restart only means the operator clicks "Open in browser"
+    /// again (the fail-safe direction).
+    handoff_codes: DashMap<String, HandoffEntry>,
 
     /// Demand-driven cache behind `GET /ha/states` (issue #170). `None` until
     /// the first request. The `tokio::sync::Mutex` makes a refresh single-flight:
@@ -394,6 +465,7 @@ impl AppState {
         let play_semaphore = Arc::new(Semaphore::new(config.playback_max_concurrency));
         let clip_gen_semaphore = Arc::new(Semaphore::new(config.clip_gen_max_concurrency));
         let thumb_semaphore = Arc::new(Semaphore::new(config.thumb_extract_max_concurrency));
+        let frame_semaphore = Arc::new(Semaphore::new(config.frame_proxy_max_concurrency));
 
         // Health-alert maintenance window (issue #46). Off by default; an
         // optional `MAINTENANCE_UNTIL` env (unix seconds) lets a deployment
@@ -424,14 +496,18 @@ impl AppState {
             mainv_needed: DashMap::new(),
             stream_rejected: DashMap::new(),
             thumb_semaphore,
+            frame_semaphore,
+            frame_unavailable: FrameLatch::default(),
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
             revoked_jtis_loaded_at: AtomicI64::new(0),
+            session_cache: DashMap::new(),
             maintenance_until: Arc::new(AtomicI64::new(maintenance_until)),
             login_failures: DashMap::new(),
             login_account_failures: DashMap::new(),
             proxy_trust,
+            handoff_codes: DashMap::new(),
             ha_states: tokio::sync::Mutex::new(None),
             event_tx: OnceLock::new(),
         }))
@@ -523,6 +599,51 @@ impl AppState {
         self.0.revoked_jtis.contains_key(&jti)
     }
 
+    // ── session cache (liveness + per-user camera grants) ─────────────────────
+
+    /// Resolve a session `jti` to the owning user's per-user camera grants, or
+    /// `None` when the session no longer exists (removed account, pruned row, a
+    /// `jti` that never had a row, or one belonging to a different user).
+    ///
+    /// Cached per `jti` for [`SESSION_CACHE_TTL_SECS`]; a miss costs exactly one
+    /// query, so the common warm path adds no DB round trip. Both outcomes are
+    /// cached, so a client looping on a dead token does not re-query every time.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a DB failure rather than guessing. The caller turns that into
+    /// a 5xx, never a 401: a transient database blip must not look like "you
+    /// have been signed out" to a client that would then discard its token.
+    pub async fn resolve_session(
+        &self,
+        jti: Uuid,
+        user_id: Uuid,
+    ) -> anyhow::Result<Option<Vec<Uuid>>> {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(entry) = self.0.session_cache.get(&jti) {
+            let (grants, checked_at) = entry.value();
+            if now - *checked_at < SESSION_CACHE_TTL_SECS {
+                return Ok(grants.clone());
+            }
+        }
+        let grants = crumb_common::db::resolve_live_session(self.pool(), jti, user_id).await?;
+        // Bound memory against a caller replaying many distinct signed tokens.
+        if self.0.session_cache.len() > SESSION_CACHE_MAX_ENTRIES {
+            self.0.session_cache.clear();
+        }
+        self.0.session_cache.insert(jti, (grants.clone(), now));
+        Ok(grants)
+    }
+
+    /// Drop every cached session so the next request re-reads liveness and the
+    /// per-user camera grants from the DB. Call after any change to a user row
+    /// (edit, removal) or after revoking sessions, so the change lands on that
+    /// user's very next request instead of waiting out the TTL.
+    #[inline]
+    pub fn invalidate_session_cache(&self) {
+        self.0.session_cache.clear();
+    }
+
     /// Borrow the database connection pool.
     #[inline]
     pub fn pool(&self) -> &Pool {
@@ -580,6 +701,40 @@ impl AppState {
     #[inline]
     pub fn thumb_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.0.thumb_semaphore)
+    }
+
+    /// Clone the live-still proxy concurrency semaphore handle (cheap `Arc`
+    /// clone). Used by `GET /cameras/{id}/frame.jpg` to cap concurrent go2rtc
+    /// still fetches.
+    #[inline]
+    pub fn frame_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.0.frame_semaphore)
+    }
+
+    /// Decide how the still proxy should fetch `camera_id`'s live still. See
+    /// [`FrameLatch::attempt_at`].
+    #[inline]
+    pub fn frame_attempt(&self, camera_id: Uuid, ttl: Duration) -> FrameAttempt {
+        self.0
+            .frame_unavailable
+            .attempt_at(camera_id, ttl, Instant::now())
+    }
+
+    /// Latch `camera_id`'s live still as unavailable for `ttl`. Call it only
+    /// when a FULL retry ladder exhausted its attempts, never from the
+    /// single-attempt path (see [`FrameLatch`]).
+    #[inline]
+    pub fn mark_frame_unavailable(&self, camera_id: Uuid, ttl: Duration) {
+        self.0
+            .frame_unavailable
+            .mark_at(camera_id, ttl, Instant::now());
+    }
+
+    /// Clear `camera_id`'s unavailable latch after a successful still fetch, so
+    /// a camera that comes back is served the normal way on the next poll.
+    #[inline]
+    pub fn clear_frame_unavailable(&self, camera_id: Uuid) {
+        self.0.frame_unavailable.clear(camera_id);
     }
 
     /// Get (or create) the singleflight lock for a thumbnail cache key. Callers
@@ -870,6 +1025,52 @@ impl AppState {
     pub fn record_login_success(&self, username: &str, client: &str) {
         self.0.login_failures.remove(&login_key(username, client));
     }
+
+    // ── console handoff codes ─────────────────────────────────────────────────
+
+    /// Mint a single-use handoff code for `user_id` (issued by the session
+    /// identified by `jti`, when it has one) and remember it for `ttl`.
+    ///
+    /// The code is ~30 bytes of OS-CSPRNG entropy rendered as lowercase hex, so
+    /// it is URL-safe without escaping. Callers hand it to a browser in a URL
+    /// fragment; the browser trades it for a real session at
+    /// `POST /auth/handoff/exchange`.
+    ///
+    /// `ttl` is a parameter rather than a constant so tests can drive the
+    /// expiry path without sleeping for the production window.
+    pub fn issue_handoff_code(&self, user_id: Uuid, jti: Option<Uuid>, ttl: Duration) -> String {
+        let now = Instant::now();
+
+        // Bound memory: drop codes that can no longer be redeemed anyway.
+        if self.0.handoff_codes.len() > HANDOFF_MAX_ENTRIES {
+            self.0.handoff_codes.retain(|_, e| e.expires_at > now);
+        }
+
+        // Two v4 UUIDs, hex-rendered: `Uuid::new_v4` draws from the OS CSPRNG
+        // (getrandom), and using it keeps this dependency-free.
+        let code = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.0.handoff_codes.insert(
+            code.clone(),
+            HandoffEntry {
+                user_id,
+                jti,
+                expires_at: now + ttl,
+            },
+        );
+        code
+    }
+
+    /// Redeem a handoff code, returning the user id and the issuing session's
+    /// `jti` on success. The entry is removed whether or not it was still
+    /// valid, so a code is usable at most once; an expired or unknown code
+    /// yields `None`.
+    pub fn consume_handoff_code(&self, code: &str) -> Option<(Uuid, Option<Uuid>)> {
+        let (_, entry) = self.0.handoff_codes.remove(code)?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some((entry.user_id, entry.jti))
+    }
 }
 
 /// Pure predicate for "is the maintenance window in effect at `now`": armed
@@ -880,13 +1081,182 @@ pub fn maintenance_active_at(until: i64, now: i64) -> bool {
     until > 0 && now < until
 }
 
+/// How the live-still proxy should fetch a camera's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAttempt {
+    /// The full cold-start retry ladder. Only a failed attempt of this kind may
+    /// arm the latch.
+    Full,
+    /// One attempt, no inter-attempt sleeps. Its failure leaves the latch alone.
+    Single,
+}
+
+/// Per-camera "last full fetch failed" latch for the live-still proxy, as a
+/// monotonic deadline per camera.
+///
+/// While the deadline is in the future the proxy makes a single attempt instead
+/// of the full ladder, so a wall of tiles pointed at a camera that is down does
+/// not hold a permit for the whole ladder on every poll. Rules that keep a slow
+/// but healthy camera from getting stuck:
+///
+/// * only a failed FULL ladder arms the latch; a failed single attempt never
+///   extends it, so the deadline is reached no matter how often the wall polls;
+/// * once the deadline passes, the next request gets [`FrameAttempt::Full`] and
+///   claims the probe by re-arming the deadline, so concurrent polls stay on the
+///   single attempt while one request proves recovery;
+/// * a success on any path clears the entry.
+#[derive(Default)]
+pub struct FrameLatch {
+    until: DashMap<Uuid, Instant>,
+}
+
+impl FrameLatch {
+    /// Decide how to fetch `camera_id`'s still at time `now`.
+    pub fn attempt_at(&self, camera_id: Uuid, ttl: Duration, now: Instant) -> FrameAttempt {
+        let Some(mut entry) = self.until.get_mut(&camera_id) else {
+            return FrameAttempt::Full;
+        };
+        if now < *entry {
+            return FrameAttempt::Single;
+        }
+        // Expired: this request is the probe. Hold the window for `ttl` so the
+        // other polls keep the cheap path until the probe reports back.
+        *entry = now + ttl;
+        FrameAttempt::Full
+    }
+
+    /// Latch `camera_id` as unavailable until `now + ttl`.
+    pub fn mark_at(&self, camera_id: Uuid, ttl: Duration, now: Instant) {
+        // Cheap unbounded-growth guard: entries are one per camera, but a
+        // pathological id churn would still be capped.
+        if self.until.len() > 4096 {
+            self.until.clear();
+        }
+        self.until.insert(camera_id, now + ttl);
+    }
+
+    /// Drop the latch for `camera_id` after a successful fetch.
+    pub fn clear(&self, camera_id: Uuid) {
+        self.until.remove(&camera_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        account_backoff_secs, login_backoff_secs, login_key, maintenance_active_at,
-        ACCOUNT_BACKOFF_BASE_SECS, ACCOUNT_FAIL_CEILING, ACCOUNT_FAIL_WINDOW,
+        account_backoff_secs, login_backoff_secs, login_key, maintenance_active_at, FrameAttempt,
+        FrameLatch, ACCOUNT_BACKOFF_BASE_SECS, ACCOUNT_FAIL_CEILING, ACCOUNT_FAIL_WINDOW,
         LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS, LOGIN_FAIL_THRESHOLD,
     };
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// Simulate the still proxy against a camera whose frames take `latency` to
+    /// arrive after it was last "cold", with the per-attempt timeouts the
+    /// handler uses (`single_timeout` for the single path, `full_timeout` per
+    /// full-ladder attempt, 4 attempts). Returns true when the request succeeds.
+    fn request(
+        latch: &FrameLatch,
+        id: Uuid,
+        ttl: Duration,
+        now: Instant,
+        latency: Duration,
+        single_timeout: Duration,
+        full_timeout: Duration,
+    ) -> bool {
+        match latch.attempt_at(id, ttl, now) {
+            FrameAttempt::Full => {
+                // Every ladder attempt waits the same latency, so it succeeds
+                // iff the latency fits one attempt's timeout.
+                if latency <= full_timeout {
+                    latch.clear(id);
+                    true
+                } else {
+                    latch.mark_at(id, ttl, now);
+                    false
+                }
+            }
+            FrameAttempt::Single => {
+                if latency <= single_timeout {
+                    latch.clear(id);
+                    true
+                } else {
+                    // Deliberately no mark_at: a single-attempt failure must
+                    // not extend the latch.
+                    false
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_latch_slow_camera_recovers_within_one_window_when_polled_every_second() {
+        let latch = FrameLatch::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        // Second 0: the camera is down, the full ladder fails and arms the latch.
+        assert!(!request(
+            &latch,
+            id,
+            ttl,
+            at(0),
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+            Duration::from_secs(5)
+        ));
+
+        // From then on the camera is slow (3 s to a frame) but healthy. The
+        // single path times out at 2 s, as the old fast path did; the wall polls
+        // every second. It must be served again no later than one window later.
+        let mut recovered_at = None;
+        for s in 1..=12 {
+            if request(
+                &latch,
+                id,
+                ttl,
+                at(s),
+                Duration::from_secs(3),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ) {
+                recovered_at = Some(s);
+                break;
+            }
+        }
+        let recovered_at = recovered_at.expect("slow camera never recovered");
+        assert!(recovered_at <= 10, "recovered too late: {recovered_at}s");
+        assert_eq!(recovered_at, 10, "probe runs exactly when the window ends");
+        // And it stays served normally afterwards.
+        assert_eq!(latch.attempt_at(id, ttl, at(11)), FrameAttempt::Full);
+    }
+
+    #[test]
+    fn frame_latch_single_failure_does_not_extend_and_probe_is_claimed_once() {
+        let latch = FrameLatch::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        latch.mark_at(id, ttl, at(0));
+        assert_eq!(latch.attempt_at(id, ttl, at(5)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(9)), FrameAttempt::Single);
+        // Window over: exactly one caller gets the full ladder, the rest stay on
+        // the single attempt while the probe runs.
+        assert_eq!(latch.attempt_at(id, ttl, at(10)), FrameAttempt::Full);
+        assert_eq!(latch.attempt_at(id, ttl, at(10)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(11)), FrameAttempt::Single);
+        // A failed probe re-arms for a fresh window; a successful one clears it.
+        latch.mark_at(id, ttl, at(14));
+        assert_eq!(latch.attempt_at(id, ttl, at(23)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(24)), FrameAttempt::Full);
+        latch.clear(id);
+        assert_eq!(latch.attempt_at(id, ttl, at(25)), FrameAttempt::Full);
+        assert_eq!(latch.attempt_at(id, ttl, at(25)), FrameAttempt::Full);
+    }
 
     #[test]
     fn account_backoff_doubles_from_base_and_caps() {
