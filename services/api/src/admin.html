@@ -4968,6 +4968,9 @@ function renderCamInfoTab(c) {
           <button class="ghost sm" onclick="testCameraStream('${c.id}','sub')">Test</button>
         </div>
       </div>
+      ${(c.source_has_credentials || c.source_sub_has_credentials)
+        ? '<div class="card-hint" style="margin:8px 0 0 2px">The camera password in these URLs is hidden behind <code>********</code>. Leave it in place to keep the stored password; type a new one over it to change it.</div>'
+        : ''}
     </div>
 
     <div class="policy-section">
@@ -9776,6 +9779,7 @@ function renderUser(id) {
       </div>
       <div class="rp-head-actions">
         <button class="primary" onclick="saveUser('${u.id}')">Save</button>
+        <button class="ghost" onclick="signOutUser('${esc(u.id)}')" title="End this account's signed-in sessions on every device">Sign out everywhere</button>
         <button class="danger-ghost" onclick="delUser('${esc(u.id)}')" ${isLastAdmin?'disabled title="Cannot remove the last administrator"':''}>Remove</button>
       </div>
     </div>
@@ -9789,6 +9793,7 @@ function renderUser(id) {
         ${userRoleOptions(u.role_id, u.role === 'admin')}
       </select>
       <div class="card-hint" style="margin-top:4px">Capabilities and the role's base cameras come from the role. <a href="#" onclick="event.preventDefault();newRole()">Add a role</a> for fine-grained permissions. You can also grant this user extra cameras below.</div>
+      <div class="card-hint" style="margin-top:4px">Setting a new password or changing the role signs this account out on its other devices. Use <b>Sign out everywhere</b> to end every session now, for example if a phone was lost.</div>
       ${cameraAccessUI('ue', u.camera_ids || [])}
       ${isLastAdmin?'<div class="info-note" style="margin-top:10px">This is the only administrator. Create another admin before you can remove or demote this account.</div>':''}
       <div id="ue-msg" class="form-msg"></div>
@@ -9839,6 +9844,29 @@ async function saveUser(id) {
     renderUser(id);
   } catch (e) { setMsg('ue-msg', e.message, 'err'); }
 }
+/* ── SIGN OUT EVERYWHERE: end every session this account holds ──────────────
+   DELETE /auth/users/:id/sessions (admin-gated). Every device holding a token
+   for this account is signed out at once; they can sign back in with the same
+   password unless it was also changed. Signing YOURSELF out here ends this
+   console session too, so say so before doing it. */
+async function signOutUser(id) {
+  const u = USERS.find(x => x.id === id);
+  const name = u ? u.username : id;
+  const me = await api('/auth/me').catch(() => null);
+  const warn = (me && me.id === id)
+    ? `Sign out every device for "${name}"? That includes this console, you will have to sign in again.`
+    : `Sign out every device for "${name}"?`;
+  if (!confirm(warn)) return;
+  try {
+    const r = await api('/auth/users/' + encodeURIComponent(id) + '/sessions', { method: 'DELETE' });
+    const n = (r && typeof r.revoked === 'number') ? r.revoked : 0;
+    toast(n === 1 ? `Signed out 1 session for "${name}".` : `Signed out ${n} sessions for "${name}".`);
+  } catch (e) {
+    setMsg('ue-msg', e.message, 'err');
+    toast(e.message, 'err', 5000);
+  }
+}
+
 /* ── REMOVE: user (refuse removing the last administrator; show API reason) ── */
 async function delUser(id) {
   // Resolve the name from the loaded model by UUID (avoids passing admin-set
@@ -9869,7 +9897,7 @@ async function delUser(id) {
    ROLES, list / create / edit / delete
    REST: GET/POST /config/roles  ·  GET/PUT/DELETE /config/roles/:id
    Role shape: { id, name, is_admin, capabilities:{export,playback,clips,ptz,
-                 manage_views,bookmarks,view_plates,actuators},
+                 manage_views,bookmarks,view_plates,actuators,manage_channels},
                  camera_ids:[uuid], created_at }
 ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -9882,6 +9910,7 @@ const ROLE_CAP_FIELDS = [
   { key: 'manage_views', label: 'Manage views',   hint: 'Create, edit and delete saved live-wall views.' },
   { key: 'view_plates',  label: 'View license plates', hint: 'Sensitive: see recognised license-plate reads and search the plate database for this role’s cameras.' },
   { key: 'actuators',    label: 'Control linked devices (locks, covers, switches) - default off', hint: 'Sensitive: operate PHYSICAL devices linked to this role’s cameras, garage doors, locks, lights, sirens. Off by default; seeing a camera never implies being able to work its devices.' },
+  { key: 'manage_channels', label: 'Manage notification destinations - default off', hint: 'Add, edit, delete and test-send notification destinations (Discord, Slack, Telegram, ntfy, Pushover, webhook). Off by default; a destination tells the server to send alerts, with snapshot images, to a host you choose. Seeing existing destinations in the list is not affected.' },
 ];
 
 /** Build the capability checkboxes + bookmarks selector for a role form. pfx = field prefix. */
@@ -10066,6 +10095,7 @@ let NOTIF_SYS_QUIET_END   = null;
 let NOTIF_SYS_ALERTS = [];  /* loaded array of system_alert_rules rows (P0-HEALTH-NOTIFY) */
 let NOTIF_ME_ID   = null;   /* current user's id, for channel owner attribution */
 let NOTIF_IS_ADMIN = false; /* current user is admin (governs the global toggle + all-channel list) */
+let NOTIF_CAN_MANAGE = false; /* admin, or a role with manage_channels: may add/edit/test/remove destinations */
 let SYS_ALERT_EDIT_KEY = null; /* event_key of the alert open in the system-alert editor modal */
 
 /* Human-readable title + short description for each system-alert event_key. */
@@ -10794,6 +10824,7 @@ async function renderNotifications() {
     ]);
     NOTIF_ME_ID    = me ? me.id : null;
     NOTIF_IS_ADMIN = !!(me && me.is_admin);
+    NOTIF_CAN_MANAGE = !!(me && (me.is_admin || (me.capabilities && me.capabilities.manage_channels)));
     NOTIF_CHANNELS = channels;
     NOTIF_RULES    = rules;
     NOTIF_ENABLED  = settings && settings.enabled !== false;
@@ -10865,9 +10896,10 @@ function _renderNotificationsPane() {
             <span style="font-size:11px;font-weight:600;color:${ch.enabled?'var(--ok)':'var(--dim2)'};white-space:nowrap">${ch.enabled?'Enabled':'Disabled'}</span>
             <span style="font-size:12px;color:var(--dim);white-space:nowrap">${esc(scopeNote)}</span>
             <div class="td-actions" style="gap:5px">
+              ${NOTIF_CAN_MANAGE ? `
               <button class="ghost xs" onclick="notifOpenConfigure('${esc(ch.id)}')">${isOpen?'Close':'Configure'}</button>
               <button class="ghost xs" id="notif-test-btn-${esc(ch.id)}" onclick="notifTestChannel('${esc(ch.id)}')">Test</button>
-              <button class="danger-ghost xs" onclick="notifRemoveChannel('${esc(ch.id)}')">Remove</button>
+              <button class="danger-ghost xs" onclick="notifRemoveChannel('${esc(ch.id)}')">Remove</button>` : ''}
             </div>
           </div>
           <div id="notif-cfg-${esc(ch.id)}" class="${isOpen?'':'hidden'}">${isOpen ? _renderConfigureForm(ch) : ''}</div>
@@ -10910,13 +10942,15 @@ function _renderNotificationsPane() {
         or a Pushover push). Add as many as you like; each can cover all cameras or a subset.
       </div>
 
-      <!-- Add-destination row -->
+      <!-- Add-destination row (only for admins and roles with manage_channels) -->
+      ${NOTIF_CAN_MANAGE ? `
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
         <select id="notif-new-kind" style="width:auto" onchange="NOTIF_NEW_KIND=this.value">
           ${kindOpts}
         </select>
         <button class="primary sm" onclick="notifOpenConfigure('__new__')">Add destination</button>
-      </div>
+      </div>` : `
+      <div class="info-note" style="margin-bottom:12px">Your role can see destinations but not change them. Ask an administrator for the "Manage notification destinations" permission.</div>`}
 
       <!-- New-channel configure form (hidden until Add is clicked) -->
       <div id="notif-cfg-__new__" class="${NOTIF_OPEN_CH==='__new__'?'':'hidden'}">${NOTIF_OPEN_CH==='__new__'?_renderConfigureForm(null):''}
@@ -11846,13 +11880,23 @@ function renderSnapshot(c) {
 }
 
 /* ── Boot ── */
-// SSO from an embedding host (the Crumb Client). The host loads
-//   /admin#token=<jwt>&embed=1
-// so the operator who's already signed into the desktop doesn't re-authenticate
-// here. Adopt the token, persist it like a normal login, then SCRUB the hash so
-// the credential never lingers in the address bar or history. embed=1 also drops
-// our own topbar/sign-out (the host owns that chrome).
-(function bootSSO() {
+// SSO from an embedding host (the Crumb Client). Two shapes, both fragments
+// (never query params, since fragments aren't sent to the server or logged):
+//   /admin#token=<jwt>&embed=1   the host's own EMBEDDED webview, same process
+//   /admin#handoff=<code>        a real browser the host launched for us
+// The embedded webview shares the host's process, so it simply passes its
+// session token. "Open in browser" crosses a process boundary into a browser's
+// history and profile storage, so it passes a single-use, short-lived code
+// instead and we trade it here for our OWN session via POST
+// /auth/handoff/exchange. Either way we persist the result like a normal login
+// and SCRUB the hash so nothing lingers in the address bar or history; embed=1
+// also drops our own topbar/sign-out (the host owns that chrome).
+//
+// Async because of the exchange: `boot()` at the bottom of this file awaits
+// SSO_READY before deciding between the app and the login screen. A failed
+// exchange (expired, already used, restarted server) leaves TOKEN empty and
+// falls through to the normal login form.
+const SSO_READY = (async function bootSSO() {
   // Chrome-less embed via query param (item #4): the desktop client's webview
   // loads /admin?embedded=1 so the console drops its own topbar (brand, back /
   // sign-out chrome) — the host draws that chrome, and doubling it up gave two
@@ -11871,11 +11915,27 @@ function renderSnapshot(c) {
   if (h.length > 1 && !h.startsWith('#/')) {
     const p = new URLSearchParams(h.slice(1));
     const t = p.get('token');
+    const handoff = p.get('handoff');
     if (t) { TOKEN = t; localStorage.setItem('crumb_admin_token', TOKEN); }
     if (p.get('embed') === '1') document.body.classList.add('embedded');
-    if (t || p.has('embed')) {
+    if (t || handoff || p.has('embed')) {
       try { history.replaceState(null, '', location.pathname + location.search); }
       catch { location.hash = ''; }
+    }
+    // Scrubbed first, redeemed second: the code is single-use and short-lived,
+    // so it must not survive in the address bar even for the exchange round-trip.
+    if (!t && handoff) {
+      try {
+        const res = await fetch('/auth/handoff/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: handoff }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.token) { TOKEN = data.token; localStorage.setItem('crumb_admin_token', TOKEN); }
+        }
+      } catch { /* offline or server restarted: fall through to the login form */ }
     }
   }
 })();
@@ -12041,6 +12101,10 @@ $('bootstrap-pass2') && $('bootstrap-pass2').addEventListener('keydown', e => { 
    wizard if first-run setup was never finished. Otherwise show the login; a
    successful login resumes the wizard too when setup is incomplete. */
 (async function boot() {
+  // A #handoff= code is redeemed asynchronously by bootSSO; wait for it so the
+  // decision below sees the resulting session. Never let that step stop the
+  // console from rendering: the worst case is the normal login form.
+  try { await SSO_READY; } catch (_) { /* fall through to the boot decision */ }
   let status = null;
   try { status = await fetch('/auth/setup-status').then(res => res.ok ? res.json() : null); } catch (_) { /* fall through */ }
   if (status && status.needs_bootstrap) { openWizard(status); return; }

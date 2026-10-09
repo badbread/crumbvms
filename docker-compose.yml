@@ -163,6 +163,8 @@ services:
       ARCHIVE_STORAGE_PATH: ${ARCHIVE_STORAGE_PATH:-/data/archive}
       EXPORT_DIR: ${EXPORT_DIR:-/exports}               # top-level, NOT under /data:ro (can't nest a mount there)
       EXPORT_TTL_SECONDS: ${EXPORT_TTL_SECONDS:-86400}
+      EXPORT_MAX_CONCURRENT: ${EXPORT_MAX_CONCURRENT:-}   # queued+running export jobs allowed at once (empty = 2)
+      EXPORT_MAX_RANGE_SECONDS: ${EXPORT_MAX_RANGE_SECONDS:-}  # longest window one export may cover (empty = 86400)
       SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}     # seeded by default (setup-env.sh generates it); blank = browser create-admin wizard
       ONVIF_CONFIG_B64: ${ONVIF_CONFIG_B64:-}           # legacy fallback; per-camera ONVIF creds live in the DB now
@@ -179,6 +181,11 @@ services:
       FRIGATE_CATCHUP_HOURS: ${FRIGATE_CATCHUP_HOURS:-24}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}         # Discord/Slack webhook on recorder-heartbeat stall; empty = silent
       UPDATE_CHECK_ENABLED: ${UPDATE_CHECK_ENABLED:-false}   # opt-in (issue #7); false = zero github.com requests
+      # GET /metrics takes an Authorization: Bearer credential. An admin session
+      # always works; this optional shared token lets a Prometheus scraper with no
+      # Crumb account read it. Empty = admin session only. /health + /version stay open.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      METRICS_TOKEN_FILE: ${METRICS_TOKEN_FILE:-}       # Docker-secret path; read first when set
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       # Built-in nightly pg_dump of the segments index (the mp4→camera/time map). docs/BACKUP.md
@@ -218,11 +225,16 @@ services:
       MAIN_REPAIR_TRANSCODE_ENABLED: ${MAIN_REPAIR_TRANSCODE_ENABLED:-}
       SEGMENT_LOW_CACHE_MAX_BYTES: ${SEGMENT_LOW_CACHE_MAX_BYTES:-}
       EXPORT_CACHE_MAX_BYTES: ${EXPORT_CACHE_MAX_BYTES:-}
+      FRAME_PROXY_MAX_CONCURRENCY: ${FRAME_PROXY_MAX_CONCURRENCY:-}   # live-still fetches in flight at once (empty = one per core, 8..32)
       # Behind the bundled Caddy (or any reverse proxy), set TRUST_PROXY=1 so the
-      # rate limiter keys on the client IP from X-Forwarded-For instead of the
-      # proxy's own address (one bucket for ALL HTTPS users otherwise). Leave
-      # empty when clients hit :8080 directly. (#241, docs/TLS.md)
+      # rate limiter and login backoff key on the client IP from X-Forwarded-For
+      # instead of the proxy's own address (one bucket for ALL HTTPS users
+      # otherwise). The header is only read on requests whose TCP peer is in
+      # TRUSTED_PROXIES (IPs, CIDRs or hostnames; empty = `caddy`, the bundled
+      # proxy), so a client hitting :8080 directly is still keyed on its own
+      # address. (#241, docs/TLS.md)
       TRUST_PROXY: ${TRUST_PROXY:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     volumes:
       - ${MEDIA_HOST_PATH:-./_data}:/data:ro            # same media root as recorder, READ-ONLY (api never writes footage)
       - crumb_exports:/exports

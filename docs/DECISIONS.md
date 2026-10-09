@@ -164,6 +164,479 @@ off `ChannelMessage`), or a new channel kind arrives that has its own
 client-side timestamp markup (add a `TimeStyle` variant; do not special-case it
 in a dispatcher).
 
+## 2026-09-07, The app-switcher cover is unconditional on mobile, and Android hides the recents snapshot without a permanently secure window
+
+**Context.** The operating system takes a picture of the app as it leaves the
+foreground and shows it on the task switcher, so whatever camera was on screen
+stays visible to whoever picks the device up next. iOS already had an opaque
+cover for this (`RootView.privacyShieldVisible`), but it was drawn only when the
+opt-in biometric lock was on, and that setting defaults to off. Android had
+nothing.
+
+**Decision, iOS.** The cover is now drawn for any signed-in session whenever the
+scene stops being `.active`, independent of `biometricLockEnabled`. The two
+concerns are separate: the cover is about what the system snapshot records, the
+lock is about who may resume the session. The lock keeps gating only the Face ID
+/ passcode challenge, and `.inactive` still never triggers that challenge, since
+`.inactive` also fires on harmless momentary interruptions (Control Center, an
+incoming-call banner, a system alert).
+
+**Decision, Android.** API 33+ calls `Activity.setRecentsScreenshotEnabled(false)`
+once in `onCreate`. Below 33 the window is made secure in `onPause` and cleared
+again in `onResume`, so it is secure only across the transition during which the
+snapshot is taken. Picture-in-Picture is exempt from the pre-33 path (a secure
+window would render the floating video window blank), and the flag is cleared
+again in `onPictureInPictureModeChanged` because entering PiP is asynchronous
+and `onPause` can run before the activity reports itself as being in PiP. The
+per-API-level decision lives in `RecentsPrivacy` so it is unit-testable.
+
+**Rejected: a permanently secure Android window** (`FLAG_SECURE` set once in
+`onCreate`). It is the simplest and strongest option and it is what most
+guidance suggests, but it also disables ordinary screenshots and screen
+recording of the app. The maintainer records screenshots and screen captures of
+the Android client for documentation and for the site, and an operator
+photographing an incident off their own phone is a legitimate use. Blocking that
+to protect a preview the operator can also protect by closing the app was judged
+the wrong trade.
+
+**Rejected: a macOS occlusion or resign-active cover.** macOS has no task
+switcher preview of this kind, and a video wall on a second monitor is meant to
+stay readable while another app has focus. macOS behavior is unchanged.
+
+**Trades knowingly accepted:**
+
+- Below API 33 the flag toggles on every pause, which includes pauses that are
+  not "leaving the app" (a system permission dialog, the biometric prompt). The
+  effect is invisible: the flag is cleared again on the next resume.
+- Below API 33, leaving the app straight into PiP can still put a video frame on
+  the recents card, because that path is deliberately exempt. API 33+ devices
+  use the dedicated switch and are unaffected.
+- The iOS cover now appears for users who never asked for a lock. It is a plain
+  opaque background with no interaction, so the only cost is a brief flat colour
+  during multitasking.
+
+**Revisit if:** Android ever gains a pre-33-compatible recents-only switch (it
+will not, but a support library shim would count), or if the minimum supported
+API rises to 33, at which point the `FLAG_SECURE` fallback and `RecentsPrivacy`
+can both be deleted. Also revisit if operators report that the PiP exemption
+matters on old devices, in which case the pre-33 path can drop PiP entirely
+(auto-enter off below 33) instead of exempting it.
+
+## 2026-09-07, Session validity is a positive cached lookup per `jti`, not a cached revoked-set alone; per-user camera grants are read from the user row
+
+**Context.** `sessions` (migration 0033) made a token revocable, and the
+`AuthUser` extractor checked it against an in-memory set of REVOKED `jti`s
+refreshed on write. That set answers "was this session signed out". It cannot
+answer "was this ever a session at all", and `sessions.user_id` is
+`ON DELETE CASCADE`, so removing an account made its rows disappear rather than
+be flagged. A token for a removed account therefore read as "not revoked" and
+kept working for the rest of its `exp`, which for a remembered mobile login is
+years. Separately, a user's per-user camera grants were baked into the token at
+login and unioned with the role's cameras at request time, so editing them did
+nothing until that user signed in again.
+
+**Decision.** The extractor now resolves each `jti` POSITIVELY: a small
+`AppState` cache maps `jti` to "session row present and not revoked, plus the
+owning user's `users.camera_ids`", populated by one joined query on a miss and
+cleared on any user change. An unknown `jti` is resolved against the DB then and
+there, never assumed either way, and the resolved grants replace
+`claims.camera_ids` in the role-union. A login token with no `jti` is refused
+outright (the table predates the first public release, so no supported client
+holds one). The existing revoked-set cache is kept as the fast path for
+revocation; the new cache answers existence.
+
+**Rejected:**
+
+- *Caching the LIVE set instead.* A session minted a millisecond ago on another
+  API replica would not be in this replica's set until the TTL lapsed, so a user
+  who just signed in would be spuriously signed out. A false 401 right after
+  login is worse than a revoke that lands a few seconds late.
+- *Querying `sessions` on every request.* Correct but puts a DB round trip on
+  the hot path of every authenticated request, including the media reads a video
+  wall issues continuously. The repo's established pattern (`roles_cache`,
+  `revoked_jtis`) is cache-the-truth, refresh-on-write.
+- *Also ending sessions when only the extra-cameras list changes.* Once the
+  grants are read from the row on each request, the new set is in force on that
+  user's very next request, so signing them out adds nothing but disruption
+  (a viewer loses their wall because an admin granted them one more camera).
+  A password or role change still ends every session: those replace the
+  credential or what the account may do.
+- *Keeping the opt-in "reject legacy `jti`-less tokens" switch* the 0033
+  migration sketched. There are no legacy tokens to keep working, and a
+  configurable switch for "accept credentials that can never be signed out" is a
+  setting nobody should choose.
+
+**Trades knowingly accepted:**
+
+- A cold `jti` costs one query, so a burst of first-time-seen sessions (an API
+  restart with many clients reconnecting) costs one query each, once.
+- Across replicas, a user edit made on another replica lands within the cache
+  TTL rather than instantly; a revoke still lands within the shorter revocation
+  TTL. Single-process installs (the norm) see both immediately.
+- A scoped media token minted just before an account was removed keeps working
+  for the rest of its short life. It is one camera, media bytes only, minutes,
+  which is the property the media token was designed around.
+- A supplied password always counts as a change, even if it is the same string:
+  hashes are salted, so old and new are never comparable.
+
+**Revisit if:** an install runs enough distinct concurrent sessions that the
+per-`jti` cache is a memory or miss-rate problem (then key the cache by user and
+carry a session generation counter), or Crumb grows a real multi-replica
+deployment story where cache TTLs are too coarse (then push invalidation between
+replicas, for example over the existing DB with a notify channel).
+
+## 2026-09-07, Opening the web console in an external browser uses a single-use handoff code, not the desktop client's session token
+
+**Context.** The desktop client can show the server's web admin console two
+ways: embedded in its own WebView, and "Open in browser", which hands the URL to
+whatever browser the OS launches. Both used the same URL shape,
+`/admin#token=<session token>&embed=1`, which `admin.html`'s `bootSSO` reads and
+persists like a login. That is fine for the embedded WebView, which is this
+client's own process, but "Open in browser" crosses a process boundary: the
+token then lives in a browser's history, its profile storage, and within reach
+of whatever extensions the operator has installed, for as long as the session
+lasts.
+
+**Decision.** The embedded WebView keeps `#token=`. "Open in browser" instead
+calls `POST /auth/handoff` (full session required, a scoped media token is
+refused), gets back a single-use code that expires in about a minute, and opens
+`/admin#handoff=<code>`. The console posts the code to
+`POST /auth/handoff/exchange`, which consumes it exactly once and mints the
+browser its OWN session: its own `jti`, its own `sessions` row, normal (not
+"remember me") expiry, so it is listed under "your sessions" and every sign-out
+path reaches it. Codes are held in memory only, bound to the issuing user and
+session; an expired, unknown, reused, or signed-out code is a 401 and the
+console falls through to its normal login form.
+
+**Rejected:**
+
+- *Keep passing the session token in the fragment.* Cheapest, and the fragment
+  never reaches the server, but the credential still lands in browser history
+  and profile storage under a different security boundary than the client that
+  owns it.
+- *Open the console with no credential at all.* Safest and free, but the
+  operator is asked to type their password again to reach a console they are
+  already signed in to on the same machine, which is exactly the friction the
+  handoff exists to remove.
+- *Persist codes in Postgres.* Rejected as unnecessary machinery: a code lives
+  for seconds, and losing the map on a restart only costs a second click.
+
+**Trades knowingly accepted:** codes are per-process, so an install running
+several API replicas behind a load balancer can have the exchange land on a
+replica that never saw the code (the operator clicks again, or the browser shows
+the login form). The browser's session is not the client's session, so signing
+out in one does not sign out the other; both are visible and revocable under
+"your sessions".
+
+**Revisit if:** Crumb starts supporting multiple API replicas behind a shared
+load balancer as a documented deployment, at which point the code store moves to
+Postgres (or a shared cache) with the same single-use semantics.
+
+## 2026-09-07, Media routes: bounded waits answering 503, not unbounded queues
+
+**Context.** Every expensive media path (clip and low-bitrate transcodes, the
+filmstrip's single-frame extractions, and now the live-still proxy) gates its
+work behind a shared semaphore. Those acquires were plain
+`acquire_owned().await`, an unbounded queue: once the permits were gone, further
+requests parked indefinitely, holding a connection and never answering. The
+media router also carried neither a request timeout nor a rate limit, both of
+which the JSON routes have had since #17.
+
+**Decision.** Every media semaphore acquire goes through one helper
+(`services/api/src/media_limits.rs::acquire_bounded`) that gives up after a
+per-call-site budget and returns `503` plus `Retry-After`. The media router
+gains its own, much larger rate-limit bucket (burst 1200, 240/s sustained,
+roughly 6x the busiest real client) and a 180 s time-to-response bound.
+
+**Why a timeout is safe over streaming media.** `tower_http`'s `TimeoutLayer`
+bounds only the handler future; response bodies have a separate
+`ResponseBodyTimeoutLayer` that is deliberately not used. Segment downloads,
+export archives, and the open-ended live `stream.mp4` all return headers
+immediately and stream afterwards, so none of them can be cut. The one route
+that legitimately produces for minutes before answering, the on-demand
+DB-vs-disk size verification walk, is mounted outside the timeout for exactly
+that reason.
+
+**Rejected: making the clients wait longer.** Raising the permit counts or the
+wait budgets keeps the failure mode (a request that never answers) and only
+moves the threshold. The clients already treat a failed media fetch as "keep the
+placeholder, poll again", so "busy, retry shortly" is both truthful and the
+behaviour they already handle.
+
+**Rejected: a per-user or per-camera semaphore instead of a global one.** It
+would give fairer degradation, but it multiplies the tuning surface and the
+memory footprint for a system whose realistic worst case is a handful of
+operators. Revisit if a deployment reports one client starving others despite
+the bounded waits.
+
+**Trades knowingly accepted.** Under genuine saturation a scrub thumbnail or a
+wall tile now fails fast instead of eventually arriving; that is the intended
+swap. A camera whose full still-fetch ladder failed is latched for 10 s so subsequent
+polls make a single attempt instead of the cold-start retry ladder (a failed single
+attempt never extends the latch, and the first request after the window runs the
+full ladder again as a probe), which means a camera coming back can be
+up to 10 s late to serve its first still.
+
+**Revisit if:** operators report 503s on the media routes during normal use
+(the budgets or permit counts are too tight), or a deployment large enough to
+need per-principal fairness appears.
+
+---
+
+## 2026-09-07, Filmstrip widths snap to a fixed ladder; export requests are capped
+
+**Context.** The thumbnail width was clamped to 48..640 but otherwise free, and
+it is part of the on-disk cache key, so 593 distinct widths for one instant meant
+593 ffmpeg runs and 593 cache files for what is visually one frame. Separately,
+`POST /export` validated only `start < end`: nothing capped the window, the
+camera count, or duplicates in the camera list, and `filter_camera_ids` is a
+scope filter rather than a de-duplicator (for an admin it returns the list
+verbatim), so `[X, X, X, ...]` ran N sequential full-range encodes all writing
+the same output file with `-y`, counted as one job against
+`EXPORT_MAX_CONCURRENT`.
+
+**Decision.**
+
+- Widths clamp and then snap to `80/160/320/480/640` (nearest, ties down). The
+  buckets are chosen so every width the shipped clients ask for lands on itself:
+  160 (Android and desktop scrub lists), 320 (the Android playback wall), 480
+  (the iOS scrub still, the desktop preview frame, and the `THUMB_PREGEN_WIDTH`
+  default), so no existing or pre-generated cache entry is invalidated.
+- `POST /export` sorts and de-duplicates the camera list, caps it at 50 distinct
+  cameras (the same ceiling `/export/batch` puts on clips, since both fan out to
+  one sequential encode per unit of work), and caps the window with a new
+  `EXPORT_MAX_RANGE_SECONDS` (default 86400, a full day of one camera).
+- Each per-camera encode gets a wall-clock budget derived from the range
+  (4x realtime, floored at 10 minutes, capped at 24 hours) and `kill_on_drop`.
+  A child that wedges now fails the job with a stored error instead of leaving
+  it `Running` forever, which used to consume an `EXPORT_MAX_CONCURRENT` slot
+  permanently until the api was restarted.
+
+**Rejected: quantizing by rounding to a multiple (say 32 px).** It bounds the
+key space too, but it does not guarantee the clients' existing widths are
+fixed points, so the whole warm thumbnail cache (including anything
+pre-generated at 480) would be re-rendered at neighbouring keys on upgrade.
+
+**Rejected: de-duplicating inside `filter_camera_ids`.** That function is the
+RBAC scope filter used by several handlers, including ones that rely on
+comparing the filtered length to the input length to detect a partial-scope
+request. Making it also dedup would silently change those comparisons.
+
+**Rejected: a stall watchdog on ffmpeg progress instead of a wall-clock
+budget.** More precise (it would catch a wedged child in seconds rather than
+hours) and the progress parsing already exists, but it is a larger change to
+the export worker than the failure mode warrants right now.
+
+**Revisit if:** a deployment genuinely exports multi-day ranges and finds the
+default cap or the derived encode budget too tight (both are configurable; the
+budget is not), or if per-camera export throughput makes the 4x realtime factor
+the binding constraint, at which point the stall watchdog becomes the better
+mechanism.
+
+## 2026-09-07, The api refuses to start on the placeholder database password, and every `_FILE` twin wins over its plain variable
+
+**Context.** Three inconsistencies in how secrets were read and documented:
+
+* `db.rs`'s `ha_env` read `HA_TOKEN` first and only fell back to
+  `HA_TOKEN_FILE`, the reverse of `config::secret_env`, which every other secret
+  goes through. An operator who mounted a Docker secret while a stale plain
+  value sat in `.env` silently got the stale one, and the docs-site already said
+  `HA_TOKEN_FILE` was "read in preference to `HA_TOKEN`".
+* The docs-site said `GO2RTC_USER`/`GO2RTC_PASS` "don't support `_FILE`". The
+  api routes both through `require_secret`, which does read the `_FILE` twin.
+  What is actually true is narrower: the embedded go2rtc restreamer expands the
+  plain variables from the process environment, so the plain form has to be set
+  regardless.
+* `.env.example` and `docker-compose.yml` ship `POSTGRES_PASSWORD=change-me` and
+  a matching `DATABASE_URL`. `JWT_SECRET` and `GO2RTC_PASS` both refuse their
+  documented placeholder at startup; the database password did not.
+
+**Decision.** `ha_env` calls `secret_env("HA_TOKEN")`, so the file wins like
+everywhere else. The two docs pages now describe the `GO2RTC_*` situation
+accurately. And `ApiConfig::from_env` refuses to start when `DATABASE_URL`'s
+userinfo password is one of the documented placeholders (`change-me`,
+`changeme`, case-insensitively), with an error naming the fix, including the
+part that trips people up: a changed `POSTGRES_PASSWORD` does not re-initialize
+an existing Postgres data volume, so the password has to be changed in the
+database too.
+
+**Trade-off accepted:** this is a startup-breaking change for an install that
+is currently running on the placeholder. That is the point, and it matches what
+`JWT_SECRET` and `GO2RTC_PASS` have always done; the error says exactly what to
+do. Only exact placeholder matches are refused, so a real password that happens
+to begin with `change-me` still starts.
+
+**Rejected:** warning instead of refusing (a warning in a log nobody reads is
+how the value survives to production, and the two adjacent secrets already set
+the refuse precedent); a generic weak-password check (arbitrary, and Crumb has
+no business grading operator passwords, only rejecting the one it shipped
+itself).
+
+**Revisit if:** a deployment shape appears where the api legitimately cannot
+know the real password, e.g. an external connection broker, in which case the
+check should key on the password being *absent* rather than a value list.
+
+---
+
+## 2026-09-07, Camera source URLs mask their password on read; sending the mask back means "keep it"
+
+**Context.** A camera's `source_url` / `source_sub_url` carry the camera's own
+`user:pass@` credentials inline, because that is what go2rtc dials.
+`onvif_password` has been write-only since the distributability work (never
+copied into a DTO, blank on `PUT` keeps the stored value), but the two source
+URLs were returned verbatim by `GET /config/cameras`, so every admin session,
+and anything that logged or cached that response, held the camera passwords in
+clear.
+
+**Decision.** `camera_to_dto` masks the userinfo password with a fixed string
+(`crumb_common::redact::CREDENTIAL_MASK`, `********`) and adds
+`source_has_credentials` / `source_sub_has_credentials` so a client can say
+"there is a stored password" without holding it. `PUT /config/cameras/{id}`
+resolves a submitted URL against the stored one: a password equal to the mask
+means keep the stored credential, anything else is taken literally and replaces
+it. The rest of the submitted URL always wins, so an operator can change the
+host or path while leaving the masked password alone. The masking and unmasking
+live in `services/common/src/redact.rs` next to the log-redaction helpers, which
+already own the `scheme://user:pass@host` parsing rule.
+
+**Why a mask inside the URL rather than a separate password field.** The URL is
+one text field the operator types, pastes and edits as a whole; splitting the
+credential out would mean a different editing model in the console and a
+migration of the stored shape. The mask keeps the field a URL, keeps
+copy-paste-and-edit working, and reuses the read/write contract `onvif_password`
+already established.
+
+**Trade-offs accepted:** a camera whose real password is literally `********`
+cannot be distinguished from the mask, so a `PUT` would keep the stored value
+rather than set that password. The API also cannot tell "keep" from "set to the
+same value", which is the same limitation the blank-keeps-it ONVIF password
+field has. The console shows a hint under the stream fields when credentials are
+stored.
+
+**Unaffected by design:** the recorder and the go2rtc reconcile loop read
+`source_url` from the database (`db::list_camera_streams`), never from a DTO, so
+the restream keeps dialling the real credentials.
+
+**Rejected:** omitting the URLs entirely from the DTO (the console needs to show
+and edit them); returning them only to a narrower role (there is no role above
+admin); a per-request "reveal" endpoint (adds a way to read the password back
+out, which is the thing being removed).
+
+**Revisit if:** a client ever needs the real source URL for something other than
+editing, or the console moves to a structured stream editor with its own
+password field, at which point the mask can be dropped in favour of a write-only
+field.
+
+---
+
+## 2026-09-07, Login backoff is keyed on (account, client), not on the account alone
+
+**Context.** Issue #127 added a repeated-failure backoff to `POST /auth/login`:
+five consecutive failures for a username, then 429 + `Retry-After` with an
+exponential window capped at 15 minutes. The counter was keyed on the username
+only, so anyone who could reach the login endpoint and knew (or guessed) a
+username could keep its owner out for as long as they kept failing, from
+anywhere.
+
+**Decision.** The counter key is now `username + \u{1f} + client`, where
+`client` comes from `rate_limit::client_key` — the same derivation the per-client
+request bucket uses, so both honour `TRUST_PROXY` identically and can never
+drift. Thresholds, the exponential schedule, the cap, the map-pruning bound and
+the 429 + `Retry-After` shape are all unchanged. A success clears only the
+client that succeeded. The per-client request bucket stays the global limiter on
+top, unchanged.
+
+Two further rules keep the per-client key from being something a client can
+choose:
+
+- **Proxy trust is per peer.** With `TRUST_PROXY` on, `X-Forwarded-For` is read
+  only when the TCP peer is in `TRUSTED_PROXIES` (IPs, CIDRs or hostnames,
+  default `caddy`, re-resolved every 30 s). The client is the right-most hop
+  that is not itself a trusted proxy, i.e. the entry the proxy appended, never
+  the client-supplied left-most one. Anything that reaches the published
+  `:8080` directly is keyed on its TCP peer whatever it sends. Previously the
+  first hop was taken from any peer, so a direct client could pick a new key
+  per request.
+- **An account-wide ceiling sits on top.** 30 failures for one username within
+  a sliding 15 minutes, from any mix of clients, put the whole account into a
+  backoff of 30 s that doubles per further failure up to the same 15-minute
+  cap, until 30 minutes pass with no failure. One client cannot reach it
+  alone: its own backoff (5 free, then 2, 4, 8, ... s) admits at most 13
+  failures in 15 minutes. A success does not clear the account count.
+
+**Trade-off accepted:** someone able to fail from three or more addresses at
+full speed can still make the owner wait (up to 15 minutes per failure while
+they keep going). That is the price of a brake that address rotation cannot
+dodge, and it takes far more than one noisy client to trigger.
+
+**Rejected (proxy trust):** trusting the Docker bridge range by default (on
+some setups host-local and published-port traffic arrives from the bridge
+gateway, so it would trust direct clients); a fixed Caddy address in compose
+(needs a pinned subnet that can collide with existing networks); honouring the
+left-most hop (client-controlled).
+
+`ConnectInfo` is extracted as an `Option` in the login handler, so a router
+driven without `into_make_service_with_connect_info` (a test harness) still
+serves logins, with every such request sharing one `"unknown-peer"` key.
+
+**Rejected:** keeping the account-wide key with an operator allowlist (more
+configuration, same failure mode by default); dropping the per-account counter
+entirely and relying on the request bucket (loses the per-account signal, and
+the bucket is deliberately generous for normal JSON traffic).
+
+**Revisit if:** Crumb ever grows an account-lockout policy an operator actually
+asks for (compliance-driven), in which case it should be an explicit, opt-in
+setting with an admin unlock, not an implicit side effect of failure counting.
+
+---
+
+## 2026-09-07, Response headers: two site-wide headers everywhere, a Content-Security-Policy on the `/admin` document only
+
+**Context.** The api sent no `X-Content-Type-Options`, no `Referrer-Policy`, and
+no `Content-Security-Policy` on any response. The admin console
+(`services/api/src/admin.html`) is one `include_str!`-embedded page whose entire
+network surface is same-origin: every `fetch()` is a relative path, the icon set
+is inline SVG (Lucide path data embedded, not hotlinked), and the only non-`'self'`
+image sources are `data:` (inline placeholder glyphs) and `blob:` (snapshot
+frames from `URL.createObjectURL`). It has no `<iframe>`, no `<base>`, no
+`<form>`, no `WebSocket`/`EventSource`/`Worker`, and one inline `<script>`.
+
+**Decision.** `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`
+are set on every response by a `tower_http::set_header` layer applied outermost
+in `main.rs` (so it also covers the `/auth` subtree, which is merged outside the
+CORS layer). The `Content-Security-Policy` is attached to the `/admin` route
+only, not to JSON or media responses, whose consumers are native clients and for
+which a document policy means nothing. The policy and both helpers live in
+`services/api/src/response_headers.rs` with a test that asserts the wiring.
+
+**Trade-off accepted:** the policy carries `'unsafe-inline'` for `script-src` and
+`style-src`, because the console is deliberately a single self-contained file
+with one inline script and inline `style=` attributes throughout. Nonces or
+hashes would mean changing how the page is assembled and served, which is a much
+larger change than this one; the policy still pins every load origin to `'self'`
+(plus `data:`/`blob:` images) and sets `base-uri 'none'`, `object-src 'none'`,
+`form-action 'self'`, `frame-ancestors 'self'`.
+
+`frame-ancestors 'self'` is safe for the desktop client: it navigates a native
+WebView2 to `/admin` as a top-level document (`apps/desktop-flutter/lib/ui/
+admin_console/admin_console_screen.dart`), not in an `<iframe>` as the retired
+Tauri client did.
+
+**Also noted, deliberately unchanged:** `admin.html` keeps its bearer token in
+`localStorage`. Moving it to a cookie or in-memory-only store changes the whole
+sign-in/refresh flow and every client that deep-links into the console with
+`#token=`; it is out of scope here.
+
+**Rejected:** a single global CSP covering the JSON/media routes (meaningless
+for native clients, and one more thing to keep in step with the media surface);
+nonce/hash-based `script-src` (needs the console to stop being one static
+`include_str!` file).
+
+**Revisit if:** the console ever gains an external asset, an `<iframe>`, a
+`WebSocket`, or a cross-origin `fetch()` (all four would need a directive
+widened, and the widening should be argued here first), or if the console is
+split into separate served assets, at which point `'unsafe-inline'` can go.
+
 ---
 
 ## 2026-08-10, Home Assistant `climate` (thermostat/HVAC setpoint) control is out of scope
@@ -2521,6 +2994,45 @@ useful for diagnosing why a camera URL failed, and the reader is the admin.
 - A credible report of admin-context SSRF being chained with another finding.
 
 Tracked privately as advisory GHSA-v7q8-gj2q-gffw.
+
+**Addendum (2026-09-07), notification channels:** the first revisit trigger above
+fired. Notification channels were reachable by any authenticated caller, so the
+outbound destination was not admin-set the way the probe targets are: any viewer
+could create a channel and have the server POST alerts, with snapshot images
+attached, to a host of their choosing. Two changes bring that surface back inside
+the accepted model.
+
+*Channel management is a permission.* Creating, updating, deleting and
+test-firing a channel now needs the `manage_channels` role capability (migration
+0081; admins imply it, it is off by default on every existing and new non-admin
+role, and a scoped media token never carries it). Listing one's own channels is
+unchanged, and existing channels keep delivering regardless of their owner's
+capabilities: only management moved. **Rejected:** gating on `AdminUser` alone,
+which would have been simpler but takes a legitimate operator task away from
+every non-admin role for good; and gating delivery as well as management, which
+would silently stop alerts on upgrade.
+
+*Destinations are checked syntactically.* For a non-admin caller the stored URL
+must be `http`/`https` with a non-empty host, and may not name loopback
+(`127.0.0.0/8`, `::1`, `localhost`), link-local (`169.254.0.0/16`, `fe80::/10`),
+the unspecified address, or a compose service name. Admins stay exempt, matching
+the decision above. **Rejected:** resolving the host at validation time, which
+buys little (the name can resolve differently later) and makes saving a channel
+depend on DNS being up; and blocking RFC1918 / ULA addresses, which would break
+the primary use case, a self-hosted ntfy or Home Assistant on the operator's own
+LAN. The test-fire endpoint, the one channel route that sends on demand, is
+additionally rate-limited per user (429 + `Retry-After`).
+
+Separately, a provider-supplied `snapshot_url` (written from a Frigate MQTT
+payload, not by an operator) is now only fetched when it is a relative path or
+sits on the configured Frigate base's own origin. **Rejected:** trusting any
+absolute URL the provider sends, which was the previous behavior and made the
+fetch target depend on whatever reaches the broker.
+
+**Additional revisit triggers:** a provider legitimately needs a destination on
+a host the syntactic check rejects (then the exemption belongs in the check, not
+in a bypass); or channel management needs to be delegated more finely than one
+capability.
 
 ## 2026-07-19, iOS/macOS v0.1.0 parity: HA overlays + LPR are read-only on mobile; client-side logic ported verbatim from the server
 

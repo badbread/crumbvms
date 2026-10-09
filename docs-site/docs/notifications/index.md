@@ -16,6 +16,15 @@ A channel is a destination: Discord, Slack, Telegram, ntfy, Pushover, or a
 plain webhook. Add a channel, then send a test notification to
 confirm it delivers before relying on it.
 
+Adding, editing, removing and test-sending a destination is limited to
+administrators and to roles granted the **Manage notification destinations**
+permission, which the console's role editor exposes and which is off by default.
+Everyone else still sees the destinations that exist, and destinations that are
+already set up keep delivering either way. A destination has to be an ordinary
+`http`/`https` address; a role with the permission cannot point one back at the
+Crumb server itself, though an administrator can. Addresses on your own LAN are
+fine, which is what a self-hosted ntfy or Home Assistant needs.
+
 ### Snapshot images
 
 Each channel chooses what image an alert attaches: no image, the plate crop,

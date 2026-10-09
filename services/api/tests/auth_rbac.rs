@@ -22,7 +22,7 @@
 //!
 //! ```sh
 //! docker run --rm -d --name crumb-test-pg \
-//!   -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=crumb \
+//!   -e POSTGRES_USER=crumb -e POSTGRES_PASSWORD=crumb-dev -e POSTGRES_DB=crumb \
 //!   -p 5432:5432 postgres:16-alpine
 //! cargo test -p crumb-api --test auth_rbac
 //! ```
@@ -1034,6 +1034,7 @@ async fn seed_viewer_no_plates(pool: &deadpool_postgres::Pool, cameras: &[Uuid])
         manage_views: true,
         view_plates: false,
         actuators: false,
+        manage_channels: false,
     };
     let role = crumb_common::db::create_role(pool, &unique("noplates-role"), &caps, cameras)
         .await
@@ -1491,9 +1492,9 @@ async fn full_jwt_via_query_token_is_rejected_on_media_routes() {
     // Fail-closed (audit 2026-07-05 #2): the legacy `?token=<full login JWT>`
     // media path is now REJECTED — a login credential in a URL can leak into
     // proxy/access logs and browser history. Every current client uses a scoped
-    // media token (GET /media-token) for per-camera media; the only remaining
-    // full-JWT-via-?token= callers are the documented permissive exceptions
-    // (export downloads and the web-console camera snapshot, tested separately).
+    // media token (GET /media-token) for per-camera media, and the export
+    // downloads (the last route that accepted a login token in the query) now
+    // take the Authorization header only, see tests/auth_handoff.rs.
     let fx = build_rbac_fixture().await;
     let pool = fx.app.pool().clone();
     let storage_id = seed_storage(&pool, fx.storage_root.path().to_str().unwrap()).await;
@@ -1516,7 +1517,7 @@ async fn full_jwt_via_query_token_is_rejected_on_media_routes() {
 // without auth. axum can't enumerate its own routes, so this table is maintained
 // by hand — WHEN YOU ADD A ROUTE, ADD IT HERE (protected → 401 for no
 // credentials, or the public allowlist → not-401). The auth extractor
-// (AuthUser / AdminUser / LegacyQueryTokenUser) is the FIRST handler parameter
+// (AuthUser / AdminUser / MediaOrFullUser) is the FIRST handler parameter
 // everywhere, so a missing token yields 401 before any path/query/body extractor
 // runs — hence dummy path params are fine. Routed via the full-surface
 // test_router() in support/mod.rs. (audit 2026-07-05: "108 routes / 120 AuthUser
@@ -1545,6 +1546,8 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::DELETE, "/auth/sessions/all".into()),
         (Method::DELETE, format!("/auth/sessions/{u}")),
         (Method::DELETE, format!("/auth/users/{u}/sessions")),
+        // -- single-use console-handoff code mint (the exchange is public) --
+        (Method::POST, "/auth/handoff".into()),
         // -- scoped media-token mint --
         (Method::GET, "/media-token".into()),
         // -- /config/* (admin console; AdminUser) --
@@ -1632,8 +1635,8 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::PUT, format!("/notifications/rules/{u}")),
         (Method::POST, "/presence".into()),
         (Method::DELETE, format!("/notifications/devices/{u}")),
-        // -- media (fail-closed AuthUser / permissive LegacyQueryTokenUser; with
-        //    NO credential at all, both return 401) --
+        // -- media (fail-closed AuthUser / media-token-accepting MediaOrFullUser;
+        //    with NO credential at all, both return 401) --
         (Method::GET, "/play/aligned".into()),
         (Method::GET, format!("/play/{u}")),
         (Method::GET, format!("/segments/{u}")),
@@ -1674,6 +1677,9 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::POST, "/auth/bootstrap".into()),
         (Method::GET, "/auth/setup-status".into()),
         (Method::GET, "/auth/needs-bootstrap".into()),
+        // The handoff exchange is reached by a browser that has no credentials
+        // yet; the single-use code in the body is the credential.
+        (Method::POST, "/auth/handoff/exchange".into()),
     ];
     for (m, path) in &public {
         let st = send_status(&app, m.clone(), path.clone()).await;
@@ -2005,6 +2011,7 @@ fn mk_caps(playback: bool, clips: bool, view_plates: bool) -> crumb_common::type
         manage_views: false,
         view_plates,
         actuators: false,
+        manage_channels: false,
     }
 }
 

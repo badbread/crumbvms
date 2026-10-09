@@ -81,6 +81,19 @@ pub(crate) const DEFAULT_THUMB_INTERVAL_SECS: i64 = 4;
 const THUMB_MIN_WIDTH: u32 = 48;
 const THUMB_MAX_WIDTH: u32 = 640;
 
+/// The only widths a thumbnail is ever rendered (and cached) at.
+///
+/// Clamping alone left 593 distinct legal widths, and the width is part of the
+/// cache key, so 593 requests for the same instant meant 593 ffmpeg runs and 593
+/// files on disk for what is visually the same frame. Snapping to this ladder
+/// collapses them onto a handful of shared keys. The buckets are chosen so every
+/// width the shipped clients ask for lands on itself and nothing is re-rendered:
+/// 160 (the scrub-list default on Android and desktop), 320 (the Android
+/// playback wall), and 480 (the iOS scrub still, the desktop preview frame, and
+/// the `THUMB_PREGEN_WIDTH` default, so the pre-generated cache stays hot). 80
+/// and 640 bracket the ladder at the clamp bounds.
+const THUMB_WIDTH_BUCKETS: [u32; 5] = [80, 160, 320, 480, 640];
+
 /// Hard ceiling on a single filmstrip window. The endpoint builds one grid
 /// entry per `DEFAULT_THUMB_INTERVAL_SECS`, so an unbounded range would
 /// allocate an enormous Vec (and OOM the process — filmstrip lives on the
@@ -196,10 +209,12 @@ async fn list_filmstrip(
 pub struct FrameQuery {
     /// Timestamp of the frame to serve.
     pub ts: DateTime<Utc>,
-    /// Requested width in pixels (informational for v1 — single resolution stored).
-    /// Parsed from the query for forward-compat but not yet used to resize.
+    /// Requested width in pixels. Clamped to `[THUMB_MIN_WIDTH, THUMB_MAX_WIDTH]`
+    /// and then snapped to [`THUMB_WIDTH_BUCKETS`]; the result is both the scale
+    /// ffmpeg renders at and part of the on-disk cache key. The list endpoint
+    /// above propagates its own `width` into every frame URL it mints, so a
+    /// client picks the width once per strip.
     #[serde(default = "default_thumb_width")]
-    #[allow(dead_code)]
     pub width: u32,
 }
 
@@ -240,7 +255,7 @@ async fn serve_frame(
     let grid_ms = DEFAULT_THUMB_INTERVAL_SECS * 1000;
     let ts_ms = q.ts.timestamp_millis().div_euclid(grid_ms) * grid_ms;
     let snapped_ts = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or(q.ts);
-    let w = q.width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    let w = quantize_thumb_width(q.width);
     let (thumbs_root, frame_path) =
         thumb_frame_path(state.config().thumb_cache_base(), camera_id, ts_ms, w);
     ensure_thumbnail(&state, camera_id, snapped_ts, w).await?;
@@ -333,7 +348,7 @@ pub(crate) async fn ensure_thumbnail(
     snapped_ts: DateTime<Utc>,
     width: u32,
 ) -> Result<PathBuf, ApiError> {
-    let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    let w = quantize_thumb_width(width);
     let (thumbs_root, frame_path) = thumb_frame_path(
         state.config().thumb_cache_base(),
         camera_id,
@@ -401,7 +416,7 @@ async fn extract_thumbnail(
     // In-segment offset (clamped non-negative).
     #[allow(clippy::cast_precision_loss)]
     let offset_secs: f64 = (ts - seg.start_ts).num_milliseconds().max(0) as f64 / 1000.0;
-    let w = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    let w = quantize_thumb_width(width);
 
     tokio::fs::create_dir_all(thumbs_root)
         .await
@@ -420,12 +435,14 @@ async fn extract_thumbnail(
     // Cap concurrent extractions so a fast multi-camera scrub (each miss is one
     // single-frame ffmpeg) can't spawn a storm, mirroring the `/play` and
     // clip-gen semaphores. The permit is held only for the decode below and
-    // released on drop when this function returns.
-    let _permit = state
-        .thumb_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("thumb semaphore closed: {e}")))?;
+    // released on drop when this function returns. Bounded: at saturation the
+    // caller gets 503 + Retry-After rather than parking on the queue forever.
+    let _permit = crate::media_limits::acquire_bounded(
+        &state.thumb_semaphore(),
+        crate::media_limits::THUMB_EXTRACT_WAIT,
+        "thumbnail extraction",
+    )
+    .await?;
 
     let args = thumb_ffmpeg_args(
         offset_secs,
@@ -471,6 +488,22 @@ async fn extract_thumbnail(
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
+
+/// Clamp a requested thumbnail width into range and then snap it to the nearest
+/// entry of [`THUMB_WIDTH_BUCKETS`].
+///
+/// The width is part of the on-disk cache key, so this is what keeps the number
+/// of distinct renditions per instant at five rather than 593. Ties (a width
+/// exactly between two buckets) snap DOWN, which favours the smaller file and,
+/// more importantly, is deterministic: the same request must always resolve to
+/// the same cache key.
+pub(crate) fn quantize_thumb_width(width: u32) -> u32 {
+    let clamped = width.clamp(THUMB_MIN_WIDTH, THUMB_MAX_WIDTH);
+    THUMB_WIDTH_BUCKETS
+        .into_iter()
+        .min_by_key(|b| (b.abs_diff(clamped), *b))
+        .unwrap_or(clamped)
+}
 
 /// Generate timestamp slots across `[start, end)` anchored to a fixed global
 /// grid of `interval_secs`, unfiltered by recorded coverage.
@@ -557,7 +590,52 @@ fn thumb_ffmpeg_args(offset_secs: f64, width: u32, input: &str, output: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::thumb_ffmpeg_args;
+    use super::{
+        quantize_thumb_width, thumb_ffmpeg_args, THUMB_MAX_WIDTH, THUMB_MIN_WIDTH,
+        THUMB_WIDTH_BUCKETS,
+    };
+
+    #[test]
+    fn quantize_thumb_width_keeps_every_shipped_client_width_exact() {
+        // The widths the clients actually ask for must land on themselves, or
+        // every existing cached thumbnail (and the pre-generated cache, which
+        // defaults to 480) would be re-rendered at a different key.
+        for w in [160, 320, 480] {
+            assert_eq!(quantize_thumb_width(w), w, "client width {w} must be exact");
+        }
+    }
+
+    #[test]
+    fn quantize_thumb_width_snaps_to_a_bucket_and_clamps() {
+        // Out of range in both directions clamps to the ladder's ends.
+        assert_eq!(quantize_thumb_width(0), THUMB_WIDTH_BUCKETS[0]);
+        assert_eq!(
+            quantize_thumb_width(THUMB_MIN_WIDTH),
+            THUMB_WIDTH_BUCKETS[0]
+        );
+        assert_eq!(quantize_thumb_width(u32::MAX), THUMB_MAX_WIDTH);
+
+        // Nearest wins.
+        assert_eq!(quantize_thumb_width(161), 160);
+        assert_eq!(quantize_thumb_width(300), 320);
+        assert_eq!(quantize_thumb_width(500), 480);
+        assert_eq!(quantize_thumb_width(639), 640);
+
+        // Exact ties snap DOWN, deterministically (240 is 80 from both 160 and
+        // 320): the same request must always resolve to the same cache key.
+        assert_eq!(quantize_thumb_width(240), 160);
+        assert_eq!(quantize_thumb_width(400), 320);
+    }
+
+    #[test]
+    fn quantize_thumb_width_collapses_the_whole_legal_range_onto_the_ladder() {
+        // The point of the quantizer: however many distinct widths a client can
+        // legally ask for, they only ever produce this many cache keys.
+        let mut seen: Vec<u32> = (0..=1000).map(quantize_thumb_width).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, THUMB_WIDTH_BUCKETS.to_vec());
+    }
 
     #[test]
     fn thumb_ffmpeg_args_forces_mjpeg() {
