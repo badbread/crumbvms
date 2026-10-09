@@ -120,6 +120,7 @@ use uuid::Uuid;
 
 use crumb_common::{
     db::{self, CreateCameraParams, PolicyFields},
+    redact,
     types::{
         Camera, CameraGroup, MotionSensitivity, RecordStream, RecordingMode, RecordingPolicy,
         ServerSettings, Storage, User, UserRole,
@@ -1200,6 +1201,15 @@ async fn update_camera(
         Some(inner) => inner,
         None => existing.source_sub_url.clone(),
     });
+    // GET masks the userinfo password, so a console that reads a camera and PUTs
+    // it back submits the mask. That means "keep the stored credential": splice
+    // it back in before anything downstream (validation of the change, the DB
+    // write, the go2rtc sync decision) sees the value. Any other password is
+    // taken literally, which is how one is changed.
+    let source_url =
+        source_url.map(|u| redact::unmask_url_password(&u, existing.source_url.as_deref()));
+    let source_sub_url =
+        source_sub_url.map(|u| redact::unmask_url_password(&u, existing.source_sub_url.as_deref()));
 
     // Guard: a Crumb-managed camera (source_url set) derives its re-stream name
     // from go2rtc_name; an empty go2rtc_name would yield main_url="" / sub_url="_sub"
@@ -2154,6 +2164,12 @@ async fn create_storage(
     // Validate the path: must exist and be a directory.
     validate_storage_path(&body.path)?;
 
+    // And it must not share a folder tree with any existing location.
+    let existing = db::list_storages(state.pool())
+        .await
+        .context("list_storages")?;
+    check_storage_path_overlap(&body.path, &existing, None)?;
+
     // Optional media-glyph override (display only): validate if given, else NULL
     // (the glyph infers from the name).
     let icon = match body.icon.as_deref().map(str::trim) {
@@ -2190,6 +2206,19 @@ async fn get_storage(
 }
 
 /// `PUT /config/storages/{id}` — partial update of a storage row.
+///
+/// A PATH CHANGE is refused while the storage holds indexed segments (audit
+/// R11). Segment rows store their path RELATIVE to the storage root, so
+/// repointing the root silently resolves every existing recording under the new
+/// folder: playback 404s at once, the bytes stay behind in a folder no storage
+/// owns (never retained, evicted or adopted), and the recorder's index sweeps
+/// start deleting the rows as dangling. Moving footage is what the per-policy
+/// "Change storage" drain is for (copy, verify, flip each row, then delete the
+/// source). We refuse rather than accept a path change when the new folder
+/// "looks like" a copy (sampling its newest files), because a partial copy
+/// would pass any sample and lose the unsampled rows; refusing cannot lose
+/// footage. A path that only differs lexically (a trailing `/`) is not a
+/// change and is left as stored.
 async fn update_storage(
     _admin: AdminUser,
     State(state): State<AppState>,
@@ -2197,11 +2226,42 @@ async fn update_storage(
     Json(body): Json<UpdateStorageRequest>,
 ) -> Result<Json<StorageDto>, ApiError> {
     // Verify the row exists.
-    let _ = require_storage(state.pool(), id).await?;
+    let current = require_storage(state.pool(), id).await?;
 
-    // If a new path is provided, validate it.
-    if let Some(ref path) = body.path {
-        validate_storage_path(path)?;
+    // The console always sends the path, changed or not; only a real change is
+    // validated and guarded.
+    let path_change: Option<&str> = body
+        .path
+        .as_deref()
+        .filter(|p| !storage_paths_lexically_equal(p, &current.path));
+
+    if let Some(new_path) = path_change {
+        let client = state.pool().get().await.context("db pool get")?;
+        let seg_cnt: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::bigint AS cnt FROM segments WHERE storage_id = $1",
+                &[&id],
+            )
+            .await
+            .context("count segments on storage")?
+            .get("cnt");
+        drop(client);
+        if seg_cnt > 0 {
+            return Err(ApiError::Conflict(format!(
+                "\"{}\" holds {seg_cnt} recording{}, stored relative to its folder, so its \
+                 folder can't be changed: the recordings would disappear from playback and \
+                 could be dropped from the index. To move footage to another disk, add the \
+                 new folder as a separate location and use \"Change storage…\" on the \
+                 recording profile.",
+                current.name,
+                if seg_cnt == 1 { "" } else { "s" },
+            )));
+        }
+        validate_storage_path(new_path)?;
+        let existing = db::list_storages(state.pool())
+            .await
+            .context("list_storages")?;
+        check_storage_path_overlap(new_path, &existing, Some(id))?;
     }
 
     // icon: Option<Option<String>>. Omitted = keep; Some(None)/Some(Some("")) =
@@ -2229,7 +2289,7 @@ async fn update_storage(
         state.pool(),
         id,
         body.name.as_deref(),
-        body.path.as_deref(),
+        path_change,
         body.total_bytes,
         icon.as_ref().map(std::option::Option::as_deref),
     )
@@ -2920,8 +2980,22 @@ async fn get_user(
 ///
 /// If `password` is provided it is re-hashed.  If `role` changes from viewer to
 /// admin, `camera_ids` is cleared automatically.
+///
+/// # Sessions
+///
+/// Changing what this account IS — its password, or the role that decides what
+/// it may do — ends that account's signed-in devices, so the change reaches the
+/// phone in someone's pocket rather than waiting out a token that can live for
+/// years. A no-op save changes nothing and signs nobody out. An admin editing
+/// their OWN account keeps the session making the request, so changing your own
+/// password does not eject you from the console mid-edit.
+///
+/// Changing only the user's extra cameras does NOT end their sessions: those
+/// grants are read from the user row on every request, so the new set is in
+/// force on that user's very next request either way, and there is nothing to be
+/// gained by making them sign in again.
 async fn update_user(
-    _admin: AdminUser,
+    admin: AdminUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUserRequest>,
@@ -3015,11 +3089,53 @@ async fn update_user(
         }
     })?;
 
+    // ── keep signed-in devices in step with the account ───────────────────────
+    // A password change replaces the credential; a role change replaces what the
+    // account may do. Either must reach every device already holding a token for
+    // it, so revoke this user's sessions when one of them actually changed.
+    //
+    // "Actually changed" is compared against the row we read before the write,
+    // so a save that alters nothing (the console re-PUTs the whole form) signs
+    // nobody out. A supplied password always counts: it is hashed with a fresh
+    // salt, so the stored hashes of the old and new password are never
+    // comparable, and an admin who typed a password into the box meant to set
+    // one. The extra-cameras list is deliberately NOT in this set (see the
+    // handler docs).
+    let password_changed = new_hash.is_some();
+    let role_changed = new_role.is_some_and(|r| r != existing.role);
+    let role_id_changed = role_id_to_set.is_some_and(|rid| Some(rid) != existing.role_id);
+
+    if password_changed || role_changed || role_id_changed {
+        // Self-edit exception: keep the session this request came in on, so an
+        // admin changing their own password stays signed in here while every
+        // other device of theirs is signed out.
+        let keep = if admin.0.user_id == id {
+            admin.0.jti
+        } else {
+            None
+        };
+        let revoked = match keep {
+            Some(jti) => db::revoke_other_sessions_for_user(state.pool(), id, jti)
+                .await
+                .context("revoke_other_sessions_for_user")?,
+            None => db::revoke_all_sessions_for_user(state.pool(), id)
+                .await
+                .context("revoke_all_sessions_for_user")?,
+        };
+        state.refresh_revoked_jtis().await;
+        tracing::info!(user_id = %id, revoked, "sessions ended after a user change");
+    }
+    // Any user edit can move the per-user camera grants, which the auth
+    // extractor caches per session; drop the cache so the next request re-reads.
+    state.invalidate_session_cache();
+
     tracing::info!(user_id = %id, "user updated");
     Ok(Json(user_to_dto(user)))
 }
 
 /// `DELETE /config/users/{id}` — delete a user.
+///
+/// Removing the account also ends every device it was signed in on, immediately.
 async fn delete_user(
     _admin: AdminUser,
     State(state): State<AppState>,
@@ -3043,11 +3159,26 @@ async fn delete_user(
         }
     }
 
+    // Revoke every session BEFORE the row goes. `sessions.user_id` cascades on
+    // delete, so the rows are about to disappear; revoking first means the
+    // in-memory revocation set picks them up on the refresh below and this
+    // process refuses those tokens from the very next request, without waiting
+    // to notice that the rows are missing.
+    let revoked = db::revoke_all_sessions_for_user(state.pool(), id)
+        .await
+        .context("revoke_all_sessions_for_user")?;
+    // Refresh while the rows still exist, so the revoked set actually observes
+    // them; a moment later they are gone and the session lookup refuses those
+    // tokens on its own.
+    state.refresh_revoked_jtis().await;
+
     db::delete_user(state.pool(), id)
         .await
         .context("delete_user")?;
 
-    tracing::info!(user_id = %id, "user deleted");
+    state.invalidate_session_cache();
+
+    tracing::info!(user_id = %id, revoked, "user deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4069,8 +4200,12 @@ async fn redetect_camera(
     // Re-read to return the authoritative post-update DTO.
     let updated = require_camera(state.pool(), id).await?;
     Ok(Json(RedetectResponse {
-        source_url: credentialed_source_url,
-        source_sub_url: credentialed_source_sub_url,
+        // Masked like the camera DTO's own copy: the console uses these only to
+        // say whether a sub stream was found, never to re-submit them.
+        source_url: redact::mask_url_password(&credentialed_source_url),
+        source_sub_url: credentialed_source_sub_url
+            .as_deref()
+            .map(redact::mask_url_password),
         ptz_supported: r.ptz_supported,
         camera: camera_to_dto(updated),
     }))
@@ -4702,6 +4837,18 @@ fn camera_to_dto(c: Camera) -> CameraDto {
     // onvif_has_password: true when a non-empty password is stored. The password
     // itself is NEVER copied into the DTO (write-only field per spec C10).
     let onvif_has_password = c.onvif_password.as_deref().is_some_and(|p| !p.is_empty());
+    // Camera source URLs carry their credentials inline. The password is masked
+    // on the way out (the rest of the URL is verbatim, so the operator still
+    // recognises and can edit it); sending the mask back on PUT keeps the stored
+    // credential. Same contract as onvif_password, expressed inside the URL.
+    let source_has_credentials = c
+        .source_url
+        .as_deref()
+        .is_some_and(redact::url_has_password);
+    let source_sub_has_credentials = c
+        .source_sub_url
+        .as_deref()
+        .is_some_and(redact::url_has_password);
     CameraDto {
         id: c.id,
         name: c.name,
@@ -4709,8 +4856,10 @@ fn camera_to_dto(c: Camera) -> CameraDto {
         go2rtc_name: c.go2rtc_name,
         main_url: c.main_url,
         sub_url: c.sub_url,
-        source_url: c.source_url,
-        source_sub_url: c.source_sub_url,
+        source_url: c.source_url.as_deref().map(redact::mask_url_password),
+        source_sub_url: c.source_sub_url.as_deref().map(redact::mask_url_password),
+        source_has_credentials,
+        source_sub_has_credentials,
         policy_id: c.policy_id,
         group_id: c.group_id,
         policy,
@@ -5178,6 +5327,98 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest(
             "password must be at least 8 characters".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Lexical normal form of a storage path: trimmed, `.` dropped, `..` resolved
+/// by popping, trailing separators dropped. No filesystem access.
+fn lexical_storage_path(path: &str) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in std::path::Path::new(path.trim()).components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when two storage paths name the same folder without resolving
+/// anything on disk (`/data/live` and `/data/live/` are the same path).
+fn storage_paths_lexically_equal(a: &str, b: &str) -> bool {
+    lexical_storage_path(a) == lexical_storage_path(b)
+}
+
+/// Canonical form of a storage path for overlap checks: the deepest existing
+/// ancestor is resolved through symlinks and the not-yet-created remainder is
+/// re-appended, so `/data/link/x` and `/data/real/x` compare equal when `link`
+/// points at `real`. Falls back to the lexical form when nothing resolves.
+fn canonical_storage_path(path: &str) -> std::path::PathBuf {
+    let lexical = lexical_storage_path(path);
+    let mut existing = lexical.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(&existing) {
+            for part in tail.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        match (
+            existing.file_name().map(std::ffi::OsStr::to_os_string),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => return lexical,
+        }
+    }
+}
+
+/// Refuse a storage path that is the same folder as, lies inside, or contains
+/// another storage's folder (audit R1). `exclude` is the storage being edited.
+///
+/// Segment rows are keyed by `(storage, path relative to its root)`. When two
+/// roots overlap, every file of the inner storage also sits under the outer
+/// one with a different relative path, so the recorder's maintenance walk of
+/// the outer root sees the inner storage's footage as files nobody indexed.
+/// The recorder now refuses to touch such files as well; this keeps new
+/// overlaps from being configured at all. Compared on canonical paths so a
+/// symlink cannot hide an overlap.
+fn check_storage_path_overlap(
+    candidate: &str,
+    existing: &[Storage],
+    exclude: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let cand = canonical_storage_path(candidate);
+    for other in existing {
+        if Some(other.id) == exclude {
+            continue;
+        }
+        let other_path = canonical_storage_path(&other.path);
+        let relation = if cand == other_path {
+            "is the same folder as"
+        } else if cand.starts_with(&other_path) {
+            "is inside the folder of"
+        } else if other_path.starts_with(&cand) {
+            "contains the folder of"
+        } else {
+            continue;
+        };
+        return Err(ApiError::Conflict(format!(
+            "'{}' {relation} the storage location \"{}\" ('{}'). Each location needs its \
+             own folder that neither contains nor sits inside another location's folder; \
+             a sibling folder works (for example '/data/disk2' next to '/data/live').",
+            candidate.trim(),
+            other.name,
+            other.path,
+        )));
     }
     Ok(())
 }
@@ -5704,5 +5945,119 @@ mod plan_camera_sync_tests {
             plan_camera_sync(None, None, "front", None, None, "front"),
             CameraSync::Nothing
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_path_overlap_tests {
+    use super::*;
+
+    fn storage(name: &str, path: &str) -> Storage {
+        Storage {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            total_bytes: None,
+            icon: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn conflict(r: &Result<(), ApiError>) -> bool {
+        matches!(r, Err(ApiError::Conflict(_)))
+    }
+
+    /// Audit R1: the same folder, an ancestor (e.g. the media root itself), and
+    /// a subfolder of an existing location are all refused.
+    #[test]
+    fn equal_ancestor_and_descendant_paths_are_refused() {
+        let live = storage("Live", "/srv/crumb-test-media/live");
+        let existing = vec![live];
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/live",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/live/",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/live/archive",
+            &existing,
+            None
+        )));
+        assert!(conflict(&check_storage_path_overlap(
+            "/srv/crumb-test-media/./live/../live/x",
+            &existing,
+            None
+        )));
+    }
+
+    /// Siblings, and names that merely share a string prefix, are fine.
+    #[test]
+    fn sibling_and_prefix_named_paths_are_accepted() {
+        let existing = vec![
+            storage("Live", "/srv/crumb-test-media/live"),
+            storage("Archive", "/srv/crumb-test-media/archive"),
+        ];
+        assert!(check_storage_path_overlap("/srv/crumb-test-media/disk2", &existing, None).is_ok());
+        assert!(check_storage_path_overlap("/srv/crumb-test-media/live2", &existing, None).is_ok());
+        assert!(
+            check_storage_path_overlap("/srv/crumb-test-media/live-archive", &existing, None)
+                .is_ok()
+        );
+    }
+
+    /// The storage being edited is not compared against itself.
+    #[test]
+    fn the_edited_storage_is_excluded() {
+        let live = storage("Live", "/srv/crumb-test-media/live");
+        let id = live.id;
+        let existing = vec![live];
+        assert!(
+            check_storage_path_overlap("/srv/crumb-test-media/live", &existing, Some(id)).is_ok()
+        );
+    }
+
+    /// A symlink cannot hide an overlap: a path through a link to an existing
+    /// location's folder is that folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_into_another_location_is_refused() {
+        let base = std::env::temp_dir().join(format!("crumb-overlap-{}", Uuid::new_v4().simple()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let existing = vec![storage("Live", real.to_str().expect("utf8"))];
+        let through_link = link.join("sub");
+        let refused = conflict(&check_storage_path_overlap(
+            through_link.to_str().expect("utf8"),
+            &existing,
+            None,
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            refused,
+            "a path through a symlink into a location must be refused"
+        );
+    }
+
+    #[test]
+    fn lexical_equality_ignores_trailing_separators_and_dots() {
+        assert!(storage_paths_lexically_equal("/data/live", "/data/live/"));
+        assert!(storage_paths_lexically_equal(
+            " /data/./live ",
+            "/data/live"
+        ));
+        assert!(!storage_paths_lexically_equal("/data/live", "/data/live2"));
     }
 }

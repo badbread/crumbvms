@@ -14,6 +14,8 @@
 //! | `POST`   | `/auth/login`              | none        | Verify credentials; issue JWT            |
 //! | `POST`   | `/auth/refresh`            | Bearer      | Re-issue a fresh token for a valid one   |
 //! | `GET`    | `/auth/me`                 | Bearer      | Return the caller's own profile          |
+//! | `POST`   | `/auth/handoff`            | Bearer      | Mint a single-use console-handoff code   |
+//! | `POST`   | `/auth/handoff/exchange`   | the code    | Trade that code for a new session token  |
 //!
 //! User management (create / update / delete / list users) lives exclusively at
 //! `/config/users` in `config_routes.rs`, which enforces the last-admin guard.
@@ -54,7 +56,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -71,7 +73,7 @@ use crumb_common::{
 };
 
 use crate::{
-    auth_mw::{AdminUser, AuthUser, MEDIA_TOKEN_TYP},
+    auth_mw::{AdminUser, AuthUser, FullSessionUser, MEDIA_TOKEN_TYP},
     dto::{
         Claims, LoginRequest, LoginResponse, MeResponse, MediaClaims, MediaTokenResponse,
         SessionDto,
@@ -485,6 +487,9 @@ pub fn routes() -> Router<AppState> {
             axum::routing::delete(revoke_all_my_sessions),
         )
         .route("/sessions/:jti", axum::routing::delete(revoke_my_session))
+        // ── console handoff to an external browser ─────────────────────────
+        .route("/handoff", post(create_handoff))
+        .route("/handoff/exchange", post(exchange_handoff))
         // Admin: sign out every device of an arbitrary user (e.g. a stolen
         // phone reported by a household member).
         .route(
@@ -559,6 +564,127 @@ async fn media_token(
         camera_id: q.camera,
         expires_at: exp,
     }))
+}
+
+// ── console handoff to an external browser ────────────────────────────────────
+
+/// Lifetime of a console-handoff code. Long enough for the OS to start the
+/// operator's browser and for that browser to load `/admin` and post the
+/// exchange, short enough that a code that never gets redeemed is dead almost
+/// immediately. Codes are single-use on top of this.
+const HANDOFF_EXPIRY_SECONDS: u64 = 60;
+
+/// Request body for `POST /auth/handoff/exchange`.
+///
+/// Kept private to this module, like [`BootstrapRequest`] (api-routes owns
+/// `dto.rs`; this module avoids touching that file for its own request shapes).
+#[derive(Debug, Deserialize)]
+struct HandoffExchangeRequest {
+    code: String,
+}
+
+/// `POST /auth/handoff`
+///
+/// Mint a single-use, ~1 minute code that a *separate* process (the desktop
+/// client's "Open in browser") can put in the console URL's fragment in place
+/// of the operator's own session token. The browser trades the code for its own
+/// session at [`exchange_handoff`], so the desktop's token never crosses the
+/// process boundary into a browser's history, profile storage, or extensions.
+///
+/// Requires a full login session ([`FullSessionUser`]): a scoped media token
+/// must never be tradeable for a console session.
+///
+/// # Errors
+///
+/// - `401`: not authenticated.
+/// - `403`: a scoped media token was presented.
+async fn create_handoff(
+    FullSessionUser(user): FullSessionUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let code = state.issue_handoff_code(
+        user.user_id,
+        user.jti,
+        std::time::Duration::from_secs(HANDOFF_EXPIRY_SECONDS),
+    );
+    Ok(Json(
+        json!({ "code": code, "expires_in": HANDOFF_EXPIRY_SECONDS }),
+    ))
+}
+
+/// `POST /auth/handoff/exchange`
+///
+/// Redeem a code from [`create_handoff`] for a NEW session token belonging to
+/// the same user. Unauthenticated by necessity (the caller is a fresh browser
+/// with no credentials of its own); the code IS the one-time credential, and it
+/// is consumed on the first attempt whether or not that attempt succeeds.
+///
+/// The result is an ordinary session: its own `jti`, its own `sessions` row,
+/// normal expiry, so it appears in "your sessions" and every sign-out path
+/// reaches it. The long-lived "remember me" expiry stays login-only, matching
+/// [`refresh`].
+///
+/// # Errors
+///
+/// - `401`: the code is unknown, already redeemed, expired, or the session
+///   that minted it has since been signed out.
+/// - `404`: the user was deleted after the code was minted.
+/// - `500`: database or signing error.
+async fn exchange_handoff(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<HandoffExchangeRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    // One message for every failure mode: which one it was tells an unknown
+    // caller something, and tells the operator nothing they can act on.
+    let invalid = || ApiError::Unauthorized("this console link is no longer valid".to_owned());
+
+    let Some((user_id, jti)) = state.consume_handoff_code(body.code.trim()) else {
+        return Err(invalid());
+    };
+
+    // A code can outlive its issuing session in the seconds between a sign-out
+    // and the exchange. Honour the sign-out rather than hand back a fresh one.
+    // This is the same check the request extractor applies: the fast revoked
+    // set first, then the positive session lookup, so a session that is gone
+    // for any reason cannot be traded for a new one. Every full session carries
+    // a jti, so a code without one is refused. A database error is a 5xx, never
+    // a silent pass.
+    let Some(jti) = jti else {
+        return Err(invalid());
+    };
+    if state.is_jti_revoked(jti).await {
+        return Err(invalid());
+    }
+    if state
+        .resolve_session(jti, user_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .is_none()
+    {
+        return Err(invalid());
+    }
+
+    let db_user = db::get_user_by_id(state.pool(), user_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("user {user_id} not found")))?;
+
+    tracing::info!(
+        user_id  = %db_user.id,
+        username = %db_user.username,
+        "console handoff redeemed"
+    );
+
+    mint_token(
+        &state,
+        &db_user,
+        false,
+        device_label(&headers).as_deref(),
+        client_ip(&headers).as_deref(),
+    )
+    .await
+    .map(Json)
 }
 
 // ── session management handlers (P0-SESSIONS) ──────────────────────────────────
@@ -660,6 +786,9 @@ async fn admin_revoke_user_sessions(
 async fn login(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    // Optional so a router driven without `into_make_service_with_connect_info`
+    // (a test harness) still serves logins; those all share one client key.
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     // ── input validation ──────────────────────────────────────────────────────
@@ -671,14 +800,29 @@ async fn login(
     }
     let username = body.username.trim();
 
-    // ── per-username brute-force backoff (issue #127) ─────────────────────────
-    // If this username is already in backoff (too many recent consecutive
-    // failures), reject with 429 + Retry-After BEFORE any DB lookup or argon2
-    // verify. Keyed by the submitted username whether or not it exists, so the
-    // limiter leaks no account-existence signal, and we never sleep — the
-    // connection is freed immediately. This is IN ADDITION to the shared per-IP
-    // request bucket applied as a layer, not a replacement.
-    if let Some(retry_after) = state.login_retry_after(username) {
+    // ── repeated-failure backoff (issue #127) ─────────────────────────────────
+    // Two brakes, both checked here BEFORE any DB lookup or argon2 verify:
+    //   * per (submitted username, client): a run of failures slows THAT
+    //     client's attempts at THAT account without locking the account, so
+    //     its owner can still sign in from their own machine;
+    //   * per account, across all clients: a higher ceiling that caps the
+    //     total guessing rate however many client addresses are used
+    //     (`state.rs`, ACCOUNT_FAIL_CEILING).
+    // Either one in effect rejects with 429 + Retry-After. Keys use the
+    // submitted username whether or not it exists, so the limiter leaks no
+    // account-existence signal, and we never sleep, the connection is freed
+    // immediately. This is IN ADDITION to the shared per-client request bucket
+    // applied as a layer, not a replacement.
+    //
+    // `client` is derived by the SAME function and the SAME proxy-trust policy
+    // the request bucket uses: X-Forwarded-For counts only when the TCP peer is
+    // a configured trusted proxy (`rate_limit.rs` module docs).
+    let client = crate::rate_limit::client_key(
+        state.proxy_trust(),
+        &headers,
+        peer.map(|ConnectInfo(addr)| addr),
+    );
+    if let Some(retry_after) = state.login_retry_after(username, &client) {
         return Err(ApiError::TooManyRequestsRetry {
             message: "too many failed login attempts; try again later".to_owned(),
             retry_after,
@@ -702,17 +846,18 @@ async fn login(
     };
 
     if !valid {
-        // Count this failure toward the per-username backoff (issue #127). The
-        // response stays a plain 401 — the backoff only changes the NEXT
-        // attempt's outcome once the threshold is crossed.
-        state.record_login_failure(username);
+        // Count this failure toward this (account, client) pair's backoff
+        // (issue #127). The response stays a plain 401 — the backoff only
+        // changes the NEXT attempt's outcome once the threshold is crossed.
+        state.record_login_failure(username, &client);
         return Err(ApiError::Unauthorized(
             "invalid username or password".to_owned(),
         ));
     }
 
-    // Successful auth clears any accumulated failure count for this username.
-    state.record_login_success(username);
+    // Successful auth clears this client's accumulated failure count for the
+    // account.
+    state.record_login_success(username, &client);
 
     // `user` is Some(_) iff `valid` is true — unwrap is safe here.
     let user = user.expect("user is Some when valid");

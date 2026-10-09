@@ -40,14 +40,17 @@ struct RootView: View {
     /// `BiometricLockView` reports success.
     @State private var isLocked = false
     #if os(iOS)
-    /// Shown (opaque, no re-auth challenge) while the scene is `.inactive` and
-    /// the lock is enabled — purely so the app-switcher snapshot (captured
-    /// around the `.inactive`/`.background` transition, before `.background`
-    /// itself actually fires) can't show live camera content. Distinct from
-    /// `isLocked`: `.inactive` also fires on plenty of harmless momentary
-    /// interruptions (Control Center, an incoming-call banner, a system
-    /// alert) where forcing a full Face ID/passcode challenge every time
-    /// would be obnoxious — this is a passive cover, not a re-auth gate.
+    /// Shown (opaque, no re-auth challenge) whenever the scene stops being
+    /// `.active`, purely so the app-switcher snapshot (captured around the
+    /// `.inactive`/`.background` transition, before `.background` itself
+    /// actually fires) can't show live camera content. Deliberately NOT tied
+    /// to `settings.biometricLockEnabled`: the cover is about what the system
+    /// snapshot records, the lock is about who may resume the session, so
+    /// every signed-in user gets the cover while the lock stays opt-in.
+    /// Distinct from `isLocked`: `.inactive` also fires on plenty of harmless
+    /// momentary interruptions (Control Center, an incoming-call banner, a
+    /// system alert) where forcing a full Face ID/passcode challenge every
+    /// time would be obnoxious, this is a passive cover, not a re-auth gate.
     @State private var privacyShieldVisible = false
     @Environment(\.scenePhase) private var scenePhase
     #endif
@@ -68,7 +71,7 @@ struct RootView: View {
             .animation(.easeInOut(duration: 0.3), value: container.isLoggedIn)
 
             #if os(iOS)
-            if container.isLoggedIn && settings.biometricLockEnabled && privacyShieldVisible && !isLocked {
+            if container.isLoggedIn && privacyShieldVisible && !isLocked {
                 CrumbColors.background.ignoresSafeArea()
                     .transition(.opacity)
             }
@@ -101,10 +104,11 @@ struct RootView: View {
         }
         #if os(iOS)
         .onChange(of: scenePhase) { phase in
-            guard settings.biometricLockEnabled else { return }
             switch phase {
             case .background:
-                isLocked = true
+                // The cover applies to everyone; only the re-auth challenge is
+                // gated on the opt-in lock.
+                if settings.biometricLockEnabled { isLocked = true }
                 privacyShieldVisible = true
             case .inactive:
                 // The app-switcher snapshot is captured around this transition
