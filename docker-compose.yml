@@ -152,6 +152,8 @@ services:
       ARCHIVE_STORAGE_PATH: ${ARCHIVE_STORAGE_PATH:-/data/archive}
       EXPORT_DIR: ${EXPORT_DIR:-/exports}               # top-level, NOT under /data:ro (can't nest a mount there)
       EXPORT_TTL_SECONDS: ${EXPORT_TTL_SECONDS:-86400}
+      EXPORT_MAX_CONCURRENT: ${EXPORT_MAX_CONCURRENT:-}   # queued+running export jobs allowed at once (empty = 2)
+      EXPORT_MAX_RANGE_SECONDS: ${EXPORT_MAX_RANGE_SECONDS:-}  # longest window one export may cover (empty = 86400)
       SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}     # seeded by default (setup-env.sh generates it); blank = browser create-admin wizard
       ONVIF_CONFIG_B64: ${ONVIF_CONFIG_B64:-}           # legacy fallback; per-camera ONVIF creds live in the DB now
@@ -207,6 +209,7 @@ services:
       MAIN_REPAIR_TRANSCODE_ENABLED: ${MAIN_REPAIR_TRANSCODE_ENABLED:-}
       SEGMENT_LOW_CACHE_MAX_BYTES: ${SEGMENT_LOW_CACHE_MAX_BYTES:-}
       EXPORT_CACHE_MAX_BYTES: ${EXPORT_CACHE_MAX_BYTES:-}
+      FRAME_PROXY_MAX_CONCURRENCY: ${FRAME_PROXY_MAX_CONCURRENCY:-}   # live-still fetches in flight at once (empty = one per core, 8..32)
       # Behind the bundled Caddy (or any reverse proxy), set TRUST_PROXY=1 so the
       # rate limiter keys on the client IP from X-Forwarded-For instead of the
       # proxy's own address (one bucket for ALL HTTPS users otherwise). Leave

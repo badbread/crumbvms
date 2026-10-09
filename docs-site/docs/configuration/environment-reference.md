@@ -115,8 +115,10 @@ value there, the database copy wins and the env value is just the default.
 One honest footnote: a few more `THUMB_*` names exist in the source
 (`THUMB_INTERVAL_SECS`, `THUMB_MAX_ATTEMPTS`, `THUMB_MAX_WIDTH`,
 `THUMB_MIN_WIDTH`, `THUMB_NEAR_BLACK_LUMA`, `THUMB_EXTRACT_TIMEOUT_SECS`) as
-fixed built-in constants (a 4-second preview grid, widths clamped 48-640, a
-12-second extract timeout, and the black-frame retry logic). They are *not*
+fixed built-in constants (a 4-second preview grid, widths clamped 48-640 and
+then snapped to the nearest of 80/160/320/480/640 so the preview cache holds a
+handful of sizes instead of hundreds, a 12-second extract timeout, and the
+black-frame retry logic). They are *not*
 read from the environment and the compose file deliberately does not forward
 them, because forwarding a name implies a tunability that does not exist.
 Setting them in `.env` does nothing, so they don't get rows here.
@@ -178,7 +180,9 @@ See [Hardware decode](/configuration/hardware-decode) for enabling this.
 |---|---|---|
 | `EXPORT_DIR` | `/exports` | its own volume, not under the read-only `/data` mount |
 | `EXPORT_TTL_SECONDS` | `86400` | how long a completed export survives before cleanup |
-| `EXPORT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | size budget for the on-disk export cache; oldest entries are dropped past it |
+| `EXPORT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | size budget for the on-disk export cache; oldest entries are dropped past it. In-flight jobs are never deleted, but the space they already occupy counts against this budget, so finished exports are cleared to make room for them |
+| `EXPORT_MAX_CONCURRENT` | `2` | how many export jobs may be queued or running at once. Each job runs one video encode per camera, so this is the main brake on export CPU. A request that arrives while the slots are full gets a "too many requests" answer and should be retried shortly |
+| `EXPORT_MAX_RANGE_SECONDS` | `86400` (1 day) | the longest time window a single export may cover, per camera. Beyond this the request is refused with a clear message rather than starting an encode that would run for hours. Raise it if you genuinely export multi-day ranges; the same limit applies to each clip in a batch export |
 
 ## Streams the server generates on demand
 
@@ -191,6 +195,7 @@ are sized for a phone on a slow link.
 | `MOBILE_STREAM_WIDTH` | `640` | transcode width in pixels, floored at 160 |
 | `MAIN_REPAIR_TRANSCODE_ENABLED` | `false` | opt-in, per-camera full-resolution H.265 to H.264 transcode of a main stream whose SDP has no `fmtp` attribute. Android's video player rejects such a main ("missing attribute fmtp", seen on some Uniview LPR cameras) and otherwise steps down to the H.264 sub in SD. Leave it off and those cameras play in SD on Android; turn it on to get HD, at the cost of recorder CPU while an Android viewer is watching that camera fullscreen. A cheaper copy-only repair does not work for this case, which is why it is a real re-encode and off by default. The cheapest fix of all, when the camera allows it, is to set the camera's main stream to H.264 in its own web UI |
 | `SEGMENT_LOW_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | size budget for the cache of low-resolution playback segments |
+| `FRAME_PROXY_MAX_CONCURRENCY` | scales with cores (one per core, at least 8, at most 32) | how many live camera stills Crumb fetches at once. The low-bandwidth tile walls on the phone apps poll one still per tile per second, so this is what keeps a big wall from queueing. Past the limit a still request is answered with "busy, retry shortly" and the tile keeps its previous image until the next poll |
 
 ## Database backup
 
