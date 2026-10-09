@@ -1358,7 +1358,10 @@ async fn main() -> Result<()> {
     if let Err(e) = db::ensure_segments_indexes(&pool).await {
         error!(error = %e, "ensure_segments_indexes failed; unique/covering indexes may be absent");
     }
-    if let Err(e) = db::ensure_server_settings_table(&pool).await {
+    // #630: SettingsSeedRole::Recorder means this process never seeds the
+    // client-facing `crumb_rtsp_base` from its own `CRUMB_GO2RTC_RTSP_BASE`,
+    // which is the loopback address it dials go2rtc on.
+    if let Err(e) = db::ensure_server_settings_table(&pool, db::SettingsSeedRole::Recorder).await {
         error!(error = %e, "ensure_server_settings_table failed; server_settings singleton may be absent");
     }
 

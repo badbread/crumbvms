@@ -61,10 +61,16 @@ Crumb's own go2rtc restreamer runs embedded in the recorder container. The
 values below are fallbacks: once you set the server's address in the admin
 console's Server & streaming settings, that value wins.
 
+The admin console's **Crumb RTSP base** is client-facing only: it is the address
+native desktop and phone apps are told to pull from, and nothing else reads it.
+The recorder dials its own embedded go2rtc over loopback, so you can set that
+field to whatever your clients can reach without affecting recording.
+
 | Key | Default | Notes |
 |---|---|---|
-| `CRUMB_GO2RTC_API_BASE` | empty | leave blank, internal compose defaults are correct |
-| `CRUMB_GO2RTC_RTSP_BASE` | empty | leave blank; set the public RTSP address in the admin console instead |
+| `CRUMB_GO2RTC_API_BASE` | empty | leave blank, internal compose defaults are correct. Read by the api only (`http://recorder:1984`); the recorder does not talk to go2rtc's REST API, so the stock compose no longer passes this key to it |
+| `CRUMB_GO2RTC_RTSP_BASE` | empty | leave blank; set the public RTSP address native clients pull from in the admin console instead. The recorder does NOT use this with the embedded restreamer, it dials go2rtc over loopback; the value only reaches the recorder when `GO2RTC_EMBEDDED=false`, where it is the external restreamer's address |
+| `CRUMB_GO2RTC_LOOPBACK_PORT` | `8554` | the port the embedded go2rtc RTSP listener binds inside the recorder container, which the recorder dials as `rtsp://127.0.0.1:<port>`. Only set it if you changed `rtsp.listen` in `go2rtc/go2rtc.yaml` |
 | `GO2RTC_USER` | `go2rtc` | a fixed, non-secret Basic-auth username label (not generated); required, compose fails fast if unset |
 | `GO2RTC_PASS` | generated | required; required to be strong, rotate with care (needs a recorder + api restart) |
 | `GO2RTC_EMBEDDED` | `true` | set `false` only if running an external restreamer |

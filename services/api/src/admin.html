@@ -1529,7 +1529,7 @@ function wizardBody(key) {
     const rtsp = sv.crumb_rtsp_base || WZ.suggested.suggested_rtsp_base || '';
     return `<label class="field-label" style="margin-top:0">Server address <span style="color:var(--dim2);font-weight:400">(how clients reach this console)</span></label>
       <input id="wz-addr" class="mono" value="${esc(addr)}" placeholder="http://198.51.100.50:8080" style="font-size:13px" />
-      <label class="field-label" style="margin-top:12px">Camera streaming base, RTSP <span style="color:var(--dim2);font-weight:400">(native desktop / phone apps use this)</span></label>
+      <label class="field-label" style="margin-top:12px">Camera streaming base, RTSP <span style="color:var(--dim2);font-weight:400">(native desktop / phone apps use this; the recorder does not)</span></label>
       <input id="wz-rtsp" class="mono" value="${esc(rtsp)}" placeholder="rtsp://198.51.100.50:18554" style="font-size:13px" />
       <div class="login-sub" style="margin-top:8px">For encrypted access, use <code>https://&lt;this-host&gt;:8443</code> instead (a Caddy sidecar terminates TLS in front of the console, self-signed by default on a LAN install). See the <b>Server</b> section, or docs/TLS.md, to trust the certificate or switch to a real domain.</div>`;
   }
@@ -7734,10 +7734,10 @@ async function renderServerSettings() {
     <div class="policy-section">
       <div class="policy-section-title">Crumb restreamer, cameras you add in Crumb</div>
       <div class="form-grid">
-        <label class="fg-label" for="srv-crumb-rtsp">Crumb RTSP base ${infoHint('Public RTSP address native clients pull from. Empty = the in-network container default.')}</label>
-        <div class="fg-ctl"><input id="srv-crumb-rtsp" class="mono" value="${esc(s.crumb_rtsp_base||'')}" placeholder="rtsp://&lt;this-host&gt;:18554" style="max-width:420px" title="Public RTSP address native clients pull from. Empty = the in-network container default." /></div>
-        <label class="fg-label" for="srv-crumb-api">Crumb API base ${infoHint('go2rtc REST/WebRTC base for the web player. Empty = the container default.')}</label>
-        <div class="fg-ctl"><input id="srv-crumb-api" class="mono" value="${esc(s.crumb_api_base||'')}" placeholder="http://go2rtc:1984" style="max-width:420px" title="go2rtc REST/WebRTC base for the web player. Empty = the container default." /></div>
+        <label class="fg-label" for="srv-crumb-rtsp">Crumb RTSP base ${infoHint('Client-facing only: the address native desktop and phone apps are told to pull streams from. The recorder does NOT use it, it dials its own embedded go2rtc over loopback. Empty = the container default.')}</label>
+        <div class="fg-ctl"><input id="srv-crumb-rtsp" class="mono" value="${esc(s.crumb_rtsp_base||'')}" placeholder="rtsp://&lt;this-host&gt;:18554" style="max-width:420px" title="Client-facing only: the address native desktop and phone apps are told to pull streams from. The recorder does NOT use it, it dials its own embedded go2rtc over loopback. Empty = the container default." /></div>
+        <label class="fg-label" for="srv-crumb-api">Crumb API base ${infoHint('go2rtc REST base the server proxies MSE, WebRTC signaling and snapshot frames through. Empty = the container default (http://recorder:1984), which is correct on a stock compose install.')}</label>
+        <div class="fg-ctl"><input id="srv-crumb-api" class="mono" value="${esc(s.crumb_api_base||'')}" placeholder="http://recorder:1984" style="max-width:420px" title="go2rtc REST base the server proxies MSE, WebRTC signaling and snapshot frames through. Empty = the container default (http://recorder:1984), which is correct on a stock compose install." /></div>
         <label class="fg-label">Restream auth ${infoHint('Whether the LAN RTSP restream (rtsp://<host>:18554) requires a username/password. Set by GO2RTC_AUTH; not editable here.')}</label>
         <div class="fg-ctl">${restreamAuthBadge(s.restream_rtsp_authenticated)}</div>
         <div class="fg-full card-hint">Frigate stream addresses &amp; the motion-decode backend moved to <b>Detection &amp; clips</b>.</div>
