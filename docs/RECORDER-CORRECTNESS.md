@@ -117,12 +117,36 @@ recorder, and later the API) must satisfy these *by construction*.
     surprise. The fallback itself is unchanged and safe, footage is never lost, only the
     disk-saving benefit of Motion mode is temporarily suspended, this item only requires
     that it also be *visible*.
+    Fail-open must also END on its own. **Every way a motion session ends closes the
+    event it has open**: the pixel frame session (`analyse_frame_stream`) emits the
+    synthetic STOP for an in-progress event on the watchdog and read-error exits too,
+    not only on cancel/EOF. Before, the frame-stall watchdog `return`ed past that STOP:
+    a camera reboot is a big scene change (START) followed by a dead stream (stall), the
+    detector reconnected and went healthy again, but the stranded START stayed open in
+    the recording task's `MotionUnion` (no time-based expiry, item 25), pinning the
+    buffer in Recording. Three production Motion-mode cameras kept every segment for 18
+    days that way until a restart rebuilt their workers. Guarded by
+    `frame_stall_then_resume_recovers_in_process_and_closes_the_event`. Separately, a
+    session that stays connected but never reaches a verdict (warm-up never completing,
+    or a duplicate-frame "long GOP" window) keeps feeding the frame watchdogs; the
+    stuck-session guard (`StuckSessionGuard`) ends it after 120 s, doubling per
+    consecutive stuck session up to 30 min. While a source stays unhealthy its `motion_detector_unhealthy` alert
+    re-fires every 4 h (`UNHEALTHY_REALERT_INTERVAL_SECS`), stopping on RECOVERED or when
+    the worker that owns the episode is torn down.
 20. **Spill never drops a buffered segment.** If the tmpfs cache nears its configured size
     (`MOTION_CACHE_TMPFS_BYTES`), the correct response is to persist the OLDEST buffered
     segments to disk (freeing cache space the same way a normal keep-verdict would), never
     to evict/delete a cached segment that hasn't been through a keep/discard decision.
     Cache pressure is allowed to change *when* a segment is written; it must never change
-    *whether* it survives.
+    *whether* it survives. The same holds when a keep verdict's copy into storage FAILS
+    (EIO, EROFS, ENOSPC): the cache file is the only copy, so it goes into a per-camera,
+    process-wide retry queue (`recording.rs` `persist_cached_or_queue`), is retried on
+    later segment boundaries with backoff (5 s doubling to 5 min) for as long as the file
+    exists, and is part of the R1 reconnect sweep's keep-set, so neither an ffmpeg
+    reconnect nor a worker respawn can delete it (audit R8). Only a cache file that has
+    already vanished is given up on, with an error log and a `storage_persist_failed`
+    event for that segment. Guarded by
+    `failed_persist_survives_the_reconnect_sweep_and_is_retried`.
 21. **The RAM cache is not a durability boundary for anything already persisted.** Once a
     segment has cleared the ordering in #17 it is on disk and indexed, a crash, container
     restart, or tmpfs wipe afterward must not be able to touch it. Only segments still
@@ -297,7 +321,13 @@ recorder, and later the API) must satisfy these *by construction*.
     - **Marker.** The recorder writes `<storage_root>/.crumb-storage` when it
       can positively confirm a storage — from the recording path
       (`index_segment`) only AFTER a real ≥floor segment is fsync'd on disk AND
-      committed to the index under that root, and from a boot/heal pass that
+      committed to the index under that root, AND (audit R9) only if the
+      storage has no indexed segments from before this recorder process
+      started, or at least one of its newest such segments is present under
+      the root (`confirm_and_write_storage_marker`). Without that second
+      condition, a disk that failed to mount was confirmed by the very first
+      segment recorded onto its empty mountpoint. A refused root is re-checked
+      at most once a minute. And from a boot/heal pass that
       requires at least one of the storage's newest INDEXED segment files to
       really be present under the root. Both writers share ONE rule: a marker
       means a real indexed segment is present. It is deliberately NOT written at

@@ -8,6 +8,61 @@ revisit.
 
 ---
 
+## 2026-10-08, Motion recovery and persist safety: every session end closes its event, stuck sessions reconnect, unhealthy alerts repeat, failed persists retry, the recording path confirms a root from earlier history
+
+**Context.** Three production Motion-mode cameras raised
+`motion_detector_unhealthy` ("frame-stall watchdog fired") once each on one
+night and then kept every segment for 18 days until a recorder restart. The
+frame-stall watchdog `return`ed out of the frame loop past the synthetic STOP
+for an in-progress event; the detector reconnected and recovered, but the
+stranded START kept the recording task's motion union open, so the buffer
+stayed in Recording. The alert fired once per episode. Separately, a session
+that keeps delivering frames the detector cannot use is never replaced by the
+watchdogs. Audit R8:
+a kept motion segment whose copy into storage failed was dropped from the ring
+and later deleted by the reconnect sweep. Audit R9: the recording path wrote
+the storage marker after any committed segment, so recording onto an empty
+mountpoint confirmed that mountpoint.
+
+**Decision.**
+- Every pixel session exit (cancel, EOF, either watchdog, read error, stuck
+  guard) emits the STOP for an event in progress. The recording side keeps its
+  no-expiry rule: the source that opened an event closes it.
+- A pixel session connected for 120 s without a verdict is torn down and
+  reconnected; the dwell doubles per consecutive stuck session up to 30 min and
+  resets on the first verdict. Reconnects continue indefinitely.
+- `motion_detector_unhealthy` re-fires every 4 h while the same episode lasts,
+  stopping on RECOVERED or when the episode's worker is gone. Constant, not a
+  setting.
+- Failed cache persists go into a process-wide per-camera retry queue (backoff
+  5 s to 5 min, no give-up while the file exists) that the R1 sweep never
+  deletes from.
+- The recording path writes the marker only when the storage has no indexed
+  segments older than this process's start, or one of its 50 newest such
+  segments is present under the root.
+
+**Rejected:**
+
+| # | Option | Verdict |
+|---|--------|---------|
+| 0 | Expire stale open keys in `MotionUnion` (or clear the union when a source recovers) | Rejected: item 25 already rejects a blind expiry (it would cut a second source's genuinely long event); closing at the source fixes the cause instead. |
+| 1 | Reconnect the moment the long-GOP check trips | Rejected: a camera whose sub-stream is keyframes-only by design would reconnect-spin; the doubling dwell bounds that to one retry per 30 min. |
+| 2 | Re-alert on every reconnect or at the rule cooldown (15 min) | Rejected: noisy for a known-degraded camera; 4 h keeps it visible without paging all night. |
+| 3 | Give up on a failed persist after N attempts | Rejected: the cache file is the only copy; a storage outage of any length must not turn into lost footage. |
+| 4 | R9 cutoff "older than the committed segment by a few segment lengths" | Rejected: after a few minutes of recording onto the wrong root, those segments become the "history" that confirms it. The process start cutoff holds for the whole process lifetime. |
+
+**Trade-offs accepted.** A genuinely long-GOP camera reconnects every 30 min
+(seconds of extra decode). The retry queue lives in memory, so a recorder
+restart with a tmpfs cache still loses queued segments (as before, now with a
+log line per failed attempt). A disk that is unmounted at recorder start and
+then recorded onto across a restart can still be confirmed by the previous
+process's segments; the reconcile breaker remains the backstop there.
+
+**Revisit triggers.** A stuck-session reconnect loop observed on a healthy
+camera; operators asking to tune the repeat interval; a persistent retry queue
+needed because the cache moves off tmpfs; a confirmed false marker from the
+cross-restart case above.
+
 ## 2026-10-08, `server_settings.crumb_rtsp_base` is CLIENT-FACING ONLY; the recorder dials its embedded go2rtc over loopback, and the bootstrap no longer seeds either `crumb_*` base column from the recorder's env
 
 **Context.** One column was serving two audiences that need different values

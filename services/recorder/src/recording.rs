@@ -378,6 +378,11 @@ pub async fn run(
         "recording task started"
     );
 
+    // Pin the process start before this worker indexes anything (audit R9:
+    // the storage-marker rule tells earlier history apart from this process's
+    // own segments).
+    let _ = recorder_process_start();
+
     let mut backoff = BACKOFF_INIT;
 
     // #73 (reconnect mid-motion-event): the motion state machine must SURVIVE
@@ -1010,10 +1015,13 @@ async fn run_ffmpeg_loop(
                     // the pre-roll). A fresh worker spawn has an empty ring,
                     // so the keep-set is empty and the sweep behaves exactly
                     // as before.
-                    let mut keep = std::collections::HashSet::new();
-                    for seg in &motion_buf.pending {
-                        keep.insert(PathBuf::from(&seg.path));
-                    }
+                    //
+                    // Audit R8: the keep-set ALSO holds every kept segment
+                    // whose copy into storage failed and is queued for retry
+                    // (no longer in the ring, but still the only copy). The
+                    // queue is process-wide, so a worker respawn spares them
+                    // too.
+                    let keep = motion_cache_keep_set(camera.id, &motion_buf.pending);
                     if let Err(e) = clear_dir_contents(&dir, &keep).await {
                         warn!(
                             camera_id = %camera.id,
@@ -1116,8 +1124,9 @@ async fn run_ffmpeg_loop(
             if ring_entry_lives_under(&seg, effective_write_dir) {
                 carried.push_back(seg);
             } else if !caching_active {
-                // Cache-dir entry while this run is fallback → persist now.
-                persist_cached_segment(
+                // Cache-dir entry while this run is fallback → persist now
+                // (a copy failure queues it for retry, never drops it: R8).
+                persist_cached_or_queue(
                     &seg,
                     camera,
                     &live_storage.id,
@@ -1990,6 +1999,20 @@ async fn finish_completed_segment(
         }
     }
 
+    // Step 3b (audit R8): retry any earlier kept segment whose copy into
+    // storage failed. Runs whatever the current mode: a queued entry is always
+    // a CACHE file (only the cache persist path queues), so the cache persist
+    // mechanics are the right ones even after a fall-back to direct-to-storage.
+    let retried_indexed = retry_unpersisted_segments(
+        camera,
+        live_storage_id,
+        live_storage_path,
+        camera_dir,
+        pool,
+        std::time::Instant::now(),
+    )
+    .await;
+
     // Step 4: execute the REAL decision only — `shadow` never touches a file.
     let signal_snapshot = pending_signals.clone();
     let any_indexed = execute_motion_decision(
@@ -2016,7 +2039,7 @@ async fn finish_completed_segment(
     // behaviour — bounded by the segment's end_ts boundary).
     prune_pending_signals(pending_signals, completed.end_ts);
 
-    any_indexed
+    any_indexed || retried_indexed
 }
 
 // ─── motion RAM-cache telemetry (migration 0039) ─────────────────────────────
@@ -2631,7 +2654,8 @@ pub(crate) async fn index_segment(
                 );
                 // A real segment is now on disk AND in the index under this root
                 // — confirm the storage (see the normal-path note below).
-                crate::reconcile::ensure_storage_marker(Path::new(storage_root)).await;
+                confirm_and_write_storage_marker(pool, storage_id, storage_root, &params.path)
+                    .await;
                 true
             }
             Ok(None) => {
@@ -2676,7 +2700,14 @@ pub(crate) async fn index_segment(
             // marker that would let reconcile prune the real disk's index rows.
             // Idempotent + best-effort: never rewrites an existing marker, and a
             // failure only costs index PRUNING, never footage.
-            crate::reconcile::ensure_storage_marker(Path::new(storage_root)).await;
+            //
+            // Audit R9: one committed segment is NOT enough on its own. If the
+            // disk failed to mount, the recorder records onto the bare
+            // mountpoint and that segment would confirm the wrong root. So the
+            // marker is written only when the storage has no indexed history
+            // from before this process started, or when at least one of its
+            // newest pre-existing segments is actually present under the root.
+            confirm_and_write_storage_marker(pool, storage_id, storage_root, &params.path).await;
             true
         }
         Err(e) => {
@@ -2689,6 +2720,122 @@ pub(crate) async fn index_segment(
             false
         }
     }
+}
+
+// ─── storage marker confirmation (audit R9) ──────────────────────────────────
+
+/// How many of a storage's newest PRE-EXISTING indexed segments are sampled to
+/// confirm a root before the recording path writes its marker. Same sample
+/// size as reconcile's boot/heal seed pass.
+const MARKER_CONFIRM_SAMPLE: i64 = 50;
+
+/// After the recording path refuses a marker on a root (or cannot check it),
+/// wait this long before checking that root again, so a camera recording onto
+/// an unconfirmed root does not query the index on every segment.
+const MARKER_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+static RECORDER_PROCESS_START: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+
+/// Wall-clock start of this recorder process (first call wins; [`run`] calls it
+/// as soon as any recording worker starts, before any segment is indexed).
+/// Segments indexed before this instant are "pre-existing history" for the
+/// marker rule.
+pub(crate) fn recorder_process_start() -> DateTime<Utc> {
+    *RECORDER_PROCESS_START.get_or_init(Utc::now)
+}
+
+/// Roots whose marker write was refused (or could not be checked) recently.
+static MARKER_REFUSED_AT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Pure rule for the recording-path marker write (audit R9).
+///
+/// `history` is the size of the sample of this storage's newest indexed
+/// segments that predate the current process (excluding the segment just
+/// committed); `present` is how many of them exist under the root. A storage
+/// with no such history is confirmed by the segment just committed (first
+/// recording ever, nothing else to compare against). A storage WITH history is
+/// confirmed only if at least one of those older segments is really there: an
+/// empty mountpoint whose disk failed to mount holds none of them.
+fn marker_write_confirmed(history: usize, present: usize) -> bool {
+    history == 0 || present > 0
+}
+
+/// Write the storage marker for `storage_root` if the recording path can
+/// confirm it is the real storage (see [`marker_write_confirmed`]). Every
+/// failure path leaves the marker absent, which only makes reconcile's dangling
+/// pass more conservative (it skips the storage and raises an alarm).
+async fn confirm_and_write_storage_marker(
+    pool: &Pool,
+    storage_id: &uuid::Uuid,
+    storage_root: &str,
+    committed_rel_path: &str,
+) {
+    let root = Path::new(storage_root);
+    if crate::reconcile::storage_marker_present(root).await {
+        return;
+    }
+    {
+        let refused = MARKER_REFUSED_AT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refused
+            .get(storage_root)
+            .is_some_and(|at| at.elapsed() < MARKER_RECHECK_INTERVAL)
+        {
+            return;
+        }
+    }
+    let note_refused = || {
+        MARKER_REFUSED_AT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(storage_root.to_owned(), std::time::Instant::now());
+    };
+
+    let history = match db::list_recent_segment_paths_for_storage_before(
+        pool,
+        *storage_id,
+        recorder_process_start(),
+        MARKER_CONFIRM_SAMPLE,
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(e) => {
+            warn!(
+                root = %storage_root,
+                error = %e,
+                "cannot sample indexed segments to confirm this storage; not writing its marker yet"
+            );
+            note_refused();
+            return;
+        }
+    };
+    let history: Vec<String> = history
+        .into_iter()
+        .filter(|rel| rel != committed_rel_path)
+        .collect();
+    let mut present = 0usize;
+    for rel in &history {
+        if tokio::fs::metadata(root.join(rel)).await.is_ok() {
+            present += 1;
+            break;
+        }
+    }
+    if marker_write_confirmed(history.len(), present) {
+        crate::reconcile::ensure_storage_marker(root).await;
+        return;
+    }
+    note_refused();
+    warn!(
+        root = %storage_root,
+        sampled = history.len(),
+        "recording onto a storage root that holds NONE of its earlier indexed segments \
+         (disk not mounted?); NOT writing the storage marker, so reconcile will not prune \
+         this storage's index"
+    );
 }
 
 // ─── motion cache dir resolution + guard ──────────────────────────────────────
@@ -2924,10 +3071,13 @@ async fn safe_copy_into_storage(src: &Path, desired: &Path) -> Result<(PathBuf, 
 /// scanned by reconcile, and a tmpfs cache clears on reboot anyway; the R1
 /// leftover-file sweep at worker start also cleans it on the next restart).
 ///
-/// Returns `true` iff the segment was successfully indexed (used for R6's
-/// `indexed_ok`), regardless of whether the cache-file delete afterward
-/// succeeded (a delete failure is warn-and-continue — never treated as
-/// indexing failure).
+/// Returns a [`PersistOutcome`]: `Indexed` iff the segment was successfully
+/// indexed (used for R6's `indexed_ok`), regardless of whether the cache-file
+/// delete afterward succeeded (a delete failure is warn-and-continue, never
+/// treated as indexing failure). `NotStored` means the copy never reached
+/// storage and the cache file was left in place as the ONLY copy; callers go
+/// through [`persist_cached_or_queue`], which queues it for retry rather than
+/// dropping it (audit R8).
 #[allow(clippy::too_many_arguments)]
 async fn persist_cached_segment(
     seg: &PendingSegment,
@@ -2937,13 +3087,13 @@ async fn persist_cached_segment(
     camera_dir: &Path,
     pool: &Pool,
     signals: &[MotionSignal],
-) -> bool {
+) -> PersistOutcome {
     let cache_path = Path::new(&seg.path);
     let filename = match cache_path.file_name() {
         Some(f) => f,
         None => {
             error!(camera_id = %camera.id, path = %seg.path, "persist_cached_segment: no filename component; skipping");
-            return false;
+            return PersistOutcome::NotStored;
         }
     };
     let desired = camera_dir.join(filename);
@@ -2963,8 +3113,9 @@ async fn persist_cached_segment(
                 src = %seg.path,
                 dst = %desired.to_string_lossy(),
                 error = %e,
-                "failed to copy cached segment into storage; leaving in cache (footage may be \
-                 lost if the cache is tmpfs and the process restarts)"
+                "failed to copy cached segment into storage; keeping it in the cache and \
+                 queueing a retry (footage may be lost only if the cache is tmpfs and the \
+                 process restarts before a retry succeeds)"
             );
             // R2 (audit 2026-07-05): a copy failure here is footage-THREATENING —
             // storage full (ENOSPC) or read-only (EROFS) while the motion RAM
@@ -3000,7 +3151,7 @@ async fn persist_cached_segment(
                     }
                 }
             }
-            return false;
+            return PersistOutcome::NotStored;
         }
     };
     let storage_path_str = storage_path.to_string_lossy().into_owned();
@@ -3059,7 +3210,250 @@ async fn persist_cached_segment(
         );
     }
 
-    indexed
+    if indexed {
+        PersistOutcome::Indexed
+    } else {
+        PersistOutcome::StoredUnindexed
+    }
+}
+
+/// Outcome of one [`persist_cached_segment`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistOutcome {
+    /// Copied into storage, fsync'd and indexed; the cache copy is gone.
+    Indexed,
+    /// Copied into storage but the index insert failed or was skipped. The
+    /// storage file is an orphan that reconcile adopts (correctness item 18),
+    /// so the cache copy has served its purpose and is gone.
+    StoredUnindexed,
+    /// The copy never reached storage (EIO, EROFS, ENOSPC, ...). The cache file
+    /// is still the ONLY copy of the footage and must be retried, never swept.
+    NotStored,
+}
+
+// ─── failed-persist retry queue (audit R8) ────────────────────────────────────
+
+/// First retry delay for a cached segment whose copy into storage failed.
+const UNPERSISTED_RETRY_BASE: Duration = Duration::from_secs(5);
+/// Cap on the per-segment retry delay. Retries never stop while the cache file
+/// exists: a transient storage error must never turn into lost footage.
+const UNPERSISTED_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// A kept motion-cache segment whose copy into storage failed. It no longer
+/// sits in the [`MotionBuffer`] ring (the keep verdict already drained it), so
+/// without this queue nothing would retry it and the next R1 cache sweep would
+/// delete the only copy.
+#[derive(Debug, Clone)]
+struct UnpersistedSegment {
+    seg: PendingSegment,
+    /// Motion signals overlapping the segment, captured at the first attempt so
+    /// a later retry still stamps `has_motion`/score/bbox correctly after
+    /// `pending_signals` has been pruned past it.
+    signals: Vec<MotionSignal>,
+    /// Failed attempts so far (>= 1 once queued).
+    attempts: u32,
+    next_attempt: std::time::Instant,
+}
+
+type UnpersistedMap = std::collections::HashMap<uuid::Uuid, Vec<UnpersistedSegment>>;
+
+/// Process-wide, keyed by camera id, so the queue survives an ffmpeg reconnect
+/// AND a worker respawn (config change): a fresh worker's empty ring must not
+/// let its R1 sweep delete a segment an earlier worker failed to persist.
+static UNPERSISTED: std::sync::LazyLock<std::sync::Mutex<UnpersistedMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(UnpersistedMap::new()));
+
+fn unpersisted_lock() -> std::sync::MutexGuard<'static, UnpersistedMap> {
+    // A poisoned lock still holds valid data (plain Vec pushes/drains); keep
+    // using it rather than losing track of footage that needs a retry.
+    UNPERSISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Delay before the retry that follows failed attempt number `attempts`:
+/// 5 s, 10 s, 20 s ... capped at 5 min.
+fn unpersisted_retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(16);
+    UNPERSISTED_RETRY_BASE
+        .saturating_mul(1u32 << shift)
+        .min(UNPERSISTED_RETRY_MAX)
+}
+
+/// Queue (or re-queue) a segment whose persist did not reach storage.
+fn queue_unpersisted(
+    camera_id: uuid::Uuid,
+    mut entry: UnpersistedSegment,
+    now: std::time::Instant,
+) {
+    entry.attempts = entry.attempts.saturating_add(1);
+    entry.next_attempt = now + unpersisted_retry_delay(entry.attempts);
+    let mut map = unpersisted_lock();
+    let list = map.entry(camera_id).or_default();
+    if !list.iter().any(|e| e.seg.path == entry.seg.path) {
+        list.push(entry);
+    }
+}
+
+/// Remove and return this camera's queued segments whose retry is due.
+fn take_due_unpersisted(camera_id: uuid::Uuid, now: std::time::Instant) -> Vec<UnpersistedSegment> {
+    let mut map = unpersisted_lock();
+    let Some(list) = map.get_mut(&camera_id) else {
+        return Vec::new();
+    };
+    let (due, later): (Vec<_>, Vec<_>) = list.drain(..).partition(|e| e.next_attempt <= now);
+    *list = later;
+    if list.is_empty() {
+        map.remove(&camera_id);
+    }
+    due
+}
+
+/// The R1 sweep keep-set: carried ring entries plus every queued
+/// not-yet-persisted segment for this camera. A file that never reached
+/// storage is never deleted by the sweep.
+fn motion_cache_keep_set(
+    camera_id: uuid::Uuid,
+    ring: &VecDeque<PendingSegment>,
+) -> std::collections::HashSet<PathBuf> {
+    let mut keep: std::collections::HashSet<PathBuf> =
+        ring.iter().map(|seg| PathBuf::from(&seg.path)).collect();
+    if let Some(list) = unpersisted_lock().get(&camera_id) {
+        keep.extend(list.iter().map(|e| PathBuf::from(&e.seg.path)));
+    }
+    keep
+}
+
+/// [`persist_cached_segment`], and on `NotStored` hand the segment to the
+/// retry queue instead of dropping it. Returns `true` iff it was indexed.
+#[allow(clippy::too_many_arguments)]
+async fn persist_cached_or_queue(
+    seg: &PendingSegment,
+    camera: &Camera,
+    storage_id: &uuid::Uuid,
+    storage_root: &str,
+    camera_dir: &Path,
+    pool: &Pool,
+    signals: &[MotionSignal],
+) -> bool {
+    match persist_cached_segment(
+        seg,
+        camera,
+        storage_id,
+        storage_root,
+        camera_dir,
+        pool,
+        signals,
+    )
+    .await
+    {
+        PersistOutcome::Indexed => true,
+        PersistOutcome::StoredUnindexed => false,
+        PersistOutcome::NotStored => {
+            let overlapping: Vec<MotionSignal> = signals
+                .iter()
+                .filter(|s| overlaps_motion(seg.start_ts, seg.end_ts, s))
+                .cloned()
+                .collect();
+            let now = std::time::Instant::now();
+            queue_unpersisted(
+                camera.id,
+                UnpersistedSegment {
+                    seg: seg.clone(),
+                    signals: overlapping,
+                    attempts: 0,
+                    next_attempt: now,
+                },
+                now,
+            );
+            error!(
+                camera_id = %camera.id,
+                path = %seg.path,
+                start_ts = %seg.start_ts,
+                "kept motion segment did not reach storage; it stays in the cache and will be \
+                 retried until it does"
+            );
+            false
+        }
+    }
+}
+
+/// Retry every due queued segment for this camera into the CURRENT live
+/// storage. A segment whose cache file has vanished is reported as lost
+/// (error log + `storage_persist_failed` event per segment) and dropped; every
+/// other failure is re-queued with backoff, indefinitely. Returns `true` iff
+/// any retried segment was indexed.
+async fn retry_unpersisted_segments(
+    camera: &Camera,
+    storage_id: &uuid::Uuid,
+    storage_root: &str,
+    camera_dir: &Path,
+    pool: &Pool,
+    now: std::time::Instant,
+) -> bool {
+    let mut any_indexed = false;
+    for entry in take_due_unpersisted(camera.id, now) {
+        // `Err` (cannot tell) reads as "still there": keep retrying.
+        if matches!(tokio::fs::try_exists(&entry.seg.path).await, Ok(false)) {
+            error!(
+                camera_id = %camera.id,
+                path = %entry.seg.path,
+                start_ts = %entry.seg.start_ts,
+                attempts = entry.attempts,
+                "kept motion segment LOST: its cache copy disappeared before it could be \
+                 persisted to storage"
+            );
+            let reason = format!(
+                "motion segment starting {} was lost: its cache copy disappeared after {} \
+                 failed attempt(s) to persist it to storage",
+                entry.seg.start_ts, entry.attempts
+            );
+            if let Err(e) = db::insert_system_event(
+                pool,
+                "storage_persist_failed",
+                Some(camera.id),
+                Some(&reason),
+            )
+            .await
+            {
+                warn!(camera_id = %camera.id, error = %e, "failed to record storage_persist_failed system event");
+            }
+            continue;
+        }
+        match persist_cached_segment(
+            &entry.seg,
+            camera,
+            storage_id,
+            storage_root,
+            camera_dir,
+            pool,
+            &entry.signals,
+        )
+        .await
+        {
+            PersistOutcome::Indexed => {
+                info!(
+                    camera_id = %camera.id,
+                    start_ts = %entry.seg.start_ts,
+                    attempts = entry.attempts,
+                    "previously failed motion segment persisted on retry"
+                );
+                any_indexed = true;
+            }
+            PersistOutcome::StoredUnindexed => {
+                info!(
+                    camera_id = %camera.id,
+                    start_ts = %entry.seg.start_ts,
+                    "previously failed motion segment reached storage on retry (index left to \
+                     reconcile)"
+                );
+            }
+            PersistOutcome::NotStored => {
+                queue_unpersisted(camera.id, entry, std::time::Instant::now());
+            }
+        }
+    }
+    any_indexed
 }
 
 /// Delete a discarded segment from the motion cache without ever touching
@@ -3119,7 +3513,7 @@ async fn execute_motion_decision(
     let mut any_indexed = false;
     if caching_active {
         for seg in &decision.persist {
-            if persist_cached_segment(
+            if persist_cached_or_queue(
                 seg,
                 camera,
                 storage_id,
@@ -5374,6 +5768,357 @@ mod tests {
             tokio::fs::metadata(&stale_path).await.is_err(),
             "a stale leftover file must still be swept"
         );
+    }
+
+    // ── audit R8: failed persists are retried, never swept ──────────────────
+
+    /// A Motion-mode camera built without a DB (only the fields the persist
+    /// path reads matter; every `Option` field defaults to `None`).
+    fn r8_camera(id: Uuid) -> Camera {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": "r8 test camera",
+            "enabled": true,
+            "go2rtc_name": format!("r8_{}", id.simple()),
+            "main_url": "r8_main",
+            "policy": {
+                "id": Uuid::new_v4(),
+                "is_default": false,
+                "origin": "operator",
+                "mode": "motion",
+                "live_retention_hours": 48,
+                "archive_enabled": false,
+                "motion_pre_seconds": 5,
+                "motion_post_seconds": 10,
+                "motion_sensitivity": "dynamic",
+                "motion_keyframes_only": false,
+                "record_stream": "main",
+                "record_audio": true
+            },
+            "onvif_motion": false,
+            "motion_source": "pixel",
+            "motion_pixel_enabled": true,
+            "motion_frigate_enabled": false,
+            "motion_ha_enabled": false,
+            "motion_algorithm": "census",
+            "created_at": "2026-01-01T00:00:00Z",
+            "served_by": "crumb",
+            "ptz_control_enabled": false
+        }))
+        .expect("test camera deserializes")
+    }
+
+    #[test]
+    fn unpersisted_retry_delay_backs_off_and_caps() {
+        assert_eq!(unpersisted_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(unpersisted_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(unpersisted_retry_delay(3), Duration::from_secs(20));
+        assert_eq!(unpersisted_retry_delay(10), UNPERSISTED_RETRY_MAX);
+        assert_eq!(unpersisted_retry_delay(u32::MAX), UNPERSISTED_RETRY_MAX);
+    }
+
+    /// The R8 sequence end to end: a kept segment whose copy into storage
+    /// fails stays in the cache, survives the reconnect-time R1 sweep (it is no
+    /// longer in the ring), is not hammered before its backoff, and reaches
+    /// storage on the retry once storage works again.
+    #[tokio::test]
+    async fn failed_persist_survives_the_reconnect_sweep_and_is_retried() {
+        let cam_id = Uuid::new_v4();
+        let camera = r8_camera(cam_id);
+        let pool = dead_pool();
+        let storage_id = Uuid::new_v4();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let root = tempfile::tempdir().expect("storage root");
+        let root_str = root.path().to_str().expect("utf8").to_owned();
+
+        let cached = cache.path().join("20260101T000000Z.mp4");
+        tokio::fs::write(&cached, vec![7u8; 4096])
+            .await
+            .expect("write cache seg");
+        let stale = cache.path().join("20251231T235956Z.mp4");
+        tokio::fs::write(&stale, b"stale")
+            .await
+            .expect("write stale");
+        let seg = PendingSegment {
+            path: cached.to_string_lossy().into_owned(),
+            start_ts: utc(2026, 1, 1, 0, 0, 0),
+            end_ts: utc(2026, 1, 1, 0, 0, 4),
+            size_bytes: 4096,
+        };
+
+        // Storage "fails": the camera dir is a regular file, so the copy errors.
+        let broken_dir = root.path().join("not-a-dir");
+        tokio::fs::write(&broken_dir, b"x")
+            .await
+            .expect("write blocker");
+        let indexed = persist_cached_or_queue(
+            &seg,
+            &camera,
+            &storage_id,
+            &root_str,
+            &broken_dir,
+            &pool,
+            &[],
+        )
+        .await;
+        assert!(!indexed);
+        assert!(
+            cached.exists(),
+            "a failed copy must leave the cache file in place"
+        );
+
+        // Reconnect: the ring is empty (the keep verdict drained it), yet the
+        // sweep must spare the queued file and still clear real leftovers.
+        let keep = motion_cache_keep_set(cam_id, &VecDeque::new());
+        assert!(
+            keep.contains(&cached),
+            "queued segment is in the R1 keep-set"
+        );
+        clear_dir_contents(cache.path(), &keep)
+            .await
+            .expect("sweep");
+        assert!(
+            cached.exists(),
+            "the R1 sweep must never delete an unpersisted segment"
+        );
+        assert!(!stale.exists(), "unrelated leftovers are still swept");
+
+        // Not due yet: nothing is attempted, the file stays queued.
+        let good_dir = root.path().join(cam_id.to_string());
+        assert!(
+            !retry_unpersisted_segments(
+                &camera,
+                &storage_id,
+                &root_str,
+                &good_dir,
+                &pool,
+                std::time::Instant::now()
+            )
+            .await
+        );
+        assert!(cached.exists());
+        assert!(motion_cache_keep_set(cam_id, &VecDeque::new()).contains(&cached));
+
+        // Storage is back and the backoff has passed: the retry copies it into
+        // storage and frees the cache. The DB is unreachable here, so the row
+        // is left to reconcile's orphan adoption (item 18), which is fine.
+        tokio::fs::create_dir_all(&good_dir)
+            .await
+            .expect("mkdir cam");
+        let later = std::time::Instant::now() + Duration::from_secs(3600);
+        retry_unpersisted_segments(&camera, &storage_id, &root_str, &good_dir, &pool, later).await;
+        assert!(
+            good_dir.join("20260101T000000Z.mp4").exists(),
+            "the retry must land the footage in storage"
+        );
+        assert!(
+            !cached.exists(),
+            "the cache copy is released once storage holds it"
+        );
+        assert!(
+            motion_cache_keep_set(cam_id, &VecDeque::new()).is_empty(),
+            "nothing left queued"
+        );
+    }
+
+    /// A queued segment whose cache file is gone is reported and dropped (it
+    /// cannot be retried), instead of being retried forever.
+    #[tokio::test]
+    async fn vanished_unpersisted_segment_is_dropped_from_the_queue() {
+        let cam_id = Uuid::new_v4();
+        let camera = r8_camera(cam_id);
+        let pool = dead_pool();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let root = tempfile::tempdir().expect("storage root");
+        let root_str = root.path().to_str().expect("utf8").to_owned();
+        let gone = cache.path().join("20260101T000008Z.mp4");
+        let now = std::time::Instant::now();
+        queue_unpersisted(
+            cam_id,
+            UnpersistedSegment {
+                seg: PendingSegment {
+                    path: gone.to_string_lossy().into_owned(),
+                    start_ts: utc(2026, 1, 1, 0, 0, 8),
+                    end_ts: utc(2026, 1, 1, 0, 0, 12),
+                    size_bytes: 4096,
+                },
+                signals: Vec::new(),
+                attempts: 0,
+                next_attempt: now,
+            },
+            now,
+        );
+        assert!(!motion_cache_keep_set(cam_id, &VecDeque::new()).is_empty());
+        retry_unpersisted_segments(
+            &camera,
+            &Uuid::new_v4(),
+            &root_str,
+            root.path(),
+            &pool,
+            now + Duration::from_secs(3600),
+        )
+        .await;
+        assert!(motion_cache_keep_set(cam_id, &VecDeque::new()).is_empty());
+    }
+
+    // ── audit R9: the recording path confirms a root before marking it ──────
+
+    #[test]
+    fn marker_write_rule() {
+        assert!(
+            marker_write_confirmed(0, 0),
+            "no history: first recording confirms"
+        );
+        assert!(
+            marker_write_confirmed(50, 1),
+            "an earlier segment is present"
+        );
+        assert!(
+            !marker_write_confirmed(50, 0),
+            "history exists but none of it is here: empty mountpoint"
+        );
+    }
+
+    /// When the index cannot be consulted, no marker is written (fail toward
+    /// "reconcile skips this storage", never toward a false confirmation).
+    #[tokio::test]
+    async fn marker_not_written_when_history_cannot_be_checked() {
+        let root = tempfile::tempdir().expect("root");
+        let root_str = root.path().to_str().expect("utf8").to_owned();
+        confirm_and_write_storage_marker(&dead_pool(), &Uuid::new_v4(), &root_str, "cam/a.mp4")
+            .await;
+        assert!(!root
+            .path()
+            .join(crate::reconcile::STORAGE_MARKER_FILENAME)
+            .exists());
+    }
+
+    fn r9_db_url() -> Option<String> {
+        let url = std::env::var("CRUMB_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let in_ci = std::env::var("CI")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false);
+        assert!(
+            url.is_some() || !in_ci,
+            "CI is set but no test database URL is configured"
+        );
+        url
+    }
+
+    /// DB-backed R9 check over a throwaway schema holding only `segments`:
+    /// a root holding none of the storage's earlier segments (the unmounted
+    /// disk) gets NO marker even though a fresh segment was just committed
+    /// there; the real disk (an earlier segment present) and a brand-new
+    /// storage (no earlier history) do.
+    #[tokio::test]
+    async fn recording_path_marker_requires_earlier_history_on_the_root() {
+        let Some(base_url) = r9_db_url() else {
+            eprintln!("skipping: CRUMB_TEST_DATABASE_URL not set");
+            return;
+        };
+        let schema = format!("crumb_r9_test_{}", Uuid::new_v4().simple());
+        let (admin, conn) = tokio_postgres::connect(&base_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(conn);
+        admin
+            .batch_execute(&format!("CREATE SCHEMA {schema};"))
+            .await
+            .expect("create schema");
+        let sep = if base_url.contains('?') { '&' } else { '?' };
+        let pool = db::build_pool(
+            &format!("{base_url}{sep}options=-c%20search_path%3D{schema}"),
+            2,
+        )
+        .expect("pool");
+        pool.get()
+            .await
+            .expect("conn")
+            .batch_execute(
+                "CREATE TABLE segments (storage_id uuid NOT NULL, path text NOT NULL, \
+                 start_ts timestamptz NOT NULL);",
+            )
+            .await
+            .expect("create segments");
+
+        let insert = |storage: Uuid, path: &'static str, ts: DateTime<Utc>| {
+            let pool = pool.clone();
+            async move {
+                pool.get()
+                    .await
+                    .expect("conn")
+                    .execute(
+                        "INSERT INTO segments (storage_id, path, start_ts) VALUES ($1, $2, $3)",
+                        &[&storage, &path, &ts],
+                    )
+                    .await
+                    .expect("insert");
+            }
+        };
+        let old = utc(2026, 1, 1, 0, 0, 0);
+        let fresh_ts = recorder_process_start() + chrono::Duration::seconds(5);
+        let marker = |root: &tempfile::TempDir| {
+            root.path()
+                .join(crate::reconcile::STORAGE_MARKER_FILENAME)
+                .exists()
+        };
+        let committed = "cam/20990101T000000Z.mp4";
+
+        // Unmounted: earlier rows exist but none of their files are under the
+        // root; the just-committed segment is.
+        let unmounted = tempfile::tempdir().expect("root");
+        let s1 = Uuid::new_v4();
+        insert(s1, "cam/20260101T000000Z.mp4", old).await;
+        insert(
+            s1,
+            "cam/20260101T000004Z.mp4",
+            old + chrono::Duration::seconds(4),
+        )
+        .await;
+        insert(s1, committed, fresh_ts).await;
+        std::fs::create_dir_all(unmounted.path().join("cam")).expect("mkdir");
+        std::fs::write(unmounted.path().join(committed), b"x").expect("write");
+        confirm_and_write_storage_marker(&pool, &s1, unmounted.path().to_str().unwrap(), committed)
+            .await;
+        assert!(
+            !marker(&unmounted),
+            "an empty mountpoint must not confirm itself"
+        );
+
+        // Real disk: one earlier segment is present.
+        let real = tempfile::tempdir().expect("root");
+        let s2 = Uuid::new_v4();
+        insert(s2, "cam/20260101T000000Z.mp4", old).await;
+        insert(s2, committed, fresh_ts).await;
+        std::fs::create_dir_all(real.path().join("cam")).expect("mkdir");
+        std::fs::write(real.path().join("cam/20260101T000000Z.mp4"), b"x").expect("write");
+        std::fs::write(real.path().join(committed), b"x").expect("write");
+        confirm_and_write_storage_marker(&pool, &s2, real.path().to_str().unwrap(), committed)
+            .await;
+        assert!(marker(&real), "a root holding earlier footage is confirmed");
+
+        // Brand-new storage: no history before this process.
+        let fresh = tempfile::tempdir().expect("root");
+        let s3 = Uuid::new_v4();
+        insert(s3, committed, fresh_ts).await;
+        std::fs::create_dir_all(fresh.path().join("cam")).expect("mkdir");
+        std::fs::write(fresh.path().join(committed), b"x").expect("write");
+        confirm_and_write_storage_marker(&pool, &s3, fresh.path().to_str().unwrap(), committed)
+            .await;
+        assert!(
+            marker(&fresh),
+            "first recording on a new storage confirms it"
+        );
+
+        let _ = admin
+            .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"))
+            .await;
     }
 
     #[tokio::test]
