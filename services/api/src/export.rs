@@ -64,7 +64,7 @@ use crumb_common::db;
 use crumb_common::types::Segment;
 
 use crate::{
-    auth_mw::{AuthUser, LegacyQueryTokenUser},
+    auth_mw::AuthUser,
     dto::{
         CreateBatchExportRequest, CreateExportRequest, CreateExportResponse, ExportJob,
         ExportOutputFile, ExportStatus,
@@ -342,10 +342,11 @@ async fn cancel_export(
 /// for the requested camera (e.g. the job used password ZIP mode and the raw
 /// files were deleted).
 async fn download_export_file(
-    // Export downloads keep the legacy full-JWT-via-?token= path (audit
-    // 2026-07-05 #2); every other media route is fail-closed. See
-    // `LegacyQueryTokenUser`.
-    LegacyQueryTokenUser(user): LegacyQueryTokenUser,
+    // Authenticated by the `Authorization: Bearer` header only, like every
+    // other route: a login token in a `?token=` query lands in proxy/access
+    // logs and browser history. Each client fetches the bytes itself and
+    // writes the file, so none of them needs a header-less URL.
+    user: AuthUser,
     State(state): State<AppState>,
     Path((job_id, camera_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -449,9 +450,10 @@ async fn download_export_file(
 /// files are deleted after the ZIP is built, so this is the only download
 /// endpoint for such jobs.
 async fn download_archive(
-    // Multi-camera archive: keeps the legacy full-JWT-via-?token= path (audit
-    // 2026-07-05 #2) since there's no single-camera scoped token for it yet.
-    LegacyQueryTokenUser(user): LegacyQueryTokenUser,
+    // Multi-camera archive: no single-camera scoped token fits it, so it takes
+    // the full session from the `Authorization: Bearer` header (never a
+    // `?token=` query).
+    user: AuthUser,
     State(state): State<AppState>,
     Path(job_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
