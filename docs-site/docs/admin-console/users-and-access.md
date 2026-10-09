@@ -33,6 +33,11 @@ The permissions a role can grant include:
   database, scoped to the role's cameras. This one is sensitive, a plate
   database is privacy-sensitive, so leave it off unless a role genuinely
   needs it.
+- **Manage notification destinations**: add, edit, remove and test-send
+  [notification](/notifications/) destinations. Off by default: a destination
+  tells the server to send alerts, with snapshot images, to a host of the
+  person's choosing, so it's an operator job rather than a personal setting.
+  Seeing the destinations that already exist isn't affected.
 - **Bookmarks**: how much [bookmark](/recording/bookmarks) access a person
   gets. Four levels: **None**; **Own** (create and see only their own);
   **View all** (see everyone's, but create and edit only their own); and
