@@ -15,6 +15,7 @@
 //! | [`logging`] | Global tracing subscriber initialisation. |
 //! | [`mqtt`] | MQTT URL guards shared by the api + recorder MQTT clients. |
 //! | [`detection`] | Pluggable detection-event framework ([`DetectionSource`] trait + types). |
+//! | [`go2rtc_streams`] | The go2rtc recording-stream definitions shared by the api and recorder. |
 
 // Several enums expose an inherent `from_str(&str) -> Option<Self>` that parses a
 // wire/DB token into the enum. This is a deliberate, readable convention (it
@@ -26,6 +27,7 @@ pub mod alert_template;
 pub mod config;
 pub mod db;
 pub mod detection;
+pub mod go2rtc_streams;
 pub mod ha;
 pub mod icons;
 pub mod logging;

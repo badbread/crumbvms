@@ -72,6 +72,7 @@ mod reconcile;
 mod recording;
 mod resource_stats;
 mod source_health;
+mod stream_registry;
 
 // ─── channel types (exported for implementers) ────────────────────────────────
 
@@ -1449,8 +1450,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    // R10: make sure the embedded go2rtc has every camera's recording streams
+    // BEFORE the workers start, and keep checking while they run, so recording
+    // does not depend on the api being up. Create-only, never fights the api's
+    // reconcile; a no-op unless this process runs the embedded go2rtc
+    // (GO2RTC_EMBEDDED=false registers nothing). See stream_registry.rs.
+    let registry_handle = stream_registry::start(
+        go2rtc_handle.is_some(),
+        pool.clone(),
+        config.go2rtc_user.clone(),
+        config.go2rtc_pass.clone(),
+        shutdown.clone(),
+    )
+    .await;
+
     let mut supervisor = RecorderSupervisor::new(pool, config, shutdown);
     supervisor.run().await?;
+
+    if let Some(h) = registry_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), h).await;
+    }
 
     // Stop the embedded go2rtc supervisor (it SIGTERMs the child, SIGKILL after
     // a bound). The shutdown token is already cancelled when run() returns, so

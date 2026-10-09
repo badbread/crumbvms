@@ -115,6 +115,52 @@ restreamer in a sibling container on the compose network while
 `GO2RTC_EMBEDDED` is still true (then the posture needs a third state, not a
 reinterpretation of the column).
 
+## 2026-10-08, The recorder creates its own recording streams in the embedded go2rtc when they are missing; the api stays the owner of everything else
+
+**Context.** go2rtc keeps streams in memory only, and the api's reconcile loop
+was their only writer. A go2rtc or recorder restart while the api was down,
+crash-looping or still booting left go2rtc empty, so no Crumb-served camera
+recorded until the api came back (audit finding R10). An api that refuses to
+boot on a bad secret makes that window longer, not shorter.
+
+**Decision.** When the recorder runs the embedded go2rtc
+(`GO2RTC_EMBEDDED` not `false` and the child was spawned), its
+`stream_registry` module creates each camera's recording streams (main and
+`<name>_sub`) that go2rtc does not have: once before the camera workers start
+(bounded at 10 s) and every 5 s after. The definitions come from
+`crumb_common::go2rtc_streams::recording_streams`, which the api's reconcile now
+calls too, so both writers send byte-identical name and source. The recorder
+is create-only: it never re-`PUT`s or `PATCH`es an existing stream, never
+touches derived streams (`_subv`, `_mainv`, `_mobile`), and only deletes a
+stream it created in the same pass whose camera row vanished on a re-read (so a
+camera delete is not undone). In steady state a name must be missing on two
+reads 2 s apart before it is created, which lets a healthy api win.
+
+**Rejected:**
+- Falling back to the camera's own RTSP (`source_url`) after N "stream not
+  found" failures: a second camera session per camera (session-capped cameras
+  refuse it), a different code path to keep correct, and Frigate and live
+  clients would still be dark.
+- Moving all stream management into the recorder: the derived client streams,
+  rejection alerts and source-edit reconnects need api state and are not
+  recording-critical; moving them is a larger change with no recording benefit.
+- Having the recorder `PATCH` existing streams too: two writers updating the
+  same stream is exactly the fight to avoid.
+
+**Trades knowingly accepted:**
+- Two writers can both create the same missing name; they send the same
+  definition, so the worst case is one replaced object before any consumer
+  attached.
+- A source edit landing in the few milliseconds between the recorder's row
+  read and its `PUT` can briefly re-create the old source; the api's next
+  reconcile `PATCH`es it to the new one.
+- After a recorder-only restart the api's cheap count check may see the main
+  streams already present and leave `_mobile`/`_subv` to its 60 s periodic pass
+  instead of its 5 s shortfall path.
+
+**Revisit if:** go2rtc gains persistent runtime streams or a writable config we
+can safely use, or stream management moves wholly into the recorder.
+
 ---
 
 ## 2026-09-08, Notification times are rendered PER PROVIDER: client-localized markup for Discord and Slack, the server's `TZ` for everyone else
