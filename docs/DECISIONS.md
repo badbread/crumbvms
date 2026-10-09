@@ -47,8 +47,10 @@ the bounded waits.
 
 **Trades knowingly accepted.** Under genuine saturation a scrub thumbnail or a
 wall tile now fails fast instead of eventually arriving; that is the intended
-swap. A camera whose still cannot be fetched is latched for 10 s so subsequent
-polls skip the cold-start retry ladder, which means a camera coming back can be
+swap. A camera whose full still-fetch ladder failed is latched for 10 s so subsequent
+polls make a single attempt instead of the cold-start retry ladder (a failed single
+attempt never extends the latch, and the first request after the window runs the
+full ladder again as a probe), which means a camera coming back can be
 up to 10 s late to serve its first still.
 
 **Revisit if:** operators report 503s on the media routes during normal use

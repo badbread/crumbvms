@@ -141,15 +141,10 @@ struct Inner {
     /// unbounded fan-out. Permit count = `config.frame_proxy_max_concurrency`.
     frame_semaphore: Arc<Semaphore>,
 
-    /// Cameras whose live still could not be fetched recently, as a monotonic
-    /// deadline: while `Instant::now() < deadline` the still proxy takes its
-    /// fast path (one quick attempt instead of the full cold-start retry
-    /// ladder), so a wall of tiles pointed at a camera that is down fails in
-    /// well under a second per poll instead of holding a permit for the ladder.
-    /// A successful fetch clears the entry, so a camera that comes back is
-    /// served normally on the very next poll. Memory-only and self-healing: a
-    /// restart just means the first poll after it pays the full ladder again.
-    frame_unavailable_until: DashMap<Uuid, Instant>,
+    /// Cameras whose live still could not be fetched recently. See
+    /// [`FrameLatch`]. Memory-only and self-healing: a restart just means the
+    /// first poll after it pays the full ladder again.
+    frame_unavailable: FrameLatch,
 
     /// Per-key in-flight locks for thumbnail extraction (singleflight). Keyed by
     /// the final cache path; a request serializes on its key so two concurrent
@@ -347,7 +342,7 @@ impl AppState {
             stream_rejected: DashMap::new(),
             thumb_semaphore,
             frame_semaphore,
-            frame_unavailable_until: DashMap::new(),
+            frame_unavailable: FrameLatch::default(),
             thumb_inflight: DashMap::new(),
             roles_cache: DashMap::new(),
             revoked_jtis: DashMap::new(),
@@ -512,35 +507,30 @@ impl AppState {
         Arc::clone(&self.0.frame_semaphore)
     }
 
-    /// Whether `camera_id`'s live still is currently latched as unavailable, so
-    /// the proxy should take its single-attempt fast path. See
-    /// [`frame_unavailable_until`](Inner::frame_unavailable_until).
+    /// Decide how the still proxy should fetch `camera_id`'s live still. See
+    /// [`FrameLatch::attempt_at`].
     #[inline]
-    pub fn frame_recently_unavailable(&self, camera_id: Uuid) -> bool {
+    pub fn frame_attempt(&self, camera_id: Uuid, ttl: Duration) -> FrameAttempt {
         self.0
-            .frame_unavailable_until
-            .get(&camera_id)
-            .is_some_and(|until| Instant::now() < *until)
+            .frame_unavailable
+            .attempt_at(camera_id, ttl, Instant::now())
     }
 
-    /// Latch `camera_id`'s live still as unavailable for `ttl`. Called when a
-    /// still fetch exhausts its attempts.
+    /// Latch `camera_id`'s live still as unavailable for `ttl`. Call it only
+    /// when a FULL retry ladder exhausted its attempts, never from the
+    /// single-attempt path (see [`FrameLatch`]).
+    #[inline]
     pub fn mark_frame_unavailable(&self, camera_id: Uuid, ttl: Duration) {
-        // Cheap unbounded-growth guard: entries are one per camera, but a
-        // pathological id churn would still be capped.
-        if self.0.frame_unavailable_until.len() > 4096 {
-            self.0.frame_unavailable_until.clear();
-        }
         self.0
-            .frame_unavailable_until
-            .insert(camera_id, Instant::now() + ttl);
+            .frame_unavailable
+            .mark_at(camera_id, ttl, Instant::now());
     }
 
     /// Clear `camera_id`'s unavailable latch after a successful still fetch, so
     /// a camera that comes back is served the normal way on the next poll.
     #[inline]
     pub fn clear_frame_unavailable(&self, camera_id: Uuid) {
-        self.0.frame_unavailable_until.remove(&camera_id);
+        self.0.frame_unavailable.clear(camera_id);
     }
 
     /// Get (or create) the singleflight lock for a thumbnail cache key. Callers
@@ -767,12 +757,181 @@ pub fn maintenance_active_at(until: i64, now: i64) -> bool {
     until > 0 && now < until
 }
 
+/// How the live-still proxy should fetch a camera's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAttempt {
+    /// The full cold-start retry ladder. Only a failed attempt of this kind may
+    /// arm the latch.
+    Full,
+    /// One attempt, no inter-attempt sleeps. Its failure leaves the latch alone.
+    Single,
+}
+
+/// Per-camera "last full fetch failed" latch for the live-still proxy, as a
+/// monotonic deadline per camera.
+///
+/// While the deadline is in the future the proxy makes a single attempt instead
+/// of the full ladder, so a wall of tiles pointed at a camera that is down does
+/// not hold a permit for the whole ladder on every poll. Rules that keep a slow
+/// but healthy camera from getting stuck:
+///
+/// * only a failed FULL ladder arms the latch; a failed single attempt never
+///   extends it, so the deadline is reached no matter how often the wall polls;
+/// * once the deadline passes, the next request gets [`FrameAttempt::Full`] and
+///   claims the probe by re-arming the deadline, so concurrent polls stay on the
+///   single attempt while one request proves recovery;
+/// * a success on any path clears the entry.
+#[derive(Default)]
+pub struct FrameLatch {
+    until: DashMap<Uuid, Instant>,
+}
+
+impl FrameLatch {
+    /// Decide how to fetch `camera_id`'s still at time `now`.
+    pub fn attempt_at(&self, camera_id: Uuid, ttl: Duration, now: Instant) -> FrameAttempt {
+        let Some(mut entry) = self.until.get_mut(&camera_id) else {
+            return FrameAttempt::Full;
+        };
+        if now < *entry {
+            return FrameAttempt::Single;
+        }
+        // Expired: this request is the probe. Hold the window for `ttl` so the
+        // other polls keep the cheap path until the probe reports back.
+        *entry = now + ttl;
+        FrameAttempt::Full
+    }
+
+    /// Latch `camera_id` as unavailable until `now + ttl`.
+    pub fn mark_at(&self, camera_id: Uuid, ttl: Duration, now: Instant) {
+        // Cheap unbounded-growth guard: entries are one per camera, but a
+        // pathological id churn would still be capped.
+        if self.until.len() > 4096 {
+            self.until.clear();
+        }
+        self.until.insert(camera_id, now + ttl);
+    }
+
+    /// Drop the latch for `camera_id` after a successful fetch.
+    pub fn clear(&self, camera_id: Uuid) {
+        self.until.remove(&camera_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        login_backoff_secs, maintenance_active_at, LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS,
-        LOGIN_FAIL_THRESHOLD,
+        login_backoff_secs, maintenance_active_at, FrameAttempt, FrameLatch,
+        LOGIN_BACKOFF_BASE_SECS, LOGIN_BACKOFF_CAP_SECS, LOGIN_FAIL_THRESHOLD,
     };
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// Simulate the still proxy against a camera whose frames take `latency` to
+    /// arrive after it was last "cold", with the per-attempt timeouts the
+    /// handler uses (`single_timeout` for the single path, `full_timeout` per
+    /// full-ladder attempt, 4 attempts). Returns true when the request succeeds.
+    fn request(
+        latch: &FrameLatch,
+        id: Uuid,
+        ttl: Duration,
+        now: Instant,
+        latency: Duration,
+        single_timeout: Duration,
+        full_timeout: Duration,
+    ) -> bool {
+        match latch.attempt_at(id, ttl, now) {
+            FrameAttempt::Full => {
+                // Every ladder attempt waits the same latency, so it succeeds
+                // iff the latency fits one attempt's timeout.
+                if latency <= full_timeout {
+                    latch.clear(id);
+                    true
+                } else {
+                    latch.mark_at(id, ttl, now);
+                    false
+                }
+            }
+            FrameAttempt::Single => {
+                if latency <= single_timeout {
+                    latch.clear(id);
+                    true
+                } else {
+                    // Deliberately no mark_at: a single-attempt failure must
+                    // not extend the latch.
+                    false
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_latch_slow_camera_recovers_within_one_window_when_polled_every_second() {
+        let latch = FrameLatch::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        // Second 0: the camera is down, the full ladder fails and arms the latch.
+        assert!(!request(
+            &latch,
+            id,
+            ttl,
+            at(0),
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            Duration::from_secs(5)
+        ));
+
+        // From then on the camera is slow (3 s to a frame) but healthy. The
+        // single path times out at 2 s, as the old fast path did; the wall polls
+        // every second. It must be served again no later than one window later.
+        let mut recovered_at = None;
+        for s in 1..=12 {
+            if request(
+                &latch,
+                id,
+                ttl,
+                at(s),
+                Duration::from_secs(3),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ) {
+                recovered_at = Some(s);
+                break;
+            }
+        }
+        let recovered_at = recovered_at.expect("slow camera never recovered");
+        assert!(recovered_at <= 10, "recovered too late: {recovered_at}s");
+        assert_eq!(recovered_at, 10, "probe runs exactly when the window ends");
+        // And it stays served normally afterwards.
+        assert_eq!(latch.attempt_at(id, ttl, at(11)), FrameAttempt::Full);
+    }
+
+    #[test]
+    fn frame_latch_single_failure_does_not_extend_and_probe_is_claimed_once() {
+        let latch = FrameLatch::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        latch.mark_at(id, ttl, at(0));
+        assert_eq!(latch.attempt_at(id, ttl, at(5)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(9)), FrameAttempt::Single);
+        // Window over: exactly one caller gets the full ladder, the rest stay on
+        // the single attempt while the probe runs.
+        assert_eq!(latch.attempt_at(id, ttl, at(10)), FrameAttempt::Full);
+        assert_eq!(latch.attempt_at(id, ttl, at(10)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(11)), FrameAttempt::Single);
+        // A failed probe re-arms for a fresh window; a successful one clears it.
+        latch.mark_at(id, ttl, at(14));
+        assert_eq!(latch.attempt_at(id, ttl, at(23)), FrameAttempt::Single);
+        assert_eq!(latch.attempt_at(id, ttl, at(24)), FrameAttempt::Full);
+        latch.clear(id);
+        assert_eq!(latch.attempt_at(id, ttl, at(25)), FrameAttempt::Full);
+        assert_eq!(latch.attempt_at(id, ttl, at(25)), FrameAttempt::Full);
+    }
 
     #[test]
     fn login_backoff_none_below_threshold() {

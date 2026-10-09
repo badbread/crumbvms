@@ -40,7 +40,7 @@ use crate::{
     dto::ViewerCameraDto,
     error::ApiError,
     go2rtc::resolve_bases,
-    state::AppState,
+    state::{AppState, FrameAttempt},
 };
 
 // ─── live-still proxy tuning ──────────────────────────────────────────────────
@@ -56,15 +56,16 @@ const FRAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(
 /// Per-attempt upstream timeout on the normal path.
 const FRAME_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Per-attempt upstream timeout on the known-bad fast path. Short: the point is
-/// to answer "not available" quickly and release the permit, not to wait out a
-/// camera that has already failed.
+/// Per-attempt upstream timeout for a disabled camera or a stream go2rtc has
+/// rejected. Short: the point is to answer "not available" quickly and release
+/// the permit, not to wait out a camera that has already failed.
 const FRAME_FAST_FAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a camera stays latched as "still unavailable" after a failed fetch.
+/// How long a camera stays latched as "still unavailable" after a failed full
+/// ladder, measured from that failure (single-attempt failures never extend it).
 /// Longer than the ~1 s poll interval of the low-bandwidth walls (so the latch
 /// actually covers their polls) but short enough that a camera coming back is
-/// served the normal way within a few seconds even if no poll succeeds first.
+/// given the full ladder again within one window even if no poll succeeds first.
 const FRAME_UNAVAILABLE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ─── route registry ───────────────────────────────────────────────────────────
@@ -168,10 +169,12 @@ async fn list_visible_cameras(
 ///
 /// A camera whose still could not be fetched is latched as unavailable for
 /// [`FRAME_UNAVAILABLE_TTL`], and while the latch holds the retry ladder
-/// below collapses to a single quick attempt. That is what keeps a wall pointed
-/// at a camera that is down cheap: the first poll pays the full cold-start
-/// ladder, every poll after it fails in about a second and releases its permit.
-/// A successful fetch clears the latch immediately.
+/// below collapses to a single attempt. That is what keeps a wall pointed at a
+/// camera that is down cheap: the first poll pays the full cold-start ladder,
+/// the polls after it make one attempt each and release their permit. Only a
+/// failed full ladder arms the latch; a single-attempt failure never extends it,
+/// and once the window ends the next request runs the full ladder again as a
+/// probe. A successful fetch on any path clears the latch immediately.
 ///
 /// # Errors
 ///
@@ -222,18 +225,24 @@ async fn get_camera_frame(
     // percent-encoding, so a plain format string is safe here.
     let upstream_url = format!("{api_base}/api/frame.jpeg?src={}", cam.go2rtc_name);
 
-    // Fast path when the camera is already known not to be producing stills: a
-    // disabled camera, a stream go2rtc has rejected, or one whose last fetch
-    // exhausted the ladder. Each of those means the cold-start retry ladder
-    // below has nothing to wait for, so it only burns a permit.
-    let known_bad = !cam.enabled
-        || state.stream_rejected(&cam.go2rtc_name)
-        || state.frame_recently_unavailable(camera_id);
-    let (max_attempts, request_timeout) = if known_bad {
-        (1, FRAME_FAST_FAIL_TIMEOUT)
-    } else {
-        (FRAME_MAX_ATTEMPTS, FRAME_REQUEST_TIMEOUT)
-    };
+    // Fast path when the camera is already known not to be producing stills.
+    //
+    // * Disabled camera, or a stream go2rtc has rejected: one short attempt; the
+    //   cold-start ladder has nothing to wait for. The latch is not involved.
+    // * Latch in force (the last FULL ladder failed less than a window ago): one
+    //   attempt with the normal per-attempt timeout, so a camera that is slow
+    //   but healthy still succeeds here and clears the latch. A failure on this
+    //   path does not extend the latch.
+    // * Latch expired: this request runs the full ladder as the probe.
+    let (max_attempts, request_timeout, full_ladder) =
+        if !cam.enabled || state.stream_rejected(&cam.go2rtc_name) {
+            (1, FRAME_FAST_FAIL_TIMEOUT, false)
+        } else {
+            match state.frame_attempt(camera_id, FRAME_UNAVAILABLE_TTL) {
+                FrameAttempt::Full => (FRAME_MAX_ATTEMPTS, FRAME_REQUEST_TIMEOUT, true),
+                FrameAttempt::Single => (1, FRAME_REQUEST_TIMEOUT, false),
+            }
+        };
 
     let http_client = reqwest::Client::builder()
         .timeout(request_timeout)
@@ -304,8 +313,11 @@ async fn get_camera_frame(
         }
     }
     let Some(bytes) = frame else {
-        // Latch the camera so the next poll takes the single-attempt path.
-        state.mark_frame_unavailable(camera_id, FRAME_UNAVAILABLE_TTL);
+        // Only a full ladder arms the latch. A single-attempt failure must not
+        // re-arm it, or a slow camera polled every second never gets a probe.
+        if full_ladder {
+            state.mark_frame_unavailable(camera_id, FRAME_UNAVAILABLE_TTL);
+        }
         return Err(ApiError::BadGateway(format!(
             "go2rtc frame ({upstream_url}) unavailable after {max_attempts} tries (last status {last_status:?}{})",
             last_err.map(|e| format!(", {e}")).unwrap_or_default(),
