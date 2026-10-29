@@ -58,11 +58,22 @@ ThemeData applyCrumbInteraction(ThemeData base, {Color? accent}) {
       child: child!,
     ),
   );
-  final chipSide = WidgetStateBorderSide.resolveWith(
-    (s) => s.contains(WidgetState.focused)
-        ? BorderSide(color: ring, width: 2)
-        : null,
-  );
+  // Chip and checkbox sides must resolve to a real BorderSide in EVERY state,
+  // including the empty set: ThemeData.lerp (run by MaterialApp's
+  // AnimatedTheme whenever the theme changes, e.g. the per-tab accent) resolves
+  // them with no states and null-checks the result. Returning null for "use
+  // the default" crashed the whole app into a grey error screen. These return
+  // Material 3's own defaults, plus the focus ring.
+  final scheme = base.colorScheme;
+  final chipSide = WidgetStateBorderSide.resolveWith((s) {
+    if (s.contains(WidgetState.focused))
+      return BorderSide(color: ring, width: 2);
+    if (s.contains(WidgetState.disabled)) {
+      return BorderSide(color: scheme.onSurface.withValues(alpha: 0.12));
+    }
+    if (s.contains(WidgetState.selected)) return BorderSide.none;
+    return BorderSide(color: scheme.outlineVariant);
+  });
   return base.copyWith(
     splashFactory: CrumbRipple.splashFactory,
     splashColor: _white(0.25),
@@ -105,11 +116,21 @@ ThemeData applyCrumbInteraction(ThemeData base, {Color? accent}) {
     ),
     checkboxTheme: base.checkboxTheme.copyWith(
       overlayColor: _overlay(),
-      side: WidgetStateBorderSide.resolveWith(
-        (s) => s.contains(WidgetState.focused)
-            ? BorderSide(color: ring, width: 2)
-            : null,
-      ),
+      side: WidgetStateBorderSide.resolveWith((s) {
+        if (s.contains(WidgetState.focused)) {
+          return BorderSide(color: ring, width: 2);
+        }
+        if (s.contains(WidgetState.disabled)) {
+          return BorderSide(
+            width: 2,
+            color: scheme.onSurface.withValues(alpha: 0.38),
+          );
+        }
+        if (s.contains(WidgetState.selected)) {
+          return const BorderSide(width: 0, color: Colors.transparent);
+        }
+        return BorderSide(width: 2, color: scheme.onSurfaceVariant);
+      }),
     ),
   );
 }

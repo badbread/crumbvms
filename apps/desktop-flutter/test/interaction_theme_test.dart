@@ -98,4 +98,18 @@ void main() {
     final shape = material.shape as OutlinedBorder;
     expect(shape.side.width, 2);
   });
+
+  // Regression: the per-tab accent re-themes the app and MaterialApp's
+  // AnimatedTheme lerps old -> new. Checkbox/Chip theme lerp resolve the border
+  // side with an empty state set and null-check it; a resolver returning null
+  // there turned the whole app into a grey error screen.
+  test('two interaction themes lerp without throwing', () {
+    final base = ThemeData.dark(useMaterial3: true);
+    final a = applyCrumbInteraction(base, accent: const Color(0xFFE8A33D));
+    final b = applyCrumbInteraction(base, accent: const Color(0xFF38BDD6));
+    for (final t in [0.0, 0.25, 0.5, 1.0]) {
+      expect(() => ThemeData.lerp(a, b, t), returnsNormally);
+      expect(() => ThemeData.lerp(base, a, t), returnsNormally);
+    }
+  });
 }
