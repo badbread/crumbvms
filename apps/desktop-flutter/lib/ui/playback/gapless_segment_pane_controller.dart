@@ -625,11 +625,17 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       return;
     }
     _resolving = true;
-    // Invalidate any prefetch already in flight for the outgoing segment.
-    _generation++;
     try {
       final cur = _current;
       if (forceReload) {
+        // A jump: invalidate any prefetch already in flight for the outgoing
+        // segment. NOT on a non-forced call: the wall-clock boundary path and
+        // the end-of-playlist fallback call resolveAt every tick while the
+        // segment is still covered, and bumping there made the correct
+        // in-flight prefetch discard its own append (a reopen stutter at
+        // every boundary). A non-forced call that does open a new file bumps
+        // at the open below.
+        _generation++;
         await _dropPrefetch();
       } else if (cur != null && cur.covers(ts)) {
         return; // still covered — nothing to do (matches the cached-skip in app.js)
@@ -699,8 +705,13 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         /* non-fatal */
       }
       // Resume only after the seek has landed on a freshly opened file, so the
-      // first shown frame is the target rather than the segment start.
-      if (!sameFile && playing) {
+      // first shown frame is the target rather than the segment start. Also
+      // on a same-file jump if mpv isn't playing: it may have reached the end
+      // of the file during the resolve (the forced path dropped the appended
+      // next entry, so mpv paused there), and the seek above clears that
+      // end state without resuming, leaving the pane paused while the
+      // playhead walks on.
+      if (playing && (!sameFile || !_player.state.playing)) {
         try {
           await _player.play();
         } catch (_) {
