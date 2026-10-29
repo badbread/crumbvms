@@ -53,6 +53,9 @@ import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart'
 import 'package:crumb_desktop/ui/special_tiles/special_tile_controller.dart';
 import 'package:crumb_desktop/ui/special_tiles/special_tile_spec.dart';
 import 'package:crumb_desktop/ui/special_tiles/special_tile_widgets.dart';
+import 'package:crumb_desktop/ui/motion/maximize_transition.dart';
+import 'package:crumb_desktop/ui/motion/maximize_widgets.dart';
+import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
 
 /// Tear down an mpv-backed [Player] without blocking the caller.
 ///
@@ -208,12 +211,28 @@ class WallScreen extends StatefulWidget {
   State<WallScreen> createState() => _WallScreenState();
 }
 
-class _WallScreenState extends State<WallScreen> {
+class _WallScreenState extends State<WallScreen>
+    with SingleTickerProviderStateMixin {
   Timer? _statsTimer;
   double? _lastCpuTime;
   DateTime? _lastSample;
 
   Camera? _maximized;
+
+  /// The maximize/restore transition: ONE controller for the whole wall (the
+  /// tiles never get their own). The maximized pane is moved with a Transform
+  /// from the tile's rect to the full wall, so no video widget is recreated or
+  /// re-parented. See [MaximizeFrame].
+  late final MaximizeTransition _maxAnim;
+
+  /// The camera whose pane is still on screen shrinking back to its slot after
+  /// a restore ([_maximized] is already null then). Null when no pane is mounted.
+  Camera? _closing;
+
+  /// The maximized camera's tile rect, in the wall Stack's coordinates,
+  /// captured at maximize time (null: the pane grows from the wall's centre).
+  Rect? _maxOrigin;
+  final GlobalKey _wallStackKey = GlobalKey();
 
   late final LiveStatusController _liveStatus;
 
@@ -301,6 +320,8 @@ class _WallScreenState extends State<WallScreen> {
   @override
   void initState() {
     super.initState();
+    _maxAnim = MaximizeTransition(vsync: this)
+      ..addStatusListener(_onMaxAnimStatus);
     _statsTimer = Timer.periodic(
       const Duration(seconds: 2),
       (_) => _pollStats(),
@@ -339,7 +360,9 @@ class _WallScreenState extends State<WallScreen> {
         // Re-check against the live list — a config refresh between build and
         // this callback could have dropped the camera.
         final cam = resolveInitialMaximize(restoreCam.id, _shown);
-        if (cam != null && _maximized == null) _maximize(cam);
+        // Re-maximizing across a minimize: no animation, the window was
+        // invisible.
+        if (cam != null && _maximized == null) _maximize(cam, animate: false);
       });
     }
   }
@@ -389,8 +412,27 @@ class _WallScreenState extends State<WallScreen> {
     // clears `_maximizeWarmCtrl` — before that stale controller can be painted.
     final maxCam = _maximized;
     if (maxCam != null && !_shown.any((c) => c.id == maxCam.id)) {
-      _restore();
+      _restore(animate: false);
     }
+    // Same for a pane that is mid-way through shrinking back: its warm-start
+    // controller belongs to a tile that is about to be unmounted.
+    final closing = _closing;
+    if (closing != null && !_shown.any((c) => c.id == closing.id)) {
+      _closing = null;
+      _maximizeWarmCtrl = null;
+      _maxAnim.collapse(animate: false);
+    }
+  }
+
+  /// A finished restore drops the pane layer (it stays mounted until its
+  /// shrink-back animation ends).
+  void _onMaxAnimStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed) return;
+    if (_maxAnim.targetExpanded || _closing == null || !mounted) return;
+    setState(() {
+      _closing = null;
+      _maximizeWarmCtrl = null;
+    });
   }
 
   /// The wall's config-change signal: re-fetch the camera list via the host.
@@ -499,6 +541,7 @@ class _WallScreenState extends State<WallScreen> {
     if (_ptzPanel.editing) unawaited(_ptzPanel.endEditAndSave());
     _ptzPanel.dispose();
     _haOverlay.dispose();
+    _maxAnim.dispose();
     super.dispose();
   }
 
@@ -509,7 +552,7 @@ class _WallScreenState extends State<WallScreen> {
   /// keep advancing (and, with seamless switching, warm-swapping streams)
   /// underneath the maximized overlay (#269). Null for plain-camera maximizes,
   /// which also UNfreezes any previously frozen slot.
-  void _maximize(Camera cam, {int? specialSlot}) {
+  void _maximize(Camera cam, {int? specialSlot, bool animate = true}) {
     // Maximizing a different camera mid panel-edit ends (and persists) the
     // edit — the editor chrome must not follow the wrong camera. The session
     // teardown is synchronous inside endEditAndSave (only the store write is
@@ -526,36 +569,75 @@ class _WallScreenState extends State<WallScreen> {
     if (cam.ptz) unawaited(_ptzPanel.loadForView(cam.id));
     widget.audio?.setMaximized('max:${cam.id}');
     widget.onMaximizedCameraChanged?.call(cam.id);
+    // A pane for THIS camera still shrinking back (restore pressed, then
+    // maximize again): reverse it in place, keeping the same pane and its
+    // players, instead of starting a new one.
+    final resume = _closing?.id == cam.id && !_maxAnim.isCollapsed;
+    // A pane already up (maximized, or another camera shrinking back) just
+    // swaps to the new camera, as before: no travel animation for a swap.
+    final swap = !resume && (_maximized != null || _closing != null);
+    final origin = (resume || swap) ? null : _tileRectInWall(cam);
+    _maxAnim.reduced = MotionTokens.reduced(context);
     setState(() {
       // Hand the tile's already-decoding controller to the maximized pane so
       // it shows live video (upscaled sub stream) instead of black while its
       // own main-stream player waits ~a GOP for its first keyframe.
-      _maximizeWarmCtrl = _tileKeys[cam.id]?.currentState?.warmController;
+      if (!resume) {
+        _maximizeWarmCtrl = _tileKeys[cam.id]?.currentState?.warmController;
+        _maxOrigin = origin;
+      }
       // Freeze the originating carousel/hotspot slot (or unfreeze on a
       // plain-camera maximize) — see the doc above (#269).
       _special.frozenSlot = specialSlot;
       _maximized = cam;
+      _closing = null;
       // Fresh key per maximize — lets the wall reach this pane's State later
       // (e.g. to push refreshed HA links after an edit saves) while keeping
       // the exact same "always a clean remount" identity a plain per-camera
       // ValueKey gave (see the field doc).
-      _maximizedPaneKey = GlobalKey<_MaximizedPaneState>();
+      if (!resume) _maximizedPaneKey = GlobalKey<_MaximizedPaneState>();
     });
+    if (swap) {
+      _maxAnim.snapExpanded();
+    } else {
+      _maxAnim.expand(animate: animate);
+    }
   }
 
-  /// Restore from the maximized pane back to the grid.
-  void _restore() {
+  /// The wall tile for [cam], as a rect in the wall Stack's coordinates (the
+  /// space the maximized pane is laid out in). Null when the tile has no stable
+  /// key (carousel/hotspot slots) or isn't laid out.
+  Rect? _tileRectInWall(Camera cam) {
+    final tile = _tileKeys[cam.id]?.currentContext?.findRenderObject();
+    final stack = _wallStackKey.currentContext?.findRenderObject();
+    if (tile is! RenderBox || stack is! RenderBox) return null;
+    if (!tile.attached || !stack.attached || !tile.hasSize) return null;
+    return MatrixUtils.transformRect(
+      tile.getTransformTo(stack),
+      Offset.zero & tile.size,
+    );
+  }
+
+  /// Restore from the maximized pane back to the grid. [animate] false drops the
+  /// pane at once (its tile is going away, or the window was just restored).
+  void _restore({bool animate = true}) {
     // Leaving the maximized view mid panel-edit ends (and persists) the edit.
     if (_ptzPanel.editing) unawaited(_ptzPanel.endEditAndSave());
     if (_haOverlay.editor.editMode) unawaited(_endHaOverlayEdit());
     widget.audio?.setMaximized(null);
     widget.onMaximizedCameraChanged?.call(null);
+    final leaving = _maximized;
+    _maxAnim.reduced = MotionTokens.reduced(context);
     setState(() {
-      _maximizeWarmCtrl = null;
+      // Keep the pane (and its warm-start surface, whose tile stays mounted)
+      // on screen while it shrinks back; the status listener drops both.
+      if (!animate || leaving == null) _maximizeWarmCtrl = null;
+      _closing = animate ? leaving : null;
       _maximized = null;
       // Let a frozen carousel/hotspot slot resume rotating (#269).
       _special.frozenSlot = null;
     });
+    if (leaving != null) _maxAnim.collapse(animate: animate);
   }
 
   /// "Edit PTZ panel…" from a tile's right-click menu or the maximized-pane
@@ -719,18 +801,27 @@ class _WallScreenState extends State<WallScreen> {
     final scaffold = Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
+        key: _wallStackKey,
         children: [
           Positioned.fill(
-            // Listen to client options so toggling "Show tile info bar" in the
-            // floating Settings panel restyles the tiles live (tile States
-            // persist by key, so no player teardown/restart).
-            child: widget.clientOptions == null
-                ? _wallBody(cams, cols, true)
-                : ListenableBuilder(
-                    listenable: widget.clientOptions!,
-                    builder: (context, _) =>
-                        _wallBody(cams, cols, widget.clientOptions!.showInfoBar),
-                  ),
+            // While a tile maximizes the whole wall recedes (scale + veil) via
+            // a layer scoped to this subtree; at rest it is an identity.
+            child: MaximizeRecedeLayer(
+              transition: _maxAnim,
+              // Listen to client options so toggling "Show tile info bar" in
+              // the floating Settings panel restyles the tiles live (tile
+              // States persist by key, so no player teardown/restart).
+              child: widget.clientOptions == null
+                  ? _wallBody(cams, cols, true)
+                  : ListenableBuilder(
+                      listenable: widget.clientOptions!,
+                      builder: (context, _) => _wallBody(
+                        cams,
+                        cols,
+                        widget.clientOptions!.showInfoBar,
+                      ),
+                    ),
+            ),
           ),
 
           // (Sign-out lives in the top bar — no redundant floating button here.
@@ -753,36 +844,51 @@ class _WallScreenState extends State<WallScreen> {
             ),
           ),
 
-          // Maximized single-camera view (main stream + zoom/pan), on top.
-          if (_maximized != null)
-            _MaximizedPane(
-              key: _maximizedPaneKey,
-              api: widget.api,
-              session: widget.session,
-              camera: _maximized!,
-              liveStatus: _liveStatus,
-              streamPrefs: widget.streamPrefs,
-              audio: widget.audio,
-              warmController: _maximizeWarmCtrl,
-              ptzPanel: _ptzPanel,
-              ptzClickMode:
-                  widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
-              ptzStyle: widget.clientOptions?.ptzStyle ?? PtzStyle.edges,
-              ptzWheelCorner:
-                  widget.clientOptions?.ptzWheelCorner ??
-                  PtzWheelCorner.bottomLeft,
-              haOverlay: _haOverlay,
-              isAdmin: widget.isAdmin,
-              canActuate: widget.canActuate,
-              onEditHaOverlay: () => unawaited(_beginHaOverlayEdit(_maximized!)),
-              onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
-              onHaOverlayCancel: () =>
-                  unawaited(_exitHaOverlayEditWithPrompt()),
-              onEditPtzPanel: () => unawaited(_beginPtzPanelEdit(_maximized!)),
-              onLinkHaEntities: () => unawaited(_refreshHaLinksFor(_maximized!.id)),
-              onHaLinksLoaded: _onHaLinksLoaded,
-              onUnauthorized: widget.onUnauthorized,
-              onClose: _restore,
+          // Maximized single-camera view (main stream + zoom/pan), on top. It
+          // stays mounted while it shrinks back to its slot after a restore
+          // (`_closing`), but takes no input then.
+          if (_maximized != null || _closing != null)
+            Positioned.fill(
+              child: IgnorePointer(
+                ignoring: _maximized == null,
+                child: MaximizeFrame(
+                  transition: _maxAnim,
+                  origin: _maxOrigin,
+                  child: Stack(
+                    children: [
+                      _MaximizedPane(
+                        key: _maximizedPaneKey,
+                        api: widget.api,
+                        session: widget.session,
+                        camera: (_maximized ?? _closing)!,
+                        liveStatus: _liveStatus,
+                        streamPrefs: widget.streamPrefs,
+                        audio: widget.audio,
+                        warmController: _maximizeWarmCtrl,
+                        ptzPanel: _ptzPanel,
+                        ptzClickMode:
+                            widget.clientOptions?.ptzClickMode ?? PtzClickMode.center,
+                        ptzStyle: widget.clientOptions?.ptzStyle ?? PtzStyle.edges,
+                        ptzWheelCorner:
+                            widget.clientOptions?.ptzWheelCorner ??
+                            PtzWheelCorner.bottomLeft,
+                        haOverlay: _haOverlay,
+                        isAdmin: widget.isAdmin,
+                        canActuate: widget.canActuate,
+                        onEditHaOverlay: () => unawaited(_beginHaOverlayEdit((_maximized ?? _closing)!)),
+                        onHaOverlayDone: () => unawaited(_endHaOverlayEdit()),
+                        onHaOverlayCancel: () =>
+                            unawaited(_exitHaOverlayEditWithPrompt()),
+                        onEditPtzPanel: () => unawaited(_beginPtzPanelEdit((_maximized ?? _closing)!)),
+                        onLinkHaEntities: () => unawaited(_refreshHaLinksFor((_maximized ?? _closing)!.id)),
+                        onHaLinksLoaded: _onHaLinksLoaded,
+                        onUnauthorized: widget.onUnauthorized,
+                        onClose: _restore,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
         ],
       ),
