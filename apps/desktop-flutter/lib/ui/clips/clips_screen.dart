@@ -38,6 +38,7 @@ import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart'
     show FullscreenController;
 import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/motion/live_motion.dart';
 
 enum ClipsDensity { compact, normal, large }
 
@@ -650,6 +651,7 @@ class _ClipCardState extends State<_ClipCard> {
     super.didUpdateWidget(old);
     if (old.clip.id != widget.clip.id) {
       _bytes = null;
+      _failed = false;
       _requested = false;
       _maybeLoad();
     }
@@ -673,15 +675,28 @@ class _ClipCardState extends State<_ClipCard> {
       widget.clip.cameraId,
       widget.clip.thumbnailUrl,
     );
-    if (url == null || _disposed) return; // no JWT fallback — stays blank
+    if (url == null || _disposed) {
+      _markFailed();
+      return; // no JWT fallback — stays blank
+    }
     try {
       final resp = await sharedHttpClient.get(Uri.parse(url));
-      if (_disposed || resp.statusCode != 200) return;
+      if (_disposed || resp.statusCode != 200) {
+        _markFailed();
+        return;
+      }
       _cacheThumb(widget.clip.id, resp.bodyBytes);
       if (mounted) setState(() => _bytes = resp.bodyBytes);
     } catch (_) {
       // leave the black placeholder
+      _markFailed();
     }
+  }
+
+  /// Stop the loading skeleton: this thumbnail is not going to arrive.
+  bool _failed = false;
+  void _markFailed() {
+    if (mounted && !_failed) setState(() => _failed = true);
   }
 
   @override
@@ -709,8 +724,15 @@ class _ClipCardState extends State<_ClipCard> {
                   fit: StackFit.expand,
                   children: [
                     Container(color: Colors.black),
+                    // Skeleton while the thumbnail loads (not after a failure).
+                    if (_bytes == null && !_failed) const ShimmerBox(),
                     if (_bytes != null)
-                      Image.memory(_bytes!, fit: BoxFit.cover, gaplessPlayback: true),
+                      Image.memory(
+                        _bytes!,
+                        fit: BoxFit.cover,
+                        gaplessPlayback: true,
+                        frameBuilder: thumbFadeFrameBuilder,
+                      ),
                     Positioned(left: 4, top: 4, child: _Chip(badge)),
                     if (dur != null) Positioned(right: 4, bottom: 4, child: _Chip(dur)),
                   ],

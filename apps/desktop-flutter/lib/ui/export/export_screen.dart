@@ -29,6 +29,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/ui/folder_picker_dialog.dart';
 
 import 'export_builder_dialog.dart';
+import 'package:crumb_desktop/ui/motion/live_motion.dart';
 
 class ExportScreen extends StatefulWidget {
   const ExportScreen({
@@ -1023,7 +1024,7 @@ class _ClipThumbnailState extends State<_ClipThumbnail> {
         future: _future,
         builder: (context, snap) {
           if (snap.connectionState != ConnectionState.done) {
-            return const SizedBox.shrink();
+            return const ShimmerBox();
           }
           final bytes = snap.data;
           if (bytes == null) {
@@ -1033,7 +1034,11 @@ class _ClipThumbnailState extends State<_ClipThumbnail> {
               color: Colors.white38,
             );
           }
-          return Image.memory(bytes, fit: BoxFit.cover);
+          return Image.memory(
+            bytes,
+            fit: BoxFit.cover,
+            frameBuilder: thumbFadeFrameBuilder,
+          );
         },
       ),
     );

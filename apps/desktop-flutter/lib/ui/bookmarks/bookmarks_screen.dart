@@ -18,6 +18,7 @@ import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 
 import 'add_bookmark_dialog.dart';
+import 'package:crumb_desktop/ui/motion/live_motion.dart';
 
 class BookmarksScreen extends StatefulWidget {
   const BookmarksScreen({
@@ -327,7 +328,12 @@ class _BookmarkThumbState extends State<_BookmarkThumb> {
             ? Stack(
                 fit: StackFit.expand,
                 children: [
-                  Image.memory(_bytes!, fit: BoxFit.cover, gaplessPlayback: true),
+                  Image.memory(
+                    _bytes!,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                    frameBuilder: thumbFadeFrameBuilder,
+                  ),
                   if (widget.bookmark.isProtected)
                     const Positioned(
                       right: 2,
@@ -340,11 +346,7 @@ class _BookmarkThumbState extends State<_BookmarkThumb> {
                 color: scheme.surfaceContainerHighest,
                 child: Center(
                   child: _loading
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
+                      ? const SizedBox.expand(child: ShimmerBox())
                       : Icon(
                           widget.bookmark.isProtected
                               ? Icons.lock_outline

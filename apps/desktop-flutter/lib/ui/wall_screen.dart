@@ -56,6 +56,7 @@ import 'package:crumb_desktop/ui/special_tiles/special_tile_widgets.dart';
 import 'package:crumb_desktop/ui/motion/maximize_transition.dart';
 import 'package:crumb_desktop/ui/motion/maximize_widgets.dart';
 import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
+import 'package:crumb_desktop/ui/motion/live_motion.dart';
 
 /// Tear down an mpv-backed [Player] without blocking the caller.
 ///
@@ -1321,7 +1322,8 @@ class _WallTile extends StatefulWidget {
   State<_WallTile> createState() => _WallTileState();
 }
 
-class _WallTileState extends State<_WallTile> {
+class _WallTileState extends State<_WallTile>
+    with SingleTickerProviderStateMixin {
   Player? _player;
   VideoController? _controller;
 
@@ -1531,6 +1533,36 @@ class _WallTileState extends State<_WallTile> {
   /// notifications (which fire for any tile) only trigger a stream swap here
   /// when our own shed status actually flips.
   bool _lastAdaptiveShed = false;
+
+  /// 0 until this tile's FIRST frame of this mount arrives, then 0 -> 1 over
+  /// 220 ms (decelerate): the video resolves out of the connecting state
+  /// instead of popping. Later reloads/swaps keep the old frame painting and
+  /// never re-run it. Steady state is 1.0, where FadeTransition adds no layer.
+  late final AnimationController _reveal = AnimationController(
+    vsync: this,
+    duration: MotionTokens.d3,
+  )..addStatusListener(_onRevealStatus);
+  late final Animation<double> _revealOpacity = _reveal.drive(
+    CurveTween(curve: MotionTokens.decelerate),
+  );
+
+  /// The reveal has finished (or was skipped): the connecting spinner is gone.
+  bool _revealed = false;
+
+  void _onRevealStatus(AnimationStatus s) {
+    if (s == AnimationStatus.completed && !_revealed && mounted) {
+      setState(() => _revealed = true);
+    }
+  }
+
+  /// Fade the video in (first frame of this mount). Idempotent.
+  void _startReveal() {
+    if (_revealed || _reveal.isAnimating || _reveal.value > 0) return;
+    if (MotionTokens.reduced(context)) {
+      _reveal.duration = MotionTokens.reducedFadeCap;
+    }
+    _reveal.forward();
+  }
 
   @override
   void initState() {
@@ -1839,6 +1871,7 @@ class _WallTileState extends State<_WallTile> {
   void _onFirstFrame(Player player, VideoController controller) {
     if (identical(player, _player)) {
       if (!_firstFrame) setState(() => _firstFrame = true);
+      _startReveal();
       return;
     }
     if (!identical(player, _pending)) return; // superseded swap — ignore
@@ -1853,6 +1886,11 @@ class _WallTileState extends State<_WallTile> {
     final promotedCamera = _pendingCamera ?? widget.camera;
     _pendingCamera = null;
     _firstFrame = true;
+    // A swap promotes an already-decoding feed over a painted one: no reveal.
+    if (!_revealed) {
+      _reveal.value = 1.0;
+      _revealed = true;
+    }
     // The incoming feed is now the painted one — promote the name label to it
     // (it lagged the pending switch on purpose, #254); _adopt's setState repaints.
     _shown = promotedCamera;
@@ -2081,6 +2119,7 @@ class _WallTileState extends State<_WallTile> {
   void dispose() {
     widget.adaptive?.removeListener(_onAdaptiveChanged);
     widget.adaptive?.dropTile(_paneId);
+    _reveal.dispose();
     _loadRetry.dispose();
     _watchdog?.dispose();
     SnapshotRegistry.instance.unregister(_paneId);
@@ -2129,6 +2168,20 @@ class _WallTileState extends State<_WallTile> {
           fit: StackFit.expand,
           children: [
             content,
+            // Motion flash on the tile border: a new motion event flashes the
+            // border once ("subtle" variant). Keyed + at a fixed index so the
+            // selection outline coming and going never disturbs it.
+            Positioned.fill(
+              key: const ValueKey('motion-flash'),
+              child: ListenableBuilder(
+                listenable: widget.liveStatus,
+                builder: (context, _) => MotionFlash(
+                  active:
+                      widget.liveStatus.cameraFor(widget.camera.id)?.recentMotion ??
+                      false,
+                ),
+              ),
+            ),
             if (selected)
               Positioned.fill(
                 child: IgnorePointer(
@@ -2230,10 +2283,16 @@ class _WallTileState extends State<_WallTile> {
                       transform: Matrix4.identity()
                         ..translateByDouble(_offset.dx, _offset.dy, 0, 1)
                         ..scaleByDouble(_scale, _scale, 1, 1),
-                      child: Video(
-                        controller: _controller!,
-                        controls: NoVideoControls,
-                        fit: widget.fit,
+                      // Fades in once, on this mount's first frame. At rest
+                      // the opacity is 1.0 (no compositing layer), so this is
+                      // not an Opacity over live video in steady state.
+                      child: FadeTransition(
+                        opacity: _revealOpacity,
+                        child: Video(
+                          controller: _controller!,
+                          controls: NoVideoControls,
+                          fit: widget.fit,
+                        ),
                       ),
                     ),
                   )
@@ -2250,6 +2309,24 @@ class _WallTileState extends State<_WallTile> {
                             height: 22,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           ),
+                  ),
+
+                // Connecting: the same small spinner (a static ring under
+                // reduced motion) sits behind the video until its first frame
+                // has faded in over it.
+                if (_controller != null && !_revealed && _error == null)
+                  Center(
+                    child: FadeTransition(
+                      opacity: ReverseAnimation(_revealOpacity),
+                      child: SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          value: MotionTokens.reduced(context) ? 0.25 : null,
+                        ),
+                      ),
+                    ),
                   ),
 
                 // HA on-video badges (issue #170 P0), view mode only — this
