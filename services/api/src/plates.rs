@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -53,6 +53,10 @@ pub fn json_routes() -> Router<AppState> {
         // and operator ground-truth confirmation (admin-only, like the
         // watchlist writes).
         .route("/lpr/ab-report", get(get_ab_report))
+        // Plate desk (LPR page redesign): today's header totals and per-plate
+        // history for the plates on screen. view_plates-gated, camera-scoped.
+        .route("/lpr/overview", get(get_lpr_overview))
+        .route("/lpr/plates/stats", post(post_plate_stats))
         .route("/lpr/ab-confirm", post(post_ab_confirm))
         .route("/config/lpr", get(get_lpr_config).put(put_lpr_config))
         .route("/config/lpr/rotate-token", post(rotate_lpr_token))
@@ -524,6 +528,277 @@ async fn delete_plate_label(
     } else {
         Err(ApiError::NotFound(format!("plate {plate} has no name set")))
     }
+}
+
+// ── plate desk: today's overview + per-plate history (`/lpr/overview`,
+// `/lpr/plates/stats`) ───────────────────────────────────────────────────────
+
+/// Max plates one `POST /lpr/plates/stats` call may ask about. Clients batch
+/// the plates currently on screen, which is well under this.
+pub const MAX_STATS_PLATES: usize = 200;
+
+/// Resolve the camera scope for an aggregate read. An explicit `requested`
+/// list is intersected with the caller's grants (out-of-scope cameras are
+/// dropped, never 403'd, exactly like `/plates`). No list means "every camera
+/// I can see": `None` (no filter) for an admin, the granted cameras otherwise.
+fn aggregate_scope(user: &AuthUser, requested: Option<Vec<Uuid>>) -> Option<Vec<Uuid>> {
+    match requested {
+        Some(ids) if !ids.is_empty() => Some(user.filter_camera_ids(&ids)),
+        _ if user.is_admin() => None,
+        _ => Some(user.camera_ids.clone()),
+    }
+}
+
+/// UTC instant of local midnight starting `day` in `tz`. A zone whose DST
+/// jump skips midnight starts that day at the first valid local instant
+/// (01:00); an ambiguous midnight takes the earlier instant.
+fn local_day_start(tz: chrono_tz::Tz, day: NaiveDate) -> DateTime<Utc> {
+    use chrono::{LocalResult, TimeZone};
+    let midnight = day.and_time(NaiveTime::MIN);
+    match tz.from_local_datetime(&midnight) {
+        LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => t.with_timezone(&Utc),
+        LocalResult::None => tz
+            .from_local_datetime(&(midnight + chrono::Duration::hours(1)))
+            .earliest()
+            .map_or_else(|| midnight.and_utc(), |t| t.with_timezone(&Utc)),
+    }
+}
+
+/// The UTC bounds of local `day`, plus the start of the 30-day window ending
+/// with it (local day `day - 29`). `None` only at the edges of the calendar.
+fn day_bounds(
+    tz: chrono_tz::Tz,
+    day: NaiveDate,
+) -> Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
+    let next = day.checked_add_days(chrono::Days::new(1))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let first = day.checked_sub_days(chrono::Days::new(db::LPR_STATS_DAYS as u64 - 1))?;
+    Some((
+        local_day_start(tz, day),
+        local_day_start(tz, next),
+        local_day_start(tz, first),
+    ))
+}
+
+/// `GET /lpr/overview` query.
+#[derive(Debug, Deserialize)]
+pub struct LprOverviewQuery {
+    /// Local calendar day (`YYYY-MM-DD`, the server's time zone). Default:
+    /// today on the server.
+    pub day: Option<NaiveDate>,
+    /// Optional comma-separated camera UUIDs to narrow to (caller-scoped).
+    /// Omitted = every camera the caller can see.
+    pub camera_ids: Option<String>,
+}
+
+/// The regulars / returning / first-time split of the day's unique plates.
+/// The three always sum to `unique_today`.
+#[derive(Debug, Serialize)]
+pub struct LprSplitDto {
+    /// Seen before the day, at least `regular_min_reads_30d` reads in the 30
+    /// days ending with it.
+    pub regulars: i64,
+    /// Seen before the day, but not (yet) a regular.
+    pub returning: i64,
+    /// First seen on the day (same number as `new_today`).
+    pub first_time: i64,
+}
+
+/// `GET /lpr/overview` response.
+#[derive(Debug, Serialize)]
+pub struct LprOverviewDto {
+    /// The local day summarized.
+    pub day: NaiveDate,
+    /// IANA name of the server time zone the day is computed in.
+    pub tz: String,
+    pub reads_today: i64,
+    pub unique_today: i64,
+    pub new_today: i64,
+    /// Reads on the day of plates on the watchlist (watch entries, exact
+    /// plate match; ignore entries never count).
+    pub watchlist_hits_today: i64,
+    pub split: LprSplitDto,
+    /// The "regular" threshold the split used, so clients label plates with
+    /// the same rule.
+    pub regular_min_reads_30d: i64,
+}
+
+/// `GET /lpr/overview?day=<YYYY-MM-DD>&camera_ids=<csv>` — the plate desk
+/// header: the day's reads, unique plates, new plates, watchlist hits and the
+/// regulars / returning / first-time split. "Day" is the server's local day.
+///
+/// `view_plates`-gated and camera-scoped like `/plates`: only reads from
+/// cameras the caller may see are counted, including the history that decides
+/// whether a plate is new or a regular.
+///
+/// # Errors
+///
+/// * `400` — malformed camera ids or an out-of-range day.
+/// * `401` / `403` — auth failure / missing `view_plates`.
+async fn get_lpr_overview(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<LprOverviewQuery>,
+) -> Result<Json<LprOverviewDto>, ApiError> {
+    user.require_view_plates()?;
+    let tz = state.config().server_tz;
+    let requested = q.camera_ids.as_deref().map(parse_uuid_csv).transpose()?;
+    let scope = aggregate_scope(&user, requested);
+    let day = q
+        .day
+        .unwrap_or_else(|| Utc::now().with_timezone(&tz).date_naive());
+    let (start, end, window) =
+        day_bounds(tz, day).ok_or_else(|| ApiError::BadRequest("day out of range".to_owned()))?;
+    let c = db::lpr_overview(state.pool(), scope.as_deref(), start, end, window)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(LprOverviewDto {
+        day,
+        tz: tz.name().to_owned(),
+        reads_today: c.reads,
+        unique_today: c.unique,
+        new_today: c.new_plates,
+        watchlist_hits_today: c.watchlist_hits,
+        split: LprSplitDto {
+            regulars: c.regulars,
+            returning: c.returning,
+            first_time: c.new_plates,
+        },
+        regular_min_reads_30d: db::LPR_REGULAR_MIN_READS_30D,
+    }))
+}
+
+/// `POST /lpr/plates/stats` body.
+#[derive(Debug, Deserialize)]
+pub struct PlateStatsBody {
+    /// Plates to describe (normalized server-side, de-duplicated; at most
+    /// [`MAX_STATS_PLATES`] entries).
+    pub plates: Vec<String>,
+    /// Optional camera narrowing (caller-scoped). Omitted = every camera the
+    /// caller can see.
+    pub camera_ids: Option<Vec<Uuid>>,
+}
+
+/// Reads of one plate on one camera.
+#[derive(Debug, Serialize)]
+pub struct PlateCameraCountDto {
+    pub camera_id: Uuid,
+    pub n: i64,
+}
+
+/// One plate's history in `POST /lpr/plates/stats`.
+#[derive(Debug, Serialize)]
+pub struct PlateStatsDto {
+    pub plate: String,
+    pub total: i64,
+    /// Reads in the last 7 local days, today included.
+    pub seen_7d: i64,
+    /// Reads in the last 30 local days, today included (`sum(days30)`).
+    pub seen_30d: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    /// Latest read before today (local), when there is one.
+    pub prev_seen: Option<DateTime<Utc>>,
+    /// Reads per camera, most first.
+    pub cameras: Vec<PlateCameraCountDto>,
+    /// 24 counts, reads per local hour of day over the whole history.
+    pub hours: Vec<i64>,
+    /// 30 counts, reads per local day, oldest first; the last one is today.
+    pub days30: Vec<i64>,
+}
+
+/// `POST /lpr/plates/stats` response.
+#[derive(Debug, Serialize)]
+pub struct PlateStatsResponse {
+    /// IANA name of the zone `hours` / `days30` are bucketed in.
+    pub tz: String,
+    /// The local day `days30` ends with.
+    pub today: NaiveDate,
+    pub regular_min_reads_30d: i64,
+    /// One entry per requested plate that has visible reads (plates with none
+    /// are omitted), ordered by plate.
+    pub plates: Vec<PlateStatsDto>,
+}
+
+/// `POST /lpr/plates/stats {plates: [...]}` — history for the plates on
+/// screen: totals, 7/30-day counts, first / last / previous sighting, camera
+/// breakdown, hour-of-day and 30-day activity, bucketed in the server's time
+/// zone. Feeds the history cells, sparklines and the plate profile.
+///
+/// `view_plates`-gated and camera-scoped: reads from cameras the caller may
+/// not see are never counted. Bounded by the requested plates through the
+/// (plate, ts) index, never a table scan.
+///
+/// # Errors
+///
+/// * `400` — more than [`MAX_STATS_PLATES`] distinct plates.
+/// * `401` / `403` — auth failure / missing `view_plates`.
+async fn post_plate_stats(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<PlateStatsBody>,
+) -> Result<Json<PlateStatsResponse>, ApiError> {
+    user.require_view_plates()?;
+    let tz = state.config().server_tz;
+    let today = Utc::now().with_timezone(&tz).date_naive();
+
+    if body.plates.len() > MAX_STATS_PLATES {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_STATS_PLATES} plates per request"
+        )));
+    }
+    let mut plates: Vec<String> = body
+        .plates
+        .iter()
+        .map(|p| db::normalize_plate(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    plates.sort_unstable();
+    plates.dedup();
+
+    let scope = aggregate_scope(&user, body.camera_ids);
+    let (today_start, _, window) = day_bounds(tz, today)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("server day out of range")))?;
+    let history = db::lpr_plate_stats(
+        state.pool(),
+        &plates,
+        scope.as_deref(),
+        tz.name(),
+        window,
+        today_start,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    let plates = history
+        .into_iter()
+        .map(|s| {
+            let seen_30d = s.days.iter().sum();
+            let seen_7d = s.days[db::LPR_STATS_DAYS - 7..].iter().sum();
+            PlateStatsDto {
+                plate: s.plate,
+                total: s.total,
+                seen_7d,
+                seen_30d,
+                first_seen: s.first_seen,
+                last_seen: s.last_seen,
+                prev_seen: s.prev_seen,
+                cameras: s
+                    .cameras
+                    .into_iter()
+                    .map(|(camera_id, n)| PlateCameraCountDto { camera_id, n })
+                    .collect(),
+                hours: s.hours.to_vec(),
+                days30: s.days.to_vec(),
+            }
+        })
+        .collect();
+    Ok(Json(PlateStatsResponse {
+        tz: tz.name().to_owned(),
+        today,
+        regular_min_reads_30d: db::LPR_REGULAR_MIN_READS_30D,
+        plates,
+    }))
 }
 
 // ── dual-engine A/B benchmark (`/lpr/ab-report`, `/lpr/ab-confirm`) ─────────
