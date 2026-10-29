@@ -102,3 +102,23 @@ Crumb keeps the preview cache from growing forever on its own: once it passes a
 size or age limit, the oldest previews are dropped, and any preview that's
 missing is simply rebuilt the next time it's needed. If you ever want to change
 those limits, they're in the [environment reference](/configuration/environment-reference).
+
+## When a camera shows no footage
+
+If there is nothing recorded at the time you are looking at, the camera's
+tile says why:
+
+- **Live edge**: you are at (or past) the current time. Recordings are saved
+  in short pieces, so the newest few seconds appear a little behind live.
+- **Footage deleted**: the time is older than this camera's retention keeps.
+  The message tells you when its recordings now start.
+- **No motion at this time**: the camera records only when it detects motion,
+  and nothing moved.
+- **Recording gap** (shown in amber): the camera is set to record all the
+  time, but nothing was recorded here. Usually the camera was offline or
+  recording stopped, so it is worth a look.
+- **Couldn't load footage**: something went wrong loading it. The message
+  includes the error and a **Retry** button.
+
+The small label in the corner of each tile shows the same reason in short
+form.

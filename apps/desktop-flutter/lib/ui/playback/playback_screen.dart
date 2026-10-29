@@ -43,6 +43,7 @@ import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'gapless_segment_pane_controller.dart';
 import 'playback_prefs.dart';
+import 'no_footage_message.dart';
 import 'playback_timeline_controller.dart';
 
 class PlaybackScreen extends StatefulWidget {
@@ -206,6 +207,19 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   // behind the scrubber) — see _syncCoverage.
   final Map<String, _CoverageCache> _coverage = {};
   final Set<String> _coverageLoading = {};
+
+  // Per-camera start of the oldest remaining recording (GET /cameras
+  // `oldest_footage_ts`). Seeded from the camera list we were given and
+  // refreshed once on entry, since retention moves it forward while the app
+  // stays open. A playhead earlier than this is footage deleted by retention.
+  late final Map<String, DateTime?> _oldestFootage = {
+    for (final c in _cameras) c.id: c.oldestFootageTs,
+  };
+  // Effective recording mode per camera (`recording_mode`), refreshed with
+  // the above so a policy change since sign-in is picked up.
+  late final Map<String, String?> _recordingMode = {
+    for (final c in _cameras) c.id: c.recordingMode,
+  };
   int _idleTicks = 0;
   bool _resolvePending = false;
 
@@ -234,6 +248,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // Hand our motion controller to the host so it can render the legend +
     // hints in the app's bottom status bar (set here, cleared in dispose).
     widget.onMotionController?.call(_motion, true);
+    unawaited(_refreshOldestFootage());
     for (final c in _cameras) {
       final pane = GaplessSegmentPaneController(
         api: widget.api,
@@ -1290,7 +1305,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         pane: _panes[maxCam.id]!,
         selected: true,
         maximized: true,
-        recordsElsewhere: _recordsElsewhere(maxCam.id),
+        oldestFootage: _oldestFootage[maxCam.id],
+        recordingMode: _recordingMode[maxCam.id],
+        playhead: () => _timeline.playhead,
+        onRetry: _retryResolve,
         onSelect: () => _selectCamera(maxCam.id),
         onMaximizeToggle: () => _toggleMaximize(maxCam.id),
         scrubFrame: _scrubbing ? _scrubFrames[maxCam.id] : null,
@@ -1338,7 +1356,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       pane: _panes[cam.id]!,
                       selected: cam.id == _selectedCameraId,
                       maximized: false,
-                      recordsElsewhere: _recordsElsewhere(cam.id),
+                      oldestFootage: _oldestFootage[cam.id],
+                      recordingMode: _recordingMode[cam.id],
+                      playhead: () => _timeline.playhead,
+                      onRetry: _retryResolve,
                       onSelect: () => _selectCamera(cam.id),
                       onMaximizeToggle: () => _toggleMaximize(cam.id),
                       scrubFrame: _scrubbing ? _scrubFrames[cam.id] : null,
@@ -1351,15 +1372,28 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     );
   }
 
-  /// Whether [camId] has any recording coverage loaded — i.e. it records at
-  /// SOME time in the navigable range. Lets a no-footage pane distinguish a
-  /// motion camera's normal gap ("records elsewhere") from a camera with no
-  /// footage at all (worth flagging). Null when coverage isn't loaded for this
-  /// camera (only the selected camera is fetched) → the tile stays neutral.
-  bool? _recordsElsewhere(String camId) {
-    final cov = _coverage[camId];
-    if (cov == null) return null;
-    return cov.spans.isNotEmpty;
+  /// Re-read each camera's oldest remaining recording. Best-effort: on any
+  /// failure the values from the camera list we were given stay in place.
+  Future<void> _refreshOldestFootage() async {
+    try {
+      final cams = await widget.api.listCameras(widget.session);
+      if (!mounted) return;
+      setState(() {
+        for (final c in cams) {
+          if (_oldestFootage.containsKey(c.id)) {
+            _oldestFootage[c.id] = c.oldestFootageTs;
+            _recordingMode[c.id] = c.recordingMode;
+          }
+        }
+      });
+    } catch (_) {
+      // Keep the seeded values.
+    }
+  }
+
+  /// Retry after a load error: re-resolve every pane at the playhead.
+  void _retryResolve() {
+    unawaited(_resolveAll(_timeline.playhead, force: true));
   }
 
   @override
@@ -1979,7 +2013,10 @@ class _PbTile extends StatefulWidget {
     required this.maximized,
     required this.onSelect,
     required this.onMaximizeToggle,
-    this.recordsElsewhere,
+    this.oldestFootage,
+    this.recordingMode,
+    this.playhead,
+    this.onRetry,
     this.scrubFrame,
   });
 
@@ -1990,11 +2027,19 @@ class _PbTile extends StatefulWidget {
   final VoidCallback onSelect;
   final VoidCallback onMaximizeToggle;
 
-  /// Whether this camera has recording coverage at OTHER times (records
-  /// elsewhere in range). Distinguishes a normal motion-camera gap (`true`) from
-  /// a camera with no footage at all (`false`, worth flagging). Null = unknown
-  /// (coverage not loaded for this camera) → a neutral message.
-  final bool? recordsElsewhere;
+  /// Start of the camera's oldest remaining recording, or null when unknown.
+  /// A no-footage playhead earlier than this reads as "Footage deleted".
+  final DateTime? oldestFootage;
+
+  /// Effective recording mode (`"continuous"` / `"motion"`), or null when the
+  /// server predates the field.
+  final String? recordingMode;
+
+  /// Current playhead, read when the no-footage overlay is built.
+  final DateTime Function()? playhead;
+
+  /// Re-resolve the panes at the playhead (the error overlay's Retry).
+  final VoidCallback? onRetry;
 
   /// Filmstrip frame shown over the video while the scrubber is being dragged.
   final Uint8List? scrubFrame;
@@ -2061,21 +2106,33 @@ class _PbTileState extends State<_PbTile> {
     }
   }
 
-  /// The overlay shown when a pane has no live segment: a load error, a spinner
-  /// while resolving, or — once resolved with nothing here — a styled "no
-  /// footage" placeholder that reads calmly for a motion gap but flags a camera
-  /// with no footage at all.
-  Widget _noFootageOverlay() {
-    if (widget.pane.error != null) {
-      return _placeholder(
-        icon: Icons.videocam_off_rounded,
-        iconColor: Colors.red.shade300,
-        title: 'Playback error',
-        subtitle: 'Could not load this segment',
-        tint: Colors.red,
-      );
-    }
-    if (!widget.pane.noFootage) {
+  /// The no-footage message for this pane right now, or null while it is
+  /// still resolving / opening a segment. Picks the actual reason (load error,
+  /// live edge, deleted by retention, no motion, recording gap) from real data;
+  /// see [noFootageMessage].
+  NoFootageMessage? _noFootageReason() {
+    final error = widget.pane.error;
+    if (error == null && !widget.pane.noFootage) return null;
+    final playhead = widget.playhead?.call();
+    final now = DateTime.now().toUtc();
+    return noFootageMessage(
+      // Without a playhead source, fall back to a moment safely outside the
+      // live edge and claim nothing about retention.
+      playhead: playhead ?? now.subtract(const Duration(days: 1)),
+      now: now,
+      error: error == null ? null : _shortError(error),
+      oldestFootage: playhead == null ? null : widget.oldestFootage,
+      recordingMode: playhead == null ? null : widget.recordingMode,
+    );
+  }
+
+  static String _shortError(String e) =>
+      e.length <= 140 ? e : '${e.substring(0, 137)}...';
+
+  /// The overlay shown when a pane has no live segment: a spinner while
+  /// resolving, otherwise the reason there is no footage here.
+  Widget _noFootageOverlay(NoFootageMessage? msg) {
+    if (msg == null) {
       // Still resolving / opening a segment.
       return const ColoredBox(
         color: Colors.black54,
@@ -2088,30 +2145,51 @@ class _PbTileState extends State<_PbTile> {
         ),
       );
     }
-    // Resolved: genuinely no footage at this instant.
-    if (widget.recordsElsewhere == false) {
-      // No coverage anywhere in range — a live/always-record camera with no
-      // footage is worth flagging (amber).
-      return _placeholder(
-        icon: Icons.warning_amber_rounded,
-        iconColor: Colors.amber.shade400,
-        title: 'No footage for this camera',
-        subtitle: 'No recordings found in this time range',
-        tint: Colors.amber,
-      );
+    switch (msg.reason) {
+      case NoFootageReason.loadError:
+        return _placeholder(
+          icon: Icons.videocam_off_rounded,
+          iconColor: Colors.red.shade300,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.red,
+          onRetry: widget.onRetry,
+        );
+      case NoFootageReason.recordingGap:
+      case NoFootageReason.noFootageForCamera:
+        return _placeholder(
+          icon: Icons.warning_amber_rounded,
+          iconColor: Colors.amber.shade400,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.amber,
+        );
+      case NoFootageReason.liveEdge:
+        return _placeholder(
+          icon: Icons.schedule_rounded,
+          iconColor: Colors.white38,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.blueGrey,
+        );
+      case NoFootageReason.footageDeleted:
+        return _placeholder(
+          icon: Icons.history_toggle_off_rounded,
+          iconColor: Colors.white38,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.blueGrey,
+        );
+      case NoFootageReason.noMotion:
+      case NoFootageReason.unknown:
+        return _placeholder(
+          icon: Icons.motion_photos_off_rounded,
+          iconColor: Colors.white38,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.blueGrey,
+        );
     }
-    // Records at other times (motion-gated gap) or unknown → calm.
-    return _placeholder(
-      icon: Icons.motion_photos_off_rounded,
-      iconColor: Colors.white38,
-      title: widget.recordsElsewhere == true
-          ? 'No motion during this time'
-          : 'No footage at this time',
-      subtitle: widget.recordsElsewhere == true
-          ? 'This camera records on motion'
-          : null,
-      tint: Colors.blueGrey,
-    );
   }
 
   Widget _placeholder({
@@ -2120,6 +2198,7 @@ class _PbTileState extends State<_PbTile> {
     required String title,
     String? subtitle,
     required Color tint,
+    VoidCallback? onRetry,
   }) {
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -2173,6 +2252,10 @@ class _PbTileState extends State<_PbTile> {
                       ),
                     ),
                   ],
+                  if (onRetry != null) ...[
+                    const SizedBox(height: 6),
+                    TextButton(onPressed: onRetry, child: const Text('Retry')),
+                  ],
                 ],
               ),
             ),
@@ -2191,6 +2274,7 @@ class _PbTileState extends State<_PbTile> {
   @override
   Widget build(BuildContext context) {
     final hasFootage = widget.pane.currentSegment != null;
+    final reason = hasFootage ? null : _noFootageReason();
     // Selected-tile outline follows the active tab accent (cyan on Playback).
     final accent = Theme.of(context).colorScheme.primary;
     return LayoutBuilder(
@@ -2238,7 +2322,8 @@ class _PbTileState extends State<_PbTile> {
                     ),
                   ),
                 ),
-                if (!hasFootage) Positioned.fill(child: _noFootageOverlay()),
+                if (!hasFootage)
+                  Positioned.fill(child: _noFootageOverlay(reason)),
                 // Filmstrip scrub frame: covers the (frozen) video while
                 // dragging so scrubbing is smooth and never flashes black.
                 // Zoomed with the same transform so it stays aligned.
@@ -2292,13 +2377,18 @@ class _PbTileState extends State<_PbTile> {
                     ),
                   ),
                 ),
-                if (!hasFootage)
-                  const Positioned(
+                if (reason != null)
+                  Positioned(
                     right: 6,
                     top: 6,
                     child: Text(
-                      'no footage',
-                      style: TextStyle(color: Colors.white38, fontSize: 10),
+                      reason.shortLabel,
+                      style: TextStyle(
+                        color: reason.isWarning
+                            ? Colors.amber.shade300
+                            : Colors.white38,
+                        fontSize: 10,
+                      ),
                     ),
                   ),
               ],

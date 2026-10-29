@@ -30,3 +30,27 @@ protected bookmarks can never quietly erode the disk savings a retention
 policy is meant to provide. If you need footage kept beyond its protection
 window, export it before the window ends. Editing a bookmark only changes
 its note; deleting the bookmark is the way to end protection early.
+
+## When a bookmark's footage has been deleted
+
+Unprotected bookmarks do not keep footage. Once retention deletes the
+recordings at a bookmark's moment, the bookmark stays in the list but its
+footage is gone. The desktop app marks such bookmarks with a **Footage
+deleted** badge, and opening one in playback says **Footage deleted** along
+with the time this camera's recordings now start, instead of a misleading
+"no motion" message.
+
+Crumb never removes these bookmarks on its own. When you want to tidy up,
+use **Remove expired** at the top of the bookmarks list: it asks once, then
+removes every bookmark whose footage is gone. A bookmark that falls in a
+short gap inside the footage you still have (no motion, or the camera was
+offline for a moment) is not counted as expired.
+
+## Deleting a bookmark
+
+Clicking the delete button asks for confirmation first. Hold **Shift** while
+clicking to delete straight away. Either way, a message with an **Undo**
+button appears for a few seconds; Undo puts the bookmark back with the same
+camera, time and note. If it was protected, the protection is restored too,
+for the time it had left (rounded up to whole days). A protection that had
+already run out is not restored.

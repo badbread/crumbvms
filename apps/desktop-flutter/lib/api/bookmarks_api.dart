@@ -31,6 +31,7 @@ class Bookmark {
     this.protectStartTs,
     this.protectEndTs,
     required this.createdAt,
+    this.footageExpired = false,
   });
 
   final String id; // UUID
@@ -39,12 +40,18 @@ class Bookmark {
   final String? cameraName;
   final DateTime ts;
   final String? description;
+
   /// While in the future, the footage window below is protected from
   /// auto-archive/delete. Null = not protected.
   final DateTime? protectUntil;
   final DateTime? protectStartTs;
   final DateTime? protectEndTs;
   final DateTime createdAt;
+
+  /// Server-computed: retention has deleted the footage at [ts] (it is older
+  /// than the camera's oldest remaining recording). False for a moment in a
+  /// recording gap, and false when the server predates the field.
+  final bool footageExpired;
 
   /// True while [protectUntil] is set and still in the future.
   bool get isProtected =>
@@ -66,7 +73,30 @@ class Bookmark {
         ? null
         : DateTime.tryParse(j['protect_end_ts'] as String),
     createdAt: DateTime.parse(j['created_at'] as String),
+    footageExpired: (j['footage_expired'] as bool?) ?? false,
   );
+
+  /// The protection to send when re-creating this bookmark (undo of a
+  /// delete), or null when it was not protected or its protection has already
+  /// lapsed at [now]. The server sets `protect_until = now + days`, so the
+  /// remaining time is rounded UP to whole days (clamped 1..30): the restored
+  /// protection can end up to a day later than the original, never earlier.
+  /// The pre/post window is taken from the stored window around [ts].
+  BookmarkProtection? restoreProtection(DateTime now) {
+    final until = protectUntil;
+    if (until == null || !until.isAfter(now)) return null;
+    final remaining = until.difference(now);
+    const day = Duration(days: 1);
+    final days = ((remaining.inSeconds + day.inSeconds - 1) ~/ day.inSeconds)
+        .clamp(1, 30);
+    final start = protectStartTs;
+    final end = protectEndTs;
+    return BookmarkProtection(
+      days: days,
+      preSeconds: start == null ? 60 : ts.difference(start).inSeconds,
+      postSeconds: end == null ? 300 : end.difference(ts).inSeconds,
+    );
+  }
 }
 
 /// Options for [BookmarksApi.createBookmark]'s optional retention protection.
@@ -177,6 +207,18 @@ extension BookmarksApi on CrumbApi {
     }
     return Bookmark.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
+
+  /// Re-create a deleted bookmark through POST /bookmarks (the undo of a
+  /// delete): same camera, moment, note and, while it has not lapsed, the same
+  /// protection window (see [Bookmark.restoreProtection]). The server assigns
+  /// a new id and creation time, and the caller becomes its creator.
+  Future<Bookmark> recreateBookmark(Session s, Bookmark b) => createBookmark(
+    s,
+    cameraId: b.cameraId,
+    ts: b.ts,
+    description: b.description,
+    protection: b.restoreProtection(DateTime.now()),
+  );
 
   /// PATCH /bookmarks/:id — edit the note (empty/null clears it).
   Future<Bookmark> updateBookmarkDescription(

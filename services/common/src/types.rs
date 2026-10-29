@@ -945,6 +945,11 @@ pub struct Bookmark {
     pub protect_end_ts: Option<DateTime<Utc>>,
     /// `bookmarks.created_at` — when the bookmark was made.
     pub created_at: DateTime<Utc>,
+    /// Computed: `true` when retention has deleted the footage at `ts` (no
+    /// segment covers it and it is older than the camera's oldest remaining
+    /// segment, or the camera has no segments at all). A moment that falls in a
+    /// recording gap inside the retained range is NOT expired.
+    pub footage_expired: bool,
 }
 
 // ─── motion grid (motion tuner) ────────────────────────────────────────────────

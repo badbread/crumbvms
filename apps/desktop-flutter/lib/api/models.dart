@@ -11,6 +11,8 @@ class Camera {
     required this.hasSub,
     required this.ptz,
     required this.servedBy,
+    this.oldestFootageTs,
+    this.recordingMode,
   });
 
   final String id; // UUID
@@ -20,6 +22,15 @@ class Camera {
   final bool ptz;
   final String servedBy; // "crumb" | "frigate"
 
+  /// Start of the camera's oldest remaining recorded segment (UTC). Null when
+  /// the camera has no footage, or the server predates the field. Anything
+  /// earlier has been deleted by retention.
+  final DateTime? oldestFootageTs;
+
+  /// Recording mode of the camera's effective policy: `"continuous"` or
+  /// `"motion"`. Null when the server predates the field.
+  final String? recordingMode;
+
   factory Camera.fromJson(Map<String, dynamic> j) => Camera(
     id: j['id'] as String,
     name: (j['name'] as String?) ?? '(unnamed)',
@@ -27,6 +38,10 @@ class Camera {
     hasSub: (j['has_sub'] as bool?) ?? false,
     ptz: (j['ptz'] as bool?) ?? false,
     servedBy: (j['served_by'] as String?) ?? 'crumb',
+    oldestFootageTs: j['oldest_footage_ts'] is String
+        ? DateTime.tryParse(j['oldest_footage_ts'] as String)?.toUtc()
+        : null,
+    recordingMode: j['recording_mode'] as String?,
   );
 }
 
