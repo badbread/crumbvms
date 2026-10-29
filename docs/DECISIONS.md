@@ -8,6 +8,70 @@ revisit.
 
 ---
 
+## 2026-10-29, `/timeline` merges contiguous segments into spans IN SQL (gaps-and-islands); the Rust merge stays as the test oracle
+
+**Context.** `GET /timeline` fetched every segment row in the window and merged
+contiguous runs in Rust. The desktop's 30-day coverage fetch (every 5 minutes
+per client) is ~650k rows per continuously recording camera; the api logged
+"large /timeline span-merge scan (audit Risk #4)" and shipped tens of MB of rows
+from Postgres per request only to collapse them into a handful of spans. The
+2026-08-07 intensity entry below left this path out of scope as "inherently
+O(rows)"; the row SCAN is still O(rows), but the transfer, row decoding and
+per-row allocation in the api need not be.
+
+**Decision.**
+
+- `db::timeline_merged_spans` runs a gaps-and-islands query: a window
+  `max(end_ts)` over the camera's earlier rows (ordered by `start_ts, id`)
+  flags a row as a span start when it is the camera's first row or starts more
+  than the 1 s tolerance after that running max; a running `sum` of the flags
+  numbers the islands; `GROUP BY (camera_id, island)` returns
+  `min(start_ts)`, `max(end_ts)`, `bool_or(has_motion)` and the first row's
+  stage. `count(*) OVER ()` gives the total, `LIMIT/OFFSET` pages in SQL.
+  Response shape, tolerance, first-wins stage, motion OR, ordering and
+  `total`/`has_more` semantics are unchanged; no client change, no migration.
+- The first row's stage is carried as `max(CASE WHEN is_start = 1 THEN stage END)`
+  rather than `(array_agg(stage ORDER BY …))[1]`: the ordered aggregate forced
+  a second full sort of every row (spilled ~36 MB to disk on 500k rows), the
+  CASE form lets Postgres hash-aggregate the few spans.
+- Ties on `start_ts` are now broken by `id` in both the SQL and the
+  `timeline_spans` row order, so "stage of the first segment" is deterministic
+  (it was planner-dependent before).
+- The old Rust merge moved to `db::merge_segments_into_spans` and is kept as the
+  executable specification: `timeline_sql_merge_edge_cases_match_reference` and
+  `timeline_sql_merge_random_fixtures_match_reference` assert the SQL equals it
+  (unpaginated and across many `limit`/`offset` pages, including past the end),
+  on hand-built edges (touching, 999 ms / exactly 1 000 ms / 1 001 ms gaps, a
+  segment contained in a longer one, mixed stages, window-straddling rows, two
+  cameras) and on seeded pseudo-random fixtures with overlaps and ties.
+
+**Measured** (Postgres 16, one camera, 500k contiguous 4 s rows with 500 gaps,
+30-day window, release build, warm cache): old path (fetch rows + Rust merge)
+~400 ms and ~500k rows / tens of MB transferred and decoded per request; new
+path ~245 ms with 500 rows returned. Server-side execution of the old
+`SELECT` alone was ~138 ms; the windowed query is ~300 ms of that work but
+removes the transfer and decode.
+
+**Rejected / not done.**
+
+- *A covering index `(camera_id, start_ts) INCLUDE (end_ts, has_motion, stage)`
+  for an index-only scan.* Not done: it is a migration on the hottest write
+  table (every recorded segment pays for it), touches recorder-adjacent schema,
+  and the remaining cost is per-row window evaluation, not heap fetches.
+- *A maintained span table updated by the recorder.* Rejected: it adds a write
+  path in the recorder (recorder correctness is sacred) and a second source of
+  truth that eviction/retention/reconcile would all have to keep in sync.
+- *Keep Rust merge, page earlier.* Rejected: `total` needs every span, so the
+  full window must be merged regardless.
+
+**Revisit triggers.**
+
+- `/timeline` still slow at much larger scale (many more cameras × long
+  retention): consider the covering index or a client-side incremental fetch.
+- Any change to merge semantics (tolerance, stage rule, motion rule): update
+  BOTH the SQL and `merge_segments_into_spans` in lockstep; the equivalence
+  tests will fail otherwise.
+
 ## 2026-10-08, Eviction under a full or missing disk: the archive tier gets its own floor, failing moves fall back to deleting live footage on the low disk, and sweeps never prune or write on an unconfirmed storage
 
 **Context.** Audit findings R2 to R7 against `services/recorder/src/archive.rs`:
