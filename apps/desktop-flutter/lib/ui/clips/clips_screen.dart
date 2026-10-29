@@ -41,6 +41,21 @@ import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 
 enum ClipsDensity { compact, normal, large }
 
+/// Toolbar icon for a tile size: more cells = smaller tiles.
+@visibleForTesting
+IconData clipsDensityIcon(ClipsDensity d) => switch (d) {
+  ClipsDensity.compact => Icons.apps, // 3x3: small tiles
+  ClipsDensity.normal => Icons.grid_view, // 2x2: medium
+  ClipsDensity.large => Icons.crop_square, // one: large
+};
+
+@visibleForTesting
+String clipsDensityLabel(ClipsDensity d) => switch (d) {
+  ClipsDensity.compact => 'small',
+  ClipsDensity.normal => 'medium',
+  ClipsDensity.large => 'large',
+};
+
 const _clipsPageSize = 200;
 const _thumbConcurrency = 6;
 // Digital-zoom ceiling for clips. Keep in sync with the _maxZoom constants,
@@ -268,9 +283,13 @@ class _ClipsScreenState extends State<ClipsScreen> {
     _load();
   }
 
-  void _cycleDensity() {
+  static ClipsDensity _nextDensity(ClipsDensity d) {
     const order = [ClipsDensity.compact, ClipsDensity.normal, ClipsDensity.large];
-    final next = order[(order.indexOf(_density) + 1) % order.length];
+    return order[(order.indexOf(d) + 1) % order.length];
+  }
+
+  void _cycleDensity() {
+    final next = _nextDensity(_density);
     setState(() => _density = next);
     _persistPrefs();
   }
@@ -417,9 +436,17 @@ class _ClipsScreenState extends State<ClipsScreen> {
               child: const Text('Now', style: TextStyle(fontSize: 12)),
             ),
           IconButton(
-            tooltip: 'Tiles: ${_density.name}',
+            tooltip:
+                'Tile size: ${clipsDensityLabel(_density)} '
+                '(click for ${clipsDensityLabel(_nextDensity(_density))})',
             onPressed: _cycleDensity,
-            icon: const Icon(Icons.grid_view, color: Colors.white70, size: 18),
+            // The icon shows the CURRENT size (it used to be a fixed grid
+            // icon whatever the setting).
+            icon: Icon(
+              clipsDensityIcon(_density),
+              color: Colors.white70,
+              size: 18,
+            ),
           ),
           IconButton(
             tooltip: 'Refresh',
