@@ -534,8 +534,25 @@ fun PlaybackScreen(
         if (state.scrubbing) {
             player.pause()
         } else {
+            // A live drag (below) leaves CLOSEST_SYNC set; frame stepping and
+            // every other seek rely on EXACT.
+            player.setSeekParameters(SeekParameters.EXACT)
             player.playWhenReady = state.playing
         }
+    }
+
+    // In-segment live drag: while the finger stays inside the segment the
+    // player already has loaded, seek it directly instead of showing filmstrip
+    // stills. CLOSEST_SYNC during the drag (snaps to a keyframe, so each seek
+    // is a cheap decode and the picture keeps up with the finger), EXACT on the
+    // release so playback resumes on the exact chosen instant. lastFedOffsetMs
+    // tracks the player's real position so the feed effect above stays in step.
+    LaunchedEffect(state.liveScrubSeek) {
+        val seek = state.liveScrubSeek ?: return@LaunchedEffect
+        if (state.currentSegmentUrl == null || lastFedUrl != state.currentSegmentUrl) return@LaunchedEffect
+        player.setSeekParameters(if (seek.exact) SeekParameters.EXACT else SeekParameters.CLOSEST_SYNC)
+        player.seekTo(seek.offsetMs)
+        lastFedOffsetMs = seek.offsetMs
     }
 
     // Listen for segment-ended (→ next segment), gapless auto-advance, and player
@@ -905,7 +922,9 @@ fun PlaybackScreen(
                             )
                         }
                         // Filmstrip thumbnail overlay during scrubbing
-                        if (state.scrubbing && state.scrubFrameUrl != null) {
+                        // (hidden while the drag is inside the loaded segment: the
+                        // live player is the preview then)
+                        if (state.scrubbing && state.scrubFrameUrl != null && !state.scrubInLoadedSegment) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
