@@ -11,24 +11,22 @@
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
+
 /// The four Plates layouts. Stored by [name] so adding a mode never renumbers
 /// an existing persisted value.
 enum PlatesViewMode { list, gallery, grouped, timeline }
 
-/// Which image(s) a plate preview shows: both the full camera frame and the
-/// cropped plate region, only the full frame, or only the crop. Stored by
-/// [name]. When both are shown, the layout depends on the view — the crop is
-/// pinned to a corner of the full frame in the compact/gallery thumbs, and set
-/// side-by-side in the list rows (which have the horizontal room).
+/// Gallery cards: show the plate crop as an inset over the frame ([both]) or
+/// the frame alone ([fullOnly]). Stored by [name]. The list no longer reads
+/// this: its one display control is [PlateDensity]. [cropOnly] is a retired
+/// value from the old "Show" menu, read back as [both].
 enum PlateImageDisplay { both, fullOnly, cropOnly }
 
-/// Where the plate crop is pinned over the full frame (compact/gallery thumbs),
-/// when both images are shown. Ignored in the side-by-side list layout.
+/// Gallery cards: the corner the plate inset is pinned to.
 enum PlateCropCorner { topLeft, topRight, bottomLeft, bottomRight }
 
-/// How large the plate crop renders — the pinned inset in gallery/compact
-/// thumbs, the crop column width in the side-by-side list, and the crop height
-/// in the detail pop-up.
+/// Gallery cards: how large the plate inset renders.
 enum PlateCropSize { small, medium, large }
 
 /// Reads/writes the Plates screen client preferences (view mode + how plate
@@ -44,6 +42,8 @@ class PlatesPrefs {
   static const String _kCropSize = 'crumb_plates_crop_size';
   static const String _kCollapse = 'crumb_plates_collapse_dupes';
   static const String _kShowWatchlist = 'crumb_plates_show_watchlist';
+  static const String _kDensity = 'crumb_plates_density';
+  static const String _kGroupByPlate = 'crumb_plates_group_by_plate';
 
   /// The last-used view mode, or [PlatesViewMode.list] when the operator has
   /// never changed it (or persistence is unavailable).
@@ -74,6 +74,9 @@ class PlatesPrefs {
     try {
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_kImageDisplay);
+      // The retired "crop only" mode has no gallery equivalent: show the
+      // inset (the plate is still the point of the card).
+      if (raw == PlateImageDisplay.cropOnly.name) return PlateImageDisplay.both;
       for (final m in PlateImageDisplay.values) {
         if (m.name == raw) return m;
       }
@@ -183,4 +186,57 @@ class PlatesPrefs {
       /* best-effort persistence */
     }
   }
+
+  /// The list's Density. When the operator never picked one, it is migrated
+  /// once from the retired list prefs: a "large" crop size becomes Large,
+  /// anything else Standard. Defaults to [PlateDensity.standard].
+  static Future<PlateDensity> getDensity() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kDensity);
+      for (final d in PlateDensity.values) {
+        if (d.name == raw) return d;
+      }
+      final migrated = densityFromLegacy(prefs.getString(_kCropSize));
+      await prefs.setString(_kDensity, migrated.name);
+      return migrated;
+    } catch (_) {
+      return PlateDensity.standard;
+    }
+  }
+
+  static Future<void> setDensity(PlateDensity d) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kDensity, d.name);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Whether the list groups reads of the same plate into one row. Defaults
+  /// to false (one row per pass, newest first).
+  static Future<bool> getGroupByPlate() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_kGroupByPlate) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> setGroupByPlate(bool on) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kGroupByPlate, on);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
 }
+
+/// One-time migration from the retired list "Crop size" pref to Density.
+PlateDensity densityFromLegacy(String? cropSize) =>
+    cropSize == PlateCropSize.large.name
+    ? PlateDensity.large
+    : PlateDensity.standard;
