@@ -3,8 +3,9 @@
 // Pure logic behind the redesigned Plates page ("plate desk"): density
 // metrics, plate classification (rails and filters), the derived hints
 // (NEW / UNUSUAL HOUR / Nx TODAY), group-by-plate flattening for a
-// fixed-extent list, compact relative-time text, and the batched, 60-second
-// plate-history cache. No widgets here, so all of it is unit-tested
+// fixed-extent list, compact relative-time text, the plate profile's visit
+// collapsing and summary sentence, and the batched, 60-second plate-history
+// cache. No widgets here, so all of it is unit-tested
 // (test/plate_desk_logic_test.dart).
 
 import 'dart:async';
@@ -12,6 +13,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'package:crumb_desktop/api/plate_desk_api.dart';
+import 'package:crumb_desktop/api/plates_api.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 
 // ─── density ───────────────────────────────────────────────────────────────
@@ -375,6 +377,153 @@ String fmtHour(int h) {
       : 'prev ${prev == null ? '-' : fmtAgo(prev, now)}, '
             'first ${fmtShortDate(s.firstSeen, now)}';
   return ('${s.total}x seen', second);
+}
+
+// ─── plate profile: visits and the summary sentence ────────────────────────
+
+/// Reads of one plate on the same camera no more than this far apart are one
+/// visit (a car pulling in, sitting at the gate, and leaving).
+const Duration kVisitGap = Duration(minutes: 5);
+
+/// One visit of a plate: consecutive reads on one camera, each within
+/// [kVisitGap] of the next.
+class PlateVisit {
+  PlateVisit(this.cameraId, this.reads);
+
+  final String cameraId;
+
+  /// Newest first.
+  final List<PlateRead> reads;
+
+  DateTime get start => reads.last.ts;
+  DateTime get end => reads.first.ts;
+  int get count => reads.length;
+
+  /// The most confident read (ties: the newest).
+  PlateRead get best {
+    var b = reads.first;
+    for (final r in reads) {
+      if ((r.confidence ?? 0) > (b.confidence ?? 0)) b = r;
+    }
+    return b;
+  }
+
+  double? get bestConfidence => best.confidence;
+}
+
+/// Collapse [reads] (any order) into visits, newest visit first. A read joins
+/// the newest open visit on its camera when it is within [gap] of that
+/// visit's oldest read; otherwise it starts a new visit.
+List<PlateVisit> collapseVisits(
+  List<PlateRead> reads, {
+  Duration gap = kVisitGap,
+}) {
+  final sorted = reads.toList()..sort((a, b) => b.ts.compareTo(a.ts));
+  final open = <String, List<PlateRead>>{};
+  final visits = <List<PlateRead>>[];
+  final cams = <List<PlateRead>, String>{};
+  for (final r in sorted) {
+    final cur = open[r.cameraId];
+    if (cur != null && cur.last.ts.difference(r.ts) <= gap) {
+      cur.add(r);
+      continue;
+    }
+    final v = <PlateRead>[r];
+    open[r.cameraId] = v;
+    visits.add(v);
+    cams[v] = r.cameraId;
+  }
+  return [for (final v in visits) PlateVisit(cams[v]!, v)];
+}
+
+/// "5 and 6 PM", "11 AM and 12 PM", "11 PM and 12 AM".
+String fmtHourRange(int h, int span) {
+  final a = h % 24;
+  final b = (h + span) % 24;
+  final aPm = a >= 12;
+  final bPm = b >= 12;
+  final a12 = a % 12 == 0 ? 12 : a % 12;
+  if (aPm == bPm && b != 0 && b != 12) return '$a12 and ${fmtHour(b)}';
+  return '${fmtHour(a)} and ${fmtHour(b)}';
+}
+
+/// The busiest window of [span] consecutive hours (wrapping at midnight):
+/// `(startHour, reads)`.
+(int, int) busiestHours(List<int> hours, int span) {
+  var bestH = 0;
+  var bestN = -1;
+  for (var h = 0; h < 24; h++) {
+    var n = 0;
+    for (var k = 0; k < span; k++) {
+      n += hours[(h + k) % 24];
+    }
+    if (n > bestN) {
+      bestN = n;
+      bestH = h;
+    }
+  }
+  return (bestH, bestN < 0 ? 0 : bestN);
+}
+
+/// The profile's plain-English summary, e.g. "Usually arrives between 5 and
+/// 6 PM, mostly on .06 LPR." [focus] is the read the profile was opened from;
+/// when its hour is unusual for this plate the summary says so.
+String plateSummary(
+  PlateStats s, {
+  required String Function(String cameraId) camName,
+  DateTime? focus,
+  DateTime? now,
+}) {
+  if (s.total <= 0) return '';
+  final n = now ?? DateTime.now();
+  final parts = <String>[];
+  String where() {
+    if (s.cameras.isEmpty) return '';
+    final top = s.cameras.first;
+    if (s.cameras.length == 1 || top.n / s.total >= 0.6) {
+      return ', mostly on ${camName(top.cameraId)}';
+    }
+    return ', across ${s.cameras.length} cameras';
+  }
+
+  if (s.isNew) {
+    final times = s.today == 1 ? 'once' : '${s.today} times';
+    final cam = s.cameras.isEmpty
+        ? ''
+        : ' on ${camName(s.cameras.first.cameraId)}';
+    parts.add('First seen today$cam, $times so far.');
+  } else if (s.total < 3) {
+    parts.add(
+      'Seen ${s.total == 1 ? 'once' : 'twice'} before, first on '
+      '${fmtShortDate(s.firstSeen, n)}${where()}.',
+    );
+  } else {
+    final (h1, n1) = busiestHours(s.hours, 1);
+    final (h3, n3) = busiestHours(s.hours, 3);
+    final String when;
+    if (n1 / s.total >= 0.25) {
+      when = 'Usually arrives between ${fmtHourRange(h1, 1)}';
+    } else if (n3 / s.total >= 0.4) {
+      when = 'Usually arrives between ${fmtHourRange(h3, 3)}';
+    } else {
+      when = 'Comes and goes at all hours';
+    }
+    parts.add('$when${where()}.');
+  }
+  if (focus != null && isUnusualHour(s.hours, focus.toLocal().hour)) {
+    final l = focus.toLocal();
+    final today = l.year == n.year && l.month == n.month && l.day == n.day;
+    final h12 = l.hour % 12 == 0 ? 12 : l.hour % 12;
+    final t =
+        '$h12:${l.minute.toString().padLeft(2, '0')} '
+        '${l.hour < 12 ? 'AM' : 'PM'}';
+    parts.add(
+      today
+          ? "Today's $t read is unusual for this plate."
+          : 'The $t read on ${fmtShortDate(focus, n)} is unusual for this plate.',
+    );
+  }
+  return parts.join(' ');
 }
 
 // ─── history cache ──────────────────────────────────────────────────────────

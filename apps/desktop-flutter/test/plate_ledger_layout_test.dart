@@ -138,4 +138,44 @@ void main() {
     expect(c.frame || c.crop, isFalse);
     expect(c.spark, isTrue);
   });
+
+  for (final size in [const Size(760, 700), const Size(1300, 900)]) {
+    testWidgets('plate profile at ${size.width} px lays out', (tester) async {
+      await tester.binding.setSurfaceSize(size);
+      final s = _busyStats();
+      for (final stats in [s, null]) {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: debugPlateProfile(
+                focus: long,
+                stats: stats == null
+                    ? null
+                    : PlateStats(
+                        plate: s.plate,
+                        total: s.total,
+                        seen7d: s.seen7d,
+                        seen30d: s.seen30d,
+                        firstSeen: s.firstSeen,
+                        lastSeen: s.lastSeen,
+                        prevSeen: s.prevSeen,
+                        cameras: const [
+                          PlateCameraCount('cam', 40),
+                          PlateCameraCount('cam2', 4),
+                        ],
+                        hours: s.hours,
+                        days30: s.days30,
+                      ),
+                watched: true,
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(tester.takeException(), isNull);
+        expect(find.textContaining('Back to plates'), findsOneWidget);
+      }
+      await tester.binding.setSurfaceSize(null);
+    });
+  }
 }

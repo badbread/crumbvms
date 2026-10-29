@@ -55,9 +55,9 @@ A coloured stripe on the left edge marks watchlist plates (pink), new plates
 (green) and regulars (amber).
 
 Hover over a plate crop to see a larger view of the frame with the plate
-outlined. Click a row to play the clip of that read; the actions menu at the
-end of the row copies the plate, names it, adds it to the watchlist, or makes
-a PDF report.
+outlined. Click a row to open the plate's profile (below); the actions menu at
+the end of the row copies the plate, names it, adds it to the watchlist, or
+makes a PDF report.
 
 ### Density
 
@@ -77,15 +77,36 @@ arrow) to unfold the earlier reads under it.
 The list loads 200 reads at a time. **Load more** at the bottom fetches the
 next 200 for the same search and time range.
 
+## Plate profile
+
+Clicking a row opens everything known about that plate:
+
+- the plate, the crop from the read you clicked, its name (admins can edit it
+  with the pencil) and the watchlist star (admins can add or remove it),
+- first and last seen, total reads, and reads in the last 30 and 7 days,
+- a one-line summary in plain English, for example "Usually arrives between
+  5 and 6 PM, mostly on Driveway LPR", which also points out when the read you
+  opened came at an unusual hour for this plate,
+- a 30-day activity chart, a 24-hour clock showing when the plate usually
+  shows up (midnight at the top), and which cameras see it most,
+- its recent visits. Reads on the same camera a few minutes apart count as one
+  visit, so a car sitting at the gate is one line, not ten. Click a visit to
+  play its clip (or jump to the timeline when there is no clip).
+
+**Play clip**, **View on timeline**, **Copy plate** and **Report** act on the
+read you opened the profile from. Press Esc or **Back to plates** to return to
+the list; with the profile open, `j` and `k` step to the next and previous
+plate in the list.
+
 ## Keyboard
 
 | Key | Action |
 |---|---|
 | `j` or Down | next row |
 | `k` or Up | previous row |
-| Enter | open the selected row |
+| Enter | open the selected plate's profile |
 | Right / Left | unfold / fold a grouped plate |
-| Esc | clear the selection |
+| Esc | close the profile, or clear the selection |
 | `1`, `2`, `3` | Compact, Standard, Large |
 
 The keys do nothing while you are typing in the search box.

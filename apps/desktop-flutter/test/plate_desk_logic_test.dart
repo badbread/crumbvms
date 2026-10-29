@@ -410,4 +410,199 @@ void main() {
       cache.dispose();
     });
   });
+
+  group('visits', () {
+    PlateRead r(String cam, int minAgo, {double conf = 0.9}) => PlateRead(
+      id: '$cam-$minAgo',
+      cameraId: cam,
+      ts: _t0.subtract(Duration(minutes: minAgo)),
+      plate: 'ABC123',
+      plateRaw: 'ABC123',
+      confidence: conf,
+      region: null,
+      sourceId: 'frigate',
+      eventId: null,
+      snapshotUrl: null,
+      displayName: null,
+      bbox: null,
+    );
+
+    test('reads within 5 min on one camera are one visit', () {
+      final v = collapseVisits([
+        r('A', 0),
+        r('A', 3, conf: 0.99),
+        r('A', 7), // 4 min after the previous read: same visit
+        r('A', 20), // 13 min gap: new visit
+        r('B', 1), // other camera: its own visit
+      ]);
+      expect(v.length, 3);
+      expect(v[0].cameraId, 'A');
+      expect(v[0].count, 3);
+      expect(v[0].best.id, 'A-3');
+      expect(v[0].start, _t0.subtract(const Duration(minutes: 7)));
+      expect(v[0].end, _t0);
+      expect(v[1].cameraId, 'B');
+      expect(v[2].count, 1);
+      expect(v[2].reads.single.id, 'A-20');
+    });
+
+    test('input order does not matter', () {
+      final a = collapseVisits([r('A', 20), r('A', 0), r('A', 3)]);
+      expect(a.map((v) => v.count), [2, 1]);
+      expect(collapseVisits(const []), isEmpty);
+    });
+  });
+
+  group('summary sentence', () {
+    String cam(String id) => id == 'lpr' ? '.06 LPR' : 'Driveway';
+
+    test('regular evening arrival, mostly one camera', () {
+      final hours = List<int>.filled(24, 0)
+        ..[17] = 30
+        ..[18] = 6
+        ..[8] = 4;
+      final s = PlateStats(
+        plate: 'X',
+        total: 40,
+        seen7d: 9,
+        seen30d: 20,
+        firstSeen: DateTime(2026, 3, 14),
+        lastSeen: DateTime(2026, 10, 29, 17, 42),
+        prevSeen: DateTime(2026, 10, 28, 17, 31),
+        cameras: const [PlateCameraCount('lpr', 32), PlateCameraCount('dw', 8)],
+        hours: hours,
+        days30: List<int>.filled(30, 0)..[29] = 1,
+      );
+      expect(
+        plateSummary(s, camName: cam),
+        'Usually arrives between 5 and 6 PM, mostly on .06 LPR.',
+      );
+      final now = DateTime(2026, 10, 29, 18);
+      expect(
+        plateSummary(
+          s,
+          camName: cam,
+          focus: DateTime(2026, 10, 29, 2, 10),
+          now: now,
+        ),
+        "Usually arrives between 5 and 6 PM, mostly on .06 LPR. "
+        "Today's 2:10 AM read is unusual for this plate.",
+      );
+    });
+
+    test('spread across hours and cameras', () {
+      final s = PlateStats(
+        plate: 'X',
+        total: 48,
+        seen7d: 1,
+        seen30d: 10,
+        firstSeen: DateTime(2026, 3, 14),
+        lastSeen: DateTime(2026, 10, 29),
+        prevSeen: null,
+        cameras: const [
+          PlateCameraCount('lpr', 24),
+          PlateCameraCount('dw', 24),
+        ],
+        hours: List<int>.filled(24, 2),
+        days30: List<int>.filled(30, 0)..[29] = 1,
+      );
+      expect(
+        plateSummary(s, camName: cam),
+        'Comes and goes at all hours, across 2 cameras.',
+      );
+    });
+
+    test('three-hour window when no single hour dominates', () {
+      final hours = List<int>.filled(24, 0)
+        ..[7] = 4
+        ..[8] = 4
+        ..[9] = 4
+        ..[20] = 2;
+      final s = PlateStats(
+        plate: 'X',
+        total: 20,
+        seen7d: 1,
+        seen30d: 10,
+        firstSeen: DateTime(2026, 3, 14),
+        lastSeen: DateTime(2026, 10, 29),
+        prevSeen: null,
+        cameras: const [PlateCameraCount('dw', 20)],
+        hours: hours..[14] = 6,
+        days30: List<int>.filled(30, 0)..[29] = 1,
+      );
+      // Busiest hour has 6 of 20 = 30%: one-hour window wins.
+      expect(
+        plateSummary(s, camName: cam),
+        startsWith('Usually arrives between 2 and 3 PM'),
+      );
+      hours[14] = 3; // now 3 of 17 < 25%, 7-10 AM holds 12 of 17
+      final s2 = PlateStats(
+        plate: 'X',
+        total: 17,
+        seen7d: 1,
+        seen30d: 10,
+        firstSeen: s.firstSeen,
+        lastSeen: s.lastSeen,
+        prevSeen: null,
+        cameras: s.cameras,
+        hours: hours,
+        days30: s.days30,
+      );
+      expect(
+        plateSummary(s2, camName: cam),
+        'Usually arrives between 7 and 10 AM, mostly on Driveway.',
+      );
+    });
+
+    test('new and rarely seen plates', () {
+      final n = PlateStats(
+        plate: 'X',
+        total: 2,
+        seen7d: 2,
+        seen30d: 2,
+        firstSeen: DateTime(2026, 10, 29, 9),
+        lastSeen: DateTime(2026, 10, 29, 10),
+        prevSeen: null,
+        cameras: const [PlateCameraCount('dw', 2)],
+        hours: List<int>.filled(24, 0),
+        days30: List<int>.filled(30, 0)..[29] = 2,
+      );
+      expect(
+        plateSummary(n, camName: cam),
+        'First seen today on Driveway, 2 times so far.',
+      );
+      final rare = PlateStats(
+        plate: 'X',
+        total: 2,
+        seen7d: 1,
+        seen30d: 1,
+        firstSeen: DateTime(2026, 6, 3, 9),
+        lastSeen: DateTime(2026, 10, 29, 10),
+        prevSeen: DateTime(2026, 6, 3, 9),
+        cameras: const [PlateCameraCount('dw', 2)],
+        hours: List<int>.filled(24, 0),
+        days30: List<int>.filled(30, 0)..[29] = 1,
+      );
+      expect(
+        plateSummary(rare, camName: cam, now: DateTime(2026, 10, 29, 12)),
+        'Seen twice before, first on Jun 3, mostly on Driveway.',
+      );
+    });
+
+    test('hour ranges', () {
+      expect(fmtHourRange(17, 1), '5 and 6 PM');
+      expect(fmtHourRange(11, 1), '11 AM and 12 PM');
+      expect(fmtHourRange(23, 1), '11 PM and 12 AM');
+      expect(fmtHourRange(7, 3), '7 and 10 AM');
+      expect(
+        busiestHours(
+          List<int>.filled(24, 0)
+            ..[23] = 3
+            ..[0] = 3,
+          2,
+        ),
+        (23, 6),
+      );
+    });
+  });
 }

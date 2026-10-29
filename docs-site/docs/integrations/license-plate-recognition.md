@@ -147,7 +147,7 @@ without retyping it.
 ## Reviewing plates on the desktop
 
 The desktop app's Plates tab shows today's totals, which plates are regulars
-and which are new, and each plate's history. See
+and which are new, each plate's history, and a profile per plate. See
 [The Plates page](./plates-page.md).
 
 ## Searching and retention

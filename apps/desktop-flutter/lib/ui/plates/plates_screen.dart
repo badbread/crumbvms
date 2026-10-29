@@ -27,6 +27,7 @@
 // provider URL.
 
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show listEquals, visibleForTesting;
@@ -52,6 +53,7 @@ import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 
 part 'plate_ledger.dart';
+part 'plate_profile.dart';
 
 /// A plate-hit clip that stalls this long without progressing is retried (the
 /// clip is transcoded on demand server-side, so a cold clip can be slow). Same
@@ -131,6 +133,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
   // The read whose pop-up clip player is open (null = none). Set by tapping a
   // row that has a linked detection event; the overlay plays that read's clip.
   PlateRead? _playing;
+
+  // The plate profile covering the results area (null = closed). Opened from
+  // any row; the clip player can still open on top of it.
+  PlateRead? _profile;
 
   // Watchlist side panel. Readable by any account that can see this tab; the
   // add/remove affordances are gated on [widget.canManageWatchlist].
@@ -407,8 +413,14 @@ class _PlatesScreenState extends State<PlatesScreen> {
   bool _onListKey(KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
     if (!mounted || _playing != null) return false;
-    if (_viewMode != PlatesViewMode.list) return false;
     if (hotkeyContextBlocked(context)) return false;
+    if (_profile != null &&
+        event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      _closeProfile();
+      return true;
+    }
+    if (_viewMode != PlatesViewMode.list) return false;
     final keys = HardwareKeyboard.instance;
     if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
       return false;
@@ -459,7 +471,14 @@ class _PlatesScreenState extends State<PlatesScreen> {
   }
 
   void _select(int i) {
-    setState(() => _selected = i);
+    setState(() {
+      _selected = i;
+      // An open profile follows the selection, so j/k pages through plates.
+      if (_profile != null && i >= 0 && i < _entries.length) {
+        _profile = _entries[i].group.representative;
+        _stats.want([_profile!.plate]);
+      }
+    });
     if (!_listScroll.hasClients) return;
     final extent = densityMetrics(_density).rowExtent;
     final top = i * extent;
@@ -472,7 +491,101 @@ class _PlatesScreenState extends State<PlatesScreen> {
     }
   }
 
-  void _openEntry(LedgerEntry e) => _openRead(e.group.representative);
+  void _openEntry(LedgerEntry e) => _openProfile(e.group.representative);
+
+  void _openProfile(PlateRead read) {
+    _hideLoupe();
+    _stats.want([read.plate]);
+    setState(() => _profile = read);
+  }
+
+  void _closeProfile() => setState(() => _profile = null);
+
+  /// The newest server-resolved name for [plate] among the loaded reads.
+  String? _nameFor(String plate, String? fallback) {
+    for (final p in _plates) {
+      if (p.plate == plate) return p.displayName;
+    }
+    return fallback;
+  }
+
+  PlateWatchlistEntry? _watchEntryFor(String plate) {
+    for (final e in _watchlist) {
+      if (e.plate == plate) return e;
+    }
+    return null;
+  }
+
+  Future<void> _unwatchPlate(PlateWatchlistEntry entry) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove ${entry.plate} from the watchlist?'),
+        content: const Text(
+          'You will no longer be alerted when this plate is read.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      await _removeFromWatchlist(entry);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e is CrumbApiException && e.statusCode == 403
+                ? 'Only admins can manage the watchlist.'
+                : 'Remove from watchlist failed: $e',
+          ),
+        ),
+      );
+    }
+  }
+
+  Widget _buildProfile(PlateRead focus) {
+    final byId = {for (final c in widget.cameras) c.id: c};
+    _stats.want([focus.plate]);
+    final entry = _watchEntryFor(focus.plate);
+    return _PlateProfile(
+      key: ValueKey('profile:${focus.plate}'),
+      focus: focus,
+      stats: _stats[focus.plate],
+      statsUnsupported: _stats.unsupported,
+      displayName: _nameFor(focus.plate, focus.displayName),
+      watchEntry: entry,
+      cameraIds: [for (final c in widget.cameras) c.id],
+      camName: (id) => byId[id]?.name ?? '(unknown camera)',
+      api: widget.api,
+      session: widget.session,
+      gate: _thumbGate,
+      canManage: widget.canManageWatchlist,
+      canName: widget.canNamePlates,
+      onClose: _closeProfile,
+      onPlay: _openRead,
+      onTimeline: (r) {
+        setState(() => _profile = null);
+        widget.onViewFootage(r.cameraId, r.ts);
+      },
+      onName: () =>
+          _namePlate(focus.plate, _nameFor(focus.plate, focus.displayName)),
+      onWatch: () => _addReadToWatchlist(focus),
+      onUnwatch: () {
+        if (entry != null) _unwatchPlate(entry);
+      },
+      onReport: _openPlateReport,
+    );
+  }
 
   /// The plate desk list: header, column titles, the fixed-extent ledger and
   /// a "Load more" footer.
@@ -1004,7 +1117,15 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 Expanded(
                   child: Row(
                     children: [
-                      Expanded(child: _buildBody(context)),
+                      Expanded(
+                        child: Stack(
+                          children: [
+                            Positioned.fill(child: _buildBody(context)),
+                            if (_profile != null)
+                              Positioned.fill(child: _buildProfile(_profile!)),
+                          ],
+                        ),
+                      ),
                       if (_showWatchlist)
                         _WatchlistPanel(
                           entries: _watchlist,
@@ -1302,7 +1423,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
       );
     }
     final byId = {for (final c in widget.cameras) c.id: c};
-    final watched = {for (final e in _watchlist) e.plate};
+    final watched = {
+      for (final e in _watchlist)
+        if (!e.isIgnore) e.plate,
+    };
     String camName(String id) => byId[id]?.name ?? '(unknown camera)';
     switch (_viewMode) {
       case PlatesViewMode.list:
