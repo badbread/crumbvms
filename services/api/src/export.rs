@@ -268,6 +268,9 @@ async fn create_export(
         output_files: vec![],
         error: None,
         progress_pct: 0,
+        current_clip: 0,
+        clip_count: 0,
+        phase: String::new(),
     };
 
     // Insert BEFORE spawning so a poll arriving immediately can find it.
@@ -1627,6 +1630,9 @@ async fn create_batch_export(
         output_files: vec![],
         error: None,
         progress_pct: 0,
+        current_clip: 0,
+        clip_count: 0,
+        phase: String::new(),
     };
     state.export_jobs().insert(job_id, job);
     persist_job_async(&state, job_id);
@@ -1896,11 +1902,15 @@ async fn run_batch_export_job(
     }
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    let slices = clip_progress_slices(&items);
     for (idx, (camera_id, start, end)) in items.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)]
-        let cam_base_pct = (idx * 100 / n).min(99) as u8;
-        #[allow(clippy::cast_possible_truncation)]
-        let cam_range_pct = (100 / n).clamp(1, 100) as u8;
+        let (cam_base_pct, cam_range_pct) = slices[idx];
+        if let Some(mut job) = state.export_jobs().get_mut(&job_id) {
+            job.current_clip = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            job.clip_count = u32::try_from(n).unwrap_or(u32::MAX);
+            "encoding".clone_into(&mut job.phase);
+            job.progress_pct = cam_base_pct;
+        }
         let stem = clip_file_stem(&cam_names[camera_id], *start, *end, tz);
         let filename = unique_file_name(&mut used_names, &stem, ext);
         let concat_name = format!("batch_{idx}_concat.txt");
@@ -1946,6 +1956,10 @@ async fn run_batch_export_job(
             "no footage found for any clip in the list".to_owned(),
         );
         return;
+    }
+
+    if let Some(mut job) = state.export_jobs().get_mut(&job_id) {
+        "packaging".clone_into(&mut job.phase);
     }
 
     // Packaging rule: zip iff a password is set, or package is "zip" and more than
@@ -2023,6 +2037,32 @@ fn set_job_status(state: &AppState, job_id: Uuid, status: ExportStatus) {
     persist_job_async(state, job_id);
 }
 
+/// Each clip's `(base, range)` slice of the 0-100 bar, proportional to its share
+/// of the batch's total footage time (it used to be 1/n each, so a 10 s clip
+/// and a 20 min clip in one batch took the same width). Slices are contiguous,
+/// every clip gets at least 1, and the last one ends at 99: 100 is set only
+/// when the whole job, packaging included, is done.
+fn clip_progress_slices(
+    items: &[(Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)],
+) -> Vec<(u8, u8)> {
+    let durs: Vec<i64> = items
+        .iter()
+        .map(|(_, s, e)| (*e - *s).num_milliseconds().max(1))
+        .collect();
+    let total: i64 = durs.iter().sum::<i64>().max(1);
+    let mut out = Vec::with_capacity(durs.len());
+    let mut acc = 0_i64;
+    for d in &durs {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let base = (acc * 99 / total) as u8;
+        acc += d;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let end = (acc * 99 / total) as u8;
+        out.push((base, end.saturating_sub(base).max(1)));
+    }
+    out
+}
+
 /// Read ffmpeg's `-progress pipe:2` output and translate elapsed time into a
 /// `progress_pct` update on the in-memory job.
 ///
@@ -2069,6 +2109,30 @@ async fn update_progress_from_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_slices_follow_clip_length() {
+        let t0 = Utc::now();
+        let cam = Uuid::new_v4();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        // 10 s then 90 s: the long clip gets ~9x the width.
+        let s = clip_progress_slices(&[(cam, at(0), at(10)), (cam, at(0), at(90))]);
+        assert_eq!(s, vec![(0, 9), (9, 90)]);
+        // Contiguous, ending at 99 (100 is reserved for "done").
+        let s = clip_progress_slices(&[
+            (cam, at(0), at(30)),
+            (cam, at(0), at(30)),
+            (cam, at(0), at(40)),
+        ]);
+        assert_eq!(s[0].0, 0);
+        for w in s.windows(2) {
+            assert_eq!(w[0].0 + w[0].1, w[1].0);
+        }
+        assert_eq!(s[2].0 + s[2].1, 99);
+        // A tiny clip still gets a sliver.
+        let s = clip_progress_slices(&[(cam, at(0), at(1)), (cam, at(0), at(3600))]);
+        assert!(s[0].1 >= 1);
+    }
 
     /// Cancelling a job must KILL and REAP the ffmpeg child (no zombie). We stand
     /// a long-lived `sleep` in for ffmpeg: a pre-cancelled token drives

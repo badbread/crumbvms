@@ -95,6 +95,9 @@ fn seed_done_job(app: &TestApp, outputs: &[(Uuid, &str, &str)], status: ExportSt
             output_files: files,
             error: None,
             progress_pct: 100,
+            current_clip: 0,
+            clip_count: 0,
+            phase: String::new(),
         },
     );
     job_id

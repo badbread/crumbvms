@@ -1553,6 +1553,14 @@ pub struct ExportJob {
     pub error: Option<String>,
     /// Progress 0–100, updated during the ffmpeg run.
     pub progress_pct: u8,
+    /// Batch jobs: the 1-based clip being encoded, and how many there are.
+    /// Both 0 when unknown (single-range exports, jobs restored from storage).
+    pub current_clip: u32,
+    pub clip_count: u32,
+    /// What the job is doing while running: `"encoding"` (ffmpeg), or
+    /// `"packaging"` (building the zip, which can take a while for large
+    /// exports). Empty when unknown.
+    pub phase: String,
 }
 
 /// A single exported file for one camera (or the whole-job ZIP archive).
