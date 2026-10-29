@@ -274,6 +274,31 @@ extension ExportApi on CrumbApi {
     }
   }
 
+  /// Fetch the pre-generated scrub sprite strip of the segment covering `ts`
+  /// (`GET /filmstrip/{cameraId}/sprite`), via a scoped `?token=` like
+  /// [fetchFilmstripFrame]. Returns the raw headers + bytes on 200 (the
+  /// caller parses the layout: see `ScrubSprite.fromResponse`), and null on
+  /// anything else: 404 means "not generated yet" (or no footage), and the
+  /// caller falls back to [fetchFilmstripFrame].
+  Future<({Map<String, String> headers, Uint8List bytes})?> fetchScrubSprite(
+    Session s,
+    String cameraId,
+    DateTime ts,
+  ) async {
+    final tok = await mintMediaToken(s, cameraId);
+    if (tok == null) return null;
+    final uri = Uri.parse('${s.base}/filmstrip/$cameraId/sprite').replace(
+      queryParameters: {'ts': ts.toUtc().toIso8601String(), 'token': tok},
+    );
+    try {
+      final resp = await sharedHttpClient.get(uri);
+      if (resp.statusCode != 200) return null;
+      return (headers: resp.headers, bytes: resp.bodyBytes);
+    } catch (_) {
+      return null;
+    }
+  }
+
   // ── POST /export/batch ────────────────────────────────────────────────────
 
   /// Submit a batch export job: a list of `{camera_id, start, end}` clips
