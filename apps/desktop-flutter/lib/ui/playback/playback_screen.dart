@@ -174,6 +174,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     session: widget.session,
   );
   Timer? _motionDebounce;
+  bool _motionForcePending = false;
 
   // Debounced write of the timeline zoom span to shared_preferences, so a
   // continuous wheel-zoom / repeated ±-button press persists only the settled
@@ -319,9 +320,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   /// Keep the motion controller's window/selection in step with the scrubber,
-  /// then (debounced) refetch intensity + detections. [force] bypasses the
-  /// controller's "same window already loaded" skip (used by the periodic
-  /// full re-fetch).
+  /// then refetch intensity + detections at most every 350 ms. [force]
+  /// bypasses the controller's "same window already loaded" skip (used by
+  /// the periodic full re-fetch).
+  ///
+  /// A throttle, not a debounce: during playback the playhead (and the
+  /// window re-centred on it) changes every 100 ms tick, and restarting a
+  /// 350 ms debounce on each change meant it never fired, so motion/HA
+  /// markers stayed blank until the operator paused. A pending timer is left
+  /// alone and fires with the latest [configure]d window; the controller's
+  /// fetch-range signature makes repeat calls for the same range no-ops.
   void _scheduleMotionRefresh({bool force = false}) {
     _motion.configure(
       windowStartMs: _timeline.windowStart.millisecondsSinceEpoch,
@@ -329,11 +337,13 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       wallCameraIds: _cameraIds,
       selectedCameraId: _maximizedCameraId ?? _selectedCameraId,
     );
-    _motionDebounce?.cancel();
-    _motionDebounce = Timer(
-      const Duration(milliseconds: 350),
-      () => _motion.refresh(force: force),
-    );
+    _motionForcePending = _motionForcePending || force;
+    if (_motionDebounce?.isActive ?? false) return;
+    _motionDebounce = Timer(const Duration(milliseconds: 350), () {
+      final f = _motionForcePending;
+      _motionForcePending = false;
+      _motion.refresh(force: f);
+    });
   }
 
   /// Seek the playhead to `ms` epoch (from a motion-strip click / prev-next).
