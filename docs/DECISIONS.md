@@ -8,6 +8,54 @@ revisit.
 
 ---
 
+## 2026-10-29, Batch export: friendly file names, optional zipping, and a server-side size estimate
+
+**Context.** Batch export named clips `clip01_<8 hex of camera uuid>` on disk and
+`clip01_<cam8>_<UTC timestamp>` in the zip, and always zipped more than one
+clip. Operators found the names unreadable and wanted plain files. The desktop
+size estimate was a flat 10 Mbps guess and came out 2.2x low on a real export
+(397 MB estimated, 874 MB actual, 4 clips, 3 cameras, copy codec).
+
+**Decision.**
+
+- Every clip (disk file and zip entry alike) is named
+  `{Camera Name} {YYYY-MM-DD} {HH.MM.SS}-{HH.MM.SS}.{ext}` in the server's local
+  zone (`server_tz`), or `{Camera Name} {date time} to {date time}` when it
+  crosses local midnight. The name is sanitized for Windows and POSIX (illegal
+  characters and control characters become `_`, whitespace collapsed, trailing
+  dots and spaces trimmed, camera part capped at 60 chars, Windows reserved
+  device names prefixed `_`) and de-duplicated with ` (2)`, ` (3)`.
+- `package` on `POST /export/batch`: `"zip"` (default, unchanged for Android and
+  iOS) or `"files"`. A password forces zip (`files` + password is a 400). In
+  `files` mode `output_files` has one entry per clip.
+- `GET /export/:job_id/output/:index` downloads an `output_files` entry by
+  position, because one camera can have several clips and
+  `/files/:camera_id` cannot address them. The old routes stay. Content-Disposition
+  is RFC 6266 (`filename*=UTF-8''` plus an ASCII fallback). The zip is offered as
+  `Crumb export {YYYY-MM-DD HH.MM}.zip` through a new `download_name` field
+  (`#[serde(default)]`, so persisted rows still load); the disk name stays
+  `crumb_export.zip`.
+- `POST /export/estimate` returns, per clip, the sum over the `main` segments the
+  export would use of `size_bytes * overlap / segment duration` (one SQL
+  aggregate, no file I/O) plus the footage seconds. It models a copy-codec export;
+  clients scale it for a re-encode.
+
+**Rejected.** A flat bitrate guess (what failed: real cameras vary 3x or more, and
+motion-mode recordings have gaps). Estimating from `ffprobe` of the files
+(file I/O per segment, too slow for a live dialog). Naming from the camera uuid
+(unreadable) or UTC times (wrong for operators reading the file later).
+Dropping the zip entirely (still the right default for a multi-clip hand-off and
+for a password).
+
+**Accepted trade-offs.** The estimate ignores container overhead and burn-in
+re-encode; the single-camera `POST /export` path keeps its uuid-based names
+(one file per camera, no ambiguity) and old URLs.
+
+**Revisit when** a client needs per-clip re-encode size accuracy beyond a scale
+factor, or the single-camera `POST /export` path is retired in favor of batch.
+
+---
+
 ## 2026-10-08, Eviction under a full or missing disk: the archive tier gets its own floor, failing moves fall back to deleting live footage on the low disk, and sweeps never prune or write on an unconfirmed storage
 
 **Context.** Audit findings R2 to R7 against `services/recorder/src/archive.rs`:

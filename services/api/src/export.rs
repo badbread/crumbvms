@@ -66,7 +66,8 @@ use crumb_common::types::Segment;
 use crate::{
     auth_mw::AuthUser,
     dto::{
-        CreateBatchExportRequest, CreateExportRequest, CreateExportResponse, ExportJob,
+        BatchExportItem, CreateBatchExportRequest, CreateExportRequest, CreateExportResponse,
+        ExportEstimateClip, ExportEstimateRequest, ExportEstimateResponse, ExportJob,
         ExportOutputFile, ExportStatus,
     },
     error::ApiError,
@@ -78,6 +79,9 @@ use crate::{
 /// Absolute path to the ffmpeg binary inside the container runtime image.
 /// The Dockerfile symlinks `/usr/lib/jellyfin-ffmpeg/ffmpeg` to this path.
 const FFMPEG_BIN: &str = "/usr/local/bin/ffmpeg";
+
+/// One validated batch clip: `(camera, start, end)`.
+type BatchClip = (Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>);
 
 /// Upper bound on clips in a single batch export job (guards ffmpeg fan-out).
 const MAX_BATCH_ITEMS: usize = 50;
@@ -182,6 +186,7 @@ pub fn routes() -> Router<AppState> {
         // Static path registered before the dynamic `:job_id` route below; matchit
         // gives static segments priority so `/export/batch` never resolves to a job id.
         .route("/export/batch", post(create_batch_export))
+        .route("/export/estimate", post(estimate_export))
         .route(
             "/export/:job_id",
             get(get_export_status).delete(cancel_export),
@@ -191,6 +196,7 @@ pub fn routes() -> Router<AppState> {
             get(download_export_file),
         )
         .route("/export/:job_id/archive", get(download_archive))
+        .route("/export/:job_id/output/:index", get(download_output))
 }
 
 // ─── POST /export ─────────────────────────────────────────────────────────────
@@ -507,16 +513,17 @@ async fn download_export_file(
     let stream = ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
     // Use the stored filename as the download name.
-    let dl_name = output_entry.filename.clone();
+    let dl_name = if output_entry.download_name.is_empty() {
+        output_entry.filename.clone()
+    } else {
+        output_entry.download_name.clone()
+    };
 
     let response = axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, output_entry.size_bytes.to_string())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{dl_name}\""),
-        )
+        .header(header::CONTENT_DISPOSITION, content_disposition(&dl_name))
         .body(body)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build download response: {e}")))?;
 
@@ -618,12 +625,388 @@ async fn download_archive(
         .header(header::CONTENT_LENGTH, archive_entry.size_bytes.to_string())
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"crumb_export.zip\"",
+            content_disposition(if archive_entry.download_name.is_empty() {
+                "crumb_export.zip"
+            } else {
+                &archive_entry.download_name
+            }),
         )
         .body(body)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build archive response: {e}")))?;
 
     Ok(response)
+}
+
+// ─── GET /export/{job_id}/output/{index} ──────────────────────────────────────
+
+/// Download one entry of a job's `output_files` by its 0-based index.
+///
+/// A batch job can hold several clips from the SAME camera, so
+/// `/export/:job_id/files/:camera_id` cannot address them; this route can.
+/// Auth mirrors the older routes: `Authorization: Bearer` only, then
+/// `assert_camera_access` on the entry's camera, or (for the nil-camera ZIP
+/// entry) access to EVERY camera in the job, exactly like `download_archive`.
+async fn download_output(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((job_id, index)): Path<(Uuid, usize)>,
+) -> Result<impl IntoResponse, ApiError> {
+    use axum::http::header;
+    use tokio_util::io::ReaderStream;
+
+    let job = state
+        .export_jobs()
+        .get(&job_id)
+        .map(|r| r.clone())
+        .ok_or_else(|| ApiError::NotFound(format!("export job {job_id} not found")))?;
+
+    if job.status != ExportStatus::Done {
+        return Err(ApiError::BadRequest(format!(
+            "export job {job_id} is not complete (status: {:?})",
+            job.status
+        )));
+    }
+
+    let entry = job
+        .output_files
+        .get(index)
+        .ok_or_else(|| ApiError::NotFound(format!("no output {index} in job {job_id}")))?
+        .clone();
+
+    if entry.camera_id == Uuid::nil() {
+        if job.camera_ids.iter().any(|c| !user.can_access_camera(*c)) {
+            return Err(ApiError::Forbidden(
+                "you do not have access to all cameras in this export job".to_owned(),
+            ));
+        }
+    } else {
+        user.assert_camera_access(entry.camera_id)?;
+    }
+
+    let output_path = PathBuf::from(&state.config().export_dir)
+        .join(job_id.to_string())
+        .join(&entry.filename);
+
+    let export_root = tokio::fs::canonicalize(&state.config().export_dir)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("canonicalize export_dir: {e}")))?;
+
+    let resolved = tokio::fs::canonicalize(&output_path).await.map_err(|_| {
+        ApiError::NotFound(format!(
+            "output {index} of job {job_id} does not exist on disk"
+        ))
+    })?;
+
+    if !resolved.starts_with(&export_root) {
+        warn!(
+            %job_id,
+            index,
+            path = %resolved.display(),
+            "path traversal guard rejected export output download"
+        );
+        return Err(ApiError::BadRequest(
+            "resolved path escapes the export directory".to_owned(),
+        ));
+    }
+
+    let content_type = match resolved.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    };
+
+    let file = tokio::fs::File::open(&resolved)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("open export output: {e}")))?;
+    let len = file.metadata().await.map_or(entry.size_bytes, |m| m.len());
+
+    let dl_name = if entry.download_name.is_empty() {
+        entry.filename.as_str()
+    } else {
+        entry.download_name.as_str()
+    };
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .header(header::CONTENT_DISPOSITION, content_disposition(dl_name))
+        .body(axum::body::Body::from_stream(ReaderStream::new(file)))
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("build output response: {e}")))
+}
+
+// ─── file naming helpers ──────────────────────────────────────────────────────
+
+/// Longest camera-name part of a clip file name, in characters.
+const NAME_PART_MAX_CHARS: usize = 60;
+
+/// True for a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`-`COM9`, `LPT1`-`LPT9`), case-insensitive. `stem` is the part of the
+/// file name before the first dot (Windows reserves `CON.txt` too).
+fn is_windows_reserved(stem: &str) -> bool {
+    let up = stem.to_ascii_uppercase();
+    matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (up.len() == 4
+            && (up.starts_with("COM") || up.starts_with("LPT"))
+            && matches!(up.as_bytes()[3], b'1'..=b'9'))
+}
+
+/// Make `raw` safe as (part of) a file name on Windows and POSIX.
+///
+/// Replaces `< > : " / \ | ? *` and control characters with `_`, collapses
+/// whitespace runs, caps at `max_chars` characters (and twice that in bytes),
+/// trims spaces and trailing dots, and prefixes `_` to a Windows reserved
+/// device name. May return an empty string; callers supply a fallback.
+fn sanitize_file_name(raw: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_space = true; // swallows leading whitespace
+    for c in raw.chars() {
+        if c.is_control() || "<>:\"/\\|?*".contains(c) {
+            out.push('_');
+            prev_space = false;
+        } else if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    let mut capped: String = out.chars().take(max_chars).collect();
+    while capped.len() > max_chars.saturating_mul(2) {
+        capped.pop();
+    }
+    let trimmed = capped.trim_end_matches([' ', '.']);
+    let stem = trimmed.split('.').next().unwrap_or("");
+    if is_windows_reserved(stem) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// `{Camera} {YYYY-MM-DD} {HH.MM.SS}-{HH.MM.SS}` in `tz`, or the
+/// `{Camera} {date time} to {date time}` form when the clip crosses local
+/// midnight. No extension.
+fn clip_file_stem(
+    camera_part: &str,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    tz: chrono_tz::Tz,
+) -> String {
+    let s = start.with_timezone(&tz);
+    let e = end.with_timezone(&tz);
+    if s.date_naive() == e.date_naive() {
+        format!(
+            "{camera_part} {} {}-{}",
+            s.format("%Y-%m-%d"),
+            s.format("%H.%M.%S"),
+            e.format("%H.%M.%S")
+        )
+    } else {
+        format!(
+            "{camera_part} {} to {}",
+            s.format("%Y-%m-%d %H.%M.%S"),
+            e.format("%Y-%m-%d %H.%M.%S")
+        )
+    }
+}
+
+/// Return `{stem}.{ext}`, or `{stem} (2).{ext}`, `(3)`... when that name is
+/// already in `used` (compared case-insensitively, as Windows would).
+fn unique_file_name(used: &mut std::collections::HashSet<String>, stem: &str, ext: &str) -> String {
+    let mut n = 1u32;
+    loop {
+        let name = if n == 1 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        if used.insert(name.to_lowercase()) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
+/// `Crumb export {YYYY-MM-DD HH.MM}.zip` in `tz` for the job creation time.
+fn zip_download_name(created_at: chrono::DateTime<Utc>, tz: chrono_tz::Tz) -> String {
+    format!(
+        "Crumb export {}.zip",
+        created_at.with_timezone(&tz).format("%Y-%m-%d %H.%M")
+    )
+}
+
+/// RFC 6266 `Content-Disposition`: an ASCII-only `filename` fallback plus the
+/// exact UTF-8 name in `filename*` (RFC 5987 percent-encoding).
+fn content_disposition(name: &str) -> String {
+    let ascii: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut pct = String::with_capacity(name.len() * 3);
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            pct.push(char::from(b));
+        } else {
+            pct.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{pct}")
+}
+
+/// How a batch job's clips are handed back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportPackage {
+    /// Today's rule: one zip when a password is set or >1 clip was produced.
+    Zip,
+    /// Every clip is its own download.
+    Files,
+}
+
+/// Parse and cross-check the `package` / `password` request fields.
+fn parse_package(package: &str, has_password: bool) -> Result<ExportPackage, ApiError> {
+    match package {
+        "zip" => Ok(ExportPackage::Zip),
+        "files" if has_password => Err(ApiError::BadRequest(
+            "a password requires package \"zip\" (encrypted exports are always zipped)".to_owned(),
+        )),
+        "files" => Ok(ExportPackage::Files),
+        other => Err(ApiError::BadRequest(format!(
+            "package must be \"zip\" or \"files\" (got \"{other}\")"
+        ))),
+    }
+}
+
+/// Build the job's `output_files` from the clips in `produced` (camera id +
+/// file name, already on disk in `export_dir`). Zips them (and removes the
+/// loose files) per `package` / `password`; see [`ExportPackage`].
+async fn package_outputs(
+    export_dir: &std::path::Path,
+    job_id: Uuid,
+    produced: Vec<(Uuid, String)>,
+    password: Option<String>,
+    package: ExportPackage,
+    zip_name: &str,
+) -> Result<Vec<ExportOutputFile>, String> {
+    let zip_it = password.is_some() || (package == ExportPackage::Zip && produced.len() > 1);
+    if !zip_it {
+        let mut out = Vec::with_capacity(produced.len());
+        for (i, (camera_id, name)) in produced.into_iter().enumerate() {
+            let size_bytes = tokio::fs::metadata(export_dir.join(&name))
+                .await
+                .map_or(0, |m| m.len());
+            out.push(ExportOutputFile {
+                camera_id,
+                download_url: format!("/export/{job_id}/output/{i}"),
+                size_bytes,
+                download_name: name.clone(),
+                filename: name,
+            });
+        }
+        return Ok(out);
+    }
+
+    let zip_path = export_dir.join("crumb_export.zip");
+    let cleanup: Vec<String> = produced.iter().map(|(_, n)| n.clone()).collect();
+    let zip_path_clone = zip_path.clone();
+    let dir = export_dir.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use zip::write::FileOptions;
+        use zip::AesMode;
+        use zip::CompressionMethod;
+
+        let out_file = std::fs::File::create(&zip_path_clone)?;
+        let mut zw = zip::write::ZipWriter::new(out_file);
+        for (_camera_id, name) in &produced {
+            // Separate scopes per branch so the differently-typed FileOptions
+            // (AES carries the password lifetime) never need to unify.
+            if let Some(p) = &password {
+                let opts = FileOptions::<()>::default()
+                    .compression_method(CompressionMethod::Stored)
+                    .with_aes_encryption(AesMode::Aes256, p.as_str());
+                zw.start_file(name.as_str(), opts)?;
+            } else {
+                // Stored (no compression): video is already compressed, and the
+                // zip crate build here doesn't enable the deflate feature.
+                let opts =
+                    FileOptions::<()>::default().compression_method(CompressionMethod::Stored);
+                zw.start_file(name.as_str(), opts)?;
+            }
+            let mut src = std::fs::File::open(dir.join(name))?;
+            std::io::copy(&mut src, &mut zw)?;
+        }
+        zw.finish()?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("build zip archive: {e}")),
+        Err(e) => return Err(format!("zip task panicked: {e}")),
+    }
+
+    // Only the archive remains downloadable.
+    for name in &cleanup {
+        let _ = tokio::fs::remove_file(export_dir.join(name)).await;
+    }
+    let size_bytes = tokio::fs::metadata(&zip_path).await.map_or(0, |m| m.len());
+    Ok(vec![ExportOutputFile {
+        camera_id: Uuid::nil(),
+        download_url: format!("/export/{job_id}/output/0"),
+        size_bytes,
+        filename: "crumb_export.zip".to_owned(),
+        download_name: zip_name.to_owned(),
+    }])
+}
+
+// ─── POST /export/estimate ────────────────────────────────────────────────────
+
+/// Estimate the size of a batch export without running it.
+///
+/// Same `require_export()` gate, per-item validation and per-camera access
+/// checks as `POST /export/batch` (shared via [`validate_batch_items`]). Per
+/// clip it sums, over the same `main`-stream segments `export_one_clip`
+/// selects, `size_bytes * overlap / segment duration` in one SQL aggregate: no
+/// file I/O. This approximates a stream-copy export; clients scale it for a
+/// re-encode.
+async fn estimate_export(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<ExportEstimateRequest>,
+) -> Result<Json<ExportEstimateResponse>, ApiError> {
+    user.require_export()?;
+    let items = validate_batch_items(&user, &state, &body.items)?;
+
+    let mut clips = Vec::with_capacity(items.len());
+    let mut bytes: u64 = 0;
+    let mut footage_seconds = 0.0_f64;
+    for (camera_id, start, end) in &items {
+        let (clip_bytes, clip_secs) =
+            db::estimate_clip_footage(state.pool(), *camera_id, "main", *start, *end)
+                .await
+                .map_err(ApiError::Internal)?;
+        bytes = bytes.saturating_add(clip_bytes);
+        footage_seconds += clip_secs;
+        clips.push(ExportEstimateClip {
+            bytes: clip_bytes,
+            footage_seconds: clip_secs,
+        });
+    }
+    Ok(Json(ExportEstimateResponse {
+        bytes,
+        footage_seconds,
+        clips,
+    }))
 }
 
 // ─── export worker task ───────────────────────────────────────────────────────
@@ -1066,6 +1449,7 @@ async fn run_export_job(
             download_url: format!("/export/{job_id}/files/{camera_id}"),
             size_bytes,
             filename: filename.clone(),
+            download_name: String::new(),
         });
 
         // Clean up the temporary concat file.
@@ -1151,6 +1535,7 @@ async fn run_export_job(
             download_url: format!("/export/{job_id}/archive"),
             size_bytes: zip_size,
             filename: "crumb_export.zip".to_owned(),
+            download_name: String::new(),
         }];
     }
 
@@ -1190,39 +1575,13 @@ async fn create_batch_export(
     // ── capability gate ───────────────────────────────────────────────────────
     user.require_export()?;
 
-    if body.items.is_empty() {
-        return Err(ApiError::BadRequest(
-            "items must contain at least one clip".to_owned(),
-        ));
-    }
-    if body.items.len() > MAX_BATCH_ITEMS {
-        return Err(ApiError::BadRequest(format!(
-            "too many clips in one batch (max {MAX_BATCH_ITEMS})"
-        )));
-    }
-
     // Validate + scope every item up front (fail the whole request on a bad one).
-    // Each item is one ffmpeg run, so each gets the same per-range cap as a
-    // single-camera export.
-    let max_range_seconds = state.config().export_max_range_seconds;
-    let mut items: Vec<(Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> =
-        Vec::with_capacity(body.items.len());
-    for it in &body.items {
-        if it.start >= it.end {
-            return Err(ApiError::BadRequest(
-                "each clip's start must be strictly before its end".to_owned(),
-            ));
-        }
-        let range_seconds = (it.end - it.start).num_seconds();
-        if range_seconds > max_range_seconds {
-            return Err(ApiError::BadRequest(format!(
-                "clip range too large: {range_seconds} seconds requested, max \
-                 {max_range_seconds} (raise EXPORT_MAX_RANGE_SECONDS to allow longer exports)"
-            )));
-        }
-        user.assert_camera_access(it.camera_id)?;
-        items.push((it.camera_id, it.start, it.end));
-    }
+    let items = validate_batch_items(&user, &state, &body.items)?;
+
+    // Packaging. An empty password string means "no password". A password forces
+    // zip, so password + "files" is a 400.
+    let password = body.password.filter(|p| !p.is_empty());
+    let package = parse_package(&body.package, password.is_some())?;
 
     // Concurrency cap (shared budget with single-range export).
     let max_concurrent = state.config().export_max_concurrent;
@@ -1276,7 +1635,6 @@ async fn create_batch_export(
     let include_audio = body.include_audio;
     let video_codec = body.video_codec;
     let container = body.container;
-    let password = body.password.filter(|p| !p.is_empty());
     let task_state = state.clone();
     let export_root = PathBuf::from(&state.config().export_dir).join(job_id.to_string());
     let cancel = CancellationToken::new();
@@ -1291,6 +1649,7 @@ async fn create_batch_export(
             video_codec,
             container,
             password,
+            package,
             export_root,
             cancel,
         )
@@ -1304,6 +1663,46 @@ async fn create_batch_export(
             status_url: format!("/export/{job_id}"),
         }),
     ))
+}
+
+/// Validate a batch (or estimate) item list: non-empty, at most
+/// `MAX_BATCH_ITEMS`, each clip ordered and within `EXPORT_MAX_RANGE_SECONDS`
+/// (each item is one ffmpeg run), and every camera in the caller's scope
+/// (all-or-nothing). Returns `(camera, start, end)` per item, in request order.
+fn validate_batch_items(
+    user: &AuthUser,
+    state: &AppState,
+    raw: &[BatchExportItem],
+) -> Result<Vec<BatchClip>, ApiError> {
+    if raw.is_empty() {
+        return Err(ApiError::BadRequest(
+            "items must contain at least one clip".to_owned(),
+        ));
+    }
+    if raw.len() > MAX_BATCH_ITEMS {
+        return Err(ApiError::BadRequest(format!(
+            "too many clips in one batch (max {MAX_BATCH_ITEMS})"
+        )));
+    }
+    let max_range_seconds = state.config().export_max_range_seconds;
+    let mut items = Vec::with_capacity(raw.len());
+    for it in raw {
+        if it.start >= it.end {
+            return Err(ApiError::BadRequest(
+                "each clip's start must be strictly before its end".to_owned(),
+            ));
+        }
+        let range_seconds = (it.end - it.start).num_seconds();
+        if range_seconds > max_range_seconds {
+            return Err(ApiError::BadRequest(format!(
+                "clip range too large: {range_seconds} seconds requested, max \
+                 {max_range_seconds} (raise EXPORT_MAX_RANGE_SECONDS to allow longer exports)"
+            )));
+        }
+        user.assert_camera_access(it.camera_id)?;
+        items.push((it.camera_id, it.start, it.end));
+    }
+    Ok(items)
 }
 
 // ─── shared single-clip ffmpeg step ───────────────────────────────────────────
@@ -1461,6 +1860,7 @@ async fn run_batch_export_job(
     video_codec: String,
     container: String,
     password: Option<String>,
+    package: ExportPackage,
     export_dir: PathBuf,
     cancel: CancellationToken,
 ) {
@@ -1475,24 +1875,34 @@ async fn run_batch_export_job(
     let codec = build_codec_args(burn_timestamp, include_audio, &video_codec, &container);
     let ext = codec.ext;
     let n = items.len();
-    // (camera id, on-disk filename, zip entry name) for each clip that produced
-    // output. The camera id is kept so a single plain file can be served via the
-    // per-camera download endpoint when we skip zipping.
-    let mut produced: Vec<(Uuid, String, String)> = Vec::with_capacity(n);
+    // (camera id, file name) for each clip that produced output. The same
+    // friendly name is used on disk and as the zip entry / download name.
+    let mut produced: Vec<(Uuid, String)> = Vec::with_capacity(n);
+
+    // Friendly names: `{Camera Name} {date} {start}-{end}.{ext}` in the server's
+    // local zone. Camera names come from the DB; fall back to the short id.
+    let tz = state.config().server_tz;
+    let mut cam_names: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+    for (camera_id, _, _) in &items {
+        if cam_names.contains_key(camera_id) {
+            continue;
+        }
+        let short: String = camera_id.simple().to_string().chars().take(8).collect();
+        let db_name = match db::get_camera(state.pool(), *camera_id).await {
+            Ok(Some(c)) => sanitize_file_name(&c.name, NAME_PART_MAX_CHARS),
+            _ => String::new(),
+        };
+        cam_names.insert(*camera_id, if db_name.is_empty() { short } else { db_name });
+    }
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (idx, (camera_id, start, end)) in items.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let cam_base_pct = (idx * 100 / n).min(99) as u8;
         #[allow(clippy::cast_possible_truncation)]
         let cam_range_pct = (100 / n).clamp(1, 100) as u8;
-        let seq = idx + 1;
-        let cam_short: String = camera_id
-            .to_string()
-            .replace('-', "")
-            .chars()
-            .take(8)
-            .collect();
-        let filename = format!("clip{seq:02}_{cam_short}.{ext}");
+        let stem = clip_file_stem(&cam_names[camera_id], *start, *end, tz);
+        let filename = unique_file_name(&mut used_names, &stem, ext);
         let concat_name = format!("batch_{idx}_concat.txt");
 
         match export_one_clip(
@@ -1513,11 +1923,7 @@ async fn run_batch_export_job(
         .await
         {
             Ok(ClipStep::Produced(_size)) => {
-                let entry = format!(
-                    "clip{seq:02}_{cam_short}_{}.{ext}",
-                    start.format("%Y%m%d-%H%M%S")
-                );
-                produced.push((*camera_id, filename, entry));
+                produced.push((*camera_id, filename));
             }
             Ok(ClipStep::NoSegments) => {
                 warn!(%job_id, %camera_id, "batch clip has no segments in range, skipping");
@@ -1542,88 +1948,22 @@ async fn run_batch_export_job(
         return;
     }
 
-    // Packaging rule: produce ONE zip iff a password is set OR there is more than
-    // one output file. A single plain file (no password) is served as-is via the
-    // per-camera endpoint. The zip is AES-256 encrypted when a password is given,
-    // otherwise Stored (unencrypted).
-    let output_files: Vec<ExportOutputFile> = if password.is_some() || produced.len() > 1 {
-        // Disk filenames to clean up after zipping (captured before `produced`
-        // moves into the blocking closure).
-        let cleanup: Vec<String> = produced.iter().map(|(_, disk, _)| disk.clone()).collect();
-
-        // Bundle every clip into ONE archive on a blocking thread (zip is sync I/O).
-        let zip_path = export_dir.join("crumb_export.zip");
-        let zip_path_clone = zip_path.clone();
-        let export_dir_clone = export_dir.clone();
-        let pw = password.clone();
-        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use zip::write::FileOptions;
-            use zip::AesMode;
-            use zip::CompressionMethod;
-
-            let out_file = std::fs::File::create(&zip_path_clone)?;
-            let mut zw = zip::write::ZipWriter::new(out_file);
-            for (_camera_id, disk_name, entry_name) in &produced {
-                // Separate scopes per branch so the differently-typed FileOptions
-                // (AES carries the password lifetime) never need to unify.
-                if let Some(p) = &pw {
-                    let opts = FileOptions::<()>::default()
-                        .compression_method(CompressionMethod::Stored)
-                        .with_aes_encryption(AesMode::Aes256, p.as_str());
-                    zw.start_file(entry_name.as_str(), opts)?;
-                } else {
-                    // Stored (no compression) — video is already compressed, and the
-                    // zip crate build here doesn't enable the deflate feature.
-                    let opts =
-                        FileOptions::<()>::default().compression_method(CompressionMethod::Stored);
-                    zw.start_file(entry_name.as_str(), opts)?;
-                }
-                let mut src = std::fs::File::open(export_dir_clone.join(disk_name))?;
-                std::io::copy(&mut src, &mut zw)?;
-            }
-            zw.finish()?;
-            Ok(())
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                fail_job(&state, job_id, format!("build zip archive: {e}"));
-                return;
-            }
+    // Packaging rule: zip iff a password is set, or package is "zip" and more than
+    // one file was produced. A single plain file (no password) is left as-is; in
+    // "files" mode every clip is its own output entry.
+    let created_at = state
+        .export_jobs()
+        .get(&job_id)
+        .map_or_else(Utc::now, |j| j.created_at);
+    let zip_name = zip_download_name(created_at, tz);
+    let output_files =
+        match package_outputs(&export_dir, job_id, produced, password, package, &zip_name).await {
+            Ok(files) => files,
             Err(e) => {
-                fail_job(&state, job_id, format!("zip task panicked: {e}"));
+                fail_job(&state, job_id, e);
                 return;
             }
-        }
-
-        // Only the archive remains downloadable.
-        for disk_name in &cleanup {
-            let _ = tokio::fs::remove_file(export_dir.join(disk_name)).await;
-        }
-        let zip_size = tokio::fs::metadata(&zip_path).await.map_or(0, |m| m.len());
-
-        vec![ExportOutputFile {
-            camera_id: Uuid::nil(),
-            download_url: format!("/export/{job_id}/archive"),
-            size_bytes: zip_size,
-            filename: "crumb_export.zip".to_owned(),
-        }]
-    } else {
-        // Exactly one file, no password → leave it as a plain video download
-        // served via the per-camera endpoint.
-        let (camera_id, disk_name, _entry) = &produced[0];
-        let size_bytes = tokio::fs::metadata(export_dir.join(disk_name))
-            .await
-            .map_or(0, |m| m.len());
-        vec![ExportOutputFile {
-            camera_id: *camera_id,
-            download_url: format!("/export/{job_id}/files/{camera_id}"),
-            size_bytes,
-            filename: disk_name.clone(),
-        }]
-    };
+        };
 
     // Honor a cancel that arrived during the non-interruptible ZIP/packaging step.
     if cancel.is_cancelled() {
@@ -1932,5 +2272,240 @@ mod tests {
             !reencoded.iter().any(|s| s == "-copyinkf:a"),
             "re-encode path decodes audio, no keyframe gate; got {reencoded:?}"
         );
+    }
+
+    // ── file naming ───────────────────────────────────────────────────────────
+
+    fn utc(s: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().into()
+    }
+
+    #[test]
+    fn sanitizer_replaces_illegal_chars_and_collapses_whitespace() {
+        assert_eq!(
+            sanitize_file_name("Front <Door>: \"A/B\\C|D?E*", 60),
+            "Front _Door__ _A_B_C_D_E_"
+        );
+        assert_eq!(sanitize_file_name("  Back \t\n yard  ", 60), "Back __ yard");
+        assert_eq!(sanitize_file_name("a\u{0}b", 60), "a_b");
+        // Spaces and trailing dots are trimmed; inner dots survive.
+        assert_eq!(sanitize_file_name(" Cam 1. . ", 60), "Cam 1");
+        assert_eq!(sanitize_file_name("v1.2 cam", 60), "v1.2 cam");
+        assert_eq!(sanitize_file_name("...", 60), "");
+        // Non-ASCII passes through untouched.
+        assert_eq!(
+            sanitize_file_name("Garten Küche 車庫", 60),
+            "Garten Küche 車庫"
+        );
+    }
+
+    #[test]
+    fn sanitizer_caps_length_in_chars_and_bytes() {
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_file_name(&long, 60).chars().count(), 60);
+        let cjk = "車".repeat(200);
+        let out = sanitize_file_name(&cjk, 60);
+        assert!(
+            out.chars().count() <= 60 && out.len() <= 120,
+            "{}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn sanitizer_prefixes_windows_reserved_names() {
+        for n in [
+            "CON", "con", "Prn", "AUX", "nul", "COM1", "lpt9", "NUL.txt", "con.mp4",
+        ] {
+            assert_eq!(sanitize_file_name(n, 60), format!("_{n}"), "{n}");
+        }
+        for n in ["COM0", "COM10", "CONSOLE", "Console 1", "LPT"] {
+            assert_eq!(sanitize_file_name(n, 60), n, "{n}");
+        }
+    }
+
+    #[test]
+    fn clip_stem_same_day_and_cross_midnight() {
+        let tz: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
+        // 2026-10-29 21:05:06Z is 14:05:06 PDT.
+        let same = clip_file_stem(
+            "Driveway",
+            utc("2026-10-29T21:05:06Z"),
+            utc("2026-10-29T21:09:10Z"),
+            tz,
+        );
+        assert_eq!(same, "Driveway 2026-10-29 14.05.06-14.09.10");
+        // 06:59:50Z..07:00:10Z crosses local midnight? 23:59:50 -> 00:00:10 PDT.
+        let cross = clip_file_stem(
+            "Driveway",
+            utc("2026-10-30T06:59:50Z"),
+            utc("2026-10-30T07:00:10Z"),
+            tz,
+        );
+        assert_eq!(cross, "Driveway 2026-10-29 23.59.50 to 2026-10-30 00.00.10");
+        // The same instants are one UTC date, so the zone matters.
+        let utc_form = clip_file_stem(
+            "Driveway",
+            utc("2026-10-30T06:59:50Z"),
+            utc("2026-10-30T07:00:10Z"),
+            chrono_tz::UTC,
+        );
+        assert_eq!(utc_form, "Driveway 2026-10-30 06.59.50-07.00.10");
+    }
+
+    #[test]
+    fn duplicate_names_get_a_counter_before_the_extension() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(unique_file_name(&mut used, "Cam 1", "mp4"), "Cam 1.mp4");
+        assert_eq!(unique_file_name(&mut used, "Cam 1", "mp4"), "Cam 1 (2).mp4");
+        assert_eq!(unique_file_name(&mut used, "CAM 1", "mp4"), "CAM 1 (3).mp4");
+        assert_eq!(unique_file_name(&mut used, "Cam 2", "mp4"), "Cam 2.mp4");
+    }
+
+    #[test]
+    fn zip_name_uses_server_zone_to_the_minute() {
+        let tz: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
+        assert_eq!(
+            zip_download_name(utc("2026-10-29T21:05:59Z"), tz),
+            "Crumb export 2026-10-29 14.05.zip"
+        );
+    }
+
+    #[test]
+    fn content_disposition_has_ascii_fallback_and_utf8_name() {
+        assert_eq!(
+            content_disposition("Front Door 2026-10-29 14.05.06-14.09.10.mp4"),
+            "attachment; filename=\"Front Door 2026-10-29 14.05.06-14.09.10.mp4\"; \
+             filename*=UTF-8''Front%20Door%202026-10-29%2014.05.06-14.09.10.mp4"
+        );
+        let cd = content_disposition("Küche \"x\".mp4");
+        assert!(
+            cd.starts_with("attachment; filename=\"K_che _x_.mp4\";"),
+            "{cd}"
+        );
+        assert!(
+            cd.ends_with("filename*=UTF-8''K%C3%BCche%20%22x%22.mp4"),
+            "{cd}"
+        );
+        assert!(cd.is_ascii());
+    }
+
+    #[test]
+    fn package_parsing_rules() {
+        assert_eq!(parse_package("zip", false).unwrap(), ExportPackage::Zip);
+        assert_eq!(parse_package("zip", true).unwrap(), ExportPackage::Zip);
+        assert_eq!(parse_package("files", false).unwrap(), ExportPackage::Files);
+        assert!(matches!(
+            parse_package("files", true),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_package("tar", false),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    async fn packaging_fixture(names: &[&str]) -> (PathBuf, Uuid, Vec<(Uuid, String)>) {
+        let job_id = Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("crumb-pkg-{job_id}"));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut produced = Vec::new();
+        for n in names {
+            tokio::fs::write(dir.join(n), format!("bytes of {n}"))
+                .await
+                .unwrap();
+            produced.push((Uuid::new_v4(), (*n).to_owned()));
+        }
+        (dir, job_id, produced)
+    }
+
+    #[tokio::test]
+    async fn files_mode_lists_every_clip_as_its_own_output() {
+        let (dir, job_id, produced) = packaging_fixture(&["A 1.mp4", "A 2.mp4", "B.mp4"]).await;
+        let out = package_outputs(
+            &dir,
+            job_id,
+            produced.clone(),
+            None,
+            ExportPackage::Files,
+            "z.zip",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        for (i, f) in out.iter().enumerate() {
+            assert_eq!(f.download_url, format!("/export/{job_id}/output/{i}"));
+            assert_eq!(f.camera_id, produced[i].0);
+            assert_eq!(f.filename, produced[i].1);
+            assert_eq!(f.download_name, produced[i].1);
+            assert!(f.size_bytes > 0);
+            assert!(
+                dir.join(&f.filename).exists(),
+                "files mode keeps loose files"
+            );
+        }
+        assert!(!dir.join("crumb_export.zip").exists());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn zip_mode_bundles_multiple_clips_but_keeps_a_single_one_plain() {
+        let (dir, job_id, produced) = packaging_fixture(&["A.mp4", "B.mp4"]).await;
+        let out = package_outputs(
+            &dir,
+            job_id,
+            produced,
+            None,
+            ExportPackage::Zip,
+            "Crumb export 2026-10-29 14.05.zip",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].camera_id, Uuid::nil());
+        assert_eq!(out[0].filename, "crumb_export.zip");
+        assert_eq!(out[0].download_name, "Crumb export 2026-10-29 14.05.zip");
+        assert_eq!(out[0].download_url, format!("/export/{job_id}/output/0"));
+        assert!(
+            !dir.join("A.mp4").exists(),
+            "loose clips are removed after zipping"
+        );
+        // The entries are named with the friendly names.
+        let zf = std::fs::File::open(dir.join("crumb_export.zip")).unwrap();
+        let mut za = zip::ZipArchive::new(zf).unwrap();
+        let mut names: Vec<String> = (0..za.len())
+            .map(|i| za.by_index(i).unwrap().name().to_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["A.mp4", "B.mp4"]);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+
+        let (dir, job_id, produced) = packaging_fixture(&["Only.mp4"]).await;
+        let out = package_outputs(&dir, job_id, produced, None, ExportPackage::Zip, "z.zip")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].filename, "Only.mp4");
+        assert_eq!(out[0].download_url, format!("/export/{job_id}/output/0"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_password_zips_even_a_single_clip() {
+        let (dir, job_id, produced) = packaging_fixture(&["Only.mp4"]).await;
+        let out = package_outputs(
+            &dir,
+            job_id,
+            produced,
+            Some("pw".to_owned()),
+            ExportPackage::Zip,
+            "z.zip",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].filename, "crumb_export.zip");
+        assert_eq!(out[0].download_name, "z.zip");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -5059,6 +5059,49 @@ pub async fn list_segments_for_range(
     rows.iter().map(segment_from_row).collect()
 }
 
+/// Prorated size and footage seconds of the segments `[start, end)` would pull
+/// in for an export of `camera_id`/`stream`.
+///
+/// Uses the SAME selection predicate as [`list_segments_for_range`] (what
+/// `export_one_clip` feeds ffmpeg), but aggregates in SQL so no rows leave the
+/// database and no file is touched. Each segment contributes
+/// `size_bytes * overlap / segment_duration`, where `overlap` is the part of the
+/// segment inside the range; footage seconds is the summed overlap. Returns
+/// `(bytes, footage_seconds)`.
+pub async fn estimate_clip_footage(
+    pool: &Pool,
+    camera_id: Uuid,
+    stream: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(u64, f64)> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            SELECT COALESCE(SUM(CASE WHEN dur > 0 THEN size_bytes::float8 * ov / dur ELSE 0 END), 0)::float8,
+                   COALESCE(SUM(ov), 0)::float8
+            FROM (
+                SELECT size_bytes,
+                       GREATEST(0, EXTRACT(EPOCH FROM (LEAST(end_ts, $4) - GREATEST(start_ts, $3))))::float8 AS ov,
+                       EXTRACT(EPOCH FROM (end_ts - start_ts))::float8 AS dur
+                FROM segments
+                WHERE camera_id = $1
+                  AND stream    = $2
+                  AND start_ts < $4
+                  AND end_ts   > $3
+            ) t
+            ",
+            &[&camera_id, &stream, &start, &end],
+        )
+        .await
+        .context("estimate_clip_footage")?;
+    let bytes: f64 = row.get(0);
+    let secs: f64 = row.get(1);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok((bytes.max(0.0).round() as u64, secs.max(0.0)))
+}
+
 /// Return the most-recent segment for a camera (any stream), for health checks.
 ///
 /// Returns `None` if the camera has no recorded segments yet.
