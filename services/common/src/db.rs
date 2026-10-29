@@ -5028,6 +5028,25 @@ pub async fn get_segment(pool: &Pool, id: Uuid) -> Result<Option<Segment>> {
     opt.map(|r| segment_from_row(&r)).transpose()
 }
 
+/// Which of `ids` still exist in `segments`. Read-only primary-key lookups;
+/// used by the api's scrub-sprite cache sweeper to remove sidecar sprites
+/// whose segment has been deleted (retention, eviction, manual delete) so a
+/// derived cache file never outlives the footage it was made from.
+pub async fn existing_segment_ids(
+    pool: &Pool,
+    ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query("SELECT id FROM segments WHERE id = ANY($1)", &[&ids])
+        .await
+        .context("existing_segment_ids")?;
+    Ok(rows.iter().map(|r| r.get::<_, Uuid>(0)).collect())
+}
+
 /// Return all segments for a camera and stream in `[start, end)`, ordered by
 /// `start_ts`.  Used by the export job to build the concat list.
 pub async fn list_segments_for_range(

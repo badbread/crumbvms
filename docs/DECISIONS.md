@@ -8,6 +8,69 @@ revisit.
 
 ---
 
+## 2026-10-29, Scrub sprites: one keyframe-only sprite strip per segment, made only by the API pre-generation worker
+
+**Context.** The scrub overlay's frames come from `GET /filmstrip/{cam}/frame`,
+which snaps every request to a fixed 4 s grid so cache keys are shared. That
+makes a drag across segments step in 4 s jumps, and every new cell is its own
+request. The 2026-07-07 entry deferred "sprite atlases"; the performance audit
+behind PRs #655-#657 recommended per-segment sprites for 1 s granularity.
+
+**Decision.**
+
+- One sidecar JPEG per recorded main-stream segment: one tile per started
+  second (4 for a 4 s segment, capped at 16), 160 px wide, in a single row,
+  tile `i` = the segment at `start + i` s. Cached at
+  `{thumb_cache_base}/.thumbs/{camera}/sprites/{segment_id}_w160_t{n}.jpg`.
+- Rendered with a keyframe-only decode (`-skip_frame nokey`, `fps=1`, `tile`):
+  every camera in the benchmark fixture set keys once per second, so this gives
+  a distinct frame per tile. A longer GOP repeats the previous keyframe (the
+  frame endpoint's "keyframe at or before" rule). The `fps` filter holds back
+  its last frame, so the first frame is split off and re-stamped as a sentinel
+  at `n` s to release the final slot without decoding anything extra.
+- Made ONLY by the API's thumbnail pre-generation worker, behind the same
+  `THUMB_PREGEN_ENABLED` / console "Scrub previews" switch as the grid frames.
+  There is no on-demand path: `GET /filmstrip/{cam}/sprite?ts=` returns 404
+  until the sprite exists, and the desktop and Android clients fall back to the
+  frame endpoint. The layout travels in `X-Crumb-Sprite-*` response headers, so
+  one GET is enough.
+- Same auth as the frame endpoint (`MediaOrFullUser`, playback capability,
+  per-camera scope, scoped `?token=` from the clients).
+- Lifetime: the serve path resolves the segment from the DB and names the file
+  by its id, so a sprite of a deleted segment is unreachable; the cache sweeper
+  deletes sprites whose segment id is no longer in `segments` (read-only
+  primary-key lookups, a DB error deletes nothing); the generator re-checks the
+  segment after publishing; and the existing `.thumbs` age/byte sweep covers
+  sprites too. Sprites live in the api's writable cache, never beside footage,
+  so they cannot delay or block the recorder's deletion of a segment.
+
+**Measured** (9 real 4 s fixture segments, 1080p to 4K, H.264 and HEVC,
+single-threaded ffmpeg 7.1): sprite 0.15-0.55 s CPU per segment (mean about
+0.36 s), 12.4-19.9 KB (mean about 14.8 KB); for comparison the 480 px grid frame
+from #657 costs 0.08-0.28 s CPU and 25-44 KB. A full decode of the same
+segments for the sprite costs 0.34-0.98 s CPU.
+
+**Rejected.**
+
+- *Full decode for exact 1 s instants:* 2-3x the CPU for no visible gain on
+  1 s-GOP cameras.
+- *One ffmpeg input per tile* (`-ss i` x4, `hstack`): no cheaper (0.16-0.94 s),
+  and slower on H.264.
+- *Rendering sprites on demand in the request path:* a 4-keyframe decode is
+  too slow for a pointer event, and the frame endpoint already covers the cold
+  case.
+- *Rendering in the recorder from the motion decoder's frames:* golden rule 2,
+  and the motion frames are grayscale sub-stream (same reasoning as 2026-07-07
+  option 2).
+- *A JSON layout endpoint plus an image endpoint:* two round-trips per segment
+  for data that fits in six headers.
+
+**Revisit triggers.** Cameras with a GOP well above 1 s become common (tiles
+would repeat; consider a full decode for those); `SEGMENT_SECONDS` raised past
+16 s (the tile cap); the sprite pass measured as the bottleneck that stops the
+worker keeping up with recording; iOS wants sprites (client work only, the
+endpoint is ready).
+
 ## 2026-10-08, Eviction under a full or missing disk: the archive tier gets its own floor, failing moves fall back to deleting live footage on the low disk, and sweeps never prune or write on an unconfirmed storage
 
 **Context.** Audit findings R2 to R7 against `services/recorder/src/archive.rs`:

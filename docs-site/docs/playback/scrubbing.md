@@ -37,6 +37,12 @@ rather have previews ready in advance so even the first drag is instant, turn on
 background pre-generation. Crumb then quietly builds previews for recent footage
 as it records.
 
+With background previews on, the desktop and Android apps also get
+second-by-second previews: Crumb builds one small strip of four pictures for
+each 4-second piece of recording, so dragging shows a new image every second
+instead of every four. These strips only exist when background previews are
+on; without them the apps simply show the regular previews.
+
 The trade-off is honest: it uses some ongoing CPU and a little disk space
 whether or not you scrub much, which is why it's off by default (a small box
 shouldn't do work nobody asked for). Turn it on if you review footage often and

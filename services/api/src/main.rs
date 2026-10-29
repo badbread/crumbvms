@@ -37,6 +37,7 @@
 //! /segments/*               → playback.rs
 //! /export/*                 → export.rs
 //! /filmstrip/*              → filmstrip.rs
+//! /filmstrip/:id/sprite      → scrub_sprite.rs
 //! /status                   → status.rs
 //! /stats/*                  → stats.rs           (admin only)
 //! /updates/latest           → updates.rs (update-available check, issue #7)
@@ -106,6 +107,7 @@ mod rate_limit;
 mod response_headers;
 mod roles;
 mod scrub_settings;
+mod scrub_sprite;
 mod segment_low;
 mod state;
 mod stats;
@@ -585,6 +587,9 @@ async fn main() -> anyhow::Result<()> {
             .merge(segment_low::routes())
             .merge(export::routes())
             .merge(filmstrip::routes())
+            // Per-segment scrub sprite strips (pre-generated only; 404 → clients
+            // fall back to the filmstrip frame endpoint).
+            .merge(scrub_sprite::routes())
             // Per-camera JPEG still proxy (authenticated, no gzip).
             .merge(cameras::routes())
             // Detection snapshot proxy (authenticated via AuthUser — Bearer or a
@@ -1057,6 +1062,21 @@ async fn export_ttl_sweeper(state: AppState, ttl_seconds: u64) {
             scrub_settings.cache_max_bytes,
         )
         .await;
+
+        // Scrub sprites are derived from ONE segment each: drop any whose
+        // segment has been deleted (retention, eviction, manual delete) so a
+        // sprite never outlives its footage. Read-only DB lookups; a DB error
+        // deletes nothing. Sprites live under the same `.thumbs` tree, so the
+        // age/byte-budget sweep above already covers them too.
+        let orphans =
+            scrub_sprite::sweep_orphan_sprites(state.pool(), state.config().thumb_cache_base())
+                .await;
+        if orphans > 0 {
+            tracing::debug!(
+                orphans,
+                "scrub sprite sweep: removed sprites of deleted segments"
+            );
+        }
     }
 }
 
