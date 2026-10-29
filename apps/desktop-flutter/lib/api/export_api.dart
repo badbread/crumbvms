@@ -134,6 +134,9 @@ class ExportJob {
     required this.outputFiles,
     required this.error,
     required this.progressPct,
+    this.currentClip = 0,
+    this.clipCount = 0,
+    this.phase = '',
   });
 
   final String id;
@@ -146,6 +149,14 @@ class ExportJob {
   final List<ExportOutputFile> outputFiles;
   final String? error;
   final int progressPct; // 0-100
+
+  /// Batch jobs: the 1-based clip being encoded and how many there are; 0
+  /// when the server doesn't report it (older servers, single-range jobs).
+  final int currentClip;
+  final int clipCount;
+
+  /// "encoding" | "packaging" while running; empty when unknown.
+  final String phase;
 
   factory ExportJob.fromJson(Map<String, dynamic> j) => ExportJob(
     id: j['id'] as String,
@@ -160,6 +171,9 @@ class ExportJob {
         .toList(growable: false),
     error: j['error'] as String?,
     progressPct: (j['progress_pct'] as num?)?.toInt() ?? 0,
+    currentClip: (j['current_clip'] as num?)?.toInt() ?? 0,
+    clipCount: (j['clip_count'] as num?)?.toInt() ?? 0,
+    phase: (j['phase'] as String?) ?? '',
   );
 }
 

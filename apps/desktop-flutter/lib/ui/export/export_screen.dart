@@ -27,6 +27,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/ui/folder_picker_dialog.dart';
+import 'package:crumb_desktop/ui/export/viewfinder_progress.dart';
 
 import 'export_builder_dialog.dart';
 
@@ -100,6 +101,13 @@ class _ExportScreenState extends State<ExportScreen> {
 
   /// Download progress after the server finishes, e.g. "2 of 4 · 340 MB".
   String? _downloadStatus;
+
+  // Real progress detail for the viewfinder (see viewfinder_progress.dart).
+  int _clipNo = 0;
+  int _clipCount = 0;
+  String _jobPhase = '';
+  int? _savePct;
+  String? _saveDetail;
 
   /// Wall-clock export timing: started when a job is submitted, ticked once a
   /// second while running so the UI shows LIVE elapsed time, and frozen when the
@@ -506,6 +514,9 @@ class _ExportScreenState extends State<ExportScreen> {
       setState(() {
         _progressPct = job.progressPct.clamp(0, 100).toInt();
         _status = job.status;
+        _clipNo = job.currentClip;
+        _clipCount = job.clipCount;
+        _jobPhase = job.phase;
       });
 
       switch (job.status) {
@@ -601,7 +612,14 @@ class _ExportScreenState extends State<ExportScreen> {
             if (!mounted) return;
             final of = files.length > 1 ? '${i + 1} of ${files.length} · ' : '';
             final pct = total > 0 ? ' (${(got * 100 / total).round()}%)' : '';
-            setState(() => _downloadStatus = 'Saving $of${_mb(got)}$pct');
+            setState(() {
+              _downloadStatus = 'Saving $of${_mb(got)}$pct';
+              _savePct = total > 0 ? (got * 100 / total).round() : null;
+              _saveDetail = [
+                if (files.length > 1) 'file ${i + 1} of ${files.length}',
+                total > 0 ? '${_mb(got)} of ${_mb(total)}' : _mb(got),
+              ].join(' · ');
+            });
           },
         );
         saved++;
@@ -887,27 +905,16 @@ class _ExportScreenState extends State<ExportScreen> {
                   // takes over — the old code kept this block alive on `_status`
                   // and its bar fell back to INDETERMINATE (endless animation)
                   // even though the export was done.
-                  if (_submitting || _running) ...[
-                    LinearProgressIndicator(
-                      // Determinate while running so the bar tracks real progress;
-                      // only the brief submit handshake is indeterminate.
-                      value: _running ? _progressPct / 100 : null,
-                      minHeight: 4,
+                  if (_submitting ||
+                      _running ||
+                      _downloadStatus != null ||
+                      _completed) ...[
+                    ViewfinderProgress(
+                      phase: _viewfinderPhase(),
+                      percent: _viewfinderPercent(),
+                      detail: _viewfinderDetail(),
+                      elapsed: _elapsed,
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _submitting
-                          ? 'Submitting…'
-                          : '${_statusLabel(_status)} $_progressPct%'
-                                '  ·  ${_fmtDuration(_elapsed)} elapsed',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  if (_downloadStatus != null) ...[
-                    const LinearProgressIndicator(minHeight: 4),
-                    const SizedBox(height: 4),
-                    Text(_downloadStatus!, style: theme.textTheme.bodySmall),
                     const SizedBox(height: 8),
                   ],
                   if (_completed) ...[
@@ -1011,13 +1018,39 @@ class _ExportScreenState extends State<ExportScreen> {
     ),
   );
 
-  String _statusLabel(ExportJobStatus? s) => switch (s) {
-    ExportJobStatus.queued => 'Queued…',
-    ExportJobStatus.running => 'Exporting…',
-    ExportJobStatus.done => 'Complete',
-    ExportJobStatus.failed => 'Failed',
-    ExportJobStatus.cancelled => 'Cancelled',
-    null => '',
+  ViewfinderPhase _viewfinderPhase() {
+    if (_submitting) return ViewfinderPhase.submitting;
+    if (_downloadStatus != null) return ViewfinderPhase.saving;
+    if (_running) {
+      return _jobPhase == 'packaging'
+          ? ViewfinderPhase.packaging
+          : ViewfinderPhase.encoding;
+    }
+    if (_completed) return ViewfinderPhase.done;
+    return switch (_status) {
+      ExportJobStatus.failed => ViewfinderPhase.failed,
+      ExportJobStatus.cancelled => ViewfinderPhase.cancelled,
+      _ => ViewfinderPhase.done,
+    };
+  }
+
+  /// Only real numbers: ffmpeg progress while encoding, bytes while saving,
+  /// none while submitting or building the zip.
+  int? _viewfinderPercent() => switch (_viewfinderPhase()) {
+    ViewfinderPhase.encoding => _progressPct,
+    ViewfinderPhase.saving => _savePct,
+    ViewfinderPhase.done => 100,
+    _ => null,
+  };
+
+  String? _viewfinderDetail() => switch (_viewfinderPhase()) {
+    ViewfinderPhase.submitting => 'starting export',
+    ViewfinderPhase.encoding =>
+      _clipCount > 1 ? 'clip $_clipNo of $_clipCount' : 'encoding',
+    ViewfinderPhase.packaging => 'building zip',
+    ViewfinderPhase.saving => _saveDetail,
+    ViewfinderPhase.done => 'took ${_fmtDuration(_elapsed)}',
+    _ => null,
   };
 
   String _submitButtonLabel() {
