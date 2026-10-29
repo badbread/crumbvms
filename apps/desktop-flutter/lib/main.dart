@@ -19,6 +19,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:window_manager/window_manager.dart';
+import 'package:crumb_desktop/state/window_state.dart';
 
 import 'package:crumb_desktop/api/boot_api.dart';
 import 'package:crumb_desktop/api/clips_api.dart' show ClipDescriptor;
@@ -141,6 +142,8 @@ Future<void> main() async {
   // window_manager — required before any fullscreen calls (fullscreen wall +
   // launch-into-fullscreen preference).
   await windowManager.ensureInitialized();
+  // Reopen at the last size/position (and maximized if it was).
+  if (kGrid == 0 && !kSpike) await WindowStateStore.instance.restoreAndAttach();
   runApp(
     kGrid > 0
         ? PerfGridApp(count: kGrid, url: kStreamUrl)
