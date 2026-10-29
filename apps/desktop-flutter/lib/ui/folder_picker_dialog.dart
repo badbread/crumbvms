@@ -54,10 +54,7 @@ String? folderNameError(String name) {
 /// Show the in-app folder picker rooted at [initialPath] (falls back to the
 /// user's home / current dir). Returns the chosen absolute path, or null if
 /// the user cancels.
-Future<String?> pickFolderInApp(
-  BuildContext context, {
-  String? initialPath,
-}) {
+Future<String?> pickFolderInApp(BuildContext context, {String? initialPath}) {
   return showDialog<String>(
     context: context,
     builder: (_) => _FolderPickerDialog(initialPath: initialPath),
@@ -152,10 +149,9 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
         if (e is Directory) dirs.add(e);
       }
       dirs.sort(
-        (a, b) =>
-            _baseName(a.path).toLowerCase().compareTo(
-              _baseName(b.path).toLowerCase(),
-            ),
+        (a, b) => _baseName(
+          a.path,
+        ).toLowerCase().compareTo(_baseName(b.path).toLowerCase()),
       );
       if (!mounted) return;
       setState(() {
@@ -184,7 +180,9 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
   String _childPath(String name) {
     final base = _current.path;
     final sep = Platform.pathSeparator;
-    return base.endsWith(sep) || base.endsWith('/') ? '$base$name' : '$base$sep$name';
+    return base.endsWith(sep) || base.endsWith('/')
+        ? '$base$name'
+        : '$base$sep$name';
   }
 
   Future<void> _createFolder() async {
@@ -196,14 +194,17 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
     final dir = Directory(_childPath(name.trim()));
     try {
       if (dir.existsSync()) {
-        setState(() => _error = 'A folder named "${name.trim()}" already exists.');
+        setState(
+          () => _error = 'A folder named "${name.trim()}" already exists.',
+        );
         return;
       }
       await dir.create();
     } on FileSystemException catch (e) {
       if (!mounted) return;
       setState(
-        () => _error = "Couldn't create the folder: ${e.osError?.message ?? e.message}",
+        () => _error =
+            "Couldn't create the folder: ${e.osError?.message ?? e.message}",
       );
       return;
     }
@@ -220,15 +221,17 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
       /* reported below */
     }
     if (!ok && mounted) {
-      setState(() => _error = "Couldn't open this folder in $_fileManagerName.");
+      setState(
+        () => _error = "Couldn't open this folder in $_fileManagerName.",
+      );
     }
   }
 
   String get _fileManagerName => Platform.isWindows
       ? 'Explorer'
       : Platform.isMacOS
-          ? 'Finder'
-          : 'the file manager';
+      ? 'Finder'
+      : 'the file manager';
 
   void _goToTypedPath() {
     final p = _pathCtrl.text.trim();
@@ -259,14 +262,21 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
                 children: [
                   const Icon(Icons.folder_open, size: 20),
                   const SizedBox(width: 8),
-                  Text(
-                    'Choose export folder',
-                    style: theme.textTheme.titleMedium,
+                  // Expanded so the header's action buttons never overflow a
+                  // narrow dialog; the title truncates instead.
+                  Expanded(
+                    child: Text(
+                      'Choose export folder',
+                      style: theme.textTheme.titleMedium,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                   ),
-                  const Spacer(),
                   TextButton.icon(
                     onPressed: _loading ? null : _createFolder,
-                    icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+                    icon: const Icon(
+                      Icons.create_new_folder_outlined,
+                      size: 18,
+                    ),
                     label: const Text('New folder'),
                   ),
                   IconButton(
@@ -319,9 +329,7 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
                     _quickChip(
                       icon: Icons.home_outlined,
                       label: 'Home',
-                      onTap: () => _navigateTo(
-                        _resolveInitial(null),
-                      ),
+                      onTap: () => _navigateTo(_resolveInitial(null)),
                     ),
                     for (final r in _roots)
                       _quickChip(
@@ -346,7 +354,10 @@ class _FolderPickerDialogState extends State<_FolderPickerDialog> {
                 const SizedBox(height: 8),
                 Text(
                   _error!,
-                  style: TextStyle(color: theme.colorScheme.error, fontSize: 12),
+                  style: TextStyle(
+                    color: theme.colorScheme.error,
+                    fontSize: 12,
+                  ),
                 ),
               ],
               const SizedBox(height: 12),
@@ -444,7 +455,10 @@ class _NewFolderDialogState extends State<_NewFolderDialog> {
   void initState() {
     super.initState();
     // Pre-select the default so typing replaces it, as Explorer does.
-    _ctrl.selection = TextSelection(baseOffset: 0, extentOffset: _ctrl.text.length);
+    _ctrl.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _ctrl.text.length,
+    );
   }
 
   @override
@@ -478,7 +492,9 @@ class _NewFolderDialogState extends State<_NewFolderDialog> {
             errorText: _error,
           ),
           onChanged: (_) {
-            if (_error != null) setState(() => _error = folderNameError(_ctrl.text));
+            if (_error != null) {
+              setState(() => _error = folderNameError(_ctrl.text));
+            }
           },
           onSubmitted: (_) => _submit(),
         ),

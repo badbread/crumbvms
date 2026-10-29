@@ -14,7 +14,8 @@ void main() {
     test('accepts ordinary names', () {
       expect(folderNameError('Driveway 2026-10-29'), isNull);
       expect(folderNameError('  exports  '), isNull);
-      expect(folderNameError('con.d'), isNull);
+      expect(folderNameError('icons'), isNull);
+      expect(folderNameError('console'), isNull);
     });
     test('rejects empty and dot names', () {
       expect(folderNameError(''), isNotNull);
@@ -28,48 +29,73 @@ void main() {
         expect(folderNameError('a${c}b'), isNotNull, reason: 'char $c');
       }
     });
-    test('rejects Windows reserved device names, with or without extension', () {
-      expect(folderNameError('CON'), isNotNull);
-      expect(folderNameError('nul'), isNotNull);
-      expect(folderNameError('com1'), isNotNull);
-      expect(folderNameError('LPT9.txt'), isNotNull);
-      expect(folderNameError('COM10'), isNull);
-    });
+    test(
+      'rejects Windows reserved device names, with or without extension',
+      () {
+        expect(folderNameError('CON'), isNotNull);
+        expect(folderNameError('nul'), isNotNull);
+        expect(folderNameError('com1'), isNotNull);
+        expect(folderNameError('LPT9.txt'), isNotNull);
+        expect(folderNameError('COM10'), isNull);
+      },
+    );
   });
 
   testWidgets('New folder creates the folder and opens it', (tester) async {
     final root = Directory.systemTemp.createTempSync('crumb_picker_');
     addTearDown(() => root.deleteSync(recursive: true));
 
+    // The picker does real directory IO, which the fake test clock never
+    // advances, and the name field's blinking cursor never settles. So
+    // alternate real waits with frame pumps until [done] holds.
+    Future<void> pumpUntil(bool Function() done) async {
+      for (var i = 0; i < 50 && !done(); i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(done(), isTrue);
+    }
+
     String? picked;
+    var closed = false;
     await tester.pumpWidget(
       MaterialApp(
         home: Builder(
           builder: (context) => TextButton(
-            onPressed: () async =>
-                picked = await pickFolderInApp(context, initialPath: root.path),
+            onPressed: () async {
+              picked = await pickFolderInApp(context, initialPath: root.path);
+              closed = true;
+            },
             child: const Text('open'),
           ),
         ),
       ),
     );
     await tester.tap(find.text('open'));
-    // Directory listing is real IO; let it finish outside the fake clock.
-    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 200)));
-    await tester.pumpAndSettle();
+    await pumpUntil(
+      () => find.text('No sub-folders here.').evaluate().isNotEmpty,
+    );
 
     await tester.tap(find.text('New folder'));
-    await tester.pumpAndSettle();
+    await pumpUntil(() => find.text('Create').evaluate().isNotEmpty);
     await tester.enterText(find.byType(TextField).last, 'Front yard');
     await tester.tap(find.text('Create'));
-    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 200)));
-    await tester.pumpAndSettle();
 
-    final created = Directory('${root.path}${Platform.pathSeparator}Front yard');
+    final created = Directory(
+      '${root.path}${Platform.pathSeparator}Front yard',
+    );
+    // Created, stepped into (the path line shows it), and empty.
+    await pumpUntil(
+      () =>
+          find.text('Use: ${created.path}').evaluate().isNotEmpty &&
+          find.text('No sub-folders here.').evaluate().isNotEmpty,
+    );
     expect(created.existsSync(), isTrue);
 
     await tester.tap(find.text('Use this folder'));
-    await tester.pumpAndSettle();
+    await pumpUntil(() => closed);
     expect(picked, created.path);
   });
 }
