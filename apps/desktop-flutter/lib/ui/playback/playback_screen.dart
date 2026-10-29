@@ -43,6 +43,7 @@ import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'gapless_segment_pane_controller.dart';
 import 'playback_prefs.dart';
+import 'playback_tick_text.dart';
 import 'playback_timeline_controller.dart';
 
 class PlaybackScreen extends StatefulWidget {
@@ -279,8 +280,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         _selectedCameraId != null ? _audioPaneId(_selectedCameraId!) : null,
       );
     }
-    // Rebuild (fresh playhead for the motion strip) + debounced motion refetch
-    // whenever the scrubber window/playhead changes.
+    // Throttled motion refetch whenever the scrubber window/playhead changes.
+    // No screen rebuild: the timeline view, the transport clock and the
+    // export-selection bar listen to [_timeline] themselves.
     _timeline.addListener(_onTimelineChanged);
     _enter();
     _idleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -314,8 +316,11 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     }
   }
 
+  /// Fires every 100 ms while playing and at pointer rate while dragging, so
+  /// it must NOT setState: that rebuilt the whole screen, every pane's Video
+  /// widget included, at tick rate. Everything that shows the playhead or the
+  /// selection listens to [_timeline] directly instead.
   void _onTimelineChanged() {
-    if (mounted) setState(() {});
     _scheduleMotionRefresh();
   }
 
@@ -475,6 +480,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     final now = DateTime.now().toUtc();
     final end = now.add(const Duration(minutes: 1));
     final cached = _coverage[camId];
+    final hadSpans = _recordsElsewhere(camId);
 
     _coverageLoading.add(camId);
     try {
@@ -522,6 +528,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (camId == _selectedCameraId) {
       _timeline.setSpans(_coverage[camId]!.spans);
     }
+    // The tiles' "records elsewhere" hint reads _coverage; rebuild only when
+    // it actually flips (setSpans no longer rebuilds the screen).
+    if (mounted && _recordsElsewhere(camId) != hadSpans) setState(() {});
   }
 
   /// Fetch every merged recorded span for [cameraId] over `[start, end)`,
@@ -615,8 +624,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             : pane.onTick(t, playing: play, mpvDriven: mpvDriven),
       );
     }
+    // No setState: this runs on every play tick, and each _PbTile listens
+    // to its own pane for the footage state it shows.
     await Future.wait(futures);
-    if (mounted) setState(() {});
   }
 
   /// Live-scrub, fired continuously while dragging the scrubber. Panes are NOT
@@ -1400,7 +1410,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                   Positioned.fill(
                     child: Padding(
                       padding: const EdgeInsets.all(2),
-                      child: _buildGrid(),
+                      child: RepaintBoundary(child: _buildGrid()),
                     ),
                   ),
                 if (!_entering && _statusMessage != null)
@@ -1436,7 +1446,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             playing: _playing,
             speeds: _speeds,
             speedIdx: _speedIdx,
-            gotoLabel: _fmtPlayheadLabel(),
+            playhead: _timeline,
+            gotoLabel: _fmtPlayheadLabel,
             onTogglePlay: _togglePlay,
             onSetSpeed: _setSpeed,
             onShuttle: _onShuttleUpdate,
@@ -1453,7 +1464,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onZoomOut: () => _zoomBy(1),
             onZoomIn: () => _zoomBy(-1),
           ),
-          if (_timeline.hasSelection) _buildExportSelectionBar(),
+          ListenableBuilder(
+            listenable: _timeline,
+            builder: (context, _) => _timeline.hasSelection
+                ? _buildExportSelectionBar()
+                : const SizedBox.shrink(),
+          ),
           // The single playback timeline: motion intensity + detection glyphs +
           // a thin recording-coverage line at the bottom, and the scrub surface
           // itself — drag = pan, click = seek, wheel = zoom, right-drag or
@@ -1520,6 +1536,7 @@ class _TransportBar extends StatelessWidget {
     required this.playing,
     required this.speeds,
     required this.speedIdx,
+    required this.playhead,
     required this.gotoLabel,
     required this.onTogglePlay,
     required this.onSetSpeed,
@@ -1541,7 +1558,11 @@ class _TransportBar extends StatelessWidget {
   final bool playing;
   final List<double> speeds;
   final int speedIdx;
-  final String gotoLabel;
+
+  /// The playback timeline; only the go-to clock label listens to it, so a
+  /// playhead tick rebuilds that label and nothing else in the bar.
+  final Listenable playhead;
+  final String Function() gotoLabel;
   final VoidCallback onTogglePlay;
   final ValueChanged<int> onSetSpeed;
 
@@ -1757,8 +1778,9 @@ class _TransportBar extends StatelessWidget {
                     child: OutlinedButton.icon(
                       onPressed: onPickGoto,
                       icon: const Icon(Icons.event, size: 15),
-                      label: Text(
-                        gotoLabel,
+                      label: PlaybackTickText(
+                        listenable: playhead,
+                        text: gotoLabel,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -2025,6 +2047,59 @@ class _PbTileState extends State<_PbTile> {
   // to 5/6/8 independently before, so the phone ran out first for no reason.
   static const double _maxZoom = 30.0;
 
+  // The parent no longer rebuilds per play tick, so the tile follows its own
+  // pane for the footage state it shows, and rebuilds only when that state
+  // flips (segment found / lost / errored), not on every pane notification.
+  late Object _footageSig = _footageSignature();
+
+  // Built once per pane: an identical widget instance makes the framework skip
+  // the whole Video subtree when the tile rebuilds (zoom, scrub frame, select).
+  late Widget _video = _buildVideo();
+
+  Object _footageSignature() => (
+    widget.pane.currentSegment != null,
+    widget.pane.noFootage,
+    widget.pane.error,
+  );
+
+  Widget _buildVideo() => RepaintBoundary(
+    child: Video(
+      controller: widget.pane.videoController,
+      controls: NoVideoControls,
+      fit: BoxFit.contain,
+    ),
+  );
+
+  void _onPaneChanged() {
+    final sig = _footageSignature();
+    if (sig == _footageSig) return;
+    _footageSig = sig;
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.pane.addListener(_onPaneChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _PbTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.pane, widget.pane)) {
+      oldWidget.pane.removeListener(_onPaneChanged);
+      widget.pane.addListener(_onPaneChanged);
+      _footageSig = _footageSignature();
+      _video = _buildVideo();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.pane.removeListener(_onPaneChanged);
+    super.dispose();
+  }
+
   void _zoomAt(Offset cursor, double factor, Size pane) {
     final newScale = (_scale * factor).clamp(1.0, _maxZoom);
     if (newScale == _scale) return;
@@ -2238,14 +2313,7 @@ class _PbTileState extends State<_PbTile> {
                   onPointerPanZoomStart: _onPanZoomStart,
                   onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, paneSize),
                   child: ClipRect(
-                    child: Transform(
-                      transform: _zoomTransform,
-                      child: Video(
-                        controller: widget.pane.videoController,
-                        controls: NoVideoControls,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
+                    child: Transform(transform: _zoomTransform, child: _video),
                   ),
                 ),
                 if (!hasFootage) Positioned.fill(child: _noFootageOverlay()),
