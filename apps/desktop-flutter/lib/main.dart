@@ -104,6 +104,13 @@ ThemeData _desktopTheme() {
       dense: true,
       minVerticalPadding: 4,
     ),
+    // Desktop windows are wider than tall, so date pickers use Material's
+    // LANDSCAPE layout: a fixed 152 px header column (about 104 px for text
+    // after padding) whose 32 px headline wrapped "Thu, Oct 29" onto two
+    // lines. At 18 px the longest "Wed, Sep 30" style date fits on one.
+    datePickerTheme: const DatePickerThemeData(
+      headerHeadlineStyle: TextStyle(fontSize: 18, height: 1.2),
+    ),
     // Slimmer switches — the M3 default reads as a phone toggle on desktop.
     switchTheme: SwitchThemeData(
       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
