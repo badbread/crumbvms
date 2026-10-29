@@ -98,6 +98,9 @@ import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
+import coil.imageLoader
+import coil.memory.MemoryCache
+import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 import video.crumb.app.data.toUserMessage
 import video.crumb.app.di.appContainer
@@ -909,12 +912,40 @@ fun PlaybackScreen(
                                     .background(Color.Black.copy(alpha = 0.55f)),
                                 contentAlignment = Alignment.Center,
                             ) {
+                                // Every new cell under the finger is a new URL. Left
+                                // to itself AsyncImage blanks to nothing until that
+                                // URL has loaded, so a drag flickered black between
+                                // frames on anything slower than a LAN. Keep the last
+                                // successfully shown frame up as the placeholder
+                                // (Coil's memory-cache key for a plain URL is the URL)
+                                // and don't crossfade, so the overlay only ever steps
+                                // from one real frame to the next.
+                                var lastShownScrubUrl by remember { mutableStateOf<String?>(null) }
+                                val scrubUrl = state.scrubFrameUrl
                                 AsyncImage(
-                                    model = state.scrubFrameUrl,
+                                    model = ImageRequest.Builder(context)
+                                        .data(scrubUrl)
+                                        .placeholderMemoryCacheKey(lastShownScrubUrl?.let { MemoryCache.Key(it) })
+                                        .crossfade(false)
+                                        .build(),
                                     contentDescription = "Scrub preview",
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier.fillMaxSize(),
+                                    onSuccess = { lastShownScrubUrl = scrubUrl },
                                 )
+                            }
+                        }
+                        // Warm the frames just ahead of the finger into Coil's
+                        // memory/disk cache so the next cells it reaches are hits
+                        // (no round-trip, no blank). The VM plans which frames
+                        // (direction-aware, nearest first); Coil dedupes a request
+                        // already cached or in flight, so re-enqueueing is cheap.
+                        val prefetchUrls = state.scrubPrefetchUrls
+                        LaunchedEffect(prefetchUrls) {
+                            if (!state.scrubbing) return@LaunchedEffect
+                            val loader = context.imageLoader
+                            for (url in prefetchUrls) {
+                                loader.enqueue(ImageRequest.Builder(context).data(url).build())
                             }
                         }
                         // Loading spinner when buffering mid-segment

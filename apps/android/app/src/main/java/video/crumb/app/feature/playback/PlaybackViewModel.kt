@@ -75,6 +75,13 @@ data class PlaybackUiState(
     val filmstrip: List<FilmstripFrame> = emptyList(),
     val scrubbing: Boolean = false,
     val scrubFrameUrl: String? = null,
+    /**
+     * Authed URLs of the filmstrip frames just around [scrubFrameUrl] in the
+     * finger's direction of travel, for the screen to warm into Coil's cache
+     * before the finger reaches them (see [PlaybackViewModel.onScrub]). Nearest
+     * first. Empty when not scrubbing.
+     */
+    val scrubPrefetchUrls: List<String> = emptyList(),
     val jumpInProgress: Boolean = false,
     /**
      * True from the moment a USER-INITIATED seek starts until its segment
@@ -134,6 +141,45 @@ private const val MIN_SPAN_MS = 60_000L            // 1 min (max zoom-in)
 private const val MAX_SPAN_MS = DEFAULT_WINDOW_HOURS * 3600_000L // = data window (max zoom-out)
 private const val FILMSTRIP_HALF_WINDOW_HOURS = 1L
 private const val FILMSTRIP_DEBOUNCE_MS = 300L
+
+/**
+ * Width the single-camera scrub preview is fetched at. This is the server's
+ * pre-generated width (`THUMB_PREGEN_WIDTH` default, and one of its five cache
+ * buckets) and the width the desktop client scrubs at, so a frame either client
+ * (or the background worker) has already rendered is served straight from disk
+ * instead of a fresh ffmpeg decode. The previous 160 px request was a cache key
+ * nobody else used: every cell a phone scrubbed over cold was its own decode,
+ * and at full-screen the 160 px frame was visibly soft anyway.
+ */
+internal const val SCRUB_FRAME_WIDTH = 480
+
+/** Frames ahead of the finger (in its direction of travel) to warm. */
+internal const val SCRUB_PREFETCH_AHEAD = 3
+/** Frames behind the finger to warm (a small reversal stays instant). */
+internal const val SCRUB_PREFETCH_BEHIND = 1
+
+/**
+ * Pure prefetch plan for the scrub overlay: the frames adjacent to [nearestIdx]
+ * in [frames] (sorted ascending by time, as the server returns them), ahead in
+ * the direction of travel ([forward]) and one behind, nearest first. The frame
+ * at [nearestIdx] itself is the one being shown and is never included.
+ */
+internal fun scrubPrefetchPlan(
+    frames: List<FilmstripFrame>,
+    nearestIdx: Int,
+    forward: Boolean,
+    ahead: Int = SCRUB_PREFETCH_AHEAD,
+    behind: Int = SCRUB_PREFETCH_BEHIND,
+): List<FilmstripFrame> {
+    if (nearestIdx !in frames.indices) return emptyList()
+    val stepAhead = if (forward) 1 else -1
+    val out = ArrayList<FilmstripFrame>(ahead + behind)
+    for (i in 1..maxOf(ahead, behind)) {
+        if (i <= ahead) frames.getOrNull(nearestIdx + i * stepAhead)?.let(out::add)
+        if (i <= behind) frames.getOrNull(nearestIdx - i * stepAhead)?.let(out::add)
+    }
+    return out
+}
 private const val NEXT_SEGMENT_LOOKAHEAD_MS = 1L
 
 /**
@@ -1038,28 +1084,38 @@ class PlaybackViewModel(
      * and kicks off a debounced filmstrip fetch so thumbnails track the finger.
      */
     fun onScrub(tsMs: Long) {
-        val nearestFrame = _state.value.filmstrip
-            .minByOrNull { kotlin.math.abs(Time.parseToMillis(it.ts) - tsMs) }
+        val frames = _state.value.filmstrip
+        val forward = tsMs >= lastScrubMs
+        lastScrubMs = tsMs
+        val nearestIdx = frames.indices
+            .minByOrNull { kotlin.math.abs(Time.parseToMillis(frames[it].ts) - tsMs) } ?: -1
+        val nearestFrame = frames.getOrNull(nearestIdx)
         _state.update { it.copy(playheadMs = tsMs) }
         if (nearestFrame != null) {
             // URL construction needs the (possibly cached, possibly a fresh fetch)
             // per-camera scoped token — resolve it off the main update, then apply
             // it only if the scrub hasn't already moved past this frame.
+            val plan = scrubPrefetchPlan(frames, nearestIdx, forward)
             viewModelScope.launch {
                 // scopedUrl() throws on a media-token fetch failure — guard it like
                 // every other consumer and just drop the frame on failure.
-                val frameUrl = runCatchingCancellable {
-                    repo.mediaUrls().scopedUrl(cameraId, nearestFrame.url)
+                val urls = runCatchingCancellable {
+                    val m = repo.mediaUrls()
+                    m.scopedUrl(cameraId, nearestFrame.url) to plan.map { m.scopedUrl(cameraId, it.url) }
                 }.getOrNull()
-                if (frameUrl != null && _state.value.scrubbing) {
-                    _state.update { it.copy(scrubFrameUrl = frameUrl) }
+                if (urls != null && _state.value.scrubbing) {
+                    _state.update { it.copy(scrubFrameUrl = urls.first, scrubPrefetchUrls = urls.second) }
                 }
             }
         } else {
-            _state.update { it.copy(scrubFrameUrl = null) }
+            _state.update { it.copy(scrubFrameUrl = null, scrubPrefetchUrls = emptyList()) }
         }
         loadFilmstrip(tsMs)
     }
+
+    /** Last scrub position, to tell the finger's direction of travel for the
+     *  prefetch plan in [onScrub]. */
+    private var lastScrubMs = 0L
 
     /** Called when the user releases the scrubber. Seeks to the final position,
      *  and recenters the (larger) data window if the playhead neared its edge so
@@ -1069,7 +1125,9 @@ class PlaybackViewModel(
      *  any in-flight step worker. */
     fun onScrubEnd(tsMs: Long) {
         cancelStepWorker()
-        _state.update { it.copy(scrubbing = false, playheadMs = tsMs, scrubFrameUrl = null) }
+        _state.update {
+            it.copy(scrubbing = false, playheadMs = tsMs, scrubFrameUrl = null, scrubPrefetchUrls = emptyList())
+        }
         val s = _state.value
         val margin = 30L * 60_000L
         if (tsMs < s.windowStartMs + margin || tsMs > s.windowEndMs - margin) {
@@ -1104,7 +1162,7 @@ class PlaybackViewModel(
             val halfMs = FILMSTRIP_HALF_WINDOW_HOURS * 3600 * 1000
             val startIso = Time.iso(Instant.ofEpochMilli((centerMs - halfMs).coerceAtLeast(0L)))
             val endIso = Time.iso(Instant.ofEpochMilli(centerMs + halfMs))
-            repo.filmstrip(cameraId, startIso, endIso, width = 160)
+            repo.filmstrip(cameraId, startIso, endIso, width = SCRUB_FRAME_WIDTH)
                 .onSuccess { frames ->
                     val nearestFrame = frames.minByOrNull {
                         kotlin.math.abs(Time.parseToMillis(it.ts) - _state.value.playheadMs)
