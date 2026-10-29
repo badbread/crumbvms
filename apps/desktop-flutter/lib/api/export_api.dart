@@ -23,7 +23,10 @@
 // /media-token, mirroring apps/desktop/src/app.js's getMediaToken/-cache.
 
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
+
+import 'package:http/http.dart' as http;
 
 import 'crumb_api.dart';
 import 'http_client.dart';
@@ -78,24 +81,44 @@ class ExportOutputFile {
     required this.downloadUrl,
     required this.sizeBytes,
     required this.filename,
+    this.downloadName,
   });
 
   final String cameraId;
-  final String downloadUrl; // server-relative, e.g. /export/{job}/files/{cam}
+  final String downloadUrl; // server-relative, e.g. /export/{job}/output/{i}
   final int sizeBytes;
   final String filename;
+
+  /// The user-facing file name the server chose (camera name + local date and
+  /// times, e.g. `Front Yard 2026-10-29 12.47.02-12.48.40.mp4`), when it
+  /// sends one separately from the on-disk [filename]. Older servers don't.
+  final String? downloadName;
 
   bool get isArchive =>
       cameraId == '00000000-0000-0000-0000-000000000000' ||
       filename.toLowerCase().endsWith('.zip');
 
-  factory ExportOutputFile.fromJson(Map<String, dynamic> j) =>
-      ExportOutputFile(
-        cameraId: j['camera_id'] as String,
-        downloadUrl: j['download_url'] as String,
-        sizeBytes: (j['size_bytes'] as num?)?.toInt() ?? 0,
-        filename: (j['filename'] as String?) ?? '',
-      );
+  factory ExportOutputFile.fromJson(Map<String, dynamic> j) => ExportOutputFile(
+    cameraId: j['camera_id'] as String,
+    downloadUrl: j['download_url'] as String,
+    sizeBytes: (j['size_bytes'] as num?)?.toInt() ?? 0,
+    filename: (j['filename'] as String?) ?? '',
+    downloadName: j['download_name'] as String?,
+  );
+}
+
+/// `POST /export/estimate` response: the recorded footage a batch would
+/// export, which is what a copy-codec export writes. The client scales it for
+/// re-encoding codecs.
+class ExportEstimate {
+  ExportEstimate({required this.bytes, required this.footageSeconds});
+  final int bytes;
+  final double footageSeconds;
+
+  factory ExportEstimate.fromJson(Map<String, dynamic> j) => ExportEstimate(
+    bytes: (j['bytes'] as num?)?.toInt() ?? 0,
+    footageSeconds: (j['footage_seconds'] as num?)?.toDouble() ?? 0,
+  );
 }
 
 /// `GET /export/{job_id}` response snapshot (`ExportJob` in dto.rs).
@@ -127,8 +150,7 @@ class ExportJob {
   factory ExportJob.fromJson(Map<String, dynamic> j) => ExportJob(
     id: j['id'] as String,
     status: ExportJobStatus.fromJson(j['status'] as String),
-    cameraIds: (j['camera_ids'] as List<dynamic>? ?? const [])
-        .cast<String>(),
+    cameraIds: (j['camera_ids'] as List<dynamic>? ?? const []).cast<String>(),
     start: DateTime.parse(j['start'] as String),
     end: DateTime.parse(j['end'] as String),
     burnTimestamp: (j['burn_timestamp'] as bool?) ?? true,
@@ -152,7 +174,8 @@ class CreateExportResult {
 class FilmstripFrame {
   FilmstripFrame({required this.ts, required this.url});
   final DateTime ts;
-  final String url; // server-relative, e.g. /filmstrip/{cam}/frame?ts=..&width=..
+  final String
+  url; // server-relative, e.g. /filmstrip/{cam}/frame?ts=..&width=..
 
   factory FilmstripFrame.fromJson(Map<String, dynamic> j) => FilmstripFrame(
     ts: DateTime.parse(j['ts'] as String),
@@ -277,10 +300,11 @@ extension ExportApi on CrumbApi {
   // ── POST /export/batch ────────────────────────────────────────────────────
 
   /// Submit a batch export job: a list of `{camera_id, start, end}` clips
-  /// (max 50 server-side — export.rs::MAX_BATCH_ITEMS) bundled into ONE
-  /// archive when `password` is set OR more than one output file is produced.
-  /// `videoCodec` is `"copy" | "h264" | "h265"`, `container` is `"mp4" |
-  /// "mkv"`. `password` empty/null -> no encryption/zip-forcing.
+  /// (max 50 server-side — export.rs::MAX_BATCH_ITEMS). `zip` bundles them
+  /// into ONE archive when more than one file is produced; `zip: false` keeps
+  /// one file per clip. A `password` always zips (the archive is what's
+  /// encrypted). `videoCodec` is `"copy" | "h264" | "h265"`, `container` is
+  /// `"mp4" | "mkv"`. `password` empty/null -> no encryption.
   Future<CreateExportResult> submitBatchExport(
     Session s, {
     required List<BatchExportItem> items,
@@ -289,7 +313,9 @@ extension ExportApi on CrumbApi {
     String videoCodec = 'copy',
     String container = 'mp4',
     String? password,
+    bool zip = true,
   }) async {
+    final hasPassword = password != null && password.isNotEmpty;
     final resp = await sharedHttpClient.post(
       Uri.parse('${s.base}/export/batch'),
       headers: {..._authHeaders(s), 'content-type': 'application/json'},
@@ -299,13 +325,16 @@ extension ExportApi on CrumbApi {
         'include_audio': includeAudio,
         'video_codec': videoCodec,
         'container': container,
-        'password': (password == null || password.isEmpty) ? null : password,
+        'password': hasPassword ? password : null,
+        // Older servers ignore this field and always zip multi-clip batches.
+        'package': (zip || hasPassword) ? 'zip' : 'files',
       }),
     );
     if (resp.statusCode != 202) {
       String detail;
       try {
-        detail = (jsonDecode(resp.body) as Map<String, dynamic>)['message']
+        detail =
+            (jsonDecode(resp.body) as Map<String, dynamic>)['message']
                 as String? ??
             resp.body;
       } catch (_) {
@@ -321,6 +350,31 @@ extension ExportApi on CrumbApi {
       jobId: j['job_id'] as String,
       statusUrl: j['status_url'] as String,
     );
+  }
+
+  // ── POST /export/estimate ─────────────────────────────────────────────────
+
+  /// Size of the recorded footage [items] cover, summed from the server's
+  /// segment index. Null on any failure, including servers that predate the
+  /// endpoint, so the caller can fall back to its own heuristic.
+  Future<ExportEstimate?> estimateExport(
+    Session s,
+    List<BatchExportItem> items,
+  ) async {
+    if (items.isEmpty) return null;
+    try {
+      final resp = await sharedHttpClient.post(
+        Uri.parse('${s.base}/export/estimate'),
+        headers: {..._authHeaders(s), 'content-type': 'application/json'},
+        body: jsonEncode({'items': items.map((it) => it.toJson()).toList()}),
+      );
+      if (resp.statusCode != 200) return null;
+      return ExportEstimate.fromJson(
+        jsonDecode(resp.body) as Map<String, dynamic>,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   // ── GET /export/{job_id} ──────────────────────────────────────────────────
@@ -358,26 +412,62 @@ extension ExportApi on CrumbApi {
 
   // ── GET /export/{job_id}/files/{camera_id} + /archive ─────────────────────
 
-  /// Download one completed output file's bytes (per-camera file OR, when
-  /// `file.isArchive`, the combined zip via `/archive`). Authenticated with
-  /// the bearer JWT in the Authorization header — no token in the URL, unlike
-  /// the old browser client which had to (a `<a download>` element cannot set
-  /// headers). `file.downloadUrl` is already the right server-relative path
-  /// for either case.
-  Future<Uint8List> downloadExportFile(
+  /// Download one completed output file (a clip, or the combined zip) to
+  /// [path], streaming it to disk rather than holding it in memory: a long
+  /// multi-camera export can be tens of GB. Writes `<path>.part` and renames
+  /// it on success, so a failed or cancelled download never leaves a
+  /// truncated file under the final name. Authenticated with the bearer JWT
+  /// in the Authorization header, never a token in the URL.
+  /// [onProgress] gets (bytes so far, expected total or 0 if unknown).
+  Future<void> downloadExportFileTo(
     Session s,
     ExportOutputFile file,
-  ) async {
-    final resp = await sharedHttpClient.get(
-      Uri.parse('${s.base}${file.downloadUrl}'),
-      headers: _authHeaders(s),
-    );
+    String path, {
+    void Function(int received, int total)? onProgress,
+  }) async {
+    final req = http.Request('GET', Uri.parse('${s.base}${file.downloadUrl}'))
+      ..headers.addAll(_authHeaders(s));
+    final resp = await sharedHttpClient.send(req);
     if (resp.statusCode != 200) {
+      await resp.stream.drain<void>();
       throw CrumbApiException(
-        'Download failed for ${file.filename} (HTTP ${resp.statusCode}).',
+        'Download failed for ${file.downloadName ?? file.filename} '
+        '(HTTP ${resp.statusCode}).',
         statusCode: resp.statusCode,
       );
     }
-    return resp.bodyBytes;
+    final total = resp.contentLength ?? file.sizeBytes;
+    final part = File('$path.part');
+    final sink = part.openWrite();
+    var received = 0;
+    try {
+      // The shared client's timeout only bounds getting the response
+      // headers; a body that stops arriving must fail too, not hang.
+      await for (final chunk in resp.stream.timeout(
+        const Duration(seconds: 60),
+      )) {
+        sink.add(chunk);
+        received += chunk.length;
+        onProgress?.call(received, total);
+      }
+      await sink.flush();
+      await sink.close();
+    } catch (_) {
+      await sink.close().catchError((_) {});
+      try {
+        await part.delete();
+      } catch (_) {
+        /* best-effort cleanup */
+      }
+      rethrow;
+    }
+    if (total > 0 && received != total) {
+      await part.delete();
+      throw CrumbApiException(
+        'Download of ${file.downloadName ?? file.filename} was cut short '
+        '($received of $total bytes).',
+      );
+    }
+    await part.rename(path);
   }
 }
