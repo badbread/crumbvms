@@ -144,6 +144,12 @@ watchlist row, or the plate detail, on the web console, desktop, Android, and
 iOS, so you can hand it off (a call to the front gate, a note to a neighbor)
 without retyping it.
 
+## Reviewing plates on the desktop
+
+The desktop app's Plates tab shows today's totals, which plates are regulars
+and which are new, and each plate's history. See
+[The Plates page](./plates-page.md).
+
 ## Searching and retention
 
 Search the read database with `GET /plates` (exact, prefix, contains, or fuzzy
