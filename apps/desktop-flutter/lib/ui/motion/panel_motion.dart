@@ -15,6 +15,8 @@
 //
 // Reduced motion: no size, scale or slide motion; fades capped at 100 ms.
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'motion_tokens.dart';
@@ -369,5 +371,90 @@ class _ToastMotionState extends State<ToastMotion>
         return Transform.translate(offset: Offset(0, dy), child: child);
       },
     );
+  }
+}
+
+/// One row for a [ListReflow]-driven list.
+class ListReflowRow<T> {
+  const ListReflowRow(this.item, {required this.leaving, required this.number});
+
+  final T item;
+
+  /// True for a row that was removed from the data and is still shrinking out.
+  final bool leaving;
+
+  /// 1-based position among the rows that are really in the list (leaving rows
+  /// do not count, so numbering is already final while they animate out).
+  final int number;
+}
+
+/// Bookkeeping that turns "the data list changed" into add / remove reflow
+/// without the owner tracking it: each [sync] diffs against the previous one,
+/// so rows that disappeared stay in the output as `leaving` for the leave
+/// duration, and [isNew] says which rows are appearing for the first time.
+/// The data itself always changes immediately; this only decides what is drawn.
+class ListReflow<T> {
+  ListReflow(this.idOf);
+
+  final int Function(T item) idOf;
+
+  final Set<int> _seen = {};
+  List<T> _last = const [];
+  final List<({int index, T item})> _ghosts = [];
+  final List<Timer> _timers = [];
+
+  /// Rows that were already present before the first draw: they do not animate.
+  void markSeen(Iterable<int> ids) => _seen.addAll(ids);
+
+  /// True the first time a (non-leaving) row id is drawn.
+  bool isNew(int id, bool leaving) => !leaving && _seen.add(id);
+
+  /// The rows to draw for [current]: removed rows are re-inserted at their old
+  /// position as `leaving` until [leaveFor] has passed, then [onChanged] fires.
+  List<ListReflowRow<T>> sync(
+    List<T> current, {
+    required Duration leaveFor,
+    required VoidCallback onChanged,
+  }) {
+    final now = {for (final d in current) idOf(d)};
+    for (var i = 0; i < _last.length; i++) {
+      final gone = _last[i];
+      final id = idOf(gone);
+      if (now.contains(id) || _ghosts.any((g) => idOf(g.item) == id)) continue;
+      final ghost = (index: i, item: gone);
+      _ghosts.add(ghost);
+      late final Timer t;
+      t = Timer(leaveFor, () {
+        _timers.remove(t);
+        _ghosts.remove(ghost);
+        onChanged();
+      });
+      _timers.add(t);
+    }
+    // A row that came back (undo) is no longer a ghost.
+    _ghosts.removeWhere((g) => now.contains(idOf(g.item)));
+    _last = List<T>.of(current);
+
+    final merged = <({T item, bool leaving})>[
+      for (final d in current) (item: d, leaving: false),
+    ];
+    for (final g in _ghosts) {
+      merged.insert(
+        g.index < merged.length ? g.index : merged.length,
+        (item: g.item, leaving: true),
+      );
+    }
+    var n = 0;
+    return [
+      for (final r in merged)
+        ListReflowRow<T>(r.item, leaving: r.leaving, number: r.leaving ? n : ++n),
+    ];
+  }
+
+  void dispose() {
+    for (final t in _timers) {
+      t.cancel();
+    }
+    _timers.clear();
   }
 }

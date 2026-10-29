@@ -192,4 +192,53 @@ void main() {
       expect(start - end, closeTo(10, 1.0));
     });
   });
+
+  group('ListReflow', () {
+    testWidgets('removed rows linger as leaving at their old spot, then go', (
+      tester,
+    ) async {
+      {
+        var changed = 0;
+        final r = ListReflow<int>((x) => x);
+        r.markSeen([1, 2, 3]);
+        var rows = r.sync(
+          [1, 2, 3],
+          leaveFor: const Duration(milliseconds: 220),
+          onChanged: () => changed++,
+        );
+        expect(rows.map((e) => e.item), [1, 2, 3]);
+        expect(rows.every((e) => !e.leaving), isTrue);
+
+        // Row 2 removed from the data.
+        rows = r.sync(
+          [1, 3],
+          leaveFor: const Duration(milliseconds: 220),
+          onChanged: () => changed++,
+        );
+        expect(rows.map((e) => e.item), [1, 2, 3]);
+        expect(rows.map((e) => e.leaving), [false, true, false]);
+        // Numbering is already final: leaving rows do not take a number.
+        expect(rows.where((e) => !e.leaving).map((e) => e.number), [1, 2]);
+
+        await tester.pump(const Duration(milliseconds: 221));
+        expect(changed, 1);
+        rows = r.sync(
+          [1, 3],
+          leaveFor: const Duration(milliseconds: 220),
+          onChanged: () => changed++,
+        );
+        expect(rows.map((e) => e.item), [1, 3]);
+        r.dispose();
+      }
+    });
+
+    test('only unseen rows are new, and only once', () {
+      final r = ListReflow<int>((x) => x);
+      r.markSeen([1]);
+      expect(r.isNew(1, false), isFalse); // seeded
+      expect(r.isNew(2, false), isTrue); // added later
+      expect(r.isNew(2, false), isFalse); // already drawn
+      expect(r.isNew(3, true), isFalse); // leaving rows never animate in
+    });
+  });
 }
