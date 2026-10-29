@@ -374,9 +374,11 @@ pub(crate) async fn ensure_thumbnail(
 /// scaled to ~`width`px, and write it to `frame_path` (creating `thumbs_root`).
 ///
 /// Resolves the covering segment via [`db::resolve_segment`] (main stream),
-/// computes the in-segment offset, and runs `ffmpeg -ss <off> -i <seg>
-/// -frames:v 1 -vf scale=W:-2`. Input-side `-ss` is a fast keyframe seek — plenty
-/// accurate for a scrub thumbnail. Returns 404 when no footage covers `ts`.
+/// computes the in-segment offset, and runs `ffmpeg -noaccurate_seek
+/// -skip_frame nokey -ss <off> -i <seg> -frames:v 1 -vf scale=W:-2`. The
+/// frame is the keyframe at or before the grid slot — see
+/// [`thumb_ffmpeg_args`] for why that is the right trade for a scrub
+/// thumbnail. Returns 404 when no footage covers `ts`.
 async fn extract_thumbnail(
     state: &AppState,
     camera_id: Uuid,
@@ -567,9 +569,32 @@ mod urlencoding {
 /// `.jpg`), so ffmpeg cannot infer the format from the extension. Without it,
 /// every extraction fails to open the output ("Unable to choose an output
 /// format") and `serve_frame` 404s. See `thumb_ffmpeg_args_forces_mjpeg`.
+///
+/// # Keyframe-only decode
+///
+/// `-noaccurate_seek` + `-skip_frame nokey` make the extraction decode exactly
+/// ONE frame: the keyframe at or before the requested offset. ffmpeg's default
+/// (accurate seek) seeks the demuxer to that same keyframe and then decodes
+/// and discards every frame up to the exact offset, i.e. up to a whole GOP
+/// (~1 s at the recorder's keyframe interval, 20-25 frames of 4K HEVC in
+/// software on the api container) per thumbnail. The frame endpoint already
+/// snaps every request to a 4 s grid, so the thumbnail was never the exact
+/// instant; landing on the preceding keyframe moves it by at most one GOP in
+/// the same direction and is invisible at scrub-preview widths. This is the
+/// dominant cost of a cache miss during a cross-segment scrub (and of the
+/// background pre-generation worker), so it is what makes a cold filmstrip
+/// feel instant rather than one-frame-per-second.
+///
+/// `-noaccurate_seek` is also what keeps the keyframe-only decode safe at the
+/// tail of a segment: with accurate seeking, frames before the offset are
+/// discarded, and if no keyframe follows the offset inside the file nothing
+/// would be emitted at all. See `thumb_ffmpeg_args_decodes_only_the_keyframe`.
 fn thumb_ffmpeg_args(offset_secs: f64, width: u32, input: &str, output: &str) -> Vec<String> {
     vec![
         "-y".to_owned(),
+        "-noaccurate_seek".to_owned(),
+        "-skip_frame".to_owned(),
+        "nokey".to_owned(),
         "-ss".to_owned(),
         format!("{offset_secs:.3}"),
         "-i".to_owned(),
@@ -657,5 +682,36 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("/thumbs/x.jpg.tmp7"));
         assert!(args.iter().any(|a| a == "-frames:v"));
         assert!(args.iter().any(|a| a == "-an"));
+    }
+
+    #[test]
+    fn thumb_ffmpeg_args_decodes_only_the_keyframe() {
+        // Both halves of the keyframe-only decode must be INPUT options (before
+        // `-i`): `-skip_frame nokey` is a decoder option that only applies to
+        // the input it precedes, and `-noaccurate_seek` only has meaning for
+        // the input-side `-ss`. Placed after `-i` they would be silently
+        // ignored and every miss would go back to decoding a full GOP.
+        let args = thumb_ffmpeg_args(3.9, 480, "/data/live/cam/seg.mp4", "/thumbs/y.jpg.tmp1");
+        let i = args
+            .iter()
+            .position(|a| a == "-i")
+            .expect("ffmpeg args must name an input");
+        let skip = args
+            .iter()
+            .position(|a| a == "-skip_frame")
+            .expect("keyframe-only decode must be requested");
+        assert_eq!(args.get(skip + 1).map(String::as_str), Some("nokey"));
+        assert!(skip < i, "-skip_frame must be an input option");
+        let noacc = args
+            .iter()
+            .position(|a| a == "-noaccurate_seek")
+            .expect("the seek must snap to the keyframe, not decode up to the offset");
+        assert!(noacc < i, "-noaccurate_seek must be an input option");
+        let ss = args
+            .iter()
+            .position(|a| a == "-ss")
+            .expect("input-side seek");
+        assert!(ss < i, "-ss must stay an input option (fast demuxer seek)");
+        assert_eq!(args.get(ss + 1).map(String::as_str), Some("3.900"));
     }
 }
