@@ -766,23 +766,44 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 style: TextStyle(color: Colors.white70, fontSize: 12),
               ),
             ),
-          TextButton.icon(
-            onPressed: () => setState(() {
-              _showWatchlist = !_showWatchlist;
-              PlatesPrefs.setShowWatchlist(_showWatchlist);
-            }),
-            icon: Icon(
-              _showWatchlist
-                  ? Icons.playlist_add_check
-                  : Icons.playlist_add,
-              size: 16,
-              color: Colors.white70,
-            ),
-            label: Text(
-              _watchlist.isEmpty
-                  ? 'Watchlist'
-                  : 'Watchlist (${_watchlist.length})',
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
+          // A toggle for the watchlist panel: accent colour + tinted fill while
+          // the panel is showing (it used to look the same on and off).
+          Tooltip(
+            message: _showWatchlist
+                ? 'Hide the watchlist panel'
+                : 'Show the watchlist panel',
+            child: TextButton.icon(
+              style: _showWatchlist
+                  ? TextButton.styleFrom(
+                      backgroundColor: Theme.of(
+                        context,
+                      ).colorScheme.primary.withValues(alpha: 0.16),
+                    )
+                  : null,
+              onPressed: () => setState(() {
+                _showWatchlist = !_showWatchlist;
+                PlatesPrefs.setShowWatchlist(_showWatchlist);
+              }),
+              icon: Icon(
+                _showWatchlist
+                    ? Icons.playlist_add_check
+                    : Icons.playlist_add,
+                size: 16,
+                color: _showWatchlist
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.white70,
+              ),
+              label: Text(
+                _watchlist.isEmpty
+                    ? 'Watchlist'
+                    : 'Watchlist (${_watchlist.length})',
+                style: TextStyle(
+                  color: _showWatchlist
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.white70,
+                  fontSize: 12,
+                ),
+              ),
             ),
           ),
           IconButton(
