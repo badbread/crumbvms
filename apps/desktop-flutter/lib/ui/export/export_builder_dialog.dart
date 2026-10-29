@@ -1,21 +1,31 @@
 // Add/edit-clip dialog for the Export tab's batch builder. Pick a camera +
-// time range, scrub a filmstrip preview to confirm you're grabbing the right
+// time range, review the recording to confirm you're grabbing the right
 // moment, then add/save the clip into the parent list.
 //
-// Ports apps/desktop/src/app.js exportOpenBuilder/exportBuilderCommit (list
-// commit) + exportPreviewSeek/exportPreviewFetch/exportPreviewPlayToggle
-// (scrubber). The old client re-fetched a frame ~110ms after the last drag
-// tick and auto-advanced at <=~24 frames per play cycle to cap extractor
-// load server-side; both limits are kept here.
+// The preview is real playback of the recorded segments, through the same
+// [GaplessSegmentPaneController] the Playback tab uses, driven here as a
+// single pane: the playhead is slaved to mpv's real position (see that
+// controller's file header), so the scrubber and the picture can't disagree.
+// It replaced a filmstrip slideshow ported from the old Tauri client, which
+// stepped ~24 still frames across the range every 700 ms (one frame every
+// ~4 s of footage on a 1.5 min clip) and had no transport controls.
+//
+// Controls: play/pause, frame step, skip 10 s, speed, a scrubber over the
+// clip's range, and Set start/end here to trim the clip at the playhead.
+// Keyboard: Space play/pause, Left/Right frame step, Shift+Left/Right 10 s.
+//
+// Times are shown in local time. The draft stores absolute instants (the
+// playback screen hands in UTC values); export_api serializes with toUtc().
 
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
-import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/ui/playback/gapless_segment_pane.dart';
+import 'package:crumb_desktop/ui/playback/gapless_segment_pane_controller.dart';
 
 /// One clip in the batch builder's list (local-only until submit turns it
 /// into a [BatchExportItem]).
@@ -64,6 +74,39 @@ Future<ExportClipDraft?> showExportClipBuilder(
   );
 }
 
+/// `h:mm:ss` style length, e.g. `1m 42s`. Public for tests.
+@visibleForTesting
+String fmtClipDuration(Duration d) {
+  final s = d.inSeconds;
+  final h = s ~/ 3600;
+  final m = (s % 3600) ~/ 60;
+  final sec = s % 60;
+  final parts = <String>[
+    if (h > 0) '${h}h',
+    if (m > 0) '${m}m',
+    if (h == 0 && (sec > 0 || m == 0)) '${sec}s',
+  ];
+  return parts.isEmpty ? '0s' : parts.join(' ');
+}
+
+String _pad2(int n) => n.toString().padLeft(2, '0');
+
+/// `YYYY-MM-DD HH:MM:SS` in LOCAL time, whatever zone [d] carries.
+@visibleForTesting
+String fmtClipDateTime(DateTime d) {
+  final l = d.toLocal();
+  return '${l.year}-${_pad2(l.month)}-${_pad2(l.day)} '
+      '${_pad2(l.hour)}:${_pad2(l.minute)}:${_pad2(l.second)}';
+}
+
+String _fmtClock(DateTime d) {
+  final l = d.toLocal();
+  return '${_pad2(l.hour)}:${_pad2(l.minute)}:${_pad2(l.second)}';
+}
+
+const _speeds = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
+const _skip = Duration(seconds: 10);
+
 class _ExportBuilderDialog extends StatefulWidget {
   const _ExportBuilderDialog({
     required this.api,
@@ -95,14 +138,16 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
   late DateTime _end;
   String? _error;
 
-  // ── preview scrubber state (mirrors exportState.builder in app.js) ───────
-  double _frac = 0.0; // 0..1 position within [_start, _end]
-  Uint8List? _frameBytes;
-  String? _previewMsg = 'Loading preview…';
-  int _reqToken = 0;
-  Timer? _debounce;
-  Timer? _playTimer;
+  // ── preview playback ────────────────────────────────────────────────────
+  GaplessSegmentPaneController? _pane;
+  late DateTime _playhead;
   bool _playing = false;
+  bool _scrubbing = false;
+  bool _tickBusy = false;
+  Timer? _tick;
+  DateTime _lastTickWall = DateTime.now();
+  int _speedIdx = _speeds.indexOf(1.0);
+  final _focus = FocusNode(debugLabel: 'clip preview');
 
   @override
   void initState() {
@@ -114,90 +159,172 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
         (widget.cameras.isNotEmpty ? widget.cameras.first.id : null);
     _end = e?.end ?? widget.preselectEnd ?? DateTime.now();
     _start =
-        e?.start ?? widget.preselectStart ?? _end.subtract(const Duration(minutes: 1));
+        e?.start ??
+        widget.preselectStart ??
+        _end.subtract(const Duration(minutes: 1));
     if (!_end.isAfter(_start)) _end = _start.add(const Duration(minutes: 1));
-    _seekTo(0);
+    _playhead = _start;
+    _attachPane();
+    _jumpTo(_start);
   }
 
   @override
   void dispose() {
-    _debounce?.cancel();
-    _playTimer?.cancel();
+    _tick?.cancel();
+    _pane?.dispose();
+    _focus.dispose();
     super.dispose();
   }
 
   Duration get _span => _end.difference(_start);
 
-  void _seekTo(double frac) {
-    if (_cameraId == null || !_end.isAfter(_start)) return;
-    frac = frac.clamp(0.0, 1.0);
-    final posMs =
-        _start.millisecondsSinceEpoch +
-        (frac * _span.inMilliseconds).round();
-    setState(() => _frac = frac);
-    _debounce?.cancel();
-    _debounce = Timer(
-      const Duration(milliseconds: 110),
-      () => _fetchFrame(DateTime.fromMillisecondsSinceEpoch(posMs)),
-    );
+  double get _frac {
+    final span = _span.inMilliseconds;
+    if (span <= 0) return 0;
+    return (_playhead.difference(_start).inMilliseconds / span).clamp(0.0, 1.0);
   }
 
-  Future<void> _fetchFrame(DateTime ts) async {
+  DateTime _clamp(DateTime t) =>
+      t.isBefore(_start) ? _start : (t.isAfter(_end) ? _end : t);
+
+  // ── pane lifecycle ──────────────────────────────────────────────────────
+
+  void _attachPane() {
+    _pane?.dispose();
     final cam = _cameraId;
-    if (cam == null) return;
-    final token = ++_reqToken;
-    final bytes = await widget.api.fetchFilmstripFrame(
-      widget.session,
-      cam,
-      ts,
-      width: 480,
-    );
-    if (!mounted || token != _reqToken) return; // superseded by a newer scrub
-    setState(() {
-      if (bytes == null) {
-        _frameBytes = null;
-        _previewMsg = 'No footage at this moment';
-      } else {
-        _frameBytes = bytes;
-        _previewMsg = null;
-      }
-    });
+    _pane = cam == null
+        ? null
+        : (GaplessSegmentPaneController(
+            api: widget.api,
+            session: widget.session,
+            cameraId: cam,
+          )..rate = _speeds[_speedIdx]);
+    final p = _pane?.player;
+    if (p != null) unawaited(p.setRate(_speeds[_speedIdx]));
   }
 
-  void _togglePlay() {
-    if (_playing) {
-      _stopPlay();
+  /// Explicit jump: move the playhead and (re)load the covering segment,
+  /// keeping the current play/pause state.
+  void _jumpTo(DateTime t) {
+    if (!_end.isAfter(_start)) return;
+    setState(() => _playhead = _clamp(t));
+    unawaited(
+      _pane?.resolveAt(_playhead, forceReload: true, playing: _playing),
+    );
+  }
+
+  /// The clip's camera or range changed: stop and reload from its start.
+  void _rangeChanged({bool cameraChanged = false}) {
+    _pause();
+    if (cameraChanged) _attachPane();
+    _jumpTo(_start);
+  }
+
+  // ── transport ───────────────────────────────────────────────────────────
+
+  void _togglePlay() => _playing ? _pause() : _play();
+
+  void _play() {
+    final pane = _pane;
+    if (pane == null || !_end.isAfter(_start)) return;
+    // At (or within a frame of) the end: replay from the start.
+    if (!_playhead.isBefore(_end.subtract(const Duration(milliseconds: 50)))) {
+      _jumpTo(_start);
+    }
+    setState(() => _playing = true);
+    unawaited(pane.player.play());
+    _lastTickWall = DateTime.now();
+    _tick?.cancel();
+    _tick = Timer.periodic(const Duration(milliseconds: 100), _onTick);
+  }
+
+  void _pause() {
+    _tick?.cancel();
+    _tick = null;
+    unawaited(_pane?.player.pause());
+    if (mounted && _playing) setState(() => _playing = false);
+  }
+
+  /// Same clock model as the Playback tab's single-pane mode: follow mpv's
+  /// real position when it can be trusted, else advance by wall time × speed
+  /// (a gap with no footage, or the moment a new file is opening).
+  void _onTick(Timer _) {
+    final pane = _pane;
+    if (!_playing || pane == null) return;
+    final wallNow = DateTime.now();
+    final elapsedMs = wallNow.difference(_lastTickWall).inMilliseconds;
+    _lastTickWall = wallNow;
+
+    final mpv = _scrubbing ? null : pane.mpvPlayhead;
+    var next =
+        mpv ??
+        _playhead.add(
+          Duration(milliseconds: (elapsedMs * _speeds[_speedIdx]).round()),
+        );
+    if (!next.isBefore(_end)) {
+      next = _end;
+      setState(() => _playhead = next);
+      _pause();
       return;
     }
-    if (_cameraId == null || !_end.isAfter(_start)) return;
-    setState(() => _playing = true);
-    final spanMs = _span.inMilliseconds;
-    // ~24 steps across the range, at least 1s apart — caps extractor load,
-    // matching exportPreviewPlayToggle's stepMs in app.js (no upper bound: a
-    // clip shorter than 24s just steps straight to the end next tick).
-    final stepMs = ((spanMs / 24).round()).clamp(1000, 1 << 31).toInt();
-    _playTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
-      final curMs =
-          _start.millisecondsSinceEpoch + (_frac * spanMs).round();
-      final nextMs = curMs + stepMs;
-      final endMs = _end.millisecondsSinceEpoch;
-      if (nextMs >= endMs) {
-        _seekTo(1);
-        _stopPlay();
-        return;
-      }
-      _seekTo((nextMs - _start.millisecondsSinceEpoch) / spanMs);
+    setState(() => _playhead = next);
+    if (!_tickBusy) {
+      _tickBusy = true;
+      pane
+          .onTick(next, playing: true, mpvDriven: true)
+          .whenComplete(() => _tickBusy = false);
+    }
+  }
+
+  Future<void> _frameStep(bool forward) async {
+    final pane = _pane;
+    if (pane == null) return;
+    _pause();
+    final t = await pane.frameStep(forward);
+    if (t != null && mounted) setState(() => _playhead = _clamp(t));
+  }
+
+  void _skipBy(Duration d) => _jumpTo(_playhead.add(d));
+
+  void _setSpeed(int idx) {
+    setState(() => _speedIdx = idx);
+    final pane = _pane;
+    if (pane == null) return;
+    pane.rate = _speeds[idx];
+    unawaited(pane.player.setRate(_speeds[idx]));
+  }
+
+  DateTime _fracToTime(double f) =>
+      _start.add(Duration(milliseconds: (f * _span.inMilliseconds).round()));
+
+  // ── trim at the playhead ────────────────────────────────────────────────
+
+  void _setStartHere() {
+    if (!_playhead.isBefore(_end)) {
+      setState(() => _error = 'Start must be before the end of the clip.');
+      return;
+    }
+    setState(() {
+      _start = _playhead;
+      _error = null;
     });
   }
 
-  void _stopPlay() {
-    _playTimer?.cancel();
-    _playTimer = null;
-    if (mounted) setState(() => _playing = false);
+  void _setEndHere() {
+    if (!_playhead.isAfter(_start)) {
+      setState(() => _error = 'End must be after the start of the clip.');
+      return;
+    }
+    setState(() {
+      _end = _playhead;
+      _error = null;
+    });
   }
 
+  // ── range editing ───────────────────────────────────────────────────────
+
   Future<void> _pickDateTime(bool isStart) async {
-    final initial = isStart ? _start : _end;
+    final initial = (isStart ? _start : _end).toLocal();
     final date = await showDatePicker(
       context: context,
       initialDate: initial,
@@ -228,25 +355,7 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
         _end = combined;
       }
     });
-    _stopPlay();
-    _seekTo(0);
-  }
-
-  String _fmt(DateTime d) =>
-      '${d.year}-${_2(d.month)}-${_2(d.day)} ${_2(d.hour)}:${_2(d.minute)}:${_2(d.second)}';
-  String _2(int n) => n.toString().padLeft(2, '0');
-
-  String _fmtDuration(Duration d) {
-    final s = d.inSeconds;
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    final parts = <String>[
-      if (h > 0) '${h}h',
-      if (m > 0) '${m}m',
-      if (h == 0 && (sec > 0 || m == 0)) '${sec}s',
-    ];
-    return parts.isEmpty ? '0s' : parts.join(' ');
+    _rangeChanged();
   }
 
   void _commit() {
@@ -270,128 +379,173 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
     );
   }
 
+  // ── UI ──────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final pane = _pane;
     return AlertDialog(
       title: Text(widget.editing != null ? 'Edit clip' : 'Add clip'),
-      content: SizedBox(
-        width: 560,
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              DropdownButtonFormField<String>(
-                initialValue: _cameraId,
-                decoration: const InputDecoration(labelText: 'Camera'),
-                items: [
-                  for (final c in widget.cameras)
-                    DropdownMenuItem(value: c.id, child: Text(c.name)),
-                ],
-                onChanged: (v) {
-                  setState(() => _cameraId = v);
-                  _stopPlay();
-                  _seekTo(0);
-                },
-              ),
-              const SizedBox(height: 12),
-              Row(
+      content: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.space): _togglePlay,
+          const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
+              _frameStep(false),
+          const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
+              _frameStep(true),
+          const SingleActivator(
+            LogicalKeyboardKey.arrowLeft,
+            shift: true,
+          ): () =>
+              _skipBy(-_skip),
+          const SingleActivator(
+            LogicalKeyboardKey.arrowRight,
+            shift: true,
+          ): () =>
+              _skipBy(_skip),
+        },
+        child: Focus(
+          focusNode: _focus,
+          autofocus: true,
+          child: SizedBox(
+            width: 720,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: _DateTimeField(
-                      label: 'Start',
-                      text: _fmt(_start),
-                      onTap: () => _pickDateTime(true),
-                    ),
+                  DropdownButtonFormField<String>(
+                    initialValue: _cameraId,
+                    decoration: const InputDecoration(labelText: 'Camera'),
+                    items: [
+                      for (final c in widget.cameras)
+                        DropdownMenuItem(value: c.id, child: Text(c.name)),
+                    ],
+                    onChanged: (v) {
+                      setState(() => _cameraId = v);
+                      _rangeChanged(cameraChanged: true);
+                    },
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _DateTimeField(
-                      label: 'End',
-                      text: _fmt(_end),
-                      onTap: () => _pickDateTime(false),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Duration: ${_fmtDuration(_span)}',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              const SizedBox(height: 8),
-              // Quick ranges ending "now" (old client's Last 1m/5m/10m/15m).
-              Wrap(
-                spacing: 6,
-                children: [
-                  for (final n in const [1, 5, 10, 15])
-                    ActionChip(
-                      label: Text('Last ${n}m'),
-                      visualDensity: VisualDensity.compact,
-                      onPressed: () {
-                        final now = DateTime.now();
-                        setState(() {
-                          _end = now;
-                          _start = now.subtract(Duration(minutes: n));
-                        });
-                        _stopPlay();
-                        _seekTo(0);
-                      },
-                    ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              // ── preview scrubber ─────────────────────────────────────────
-              AspectRatio(
-                aspectRatio: 16 / 9,
-                child: Container(
-                  color: Colors.black,
-                  alignment: Alignment.center,
-                  child: _frameBytes != null
-                      ? Image.memory(_frameBytes!, fit: BoxFit.contain)
-                      : Text(
-                          _previewMsg ?? '',
-                          style: const TextStyle(color: Colors.white54),
-                        ),
-                ),
-              ),
-              Row(
-                children: [
-                  IconButton(
-                    icon: Icon(_playing ? Icons.pause : Icons.play_arrow),
-                    onPressed: _togglePlay,
-                  ),
-                  Expanded(
-                    child: Slider(
-                      value: _frac,
-                      onChanged: (v) {
-                        _stopPlay();
-                        _seekTo(v);
-                      },
-                    ),
-                  ),
-                  SizedBox(
-                    width: 90,
-                    child: Text(
-                      _fmtDuration(
-                        Duration(
-                          milliseconds:
-                              (_frac * _span.inMilliseconds).round(),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _DateTimeField(
+                          label: 'Start',
+                          text: fmtClipDateTime(_start),
+                          onTap: () => _pickDateTime(true),
                         ),
                       ),
-                      textAlign: TextAlign.right,
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _DateTimeField(
+                          label: 'End',
+                          text: fmtClipDateTime(_end),
+                          onTap: () => _pickDateTime(false),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Duration: ${fmtClipDuration(_span)}',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 8),
+                  // Quick ranges ending "now" (old client's Last 1m/5m/10m/15m).
+                  Wrap(
+                    spacing: 6,
+                    children: [
+                      for (final n in const [1, 5, 10, 15])
+                        ActionChip(
+                          label: Text('Last ${n}m'),
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () {
+                            final now = DateTime.now();
+                            setState(() {
+                              _end = now;
+                              _start = now.subtract(Duration(minutes: n));
+                            });
+                            _rangeChanged();
+                          },
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  // ── preview ────────────────────────────────────────────
+                  AspectRatio(
+                    aspectRatio: 16 / 9,
+                    child: pane == null
+                        ? const ColoredBox(color: Colors.black)
+                        : GestureDetector(
+                            onTap: _togglePlay,
+                            child: GaplessSegmentPane(controller: pane),
+                          ),
+                  ),
+                  SliderTheme(
+                    data: SliderTheme.of(
+                      context,
+                    ).copyWith(overlayShape: SliderComponentShape.noOverlay),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      child: Slider(
+                        value: _frac,
+                        onChangeStart: (_) {
+                          _scrubbing = true;
+                          _pause();
+                        },
+                        onChanged: (v) {
+                          final t = _fracToTime(v);
+                          setState(() => _playhead = t);
+                          // Cheap in-file seek while dragging; the release
+                          // below loads another segment if needed.
+                          unawaited(pane?.seekWithinSegment(t));
+                        },
+                        onChangeEnd: (v) {
+                          _scrubbing = false;
+                          _jumpTo(_fracToTime(v));
+                        },
+                      ),
                     ),
                   ),
+                  _transportRow(theme),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: _setStartHere,
+                        icon: const Icon(Icons.first_page, size: 18),
+                        label: const Text('Set start here'),
+                      ),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                        onPressed: _setEndHere,
+                        icon: const Icon(Icons.last_page, size: 18),
+                        label: const Text('Set end here'),
+                      ),
+                      const Spacer(),
+                      Flexible(
+                        child: Text(
+                          'Space play · ←/→ frame · Shift+←/→ 10 s',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.hintColor,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      _error!,
+                      style: TextStyle(color: theme.colorScheme.error),
+                    ),
+                  ],
                 ],
               ),
-              if (_error != null) ...[
-                const SizedBox(height: 8),
-                Text(
-                  _error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              ],
-            ],
+            ),
           ),
         ),
       ),
@@ -407,6 +561,73 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
       ],
     );
   }
+
+  Widget _transportRow(ThemeData theme) {
+    final offset = _playhead.difference(_start);
+    return Row(
+      children: [
+        IconButton(
+          tooltip: 'Back 10 s (Shift+←)',
+          onPressed: () => _skipBy(-_skip),
+          icon: const Icon(Icons.replay_10),
+        ),
+        IconButton(
+          tooltip: 'Previous frame (←)',
+          onPressed: () => _frameStep(false),
+          icon: const Icon(Icons.skip_previous),
+        ),
+        IconButton.filled(
+          tooltip: _playing ? 'Pause (Space)' : 'Play (Space)',
+          onPressed: _togglePlay,
+          icon: Icon(_playing ? Icons.pause : Icons.play_arrow),
+        ),
+        IconButton(
+          tooltip: 'Next frame (→)',
+          onPressed: () => _frameStep(true),
+          icon: const Icon(Icons.skip_next),
+        ),
+        IconButton(
+          tooltip: 'Forward 10 s (Shift+→)',
+          onPressed: () => _skipBy(_skip),
+          icon: const Icon(Icons.forward_10),
+        ),
+        const SizedBox(width: 4),
+        PopupMenuButton<int>(
+          tooltip: 'Playback speed',
+          initialValue: _speedIdx,
+          onSelected: _setSpeed,
+          itemBuilder: (_) => [
+            for (var i = 0; i < _speeds.length; i++)
+              PopupMenuItem(value: i, child: Text(_speedLabel(_speeds[i]))),
+          ],
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Text(
+              _speedLabel(_speeds[_speedIdx]),
+              style: theme.textTheme.labelLarge,
+            ),
+          ),
+        ),
+        const Spacer(),
+        Text(
+          _fmtClock(_playhead),
+          style: theme.textTheme.titleSmall?.copyWith(
+            fontFeatures: const [FontFeature.tabularFigures()],
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '${fmtClipDuration(offset)} / ${fmtClipDuration(_span)}',
+          style: theme.textTheme.bodySmall?.copyWith(
+            fontFeatures: const [FontFeature.tabularFigures()],
+          ),
+        ),
+      ],
+    );
+  }
+
+  static String _speedLabel(double s) =>
+      s == s.roundToDouble() ? '${s.toInt()}×' : '$s×';
 }
 
 class _DateTimeField extends StatelessWidget {

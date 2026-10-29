@@ -63,6 +63,7 @@ class PlaybackScreen extends StatefulWidget {
     this.onExitFocus,
     this.onMotionController,
     this.audio,
+    this.onLeave,
   });
 
   final CrumbApi api;
@@ -129,6 +130,13 @@ class PlaybackScreen extends StatefulWidget {
   /// global audio button use). Playback registers its panes here so the
   /// selected/maximized camera is audible when audio is on.
   final AudioFollowController? audio;
+
+  /// Called from dispose with the playhead the operator left at, so the host
+  /// can reopen Playback there (pass it back as [initialTime]). The tab is
+  /// torn down on every tab switch and on minimize to free its mpv players;
+  /// without this, coming back from Export jumped to the latest footage.
+  /// Not called if the screen is disposed before its initial load finished.
+  final void Function(DateTime playhead)? onLeave;
 
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
@@ -345,6 +353,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   @override
   void dispose() {
+    if (!_entering) widget.onLeave?.call(_timeline.playhead);
     _tickTimer?.cancel();
     _shuttleTimer?.cancel();
     _idleTimer?.cancel();
