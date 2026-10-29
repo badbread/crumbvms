@@ -10,9 +10,17 @@
 // stepped ~24 still frames across the range every 700 ms (one frame every
 // ~4 s of footage on a 1.5 min clip) and had no transport controls.
 //
-// Controls: play/pause, frame step, skip 10 s, speed, a scrubber over the
-// clip's range, and Set start/end here to trim the clip at the playhead.
+// Controls: play/pause, frame step, skip 10 s, speed, and Set start/end here
+// to trim at the playhead. Below the video, a trim timeline
+// ([ClipTrimTimeline]) shows the clip with some footage either side: drag the
+// selection handles to adjust it, drag anywhere else to scrub, wheel to zoom.
 // Keyboard: Space play/pause, Left/Right frame step, Shift+Left/Right 10 s.
+//
+// Scrubbing is the Playback tab's technique (playback_screen.dart _liveSeek):
+// inside the loaded segment, a cheap in-file seek, so the video itself tracks
+// the drag; outside it, a server-extracted filmstrip frame (throttled, 4 s
+// grid) over the video. Added here for trimming: when a drag rests outside
+// the loaded segment, that segment is loaded so the exact frame shows.
 //
 // Times are shown in local time. The draft stores absolute instants (the
 // playback screen hands in UTC values); export_api serializes with toUtc().
@@ -23,7 +31,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
+import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/api/playback_api.dart';
+import 'package:crumb_desktop/ui/export/clip_trim_timeline.dart';
 import 'package:crumb_desktop/ui/playback/gapless_segment_pane.dart';
 import 'package:crumb_desktop/ui/playback/gapless_segment_pane_controller.dart';
 
@@ -149,6 +160,20 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
   int _speedIdx = _speeds.indexOf(1.0);
   final _focus = FocusNode(debugLabel: 'clip preview');
 
+  // ── trim timeline ───────────────────────────────────────────────────────
+  late DateTime _winStart;
+  late DateTime _winEnd;
+  List<(DateTime, DateTime)> _coverage = const [];
+  Timer? _coverageDebounce;
+  int _coverageToken = 0;
+
+  // Scrub state (see the file header).
+  Uint8List? _scrubFrame;
+  int _scrubToken = 0;
+  DateTime _lastScrubFetch = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _settle;
+  DateTime? _scrubAt;
+
   @override
   void initState() {
     super.initState();
@@ -164,6 +189,7 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
         _end.subtract(const Duration(minutes: 1));
     if (!_end.isAfter(_start)) _end = _start.add(const Duration(minutes: 1));
     _playhead = _start;
+    _repad();
     _attachPane();
     _jumpTo(_start);
   }
@@ -171,6 +197,8 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
   @override
   void dispose() {
     _tick?.cancel();
+    _settle?.cancel();
+    _coverageDebounce?.cancel();
     _pane?.dispose();
     _focus.dispose();
     super.dispose();
@@ -178,14 +206,46 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
 
   Duration get _span => _end.difference(_start);
 
-  double get _frac {
-    final span = _span.inMilliseconds;
-    if (span <= 0) return 0;
-    return (_playhead.difference(_start).inMilliseconds / span).clamp(0.0, 1.0);
+  /// The playhead may sit anywhere in the timeline window, including just
+  /// outside the selection (to look for the right trim point).
+  DateTime _clamp(DateTime t) =>
+      t.isBefore(_winStart) ? _winStart : (t.isAfter(_winEnd) ? _winEnd : t);
+
+  bool _inSelection(DateTime t) => !t.isBefore(_start) && t.isBefore(_end);
+
+  /// Re-frame the timeline window around the selection: half the clip's
+  /// length either side, at least 15 s and at most 30 min.
+  void _repad() {
+    final spanMs = _span.inMilliseconds;
+    final padMs = (spanMs ~/ 2).clamp(15000, 30 * 60 * 1000);
+    _winStart = _start.subtract(Duration(milliseconds: padMs));
+    _winEnd = _end.add(Duration(milliseconds: padMs));
+    _loadCoverageSoon();
   }
 
-  DateTime _clamp(DateTime t) =>
-      t.isBefore(_start) ? _start : (t.isAfter(_end) ? _end : t);
+  void _loadCoverageSoon() {
+    _coverageDebounce?.cancel();
+    _coverageDebounce = Timer(const Duration(milliseconds: 250), _loadCoverage);
+  }
+
+  Future<void> _loadCoverage() async {
+    final cam = _cameraId;
+    if (cam == null) return;
+    final token = ++_coverageToken;
+    final spans = await widget.api.fetchTimeline(
+      widget.session,
+      [cam],
+      _winStart,
+      _winEnd,
+    );
+    if (!mounted || token != _coverageToken) return;
+    setState(() {
+      _coverage = [
+        for (final sp in spans)
+          if (sp.cameraId == cam) (sp.start, sp.end),
+      ];
+    });
+  }
 
   // ── pane lifecycle ──────────────────────────────────────────────────────
 
@@ -217,6 +277,7 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
   void _rangeChanged({bool cameraChanged = false}) {
     _pause();
     if (cameraChanged) _attachPane();
+    _repad();
     _jumpTo(_start);
   }
 
@@ -227,8 +288,10 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
   void _play() {
     final pane = _pane;
     if (pane == null || !_end.isAfter(_start)) return;
-    // At (or within a frame of) the end: replay from the start.
-    if (!_playhead.isBefore(_end.subtract(const Duration(milliseconds: 50)))) {
+    // Play covers the selection: from outside it, or at (or within a frame
+    // of) its end, start over from the selection start.
+    if (!_inSelection(_playhead) ||
+        !_playhead.isBefore(_end.subtract(const Duration(milliseconds: 50)))) {
       _jumpTo(_start);
     }
     setState(() => _playing = true);
@@ -294,8 +357,102 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
     unawaited(pane.player.setRate(_speeds[idx]));
   }
 
-  DateTime _fracToTime(double f) =>
-      _start.add(Duration(milliseconds: (f * _span.inMilliseconds).round()));
+  // ── scrubbing (trim timeline drags) ─────────────────────────────────────
+
+  void _onTrimDragStart(TrimTarget target) {
+    _pause();
+    _scrubbing = true;
+    setState(() => _error = null);
+  }
+
+  void _onTrimDrag(TrimTarget target, DateTime t) {
+    setState(() {
+      switch (target) {
+        case TrimTarget.start:
+          _start = t;
+        case TrimTarget.end:
+          _end = t;
+        case TrimTarget.playhead:
+          break;
+      }
+      // Whatever is being dragged is what the preview shows.
+      _playhead = t;
+    });
+    _liveSeek(t);
+  }
+
+  void _onTrimDragEnd(TrimTarget target, DateTime t) {
+    _scrubbing = false;
+    _settle?.cancel();
+    _scrubToken++; // an in-flight frame fetch must not repaint the overlay
+    setState(() => _scrubFrame = null);
+    // A handle dragged near the window's edge: re-frame so it can go further.
+    if (target != TrimTarget.playhead) {
+      final edgeMs = _winEnd.difference(_winStart).inMilliseconds ~/ 20;
+      if (_start.difference(_winStart).inMilliseconds < edgeMs ||
+          _winEnd.difference(_end).inMilliseconds < edgeMs) {
+        _repad();
+      }
+    }
+    _jumpTo(t);
+  }
+
+  /// Show the frame at [t] during a drag, as fast as possible.
+  void _liveSeek(DateTime t) {
+    _scrubAt = t;
+    final pane = _pane;
+    if (pane == null) return;
+    if (pane.currentSegment?.covers(t) ?? false) {
+      // The loaded file has it: exact in-file seek, real video shows.
+      unawaited(pane.seekWithinSegment(t));
+      if (_scrubFrame != null) {
+        _scrubToken++;
+        setState(() => _scrubFrame = null);
+      }
+      return;
+    }
+    // Outside the loaded segment: a filmstrip frame now (throttled to about
+    // 8 a second), and the real segment once the drag rests for a moment.
+    _settle?.cancel();
+    _settle = Timer(const Duration(milliseconds: 180), () async {
+      final at = _scrubAt;
+      if (!_scrubbing || at == null) return;
+      await pane.resolveAt(at, forceReload: true, playing: false);
+      // Re-evaluate against the newest drag position: clears the overlay if
+      // the loaded segment now covers it.
+      final now = _scrubAt;
+      if (mounted && _scrubbing && now != null) _liveSeek(now);
+    });
+    final now = DateTime.now();
+    if (now.difference(_lastScrubFetch) < const Duration(milliseconds: 120)) {
+      return;
+    }
+    _lastScrubFetch = now;
+    unawaited(_fetchScrubFrame(t, ++_scrubToken));
+  }
+
+  Future<void> _fetchScrubFrame(DateTime t, int token) async {
+    final cam = _cameraId;
+    if (cam == null) return;
+    final bytes = await widget.api.fetchFilmstripFrame(
+      widget.session,
+      cam,
+      t,
+      width: 640,
+    );
+    if (!mounted || token != _scrubToken || !_scrubbing || bytes == null) {
+      return;
+    }
+    setState(() => _scrubFrame = bytes);
+  }
+
+  void _onZoom(DateTime start, DateTime end) {
+    setState(() {
+      _winStart = start;
+      _winEnd = end;
+    });
+    _loadCoverageSoon();
+  }
 
   // ── trim at the playhead ────────────────────────────────────────────────
 
@@ -480,34 +637,61 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
                         ? const ColoredBox(color: Colors.black)
                         : GestureDetector(
                             onTap: _togglePlay,
-                            child: GaplessSegmentPane(controller: pane),
+                            child: Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                GaplessSegmentPane(controller: pane),
+                                // Scrub frame over the video while a drag is
+                                // outside the loaded segment.
+                                if (_scrubFrame != null)
+                                  ColoredBox(
+                                    color: Colors.black,
+                                    child: Image.memory(
+                                      _scrubFrame!,
+                                      fit: BoxFit.contain,
+                                      gaplessPlayback: true,
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                   ),
-                  SliderTheme(
-                    data: SliderTheme.of(
-                      context,
-                    ).copyWith(overlayShape: SliderComponentShape.noOverlay),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 10),
-                      child: Slider(
-                        value: _frac,
-                        onChangeStart: (_) {
-                          _scrubbing = true;
-                          _pause();
-                        },
-                        onChanged: (v) {
-                          final t = _fracToTime(v);
-                          setState(() => _playhead = t);
-                          // Cheap in-file seek while dragging; the release
-                          // below loads another segment if needed.
-                          unawaited(pane?.seekWithinSegment(t));
-                        },
-                        onChangeEnd: (v) {
-                          _scrubbing = false;
-                          _jumpTo(_fracToTime(v));
-                        },
+                  const SizedBox(height: 8),
+                  ClipTrimTimeline(
+                    windowStart: _winStart,
+                    windowEnd: _winEnd,
+                    selectionStart: _start,
+                    selectionEnd: _end,
+                    playhead: _playhead,
+                    coverage: _coverage,
+                    onDragStart: _onTrimDragStart,
+                    onDrag: _onTrimDrag,
+                    onDragEnd: _onTrimDragEnd,
+                    onZoom: _onZoom,
+                  ),
+                  Row(
+                    children: [
+                      Text(
+                        _fmtClock(_winStart),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.hintColor,
+                        ),
                       ),
-                    ),
+                      const Spacer(),
+                      Text(
+                        'Drag the ends to trim · wheel to zoom',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.hintColor,
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(
+                        _fmtClock(_winEnd),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.hintColor,
+                        ),
+                      ),
+                    ],
                   ),
                   _transportRow(theme),
                   const SizedBox(height: 4),
@@ -617,7 +801,8 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
         ),
         const SizedBox(width: 8),
         Text(
-          '${fmtClipDuration(offset)} / ${fmtClipDuration(_span)}',
+          // Before the selection (looking for a trim point) reads negative.
+          '${offset.isNegative ? '-' : ''}${fmtClipDuration(offset.abs())} / ${fmtClipDuration(_span)}',
           style: theme.textTheme.bodySmall?.copyWith(
             fontFeatures: const [FontFeature.tabularFigures()],
           ),
