@@ -98,6 +98,7 @@ enum PtzWheelCorner {
 
 const String _kShowInfoBar = 'crumb.showInfoBar';
 const String _kShowAllCamerasView = 'crumb.showAllCamerasView';
+const String _kShowPerfStats = 'crumb.showPerfStats';
 const String _kHotkeysEnabled = 'crumb.hotkeysEnabled';
 const String _kMaximizeMain = 'crumb.maximizeMain';
 const String _kPtzClickMode = 'crumb.ptzClickMode';
@@ -127,6 +128,7 @@ class ClientOptionsStore extends ChangeNotifier {
     this._prefs, {
     required bool showInfoBar,
     required bool showAllCamerasView,
+    required bool showPerfStats,
     required bool hotkeysEnabled,
     required bool maximizeMain,
     required PtzClickMode ptzClickMode,
@@ -140,6 +142,7 @@ class ClientOptionsStore extends ChangeNotifier {
     required bool adaptiveWallGuardrailDontWarn,
   }) : _showInfoBar = showInfoBar,
        _showAllCamerasView = showAllCamerasView,
+       _showPerfStats = showPerfStats,
        _hotkeysEnabled = hotkeysEnabled,
        _maximizeMain = maximizeMain,
        _ptzClickMode = ptzClickMode,
@@ -156,6 +159,7 @@ class ClientOptionsStore extends ChangeNotifier {
 
   bool _showInfoBar;
   bool _showAllCamerasView;
+  bool _showPerfStats;
   bool _hotkeysEnabled;
   bool _maximizeMain;
   PtzClickMode _ptzClickMode;
@@ -179,6 +183,7 @@ class ClientOptionsStore extends ChangeNotifier {
       prefs,
       showInfoBar: prefs?.getBool(_kShowInfoBar) ?? true,
       showAllCamerasView: prefs?.getBool(_kShowAllCamerasView) ?? true,
+      showPerfStats: prefs?.getBool(_kShowPerfStats) ?? true,
       hotkeysEnabled: prefs?.getBool(_kHotkeysEnabled) ?? true,
       maximizeMain: prefs?.getBool(_kMaximizeMain) ?? true,
       ptzClickMode: PtzClickMode.fromWire(prefs?.getString(_kPtzClickMode)),
@@ -203,6 +208,16 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _showInfoBar) return;
     _showInfoBar = v;
     unawaited(_prefs?.setBool(_kShowInfoBar, v));
+    notifyListeners();
+  }
+
+  // ── live-wall performance readout (cameras, CPU, GPU, decode, memory)
+  //    in the bottom status bar; on by default ──
+  bool get showPerfStats => _showPerfStats;
+  set showPerfStats(bool v) {
+    if (v == _showPerfStats) return;
+    _showPerfStats = v;
+    unawaited(_prefs?.setBool(_kShowPerfStats, v));
     notifyListeners();
   }
 

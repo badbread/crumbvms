@@ -204,6 +204,13 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Show "All Cameras" quick view',
             subtitle: 'Auto-build a grid of every camera as a selectable view.',
           ),
+          _switchRow(
+            value: _o.showPerfStats,
+            onChanged: (v) => setState(() => _o.showPerfStats = v),
+            title: 'Show performance stats',
+            subtitle:
+                'Camera count, CPU, GPU, decode and memory in the bottom bar.',
+          ),
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 6, 16, 2),
             child: Text(
