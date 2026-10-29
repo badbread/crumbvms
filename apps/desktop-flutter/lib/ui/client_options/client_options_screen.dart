@@ -87,6 +87,8 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setSeamlessTileSwitching(bool v) =>
       setState(() => _o.seamlessTileSwitching = v);
 
+  void _setReduceMotion(bool v) => setState(() => _o.reduceMotion = v);
+
   void _setAdaptiveGuardrail(bool v) =>
       setState(() => _o.adaptiveWallGuardrail = v);
   void _setAdaptiveBackpressure(bool v) =>
@@ -299,6 +301,14 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Seamless carousel/hotspot switching',
             subtitle:
                 'Pre-warm the incoming camera and swap only once it has a frame, so a carousel or auto-hotspot tile never blanks to black on a switch. Turn off on low-powered machines to avoid the brief second decode.',
+          ),
+
+          _switchRow(
+            value: _o.reduceMotion,
+            onChanged: _setReduceMotion,
+            title: 'Reduce motion',
+            subtitle:
+                'Turns off sliding and scaling animations, keeps only brief fades, and stops pulsing indicators. Also follows the Windows "Show animations" setting.',
           ),
 
           const Divider(height: 24),

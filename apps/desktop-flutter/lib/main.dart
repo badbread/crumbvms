@@ -74,6 +74,8 @@ import 'package:crumb_desktop/ui/updates/update_banner.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
 import 'package:crumb_desktop/ui/waiting_for_server_screen.dart';
 import 'package:crumb_desktop/ui/wall_screen.dart';
+import 'package:crumb_desktop/ui/motion/crumb_interaction_theme.dart';
+import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
 
 /// Run modes (default = the real client: login then live wall):
 ///   `--dart-define=GRID=N`  -> N-up media_kit perf harness (perf_grid.dart)
@@ -96,7 +98,7 @@ const String kStreamUrl = String.fromEnvironment(
 /// desktop VMS; this compacts control density and type for a professional look.
 ThemeData _desktopTheme() {
   final base = ThemeData.dark(useMaterial3: true);
-  return base.copyWith(
+  return applyCrumbInteraction(base.copyWith(
     visualDensity: VisualDensity.compact,
     materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
     textTheme: base.textTheme.apply(fontSizeFactor: 0.9),
@@ -111,7 +113,7 @@ ThemeData _desktopTheme() {
         (s) => s.contains(WidgetState.selected) ? base.colorScheme.primary : null,
       ),
     ),
-  );
+  ));
 }
 
 Future<void> main() async {
@@ -505,6 +507,9 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
       title: 'Crumb',
       debugShowCheckedModeBanner: false,
       theme: _desktopTheme(),
+      // Folds the in-app "Reduce motion" option into MediaQuery so it and the
+      // OS setting are one signal everywhere.
+      builder: (context, child) => MotionPrefsScope(child: child!),
       // Esc exits OS fullscreen before any inner Esc handling (maximize-exit
       // etc.) — same priority order as the old client.
       home: FullscreenEscHandler(controller: _fullscreen, child: home),
@@ -900,8 +905,11 @@ class _MainShellState extends State<MainShell> with WindowListener {
     // the current tab's colour.
     final base = Theme.of(context);
     return Theme(
-      data: base.copyWith(
-        colorScheme: base.colorScheme.copyWith(primary: _accentColor),
+      data: applyCrumbInteraction(
+        base.copyWith(
+          colorScheme: base.colorScheme.copyWith(primary: _accentColor),
+        ),
+        accent: _accentColor,
       ),
       child: _buildScaffold(session),
     );
