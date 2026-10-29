@@ -8,12 +8,15 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('MotionTokens', () {
-    test('duration tiers are 90 / 150 / 220 / 280 ms and nothing is longer', () {
-      expect(MotionTokens.d1.inMilliseconds, 90);
-      expect(MotionTokens.d2.inMilliseconds, 150);
-      expect(MotionTokens.d3.inMilliseconds, 220);
-      expect(MotionTokens.d4.inMilliseconds, 280);
-    });
+    test(
+      'duration tiers are 90 / 150 / 220 / 280 ms and nothing is longer',
+      () {
+        expect(MotionTokens.d1.inMilliseconds, 90);
+        expect(MotionTokens.d2.inMilliseconds, 150);
+        expect(MotionTokens.d3.inMilliseconds, 220);
+        expect(MotionTokens.d4.inMilliseconds, 280);
+      },
+    );
 
     test('curves match the prototype and never overshoot', () {
       expect(MotionTokens.standard, const Cubic(0.2, 0.0, 0.0, 1.0));
@@ -75,10 +78,7 @@ void main() {
     ) async {
       var seen = false;
       await tester.pumpWidget(
-        MediaQuery(
-          data: const MediaQueryData(),
-          child: probe((v) => seen = v),
-        ),
+        MediaQuery(data: const MediaQueryData(), child: probe((v) => seen = v)),
       );
       expect(seen, isFalse);
       MotionPrefs.reduceMotion.value = true;

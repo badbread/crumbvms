@@ -93,7 +93,8 @@ class MaximizeFrame extends StatelessWidget {
       builder: (context, constraints) {
         final size = constraints.biggest;
         final full = Offset.zero & size;
-        final from = origin ??
+        final from =
+            origin ??
             Rect.fromCenter(
               center: full.center,
               width: size.width * 0.5,

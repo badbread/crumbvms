@@ -58,7 +58,8 @@ void main() {
     // see exactly which tabs stay mounted.
     final log = <String>[];
 
-    Widget page(String name) => _Probe(key: ValueKey(name), name: name, log: log);
+    Widget page(String name) =>
+        _Probe(key: ValueKey(name), name: name, log: log);
 
     Widget host(int index, {bool reduced = false}) => MediaQuery(
       data: MediaQueryData(disableAnimations: reduced),
@@ -171,7 +172,9 @@ void main() {
       return tester.getRect(f);
     }
 
-    testWidgets('slides and resizes to the new tab over 220 ms', (tester) async {
+    testWidgets('slides and resizes to the new tab over 220 ms', (
+      tester,
+    ) async {
       await tester.pumpWidget(tabs(0, Colors.orange));
       await tester.pump();
       await tester.pump();

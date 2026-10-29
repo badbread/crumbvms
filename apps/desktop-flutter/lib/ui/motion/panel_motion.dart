@@ -144,19 +144,20 @@ class PopPresence extends StatefulWidget {
 
 class _PopPresenceState extends State<PopPresence>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(
-    vsync: this,
-    duration: MotionTokens.d3,
-    reverseDuration: MotionTokens.d2,
-    value: widget.present ? 1 : 0,
-  )..addStatusListener((status) {
-      // Drop the panel once its exit has finished. Deferred: a status change can
-      // fire synchronously from didUpdateWidget, where setState is illegal.
-      if (status != AnimationStatus.dismissed) return;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) setState(() {});
+  late final AnimationController _c =
+      AnimationController(
+        vsync: this,
+        duration: MotionTokens.d3,
+        reverseDuration: MotionTokens.d2,
+        value: widget.present ? 1 : 0,
+      )..addStatusListener((status) {
+        // Drop the panel once its exit has finished. Deferred: a status change can
+        // fire synchronously from didUpdateWidget, where setState is illegal.
+        if (status != AnimationStatus.dismissed) return;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) setState(() {});
+        });
       });
-    });
 
   late final CurvedAnimation _curved = CurvedAnimation(
     parent: _c,
@@ -278,10 +279,7 @@ class _SideSlidePanelState extends State<SideSlidePanel>
     return IgnorePointer(
       ignoring: !widget.open,
       child: reduced
-          ? FadeTransition(
-              opacity: slide,
-              child: _shell(body),
-            )
+          ? FadeTransition(opacity: slide, child: _shell(body))
           : SlideTransition(
               position: Tween<Offset>(
                 begin: const Offset(1, 0),

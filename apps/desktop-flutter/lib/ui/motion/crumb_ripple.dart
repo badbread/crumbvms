@@ -65,12 +65,11 @@ class CrumbRipple extends InteractiveInkFeature {
   }) : _position = position,
        _borderRadius = borderRadius ?? BorderRadius.zero,
        _reduced = isReducedMotionNow(),
-       _clipCallback = rectCallback ??
+       _clipCallback =
+           rectCallback ??
            (containedInkWell ? (() => Offset.zero & referenceBox.size) : null),
        super(controller: controller) {
-    final size = rectCallback != null
-        ? rectCallback().size
-        : referenceBox.size;
+    final size = rectCallback != null ? rectCallback().size : referenceBox.size;
     // Reach the farthest corner from the press point, but never grow past
     // kMaxRadius: a very wide control should still read as a local touch.
     final farthest = math.max(
@@ -83,16 +82,18 @@ class CrumbRipple extends InteractiveInkFeature {
         (position - size.bottomRight(Offset.zero)).distance,
       ),
     );
-    _targetRadius = radius ?? (_reduced ? farthest : math.min(farthest, kMaxRadius));
-    _anim = AnimationController(
-      duration: _reduced ? MotionTokens.reducedFadeCap : kDuration,
-      vsync: controller.vsync,
-    )
-      ..addListener(controller.markNeedsPaint)
-      ..addStatusListener((s) {
-        if (s == AnimationStatus.completed) dispose();
-      })
-      ..forward();
+    _targetRadius =
+        radius ?? (_reduced ? farthest : math.min(farthest, kMaxRadius));
+    _anim =
+        AnimationController(
+            duration: _reduced ? MotionTokens.reducedFadeCap : kDuration,
+            vsync: controller.vsync,
+          )
+          ..addListener(controller.markNeedsPaint)
+          ..addStatusListener((s) {
+            if (s == AnimationStatus.completed) dispose();
+          })
+          ..forward();
     controller.addInkFeature(this);
   }
 
@@ -134,9 +135,7 @@ class CrumbRipple extends InteractiveInkFeature {
     final alpha = (_reduced ? (1 - t) * 0.5 : (1 - t) * 0.6) * color.a;
     if (alpha <= 0) return;
     final eased = MotionTokens.standard.transform(t);
-    final r = _reduced
-        ? _targetRadius
-        : 5 + (_targetRadius - 5) * eased;
+    final r = _reduced ? _targetRadius : 5 + (_targetRadius - 5) * eased;
     paintInkCircle(
       canvas: canvas,
       transform: transform,

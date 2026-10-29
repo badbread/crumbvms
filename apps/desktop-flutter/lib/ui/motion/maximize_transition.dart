@@ -84,7 +84,9 @@ class MaximizeTransition {
 
   /// The run duration for [expanding].
   Duration durationFor({required bool expanding}) {
-    final d = expanding ? MotionTokens.d4 : MotionTokens.reverseOf(MotionTokens.d4);
+    final d = expanding
+        ? MotionTokens.d4
+        : MotionTokens.reverseOf(MotionTokens.d4);
     return MotionTokens.scaled(d, reduced: reduced);
   }
 

@@ -4,6 +4,7 @@
 // reverse, interrupt (retarget from the current geometry), snap, reduced motion.
 
 import 'package:crumb_desktop/ui/motion/maximize_transition.dart';
+import 'package:crumb_desktop/ui/motion/maximize_widgets.dart';
 import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -84,7 +85,9 @@ void main() {
     final t = await _make(tester);
     t.expand();
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 230)); // just past 80% of 280
+    await tester.pump(
+      const Duration(milliseconds: 230),
+    ); // just past 80% of 280
     expect(t.recede, closeTo(1.0, 1e-6));
     await tester.pump(const Duration(milliseconds: 100));
     t.collapse();
@@ -182,4 +185,150 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     expect(seen.last, AnimationStatus.completed);
   });
+
+  group('layers keep the video subtree alive', () {
+    // Stands in for the media_kit Video / the tile: counts mounts.
+    testWidgets('pane and tiles are never rebuilt from scratch mid-run', (
+      tester,
+    ) async {
+      var paneInits = 0, tileInits = 0;
+      late MaximizeTransition t;
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: _Harness2(
+            onReady: (x) => t = x,
+            paneInit: () => paneInits++,
+            tileInit: () => tileInits++,
+          ),
+        ),
+      );
+      expect(paneInits, 1);
+      expect(tileInits, 1);
+      t.expand();
+      for (var i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      await tester.pumpAndSettle();
+      t.collapse();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      t.expand(); // interrupt
+      await tester.pumpAndSettle();
+      t.collapse();
+      await tester.pumpAndSettle();
+      expect(paneInits, 1, reason: 'the pane State must never be recreated');
+      expect(tileInits, 1, reason: 'the tiles must never be recreated');
+    });
+
+    testWidgets('pane lands exactly on the tile rect, then the full rect', (
+      tester,
+    ) async {
+      late MaximizeTransition t;
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: _Harness2(
+            onReady: (x) => t = x,
+            paneInit: () {},
+            tileInit: () {},
+            origin: const Rect.fromLTWH(100, 50, 160, 90), // 16:9 slot
+          ),
+        ),
+      );
+      final pane = find.byKey(const ValueKey('pane'));
+      // Collapsed: scaled to the slot (same aspect as the 800x450 area).
+      expect(tester.getRect(pane).left, closeTo(100, 0.5));
+      expect(tester.getRect(pane).width, closeTo(160, 0.5));
+      t.expand();
+      await tester.pumpAndSettle();
+      expect(tester.getRect(pane), const Rect.fromLTWH(0, 0, 800, 450));
+    });
+  });
+}
+
+class _Harness2 extends StatefulWidget {
+  const _Harness2({
+    required this.onReady,
+    required this.paneInit,
+    required this.tileInit,
+    this.origin = const Rect.fromLTWH(10, 10, 100, 56.25),
+  });
+  final void Function(MaximizeTransition) onReady;
+  final VoidCallback paneInit;
+  final VoidCallback tileInit;
+  final Rect origin;
+  @override
+  State<_Harness2> createState() => _Harness2State();
+}
+
+class _Harness2State extends State<_Harness2>
+    with SingleTickerProviderStateMixin {
+  late final MaximizeTransition t = MaximizeTransition(vsync: this);
+  @override
+  void initState() {
+    super.initState();
+    widget.onReady(t);
+  }
+
+  @override
+  void dispose() {
+    t.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.topLeft,
+      child: SizedBox(
+        width: 800,
+        height: 450,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: MaximizeRecedeLayer(
+                transition: t,
+                child: _Probe(onInit: widget.tileInit),
+              ),
+            ),
+            Positioned.fill(
+              child: MaximizeFrame(
+                transition: t,
+                origin: widget.origin,
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: _Probe(
+                        key: const ValueKey('pane'),
+                        onInit: widget.paneInit,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Probe extends StatefulWidget {
+  const _Probe({super.key, required this.onInit});
+  final VoidCallback onInit;
+  @override
+  State<_Probe> createState() => _ProbeState();
+}
+
+class _ProbeState extends State<_Probe> {
+  @override
+  void initState() {
+    super.initState();
+    widget.onInit();
+  }
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.expand();
 }

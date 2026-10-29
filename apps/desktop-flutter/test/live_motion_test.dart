@@ -41,19 +41,20 @@ void main() {
     ) async {
       expect(RecBreath.instance.isTicking, isFalse);
       await tester.pumpWidget(
-        _wrap(
-          Row(
-            children: List.generate(12, (_) => const RecDot()),
-          ),
-        ),
+        _wrap(Row(children: List.generate(12, (_) => const RecDot()))),
       );
       expect(RecBreath.instance.isTicking, isTrue);
       await tester.pump(const Duration(milliseconds: 1100));
       expect(RecBreath.instance.value, lessThan(0.6));
       // All twelve dots are FadeTransitions over the same animation object.
-      final fades = tester.widgetList<FadeTransition>(find.byType(FadeTransition));
+      final fades = tester.widgetList<FadeTransition>(
+        find.byType(FadeTransition),
+      );
       expect(fades.length, 12);
-      expect(fades.every((f) => identical(f.opacity, RecBreath.instance)), isTrue);
+      expect(
+        fades.every((f) => identical(f.opacity, RecBreath.instance)),
+        isTrue,
+      );
       await tester.pumpWidget(_wrap(const SizedBox()));
       expect(RecBreath.instance.isTicking, isFalse);
     });
@@ -76,28 +77,38 @@ void main() {
   });
 
   group('MotionFlash', () {
-    testWidgets('flashes on a false-to-true edge, not on mount', (tester) async {
-      Widget host(bool active) =>
-          _wrap(SizedBox(width: 100, height: 60, child: MotionFlash(active: active)));
+    testWidgets('flashes on a false-to-true edge, not on mount', (
+      tester,
+    ) async {
+      Widget host(bool active) => _wrap(
+        SizedBox(width: 100, height: 60, child: MotionFlash(active: active)),
+      );
       await tester.pumpWidget(host(true)); // already in motion at mount
       expect(tester.hasRunningAnimations, isFalse);
       await tester.pumpWidget(host(false));
       await tester.pumpWidget(host(true)); // new event
       expect(tester.hasRunningAnimations, isTrue);
-      await tester.pump(MotionFlash.duration + const Duration(milliseconds: 50));
+      await tester.pump(
+        MotionFlash.duration + const Duration(milliseconds: 50),
+      );
       expect(tester.hasRunningAnimations, isFalse);
     });
   });
 
   group('ShimmerBox', () {
     testWidgets('sweeps while motion is allowed', (tester) async {
-      await tester.pumpWidget(_wrap(const SizedBox(width: 80, height: 45, child: ShimmerBox())));
+      await tester.pumpWidget(
+        _wrap(const SizedBox(width: 80, height: 45, child: ShimmerBox())),
+      );
       expect(tester.hasRunningAnimations, isTrue);
     });
 
     testWidgets('static under reduced motion', (tester) async {
       await tester.pumpWidget(
-        _wrap(const SizedBox(width: 80, height: 45, child: ShimmerBox()), reduced: true),
+        _wrap(
+          const SizedBox(width: 80, height: 45, child: ShimmerBox()),
+          reduced: true,
+        ),
       );
       expect(tester.hasRunningAnimations, isFalse);
     });

@@ -83,7 +83,8 @@ void main() {
     Widget host(bool present, {bool reduced = false}) => _wrap(
       PopPresence(
         present: present,
-        builder: (_) => const SizedBox(width: 100, height: 100, child: Text('panel')),
+        builder: (_) =>
+            const SizedBox(width: 100, height: 100, child: Text('panel')),
       ),
       reduced: reduced,
     );
@@ -108,13 +109,24 @@ void main() {
       await tester.pumpWidget(host(false));
       await tester.pumpWidget(host(true));
       await tester.pump();
-      final scale = tester.widget<ScaleTransition>(find.byType(ScaleTransition));
+      final scale = tester.widget<ScaleTransition>(
+        find.byType(ScaleTransition),
+      );
       expect(scale.scale.value, closeTo(0.96, 0.01));
       await tester.pump(const Duration(milliseconds: 230));
       expect(scale.scale.value, closeTo(1.0, 1e-6));
       await tester.pumpWidget(host(false));
       expect(
-        tester.widget<IgnorePointer>(find.ancestor(of: find.text('panel'), matching: find.byType(IgnorePointer)).first).ignoring,
+        tester
+            .widget<IgnorePointer>(
+              find
+                  .ancestor(
+                    of: find.text('panel'),
+                    matching: find.byType(IgnorePointer),
+                  )
+                  .first,
+            )
+            .ignoring,
         isTrue,
       );
     });
@@ -155,7 +167,12 @@ void main() {
       final panelX = tester.getTopLeft(find.text('detail')).dx;
       expect(panelX, lessThan(closedX)); // moving in
       final textFade = tester.widget<FadeTransition>(
-        find.ancestor(of: find.text('detail'), matching: find.byType(FadeTransition)).first,
+        find
+            .ancestor(
+              of: find.text('detail'),
+              matching: find.byType(FadeTransition),
+            )
+            .first,
       );
       expect(textFade.opacity.value, 0.0); // still waiting 60 ms behind
       await tester.pump(const Duration(milliseconds: 250));

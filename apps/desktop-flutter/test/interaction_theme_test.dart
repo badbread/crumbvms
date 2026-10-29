@@ -23,8 +23,10 @@ void main() {
     expect(t.splashFactory, same(CrumbRipple.splashFactory));
     expect(t.hoverColor.a, lessThan(0.1));
     expect(t.focusColor.a, greaterThan(t.hoverColor.a));
-    expect(t.expansionTileTheme.expansionAnimationStyle?.duration,
-        const Duration(milliseconds: 220));
+    expect(
+      t.expansionTileTheme.expansionAnimationStyle?.duration,
+      const Duration(milliseconds: 220),
+    );
   });
 
   testWidgets('a button settles to 0.97 on press and back on release', (
@@ -35,10 +37,12 @@ void main() {
       _app(FilledButton(onPressed: () => taps++, child: const Text('Go'))),
     );
     double scaleOf() => tester
-        .widget<AnimatedScale>(find.descendant(
-          of: find.byType(FilledButton),
-          matching: find.byType(AnimatedScale),
-        ))
+        .widget<AnimatedScale>(
+          find.descendant(
+            of: find.byType(FilledButton),
+            matching: find.byType(AnimatedScale),
+          ),
+        )
         .scale;
     expect(scaleOf(), 1.0);
     final g = await tester.startGesture(tester.getCenter(find.text('Go')));
@@ -64,10 +68,12 @@ void main() {
     final g = await tester.startGesture(tester.getCenter(find.text('Go')));
     await tester.pump();
     final s = tester
-        .widget<AnimatedScale>(find.descendant(
-          of: find.byType(FilledButton),
-          matching: find.byType(AnimatedScale),
-        ))
+        .widget<AnimatedScale>(
+          find.descendant(
+            of: find.byType(FilledButton),
+            matching: find.byType(AnimatedScale),
+          ),
+        )
         .scale;
     expect(s, 1.0);
     await g.up();
@@ -76,21 +82,18 @@ void main() {
 
   testWidgets('keyboard focus draws a 2 px ring', (tester) async {
     await tester.pumpWidget(
-      _app(
-        OutlinedButton(
-          onPressed: () {},
-          child: const Text('Tab to me'),
-        ),
-      ),
+      _app(OutlinedButton(onPressed: () {}, child: const Text('Tab to me'))),
     );
     // Keyboard traversal marks the focus as visible ("traditional").
     await tester.sendKeyEvent(LogicalKeyboardKey.tab);
     await tester.pumpAndSettle();
     final material = tester.widget<Material>(
-      find.descendant(
-        of: find.byType(OutlinedButton),
-        matching: find.byType(Material),
-      ).first,
+      find
+          .descendant(
+            of: find.byType(OutlinedButton),
+            matching: find.byType(Material),
+          )
+          .first,
     );
     final shape = material.shape as OutlinedBorder;
     expect(shape.side.width, 2);
