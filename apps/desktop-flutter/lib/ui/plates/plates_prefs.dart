@@ -44,6 +44,8 @@ class PlatesPrefs {
   static const String _kShowWatchlist = 'crumb_plates_show_watchlist';
   static const String _kDensity = 'crumb_plates_density';
   static const String _kGroupByPlate = 'crumb_plates_group_by_plate';
+  static const String _kGridLoupe = 'crumb_plates_grid_loupe';
+  static const String _kGridTall = 'crumb_plates_grid_tall';
 
   /// The last-used view mode, or [PlatesViewMode.list] when the operator has
   /// never changed it (or persistence is unavailable).
@@ -229,6 +231,45 @@ class PlatesPrefs {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_kGroupByPlate, on);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Grid hover magnifier: 0 = off, 2 or 3 = zoom. Defaults to 2.
+  static Future<int> getGridLoupe() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final v = prefs.getInt(_kGridLoupe);
+      return (v == 0 || v == 2 || v == 3) ? v! : 2;
+    } catch (_) {
+      return 2;
+    }
+  }
+
+  static Future<void> setGridLoupe(int zoom) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_kGridLoupe, zoom);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Grid "Tall cards" (adds the 24-hour histogram). Defaults to false.
+  static Future<bool> getGridTall() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_kGridTall) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> setGridTall(bool on) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kGridTall, on);
     } catch (_) {
       /* best-effort persistence */
     }

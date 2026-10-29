@@ -77,9 +77,29 @@ arrow) to unfold the earlier reads under it.
 The list loads 200 reads at a time. **Load more** at the bottom fetches the
 next 200 for the same search and time range.
 
+## Grid
+
+The grid button in the toolbar shows the same reads as cards: the camera frame
+large, with the plate cut out and pinned in a corner. The controls above the
+cards change them right away:
+
+- **Show**: the plate inset, or the frame only.
+- **Inset size** (S, M, L) and **Inset corner** (TL, TR, BL, BR).
+- **Loupe**: a round magnifier that follows the mouse over the frame, at 2x
+  or 3x, handy for reading a plate or a car's details without opening it.
+- **Tall cards**: adds a small chart of the hours of the day this plate
+  usually shows up, with the hour of this read highlighted.
+
+Each card shows how many times the plate has been seen and when it was last
+seen before today, plus NEW, Watchlist, Regular and Unusual hour marks and the
+plate's name. Hover a card for Copy, Name, Watchlist and Report buttons. With
+**Group by plate** on, a plate with several reads becomes one stacked card
+showing the number of reads. The header filters, `j` / `k` and Enter work
+the same as in the list, and clicking a card opens the plate's profile.
+
 ## Plate profile
 
-Clicking a row opens everything known about that plate:
+Clicking a row or a card opens everything known about that plate:
 
 - the plate, the crop from the read you clicked, its name (admins can edit it
   with the pencil) and the watchlist star (admins can add or remove it),

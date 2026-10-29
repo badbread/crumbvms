@@ -52,6 +52,7 @@ import 'package:crumb_desktop/ui/plates/plate_name_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 
+part 'plate_contact_sheet.dart';
 part 'plate_ledger.dart';
 part 'plate_profile.dart';
 
@@ -187,6 +188,11 @@ class _PlatesScreenState extends State<PlatesScreen> {
   );
   final ScrollController _listScroll = ScrollController();
   bool _loadingMore = false;
+  // Grid ("contact sheet") view.
+  int _gridLoupe = 2; // 0 = off
+  bool _gridTall = false;
+  final ScrollController _gridScroll = ScrollController();
+  int _gridColumns = 1;
   // The single shared hover loupe over plate crops.
   OverlayEntry? _loupeEntry;
   PlateRead? _loupeRead;
@@ -243,8 +249,12 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final showWatchlist = await PlatesPrefs.getShowWatchlist();
     final density = await PlatesPrefs.getDensity();
     final groupByPlate = await PlatesPrefs.getGroupByPlate();
+    final gridLoupe = await PlatesPrefs.getGridLoupe();
+    final gridTall = await PlatesPrefs.getGridTall();
     if (!mounted) return;
     setState(() {
+      _gridLoupe = gridLoupe;
+      _gridTall = gridTall;
       _density = density;
       _groupByPlate = groupByPlate;
       _viewMode = mode;
@@ -420,7 +430,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
       _closeProfile();
       return true;
     }
-    if (_viewMode != PlatesViewMode.list) return false;
+    if (_viewMode != PlatesViewMode.list &&
+        _viewMode != PlatesViewMode.gallery) {
+      return false;
+    }
     final keys = HardwareKeyboard.instance;
     if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
       return false;
@@ -463,7 +476,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
       LogicalKeyboardKey.digit3 => PlateDensity.large,
       _ => null,
     };
-    if (density != null) {
+    if (density != null && _viewMode == PlatesViewMode.list) {
       _setDensity(density);
       return true;
     }
@@ -479,15 +492,19 @@ class _PlatesScreenState extends State<PlatesScreen> {
         _stats.want([_profile!.plate]);
       }
     });
-    if (!_listScroll.hasClients) return;
-    final extent = densityMetrics(_density).rowExtent;
-    final top = i * extent;
-    final pos = _listScroll.position;
+    final grid = _viewMode == PlatesViewMode.gallery;
+    final ctrl = grid ? _gridScroll : _listScroll;
+    if (!ctrl.hasClients) return;
+    final extent = grid
+        ? _cardExtent(_gridTall) + 12
+        : densityMetrics(_density).rowExtent;
+    final top = grid ? (i ~/ _gridColumns) * extent : i * extent;
+    final pos = ctrl.position;
     if (top < pos.pixels) {
-      _listScroll.jumpTo(top);
+      ctrl.jumpTo(top);
     } else if (top + extent > pos.pixels + pos.viewportDimension) {
       final target = top + extent - pos.viewportDimension;
-      _listScroll.jumpTo(target > pos.maxScrollExtent ? pos.maxScrollExtent : target);
+      ctrl.jumpTo(target > pos.maxScrollExtent ? pos.maxScrollExtent : target);
     }
   }
 
@@ -706,6 +723,156 @@ class _PlatesScreenState extends State<PlatesScreen> {
     );
   }
 
+  /// The grid view: the inset / loupe / tall controls, then fixed-size cards
+  /// (the same passes, filters and group-by-plate as the list).
+  Widget _buildSheet(BuildContext context, Set<String> watched) {
+    final byId = {for (final c in widget.cameras) c.id: c};
+    final groups = _collapse
+        ? collapsePlateReads(_plates)
+        : [for (final p in _plates) PlateGroup(p, [p])];
+    if (_deskFilter != DeskFilter.all) {
+      _stats.want(groups.map((g) => g.representative.plate));
+    }
+    final visible = _deskFilter == DeskFilter.all
+        ? groups
+        : groups
+              .where(
+                (g) => deskFilterMatches(
+                  _deskFilter,
+                  watched: watched.contains(g.representative.plate),
+                  stats: _stats[g.representative.plate],
+                ),
+              )
+              .toList();
+    // Grouped: one card per plate (stacked when it has several passes).
+    final entries = flattenLedger(visible, groupByPlate: _groupByPlate);
+    _entries = entries;
+    if (_selected >= entries.length) _selected = entries.length - 1;
+    final hasMore = _plates.length < _total;
+    final controls = _SheetControls(
+      size: _cropSize,
+      corner: _cropCorner,
+      display: _imageDisplay,
+      loupe: _gridLoupe,
+      tall: _gridTall,
+      onSize: _setCropSize,
+      onCorner: _setCropCorner,
+      onDisplay: _setImageDisplay,
+      onLoupe: (z) {
+        setState(() => _gridLoupe = z);
+        PlatesPrefs.setGridLoupe(z);
+      },
+      onTall: (on) {
+        setState(() => _gridTall = on);
+        PlatesPrefs.setGridTall(on);
+      },
+    );
+    if (entries.isEmpty) {
+      return Column(
+        children: [
+          controls,
+          const Expanded(
+            child: Center(
+              child: Text(
+                'No plate reads to show.',
+                style: TextStyle(color: Colors.white38),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+    return Column(
+      children: [
+        controls,
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, c) {
+              _gridColumns = ((c.maxWidth - 24 + 12) / (_kCardMaxWidth + 12))
+                  .ceil()
+                  .clamp(1, 64);
+              return CustomScrollView(
+                controller: _gridScroll,
+                slivers: [
+                  SliverPadding(
+                    padding: const EdgeInsets.all(12),
+                    sliver: SliverGrid.builder(
+                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: _kCardMaxWidth,
+                        mainAxisExtent: _cardExtent(_gridTall),
+                        mainAxisSpacing: 12,
+                        crossAxisSpacing: 12,
+                      ),
+                      itemCount: entries.length,
+                      itemBuilder: (context, i) {
+                        final e = entries[i];
+                        final read = e.group.representative;
+                        _stats.want([read.plate]);
+                        return RepaintBoundary(
+                          child: _SheetCard(
+                            key: ValueKey(e.key),
+                            entry: e,
+                            stats: _stats[read.plate],
+                            watched: watched.contains(read.plate),
+                            cameraName:
+                                byId[read.cameraId]?.name ?? '(unknown camera)',
+                            selected: i == _selected,
+                            insetSize: _cropSize,
+                            insetCorner: _cropCorner,
+                            showInset:
+                                _imageDisplay != PlateImageDisplay.fullOnly,
+                            loupe: _gridLoupe,
+                            tall: _gridTall,
+                            session: widget.session,
+                            gate: _thumbGate,
+                            canManage: widget.canManageWatchlist,
+                            canName: widget.canNamePlates,
+                            onTap: () {
+                              setState(() => _selected = i);
+                              _openProfile(read);
+                            },
+                            onAddToWatchlist: () => _addReadToWatchlist(read),
+                            onNamePlate: () =>
+                                _namePlate(read.plate, read.displayName),
+                            onReport: () => _openPlateReport(read),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  if (hasMore)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 16),
+                        child: Center(
+                          child: _loadingMore
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : TextButton(
+                                  onPressed: _loadMore,
+                                  child: Text(
+                                    'Load more (${_plates.length} of $_total loaded)',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+
   /// The header above every view (hidden on an older server).
   Widget? _buildDeskHeader() {
     final o = _overview;
@@ -716,13 +883,15 @@ class _PlatesScreenState extends State<PlatesScreen> {
       groupByPlate: _groupByPlate,
       onFilter: (f) {
         _setDeskFilter(f);
-        if (f != DeskFilter.all && _viewMode != PlatesViewMode.list) {
+        if (f != DeskFilter.all && _viewMode != PlatesViewMode.list &&
+            _viewMode != PlatesViewMode.gallery) {
           _setViewMode(PlatesViewMode.list);
         }
       },
       onGroupByPlate: (on) {
         _setGroupByPlate(on);
-        if (on && _viewMode != PlatesViewMode.list) {
+        if (on && _viewMode != PlatesViewMode.list &&
+            _viewMode != PlatesViewMode.gallery) {
           _setViewMode(PlatesViewMode.list);
         }
       },
@@ -799,6 +968,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
     HardwareKeyboard.instance.removeHandler(_onListKey);
     _hideLoupe();
     _listScroll.dispose();
+    _gridScroll.dispose();
     _stats
       ..removeListener(_onStatsChanged)
       ..dispose();
@@ -1278,7 +1448,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
           _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
           if (_viewMode == PlatesViewMode.list)
             _DensityToggle(value: _density, onChanged: _setDensity),
-          if (_viewMode == PlatesViewMode.list)
+          if (_viewMode == PlatesViewMode.list ||
+              _viewMode == PlatesViewMode.gallery)
             FilterChip(
               label: const Text('Group by plate'),
               selected: _groupByPlate,
@@ -1321,15 +1492,6 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 ),
               ),
             ),
-          if (_viewMode == PlatesViewMode.gallery)
-            _DisplayOptionsButton(
-            imageMode: _imageDisplay,
-            cropCorner: _cropCorner,
-            cropSize: _cropSize,
-            onModeChanged: _setImageDisplay,
-            onCornerChanged: _setCropCorner,
-            onSizeChanged: _setCropSize,
-          ),
           if (_abAvailable)
             TextButton.icon(
               onPressed: () => showAbBenchmark(
@@ -1435,17 +1597,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
         // group-by-plate then folds passes of the same plate together.
         return _buildLedger(context, watched);
       case PlatesViewMode.gallery:
-        return _PlateGallery(
-          reads: _plates,
-          camName: camName,
-          api: widget.api,
-          session: widget.session,
-          gate: _thumbGate,
-          imageMode: _imageDisplay,
-          cropCorner: _cropCorner,
-          cropSize: _cropSize,
-          onTap: _openRead,
-        );
+        return _buildSheet(context, watched);
       case PlatesViewMode.grouped:
         return _PlateGroupedList(
           reads: _plates,
@@ -1519,96 +1671,9 @@ class _ViewModeToggle extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         seg(PlatesViewMode.list, Icons.view_list, 'List'),
-        seg(PlatesViewMode.gallery, Icons.grid_view, 'Gallery'),
+        seg(PlatesViewMode.gallery, Icons.grid_view, 'Grid'),
         seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
         seg(PlatesViewMode.timeline, Icons.timeline, 'Timeline feed'),
-      ],
-    );
-  }
-}
-
-/// Gallery-only popover for the plate inset on each card: frame + inset or
-/// frame only, the inset size, and its corner. Persisted via [PlatesPrefs].
-/// (The list's one display control is the Density toggle.)
-class _DisplayOptionsButton extends StatelessWidget {
-  const _DisplayOptionsButton({
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onModeChanged,
-    required this.onCornerChanged,
-    required this.onSizeChanged,
-  });
-
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final ValueChanged<PlateImageDisplay> onModeChanged;
-  final ValueChanged<PlateCropCorner> onCornerChanged;
-  final ValueChanged<PlateCropSize> onSizeChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final cornersEnabled = imageMode == PlateImageDisplay.both;
-    final cropEnabled = imageMode == PlateImageDisplay.both;
-    PopupMenuItem<Object> header(String text) => PopupMenuItem<Object>(
-          enabled: false,
-          height: 26,
-          child: Text(
-            text,
-            style: const TextStyle(
-              color: Colors.white38,
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.4,
-            ),
-          ),
-        );
-    CheckedPopupMenuItem<Object> modeItem(PlateImageDisplay m, String label) =>
-        CheckedPopupMenuItem<Object>(
-          value: m,
-          checked: imageMode == m,
-          child: Text(label, style: const TextStyle(fontSize: 13)),
-        );
-    CheckedPopupMenuItem<Object> cornerItem(PlateCropCorner c, String label) =>
-        CheckedPopupMenuItem<Object>(
-          value: c,
-          checked: cropCorner == c,
-          enabled: cornersEnabled,
-          child: Text(label, style: const TextStyle(fontSize: 13)),
-        );
-    CheckedPopupMenuItem<Object> sizeItem(PlateCropSize s, String label) =>
-        CheckedPopupMenuItem<Object>(
-          value: s,
-          checked: cropSize == s,
-          enabled: cropEnabled,
-          child: Text(label, style: const TextStyle(fontSize: 13)),
-        );
-    return PopupMenuButton<Object>(
-      tooltip: 'Plate inset',
-      icon: const Icon(Icons.photo_size_select_large,
-          color: Colors.white70, size: 18),
-      color: const Color(0xFF23262E),
-      onSelected: (v) {
-        if (v is PlateImageDisplay) onModeChanged(v);
-        if (v is PlateCropCorner) onCornerChanged(v);
-        if (v is PlateCropSize) onSizeChanged(v);
-      },
-      itemBuilder: (context) => [
-        header('SHOW'),
-        modeItem(PlateImageDisplay.both, 'Frame + plate inset'),
-        modeItem(PlateImageDisplay.fullOnly, 'Frame only'),
-        const PopupMenuDivider(),
-        header('INSET SIZE'),
-        sizeItem(PlateCropSize.small, 'Small'),
-        sizeItem(PlateCropSize.medium, 'Medium'),
-        sizeItem(PlateCropSize.large, 'Large'),
-        const PopupMenuDivider(),
-        header('INSET CORNER'),
-        cornerItem(PlateCropCorner.topLeft, 'Top-left'),
-        cornerItem(PlateCropCorner.topRight, 'Top-right'),
-        cornerItem(PlateCropCorner.bottomLeft, 'Bottom-left'),
-        cornerItem(PlateCropCorner.bottomRight, 'Bottom-right'),
       ],
     );
   }
@@ -2056,7 +2121,6 @@ class _PlateThumb extends StatefulWidget {
     required this.gate,
     this.width = 92,
     this.height = 56,
-    this.radius = 6,
     this.iconSize = 22,
     this.imageMode = PlateImageDisplay.fullOnly,
     this.cropCorner = PlateCropCorner.bottomRight,
@@ -2070,7 +2134,7 @@ class _PlateThumb extends StatefulWidget {
   final _ConcurrencyGate gate;
   final double width;
   final double height;
-  final double radius;
+  final double radius = 6;
   final double iconSize;
 
   /// Which image(s) to show — the full frame, the plate crop, or both. The crop
@@ -2415,178 +2479,6 @@ class _ChipBox extends StatelessWidget {
           fontSize: 12,
           fontWeight: FontWeight.w600,
           fontFeatures: const [FontFeature.tabularFigures()],
-        ),
-      ),
-    );
-  }
-}
-
-// ─── gallery view ──────────────────────────────────────────────────────────
-
-/// Responsive grid of plate cards: snapshot thumbnail (or placeholder), the
-/// plate (mono), camera, time, and a confidence chip. A card tap routes through
-/// the same [onTap] the list uses (pop-up clip player, or timeline hand-off for
-/// a read with no linked event).
-class _PlateGallery extends StatelessWidget {
-  const _PlateGallery({
-    required this.reads,
-    required this.camName,
-    required this.api,
-    required this.session,
-    required this.gate,
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onTap,
-  });
-
-  final List<PlateRead> reads;
-  final String Function(String cameraId) camName;
-  final CrumbApi api;
-  final Session session;
-  final _ConcurrencyGate gate;
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final void Function(PlateRead) onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return GridView.builder(
-      padding: const EdgeInsets.all(12),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 260,
-        mainAxisSpacing: 12,
-        crossAxisSpacing: 12,
-        childAspectRatio: 1.15,
-      ),
-      itemCount: reads.length,
-      itemBuilder: (context, i) {
-        final p = reads[i];
-        return _PlateGalleryCard(
-          key: ValueKey(p.id),
-          read: p,
-          cameraName: camName(p.cameraId),
-          api: api,
-          session: session,
-          gate: gate,
-          imageMode: imageMode,
-          cropCorner: cropCorner,
-          cropSize: cropSize,
-          onTap: () => onTap(p),
-        );
-      },
-    );
-  }
-}
-
-class _PlateGalleryCard extends StatelessWidget {
-  const _PlateGalleryCard({
-    super.key,
-    required this.read,
-    required this.cameraName,
-    required this.api,
-    required this.session,
-    required this.gate,
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onTap,
-  });
-
-  final PlateRead read;
-  final String cameraName;
-  final CrumbApi api;
-  final Session session;
-  final _ConcurrencyGate gate;
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: const Color(0xFF1E2026),
-      borderRadius: BorderRadius.circular(8),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
-              child: _PlateThumb(
-                read: read,
-                api: api,
-                session: session,
-                gate: gate,
-                width: double.infinity,
-                height: double.infinity,
-                radius: 0,
-                iconSize: 34,
-                // Gallery cards feature the plate: the crop pins to the chosen
-                // corner over the full frame (or per the operator's display
-                // preference — full-only / crop-only). Falls back gracefully
-                // when there's no bbox.
-                imageMode: imageMode,
-                cropCorner: cropCorner,
-                cropSize: cropSize,
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _PlateHeadline(
-                          name: read.displayName,
-                          plate: read.plate,
-                          plateStyle: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 1.3,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      _ConfidenceChip(read.confidence),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      const Icon(Icons.videocam_outlined,
-                          size: 12, color: Colors.white38),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: Text(
-                          cameraName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    _fmtDateTime(read.ts),
-                    style: const TextStyle(color: Colors.white54, fontSize: 10),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ),
       ),
     );

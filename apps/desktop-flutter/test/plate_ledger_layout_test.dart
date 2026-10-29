@@ -14,6 +14,7 @@ import 'package:crumb_desktop/api/plate_desk_api.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
+import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 import 'package:crumb_desktop/ui/plates/plates_screen.dart';
 
 PlateRead _read(String plate, {String? name, int minAgo = 0}) => PlateRead(
@@ -177,5 +178,32 @@ void main() {
       }
       await tester.binding.setSurfaceSize(null);
     });
+  }
+
+  for (final tall in [false, true]) {
+    for (final width in [200.0, 260.0]) {
+      testWidgets('grid card (tall: $tall) at $width px lays out', (
+        tester,
+      ) async {
+        for (final entry in [LedgerEntry(group: group), head]) {
+          for (final stats in [_busyStats(), null]) {
+            for (final corner in PlateCropCorner.values) {
+              await _pump(
+                tester,
+                debugSheetCard(
+                  entry: entry,
+                  width: width,
+                  stats: stats,
+                  tall: tall,
+                  corner: corner,
+                ),
+              );
+              expect(tester.takeException(), isNull);
+            }
+          }
+        }
+        await tester.binding.setSurfaceSize(null);
+      });
+    }
   }
 }
