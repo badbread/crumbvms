@@ -220,6 +220,33 @@ class _ExportScreenState extends State<ExportScreen> {
     _notifyChanged();
   }
 
+  /// Another clip over the same time range, inserted right after [draft]:
+  /// the Add clip dialog opens pre-filled so the operator just picks another
+  /// camera (several angles of one event). Cancel adds nothing.
+  Future<void> _duplicateClip(ExportClipDraft draft) async {
+    final result = await showExportClipBuilder(
+      context,
+      api: widget.api,
+      session: widget.session,
+      cameras: widget.cameras,
+      preselectCameraId: draft.cameraId,
+      preselectStart: draft.start,
+      preselectEnd: draft.end,
+      nextId: ++_seq,
+    );
+    if (result == null) {
+      _seq--; // unused id, keep the sequence tight
+      return;
+    }
+    setState(() {
+      final i = _list.indexWhere((d) => d.id == draft.id);
+      _list.insert(i >= 0 ? i + 1 : _list.length, result);
+      _thumbCache.remove(result.id);
+      _clearCompletedState();
+    });
+    _notifyChanged();
+  }
+
   void _removeClip(ExportClipDraft draft) {
     setState(() {
       _list.removeWhere((d) => d.id == draft.id);
@@ -621,6 +648,7 @@ class _ExportScreenState extends State<ExportScreen> {
                                   '${_fmtClock(it.start)} -> ${_fmtClock(it.end)}',
                               durationLabel: _fmtDuration(it.duration),
                               onEdit: () => _editClip(it),
+                              onDuplicate: () => _duplicateClip(it),
                               onRemove: () => _removeClip(it),
                             );
                           },
@@ -927,6 +955,7 @@ class _ClipRow extends StatelessWidget {
     required this.rangeLabel,
     required this.durationLabel,
     required this.onEdit,
+    required this.onDuplicate,
     required this.onRemove,
   });
 
@@ -937,6 +966,7 @@ class _ClipRow extends StatelessWidget {
   final String rangeLabel;
   final String durationLabel;
   final VoidCallback onEdit;
+  final VoidCallback onDuplicate;
   final VoidCallback onRemove;
 
   @override
@@ -977,6 +1007,11 @@ class _ClipRow extends StatelessWidget {
             tooltip: 'Edit clip',
             icon: const Icon(Icons.edit_outlined, size: 18),
             onPressed: onEdit,
+          ),
+          IconButton(
+            tooltip: 'Duplicate (same time, pick another camera)',
+            icon: const Icon(Icons.content_copy_outlined, size: 17),
+            onPressed: onDuplicate,
           ),
           IconButton(
             tooltip: 'Remove clip',
