@@ -444,6 +444,9 @@ class PlaybackViewModel(
      * failure path which surfaces the existing error snackbar + Retry (review A1).
      */
     fun onPlayerError() {
+        // The cached resolve may point at the very file that just failed (e.g.
+        // retention deleted it): make the recovery resolve ask the server.
+        repo.invalidateResolveCache(cameraId)
         seekTo(_state.value.playheadMs)
     }
 

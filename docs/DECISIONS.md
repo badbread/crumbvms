@@ -8,6 +8,41 @@ revisit.
 
 ---
 
+## 2026-10-29, Playback `/play/` resolves are cached briefly on the client, token-less and positive-only
+
+**Context.** A scrub release, a frame-step, a re-seek and the adjacent-segment
+probes on desktop and Android each paid a `GET /play/{camera_id}` round trip,
+even though most of them land in a segment the same client resolved moments
+earlier, and a segment's id and `[start, end)` window never change once indexed.
+
+**Decision.** Desktop (`lib/api/play_resolve_cache.dart`, used by
+`PlaybackApi.resolveSegment`) and Android (`data/PlayResolveCache.kt`, used by
+`CrumbRepository.resolveSegment`) keep a bounded (256 segments) in-memory cache
+of resolves with a 60 s TTL from fetch time. Any instant inside a cached
+segment's window hits. Only 200 answers are cached (a 404 never is, so new
+footage appears on the next resolve). The cached value is the token-less
+`/segments/{id}` path; the scoped `?token=` media claim is still attached from
+the media-token cache at use time, so a cached resolve can never yield an
+expired media URL. Keys include the server and session token (one principal's
+grants never answer another's resolve); sign-out clears it; Android's
+player-error recovery invalidates the camera first so recovery always asks the
+server. Callers can pass `bypassCache`.
+
+**Rejected.** HTTP caching headers on `/play/` (`Cache-Control`): the desktop
+and Android HTTP stacks would cache per exact URL, i.e. per `ts`, so a release
+a few hundred ms from the last resolve would still miss; it also widens what
+intermediaries may store for an authenticated endpoint. A longer TTL: a
+segment retention deletes would stay answerable longer for no real gain, since
+the hits come from actions seconds apart.
+
+**Trade-offs accepted.** For up to 60 s a resolve can name a segment that
+retention or reconcile has just removed; the player then fails to open it,
+exactly as it would if the deletion had landed right after a fresh resolve.
+
+**Revisit if.** Segment windows ever become mutable after indexing (e.g. an
+in-flight segment indexed with a growing end), or iOS gains the same scrub
+paths (it has no cache yet).
+
 ## 2026-10-08, Eviction under a full or missing disk: the archive tier gets its own floor, failing moves fall back to deleting live footage on the low disk, and sweeps never prune or write on an unconfirmed storage
 
 **Context.** Audit findings R2 to R7 against `services/recorder/src/archive.rs`:

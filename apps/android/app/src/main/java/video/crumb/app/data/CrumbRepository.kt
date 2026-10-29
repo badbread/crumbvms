@@ -68,6 +68,9 @@ class CrumbRepository(private val container: AppContainer) {
      */
     private val batchUnsupportedBases = ConcurrentHashMap.newKeySet<String>()
 
+    /** Recent `/play/` answers — see [PlayResolveCache] and [resolveSegment]. */
+    private val playResolveCache = PlayResolveCache()
+
     fun mediaUrls(): MediaUrls = container.mediaUrls()
 
     /**
@@ -145,6 +148,7 @@ class CrumbRepository(private val container: AppContainer) {
     fun logout() {
         store.clearSession()
         container.clearMediaTokenCache()
+        playResolveCache.invalidate()
     }
 
     /** Drop dead pooled sockets on the current client — see
@@ -281,8 +285,33 @@ class CrumbRepository(private val container: AppContainer) {
             .toMap()
     }
 
-    suspend fun resolveSegment(cameraId: String, tsIso: String, stream: String = "main"): Result<ResolvedSegment> =
-        runCatchingCancellable { api.play(cameraId, tsIso, stream) }
+    /**
+     * `GET /play/{camera_id}` — the segment covering [tsIso]. A segment
+     * resolved within the last minute that covers the instant is answered from
+     * [PlayResolveCache] without a round trip (a scrub release or re-seek
+     * landing in the loaded segment, the next-segment prefetch after a
+     * scrub-back). [bypassCache] always asks the server; its answer still
+     * refreshes the cache. 404s are never cached.
+     */
+    suspend fun resolveSegment(
+        cameraId: String,
+        tsIso: String,
+        stream: String = "main",
+        bypassCache: Boolean = false,
+    ): Result<ResolvedSegment> {
+        val scope = "${store.serverUrl}|${store.token.orEmpty()}"
+        val tsMs = Time.parseToMillis(tsIso)
+        if (!bypassCache) {
+            playResolveCache.lookup(scope, cameraId, stream, tsMs)?.let { return Result.success(it) }
+        }
+        return runCatchingCancellable { api.play(cameraId, tsIso, stream) }
+            .onSuccess { seg -> if (seg.cameraId == cameraId) playResolveCache.put(scope, stream, seg, tsMs) }
+    }
+
+    /** Forget cached `/play/` resolves for [cameraId] (all cameras if null), so
+     *  the next [resolveSegment] asks the server — e.g. before re-resolving
+     *  after a player error, which may mean the cached segment is gone. */
+    fun invalidateResolveCache(cameraId: String? = null) = playResolveCache.invalidate(cameraId)
 
     /**
      * Next/previous merged motion-event start (epoch-millis) relative to
