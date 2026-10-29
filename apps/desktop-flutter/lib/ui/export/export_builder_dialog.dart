@@ -250,7 +250,12 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
   // ── pane lifecycle ──────────────────────────────────────────────────────
 
   void _attachPane() {
-    _pane?.dispose();
+    // Dispose the outgoing controller only after the frame that unmounts its
+    // video widget, so that widget never detaches from a disposed notifier.
+    final old = _pane;
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
     final cam = _cameraId;
     _pane = cam == null
         ? null
@@ -640,7 +645,15 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
                             child: Stack(
                               fit: StackFit.expand,
                               children: [
-                                GaplessSegmentPane(controller: pane),
+                                // Keyed to the controller: media_kit's Video binds to its
+                                // player once in initState and ignores a new
+                                // controller in didUpdateWidget, so after a
+                                // camera change it stayed on the disposed
+                                // player and showed black.
+                                GaplessSegmentPane(
+                                  key: ObjectKey(pane),
+                                  controller: pane,
+                                ),
                                 // Scrub frame over the video while a drag is
                                 // outside the loaded segment.
                                 if (_scrubFrame != null)
