@@ -30,6 +30,7 @@ import 'package:crumb_desktop/ui/folder_picker_dialog.dart';
 
 import 'export_builder_dialog.dart';
 import 'package:crumb_desktop/ui/motion/live_motion.dart';
+import 'package:crumb_desktop/ui/motion/panel_motion.dart';
 
 class ExportScreen extends StatefulWidget {
   const ExportScreen({
@@ -61,6 +62,15 @@ class ExportScreen extends StatefulWidget {
 
 class _ExportScreenState extends State<ExportScreen> {
   final List<ExportClipDraft> _list = [];
+
+  /// Rows that were already in the list when the screen opened (or when they
+  /// were first drawn): everything else is new and animates in.
+  final Set<int> _seenRowIds = {};
+
+  /// Rows just removed from [_list] that are still shrinking out of view. The
+  /// data changes at once (and the host is told); only the picture lingers.
+  final List<({int index, ExportClipDraft draft})> _ghostRows = [];
+  final List<Timer> _ghostTimers = [];
   final Map<int, Widget> _thumbCache = {};
   int _seq = 0;
 
@@ -121,6 +131,7 @@ class _ExportScreenState extends State<ExportScreen> {
     super.initState();
     if (widget.initialClips.isNotEmpty) {
       _list.addAll(widget.initialClips);
+      _seenRowIds.addAll(widget.initialClips.map((c) => c.id));
       // Keep new ids above every seeded one so add/edit never collide.
       _seq = widget.initialClips.map((c) => c.id).reduce((a, b) => a > b ? a : b);
     }
@@ -168,6 +179,9 @@ class _ExportScreenState extends State<ExportScreen> {
   void dispose() {
     _pollTimer?.cancel();
     _elapsedTicker?.cancel();
+    for (final t in _ghostTimers) {
+      t.cancel();
+    }
     _passwordCtrl.dispose();
     _destDirCtrl.dispose();
     super.dispose();
@@ -222,12 +236,70 @@ class _ExportScreenState extends State<ExportScreen> {
   }
 
   void _removeClip(ExportClipDraft draft) {
+    final at = _list.indexWhere((d) => d.id == draft.id);
+    if (at >= 0) {
+      final ghost = (index: at, draft: draft);
+      _ghostRows.add(ghost);
+      late final Timer t;
+      t = Timer(SizeFadeRow.leaveDurationFor(context), () {
+        _ghostTimers.remove(t);
+        if (mounted) setState(() => _ghostRows.remove(ghost));
+      });
+      _ghostTimers.add(t);
+    }
     setState(() {
       _list.removeWhere((d) => d.id == draft.id);
       _thumbCache.remove(draft.id);
       _clearCompletedState();
     });
     _notifyChanged();
+  }
+
+  /// The clip list: new rows grow + fade in, removed rows shrink + fade out
+  /// (`_ghostRows`), and the rest reflow with them.
+  Widget _clipRows() {
+    final rows = <({ExportClipDraft draft, bool leaving})>[
+      for (final d in _list) (draft: d, leaving: false),
+    ];
+    for (final g in _ghostRows) {
+      rows.insert(
+        g.index < rows.length ? g.index : rows.length,
+        (draft: g.draft, leaving: true),
+      );
+    }
+    var number = 0;
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      itemCount: rows.length,
+      itemBuilder: (context, i) {
+        final row = rows[i];
+        final it = row.draft;
+        // A row we have not drawn before is new: animate it in.
+        final isNew = !row.leaving && _seenRowIds.add(it.id);
+        if (!row.leaving) number++;
+        return SizeFadeRow(
+          key: ValueKey(it.id),
+          animateIn: isNew,
+          leaving: row.leaving,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (i > 0) const Divider(height: 1),
+              _ClipRow(
+                index: number,
+                draft: it,
+                cameraName: _cameraName(it.cameraId),
+                thumbnail: _thumbFor(it),
+                rangeLabel: '${_fmtClock(it.start)} -> ${_fmtClock(it.end)}',
+                durationLabel: _fmtDuration(it.duration),
+                onEdit: () => _editClip(it),
+                onRemove: () => _removeClip(it),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   /// Any list/settings edit after a completed export reverts the button back
@@ -603,29 +675,7 @@ class _ExportScreenState extends State<ExportScreen> {
                             ],
                           ),
                         )
-                      : ListView.separated(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 6,
-                          ),
-                          itemCount: _list.length,
-                          separatorBuilder: (_, __) =>
-                              const Divider(height: 1),
-                          itemBuilder: (context, i) {
-                            final it = _list[i];
-                            return _ClipRow(
-                              index: i + 1,
-                              draft: it,
-                              cameraName: _cameraName(it.cameraId),
-                              thumbnail: _thumbFor(it),
-                              rangeLabel:
-                                  '${_fmtClock(it.start)} -> ${_fmtClock(it.end)}',
-                              durationLabel: _fmtDuration(it.duration),
-                              onEdit: () => _editClip(it),
-                              onRemove: () => _removeClip(it),
-                            );
-                          },
-                        ),
+                      : _clipRows(),
                 ),
               ],
             ),

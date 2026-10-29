@@ -87,6 +87,15 @@ ThemeData applyCrumbInteraction(ThemeData base, {Color? accent}) {
     segmentedButtonTheme: SegmentedButtonThemeData(
       style: base.segmentedButtonTheme.style?.merge(common()) ?? common(),
     ),
+    // Expand / collapse sections animate their height on the standard curve.
+    expansionTileTheme: base.expansionTileTheme.copyWith(
+      expansionAnimationStyle: AnimationStyle(
+        duration: MotionTokens.d3,
+        reverseDuration: MotionTokens.d3,
+        curve: MotionTokens.standard,
+        reverseCurve: MotionTokens.standard,
+      ),
+    ),
     chipTheme: base.chipTheme.copyWith(side: chipSide),
     switchTheme: base.switchTheme.copyWith(
       overlayColor: _overlay(),

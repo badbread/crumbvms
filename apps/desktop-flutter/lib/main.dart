@@ -77,6 +77,7 @@ import 'package:crumb_desktop/ui/wall_screen.dart';
 import 'package:crumb_desktop/ui/motion/crumb_interaction_theme.dart';
 import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
 import 'package:crumb_desktop/ui/motion/tab_motion.dart';
+import 'package:crumb_desktop/ui/motion/panel_motion.dart';
 
 /// Run modes (default = the real client: login then live wall):
 ///   `--dart-define=GRID=N`  -> N-up media_kit perf harness (perf_grid.dart)
@@ -989,10 +990,16 @@ class _MainShellState extends State<MainShell> with WindowListener {
                     // hotkey handlers registered — HotkeySuppressor is what
                     // stops a keypress in the shortcut-capture box from also
                     // firing the shortcut behind the panel.
-                    if (_settingsOpen)
-                      Positioned.fill(
-                        child: HotkeySuppressor(child: _settingsPanel(session)),
+                    // Opens with scale 0.96 -> 1 + fade, closes faster; the
+                    // panel stays mounted only while it animates out.
+                    Positioned.fill(
+                      child: PopPresence(
+                        present: _settingsOpen,
+                        builder: (context) => HotkeySuppressor(
+                          child: _settingsPanel(session),
+                        ),
                       ),
+                    ),
                   ],
                 ),
               ),

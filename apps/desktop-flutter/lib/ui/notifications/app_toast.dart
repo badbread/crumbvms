@@ -27,6 +27,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../motion/panel_motion.dart';
 
 class AppToast {
   AppToast._();
@@ -82,9 +83,9 @@ class AppToast {
           child: ValueListenableBuilder<bool>(
             valueListenable: visible,
             builder: (context, isVisible, _) {
-              return AnimatedOpacity(
-                opacity: isVisible ? 1 : 0,
-                duration: const Duration(milliseconds: 200),
+              // Rises 10 px as it fades in; fades out on close.
+              return ToastMotion(
+                visible: isVisible,
                 child: MouseRegion(
                   // Pause auto-dismiss while hovered so a clickable detail
                   // line stays reachable (app.js: mouseenter/mouseleave).
