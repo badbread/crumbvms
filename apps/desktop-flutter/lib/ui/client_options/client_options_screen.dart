@@ -78,6 +78,11 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
     widget.onMaybeLayoutAffectingChange?.call();
   }
 
+  void _setInfoBarOverlay(bool v) {
+    setState(() => _o.infoBarOverlay = v);
+    widget.onMaybeLayoutAffectingChange?.call();
+  }
+
   void _setShowAllCamerasView(bool v) => setState(() => _o.showAllCamerasView = v);
   void _setHotkeysEnabled(bool v) => setState(() => _o.hotkeysEnabled = v);
   void _setMaximizeMain(bool v) => setState(() => _o.maximizeMain = v);
@@ -197,6 +202,16 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             onChanged: _setShowInfoBar,
             title: 'Show tile info bar',
             subtitle: 'Camera name and REC/motion indicators on each tile.',
+          ),
+          Padding(
+            padding: const EdgeInsets.only(left: 16),
+            child: _switchRow(
+              value: _o.infoBarOverlay,
+              onChanged: _o.showInfoBar ? _setInfoBarOverlay : null,
+              title: 'Overlay on video',
+              subtitle: 'Float the bar over the top of the picture instead '
+                  'of above it, so the video keeps the full tile.',
+            ),
           ),
           _switchRow(
             value: _o.showAllCamerasView,

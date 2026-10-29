@@ -97,6 +97,7 @@ enum PtzWheelCorner {
 }
 
 const String _kShowInfoBar = 'crumb.showInfoBar';
+const String _kInfoBarOverlay = 'crumb.infoBarOverlay';
 const String _kShowAllCamerasView = 'crumb.showAllCamerasView';
 const String _kHotkeysEnabled = 'crumb.hotkeysEnabled';
 const String _kMaximizeMain = 'crumb.maximizeMain';
@@ -126,6 +127,7 @@ class ClientOptionsStore extends ChangeNotifier {
   ClientOptionsStore._(
     this._prefs, {
     required bool showInfoBar,
+    required bool infoBarOverlay,
     required bool showAllCamerasView,
     required bool hotkeysEnabled,
     required bool maximizeMain,
@@ -139,6 +141,7 @@ class ClientOptionsStore extends ChangeNotifier {
     required bool adaptiveWallBackpressure,
     required bool adaptiveWallGuardrailDontWarn,
   }) : _showInfoBar = showInfoBar,
+       _infoBarOverlay = infoBarOverlay,
        _showAllCamerasView = showAllCamerasView,
        _hotkeysEnabled = hotkeysEnabled,
        _maximizeMain = maximizeMain,
@@ -155,6 +158,7 @@ class ClientOptionsStore extends ChangeNotifier {
   final SharedPreferences? _prefs;
 
   bool _showInfoBar;
+  bool _infoBarOverlay;
   bool _showAllCamerasView;
   bool _hotkeysEnabled;
   bool _maximizeMain;
@@ -178,6 +182,7 @@ class ClientOptionsStore extends ChangeNotifier {
     return ClientOptionsStore._(
       prefs,
       showInfoBar: prefs?.getBool(_kShowInfoBar) ?? true,
+      infoBarOverlay: prefs?.getBool(_kInfoBarOverlay) ?? false,
       showAllCamerasView: prefs?.getBool(_kShowAllCamerasView) ?? true,
       hotkeysEnabled: prefs?.getBool(_kHotkeysEnabled) ?? true,
       maximizeMain: prefs?.getBool(_kMaximizeMain) ?? true,
@@ -203,6 +208,16 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _showInfoBar) return;
     _showInfoBar = v;
     unawaited(_prefs?.setBool(_kShowInfoBar, v));
+    notifyListeners();
+  }
+
+  // ── info bar floats over the top of the video instead of taking its own
+  //    row above it (so the video keeps the tile's full size) ──
+  bool get infoBarOverlay => _infoBarOverlay;
+  set infoBarOverlay(bool v) {
+    if (v == _infoBarOverlay) return;
+    _infoBarOverlay = v;
+    unawaited(_prefs?.setBool(_kInfoBarOverlay, v));
     notifyListeners();
   }
 

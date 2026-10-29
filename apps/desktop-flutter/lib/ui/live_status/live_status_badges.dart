@@ -80,6 +80,7 @@ class TileInfoBar extends StatelessWidget {
     this.dataSaver = false,
     this.autoReduced = false,
     this.height = 18,
+    this.translucent = false,
   });
 
   /// Camera display name.
@@ -110,6 +111,10 @@ class TileInfoBar extends StatelessWidget {
   /// Strip height in logical px. Kept small so it eats minimal video area.
   final double height;
 
+  /// Overlay mode: the strip floats over the video, so let more of the
+  /// picture show through it.
+  final bool translucent;
+
   @override
   Widget build(BuildContext context) {
     final showGenericMotion = recentMotion && detectionKeys.isEmpty;
@@ -121,7 +126,7 @@ class TileInfoBar extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 6),
       // Navy blue, matching the old client's camera tile-strip header
       // (rgba(20,36,66)) rather than a plain black bar.
-      color: const Color.fromRGBO(20, 38, 72, 0.94),
+      color: Color.fromRGBO(20, 38, 72, translucent ? 0.6 : 0.94),
       child: Row(
         children: [
           Container(
