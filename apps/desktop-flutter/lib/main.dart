@@ -76,6 +76,7 @@ import 'package:crumb_desktop/ui/waiting_for_server_screen.dart';
 import 'package:crumb_desktop/ui/wall_screen.dart';
 import 'package:crumb_desktop/ui/motion/crumb_interaction_theme.dart';
 import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
+import 'package:crumb_desktop/ui/motion/tab_motion.dart';
 
 /// Run modes (default = the real client: login then live wall):
 ///   `--dart-define=GRID=N`  -> N-up media_kit perf harness (perf_grid.dart)
@@ -888,6 +889,23 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
   static const Color _settingsColor = Color(0xFF9AA4B2); // neutral slate
 
+  /// The tabs actually shown. The Plates tab is capability-gated; every other
+  /// tab always shows.
+  List<(int, IconData, String, Color)> get _visibleTabs => [
+    for (final t in _tabs)
+      if (t.$1 != _platesIndex || _platesEnabled) t,
+  ];
+
+  /// The tab whose content is shown: Plates falls back to Live while disabled.
+  int get _effectiveIndex =>
+      (_index == _platesIndex && !_platesEnabled) ? _liveIndex : _index;
+
+  /// On-screen position of a tab (display order differs from the numeric index).
+  int _displayOrder(int tab) {
+    final i = _tabs.indexWhere((t) => t.$1 == tab);
+    return i < 0 ? 0 : i;
+  }
+
   /// The active tab's accent color, used app-wide (selection outlines, active
   /// chips, highlights) — mirrors the old client swapping `--accent` per tab.
   /// Looked up by index value (`.$1`), not list position, since [_tabs] is
@@ -956,7 +974,15 @@ class _MainShellState extends State<MainShell> with WindowListener {
               Expanded(
                 child: Stack(
                   children: [
-                    _buildBody(session),
+                    // Tab content cross-fades with a small directional slide;
+                    // Live/Playback (mpv) are disposed immediately, never kept
+                    // alive for the fade (see tab_motion.dart).
+                    TabContentTransition(
+                      index: _effectiveIndex,
+                      order: _displayOrder,
+                      isVideoHeavy: (i) => i == _liveIndex || i == _playbackIndex,
+                      child: _buildBody(session),
+                    ),
                     // The floating Settings panel overlays the current tab with
                     // no scrim, so the wall behind stays live + interactive.
                     // It is NOT a pushed route, so the tab underneath keeps its
@@ -998,12 +1024,21 @@ class _MainShellState extends State<MainShell> with WindowListener {
         ),
         child: Row(
           children: [
-            for (final (i, icon, label, color) in _tabs)
-              // The Plates tab is capability-gated; every other tab always shows.
-              if (i != _platesIndex || _platesEnabled)
-                _tabButton(i, icon, label, color),
-            // Settings is a floating-panel toggle, not a body tab.
-            _settingsToggle(),
+            // One accent underline slides/resizes under the active tab (and
+            // its colour tweens); Settings gets its own that fades in place.
+            SlidingUnderlineRow(
+              selected: _visibleTabs.indexWhere((t) => t.$1 == _effectiveIndex),
+              color: _accentColor,
+              secondary: _visibleTabs.length,
+              secondaryVisible: _settingsOpen,
+              secondaryColor: _settingsColor,
+              children: [
+                for (final (i, icon, label, color) in _visibleTabs)
+                  _tabButton(i, icon, label, color),
+                // Settings is a floating-panel toggle, not a body tab.
+                _settingsToggle(),
+              ],
+            ),
             const Spacer(),
             // Connected server address.
             Padding(
@@ -1532,37 +1567,38 @@ class _TopTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    // The underline itself is drawn by SlidingUnderlineRow (it slides between
+    // tabs); here only the icon/label colour eases between states.
+    final reduced = MotionTokens.reduced(context);
+    final dur = MotionTokens.scaled(MotionTokens.d2, reduced: reduced);
     return InkWell(
       onTap: onTap,
       hoverColor: Colors.white.withValues(alpha: 0.04),
       child: Container(
         height: 42,
         padding: const EdgeInsets.symmetric(horizontal: 13),
-        decoration: BoxDecoration(
-          border: Border(
-            bottom: BorderSide(
-              color: selected ? color : Colors.transparent,
-              width: 2,
-            ),
-          ),
-        ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              icon,
-              size: 15,
-              color: selected ? color : scheme.onSurfaceVariant,
+            TweenAnimationBuilder<Color?>(
+              tween: ColorTween(
+                end: selected ? color : scheme.onSurfaceVariant,
+              ),
+              duration: dur,
+              curve: MotionTokens.standard,
+              builder: (context, c, _) => Icon(icon, size: 15, color: c),
             ),
             const SizedBox(width: 6),
-            Text(
-              label,
+            AnimatedDefaultTextStyle(
+              duration: dur,
+              curve: MotionTokens.standard,
               style: TextStyle(
                 fontSize: 12.5,
                 letterSpacing: 0.2,
                 fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
                 color: selected ? scheme.onSurface : scheme.onSurfaceVariant,
               ),
+              child: Text(label),
             ),
           ],
         ),
