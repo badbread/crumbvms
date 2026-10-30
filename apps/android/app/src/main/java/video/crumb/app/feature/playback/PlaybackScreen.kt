@@ -986,7 +986,7 @@ fun PlaybackScreen(
                         // filmstrip frame wherever the server has pre-generated one
                         // for the segment under the finger (see ScrubSprites.kt).
                         val spriteTile = state.scrubSprite
-                        if (state.scrubbing && spriteTile != null) {
+                        if (state.scrubbing && spriteTile != null && !state.scrubInLoadedSegment) {
                             val painter = remember(spriteTile) { spriteTilePainter(spriteTile) }
                             Image(
                                 painter = painter,

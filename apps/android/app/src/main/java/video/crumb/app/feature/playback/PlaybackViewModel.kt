@@ -1178,6 +1178,9 @@ class PlaybackViewModel(
                     playheadMs = tsMs,
                     scrubInLoadedSegment = true,
                     scrubFrameUrl = null,
+                    // The live player is the preview: drop any sprite tile left over
+                    // from a neighbouring segment, or it would cover the video.
+                    scrubSprite = null,
                     scrubPrefetchUrls = emptyList(),
                     liveScrubSeek = LiveScrubSeek(liveOffset, exact = false, seq = ++liveScrubSeq),
                 )
@@ -1250,7 +1253,9 @@ class PlaybackViewModel(
                 spriteCache.put(tsMs, sprite)
                 // Judge against where the finger is NOW, not where it was.
                 val s = _state.value
-                if (sprite != null && s.scrubbing && sprite.layout.covers(s.playheadMs)) {
+                if (sprite != null && s.scrubbing && !s.scrubInLoadedSegment &&
+                    sprite.layout.covers(s.playheadMs)
+                ) {
                     _state.update { it.copy(scrubSprite = spriteCache.lookup(it.playheadMs)) }
                 }
             } finally {
