@@ -546,3 +546,110 @@ async fn ingest_matching_resolves_corrections() {
         .await
         .unwrap());
 }
+
+/// The alias list and the suggestions endpoint must not reveal plate strings
+/// (misreads or canonical plates) that were only read on cameras the caller
+/// cannot see, nor the creating admin's username.
+#[tokio::test]
+async fn alias_list_and_suggestions_are_camera_scoped() {
+    let app = TestApp::new().await;
+    let cam_a = seed_camera(app.pool()).await;
+    let cam_b = seed_camera(app.pool()).await;
+    let now = Utc::now() - Duration::seconds(5);
+
+    // Visible correction: both plates read on cam_a.
+    let vis_canon = fresh_plate();
+    let vis_alias = misread_of(&vis_canon);
+    seed_read(app.pool(), cam_a, &vis_canon, now).await;
+    seed_read(app.pool(), cam_a, &vis_alias, now).await;
+    // Hidden correction: both plates only ever read on cam_b.
+    let hid_canon = fresh_plate();
+    let hid_alias = misread_of(&hid_canon);
+    seed_read(app.pool(), cam_b, &hid_canon, now).await;
+    seed_read(app.pool(), cam_b, &hid_alias, now).await;
+    // Mixed: canonical read on both cameras, misread only on cam_b: visible
+    // through the canonical.
+    let mix_canon = fresh_plate();
+    let mix_alias = misread_of(&mix_canon);
+    seed_read(app.pool(), cam_a, &mix_canon, now).await;
+    seed_read(app.pool(), cam_b, &mix_alias, now).await;
+
+    let admin = admin_token(&app).await;
+    for (a, c) in [
+        (&vis_alias, &vis_canon),
+        (&hid_alias, &hid_canon),
+        (&mix_alias, &mix_canon),
+    ] {
+        assert_eq!(correct(&app, &admin, a, c).await, StatusCode::CREATED);
+    }
+
+    let viewer = seed_viewer(app.pool(), &[cam_a]).await;
+    let token = login(&app, &viewer.username, &viewer.password).await;
+
+    let list = body_json(app.send(get_auth("/lpr/plate-aliases", &token)).await).await;
+    let rows = list.as_array().unwrap();
+    let has = |alias: &str| rows.iter().any(|r| r["alias_plate"] == alias);
+    assert!(has(&vis_alias), "visible correction is listed");
+    assert!(has(&mix_alias), "visible via its canonical plate");
+    assert!(!has(&hid_alias), "cam_b-only correction must not leak");
+    assert!(
+        !rows.iter().any(|r| r["canonical_plate"] == hid_canon.as_str()),
+        "cam_b-only canonical plate must not leak"
+    );
+    assert!(
+        rows.iter().all(|r| r["created_by"].is_null()),
+        "non-admins never see admin usernames"
+    );
+
+    // Admins still see everything, including who made the correction.
+    let list = body_json(app.send(get_auth("/lpr/plate-aliases", &admin)).await).await;
+    let rows = list.as_array().unwrap();
+    assert!(rows.iter().any(|r| r["alias_plate"] == hid_alias.as_str()));
+    assert!(rows
+        .iter()
+        .any(|r| r["alias_plate"] == hid_alias.as_str() && r["created_by"].is_string()));
+
+    // Suggestions: the hidden plate's group is not revealed.
+    let sug = body_json(
+        app.send(get_auth(
+            &format!("/lpr/plate-alias-suggestions?plate={hid_canon}"),
+            &token,
+        ))
+        .await,
+    )
+    .await;
+    assert!(sug["aliases"].as_array().unwrap().is_empty());
+    assert_eq!(sug["reads"], 0);
+    let sug = body_json(
+        app.send(get_auth(
+            &format!("/lpr/plate-alias-suggestions?plate={hid_alias}"),
+            &token,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(
+        sug["canonical_plate"], hid_alias.as_str(),
+        "a hidden canonical plate is not disclosed"
+    );
+    // Admin sees the real canonical plate.
+    let sug = body_json(
+        app.send(get_auth(
+            &format!("/lpr/plate-alias-suggestions?plate={hid_alias}"),
+            &admin,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(sug["canonical_plate"], hid_canon.as_str());
+    // Visible group still reports its aliases to the scoped viewer.
+    let sug = body_json(
+        app.send(get_auth(
+            &format!("/lpr/plate-alias-suggestions?plate={vis_canon}"),
+            &token,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(sug["aliases"][0], vis_alias.as_str());
+}

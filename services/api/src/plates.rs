@@ -587,17 +587,40 @@ async fn alias_dtos(
             reads: counts.get(&a.alias_plate).copied().unwrap_or(0),
             alias_plate: a.alias_plate,
             canonical_plate: a.canonical_plate,
-            created_by: a.created_by_username,
+            // Admin usernames are only for admins.
+            created_by: if user.is_admin() {
+                a.created_by_username
+            } else {
+                None
+            },
             created_at: a.created_at,
         })
         .collect())
 }
 
+/// The plates among `plates` that have at least one read on a camera in
+/// `scope` (`None` = every camera, so all of them).
+async fn plates_visible_in_scope(
+    state: &AppState,
+    plates: &[String],
+    scope: Option<&[Uuid]>,
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    if scope.is_none() {
+        return Ok(plates.iter().cloned().collect());
+    }
+    Ok(db::plate_raw_read_counts(state.pool(), plates, scope)
+        .await
+        .map_err(ApiError::Internal)?
+        .into_keys()
+        .collect())
+}
+
 /// `GET /lpr/plate-aliases[?canonical=<plate>]` — the plate corrections, or
 /// only the known misreads of one plate (the plate profile's list).
-/// `view_plates`-gated like the watchlist read; the per-alias read counts are
-/// camera-scoped, so they never count reads from cameras the caller may not
-/// see.
+/// `view_plates`-gated. For non-admins the list is camera-scoped: a correction
+/// is returned only when its misread or its canonical plate has a read on a
+/// camera the caller may see, the read counts only count such cameras, and
+/// `created_by` (an admin username) is omitted.
 ///
 /// # Errors
 ///
@@ -613,9 +636,21 @@ async fn get_plate_aliases(
         .as_deref()
         .map(db::normalize_plate)
         .filter(|p| !p.is_empty());
-    let aliases = db::list_plate_aliases(state.pool(), canonical.as_deref())
+    let mut aliases = db::list_plate_aliases(state.pool(), canonical.as_deref())
         .await
         .map_err(ApiError::Internal)?;
+    if !user.is_admin() {
+        // A correction is OCR output from specific cameras: show it only when
+        // the misread or the plate it counts as was read on a camera the
+        // caller may see.
+        let scope = aggregate_scope(&user, None);
+        let both: Vec<String> = aliases
+            .iter()
+            .flat_map(|a| [a.alias_plate.clone(), a.canonical_plate.clone()])
+            .collect();
+        let visible = plates_visible_in_scope(&state, &both, scope.as_deref()).await?;
+        aliases.retain(|a| visible.contains(&a.alias_plate) || visible.contains(&a.canonical_plate));
+    }
     Ok(Json(alias_dtos(&state, &user, aliases).await?))
 }
 
@@ -773,15 +808,30 @@ async fn get_plate_alias_suggestions(
     }
     let scope = aggregate_scope(&user, None);
     let pool = state.pool();
-    let canonical_plate = db::resolve_plate_alias(pool, &plate)
+    let mut canonical_plate = db::resolve_plate_alias(pool, &plate)
         .await
         .map_err(ApiError::Internal)?;
-    let aliases: Vec<String> = db::plate_aliases_of(pool, std::slice::from_ref(&plate))
+    let mut aliases: Vec<String> = db::plate_aliases_of(pool, std::slice::from_ref(&plate))
         .await
         .map_err(ApiError::Internal)?
         .into_iter()
         .map(|(a, _)| a)
         .collect();
+    if !user.is_admin() {
+        // Same visibility rule as `GET /lpr/plate-aliases`: a correction row
+        // shows only when one of its two plates was read on a visible camera.
+        let mut probe = aliases.clone();
+        probe.push(plate.clone());
+        probe.push(canonical_plate.clone());
+        let visible = plates_visible_in_scope(&state, &probe, scope.as_deref()).await?;
+        // If the input itself is visible, every correction touching it is.
+        if !visible.contains(&plate) {
+            aliases.retain(|a| visible.contains(a));
+            if !visible.contains(&canonical_plate) {
+                canonical_plate.clone_from(&plate);
+            }
+        }
+    }
     let mut group = aliases.clone();
     group.push(plate.clone());
     let reads = db::plate_raw_read_counts(pool, &group, scope.as_deref())
