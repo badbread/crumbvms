@@ -351,6 +351,11 @@ class SecureStore(context: Context) {
         get() = safeRead(false) { it.getBoolean(KEY_LOW_BW_AUTOFIX, false) }
         set(value) = safeWrite { it.putBoolean(KEY_LOW_BW_AUTOFIX, value) }
 
+    /** The Clips tab's camera filter (a camera id), or null for all cameras. */
+    var clipsCameraId: String?
+        get() = safeRead(null) { it.getString(KEY_CLIPS_CAMERA, null) }
+        set(value) = safeWrite { if (value == null) it.remove(KEY_CLIPS_CAMERA) else it.putString(KEY_CLIPS_CAMERA, value) }
+
     /**
      * Adaptive live-wall quality (issue #384). When on (the default), the wall
      * protects the device's video decoder from over-subscription: a config-time
@@ -475,6 +480,7 @@ class SecureStore(context: Context) {
         private const val KEY_PLAYBACK_QUALITY = "playback_quality"
         private const val KEY_LIVE_LAYOUT = "live_grid_layout"
         private const val KEY_LOW_BW_AUTOFIX = "low_bw_autofix_applied"
+        private const val KEY_CLIPS_CAMERA = "clips_camera_id"
         private const val KEY_ADAPTIVE_WALL = "adaptive_wall_quality"
         private const val KEY_WALL_GUARDRAIL_SILENCED = "wall_guardrail_silenced"
         private const val KEY_PTZ_STYLE = "ptz_style"

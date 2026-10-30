@@ -9,8 +9,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import video.crumb.app.data.CameraDto
 import video.crumb.app.data.ClipDescriptor
 import video.crumb.app.data.CrumbRepository
+import video.crumb.app.data.SecureStore
 import video.crumb.app.data.toUserMessage
 import java.time.Instant
 
@@ -19,14 +21,21 @@ data class ClipsUiState(
     val clips: List<ClipDescriptor> = emptyList(),
     val type: String = "all",
     val hours: Long = 24,
+    /** Cameras the caller can see, for the camera filter. */
+    val cameras: List<CameraDto> = emptyList(),
+    /** The camera filter: one camera id, or null for all cameras. */
+    val cameraId: String? = null,
     val error: String? = null,
     /** Server-configured motion-highlight auto-zoom duration (seconds; 0 = off). */
     val motionHighlightSeconds: Int = 0,
 )
 
 /** Loads the source-abstracted `/clips` feed for the Clips tab. */
-class ClipsViewModel(private val repo: CrumbRepository) : ViewModel() {
-    private val _state = MutableStateFlow(ClipsUiState())
+class ClipsViewModel(
+    private val repo: CrumbRepository,
+    private val store: SecureStore,
+) : ViewModel() {
+    private val _state = MutableStateFlow(ClipsUiState(cameraId = store.clipsCameraId))
     val state: StateFlow<ClipsUiState> = _state.asStateFlow()
 
     init { load() }
@@ -40,6 +49,14 @@ class ClipsViewModel(private val repo: CrumbRepository) : ViewModel() {
     fun setHours(hours: Long) {
         if (hours == _state.value.hours) return
         _state.update { it.copy(hours = hours) }
+        load()
+    }
+
+    /** Filter to one camera, or null for all cameras. Remembered across launches. */
+    fun setCamera(cameraId: String?) {
+        if (cameraId == _state.value.cameraId) return
+        store.clipsCameraId = cameraId
+        _state.update { it.copy(cameraId = cameraId) }
         load()
     }
 
@@ -76,13 +93,19 @@ class ClipsViewModel(private val repo: CrumbRepository) : ViewModel() {
             // viewer account. `visibleCameras()` is the caller-scoped list every
             // other screen uses. Surface a real failure instead of swallowing it.
             val camsResult = repo.visibleCameras()
-            val cams = camsResult.getOrNull()?.map { it.id }
-            if (cams == null) {
+            val visible = camsResult.getOrNull()
+            if (visible == null) {
                 _state.update {
                     it.copy(loading = false, error = camsResult.exceptionOrNull()?.toUserMessage())
                 }
                 return@launch
             }
+            // A remembered camera that is gone (deleted, or access revoked)
+            // falls back to all cameras rather than an empty list.
+            val picked = _state.value.cameraId?.takeIf { id -> visible.any { it.id == id } }
+            if (picked == null && _state.value.cameraId != null) store.clipsCameraId = null
+            _state.update { it.copy(cameras = visible, cameraId = picked) }
+            val cams = if (picked != null) listOf(picked) else visible.map { it.id }
             if (cams.isEmpty()) {
                 _state.update { it.copy(loading = false, clips = emptyList()) }
                 return@launch
