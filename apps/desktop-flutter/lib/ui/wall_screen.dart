@@ -1822,6 +1822,16 @@ class _WallTileState extends State<_WallTile>
       _controller = controller;
       _error = null;
     });
+    // The width event that marks the first decoded frame can fire BEFORE this
+    // adopt (while `player.open()` was still awaiting, or while a busy UI
+    // isolate delayed the continuation, e.g. a fullscreen toggle tearing down
+    // and re-opening every tile). The stream listener ignores a player that is
+    // neither `_player` nor `_pending`, so that event was dropped and the
+    // reveal never started: video stuck at opacity 0 under the connecting
+    // spinner, forever. Re-check the player's current state, as the swap path
+    // does.
+    final w = player.state.width;
+    if (w != null && w > 0 && mounted) _onFirstFrame(player, controller);
   }
 
   /// Watchdog reconnect for a confirmed-stalled pane: refetch the stream URL

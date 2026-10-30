@@ -70,6 +70,7 @@ import 'package:crumb_desktop/ui/saved_views/saved_views_screen.dart';
 import 'package:crumb_desktop/ui/saved_views/view_prefs.dart';
 import 'package:crumb_desktop/ui/saved_views/view_selector_bar.dart';
 import 'package:crumb_desktop/ui/settings/settings_window.dart';
+import 'package:crumb_desktop/ui/shell_column.dart';
 import 'package:crumb_desktop/ui/snapshot/snapshot_hotkey.dart';
 import 'package:crumb_desktop/ui/updates/update_banner.dart';
 import 'package:crumb_desktop/ui/updates/update_check_controller.dart';
@@ -955,75 +956,71 @@ class _MainShellState extends State<MainShell> with WindowListener {
         listenable: widget.fullscreen,
         builder: (context, _) {
           final chromeHidden = widget.fullscreen.isFullscreen;
-          return Column(
-            children: [
-              if (!chromeHidden) ...[
-                RecordingAlertBanner(controller: widget.recordingAlerts),
-                UpdateBanner(controller: widget.updateCheck),
-                _buildTopBar(session),
-                // Saved-views quick-switch row — shared by Live and Playback so
-                // the header stays the same across the two. Playback only needs
-                // to pick which cameras to review, so it hides the Live-only
-                // Snapshot + Config View controls.
-                if (_index == _liveIndex || _index == _playbackIndex)
-                  ViewSelectorBar(
-                    key: ValueKey('viewbar-$_viewsRefreshToken'),
-                    api: widget.api,
-                    session: session,
-                    cameras: widget.cameras,
-                    activeViewId: _activeViewId,
-                    onApply: _applyView,
-                    onSnapshot: _index == _liveIndex
-                        ? () => SnapshotService.captureActivePane(context)
-                        : null,
-                    onConfigView: _index == _liveIndex
-                        ? () => _openConfigView(session)
-                        : null,
-                    // Live-only: the global "hide HA overlays" quick-toggle
-                    // (Playback draws no HA badges).
-                    showHaOverlayToggle: _index == _liveIndex,
-                    // Hide the "All Cameras" chip when the option is off.
-                    showAllCameras:
-                        widget.clientOptions?.showAllCamerasView ?? true,
-                  ),
-              ],
-              Expanded(
-                child: Stack(
-                  children: [
-                    // Tab content cross-fades with a small directional slide;
-                    // Live/Playback (mpv) are disposed immediately, never kept
-                    // alive for the fade (see tab_motion.dart).
-                    TabContentTransition(
-                      index: _effectiveIndex,
-                      order: _displayOrder,
-                      isVideoHeavy: (i) => i == _liveIndex || i == _playbackIndex,
-                      child: _buildBody(session),
-                    ),
-                    // The floating Settings panel overlays the current tab with
-                    // no scrim, so the wall behind stays live + interactive.
-                    // It is NOT a pushed route, so the tab underneath keeps its
-                    // hotkey handlers registered — HotkeySuppressor is what
-                    // stops a keypress in the shortcut-capture box from also
-                    // firing the shortcut behind the panel.
-                    // Opens with scale 0.96 -> 1 + fade, closes faster; the
-                    // panel stays mounted only while it animates out.
-                    Positioned.fill(
-                      child: PopPresence(
-                        present: _settingsOpen,
-                        builder: (context) => HotkeySuppressor(
-                          child: _settingsPanel(session),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              if (!chromeHidden)
-                StatusBar(
-                  controller: widget.statusBar,
-                  leading: _statusBarLeading(),
+          return ShellColumn(
+            chromeHidden: chromeHidden,
+            top: () => [
+              RecordingAlertBanner(controller: widget.recordingAlerts),
+              UpdateBanner(controller: widget.updateCheck),
+              _buildTopBar(session),
+              // Saved-views quick-switch row — shared by Live and Playback so
+              // the header stays the same across the two. Playback only needs
+              // to pick which cameras to review, so it hides the Live-only
+              // Snapshot + Config View controls.
+              if (_index == _liveIndex || _index == _playbackIndex)
+                ViewSelectorBar(
+                  key: ValueKey('viewbar-$_viewsRefreshToken'),
+                  api: widget.api,
+                  session: session,
+                  cameras: widget.cameras,
+                  activeViewId: _activeViewId,
+                  onApply: _applyView,
+                  onSnapshot: _index == _liveIndex
+                      ? () => SnapshotService.captureActivePane(context)
+                      : null,
+                  onConfigView: _index == _liveIndex
+                      ? () => _openConfigView(session)
+                      : null,
+                  // Live-only: the global "hide HA overlays" quick-toggle
+                  // (Playback draws no HA badges).
+                  showHaOverlayToggle: _index == _liveIndex,
+                  // Hide the "All Cameras" chip when the option is off.
+                  showAllCameras:
+                      widget.clientOptions?.showAllCamerasView ?? true,
                 ),
             ],
+            body: Stack(
+              children: [
+                // Tab content cross-fades with a small directional slide;
+                // Live/Playback (mpv) are disposed immediately, never kept
+                // alive for the fade (see tab_motion.dart).
+                TabContentTransition(
+                  index: _effectiveIndex,
+                  order: _displayOrder,
+                  isVideoHeavy: (i) => i == _liveIndex || i == _playbackIndex,
+                  child: _buildBody(session),
+                ),
+                // The floating Settings panel overlays the current tab with
+                // no scrim, so the wall behind stays live + interactive.
+                // It is NOT a pushed route, so the tab underneath keeps its
+                // hotkey handlers registered — HotkeySuppressor is what
+                // stops a keypress in the shortcut-capture box from also
+                // firing the shortcut behind the panel.
+                // Opens with scale 0.96 -> 1 + fade, closes faster; the
+                // panel stays mounted only while it animates out.
+                Positioned.fill(
+                  child: PopPresence(
+                    present: _settingsOpen,
+                    builder: (context) => HotkeySuppressor(
+                      child: _settingsPanel(session),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            bottom: StatusBar(
+              controller: widget.statusBar,
+              leading: _statusBarLeading(),
+            ),
           );
         },
       ),
