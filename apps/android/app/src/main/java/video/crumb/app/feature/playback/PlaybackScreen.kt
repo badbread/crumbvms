@@ -121,6 +121,7 @@ import video.crumb.app.ui.player.MediaFactory
 import video.crumb.app.ui.player.PlayerSurface
 import video.crumb.app.ui.player.ViewTransform
 import video.crumb.app.ui.player.ZoomableVideoSurface
+import video.crumb.app.ui.player.cameraSwipe
 import video.crumb.app.ui.player.rememberZoomableSurfaceState
 import video.crumb.app.feature.export.ExportRange
 import video.crumb.app.feature.live.rememberIsMetered
@@ -880,7 +881,11 @@ fun PlaybackScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .background(Color.Black),
+                    .background(Color.Black)
+                    // Swipe-to-switch must work from loading/error/"No footage"
+                    // states too (#622); the video surface has its own (zoom-aware)
+                    // detector and consumes its gestures, so this ignores those.
+                    .cameraSwipe(if (cameraIds.size > 1) { dir -> switchCameraByOffset(dir) } else null),
                 contentAlignment = Alignment.Center,
             ) {
                 when {

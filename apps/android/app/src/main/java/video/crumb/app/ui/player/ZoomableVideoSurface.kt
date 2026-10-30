@@ -53,8 +53,8 @@ private const val MAX_SCALE = 30.0f
 /** A horizontal swipe (at 1x) must travel at least this fraction of the view
  *  width to count as a camera switch, with a floor so tiny views still need a
  *  deliberate swipe. */
-private const val SWIPE_WIDTH_FRACTION = 0.15f
-private const val SWIPE_MIN_PX = 120f
+internal const val SWIPE_WIDTH_FRACTION = 0.15f
+internal const val SWIPE_MIN_PX = 120f
 
 /**
  * Snapshot of the digital-zoom transform, surfaced to a parent via
@@ -226,10 +226,7 @@ fun ZoomableVideoSurface(
                     if (cb != null && maxPointers < 2 && !suppressPan &&
                         zoom <= 1.001f && size.width > 0
                     ) {
-                        val threshold = (size.width * SWIPE_WIDTH_FRACTION).coerceAtLeast(SWIPE_MIN_PX)
-                        if (abs(totalPan.x) > threshold && abs(totalPan.x) > abs(totalPan.y) * 1.3f) {
-                            cb(if (totalPan.x < 0f) 1 else -1)
-                        }
+                        cameraSwipeDirection(totalPan.x, totalPan.y, size.width)?.let(cb)
                     }
                 }
             }
