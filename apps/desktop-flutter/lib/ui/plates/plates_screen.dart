@@ -43,8 +43,10 @@ import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plate_desk_api.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/clips/clip_bookmark.dart';
 import 'package:crumb_desktop/ui/clips/clip_controls.dart';
 import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
+import 'package:crumb_desktop/ui/clips/zoomable_video.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
@@ -2785,8 +2787,9 @@ class _PlateGroupedList extends StatelessWidget {
 /// same style/behavior as the Clips tab's clip player (both render through the
 /// shared [ClipPlayerShell]: Positioned.fill overlay over the tab, closes on
 /// Esc / the close X / a tap on the dark backdrop, actions under the video),
-/// trimmed to what a plate hit needs: no zoom/snapshot/bookmark, plus a "View
-/// on timeline" hand-off.
+/// trimmed to what a plate hit needs: no snapshot, plus a "View on timeline"
+/// hand-off. Wheel zoom / drag pan ([ZoomableVideo]) and a bookmark button
+/// (in [ClipControls]) are built in.
 ///
 /// The clip is resolved exactly like a Clips detection clip: the read's
 /// [PlateRead.eventId] is the `d:<event-uuid>` clip id, played from
@@ -2863,10 +2866,37 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   // state is the user pausing (or a seek/frame-step), NOT a stall, so the
   // watchdog must never re-open the clip from the start again.
   bool _everPlayed = false;
+  bool _bookmarksOk = true;
+
+  /// Bookmark `at` (default: the playhead) on the read's camera.
+  Future<void> _bookmark([DateTime? at]) {
+    final t = _transport;
+    return bookmarkClipMoment(
+      context,
+      api: widget.api,
+      session: widget.session,
+      cameraId: widget.read.cameraId,
+      cameraName: widget.cameraName,
+      at: at ??
+          widget.read.ts
+              .subtract(kPlateClipLead)
+              .add(t?.position ?? kPlateClipLead),
+      description: clipBookmarkDescription(
+        plate: widget.read.plate,
+        displayName: widget.read.displayName,
+        cameraName: widget.cameraName,
+      ),
+    );
+  }
 
   @override
   void initState() {
     super.initState();
+    unawaited(
+      clipBookmarksAvailable(widget.api, widget.session).then((ok) {
+        if (mounted && !ok) setState(() => _bookmarksOk = false);
+      }),
+    );
     // Esc closes the pop-up regardless of which node holds keyboard focus — a
     // HardwareKeyboard handler fires for every key event, independent of the
     // focus chain (same rationale as the Clips clip player's _onKeyEvent).
@@ -2907,7 +2937,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
     // Shared clip shortcuts (Space, Left / Right, `,` `.`).
     final t = _transport;
     if (t != null && !hotkeyContextBlocked(context)) {
-      return handleClipTransportKey(event, t);
+      return handleClipTransportKey(
+        event,
+        t,
+        onBookmark: _bookmarksOk ? () => unawaited(_bookmark()) : null,
+      );
     }
     return false;
   }
@@ -3136,6 +3170,8 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
                     transport: _transport!,
                     wallStart: widget.read.ts.subtract(kPlateClipLead),
                     markAt: kPlateClipLead,
+                    onBookmark:
+                        _bookmarksOk ? (at) => unawaited(_bookmark(at)) : null,
                   ),
                 ),
               )
@@ -3200,10 +3236,12 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
       return Text(_error!, style: const TextStyle(color: Colors.redAccent));
     }
     if (_controller == null) return const CircularProgressIndicator();
-    final video = Video(
-      controller: _controller!,
-      controls: NoVideoControls,
-      fit: BoxFit.contain,
+    final video = ZoomableVideo(
+      child: Video(
+        controller: _controller!,
+        controls: NoVideoControls,
+        fit: BoxFit.contain,
+      ),
     );
     final vw = (_player?.state.width ?? 0).toDouble();
     final vh = (_player?.state.height ?? 0).toDouble();

@@ -626,6 +626,7 @@ class _PlateProfileState extends State<_PlateProfile> {
               session: widget.session,
               read: r,
               height: h,
+              cameraName: widget.camName(r.cameraId),
               onFullscreen: (pos) => widget.onPlay(r, position: pos),
             )
           else
@@ -990,11 +991,15 @@ class _InlineClip extends StatefulWidget {
     required this.read,
     required this.height,
     required this.onFullscreen,
+    this.cameraName = '',
   });
 
   final CrumbApi api;
   final Session session;
   final PlateRead read;
+
+  /// Camera label for the bookmark note; empty when unknown.
+  final String cameraName;
 
   /// Height of the video area (the controls sit below it).
   final double height;
@@ -1012,12 +1017,38 @@ class _InlineClipState extends State<_InlineClip> {
   MediaKitClipTransport? _transport;
   String? _error;
   bool _disposed = false;
+  bool _bookmarksOk = true;
 
   @override
   void initState() {
     super.initState();
     HardwareKeyboard.instance.addHandler(_onKey);
     unawaited(_open());
+    unawaited(
+      clipBookmarksAvailable(widget.api, widget.session).then((ok) {
+        if (mounted && !ok) setState(() => _bookmarksOk = false);
+      }),
+    );
+  }
+
+  DateTime get _wallStart => widget.read.ts.subtract(kPlateClipLead);
+
+  /// Bookmark `at` (default: the playhead) on the read's camera.
+  Future<void> _bookmark([DateTime? at]) {
+    final t = _transport;
+    return bookmarkClipMoment(
+      context,
+      api: widget.api,
+      session: widget.session,
+      cameraId: widget.read.cameraId,
+      cameraName: widget.cameraName,
+      at: at ?? _wallStart.add(t?.position ?? kPlateClipLead),
+      description: clipBookmarkDescription(
+        plate: widget.read.plate,
+        displayName: widget.read.displayName,
+        cameraName: widget.cameraName,
+      ),
+    );
   }
 
   /// Space / Left / Right / , / . while the profile is up. Stands down for a
@@ -1028,7 +1059,11 @@ class _InlineClipState extends State<_InlineClip> {
     if (t == null || !mounted) return false;
     if (_PlateClipPlayerState.openCount > 0) return false;
     if (hotkeyContextBlocked(context)) return false;
-    return handleClipTransportKey(event, t);
+    return handleClipTransportKey(
+      event,
+      t,
+      onBookmark: _bookmarksOk ? () => unawaited(_bookmark()) : null,
+    );
   }
 
   Future<void> _open() async {
@@ -1102,7 +1137,9 @@ class _InlineClipState extends State<_InlineClip> {
         ),
       );
     } else {
-      video = Video(controller: c, controls: NoVideoControls, fit: BoxFit.contain);
+      video = ZoomableVideo(
+        child: Video(controller: c, controls: NoVideoControls, fit: BoxFit.contain),
+      );
     }
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1113,9 +1150,10 @@ class _InlineClipState extends State<_InlineClip> {
             color: _kSurface1,
             child: ClipControls(
               transport: t,
-              wallStart: widget.read.ts.subtract(kPlateClipLead),
+              wallStart: _wallStart,
               markAt: kPlateClipLead,
               onFullscreen: () => unawaited(_fullscreen()),
+              onBookmark: _bookmarksOk ? (at) => unawaited(_bookmark(at)) : null,
             ),
           )
         else

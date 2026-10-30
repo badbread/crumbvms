@@ -230,9 +230,14 @@ class MediaKitClipTransport extends ClipTransport {
 // ── keyboard ──────────────────────────────────────────────────────────────
 
 /// Shared clip shortcuts: Space play/pause, Left / Right skip 1 s, `,` and `.`
-/// step one frame back / forward. Returns true when the key was consumed.
+/// step one frame back / forward, and `B` bookmarks the playhead when
+/// [onBookmark] is given. Returns true when the key was consumed.
 /// Callers are responsible for the context gate (`hotkeyContextBlocked`).
-bool handleClipTransportKey(KeyEvent event, ClipTransport t) {
+bool handleClipTransportKey(
+  KeyEvent event,
+  ClipTransport t, {
+  VoidCallback? onBookmark,
+}) {
   if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
   final keys = HardwareKeyboard.instance;
   if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
@@ -260,6 +265,10 @@ bool handleClipTransportKey(KeyEvent event, ClipTransport t) {
     unawaited(t.stepFrame(true));
     return true;
   }
+  if (k == LogicalKeyboardKey.keyB && onBookmark != null) {
+    if (event is KeyDownEvent) onBookmark();
+    return true;
+  }
   return false;
 }
 
@@ -273,6 +282,7 @@ class ClipControls extends StatelessWidget {
     this.wallStart,
     this.markAt,
     this.onFullscreen,
+    this.onBookmark,
   });
 
   final ClipTransport transport;
@@ -285,6 +295,10 @@ class ClipControls extends StatelessWidget {
 
   /// Shows a full-screen button when set.
   final VoidCallback? onFullscreen;
+
+  /// Shows a bookmark button when set and [wallStart] is known; called with the
+  /// wall-clock time at the playhead.
+  final ValueChanged<DateTime>? onBookmark;
 
   @override
   Widget build(BuildContext context) {
@@ -417,6 +431,13 @@ class ClipControls extends StatelessWidget {
                             () => unawaited(t.setMuted(!t.muted)),
                             key: const ValueKey('clip-mute'),
                           ),
+                          if (onBookmark != null && wall != null)
+                            btn(
+                              Icons.bookmark_add_outlined,
+                              'Bookmark this moment (B)',
+                              () => onBookmark!(wall.add(t.position)),
+                              key: const ValueKey('clip-bookmark'),
+                            ),
                           if (onFullscreen != null)
                             btn(
                               Icons.fullscreen,
