@@ -56,6 +56,7 @@ import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 part 'plate_contact_sheet.dart';
 part 'plate_ledger.dart';
 part 'plate_profile.dart';
+part 'plate_profile_charts.dart';
 
 /// A plate-hit clip that stalls this long without progressing is retried (the
 /// clip is transcoded on demand server-side, so a cold clip can be slow). Same
