@@ -16,6 +16,14 @@ val TextPrimary = Color(0xFFE8E9ED)        // off-white
 val TextSecondary = Color(0xFF8B93A1)      // slate-lite
 val DangerRed = Color(0xFFE5484D)          // crumb-rec red
 
+// LPR tab accent: "registration blue", the same colour the desktop LPR tab uses.
+// Replaces the old plate-red on the LPR tab only; red stays "danger / REC".
+val LprAccent = Color(0xFF4F8DFF)          // selected tab, chart bars, chips, toggles
+val LprAccentHot = Color(0xFF86B1FF)       // text and icons on a tinted accent surface
+val LprAccentInk = Color(0xFF0B1220)       // text and icons ON a solid accent fill
+val LprAccentChip = Color(0x334F8DFF)      // ~20% accent wash behind chips and selected segments
+val LprWatchAmber = Color(0xFFE8A33D)      // watchlist star and rail
+
 /**
  * Semantic colors for the playback timeline — CrumbVMS "The Trail".
  *
