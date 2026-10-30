@@ -593,7 +593,9 @@ async fn alias_list_and_suggestions_are_camera_scoped() {
     assert!(has(&mix_alias), "visible via its canonical plate");
     assert!(!has(&hid_alias), "cam_b-only correction must not leak");
     assert!(
-        !rows.iter().any(|r| r["canonical_plate"] == hid_canon.as_str()),
+        !rows
+            .iter()
+            .any(|r| r["canonical_plate"] == hid_canon.as_str()),
         "cam_b-only canonical plate must not leak"
     );
     assert!(
@@ -629,7 +631,8 @@ async fn alias_list_and_suggestions_are_camera_scoped() {
     )
     .await;
     assert_eq!(
-        sug["canonical_plate"], hid_alias.as_str(),
+        sug["canonical_plate"],
+        hid_alias.as_str(),
         "a hidden canonical plate is not disclosed"
     );
     // Admin sees the real canonical plate.

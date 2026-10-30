@@ -649,7 +649,8 @@ async fn get_plate_aliases(
             .flat_map(|a| [a.alias_plate.clone(), a.canonical_plate.clone()])
             .collect();
         let visible = plates_visible_in_scope(&state, &both, scope.as_deref()).await?;
-        aliases.retain(|a| visible.contains(&a.alias_plate) || visible.contains(&a.canonical_plate));
+        aliases
+            .retain(|a| visible.contains(&a.alias_plate) || visible.contains(&a.canonical_plate));
     }
     Ok(Json(alias_dtos(&state, &user, aliases).await?))
 }
