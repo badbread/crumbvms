@@ -501,7 +501,7 @@ private fun SightingVideo(
             VideoButton(
                 if (playback.muted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
                 if (playback.muted) "Turn sound on" else "Mute",
-            ) { playback.setMuted(!playback.muted) }
+            ) { playback.applyMuted(!playback.muted) }
         }
     }
 }

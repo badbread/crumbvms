@@ -159,7 +159,7 @@ class SightingPlayback(
         }
     }
 
-    fun setMuted(value: Boolean) {
+    fun applyMuted(value: Boolean) {
         muted = value
         player.volume = if (value) 0f else 1f
         // Audio focus only while sound is on, so a silent review does not pause the user's music.

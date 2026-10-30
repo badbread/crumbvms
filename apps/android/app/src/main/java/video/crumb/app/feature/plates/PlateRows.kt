@@ -8,6 +8,7 @@
 package video.crumb.app.feature.plates
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.combinedClickable
@@ -54,6 +55,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
@@ -65,6 +68,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -263,7 +268,7 @@ internal fun PlateNameText(name: String, modifier: Modifier = Modifier, sizeSp: 
         fontWeight = FontWeight.Medium,
         maxLines = 1,
         softWrap = false,
-        modifier = modifier.basicMarquee(iterations = Int.MAX_VALUE, initialDelayMillis = 1500, delayMillis = 1500),
+        modifier = modifier.basicMarquee(iterations = Int.MAX_VALUE, initialDelayMillis = 1500, repeatDelayMillis = 1500),
     )
 }
 
@@ -470,9 +475,10 @@ fun PlateGalleryCard(
     val context = LocalContext.current
     val url = rememberSnapshotUrl(read, mediaUrls)
     val bbox = read.bbox?.takeIf { it.size >= 4 }
-    var aspect by remember(read.id) {
-        mutableFloatStateOf(CropAspectCache.get(read.id) ?: cropAspectEstimate(bbox) ?: DEFAULT_PLATE_ASPECT)
-    }
+    // One decode serves both the frame and the crop inset: the inset is drawn out
+    // of the same bitmap, so the gallery makes a single request per card and the
+    // inset's aspect is pixel-true.
+    var frame by remember(read.id) { mutableStateOf<ImageBitmap?>(null) }
     Column(
         modifier
             .clip(RoundedCornerShape(12.dp))
@@ -491,47 +497,44 @@ fun PlateGalleryCard(
                 .fillMaxWidth()
                 .background(Color(0xFF1A1E27)),
         ) {
-            val frameH = maxWidth * 10f / 16f
-            Box(Modifier.size(width = maxWidth, height = frameH)) {
+            val maxW = maxWidth
+            val frameH = maxW * 10f / 16f
+            Box(Modifier.size(width = maxW, height = frameH)) {
                 if (url != null) {
                     val frameRequest = remember(url) {
-                        ImageRequest.Builder(context).data(url).size(CROP_DECODE_PX / 2).build()
+                        ImageRequest.Builder(context).data(url).size(CROP_DECODE_PX).build()
                     }
                     AsyncImage(
                         model = frameRequest,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
+                        onSuccess = { state ->
+                            val bmp = (state.result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                            if (bmp != null) frame = bmp.asImageBitmap()
+                        },
                     )
-                    if (bbox != null) {
-                        val cropRequest = remember(url, bbox) {
-                            ImageRequest.Builder(context)
-                                .data(url)
-                                .size(CROP_DECODE_PX)
-                                .transformations(PlateCropTransformation(bbox))
-                                .build()
-                        }
+                    val bmp = frame
+                    val rect = if (bbox != null && bmp != null) bboxToRect(bbox, bmp.width, bmp.height) else null
+                    if (bmp != null && rect != null) {
+                        val insetAspect = clampCropAspect(rect.width().toFloat() / rect.height())
+                        CropAspectCache.put(read.id, insetAspect)
                         // Inset height is a third of the frame; width follows the crop's real aspect.
-                        val insetH = frameH * 0.34f
-                        val (iw, ih) = fitCropBox(aspect, (maxWidth * 0.8f).value, insetH.value)
-                        AsyncImage(
-                            model = cropRequest,
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
+                        val (iw, ih) = fitCropBox(insetAspect, (maxW * 0.8f).value, (frameH * 0.34f).value)
+                        Canvas(
+                            Modifier
                                 .align(Alignment.BottomStart)
                                 .padding(6.dp)
                                 .size(iw.dp, ih.dp)
                                 .clip(RoundedCornerShape(3.dp)),
-                            onSuccess = { state ->
-                                val d = state.result.drawable
-                                if (d.intrinsicWidth > 0 && d.intrinsicHeight > 0) {
-                                    val real = clampCropAspect(d.intrinsicWidth.toFloat() / d.intrinsicHeight)
-                                    CropAspectCache.put(read.id, real)
-                                    if (kotlin.math.abs(real - aspect) > 0.01f) aspect = real
-                                }
-                            },
-                        )
+                        ) {
+                            drawImage(
+                                image = bmp,
+                                srcOffset = IntOffset(rect.left, rect.top),
+                                srcSize = IntSize(rect.width(), rect.height()),
+                                dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()),
+                            )
+                        }
                     }
                 } else {
                     Icon(
@@ -611,8 +614,9 @@ fun PlatePeek(
                 .background(Color(0xFF24272E))
                 .padding(14.dp),
         ) {
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                PlateCropImage(read, mediaUrls, slotW = 320.dp, slotH = 150.dp, corner = 8.dp, large = true)
+            BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                // Fill the card's width (up to 320 dp) so a narrow phone never clips the crop.
+                PlateCropImage(read, mediaUrls, slotW = minOf(maxWidth, 320.dp), slotH = 150.dp, corner = 8.dp, large = true)
             }
             Spacer(Modifier.size(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
