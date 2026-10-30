@@ -53,12 +53,38 @@ class FullscreenController extends ChangeNotifier with WindowListener {
     super.dispose();
   }
 
+  /// The native transition currently in flight, if any. On Windows a single
+  /// `setFullScreen` is a SEQUENCE of window resizes (window_manager maximizes,
+  /// then restyles + repositions; leaving restores, restyles, repositions and
+  /// refreshes the child view), and the Flutter embedder blocks the platform
+  /// thread on each of them until a frame of the new size is presented. A
+  /// second request landing mid-sequence (F11 bounce, double-click on the
+  /// toolbar button, Esc right after F11) would interleave two of those
+  /// sequences; they are serialized here instead.
+  Future<void>? _transition;
+
   /// Sets the OS window's fullscreen state and hides/restores chrome.
   /// Equivalent to the old client's `setCamerasFullscreen(on)`.
+  ///
+  /// The Flutter-side state (and the chrome show/hide it drives) flips at once;
+  /// the OS window follows. Requests are applied in order, one native
+  /// transition at a time.
   Future<void> setFullscreen(bool on) async {
     if (on == _isFullscreen) return;
     _isFullscreen = on;
     notifyListeners();
+    final previous = _transition;
+    final mine = _applyNative(previous, on);
+    _transition = mine;
+    await mine;
+    if (identical(_transition, mine)) _transition = null;
+  }
+
+  Future<void> _applyNative(Future<void>? previous, bool on) async {
+    if (previous != null) await previous;
+    // Superseded while queued (toggled back before the window moved): the
+    // later request's own transition applies the final state; skip this one.
+    if (on != _isFullscreen) return;
     try {
       await windowManager.setFullScreen(on);
     } catch (_) {
