@@ -277,6 +277,14 @@ pub struct ViewerCameraDto {
     /// Clients need this to pick the correct RTSP/WebRTC base URL.
     pub served_by: String,
     pub created_at: DateTime<Utc>,
+    /// Start of the camera's oldest remaining recorded segment, or `null` when
+    /// it has no footage at all. Playback uses it to tell "deleted by
+    /// retention" apart from a recording gap.
+    pub oldest_footage_ts: Option<DateTime<Utc>>,
+    /// Recording mode of the camera's EFFECTIVE policy (own, else its group's,
+    /// else the default): `"continuous"` or `"motion"`. Playback uses it to say
+    /// why a moment inside the retained range has no footage.
+    pub recording_mode: &'static str,
 }
 
 /// Response shape for a camera (with embedded policy summary).

@@ -6520,13 +6520,43 @@ pub async fn backfill_onvif_from_source(pool: &Pool) -> Result<u64> {
     Ok(repaired)
 }
 
+/// SQL expression (over a bookmark aliased `b`) for [`Bookmark::footage_expired`]:
+/// true when no segment of the camera covers `b.ts` AND `b.ts` is earlier than
+/// the camera's oldest remaining segment (or the camera has no segments at
+/// all). A moment inside the retained range that falls in a recording gap is
+/// NOT expired. Both subqueries are bounded index scans on
+/// `segments (camera_id, start_ts)`; the covering check only looks back one
+/// hour, far longer than any segment.
+macro_rules! bookmark_footage_expired_sql {
+    () => {
+        r"CASE WHEN EXISTS (
+                 SELECT 1 FROM segments s
+                 WHERE s.camera_id = b.camera_id
+                   AND s.start_ts > b.ts - interval '1 hour'
+                   AND s.start_ts <= b.ts
+                   AND s.end_ts > b.ts)
+             THEN false
+             ELSE COALESCE(
+                 b.ts < (SELECT s2.start_ts FROM segments s2
+                         WHERE s2.camera_id = b.camera_id
+                         ORDER BY s2.start_ts LIMIT 1),
+                 true)
+           END AS footage_expired"
+    };
+}
+
 /// Columns selected for a [`Bookmark`], with the joined camera name.
-const BOOKMARK_SELECT: &str = r"
+const BOOKMARK_SELECT: &str = concat!(
+    r"
     SELECT b.id, b.camera_id, c.name AS camera_name, b.ts, b.description,
-           b.protect_until, b.protect_start_ts, b.protect_end_ts, b.created_at
+           b.protect_until, b.protect_start_ts, b.protect_end_ts, b.created_at,
+           ",
+    bookmark_footage_expired_sql!(),
+    r"
     FROM bookmarks b
     LEFT JOIN cameras c ON c.id = b.camera_id
-";
+"
+);
 
 /// List every bookmark, newest moment first (for the cross-camera list view).
 ///
@@ -6575,7 +6605,8 @@ pub async fn create_bookmark(
     let client = get_conn(pool).await?;
     let row = client
         .query_one(
-            r"
+            concat!(
+                r"
             WITH ins AS (
                 INSERT INTO bookmarks
                     (camera_id, ts, description, created_by,
@@ -6584,10 +6615,14 @@ pub async fn create_bookmark(
                 RETURNING id, camera_id, ts, description, protect_until,
                           protect_start_ts, protect_end_ts, created_at
             )
-            SELECT ins.id, ins.camera_id, c.name AS camera_name, ins.ts, ins.description,
-                   ins.protect_until, ins.protect_start_ts, ins.protect_end_ts, ins.created_at
-            FROM ins LEFT JOIN cameras c ON c.id = ins.camera_id
-            ",
+            SELECT b.id, b.camera_id, c.name AS camera_name, b.ts, b.description,
+                   b.protect_until, b.protect_start_ts, b.protect_end_ts, b.created_at,
+                   ",
+                bookmark_footage_expired_sql!(),
+                r"
+            FROM ins b LEFT JOIN cameras c ON c.id = b.camera_id
+            "
+            ),
             &[
                 &camera_id,
                 &ts,
@@ -6648,7 +6683,8 @@ pub async fn create_protected_bookmark_capped(
     }
     let row = tx
         .query_one(
-            r"
+            concat!(
+                r"
             WITH ins AS (
                 INSERT INTO bookmarks
                     (camera_id, ts, description, created_by,
@@ -6657,10 +6693,14 @@ pub async fn create_protected_bookmark_capped(
                 RETURNING id, camera_id, ts, description, protect_until,
                           protect_start_ts, protect_end_ts, created_at
             )
-            SELECT ins.id, ins.camera_id, c.name AS camera_name, ins.ts, ins.description,
-                   ins.protect_until, ins.protect_start_ts, ins.protect_end_ts, ins.created_at
-            FROM ins LEFT JOIN cameras c ON c.id = ins.camera_id
-            ",
+            SELECT b.id, b.camera_id, c.name AS camera_name, b.ts, b.description,
+                   b.protect_until, b.protect_start_ts, b.protect_end_ts, b.created_at,
+                   ",
+                bookmark_footage_expired_sql!(),
+                r"
+            FROM ins b LEFT JOIN cameras c ON c.id = b.camera_id
+            "
+            ),
             &[
                 &camera_id,
                 &ts,
@@ -6692,16 +6732,21 @@ pub async fn update_bookmark_description(
     let client = get_conn(pool).await?;
     let row = client
         .query_opt(
-            r"
+            concat!(
+                r"
             WITH upd AS (
                 UPDATE bookmarks SET description = $2 WHERE id = $1
                 RETURNING id, camera_id, ts, description, protect_until,
                           protect_start_ts, protect_end_ts, created_at
             )
-            SELECT upd.id, upd.camera_id, c.name AS camera_name, upd.ts, upd.description,
-                   upd.protect_until, upd.protect_start_ts, upd.protect_end_ts, upd.created_at
-            FROM upd LEFT JOIN cameras c ON c.id = upd.camera_id
-            ",
+            SELECT b.id, b.camera_id, c.name AS camera_name, b.ts, b.description,
+                   b.protect_until, b.protect_start_ts, b.protect_end_ts, b.created_at,
+                   ",
+                bookmark_footage_expired_sql!(),
+                r"
+            FROM upd b LEFT JOIN cameras c ON c.id = b.camera_id
+            "
+            ),
             &[&id, &description],
         )
         .await
@@ -6791,7 +6836,43 @@ fn bookmark_from_row(row: &tokio_postgres::Row) -> Bookmark {
         protect_start_ts: row.try_get("protect_start_ts").unwrap_or(None),
         protect_end_ts: row.try_get("protect_end_ts").unwrap_or(None),
         created_at: row.get("created_at"),
+        footage_expired: row.try_get("footage_expired").unwrap_or(false),
     }
+}
+
+/// Start of the oldest remaining segment per camera, for every camera that has
+/// at least one segment (cameras with none are absent from the map).
+///
+/// One query with a per-camera `ORDER BY start_ts LIMIT 1` subselect, so each
+/// camera costs a single probe of `segments (camera_id, start_ts)` rather than
+/// a `GROUP BY` scan over the whole segments table.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn oldest_segment_start_by_camera(
+    pool: &Pool,
+) -> Result<std::collections::HashMap<Uuid, DateTime<Utc>>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"
+            SELECT c.id,
+                   (SELECT s.start_ts FROM segments s
+                    WHERE s.camera_id = c.id
+                    ORDER BY s.start_ts LIMIT 1) AS oldest
+            FROM cameras c
+            ",
+            &[],
+        )
+        .await
+        .context("oldest_segment_start_by_camera")?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oldest: Option<DateTime<Utc>> = r.get("oldest");
+            oldest.map(|ts| (r.get::<_, Uuid>("id"), ts))
+        })
+        .collect())
 }
 
 // ─── recorder heartbeat ────────────────────────────────────────────────────────

@@ -109,6 +109,9 @@ async fn list_visible_cameras(
     let all = db::list_cameras_all(state.pool())
         .await
         .context("list_cameras_all")?;
+    let oldest = db::oldest_segment_start_by_camera(state.pool())
+        .await
+        .context("oldest_segment_start_by_camera")?;
 
     let dtos: Vec<ViewerCameraDto> = all
         .into_iter()
@@ -126,6 +129,10 @@ async fn list_visible_cameras(
             icon: c.icon,
             served_by: c.served_by,
             created_at: c.created_at,
+            oldest_footage_ts: oldest.get(&c.id).copied(),
+            // `list_cameras_all` reads `v_camera_effective_policy`, so this is
+            // already the resolved own -> group -> default policy.
+            recording_mode: c.policy.mode.as_str(),
         })
         .collect();
 

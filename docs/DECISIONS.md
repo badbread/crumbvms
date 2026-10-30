@@ -8,6 +8,43 @@ revisit.
 
 ---
 
+## 2026-10-29, Bookmarks whose footage retention deleted: flag at read time, never auto-delete
+
+**Chosen:** `footage_expired` is computed in the bookmark SELECT on every read
+(no segment covers `ts` AND `ts` is earlier than the camera's oldest segment,
+or the camera has no segments), using two bounded probes of
+`segments (camera_id, start_ts)`. `GET /cameras` gains `oldest_footage_ts`
+(one per-camera `ORDER BY start_ts LIMIT 1` subselect, not a `GROUP BY` over
+all segments) and the effective `recording_mode`, so playback states the
+actual reason a moment has no footage instead of guessing from loaded
+coverage. Expired bookmarks are badged and can be removed in bulk by the
+operator ("Remove expired (N)", confirmed); nothing is deleted automatically.
+Deletes ask for confirmation (Shift+click skips) and offer Undo, which
+re-creates the bookmark through `POST /bookmarks`.
+
+**Rejected:**
+
+- Auto-deleting a bookmark when retention removes its footage. The note and
+  the moment can still matter (an incident reference, a plate read) after the
+  video is gone, and silently removing operator data is the wrong default.
+- A stored `footage_expired` column updated by the retention sweep. It would
+  add a write to the eviction path (recorder correctness) and could drift;
+  the read-time check is cheap and always current.
+- A server-side soft delete / restore endpoint for undo. Re-creating through
+  the existing create API needed no new endpoint or migration; the cost is
+  that a restored bookmark gets a new id and creation time, its creator
+  becomes whoever pressed Undo, and a protection is restored for its
+  remaining time rounded up to whole days (a lapsed one is not restored).
+
+**Revisit triggers:**
+
+- Bookmark lists large enough that the per-row probes show up in
+  `GET /bookmarks` latency.
+- A need for undo to preserve the original id or creator (e.g. bookmarks
+  referenced from elsewhere by id), which would justify soft delete.
+- Operators asking for automatic cleanup, which would then be an explicit,
+  opt-in setting.
+
 ## 2026-10-29, Scrub pre-generation stays OFF by default; documented as the scrubbing knob, with a catch-up cap
 
 **Context.** #657 made a grid frame a single keyframe decode and the scrub
