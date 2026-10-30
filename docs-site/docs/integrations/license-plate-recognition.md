@@ -144,6 +144,18 @@ watchlist row, or the plate detail, on the web console, desktop, Android, and
 iOS, so you can hand it off (a call to the front gate, a note to a neighbor)
 without retyping it.
 
+## Correcting a misread plate
+
+When the reader gets one character wrong, the same car shows up as two plates
+(`GIF2GAB` and `GIT2GAB`). An admin can mark one as a misread of the other, and
+from then on both count as the real plate in every client: searches, history,
+today's totals, names and watchlist alerts. The original reads are kept, so a
+correction can be undone at any time. On the desktop it is **Correct plate...**
+in a plate's profile or row menu, see
+[Correcting a misread plate](./plates-page.md#correcting-a-misread-plate). The
+API is `GET`/`POST /lpr/plate-aliases` and `DELETE /lpr/plate-aliases/:alias`
+(reading needs **View license plates**, changing is admin-only).
+
 ## Reviewing plates on the desktop
 
 The desktop app's Plates tab shows today's totals, which plates are regulars

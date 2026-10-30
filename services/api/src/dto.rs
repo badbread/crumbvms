@@ -277,6 +277,14 @@ pub struct ViewerCameraDto {
     /// Clients need this to pick the correct RTSP/WebRTC base URL.
     pub served_by: String,
     pub created_at: DateTime<Utc>,
+    /// Start of the camera's oldest remaining recorded segment, or `null` when
+    /// it has no footage at all. Playback uses it to tell "deleted by
+    /// retention" apart from a recording gap.
+    pub oldest_footage_ts: Option<DateTime<Utc>>,
+    /// Recording mode of the camera's EFFECTIVE policy (own, else its group's,
+    /// else the default): `"continuous"` or `"motion"`. Playback uses it to say
+    /// why a moment inside the retained range has no footage.
+    pub recording_mode: &'static str,
 }
 
 /// Response shape for a camera (with embedded policy summary).
@@ -1488,6 +1496,40 @@ pub struct CreateBatchExportRequest {
     pub container: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Packaging: `"zip"` (default; today's behaviour: one archive when more
+    /// than one clip is produced or a password is set, a single clip stays a
+    /// plain file) or `"files"` (every clip is its own download). A password
+    /// forces zip, so `password` + `"files"` is a 400. Any other value is a 400.
+    #[serde(default = "default_package")]
+    pub package: String,
+}
+
+fn default_package() -> String {
+    "zip".to_owned()
+}
+
+/// `POST /export/estimate` request body: the same items as a batch export.
+#[derive(Debug, Deserialize)]
+pub struct ExportEstimateRequest {
+    pub items: Vec<BatchExportItem>,
+}
+
+/// One clip's share of an export size estimate.
+#[derive(Debug, Serialize)]
+pub struct ExportEstimateClip {
+    /// Prorated size of the recorded segments the export would use, in bytes
+    /// (approximates a stream-copy export; clients scale it for re-encode).
+    pub bytes: u64,
+    /// Seconds of recorded footage inside the clip's range.
+    pub footage_seconds: f64,
+}
+
+/// `POST /export/estimate` response; `clips` is in request order.
+#[derive(Debug, Serialize)]
+pub struct ExportEstimateResponse {
+    pub bytes: u64,
+    pub footage_seconds: f64,
+    pub clips: Vec<ExportEstimateClip>,
 }
 
 /// Status of an export job.
@@ -1519,14 +1561,23 @@ pub struct ExportJob {
     pub error: Option<String>,
     /// Progress 0–100, updated during the ffmpeg run.
     pub progress_pct: u8,
+    /// Batch jobs: the 1-based clip being encoded, and how many there are.
+    /// Both 0 when unknown (single-range exports, jobs restored from storage).
+    pub current_clip: u32,
+    pub clip_count: u32,
+    /// What the job is doing while running: `"encoding"` (ffmpeg), or
+    /// `"packaging"` (building the zip, which can take a while for large
+    /// exports). Empty when unknown.
+    pub phase: String,
 }
 
 /// A single exported file for one camera (or the whole-job ZIP archive).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportOutputFile {
     pub camera_id: Uuid,
-    /// Download URL.  Per-camera: `GET /export/{job_id}/files/{camera_id}`.
-    /// ZIP archive: `GET /export/{job_id}/archive`.
+    /// Download URL. Batch exports: `GET /export/{job_id}/output/{index}`
+    /// (0-based index into `output_files`). Single-range `POST /export`:
+    /// `GET /export/{job_id}/files/{camera_id}` or `/export/{job_id}/archive`.
     pub download_url: String,
     pub size_bytes: u64,
     /// Basename of the file on disk, including extension (e.g. `"a1b2….mkv"`
@@ -1539,6 +1590,13 @@ pub struct ExportOutputFile {
     /// but it prevents a hard deserialization failure on rehydration).
     #[serde(default)]
     pub filename: String,
+    /// User-facing file name to offer in `Content-Disposition` and to show in
+    /// a save dialog (e.g. `"Driveway 2026-10-29 14.05.06-14.09.10.mp4"` or
+    /// `"Crumb export 2026-10-29 14.05.zip"`). May differ from `filename`
+    /// (the on-disk name). `#[serde(default)]` so persisted rows that pre-date
+    /// this field still deserialize; an empty value means "use `filename`".
+    #[serde(default)]
+    pub download_name: String,
 }
 
 /// `POST /export` response.

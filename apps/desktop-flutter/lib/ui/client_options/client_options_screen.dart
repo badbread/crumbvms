@@ -78,6 +78,11 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
     widget.onMaybeLayoutAffectingChange?.call();
   }
 
+  void _setInfoBarOverlay(bool v) {
+    setState(() => _o.infoBarOverlay = v);
+    widget.onMaybeLayoutAffectingChange?.call();
+  }
+
   void _setShowAllCamerasView(bool v) => setState(() => _o.showAllCamerasView = v);
   void _setHotkeysEnabled(bool v) => setState(() => _o.hotkeysEnabled = v);
   void _setMaximizeMain(bool v) => setState(() => _o.maximizeMain = v);
@@ -86,6 +91,8 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
   void _setOpenClipsInHd(bool v) => setState(() => _o.openClipsInHd = v);
   void _setSeamlessTileSwitching(bool v) =>
       setState(() => _o.seamlessTileSwitching = v);
+
+  void _setReduceMotion(bool v) => setState(() => _o.reduceMotion = v);
 
   void _setAdaptiveGuardrail(bool v) =>
       setState(() => _o.adaptiveWallGuardrail = v);
@@ -198,11 +205,28 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Show tile info bar',
             subtitle: 'Camera name and REC/motion indicators on each tile.',
           ),
+          Padding(
+            padding: const EdgeInsets.only(left: 16),
+            child: _switchRow(
+              value: _o.infoBarOverlay,
+              onChanged: _o.showInfoBar ? _setInfoBarOverlay : null,
+              title: 'Overlay on video',
+              subtitle: 'Float the bar over the top of the picture instead '
+                  'of above it, so the video keeps the full tile.',
+            ),
+          ),
           _switchRow(
             value: _o.showAllCamerasView,
             onChanged: _setShowAllCamerasView,
             title: 'Show "All Cameras" quick view',
             subtitle: 'Auto-build a grid of every camera as a selectable view.',
+          ),
+          _switchRow(
+            value: _o.showPerfStats,
+            onChanged: (v) => setState(() => _o.showPerfStats = v),
+            title: 'Show performance stats',
+            subtitle:
+                'Camera count, CPU, GPU, decode and memory in the bottom bar.',
           ),
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 6, 16, 2),
@@ -299,6 +323,14 @@ class _ClientOptionsScreenState extends State<ClientOptionsScreen> {
             title: 'Seamless carousel/hotspot switching',
             subtitle:
                 'Pre-warm the incoming camera and swap only once it has a frame, so a carousel or auto-hotspot tile never blanks to black on a switch. Turn off on low-powered machines to avoid the brief second decode.',
+          ),
+
+          _switchRow(
+            value: _o.reduceMotion,
+            onChanged: _setReduceMotion,
+            title: 'Reduce motion',
+            subtitle:
+                'Turns off sliding and scaling animations, keeps only brief fades, and stops pulsing indicators. Also follows the Windows "Show animations" setting.',
           ),
 
           const Divider(height: 24),

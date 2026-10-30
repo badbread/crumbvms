@@ -153,6 +153,9 @@ void main() {
 
       await tester.tap(find.text('Auto').first);
       await tester.pumpAndSettle();
+      // Autofocus loses to the app root's, so focus the field for real.
+      await tester.tap(find.widgetWithText(TextField, 'Search icons…'));
+      await tester.pumpAndSettle();
       expect(hotkeyContextBlocked(), isTrue);
 
       // Collapse the grid again — the realistic way out, and the one that
@@ -185,6 +188,9 @@ void main() {
       addTearDown(host.dispose);
 
       await tester.tap(find.byTooltip('Rename badge'));
+      await tester.pumpAndSettle();
+      // Autofocus loses to the app root's, so focus the field for real.
+      await tester.tap(find.widgetWithText(TextField, 'Badge label'));
       await tester.pumpAndSettle();
 
       expect(hotkeyContextBlocked(), isTrue);

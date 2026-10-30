@@ -37,10 +37,25 @@ rather have previews ready in advance so even the first drag is instant, turn on
 background pre-generation. Crumb then quietly builds previews for recent footage
 as it records.
 
+With background previews on, the desktop and Android apps also get
+second-by-second previews: Crumb builds one small strip of four pictures for
+each 4-second piece of recording, so dragging shows a new image every second
+instead of every four. These strips only exist when background previews are
+on; without them the apps simply show the regular previews.
+
 The trade-off is honest: it uses some ongoing CPU and a little disk space
 whether or not you scrub much, which is why it's off by default (a small box
 shouldn't do work nobody asked for). Turn it on if you review footage often and
 want it to feel instant everywhere.
+
+How much, measured on real camera footage: about 7 to 20 percent of one CPU
+core per camera while it records (4K cameras at the top of that range, 1080p at
+the bottom), and about 1 GB of preview images per camera per day, which the
+preview cache budget (20 GB by default) keeps in check by dropping the oldest.
+Crumb builds one preview at a time, so this never takes more than about one CPU
+core however many cameras you have. With more than about five to seven 4K cameras it
+can't cover everything, so it concentrates on the most recent two hours, and
+older footage gets its previews the normal way the first time you drag there.
 
 The easiest way to turn it on is the admin console: **Server settings → Scrub
 previews**. Flip "Pre-generate scrub previews" and it starts within a few
@@ -102,3 +117,23 @@ Crumb keeps the preview cache from growing forever on its own: once it passes a
 size or age limit, the oldest previews are dropped, and any preview that's
 missing is simply rebuilt the next time it's needed. If you ever want to change
 those limits, they're in the [environment reference](/configuration/environment-reference).
+
+## When a camera shows no footage
+
+If there is nothing recorded at the time you are looking at, the camera's
+tile says why:
+
+- **Live edge**: you are at (or past) the current time. Recordings are saved
+  in short pieces, so the newest few seconds appear a little behind live.
+- **Footage deleted**: the time is older than this camera's retention keeps.
+  The message tells you when its recordings now start.
+- **No motion at this time**: the camera records only when it detects motion,
+  and nothing moved.
+- **Recording gap** (shown in amber): the camera is set to record all the
+  time, but nothing was recorded here. Usually the camera was offline or
+  recording stopped, so it is worth a look.
+- **Couldn't load footage**: something went wrong loading it. The message
+  includes the error and a **Retry** button.
+
+The small label in the corner of each tile shows the same reason in short
+form.

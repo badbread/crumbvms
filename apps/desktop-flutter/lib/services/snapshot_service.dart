@@ -36,6 +36,36 @@ import 'package:url_launcher/url_launcher.dart';
 import 'snapshot_registry.dart';
 import '../ui/snapshot/snapshot_toast.dart';
 
+String _p2(int n) => n.toString().padLeft(2, '0');
+
+/// `Front Yard 2026-10-29 13.45.07.jpg`: camera name and the local time of the
+/// frame, safe as a Windows file name.
+@visibleForTesting
+String snapshotFileName(String cameraName, DateTime at) {
+  final l = at.toLocal();
+  var cam = cameraName
+      .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim()
+      .replaceAll(RegExp(r'[. ]+$'), '');
+  if (cam.isEmpty) cam = 'Camera';
+  return '$cam ${l.year}-${_p2(l.month)}-${_p2(l.day)} '
+      '${_p2(l.hour)}.${_p2(l.minute)}.${_p2(l.second)}.jpg';
+}
+
+/// `dir/name`, or `dir/name (2).jpg`, `(3)`… so two snapshots in the same
+/// second never overwrite each other.
+@visibleForTesting
+String uniqueSnapshotPath(String dir, String name) {
+  final sep = Platform.pathSeparator;
+  if (!File('$dir$sep$name').existsSync()) return '$dir$sep$name';
+  final stem = name.substring(0, name.length - '.jpg'.length);
+  for (var i = 2; ; i++) {
+    final candidate = '$dir$sep$stem ($i).jpg';
+    if (!File(candidate).existsSync()) return candidate;
+  }
+}
+
 class SnapshotService {
   SnapshotService._();
 
@@ -80,12 +110,10 @@ class SnapshotService {
       final dir = Directory('$home${sep}Pictures${sep}CrumbVMS');
       await dir.create(recursive: true);
 
-      final ts = DateTime.now().millisecondsSinceEpoch;
-      final safeName = target.cameraName.replaceAll(
-        RegExp(r'[^A-Za-z0-9]+'),
-        '_',
+      final at = (target.frameTime?.call() ?? DateTime.now()).toLocal();
+      final file = File(
+        uniqueSnapshotPath(dir.path, snapshotFileName(target.cameraName, at)),
       );
-      final file = File('${dir.path}$sep' 'snap-$safeName-$ts.jpg');
       await file.writeAsBytes(bytes, flush: true);
 
       if (!context.mounted) return;

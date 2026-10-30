@@ -1,0 +1,6 @@
+# gitleaks findings reviewed and accepted (fingerprint = commit:file:rule:line).
+# Placeholder media URLs in a desktop unit test (#646), not a real LAN address;
+# later commits mark the lines gitleaks:allow, this covers the commit that added them.
+6e61c973750eba6e3c688e0032b636957e115778:apps/desktop-flutter/test/playback_prefetch_match_test.dart:homelab-rfc1918:12
+6e61c973750eba6e3c688e0032b636957e115778:apps/desktop-flutter/test/playback_prefetch_match_test.dart:homelab-rfc1918:13
+6e61c973750eba6e3c688e0032b636957e115778:apps/desktop-flutter/test/playback_prefetch_match_test.dart:homelab-rfc1918:25

@@ -29,6 +29,8 @@ import 'dart:async' show unawaited;
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../ui/motion/motion_tokens.dart';
+
 /// What a click on a live/maximized PTZ-capable tile does.
 /// Mirrors `options.ptzClickMode` ('center' | 'pan' | 'off').
 enum PtzClickMode {
@@ -97,7 +99,9 @@ enum PtzWheelCorner {
 }
 
 const String _kShowInfoBar = 'crumb.showInfoBar';
+const String _kInfoBarOverlay = 'crumb.infoBarOverlay';
 const String _kShowAllCamerasView = 'crumb.showAllCamerasView';
+const String _kShowPerfStats = 'crumb.showPerfStats';
 const String _kHotkeysEnabled = 'crumb.hotkeysEnabled';
 const String _kMaximizeMain = 'crumb.maximizeMain';
 const String _kPtzClickMode = 'crumb.ptzClickMode';
@@ -106,6 +110,8 @@ const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
 const String _kZoomSwitchesToMain = 'crumb.zoomSwitchesToMain';
 const String _kOpenClipsInHd = 'crumb.openClipsInHd';
 const String _kSeamlessTileSwitch = 'crumb.seamlessTileSwitch';
+// In-app "Reduce motion" (the OS setting is honoured regardless).
+const String _kReduceMotion = 'crumb.reduceMotion';
 // Adaptive live-wall quality (issue #382) — client-local, both default ON.
 const String _kAdaptiveWallGuardrail = 'crumb.adaptiveWallGuardrail';
 const String _kAdaptiveWallBackpressure = 'crumb.adaptiveWallBackpressure';
@@ -126,7 +132,9 @@ class ClientOptionsStore extends ChangeNotifier {
   ClientOptionsStore._(
     this._prefs, {
     required bool showInfoBar,
+    required bool infoBarOverlay,
     required bool showAllCamerasView,
+    required bool showPerfStats,
     required bool hotkeysEnabled,
     required bool maximizeMain,
     required PtzClickMode ptzClickMode,
@@ -138,8 +146,11 @@ class ClientOptionsStore extends ChangeNotifier {
     required bool adaptiveWallGuardrail,
     required bool adaptiveWallBackpressure,
     required bool adaptiveWallGuardrailDontWarn,
+    required bool reduceMotion,
   }) : _showInfoBar = showInfoBar,
+       _infoBarOverlay = infoBarOverlay,
        _showAllCamerasView = showAllCamerasView,
+       _showPerfStats = showPerfStats,
        _hotkeysEnabled = hotkeysEnabled,
        _maximizeMain = maximizeMain,
        _ptzClickMode = ptzClickMode,
@@ -150,12 +161,15 @@ class ClientOptionsStore extends ChangeNotifier {
        _seamlessTileSwitching = seamlessTileSwitching,
        _adaptiveWallGuardrail = adaptiveWallGuardrail,
        _adaptiveWallBackpressure = adaptiveWallBackpressure,
-       _adaptiveWallGuardrailDontWarn = adaptiveWallGuardrailDontWarn;
+       _adaptiveWallGuardrailDontWarn = adaptiveWallGuardrailDontWarn,
+       _reduceMotion = reduceMotion;
 
   final SharedPreferences? _prefs;
 
   bool _showInfoBar;
+  bool _infoBarOverlay;
   bool _showAllCamerasView;
+  bool _showPerfStats;
   bool _hotkeysEnabled;
   bool _maximizeMain;
   PtzClickMode _ptzClickMode;
@@ -167,6 +181,7 @@ class ClientOptionsStore extends ChangeNotifier {
   bool _adaptiveWallGuardrail;
   bool _adaptiveWallBackpressure;
   bool _adaptiveWallGuardrailDontWarn;
+  bool _reduceMotion;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -175,10 +190,13 @@ class ClientOptionsStore extends ChangeNotifier {
     } catch (_) {
       prefs = null; // package not wired up yet — in-memory only, per-session
     }
+    MotionPrefs.reduceMotion.value = prefs?.getBool(_kReduceMotion) ?? false;
     return ClientOptionsStore._(
       prefs,
       showInfoBar: prefs?.getBool(_kShowInfoBar) ?? true,
+      infoBarOverlay: prefs?.getBool(_kInfoBarOverlay) ?? false,
       showAllCamerasView: prefs?.getBool(_kShowAllCamerasView) ?? true,
+      showPerfStats: prefs?.getBool(_kShowPerfStats) ?? true,
       hotkeysEnabled: prefs?.getBool(_kHotkeysEnabled) ?? true,
       maximizeMain: prefs?.getBool(_kMaximizeMain) ?? true,
       ptzClickMode: PtzClickMode.fromWire(prefs?.getString(_kPtzClickMode)),
@@ -194,6 +212,7 @@ class ClientOptionsStore extends ChangeNotifier {
           prefs?.getBool(_kAdaptiveWallBackpressure) ?? true,
       adaptiveWallGuardrailDontWarn:
           prefs?.getBool(_kAdaptiveWallGuardrailDontWarn) ?? false,
+      reduceMotion: prefs?.getBool(_kReduceMotion) ?? false,
     );
   }
 
@@ -203,6 +222,26 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _showInfoBar) return;
     _showInfoBar = v;
     unawaited(_prefs?.setBool(_kShowInfoBar, v));
+    notifyListeners();
+  }
+
+  // ── info bar floats over the top of the video instead of taking its own
+  //    row above it (so the video keeps the tile's full size) ──
+  bool get infoBarOverlay => _infoBarOverlay;
+  set infoBarOverlay(bool v) {
+    if (v == _infoBarOverlay) return;
+    _infoBarOverlay = v;
+    unawaited(_prefs?.setBool(_kInfoBarOverlay, v));
+    notifyListeners();
+  }
+
+  // ── live-wall performance readout (cameras, CPU, GPU, decode, memory)
+  //    in the bottom status bar; on by default ──
+  bool get showPerfStats => _showPerfStats;
+  set showPerfStats(bool v) {
+    if (v == _showPerfStats) return;
+    _showPerfStats = v;
+    unawaited(_prefs?.setBool(_kShowPerfStats, v));
     notifyListeners();
   }
 
@@ -286,6 +325,17 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _seamlessTileSwitching) return;
     _seamlessTileSwitching = v;
     unawaited(_prefs?.setBool(_kSeamlessTileSwitch, v));
+    notifyListeners();
+  }
+
+  // ── Reduce motion: no position/size motion, short fades, static indicators.
+  //    Mirrored into MotionPrefs so the app root can fold it into MediaQuery. ──
+  bool get reduceMotion => _reduceMotion;
+  set reduceMotion(bool v) {
+    if (v == _reduceMotion) return;
+    _reduceMotion = v;
+    MotionPrefs.reduceMotion.value = v;
+    unawaited(_prefs?.setBool(_kReduceMotion, v));
     notifyListeners();
   }
 

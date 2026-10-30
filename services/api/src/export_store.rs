@@ -148,6 +148,9 @@ pub async fn load_all_export_jobs(pool: &Pool) -> Result<Vec<ExportJob>> {
             output_files,
             error: row.get("error"),
             progress_pct: u8::try_from(progress.clamp(0, 100)).unwrap_or(0),
+            current_clip: 0,
+            clip_count: 0,
+            phase: String::new(),
         });
     }
     Ok(jobs)

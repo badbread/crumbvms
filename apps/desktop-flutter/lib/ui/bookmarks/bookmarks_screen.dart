@@ -11,6 +11,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HardwareKeyboard;
 
 import 'package:crumb_desktop/api/bookmarks_api.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
@@ -18,6 +19,7 @@ import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 
 import 'add_bookmark_dialog.dart';
+import 'package:crumb_desktop/ui/motion/live_motion.dart';
 
 class BookmarksScreen extends StatefulWidget {
   const BookmarksScreen({
@@ -107,20 +109,159 @@ class _BookmarksScreenState extends State<BookmarksScreen> {
     }
   }
 
+  String _cameraLabel(Bookmark bm) =>
+      bm.cameraName ?? _cameraById(bm.cameraId)?.name ?? 'Camera';
+
+  /// Delete one bookmark. Asks first unless Shift is held at click time; every
+  /// delete offers Undo.
   Future<void> _delete(Bookmark bm) async {
-    // Optimistic removal, same as the old client's row.remove() on success.
-    final prev = _bookmarks;
-    setState(() => _bookmarks = prev?.where((b) => b.id != bm.id).toList());
-    try {
-      await widget.api.deleteBookmark(widget.session, bm.id);
-    } catch (e) {
-      // Restore the row and surface the error.
-      if (!mounted) return;
-      setState(() => _bookmarks = prev);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Delete bookmark failed: $e')));
+    final skipConfirm = HardwareKeyboard.instance.isShiftPressed;
+    if (!skipConfirm) {
+      final ok = await _confirmDelete(bm);
+      if (ok != true || !mounted) return;
     }
+    await _deleteMany([bm]);
+  }
+
+  Future<bool?> _confirmDelete(Bookmark bm) {
+    final desc = (bm.description ?? '').trim();
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete bookmark?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('${_cameraLabel(bm)} · ${_formatDateTime(bm.ts)}'),
+            if (desc.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(desc, style: Theme.of(ctx).textTheme.bodySmall),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            autofocus: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// "Remove expired (N)": confirm, then delete every bookmark whose footage
+  /// retention has already deleted. Never automatic.
+  Future<void> _removeExpired() async {
+    final expired = expiredBookmarks(_bookmarks ?? const []);
+    if (expired.isEmpty) return;
+    final n = expired.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+          n == 1
+              ? 'Remove 1 expired bookmark?'
+              : 'Remove $n expired bookmarks?',
+        ),
+        content: const Text(
+          'Their footage has already been deleted by retention, so they can '
+          'no longer be played back.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await _deleteMany(expired);
+  }
+
+  /// Optimistically remove [targets], delete them on the server, then show a
+  /// SnackBar with Undo for the ones that were actually deleted. Rows whose
+  /// delete failed come back.
+  Future<void> _deleteMany(List<Bookmark> targets) async {
+    final ids = {for (final b in targets) b.id};
+    setState(
+      () => _bookmarks = _bookmarks?.where((b) => !ids.contains(b.id)).toList(),
+    );
+    final deleted = <Bookmark>[];
+    Object? firstError;
+    for (final bm in targets) {
+      try {
+        await widget.api.deleteBookmark(widget.session, bm.id);
+        deleted.add(bm);
+      } catch (e) {
+        firstError ??= e;
+      }
+    }
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    if (firstError != null) {
+      // Put back the rows that were not deleted.
+      final failed = targets.where((b) => !deleted.contains(b)).toList();
+      setState(() {
+        _bookmarks = [...?_bookmarks, ...failed]
+          ..sort((a, b) => b.ts.compareTo(a.ts));
+      });
+    }
+    if (deleted.isEmpty) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Delete bookmark failed: $firstError')),
+      );
+      return;
+    }
+    final failedNote = firstError == null
+        ? ''
+        : ' (${targets.length - deleted.length} failed: $firstError)';
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text('${bookmarksDeletedMessage(deleted.length)}$failedNote'),
+        duration: const Duration(seconds: 8),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () => _undoDelete(deleted),
+        ),
+      ),
+    );
+  }
+
+  /// Re-create deleted bookmarks with the same camera, moment, note and
+  /// (unless it has lapsed) protection. They come back with new ids.
+  Future<void> _undoDelete(List<Bookmark> deleted) async {
+    var restored = 0;
+    Object? firstError;
+    for (final bm in deleted) {
+      try {
+        await widget.api.recreateBookmark(widget.session, bm);
+        restored++;
+      } catch (e) {
+        firstError ??= e;
+      }
+    }
+    if (!mounted) return;
+    await _load();
+    if (!mounted || firstError == null) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Restored $restored of ${deleted.length} bookmarks: $firstError',
+        ),
+      ),
+    );
   }
 
   @override
@@ -129,6 +270,14 @@ class _BookmarksScreenState extends State<BookmarksScreen> {
       appBar: AppBar(
         title: const Text('Bookmarks'),
         actions: [
+          if (expiredBookmarks(_bookmarks ?? const []).isNotEmpty)
+            TextButton.icon(
+              onPressed: _loading ? null : _removeExpired,
+              icon: const Icon(Icons.delete_sweep_outlined),
+              label: Text(
+                'Remove expired (${expiredBookmarks(_bookmarks!).length})',
+              ),
+            ),
           IconButton(
             tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),
@@ -216,14 +365,11 @@ class _BookmarkRow extends StatelessWidget {
     final when = _formatDateTime(bookmark.ts);
     final desc = (bookmark.description ?? '').trim();
     final theme = Theme.of(context);
+    final expired = bookmark.footageExpired;
 
     return ListTile(
       onTap: onJump,
-      leading: _BookmarkThumb(
-        api: api,
-        session: session,
-        bookmark: bookmark,
-      ),
+      leading: _BookmarkThumb(api: api, session: session, bookmark: bookmark),
       title: Row(
         children: [
           Text(
@@ -235,6 +381,7 @@ class _BookmarkRow extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           Text('· $when', style: theme.textTheme.bodySmall),
+          if (expired) ...[const SizedBox(width: 8), const _ExpiredBadge()],
         ],
       ),
       subtitle: Text(
@@ -252,12 +399,17 @@ class _BookmarkRow extends StatelessWidget {
         children: [
           if (onJump != null)
             IconButton(
-              tooltip: 'Jump to playback',
-              icon: const Icon(Icons.play_circle_outline),
+              tooltip: expired
+                  ? 'Footage for this bookmark was deleted by retention'
+                  : 'Jump to playback',
+              icon: Icon(
+                Icons.play_circle_outline,
+                color: expired ? theme.disabledColor : null,
+              ),
               onPressed: onJump,
             ),
           IconButton(
-            tooltip: 'Delete',
+            tooltip: 'Delete (Shift+click to skip confirmation)',
             icon: const Icon(Icons.close),
             onPressed: onDelete,
           ),
@@ -266,6 +418,47 @@ class _BookmarkRow extends StatelessWidget {
     );
   }
 }
+
+/// Small "Footage deleted" chip on a bookmark whose footage retention has
+/// already removed.
+class _ExpiredBadge extends StatelessWidget {
+  const _ExpiredBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: 'Footage for this bookmark was deleted by retention',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          'Footage deleted',
+          style: Theme.of(
+            context,
+          ).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      ),
+    );
+  }
+}
+
+/// Bookmarks whose footage retention has already deleted (server-computed
+/// `footage_expired`; always empty against a server that predates it).
+///
+/// Protected bookmarks are never included: deleting one lifts its
+/// protection, so "Remove expired" must not touch them even if the server
+/// flags them (defense in depth; remove those one at a time instead).
+List<Bookmark> expiredBookmarks(Iterable<Bookmark> all) => all
+    .where((b) => b.footageExpired && !b.isProtected)
+    .toList(growable: false);
+
+/// SnackBar text after deleting [n] bookmarks.
+String bookmarksDeletedMessage(int n) =>
+    n == 1 ? 'Bookmark deleted' : '$n bookmarks deleted';
 
 /// A small preview snapshot of the moment a bookmark marks — one filmstrip
 /// JPEG frame at the bookmark's timestamp — falling back to a bookmark icon
@@ -327,7 +520,12 @@ class _BookmarkThumbState extends State<_BookmarkThumb> {
             ? Stack(
                 fit: StackFit.expand,
                 children: [
-                  Image.memory(_bytes!, fit: BoxFit.cover, gaplessPlayback: true),
+                  Image.memory(
+                    _bytes!,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                    frameBuilder: thumbFadeFrameBuilder,
+                  ),
                   if (widget.bookmark.isProtected)
                     const Positioned(
                       right: 2,
@@ -340,11 +538,7 @@ class _BookmarkThumbState extends State<_BookmarkThumb> {
                 color: scheme.surfaceContainerHighest,
                 child: Center(
                   child: _loading
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
+                      ? const SizedBox.expand(child: ShimmerBox())
                       : Icon(
                           widget.bookmark.isProtected
                               ? Icons.lock_outline
@@ -370,6 +564,8 @@ String _formatDateTime(DateTime dt) {
   final s = local.second.toString().padLeft(2, '0');
   final now = DateTime.now();
   final isToday =
-      local.year == now.year && local.month == now.month && local.day == now.day;
+      local.year == now.year &&
+      local.month == now.month &&
+      local.day == now.day;
   return isToday ? '$h:$mi:$s' : '${local.year}-$mo-$d $h:$mi:$s';
 }

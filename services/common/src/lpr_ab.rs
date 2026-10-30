@@ -439,6 +439,7 @@ mod tests {
             snapshot_url: None,
             bbox: None,
             display_name: None,
+            corrected_from: None,
         }
     }
 

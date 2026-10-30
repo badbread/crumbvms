@@ -605,4 +605,78 @@ void main() {
       );
     });
   });
+
+  group('hide regulars', () {
+    // Regular: seen before today and >= 5 reads in 30 d. New: no prior sighting.
+    final regular = _stats(seen30d: 8, prev: _t0.subtract(const Duration(days: 1)));
+    final fresh = _stats(total: 1, seen30d: 1);
+    final reads = [
+      _read('REG1', minAgo: 1),
+      _read('NEW1', minAgo: 2),
+      _read('UNK1', minAgo: 3),
+      _read('WAT1', minAgo: 4),
+    ];
+    final statsByPlate = {'REG1': regular, 'NEW1': fresh, 'WAT1': regular};
+    PlateStats? statsFor(String p) => statsByPlate[p];
+
+    test('isHiddenRegular: only known, unwatched regulars', () {
+      expect(regular.isRegular, isTrue);
+      expect(isHiddenRegular(watched: false, stats: regular), isTrue);
+      expect(isHiddenRegular(watched: true, stats: regular), isFalse);
+      expect(isHiddenRegular(watched: false, stats: fresh), isFalse);
+      expect(isHiddenRegular(watched: false, stats: null), isFalse);
+    });
+
+    test('groups: regulars dropped; unknown, new and watchlisted kept', () {
+      final groups = [for (final r in reads) _g(r)];
+      final out = withoutRegularGroups(
+        groups,
+        watched: (p) => p == 'WAT1',
+        stats: statsFor,
+      );
+      expect([for (final g in out) g.representative.plate], [
+        'NEW1',
+        'UNK1',
+        'WAT1',
+      ]);
+    });
+
+    test('reads variant matches the groups variant', () {
+      final out = withoutRegularReads(
+        reads,
+        watched: (p) => p == 'WAT1',
+        stats: statsFor,
+      );
+      expect([for (final r in out) r.plate], ['NEW1', 'UNK1', 'WAT1']);
+      expect(reads.length - out.length, 1);
+    });
+
+    test('nothing hidden before stats load', () {
+      final out = withoutRegularReads(
+        reads,
+        watched: (_) => false,
+        stats: (_) => null,
+      );
+      expect(out.length, reads.length);
+    });
+
+    test('yields to the Regulars desk filter', () {
+      expect(
+        hideRegularsActive(hideRegulars: true, filter: DeskFilter.all),
+        isTrue,
+      );
+      expect(
+        hideRegularsActive(hideRegulars: true, filter: DeskFilter.watchlist),
+        isTrue,
+      );
+      expect(
+        hideRegularsActive(hideRegulars: true, filter: DeskFilter.regulars),
+        isFalse,
+      );
+      expect(
+        hideRegularsActive(hideRegulars: false, filter: DeskFilter.all),
+        isFalse,
+      );
+    });
+  });
 }

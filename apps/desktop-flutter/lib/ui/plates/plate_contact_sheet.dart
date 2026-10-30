@@ -16,17 +16,60 @@ const double _kCardFrameHeight = 140;
 const double _kCardFooter = 70;
 const double _kCardHistogram = 50;
 
-/// Includes the 10 px the stacked-card shadow needs.
-double _cardExtent(bool tall) =>
-    _kCardFrameHeight + _kCardFooter + (tall ? _kCardHistogram : 0) + 10;
+/// The dedicated line a known plate name takes under the plate (2 px gap +
+/// 16 px line). Only named cards use it; the grid reserves it in every slot
+/// of a sheet that has at least one named card ([_cardExtent]'s `named`), and
+/// unnamed cards keep their own, shorter height inside the slot.
+const double _kCardNameLine = 18;
 
-/// Inset width as a fraction of the card width, per size: clearly different
-/// steps.
+/// Includes the 10 px the stacked-card shadow needs. [named] adds the name
+/// line (see [_kCardNameLine]).
+double _cardExtent(bool tall, {bool named = false}) =>
+    _kCardFrameHeight +
+    _kCardFooter +
+    (tall ? _kCardHistogram : 0) +
+    (named ? _kCardNameLine : 0) +
+    10;
+
+/// Largest inset width as a fraction of the card width, per size.
 double _insetFraction(PlateCropSize s) => switch (s) {
   PlateCropSize.small => 0.30,
   PlateCropSize.medium => 0.45,
   PlateCropSize.large => 0.62,
 };
+
+/// Largest inset height as a fraction of the frame height, per size.
+double _insetHeightFraction(PlateCropSize s) => switch (s) {
+  PlateCropSize.small => 0.24,
+  PlateCropSize.medium => 0.34,
+  PlateCropSize.large => 0.46,
+};
+
+/// The inset's size for a crop of [aspect] (width / height): as big as the
+/// size step allows in both directions while keeping the crop's own shape,
+/// so it fills the inset exactly. A fixed 3:1 box with the crop letterboxed
+/// inside it showed wide black bars beside most plates (crops are rarely 3:1).
+@visibleForTesting
+Size plateInsetSize({
+  required double cardWidth,
+  required double frameHeight,
+  required PlateCropSize size,
+  required double? aspect,
+}) {
+  final a = (aspect == null || !aspect.isFinite || aspect <= 0)
+      ? 3.0
+      : aspect.clamp(0.8, 6.0);
+  final maxW = cardWidth * _insetFraction(size);
+  final maxH = frameHeight * _insetHeightFraction(size);
+  var h = maxH;
+  var w = h * a;
+  if (w > maxW) {
+    w = maxW;
+    h = w / a;
+  }
+  return Size(w, h.clamp(14.0, maxH));
+}
+
 
 /// The control row above the sheet.
 class _SheetControls extends StatelessWidget {
@@ -124,7 +167,10 @@ class _SheetControls extends StatelessWidget {
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              label('Loupe'),
+              Tooltip(
+                message: 'Point at a photo to magnify that spot',
+                child: label('Hover zoom'),
+              ),
               _Seg<int>(
                 value: loupe,
                 options: const [(0, 'Off'), (2, '2x'), (3, '3x')],
@@ -173,20 +219,15 @@ class _Seg<T> extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             for (final (v, text) in options)
-              InkWell(
+              _FbSegCell(
+                on: v == value,
                 onTap: enabled ? () => onChanged(v) : null,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 9,
-                    vertical: 4,
-                  ),
-                  color: v == value ? _kPink : _kSurface2,
-                  child: Text(
-                    text,
-                    style: TextStyle(
-                      color: v == value ? Colors.white : Colors.white70,
-                      fontSize: 12,
-                    ),
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    color: v == value ? _kLprInk : Colors.white70,
+                    fontSize: 12,
+                    fontWeight: v == value ? FontWeight.w600 : FontWeight.w400,
                   ),
                 ),
               ),
@@ -210,6 +251,7 @@ class _SheetCard extends StatefulWidget {
     required this.showInset,
     required this.loupe,
     required this.tall,
+    this.slotHasNameLine = false,
     required this.session,
     required this.gate,
     required this.canManage,
@@ -230,6 +272,10 @@ class _SheetCard extends StatefulWidget {
   final bool showInset;
   final int loupe;
   final bool tall;
+
+  /// The grid slot is [_kCardNameLine] taller because some card in the sheet
+  /// is named. An unnamed card then keeps its normal height (top-aligned).
+  final bool slotHasNameLine;
   final Session session;
   final _ConcurrencyGate gate;
   final bool canManage;
@@ -296,6 +342,7 @@ class _SheetCardState extends State<_SheetCard> {
     });
   }
 
+
   @override
   Widget build(BuildContext context) {
     final read = _read;
@@ -304,13 +351,15 @@ class _SheetCardState extends State<_SheetCard> {
     final stacked = bundle != null && bundle.passCount > 1;
     final hints = plateHints(s, read.ts);
     final rail = _railColor(plateRail(watched: widget.watched, stats: s));
+    final named = (read.displayName?.trim() ?? '').isNotEmpty;
     final card = Container(
+      key: const ValueKey('sheet-card-body'),
       decoration: BoxDecoration(
         color: _kSurface1,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
           color: widget.selected || _hover
-              ? _kPink
+              ? _kLprAccent
               : (rail ?? _kSurface2).withValues(alpha: rail == null ? 1 : 0.7),
         ),
         boxShadow: stacked
@@ -346,7 +395,16 @@ class _SheetCardState extends State<_SheetCard> {
         child: Padding(
           // Room for the stacked shadow.
           padding: const EdgeInsets.only(right: 10, bottom: 10),
-          child: card,
+          child: widget.slotHasNameLine && !named
+              ? Align(
+                  alignment: Alignment.topCenter,
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: _cardExtent(widget.tall) - 10,
+                    child: card,
+                  ),
+                )
+              : card,
         ),
       ),
     );
@@ -377,21 +435,27 @@ class _SheetCardState extends State<_SheetCard> {
               cacheWidth: (w * dpr * scale).round().clamp(1, 2560),
             ),
     );
-    final insetW = w * _insetFraction(widget.insetSize);
-    final insetH = (insetW / 3).clamp(18.0, _kCardFrameHeight * 0.5);
     final crop = _crop;
+    final insetSize = plateInsetSize(
+      cardWidth: w,
+      frameHeight: _kCardFrameHeight,
+      size: widget.insetSize,
+      aspect: crop == null ? null : peekPlateCropAspect(read.id),
+    );
+    final insetW = insetSize.width;
+    final insetH = insetSize.height;
     final inset = Container(
       width: insetW,
       height: insetH,
       decoration: BoxDecoration(
         color: Colors.black,
         borderRadius: BorderRadius.circular(5),
-        border: Border.all(color: _kPink, width: 2),
+        border: Border.all(color: _kLprAccent, width: 2),
         boxShadow: const [BoxShadow(color: Colors.black87, blurRadius: 8)],
       ),
       clipBehavior: Clip.antiAlias,
       child: crop != null
-          ? Image.memory(crop, fit: BoxFit.contain, gaplessPlayback: true)
+          ? Image.memory(crop, fit: BoxFit.cover, gaplessPlayback: true)
           : _PlateTile(plate: read.plate, height: insetH),
     );
     final corner = widget.insetCorner;
@@ -466,7 +530,7 @@ class _SheetCardState extends State<_SheetCard> {
                   height: loupeD,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    border: Border.all(color: _kPink, width: 2),
+                    border: Border.all(color: _kLprAccent, width: 2),
                     boxShadow: const [
                       BoxShadow(color: Colors.black, blurRadius: 12),
                     ],
@@ -507,13 +571,13 @@ class _SheetCardState extends State<_SheetCard> {
   Widget _badge(String text) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
     decoration: BoxDecoration(
-      color: _kPink,
+      color: _kLprAccent,
       borderRadius: BorderRadius.circular(10),
     ),
     child: Text(
       text,
       style: const TextStyle(
-        color: Colors.white,
+        color: _kLprInk,
         fontSize: 11,
         fontWeight: FontWeight.w700,
       ),
@@ -547,7 +611,10 @@ class _SheetCardState extends State<_SheetCard> {
               Icons.content_copy_outlined,
               () => copyPlateToClipboard(context, copy),
             ),
-          if (canOfferPlateName(isAdmin: widget.canName, plate: read.plate))
+          // Only for unnamed plates: a named plate shows its name on the
+          // card, and renaming lives in its profile.
+          if (canOfferPlateName(isAdmin: widget.canName, plate: read.plate) &&
+              (read.displayName?.trim() ?? '').isEmpty)
             btn(
               plateNameActionTooltip(read.displayName),
               Icons.label_outline,
@@ -566,8 +633,36 @@ class _SheetCardState extends State<_SheetCard> {
     );
   }
 
+  /// The known name on its own line under the plate: an accent tag icon and
+  /// the name, which scrolls (and only it) when it does not fit.
+  Widget _nameLine(String name) => Padding(
+    padding: const EdgeInsets.only(top: 2),
+    child: SizedBox(
+      height: _kCardNameLine - 2,
+      child: Row(
+        children: [
+          const Icon(Icons.sell_outlined, size: 12, color: _kLprAccent),
+          const SizedBox(width: 6),
+          Expanded(
+            child: MarqueeText(
+              name,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
   Widget _footer(PlateRead read, PlateStats? s, PlateHints hints) {
     final name = read.displayName?.trim() ?? '';
+    // A chip is (priority, text, colour); the row keeps the highest-priority
+    // chips that FIT and drops the rest whole, so none is ever cut mid-word.
+    const chipStyleSize = 10.5;
     Widget chip(String text, {Color? c}) => Container(
       margin: const EdgeInsets.only(right: 4),
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
@@ -577,7 +672,7 @@ class _SheetCardState extends State<_SheetCard> {
       ),
       child: Text(
         text,
-        style: TextStyle(color: c ?? Colors.white70, fontSize: 10.5),
+        style: TextStyle(color: c ?? Colors.white70, fontSize: chipStyleSize),
       ),
     );
     final now = DateTime.now();
@@ -602,22 +697,64 @@ class _SheetCardState extends State<_SheetCard> {
                   ),
                 ),
               ),
-              Text(
-                '${_fmtClock(read.ts)}  ${_dayLabel(read.ts, now)}',
-                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              const SizedBox(width: 6),
+              // Shrinks with an ellipsis on narrow cards instead of pushing
+              // the row over ("10:43 PM  today" is a digit wider after 10).
+              Flexible(
+                child: Text(
+                  '${_fmtClock(read.ts)}  ${_dayLabel(read.ts, now)}',
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white38, fontSize: 11),
+                ),
               ),
             ],
           ),
+          if (name.isNotEmpty) _nameLine(name),
           const SizedBox(height: 5),
-          _clipRow([
-            if (s != null) chip('seen ${s.total}x'),
-            if (s?.prevSeen != null) chip('last ${fmtAgo(s!.prevSeen!, now)}'),
-            if (hints.isNew) chip('NEW', c: _kGreen),
-            if (widget.watched) chip('Watchlist', c: _kPink),
-            if (s != null && s.isRegular) chip('Regular', c: _kAmber),
-            if (hints.unusualHour) chip('Unusual hour', c: _kAmber),
-            if (name.isNotEmpty) chip(name, c: _kGreen),
-          ]),
+          LayoutBuilder(
+            builder: (context, box) {
+              // Lower number = dropped first when the card is too narrow.
+              final specs = <({int keep, String text, Color? c})>[
+                if (s != null) (keep: 1, text: 'seen ${s.total}x', c: null),
+                if (s?.prevSeen != null)
+                  (keep: 0, text: 'last ${fmtAgo(s!.prevSeen!, now)}', c: null),
+                if (hints.isNew) (keep: 4, text: 'NEW', c: _kGreen),
+                if (widget.watched) (keep: 5, text: 'Watchlist', c: _kAmber),
+                if (s != null && s.isRegular)
+                  (keep: 3, text: 'Regular', c: _kLprAccent),
+                if (hints.unusualHour)
+                  (keep: 2, text: 'Unusual hour', c: _kAmber),
+              ];
+              final scaler = MediaQuery.textScalerOf(context);
+              double w(String t) {
+                final tp = TextPainter(
+                  text: TextSpan(
+                    text: t,
+                    style: const TextStyle(fontSize: chipStyleSize),
+                  ),
+                  textDirection: TextDirection.ltr,
+                  textScaler: scaler,
+                )..layout();
+                final width = tp.width;
+                tp.dispose();
+                // 6 + 6 padding, 4 margin, 1 for rounding.
+                return width + 17;
+              }
+
+              final shown = [...specs];
+              double total() => shown.fold(0.0, (a, e) => a + w(e.text));
+              while (shown.length > 1 && total() > box.maxWidth) {
+                var drop = 0;
+                for (var i = 1; i < shown.length; i++) {
+                  if (shown[i].keep < shown[drop].keep) drop = i;
+                }
+                shown.removeAt(drop);
+              }
+              return _clipRow([for (final e in shown) chip(e.text, c: e.c)]);
+            },
+          ),
           if (widget.tall) ...[
             const SizedBox(height: 8),
             SizedBox(
@@ -673,7 +810,10 @@ class _HourBarsPainter extends CustomPainter {
       final bh = v == 0 ? 1.5 : 2 + (size.height - 2) * v / maxV;
       canvas.drawRect(
         Rect.fromLTWH(h * slot + 0.5, size.height - bh, slot - 1, bh),
-        Paint()..color = h == now ? _kGreen : _kGreen.withValues(alpha: 0.35),
+        Paint()
+          ..color = h == now
+              ? _kLprAccent
+              : _kLprAccent.withValues(alpha: 0.35),
       );
     }
   }
@@ -692,10 +832,14 @@ Widget debugSheetCard({
   bool tall = false,
   PlateCropSize size = PlateCropSize.large,
   PlateCropCorner corner = PlateCropCorner.bottomLeft,
+  bool? reserveNameLine,
 }) {
+  final named =
+      (entry.group.representative.displayName?.trim() ?? '').isNotEmpty;
+  final reserve = reserveNameLine ?? named;
   return SizedBox(
     width: width,
-    height: _cardExtent(tall),
+    height: _cardExtent(tall, named: reserve),
     child: _SheetCard(
       entry: entry,
       stats: stats,
@@ -707,6 +851,7 @@ Widget debugSheetCard({
       showInset: true,
       loupe: 2,
       tall: tall,
+      slotHasNameLine: reserve,
       session: Session(base: 'http://127.0.0.1:9', token: ''),
       gate: _ConcurrencyGate(1),
       canManage: true,

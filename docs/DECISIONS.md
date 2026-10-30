@@ -8,6 +8,350 @@ revisit.
 
 ---
 
+## 2026-10-29, LPR plate corrections: an admin-managed alias table resolved on the server; raw reads are never rewritten
+
+**Context.** Plate OCR sometimes misreads one character, so one car shows up
+as two plates (the owner's example: `GIF2GAB` and `GIT2GAB`). Its history,
+"regular" status, counts and profile were split in two with no way to tell
+Crumb they are the same vehicle (issue #673).
+
+**Decision.**
+
+- **Storage: `plate_aliases` (migration 0084)**, `alias_plate` (primary key)
+  -> `canonical_plate`, plus `created_by` and `created_at`. Both are
+  normalized plates. `plate_reads` is never rewritten: a read keeps what the
+  engine read, a correction applies when reads are queried, and deleting the
+  row undoes it. Not pruned by plate retention (operator curation, like
+  `plate_labels` and the watchlist).
+- **One level only.** A canonical plate is never itself an alias. The write
+  path (`db::create_plate_alias`, under an advisory lock) flattens: correcting
+  `A -> B` when `B -> C` exists stores `A -> C`; aliases that pointed at `A`
+  move to its new canonical plate; correcting `B -> A` when `A -> B` exists
+  swaps them. Resolution is therefore always a single LEFT JOIN on the alias
+  primary key, never a recursive walk.
+- **Resolution rule (every read path, verbatim):** a read counts as
+  `COALESCE(plate_aliases.canonical_plate, plate_reads.plate)`.
+  - `GET /plates`: `plate` is the canonical plate; new nullable
+    `corrected_from` carries the raw read when it was corrected. Every search
+    mode matches the raw read OR its canonical plate, so an exact search for
+    the canonical plate (the profile's visits) returns its misreads, and a
+    search for the misread string still finds the reads. The name resolves as
+    `COALESCE(label(canonical), label(raw), watchlist label(canonical),
+    watchlist label(raw))`.
+  - `POST /lpr/plates/stats`: a requested misread is answered under its
+    canonical plate, and a canonical plate's numbers include every read stored
+    under its aliases. The SQL still groups by the stored plate through the
+    `(plate, ts)` index and folds the groups in Rust.
+  - `GET /lpr/overview`: today's unique plates, new plates, regulars and
+    watchlist hits are counted per canonical plate.
+  - Ingest: the ignore list and watchlist alert matching also try the read's
+    canonical plate, so a known misread of a watched plate alerts.
+  - The A/B engine benchmark does NOT resolve (`PlateReadQuery::resolve_aliases
+    = false`): it must score the engines on what they read, and a correction
+    would inflate their accuracy.
+- **Server-side resolution, not client-side**, so every client agrees and the
+  clients that already show reads (Android, iOS, the web console) show
+  corrected plates with no client change.
+- **Endpoints and permissions:** `GET /lpr/plate-aliases[?canonical=]` and
+  `GET /lpr/plate-alias-suggestions?plate=` are `view_plates`-gated (like the
+  watchlist read) with camera-scoped read counts; suggestions only consider
+  plates seen on cameras the caller may see. `POST /lpr/plate-aliases` and
+  `DELETE /lpr/plate-aliases/:alias` are admin-only, the same gate as plate
+  names and watchlist writes: a correction changes what every operator sees.
+- **Suggestions** reuse the watchlist matcher's distance (`db::levenshtein`,
+  OCR-confusable pairs such as `O`/`0` cost nothing): plates in scope within 2
+  edits, folded onto their canonical plates, closest then busiest first. It
+  scans the distinct plates of the right length, which plate retention bounds;
+  it backs an admin dialog, not a hot path.
+- **Desktop:** "Correct plate..." in the plate profile and the list row menu
+  opens a dialog with likely matches, the effect ("GIT2GAB's 12 reads will
+  count as GIF2GAB"), and Undo; the canonical plate's profile lists its known
+  misreads with Undo.
+
+**Rejected.**
+
+- *Rewriting `plate_reads.plate`* (a one-shot "merge"): simplest to query, but
+  irreversible, destroys the OCR text needed for audit and for the engine
+  benchmark, and a wrong merge could not be told apart from a real read.
+- *Client-side resolution* (each client fetches the alias list and re-maps):
+  five clients would have to agree on the rule, server counts (stats, overview)
+  would still be split, and an old client would show split plates forever.
+- *Applying corrections to every confusable or fuzzy variant automatically*
+  (the plate-names entry, 2026-07-31, deferred naming fuzzy variants for the
+  same reason): it risks merging genuinely different plates. A correction is
+  an explicit, per-string operator decision.
+- *A per-read override in this change* (correct one read without aliasing the
+  string): deferred. An alias on a one-off misread only affects that string,
+  and the dialog shows how many reads it moves before saving, so the alias
+  covers the reported case. Because resolution is centralized in the
+  `COALESCE` above, an override column on `plate_reads` can be added later as
+  the first term.
+
+**Trade-offs accepted.** Every plate query now carries a LEFT JOIN on a small
+primary-keyed table (and stats one extra lookup). The alias list is visible
+to anyone with `view_plates`, like the watchlist, though its read counts are
+camera-scoped. Events on the timeline (`events.sub_label`) still show the raw
+plate. Android and iOS display corrected plates but cannot make corrections
+yet. The watchlist-hit tile now counts a watched plate's misreads too.
+
+**Revisit if.** Operators need to correct single reads (add the per-read
+override), non-admins should be able to correct (split a capability), the
+alias table grows large enough that the suggestion scan shows up as slow, or
+the timeline should show corrected plates.
+
+---
+
+## 2026-10-29, Bookmarks whose footage retention deleted: flag at read time, never auto-delete
+
+**Chosen:** `footage_expired` is computed in the bookmark SELECT on every read
+(no segment covers `ts` AND `ts` is earlier than the camera's oldest segment,
+or the camera has no segments), using two bounded probes of
+`segments (camera_id, start_ts)`. `GET /cameras` gains `oldest_footage_ts`
+(one per-camera `ORDER BY start_ts LIMIT 1` subselect, not a `GROUP BY` over
+all segments) and the effective `recording_mode`, so playback states the
+actual reason a moment has no footage instead of guessing from loaded
+coverage. Expired bookmarks are badged and can be removed in bulk by the
+operator ("Remove expired (N)", confirmed); nothing is deleted automatically.
+Deletes ask for confirmation (Shift+click skips) and offer Undo, which
+re-creates the bookmark through `POST /bookmarks`.
+
+**Rejected:**
+
+- Auto-deleting a bookmark when retention removes its footage. The note and
+  the moment can still matter (an incident reference, a plate read) after the
+  video is gone, and silently removing operator data is the wrong default.
+- A stored `footage_expired` column updated by the retention sweep. It would
+  add a write to the eviction path (recorder correctness) and could drift;
+  the read-time check is cheap and always current.
+- A server-side soft delete / restore endpoint for undo. Re-creating through
+  the existing create API needed no new endpoint or migration; the cost is
+  that a restored bookmark gets a new id and creation time, its creator
+  becomes whoever pressed Undo, and a protection is restored for its
+  remaining time rounded up to whole days (a lapsed one is not restored).
+
+**Revisit triggers:**
+
+- Bookmark lists large enough that the per-row probes show up in
+  `GET /bookmarks` latency.
+- A need for undo to preserve the original id or creator (e.g. bookmarks
+  referenced from elsewhere by id), which would justify soft delete.
+- Operators asking for automatic cleanup, which would then be an explicit,
+  opt-in setting.
+
+## 2026-10-29, Scrub pre-generation stays OFF by default; documented as the scrubbing knob, with a catch-up cap
+
+**Context.** #657 made a grid frame a single keyframe decode and the scrub
+sprites (entry below) made pre-generation worth more, so the audit asked
+whether `THUMB_PREGEN_ENABLED` (one switch for grid frames AND sprites) should
+now default to on.
+
+**Measured** (9 real 4 s fixture segments, 1080p to 4K, H.264/HEVC,
+single-threaded ffmpeg 7.1): grid frame 0.08-0.28 s CPU and 25-44 KB; sprite
+0.15-0.55 s CPU and 12-20 KB. Per camera that is one of each per 4 s of
+footage: about 0.28 s (1080p) to 0.8 s (4K) of CPU per 4 s, i.e. **7-20 % of
+one core per camera** (1080p about 7 %, 4K 13-22 %, fixture mean about 14 %), and
+**~1.0 GB/day of cache per camera** (21 600 segments x ~48 KB). The worker is
+serial (one ffmpeg in flight), so its total is capped near one core: it keeps
+up with about 5-7 4K or 14 1080p cameras. The default cache budget (20 GB)
+holds about 20 camera-days.
+
+**Decision.** Keep the default OFF, and make the knob prominent instead:
+the environment reference, the scrubbing page, `.env.example`, the admin
+console hint and `docs/AI-INSTALL.md` now say what it does and what it costs,
+in numbers. One switch keeps covering both grid frames and sprites.
+
+Also: the worker's per-camera start point is now capped
+(`thumb_pregen::pass_start_ms`). A camera whose watermark is older than the
+lookback window (at least 2 h) skips ahead instead of chasing an ever-growing
+backlog, so a box with more cameras than one serial worker can serve still
+gets previews for the most recent footage. Skipped footage keeps the
+on-demand path.
+
+**Why not default on.** An always-on cost of 7-20 % of a core and 1 GB/day of
+writes per camera is paid by every install, including small boxes where the
+recorder (the component that must never fall behind) shares those cores, and
+it is paid whether or not anyone ever scrubs. The on-demand path after #657 is
+already 0.1-0.3 s for a cold 4K cell and instant on revisit, and the clients
+prefetch around the cursor, so the default experience is good without it.
+
+**Rejected.**
+
+- *Default on with a lower concurrency limit:* the worker is already serial;
+  a lower limit can't go below one ffmpeg, and the per-camera cost is the
+  problem, not a burst.
+- *Default on for sprites only:* the sprites are the larger CPU share and the
+  smaller user-visible change; splitting the switch would add a second knob
+  for operators to reason about.
+- *Auto-enable based on core count:* hidden behaviour that changes with
+  hardware is harder to support than one documented switch.
+
+**Revisit triggers.** Hardware decode available to the api container (would
+cut the per-picture CPU several-fold); a cheaper source of preview frames
+(recorded sub stream, see the 2026-07-07 entry); field reports that first-drag
+latency is the main complaint on default installs.
+
+## 2026-10-29, Scrub sprites: one keyframe-only sprite strip per segment, made only by the API pre-generation worker
+
+**Context.** The scrub overlay's frames come from `GET /filmstrip/{cam}/frame`,
+which snaps every request to a fixed 4 s grid so cache keys are shared. That
+makes a drag across segments step in 4 s jumps, and every new cell is its own
+request. The 2026-07-07 entry deferred "sprite atlases"; the performance audit
+behind PRs #655-#657 recommended per-segment sprites for 1 s granularity.
+
+**Decision.**
+
+- One sidecar JPEG per recorded main-stream segment: one tile per started
+  second (4 for a 4 s segment, capped at 16), 160 px wide, in a single row,
+  tile `i` = the segment at `start + i` s. Cached at
+  `{thumb_cache_base}/.thumbs/{camera}/sprites/{segment_id}_w160_t{n}.jpg`.
+- Rendered with a keyframe-only decode (`-skip_frame nokey`, `fps=1`, `tile`):
+  every camera in the benchmark fixture set keys once per second, so this gives
+  a distinct frame per tile. A longer GOP repeats the previous keyframe (the
+  frame endpoint's "keyframe at or before" rule). The `fps` filter holds back
+  its last frame, so the first frame is split off and re-stamped as a sentinel
+  at `n` s to release the final slot without decoding anything extra.
+- Made ONLY by the API's thumbnail pre-generation worker, behind the same
+  `THUMB_PREGEN_ENABLED` / console "Scrub previews" switch as the grid frames.
+  There is no on-demand path: `GET /filmstrip/{cam}/sprite?ts=` returns 404
+  until the sprite exists, and the desktop and Android clients fall back to the
+  frame endpoint. The layout travels in `X-Crumb-Sprite-*` response headers, so
+  one GET is enough.
+- Same auth as the frame endpoint (`MediaOrFullUser`, playback capability,
+  per-camera scope, scoped `?token=` from the clients).
+- Lifetime: the serve path resolves the segment from the DB and names the file
+  by its id, so a sprite of a deleted segment is unreachable; the cache sweeper
+  deletes sprites whose segment id is no longer in `segments` (read-only
+  primary-key lookups, a DB error deletes nothing); the generator re-checks the
+  segment after publishing; and the existing `.thumbs` age/byte sweep covers
+  sprites too. Sprites live in the api's writable cache, never beside footage,
+  so they cannot delay or block the recorder's deletion of a segment.
+
+**Measured** (9 real 4 s fixture segments, 1080p to 4K, H.264 and HEVC,
+single-threaded ffmpeg 7.1): sprite 0.15-0.55 s CPU per segment (mean about
+0.36 s), 12.4-19.9 KB (mean about 14.8 KB); for comparison the 480 px grid frame
+from #657 costs 0.08-0.28 s CPU and 25-44 KB. A full decode of the same
+segments for the sprite costs 0.34-0.98 s CPU.
+
+**Rejected.**
+
+- *Full decode for exact 1 s instants:* 2-3x the CPU for no visible gain on
+  1 s-GOP cameras.
+- *One ffmpeg input per tile* (`-ss i` x4, `hstack`): no cheaper (0.16-0.94 s),
+  and slower on H.264.
+- *Rendering sprites on demand in the request path:* a 4-keyframe decode is
+  too slow for a pointer event, and the frame endpoint already covers the cold
+  case.
+- *Rendering in the recorder from the motion decoder's frames:* golden rule 2,
+  and the motion frames are grayscale sub-stream (same reasoning as 2026-07-07
+  option 2).
+- *A JSON layout endpoint plus an image endpoint:* two round-trips per segment
+  for data that fits in six headers.
+
+**Revisit triggers.** Cameras with a GOP well above 1 s become common (tiles
+would repeat; consider a full decode for those); `SEGMENT_SECONDS` raised past
+16 s (the tile cap); the sprite pass measured as the bottleneck that stops the
+worker keeping up with recording; iOS wants sprites (client work only, the
+endpoint is ready).
+
+## 2026-10-29, Playback `/play/` resolves are cached briefly on the client, token-less and positive-only
+
+**Context.** A scrub release, a frame-step, a re-seek and the adjacent-segment
+probes on desktop and Android each paid a `GET /play/{camera_id}` round trip,
+even though most of them land in a segment the same client resolved moments
+earlier, and a segment's id and `[start, end)` window never change once indexed.
+
+**Decision.** Desktop (`lib/api/play_resolve_cache.dart`, used by
+`PlaybackApi.resolveSegment`) and Android (`data/PlayResolveCache.kt`, used by
+`CrumbRepository.resolveSegment`) keep a bounded (256 segments) in-memory cache
+of resolves with a 60 s TTL from fetch time. Any instant inside a cached
+segment's window hits. Only 200 answers are cached (a 404 never is, so new
+footage appears on the next resolve). The cached value is the token-less
+`/segments/{id}` path; the scoped `?token=` media claim is still attached from
+the media-token cache at use time, so a cached resolve can never yield an
+expired media URL. Keys include the server and session token (one principal's
+grants never answer another's resolve); sign-out clears it; Android's
+player-error recovery invalidates the camera first so recovery always asks the
+server. Callers can pass `bypassCache`.
+
+**Rejected.** HTTP caching headers on `/play/` (`Cache-Control`): the desktop
+and Android HTTP stacks would cache per exact URL, i.e. per `ts`, so a release
+a few hundred ms from the last resolve would still miss; it also widens what
+intermediaries may store for an authenticated endpoint. A longer TTL: a
+segment retention deletes would stay answerable longer for no real gain, since
+the hits come from actions seconds apart.
+
+**Trade-offs accepted.** For up to 60 s a resolve can name a segment that
+retention or reconcile has just removed; the player then fails to open it,
+exactly as it would if the deletion had landed right after a fresh resolve.
+
+**Revisit if.** Segment windows ever become mutable after indexing (e.g. an
+in-flight segment indexed with a growing end), or iOS gains the same scrub
+paths (it has no cache yet).
+
+## 2026-10-29, `/timeline` merges contiguous segments into spans IN SQL (gaps-and-islands); the Rust merge stays as the test oracle
+
+**Context.** `GET /timeline` fetched every segment row in the window and merged
+contiguous runs in Rust. The desktop's 30-day coverage fetch (every 5 minutes
+per client) is ~650k rows per continuously recording camera; the api logged
+"large /timeline span-merge scan (audit Risk #4)" and shipped tens of MB of rows
+from Postgres per request only to collapse them into a handful of spans. The
+2026-08-07 intensity entry below left this path out of scope as "inherently
+O(rows)"; the row SCAN is still O(rows), but the transfer, row decoding and
+per-row allocation in the api need not be.
+
+**Decision.**
+
+- `db::timeline_merged_spans` runs a gaps-and-islands query: a window
+  `max(end_ts)` over the camera's earlier rows (ordered by `start_ts, id`)
+  flags a row as a span start when it is the camera's first row or starts more
+  than the 1 s tolerance after that running max; a running `sum` of the flags
+  numbers the islands; `GROUP BY (camera_id, island)` returns
+  `min(start_ts)`, `max(end_ts)`, `bool_or(has_motion)` and the first row's
+  stage. `count(*) OVER ()` gives the total, `LIMIT/OFFSET` pages in SQL.
+  Response shape, tolerance, first-wins stage, motion OR, ordering and
+  `total`/`has_more` semantics are unchanged; no client change, no migration.
+- The first row's stage is carried as `max(CASE WHEN is_start = 1 THEN stage END)`
+  rather than `(array_agg(stage ORDER BY …))[1]`: the ordered aggregate forced
+  a second full sort of every row (spilled ~36 MB to disk on 500k rows), the
+  CASE form lets Postgres hash-aggregate the few spans.
+- Ties on `start_ts` are now broken by `id` in both the SQL and the
+  `timeline_spans` row order, so "stage of the first segment" is deterministic
+  (it was planner-dependent before).
+- The old Rust merge moved to `db::merge_segments_into_spans` and is kept as the
+  executable specification: `timeline_sql_merge_edge_cases_match_reference` and
+  `timeline_sql_merge_random_fixtures_match_reference` assert the SQL equals it
+  (unpaginated and across many `limit`/`offset` pages, including past the end),
+  on hand-built edges (touching, 999 ms / exactly 1 000 ms / 1 001 ms gaps, a
+  segment contained in a longer one, mixed stages, window-straddling rows, two
+  cameras) and on seeded pseudo-random fixtures with overlaps and ties.
+
+**Measured** (Postgres 16, one camera, 500k contiguous 4 s rows with 500 gaps,
+30-day window, release build, warm cache): old path (fetch rows + Rust merge)
+~400 ms and ~500k rows / tens of MB transferred and decoded per request; new
+path ~245 ms with 500 rows returned. Server-side execution of the old
+`SELECT` alone was ~138 ms; the windowed query is ~300 ms of that work but
+removes the transfer and decode.
+
+**Rejected / not done.**
+
+- *A covering index `(camera_id, start_ts) INCLUDE (end_ts, has_motion, stage)`
+  for an index-only scan.* Not done: it is a migration on the hottest write
+  table (every recorded segment pays for it), touches recorder-adjacent schema,
+  and the remaining cost is per-row window evaluation, not heap fetches.
+- *A maintained span table updated by the recorder.* Rejected: it adds a write
+  path in the recorder (recorder correctness is sacred) and a second source of
+  truth that eviction/retention/reconcile would all have to keep in sync.
+- *Keep Rust merge, page earlier.* Rejected: `total` needs every span, so the
+  full window must be merged regardless.
+
+**Revisit triggers.**
+
+- `/timeline` still slow at much larger scale (many more cameras × long
+  retention): consider the covering index or a client-side incremental fetch.
+- Any change to merge semantics (tolerance, stage rule, motion rule): update
+  BOTH the SQL and `merge_segments_into_spans` in lockstep; the equivalence
+  tests will fail otherwise.
+
 ## 2026-10-29, LPR page redesign ("plate desk"): two server aggregates, history buckets in the server time zone, hints computed on the client
 
 **Context.** The desktop Plates page listed reads with no sense of history: an
@@ -65,6 +409,54 @@ page then hides the header as it does for an older server.
 **Revisit if.** Stats requests show up as slow in production (move to a
 summary table), operators want the regular threshold configurable, or
 Android/iOS adopt the plate desk and need the hint rules shared server-side.
+
+---
+
+## 2026-10-29, Batch export: friendly file names, optional zipping, and a server-side size estimate
+
+**Context.** Batch export named clips `clip01_<8 hex of camera uuid>` on disk and
+`clip01_<cam8>_<UTC timestamp>` in the zip, and always zipped more than one
+clip. Operators found the names unreadable and wanted plain files. The desktop
+size estimate was a flat 10 Mbps guess and came out 2.2x low on a real export
+(397 MB estimated, 874 MB actual, 4 clips, 3 cameras, copy codec).
+
+**Decision.**
+
+- Every clip (disk file and zip entry alike) is named
+  `{Camera Name} {YYYY-MM-DD} {HH.MM.SS}-{HH.MM.SS}.{ext}` in the server's local
+  zone (`server_tz`), or `{Camera Name} {date time} to {date time}` when it
+  crosses local midnight. The name is sanitized for Windows and POSIX (illegal
+  characters and control characters become `_`, whitespace collapsed, trailing
+  dots and spaces trimmed, camera part capped at 60 chars, Windows reserved
+  device names prefixed `_`) and de-duplicated with ` (2)`, ` (3)`.
+- `package` on `POST /export/batch`: `"zip"` (default, unchanged for Android and
+  iOS) or `"files"`. A password forces zip (`files` + password is a 400). In
+  `files` mode `output_files` has one entry per clip.
+- `GET /export/:job_id/output/:index` downloads an `output_files` entry by
+  position, because one camera can have several clips and
+  `/files/:camera_id` cannot address them. The old routes stay. Content-Disposition
+  is RFC 6266 (`filename*=UTF-8''` plus an ASCII fallback). The zip is offered as
+  `Crumb export {YYYY-MM-DD HH.MM}.zip` through a new `download_name` field
+  (`#[serde(default)]`, so persisted rows still load); the disk name stays
+  `crumb_export.zip`.
+- `POST /export/estimate` returns, per clip, the sum over the `main` segments the
+  export would use of `size_bytes * overlap / segment duration` (one SQL
+  aggregate, no file I/O) plus the footage seconds. It models a copy-codec export;
+  clients scale it for a re-encode.
+
+**Rejected.** A flat bitrate guess (what failed: real cameras vary 3x or more, and
+motion-mode recordings have gaps). Estimating from `ffprobe` of the files
+(file I/O per segment, too slow for a live dialog). Naming from the camera uuid
+(unreadable) or UTC times (wrong for operators reading the file later).
+Dropping the zip entirely (still the right default for a multi-clip hand-off and
+for a password).
+
+**Accepted trade-offs.** The estimate ignores container overhead and burn-in
+re-encode; the single-camera `POST /export` path keeps its uuid-based names
+(one file per camera, no ambiguity) and old URLs.
+
+**Revisit when** a client needs per-clip re-encode size accuracy beyond a scale
+factor, or the single-camera `POST /export` path is retired in favor of batch.
 
 ---
 

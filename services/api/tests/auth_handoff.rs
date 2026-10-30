@@ -89,9 +89,13 @@ fn seed_done_export_job(app: &TestApp, camera_id: Uuid) -> Uuid {
                 download_url: format!("/export/{job_id}/files/{camera_id}"),
                 size_bytes: bytes.len() as u64,
                 filename,
+                download_name: String::new(),
             }],
             error: None,
             progress_pct: 100,
+            current_clip: 0,
+            clip_count: 0,
+            phase: String::new(),
         },
     );
     job_id

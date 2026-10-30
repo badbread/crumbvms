@@ -55,6 +55,18 @@ object MediaFactory {
      *    more slack before it rebuffers. (This reduces thrash; it does not change
      *    the source bitrate — that is what the `low.mp4` quality lever is for.)
      *
+     *    The START threshold is deliberately much lower than the window. Every
+     *    scrub release, motion jump and gap crossing is a hard `setMediaSource`
+     *    into a fresh ~4 s segment, and with ExoPlayer's default
+     *    `bufferForPlaybackMs` of 2 500 ms the first frame was held back until
+     *    more than half of that file had downloaded, which is what made a seek
+     *    feel like a stall even on a LAN. Starting at 750 ms shows the frame as
+     *    soon as a GOP is in; the generous min/max window above still fills
+     *    behind it, so steady-state WAN resilience is unchanged. The post-
+     *    rebuffer threshold stays higher (a link that just underran gets more
+     *    slack before resuming) but is also lower than before: a 4 s segment
+     *    cannot buffer 5 s.
+     *
      * Caller MUST call `release()` when done.
      */
     fun newPlaybackPlayer(context: Context): ExoPlayer {
@@ -62,8 +74,8 @@ object MediaFactory {
             .setBufferDurationsMs(
                 /* minBufferMs */ 15_000,
                 /* maxBufferMs */ 60_000,
-                /* bufferForPlaybackMs */ 2_500,
-                /* bufferForPlaybackAfterRebufferMs */ 5_000,
+                /* bufferForPlaybackMs */ PLAYBACK_START_BUFFER_MS,
+                /* bufferForPlaybackAfterRebufferMs */ PLAYBACK_REBUFFER_START_MS,
             )
             // Retain up to 30 s of already-played media so a small backward scrub
             // replays from memory rather than re-downloading over the slow link.
@@ -110,13 +122,32 @@ object MediaFactory {
             .setForceUseRtpTcp(true)
             .createMediaSource(MediaItem.fromUri(url))
 
-    /** Progressive HTTP source for a recorded segment (URL already authed). */
-    fun httpSource(url: String): MediaSource {
-        val dataSourceFactory = DefaultHttpDataSource.Factory()
+    /** See [newPlaybackPlayer]: buffered media required before the first frame
+     *  of a freshly loaded segment is shown. */
+    const val PLAYBACK_START_BUFFER_MS = 750
+    /** See [newPlaybackPlayer]: buffered media required to resume after an
+     *  underrun mid-segment. */
+    const val PLAYBACK_REBUFFER_START_MS = 2_000
+
+    /**
+     * One HTTP data-source factory for every recorded-segment source. Each
+     * `httpSource` call used to build its own factory; the factory itself is
+     * cheap, but sharing one keeps a single `TransferListener`/defaults set and
+     * makes the connection reuse story explicit: the underlying
+     * `HttpURLConnection` keep-alive pool is process-wide, so back-to-back
+     * segment opens (a scrub release right after a prefetch, or the gapless
+     * playlist append) reuse the warm socket to the API instead of paying a
+     * TCP (and on HTTPS, TLS) handshake per 4 s file.
+     */
+    private val segmentDataSourceFactory: DefaultHttpDataSource.Factory by lazy {
+        DefaultHttpDataSource.Factory()
             .setConnectTimeoutMs(10_000)
             .setReadTimeoutMs(30_000)
             .setAllowCrossProtocolRedirects(true)
-        return ProgressiveMediaSource.Factory(dataSourceFactory)
-            .createMediaSource(MediaItem.fromUri(url))
     }
+
+    /** Progressive HTTP source for a recorded segment (URL already authed). */
+    fun httpSource(url: String): MediaSource =
+        ProgressiveMediaSource.Factory(segmentDataSourceFactory)
+            .createMediaSource(MediaItem.fromUri(url))
 }

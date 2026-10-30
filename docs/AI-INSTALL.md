@@ -775,6 +775,23 @@ camera, with an operator-ready `fallback_reason` when the recorder had to fall
 back to CPU. A wrong pick is safe: the recorder logs a warning and falls back to
 CPU automatically.
 
+### Scrub previews (optional, the one scrubbing knob)
+
+Leave this off unless the user asks for the snappiest possible scrubbing or says
+they review footage a lot. Off (the default), the first drag over a spot builds
+its preview on demand (about 0.1-0.3 s per picture on 4K) and later drags are
+instant. On, the api builds previews for new footage in the background, so the
+first drag is instant too and the desktop/Android apps get 1-second previews.
+Cost per camera: about 7-20 % of one CPU core and about 1 GB/day of cache (held
+inside `THUMB_CACHE_MAX_BYTES`, 20 GB by default). The worker runs one ffmpeg at
+a time, so it never takes more than about one core in total. Turn it on in the
+admin console (**Server settings → Scrub previews**, live, no restart) or with
+`THUMB_PREGEN_ENABLED=true` in `.env` + `docker compose up -d api`. On a small
+host (a few cores shared with the recorder) prefer leaving it off.
+
+**Verify:** `GET /config/scrub-preview` (admin) shows `pregen_enabled.value: true`,
+and the api log shows `thumb pre-generation: enabled`.
+
 ---
 
 ## 7. Confirm it actually works

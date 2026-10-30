@@ -187,6 +187,45 @@ bool deskFilterMatches(
   }
 }
 
+/// Whether a read of a plate is hidden by the "Hide regulars" toggle: the
+/// plate is a known regular and is not on the watchlist. A plate whose stats
+/// have not loaded yet is never hidden (no flicker-hiding of unknowns), and a
+/// watchlisted plate is always shown.
+bool isHiddenRegular({required bool watched, PlateStats? stats}) =>
+    !watched && stats != null && stats.isRegular;
+
+/// Drops the groups of known, non-watchlisted regulars. The hook shared by the
+/// List and Grid views (before the desk filter and group-by-plate).
+List<PlateGroup> withoutRegularGroups(
+  List<PlateGroup> groups, {
+  required bool Function(String plate) watched,
+  required PlateStats? Function(String plate) stats,
+}) => [
+  for (final g in groups)
+    if (!isHiddenRegular(
+      watched: watched(g.representative.plate),
+      stats: stats(g.representative.plate),
+    ))
+      g,
+];
+
+/// Drops the raw reads of known, non-watchlisted regulars (Grouped view).
+List<PlateRead> withoutRegularReads(
+  List<PlateRead> reads, {
+  required bool Function(String plate) watched,
+  required PlateStats? Function(String plate) stats,
+}) => [
+  for (final r in reads)
+    if (!isHiddenRegular(watched: watched(r.plate), stats: stats(r.plate))) r,
+];
+
+/// Whether "Hide regulars" is in effect. It yields to the desk "Regulars"
+/// filter (which would otherwise show nothing), so the two never fight.
+bool hideRegularsActive({
+  required bool hideRegulars,
+  required DeskFilter filter,
+}) => hideRegulars && filter != DeskFilter.regulars;
+
 String deskFilterLabel(DeskFilter f) => switch (f) {
   DeskFilter.all => 'All reads',
   DeskFilter.firstTime => 'First-time plates',
