@@ -29,6 +29,8 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/ui/folder_picker_dialog.dart';
 
 import 'export_builder_dialog.dart';
+import 'package:crumb_desktop/ui/motion/live_motion.dart';
+import 'package:crumb_desktop/ui/motion/panel_motion.dart';
 
 class ExportScreen extends StatefulWidget {
   const ExportScreen({
@@ -60,6 +62,7 @@ class ExportScreen extends StatefulWidget {
 
 class _ExportScreenState extends State<ExportScreen> {
   final List<ExportClipDraft> _list = [];
+  final _reflow = ListReflow<ExportClipDraft>((d) => d.id);
   final Map<int, Widget> _thumbCache = {};
   int _seq = 0;
 
@@ -120,6 +123,7 @@ class _ExportScreenState extends State<ExportScreen> {
     super.initState();
     if (widget.initialClips.isNotEmpty) {
       _list.addAll(widget.initialClips);
+      _reflow.markSeen(widget.initialClips.map((c) => c.id));
       // Keep new ids above every seeded one so add/edit never collide.
       _seq = widget.initialClips.map((c) => c.id).reduce((a, b) => a > b ? a : b);
     }
@@ -167,6 +171,7 @@ class _ExportScreenState extends State<ExportScreen> {
   void dispose() {
     _pollTimer?.cancel();
     _elapsedTicker?.cancel();
+    _reflow.dispose();
     _passwordCtrl.dispose();
     _destDirCtrl.dispose();
     super.dispose();
@@ -546,6 +551,14 @@ class _ExportScreenState extends State<ExportScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // The list plus any just-removed rows still shrinking out of view.
+    final rows = _reflow.sync(
+      _list,
+      leaveFor: SizeFadeRow.leaveDurationFor(context),
+      onChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
     return Scaffold(
       // No AppBar: the top tab bar already labels this "Export" — a second
       // page header just wastes vertical space.
@@ -607,13 +620,17 @@ class _ExportScreenState extends State<ExportScreen> {
                             horizontal: 12,
                             vertical: 6,
                           ),
-                          itemCount: _list.length,
+                          itemCount: rows.length,
                           separatorBuilder: (_, __) =>
                               const Divider(height: 1),
                           itemBuilder: (context, i) {
-                            final it = _list[i];
-                            return _ClipRow(
-                              index: i + 1,
+                            final it = rows[i].item;
+                            return SizeFadeRow(
+                              key: ValueKey(it.id),
+                              animateIn: _reflow.isNew(it.id, rows[i].leaving),
+                              leaving: rows[i].leaving,
+                              child: _ClipRow(
+                              index: rows[i].number,
                               draft: it,
                               cameraName: _cameraName(it.cameraId),
                               thumbnail: _thumbFor(it),
@@ -622,7 +639,7 @@ class _ExportScreenState extends State<ExportScreen> {
                               durationLabel: _fmtDuration(it.duration),
                               onEdit: () => _editClip(it),
                               onRemove: () => _removeClip(it),
-                            );
+                            ));
                           },
                         ),
                 ),
@@ -1023,7 +1040,7 @@ class _ClipThumbnailState extends State<_ClipThumbnail> {
         future: _future,
         builder: (context, snap) {
           if (snap.connectionState != ConnectionState.done) {
-            return const SizedBox.shrink();
+            return const ShimmerBox();
           }
           final bytes = snap.data;
           if (bytes == null) {
@@ -1033,7 +1050,11 @@ class _ClipThumbnailState extends State<_ClipThumbnail> {
               color: Colors.white38,
             );
           }
-          return Image.memory(bytes, fit: BoxFit.cover);
+          return Image.memory(
+            bytes,
+            fit: BoxFit.cover,
+            frameBuilder: thumbFadeFrameBuilder,
+          );
         },
       ),
     );

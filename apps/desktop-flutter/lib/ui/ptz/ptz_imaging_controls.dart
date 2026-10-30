@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/ptz_extras_api.dart';
+import '../motion/crumb_interaction_theme.dart';
 
 class PtzImagingControls extends StatefulWidget {
   const PtzImagingControls({
@@ -46,7 +47,7 @@ class _PtzImagingControlsState extends State<PtzImagingControls> {
         onPointerDown: (_) => _fire(start),
         onPointerUp: (_) => _fire(stop),
         onPointerCancel: (_) => _fire(stop),
-        child: _chip(label),
+        child: PressScaleListener(child: _chip(label)),
       ),
     );
   }
@@ -54,7 +55,10 @@ class _PtzImagingControlsState extends State<PtzImagingControls> {
   Widget _tapBtn(String label, ImagingAction action, {String? tooltip}) {
     return Tooltip(
       message: tooltip ?? label,
-      child: GestureDetector(onTap: () => _fire(action), child: _chip(label)),
+      child: GestureDetector(
+        onTap: () => _fire(action),
+        child: PressScaleListener(child: _chip(label)),
+      ),
     );
   }
 

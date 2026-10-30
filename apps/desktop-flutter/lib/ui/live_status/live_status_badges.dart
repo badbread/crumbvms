@@ -7,6 +7,7 @@
 import 'package:flutter/material.dart';
 
 import 'detection_icons.dart';
+import '../motion/live_motion.dart';
 
 /// Small top-strip badge row for one camera tile: a REC dot (active when
 /// `recording`), a MOTION dot (active when `recentMotion` and there are no
@@ -41,7 +42,7 @@ class LiveStatusBadgeRow extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           // Recording is just a red dot (no "REC" label), matching the old client.
-          if (recording) const _Dot(color: Colors.redAccent),
+          if (recording) const RecDot(),
           if (recording && showGenericMotion) const SizedBox(width: 8),
           // Generic motion = the running-man icon (no "MOTION" text), matching
           // the old client.
@@ -183,24 +184,12 @@ class TileInfoBar extends StatelessWidget {
           ],
           if (recording) ...[
             const SizedBox(width: 6),
-            const _Dot(color: Colors.redAccent),
+            const RecDot(),
           ],
         ],
       ),
     );
   }
-}
-
-class _Dot extends StatelessWidget {
-  const _Dot({required this.color});
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    width: 7,
-    height: 7,
-    decoration: BoxDecoration(shape: BoxShape.circle, color: color),
-  );
 }
 
 class _DetectionGlyph extends StatelessWidget {

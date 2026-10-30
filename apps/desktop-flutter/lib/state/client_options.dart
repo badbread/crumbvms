@@ -29,6 +29,8 @@ import 'dart:async' show unawaited;
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../ui/motion/motion_tokens.dart';
+
 /// What a click on a live/maximized PTZ-capable tile does.
 /// Mirrors `options.ptzClickMode` ('center' | 'pan' | 'off').
 enum PtzClickMode {
@@ -106,6 +108,8 @@ const String _kPtzWheelCorner = 'crumb.ptzWheelCorner';
 const String _kZoomSwitchesToMain = 'crumb.zoomSwitchesToMain';
 const String _kOpenClipsInHd = 'crumb.openClipsInHd';
 const String _kSeamlessTileSwitch = 'crumb.seamlessTileSwitch';
+// In-app "Reduce motion" (the OS setting is honoured regardless).
+const String _kReduceMotion = 'crumb.reduceMotion';
 // Adaptive live-wall quality (issue #382) — client-local, both default ON.
 const String _kAdaptiveWallGuardrail = 'crumb.adaptiveWallGuardrail';
 const String _kAdaptiveWallBackpressure = 'crumb.adaptiveWallBackpressure';
@@ -138,6 +142,7 @@ class ClientOptionsStore extends ChangeNotifier {
     required bool adaptiveWallGuardrail,
     required bool adaptiveWallBackpressure,
     required bool adaptiveWallGuardrailDontWarn,
+    required bool reduceMotion,
   }) : _showInfoBar = showInfoBar,
        _showAllCamerasView = showAllCamerasView,
        _hotkeysEnabled = hotkeysEnabled,
@@ -150,7 +155,8 @@ class ClientOptionsStore extends ChangeNotifier {
        _seamlessTileSwitching = seamlessTileSwitching,
        _adaptiveWallGuardrail = adaptiveWallGuardrail,
        _adaptiveWallBackpressure = adaptiveWallBackpressure,
-       _adaptiveWallGuardrailDontWarn = adaptiveWallGuardrailDontWarn;
+       _adaptiveWallGuardrailDontWarn = adaptiveWallGuardrailDontWarn,
+       _reduceMotion = reduceMotion;
 
   final SharedPreferences? _prefs;
 
@@ -167,6 +173,7 @@ class ClientOptionsStore extends ChangeNotifier {
   bool _adaptiveWallGuardrail;
   bool _adaptiveWallBackpressure;
   bool _adaptiveWallGuardrailDontWarn;
+  bool _reduceMotion;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -175,6 +182,7 @@ class ClientOptionsStore extends ChangeNotifier {
     } catch (_) {
       prefs = null; // package not wired up yet — in-memory only, per-session
     }
+    MotionPrefs.reduceMotion.value = prefs?.getBool(_kReduceMotion) ?? false;
     return ClientOptionsStore._(
       prefs,
       showInfoBar: prefs?.getBool(_kShowInfoBar) ?? true,
@@ -194,6 +202,7 @@ class ClientOptionsStore extends ChangeNotifier {
           prefs?.getBool(_kAdaptiveWallBackpressure) ?? true,
       adaptiveWallGuardrailDontWarn:
           prefs?.getBool(_kAdaptiveWallGuardrailDontWarn) ?? false,
+      reduceMotion: prefs?.getBool(_kReduceMotion) ?? false,
     );
   }
 
@@ -286,6 +295,17 @@ class ClientOptionsStore extends ChangeNotifier {
     if (v == _seamlessTileSwitching) return;
     _seamlessTileSwitching = v;
     unawaited(_prefs?.setBool(_kSeamlessTileSwitch, v));
+    notifyListeners();
+  }
+
+  // ── Reduce motion: no position/size motion, short fades, static indicators.
+  //    Mirrored into MotionPrefs so the app root can fold it into MediaQuery. ──
+  bool get reduceMotion => _reduceMotion;
+  set reduceMotion(bool v) {
+    if (v == _reduceMotion) return;
+    _reduceMotion = v;
+    MotionPrefs.reduceMotion.value = v;
+    unawaited(_prefs?.setBool(_kReduceMotion, v));
     notifyListeners();
   }
 

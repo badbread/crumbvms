@@ -12,6 +12,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'ptz_click_mode.dart';
 import 'ptz_imaging_controls.dart';
 import 'ptz_presets_panel.dart';
+import '../motion/crumb_interaction_theme.dart';
 
 class PtzExtrasPanel extends StatelessWidget {
   const PtzExtrasPanel({
@@ -35,17 +36,19 @@ class PtzExtrasPanel extends StatelessWidget {
       message: tooltip,
       child: GestureDetector(
         onTap: () => onClickModeChanged(m),
-        child: Container(
-          margin: const EdgeInsets.all(2),
-          padding: const EdgeInsets.all(6),
-          decoration: BoxDecoration(
-            color: active
-                ? Colors.cyanAccent.withValues(alpha: 0.28)
-                : Colors.white.withValues(alpha: 0.14),
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: active ? Colors.cyanAccent : Colors.white24),
+        child: PressScaleListener(
+          child: Container(
+            margin: const EdgeInsets.all(2),
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: active
+                  ? Colors.cyanAccent.withValues(alpha: 0.28)
+                  : Colors.white.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: active ? Colors.cyanAccent : Colors.white24),
+            ),
+            child: Icon(icon, color: Colors.white, size: 16),
           ),
-          child: Icon(icon, color: Colors.white, size: 16),
         ),
       ),
     );
