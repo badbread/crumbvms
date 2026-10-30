@@ -35,8 +35,10 @@ use crate::{
 
 /// Mount the authenticated JSON routes: `GET /plates` (view_plates-gated), the
 /// admin `GET`/`PUT /config/lpr` enable toggle, the plate-watchlist CRUD (reads
-/// gated on `view_plates`, writes admin-only), and the plate-name CRUD
-/// (`PUT`/`DELETE /lpr/plate-labels`, admin-only, issue #363).
+/// gated on `view_plates`, writes admin-only), the plate-name CRUD
+/// (`PUT`/`DELETE /lpr/plate-labels`, admin-only, issue #363), and the plate
+/// corrections (`/lpr/plate-aliases`, reads `view_plates`, writes admin-only,
+/// issue #673).
 ///
 /// Mounted in `json_routes` (rate-limited, gzip, 30 s timeout).
 pub fn json_routes() -> Router<AppState> {
@@ -78,6 +80,21 @@ pub fn json_routes() -> Router<AppState> {
         .route(
             "/lpr/plate-labels/:plate",
             axum::routing::delete(delete_plate_label),
+        )
+        // Plate corrections (issue #673): "this misread is really that
+        // plate". Reads are view_plates-gated and camera-scoped; writes are
+        // admin-only, like plate names and the watchlist.
+        .route(
+            "/lpr/plate-aliases",
+            get(get_plate_aliases).post(post_plate_alias),
+        )
+        .route(
+            "/lpr/plate-aliases/:alias",
+            axum::routing::delete(delete_plate_alias),
+        )
+        .route(
+            "/lpr/plate-alias-suggestions",
+            get(get_plate_alias_suggestions),
         )
 }
 
@@ -530,6 +547,269 @@ async fn delete_plate_label(
     }
 }
 
+// ── plate corrections (`/lpr/plate-aliases`, issue #673) ─────────────────────
+
+/// One plate correction as served to clients.
+#[derive(Debug, Serialize)]
+pub struct PlateAliasDto {
+    /// The misread plate string (normalized).
+    pub alias_plate: String,
+    /// The plate its reads count as.
+    pub canonical_plate: String,
+    /// Username of the admin who made the correction, when still known.
+    pub created_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// Reads stored under the misread string on cameras the caller may see:
+    /// how many reads this correction moves.
+    pub reads: i64,
+}
+
+/// `GET /lpr/plate-aliases` query.
+#[derive(Debug, Deserialize)]
+pub struct PlateAliasQuery {
+    /// Only the misreads of this plate (normalized server-side).
+    pub canonical: Option<String>,
+}
+
+async fn alias_dtos(
+    state: &AppState,
+    user: &AuthUser,
+    aliases: Vec<db::PlateAlias>,
+) -> Result<Vec<PlateAliasDto>, ApiError> {
+    let scope = aggregate_scope(user, None);
+    let plates: Vec<String> = aliases.iter().map(|a| a.alias_plate.clone()).collect();
+    let counts = db::plate_raw_read_counts(state.pool(), &plates, scope.as_deref())
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(aliases
+        .into_iter()
+        .map(|a| PlateAliasDto {
+            reads: counts.get(&a.alias_plate).copied().unwrap_or(0),
+            alias_plate: a.alias_plate,
+            canonical_plate: a.canonical_plate,
+            created_by: a.created_by_username,
+            created_at: a.created_at,
+        })
+        .collect())
+}
+
+/// `GET /lpr/plate-aliases[?canonical=<plate>]` — the plate corrections, or
+/// only the known misreads of one plate (the plate profile's list).
+/// `view_plates`-gated like the watchlist read; the per-alias read counts are
+/// camera-scoped, so they never count reads from cameras the caller may not
+/// see.
+///
+/// # Errors
+///
+/// * `401` / `403` — auth failure / missing `view_plates`.
+async fn get_plate_aliases(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<PlateAliasQuery>,
+) -> Result<Json<Vec<PlateAliasDto>>, ApiError> {
+    user.require_view_plates()?;
+    let canonical = q
+        .canonical
+        .as_deref()
+        .map(db::normalize_plate)
+        .filter(|p| !p.is_empty());
+    let aliases = db::list_plate_aliases(state.pool(), canonical.as_deref())
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(alias_dtos(&state, &user, aliases).await?))
+}
+
+/// `POST /lpr/plate-aliases` body: reads of `alias` count as `canonical`.
+/// Both are normalized server-side.
+#[derive(Debug, Deserialize)]
+pub struct PlateAliasCreate {
+    pub alias: String,
+    pub canonical: String,
+}
+
+/// `POST /lpr/plate-aliases` response: the stored correction plus any older
+/// corrections that were re-pointed to keep one level.
+#[derive(Debug, Serialize)]
+pub struct PlateAliasCreated {
+    pub alias: PlateAliasDto,
+    /// Aliases that pointed at the new alias and now point at its canonical
+    /// plate.
+    pub moved: Vec<String>,
+}
+
+/// `POST /lpr/plate-aliases {alias, canonical}` — record that a plate string
+/// is a misread of another plate (issue #673). Admin-only, matching the plate
+/// names and watchlist writes: a correction changes what every operator sees.
+///
+/// Raw reads are never rewritten; the correction is applied when reads are
+/// queried and is undone with `DELETE`. Chains are flattened: naming a plate
+/// that is itself a misread stores its canonical plate instead, and
+/// correcting `B -> A` when `A -> B` exists swaps the two.
+///
+/// # Errors
+///
+/// * `400` — a plate normalizes to empty, or both are the same plate.
+/// * `401` / `403` — auth failure / not an admin.
+async fn post_plate_alias(
+    admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<PlateAliasCreate>,
+) -> Result<(StatusCode, Json<PlateAliasCreated>), ApiError> {
+    let written = db::create_plate_alias(
+        state.pool(),
+        &body.alias,
+        &body.canonical,
+        Some(admin.0.user_id),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    match written {
+        db::PlateAliasWrite::Saved { alias, moved } => {
+            let mut dtos = alias_dtos(&state, &admin.0, vec![alias]).await?;
+            let alias = dtos.pop().ok_or_else(|| {
+                ApiError::Internal(anyhow::anyhow!("plate alias vanished after write"))
+            })?;
+            Ok((
+                StatusCode::CREATED,
+                Json(PlateAliasCreated { alias, moved }),
+            ))
+        }
+        db::PlateAliasWrite::Invalid => Err(ApiError::BadRequest(
+            "alias and canonical must each contain at least one alphanumeric character \
+             and must be different plates"
+                .to_owned(),
+        )),
+    }
+}
+
+/// `DELETE /lpr/plate-aliases/:alias` — undo a correction: reads of the
+/// misread string count as themselves again (admin-only). 404 when the plate
+/// has no correction.
+///
+/// # Errors
+///
+/// * `400` — the plate normalizes to empty.
+/// * `401` / `403` — auth failure / not an admin.
+/// * `404` — no correction for this plate.
+async fn delete_plate_alias(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if db::normalize_plate(&alias).is_empty() {
+        return Err(ApiError::BadRequest(
+            "plate must contain at least one alphanumeric character".to_owned(),
+        ));
+    }
+    let removed = db::delete_plate_alias(state.pool(), &alias)
+        .await
+        .map_err(ApiError::Internal)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!(
+            "plate {alias} has no correction"
+        )))
+    }
+}
+
+/// `GET /lpr/plate-alias-suggestions` query.
+#[derive(Debug, Deserialize)]
+pub struct PlateSuggestQuery {
+    /// The plate being corrected (normalized server-side).
+    pub plate: String,
+}
+
+/// One likely correction target.
+#[derive(Debug, Serialize)]
+pub struct PlateSuggestionDto {
+    pub plate: String,
+    pub reads: i64,
+    pub distance: usize,
+    pub display_name: Option<String>,
+}
+
+/// `GET /lpr/plate-alias-suggestions` response.
+#[derive(Debug, Serialize)]
+pub struct PlateSuggestResponse {
+    /// The normalized input plate.
+    pub plate: String,
+    /// What the input currently counts as (itself, unless already corrected).
+    pub canonical_plate: String,
+    /// Visible reads a correction of `plate` would move: its own reads plus
+    /// those of any misreads that currently point at it.
+    pub reads: i64,
+    /// Misreads that currently point at `plate` and would move with it.
+    pub aliases: Vec<String>,
+    /// Likely real plates, closest first.
+    pub suggestions: Vec<PlateSuggestionDto>,
+}
+
+/// Most suggestions returned.
+const MAX_PLATE_SUGGESTIONS: usize = 8;
+
+/// `GET /lpr/plate-alias-suggestions?plate=<plate>` — feeds the "Correct
+/// plate" dialog: the existing plates `plate` is probably a misread of (within
+/// two character edits, with OCR-confusable characters such as `O`/`0` free,
+/// the same distance as watchlist matching), and how many reads a correction
+/// would move. `view_plates`-gated and camera-scoped: only plates and reads on
+/// cameras the caller may see are considered.
+///
+/// # Errors
+///
+/// * `400` — the plate normalizes to empty.
+/// * `401` / `403` — auth failure / missing `view_plates`.
+async fn get_plate_alias_suggestions(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<PlateSuggestQuery>,
+) -> Result<Json<PlateSuggestResponse>, ApiError> {
+    user.require_view_plates()?;
+    let plate = db::normalize_plate(&q.plate);
+    if plate.is_empty() {
+        return Err(ApiError::BadRequest(
+            "plate must contain at least one alphanumeric character".to_owned(),
+        ));
+    }
+    let scope = aggregate_scope(&user, None);
+    let pool = state.pool();
+    let canonical_plate = db::resolve_plate_alias(pool, &plate)
+        .await
+        .map_err(ApiError::Internal)?;
+    let aliases: Vec<String> = db::plate_aliases_of(pool, std::slice::from_ref(&plate))
+        .await
+        .map_err(ApiError::Internal)?
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
+    let mut group = aliases.clone();
+    group.push(plate.clone());
+    let reads = db::plate_raw_read_counts(pool, &group, scope.as_deref())
+        .await
+        .map_err(ApiError::Internal)?
+        .values()
+        .sum();
+    let suggestions =
+        db::suggest_plate_corrections(pool, &plate, scope.as_deref(), MAX_PLATE_SUGGESTIONS)
+            .await
+            .map_err(ApiError::Internal)?
+            .into_iter()
+            .map(|s| PlateSuggestionDto {
+                plate: s.plate,
+                reads: s.reads,
+                distance: s.distance,
+                display_name: s.display_name,
+            })
+            .collect();
+    Ok(Json(PlateSuggestResponse {
+        plate,
+        canonical_plate,
+        reads,
+        aliases,
+        suggestions,
+    }))
+}
+
 // ── plate desk: today's overview + per-plate history (`/lpr/overview`,
 // `/lpr/plates/stats`) ───────────────────────────────────────────────────────
 
@@ -716,7 +996,9 @@ pub struct PlateStatsResponse {
     pub today: NaiveDate,
     pub regular_min_reads_30d: i64,
     /// One entry per requested plate that has visible reads (plates with none
-    /// are omitted), ordered by plate.
+    /// are omitted), ordered by plate. Plate corrections are resolved: a
+    /// requested misread is answered under its canonical plate, and a
+    /// canonical plate's numbers include its misreads (issue #673).
     pub plates: Vec<PlateStatsDto>,
 }
 
@@ -1017,6 +1299,9 @@ async fn get_ab_report(
             match_mode: db::PlateMatch::Contains,
             limit: AB_MAX_READS,
             offset: 0,
+            // Score the engines on what they read, never on an operator's
+            // later correction (which would inflate their accuracy).
+            resolve_aliases: false,
         },
     )
     .await
@@ -1326,6 +1611,8 @@ async fn get_plates(
         match_mode,
         limit,
         offset,
+        // Corrected reads count as their canonical plate (issue #673).
+        resolve_aliases: true,
     };
 
     let (plates, total) = db::list_plate_reads(state.pool(), &query)

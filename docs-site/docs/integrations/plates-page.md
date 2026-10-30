@@ -56,8 +56,8 @@ A coloured stripe on the left edge marks watchlist plates (pink), new plates
 
 Hover over a plate crop to see a larger view of the frame with the plate
 outlined. Click a row to open the plate's profile (below); the actions menu at
-the end of the row copies the plate, names it, adds it to the watchlist, or
-makes a PDF report.
+the end of the row copies the plate, names it, corrects a misread (see below),
+adds it to the watchlist, or makes a PDF report.
 
 ### Density
 
@@ -117,6 +117,32 @@ Clicking a row or a card opens everything known about that plate:
 read you opened the profile from. Press Esc or **Back to plates** to return to
 the list; with the profile open, `j` and `k` step to the next and previous
 plate in the list.
+
+## Correcting a misread plate
+
+Plate readers sometimes get one character wrong, so the same car shows up as
+two plates, for example `GIF2GAB` and `GIT2GAB`. You can tell Crumb that one is
+a misread of the other, and from then on they count as one car everywhere:
+in the list, the history and the charts, today's totals, the profile, plate
+names and watchlist alerts.
+
+1. Open the misread plate's actions menu (the three dots at the end of the row)
+   or its profile, and choose **Correct plate...**.
+2. Type the real plate, or click one of the **likely matches**. Crumb suggests
+   plates you have already seen that are one or two characters away, with how
+   often each was seen. Look-alike characters such as `O` and `0` count as a
+   match.
+3. Check the sentence under the field, for example "GIT2GAB's 12 reads will
+   count as GIF2GAB", and click **Correct**.
+
+Future reads of the misread count as the real plate too. Crumb never changes
+the reads themselves: the profile of the real plate lists its **known
+misreads**, and **Undo** there (or in the message right after you correct)
+turns a correction back off.
+
+Only admins can correct plates, the same as naming them. Everyone else sees
+the corrected plates. The A/B engine benchmark keeps scoring each engine on
+what it actually read.
 
 ## Keyboard
 

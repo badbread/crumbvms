@@ -326,7 +326,28 @@ class _PlateProfileState extends State<_PlateProfile> {
                 label: 'Report',
                 onTap: () => widget.onReport(read),
               ),
+              if (canOfferPlateCorrection(
+                isAdmin: widget.canName,
+                plate: _plate,
+              ))
+                _ProfileButton(
+                  icon: Icons.spellcheck,
+                  label: 'Correct plate...',
+                  onTap: () => showPlateCorrectionDialog(
+                    context,
+                    api: widget.api,
+                    session: widget.session,
+                    plate: _plate,
+                  ),
+                ),
             ],
+          ),
+          // Plates corrected to this one (issue #673), with Undo for admins.
+          PlateMisreadsSection(
+            api: widget.api,
+            session: widget.session,
+            plate: _plate,
+            canEdit: widget.canName,
           ),
         ],
       ),

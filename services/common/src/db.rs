@@ -9640,6 +9640,455 @@ pub async fn delete_plate_label(pool: &Pool, plate: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+// ─── plate corrections (plate_aliases, migration 0084) ──────────────────────
+
+/// One operator correction: reads of `alias_plate` count as `canonical_plate`
+/// (issue #673). Both are normalized plates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlateAlias {
+    pub alias_plate: String,
+    pub canonical_plate: String,
+    /// The admin who made the correction (`None` once that account is gone).
+    pub created_by: Option<Uuid>,
+    pub created_by_username: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+fn plate_alias_from_row(row: &tokio_postgres::Row) -> PlateAlias {
+    PlateAlias {
+        alias_plate: row.get("alias_plate"),
+        canonical_plate: row.get("canonical_plate"),
+        created_by: row.get("created_by"),
+        created_by_username: row.get("created_by_username"),
+        created_at: row.get("created_at"),
+    }
+}
+
+const PLATE_ALIAS_SELECT: &str = "SELECT a.alias_plate, a.canonical_plate, a.created_by, \
+     u.username AS created_by_username, a.created_at \
+     FROM plate_aliases a LEFT JOIN users u ON u.id = a.created_by";
+
+/// List plate corrections, ordered by canonical plate then alias. With
+/// `canonical`, only the misreads of that (already normalized) plate.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn list_plate_aliases(pool: &Pool, canonical: Option<&str>) -> Result<Vec<PlateAlias>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            &format!(
+                "{PLATE_ALIAS_SELECT} \
+                 WHERE $1::text IS NULL OR a.canonical_plate = $1 \
+                 ORDER BY a.canonical_plate, a.alias_plate"
+            ),
+            &[&canonical],
+        )
+        .await
+        .context("list_plate_aliases")?;
+    Ok(rows.iter().map(plate_alias_from_row).collect())
+}
+
+/// The canonical plate for each of `plates` (already normalized) that is an
+/// alias. Plates that are not aliases are absent from the map.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn resolve_plate_aliases(
+    pool: &Pool,
+    plates: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    if plates.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let plates: Vec<String> = plates.to_vec();
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT alias_plate, canonical_plate FROM plate_aliases \
+             WHERE alias_plate = ANY($1)",
+            &[&plates],
+        )
+        .await
+        .context("resolve_plate_aliases")?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("alias_plate"), r.get("canonical_plate")))
+        .collect())
+}
+
+/// The canonical plate `plate` (already normalized) counts as: its alias
+/// target, or `plate` itself when it is not an alias.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn resolve_plate_alias(pool: &Pool, plate: &str) -> Result<String> {
+    let one = [plate.to_owned()];
+    Ok(resolve_plate_aliases(pool, &one)
+        .await?
+        .remove(plate)
+        .unwrap_or_else(|| plate.to_owned()))
+}
+
+/// Every `(alias, canonical)` pair whose canonical plate is in `canonicals`.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn plate_aliases_of(pool: &Pool, canonicals: &[String]) -> Result<Vec<(String, String)>> {
+    if canonicals.is_empty() {
+        return Ok(vec![]);
+    }
+    let canonicals: Vec<String> = canonicals.to_vec();
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT alias_plate, canonical_plate FROM plate_aliases \
+             WHERE canonical_plate = ANY($1) ORDER BY alias_plate",
+            &[&canonicals],
+        )
+        .await
+        .context("plate_aliases_of")?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("alias_plate"), r.get("canonical_plate")))
+        .collect())
+}
+
+/// Reads stored under each of `plates` exactly (the raw OCR string, no alias
+/// resolution), counting only `camera_ids` (`None` = every camera). Plates
+/// with no visible reads are absent.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn plate_raw_read_counts(
+    pool: &Pool,
+    plates: &[String],
+    camera_ids: Option<&[Uuid]>,
+) -> Result<std::collections::HashMap<String, i64>> {
+    if plates.is_empty() || camera_ids.is_some_and(<[Uuid]>::is_empty) {
+        return Ok(std::collections::HashMap::new());
+    }
+    let plates: Vec<String> = plates.to_vec();
+    let cams: Option<Vec<Uuid>> = camera_ids.map(<[Uuid]>::to_vec);
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT plate, count(*)::bigint AS n FROM plate_reads \
+             WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
+             GROUP BY plate",
+            &[&plates, &cams],
+        )
+        .await
+        .context("plate_raw_read_counts")?;
+    Ok(rows.iter().map(|r| (r.get("plate"), r.get("n"))).collect())
+}
+
+/// Outcome of [`create_plate_alias`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlateAliasWrite {
+    /// Stored. `alias.canonical_plate` may differ from the requested one when
+    /// the request named a plate that is itself an alias (chains are
+    /// flattened). `moved` lists aliases that pointed at the new alias and
+    /// were re-pointed to its canonical plate.
+    Saved {
+        alias: PlateAlias,
+        moved: Vec<String>,
+    },
+    /// A plate normalized to empty, or alias and canonical are the same plate.
+    Invalid,
+}
+
+/// Record that reads of `alias` count as `canonical` (issue #673). Both are
+/// normalized here. Keeps the table one level deep under an advisory lock:
+///
+/// * `canonical` that is itself an alias of X: store `alias -> X`.
+/// * `canonical` that is an alias of `alias` (the reverse of an existing
+///   correction): swap them, `alias` becomes the misread.
+/// * aliases that pointed at `alias` move to the new canonical plate.
+/// * re-correcting an existing alias edits its row.
+///
+/// Raw `plate_reads` are never touched.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub async fn create_plate_alias(
+    pool: &Pool,
+    alias: &str,
+    canonical: &str,
+    created_by: Option<Uuid>,
+) -> Result<PlateAliasWrite> {
+    let alias = normalize_plate(alias);
+    let canonical = normalize_plate(canonical);
+    if alias.is_empty() || canonical.is_empty() || alias == canonical {
+        return Ok(PlateAliasWrite::Invalid);
+    }
+    let mut client = get_conn(pool).await?;
+    let tx = client
+        .transaction()
+        .await
+        .context("create_plate_alias: begin")?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('crumb:plate_aliases'))",
+        &[],
+    )
+    .await
+    .context("create_plate_alias: lock")?;
+
+    let canonical_target: Option<String> = tx
+        .query_opt(
+            "SELECT canonical_plate FROM plate_aliases WHERE alias_plate = $1",
+            &[&canonical],
+        )
+        .await
+        .context("create_plate_alias: resolve")?
+        .map(|r| r.get("canonical_plate"));
+    let target = match canonical_target {
+        // Reversing an existing correction: drop the old direction.
+        Some(t) if t == alias => {
+            tx.execute(
+                "DELETE FROM plate_aliases WHERE alias_plate = $1",
+                &[&canonical],
+            )
+            .await
+            .context("create_plate_alias: swap")?;
+            canonical
+        }
+        Some(t) => t,
+        None => canonical,
+    };
+
+    let moved: Vec<String> = tx
+        .query(
+            "UPDATE plate_aliases SET canonical_plate = $2 \
+             WHERE canonical_plate = $1 RETURNING alias_plate",
+            &[&alias, &target],
+        )
+        .await
+        .context("create_plate_alias: re-point")?
+        .iter()
+        .map(|r| r.get("alias_plate"))
+        .collect();
+
+    tx.execute(
+        "INSERT INTO plate_aliases (alias_plate, canonical_plate, created_by) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (alias_plate) DO UPDATE SET \
+           canonical_plate = EXCLUDED.canonical_plate, \
+           created_by = EXCLUDED.created_by, \
+           created_at = now()",
+        &[&alias, &target, &created_by],
+    )
+    .await
+    .context("create_plate_alias: insert")?;
+    let row = tx
+        .query_one(
+            &format!("{PLATE_ALIAS_SELECT} WHERE a.alias_plate = $1"),
+            &[&alias],
+        )
+        .await
+        .context("create_plate_alias: read back")?;
+    let saved = plate_alias_from_row(&row);
+    tx.commit().await.context("create_plate_alias: commit")?;
+    let mut moved = moved;
+    moved.sort_unstable();
+    Ok(PlateAliasWrite::Saved {
+        alias: saved,
+        moved,
+    })
+}
+
+/// Undo a correction: reads of `alias` count as themselves again. Normalizes
+/// `alias`. Returns whether a row was deleted.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn delete_plate_alias(pool: &Pool, alias: &str) -> Result<bool> {
+    let alias = normalize_plate(alias);
+    if alias.is_empty() {
+        return Ok(false);
+    }
+    let client = get_conn(pool).await?;
+    let n = client
+        .execute(
+            "DELETE FROM plate_aliases WHERE alias_plate = $1",
+            &[&alias],
+        )
+        .await
+        .context("delete_plate_alias")?;
+    Ok(n > 0)
+}
+
+/// One likely correction target from [`suggest_plate_corrections`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlateCorrectionSuggestion {
+    /// A canonical plate (never an alias).
+    pub plate: String,
+    /// Visible reads that count as this plate (its own plus its aliases').
+    pub reads: i64,
+    /// Smallest OCR-aware edit distance between the input and the plate or
+    /// one of its aliases (`O`/`0`-style confusions are free, see
+    /// [`levenshtein`]).
+    pub distance: usize,
+    /// The plate's resolved name, if any.
+    pub display_name: Option<String>,
+}
+
+/// Largest edit distance [`suggest_plate_corrections`] offers.
+pub const PLATE_SUGGEST_MAX_EDITS: usize = 2;
+
+/// Existing plates that `plate` (already normalized) is probably a misread
+/// of: plates with visible reads (on `camera_ids`, `None` = every camera)
+/// within [`PLATE_SUGGEST_MAX_EDITS`] edits under the same OCR-confusable-aware
+/// distance as watchlist matching. Candidates are folded onto their canonical
+/// plate, and the input's own canonical plate is excluded. Closest first, then
+/// most reads, at most `limit`.
+///
+/// Scans the distinct plates in scope whose length is within the edit budget
+/// (bounded by plate retention); it backs an interactive admin dialog, not a
+/// hot path.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub async fn suggest_plate_corrections(
+    pool: &Pool,
+    plate: &str,
+    camera_ids: Option<&[Uuid]>,
+    limit: usize,
+) -> Result<Vec<PlateCorrectionSuggestion>> {
+    if plate.is_empty() || camera_ids.is_some_and(<[Uuid]>::is_empty) {
+        return Ok(vec![]);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let len = plate.chars().count() as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let budget = PLATE_SUGGEST_MAX_EDITS as i32;
+    let cams: Option<Vec<Uuid>> = camera_ids.map(<[Uuid]>::to_vec);
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT plate, count(*)::bigint AS n FROM plate_reads \
+             WHERE length(plate) BETWEEN $2 AND $3 \
+               AND ($1::uuid[] IS NULL OR camera_id = ANY($1)) \
+             GROUP BY plate",
+            &[&cams, &(len - budget), &(len + budget)],
+        )
+        .await
+        .context("suggest_plate_corrections: candidates")?;
+    let near: Vec<(String, i64, usize)> = rows
+        .iter()
+        .filter_map(|r| {
+            let p: String = r.get("plate");
+            let d = levenshtein(plate, &p);
+            (p != plate && d <= PLATE_SUGGEST_MAX_EDITS).then(|| (p, r.get("n"), d))
+        })
+        .collect();
+    if near.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Fold candidates onto their canonical plates; never suggest the input's
+    // own canonical plate (it already counts as that).
+    let mut lookup: Vec<String> = near.iter().map(|(p, _, _)| p.clone()).collect();
+    lookup.push(plate.to_owned());
+    let resolved = resolve_plate_aliases(pool, &lookup).await?;
+    let own = resolved
+        .get(plate)
+        .cloned()
+        .unwrap_or_else(|| plate.to_owned());
+    let mut folded: std::collections::BTreeMap<String, (i64, usize)> =
+        std::collections::BTreeMap::new();
+    for (p, n, d) in near {
+        let canon = resolved.get(&p).cloned().unwrap_or(p);
+        if canon == own || canon == plate {
+            continue;
+        }
+        let e = folded.entry(canon).or_insert((0, usize::MAX));
+        e.0 += n;
+        e.1 = e.1.min(d);
+    }
+    if folded.is_empty() {
+        return Ok(vec![]);
+    }
+    // A canonical plate's reads also include its aliases outside the edit
+    // budget, so count its whole group.
+    let canonicals: Vec<String> = folded.keys().cloned().collect();
+    let groups = plate_aliases_of(pool, &canonicals).await?;
+    let mut members: Vec<String> = canonicals.clone();
+    members.extend(groups.iter().map(|(a, _)| a.clone()));
+    let counts = plate_raw_read_counts(pool, &members, camera_ids).await?;
+    for (canon, entry) in &mut folded {
+        let mut total = counts.get(canon).copied().unwrap_or(0);
+        for (a, c) in &groups {
+            if c == canon {
+                total += counts.get(a).copied().unwrap_or(0);
+            }
+        }
+        entry.0 = entry.0.max(total);
+    }
+    let names = plate_display_names(pool, &canonicals).await?;
+
+    let mut out: Vec<PlateCorrectionSuggestion> = folded
+        .into_iter()
+        .map(|(p, (reads, distance))| PlateCorrectionSuggestion {
+            display_name: names.get(&p).cloned(),
+            plate: p,
+            reads,
+            distance,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.distance
+            .cmp(&b.distance)
+            .then_with(|| b.reads.cmp(&a.reads))
+            .then_with(|| a.plate.cmp(&b.plate))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+/// The resolved human-readable name for each of `plates` (already
+/// normalized) that has one: `COALESCE(plate_labels.label,
+/// lpr_watchlist.label)`, the same precedence as the read path.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn plate_display_names(
+    pool: &Pool,
+    plates: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    if plates.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let plates: Vec<String> = plates.to_vec();
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            "SELECT p, COALESCE( \
+               (SELECT pl.label FROM plate_labels pl WHERE pl.plate = p), \
+               (SELECT w.label FROM lpr_watchlist w WHERE w.plate = p)) AS name \
+             FROM unnest($1::text[]) AS p",
+            &[&plates],
+        )
+        .await
+        .context("plate_display_names")?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let p: String = r.get("p");
+            r.get::<_, Option<String>>("name").map(|n| (p, n))
+        })
+        .collect())
+}
+
 /// Levenshtein edit distance between two strings, counted over Unicode `char`s
 /// (classic two-row dynamic program). Plates are short, so the O(a·b) cost is
 /// negligible. This is the core of the character-tolerance watchlist/ignore
@@ -9776,6 +10225,9 @@ pub async fn pg_trgm_available(pool: &Pool) -> bool {
 /// Returns an error if the query fails.
 pub async fn is_plate_ignored(pool: &Pool, plate: &str, fuzz: f32) -> Result<bool> {
     let read = normalize_plate(plate);
+    // A corrected misread (migration 0084) is also checked as its canonical
+    // plate, so ignoring a plate ignores its known misreads too.
+    let canonical = resolve_plate_alias(pool, &read).await?;
     let client = get_conn(pool).await?;
     let rows = client
         .query("SELECT plate FROM lpr_watchlist WHERE kind = 'ignore'", &[])
@@ -9783,7 +10235,9 @@ pub async fn is_plate_ignored(pool: &Pool, plate: &str, fuzz: f32) -> Result<boo
         .context("is_plate_ignored")?;
     Ok(rows.iter().any(|row| {
         let entry: String = row.get("plate");
-        levenshtein(&read, &normalize_plate(&entry)) <= allowed_edits(&entry, fuzz)
+        let norm = normalize_plate(&entry);
+        let allowed = allowed_edits(&entry, fuzz);
+        levenshtein(&read, &norm) <= allowed || levenshtein(&canonical, &norm) <= allowed
     }))
 }
 
@@ -9803,6 +10257,9 @@ pub async fn match_watchlist(
     fuzz: f32,
 ) -> Result<Option<PlateWatchlistEntry>> {
     let read = normalize_plate(plate);
+    // A corrected misread (migration 0084) also matches as its canonical
+    // plate, so a known misread of a watched plate still alerts.
+    let canonical = resolve_plate_alias(pool, &read).await?;
     let client = get_conn(pool).await?;
     let rows = client
         .query(
@@ -9819,7 +10276,7 @@ pub async fn match_watchlist(
         .filter_map(|row| {
             let entry = watchlist_from_row(row);
             let norm = normalize_plate(&entry.plate);
-            let dist = levenshtein(&read, &norm);
+            let dist = levenshtein(&read, &norm).min(levenshtein(&canonical, &norm));
             (dist <= allowed_edits(&entry.plate, fuzz)).then_some((dist, norm, entry))
         })
         .min_by(|(da, na, _), (db, nb, _)| {
@@ -9915,6 +10372,14 @@ pub struct PlateReadQuery {
     pub match_mode: PlateMatch,
     pub limit: i64,
     pub offset: i64,
+    /// Resolve operator plate corrections (`plate_aliases`, migration 0084):
+    /// each read comes back with `plate` = the canonical plate it counts as
+    /// and `corrected_from` = what the engine read, a search matches either
+    /// the raw read or its canonical plate (an exact search for a canonical
+    /// plate also returns its misreads), and the name resolves on the
+    /// canonical plate. `false` returns exactly what the engines read (the A/B
+    /// benchmark scores the engines on their raw output).
+    pub resolve_aliases: bool,
 }
 
 fn plate_read_from_row(row: &tokio_postgres::Row) -> PlateRead {
@@ -9943,6 +10408,7 @@ fn plate_read_from_row(row: &tokio_postgres::Row) -> PlateRead {
         snapshot_url: row.get("snapshot_url"),
         bbox,
         display_name: row.get("display_name"),
+        corrected_from: row.get("corrected_from"),
     }
 }
 
@@ -9959,17 +10425,27 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
     }
     let client = get_conn(pool).await?;
 
-    let mut conds: Vec<String> = vec!["camera_id = ANY($1)".to_owned()];
+    // Plate corrections (migration 0084): `pa` is the read's alias row, NULL
+    // for an uncorrected read. A LEFT JOIN on the alias primary key cannot fan
+    // out the result. With resolution off, `pa` is an always-NULL stand-in so
+    // every expression below stays the same and reduces to the raw plate.
+    let from = if q.resolve_aliases {
+        "plate_reads LEFT JOIN plate_aliases pa ON pa.alias_plate = plate_reads.plate"
+    } else {
+        "plate_reads LEFT JOIN (SELECT NULL::text AS canonical_plate) pa ON false"
+    };
+
+    let mut conds: Vec<String> = vec!["plate_reads.camera_id = ANY($1)".to_owned()];
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&q.camera_ids];
     let mut n = 1;
     if let Some(ref s) = q.start {
         n += 1;
-        conds.push(format!("ts >= ${n}"));
+        conds.push(format!("plate_reads.ts >= ${n}"));
         params.push(s);
     }
     if let Some(ref e) = q.end {
         n += 1;
-        conds.push(format!("ts < ${n}"));
+        conds.push(format!("plate_reads.ts < ${n}"));
         params.push(e);
     }
     // pg_trgm may be absent on an external BYO-Postgres (migration 0051 guards
@@ -9981,23 +10457,43 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
     } else {
         q.match_mode
     };
-    let mut order = "ts DESC".to_owned();
+    let mut order = "plate_reads.ts DESC".to_owned();
     if let Some(ref plate) = q.plate {
         n += 1;
+        // Every mode matches the raw read OR the canonical plate it was
+        // corrected to (`pa.canonical_plate` is NULL when uncorrected or when
+        // resolution is off, so that arm is simply false).
         match match_mode {
-            PlateMatch::Exact => conds.push(format!("plate = ${n}")),
-            PlateMatch::Prefix => conds.push(format!("plate LIKE ${n} || '%'")),
-            PlateMatch::Contains => conds.push(format!("plate LIKE '%' || ${n} || '%'")),
+            // Exact stays an index lookup on (plate, ts): the plate itself
+            // plus the strings corrected to it.
+            PlateMatch::Exact if q.resolve_aliases => conds.push(format!(
+                "plate_reads.plate = ANY(ARRAY[${n}::text] || ARRAY( \
+                   SELECT a.alias_plate FROM plate_aliases a WHERE a.canonical_plate = ${n}))"
+            )),
+            PlateMatch::Exact => conds.push(format!("plate_reads.plate = ${n}")),
+            PlateMatch::Prefix => conds.push(format!(
+                "(plate_reads.plate LIKE ${n} || '%' OR pa.canonical_plate LIKE ${n} || '%')"
+            )),
+            PlateMatch::Contains => conds.push(format!(
+                "(plate_reads.plate LIKE '%' || ${n} || '%' \
+                  OR pa.canonical_plate LIKE '%' || ${n} || '%')"
+            )),
             PlateMatch::Fuzzy => {
-                conds.push(format!("plate % ${n}"));
-                order = format!("similarity(plate, ${n}) DESC, ts DESC");
+                conds.push(format!(
+                    "(plate_reads.plate % ${n} OR pa.canonical_plate % ${n})"
+                ));
+                order = format!(
+                    "GREATEST(similarity(plate_reads.plate, ${n}), \
+                              COALESCE(similarity(pa.canonical_plate, ${n}), 0)) DESC, \
+                     plate_reads.ts DESC"
+                );
             }
         }
         params.push(plate);
     }
     let where_clause = conds.join(" AND ");
 
-    let count_sql = format!("SELECT COUNT(*)::bigint AS cnt FROM plate_reads WHERE {where_clause}");
+    let count_sql = format!("SELECT COUNT(*)::bigint AS cnt FROM {from} WHERE {where_clause}");
     let total: i64 = client
         .query_one(&count_sql, &params)
         .await
@@ -10006,18 +10502,28 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
 
     let limit_idx = n + 1;
     let offset_idx = n + 2;
-    // display_name (issue #363): resolve a human-readable name for the plate as
-    // COALESCE(plate_labels.label, lpr_watchlist.label) on the normalized plate,
-    // via two correlated scalar subqueries. Both are unique on `plate`, so each
-    // yields at most one row and cannot fan out the result set.
+    // display_name (issue #363): the human-readable name for the plate, via
+    // correlated scalar subqueries on tables that are unique on `plate`, so
+    // none can fan out the result. With a correction (issue #673) the name
+    // resolves on the canonical plate first, then falls back to a name the
+    // operator had given the misread string; first-class names beat watchlist
+    // labels either way. Uncorrected reads reduce to the original
+    // COALESCE(plate_labels.label, lpr_watchlist.label) on the plate.
     let list_sql = format!(
-        "SELECT id, camera_id, ts, plate, plate_raw, confidence, region, source_id, event_id, \
-         snapshot_url, bbox_x1, bbox_y1, bbox_x2, bbox_y2, \
+        "SELECT plate_reads.id, plate_reads.camera_id, plate_reads.ts, \
+         COALESCE(pa.canonical_plate, plate_reads.plate) AS plate, \
+         CASE WHEN pa.canonical_plate IS NULL THEN NULL ELSE plate_reads.plate END \
+           AS corrected_from, \
+         plate_reads.plate_raw, plate_reads.confidence, plate_reads.region, \
+         plate_reads.source_id, plate_reads.event_id, plate_reads.snapshot_url, \
+         plate_reads.bbox_x1, plate_reads.bbox_y1, plate_reads.bbox_x2, plate_reads.bbox_y2, \
          COALESCE( \
+           (SELECT pl.label FROM plate_labels pl WHERE pl.plate = pa.canonical_plate), \
            (SELECT pl.label FROM plate_labels pl WHERE pl.plate = plate_reads.plate), \
+           (SELECT w.label FROM lpr_watchlist w WHERE w.plate = pa.canonical_plate), \
            (SELECT w.label FROM lpr_watchlist w WHERE w.plate = plate_reads.plate) \
          ) AS display_name \
-         FROM plate_reads WHERE {where_clause} \
+         FROM {from} WHERE {where_clause} \
          ORDER BY {order} LIMIT ${limit_idx} OFFSET ${offset_idx}"
     );
     params.push(&q.limit);
@@ -10082,21 +10588,29 @@ pub async fn lpr_overview(
     let cams: Option<Vec<Uuid>> = camera_ids.map(<[Uuid]>::to_vec);
     let client = get_conn(pool).await?;
     // `today` is bounded by the ts index; `hist` only looks at the plates read
-    // today, through the (plate, ts) index from migration 0083.
+    // today, through the (plate, ts) index from migration 0083. Plate
+    // corrections (migration 0084) are resolved: a misread counts as its
+    // canonical plate (`today`), and a plate's history and watchlist status
+    // include its aliases (`members` = each canonical plate plus its aliases).
     let row = client
         .query_one(
             "WITH today AS ( \
-               SELECT plate, count(*)::bigint AS n FROM plate_reads \
-               WHERE ts >= $1 AND ts < $2 AND ($3::uuid[] IS NULL OR camera_id = ANY($3)) \
-               GROUP BY plate \
+               SELECT COALESCE(pa.canonical_plate, r.plate) AS plate, count(*)::bigint AS n \
+               FROM plate_reads r LEFT JOIN plate_aliases pa ON pa.alias_plate = r.plate \
+               WHERE r.ts >= $1 AND r.ts < $2 AND ($3::uuid[] IS NULL OR r.camera_id = ANY($3)) \
+               GROUP BY 1 \
+             ), members AS ( \
+               SELECT plate AS member, plate AS canon FROM today \
+               UNION ALL \
+               SELECT a.alias_plate, a.canonical_plate \
+               FROM plate_aliases a JOIN today t ON t.plate = a.canonical_plate \
              ), hist AS ( \
-               SELECT r.plate, \
+               SELECT m.canon AS plate, \
                       count(*) FILTER (WHERE r.ts >= $4)::bigint AS n30, \
                       min(r.ts) AS first_seen \
-               FROM plate_reads r \
-               WHERE r.plate IN (SELECT plate FROM today) AND r.ts < $2 \
-                 AND ($3::uuid[] IS NULL OR r.camera_id = ANY($3)) \
-               GROUP BY r.plate \
+               FROM plate_reads r JOIN members m ON m.member = r.plate \
+               WHERE r.ts < $2 AND ($3::uuid[] IS NULL OR r.camera_id = ANY($3)) \
+               GROUP BY m.canon \
              ) \
              SELECT \
                COALESCE((SELECT sum(n) FROM today), 0)::bigint AS reads, \
@@ -10104,8 +10618,9 @@ pub async fn lpr_overview(
                count(*) FILTER (WHERE h.first_seen >= $1)::bigint AS new_plates, \
                count(*) FILTER (WHERE h.first_seen < $1 AND h.n30 >= $5)::bigint AS regulars, \
                count(*) FILTER (WHERE h.first_seen < $1 AND h.n30 < $5)::bigint AS returning, \
-               COALESCE((SELECT sum(t.n) FROM today t \
-                         JOIN lpr_watchlist w ON w.plate = t.plate AND w.kind = 'watch'), 0)::bigint \
+               COALESCE((SELECT sum(t.n) FROM today t WHERE EXISTS ( \
+                           SELECT 1 FROM lpr_watchlist w JOIN members m ON m.member = w.plate \
+                           WHERE w.kind = 'watch' AND m.canon = t.plate)), 0)::bigint \
                  AS watchlist_hits \
              FROM hist h",
             &[
@@ -10147,6 +10662,11 @@ pub struct PlateHistoryStats {
 
 /// Per-plate history for a bounded set of (already normalized) plates.
 ///
+/// Plate corrections are resolved (migration 0084): a requested misread is
+/// answered under its canonical plate, and a canonical plate's history
+/// includes every read stored under its aliases. The result is keyed (and
+/// ordered) by canonical plate, one entry per distinct canonical plate.
+///
 /// Counts only reads on `camera_ids` (`None` = every camera, for admins;
 /// `Some(&[])` = nothing). `tz` is the IANA zone the hour and day buckets are
 /// computed in; `window_start` is the UTC start of local day `today - 29` and
@@ -10169,57 +10689,100 @@ pub async fn lpr_plate_stats(
     if plates.is_empty() || camera_ids.is_some_and(<[Uuid]>::is_empty) {
         return Ok(vec![]);
     }
-    let plates: Vec<String> = plates.to_vec();
     let cams: Option<Vec<Uuid>> = camera_ids.map(<[Uuid]>::to_vec);
     let client = get_conn(pool).await?;
 
+    // Plate corrections (migration 0084): a requested misread resolves to its
+    // canonical plate, and each canonical plate's history includes the reads
+    // stored under its aliases. `canon_of` maps every stored plate string we
+    // query (`members`) to the canonical plate its reads are counted under.
+    let resolved = resolve_plate_aliases(pool, plates).await?;
+    let mut canonicals: Vec<String> = plates
+        .iter()
+        .map(|p| resolved.get(p).cloned().unwrap_or_else(|| p.clone()))
+        .collect();
+    canonicals.sort_unstable();
+    canonicals.dedup();
+    let mut canon_of: std::collections::HashMap<String, String> =
+        canonicals.iter().map(|c| (c.clone(), c.clone())).collect();
+    for (alias, canon) in plate_aliases_of(pool, &canonicals).await? {
+        canon_of.insert(alias, canon);
+    }
+    let members: Vec<String> = canon_of.keys().cloned().collect();
+
+    // Every query below groups by the STORED plate (so it stays an index scan
+    // on `plate = ANY($1)`); the per-member rows are then folded into their
+    // canonical plate here.
     let base = client
         .query(
             "SELECT plate, count(*)::bigint AS total, min(ts) AS first_seen, \
                     max(ts) AS last_seen, max(ts) FILTER (WHERE ts < $3) AS prev_seen \
              FROM plate_reads \
              WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
-             GROUP BY plate ORDER BY plate",
-            &[&plates, &cams, &today_start],
+             GROUP BY plate",
+            &[&members, &cams, &today_start],
         )
         .await
         .context("lpr_plate_stats: totals")?;
-    let mut out: Vec<PlateHistoryStats> = base
-        .iter()
-        .map(|r| PlateHistoryStats {
-            plate: r.get("plate"),
-            total: r.get("total"),
-            first_seen: r.get("first_seen"),
-            last_seen: r.get("last_seen"),
-            prev_seen: r.get("prev_seen"),
-            cameras: vec![],
-            hours: [0; 24],
-            days: [0; LPR_STATS_DAYS],
-        })
-        .collect();
-    if out.is_empty() {
-        return Ok(out);
+    let mut by_canon: std::collections::BTreeMap<String, PlateHistoryStats> =
+        std::collections::BTreeMap::new();
+    for r in &base {
+        let member: String = r.get("plate");
+        let Some(canon) = canon_of.get(&member) else {
+            continue;
+        };
+        let total: i64 = r.get("total");
+        let first_seen: DateTime<Utc> = r.get("first_seen");
+        let last_seen: DateTime<Utc> = r.get("last_seen");
+        let prev_seen: Option<DateTime<Utc>> = r.get("prev_seen");
+        by_canon
+            .entry(canon.clone())
+            .and_modify(|s| {
+                s.total += total;
+                s.first_seen = s.first_seen.min(first_seen);
+                s.last_seen = s.last_seen.max(last_seen);
+                s.prev_seen = s.prev_seen.max(prev_seen);
+            })
+            .or_insert_with(|| PlateHistoryStats {
+                plate: canon.clone(),
+                total,
+                first_seen,
+                last_seen,
+                prev_seen,
+                cameras: vec![],
+                hours: [0; 24],
+                days: [0; LPR_STATS_DAYS],
+            });
     }
-    let idx: std::collections::HashMap<String, usize> = out
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.plate.clone(), i))
-        .collect();
+    if by_canon.is_empty() {
+        return Ok(vec![]);
+    }
 
     let cams_rows = client
         .query(
             "SELECT plate, camera_id, count(*)::bigint AS n FROM plate_reads \
              WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
-             GROUP BY plate, camera_id ORDER BY plate, n DESC, camera_id",
-            &[&plates, &cams],
+             GROUP BY plate, camera_id",
+            &[&members, &cams],
         )
         .await
         .context("lpr_plate_stats: cameras")?;
     for r in &cams_rows {
-        let plate: String = r.get("plate");
-        if let Some(&i) = idx.get(&plate) {
-            out[i].cameras.push((r.get("camera_id"), r.get("n")));
+        let member: String = r.get("plate");
+        let Some(s) = canon_of.get(&member).and_then(|c| by_canon.get_mut(c)) else {
+            continue;
+        };
+        let camera_id: Uuid = r.get("camera_id");
+        let n: i64 = r.get("n");
+        match s.cameras.iter_mut().find(|(id, _)| *id == camera_id) {
+            Some(entry) => entry.1 += n,
+            None => s.cameras.push((camera_id, n)),
         }
+    }
+    for s in by_canon.values_mut() {
+        // Most reads first, ties by camera id (deterministic).
+        s.cameras
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     }
 
     let hour_rows = client
@@ -10228,16 +10791,19 @@ pub async fn lpr_plate_stats(
              FROM plate_reads \
              WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
              GROUP BY 1, 2",
-            &[&plates, &cams, &tz],
+            &[&members, &cams, &tz],
         )
         .await
         .context("lpr_plate_stats: hours")?;
     for r in &hour_rows {
-        let plate: String = r.get("plate");
+        let member: String = r.get("plate");
         let h: i32 = r.get("h");
-        if let (Some(&i), Ok(h)) = (idx.get(&plate), usize::try_from(h)) {
+        if let (Some(s), Ok(h)) = (
+            canon_of.get(&member).and_then(|c| by_canon.get_mut(c)),
+            usize::try_from(h),
+        ) {
             if h < 24 {
-                out[i].hours[h] += r.get::<_, i64>("n");
+                s.hours[h] += r.get::<_, i64>("n");
             }
         }
     }
@@ -10250,20 +10816,23 @@ pub async fn lpr_plate_stats(
              FROM plate_reads \
              WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) AND ts >= $4 \
              GROUP BY 1, 2",
-            &[&plates, &cams, &tz, &window_start],
+            &[&members, &cams, &tz, &window_start],
         )
         .await
         .context("lpr_plate_stats: days")?;
     for r in &day_rows {
-        let plate: String = r.get("plate");
+        let member: String = r.get("plate");
         let d: i32 = r.get("d");
-        if let (Some(&i), Ok(d)) = (idx.get(&plate), usize::try_from(d)) {
+        if let (Some(s), Ok(d)) = (
+            canon_of.get(&member).and_then(|c| by_canon.get_mut(c)),
+            usize::try_from(d),
+        ) {
             if d < LPR_STATS_DAYS {
-                out[i].days[d] += r.get::<_, i64>("n");
+                s.days[d] += r.get::<_, i64>("n");
             }
         }
     }
-    Ok(out)
+    Ok(by_canon.into_values().collect())
 }
 
 // ─── LPR A/B benchmark (lpr_pass_truth, migration 0070) ─────────────────────
@@ -11715,6 +12284,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0083_plate_reads_plate_ts_index.sql",
         include_str!("../../../db/migrations/0083_plate_reads_plate_ts_index.sql"),
+    ),
+    (
+        "0084_plate_aliases.sql",
+        include_str!("../../../db/migrations/0084_plate_aliases.sql"),
     ),
 ];
 
@@ -15900,6 +16473,7 @@ mod tests {
                 match_mode: PlateMatch::Exact,
                 limit: 10,
                 offset: 0,
+                resolve_aliases: true,
             },
         )
         .await
