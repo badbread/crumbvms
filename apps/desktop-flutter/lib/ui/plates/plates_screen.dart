@@ -1370,8 +1370,11 @@ class _PlatesScreenState extends State<PlatesScreen> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
           SizedBox(
-            width: 260,
+            // Same 34 px height, radius and fill as the _ToolGroup tiles.
+            width: 240,
+            height: 34,
             child: TextField(
+              textAlignVertical: TextAlignVertical.center,
               controller: _searchController,
               onChanged: _onSearchChanged,
               onSubmitted: (_) {
@@ -1383,10 +1386,14 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 isDense: true,
                 hintText: 'Search plate…',
                 hintStyle: const TextStyle(color: Colors.white38, fontSize: 13),
-                prefixIcon: const Icon(Icons.search, size: 18, color: Colors.white38),
+                prefixIcon: const Icon(Icons.search, size: 16, color: Colors.white38),
+                prefixIconConstraints: const BoxConstraints(minWidth: 32, minHeight: 34),
+                suffixIconConstraints: const BoxConstraints(minWidth: 30, minHeight: 34),
                 suffixIcon: _query.isEmpty
                     ? null
                     : IconButton(
+                        padding: EdgeInsets.zero,
+                        visualDensity: VisualDensity.compact,
                         icon: const Icon(Icons.clear, size: 16, color: Colors.white38),
                         onPressed: () {
                           _searchController.clear();
@@ -1395,10 +1402,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
                         },
                       ),
                 filled: true,
-                fillColor: const Color(0xFF2A2D35),
-                contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                fillColor: const Color(0xFF26292F),
+                contentPadding: EdgeInsets.zero,
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(6),
+                  borderRadius: BorderRadius.circular(8),
                   borderSide: BorderSide.none,
                 ),
               ),
