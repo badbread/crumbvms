@@ -31,6 +31,10 @@ double _cardExtent(bool tall, {bool named = false}) =>
     (named ? _kCardNameLine : 0) +
     10;
 
+/// Height of the hover action strip at the top of a card's frame; the
+/// magnifier stays off while the pointer is in it.
+const double _kActionStrip = 34;
+
 /// Largest inset width as a fraction of the card width, per size.
 double _insetFraction(PlateCropSize s) => switch (s) {
   PlateCropSize.small => 0.30,
@@ -513,14 +517,8 @@ class _SheetCardState extends State<_SheetCard> {
               right: (widget.showInset && top && left) ? 8 : null,
               child: _badge('x${hints.todayCount} today'),
             ),
-          if (_hover && p == null)
-            Positioned(
-              top: 6,
-              left: 0,
-              right: 0,
-              child: Center(child: _hoverActions(read)),
-            ),
-          if (p != null && frame != null)
+          // No magnifier over the action strip, so its buttons stay usable.
+          if (p != null && frame != null && p.dy > _kActionStrip)
             Positioned(
               left: (p.dx - loupeD / 2).clamp(0.0, w - loupeD),
               top: (p.dy - loupeD - 8).clamp(0.0, _kCardFrameHeight - loupeD),
@@ -562,6 +560,13 @@ class _SheetCardState extends State<_SheetCard> {
                   ),
                 ),
               ),
+            ),
+          if (_hover)
+            Positioned(
+              top: 6,
+              left: 0,
+              right: 0,
+              child: Center(child: _hoverActions(read)),
             ),
         ],
       ),
