@@ -2,6 +2,7 @@
 
 package video.crumb.app.feature.playback
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
@@ -70,6 +71,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -954,6 +959,19 @@ fun PlaybackScreen(
                                 )
                             }
                         }
+                        // Sprite-strip tile (1 s granularity) drawn over the 4 s-grid
+                        // filmstrip frame wherever the server has pre-generated one
+                        // for the segment under the finger (see ScrubSprites.kt).
+                        val spriteTile = state.scrubSprite
+                        if (state.scrubbing && spriteTile != null) {
+                            val painter = remember(spriteTile) { spriteTilePainter(spriteTile) }
+                            Image(
+                                painter = painter,
+                                contentDescription = "Scrub preview",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize().background(Color.Black),
+                            )
+                        }
                         // Warm the frames just ahead of the finger into Coil's
                         // memory/disk cache so the next cells it reaches are hits
                         // (no round-trip, no blank). The VM plans which frames
@@ -1504,4 +1522,11 @@ private fun cropToViewport(bitmap: android.graphics.Bitmap, transform: ViewTrans
         android.util.Log.w("Snapshot", "viewport crop failed; saving full frame", e)
         bitmap
     }
+}
+
+/** Painter for one tile of a scrub sprite strip (crops the strip, no copy). */
+private fun spriteTilePainter(tile: SpriteTile<android.graphics.Bitmap>): BitmapPainter {
+    val bmp = tile.sprite.image
+    val (x, y, w, h) = tile.sprite.layout.tileRect(tile.index, bmp.width, bmp.height).toList()
+    return BitmapPainter(bmp.asImageBitmap(), IntOffset(x, y), IntSize(w.coerceAtLeast(1), h.coerceAtLeast(1)))
 }

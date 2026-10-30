@@ -2,6 +2,8 @@
 
 package video.crumb.app.feature.playback
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import video.crumb.app.data.DetectionEvent
@@ -13,7 +15,9 @@ import video.crumb.app.data.isNotFound
 import video.crumb.app.data.runCatchingCancellable
 import video.crumb.app.data.toUserMessage
 import video.crumb.app.ui.Time
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -95,6 +99,12 @@ data class PlaybackUiState(
     /** True while the drag is inside the loaded segment, so the live player
      *  itself is the preview and the filmstrip overlay is hidden. */
     val scrubInLoadedSegment: Boolean = false,
+    /**
+     * Tile of a pre-generated sprite strip covering the scrub position (1 s
+     * granularity), drawn over the filmstrip frame when present. Null when no
+     * sprite covers it (not generated on the server yet): the frame shows.
+     */
+    val scrubSprite: SpriteTile<Bitmap>? = null,
     val jumpInProgress: Boolean = false,
     /**
      * True from the moment a USER-INITIATED seek starts until its segment
@@ -170,6 +180,9 @@ internal const val SCRUB_FRAME_WIDTH = 480
 internal const val SCRUB_PREFETCH_AHEAD = 3
 /** Frames behind the finger to warm (a small reversal stays instant). */
 internal const val SCRUB_PREFETCH_BEHIND = 1
+
+/** Sprite requests allowed in flight (the one under the finger + those ahead). */
+internal const val SPRITE_INFLIGHT_MAX = 3
 
 /**
  * Pure prefetch plan for the scrub overlay: the frames adjacent to [nearestIdx]
@@ -366,6 +379,7 @@ class PlaybackViewModel(
         seekJob?.cancel()
         filmstripJob?.cancel()
         prefetchJob?.cancel()
+        spriteCache.clear() // sprites are per camera
         cancelStepWorker() // new camera invalidates the anchor + any in-flight step
         val prev = _state.value
         if (preserveTime && prev.playheadMs > 0L) {
@@ -1173,7 +1187,56 @@ class PlaybackViewModel(
         } else {
             _state.update { it.copy(scrubFrameUrl = null, scrubPrefetchUrls = emptyList()) }
         }
+        showSpriteAt(tsMs, forward)
         loadFilmstrip(tsMs)
+    }
+
+    // ── scrub sprite strips (1 s granularity; see ScrubSprites.kt) ───────────────
+    private val spriteCache = ScrubSpriteCache<Bitmap>()
+    private val spriteInflight = HashSet<Long>()
+
+    /**
+     * Sprite path of [onScrub]: show the tile for [tsMs] if a cached sprite
+     * covers it (and warm the next segments in the direction of travel);
+     * otherwise clear any stale tile and ask the server for the sprite in the
+     * background, unless it recently had none. The filmstrip frame stays the
+     * fallback underneath either way.
+     */
+    private fun showSpriteAt(tsMs: Long, forward: Boolean) {
+        val hit = spriteCache.lookup(tsMs)
+        if (_state.value.scrubSprite != hit) _state.update { it.copy(scrubSprite = hit) }
+        if (hit != null) {
+            spriteCache.probesAhead(hit.sprite.layout, forward).forEach { fetchSprite(it) }
+        } else if (!spriteCache.isKnownMiss(tsMs)) {
+            fetchSprite(tsMs)
+        }
+    }
+
+    private fun fetchSprite(tsMs: Long) {
+        val key = Math.floorDiv(tsMs, SPRITE_MISS_CELL_MS)
+        if (spriteInflight.size >= SPRITE_INFLIGHT_MAX || !spriteInflight.add(key)) return
+        val cam = cameraId
+        viewModelScope.launch {
+            try {
+                val raw = repo.scrubSprite(cam, tsMs)
+                val sprite = raw?.let { (headers, bytes) ->
+                    val layout = SpriteLayout.fromHeaders(headers) ?: return@let null
+                    val bmp = withContext(Dispatchers.Default) {
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    } ?: return@let null
+                    ScrubSprite(layout, bmp)
+                }
+                if (cam != cameraId) return@launch // camera switched meanwhile
+                spriteCache.put(tsMs, sprite)
+                // Judge against where the finger is NOW, not where it was.
+                val s = _state.value
+                if (sprite != null && s.scrubbing && sprite.layout.covers(s.playheadMs)) {
+                    _state.update { it.copy(scrubSprite = spriteCache.lookup(it.playheadMs)) }
+                }
+            } finally {
+                spriteInflight.remove(key)
+            }
+        }
     }
 
     /** Last scrub position, to tell the finger's direction of travel for the
@@ -1207,6 +1270,7 @@ class PlaybackViewModel(
                 // still a state change and still seeks.
                 liveScrubSeek = liveOffset?.let { o -> LiveScrubSeek(o, exact = true, seq = ++liveScrubSeq) },
                 segmentOffsetMs = if (liveOffset != null) -1L else it.segmentOffsetMs,
+                scrubSprite = null,
             )
         }
         val s = _state.value

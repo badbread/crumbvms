@@ -9,9 +9,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import retrofit2.HttpException
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLHandshakeException
 
 /**
@@ -397,6 +402,39 @@ class CrumbRepository(private val container: AppContainer) {
 
     suspend fun filmstrip(cameraId: String, startIso: String, endIso: String, width: Int = 160): Result<List<FilmstripFrame>> =
         runCatchingCancellable { api.filmstrip(cameraId, startIso, endIso, width).frames }
+
+    /**
+     * Plain client for scoped-token media byte fetches. Deliberately NOT the API
+     * client: that one attaches the bearer JWT and treats any 401 as "session
+     * expired, log out", and an expired 15-minute media token must never do that.
+     */
+    private val mediaHttp: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * The pre-generated scrub sprite strip of the segment covering [tsMs]
+     * (`GET /filmstrip/{camera}/sprite`, scoped `?token=`): its response headers
+     * (the tile layout, see `SpriteLayout.fromHeaders`) and JPEG bytes. Null on
+     * anything but a 200: a 404 means "not generated yet" (or no footage) and
+     * the caller keeps using the filmstrip frame.
+     */
+    suspend fun scrubSprite(cameraId: String, tsMs: Long): Pair<Map<String, String>, ByteArray>? =
+        withContext(Dispatchers.IO) {
+            runCatchingCancellable {
+                val ts = android.net.Uri.encode(Time.iso(java.time.Instant.ofEpochMilli(tsMs)))
+                val url = mediaUrls().scopedUrl(cameraId, "/filmstrip/$cameraId/sprite?ts=$ts")
+                mediaHttp.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                    val body = if (resp.code == 200) resp.body?.bytes() else null
+                    body?.let { bytes ->
+                        resp.headers.names().associateWith { resp.header(it).orEmpty() } to bytes
+                    }
+                }
+            }.getOrNull()
+        }
 
     // ── bookmarks (server-shared) ───────────────────────────────────────────────
     /** All bookmarks (newest first) when [cameraId] is null; else one camera's (oldest first). */
