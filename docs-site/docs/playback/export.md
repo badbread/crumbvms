@@ -10,6 +10,22 @@ When you need to hand footage to someone (a neighbor, an insurer, the police),
 Crumb lets you pull the relevant moments out and save them as ordinary video
 files, without giving anyone access to your system.
 
+## Marking the moment you want
+
+The quickest way to start an export is from playback itself. While you are
+reviewing a camera, mark an **in point** and an **out point** on the timeline.
+The marked window is drawn as an amber bracket, and a bar appears under the
+video showing its exact start, end and length, down to the second. Drag either
+end of the bracket to trim it, then press Export and the export opens already
+filled in with that camera and that window, so you are not retyping times you
+just scrubbed to.
+
+On the desktop that mark is a Shift+drag across the timeline. On Android, where
+there is no Shift key, "Set in point" and "Set out point" in the playback
+controls menu place each end at the playhead, and you drag the bracket's handles
+to fine-tune. If you press Export without marking anything, Crumb offers the
+hour ending at wherever you were looking, which you can then adjust.
+
 ## Building an export list
 
 Rather than exporting one clip at a time, Crumb works from a list. As you review

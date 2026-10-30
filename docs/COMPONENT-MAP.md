@@ -298,7 +298,7 @@ is not. The web admin console doubles as the desktop's management surface
 | Live wall / viewing | live section | wall builder, carousels, hotspot, PTZ tiles | `live/` | `Live/` |
 | Playback + timeline | playback section | timeline, scrub, prefetch, zoom, 1 s scrub sprites (`scrub_sprite_cache.dart`) | `playback/` (1 s scrub sprites, `ScrubSprites.kt`) | `Playback/` (scrub sprites deferred: keeps the 4 s filmstrip frames) |
 | Clips | clips section | clips view | `clips/` | `Clips/` |
-| Export (batch: friendly file names, `package` zip/files, `POST /export/estimate`, `GET /export/:job_id/output/:index`; `docs/DECISIONS.md` 2026-10-29) | export section (unchanged, default zip) | export list: package choice + size estimate (desktop half of the same change) | `export/` (unchanged, default zip; friendly names arrive via `Content-Disposition`) | `Export/` (unchanged, default zip) |
+| Export (batch: friendly file names, `package` zip/files, `POST /export/estimate`, `GET /export/:job_id/output/:index`; `docs/DECISIONS.md` 2026-10-29) | export section (unchanged, default zip) | export list: package choice + size estimate; timeline Shift+drag selection → "Export selection" bar | `export/` (single-shot window; in/out bracket on `playback/CenteredTimeline.kt` + seeded `Routes.export(...)`; default zip, friendly names arrive via `Content-Disposition`; batch list still deferred, issue #617) | `Export/` (batch list, default zip) |
 | Bookmarks | bookmarks UI | bookmark UI | `AddBookmarkDialog.kt` (in `ui/`) | `Bookmarks/` |
 | PTZ / imaging | camera controls | on-video PTZ panel (customizable) | `live/` player controls | `Live/` |
 | Motion tuner | tuner section | inline tuner | `tuner/` | `Tuner/` |
