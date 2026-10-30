@@ -174,6 +174,8 @@ class ExportViewModel(private val repo: CrumbRepository) : ViewModel() {
                         _state.update { it.copy(job = job, jobError = null) }
                         if (job.isTerminal) {
                             _state.update { it.copy(polling = false) }
+                            // Cancelled is terminal but user-initiated, not a failure -
+                            // stop polling quietly, no error toast.
                             if (job.isFailed) {
                                 _state.update {
                                     it.copy(jobError = job.error ?: "Export failed.")
