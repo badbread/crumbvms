@@ -33,6 +33,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddAPhoto
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Hd
@@ -95,6 +96,7 @@ import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import video.crumb.app.data.CameraDto
 import video.crumb.app.data.ClipDescriptor
 import video.crumb.app.di.appContainer
 import video.crumb.app.feature.playback.saveFrameToGallery
@@ -119,7 +121,7 @@ fun ClipsScreen(
 ) {
     val container = appContainer()
     val vm: ClipsViewModel = viewModel(
-        factory = viewModelFactory { initializer { ClipsViewModel(container.repository) } },
+        factory = viewModelFactory { initializer { ClipsViewModel(container.repository, container.store) } },
     )
     val state by vm.state.collectAsStateWithLifecycle()
     val mediaUrls = remember { container.mediaUrls() }
@@ -203,8 +205,14 @@ fun ClipsScreen(
             }
             Row(
                 Modifier.padding(horizontal = 12.dp).fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
+                CameraSelector(
+                    cameras = state.cameras,
+                    cameraId = state.cameraId,
+                    onSelect = { vm.setCamera(it) },
+                )
+                Spacer(Modifier.weight(1f))
                 Text(
                     "${state.clips.size} clips",
                     style = MaterialTheme.typography.bodySmall,
@@ -298,6 +306,35 @@ private fun ClipsFilters(
         }
         Spacer(Modifier.weight(1f))
         RangeSelector(hours = hours, onSelect = onHours)
+    }
+}
+
+/** "All cameras" / one-camera dropdown for the Clips feed. */
+@Composable
+private fun CameraSelector(
+    cameras: List<CameraDto>,
+    cameraId: String?,
+    onSelect: (String?) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val current = cameras.firstOrNull { it.id == cameraId }?.name ?: "All cameras"
+    Box {
+        TextButton(onClick = { open = true }, enabled = cameras.size > 1 || cameraId != null) {
+            Text(current, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Choose camera")
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text("All cameras") },
+                onClick = { open = false; onSelect(null) },
+            )
+            cameras.sortedBy { it.name.lowercase() }.forEach { cam ->
+                DropdownMenuItem(
+                    text = { Text(cam.name) },
+                    onClick = { open = false; onSelect(cam.id) },
+                )
+            }
+        }
     }
 }
 
