@@ -92,6 +92,19 @@ data class PlaybackUiState(
      * sprite covers it (not generated on the server yet): the frame shows.
      */
     val scrubSprite: SpriteTile<Bitmap>? = null,
+    /**
+     * A seek the screen applies straight to the ALREADY LOADED segment, with no
+     * resolve round-trip, while the finger stays inside that segment (see
+     * [PlaybackViewModel.onScrub]): `exact = false` during the drag (the screen
+     * seeks to the closest sync frame, which is instant), `exact = true` for the
+     * release. [LiveScrubSeek.seq] makes every request a distinct value so the
+     * screen re-applies it even if the offset repeats. Null when the last
+     * scrub position was outside the loaded segment.
+     */
+    val liveScrubSeek: LiveScrubSeek? = null,
+    /** True while the drag is inside the loaded segment, so the live player
+     *  itself is the preview and the filmstrip overlay is hidden. */
+    val scrubInLoadedSegment: Boolean = false,
     val jumpInProgress: Boolean = false,
     /**
      * True from the moment a USER-INITIATED seek starts until its segment
@@ -193,6 +206,32 @@ internal fun scrubPrefetchPlan(
     }
     return out
 }
+/** See [PlaybackUiState.liveScrubSeek]. */
+data class LiveScrubSeek(val offsetMs: Long, val exact: Boolean, val seq: Int)
+
+/**
+ * Pure decision behind the in-segment live drag: the offset into [segment]
+ * (the segment the player has loaded) that [tsMs] falls at, or null when the
+ * player cannot serve [tsMs] by a local seek and the scrub must use the
+ * filmstrip overlay plus a resolve on release. Null when nothing is loaded,
+ * when [tsMs] is outside `[start, end)`, or while a user seek or motion jump
+ * is resolving (the loaded segment is then stale and about to be replaced).
+ */
+internal fun liveScrubOffsetMs(
+    segment: ResolvedSegment?,
+    tsMs: Long,
+    userSeekInProgress: Boolean,
+    jumpInProgress: Boolean,
+): Long? {
+    if (segment == null || userSeekInProgress || jumpInProgress) return null
+    // Time.parseToMillis yields 0 for an unparseable timestamp.
+    val startMs = Time.parseToMillis(segment.start).takeIf { it > 0L } ?: return null
+    val endMs = Time.parseToMillis(segment.end).takeIf { it > startMs }
+        ?: (startMs + segment.durationMs).takeIf { segment.durationMs > 0 }
+        ?: return null
+    return if (tsMs in startMs until endMs) tsMs - startMs else null
+}
+
 private const val NEXT_SEGMENT_LOOKAHEAD_MS = 1L
 
 /**
@@ -1104,7 +1143,29 @@ class PlaybackViewModel(
         val nearestIdx = frames.indices
             .minByOrNull { kotlin.math.abs(Time.parseToMillis(frames[it].ts) - tsMs) } ?: -1
         val nearestFrame = frames.getOrNull(nearestIdx)
-        _state.update { it.copy(playheadMs = tsMs) }
+        val s0 = _state.value
+        val liveOffset = liveScrubOffsetMs(s0.currentSegment, tsMs, s0.userSeekInProgress, s0.jumpInProgress)
+        if (liveOffset != null) {
+            // Inside the segment the player already has loaded: seek it directly
+            // (closest sync frame, so it is instant) and let the real video be the
+            // preview. No overlay, no token/URL work. The filmstrip still loads
+            // below so the overlay is ready the moment the finger leaves.
+            _state.update {
+                it.copy(
+                    playheadMs = tsMs,
+                    scrubInLoadedSegment = true,
+                    scrubFrameUrl = null,
+                    // The live player is the preview: drop any sprite tile left over
+                    // from a neighbouring segment, or it would cover the video.
+                    scrubSprite = null,
+                    scrubPrefetchUrls = emptyList(),
+                    liveScrubSeek = LiveScrubSeek(liveOffset, exact = false, seq = ++liveScrubSeq),
+                )
+            }
+            loadFilmstrip(tsMs)
+            return
+        }
+        _state.update { it.copy(playheadMs = tsMs, scrubInLoadedSegment = false) }
         if (nearestFrame != null) {
             // URL construction needs the (possibly cached, possibly a fresh fetch)
             // per-camera scoped token — resolve it off the main update, then apply
@@ -1117,7 +1178,9 @@ class PlaybackViewModel(
                     val m = repo.mediaUrls()
                     m.scopedUrl(cameraId, nearestFrame.url) to plan.map { m.scopedUrl(cameraId, it.url) }
                 }.getOrNull()
-                if (urls != null && _state.value.scrubbing) {
+                // Also drop it if the finger has since moved back into the loaded
+                // segment, where the live player is the preview.
+                if (urls != null && _state.value.scrubbing && !_state.value.scrubInLoadedSegment) {
                     _state.update { it.copy(scrubFrameUrl = urls.first, scrubPrefetchUrls = urls.second) }
                 }
             }
@@ -1167,7 +1230,9 @@ class PlaybackViewModel(
                 spriteCache.put(tsMs, sprite)
                 // Judge against where the finger is NOW, not where it was.
                 val s = _state.value
-                if (sprite != null && s.scrubbing && sprite.layout.covers(s.playheadMs)) {
+                if (sprite != null && s.scrubbing && !s.scrubInLoadedSegment &&
+                    sprite.layout.covers(s.playheadMs)
+                ) {
                     _state.update { it.copy(scrubSprite = spriteCache.lookup(it.playheadMs)) }
                 }
             } finally {
@@ -1180,6 +1245,9 @@ class PlaybackViewModel(
      *  prefetch plan in [onScrub]. */
     private var lastScrubMs = 0L
 
+    /** Sequence for [LiveScrubSeek.seq]. */
+    private var liveScrubSeq = 0
+
     /** Called when the user releases the scrubber. Seeks to the final position,
      *  and recenters the (larger) data window if the playhead neared its edge so
      *  the centered timeline always has spans to show on both sides. Scrubbing
@@ -1188,6 +1256,8 @@ class PlaybackViewModel(
      *  any in-flight step worker. */
     fun onScrubEnd(tsMs: Long) {
         cancelStepWorker()
+        val s0 = _state.value
+        val liveOffset = liveScrubOffsetMs(s0.currentSegment, tsMs, s0.userSeekInProgress, s0.jumpInProgress)
         _state.update {
             it.copy(
                 scrubbing = false,
@@ -1195,6 +1265,14 @@ class PlaybackViewModel(
                 scrubFrameUrl = null,
                 scrubPrefetchUrls = emptyList(),
                 scrubSprite = null,
+                scrubInLoadedSegment = false,
+                // Released inside the loaded segment: one EXACT local seek, no
+                // resolve. segmentOffsetMs goes to -1 ("position owned by the
+                // live seek"), which the screen's feed effect ignores, so a later
+                // resolve landing on this same segment at the old offset is
+                // still a state change and still seeks.
+                liveScrubSeek = liveOffset?.let { o -> LiveScrubSeek(o, exact = true, seq = ++liveScrubSeq) },
+                segmentOffsetMs = if (liveOffset != null) -1L else it.segmentOffsetMs,
             )
         }
         val s = _state.value
@@ -1206,6 +1284,13 @@ class PlaybackViewModel(
             val we = (tsMs + half).coerceAtMost(now)
             _state.update { it.copy(windowStartMs = ws, windowEndMs = we) }
             loadTimeline(ws, we)
+        }
+        if (liveOffset != null) {
+            // Nothing to resolve: the player already holds this segment. Cancel
+            // any internal (auto-advance) resolve still in flight so it cannot
+            // replace the segment the user just positioned in.
+            seekJob?.cancel()
+            return
         }
         seekTo(tsMs, userInitiated = true)
     }
