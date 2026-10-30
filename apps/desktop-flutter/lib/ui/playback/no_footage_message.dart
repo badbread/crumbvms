@@ -102,6 +102,16 @@ NoFootageMessage noFootageMessage({
         'This camera records only when it detects motion',
       );
     }
+    if (recordingMode != 'continuous' && !motionNow) {
+      // A server too old to report the mode, and no recent motion: don't
+      // claim footage is on its way when it may not be.
+      return const NoFootageMessage(
+        NoFootageReason.unknown,
+        'Nothing recorded yet',
+        'no footage',
+        'Nothing has been recorded here in the last few seconds',
+      );
+    }
     return const NoFootageMessage(
       NoFootageReason.liveEdge,
       'Live edge',
