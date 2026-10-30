@@ -43,6 +43,8 @@ import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'gapless_segment_pane_controller.dart';
 import 'scrub_frame_cache.dart';
+import 'scrub_sprite_cache.dart';
+import 'scrub_sprite_view.dart';
 import 'playback_prefs.dart';
 import 'playback_tick_text.dart';
 import 'playback_timeline_controller.dart';
@@ -209,6 +211,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   // filmstrip overlay) so the release is a seek instead of an HTTP round-trip
   // plus a cold mpv open. See _liveSeek.
   Timer? _scrubDwell;
+  // Per-segment sprite strips (1 s granularity in one request per segment),
+  // preferred over the 4 s-grid frames wherever the server has pre-generated
+  // them; the frames stay the fallback. See scrub_sprite_cache.dart.
+  final ScrubSpriteCache _spriteCache = ScrubSpriteCache();
+  final Map<String, ScrubSpriteTile> _scrubSprites = {};
+  final Set<String> _spriteInflight = {};
 
   bool _playing = false;
   int _speedIdx = 1; // 1x
@@ -694,12 +702,18 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _scrubDwell?.cancel();
     _scrubDwell = Timer(_kScrubDwell, () => _preopenAt(t));
     if (_panes[focusId]?.currentSegment?.covers(t) ?? false) {
-      if (_scrubFrames.isNotEmpty) {
+      if (_scrubFrames.isNotEmpty || _scrubSprites.isNotEmpty) {
         _scrubToken++; // an in-flight fetch must not repaint the overlay
-        setState(_scrubFrames.clear);
+        setState(() {
+          _scrubFrames.clear();
+          _scrubSprites.clear();
+        });
       }
       return;
     }
+    // A pre-generated sprite strip gives 1 s granularity; use it whenever one
+    // covers `t`, and fall through to the 4 s-grid frame otherwise.
+    if (_showSpriteAt(focusId, tMs, direction)) return;
     // Filmstrip frame for the focused pane. A cell already fetched this
     // session repaints synchronously from the cache (dragging back over
     // covered ground, or a cell the prefetch below warmed before the cursor
@@ -712,8 +726,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (cached != null) {
       _scrubToken++; // supersede any in-flight fetch for an older cell
       _scrubTrailing?.cancel();
-      if (!identical(_scrubFrames[focusId], cached)) {
-        setState(() => _scrubFrames[focusId] = cached);
+      if (!identical(_scrubFrames[focusId], cached) ||
+          _scrubSprites.containsKey(focusId)) {
+        setState(() {
+          _scrubFrames[focusId] = cached;
+          _scrubSprites.remove(focusId);
+        });
       }
       _prefetchScrubNeighbours(focusId, tMs, direction);
       return;
@@ -802,7 +820,78 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (!mounted || token != _scrubToken || !_scrubbing) return;
     // A 404 (coverage gap) keeps the last frame rather than blanking the pane.
     if (bytes == null) return;
-    setState(() => _scrubFrames[camId] = bytes);
+    setState(() {
+      _scrubFrames[camId] = bytes;
+      _scrubSprites.remove(camId);
+    });
+  }
+
+  /// At most this many sprite requests in flight (the one under the cursor
+  /// plus the segments ahead of it).
+  static const int _kSpriteInflightMax = 3;
+
+  /// Sprite path of [_liveSeek]. Shows the tile for [tMs] when a cached
+  /// sprite covers it (and warms the next segments in the direction of
+  /// travel), returning true. Otherwise asks the server for the sprite in the
+  /// background (unless it recently had none) and returns false, so the
+  /// caller shows a 4 s-grid frame meanwhile; the sprite replaces it on
+  /// arrival if the cursor is still inside it.
+  bool _showSpriteAt(String camId, int tMs, int direction) {
+    final hit = _spriteCache.lookup(camId, tMs);
+    if (hit == null) {
+      if (!_spriteCache.isKnownMiss(camId, tMs)) _fetchSprite(camId, tMs);
+      return false;
+    }
+    _scrubToken++; // an in-flight frame fetch must not cover the finer tile
+    _scrubTrailing?.cancel();
+    if (_scrubSprites[camId] != hit) {
+      setState(() => _scrubSprites[camId] = hit);
+    }
+    for (final p in _spriteCache.probesAhead(
+      camId,
+      hit.sprite,
+      direction: direction,
+    )) {
+      _fetchSprite(camId, p);
+    }
+    return true;
+  }
+
+  void _fetchSprite(String camId, int tMs) {
+    if (!_scrubbing || _spriteInflight.length >= _kSpriteInflightMax) return;
+    final key = '$camId|${tMs ~/ kScrubSpriteMissCellMs}';
+    if (!_spriteInflight.add(key)) return;
+    unawaited(() async {
+      try {
+        final r = await widget.api.fetchScrubSprite(
+          widget.session,
+          camId,
+          DateTime.fromMillisecondsSinceEpoch(tMs, isUtc: true),
+        );
+        final sprite = r == null
+            ? null
+            : ScrubSprite.fromResponse(r.headers, r.bytes);
+        _spriteCache.put(camId, tMs, sprite);
+        if (sprite == null || !mounted || !_scrubbing) return;
+        // Judge against where the cursor is NOW, not where it was when the
+        // request went out: show it only if it is still under the cursor, on
+        // the focused pane, and the pane's own video isn't already tracking.
+        final cur = _lastScrubMs;
+        final focusId = _maximizedCameraId ?? _selectedCameraId;
+        if (focusId != camId || !sprite.covers(cur)) return;
+        final curT = DateTime.fromMillisecondsSinceEpoch(cur, isUtc: true);
+        if (_panes[camId]?.currentSegment?.covers(curT) ?? false) return;
+        _scrubToken++;
+        setState(
+          () => _scrubSprites[camId] = ScrubSpriteTile(
+            sprite,
+            sprite.tileFor(cur),
+          ),
+        );
+      } finally {
+        _spriteInflight.remove(key);
+      }
+    }());
   }
 
   /// The cursor has rested at [t] mid-drag (see [_kScrubDwell]): for every
@@ -836,6 +925,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       setState(() {
         _scrubbing = false;
         _scrubFrames.clear();
+        _scrubSprites.clear();
       });
     }
     _scrubDwell?.cancel();
@@ -1269,6 +1359,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       setState(() {
         _scrubbing = false;
         _scrubFrames.clear();
+        _scrubSprites.clear();
       });
     }
     for (final pane in _panes.values) {
@@ -1466,6 +1557,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         onSelect: () => _selectCamera(maxCam.id),
         onMaximizeToggle: () => _toggleMaximize(maxCam.id),
         scrubFrame: _scrubbing ? _scrubFrames[maxCam.id] : null,
+        scrubSprite: _scrubbing ? _scrubSprites[maxCam.id] : null,
       );
     }
 
@@ -1514,6 +1606,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       onSelect: () => _selectCamera(cam.id),
                       onMaximizeToggle: () => _toggleMaximize(cam.id),
                       scrubFrame: _scrubbing ? _scrubFrames[cam.id] : null,
+                      scrubSprite: _scrubbing ? _scrubSprites[cam.id] : null,
                     ),
             ),
           );
@@ -2165,6 +2258,7 @@ class _PbTile extends StatefulWidget {
     required this.onMaximizeToggle,
     this.recordsElsewhere,
     this.scrubFrame,
+    this.scrubSprite,
   });
 
   final Camera camera;
@@ -2182,6 +2276,10 @@ class _PbTile extends StatefulWidget {
 
   /// Filmstrip frame shown over the video while the scrubber is being dragged.
   final Uint8List? scrubFrame;
+
+  /// Sprite-strip tile shown over [scrubFrame] while dragging (finer, 1 s
+  /// granularity) when the server has pre-generated one for this segment.
+  final ScrubSpriteTile? scrubSprite;
 
   @override
   State<_PbTile> createState() => _PbTileState();
@@ -2481,6 +2579,18 @@ class _PbTileState extends State<_PbTile> {
                           widget.scrubFrame!,
                           fit: BoxFit.contain,
                           gaplessPlayback: true,
+                        ),
+                      ),
+                    ),
+                  ),
+                if (widget.scrubSprite != null)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: Transform(
+                        transform: _zoomTransform,
+                        child: ColoredBox(
+                          color: Colors.black,
+                          child: ScrubSpriteTileView(tile: widget.scrubSprite!),
                         ),
                       ),
                     ),
