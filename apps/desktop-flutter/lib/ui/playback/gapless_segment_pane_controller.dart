@@ -121,6 +121,18 @@ const Duration kMpvPlayheadGrace = Duration(milliseconds: 300);
 /// what made one back-click skip a whole segment.
 const Duration kFirstFrameEpsilon = Duration(milliseconds: 20);
 
+/// How long [GaplessSegmentPaneController.seekWithinSegment] waits for a
+/// scrub seek to land before issuing the next one. mpv's absolute seeks are
+/// hr-exact: each one decodes forward from the preceding keyframe (up to a
+/// whole ~1 s GOP of 4K HEVC), so letting every pointer event issue its own
+/// seek kept the decoder restarting and never finishing; the pane looked
+/// frozen or lagged a long way behind the cursor. One seek in flight at a
+/// time, with the newest target replayed when it lands, keeps the picture
+/// moving at the decoder's real pace (typically 10-30 frames/s) and always
+/// converges on the last cursor position. The timeout only bounds a seek
+/// that does not report a position change (target == current position).
+const Duration kScrubSeekSettle = Duration(milliseconds: 150);
+
 /// How far the exact-seek fallback steps backward when the native
 /// `frame-back-step` reports no movement mid-file: one frame at 30 fps.
 /// At lower frame rates the target still lands inside the previous frame
@@ -178,6 +190,18 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   bool _prefetching = false;
   bool _resolving = false;
   bool _advancing = false;
+
+  /// Scrub-seek coalescing (see [seekWithinSegment] / [kScrubSeekSettle]):
+  /// at most one in-segment seek is in flight; a newer target arriving
+  /// meanwhile is parked here and replayed when the in-flight one lands.
+  bool _scrubSeekInFlight = false;
+  DateTime? _pendingScrubTs;
+
+  /// True while this pane is hidden (another camera is maximized) and its
+  /// decoder has been paused by [park]. Cleared by the next [onTick], which
+  /// also re-syncs the pane to the playhead it missed while parked.
+  bool _parked = false;
+  bool get parked => _parked;
 
   // Coalesced follow-up resolve. A [resolveAt] call that arrives while another
   // is in-flight is NOT dropped (that desynced the pane from the playhead when
@@ -351,6 +375,23 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     bool playing = false,
     bool mpvDriven = false,
   }) async {
+    if (_parked) {
+      // The pane just became visible again. Its decoder was paused while
+      // hidden and the playhead moved on without it, so the linear boundary
+      // logic below has nothing valid to work from: do one forced re-sync at
+      // the playhead (reload or in-file seek, as needed) and reassert the
+      // transport state. Not `_resolving`-gated: resolveAt coalesces itself.
+      _parked = false;
+      await resolveAt(playhead, forceReload: true, playing: playing);
+      if (playing && !_player.state.playing) {
+        try {
+          await _player.play();
+        } catch (_) {
+          /* non-fatal — the transport owner reasserts play on its next change */
+        }
+      }
+      return;
+    }
     final cur = _current;
     if (cur == null) {
       if (!_resolving) await resolveAt(playhead, playing: playing);
@@ -938,14 +979,56 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   /// `pbSeekAllPanes`'s same-segment branch. If `ts` has left the current
   /// segment, this is a no-op; callers should follow up with [resolveAt]
   /// once the scrub commits (mirrors the timeline's `onCommitSeek`).
+  ///
+  /// Coalesced: pointer events arrive at 60-120 Hz but an hr-exact seek
+  /// costs a keyframe-forward decode, so only one seek is in flight at a
+  /// time and the newest target is replayed when it lands (see
+  /// [kScrubSeekSettle]). The target is re-read against [_current] on each
+  /// replay, so a segment swap mid-scrub can't land a stale offset in the
+  /// wrong file.
   Future<void> seekWithinSegment(DateTime ts) async {
-    final cur = _current;
-    if (cur == null || !cur.covers(ts)) return;
-    final offsetMs = (ts.millisecondsSinceEpoch - cur.startMs)
-        .clamp(0, cur.durationMs)
-        .toInt();
+    if (_scrubSeekInFlight) {
+      _pendingScrubTs = ts;
+      return;
+    }
+    _scrubSeekInFlight = true;
     try {
-      await _player.seek(Duration(milliseconds: offsetMs));
+      DateTime? target = ts;
+      while (target != null) {
+        final cur = _current;
+        if (cur == null || !cur.covers(target)) break;
+        final offsetMs = (target.millisecondsSinceEpoch - cur.startMs)
+            .clamp(0, cur.durationMs)
+            .toInt();
+        final before = _player.state.position;
+        try {
+          await _player.seek(Duration(milliseconds: offsetMs));
+        } catch (_) {
+          /* non-fatal */
+        }
+        await _positionAfter(before, timeout: kScrubSeekSettle);
+        target = _pendingScrubTs;
+        _pendingScrubTs = null;
+      }
+    } finally {
+      _scrubSeekInFlight = false;
+      _pendingScrubTs = null;
+    }
+  }
+
+  /// The pane is about to be hidden (another camera was maximized): stop its
+  /// decoder. The screen only builds and ticks the active panes, but the
+  /// hidden ones kept decoding full-rate 4K HEVC into a texture nobody drew,
+  /// starving the one pane the operator was actually looking at (and the
+  /// scrub seeks on it). Idempotent; undone by the next [onTick], which
+  /// re-syncs the pane to the playhead it missed. Nothing else here changes:
+  /// the loaded segment and any prefetch are kept so a quick restore inside
+  /// the same segment is just a seek.
+  Future<void> park() async {
+    if (_parked) return;
+    _parked = true;
+    try {
+      await _player.pause();
     } catch (_) {
       /* non-fatal */
     }

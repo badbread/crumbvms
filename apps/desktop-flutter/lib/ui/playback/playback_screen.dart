@@ -42,6 +42,7 @@ import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'gapless_segment_pane_controller.dart';
+import 'scrub_frame_cache.dart';
 import 'playback_prefs.dart';
 import 'playback_tick_text.dart';
 import 'playback_timeline_controller.dart';
@@ -196,6 +197,18 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   final Map<String, Uint8List?> _scrubFrames = {};
   int _scrubToken = 0;
   DateTime _lastScrubFetch = DateTime.fromMillisecondsSinceEpoch(0);
+  // Frames already fetched this session, keyed by the server's 4 s grid cell,
+  // plus the cells being warmed ahead of the cursor. A revisited cell repaints
+  // synchronously from here; see scrub_frame_cache.dart.
+  final ScrubFrameCache _scrubCache = ScrubFrameCache();
+  final Set<String> _scrubPrefetchInflight = {};
+  int _lastScrubMs = 0;
+  Timer? _scrubTrailing;
+  // Dwell pre-open: while the cursor rests outside a pane's loaded segment
+  // during a drag, resolve+open the target segment (paused, behind the
+  // filmstrip overlay) so the release is a seek instead of an HTTP round-trip
+  // plus a cold mpv open. See _liveSeek.
+  Timer? _scrubDwell;
 
   bool _playing = false;
   int _speedIdx = 1; // 1x
@@ -363,6 +376,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     _tickTimer?.cancel();
     _shuttleTimer?.cancel();
     _idleTimer?.cancel();
+    _scrubTrailing?.cancel();
+    _scrubDwell?.cancel();
     _motionDebounce?.cancel();
     _spanPersistDebounce?.cancel();
     _timeline.removeListener(_onTimelineChanged);
@@ -616,13 +631,24 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }) async {
     final play = playing ?? _playing;
     final futures = <Future<void>>[];
-    for (final cam in _activeCameras()) {
+    final active = _activeCameras();
+    for (final cam in active) {
       final pane = _panes[cam.id]!;
       futures.add(
         force
             ? pane.resolveAt(t, forceReload: true, playing: play)
             : pane.onTick(t, playing: play, mpvDriven: mpvDriven),
       );
+    }
+    // Panes that are not active right now (the grid behind a maximized
+    // camera) are neither built nor ticked, but their players kept decoding
+    // at full rate into textures nobody drew. Park them; the pane's next
+    // onTick (when it becomes active again) re-syncs it to the playhead.
+    if (active.length < _panes.length) {
+      final activeIds = {for (final c in active) c.id};
+      for (final e in _panes.entries) {
+        if (!activeIds.contains(e.key)) futures.add(e.value.park());
+      }
     }
     // No setState: this runs on every play tick, and each _PbTile listens
     // to its own pane for the footage state it shows.
@@ -658,6 +684,15 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // is inside the focused pane's loaded segment, drop the overlay and let
     // the real video show through; the filmstrip remains the cross-segment
     // fallback only.
+    final tMs = t.millisecondsSinceEpoch;
+    final direction = tMs >= _lastScrubMs ? 1 : -1;
+    _lastScrubMs = tMs;
+    // While the cursor rests outside what the active panes have loaded,
+    // pre-open the target segment behind the overlay so the release only
+    // needs a seek (see _scrubDwell). Re-armed on every move: a cursor in
+    // motion never opens anything, a cursor that pauses for a beat does.
+    _scrubDwell?.cancel();
+    _scrubDwell = Timer(_kScrubDwell, () => _preopenAt(t));
     if (_panes[focusId]?.currentSegment?.covers(t) ?? false) {
       if (_scrubFrames.isNotEmpty) {
         _scrubToken++; // an in-flight fetch must not repaint the overlay
@@ -665,14 +700,95 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       }
       return;
     }
-    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
-    // server-side extract load, superseded-request-safe via a token.
-    final now = DateTime.now();
-    if (now.difference(_lastScrubFetch) < const Duration(milliseconds: 120)) {
+    // Filmstrip frame for the focused pane. A cell already fetched this
+    // session repaints synchronously from the cache (dragging back over
+    // covered ground, or a cell the prefetch below warmed before the cursor
+    // got there); only a genuinely new cell goes to the server, throttled
+    // (~8/sec) to cap the server-side extract load and
+    // superseded-request-safe via a token. The cells just ahead of the
+    // cursor are warmed in the background so the next ones are hits too.
+    const width = _kScrubWidth;
+    final cached = _scrubCache.get(focusId, tMs, width);
+    if (cached != null) {
+      _scrubToken++; // supersede any in-flight fetch for an older cell
+      _scrubTrailing?.cancel();
+      if (!identical(_scrubFrames[focusId], cached)) {
+        setState(() => _scrubFrames[focusId] = cached);
+      }
+      _prefetchScrubNeighbours(focusId, tMs, direction);
       return;
     }
+    if (_scrubCache.isKnownMiss(focusId, tMs, width)) {
+      // Nothing to show for this cell (a coverage gap): keep the last frame
+      // rather than flashing, and still warm the cells ahead.
+      _prefetchScrubNeighbours(focusId, tMs, direction);
+      return;
+    }
+    final now = DateTime.now();
+    final sinceLast = now.difference(_lastScrubFetch);
+    if (sinceLast < _kScrubFetchThrottle) {
+      // Trailing edge: the throttle used to simply drop this move, so a drag
+      // that stopped inside the window left the overlay one cell stale until
+      // the next pointer event. Fetch it when the window closes instead.
+      _scrubTrailing?.cancel();
+      _scrubTrailing = Timer(_kScrubFetchThrottle - sinceLast, () {
+        if (!_scrubbing || !mounted) return;
+        _lastScrubFetch = DateTime.now();
+        _fetchScrubFrame(focusId, t, ++_scrubToken);
+      });
+      return;
+    }
+    _scrubTrailing?.cancel();
     _lastScrubFetch = now;
     _fetchScrubFrame(focusId, t, ++_scrubToken);
+    _prefetchScrubNeighbours(focusId, tMs, direction);
+  }
+
+  /// Width the scrub overlay is fetched at. 480 is the server's pre-generated
+  /// width (`THUMB_PREGEN_WIDTH` default) and one of its cache buckets, so a
+  /// frame the background worker already rendered is served from disk.
+  static const int _kScrubWidth = 480;
+  static const Duration _kScrubFetchThrottle = Duration(milliseconds: 120);
+
+  /// Pointer-rest time before the active panes pre-open the segment under the
+  /// cursor. Longer than the gap between pointer events during a drag (so a
+  /// moving cursor never opens anything), shorter than a human "pause to
+  /// look": by the time the operator releases on what they see, the file is
+  /// usually already loaded and the release is an in-file seek.
+  static const Duration _kScrubDwell = Duration(milliseconds: 180);
+
+  /// Warm the filmstrip cells around [tMs] in the direction of travel.
+  /// Bounded: at most [_kScrubPrefetchMax] background fetches in flight, so a
+  /// fast drag can't fan out an unbounded request storm (the server's media
+  /// bucket is generous, but a 4K HEVC cold extract is still real work).
+  static const int _kScrubPrefetchMax = 3;
+  void _prefetchScrubNeighbours(String camId, int tMs, int direction) {
+    if (!_scrubbing) return;
+    final slots = _scrubCache.slotsToPrefetch(
+      camId,
+      tMs,
+      _kScrubWidth,
+      direction: direction,
+    );
+    for (final slotMs in slots) {
+      if (_scrubPrefetchInflight.length >= _kScrubPrefetchMax) break;
+      final key = '$camId|$slotMs';
+      if (_scrubPrefetchInflight.contains(key)) continue;
+      _scrubPrefetchInflight.add(key);
+      unawaited(() async {
+        try {
+          final bytes = await widget.api.fetchFilmstripFrame(
+            widget.session,
+            camId,
+            DateTime.fromMillisecondsSinceEpoch(slotMs, isUtc: true),
+            width: _kScrubWidth,
+          );
+          _scrubCache.put(camId, slotMs, _kScrubWidth, bytes);
+        } finally {
+          _scrubPrefetchInflight.remove(key);
+        }
+      }());
+    }
   }
 
   Future<void> _fetchScrubFrame(String camId, DateTime t, int token) async {
@@ -680,10 +796,35 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       widget.session,
       camId,
       t,
-      width: 480,
+      width: _kScrubWidth,
     );
+    _scrubCache.put(camId, t.millisecondsSinceEpoch, _kScrubWidth, bytes);
     if (!mounted || token != _scrubToken || !_scrubbing) return;
+    // A 404 (coverage gap) keeps the last frame rather than blanking the pane.
+    if (bytes == null) return;
     setState(() => _scrubFrames[camId] = bytes);
+  }
+
+  /// The cursor has rested at [t] mid-drag (see [_kScrubDwell]): for every
+  /// active pane whose loaded segment does not cover `t`, resolve and open the
+  /// covering segment now, paused, so the eventual release ([_commitSeek])
+  /// finds the file already loaded and only has to seek. The filmstrip
+  /// overlay stays up until release, so the open is invisible; once the pane
+  /// reports the new segment, `_liveSeek` drops the overlay for it and the
+  /// in-segment seeks take over, which is strictly better than the 4 s-grid
+  /// filmstrip. A pane whose segment already covers `t` is untouched, and a
+  /// `t` in a coverage gap resolves to "no footage" exactly as a release
+  /// there would. Each pane's `resolveAt` coalesces its own racing calls, so
+  /// a second dwell (or the release itself) while an open is in flight is
+  /// replayed with the newest target, never dropped.
+  void _preopenAt(DateTime t) {
+    if (!_scrubbing || !mounted) return;
+    for (final cam in _activeCameras()) {
+      final pane = _panes[cam.id];
+      if (pane == null) continue;
+      if (pane.currentSegment?.covers(t) ?? false) continue;
+      unawaited(pane.resolveAt(t, forceReload: true, playing: false));
+    }
   }
 
   /// Playhead position is final (drag released, or a click-seek) — full
@@ -697,10 +838,21 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         _scrubFrames.clear();
       });
     }
+    _scrubDwell?.cancel();
+    _scrubTrailing?.cancel();
     // Coverage is preloaded (static) — this only extends the cache if the
     // operator navigated past its horizon, so don't hold up the video resolve.
     unawaited(_syncCoverage());
     await _resolveAll(t, force: true);
+    // A dwell pre-open (see _preopenAt) loads the target file PAUSED; when
+    // the release lands in that same file the resolve above is only a seek
+    // and does not restart playback on its own. Reassert the transport state.
+    if (_playing) {
+      for (final cam in _activeCameras()) {
+        final p = _panes[cam.id]?.player;
+        if (p != null && !p.state.playing) unawaited(p.play());
+      }
+    }
   }
 
   Future<void> _onZoomChanged() async {

@@ -26,6 +26,7 @@
 // its calls through the shared timeout client (`sharedHttpClient`) instead.
 
 import 'dart:convert';
+import 'dart:isolate';
 
 import 'crumb_api.dart';
 import 'http_client.dart';
@@ -59,6 +60,27 @@ class RecordedSpan {
     hasMotion: (j['has_motion'] as bool?) ?? false,
     stage: (j['stage'] as String?) ?? 'live',
   );
+}
+
+/// Bodies at/above this size are decoded off the UI isolate by
+/// [PlaybackApi.fetchTimeline]. 64 KiB is roughly 400 merged spans: anything
+/// larger is a coverage-style fetch whose decode would be felt as a hitch;
+/// anything smaller decodes in well under a frame inline.
+const int kOffIsolateParseBytes = 64 * 1024;
+
+/// Decode a `GET /timeline` response body into spans. Top-level (not a
+/// closure over `this`) so it can run on a worker isolate via
+/// [Isolate.run]; a malformed body yields `[]`, matching the fetch's
+/// best-effort contract.
+List<RecordedSpan> parseTimelineSpans(String body) {
+  try {
+    final j = jsonDecode(body) as Map<String, dynamic>;
+    return (j['spans'] as List<dynamic>? ?? const [])
+        .map((e) => RecordedSpan.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  } catch (_) {
+    return const [];
+  }
 }
 
 /// A resolved recording segment (`GET /play/{camera_id}` / `/play/aligned`).
@@ -165,11 +187,17 @@ extension PlaybackApi on CrumbApi {
     try {
       final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return const [];
-      final j = jsonDecode(resp.body) as Map<String, dynamic>;
-      final spans = (j['spans'] as List<dynamic>? ?? const [])
-          .map((e) => RecordedSpan.fromJson(e as Map<String, dynamic>))
-          .toList(growable: false);
-      return spans;
+      final body = resp.body;
+      // A coverage fetch (30 days of spans, up to the server's 10 000-span
+      // page) is a multi-megabyte JSON body; decoding it on the UI isolate is
+      // a visible hitch (tens of ms) that lands mid-scrub or mid-playback on
+      // the periodic refetch. Parse large bodies on a worker isolate; the
+      // small per-window fetches stay inline (an isolate spawn costs more
+      // than they do).
+      if (body.length >= kOffIsolateParseBytes) {
+        return Isolate.run(() => parseTimelineSpans(body));
+      }
+      return parseTimelineSpans(body);
     } catch (_) {
       return const [];
     }
