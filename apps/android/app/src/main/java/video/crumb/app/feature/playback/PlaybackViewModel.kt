@@ -2,6 +2,8 @@
 
 package video.crumb.app.feature.playback
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import video.crumb.app.data.DetectionEvent
@@ -12,8 +14,11 @@ import video.crumb.app.data.CrumbRepository
 import video.crumb.app.data.isNotFound
 import video.crumb.app.data.runCatchingCancellable
 import video.crumb.app.data.toUserMessage
+import video.crumb.app.feature.export.ExportRange
 import video.crumb.app.ui.Time
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -75,6 +80,32 @@ data class PlaybackUiState(
     val filmstrip: List<FilmstripFrame> = emptyList(),
     val scrubbing: Boolean = false,
     val scrubFrameUrl: String? = null,
+    /**
+     * Authed URLs of the filmstrip frames just around [scrubFrameUrl] in the
+     * finger's direction of travel, for the screen to warm into Coil's cache
+     * before the finger reaches them (see [PlaybackViewModel.onScrub]). Nearest
+     * first. Empty when not scrubbing.
+     */
+    val scrubPrefetchUrls: List<String> = emptyList(),
+    /**
+     * A seek the screen applies straight to the ALREADY LOADED segment, with no
+     * resolve round-trip, while the finger stays inside that segment (see
+     * [PlaybackViewModel.onScrub]): `exact = false` during the drag (the screen
+     * seeks to the closest sync frame, which is instant), `exact = true` for the
+     * release. [LiveScrubSeek.seq] makes every request a distinct value so the
+     * screen re-applies it even if the offset repeats. Null when the last
+     * scrub position was outside the loaded segment.
+     */
+    val liveScrubSeek: LiveScrubSeek? = null,
+    /** True while the drag is inside the loaded segment, so the live player
+     *  itself is the preview and the filmstrip overlay is hidden. */
+    val scrubInLoadedSegment: Boolean = false,
+    /**
+     * Tile of a pre-generated sprite strip covering the scrub position (1 s
+     * granularity), drawn over the filmstrip frame when present. Null when no
+     * sprite covers it (not generated on the server yet): the frame shows.
+     */
+    val scrubSprite: SpriteTile<Bitmap>? = null,
     val jumpInProgress: Boolean = false,
     /**
      * True from the moment a USER-INITIATED seek starts until its segment
@@ -126,7 +157,26 @@ data class PlaybackUiState(
      * events exist. The timeline icon layer is invisible when this list is empty.
      */
     val detectionEvents: List<DetectionEvent> = emptyList(),
-)
+    /**
+     * Raw IN edge of the export bracket ("mark for export"), epoch-millis, or null
+     * when nothing is marked. Held exactly as the operator placed it and ordered
+     * only when read ([ExportRange.normalize]) so dragging one handle past the
+     * other never swaps which handle the finger is holding — the same model the
+     * desktop timeline controller and the iOS timeline use.
+     */
+    val exportSelStartMs: Long? = null,
+    /** Raw OUT edge of the export bracket, epoch-millis, or null. */
+    val exportSelEndMs: Long? = null,
+) {
+    /** True once BOTH edges are marked and the range is long enough to export. */
+    val hasExportSelection: Boolean
+        get() {
+            val s = exportSelStartMs ?: return false
+            val e = exportSelEndMs ?: return false
+            val (a, b) = ExportRange.normalize(s, e)
+            return ExportRange.isValid(a, b)
+        }
+}
 
 private val SPEED_STEPS = listOf(0.5f, 1f, 2f, 4f, 8f)
 private const val DEFAULT_WINDOW_HOURS = 6L
@@ -134,6 +184,74 @@ private const val MIN_SPAN_MS = 60_000L            // 1 min (max zoom-in)
 private const val MAX_SPAN_MS = DEFAULT_WINDOW_HOURS * 3600_000L // = data window (max zoom-out)
 private const val FILMSTRIP_HALF_WINDOW_HOURS = 1L
 private const val FILMSTRIP_DEBOUNCE_MS = 300L
+
+/**
+ * Width the single-camera scrub preview is fetched at. This is the server's
+ * pre-generated width (`THUMB_PREGEN_WIDTH` default, and one of its five cache
+ * buckets) and the width the desktop client scrubs at, so a frame either client
+ * (or the background worker) has already rendered is served straight from disk
+ * instead of a fresh ffmpeg decode. The previous 160 px request was a cache key
+ * nobody else used: every cell a phone scrubbed over cold was its own decode,
+ * and at full-screen the 160 px frame was visibly soft anyway.
+ */
+internal const val SCRUB_FRAME_WIDTH = 480
+
+/** Frames ahead of the finger (in its direction of travel) to warm. */
+internal const val SCRUB_PREFETCH_AHEAD = 3
+/** Frames behind the finger to warm (a small reversal stays instant). */
+internal const val SCRUB_PREFETCH_BEHIND = 1
+
+/** Sprite requests allowed in flight (the one under the finger + those ahead). */
+internal const val SPRITE_INFLIGHT_MAX = 3
+
+/**
+ * Pure prefetch plan for the scrub overlay: the frames adjacent to [nearestIdx]
+ * in [frames] (sorted ascending by time, as the server returns them), ahead in
+ * the direction of travel ([forward]) and one behind, nearest first. The frame
+ * at [nearestIdx] itself is the one being shown and is never included.
+ */
+internal fun scrubPrefetchPlan(
+    frames: List<FilmstripFrame>,
+    nearestIdx: Int,
+    forward: Boolean,
+    ahead: Int = SCRUB_PREFETCH_AHEAD,
+    behind: Int = SCRUB_PREFETCH_BEHIND,
+): List<FilmstripFrame> {
+    if (nearestIdx !in frames.indices) return emptyList()
+    val stepAhead = if (forward) 1 else -1
+    val out = ArrayList<FilmstripFrame>(ahead + behind)
+    for (i in 1..maxOf(ahead, behind)) {
+        if (i <= ahead) frames.getOrNull(nearestIdx + i * stepAhead)?.let(out::add)
+        if (i <= behind) frames.getOrNull(nearestIdx - i * stepAhead)?.let(out::add)
+    }
+    return out
+}
+/** See [PlaybackUiState.liveScrubSeek]. */
+data class LiveScrubSeek(val offsetMs: Long, val exact: Boolean, val seq: Int)
+
+/**
+ * Pure decision behind the in-segment live drag: the offset into [segment]
+ * (the segment the player has loaded) that [tsMs] falls at, or null when the
+ * player cannot serve [tsMs] by a local seek and the scrub must use the
+ * filmstrip overlay plus a resolve on release. Null when nothing is loaded,
+ * when [tsMs] is outside `[start, end)`, or while a user seek or motion jump
+ * is resolving (the loaded segment is then stale and about to be replaced).
+ */
+internal fun liveScrubOffsetMs(
+    segment: ResolvedSegment?,
+    tsMs: Long,
+    userSeekInProgress: Boolean,
+    jumpInProgress: Boolean,
+): Long? {
+    if (segment == null || userSeekInProgress || jumpInProgress) return null
+    // Time.parseToMillis yields 0 for an unparseable timestamp.
+    val startMs = Time.parseToMillis(segment.start).takeIf { it > 0L } ?: return null
+    val endMs = Time.parseToMillis(segment.end).takeIf { it > startMs }
+        ?: (startMs + segment.durationMs).takeIf { segment.durationMs > 0 }
+        ?: return null
+    return if (tsMs in startMs until endMs) tsMs - startMs else null
+}
+
 private const val NEXT_SEGMENT_LOOKAHEAD_MS = 1L
 
 /**
@@ -281,6 +399,7 @@ class PlaybackViewModel(
         seekJob?.cancel()
         filmstripJob?.cancel()
         prefetchJob?.cancel()
+        spriteCache.clear() // sprites are per camera
         cancelStepWorker() // new camera invalidates the anchor + any in-flight step
         val prev = _state.value
         if (preserveTime && prev.playheadMs > 0L) {
@@ -444,6 +563,9 @@ class PlaybackViewModel(
      * failure path which surfaces the existing error snackbar + Retry (review A1).
      */
     fun onPlayerError() {
+        // The cached resolve may point at the very file that just failed (e.g.
+        // retention deleted it): make the recovery resolve ask the server.
+        repo.invalidateResolveCache(cameraId)
         seekTo(_state.value.playheadMs)
     }
 
@@ -1038,28 +1160,116 @@ class PlaybackViewModel(
      * and kicks off a debounced filmstrip fetch so thumbnails track the finger.
      */
     fun onScrub(tsMs: Long) {
-        val nearestFrame = _state.value.filmstrip
-            .minByOrNull { kotlin.math.abs(Time.parseToMillis(it.ts) - tsMs) }
-        _state.update { it.copy(playheadMs = tsMs) }
+        val frames = _state.value.filmstrip
+        val forward = tsMs >= lastScrubMs
+        lastScrubMs = tsMs
+        val nearestIdx = frames.indices
+            .minByOrNull { kotlin.math.abs(Time.parseToMillis(frames[it].ts) - tsMs) } ?: -1
+        val nearestFrame = frames.getOrNull(nearestIdx)
+        val s0 = _state.value
+        val liveOffset = liveScrubOffsetMs(s0.currentSegment, tsMs, s0.userSeekInProgress, s0.jumpInProgress)
+        if (liveOffset != null) {
+            // Inside the segment the player already has loaded: seek it directly
+            // (closest sync frame, so it is instant) and let the real video be the
+            // preview. No overlay, no token/URL work. The filmstrip still loads
+            // below so the overlay is ready the moment the finger leaves.
+            _state.update {
+                it.copy(
+                    playheadMs = tsMs,
+                    scrubInLoadedSegment = true,
+                    scrubFrameUrl = null,
+                    // The live player is the preview: drop any sprite tile left over
+                    // from a neighbouring segment, or it would cover the video.
+                    scrubSprite = null,
+                    scrubPrefetchUrls = emptyList(),
+                    liveScrubSeek = LiveScrubSeek(liveOffset, exact = false, seq = ++liveScrubSeq),
+                )
+            }
+            loadFilmstrip(tsMs)
+            return
+        }
+        _state.update { it.copy(playheadMs = tsMs, scrubInLoadedSegment = false) }
         if (nearestFrame != null) {
             // URL construction needs the (possibly cached, possibly a fresh fetch)
             // per-camera scoped token — resolve it off the main update, then apply
             // it only if the scrub hasn't already moved past this frame.
+            val plan = scrubPrefetchPlan(frames, nearestIdx, forward)
             viewModelScope.launch {
                 // scopedUrl() throws on a media-token fetch failure — guard it like
                 // every other consumer and just drop the frame on failure.
-                val frameUrl = runCatchingCancellable {
-                    repo.mediaUrls().scopedUrl(cameraId, nearestFrame.url)
+                val urls = runCatchingCancellable {
+                    val m = repo.mediaUrls()
+                    m.scopedUrl(cameraId, nearestFrame.url) to plan.map { m.scopedUrl(cameraId, it.url) }
                 }.getOrNull()
-                if (frameUrl != null && _state.value.scrubbing) {
-                    _state.update { it.copy(scrubFrameUrl = frameUrl) }
+                // Also drop it if the finger has since moved back into the loaded
+                // segment, where the live player is the preview.
+                if (urls != null && _state.value.scrubbing && !_state.value.scrubInLoadedSegment) {
+                    _state.update { it.copy(scrubFrameUrl = urls.first, scrubPrefetchUrls = urls.second) }
                 }
             }
         } else {
-            _state.update { it.copy(scrubFrameUrl = null) }
+            _state.update { it.copy(scrubFrameUrl = null, scrubPrefetchUrls = emptyList()) }
         }
+        showSpriteAt(tsMs, forward)
         loadFilmstrip(tsMs)
     }
+
+    // ── scrub sprite strips (1 s granularity; see ScrubSprites.kt) ───────────────
+    private val spriteCache = ScrubSpriteCache<Bitmap>()
+    private val spriteInflight = HashSet<Long>()
+
+    /**
+     * Sprite path of [onScrub]: show the tile for [tsMs] if a cached sprite
+     * covers it (and warm the next segments in the direction of travel);
+     * otherwise clear any stale tile and ask the server for the sprite in the
+     * background, unless it recently had none. The filmstrip frame stays the
+     * fallback underneath either way.
+     */
+    private fun showSpriteAt(tsMs: Long, forward: Boolean) {
+        val hit = spriteCache.lookup(tsMs)
+        if (_state.value.scrubSprite != hit) _state.update { it.copy(scrubSprite = hit) }
+        if (hit != null) {
+            spriteCache.probesAhead(hit.sprite.layout, forward).forEach { fetchSprite(it) }
+        } else if (!spriteCache.isKnownMiss(tsMs)) {
+            fetchSprite(tsMs)
+        }
+    }
+
+    private fun fetchSprite(tsMs: Long) {
+        val key = Math.floorDiv(tsMs, SPRITE_MISS_CELL_MS)
+        if (spriteInflight.size >= SPRITE_INFLIGHT_MAX || !spriteInflight.add(key)) return
+        val cam = cameraId
+        viewModelScope.launch {
+            try {
+                val raw = repo.scrubSprite(cam, tsMs)
+                val sprite = raw?.let { (headers, bytes) ->
+                    val layout = SpriteLayout.fromHeaders(headers) ?: return@let null
+                    val bmp = withContext(Dispatchers.Default) {
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    } ?: return@let null
+                    ScrubSprite(layout, bmp)
+                }
+                if (cam != cameraId) return@launch // camera switched meanwhile
+                spriteCache.put(tsMs, sprite)
+                // Judge against where the finger is NOW, not where it was.
+                val s = _state.value
+                if (sprite != null && s.scrubbing && !s.scrubInLoadedSegment &&
+                    sprite.layout.covers(s.playheadMs)
+                ) {
+                    _state.update { it.copy(scrubSprite = spriteCache.lookup(it.playheadMs)) }
+                }
+            } finally {
+                spriteInflight.remove(key)
+            }
+        }
+    }
+
+    /** Last scrub position, to tell the finger's direction of travel for the
+     *  prefetch plan in [onScrub]. */
+    private var lastScrubMs = 0L
+
+    /** Sequence for [LiveScrubSeek.seq]. */
+    private var liveScrubSeq = 0
 
     /** Called when the user releases the scrubber. Seeks to the final position,
      *  and recenters the (larger) data window if the playhead neared its edge so
@@ -1069,7 +1279,25 @@ class PlaybackViewModel(
      *  any in-flight step worker. */
     fun onScrubEnd(tsMs: Long) {
         cancelStepWorker()
-        _state.update { it.copy(scrubbing = false, playheadMs = tsMs, scrubFrameUrl = null) }
+        val s0 = _state.value
+        val liveOffset = liveScrubOffsetMs(s0.currentSegment, tsMs, s0.userSeekInProgress, s0.jumpInProgress)
+        _state.update {
+            it.copy(
+                scrubbing = false,
+                playheadMs = tsMs,
+                scrubFrameUrl = null,
+                scrubPrefetchUrls = emptyList(),
+                scrubInLoadedSegment = false,
+                // Released inside the loaded segment: one EXACT local seek, no
+                // resolve. segmentOffsetMs goes to -1 ("position owned by the
+                // live seek"), which the screen's feed effect ignores, so a later
+                // resolve landing on this same segment at the old offset is
+                // still a state change and still seeks.
+                liveScrubSeek = liveOffset?.let { o -> LiveScrubSeek(o, exact = true, seq = ++liveScrubSeq) },
+                segmentOffsetMs = if (liveOffset != null) -1L else it.segmentOffsetMs,
+                scrubSprite = null,
+            )
+        }
         val s = _state.value
         val margin = 30L * 60_000L
         if (tsMs < s.windowStartMs + margin || tsMs > s.windowEndMs - margin) {
@@ -1079,6 +1307,13 @@ class PlaybackViewModel(
             val we = (tsMs + half).coerceAtMost(now)
             _state.update { it.copy(windowStartMs = ws, windowEndMs = we) }
             loadTimeline(ws, we)
+        }
+        if (liveOffset != null) {
+            // Nothing to resolve: the player already holds this segment. Cancel
+            // any internal (auto-advance) resolve still in flight so it cannot
+            // replace the segment the user just positioned in.
+            seekJob?.cancel()
+            return
         }
         seekTo(tsMs, userInitiated = true)
     }
@@ -1104,7 +1339,7 @@ class PlaybackViewModel(
             val halfMs = FILMSTRIP_HALF_WINDOW_HOURS * 3600 * 1000
             val startIso = Time.iso(Instant.ofEpochMilli((centerMs - halfMs).coerceAtLeast(0L)))
             val endIso = Time.iso(Instant.ofEpochMilli(centerMs + halfMs))
-            repo.filmstrip(cameraId, startIso, endIso, width = 160)
+            repo.filmstrip(cameraId, startIso, endIso, width = SCRUB_FRAME_WIDTH)
                 .onSuccess { frames ->
                     val nearestFrame = frames.minByOrNull {
                         kotlin.math.abs(Time.parseToMillis(it.ts) - _state.value.playheadMs)
@@ -1128,6 +1363,48 @@ class PlaybackViewModel(
     /** Clear a transient error so the UI can retry. */
     fun clearError() {
         _state.update { it.copy(error = null) }
+    }
+
+    // ─── export in/out bracket ──────────────────────────────────────────────
+
+    /**
+     * Place one edge of the export bracket. The missing edge is seeded from the
+     * playhead so a range is visible as soon as the first mark lands, and a mark
+     * is clamped to "now" because there is no footage in the future. Mirrors the
+     * desktop `pbSetExportEdge` and iOS `setExportEdge`.
+     */
+    fun setExportEdge(isStart: Boolean, epochMs: Long) {
+        _state.update { s ->
+            val (start, end) = ExportRange.setEdge(
+                currentStart = s.exportSelStartMs,
+                currentEnd = s.exportSelEndMs,
+                isStart = isStart,
+                ms = epochMs,
+                playheadMs = s.playheadMs,
+                nowMs = Instant.now().toEpochMilli(),
+            )
+            s.copy(exportSelStartMs = start, exportSelEndMs = end)
+        }
+    }
+
+    /** Mark IN at the current playhead (touch equivalent of the desktop shift-drag). */
+    fun markExportIn() = setExportEdge(isStart = true, epochMs = _state.value.playheadMs)
+
+    /** Mark OUT at the current playhead. */
+    fun markExportOut() = setExportEdge(isStart = false, epochMs = _state.value.playheadMs)
+
+    fun clearExportSelection() {
+        _state.update { it.copy(exportSelStartMs = null, exportSelEndMs = null) }
+    }
+
+    /**
+     * The range an Export hand-off should carry: the bracketed selection when one
+     * exists, otherwise the hour ending at the playhead (the prior default, and
+     * what iOS `exportRange()` falls back to).
+     */
+    fun exportRange(): Pair<Long, Long> {
+        val s = _state.value
+        return ExportRange.forExport(s.exportSelStartMs, s.exportSelEndMs, s.playheadMs)
     }
 
     override fun onCleared() {

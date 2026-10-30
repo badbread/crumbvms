@@ -9,9 +9,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import retrofit2.HttpException
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLHandshakeException
 
 /**
@@ -67,6 +72,9 @@ class CrumbRepository(private val container: AppContainer) {
      * from concurrent scrub-triggered loads.
      */
     private val batchUnsupportedBases = ConcurrentHashMap.newKeySet<String>()
+
+    /** Recent `/play/` answers — see [PlayResolveCache] and [resolveSegment]. */
+    private val playResolveCache = PlayResolveCache()
 
     fun mediaUrls(): MediaUrls = container.mediaUrls()
 
@@ -145,6 +153,7 @@ class CrumbRepository(private val container: AppContainer) {
     fun logout() {
         store.clearSession()
         container.clearMediaTokenCache()
+        playResolveCache.invalidate()
     }
 
     /** Drop dead pooled sockets on the current client — see
@@ -281,8 +290,33 @@ class CrumbRepository(private val container: AppContainer) {
             .toMap()
     }
 
-    suspend fun resolveSegment(cameraId: String, tsIso: String, stream: String = "main"): Result<ResolvedSegment> =
-        runCatchingCancellable { api.play(cameraId, tsIso, stream) }
+    /**
+     * `GET /play/{camera_id}` — the segment covering [tsIso]. A segment
+     * resolved within the last minute that covers the instant is answered from
+     * [PlayResolveCache] without a round trip (a scrub release or re-seek
+     * landing in the loaded segment, the next-segment prefetch after a
+     * scrub-back). [bypassCache] always asks the server; its answer still
+     * refreshes the cache. 404s are never cached.
+     */
+    suspend fun resolveSegment(
+        cameraId: String,
+        tsIso: String,
+        stream: String = "main",
+        bypassCache: Boolean = false,
+    ): Result<ResolvedSegment> {
+        val scope = "${store.serverUrl}|${store.token.orEmpty()}"
+        val tsMs = Time.parseToMillis(tsIso)
+        if (!bypassCache) {
+            playResolveCache.lookup(scope, cameraId, stream, tsMs)?.let { return Result.success(it) }
+        }
+        return runCatchingCancellable { api.play(cameraId, tsIso, stream) }
+            .onSuccess { seg -> if (seg.cameraId == cameraId) playResolveCache.put(scope, stream, seg, tsMs) }
+    }
+
+    /** Forget cached `/play/` resolves for [cameraId] (all cameras if null), so
+     *  the next [resolveSegment] asks the server — e.g. before re-resolving
+     *  after a player error, which may mean the cached segment is gone. */
+    fun invalidateResolveCache(cameraId: String? = null) = playResolveCache.invalidate(cameraId)
 
     /**
      * Next/previous merged motion-event start (epoch-millis) relative to
@@ -369,6 +403,39 @@ class CrumbRepository(private val container: AppContainer) {
     suspend fun filmstrip(cameraId: String, startIso: String, endIso: String, width: Int = 160): Result<List<FilmstripFrame>> =
         runCatchingCancellable { api.filmstrip(cameraId, startIso, endIso, width).frames }
 
+    /**
+     * Plain client for scoped-token media byte fetches. Deliberately NOT the API
+     * client: that one attaches the bearer JWT and treats any 401 as "session
+     * expired, log out", and an expired 15-minute media token must never do that.
+     */
+    private val mediaHttp: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * The pre-generated scrub sprite strip of the segment covering [tsMs]
+     * (`GET /filmstrip/{camera}/sprite`, scoped `?token=`): its response headers
+     * (the tile layout, see `SpriteLayout.fromHeaders`) and JPEG bytes. Null on
+     * anything but a 200: a 404 means "not generated yet" (or no footage) and
+     * the caller keeps using the filmstrip frame.
+     */
+    suspend fun scrubSprite(cameraId: String, tsMs: Long): Pair<Map<String, String>, ByteArray>? =
+        withContext(Dispatchers.IO) {
+            runCatchingCancellable {
+                val ts = android.net.Uri.encode(Time.iso(java.time.Instant.ofEpochMilli(tsMs)))
+                val url = mediaUrls().scopedUrl(cameraId, "/filmstrip/$cameraId/sprite?ts=$ts")
+                mediaHttp.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                    val body = if (resp.code == 200) resp.body?.bytes() else null
+                    body?.let { bytes ->
+                        resp.headers.names().associateWith { resp.header(it).orEmpty() } to bytes
+                    }
+                }
+            }.getOrNull()
+        }
+
     // ── bookmarks (server-shared) ───────────────────────────────────────────────
     /** All bookmarks (newest first) when [cameraId] is null; else one camera's (oldest first). */
     suspend fun bookmarks(cameraId: String? = null): Result<List<BookmarkDto>> =
@@ -415,6 +482,19 @@ class CrumbRepository(private val container: AppContainer) {
         runCatchingCancellable { api.createExport(CreateExportRequest(cameraIds, startIso, endIso, burn)) }
 
     suspend fun exportStatus(jobId: String): Result<ExportJob> = runCatchingCancellable { api.exportStatus(jobId) }
+
+    /**
+     * Cancel a queued/running export job (`DELETE /export/{job_id}`).
+     *
+     * The endpoint answers `204 No Content`, so the response body carries nothing;
+     * an unsuccessful status is turned into a failure here rather than silently
+     * reported as a cancel that never happened.
+     */
+    suspend fun cancelExport(jobId: String): Result<Unit> = runCatchingCancellable {
+        val response = api.cancelExport(jobId)
+        if (!response.isSuccessful) error("Server returned HTTP ${response.code()}")
+        Unit
+    }
 
     /**
      * Fetch detection events for one camera over a time window.

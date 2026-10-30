@@ -29,6 +29,7 @@ import '../../api/ptz_panel_models.dart';
 import '../overlay_editor/overlay_editor_layer.dart';
 import '../overlay_editor/overlay_item.dart';
 import 'ptz_panel_controller.dart';
+import '../motion/crumb_interaction_theme.dart';
 
 class PtzPanelOverlay extends StatelessWidget {
   const PtzPanelOverlay({
@@ -182,18 +183,23 @@ class _PtzViewButtonState extends State<_PtzViewButton> {
           if (!_isMomentary) controller.stopContinuous();
         },
         onTap: _isMomentary ? _dispatchTap : null,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 90),
-          decoration: BoxDecoration(
-            color: bg,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(color: border, width: 1.2),
-          ),
-          alignment: Alignment.center,
-          child: LayoutBuilder(
-            builder: (context, constraints) => _PtzGlyphOrLabel(
-              button: button,
-              boxHeight: constraints.maxHeight,
+        // Visual press settle only (PressScale never touches the gesture
+        // above: PTZ dispatch stays immediate).
+        child: PressScale(
+          pressed: _pressed,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 90),
+            decoration: BoxDecoration(
+              color: bg,
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: border, width: 1.2),
+            ),
+            alignment: Alignment.center,
+            child: LayoutBuilder(
+              builder: (context, constraints) => _PtzGlyphOrLabel(
+                button: button,
+                boxHeight: constraints.maxHeight,
+              ),
             ),
           ),
         ),
@@ -314,24 +320,27 @@ class _PtzViewButtonState extends State<_PtzViewButton> {
             if (!isCenter) controller.stopContinuous();
           },
           onTap: isCenter ? () => controller.home() : null,
-          child: Container(
-            decoration: BoxDecoration(
-              color: pressed
-                  ? const Color(0xFF2CA3E8).withValues(alpha: 0.5)
-                  : (hovered
-                      ? Colors.white.withValues(alpha: 0.12)
-                      : Colors.transparent),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: Center(
-              child: icon != null
-                  ? Icon(icon, color: Colors.white70, size: 16)
-                  : isCenter
-                  ? const Icon(Icons.home, color: Colors.white70, size: 16)
-                  : const Text(
-                      '•',
-                      style: TextStyle(color: Colors.white38, fontSize: 12),
-                    ),
+          child: PressScale(
+            pressed: pressed,
+            child: Container(
+              decoration: BoxDecoration(
+                color: pressed
+                    ? const Color(0xFF2CA3E8).withValues(alpha: 0.5)
+                    : (hovered
+                        ? Colors.white.withValues(alpha: 0.12)
+                        : Colors.transparent),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Center(
+                child: icon != null
+                    ? Icon(icon, color: Colors.white70, size: 16)
+                    : isCenter
+                    ? const Icon(Icons.home, color: Colors.white70, size: 16)
+                    : const Text(
+                        '•',
+                        style: TextStyle(color: Colors.white38, fontSize: 12),
+                      ),
+              ),
             ),
           ),
         ),

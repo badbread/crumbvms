@@ -980,6 +980,13 @@ class _LedgerRowState extends State<_LedgerRow> {
             copyPlateToClipboard(context, copy);
           case 'name':
             widget.onNamePlate();
+          case 'correct':
+            showPlateCorrectionDialog(
+              context,
+              api: widget.api,
+              session: widget.session,
+              plate: read.plate,
+            );
           case 'watch':
             widget.onAddToWatchlist();
           case 'report':
@@ -1000,6 +1007,11 @@ class _LedgerRowState extends State<_LedgerRow> {
               plateNameActionLabel(read.displayName),
               style: const TextStyle(fontSize: 13),
             ),
+          ),
+        if (canOfferPlateCorrection(isAdmin: widget.canName, plate: read.plate))
+          const PopupMenuItem(
+            value: 'correct',
+            child: Text('Correct plate...', style: TextStyle(fontSize: 13)),
           ),
         if (canWatch)
           PopupMenuItem(

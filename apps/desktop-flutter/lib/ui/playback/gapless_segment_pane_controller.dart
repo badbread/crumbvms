@@ -121,12 +121,41 @@ const Duration kMpvPlayheadGrace = Duration(milliseconds: 300);
 /// what made one back-click skip a whole segment.
 const Duration kFirstFrameEpsilon = Duration(milliseconds: 20);
 
+/// How long [GaplessSegmentPaneController.seekWithinSegment] waits for a
+/// scrub seek to land before issuing the next one. mpv's absolute seeks are
+/// hr-exact: each one decodes forward from the preceding keyframe (up to a
+/// whole ~1 s GOP of 4K HEVC), so letting every pointer event issue its own
+/// seek kept the decoder restarting and never finishing; the pane looked
+/// frozen or lagged a long way behind the cursor. One seek in flight at a
+/// time, with the newest target replayed when it lands, keeps the picture
+/// moving at the decoder's real pace (typically 10-30 frames/s) and always
+/// converges on the last cursor position. The timeout only bounds a seek
+/// that does not report a position change (target == current position).
+const Duration kScrubSeekSettle = Duration(milliseconds: 150);
+
 /// How far the exact-seek fallback steps backward when the native
 /// `frame-back-step` reports no movement mid-file: one frame at 30 fps.
 /// At lower frame rates the target still lands inside the previous frame
 /// (frames are wider); at higher ones it may skip a single frame — an
 /// acceptable rare-fallback error that can never skip a whole segment.
 const int kReverseStepFallbackMs = 33;
+
+/// Whether entry [index] of [pl] is the media at [url]. Compares the file
+/// (scheme, host, port, path) and ignores the query, which only carries the
+/// scoped media token, so a re-encoded or reordered query can't make a
+/// genuine gapless advance look foreign. Null [url] (nothing was prefetched)
+/// never matches.
+@visibleForTesting
+bool playlistEntryIs(Playlist pl, int index, String? url) {
+  if (url == null || index < 0 || index >= pl.medias.length) return false;
+  final a = Uri.tryParse(pl.medias[index].uri);
+  final b = Uri.tryParse(url);
+  if (a == null || b == null) return pl.medias[index].uri == url;
+  return a.scheme == b.scheme &&
+      a.host == b.host &&
+      a.port == b.port &&
+      Uri.decodeFull(a.path) == Uri.decodeFull(b.path);
+}
 
 class GaplessSegmentPaneController extends ChangeNotifier {
   GaplessSegmentPaneController({
@@ -167,6 +196,22 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   ResolvedSegment? get currentSegment => _current;
   ResolvedSegment? _prefetched;
 
+  /// The media URL appended for [_prefetched], so an mpv playlist advance is
+  /// only adopted when mpv really moved onto that file (see
+  /// [_onPlaylistChanged]).
+  String? _prefetchedUrl;
+
+  /// Bumped by every jump/resolve and every `open()`. A prefetch captures it
+  /// before its first await and, if it changed by the time its append lands,
+  /// removes what it appended instead of keeping it. Without this, a prefetch
+  /// started for the OLD segment (the tick keeps prefetching from [_current]
+  /// while a scrub's resolve is still loading the new file, and `_current`
+  /// only changes when that resolve finishes) appended its stale file behind
+  /// the newly opened one. mpv then played that stale file at the next EOF
+  /// while the bookkeeping adopted the correct prefetch: the picture jumped
+  /// a second or two after a scrub and the playhead didn't.
+  int _generation = 0;
+
   /// When [_current] last changed — gates [mpvPlayhead] behind
   /// [kMpvPlayheadGrace] so a stale `state.position` from the previous file
   /// never gets attributed to the new segment (see the const's doc).
@@ -178,6 +223,18 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   bool _prefetching = false;
   bool _resolving = false;
   bool _advancing = false;
+
+  /// Scrub-seek coalescing (see [seekWithinSegment] / [kScrubSeekSettle]):
+  /// at most one in-segment seek is in flight; a newer target arriving
+  /// meanwhile is parked here and replayed when the in-flight one lands.
+  bool _scrubSeekInFlight = false;
+  DateTime? _pendingScrubTs;
+
+  /// True while this pane is hidden (another camera is maximized) and its
+  /// decoder has been paused by [park]. Cleared by the next [onTick], which
+  /// also re-syncs the pane to the playhead it missed while parked.
+  bool _parked = false;
+  bool get parked => _parked;
 
   // Coalesced follow-up resolve. A [resolveAt] call that arrives while another
   // is in-flight is NOT dropped (that desynced the pane from the playhead when
@@ -306,11 +363,26 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     if (_advancing || _resolving) return;
     final pre = _prefetched;
     if (pre == null || pl.index <= 0) return;
+    // Adopt only if mpv moved onto the file we prefetched. Anything else in
+    // the playlist (a stale append that slipped past every other guard)
+    // must not be labelled with the prefetched segment's times: re-resolve
+    // where the footage should continue, so the picture follows the playhead.
+    if (!playlistEntryIs(pl, pl.index, _prefetchedUrl)) {
+      final resumeAt = DateTime.fromMillisecondsSinceEpoch(
+        (_current?.endMs ?? pre.startMs) + 1,
+        isUtc: true,
+      );
+      unawaited(
+        resolveAt(resumeAt, forceReload: true, playing: _player.state.playing),
+      );
+      return;
+    }
     // State flips are synchronous (before any await) so a burst of playlist
     // events can't double-apply the same prefetch.
     _current = pre;
     _currentSince = DateTime.now();
     _prefetched = null;
+    _prefetchedUrl = null;
     noFootage = false;
     error = null;
     notifyListeners();
@@ -351,6 +423,23 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     bool playing = false,
     bool mpvDriven = false,
   }) async {
+    if (_parked) {
+      // The pane just became visible again. Its decoder was paused while
+      // hidden and the playhead moved on without it, so the linear boundary
+      // logic below has nothing valid to work from: do one forced re-sync at
+      // the playhead (reload or in-file seek, as needed) and reassert the
+      // transport state. Not `_resolving`-gated: resolveAt coalesces itself.
+      _parked = false;
+      await resolveAt(playhead, forceReload: true, playing: playing);
+      if (playing && !_player.state.playing) {
+        try {
+          await _player.play();
+        } catch (_) {
+          /* non-fatal — the transport owner reasserts play on its next change */
+        }
+      }
+      return;
+    }
     final cur = _current;
     if (cur == null) {
       if (!_resolving) await resolveAt(playhead, playing: playing);
@@ -387,7 +476,10 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     final untilEnd = cur.end.difference(playhead);
     if (untilEnd.inMilliseconds <= leadMs &&
         _prefetched == null &&
-        !_prefetching) {
+        !_prefetching &&
+        // A resolve in flight is replacing [cur]; a prefetch now would be
+        // for the outgoing segment.
+        !_resolving) {
       unawaited(_prefetchNext());
     }
 
@@ -426,6 +518,7 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   Future<void> _prefetchNext() async {
     final cur = _current;
     if (cur == null) return;
+    final gen = _generation;
     _prefetching = true;
     try {
       final seg = await api.resolveSegment(
@@ -437,16 +530,25 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       // A jump/seek may have swapped the current segment while the resolve
       // was in flight — this prefetch was for the OLD linear path, drop it
       // (a forced resolve invalidates the look-ahead, as in app.js).
-      if (!identical(_current, cur)) return;
+      if (!identical(_current, cur) || gen != _generation) return;
       // Keep only if it's genuinely a LATER segment (guard against the API
       // returning the same/overlapping one near the boundary) — mirrors
       // app.js's `seg.startMs >= cur.segEndMs - 250` guard.
       if (seg == null || seg.startMs < cur.endMs - 250) return;
       final url = await api.mediaUrlForSegment(_session, seg);
-      if (url == null || !identical(_current, cur)) return;
+      if (url == null || !identical(_current, cur) || gen != _generation) {
+        return;
+      }
       try {
         await _player.add(Media(url));
+        if (gen != _generation || !identical(_current, cur)) {
+          // A jump landed while the append was in flight: what we appended
+          // now sits behind the NEW file. Take it back out.
+          await _removeTrailingEntries();
+          return;
+        }
         _prefetched = seg;
+        _prefetchedUrl = url;
       } catch (_) {
         // append failed — the boundary resolve below will fall back to a
         // live fetch, matching app.js's comment on the same failure mode.
@@ -488,6 +590,7 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         _current = pre;
         _currentSince = DateTime.now();
         _prefetched = null;
+        _prefetchedUrl = null;
         noFootage = false;
         error = null;
         notifyListeners();
@@ -512,9 +615,24 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   Future<void> _dropPrefetch() async {
     if (_prefetched == null) return;
     _prefetched = null;
+    _prefetchedUrl = null;
     try {
       final n = _player.state.playlist.medias.length;
       if (n > 1) await _player.remove(n - 1);
+    } catch (_) {
+      /* best-effort */
+    }
+  }
+
+  /// Remove every playlist entry after the current one. Used when a stale
+  /// append is detected, and right after a fresh `open()` so the new file is
+  /// alone in the playlist whatever raced it.
+  Future<void> _removeTrailingEntries() async {
+    try {
+      final pl = _player.state.playlist;
+      for (var i = pl.medias.length - 1; i > pl.index; i--) {
+        await _player.remove(i);
+      }
     } catch (_) {
       /* best-effort */
     }
@@ -551,6 +669,14 @@ class GaplessSegmentPaneController extends ChangeNotifier {
     try {
       final cur = _current;
       if (forceReload) {
+        // A jump: invalidate any prefetch already in flight for the outgoing
+        // segment. NOT on a non-forced call: the wall-clock boundary path and
+        // the end-of-playlist fallback call resolveAt every tick while the
+        // segment is still covered, and bumping there made the correct
+        // in-flight prefetch discard its own append (a reopen stutter at
+        // every boundary). A non-forced call that does open a new file bumps
+        // at the open below.
+        _generation++;
         await _dropPrefetch();
       } else if (cur != null && cur.covers(ts)) {
         return; // still covered — nothing to do (matches the cached-skip in app.js)
@@ -593,6 +719,9 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         // gap is larger. Seeking while paused renders the exact target frame
         // first; playback (if any) resumes only after it has landed.
         await _player.open(Playlist([Media(url)]), play: false);
+        _generation++;
+        _prefetched = null;
+        _prefetchedUrl = null;
         try {
           await _player.setRate(rate);
         } catch (_) {
@@ -617,17 +746,26 @@ class GaplessSegmentPaneController extends ChangeNotifier {
         /* non-fatal */
       }
       // Resume only after the seek has landed on a freshly opened file, so the
-      // first shown frame is the target rather than the segment start.
-      if (!sameFile && playing) {
+      // first shown frame is the target rather than the segment start. Also
+      // on a same-file jump if mpv isn't playing: it may have reached the end
+      // of the file during the resolve (the forced path dropped the appended
+      // next entry, so mpv paused there), and the seek above clears that
+      // end state without resuming, leaving the pane paused while the
+      // playhead walks on.
+      if (playing && (!sameFile || !_player.state.playing)) {
         try {
           await _player.play();
         } catch (_) {
           /* non-fatal — the transport owner reasserts play on its next change */
         }
       }
+      // Whatever raced the open, the new file plays alone; the next prefetch
+      // (from this segment) appends the correct follower.
+      if (!sameFile) await _removeTrailingEntries();
       _current = seg;
       _currentSince = DateTime.now();
       _prefetched = null;
+      _prefetchedUrl = null;
       noFootage = false;
       error = null;
       notifyListeners();
@@ -880,6 +1018,8 @@ class GaplessSegmentPaneController extends ChangeNotifier {
       // open() replaces the whole playlist, taking any appended prefetch
       // with it — forget the bookkeeping to match.
       _prefetched = null;
+      _prefetchedUrl = null;
+      _generation++;
       await _player.open(Playlist([Media(url)]), play: false);
       try {
         await _player.setRate(rate);
@@ -938,14 +1078,56 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   /// `pbSeekAllPanes`'s same-segment branch. If `ts` has left the current
   /// segment, this is a no-op; callers should follow up with [resolveAt]
   /// once the scrub commits (mirrors the timeline's `onCommitSeek`).
+  ///
+  /// Coalesced: pointer events arrive at 60-120 Hz but an hr-exact seek
+  /// costs a keyframe-forward decode, so only one seek is in flight at a
+  /// time and the newest target is replayed when it lands (see
+  /// [kScrubSeekSettle]). The target is re-read against [_current] on each
+  /// replay, so a segment swap mid-scrub can't land a stale offset in the
+  /// wrong file.
   Future<void> seekWithinSegment(DateTime ts) async {
-    final cur = _current;
-    if (cur == null || !cur.covers(ts)) return;
-    final offsetMs = (ts.millisecondsSinceEpoch - cur.startMs)
-        .clamp(0, cur.durationMs)
-        .toInt();
+    if (_scrubSeekInFlight) {
+      _pendingScrubTs = ts;
+      return;
+    }
+    _scrubSeekInFlight = true;
     try {
-      await _player.seek(Duration(milliseconds: offsetMs));
+      DateTime? target = ts;
+      while (target != null) {
+        final cur = _current;
+        if (cur == null || !cur.covers(target)) break;
+        final offsetMs = (target.millisecondsSinceEpoch - cur.startMs)
+            .clamp(0, cur.durationMs)
+            .toInt();
+        final before = _player.state.position;
+        try {
+          await _player.seek(Duration(milliseconds: offsetMs));
+        } catch (_) {
+          /* non-fatal */
+        }
+        await _positionAfter(before, timeout: kScrubSeekSettle);
+        target = _pendingScrubTs;
+        _pendingScrubTs = null;
+      }
+    } finally {
+      _scrubSeekInFlight = false;
+      _pendingScrubTs = null;
+    }
+  }
+
+  /// The pane is about to be hidden (another camera was maximized): stop its
+  /// decoder. The screen only builds and ticks the active panes, but the
+  /// hidden ones kept decoding full-rate 4K HEVC into a texture nobody drew,
+  /// starving the one pane the operator was actually looking at (and the
+  /// scrub seeks on it). Idempotent; undone by the next [onTick], which
+  /// re-syncs the pane to the playhead it missed. Nothing else here changes:
+  /// the loaded segment and any prefetch are kept so a quick restore inside
+  /// the same segment is just a seek.
+  Future<void> park() async {
+    if (_parked) return;
+    _parked = true;
+    try {
+      await _player.pause();
     } catch (_) {
       /* non-fatal */
     }

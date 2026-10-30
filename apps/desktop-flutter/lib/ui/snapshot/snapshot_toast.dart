@@ -14,6 +14,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../motion/panel_motion.dart';
 
 class SnapshotToast {
   SnapshotToast._();
@@ -54,9 +55,8 @@ class SnapshotToast {
           child: ValueListenableBuilder<bool>(
             valueListenable: visible,
             builder: (context, isVisible, _) {
-              return AnimatedOpacity(
-                opacity: isVisible ? 1 : 0,
-                duration: const Duration(milliseconds: 200),
+              return ToastMotion(
+                visible: isVisible,
                 child: _ToastCard(
                   icon: icon,
                   title: title,

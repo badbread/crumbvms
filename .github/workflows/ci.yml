@@ -98,13 +98,13 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # ── Android client: compile-check the debug build ───────────────────────────
+  # ── Android client: compile-check the debug build + run JVM unit tests ───────────────────────────
   # Catches Kotlin/resource/manifest breakage on every PR. Without this the
   # Android app was only ever built by android-release.yml on a `v*` tag, so a
   # broken commit surfaced at release time. Debug build only (no signing) —
   # mirrors android-release.yml's toolchain (JDK 17, SDK via setup-android).
   android:
-    name: android (debug build)
+    name: android (debug build + unit tests)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -139,7 +139,41 @@ jobs:
       - name: Assemble debug APK
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleDebug --console=plain --stacktrace
+          ./gradlew :app:assembleDebug :app:testDebugUnitTest --console=plain --stacktrace
+
+  # ── Flutter desktop client: analyze + test ──────────────────────────────────
+  # apps/desktop-flutter had no per-PR gate (it was only compiled by the Windows
+  # release workflow on a tag). The ~25 test files are pure Dart/widget tests:
+  # none import flutter_rust_bridge's generated bindings or media_kit, so
+  # `flutter test` never loads the Rust core or libmpv and an ubuntu runner is
+  # enough (no Rust/LLVM/Windows needed; those are only for `flutter build`).
+  # Flutter version matches windows-release-flutter.yml; bump both together.
+  flutter:
+    name: flutter (analyze, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop-flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.6"
+          channel: stable
+          cache: true
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      # Fails on warnings and errors; the existing info-level lints are
+      # tolerated (--no-fatal-infos) until they are cleaned up.
+      - name: flutter analyze
+        run: flutter analyze --no-fatal-infos lib test
+
+      - name: flutter test
+        run: flutter test
 
   # ── Docker images: build + tag (push only if registry configured) ───────────
   images:

@@ -191,6 +191,12 @@ pub struct PlateRead {
     /// neither a first-class name nor a watchlist label; clients then show the
     /// raw `plate`. The raw plate is always retained alongside it.
     pub display_name: Option<String>,
+    /// The plate string the engine actually read, when an operator corrected
+    /// it (`plate_aliases`, migration 0084, issue #673): `plate` is then the
+    /// canonical plate the read counts as, and this is the raw normalized read.
+    /// `None` for an uncorrected read (and on paths that do not resolve
+    /// corrections, such as the A/B benchmark, where `plate` is always raw).
+    pub corrected_from: Option<String>,
 }
 
 /// Operator-confirmed ground truth for one derived vehicle "pass"
@@ -945,6 +951,11 @@ pub struct Bookmark {
     pub protect_end_ts: Option<DateTime<Utc>>,
     /// `bookmarks.created_at` — when the bookmark was made.
     pub created_at: DateTime<Utc>,
+    /// Computed: `true` when retention has deleted the footage at `ts` (no
+    /// segment covers it and it is older than the camera's oldest remaining
+    /// segment, or the camera has no segments at all). A moment that falls in a
+    /// recording gap inside the retained range is NOT expired.
+    pub footage_expired: bool,
 }
 
 // ─── motion grid (motion tuner) ────────────────────────────────────────────────

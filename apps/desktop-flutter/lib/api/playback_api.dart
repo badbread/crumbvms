@@ -26,10 +26,12 @@
 // its calls through the shared timeout client (`sharedHttpClient`) instead.
 
 import 'dart:convert';
+import 'dart:isolate';
 
 import 'crumb_api.dart';
 import 'http_client.dart';
 import 'models.dart';
+import 'play_resolve_cache.dart';
 
 /// A merged recorded span for one camera (`GET /timeline` -> `spans[]`).
 /// Contiguous segments (gap < ~1s) are already merged server-side.
@@ -58,6 +60,27 @@ class RecordedSpan {
     hasMotion: (j['has_motion'] as bool?) ?? false,
     stage: (j['stage'] as String?) ?? 'live',
   );
+}
+
+/// Bodies at/above this size are decoded off the UI isolate by
+/// [PlaybackApi.fetchTimeline]. 64 KiB is roughly 400 merged spans: anything
+/// larger is a coverage-style fetch whose decode would be felt as a hitch;
+/// anything smaller decodes in well under a frame inline.
+const int kOffIsolateParseBytes = 64 * 1024;
+
+/// Decode a `GET /timeline` response body into spans. Top-level (not a
+/// closure over `this`) so it can run on a worker isolate via
+/// [Isolate.run]; a malformed body yields `[]`, matching the fetch's
+/// best-effort contract.
+List<RecordedSpan> parseTimelineSpans(String body) {
+  try {
+    final j = jsonDecode(body) as Map<String, dynamic>;
+    return (j['spans'] as List<dynamic>? ?? const [])
+        .map((e) => RecordedSpan.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  } catch (_) {
+    return const [];
+  }
 }
 
 /// A resolved recording segment (`GET /play/{camera_id}` / `/play/aligned`).
@@ -111,6 +134,9 @@ extension PlaybackApi on CrumbApi {
   static final Map<String, _CachedMediaToken> _tokenCache = {};
   static final Map<String, Future<String?>> _tokenInflight = {};
 
+  /// Recent `/play/{camera_id}` answers (see play_resolve_cache.dart).
+  static final PlayResolveCache playResolveCache = PlayResolveCache();
+
   /// Drop every cached (and in-flight) media token. Called from session
   /// teardown (`main.dart`) so a signed-out principal's still-valid scoped
   /// tokens can never be reused by whoever signs in next on a shared
@@ -120,7 +146,13 @@ extension PlaybackApi on CrumbApi {
   static void clearTokenCache() {
     _tokenCache.clear();
     _tokenInflight.clear();
+    playResolveCache.invalidate();
   }
+
+  /// Forget cached segment resolves (all, or only [cameraId]'s), so the next
+  /// [resolveSegment] asks the server again.
+  static void invalidateResolveCache({String? cameraId}) =>
+      playResolveCache.invalidate(cameraId: cameraId);
 
   Map<String, String> _authHeaders(Session s) => {
     'authorization': 'Bearer ${s.token}',
@@ -155,11 +187,17 @@ extension PlaybackApi on CrumbApi {
     try {
       final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return const [];
-      final j = jsonDecode(resp.body) as Map<String, dynamic>;
-      final spans = (j['spans'] as List<dynamic>? ?? const [])
-          .map((e) => RecordedSpan.fromJson(e as Map<String, dynamic>))
-          .toList(growable: false);
-      return spans;
+      final body = resp.body;
+      // A coverage fetch (30 days of spans, up to the server's 10 000-span
+      // page) is a multi-megabyte JSON body; decoding it on the UI isolate is
+      // a visible hitch (tens of ms) that lands mid-scrub or mid-playback on
+      // the periodic refetch. Parse large bodies on a worker isolate; the
+      // small per-window fetches stay inline (an isolate spawn costs more
+      // than they do).
+      if (body.length >= kOffIsolateParseBytes) {
+        return Isolate.run(() => parseTimelineSpans(body));
+      }
+      return parseTimelineSpans(body);
     } catch (_) {
       return const [];
     }
@@ -168,21 +206,38 @@ extension PlaybackApi on CrumbApi {
   /// GET /play/{camera_id}?ts=<iso>&stream=<main|sub> — resolve the segment
   /// covering `ts`. Returns `null` on 404 ("no footage at this time" — a
   /// normal outcome, not an error) or on network failure.
+  ///
+  /// A segment resolved within the last minute that covers `ts` is answered
+  /// from [playResolveCache] without a round trip (scrub release, frame-step
+  /// and adjacent-segment probes mostly land in one). Pass `bypassCache` to
+  /// always ask the server; its answer still refreshes the cache.
   Future<ResolvedSegment?> resolveSegment(
     Session s,
     String cameraId,
     DateTime ts, {
     String stream = 'main',
+    bool bypassCache = false,
   }) async {
+    final scope = '${s.base}|${s.token}';
+    if (!bypassCache) {
+      final hit = playResolveCache.lookup(scope, cameraId, stream, ts);
+      if (hit != null) return hit;
+    }
     final uri = Uri.parse('${s.base}/play/$cameraId').replace(
       queryParameters: {'ts': ts.toUtc().toIso8601String(), 'stream': stream},
     );
     try {
       final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return null;
-      return ResolvedSegment.fromJson(
+      final seg = ResolvedSegment.fromJson(
         jsonDecode(resp.body) as Map<String, dynamic>,
       );
+      // Only a segment that really covers `ts` and belongs to the asked
+      // camera is reusable for later lookups.
+      if (seg.cameraId == cameraId && seg.covers(ts)) {
+        playResolveCache.put(scope, stream, seg);
+      }
+      return seg;
     } catch (_) {
       return null;
     }

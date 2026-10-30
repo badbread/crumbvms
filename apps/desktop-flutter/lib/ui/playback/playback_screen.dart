@@ -38,11 +38,18 @@ import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
+import 'package:crumb_desktop/services/snapshot_registry.dart';
+import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
 import 'gapless_segment_pane_controller.dart';
+import 'scrub_frame_cache.dart';
+import 'scrub_sprite_cache.dart';
+import 'scrub_sprite_view.dart';
 import 'playback_prefs.dart';
+import 'playback_tick_text.dart';
+import 'no_footage_message.dart';
 import 'playback_timeline_controller.dart';
 
 class PlaybackScreen extends StatefulWidget {
@@ -63,6 +70,7 @@ class PlaybackScreen extends StatefulWidget {
     this.onExitFocus,
     this.onMotionController,
     this.audio,
+    this.onLeave,
   });
 
   final CrumbApi api;
@@ -130,6 +138,13 @@ class PlaybackScreen extends StatefulWidget {
   /// selected/maximized camera is audible when audio is on.
   final AudioFollowController? audio;
 
+  /// Called from dispose with the playhead the operator left at, so the host
+  /// can reopen Playback there (pass it back as [initialTime]). The tab is
+  /// torn down on every tab switch and on minimize to free its mpv players;
+  /// without this, coming back from Export jumped to the latest footage.
+  /// Not called if the screen is disposed before its initial load finished.
+  final void Function(DateTime playhead)? onLeave;
+
   @override
   State<PlaybackScreen> createState() => _PlaybackScreenState();
 }
@@ -174,6 +189,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     session: widget.session,
   );
   Timer? _motionDebounce;
+  bool _motionForcePending = false;
 
   // Debounced write of the timeline zoom span to shared_preferences, so a
   // continuous wheel-zoom / repeated ±-button press persists only the settled
@@ -194,6 +210,24 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   final Map<String, Uint8List?> _scrubFrames = {};
   int _scrubToken = 0;
   DateTime _lastScrubFetch = DateTime.fromMillisecondsSinceEpoch(0);
+  // Frames already fetched this session, keyed by the server's 4 s grid cell,
+  // plus the cells being warmed ahead of the cursor. A revisited cell repaints
+  // synchronously from here; see scrub_frame_cache.dart.
+  final ScrubFrameCache _scrubCache = ScrubFrameCache();
+  final Set<String> _scrubPrefetchInflight = {};
+  int _lastScrubMs = 0;
+  Timer? _scrubTrailing;
+  // Dwell pre-open: while the cursor rests outside a pane's loaded segment
+  // during a drag, resolve+open the target segment (paused, behind the
+  // filmstrip overlay) so the release is a seek instead of an HTTP round-trip
+  // plus a cold mpv open. See _liveSeek.
+  Timer? _scrubDwell;
+  // Per-segment sprite strips (1 s granularity in one request per segment),
+  // preferred over the 4 s-grid frames wherever the server has pre-generated
+  // them; the frames stay the fallback. See scrub_sprite_cache.dart.
+  final ScrubSpriteCache _spriteCache = ScrubSpriteCache();
+  final Map<String, ScrubSpriteTile> _scrubSprites = {};
+  final Set<String> _spriteInflight = {};
 
   bool _playing = false;
   int _speedIdx = 1; // 1x
@@ -206,6 +240,19 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   // behind the scrubber) — see _syncCoverage.
   final Map<String, _CoverageCache> _coverage = {};
   final Set<String> _coverageLoading = {};
+
+  // Per-camera start of the oldest remaining recording (GET /cameras
+  // `oldest_footage_ts`). Seeded from the camera list we were given and
+  // refreshed once on entry, since retention moves it forward while the app
+  // stays open. A playhead earlier than this is footage deleted by retention.
+  late final Map<String, DateTime?> _oldestFootage = {
+    for (final c in _cameras) c.id: c.oldestFootageTs,
+  };
+  // Effective recording mode per camera (`recording_mode`), refreshed with
+  // the above so a policy change since sign-in is picked up.
+  late final Map<String, String?> _recordingMode = {
+    for (final c in _cameras) c.id: c.recordingMode,
+  };
   int _idleTicks = 0;
   bool _resolvePending = false;
 
@@ -234,6 +281,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // Hand our motion controller to the host so it can render the legend +
     // hints in the app's bottom status bar (set here, cleared in dispose).
     widget.onMotionController?.call(_motion, true);
+    unawaited(_refreshOldestFootage());
     for (final c in _cameras) {
       final pane = GaplessSegmentPaneController(
         api: widget.api,
@@ -247,6 +295,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       // active pane becomes audible once its footage actually loads.
       pane.addListener(_syncAudioReconcile);
       _panes[c.id] = pane;
+      // Snapshot target (S key / the transport bar's camera button), named
+      // after the footage time under the playhead rather than "now".
+      SnapshotRegistry.instance.register(
+        _snapshotPaneId(c.id),
+        SnapshotTarget(
+          player: pane.player,
+          cameraName: c.name,
+          frameTime: () => _timeline.playhead,
+        ),
+      );
     }
     _selectedCameraId = _cameras.isNotEmpty ? _cameras.first.id : null;
     // Carry a maximized live pane into playback (if it's one of our cameras).
@@ -255,6 +313,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _maximizedCameraId = maxId;
       _selectedCameraId = maxId;
     }
+    _syncSnapshotTarget();
     // Register panes with the shared audio-follow controller so the active
     // (maximized else selected) camera is audible when audio is on — and reset
     // the controller's target off any stale wall pane onto ours.
@@ -278,8 +337,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         _selectedCameraId != null ? _audioPaneId(_selectedCameraId!) : null,
       );
     }
-    // Rebuild (fresh playhead for the motion strip) + debounced motion refetch
-    // whenever the scrubber window/playhead changes.
+    // Throttled motion refetch whenever the scrubber window/playhead changes.
+    // No screen rebuild: the timeline view, the transport clock and the
+    // export-selection bar listen to [_timeline] themselves.
     _timeline.addListener(_onTimelineChanged);
     _enter();
     _idleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -313,15 +373,25 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     }
   }
 
+  /// Fires every 100 ms while playing and at pointer rate while dragging, so
+  /// it must NOT setState: that rebuilt the whole screen, every pane's Video
+  /// widget included, at tick rate. Everything that shows the playhead or the
+  /// selection listens to [_timeline] directly instead.
   void _onTimelineChanged() {
-    if (mounted) setState(() {});
     _scheduleMotionRefresh();
   }
 
   /// Keep the motion controller's window/selection in step with the scrubber,
-  /// then (debounced) refetch intensity + detections. [force] bypasses the
-  /// controller's "same window already loaded" skip (used by the periodic
-  /// full re-fetch).
+  /// then refetch intensity + detections at most every 350 ms. [force]
+  /// bypasses the controller's "same window already loaded" skip (used by
+  /// the periodic full re-fetch).
+  ///
+  /// A throttle, not a debounce: during playback the playhead (and the
+  /// window re-centred on it) changes every 100 ms tick, and restarting a
+  /// 350 ms debounce on each change meant it never fired, so motion/HA
+  /// markers stayed blank until the operator paused. A pending timer is left
+  /// alone and fires with the latest [configure]d window; the controller's
+  /// fetch-range signature makes repeat calls for the same range no-ops.
   void _scheduleMotionRefresh({bool force = false}) {
     _motion.configure(
       windowStartMs: _timeline.windowStart.millisecondsSinceEpoch,
@@ -329,11 +399,29 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       wallCameraIds: _cameraIds,
       selectedCameraId: _maximizedCameraId ?? _selectedCameraId,
     );
-    _motionDebounce?.cancel();
-    _motionDebounce = Timer(
-      const Duration(milliseconds: 350),
-      () => _motion.refresh(force: force),
-    );
+    _motionForcePending = _motionForcePending || force;
+    if (_motionDebounce?.isActive ?? false) return;
+    _motionDebounce = Timer(const Duration(milliseconds: 350), () {
+      final f = _motionForcePending;
+      _motionForcePending = false;
+      _motion.refresh(force: f);
+    });
+  }
+
+  /// Whether [cameraId] had motion in the last [kRecentMotionWindow], from the
+  /// motion strip's loaded intensity buckets. False when the strip has no data
+  /// reaching "now" for it.
+  bool _hadRecentMotion(String cameraId) {
+    final b = _motion.intensityByCam[cameraId];
+    if (b == null || b.buckets.isEmpty) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final step = math.max(1000, b.bucketMs);
+    for (var t = now - kRecentMotionWindow.inMilliseconds; t <= now; t += step) {
+      final i = b.indexAt(t);
+      if (i != null && b.buckets[i] >= kMotionAbsFloor) return true;
+    }
+    final last = b.indexAt(now);
+    return last != null && b.buckets[last] >= kMotionAbsFloor;
   }
 
   /// Seek the playhead to `ms` epoch (from a motion-strip click / prev-next).
@@ -345,9 +433,12 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
 
   @override
   void dispose() {
+    if (!_entering) widget.onLeave?.call(_timeline.playhead);
     _tickTimer?.cancel();
     _shuttleTimer?.cancel();
     _idleTimer?.cancel();
+    _scrubTrailing?.cancel();
+    _scrubDwell?.cancel();
     _motionDebounce?.cancel();
     _spanPersistDebounce?.cancel();
     _timeline.removeListener(_onTimelineChanged);
@@ -363,6 +454,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       for (final c in _cameras) {
         audio.unregisterPane(_audioPaneId(c.id));
       }
+    }
+    for (final c in _cameras) {
+      SnapshotRegistry.instance.unregister(_snapshotPaneId(c.id));
     }
     for (final p in _panes.values) {
       p.removeListener(_syncAudioReconcile);
@@ -512,6 +606,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (camId == _selectedCameraId) {
       _timeline.setSpans(_coverage[camId]!.spans);
     }
+    // No setState: the timeline repaints from setSpans, and the tiles' no-footage
+    // reasons come from the server's oldest_footage_ts / recording_mode, not
+    // from this coverage cache.
   }
 
   /// Fetch every merged recorded span for [cameraId] over `[start, end)`,
@@ -597,7 +694,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }) async {
     final play = playing ?? _playing;
     final futures = <Future<void>>[];
-    for (final cam in _activeCameras()) {
+    final active = _activeCameras();
+    for (final cam in active) {
       final pane = _panes[cam.id]!;
       futures.add(
         force
@@ -605,8 +703,19 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             : pane.onTick(t, playing: play, mpvDriven: mpvDriven),
       );
     }
+    // Panes that are not active right now (the grid behind a maximized
+    // camera) are neither built nor ticked, but their players kept decoding
+    // at full rate into textures nobody drew. Park them; the pane's next
+    // onTick (when it becomes active again) re-syncs it to the playhead.
+    if (active.length < _panes.length) {
+      final activeIds = {for (final c in active) c.id};
+      for (final e in _panes.entries) {
+        if (!activeIds.contains(e.key)) futures.add(e.value.park());
+      }
+    }
+    // No setState: this runs on every play tick, and each _PbTile listens
+    // to its own pane for the footage state it shows.
     await Future.wait(futures);
-    if (mounted) setState(() {});
   }
 
   /// Live-scrub, fired continuously while dragging the scrubber. Panes are NOT
@@ -638,21 +747,121 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // is inside the focused pane's loaded segment, drop the overlay and let
     // the real video show through; the filmstrip remains the cross-segment
     // fallback only.
+    final tMs = t.millisecondsSinceEpoch;
+    final direction = tMs >= _lastScrubMs ? 1 : -1;
+    _lastScrubMs = tMs;
+    // While the cursor rests outside what the active panes have loaded,
+    // pre-open the target segment behind the overlay so the release only
+    // needs a seek (see _scrubDwell). Re-armed on every move: a cursor in
+    // motion never opens anything, a cursor that pauses for a beat does.
+    _scrubDwell?.cancel();
+    _scrubDwell = Timer(_kScrubDwell, () => _preopenAt(t));
     if (_panes[focusId]?.currentSegment?.covers(t) ?? false) {
-      if (_scrubFrames.isNotEmpty) {
+      if (_scrubFrames.isNotEmpty || _scrubSprites.isNotEmpty) {
         _scrubToken++; // an in-flight fetch must not repaint the overlay
-        setState(_scrubFrames.clear);
+        setState(() {
+          _scrubFrames.clear();
+          _scrubSprites.clear();
+        });
       }
       return;
     }
-    // Filmstrip frame for the focused pane, throttled (~8/sec) to cap the
-    // server-side extract load, superseded-request-safe via a token.
-    final now = DateTime.now();
-    if (now.difference(_lastScrubFetch) < const Duration(milliseconds: 120)) {
+    // A pre-generated sprite strip gives 1 s granularity; use it whenever one
+    // covers `t`, and fall through to the 4 s-grid frame otherwise.
+    if (_showSpriteAt(focusId, tMs, direction)) return;
+    // Filmstrip frame for the focused pane. A cell already fetched this
+    // session repaints synchronously from the cache (dragging back over
+    // covered ground, or a cell the prefetch below warmed before the cursor
+    // got there); only a genuinely new cell goes to the server, throttled
+    // (~8/sec) to cap the server-side extract load and
+    // superseded-request-safe via a token. The cells just ahead of the
+    // cursor are warmed in the background so the next ones are hits too.
+    const width = _kScrubWidth;
+    final cached = _scrubCache.get(focusId, tMs, width);
+    if (cached != null) {
+      _scrubToken++; // supersede any in-flight fetch for an older cell
+      _scrubTrailing?.cancel();
+      if (!identical(_scrubFrames[focusId], cached) ||
+          _scrubSprites.containsKey(focusId)) {
+        setState(() {
+          _scrubFrames[focusId] = cached;
+          _scrubSprites.remove(focusId);
+        });
+      }
+      _prefetchScrubNeighbours(focusId, tMs, direction);
       return;
     }
+    if (_scrubCache.isKnownMiss(focusId, tMs, width)) {
+      // Nothing to show for this cell (a coverage gap): keep the last frame
+      // rather than flashing, and still warm the cells ahead.
+      _prefetchScrubNeighbours(focusId, tMs, direction);
+      return;
+    }
+    final now = DateTime.now();
+    final sinceLast = now.difference(_lastScrubFetch);
+    if (sinceLast < _kScrubFetchThrottle) {
+      // Trailing edge: the throttle used to simply drop this move, so a drag
+      // that stopped inside the window left the overlay one cell stale until
+      // the next pointer event. Fetch it when the window closes instead.
+      _scrubTrailing?.cancel();
+      _scrubTrailing = Timer(_kScrubFetchThrottle - sinceLast, () {
+        if (!_scrubbing || !mounted) return;
+        _lastScrubFetch = DateTime.now();
+        _fetchScrubFrame(focusId, t, ++_scrubToken);
+      });
+      return;
+    }
+    _scrubTrailing?.cancel();
     _lastScrubFetch = now;
     _fetchScrubFrame(focusId, t, ++_scrubToken);
+    _prefetchScrubNeighbours(focusId, tMs, direction);
+  }
+
+  /// Width the scrub overlay is fetched at. 480 is the server's pre-generated
+  /// width (`THUMB_PREGEN_WIDTH` default) and one of its cache buckets, so a
+  /// frame the background worker already rendered is served from disk.
+  static const int _kScrubWidth = 480;
+  static const Duration _kScrubFetchThrottle = Duration(milliseconds: 120);
+
+  /// Pointer-rest time before the active panes pre-open the segment under the
+  /// cursor. Longer than the gap between pointer events during a drag (so a
+  /// moving cursor never opens anything), shorter than a human "pause to
+  /// look": by the time the operator releases on what they see, the file is
+  /// usually already loaded and the release is an in-file seek.
+  static const Duration _kScrubDwell = Duration(milliseconds: 180);
+
+  /// Warm the filmstrip cells around [tMs] in the direction of travel.
+  /// Bounded: at most [_kScrubPrefetchMax] background fetches in flight, so a
+  /// fast drag can't fan out an unbounded request storm (the server's media
+  /// bucket is generous, but a 4K HEVC cold extract is still real work).
+  static const int _kScrubPrefetchMax = 3;
+  void _prefetchScrubNeighbours(String camId, int tMs, int direction) {
+    if (!_scrubbing) return;
+    final slots = _scrubCache.slotsToPrefetch(
+      camId,
+      tMs,
+      _kScrubWidth,
+      direction: direction,
+    );
+    for (final slotMs in slots) {
+      if (_scrubPrefetchInflight.length >= _kScrubPrefetchMax) break;
+      final key = '$camId|$slotMs';
+      if (_scrubPrefetchInflight.contains(key)) continue;
+      _scrubPrefetchInflight.add(key);
+      unawaited(() async {
+        try {
+          final bytes = await widget.api.fetchFilmstripFrame(
+            widget.session,
+            camId,
+            DateTime.fromMillisecondsSinceEpoch(slotMs, isUtc: true),
+            width: _kScrubWidth,
+          );
+          _scrubCache.put(camId, slotMs, _kScrubWidth, bytes);
+        } finally {
+          _scrubPrefetchInflight.remove(key);
+        }
+      }());
+    }
   }
 
   Future<void> _fetchScrubFrame(String camId, DateTime t, int token) async {
@@ -660,10 +869,106 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       widget.session,
       camId,
       t,
-      width: 480,
+      width: _kScrubWidth,
     );
+    _scrubCache.put(camId, t.millisecondsSinceEpoch, _kScrubWidth, bytes);
     if (!mounted || token != _scrubToken || !_scrubbing) return;
-    setState(() => _scrubFrames[camId] = bytes);
+    // A 404 (coverage gap) keeps the last frame rather than blanking the pane.
+    if (bytes == null) return;
+    setState(() {
+      _scrubFrames[camId] = bytes;
+      _scrubSprites.remove(camId);
+    });
+  }
+
+  /// At most this many sprite requests in flight (the one under the cursor
+  /// plus the segments ahead of it).
+  static const int _kSpriteInflightMax = 3;
+
+  /// Sprite path of [_liveSeek]. Shows the tile for [tMs] when a cached
+  /// sprite covers it (and warms the next segments in the direction of
+  /// travel), returning true. Otherwise asks the server for the sprite in the
+  /// background (unless it recently had none) and returns false, so the
+  /// caller shows a 4 s-grid frame meanwhile; the sprite replaces it on
+  /// arrival if the cursor is still inside it.
+  bool _showSpriteAt(String camId, int tMs, int direction) {
+    final hit = _spriteCache.lookup(camId, tMs);
+    if (hit == null) {
+      if (!_spriteCache.isKnownMiss(camId, tMs)) _fetchSprite(camId, tMs);
+      return false;
+    }
+    _scrubToken++; // an in-flight frame fetch must not cover the finer tile
+    _scrubTrailing?.cancel();
+    if (_scrubSprites[camId] != hit) {
+      setState(() => _scrubSprites[camId] = hit);
+    }
+    for (final p in _spriteCache.probesAhead(
+      camId,
+      hit.sprite,
+      direction: direction,
+    )) {
+      _fetchSprite(camId, p);
+    }
+    return true;
+  }
+
+  void _fetchSprite(String camId, int tMs) {
+    if (!_scrubbing || _spriteInflight.length >= _kSpriteInflightMax) return;
+    final key = '$camId|${tMs ~/ kScrubSpriteMissCellMs}';
+    if (!_spriteInflight.add(key)) return;
+    unawaited(() async {
+      try {
+        final r = await widget.api.fetchScrubSprite(
+          widget.session,
+          camId,
+          DateTime.fromMillisecondsSinceEpoch(tMs, isUtc: true),
+        );
+        final sprite = r == null
+            ? null
+            : ScrubSprite.fromResponse(r.headers, r.bytes);
+        _spriteCache.put(camId, tMs, sprite);
+        if (sprite == null || !mounted || !_scrubbing) return;
+        // Judge against where the cursor is NOW, not where it was when the
+        // request went out: show it only if it is still under the cursor, on
+        // the focused pane, and the pane's own video isn't already tracking.
+        final cur = _lastScrubMs;
+        final focusId = _maximizedCameraId ?? _selectedCameraId;
+        if (focusId != camId || !sprite.covers(cur)) return;
+        final curT = DateTime.fromMillisecondsSinceEpoch(cur, isUtc: true);
+        if (_panes[camId]?.currentSegment?.covers(curT) ?? false) return;
+        _scrubToken++;
+        setState(
+          () => _scrubSprites[camId] = ScrubSpriteTile(
+            sprite,
+            sprite.tileFor(cur),
+          ),
+        );
+      } finally {
+        _spriteInflight.remove(key);
+      }
+    }());
+  }
+
+  /// The cursor has rested at [t] mid-drag (see [_kScrubDwell]): for every
+  /// active pane whose loaded segment does not cover `t`, resolve and open the
+  /// covering segment now, paused, so the eventual release ([_commitSeek])
+  /// finds the file already loaded and only has to seek. The filmstrip
+  /// overlay stays up until release, so the open is invisible; once the pane
+  /// reports the new segment, `_liveSeek` drops the overlay for it and the
+  /// in-segment seeks take over, which is strictly better than the 4 s-grid
+  /// filmstrip. A pane whose segment already covers `t` is untouched, and a
+  /// `t` in a coverage gap resolves to "no footage" exactly as a release
+  /// there would. Each pane's `resolveAt` coalesces its own racing calls, so
+  /// a second dwell (or the release itself) while an open is in flight is
+  /// replayed with the newest target, never dropped.
+  void _preopenAt(DateTime t) {
+    if (!_scrubbing || !mounted) return;
+    for (final cam in _activeCameras()) {
+      final pane = _panes[cam.id];
+      if (pane == null) continue;
+      if (pane.currentSegment?.covers(t) ?? false) continue;
+      unawaited(pane.resolveAt(t, forceReload: true, playing: false));
+    }
   }
 
   /// Playhead position is final (drag released, or a click-seek) — full
@@ -675,12 +980,24 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       setState(() {
         _scrubbing = false;
         _scrubFrames.clear();
+        _scrubSprites.clear();
       });
     }
+    _scrubDwell?.cancel();
+    _scrubTrailing?.cancel();
     // Coverage is preloaded (static) — this only extends the cache if the
     // operator navigated past its horizon, so don't hold up the video resolve.
     unawaited(_syncCoverage());
     await _resolveAll(t, force: true);
+    // A dwell pre-open (see _preopenAt) loads the target file PAUSED; when
+    // the release lands in that same file the resolve above is only a seek
+    // and does not restart playback on its own. Reassert the transport state.
+    if (_playing) {
+      for (final cam in _activeCameras()) {
+        final p = _panes[cam.id]?.player;
+        if (p != null && !p.state.playing) unawaited(p.play());
+      }
+    }
   }
 
   Future<void> _onZoomChanged() async {
@@ -1097,6 +1414,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       setState(() {
         _scrubbing = false;
         _scrubFrames.clear();
+        _scrubSprites.clear();
       });
     }
     for (final pane in _panes.values) {
@@ -1215,9 +1533,22 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   /// `wall:<id>` so the two screens don't clash in the shared controller).
   String _audioPaneId(String camId) => 'pb:$camId';
 
+  String _snapshotPaneId(String camId) => 'pb:$camId';
+
+  /// Snapshots capture the maximized camera, else the selected one.
+  void _syncSnapshotTarget() {
+    final id = _maximizedCameraId ?? _selectedCameraId;
+    SnapshotRegistry.instance.setActive(
+      id == null ? null : _snapshotPaneId(id),
+    );
+  }
+
+  void _snapshot() => SnapshotService.captureActivePane(context);
+
   void _selectCamera(String cameraId) {
     if (cameraId == _selectedCameraId) return;
     setState(() => _selectedCameraId = cameraId);
+    _syncSnapshotTarget();
     widget.audio?.setSelected(_audioPaneId(cameraId));
     // Instant repaint from the cache (empty on first select of this camera),
     // then preload / live-edge top-up in the background.
@@ -1236,6 +1567,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     setState(() {
       _maximizedCameraId = _maximizedCameraId == cameraId ? null : cameraId;
     });
+    _syncSnapshotTarget();
     // Audio follows the maximized pane (or falls back to the selected one when
     // restored). The pane's Player persists across maximize, so not recreated.
     widget.audio?.setMaximized(
@@ -1290,10 +1622,15 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         pane: _panes[maxCam.id]!,
         selected: true,
         maximized: true,
-        recordsElsewhere: _recordsElsewhere(maxCam.id),
+        oldestFootage: _oldestFootage[maxCam.id],
+        recordingMode: _recordingMode[maxCam.id],
+        motionNow: () => _hadRecentMotion(maxCam.id),
+        playhead: () => _timeline.playhead,
+        onRetry: _retryResolve,
         onSelect: () => _selectCamera(maxCam.id),
         onMaximizeToggle: () => _toggleMaximize(maxCam.id),
         scrubFrame: _scrubbing ? _scrubFrames[maxCam.id] : null,
+        scrubSprite: _scrubbing ? _scrubSprites[maxCam.id] : null,
       );
     }
 
@@ -1338,10 +1675,15 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       pane: _panes[cam.id]!,
                       selected: cam.id == _selectedCameraId,
                       maximized: false,
-                      recordsElsewhere: _recordsElsewhere(cam.id),
+                      oldestFootage: _oldestFootage[cam.id],
+                      recordingMode: _recordingMode[cam.id],
+                      motionNow: () => _hadRecentMotion(cam.id),
+                      playhead: () => _timeline.playhead,
+                      onRetry: _retryResolve,
                       onSelect: () => _selectCamera(cam.id),
                       onMaximizeToggle: () => _toggleMaximize(cam.id),
                       scrubFrame: _scrubbing ? _scrubFrames[cam.id] : null,
+                      scrubSprite: _scrubbing ? _scrubSprites[cam.id] : null,
                     ),
             ),
           );
@@ -1351,15 +1693,28 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     );
   }
 
-  /// Whether [camId] has any recording coverage loaded — i.e. it records at
-  /// SOME time in the navigable range. Lets a no-footage pane distinguish a
-  /// motion camera's normal gap ("records elsewhere") from a camera with no
-  /// footage at all (worth flagging). Null when coverage isn't loaded for this
-  /// camera (only the selected camera is fetched) → the tile stays neutral.
-  bool? _recordsElsewhere(String camId) {
-    final cov = _coverage[camId];
-    if (cov == null) return null;
-    return cov.spans.isNotEmpty;
+  /// Re-read each camera's oldest remaining recording. Best-effort: on any
+  /// failure the values from the camera list we were given stay in place.
+  Future<void> _refreshOldestFootage() async {
+    try {
+      final cams = await widget.api.listCameras(widget.session);
+      if (!mounted) return;
+      setState(() {
+        for (final c in cams) {
+          if (_oldestFootage.containsKey(c.id)) {
+            _oldestFootage[c.id] = c.oldestFootageTs;
+            _recordingMode[c.id] = c.recordingMode;
+          }
+        }
+      });
+    } catch (_) {
+      // Keep the seeded values.
+    }
+  }
+
+  /// Retry after a load error: re-resolve every pane at the playhead.
+  void _retryResolve() {
+    unawaited(_resolveAll(_timeline.playhead, force: true));
   }
 
   @override
@@ -1390,7 +1745,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                   Positioned.fill(
                     child: Padding(
                       padding: const EdgeInsets.all(2),
-                      child: _buildGrid(),
+                      child: RepaintBoundary(child: _buildGrid()),
                     ),
                   ),
                 if (!_entering && _statusMessage != null)
@@ -1426,7 +1781,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             playing: _playing,
             speeds: _speeds,
             speedIdx: _speedIdx,
-            gotoLabel: _fmtPlayheadLabel(),
+            playhead: _timeline,
+            gotoLabel: _fmtPlayheadLabel,
             onTogglePlay: _togglePlay,
             onSetSpeed: _setSpeed,
             onShuttle: _onShuttleUpdate,
@@ -1440,10 +1796,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onFrameFwd: () => _frameStep(true),
             onNudge: _shiftWindow,
             onBookmark: _addBookmark,
+            onSnapshot: _snapshot,
             onZoomOut: () => _zoomBy(1),
             onZoomIn: () => _zoomBy(-1),
           ),
-          if (_timeline.hasSelection) _buildExportSelectionBar(),
+          ListenableBuilder(
+            listenable: _timeline,
+            builder: (context, _) => _timeline.hasSelection
+                ? _buildExportSelectionBar()
+                : const SizedBox.shrink(),
+          ),
           // The single playback timeline: motion intensity + detection glyphs +
           // a thin recording-coverage line at the bottom, and the scrub surface
           // itself — drag = pan, click = seek, wheel = zoom, right-drag or
@@ -1510,6 +1872,7 @@ class _TransportBar extends StatelessWidget {
     required this.playing,
     required this.speeds,
     required this.speedIdx,
+    required this.playhead,
     required this.gotoLabel,
     required this.onTogglePlay,
     required this.onSetSpeed,
@@ -1524,6 +1887,7 @@ class _TransportBar extends StatelessWidget {
     required this.onFrameFwd,
     required this.onNudge,
     required this.onBookmark,
+    required this.onSnapshot,
     required this.onZoomOut,
     required this.onZoomIn,
   });
@@ -1531,7 +1895,11 @@ class _TransportBar extends StatelessWidget {
   final bool playing;
   final List<double> speeds;
   final int speedIdx;
-  final String gotoLabel;
+
+  /// The playback timeline; only the go-to clock label listens to it, so a
+  /// playhead tick rebuilds that label and nothing else in the bar.
+  final Listenable playhead;
+  final String Function() gotoLabel;
   final VoidCallback onTogglePlay;
   final ValueChanged<int> onSetSpeed;
 
@@ -1548,6 +1916,9 @@ class _TransportBar extends StatelessWidget {
   final VoidCallback onFrameFwd;
   final void Function(Duration by) onNudge;
   final VoidCallback onBookmark;
+
+  /// Save a still of the selected (or maximized) camera's current frame.
+  final VoidCallback onSnapshot;
   final VoidCallback onZoomOut;
   final VoidCallback onZoomIn;
 
@@ -1747,8 +2118,9 @@ class _TransportBar extends StatelessWidget {
                     child: OutlinedButton.icon(
                       onPressed: onPickGoto,
                       icon: const Icon(Icons.event, size: 15),
-                      label: Text(
-                        gotoLabel,
+                      label: PlaybackTickText(
+                        listenable: playhead,
+                        text: gotoLabel,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -1770,6 +2142,13 @@ class _TransportBar extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 6),
+                _iconBtn(
+                  Icons.camera_alt_outlined,
+                  'Snapshot',
+                  'Save a still of the selected camera',
+                  onSnapshot,
+                  size: 20,
+                ),
                 _iconBtn(
                   Icons.bookmark_add_outlined,
                   'Bookmark',
@@ -1979,8 +2358,13 @@ class _PbTile extends StatefulWidget {
     required this.maximized,
     required this.onSelect,
     required this.onMaximizeToggle,
-    this.recordsElsewhere,
+    this.oldestFootage,
+    this.recordingMode,
+    this.motionNow,
+    this.playhead,
+    this.onRetry,
     this.scrubFrame,
+    this.scrubSprite,
   });
 
   final Camera camera;
@@ -1990,14 +2374,31 @@ class _PbTile extends StatefulWidget {
   final VoidCallback onSelect;
   final VoidCallback onMaximizeToggle;
 
-  /// Whether this camera has recording coverage at OTHER times (records
-  /// elsewhere in range). Distinguishes a normal motion-camera gap (`true`) from
-  /// a camera with no footage at all (`false`, worth flagging). Null = unknown
-  /// (coverage not loaded for this camera) → a neutral message.
-  final bool? recordsElsewhere;
+  /// Start of the camera's oldest remaining recording, or null when unknown.
+  /// A no-footage playhead earlier than this reads as "Footage deleted".
+  final DateTime? oldestFootage;
+
+  /// Effective recording mode (`"continuous"` / `"motion"`), or null when the
+  /// server predates the field.
+  final String? recordingMode;
+
+  /// Whether the camera had motion in the last few seconds, read with the
+  /// playhead. Tells a motion camera that is recording (footage not indexed
+  /// yet: "Live edge") from one that is idle ("No motion right now").
+  final bool Function()? motionNow;
+
+  /// Current playhead, read when the no-footage overlay is built.
+  final DateTime Function()? playhead;
+
+  /// Re-resolve the panes at the playhead (the error overlay's Retry).
+  final VoidCallback? onRetry;
 
   /// Filmstrip frame shown over the video while the scrubber is being dragged.
   final Uint8List? scrubFrame;
+
+  /// Sprite-strip tile shown over [scrubFrame] while dragging (finer, 1 s
+  /// granularity) when the server has pre-generated one for this segment.
+  final ScrubSpriteTile? scrubSprite;
 
   @override
   State<_PbTile> createState() => _PbTileState();
@@ -2014,6 +2415,59 @@ class _PbTileState extends State<_PbTile> {
   // clips ceiling, Android MAX_SCALE and the iOS zoomable() default: they drifted
   // to 5/6/8 independently before, so the phone ran out first for no reason.
   static const double _maxZoom = 30.0;
+
+  // The parent no longer rebuilds per play tick, so the tile follows its own
+  // pane for the footage state it shows, and rebuilds only when that state
+  // flips (segment found / lost / errored), not on every pane notification.
+  late Object _footageSig = _footageSignature();
+
+  // Built once per pane: an identical widget instance makes the framework skip
+  // the whole Video subtree when the tile rebuilds (zoom, scrub frame, select).
+  late Widget _video = _buildVideo();
+
+  Object _footageSignature() => (
+    widget.pane.currentSegment != null,
+    widget.pane.noFootage,
+    widget.pane.error,
+  );
+
+  Widget _buildVideo() => RepaintBoundary(
+    child: Video(
+      controller: widget.pane.videoController,
+      controls: NoVideoControls,
+      fit: BoxFit.contain,
+    ),
+  );
+
+  void _onPaneChanged() {
+    final sig = _footageSignature();
+    if (sig == _footageSig) return;
+    _footageSig = sig;
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.pane.addListener(_onPaneChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _PbTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.pane, widget.pane)) {
+      oldWidget.pane.removeListener(_onPaneChanged);
+      widget.pane.addListener(_onPaneChanged);
+      _footageSig = _footageSignature();
+      _video = _buildVideo();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.pane.removeListener(_onPaneChanged);
+    super.dispose();
+  }
 
   void _zoomAt(Offset cursor, double factor, Size pane) {
     final newScale = (_scale * factor).clamp(1.0, _maxZoom);
@@ -2061,21 +2515,34 @@ class _PbTileState extends State<_PbTile> {
     }
   }
 
-  /// The overlay shown when a pane has no live segment: a load error, a spinner
-  /// while resolving, or — once resolved with nothing here — a styled "no
-  /// footage" placeholder that reads calmly for a motion gap but flags a camera
-  /// with no footage at all.
-  Widget _noFootageOverlay() {
-    if (widget.pane.error != null) {
-      return _placeholder(
-        icon: Icons.videocam_off_rounded,
-        iconColor: Colors.red.shade300,
-        title: 'Playback error',
-        subtitle: 'Could not load this segment',
-        tint: Colors.red,
-      );
-    }
-    if (!widget.pane.noFootage) {
+  /// The no-footage message for this pane right now, or null while it is
+  /// still resolving / opening a segment. Picks the actual reason (load error,
+  /// live edge, deleted by retention, no motion, recording gap) from real data;
+  /// see [noFootageMessage].
+  NoFootageMessage? _noFootageReason() {
+    final error = widget.pane.error;
+    if (error == null && !widget.pane.noFootage) return null;
+    final playhead = widget.playhead?.call();
+    final now = DateTime.now().toUtc();
+    return noFootageMessage(
+      // Without a playhead source, fall back to a moment safely outside the
+      // live edge and claim nothing about retention.
+      playhead: playhead ?? now.subtract(const Duration(days: 1)),
+      now: now,
+      error: error == null ? null : _shortError(error),
+      oldestFootage: playhead == null ? null : widget.oldestFootage,
+      recordingMode: playhead == null ? null : widget.recordingMode,
+      motionNow: widget.motionNow?.call() ?? false,
+    );
+  }
+
+  static String _shortError(String e) =>
+      e.length <= 140 ? e : '${e.substring(0, 137)}...';
+
+  /// The overlay shown when a pane has no live segment: a spinner while
+  /// resolving, otherwise the reason there is no footage here.
+  Widget _noFootageOverlay(NoFootageMessage? msg) {
+    if (msg == null) {
       // Still resolving / opening a segment.
       return const ColoredBox(
         color: Colors.black54,
@@ -2088,30 +2555,51 @@ class _PbTileState extends State<_PbTile> {
         ),
       );
     }
-    // Resolved: genuinely no footage at this instant.
-    if (widget.recordsElsewhere == false) {
-      // No coverage anywhere in range — a live/always-record camera with no
-      // footage is worth flagging (amber).
-      return _placeholder(
-        icon: Icons.warning_amber_rounded,
-        iconColor: Colors.amber.shade400,
-        title: 'No footage for this camera',
-        subtitle: 'No recordings found in this time range',
-        tint: Colors.amber,
-      );
+    switch (msg.reason) {
+      case NoFootageReason.loadError:
+        return _placeholder(
+          icon: Icons.videocam_off_rounded,
+          iconColor: Colors.red.shade300,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.red,
+          onRetry: widget.onRetry,
+        );
+      case NoFootageReason.recordingGap:
+      case NoFootageReason.noFootageForCamera:
+        return _placeholder(
+          icon: Icons.warning_amber_rounded,
+          iconColor: Colors.amber.shade400,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.amber,
+        );
+      case NoFootageReason.liveEdge:
+        return _placeholder(
+          icon: Icons.schedule_rounded,
+          iconColor: Colors.white38,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.blueGrey,
+        );
+      case NoFootageReason.footageDeleted:
+        return _placeholder(
+          icon: Icons.history_toggle_off_rounded,
+          iconColor: Colors.white38,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.blueGrey,
+        );
+      case NoFootageReason.noMotion:
+      case NoFootageReason.unknown:
+        return _placeholder(
+          icon: Icons.motion_photos_off_rounded,
+          iconColor: Colors.white38,
+          title: msg.title,
+          subtitle: msg.subtitle,
+          tint: Colors.blueGrey,
+        );
     }
-    // Records at other times (motion-gated gap) or unknown → calm.
-    return _placeholder(
-      icon: Icons.motion_photos_off_rounded,
-      iconColor: Colors.white38,
-      title: widget.recordsElsewhere == true
-          ? 'No motion during this time'
-          : 'No footage at this time',
-      subtitle: widget.recordsElsewhere == true
-          ? 'This camera records on motion'
-          : null,
-      tint: Colors.blueGrey,
-    );
   }
 
   Widget _placeholder({
@@ -2120,6 +2608,7 @@ class _PbTileState extends State<_PbTile> {
     required String title,
     String? subtitle,
     required Color tint,
+    VoidCallback? onRetry,
   }) {
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -2173,6 +2662,10 @@ class _PbTileState extends State<_PbTile> {
                       ),
                     ),
                   ],
+                  if (onRetry != null) ...[
+                    const SizedBox(height: 6),
+                    TextButton(onPressed: onRetry, child: const Text('Retry')),
+                  ],
                 ],
               ),
             ),
@@ -2191,6 +2684,7 @@ class _PbTileState extends State<_PbTile> {
   @override
   Widget build(BuildContext context) {
     final hasFootage = widget.pane.currentSegment != null;
+    final reason = hasFootage ? null : _noFootageReason();
     // Selected-tile outline follows the active tab accent (cyan on Playback).
     final accent = Theme.of(context).colorScheme.primary;
     return LayoutBuilder(
@@ -2228,17 +2722,11 @@ class _PbTileState extends State<_PbTile> {
                   onPointerPanZoomStart: _onPanZoomStart,
                   onPointerPanZoomUpdate: (e) => _onPanZoomUpdate(e, paneSize),
                   child: ClipRect(
-                    child: Transform(
-                      transform: _zoomTransform,
-                      child: Video(
-                        controller: widget.pane.videoController,
-                        controls: NoVideoControls,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
+                    child: Transform(transform: _zoomTransform, child: _video),
                   ),
                 ),
-                if (!hasFootage) Positioned.fill(child: _noFootageOverlay()),
+                if (!hasFootage)
+                  Positioned.fill(child: _noFootageOverlay(reason)),
                 // Filmstrip scrub frame: covers the (frozen) video while
                 // dragging so scrubbing is smooth and never flashes black.
                 // Zoomed with the same transform so it stays aligned.
@@ -2251,6 +2739,18 @@ class _PbTileState extends State<_PbTile> {
                           widget.scrubFrame!,
                           fit: BoxFit.contain,
                           gaplessPlayback: true,
+                        ),
+                      ),
+                    ),
+                  ),
+                if (widget.scrubSprite != null)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: Transform(
+                        transform: _zoomTransform,
+                        child: ColoredBox(
+                          color: Colors.black,
+                          child: ScrubSpriteTileView(tile: widget.scrubSprite!),
                         ),
                       ),
                     ),
@@ -2292,13 +2792,18 @@ class _PbTileState extends State<_PbTile> {
                     ),
                   ),
                 ),
-                if (!hasFootage)
-                  const Positioned(
+                if (reason != null)
+                  Positioned(
                     right: 6,
                     top: 6,
                     child: Text(
-                      'no footage',
-                      style: TextStyle(color: Colors.white38, fontSize: 10),
+                      reason.shortLabel,
+                      style: TextStyle(
+                        color: reason.isWarning
+                            ? Colors.amber.shade300
+                            : Colors.white38,
+                        fontSize: 10,
+                      ),
                     ),
                   ),
               ],

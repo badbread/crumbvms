@@ -1647,6 +1647,7 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::POST, format!("/live/{u}/webrtc")),
         (Method::GET, format!("/filmstrip/{u}")),
         (Method::GET, format!("/filmstrip/{u}/frame")),
+        (Method::GET, format!("/filmstrip/{u}/sprite")),
         (Method::GET, format!("/export/{u}/archive")),
         (Method::GET, format!("/export/{u}/files/{u}")),
         (Method::POST, "/export".into()),

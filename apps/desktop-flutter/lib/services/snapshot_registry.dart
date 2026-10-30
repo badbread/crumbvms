@@ -21,12 +21,20 @@ import 'package:media_kit/media_kit.dart';
 /// One capturable video pane: a live mpv-backed [Player] plus enough
 /// metadata to name the saved snapshot file.
 class SnapshotTarget {
-  const SnapshotTarget({required this.player, required this.cameraName});
+  const SnapshotTarget({
+    required this.player,
+    required this.cameraName,
+    this.frameTime,
+  });
 
   final Player player;
 
   /// Used only for the saved filename (sanitized) — cosmetic, not an id.
   final String cameraName;
+
+  /// When the frame on screen was recorded, for the file name. Playback
+  /// passes its playhead; null (live) means "now".
+  final DateTime Function()? frameTime;
 }
 
 class SnapshotRegistry {
