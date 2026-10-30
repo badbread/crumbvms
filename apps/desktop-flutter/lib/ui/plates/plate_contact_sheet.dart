@@ -697,9 +697,17 @@ class _SheetCardState extends State<_SheetCard> {
                   ),
                 ),
               ),
-              Text(
-                '${_fmtClock(read.ts)}  ${_dayLabel(read.ts, now)}',
-                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              const SizedBox(width: 6),
+              // Shrinks with an ellipsis on narrow cards instead of pushing
+              // the row over ("10:43 PM  today" is a digit wider after 10).
+              Flexible(
+                child: Text(
+                  '${_fmtClock(read.ts)}  ${_dayLabel(read.ts, now)}',
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white38, fontSize: 11),
+                ),
               ),
             ],
           ),
