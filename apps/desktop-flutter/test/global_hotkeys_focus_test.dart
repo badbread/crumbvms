@@ -259,6 +259,9 @@ void main() {
       );
       await tester.pumpWidget(_appRoot(child: wall.widget));
       await tester.pump();
+      // Tap to focus for real: `autofocus` loses to the app root's own.
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
       await tester.sendKeyEvent(LogicalKeyboardKey.keyM);
       await tester.sendKeyEvent(LogicalKeyboardKey.digit1);
       await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
@@ -420,6 +423,9 @@ void main() {
         ),
       );
       await tester.pump();
+      // Tap to focus for real: `autofocus` loses to the app root's own.
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
       await tester.sendKeyEvent(LogicalKeyboardKey.keyH);
       await tester.pump();
       expect(toggles, 0);
@@ -542,6 +548,9 @@ void main() {
         ),
       );
       await tester.pumpWidget(_appRoot(child: pb.widget));
+      await tester.pump();
+      // Tap to focus for real: `autofocus` loses to the app root's own.
+      await tester.tap(find.byType(TextField));
       await tester.pump();
       await tester.sendKeyEvent(LogicalKeyboardKey.space);
       await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);

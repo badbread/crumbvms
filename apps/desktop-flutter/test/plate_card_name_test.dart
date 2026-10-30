@@ -7,6 +7,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:crumb_desktop/api/plate_desk_api.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
@@ -99,4 +100,45 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.binding.setSurfaceSize(null);
   });
+
+  for (final width in [190.0, 210.0, 230.0, 260.0]) {
+    testWidgets('chips never hard-clip at card width $width', (tester) async {
+      final stats = PlateStats(
+        plate: 'GIF2GAB',
+        total: 260,
+        seen7d: 40,
+        seen30d: 260,
+        firstSeen: DateTime.now().subtract(const Duration(days: 40)),
+        lastSeen: DateTime.now(),
+        prevSeen: DateTime.now().subtract(const Duration(hours: 22)),
+        cameras: const [],
+        hours: List<int>.filled(24, 1),
+        days30: List<int>.filled(30, 1),
+      );
+      await _pump(
+        tester,
+        debugSheetCard(
+          entry: _entry('Charles'),
+          width: width,
+          stats: stats,
+        ),
+      );
+      expect(tester.takeException(), isNull);
+      // Each chip that is shown is shown whole: its text is fully inside the
+      // clip row, and the highest-priority ones survive.
+      expect(find.text('Watchlist'), findsOneWidget);
+      for (final t in ['seen 260x', 'Regular', 'Watchlist']) {
+        final f = find.text(t);
+        if (f.evaluate().isEmpty) continue;
+        final chipRect = tester.getRect(
+          find.ancestor(of: f, matching: find.byType(Container)).first,
+        );
+        final viewport = tester.getRect(
+          find.ancestor(of: f, matching: find.byType(SingleChildScrollView)).first,
+        );
+        expect(chipRect.right, lessThanOrEqualTo(viewport.right + 0.5));
+      }
+      if (width >= 260) expect(find.text('Regular'), findsOneWidget);
+    });
+  }
 }

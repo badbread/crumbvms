@@ -16,9 +16,13 @@
 // This file intentionally does not touch server state — fullscreen is a
 // pure client/window concern, same as the old client.
 
+import 'dart:async' show scheduleMicrotask;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:window_manager/window_manager.dart';
+
+import 'package:crumb_desktop/ui/hotkeys/text_focus.dart';
 
 /// Owns the OS-window fullscreen ("camera wall") state for the desktop
 /// client and keeps it in sync if the window leaves fullscreen through a
@@ -106,7 +110,7 @@ class FullscreenController extends ChangeNotifier with WindowListener {
 /// field itself before this reaches a Shortcuts/Actions boundary higher up,
 /// but the explicit check here keeps the intent obvious and matches the old
 /// client's early-return shape).
-class FullscreenEscHandler extends StatelessWidget {
+class FullscreenEscHandler extends StatefulWidget {
   const FullscreenEscHandler({
     super.key,
     required this.controller,
@@ -117,7 +121,56 @@ class FullscreenEscHandler extends StatelessWidget {
   final Widget child;
 
   @override
+  State<FullscreenEscHandler> createState() => _FullscreenEscHandlerState();
+}
+
+class _FullscreenEscHandlerState extends State<FullscreenEscHandler> {
+  @override
+  void initState() {
+    super.initState();
+    // The Focus.onKeyEvent below only sees keys while primary focus is this
+    // node or a DESCENDANT. Clicking the toolbar's fullscreen button and then
+    // hiding the toolbar disposes the focused button, which parks primary
+    // focus on the route's FocusScope, an ANCESTOR of this node, so Esc never
+    // reached it and the operator was trapped in fullscreen. A HardwareKeyboard
+    // handler fires regardless of focus (see hotkey_gate.dart).
+    HardwareKeyboard.instance.addHandler(_onHardwareKey);
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onHardwareKey);
+    super.dispose();
+  }
+
+  bool _onHardwareKey(KeyEvent event) {
+    if (event is! KeyDownEvent || !mounted) return false;
+    final key = event.logicalKey;
+    final isEsc = key == LogicalKeyboardKey.escape;
+    final isF11 = key == LogicalKeyboardKey.f11;
+    if (!isEsc && !isF11) return false;
+    // Typing owns the keyboard (Esc / F11 in a field is the field's).
+    if (textInputHasFocus()) return false;
+    // A dialog / menu on top owns its own Esc.
+    if (isEsc && (Navigator.maybeOf(context)?.canPop() ?? false)) return false;
+    final c = widget.controller;
+    if (isEsc && !c.isFullscreen) return false;
+    // Deferred to a microtask so other handlers for this same key press (the
+    // wall's / Playback's own Esc, which check `isFullscreen` to give leaving
+    // fullscreen priority) still see the state as it was. Not consumed.
+    scheduleMicrotask(() {
+      if (isF11) {
+        c.toggle();
+      } else if (c.isFullscreen) {
+        c.setFullscreen(false);
+      }
+    });
+    return false;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final controller = widget.controller;
     return AnimatedBuilder(
       animation: controller,
       builder: (context, _) {
@@ -128,15 +181,77 @@ class FullscreenEscHandler extends StatelessWidget {
             if (event.logicalKey != LogicalKeyboardKey.escape) {
               return KeyEventResult.ignored;
             }
-            final focused = FocusManager.instance.primaryFocus;
-            if (focused?.context?.widget is EditableText) {
+            if (textInputHasFocus()) {
               return KeyEventResult.ignored;
             }
             if (!controller.isFullscreen) return KeyEventResult.ignored;
             controller.setFullscreen(false);
             return KeyEventResult.handled;
           },
-          child: child,
+          child: widget.child,
+        );
+      },
+    );
+  }
+}
+
+/// A safety-net exit control for the fullscreen wall: invisible until the
+/// pointer enters the top-right corner, then a button that leaves fullscreen.
+/// Place it in a [Stack] over the wall; renders nothing when not fullscreen.
+class FullscreenExitCorner extends StatefulWidget {
+  const FullscreenExitCorner({super.key, required this.controller});
+
+  final FullscreenController controller;
+
+  @override
+  State<FullscreenExitCorner> createState() => _FullscreenExitCornerState();
+}
+
+class _FullscreenExitCornerState extends State<FullscreenExitCorner> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.controller,
+      builder: (context, _) {
+        if (!widget.controller.isFullscreen) return const SizedBox.shrink();
+        return Positioned(
+          top: 0,
+          right: 0,
+          child: MouseRegion(
+            onEnter: (_) => setState(() => _hover = true),
+            onExit: (_) => setState(() => _hover = false),
+            child: SizedBox(
+              key: const ValueKey('fullscreen-exit-corner'),
+              width: 72,
+              height: 56,
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 120),
+                opacity: _hover ? 1 : 0,
+                child: Align(
+                  alignment: Alignment.topRight,
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Material(
+                      color: Colors.black87,
+                      shape: const CircleBorder(),
+                      child: IconButton(
+                        tooltip: 'Exit fullscreen (Esc / F11)',
+                        icon: const Icon(
+                          Icons.fullscreen_exit,
+                          color: Colors.white,
+                        ),
+                        onPressed: _hover
+                            ? () => widget.controller.setFullscreen(false)
+                            : null,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
         );
       },
     );
