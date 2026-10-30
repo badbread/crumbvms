@@ -374,10 +374,6 @@ class PlaybackViewModel(
     private val _toast = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val toast: SharedFlow<String> = _toast.asSharedFlow()
 
-    init {
-        startCamera(initialCameraId, preserveTime = false)
-    }
-
     /**
      * (Re)initialise all state for [camId]. Resets only the PER-CAMERA data/overlays
      * (spans, motion histogram, detection events, segment, filmstrip) so the previous
@@ -1413,5 +1409,14 @@ class PlaybackViewModel(
         seekJob?.cancel()
         prefetchJob?.cancel()
         stepJob?.cancel()
+    }
+
+    // Kept LAST in the class on purpose: Kotlin runs property initializers and
+    // init blocks in declaration order, and startCamera() touches state declared
+    // all through this file (spriteCache, lowQuality, ...). Run any earlier and
+    // those are still null (crash on opening Playback) or get reset to their
+    // defaults after startCamera set them.
+    init {
+        startCamera(initialCameraId, preserveTime = false)
     }
 }
