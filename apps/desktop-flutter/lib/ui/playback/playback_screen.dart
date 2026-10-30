@@ -38,6 +38,8 @@ import 'package:crumb_desktop/ui/hints/shift_hints.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/hotkeys/playback_hotkeys_listener.dart';
 import 'package:crumb_desktop/services/audio_follow_controller.dart';
+import 'package:crumb_desktop/services/snapshot_registry.dart';
+import 'package:crumb_desktop/services/snapshot_service.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_controller.dart';
 import 'package:crumb_desktop/ui/motion_timeline/motion_timeline_view.dart';
 
@@ -270,6 +272,16 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       // active pane becomes audible once its footage actually loads.
       pane.addListener(_syncAudioReconcile);
       _panes[c.id] = pane;
+      // Snapshot target (S key / the transport bar's camera button), named
+      // after the footage time under the playhead rather than "now".
+      SnapshotRegistry.instance.register(
+        _snapshotPaneId(c.id),
+        SnapshotTarget(
+          player: pane.player,
+          cameraName: c.name,
+          frameTime: () => _timeline.playhead,
+        ),
+      );
     }
     _selectedCameraId = _cameras.isNotEmpty ? _cameras.first.id : null;
     // Carry a maximized live pane into playback (if it's one of our cameras).
@@ -278,6 +290,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       _maximizedCameraId = maxId;
       _selectedCameraId = maxId;
     }
+    _syncSnapshotTarget();
     // Register panes with the shared audio-follow controller so the active
     // (maximized else selected) camera is audible when audio is on — and reset
     // the controller's target off any stale wall pane onto ours.
@@ -401,6 +414,9 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
       for (final c in _cameras) {
         audio.unregisterPane(_audioPaneId(c.id));
       }
+    }
+    for (final c in _cameras) {
+      SnapshotRegistry.instance.unregister(_snapshotPaneId(c.id));
     }
     for (final p in _panes.values) {
       p.removeListener(_syncAudioReconcile);
@@ -1478,9 +1494,22 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   /// `wall:<id>` so the two screens don't clash in the shared controller).
   String _audioPaneId(String camId) => 'pb:$camId';
 
+  String _snapshotPaneId(String camId) => 'pb:$camId';
+
+  /// Snapshots capture the maximized camera, else the selected one.
+  void _syncSnapshotTarget() {
+    final id = _maximizedCameraId ?? _selectedCameraId;
+    SnapshotRegistry.instance.setActive(
+      id == null ? null : _snapshotPaneId(id),
+    );
+  }
+
+  void _snapshot() => SnapshotService.captureActivePane(context);
+
   void _selectCamera(String cameraId) {
     if (cameraId == _selectedCameraId) return;
     setState(() => _selectedCameraId = cameraId);
+    _syncSnapshotTarget();
     widget.audio?.setSelected(_audioPaneId(cameraId));
     // Instant repaint from the cache (empty on first select of this camera),
     // then preload / live-edge top-up in the background.
@@ -1499,6 +1528,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     setState(() {
       _maximizedCameraId = _maximizedCameraId == cameraId ? null : cameraId;
     });
+    _syncSnapshotTarget();
     // Audio follows the maximized pane (or falls back to the selected one when
     // restored). The pane's Player persists across maximize, so not recreated.
     widget.audio?.setMaximized(
@@ -1706,6 +1736,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
             onFrameFwd: () => _frameStep(true),
             onNudge: _shiftWindow,
             onBookmark: _addBookmark,
+            onSnapshot: _snapshot,
             onZoomOut: () => _zoomBy(1),
             onZoomIn: () => _zoomBy(-1),
           ),
@@ -1796,6 +1827,7 @@ class _TransportBar extends StatelessWidget {
     required this.onFrameFwd,
     required this.onNudge,
     required this.onBookmark,
+    required this.onSnapshot,
     required this.onZoomOut,
     required this.onZoomIn,
   });
@@ -1824,6 +1856,9 @@ class _TransportBar extends StatelessWidget {
   final VoidCallback onFrameFwd;
   final void Function(Duration by) onNudge;
   final VoidCallback onBookmark;
+
+  /// Save a still of the selected (or maximized) camera's current frame.
+  final VoidCallback onSnapshot;
   final VoidCallback onZoomOut;
   final VoidCallback onZoomIn;
 
@@ -2047,6 +2082,13 @@ class _TransportBar extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 6),
+                _iconBtn(
+                  Icons.camera_alt_outlined,
+                  'Snapshot',
+                  'Save a still of the selected camera',
+                  onSnapshot,
+                  size: 20,
+                ),
                 _iconBtn(
                   Icons.bookmark_add_outlined,
                   'Bookmark',
