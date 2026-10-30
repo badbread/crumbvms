@@ -634,6 +634,11 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// bookmark hand-offs leave it false. One-shot: cleared on manual tab nav.
   bool _playbackAutoPlay = false;
 
+  /// Where the operator left Playback (reported on its teardown). Reopens
+  /// Playback there when no hand-off asks for a specific moment, so a trip to
+  /// Export (or a minimize) doesn't lose the review position. Session-only.
+  DateTime? _playbackResumeAt;
+
   /// Which camera is maximized on the live wall (or null) — carried into
   /// Playback so switching tabs keeps the same full-pane camera.
   String? _liveMaximizedId;
@@ -1384,7 +1389,14 @@ class _MainShellState extends State<MainShell> with WindowListener {
           // Reproduce the wall's custom layout — but a single-camera focus
           // (from Clips) has no layout, it just maximizes that camera.
           view: _playbackFocusCameraId != null ? null : _appliedView,
-          initialTime: _playbackSeekTo,
+          initialTime: _playbackSeekTo ?? _playbackResumeAt,
+          // A plain field write, not setState: this runs during dispose.
+          // Left at (or near) the live edge → no resume, so the next entry
+          // goes to the latest footage instead of a stale "now".
+          onLeave: (t) => _playbackResumeAt =
+              DateTime.now().toUtc().difference(t) > const Duration(seconds: 30)
+              ? t
+              : null,
           autoPlay: _playbackAutoPlay,
           // Carry a maximized live pane (or the Clips focus) into Playback.
           initialMaximizedCameraId:
