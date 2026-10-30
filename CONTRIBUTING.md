@@ -71,6 +71,17 @@ cargo test --workspace
 Clippy warnings are treated as errors (`-D warnings`), so a clean `clippy` run
 is required, not just a green `test`.
 
+Changes under `apps/desktop-flutter` are also checked by CI (Flutter 3.44.6).
+From that directory:
+
+```bash
+flutter analyze --no-fatal-infos lib test
+flutter test
+```
+
+Warnings and errors fail the analyze step; info-level lints do not. Changes
+under `apps/android` additionally run `./gradlew :app:testDebugUnitTest`.
+
 The integration tests need a Postgres to talk to. A throwaway one:
 
 ```bash

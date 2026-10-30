@@ -48,6 +48,13 @@ not a hobby dashboard.
    cargo clippy --all-targets -- -D warnings   # warnings are errors
    cargo test --workspace                      # needs a Postgres, see below
    ```
+   If you touched `apps/desktop-flutter`, also run (from that directory; CI's
+   `flutter` job runs the same, Flutter 3.44.6):
+   ```bash
+   flutter analyze --no-fatal-infos lib test   # warnings/errors fail, infos don't
+   flutter test
+   ```
+   If you touched `apps/android`, CI also runs `./gradlew :app:testDebugUnitTest`.
    Throwaway test database for the integration tests:
    ```bash
    docker run -d --name crumb-test-pg -e POSTGRES_PASSWORD=test \
