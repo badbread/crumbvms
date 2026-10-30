@@ -1345,9 +1345,13 @@ class _MainShellState extends State<MainShell> with WindowListener {
       );
     }
     if (_index == _liveIndex) {
-      return ValueListenableBuilder<String?>(
-        valueListenable: _wallStats,
-        builder: (context, v, _) {
+      // Rebuild on the option too, so the Settings toggle applies at once.
+      final options = widget.clientOptions;
+      return ListenableBuilder(
+        listenable: Listenable.merge([_wallStats, ?options]),
+        builder: (context, _) {
+          final v = _wallStats.value;
+          if (options?.showPerfStats == false) return const SizedBox.shrink();
           if (v == null || v.isEmpty) return const SizedBox.shrink();
           return Text(
             v,
