@@ -26,7 +26,7 @@ import video.crumb.app.feature.live.NetworkStatusObserver
  */
 class AppContainer(context: Context) {
 
-    val store = SecureStore(context.applicationContext)
+    val store = SecureStore(context.applicationContext).also { it.applyPlaybackControlsMigration() }
 
     /**
      * The single app-wide connectivity observer. Live tiles subscribe to its

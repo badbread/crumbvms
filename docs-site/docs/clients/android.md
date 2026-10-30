@@ -57,6 +57,24 @@ the name, watchlist state, known misreads (with Undo) and **Correct plate**. In 
 video sits on the left and the tabs on the right. Hide regulars and the history need a server
 that has the plate-history endpoint; on an older server they are simply not shown.
 
+## Simple and advanced playback controls
+
+Playback has two control layouts, picked with **Settings > Playback > Show advanced playback controls**.
+The choice is stored on the phone, so each device can differ.
+
+- **Simple** (the default on a new install) keeps the bar calm: previous motion,
+  play and pause, next motion, a speed chip, a Live pill and a More button. More
+  opens a sheet with jump to time, snapshot, bookmark, clip, quality, go to first
+  and frame step. Choosing Frame step puts the step back and step forward buttons
+  on the bar until you press play. The sheet ends with Switch to advanced controls.
+- **Advanced** shows every control at once. In landscape they sit in one row
+  grouped by purpose; in portrait there is a navigation row and a row of labelled
+  tools, with mute and quality in the top bar. Long-press the bar for Switch to
+  simple controls.
+
+Phones that had the app before this option existed start in Advanced, so nothing
+moves on update. The camera wall view in Playback is the same in both modes.
+
 ## Verifying the download (optional but recommended)
 
 The APK is signed with the project's release keystore in CI, but it isn't
