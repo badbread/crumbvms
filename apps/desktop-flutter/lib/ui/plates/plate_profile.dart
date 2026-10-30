@@ -125,20 +125,107 @@ class _PlateProfileState extends State<_PlateProfile> {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: _kSurface0,
+    // The mouse's Back button returns to the list, like Esc.
+    return Listener(
+      onPointerDown: (e) {
+        if (e.buttons & kBackMouseButton != 0) widget.onClose();
+      },
+      child: Material(
+        color: _kSurface0,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _header(),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(width: 290, child: _aside(context)),
+                  const VerticalDivider(width: 1, color: _kSurface2),
+                  Expanded(child: _main(context)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The screen's title bar: a filled Back button, where you are, and how to
+  /// get back. It replaces the list's controls so the profile can't be
+  /// mistaken for part of the list.
+  Widget _header() {
+    final name = widget.displayName?.trim() ?? '';
+    return Container(
+      height: 54,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: const BoxDecoration(
+        color: Color(0xFF262A33),
+        border: Border(bottom: BorderSide(color: _kPink, width: 2)),
+      ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SizedBox(width: 290, child: _aside(context)),
-          const VerticalDivider(width: 1, color: _kSurface2),
-          Expanded(child: _main(context)),
+          FilledButton.icon(
+            onPressed: widget.onClose,
+            icon: const Icon(Icons.arrow_back, size: 18),
+            label: const Text('Back to plates'),
+            style: FilledButton.styleFrom(
+              backgroundColor: _kPink,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            ),
+          ),
+          const SizedBox(width: 18),
+          const Text(
+            'Plate profile',
+            style: TextStyle(color: Colors.white54, fontSize: 13),
+          ),
+          const Icon(Icons.chevron_right, color: Colors.white38, size: 18),
+          Expanded(
+            child: Text(
+              name.isEmpty ? _plate : '$_plate  ·  $name',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const Flexible(
+            child: Text(
+              'Esc or mouse Back to return',
+              maxLines: 1,
+              overflow: TextOverflow.fade,
+              softWrap: false,
+              style: TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
+          const SizedBox(width: 6),
         ],
       ),
     );
   }
 
   // ── left column ──────────────────────────────────────────────────────────
+
+  void _copyPlate(BuildContext context) {
+    final plate = _plate;
+    if (plate.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: plate));
+    ScaffoldMessenger.maybeOf(context)
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('Copied $plate'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          width: 220,
+        ),
+      );
+  }
 
   Widget _aside(BuildContext context) {
     final s = widget.stats;
@@ -194,34 +281,41 @@ class _PlateProfileState extends State<_PlateProfile> {
     return Container(
       color: _kSurface1,
       child: ListView(
-        padding: const EdgeInsets.fromLTRB(18, 10, 18, 18),
+        padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
         children: [
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: widget.onClose,
-              icon: const Icon(Icons.arrow_back, size: 16),
-              label: const Text('Back to plates (Esc)'),
-              style: TextButton.styleFrom(foregroundColor: Colors.white54),
-            ),
-          ),
-          const SizedBox(height: 6),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: SizedBox(
-              height: 78,
-              child: _PlateTile(plate: _plate, height: 78),
+          // Click to copy the plate (the text is also selectable).
+          Tooltip(
+            message: 'Click to copy',
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => _copyPlate(context),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: SizedBox(
+                    height: 78,
+                    child: _PlateTile(
+                      plate: _plate,
+                      height: 78,
+                      selectable: true,
+                    ),
+                  ),
+                ),
+              ),
             ),
           ),
           if (crop != null) ...[
             const SizedBox(height: 8),
+            // The crop at the column's full width in its own shape: a fixed
+            // black box letterboxed it into a small strip with wide bars.
             ClipRRect(
               borderRadius: BorderRadius.circular(6),
-              child: Container(
-                color: Colors.black,
-                height: 74,
-                alignment: Alignment.center,
-                child: Image.memory(crop, fit: BoxFit.contain),
+              child: Image.memory(
+                crop,
+                width: double.infinity,
+                fit: BoxFit.fitWidth,
+                filterQuality: FilterQuality.medium,
+                gaplessPlayback: true,
               ),
             ),
           ],

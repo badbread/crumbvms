@@ -20,13 +20,45 @@ const double _kCardHistogram = 50;
 double _cardExtent(bool tall) =>
     _kCardFrameHeight + _kCardFooter + (tall ? _kCardHistogram : 0) + 10;
 
-/// Inset width as a fraction of the card width, per size: clearly different
-/// steps.
+/// Largest inset width as a fraction of the card width, per size.
 double _insetFraction(PlateCropSize s) => switch (s) {
   PlateCropSize.small => 0.30,
   PlateCropSize.medium => 0.45,
   PlateCropSize.large => 0.62,
 };
+
+/// Largest inset height as a fraction of the frame height, per size.
+double _insetHeightFraction(PlateCropSize s) => switch (s) {
+  PlateCropSize.small => 0.24,
+  PlateCropSize.medium => 0.34,
+  PlateCropSize.large => 0.46,
+};
+
+/// The inset's size for a crop of [aspect] (width / height): as big as the
+/// size step allows in both directions while keeping the crop's own shape,
+/// so it fills the inset exactly. A fixed 3:1 box with the crop letterboxed
+/// inside it showed wide black bars beside most plates (crops are rarely 3:1).
+@visibleForTesting
+Size plateInsetSize({
+  required double cardWidth,
+  required double frameHeight,
+  required PlateCropSize size,
+  required double? aspect,
+}) {
+  final a = (aspect == null || !aspect.isFinite || aspect <= 0)
+      ? 3.0
+      : aspect.clamp(0.8, 6.0);
+  final maxW = cardWidth * _insetFraction(size);
+  final maxH = frameHeight * _insetHeightFraction(size);
+  var h = maxH;
+  var w = h * a;
+  if (w > maxW) {
+    w = maxW;
+    h = w / a;
+  }
+  return Size(w, h.clamp(14.0, maxH));
+}
+
 
 /// The control row above the sheet.
 class _SheetControls extends StatelessWidget {
@@ -124,7 +156,10 @@ class _SheetControls extends StatelessWidget {
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              label('Loupe'),
+              Tooltip(
+                message: 'Point at a photo to magnify that spot',
+                child: label('Hover zoom'),
+              ),
               _Seg<int>(
                 value: loupe,
                 options: const [(0, 'Off'), (2, '2x'), (3, '3x')],
@@ -296,6 +331,7 @@ class _SheetCardState extends State<_SheetCard> {
     });
   }
 
+
   @override
   Widget build(BuildContext context) {
     final read = _read;
@@ -377,9 +413,15 @@ class _SheetCardState extends State<_SheetCard> {
               cacheWidth: (w * dpr * scale).round().clamp(1, 2560),
             ),
     );
-    final insetW = w * _insetFraction(widget.insetSize);
-    final insetH = (insetW / 3).clamp(18.0, _kCardFrameHeight * 0.5);
     final crop = _crop;
+    final insetSize = plateInsetSize(
+      cardWidth: w,
+      frameHeight: _kCardFrameHeight,
+      size: widget.insetSize,
+      aspect: crop == null ? null : peekPlateCropAspect(read.id),
+    );
+    final insetW = insetSize.width;
+    final insetH = insetSize.height;
     final inset = Container(
       width: insetW,
       height: insetH,
@@ -391,7 +433,7 @@ class _SheetCardState extends State<_SheetCard> {
       ),
       clipBehavior: Clip.antiAlias,
       child: crop != null
-          ? Image.memory(crop, fit: BoxFit.contain, gaplessPlayback: true)
+          ? Image.memory(crop, fit: BoxFit.cover, gaplessPlayback: true)
           : _PlateTile(plate: read.plate, height: insetH),
     );
     final corner = widget.insetCorner;
@@ -547,7 +589,10 @@ class _SheetCardState extends State<_SheetCard> {
               Icons.content_copy_outlined,
               () => copyPlateToClipboard(context, copy),
             ),
-          if (canOfferPlateName(isAdmin: widget.canName, plate: read.plate))
+          // Only for unnamed plates: a named plate shows its name on the
+          // card, and renaming lives in its profile.
+          if (canOfferPlateName(isAdmin: widget.canName, plate: read.plate) &&
+              (read.displayName?.trim() ?? '').isEmpty)
             btn(
               plateNameActionTooltip(read.displayName),
               Icons.label_outline,

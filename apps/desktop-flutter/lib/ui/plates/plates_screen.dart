@@ -31,6 +31,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show listEquals, visibleForTesting;
+import 'package:flutter/gestures.dart' show kBackMouseButton;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
@@ -1282,8 +1283,11 @@ class _PlatesScreenState extends State<PlatesScreen> {
           children: [
             Column(
               children: [
-                _buildFilterBar(context),
-                ?_buildDeskHeader(),
+                // The profile is its own screen: the list's controls hide
+                // while it is open (the list stays mounted underneath, so its
+                // scroll position survives).
+                if (_profile == null) _buildFilterBar(context),
+                if (_profile == null) ?_buildDeskHeader(),
                 Expanded(
                   child: Row(
                     children: [
@@ -1350,22 +1354,23 @@ class _PlatesScreenState extends State<PlatesScreen> {
   }
 
   Widget _buildFilterBar(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
     final camLabel = _selectedCameraIds.length == widget.cameras.length
         ? 'All cameras'
         : '${_selectedCameraIds.length} of ${widget.cameras.length} cameras';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: const BoxDecoration(
-        color: Color(0xFF1E2026),
-        border: Border(bottom: BorderSide(color: Colors.white12)),
-      ),
-      child: Wrap(
-        crossAxisAlignment: WrapCrossAlignment.center,
-        spacing: 10,
-        runSpacing: 8,
-        children: [
+    // Two rows of labelled groups: what to find (search, match, cameras,
+    // when) on top, how to show it (layout, density, grouping, panels) below.
+    // One long Wrap of look-alike chips was hard to read.
+    final findRow = Row(
+      children: [
+        Expanded(
+          child: Wrap(
+            spacing: 10,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
           SizedBox(
-            width: 220,
+            width: 260,
             child: TextField(
               controller: _searchController,
               onChanged: _onSearchChanged,
@@ -1399,167 +1404,202 @@ class _PlatesScreenState extends State<PlatesScreen> {
               ),
             ),
           ),
-          _MatchToggle(
-            value: _match,
-            onChanged: (v) {
-              setState(() => _match = v);
-              if (_query.trim().isNotEmpty) _load();
-            },
-          ),
-          TextButton.icon(
-            onPressed: _pickCameras,
-            icon: const Icon(Icons.videocam_outlined, size: 16, color: Colors.white70),
-            label: Text(
-              camLabel,
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-          ),
-          DropdownButton<int>(
-            value: _hours,
-            dropdownColor: const Color(0xFF23252C),
-            style: const TextStyle(color: Colors.white, fontSize: 13),
-            underline: const SizedBox.shrink(),
-            items: [
-              for (final e in _rangeOptions.entries)
-                DropdownMenuItem(value: e.key, child: Text(e.value)),
+              _ToolGroup(
+                label: 'Match',
+                child: _Seg<String>(
+                  value: _match,
+                  options: const [
+                    ('exact', 'Exact'),
+                    ('contains', 'Contains'),
+                    ('fuzzy', 'Fuzzy'),
+                  ],
+                  onChanged: (v) {
+                    setState(() => _match = v);
+                    if (_query.trim().isNotEmpty) _load();
+                  },
+                ),
+              ),
+              _ToolGroup(
+                child: _ToolButton(
+                  icon: Icons.videocam_outlined,
+                  label: camLabel,
+                  tooltip: 'Choose which cameras to search',
+                  onTap: _pickCameras,
+                ),
+              ),
+              _ToolGroup(
+                label: 'When',
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DropdownButton<int>(
+                      value: _hours,
+                      isDense: true,
+                      dropdownColor: const Color(0xFF23252C),
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                      underline: const SizedBox.shrink(),
+                      items: [
+                        for (final e in _rangeOptions.entries)
+                          DropdownMenuItem(value: e.key, child: Text(e.value)),
+                      ],
+                      onChanged: (v) {
+                        if (v == null) return;
+                        setState(() => _hours = v);
+                        _load();
+                      },
+                    ),
+                    const SizedBox(width: 6),
+                    _ToolButton(
+                      icon: Icons.event,
+                      label: _anchorEnd == null
+                          ? 'Ending now'
+                          : 'Ending ${_fmtDateTime(_anchorEnd!)}',
+                      tooltip: 'Pick the date and time the range ends at',
+                      onTap: _hours == 0 ? null : _pickWhen,
+                    ),
+                    if (_anchorEnd != null && _hours != 0)
+                      _ToolButton(
+                        icon: Icons.restore,
+                        label: 'Back to now',
+                        onTap: () {
+                          setState(() => _anchorEnd = null);
+                          _load();
+                        },
+                      ),
+                  ],
+                ),
+              ),
             ],
-            onChanged: (v) {
-              if (v == null) return;
-              setState(() => _hours = v);
-              _load();
-            },
           ),
-          TextButton.icon(
-            onPressed: _hours == 0 ? null : _pickWhen,
-            icon: const Icon(Icons.event, size: 16, color: Colors.white70),
+        ),
+        const SizedBox(width: 12),
+        if (!_loading)
+          Text(
+            '$_total plate${_total == 1 ? '' : 's'}',
+            style: const TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+        IconButton(
+          tooltip: 'Refresh',
+          onPressed: () {
+            _stats.invalidate();
+            _load();
+          },
+          icon: const Icon(Icons.refresh, color: Colors.white70, size: 18),
+        ),
+      ],
+    );
+    final viewRow = Row(
+      children: [
+        Expanded(
+          child: Wrap(
+            spacing: 10,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _ToolGroup(
+                label: 'View',
+                child: _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
+              ),
+              if (_viewMode == PlatesViewMode.list)
+                _ToolGroup(
+                  label: 'Size',
+                  child: _DensityToggle(value: _density, onChanged: _setDensity),
+                ),
+              if (_viewMode == PlatesViewMode.list ||
+                  _viewMode == PlatesViewMode.gallery)
+                _ToolGroup(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _ToolToggle(
+                        label: 'Group by plate',
+                        on: _groupByPlate,
+                        tooltip:
+                            'Fold every read of a plate into one expandable row',
+                        onTap: () => _setGroupByPlate(!_groupByPlate),
+                      ),
+                      if (_viewMode == PlatesViewMode.list)
+                        _ToolToggle(
+                          label: 'Merge duplicates',
+                          on: _collapse,
+                          tooltip: _collapse
+                              ? 'Duplicate reads of the same car (both engines +\nrepeat reads) are merged into one row. Click to show every raw read.'
+                              : 'Showing every raw read. Click to merge duplicates of the\nsame car into one row.',
+                          onTap: () => _setCollapse(!_collapse),
+                        ),
+                    ],
+                  ),
+                ),
+              if (_deskFilter != DeskFilter.all)
+                InputChip(
+                  label: Text(deskFilterLabel(_deskFilter)),
+                  labelStyle: const TextStyle(fontSize: 12, color: Colors.white),
+                  backgroundColor: _kPink.withValues(alpha: 0.25),
+                  side: BorderSide.none,
+                  onDeleted: () => _setDeskFilter(DeskFilter.all),
+                  deleteIconColor: Colors.white70,
+                  tooltip: 'Clear the filter',
+                  visualDensity: VisualDensity.compact,
+                ),
+            ],
+          ),
+        ),
+        if (_abAvailable)
+          _ToolButton(
+            icon: Icons.speed,
+            label: 'Benchmark',
+            onTap: () => showAbBenchmark(
+              context,
+              api: widget.api,
+              session: widget.session,
+              canConfirm: widget.canManageWatchlist,
+            ),
+          ),
+        const SizedBox(width: 6),
+        // A toggle for the watchlist panel: accent colour + tinted fill while
+        // the panel is showing (same behaviour as PR #651).
+        Tooltip(
+          message: _showWatchlist
+              ? 'Hide the watchlist panel'
+              : 'Show the watchlist panel',
+          child: TextButton.icon(
+            style: _showWatchlist
+                ? TextButton.styleFrom(
+                    backgroundColor: accent.withValues(alpha: 0.16),
+                  )
+                : null,
+            onPressed: () => setState(() {
+              _showWatchlist = !_showWatchlist;
+              PlatesPrefs.setShowWatchlist(_showWatchlist);
+            }),
+            icon: Icon(
+              _showWatchlist ? Icons.playlist_add_check : Icons.playlist_add,
+              size: 16,
+              color: _showWatchlist ? accent : Colors.white70,
+            ),
             label: Text(
-              _anchorEnd == null ? 'Jump to…' : _fmtDateTime(_anchorEnd!),
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-          ),
-          if (_anchorEnd != null && _hours != 0)
-            TextButton(
-              onPressed: () {
-                setState(() => _anchorEnd = null);
-                _load();
-              },
-              child: const Text('Now', style: TextStyle(fontSize: 12)),
-            ),
-          _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
-          if (_viewMode == PlatesViewMode.list)
-            _DensityToggle(value: _density, onChanged: _setDensity),
-          if (_viewMode == PlatesViewMode.list ||
-              _viewMode == PlatesViewMode.gallery)
-            FilterChip(
-              label: const Text('Group by plate'),
-              selected: _groupByPlate,
-              onSelected: _setGroupByPlate,
-              showCheckmark: false,
-              tooltip: 'Fold every read of a plate into one expandable row',
-              labelStyle: TextStyle(
+              _watchlist.isEmpty
+                  ? 'Watchlist'
+                  : 'Watchlist (${_watchlist.length})',
+              style: TextStyle(
+                color: _showWatchlist ? accent : Colors.white70,
                 fontSize: 12,
-                color: _groupByPlate ? Colors.white : Colors.white70,
-              ),
-              selectedColor: _kPink.withValues(alpha: 0.35),
-              backgroundColor: const Color(0xFF2A2D35),
-              side: BorderSide.none,
-              visualDensity: VisualDensity.compact,
-            ),
-          if (_deskFilter != DeskFilter.all)
-            InputChip(
-              label: Text(deskFilterLabel(_deskFilter)),
-              labelStyle: const TextStyle(fontSize: 12, color: Colors.white),
-              backgroundColor: _kPink.withValues(alpha: 0.25),
-              side: BorderSide.none,
-              onDeleted: () => _setDeskFilter(DeskFilter.all),
-              deleteIconColor: Colors.white70,
-              tooltip: 'Clear the filter',
-              visualDensity: VisualDensity.compact,
-            ),
-          if (_viewMode == PlatesViewMode.list)
-            Tooltip(
-              message: _collapse
-                  ? 'Collapsing duplicate reads of the same car (both engines +\nrepeat reads) into one row. Click to show every raw read.'
-                  : 'Showing every raw read. Click to collapse duplicates of the\nsame car into one row.',
-              child: IconButton(
-                onPressed: () => _setCollapse(!_collapse),
-                icon: Icon(
-                  _collapse ? Icons.layers : Icons.layers_clear,
-                  size: 18,
-                  color: _collapse
-                      ? Theme.of(context).colorScheme.primary
-                      : Colors.white54,
-                ),
-              ),
-            ),
-          if (_abAvailable)
-            TextButton.icon(
-              onPressed: () => showAbBenchmark(
-                context,
-                api: widget.api,
-                session: widget.session,
-                canConfirm: widget.canManageWatchlist,
-              ),
-              icon: const Icon(Icons.speed, size: 16, color: Colors.white70),
-              label: const Text(
-                'Benchmark',
-                style: TextStyle(color: Colors.white70, fontSize: 12),
-              ),
-            ),
-          // A toggle for the watchlist panel: accent colour + tinted fill while
-          // the panel is showing (same behaviour as PR #651).
-          Tooltip(
-            message: _showWatchlist
-                ? 'Hide the watchlist panel'
-                : 'Show the watchlist panel',
-            child: TextButton.icon(
-              style: _showWatchlist
-                  ? TextButton.styleFrom(
-                      backgroundColor: Theme.of(
-                        context,
-                      ).colorScheme.primary.withValues(alpha: 0.16),
-                    )
-                  : null,
-              onPressed: () => setState(() {
-                _showWatchlist = !_showWatchlist;
-                PlatesPrefs.setShowWatchlist(_showWatchlist);
-              }),
-              icon: Icon(
-                _showWatchlist
-                    ? Icons.playlist_add_check
-                    : Icons.playlist_add,
-                size: 16,
-                color: _showWatchlist
-                    ? Theme.of(context).colorScheme.primary
-                    : Colors.white70,
-              ),
-              label: Text(
-                _watchlist.isEmpty
-                    ? 'Watchlist'
-                    : 'Watchlist (${_watchlist.length})',
-                style: TextStyle(
-                  color: _showWatchlist
-                      ? Theme.of(context).colorScheme.primary
-                      : Colors.white70,
-                  fontSize: 12,
-                ),
               ),
             ),
           ),
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: () {
-              _stats.invalidate();
-              _load();
-            },
-            icon: const Icon(Icons.refresh, color: Colors.white70, size: 18),
-          ),
-          if (!_loading)
-            Text(
-              '$_total plate${_total == 1 ? '' : 's'}',
-              style: const TextStyle(color: Colors.white38, fontSize: 12),
-            ),
-        ],
+        ),
+      ],
+    );
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+      decoration: const BoxDecoration(
+        color: Color(0xFF1E2026),
+        border: Border(bottom: BorderSide(color: Colors.white12)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [findRow, const SizedBox(height: 8), viewRow],
       ),
     );
   }
@@ -1616,27 +1656,14 @@ class _PlatesScreenState extends State<PlatesScreen> {
           onNamePlate: (r) => _namePlate(r.plate, r.displayName),
           onReport: _openPlateReport,
         );
-      case PlatesViewMode.timeline:
-        return _PlateTimeline(
-          reads: _plates,
-          camName: camName,
-          api: widget.api,
-          session: widget.session,
-          gate: _thumbGate,
-          imageMode: PlateImageDisplay.both,
-          cropCorner: PlateCropCorner.bottomRight,
-          cropSize: PlateCropSize.medium,
-          onTap: _openRead,
-        );
     }
   }
 }
 
 // ─── view-mode switcher ────────────────────────────────────────────────────
 
-/// Segmented control for the four Plates layouts, styled to match
-/// [_MatchToggle] (icon-only ChoiceChips with tooltips to stay compact in the
-/// filter bar's Wrap).
+/// Segmented control for the four Plates layouts: icon segments with
+/// tooltips, styled like [_Seg].
 class _ViewModeToggle extends StatelessWidget {
   const _ViewModeToggle({required this.value, required this.onChanged});
   final PlatesViewMode value;
@@ -1644,80 +1671,173 @@ class _ViewModeToggle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent = Theme.of(context).colorScheme.primary;
     Widget seg(PlatesViewMode mode, IconData icon, String tip) {
-      final active = value == mode;
-      return Padding(
-        padding: const EdgeInsets.only(right: 4),
-        child: Tooltip(
-          message: tip,
-          child: ChoiceChip(
-            label: Icon(
-              icon,
-              size: 16,
-              color: active ? Colors.black : Colors.white70,
-            ),
-            selected: active,
-            onSelected: (_) => onChanged(mode),
-            showCheckmark: false,
-            selectedColor: accent,
-            backgroundColor: const Color(0xFF2A2D35),
+      final on = value == mode;
+      return Tooltip(
+        message: tip,
+        child: InkWell(
+          onTap: () => onChanged(mode),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            color: on ? _kPink : _kSurface2,
+            child: Icon(icon, size: 16, color: on ? Colors.white : Colors.white70),
           ),
         ),
       );
     }
 
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        seg(PlatesViewMode.list, Icons.view_list, 'List'),
-        seg(PlatesViewMode.gallery, Icons.grid_view, 'Grid'),
-        seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
-        seg(PlatesViewMode.timeline, Icons.timeline, 'Timeline feed'),
-      ],
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          seg(PlatesViewMode.list, Icons.view_list, 'List'),
+          seg(PlatesViewMode.gallery, Icons.grid_view, 'Grid'),
+          seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
+        ],
+      ),
     );
+  }
+}
+
+// ─── filter bar pieces ─────────────────────────────────────────────────────
+
+/// One labelled group in the filter bar: a quiet caption and its control on
+/// a shared tile, so related controls read as one unit.
+class _ToolGroup extends StatelessWidget {
+  const _ToolGroup({required this.child, this.label});
+
+  final String? label;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 34,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF26292F),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (label != null) ...[
+            Text(
+              label!,
+              style: const TextStyle(
+                color: Colors.white38,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.4,
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+/// A flat icon + label button for inside a [_ToolGroup].
+class _ToolButton extends StatelessWidget {
+  const _ToolButton({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.tooltip,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback? onTap;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    final b = InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 16, color: enabled ? Colors.white70 : Colors.white24),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              softWrap: false,
+              style: TextStyle(
+                color: enabled ? Colors.white : Colors.white38,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    return tooltip == null ? b : Tooltip(message: tooltip!, child: b);
+  }
+}
+
+/// An on/off pill for inside a [_ToolGroup] (accent fill when on).
+class _ToolToggle extends StatelessWidget {
+  const _ToolToggle({
+    required this.label,
+    required this.on,
+    required this.onTap,
+    this.tooltip,
+  });
+
+  final String label;
+  final bool on;
+  final VoidCallback onTap;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final b = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+          decoration: BoxDecoration(
+            color: on ? _kPink : _kSurface2,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                on ? Icons.check : Icons.add,
+                size: 13,
+                color: on ? Colors.white : Colors.white54,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  color: on ? Colors.white : Colors.white70,
+                  fontSize: 12,
+                  fontWeight: on ? FontWeight.w600 : FontWeight.w400,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return tooltip == null ? b : Tooltip(message: tooltip!, child: b);
   }
 }
 
 // ─── filter widgets ───────────────────────────────────────────────────────
-
-class _MatchToggle extends StatelessWidget {
-  const _MatchToggle({required this.value, required this.onChanged});
-  final String value;
-  final ValueChanged<String> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final accent = Theme.of(context).colorScheme.primary;
-    Widget seg(String v, String label) {
-      final active = value == v;
-      return Padding(
-        padding: const EdgeInsets.only(right: 4),
-        child: ChoiceChip(
-          label: Text(label),
-          selected: active,
-          onSelected: (_) => onChanged(v),
-          labelStyle: TextStyle(
-            fontSize: 12,
-            color: active ? Colors.black : Colors.white70,
-          ),
-          selectedColor: accent,
-          checkmarkColor: Colors.black,
-          backgroundColor: const Color(0xFF2A2D35),
-        ),
-      );
-    }
-
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        seg('exact', 'Exact'),
-        seg('contains', 'Contains'),
-        seg('fuzzy', 'Fuzzy'),
-      ],
-    );
-  }
-}
 
 /// Camera multi-select dialog with All / None shortcuts. Returns the new
 /// selection, or null if cancelled.
@@ -2121,7 +2241,6 @@ class _PlateThumb extends StatefulWidget {
     required this.gate,
     this.width = 92,
     this.height = 56,
-    this.iconSize = 22,
     this.imageMode = PlateImageDisplay.fullOnly,
     this.cropCorner = PlateCropCorner.bottomRight,
     this.cropSize = PlateCropSize.medium,
@@ -2135,7 +2254,7 @@ class _PlateThumb extends StatefulWidget {
   final double width;
   final double height;
   final double radius = 6;
-  final double iconSize;
+  final double iconSize = 22;
 
   /// Which image(s) to show — the full frame, the plate crop, or both. The crop
   /// is derived client-side from the fetched snapshot (engine-native decode,
@@ -2637,138 +2756,6 @@ class _PlateGroupedList extends StatelessWidget {
                   onReport: () => onReport(r),
                 ),
             ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-// ─── timeline feed view ────────────────────────────────────────────────────
-
-/// Chronological (newest-first) large-row feed — bigger thumbnail, plate,
-/// camera, and time per row for touch/scan-friendly browsing. Taps route
-/// through the same [onTap] as the list.
-class _PlateTimeline extends StatelessWidget {
-  const _PlateTimeline({
-    required this.reads,
-    required this.camName,
-    required this.api,
-    required this.session,
-    required this.gate,
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onTap,
-  });
-
-  final List<PlateRead> reads;
-  final String Function(String cameraId) camName;
-  final CrumbApi api;
-  final Session session;
-  final _ConcurrencyGate gate;
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final void Function(PlateRead) onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-      itemCount: reads.length,
-      separatorBuilder: (_, _) => const SizedBox(height: 8),
-      itemBuilder: (context, i) {
-        final p = reads[i];
-        return Material(
-          color: const Color(0xFF1E2026),
-          borderRadius: BorderRadius.circular(8),
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
-            onTap: () => onTap(p),
-            child: Padding(
-              padding: const EdgeInsets.all(10),
-              child: Row(
-                children: [
-                  _PlateThumb(
-                    read: p,
-                    api: api,
-                    session: session,
-                    gate: gate,
-                    imageMode: imageMode,
-                    cropCorner: cropCorner,
-                    cropSize: cropSize,
-                    // Big feed rows have the room — show both side-by-side, wide.
-                    sideBySide: imageMode == PlateImageDisplay.both,
-                    width: imageMode == PlateImageDisplay.both ? 320 : 190,
-                    height: 108,
-                    iconSize: 34,
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _PlateHeadline(
-                          name: p.displayName,
-                          plate: p.plate,
-                          plateStyle: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 24,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 2,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Row(
-                          children: [
-                            const Icon(Icons.videocam_outlined,
-                                size: 14, color: Colors.white38),
-                            const SizedBox(width: 4),
-                            Flexible(
-                              child: Text(
-                                camName(p.cameraId),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 13,
-                                ),
-                              ),
-                            ),
-                            if (p.region != null && p.region!.isNotEmpty) ...[
-                              const SizedBox(width: 8),
-                              Text(
-                                p.region!,
-                                style: const TextStyle(
-                                  color: Colors.white38,
-                                  fontSize: 12,
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          _fmtDateTime(p.ts),
-                          style: const TextStyle(
-                            color: Colors.white54,
-                            fontSize: 13,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  _ConfidenceChip(p.confidence),
-                  const SizedBox(width: 6),
-                  const Icon(Icons.chevron_right,
-                      color: Colors.white24, size: 22),
-                ],
-              ),
-            ),
           ),
         );
       },
@@ -4508,6 +4495,12 @@ Color? _parseHexColor(String? hex) {
 /// BYTES rather than a fixed entry COUNT — a count budget of a few hundred
 /// full-frame JPEGs could balloon to well over 100 MB.
 final Map<String, Uint8List> _snapshotCache = {};
+
+/// Puts a frame in the snapshot cache so widget tests can render cards
+/// without the network.
+@visibleForTesting
+void debugSeedSnapshot(String eventId, Uint8List bytes) =>
+    _snapshotCache[eventId] = bytes;
 final List<String> _snapshotCacheOrder = []; // LRU-ish, oldest first
 const _snapshotCacheMaxBytes = 48 * 1024 * 1024; // 48 MiB
 int _snapshotCacheBytes = 0;
