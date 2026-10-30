@@ -147,41 +147,66 @@ void main() {
 }
 
 void wideLayoutTest() {
-  testWidgets('wide profile puts the visits panel beside the video', (
-    tester,
-  ) async {
-    await tester.binding.setSurfaceSize(const Size(1600, 900));
-    addTearDown(() => tester.binding.setSurfaceSize(null));
-    final focus = PlateRead(
-      id: 'r',
-      cameraId: 'cam',
-      ts: DateTime.now(),
-      plate: 'ABC123',
-      plateRaw: 'ABC123',
-      confidence: 0.9,
-      region: 'CA',
-      sourceId: 'crumb-alpr',
-      eventId: null,
-      snapshotUrl: null,
-      displayName: null,
-      bbox: const [0.4, 0.6, 0.1, 0.05],
-    );
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: debugPlateProfile(focus: focus, stats: _stats()),
+  for (final width in [1456.0, 1600.0, 1900.0]) {
+    testWidgets('wide profile at $width: visits fill the row, rows do not clip', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(Size(width, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      PlateRead read(int i) => PlateRead(
+        id: 'r$i',
+        cameraId: 'cam',
+        // Far apart so every read is its own visit.
+        ts: DateTime.now().subtract(Duration(hours: 5 * i)),
+        plate: 'ABC123',
+        plateRaw: 'ABC123',
+        confidence: 1.0,
+        region: 'CA',
+        sourceId: 'crumb-alpr',
+        eventId: null,
+        snapshotUrl: null,
+        displayName: null,
+        bbox: const [0.4, 0.6, 0.1, 0.05],
+      );
+      final reads = [for (var i = 0; i < 6; i++) read(i)];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: debugPlateProfile(
+              focus: reads.first,
+              stats: _stats(),
+              reads: reads,
+            ),
+          ),
         ),
-      ),
-    );
-    await tester.pumpAndSettle(const Duration(milliseconds: 100));
-    expect(tester.takeException(), isNull);
-    final hero = tester.getRect(find.byKey(const ValueKey('profile-hero')));
-    final visits = tester.getRect(find.byKey(const ValueKey('profile-visits')));
-    expect(visits.left, greaterThanOrEqualTo(hero.right));
-    expect(visits.top, closeTo(hero.top, 1));
-    expect(visits.height, closeTo(hero.height, 1));
-    expect(visits.width, inInclusiveRange(320, 380));
-    // 16:9 video, no letterbox: the box is as wide as the video needs.
-    expect(hero.width / (hero.height - 34), closeTo(16 / 9, 0.02));
-  });
+      );
+      await tester.pumpAndSettle(const Duration(milliseconds: 100));
+      expect(tester.takeException(), isNull);
+      final hero = tester.getRect(find.byKey(const ValueKey('profile-hero')));
+      final visits = tester.getRect(
+        find.byKey(const ValueKey('profile-visits')),
+      );
+      expect(visits.left, greaterThanOrEqualTo(hero.right));
+      expect(visits.top, closeTo(hero.top, 1));
+      expect(visits.height, closeTo(hero.height, 1));
+      expect(visits.width, greaterThanOrEqualTo(320));
+      // 16:9 video, no letterbox: the box is as wide as the video needs.
+      expect(hero.width / (hero.height - 34), closeTo(16 / 9, 0.02));
+      // The hero row spans the same width as the stats cards below it.
+      final hour = find.ancestor(
+        of: find.text('HOUR OF DAY'),
+        matching: find.byType(Container),
+      );
+      final cardRight = tester.getRect(hour.first).right;
+      expect(visits.right, closeTo(cardRight, 1));
+      // Visit meta ellipsizes or fits; it is never hard-clipped.
+      final meta = find.textContaining(' read, 100%');
+      expect(meta, findsWidgets);
+      for (final e in meta.evaluate()) {
+        final box = e.renderObject! as RenderBox;
+        final r = box.localToGlobal(Offset.zero) & box.size;
+        expect(r.right, lessThanOrEqualTo(visits.right));
+      }
+    });
+  }
 }

@@ -949,6 +949,8 @@ class _MainShellState extends State<MainShell> with WindowListener {
                 child: Stack(
                   children: [
                     _buildBody(session),
+                    // Visible way out of fullscreen if the keys ever fail.
+                    FullscreenExitCorner(controller: widget.fullscreen),
                     // The floating Settings panel overlays the current tab with
                     // no scrim, so the wall behind stays live + interactive.
                     // It is NOT a pushed route, so the tab underneath keeps its

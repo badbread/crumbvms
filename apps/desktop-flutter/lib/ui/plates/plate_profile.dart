@@ -17,7 +17,6 @@ const _profileReadLimit = 200;
 /// Main-column width from which the visits list sits beside the hero video.
 const _profileSideBySideMin = 1100.0;
 const _profileVisitsMinW = 320.0;
-const _profileVisitsMaxW = 380.0;
 
 /// Height of the caption bar under the hero video.
 const _profileCaptionH = 32.0;
@@ -47,7 +46,11 @@ class _PlateProfile extends StatefulWidget {
     required this.onWatch,
     required this.onUnwatch,
     required this.onReport,
+    this.debugReads,
   });
+
+  /// Tests only: reads shown instead of fetching the visits from a server.
+  final List<PlateRead>? debugReads;
 
   /// The read the profile was opened from (its plate is the profile's plate).
   final PlateRead focus;
@@ -132,6 +135,15 @@ class _PlateProfileState extends State<_PlateProfile> {
     });
     if (plate.isEmpty) {
       setState(() => _loading = false);
+      return;
+    }
+    final seeded = widget.debugReads;
+    if (seeded != null) {
+      setState(() {
+        _reads = seeded;
+        _visits = collapseVisits(seeded);
+        _loading = false;
+      });
       return;
     }
     try {
@@ -549,10 +561,6 @@ class _PlateProfileState extends State<_PlateProfile> {
     final maxVideoW = avail - gap - _profileVisitsMinW;
     if (videoW > maxVideoW) videoW = maxVideoW;
     final videoH = videoW * 9 / 16;
-    final panelW = (avail - videoW - gap).clamp(
-      _profileVisitsMinW,
-      _profileVisitsMaxW,
-    );
     final totalH = videoH + _profileCaptionH + 2;
     return Padding(
       padding: const EdgeInsets.only(bottom: 14),
@@ -564,34 +572,37 @@ class _PlateProfileState extends State<_PlateProfile> {
             child: _hero(videoW, videoHeight: videoH, bottomMargin: 0),
           ),
           const SizedBox(width: gap),
-          Container(
-            key: const ValueKey('profile-visits'),
-            width: panelW,
-            height: totalH,
-            padding: const EdgeInsets.fromLTRB(14, 14, 8, 8),
-            decoration: BoxDecoration(
-              color: _kSurface1,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text(
-                  'RECENT VISITS',
-                  style: TextStyle(
-                    color: Colors.white38,
-                    fontSize: 11,
-                    letterSpacing: 0.6,
+          // Takes ALL the width the video leaves, so the hero row's right edge
+          // lines up with the stats cards below it.
+          Expanded(
+            child: Container(
+              key: const ValueKey('profile-visits'),
+              height: totalH,
+              padding: const EdgeInsets.fromLTRB(14, 14, 8, 8),
+              decoration: BoxDecoration(
+                color: _kSurface1,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'RECENT VISITS',
+                    style: TextStyle(
+                      color: Colors.white38,
+                      fontSize: 11,
+                      letterSpacing: 0.6,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 10),
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.only(right: 6),
-                    child: _visitsList(s),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: _visitsList(s),
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ],
@@ -838,19 +849,40 @@ class _PlateProfileState extends State<_PlateProfile> {
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: _clipRow([
-                Text(
-                  when,
-                  style: const TextStyle(color: Colors.white, fontSize: 12.5),
-                ),
-                const SizedBox(width: 10),
-                Text(
-                  '${widget.camName(v.cameraId)}  ·  '
-                  '${v.count} read${v.count == 1 ? '' : 's'}$conf',
-                  style: const TextStyle(color: Colors.white38, fontSize: 12),
-                ),
-                if (unusual) _tag('UNUSUAL HOUR', _kAmber),
-              ]),
+              // Two lines, each ellipsized: a hard-clipped single row cut the
+              // meta mid-word ("1 read, 100") in a narrow visits panel.
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    when,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 12.5),
+                  ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          '${widget.camName(v.cameraId)}  ·  '
+                          '${v.count} read${v.count == 1 ? '' : 's'}$conf',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      if (unusual) ...[
+                        const SizedBox(width: 8),
+                        _tag('UNUSUAL HOUR', _kAmber),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
             ),
             Tooltip(
               message: hasClip ? 'Play above' : 'View on timeline',
@@ -935,8 +967,10 @@ Widget debugPlateProfile({
   required PlateRead focus,
   PlateStats? stats,
   bool watched = false,
+  List<PlateRead>? reads,
 }) {
   return _PlateProfile(
+    debugReads: reads,
     focus: focus,
     stats: stats,
     statsUnsupported: stats == null,

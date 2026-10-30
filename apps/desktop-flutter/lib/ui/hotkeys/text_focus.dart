@@ -47,11 +47,28 @@ bool textInputHasFocus() {
   // which killed every single-key shortcut for as long as a panel containing
   // any text field was on screen (the HA badge popover always has one).
   if (node is FocusScopeNode) return false;
+  // The usual real-field shape: the focused node is the Focus that EditableText
+  // builds INSIDE itself, so the field is an ANCESTOR of the focused element.
+  // (The earlier downward-only walk missed this entirely and only "worked"
+  // because the app root's plain Focus, which holds primary focus whenever no
+  // field is actually focused, has the whole app below it.) Guarded: a node
+  // that is mid-teardown may have a defunct context.
+  try {
+    if (ctx.findAncestorWidgetOfExactType<EditableText>() != null) return true;
+  } catch (_) {
+    return false;
+  }
   var found = false;
   void visit(Element e) {
     if (found) return;
-    if (e.widget is EditableText) {
-      found = true;
+    final w = e.widget;
+    if (w is EditableText) {
+      // Only a field that is itself in the focus chain counts. The app root's
+      // autofocused `Focus` (FullscreenEscHandler) is a plain node whose
+      // subtree is the WHOLE app, so "some EditableText exists below primary
+      // focus" is true on any tab that shows a search box (Plates), and every
+      // hardware hotkey on that tab went dead (Esc / Space / j / k).
+      if (w.focusNode.hasFocus) found = true;
       return;
     }
     e.visitChildren(visit);

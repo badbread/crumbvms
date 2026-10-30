@@ -660,6 +660,9 @@ class _SheetCardState extends State<_SheetCard> {
 
   Widget _footer(PlateRead read, PlateStats? s, PlateHints hints) {
     final name = read.displayName?.trim() ?? '';
+    // A chip is (priority, text, colour); the row keeps the highest-priority
+    // chips that FIT and drops the rest whole, so none is ever cut mid-word.
+    const chipStyleSize = 10.5;
     Widget chip(String text, {Color? c}) => Container(
       margin: const EdgeInsets.only(right: 4),
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
@@ -669,7 +672,7 @@ class _SheetCardState extends State<_SheetCard> {
       ),
       child: Text(
         text,
-        style: TextStyle(color: c ?? Colors.white70, fontSize: 10.5),
+        style: TextStyle(color: c ?? Colors.white70, fontSize: chipStyleSize),
       ),
     );
     final now = DateTime.now();
@@ -702,14 +705,48 @@ class _SheetCardState extends State<_SheetCard> {
           ),
           if (name.isNotEmpty) _nameLine(name),
           const SizedBox(height: 5),
-          _clipRow([
-            if (s != null) chip('seen ${s.total}x'),
-            if (s?.prevSeen != null) chip('last ${fmtAgo(s!.prevSeen!, now)}'),
-            if (hints.isNew) chip('NEW', c: _kGreen),
-            if (widget.watched) chip('Watchlist', c: _kAmber),
-            if (s != null && s.isRegular) chip('Regular', c: _kLprAccent),
-            if (hints.unusualHour) chip('Unusual hour', c: _kAmber),
-          ]),
+          LayoutBuilder(
+            builder: (context, box) {
+              // Lower number = dropped first when the card is too narrow.
+              final specs = <({int keep, String text, Color? c})>[
+                if (s != null) (keep: 1, text: 'seen ${s.total}x', c: null),
+                if (s?.prevSeen != null)
+                  (keep: 0, text: 'last ${fmtAgo(s!.prevSeen!, now)}', c: null),
+                if (hints.isNew) (keep: 4, text: 'NEW', c: _kGreen),
+                if (widget.watched) (keep: 5, text: 'Watchlist', c: _kAmber),
+                if (s != null && s.isRegular)
+                  (keep: 3, text: 'Regular', c: _kLprAccent),
+                if (hints.unusualHour)
+                  (keep: 2, text: 'Unusual hour', c: _kAmber),
+              ];
+              final scaler = MediaQuery.textScalerOf(context);
+              double w(String t) {
+                final tp = TextPainter(
+                  text: TextSpan(
+                    text: t,
+                    style: const TextStyle(fontSize: chipStyleSize),
+                  ),
+                  textDirection: TextDirection.ltr,
+                  textScaler: scaler,
+                )..layout();
+                final width = tp.width;
+                tp.dispose();
+                // 6 + 6 padding, 4 margin, 1 for rounding.
+                return width + 17;
+              }
+
+              final shown = [...specs];
+              double total() => shown.fold(0.0, (a, e) => a + w(e.text));
+              while (shown.length > 1 && total() > box.maxWidth) {
+                var drop = 0;
+                for (var i = 1; i < shown.length; i++) {
+                  if (shown[i].keep < shown[drop].keep) drop = i;
+                }
+                shown.removeAt(drop);
+              }
+              return _clipRow([for (final e in shown) chip(e.text, c: e.c)]);
+            },
+          ),
           if (widget.tall) ...[
             const SizedBox(height: 8),
             SizedBox(
