@@ -1546,10 +1546,12 @@ class _WallTileState extends State<_WallTile>
   /// 220 ms (decelerate): the video resolves out of the connecting state
   /// instead of popping. Later reloads/swaps keep the old frame painting and
   /// never re-run it. Steady state is 1.0, where FadeTransition adds no layer.
-  late final AnimationController _reveal = AnimationController(
-    vsync: this,
-    duration: MotionTokens.d3,
-  )..addStatusListener(_onRevealStatus);
+  ///
+  /// Created eagerly in [initState], not lazily: a tile that never got a first
+  /// frame (stream fetch denied, remount before the keyframe) used to create
+  /// this for the first time inside [dispose], where the ticker's TickerMode
+  /// ancestor lookup asserts on a deactivated element.
+  late final AnimationController _reveal;
   late final Animation<double> _revealOpacity = _reveal.drive(
     CurveTween(curve: MotionTokens.decelerate),
   );
@@ -1575,12 +1577,22 @@ class _WallTileState extends State<_WallTile>
   @override
   void initState() {
     super.initState();
+    _reveal = AnimationController(vsync: this, duration: MotionTokens.d3)
+      ..addStatusListener(_onRevealStatus);
     _shown = widget.camera;
     _lastAdaptiveShed = _adaptiveShed;
     widget.adaptive?.addListener(_onAdaptiveChanged);
+    _trace('mounted: ${widget.camera.id}');
     _load();
     unawaited(_loadHaLinks());
   }
+
+  /// One console line per tile lifecycle event, prefixed `wall tile`, so a
+  /// console log can be grepped to prove that a fullscreen toggle (or any other
+  /// shell-level change) did NOT remount tiles or open new players: a toggle
+  /// must add zero `wall tile` lines. A handful of lines per mount only, so it
+  /// is cheap enough to keep in release builds (it is how a tester checks).
+  static void _trace(String event) => debugPrint('wall tile $event');
 
   /// The adaptive controller changed something. If OUR shed status flipped,
   /// swap the stream (main<->sub); the old player keeps painting until the
@@ -1664,6 +1676,7 @@ class _WallTileState extends State<_WallTile>
       final player = Player();
       final controller = VideoController(player);
       spawned = player;
+      _trace('player created: ${widget.camera.id}');
       // Diagnostics (#180): player errors always captured; mpv log in verbose.
       DiagnosticsService.instance.attachPlayer(
         'live:${widget.camera.name}',
@@ -2135,6 +2148,7 @@ class _WallTileState extends State<_WallTile>
 
   @override
   void dispose() {
+    _trace('disposed: ${widget.camera.id}');
     widget.adaptive?.removeListener(_onAdaptiveChanged);
     widget.adaptive?.dropTile(_paneId);
     _reveal.dispose();
