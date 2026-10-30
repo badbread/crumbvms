@@ -217,7 +217,8 @@ class ExportViewModel(
      * already finished is an idempotent success, so a race with completion is safe.
      *
      * Polling stops locally on success and the job card is cleared back to a plain
-     * "Export cancelled." notice rather than a red failure.
+     * "Export cancelled." notice rather than a red failure. If the job turns out to
+     * have finished first, the completed job is kept so it can still be downloaded.
      */
     fun cancelExport() {
         val jobId = activeJobId ?: _state.value.job?.id ?: return
@@ -229,15 +230,30 @@ class ExportViewModel(
                     pollJob?.cancel()
                     pollJob = null
                     activeJobId = null
+                    // The server answers 204 for an already-Done job and keeps its
+                    // files, so a cancel that loses the race against completion must
+                    // not hide the finished export: check once and keep it if Done.
+                    val finished = repo.exportStatus(jobId).getOrNull()?.takeIf { it.isDone }
                     _state.update {
-                        it.copy(
-                            cancelling = false,
-                            polling = false,
-                            submitting = false,
-                            job = null,
-                            jobError = null,
-                            notice = "Export cancelled.",
-                        )
+                        if (finished != null) {
+                            it.copy(
+                                cancelling = false,
+                                polling = false,
+                                submitting = false,
+                                job = finished,
+                                jobError = null,
+                                notice = "Export had already finished.",
+                            )
+                        } else {
+                            it.copy(
+                                cancelling = false,
+                                polling = false,
+                                submitting = false,
+                                job = null,
+                                jobError = null,
+                                notice = "Export cancelled.",
+                            )
+                        }
                     }
                 }
                 .onFailure { t ->
