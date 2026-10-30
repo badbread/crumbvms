@@ -55,7 +55,9 @@ fun JumpToDateTimeDialog(
 ) {
     val initCal = remember(initialMs) { Calendar.getInstance().apply { timeInMillis = initialMs } }
     var pickingTime by rememberSaveable { mutableStateOf(false) }
-    val dateState = rememberDatePickerState(initialSelectedDateMillis = initialMs)
+    val dateState = rememberDatePickerState(
+        initialSelectedDateMillis = localDateAsPickerMillis(initialMs),
+    )
     val timeState = rememberTimePickerState(
         initialHour = initCal.get(Calendar.HOUR_OF_DAY),
         initialMinute = initCal.get(Calendar.MINUTE),
@@ -86,29 +88,54 @@ fun JumpToDateTimeDialog(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    val dateMs = dateState.selectedDateMillis ?: initialMs
-                    // Material3's date picker reports the selection as UTC midnight,
-                    // so read Y/M/D in UTC, then combine with the chosen LOCAL h:m.
-                    val utc = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
-                        .apply { timeInMillis = dateMs }
-                    val target = Calendar.getInstance().apply {
-                        set(
-                            utc.get(Calendar.YEAR),
-                            utc.get(Calendar.MONTH),
-                            utc.get(Calendar.DAY_OF_MONTH),
-                            timeState.hour,
-                            timeState.minute,
-                            if (preserveSeconds) initCal.get(Calendar.SECOND) else 0,
-                        )
-                        set(
-                            Calendar.MILLISECOND,
-                            if (preserveSeconds) initCal.get(Calendar.MILLISECOND) else 0,
-                        )
-                    }.timeInMillis
+                    val dateMs = dateState.selectedDateMillis ?: localDateAsPickerMillis(initialMs)
+                    val target = combinePickerDateWithLocalTime(
+                        pickerDateMs = dateMs,
+                        hour = timeState.hour,
+                        minute = timeState.minute,
+                        second = if (preserveSeconds) initCal.get(Calendar.SECOND) else 0,
+                        millis = if (preserveSeconds) initCal.get(Calendar.MILLISECOND) else 0,
+                    )
                     onPicked(target)
                 }) { Text("Go") }
             },
             dismissButton = { TextButton(onClick = { pickingTime = false }) { Text("Back") } },
         )
     }
+}
+
+/**
+ * The value to hand Material3's DatePicker as `selectedDateMillis` for an
+ * instant: the instant's LOCAL calendar date expressed as UTC midnight. The
+ * picker reads that value in UTC, so passing the raw instant preselects the
+ * wrong day for any local time that falls on a different UTC date (evenings in
+ * the Americas, mornings in UTC+ zones).
+ */
+internal fun localDateAsPickerMillis(instantMs: Long, zone: TimeZone = TimeZone.getDefault()): Long {
+    val local = Calendar.getInstance(zone).apply { timeInMillis = instantMs }
+    return Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+        clear()
+        set(local.get(Calendar.YEAR), local.get(Calendar.MONTH), local.get(Calendar.DAY_OF_MONTH))
+    }.timeInMillis
+}
+
+/**
+ * Inverse of [localDateAsPickerMillis]: read the picker's selection (UTC
+ * midnight of the chosen date) as Y/M/D and combine it with the chosen LOCAL
+ * time of day, returning the instant in epoch-millis.
+ */
+internal fun combinePickerDateWithLocalTime(
+    pickerDateMs: Long,
+    hour: Int,
+    minute: Int,
+    second: Int,
+    millis: Int,
+    zone: TimeZone = TimeZone.getDefault(),
+): Long {
+    val utc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { timeInMillis = pickerDateMs }
+    return Calendar.getInstance(zone).apply {
+        clear()
+        set(utc.get(Calendar.YEAR), utc.get(Calendar.MONTH), utc.get(Calendar.DAY_OF_MONTH), hour, minute, second)
+        set(Calendar.MILLISECOND, millis)
+    }.timeInMillis
 }
