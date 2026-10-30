@@ -9,8 +9,8 @@ import 'package:media_kit/media_kit.dart';
 import 'package:crumb_desktop/ui/playback/gapless_segment_pane_controller.dart';
 
 void main() {
-  const a = 'http://10.0.0.5:8080/media/segments/aaa.mp4?token=one';
-  const b = 'http://10.0.0.5:8080/media/segments/bbb.mp4?token=two';
+  const a = 'http://10.0.0.5:8080/media/segments/aaa.mp4?token=one'; // gitleaks:allow
+  const b = 'http://10.0.0.5:8080/media/segments/bbb.mp4?token=two'; // gitleaks:allow
   final pl = Playlist([Media(a), Media(b)], index: 1);
 
   test('matches the same file', () {
@@ -22,7 +22,7 @@ void main() {
       playlistEntryIs(
         pl,
         1,
-        'http://10.0.0.5:8080/media/segments/bbb.mp4?token=refreshed',
+        'http://10.0.0.5:8080/media/segments/bbb.mp4?token=refreshed', // gitleaks:allow
       ),
       isTrue,
     );
